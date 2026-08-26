@@ -815,6 +815,17 @@ fn test_repository() -> (tempfile::TempDir, PathBuf) {
         "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
     )
     .expect("write second scheduler repository fixture");
+    fs::create_dir(repo.join("tests")).expect("create scheduler test-target directory");
+    fs::write(
+        repo.join("tests/scheduler_preclaim.rs"),
+        "#[test]\nfn scheduler_preclaim_fixture() {}\n",
+    )
+    .expect("write scheduler test-target fixture");
+    fs::write(
+        repo.join("tests/scheduler_preclaim_b.rs"),
+        "#[test]\nfn scheduler_preclaim_b_fixture() {}\n",
+    )
+    .expect("write second scheduler test-target fixture");
     let mut index = repository.index().expect("open scheduler fixture index");
     index
         .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
@@ -910,9 +921,45 @@ macro_rules! with_invalid_schedule_context {
 
 macro_rules! with_valid_schedule_context {
     ($context:ident, $assignments:expr, $max_children:expr, $body:block) => {{
+        let assignments = $assignments;
+        let requested_assignments = assignments.clone();
+        with_valid_schedule_context!(
+            @plans,
+            $context,
+            assignments,
+            requested_assignments,
+            $max_children,
+            $body
+        )
+    }};
+    (
+        $context:ident,
+        current = $assignments:expr,
+        requested = $requested_assignments:expr,
+        $max_children:expr,
+        $body:block
+    ) => {{
+        with_valid_schedule_context!(
+            @plans,
+            $context,
+            $assignments,
+            $requested_assignments,
+            $max_children,
+            $body
+        )
+    }};
+    (
+        @plans,
+        $context:ident,
+        $assignments:expr,
+        $requested_assignments:expr,
+        $max_children:expr,
+        $body:block
+    ) => {{
         let (_temp, repo) = test_repository();
         let options = test_options(&repo, "direct-valid-scheduler");
         let plan = test_plan($assignments);
+        let requested_plan = test_plan($requested_assignments);
         let schedule = root_schedule(&plan);
         let consultant = SupervisorConsultantPlan::default();
         let assignment_metadata = AssignmentMetadata::new();
@@ -959,7 +1006,7 @@ macro_rules! with_valid_schedule_context {
         };
         let $context = AssignmentSchedulerContext {
             plan: &plan,
-            requested_plan: &plan,
+            requested_plan: &requested_plan,
             execution_target: None,
             budget_config: &budget_config,
             consultant: &consultant,
@@ -1139,93 +1186,980 @@ fn concurrent_scheduler_preserves_schedule_error_context_before_spawning() {
 }
 
 #[test]
-fn serial_scheduler_directly_dispatches_and_completes_fake_assignment() {
+fn preclaim_viable_assignment_passes_unchanged_and_completes_normally() {
     // Fake dispatch keeps the provisional default model's configured
     // capability evidence; it does not treat an empty resolved slug as
     // authority by itself.
+    let mut viable_assignment = test_assignment("serial-child", "tests/scheduler_preclaim.rs");
+    viable_assignment.task = Some(
+        "update tests/scheduler_preclaim.rs and run cargo test --test scheduler_preclaim"
+            .to_string(),
+    );
+    let unchanged_assignment = viable_assignment.clone();
+    with_valid_schedule_context!(context, vec![viable_assignment], 1, {
+        let mut progress = SchedulerProgress::new(1, 2);
+        let cancellation = ProcessCancellation::new();
+        let serial_intents = Mutex::new(Vec::new());
+
+        run_serial_assignment_schedule(&context, &mut progress, &cancellation, &serial_intents)
+            .expect("serial scheduler dispatch succeeds");
+
+        let outcome = progress.indexed_outcomes[0]
+            .as_ref()
+            .expect("serial scheduler stores completed outcome");
+        assert_eq!(
+            outcome.report.as_ref().map(|report| report.id.as_str()),
+            Some("serial-child")
+        );
+        assert!(outcome.fatal_error.is_none());
+        assert!(!outcome.assignment_failed);
+        assert_eq!(outcome.released_claims.len(), 1);
+        assert!(outcome.release_errors.is_empty());
+        assert!(outcome.semantic_release_errors.is_empty());
+        let concurrency = progress.concurrency.finish();
+        assert_eq!(concurrency.started_assignment_count, 1);
+        assert_eq!(concurrency.completed_assignment_count, 1);
+        assert_eq!(concurrency.peak, 1);
+        assert!(concurrency
+            .mean
+            .is_some_and(|mean| mean > 0.0 && mean <= 1.0));
+        assert_eq!(
+            outcome.claimed_paths,
+            vec![PathBuf::from("tests/scheduler_preclaim.rs")]
+        );
+        assert_eq!(context.plan.assignments[0], unchanged_assignment);
+        let decisions =
+            fs::read_to_string(context.run_dir.join(preclaim::PRECLAIM_DECISIONS_RELATIVE))
+                .expect("read recorded pre-claim decisions");
+        assert!(
+            decisions.contains("\"disposition\":\"claim\"")
+                || decisions.contains("\"disposition\": \"claim\"")
+        );
+        assert!(
+            decisions.contains("\"evidence_source\":\"synthetic_simulation\"")
+                || decisions.contains("\"evidence_source\": \"synthetic_simulation\"")
+        );
+        assert!(decisions.contains("serial-child"));
+    });
+}
+
+fn requested_preclaim_directive(json: &str) -> String {
+    format!("maco-preclaim-v1:{json}")
+}
+
+fn read_recorded_preclaim_decisions(run_dir: &Path) -> Vec<preclaim::PreclaimDecision> {
+    fs::read_to_string(run_dir.join(preclaim::PRECLAIM_DECISIONS_RELATIVE))
+        .expect("read recorded pre-claim decisions")
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).expect("parse recorded pre-claim decision"))
+        .collect()
+}
+
+#[test]
+fn trusted_requested_plan_claim_override_is_recorded_before_scheduler_claim_state() {
+    let mut current = test_assignment("trusted-claim", "README.md");
+    current.task = Some("update the bounded documentation assignment".to_string());
+    let mut requested = current.clone();
+    requested.notes = Some(requested_preclaim_directive(
+        r#"{"operator_override":{"disposition":"claim","rationale":"operator reviewed the bounded documentation change"}}"#,
+    ));
+
     with_valid_schedule_context!(
         context,
-        vec![test_assignment("serial-child", "README.md")],
+        current = vec![current],
+        requested = vec![requested],
         1,
         {
-            let mut progress = SchedulerProgress::new(1, 2);
+            let evidence = PreclaimRunEvidence::acquire(
+                context.repo,
+                SupervisorRuntime::Fake,
+                SupervisorExecutionRuntime::Verified,
+            );
+            let decision = preclaim_assignment(
+                context.artifacts,
+                &context.plan.assignments[0],
+                &context.requested_plan.assignments,
+                &evidence,
+            )
+            .expect("trusted claim override produces a persisted decision");
+
+            assert_eq!(decision.disposition, preclaim::PreclaimDisposition::Claim);
+            assert_eq!(
+                decision.triage_outcome,
+                preclaim::PreclaimTriageOutcome::OperatorOverride
+            );
+            assert_eq!(
+                decision.authority,
+                preclaim::PreclaimDecisionAuthority::Operator
+            );
+            assert!(decision.map_present && decision.risk_present && decision.runtime_present);
+            assert_eq!(
+                decision.dimensions.clear_verification_path,
+                preclaim::ViabilityFinding::Unknown
+            );
+            let recorded_override = decision
+                .operator_override
+                .as_ref()
+                .expect("claim override remains typed on the decision");
+            assert_eq!(
+                recorded_override.rationale,
+                "operator reviewed the bounded documentation change"
+            );
+            assert!(!recorded_override.rationale.trim().is_empty());
+            assert!(!decision.reason.contains("README.md"));
+
+            let recorded_decisions = read_recorded_preclaim_decisions(context.run_dir);
+            let [recorded_before_claim] = recorded_decisions.as_slice() else {
+                panic!("trusted claim override must persist exactly one pre-claim decision");
+            };
+            assert_eq!(recorded_before_claim, &decision);
+            assert!(context
+                .sync_store
+                .snapshot()
+                .expect("snapshot claims before scheduler admission")
+                .is_empty());
+            assert!(context
+                .manager
+                .list()
+                .expect("list worktrees before scheduler admission")
+                .is_empty());
+            assert!(!context
+                .run_dir
+                .join("assignments/trusted-claim.prompt.md")
+                .exists());
+
+            let mut progress = SchedulerProgress::new(1, 1);
+            progress
+                .install_preclaim_decisions(vec![decision])
+                .expect("install trusted prepared pre-claim decision");
             let cancellation = ProcessCancellation::new();
             let serial_intents = Mutex::new(Vec::new());
-
             run_serial_assignment_schedule(&context, &mut progress, &cancellation, &serial_intents)
-                .expect("serial scheduler dispatch succeeds");
+                .expect("trusted claim override admits the otherwise ambiguous assignment");
 
             let outcome = progress.indexed_outcomes[0]
                 .as_ref()
-                .expect("serial scheduler stores completed outcome");
-            assert_eq!(
-                outcome.report.as_ref().map(|report| report.id.as_str()),
-                Some("serial-child")
-            );
-            assert!(outcome.fatal_error.is_none());
+                .expect("claim override stores an execution outcome");
             assert!(!outcome.assignment_failed);
-            assert_eq!(outcome.released_claims.len(), 1);
-            assert!(outcome.release_errors.is_empty());
-            assert!(outcome.semantic_release_errors.is_empty());
-            let concurrency = progress.concurrency.finish();
-            assert_eq!(concurrency.started_assignment_count, 1);
-            assert_eq!(concurrency.completed_assignment_count, 1);
-            assert_eq!(concurrency.peak, 1);
-            assert!(concurrency
-                .mean
-                .is_some_and(|mean| mean > 0.0 && mean <= 1.0));
+            assert!(outcome.report.is_some());
             assert_eq!(outcome.claimed_paths, vec![PathBuf::from("README.md")]);
-            let decisions =
-                fs::read_to_string(context.run_dir.join(preclaim::PRECLAIM_DECISIONS_RELATIVE))
-                    .expect("read recorded pre-claim decisions");
-            assert!(
-                decisions.contains("\"disposition\":\"claim\"")
-                    || decisions.contains("\"disposition\": \"claim\"")
-            );
-            assert!(
-                decisions.contains("\"evidence_source\":\"synthetic_simulation\"")
-                    || decisions.contains("\"evidence_source\": \"synthetic_simulation\"")
-            );
-            assert!(decisions.contains("serial-child"));
+            assert_eq!(outcome.released_claims.len(), 1);
+            assert_eq!(progress.concurrency.finish().started_assignment_count, 1);
         }
     );
 }
 
 #[test]
-fn scheduler_fails_closed_before_claim_when_map_risk_runtime_are_missing() {
+fn verified_preparation_uses_requested_plan_override_before_assignment_selection_or_claim() {
+    let (_temp, repo) = test_repository();
+    let mut assignment = test_assignment("verified-operator-claim", "README.md");
+    assignment.task = Some("update the bounded documentation assignment".to_string());
+    assignment.notes = Some(requested_preclaim_directive(
+        r#"{"operator_override":{"disposition":"claim","rationale":"authenticated caller approved the ambiguous verification path"}}"#,
+    ));
+    let plan = test_plan(vec![assignment]);
+    let catalog = test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
+        .expect("construct deterministic Codex selector catalog");
+    let mut options = test_options(&repo, "verified-operator-claim");
+    options.runtime = SupervisorRuntime::Codex;
+
+    let prepared = prepare_supervisor_run(
+        LoadedSupervisorPlan {
+            plan,
+            consultant: SupervisorConsultantPlan::default(),
+            assignment_metadata: AssignmentMetadata::new(),
+            plan_metadata: SupervisorPlanMetadata::default(),
+        },
+        &options,
+        1,
+        SupervisorExecutionRuntime::Verified,
+        SupervisorWorktreeCreation::VerifiedTestOnly,
+        Ok(catalog),
+    )
+    .expect("trusted requested-plan override passes verified scheduler preparation");
+
+    let [decision] = prepared.preclaim_decisions.as_slice() else {
+        panic!("verified preparation must retain exactly one pre-claim decision");
+    };
+    assert_eq!(decision.disposition, preclaim::PreclaimDisposition::Claim);
+    assert_eq!(
+        decision.triage_outcome,
+        preclaim::PreclaimTriageOutcome::OperatorOverride
+    );
+    assert_eq!(
+        decision.authority,
+        preclaim::PreclaimDecisionAuthority::Operator
+    );
+    assert!(decision.map_present && decision.risk_present && decision.runtime_present);
+    assert_eq!(
+        decision.dimensions.clear_verification_path,
+        preclaim::ViabilityFinding::Unknown
+    );
+    assert_eq!(
+        decision
+            .operator_override
+            .as_ref()
+            .map(|operator_override| operator_override.rationale.as_str()),
+        Some("authenticated caller approved the ambiguous verification path")
+    );
+    assert!(!prepared.selection_decisions.is_empty());
+    assert!(!prepared.plan.role_models.is_empty());
+    assert!(prepared.requested_plan.role_models.is_empty());
+
+    let recorded = read_recorded_preclaim_decisions(&prepared.run_dir);
+    assert_eq!(recorded, prepared.preclaim_decisions);
+    assert!(SyncStore::open(&repo)
+        .expect("open verified pre-claim sync store")
+        .snapshot()
+        .expect("snapshot verified pre-claim sync store")
+        .is_empty());
+    assert!(prepared
+        .manager
+        .list()
+        .expect("list verified pre-claim worktrees")
+        .is_empty());
+    assert!(!prepared
+        .run_dir
+        .join("assignments/verified-operator-claim.prompt.md")
+        .exists());
+}
+
+fn preselection_failure_assignment(assignment_id: &str) -> OrchestratorAssignment {
+    let mut assignment = mechanical_assignment(assignment_id);
+    assignment.assigned_paths = vec![PathBuf::from("tests/scheduler_preclaim.rs")];
+    assignment.task = Some(
+        "update tests/scheduler_preclaim.rs and run cargo test --test scheduler_preclaim"
+            .to_string(),
+    );
+    assignment.worker_assignments[0].assigned_paths = assignment.assigned_paths.clone();
+    assignment
+}
+
+fn assert_preselection_failure_has_no_assignment_side_effects(
+    repo: &Path,
+    run_id: &RunId,
+    assignment_id: &str,
+) {
+    assert!(SyncStore::open(repo)
+        .expect("open failed-preselection claim store")
+        .snapshot()
+        .expect("snapshot failed-preselection claim store")
+        .is_empty());
+    assert!(WorktreeManager::new(repo)
+        .list()
+        .expect("list failed-preselection worktrees")
+        .is_empty());
+
+    let run_dir = repo
+        .join(RunArtifactFamily::Supervise.run_root())
+        .join(run_id.as_str());
+    assert!(run_dir.is_dir());
+    for forbidden in [
+        PathBuf::from(SELECTION_LEDGER_RELATIVE),
+        RunArtifactFamily::Supervise.final_report_relative_path(),
+        PathBuf::from(format!("assignments/{assignment_id}.prompt.md")),
+        PathBuf::from(format!(
+            "assignments/{assignment_id}.attempt-1.worktree-writable-admission.json"
+        )),
+        PathBuf::from(format!("reports/{assignment_id}.json")),
+        PathBuf::from(format!("evidence/incoming/{assignment_id}.json")),
+        PathBuf::from(format!("logs/{assignment_id}.jsonl")),
+        PathBuf::from(format!("logs/{assignment_id}.summary.json")),
+        PathBuf::from(format!(
+            "logs/workers/{assignment_id}/mechanical-worker.jsonl"
+        )),
+    ] {
+        assert!(
+            !run_dir.join(&forbidden).exists(),
+            "failed preselection unexpectedly created {}",
+            forbidden.display()
+        );
+    }
+    for forbidden_directory in ["assignments", "selection", "reports", "logs", "incoming"] {
+        assert!(
+            !run_dir.join(forbidden_directory).exists(),
+            "failed preselection unexpectedly created {forbidden_directory}"
+        );
+    }
+
+    let rolling_budget_root = repo
+        .join(".git/maco/state")
+        .join(crate::budget_ledger::BUDGET_LEDGER_ROOT_NAME)
+        .join("workspace");
+    assert!(
+        !rolling_budget_root.exists(),
+        "failed preselection must not reserve or consume workspace budget"
+    );
+    assert!(
+        open_supervisor_checkpoint(repo, run_id).is_err(),
+        "failed preselection must not create a checkpoint or assignment_started record"
+    );
+}
+
+#[test]
+fn preclaim_early_durability_survives_objective_preselection_failure() {
+    let (_temp, repo) = test_repository();
+    let assignment_id = "durable-before-preselection-failure";
+    let assignment = preselection_failure_assignment(assignment_id);
+    assert!(assignment.runtime.is_none());
+    let plan = test_plan(vec![assignment]);
+    assert!(plan.role_models.is_empty());
+    let catalog = test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
+        .expect("construct deterministic Codex selector catalog");
+    let mut plan_metadata = SupervisorPlanMetadata::default();
+    plan_metadata.objective_profile = Some("missing-preclaim-durability-v1".to_string());
+    let run_id = RunId::new("durable-before-preselection-failure")
+        .expect("valid failed-preselection run id");
+    let mut options = test_options(&repo, run_id.as_str());
+    options.runtime = SupervisorRuntime::Codex;
+
+    let error = match prepare_supervisor_run(
+        LoadedSupervisorPlan {
+            plan,
+            consultant: SupervisorConsultantPlan::default(),
+            assignment_metadata: AssignmentMetadata::new(),
+            plan_metadata,
+        },
+        &options,
+        1,
+        SupervisorExecutionRuntime::Verified,
+        SupervisorWorktreeCreation::VerifiedTestOnly,
+        Ok(catalog),
+    ) {
+        Ok(_) => panic!("unknown objective profile must fail scheduler preselection"),
+        Err(error) => error,
+    };
+    let error = format!("{error:#}");
+    assert!(error.contains("failed to resolve the supervisor objective profile"));
+    assert!(error.contains("unknown objective profile id 'missing-preclaim-durability-v1'"));
+
+    let run_dir = repo
+        .join(RunArtifactFamily::Supervise.run_root())
+        .join(run_id.as_str());
+    let decisions = read_recorded_preclaim_decisions(&run_dir);
+    let [decision] = decisions.as_slice() else {
+        panic!("preselection failure must retain exactly one private pre-claim decision");
+    };
+    assert_eq!(decision.assignment_id, assignment_id);
+    assert_eq!(decision.disposition, preclaim::PreclaimDisposition::Claim);
+
+    let events = fs::read_to_string(run_dir.join(ORCHESTRATION_EVENT_PATH))
+        .expect("read failed-preselection orchestration events")
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_str::<OrchestrationEvent>(line)
+                .expect("parse failed-preselection orchestration event")
+        })
+        .filter(|event| event.node == assignment_id && event.kind == OrchestrationEventKind::Gate)
+        .collect::<Vec<_>>();
+    let [gate] = events.as_slice() else {
+        panic!("preselection failure must retain exactly one assignment Gate event");
+    };
+    assert_eq!(gate.payload["assignment_id"].as_str(), Some(assignment_id));
+    assert_eq!(gate.payload["disposition"].as_str(), Some("claim"));
+
+    assert_preselection_failure_has_no_assignment_side_effects(&repo, &run_id, assignment_id);
+}
+
+#[test]
+fn preclaim_early_durability_gate_failure_stops_before_assignment_side_effects() {
+    let (_temp, repo) = test_repository();
+    let assignment_id = "preclaim-gate-persistence-failure";
+    let assignment = preselection_failure_assignment(assignment_id);
+    assert!(assignment.runtime.is_none());
+    let plan = test_plan(vec![assignment]);
+    assert!(plan.role_models.is_empty());
+    let catalog = test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
+        .expect("construct deterministic Codex selector catalog");
+    let run_id = RunId::new("preclaim-gate-persistence-failure")
+        .expect("valid Gate-persistence-failure run id");
+    let mut options = test_options(&repo, run_id.as_str());
+    options.runtime = SupervisorRuntime::Codex;
+    crate::orchestration_event::set_orchestration_event_append_fault();
+
+    let error = match prepare_supervisor_run(
+        LoadedSupervisorPlan {
+            plan,
+            consultant: SupervisorConsultantPlan::default(),
+            assignment_metadata: AssignmentMetadata::new(),
+            plan_metadata: SupervisorPlanMetadata::default(),
+        },
+        &options,
+        1,
+        SupervisorExecutionRuntime::Verified,
+        SupervisorWorktreeCreation::VerifiedTestOnly,
+        Ok(catalog),
+    ) {
+        Ok(_) => panic!("failed pre-claim Gate persistence must stop scheduler preparation"),
+        Err(error) => error,
+    };
+    assert!(format!("{error:#}").contains("failed to persist pre-claim orchestration Gate event"));
+
+    let run_dir = repo
+        .join(RunArtifactFamily::Supervise.run_root())
+        .join(run_id.as_str());
+    let decisions = read_recorded_preclaim_decisions(&run_dir);
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].assignment_id, assignment_id);
+    let assignment_gate_count = fs::read_to_string(run_dir.join(ORCHESTRATION_EVENT_PATH))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_str::<OrchestrationEvent>(line)
+                .expect("parse Gate-persistence-failure orchestration event")
+        })
+        .filter(|event| event.node == assignment_id && event.kind == OrchestrationEventKind::Gate)
+        .count();
+    assert_eq!(assignment_gate_count, 0);
+
+    assert_preselection_failure_has_no_assignment_side_effects(&repo, &run_id, assignment_id);
+}
+
+#[test]
+fn trusted_requested_plan_park_override_is_reversible_and_has_no_scheduler_side_effects() {
+    let mut current = mechanical_assignment("trusted-park");
+    current.assigned_paths = vec![PathBuf::from("tests/scheduler_preclaim.rs")];
+    current.worker_assignments[0].assigned_paths = current.assigned_paths.clone();
+    let mut requested = current.clone();
+    requested.notes = Some(requested_preclaim_directive(
+        r#"{"operator_override":{"disposition":"park","rationale":"operator requested a reversible hold"}}"#,
+    ));
+
     with_valid_schedule_context!(
         context,
-        vec![test_assignment("parked-child", "README.md")],
+        current = vec![current],
+        requested = vec![requested],
         1,
         {
-            let _missing = preclaim::ForceMissingPreclaimEvidence::install();
+            let evidence = PreclaimRunEvidence::acquire(
+                context.repo,
+                SupervisorRuntime::Fake,
+                SupervisorExecutionRuntime::Verified,
+            );
+            let decision = preclaim_assignment(
+                context.artifacts,
+                &context.plan.assignments[0],
+                &context.requested_plan.assignments,
+                &evidence,
+            )
+            .expect("trusted park override produces a persisted decision");
+            assert_eq!(decision.disposition, preclaim::PreclaimDisposition::Park);
+            assert_eq!(
+                decision.triage_outcome,
+                preclaim::PreclaimTriageOutcome::OperatorOverride
+            );
+            assert_eq!(
+                decision.authority,
+                preclaim::PreclaimDecisionAuthority::Operator
+            );
+            assert!(decision.parking_reversible);
+            assert!(decision.map_present && decision.risk_present && decision.runtime_present);
+            assert_eq!(
+                decision
+                    .operator_override
+                    .as_ref()
+                    .map(|operator_override| operator_override.rationale.as_str()),
+                Some("operator requested a reversible hold")
+            );
+
             let mut progress = SchedulerProgress::new(1, 1);
+            progress
+                .install_preclaim_decisions(vec![decision.clone()])
+                .expect("install trusted prepared park decision");
             let cancellation = ProcessCancellation::new();
             let serial_intents = Mutex::new(Vec::new());
-
             run_serial_assignment_schedule(&context, &mut progress, &cancellation, &serial_intents)
-                .expect("missing-evidence pre-claim parks without aborting the scheduler");
+                .expect("trusted park override remains a normal reversible scheduler outcome");
 
             let outcome = progress.indexed_outcomes[0]
                 .as_ref()
-                .expect("parked assignment still records an outcome");
+                .expect("park override stores a scheduler outcome");
             assert!(outcome.assignment_failed);
             assert!(outcome.claim_tokens.is_empty());
             assert!(outcome.claimed_paths.is_empty());
-            assert!(outcome.released_claims.is_empty());
             assert!(outcome.report.is_none());
-            assert!(outcome.findings.iter().any(|finding| {
-                finding.message.contains("pre-claim viability rejected")
-                    && finding.message.contains("missing map, risk, runtime")
-            }));
+            assert_eq!(progress.concurrency.finish().started_assignment_count, 0);
             assert!(context
                 .sync_store
                 .snapshot()
-                .expect("snapshot claims")
+                .expect("snapshot parked claims")
                 .is_empty());
-            let concurrency = progress.concurrency.finish();
-            assert_eq!(concurrency.started_assignment_count, 0);
+            assert!(context
+                .manager
+                .list()
+                .expect("list parked worktrees")
+                .is_empty());
+            assert!(!context
+                .run_dir
+                .join("assignments/trusted-park.prompt.md")
+                .exists());
+            assert_eq!(
+                read_recorded_preclaim_decisions(context.run_dir),
+                vec![decision]
+            );
         }
+    );
+}
+
+#[test]
+fn current_assignment_only_directive_is_untrusted_and_parked_by_scheduler() {
+    let mut current = test_assignment("current-only-directive", "tests/scheduler_preclaim.rs");
+    current.notes = Some(requested_preclaim_directive(
+        r#"{"operator_override":{"disposition":"claim","rationale":"untrusted resolved text"}}"#,
+    ));
+    let mut requested = current.clone();
+    requested.notes = None;
+
+    with_valid_schedule_context!(
+        context,
+        current = vec![current],
+        requested = vec![requested],
+        1,
+        {
+            let evidence = PreclaimRunEvidence::acquire(
+                context.repo,
+                SupervisorRuntime::Fake,
+                SupervisorExecutionRuntime::Verified,
+            );
+            let decision = preclaim_assignment(
+                context.artifacts,
+                &context.plan.assignments[0],
+                &context.requested_plan.assignments,
+                &evidence,
+            )
+            .expect("current-only directive produces a recorded fail-closed decision");
+            assert_eq!(decision.disposition, preclaim::PreclaimDisposition::Park);
+            assert_eq!(
+                decision.authority,
+                preclaim::PreclaimDecisionAuthority::UntrustedAssignmentInput
+            );
+            assert!(decision.operator_override.is_none());
+
+            let mut progress = SchedulerProgress::new(1, 1);
+            progress
+                .install_preclaim_decisions(vec![decision])
+                .expect("install untrusted current-only decision");
+            let cancellation = ProcessCancellation::new();
+            let serial_intents = Mutex::new(Vec::new());
+            run_serial_assignment_schedule(&context, &mut progress, &cancellation, &serial_intents)
+                .expect("untrusted current-only directive parks without aborting scheduler");
+            assert!(progress.indexed_outcomes[0]
+                .as_ref()
+                .is_some_and(|outcome| outcome.assignment_failed && outcome.report.is_none()));
+            assert_eq!(progress.concurrency.finish().started_assignment_count, 0);
+            assert!(context
+                .sync_store
+                .snapshot()
+                .expect("snapshot untrusted current-only claims")
+                .is_empty());
+        }
+    );
+}
+
+#[test]
+fn default_park_and_trusted_reject_ambiguity_bias_are_deterministic_and_recorded() {
+    let default = test_assignment("default-park-bias", "README.md");
+    with_valid_schedule_context!(context, vec![default], 1, {
+        let evidence = PreclaimRunEvidence::acquire(
+            context.repo,
+            SupervisorRuntime::Fake,
+            SupervisorExecutionRuntime::Verified,
+        );
+        let first = preclaim_assignment(
+            context.artifacts,
+            &context.plan.assignments[0],
+            &context.requested_plan.assignments,
+            &evidence,
+        )
+        .expect("record default ambiguity-bias decision");
+        let second = preclaim_assignment(
+            context.artifacts,
+            &context.plan.assignments[0],
+            &context.requested_plan.assignments,
+            &evidence,
+        )
+        .expect("record repeated default ambiguity-bias decision");
+        assert_eq!(first, second);
+        assert_eq!(first.ambiguity_bias, preclaim::PreclaimAmbiguityBias::Park);
+        assert_eq!(
+            first.triage_outcome,
+            preclaim::PreclaimTriageOutcome::Ambiguous
+        );
+        assert_eq!(first.disposition, preclaim::PreclaimDisposition::Park);
+        assert_eq!(
+            read_recorded_preclaim_decisions(context.run_dir),
+            vec![first; 2]
+        );
+    });
+
+    let current = test_assignment("trusted-reject-bias", "README.md");
+    let mut requested = current.clone();
+    requested.notes = Some(requested_preclaim_directive(
+        r#"{"ambiguity_bias":"reject"}"#,
+    ));
+    with_valid_schedule_context!(
+        context,
+        current = vec![current],
+        requested = vec![requested],
+        1,
+        {
+            let evidence = PreclaimRunEvidence::acquire(
+                context.repo,
+                SupervisorRuntime::Fake,
+                SupervisorExecutionRuntime::Verified,
+            );
+            let first = preclaim_assignment(
+                context.artifacts,
+                &context.plan.assignments[0],
+                &context.requested_plan.assignments,
+                &evidence,
+            )
+            .expect("record trusted reject-bias decision");
+            let second = preclaim_assignment(
+                context.artifacts,
+                &context.plan.assignments[0],
+                &context.requested_plan.assignments,
+                &evidence,
+            )
+            .expect("record repeated trusted reject-bias decision");
+            assert_eq!(first, second);
+            assert_eq!(
+                first.ambiguity_bias,
+                preclaim::PreclaimAmbiguityBias::Reject
+            );
+            assert_eq!(
+                first.triage_outcome,
+                preclaim::PreclaimTriageOutcome::Rejected
+            );
+            assert_eq!(first.disposition, preclaim::PreclaimDisposition::Park);
+            assert_eq!(
+                read_recorded_preclaim_decisions(context.run_dir),
+                vec![first; 2]
+            );
+        }
+    );
+}
+
+fn assert_authenticated_park_has_no_assignment_side_effects(
+    max_concurrent_children: usize,
+    run_id: &str,
+    assignment_id: &str,
+) {
+    let (_temp, repo) = test_repository();
+    let mut assignment = mechanical_assignment(assignment_id);
+    assignment.assigned_paths = vec![PathBuf::from("tests/scheduler_preclaim.rs")];
+    assignment.task = Some(
+        "update tests/scheduler_preclaim.rs and run cargo test --test scheduler_preclaim"
+            .to_string(),
+    );
+    assignment.environment_requirements = vec![EnvironmentRequirement::network(
+        crate::external_agent::EnvironmentNetworkAccess::Enabled,
+    )];
+    assignment.worker_assignments[0].assigned_paths = assignment.assigned_paths.clone();
+    assignment.worker_assignments[0].environment_requirements =
+        vec![EnvironmentRequirement::network(
+            crate::external_agent::EnvironmentNetworkAccess::Enabled,
+        )];
+    assert!(assignment.notes.is_none());
+
+    let run_id = RunId::new(run_id).expect("valid authenticated parked run id");
+    let mut options = test_options(&repo, run_id.as_str());
+    options.runtime = SupervisorRuntime::Codex;
+    options.admission_overrides = SupervisorAdmissionConfig {
+        max_concurrent_children: Some(max_concurrent_children),
+        provider_inflight_limit: Some(max_concurrent_children),
+        host_memory_available_mib: Some(max_concurrent_children),
+        host_memory_per_child_mib: Some(1),
+        host_fd_available: Some(max_concurrent_children),
+        host_fds_per_child: Some(1),
+        host_disk_available_mib: Some(max_concurrent_children),
+        host_disk_per_child_mib: Some(1),
+        host_fallback_children: Some(max_concurrent_children),
+    };
+    let plan = test_plan(vec![assignment.clone()]);
+    let runtime_model_catalog = test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
+        .expect("construct deterministic Codex selector catalog");
+    let loaded = LoadedSupervisorPlan {
+        plan,
+        consultant: SupervisorConsultantPlan::default(),
+        assignment_metadata: AssignmentMetadata::new(),
+        plan_metadata: SupervisorPlanMetadata::default(),
+    };
+    let runner_calls = std::sync::atomic::AtomicUsize::new(0);
+    let runner = |_: &ExternalAgentCommand,
+                  _: &ProcessCancellation,
+                  _: Option<ExternalPreActionReviewRuntime<'_>>|
+     -> ExternalAgentRun {
+        runner_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        panic!("parked assignment must not invoke the child runner")
+    };
+
+    let report = run_supervisor_plan_with_runner_and_creation(
+        loaded,
+        options,
+        max_concurrent_children,
+        SupervisorExecutionRuntime::Verified,
+        SupervisorWorktreeCreation::VerifiedTestOnly,
+        Ok(runtime_model_catalog),
+        &runner,
+    )
+    .expect("parked assignment finalizes an authenticated supervisor report");
+
+    assert!(!report.success);
+    assert!(report.rejected);
+    assert_eq!(report.runtime, SupervisorRuntime::Codex);
+    assert!(!report.publishable);
+    assert_eq!(report.run_lifecycle, SupervisorRunLifecycle::Finalized);
+    assert_eq!(runner_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(report.claim_tokens.is_empty());
+    assert!(report.released_claims.is_empty());
+    assert!(report.release_errors.is_empty());
+    assert!(report.orchestrator_reports.is_empty());
+    assert!(report.commands_run.is_empty());
+    assert!(report.environment_failures.is_empty());
+    assert!(report.gate_denials.is_empty());
+    assert!(report.findings.iter().any(|finding| {
+        finding.message.contains("pre-claim viability parked")
+            && finding.message.contains("autonomously_completable=no")
+    }));
+
+    let execution = report
+        .role_economics_profile
+        .as_ref()
+        .and_then(|profile| profile.execution.as_ref())
+        .expect("parked run records scheduler-observed execution telemetry");
+    assert_eq!(execution.started_assignment_count, 0);
+    assert_eq!(execution.completed_assignment_count, 0);
+    assert_eq!(
+        execution.concurrency.configured_max_concurrent_children,
+        max_concurrent_children
+    );
+    let admission = execution
+        .concurrency
+        .policy_input_details
+        .as_ref()
+        .expect("parked run records resolved admission inputs");
+    assert_eq!(admission.entrypoint_bound, max_concurrent_children);
+    assert_eq!(admission.resolved_bound, max_concurrent_children);
+    assert_eq!(admission.host.resolved_bound, max_concurrent_children);
+    assert_eq!(
+        admission.provider_inflight_source,
+        AdmissionInputSource::Configured
+    );
+    assert_eq!(
+        admission.host.memory_available_source,
+        AdmissionInputSource::Configured
+    );
+    assert_eq!(
+        admission.host.fd_available_source,
+        AdmissionInputSource::Configured
+    );
+    assert_eq!(
+        admission.host.disk_available_source,
+        AdmissionInputSource::Configured
+    );
+    assert_eq!(admission.host.memory_bound, Some(max_concurrent_children));
+    assert_eq!(admission.host.fd_bound, Some(max_concurrent_children));
+    assert_eq!(admission.host.disk_bound, Some(max_concurrent_children));
+    assert_eq!(
+        admission.effective.max_concurrent_children,
+        Some(max_concurrent_children)
+    );
+    assert_eq!(admission.provider_inflight_bound, max_concurrent_children);
+    assert_eq!(execution.concurrency.achieved_max_concurrent_children, 0);
+    assert!(execution
+        .concurrency
+        .achieved_mean_concurrent_children
+        .is_none());
+    assert!(execution.budget_degradations.is_empty());
+    assert!(execution.assignment_effort_bindings.is_empty());
+    assert!(execution.selection_decisions.is_empty());
+    let [selection_ledger_entry] = execution.assignment_selection_ledger.as_slice() else {
+        panic!("parked assignment must have exactly one unbound selection ledger entry");
+    };
+    assert_eq!(selection_ledger_entry.assignment_id, assignment_id);
+    assert_eq!(selection_ledger_entry.attempt, 0);
+    assert!(selection_ledger_entry.selected_runtime.is_none());
+    assert!(selection_ledger_entry.selected_model.is_none());
+    assert!(selection_ledger_entry.selected_reasoning_effort.is_none());
+    assert_eq!(
+        selection_ledger_entry.catalog_source,
+        AssignmentCatalogSource::None
+    );
+    assert!(selection_ledger_entry.catalog_snapshot_digest.is_none());
+    assert!(selection_ledger_entry.catalog_revisions.is_empty());
+    assert!(selection_ledger_entry.rejected_candidates.is_empty());
+    assert!(selection_ledger_entry.quota_evidence.is_none());
+    assert!(selection_ledger_entry
+        .evidence_gap
+        .as_deref()
+        .is_some_and(|gap| gap.contains("parked by the pre-claim viability gate")));
+
+    let budget = report
+        .run_budget
+        .as_ref()
+        .expect("parked run records unchanged budget state");
+    for amount in [budget.consumed, budget.reserved, budget.committed] {
+        assert_eq!(amount.tokens, 0);
+        assert!(amount.cost_usd.is_none_or(|cost| cost == 0.0));
+    }
+    assert_eq!(budget.active_reservations, 0);
+    assert!(budget.roles.is_empty());
+
+    assert!(SyncStore::open(&repo)
+        .expect("reopen parked claim store")
+        .snapshot()
+        .expect("snapshot parked claim store")
+        .is_empty());
+    assert!(WorktreeManager::new(&repo)
+        .list()
+        .expect("list parked managed worktrees")
+        .is_empty());
+
+    let run_dir = repo
+        .join(RunArtifactFamily::Supervise.run_root())
+        .join(run_id.as_str());
+    let forbidden_assignment_artifacts = [
+        PathBuf::from(format!("assignments/{assignment_id}.prompt.md")),
+        PathBuf::from(format!(
+            "assignments/{assignment_id}.attempt-1.worktree-writable-admission.json"
+        )),
+        PathBuf::from(format!(
+            "assignments/{assignment_id}.attempt-1.worktree-writable-admission.schema.json"
+        )),
+        PathBuf::from(format!("reports/{assignment_id}.json")),
+        PathBuf::from(format!("evidence/incoming/{assignment_id}.json")),
+        PathBuf::from(format!("logs/{assignment_id}.jsonl")),
+        PathBuf::from(format!("logs/{assignment_id}.summary.json")),
+        PathBuf::from(format!(
+            "logs/workers/{assignment_id}/mechanical-worker.jsonl"
+        )),
+    ];
+    for relative in &forbidden_assignment_artifacts {
+        assert!(
+            !run_dir.join(relative).exists(),
+            "parked assignment unexpectedly created {}",
+            relative.display()
+        );
+    }
+    assert!(!run_dir.join("incoming").exists());
+
+    let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)
+        .expect("open finalized parked supervisor artifacts");
+    assert!(reader
+        .read(RunArtifactFamily::Supervise.final_report_relative_path())
+        .is_ok());
+    let preclaim_decision_bytes = reader
+        .read(preclaim::PRECLAIM_DECISIONS_RELATIVE)
+        .expect("read finalized parked pre-claim decisions");
+    let preclaim_decisions = preclaim_decision_bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_slice::<preclaim::PreclaimDecision>(line)
+                .expect("parse finalized parked pre-claim decision")
+        })
+        .collect::<Vec<_>>();
+    let [preclaim_decision] = preclaim_decisions.as_slice() else {
+        panic!("parked assignment must persist exactly one pre-claim decision");
+    };
+    assert_eq!(preclaim_decision.assignment_id, assignment_id);
+    assert_eq!(
+        preclaim_decision.disposition,
+        preclaim::PreclaimDisposition::Park
+    );
+
+    let orchestration_event_bytes = reader
+        .read(ORCHESTRATION_EVENT_PATH)
+        .expect("read finalized parked orchestration journal");
+    let assignment_gate_events = orchestration_event_bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_slice::<OrchestrationEvent>(line)
+                .expect("parse finalized parked orchestration event")
+        })
+        .filter(|event| event.node == assignment_id && event.kind == OrchestrationEventKind::Gate)
+        .collect::<Vec<_>>();
+    let [assignment_gate_event] = assignment_gate_events.as_slice() else {
+        panic!("parked assignment must record exactly one orchestration Gate event");
+    };
+    assert_eq!(
+        assignment_gate_event.payload["assignment_id"].as_str(),
+        Some(assignment_id)
+    );
+    assert_eq!(
+        assignment_gate_event.payload["disposition"].as_str(),
+        Some("park")
+    );
+    assert!(forbidden_assignment_artifacts.iter().all(|forbidden| {
+        reader
+            .finalization()
+            .files
+            .iter()
+            .all(|record| record.path.as_path() != forbidden.as_path())
+    }));
+
+    let (checkpoint_writer, checkpoint) =
+        open_supervisor_checkpoint(&repo, &run_id).expect("open authenticated parked checkpoint");
+    assert_eq!(
+        checkpoint.pending_assignments,
+        vec![assignment_id.to_string()]
+    );
+    assert!(checkpoint.uncertain_assignments.is_empty());
+    assert!(checkpoint.completed_assignments.is_empty());
+    assert!(checkpoint.final_report.is_some());
+    assert!(checkpoint.finalization_started);
+    assert!(checkpoint.finalized);
+    drop(checkpoint_writer);
+
+    let authenticator =
+        repository_authenticator_key_only(&repo).expect("open checkpoint authenticator");
+    let checkpoint_journal =
+        crate::state_journal::StateJournal::open_instance(authenticator, run_id.as_str())
+            .expect("open authenticated parked checkpoint journal");
+    let checkpoint_records = checkpoint_journal.records();
+    assert_eq!(
+        checkpoint_records
+            .first()
+            .map(|record| record.phase.as_str()),
+        Some("supervise_prepared")
+    );
+    assert_eq!(
+        checkpoint_records
+            .first()
+            .and_then(|record| record.payload["max_concurrent_children"].as_u64()),
+        u64::try_from(max_concurrent_children).ok()
+    );
+    assert!(checkpoint_records
+        .iter()
+        .any(|record| record.phase == "artifact_finalized"));
+    assert!(checkpoint_records
+        .iter()
+        .all(|record| record.phase != "assignment_started"));
+    assert!(checkpoint_records
+        .iter()
+        .all(|record| record.phase != "assignment_completed"));
+}
+
+#[test]
+fn preclaim_serial_park_has_authenticated_pending_checkpoint_and_no_assignment_side_effects() {
+    assert_authenticated_park_has_no_assignment_side_effects(
+        1,
+        "serial-authenticated-park",
+        "serial-parked-child",
+    );
+}
+
+#[test]
+fn preclaim_concurrent_park_has_authenticated_pending_checkpoint_and_no_assignment_side_effects() {
+    assert_authenticated_park_has_no_assignment_side_effects(
+        2,
+        "concurrent-authenticated-park",
+        "concurrent-parked-child",
     );
 }
 
@@ -1237,9 +2171,13 @@ fn missing_map_risk_runtime_parks_before_claiming_paths() {
         1,
         {
             let evidence = PreclaimRunEvidence::missing();
-            let decision =
-                preclaim_assignment(context.artifacts, &context.plan.assignments[0], &evidence)
-                    .expect("record missing-evidence pre-claim decision");
+            let decision = preclaim_assignment(
+                context.artifacts,
+                &context.plan.assignments[0],
+                &context.requested_plan.assignments,
+                &evidence,
+            )
+            .expect("record missing-evidence pre-claim decision");
             assert!(!decision.allows_path_claim());
             assert!(decision.reason.contains("missing map, risk, runtime"));
 
@@ -1249,7 +2187,7 @@ fn missing_map_risk_runtime_parks_before_claiming_paths() {
             assert!(parked.claimed_paths.is_empty());
             assert!(parked.released_claims.is_empty());
             assert!(parked.findings.iter().any(|finding| {
-                finding.message.contains("pre-claim viability rejected")
+                finding.message.contains("pre-claim viability parked")
                     && finding.message.contains("missing map, risk, runtime")
             }));
 
@@ -1281,7 +2219,7 @@ fn simulation_acquire_records_synthetic_claim_without_map_risk_scan() {
         SupervisorRuntime::Fake,
         SupervisorExecutionRuntime::NonpublishableSimulation,
     );
-    let assignment = test_assignment("acquired-child", "README.md");
+    let assignment = test_assignment("acquired-child", "tests/scheduler_preclaim.rs");
     assert!(
         evidence.repo_map.is_none(),
         "simulation must not require a scanned repository map"
@@ -1291,7 +2229,8 @@ fn simulation_acquire_records_synthetic_claim_without_map_risk_scan() {
         "simulation must not require a scanned risk report"
     );
     let decision = preclaim::evaluate_preclaim_viability(
-        &assignment.id,
+        &assignment,
+        std::slice::from_ref(&assignment),
         evidence.repo_map.as_ref(),
         None,
         evidence.runtime,
@@ -1310,8 +2249,10 @@ fn simulation_acquire_records_synthetic_claim_without_map_risk_scan() {
 
 #[test]
 fn verified_acquire_without_evidence_still_fails_closed() {
+    let assignment = test_assignment("verified-child", "README.md");
     let decision = preclaim::evaluate_preclaim_viability(
-        "verified-child",
+        &assignment,
+        std::slice::from_ref(&assignment),
         None,
         None,
         None,
@@ -1366,8 +2307,8 @@ fn concurrent_scheduler_directly_dispatches_completes_and_orders_fake_assignment
     with_valid_schedule_context!(
         context,
         vec![
-            test_assignment("concurrent-a", "README.md"),
-            test_assignment("concurrent-b", "Cargo.toml"),
+            test_assignment("concurrent-a", "tests/scheduler_preclaim.rs"),
+            test_assignment("concurrent-b", "tests/scheduler_preclaim_b.rs"),
         ],
         2,
         {
