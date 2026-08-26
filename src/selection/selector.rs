@@ -10,7 +10,7 @@ use super::types::*;
 const BUILT_IN_PRIORS: &str = include_str!("data/priors-2026-08-07.json");
 const PRIOR_DATASET_SCHEMA_VERSION: u32 = 2;
 const SELECTOR_CALIBRATION_VERSION: u32 = 3;
-const SELECTION_SCHEMA_VERSION: u32 = 3;
+const SELECTION_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SelectionError {
@@ -39,9 +39,24 @@ pub fn measured_authority_eligibility(
 }
 
 pub fn select(input: &SelectionInput) -> Result<SelectionProvenance, SelectionError> {
+    select_with_switch_cost_estimates(input, &[])
+}
+
+/// Select with candidate-keyed evidence produced by the optimizer's canonical
+/// switch-cost model. Missing switch entries retain the optimizer's canonical
+/// cold-start estimate, including its inferred provenance and uncertainty. A
+/// switching arm charges the more conservative of that estimate and the
+/// resolved-profile prior; continue remains zero.
+pub fn select_with_switch_cost_estimates(
+    input: &SelectionInput,
+    switch_cost_evidence: &[CandidateSwitchCostEvidence],
+) -> Result<SelectionProvenance, SelectionError> {
     let mut normalized = input.clone();
     normalize_input(&mut normalized);
     validate_input(&normalized)?;
+    let mut normalized_switch_cost_evidence = switch_cost_evidence.to_vec();
+    normalized_switch_cost_evidence.sort_by(|left, right| left.candidate.cmp(&right.candidate));
+    validate_switch_cost_evidence(&normalized, &normalized_switch_cost_evidence)?;
 
     let calibration = normalized
         .priors
@@ -60,7 +75,7 @@ pub fn select(input: &SelectionInput) -> Result<SelectionProvenance, SelectionEr
                 normalized.priors.revision
             ))
         })?;
-    let input_digests = input_digests(&normalized)?;
+    let input_digests = input_digests(&normalized, &normalized_switch_cost_evidence)?;
     let profile_digest = digest(calibration)?;
     if normalized
         .objective_profile
@@ -89,6 +104,7 @@ pub fn select(input: &SelectionInput) -> Result<SelectionProvenance, SelectionEr
                     catalog,
                     model,
                     candidate,
+                    &normalized_switch_cost_evidence,
                 )?);
             }
         }
@@ -228,6 +244,7 @@ pub fn select(input: &SelectionInput) -> Result<SelectionProvenance, SelectionEr
         normalized_input: normalized.clone(),
         normalized_task: normalized.task,
         input_digests,
+        provided_switch_cost_evidence: normalized_switch_cost_evidence,
         objective_profile: SelectorCalibrationProvenance {
             dataset_id: normalized.priors.dataset_id,
             dataset_revision: normalized.priors.revision,
@@ -726,12 +743,65 @@ fn validate_input(input: &SelectionInput) -> Result<(), SelectionError> {
     Ok(())
 }
 
+fn validate_switch_cost_evidence(
+    input: &SelectionInput,
+    evidence: &[CandidateSwitchCostEvidence],
+) -> Result<(), SelectionError> {
+    if evidence
+        .windows(2)
+        .any(|pair| pair[0].candidate == pair[1].candidate)
+    {
+        return invalid("switch-cost evidence contains a duplicate candidate");
+    }
+    for item in evidence {
+        validate_candidate_key("switch_cost_evidence.candidate", &item.candidate)?;
+        if !candidate_is_advertised(input, &item.candidate) {
+            return invalid(format!(
+                "switch-cost evidence candidate '{}:{}:{:?}' is absent from the advertised candidate set",
+                item.candidate.runtime, item.candidate.model, item.candidate.effort
+            ));
+        }
+        item.estimate.validate().map_err(|error| {
+            SelectionError::InvalidInput(format!(
+                "switch-cost evidence for '{}:{}:{:?}' is invalid: {error}",
+                item.candidate.runtime, item.candidate.model, item.candidate.effort
+            ))
+        })?;
+        let expected =
+            canonical_switch_transition(input.signals.previous_choice.as_ref(), &item.candidate);
+        if item.estimate.class != expected
+            && item.estimate.class != TransitionClass::FreshSessionOrWorktree
+        {
+            return invalid(format!(
+                "switch-cost evidence for '{}:{}:{:?}' has class '{}' but candidate keys imply '{}'",
+                item.candidate.runtime,
+                item.candidate.model,
+                item.candidate.effort,
+                item.estimate.class.as_str(),
+                expected.as_str()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn candidate_is_advertised(input: &SelectionInput, candidate: &CandidateKey) -> bool {
+    input.catalogs.iter().any(|catalog| {
+        catalog.runtime == candidate.runtime
+            && catalog.models.iter().any(|model| {
+                model.model == candidate.model
+                    && model.supported_efforts.contains(&candidate.effort)
+            })
+    })
+}
+
 fn evaluate_candidate(
     input: &SelectionInput,
     profile: &SelectorCalibration,
     _catalog: &RuntimeCatalog,
     model: &CatalogModel,
     candidate: CandidateKey,
+    switch_cost_evidence: &[CandidateSwitchCostEvidence],
 ) -> Result<CandidateEvaluation, SelectionError> {
     let prior = input
         .priors
@@ -1023,11 +1093,12 @@ fn evaluate_candidate(
     }
 
     let score = if reasons.is_empty() {
+        let switch = resolve_switch_cost(input, &candidate, switch_cost_evidence)?;
         pool.map(|pool| {
             score_candidate(CandidateScoringInput {
                 profile,
                 routing_weights: &input.resolved_objective_profile.profile.tradeoffs,
-                switch_costs: &input.resolved_objective_profile.profile.switch_costs,
+                switch,
                 pool,
                 candidate: &candidate,
                 signals: &input.signals,
@@ -1273,7 +1344,7 @@ fn quota_decision_provenance(
 struct CandidateScoringInput<'a> {
     profile: &'a SelectorCalibration,
     routing_weights: &'a crate::objective_profile::TradeoffWeights,
-    switch_costs: &'a ContextSwitchCosts,
+    switch: ResolvedSwitchCost,
     pool: &'a RuntimePoolState,
     candidate: &'a CandidateKey,
     signals: &'a DynamicSignals,
@@ -1284,11 +1355,78 @@ struct CandidateScoringInput<'a> {
     expected_human_review_cost_per_accepted_task_microunits: u64,
 }
 
+struct ResolvedSwitchCost {
+    estimate: SwitchCostEstimate,
+    origin: SwitchCostEvidenceOrigin,
+    configured_profile_prior_microunits: u64,
+    configured_profile_prior_origin: ConfiguredSwitchCostOrigin,
+}
+
+fn resolve_switch_cost(
+    input: &SelectionInput,
+    candidate: &CandidateKey,
+    evidence: &[CandidateSwitchCostEvidence],
+) -> Result<ResolvedSwitchCost, SelectionError> {
+    let implied_class =
+        canonical_switch_transition(input.signals.previous_choice.as_ref(), candidate);
+    let (configured_profile_prior_microunits, configured_profile_prior_origin) = match implied_class
+    {
+        TransitionClass::ModelChangeSameRuntime => (
+            input
+                .resolved_objective_profile
+                .profile
+                .switch_costs
+                .model_change_same_runtime_microunits,
+            ConfiguredSwitchCostOrigin::ResolvedProfileInferredPrior,
+        ),
+        TransitionClass::RuntimeAdapterChange => (
+            input
+                .resolved_objective_profile
+                .profile
+                .switch_costs
+                .runtime_change_microunits,
+            ConfiguredSwitchCostOrigin::ResolvedProfileInferredPrior,
+        ),
+        TransitionClass::Continue | TransitionClass::FreshSessionOrWorktree => {
+            (0, ConfiguredSwitchCostOrigin::NotApplicable)
+        }
+    };
+    if let Ok(index) = evidence.binary_search_by(|item| item.candidate.cmp(candidate)) {
+        return Ok(ResolvedSwitchCost {
+            estimate: evidence[index].estimate.clone(),
+            origin: SwitchCostEvidenceOrigin::OptimizerEstimate,
+            configured_profile_prior_microunits,
+            configured_profile_prior_origin,
+        });
+    }
+
+    if implied_class == TransitionClass::Continue {
+        return Ok(ResolvedSwitchCost {
+            estimate: SwitchCostEstimate::zero(implied_class),
+            origin: SwitchCostEvidenceOrigin::ContinueZero,
+            configured_profile_prior_microunits,
+            configured_profile_prior_origin,
+        });
+    }
+    let estimate = crate::optimizer::switch_cost::SwitchCostModel::new().estimate(implied_class);
+    estimate.validate().map_err(|error| {
+        SelectionError::InvalidInput(format!(
+            "canonical optimizer cold-start switch-cost prior is invalid: {error}"
+        ))
+    })?;
+    Ok(ResolvedSwitchCost {
+        estimate,
+        origin: SwitchCostEvidenceOrigin::OptimizerColdStartPrior,
+        configured_profile_prior_microunits,
+        configured_profile_prior_origin,
+    })
+}
+
 fn score_candidate(input: CandidateScoringInput<'_>) -> Result<ScoreBreakdown, SelectionError> {
     let CandidateScoringInput {
         profile,
         routing_weights,
-        switch_costs,
+        switch,
         pool,
         candidate,
         signals,
@@ -1371,18 +1509,20 @@ fn score_candidate(input: CandidateScoringInput<'_>) -> Result<ScoreBreakdown, S
     } else {
         0
     };
-    let switch_transition = context_switch_transition(signals.previous_choice.as_ref(), candidate);
-    let configured_switch_cost_microunits = match switch_transition {
-        ContextSwitchTransition::Initial
-        | ContextSwitchTransition::Stay
-        | ContextSwitchTransition::EffortChangeSameRuntimeModel => 0,
-        ContextSwitchTransition::ModelChangeSameRuntime => {
-            switch_costs.model_change_same_runtime_microunits
-        }
-        ContextSwitchTransition::RuntimeChange => switch_costs.runtime_change_microunits,
+    let switch_transition = switch.estimate.class;
+    let configured_switch_cost_microunits = switch.configured_profile_prior_microunits;
+    let configured_switch_cost_origin = switch.configured_profile_prior_origin;
+    let evidence_derived_switch_cost_microunits = i64_to_u64(
+        switch.estimate.applied_objective_term_micros(true),
+        "evidence-derived canonical context-switch estimate",
+    )?;
+    let applied_switch_cost_microunits = if switch_transition.is_switch() {
+        evidence_derived_switch_cost_microunits.max(configured_switch_cost_microunits)
+    } else {
+        0
     };
     let switch_cost_microunits = normalize_cost_per_accepted(
-        configured_switch_cost_microunits,
+        applied_switch_cost_microunits,
         posterior_quality_basis_points,
         "context-switch cost per accepted task",
     )?;
@@ -1445,7 +1585,11 @@ fn score_candidate(input: CandidateScoringInput<'_>) -> Result<ScoreBreakdown, S
         retry_cost_microunits,
         degrade_cost_microunits,
         switch_transition,
+        switch_cost_origin: switch.origin,
+        switch_cost_estimate: switch.estimate,
         configured_switch_cost_microunits,
+        configured_switch_cost_origin,
+        applied_switch_cost_microunits,
         switch_cost_microunits,
         routing_score_semantics: RoutingScoreSemantics::LegacyBaselinePlusCostProxyAdjustmentsV1,
         routing_tradeoff_weights: routing_weights.clone(),
@@ -1459,21 +1603,19 @@ fn score_candidate(input: CandidateScoringInput<'_>) -> Result<ScoreBreakdown, S
     })
 }
 
-fn context_switch_transition(
+fn canonical_switch_transition(
     previous: Option<&CandidateKey>,
     candidate: &CandidateKey,
-) -> ContextSwitchTransition {
+) -> TransitionClass {
     let Some(previous) = previous else {
-        return ContextSwitchTransition::Initial;
+        return TransitionClass::Continue;
     };
     if previous.runtime != candidate.runtime {
-        ContextSwitchTransition::RuntimeChange
+        TransitionClass::RuntimeAdapterChange
     } else if previous.model != candidate.model {
-        ContextSwitchTransition::ModelChangeSameRuntime
-    } else if previous.effort != candidate.effort {
-        ContextSwitchTransition::EffortChangeSameRuntimeModel
+        TransitionClass::ModelChangeSameRuntime
     } else {
-        ContextSwitchTransition::Stay
+        TransitionClass::Continue
     }
 }
 
@@ -1588,7 +1730,11 @@ fn selected_choice(
     Ok(SelectedChoice {
         candidate: evaluation.candidate.clone(),
         switch_transition: score.switch_transition,
+        switch_cost_origin: score.switch_cost_origin,
+        switch_cost_estimate: score.switch_cost_estimate.clone(),
         configured_switch_cost_microunits: score.configured_switch_cost_microunits,
+        configured_switch_cost_origin: score.configured_switch_cost_origin,
+        applied_switch_cost_microunits: score.applied_switch_cost_microunits,
         switch_cost_microunits: score.switch_cost_microunits,
         total_score_microunits: score.total_score_microunits,
         reason,
@@ -1625,7 +1771,11 @@ fn runner_ups(
             rank: usize_to_u32(ordinal, "runner-up rank")?,
             candidate,
             switch_transition: score.switch_transition,
+            switch_cost_origin: score.switch_cost_origin,
+            switch_cost_estimate: score.switch_cost_estimate.clone(),
             configured_switch_cost_microunits: score.configured_switch_cost_microunits,
+            configured_switch_cost_origin: score.configured_switch_cost_origin,
+            applied_switch_cost_microunits: score.applied_switch_cost_microunits,
             switch_cost_microunits: score.switch_cost_microunits,
             total_score_microunits: score.total_score_microunits,
         });
@@ -1881,9 +2031,13 @@ fn selection_triggers(input: &SelectionInput, catalogs_digest: &str) -> Vec<Sele
     triggers
 }
 
-fn input_digests(input: &SelectionInput) -> Result<InputDigests, SelectionError> {
+fn input_digests(
+    input: &SelectionInput,
+    switch_cost_evidence: &[CandidateSwitchCostEvidence],
+) -> Result<InputDigests, SelectionError> {
     Ok(InputDigests {
         normalized_input: digest(input)?,
+        switch_cost_evidence: digest(switch_cost_evidence)?,
         task: digest(&input.task)?,
         catalogs: digest(&input.catalogs)?,
         pools: digest(&input.pools)?,
@@ -1946,7 +2100,7 @@ fn validate_resolved_objective_profile(
     Ok(())
 }
 
-fn digest<T: Serialize>(value: &T) -> Result<DigestRecord, SelectionError> {
+fn digest<T: Serialize + ?Sized>(value: &T) -> Result<DigestRecord, SelectionError> {
     let bytes = serde_json::to_vec(value)
         .map_err(|error| SelectionError::Serialization(error.to_string()))?;
     Ok(DigestRecord {
@@ -2103,6 +2257,11 @@ fn checked_sum_costs(
 fn u128_to_u64(value: u128, context: &str) -> Result<u64, SelectionError> {
     u64::try_from(value)
         .map_err(|_| SelectionError::InvalidInput(format!("{context} overflowed u64")))
+}
+
+fn i64_to_u64(value: i64, context: &str) -> Result<u64, SelectionError> {
+    u64::try_from(value)
+        .map_err(|_| SelectionError::InvalidInput(format!("{context} was negative")))
 }
 
 fn usize_to_u32(value: usize, context: &str) -> Result<u32, SelectionError> {

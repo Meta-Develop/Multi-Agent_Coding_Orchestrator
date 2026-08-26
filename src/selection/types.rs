@@ -7,6 +7,7 @@ pub use crate::objective_profile::ContextSwitchCosts;
 use crate::optimizer::quota_pools::{
     ConsumptionSource, ExhaustionBehavior, PoolKind, PoolReference,
 };
+pub use crate::optimizer::switch_cost::{SwitchCostEstimate, TransitionClass};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -121,6 +122,15 @@ pub struct CandidateKey {
     pub runtime: String,
     pub model: String,
     pub effort: ReasoningEffort,
+}
+
+/// Associates the optimizer's canonical switch-cost evidence with one
+/// selector candidate without copying or flattening its evidence fields.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateSwitchCostEvidence {
+    pub candidate: CandidateKey,
+    pub estimate: SwitchCostEstimate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -490,6 +500,7 @@ pub struct DigestRecord {
 #[serde(deny_unknown_fields)]
 pub struct InputDigests {
     pub normalized_input: DigestRecord,
+    pub switch_cost_evidence: DigestRecord,
     pub task: DigestRecord,
     pub catalogs: DigestRecord,
     pub pools: DigestRecord,
@@ -573,11 +584,19 @@ pub struct ScoreBreakdown {
     pub marginal_cost_microunits: u64,
     pub retry_cost_microunits: u64,
     pub degrade_cost_microunits: u64,
-    #[serde(default)]
-    pub switch_transition: ContextSwitchTransition,
-    #[serde(default)]
+    /// Source-compatible scalar mirror of `switch_cost_estimate.class`.
+    pub switch_transition: TransitionClass,
+    pub switch_cost_origin: SwitchCostEvidenceOrigin,
+    pub switch_cost_estimate: SwitchCostEstimate,
+    /// Conservative estimate from the resolved objective profile.
+    ///
+    /// Switching arms charge at least this amount; measured or inferred
+    /// optimizer evidence can raise the charged term.
     pub configured_switch_cost_microunits: u64,
-    #[serde(default)]
+    pub configured_switch_cost_origin: ConfiguredSwitchCostOrigin,
+    /// Raw cost licensed for this comparison before quality normalization.
+    pub applied_switch_cost_microunits: u64,
+    /// Applied cost normalized per accepted task and added to the score.
     pub switch_cost_microunits: u64,
     pub routing_score_semantics: RoutingScoreSemantics,
     pub routing_tradeoff_weights: TradeoffWeights,
@@ -624,24 +643,44 @@ pub struct CandidateEvaluation {
 pub struct RankedScore {
     pub rank: u32,
     pub candidate: CandidateKey,
-    #[serde(default)]
-    pub switch_transition: ContextSwitchTransition,
-    #[serde(default)]
+    pub switch_transition: TransitionClass,
+    pub switch_cost_origin: SwitchCostEvidenceOrigin,
+    pub switch_cost_estimate: SwitchCostEstimate,
     pub configured_switch_cost_microunits: u64,
-    #[serde(default)]
+    pub configured_switch_cost_origin: ConfiguredSwitchCostOrigin,
+    pub applied_switch_cost_microunits: u64,
     pub switch_cost_microunits: u64,
     pub total_score_microunits: u64,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ContextSwitchTransition {
-    #[default]
-    Initial,
-    Stay,
-    EffortChangeSameRuntimeModel,
-    ModelChangeSameRuntime,
-    RuntimeChange,
+pub enum SwitchCostEvidenceOrigin {
+    OptimizerEstimate,
+    OptimizerColdStartPrior,
+    ContinueZero,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfiguredSwitchCostOrigin {
+    NotApplicable,
+    ResolvedProfileInferredPrior,
+}
+
+/// Source compatibility for callers that referred to the selector-local name.
+/// The semantic type is now the optimizer's canonical [`TransitionClass`].
+pub type ContextSwitchTransition = TransitionClass;
+
+impl TransitionClass {
+    #[allow(non_upper_case_globals)]
+    pub const Initial: Self = Self::Continue;
+    #[allow(non_upper_case_globals)]
+    pub const Stay: Self = Self::Continue;
+    #[allow(non_upper_case_globals)]
+    pub const EffortChangeSameRuntimeModel: Self = Self::Continue;
+    #[allow(non_upper_case_globals)]
+    pub const RuntimeChange: Self = Self::RuntimeAdapterChange;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -750,11 +789,12 @@ pub struct QuotaDecisionProvenance {
 #[serde(deny_unknown_fields)]
 pub struct SelectedChoice {
     pub candidate: CandidateKey,
-    #[serde(default)]
-    pub switch_transition: ContextSwitchTransition,
-    #[serde(default)]
+    pub switch_transition: TransitionClass,
+    pub switch_cost_origin: SwitchCostEvidenceOrigin,
+    pub switch_cost_estimate: SwitchCostEstimate,
     pub configured_switch_cost_microunits: u64,
-    #[serde(default)]
+    pub configured_switch_cost_origin: ConfiguredSwitchCostOrigin,
+    pub applied_switch_cost_microunits: u64,
     pub switch_cost_microunits: u64,
     pub total_score_microunits: u64,
     pub reason: ChoiceReason,
@@ -809,6 +849,7 @@ pub struct SelectionProvenance {
     pub normalized_input: SelectionInput,
     pub normalized_task: TaskProfile,
     pub input_digests: InputDigests,
+    pub provided_switch_cost_evidence: Vec<CandidateSwitchCostEvidence>,
     /// Legacy wire field name retained for selection-artifact compatibility.
     pub objective_profile: SelectorCalibrationProvenance,
     pub resolved_objective_profile: ResolvedObjectiveProfile,

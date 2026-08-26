@@ -166,6 +166,22 @@ pub struct InvocationRecord {
     pub requested_model: Option<RuntimeSlug>,
     #[serde(default)]
     pub resolved_model: Option<RuntimeSlug>,
+    /// Durable runtime session identity used to distinguish a warm model
+    /// transition from a fresh-session transition.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Durable checkout/worktree identity; changing it invalidates runtime-side
+    /// state even when backend and model strings are unchanged.
+    #[serde(default)]
+    pub worktree_id: Option<String>,
+    /// Measured adapter startup/session warmup time. Absence is unknown, never
+    /// a measured zero.
+    #[serde(default)]
+    pub runtime_startup_micros: Option<i64>,
+    /// Measured value of checkpointed runtime-side state lost on transition.
+    /// Absence is unknown, never a measured zero.
+    #[serde(default)]
+    pub lost_checkpoint_cost_micros: Option<i64>,
     #[serde(default)]
     pub requested_effort: Option<CanonicalEffort>,
     #[serde(default)]
@@ -239,6 +255,10 @@ impl InvocationRecord {
             provider: None,
             requested_model: None,
             resolved_model: None,
+            session_id: None,
+            worktree_id: None,
+            runtime_startup_micros: None,
+            lost_checkpoint_cost_micros: None,
             requested_effort: None,
             resolved_effort: None,
             role: None,
@@ -280,6 +300,19 @@ impl InvocationRecord {
             if finished.as_millis() < self.started_at.as_millis() {
                 return Err(OptimizerError::invalid("finished_at precedes started_at"));
             }
+        }
+        if self.runtime_startup_micros.is_some_and(|value| value < 0) {
+            return Err(OptimizerError::invalid(
+                "runtime_startup_micros must be non-negative",
+            ));
+        }
+        if self
+            .lost_checkpoint_cost_micros
+            .is_some_and(|value| value < 0)
+        {
+            return Err(OptimizerError::invalid(
+                "lost_checkpoint_cost_micros must be non-negative",
+            ));
         }
         Ok(())
     }
