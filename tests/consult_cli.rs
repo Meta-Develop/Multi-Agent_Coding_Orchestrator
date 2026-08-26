@@ -325,6 +325,7 @@ fn consult_custom_codex_is_confined_but_never_publishable() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let fake_codex = write_fake_codex_consultant(temp.path())?;
+    let target_launch_marker = temp.path().join("fake-codex-target-started");
     let report = run_failure_json(&[
         "consult",
         "ask",
@@ -346,27 +347,35 @@ fn consult_custom_codex_is_confined_but_never_publishable() -> Result<()> {
     assert_eq!(report["success"], false);
     assert_eq!(report["status"], "failed");
     assert_eq!(report["runtime"], "codex");
-    let verified_backend_available = report["exit_info"]["exit_code"] == 0;
-    if !verified_backend_available {
-        let error = report["exit_info"]["error"]
-            .as_str()
-            .context("fail-closed external error")?;
-        assert!(
-            error.contains("version preflight")
-                || error.contains("strict-offline version diagnostic")
-                || error.contains("process-tree ownership")
-                || error.contains("containment"),
-            "unexpected fail-closed error: {error}"
-        );
-    } else {
-        assert!(report["caveats"]
-            .as_array()
-            .context("caveats")?
-            .iter()
-            .any(|caveat| caveat
-                .as_str()
-                .is_some_and(|text| text.contains("did not exit successfully"))));
-    }
+    assert_eq!(report["no_further_delegation"], true);
+    assert_eq!(report["read_only"], true);
+    assert_eq!(report["exit_info"]["exit_code"], Value::Null);
+    assert_eq!(report["exit_info"]["timed_out"], false);
+    let error = report["exit_info"]["error"]
+        .as_str()
+        .context("fail-closed external error")?;
+    assert!(
+        error.contains("version preflight")
+            || error.contains("strict-offline version diagnostic")
+            || error.contains("process-tree ownership")
+            || error.contains("containment"),
+        "unexpected fail-closed error: {error}"
+    );
+    assert!(
+        error.contains("external target was not started")
+            || error.contains("version preflight")
+            || error.contains("process-tree ownership")
+            || error.contains("containment"),
+        "refusal did not prove a pre-target boundary: {error}"
+    );
+    assert!(!target_launch_marker.exists());
+    assert!(report["caveats"]
+        .as_array()
+        .context("caveats")?
+        .iter()
+        .any(|caveat| caveat.as_str().is_some_and(|text| {
+            text.contains("failed to capture Codex consultant report from reserved descriptor")
+        })));
     let command = report["exit_info"]["command"]
         .as_array()
         .context("command")?;
@@ -408,14 +417,29 @@ fn consult_custom_codex_is_confined_but_never_publishable() -> Result<()> {
     ));
     assert!(!command.iter().any(|arg| arg == "--sandbox"));
     assert!(!command.iter().any(|arg| arg == "--enable"));
-    if verified_backend_available {
-        let raw_log =
-            fs::read_to_string(repo_path.join(".maco/consult/runs/consult-codex/trusted/raw.log"))
-                .context("read raw log")?;
-        assert!(raw_log.contains(r#""consultant_role_prefix":true"#));
-        assert!(raw_log.contains(r#""goals":false"#));
-        assert!(raw_log.contains(r#""multi_agent":false"#));
-    }
+    let public_report = serde_json::to_string(&report).context("serialize public report")?;
+    assert!(!public_report.contains(repo_path_text));
+    assert!(!public_report.contains(fake_codex_text));
+    assert!(!public_report.contains(path_str(temp.path())?));
+
+    let run_dir = repo_path.join(".maco/consult/runs/consult-codex");
+    assert_eq!(fs::read(run_dir.join("trusted/raw.log"))?, b"");
+    assert!(!run_dir.join("incoming").exists());
+    assert!(!run_dir.join("capture").exists());
+    assert!(run_dir.join(".maco-artifact-final.json").exists());
+
+    let run_id = RunId::new("consult-codex")?;
+    let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Consult, &run_id)?;
+    let finalization = reader.finalization();
+    assert_eq!(
+        finalization.final_report,
+        Path::new("trusted/consultant-report.json")
+    );
+    assert!(!finalization.publish_requested);
+    assert!(!finalization.publishable);
+    let stored_report: Value =
+        serde_json::from_slice(&reader.read("trusted/consultant-report.json")?)?;
+    assert_eq!(stored_report, report);
     assert_eq!(
         fs::read_to_string(repo_path.join("README.md"))?,
         "# Test Repo\n"
@@ -526,6 +550,7 @@ if [ "${1:-}" = "--version" ]; then
   printf '%s\n' 'codex-cli 0.142.3'
   exit 0
 fi
+: > "${0%/*}/fake-codex-target-started"
 report=
 cd_arg=
 goals=false

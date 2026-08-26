@@ -1168,17 +1168,7 @@ impl ExternalAgentRun {
     /// trusted runner must retain proof that both its owned process tree and side effects were
     /// contained. Missing or unverified evidence therefore remains fail-closed.
     pub(crate) fn environment_preflight_quiescence_verified(&self) -> bool {
-        self.environment_blocked()
-            && (!self
-                .stdout
-                .run_metadata
-                .environment_preflight_process_started
-                || (self
-                    .process_tree
-                    .is_some_and(ProcessTreeEvidence::is_verified_empty)
-                    && self
-                        .side_effects
-                        .is_some_and(SideEffectConfinementEvidence::is_verified)))
+        self.environment_blocked() && self.scratch_quiescence_verified()
     }
 
     pub fn sandbox_denials(&self) -> &[SandboxDenialEvidence] {
@@ -1271,18 +1261,31 @@ impl ExternalAgentRun {
     /// released and no preflight probe started, or every launched process is
     /// proven empty with verified side-effect confinement.
     pub(crate) fn scratch_quiescence_verified(&self) -> bool {
-        let process_started = self.stdout.target_launch_attempted
-            || self
-                .stdout
-                .run_metadata
-                .environment_preflight_process_started;
-        !process_started
-            || (self
+        if self.stdout.target_launch_attempted {
+            return self
                 .process_tree
                 .is_some_and(ProcessTreeEvidence::is_verified_empty)
                 && self
                     .side_effects
-                    .is_some_and(SideEffectConfinementEvidence::is_verified))
+                    .is_some_and(SideEffectConfinementEvidence::is_verified);
+        }
+        if self
+            .stdout
+            .run_metadata
+            .environment_preflight_process_started
+        {
+            return self
+                .stdout
+                .run_metadata
+                .environment_preflight_quiescence_verified
+                || (self
+                    .process_tree
+                    .is_some_and(ProcessTreeEvidence::is_verified_empty)
+                    && self
+                        .side_effects
+                        .is_some_and(SideEffectConfinementEvidence::is_verified));
+        }
+        true
     }
 }
 
@@ -1444,6 +1447,10 @@ struct ExternalAgentRunMetadata {
     environment_preflight_results: Vec<EnvironmentPreflightResult>,
     environment_failures: Vec<EnvironmentFailure>,
     environment_preflight_process_started: bool,
+    /// Held proof for scratch cleanup after a probe-only run. This is never serialized: a
+    /// restored report cannot confer cleanup authority, and a target launch must earn fresh
+    /// process-tree and side-effect evidence on the shared run fields.
+    environment_preflight_quiescence_verified: bool,
     sandbox_denials: Vec<SandboxDenialEvidence>,
     gate_denials: Vec<GateDenial>,
     machine_global_bypasses: Vec<MachineGlobalBypassAttribution>,
@@ -1970,8 +1977,8 @@ fn run_external_agent_runtime(
         && !spec.invocation.is_adapter_subprocess()
     {
         report.duration_ms = duration_millis(started.elapsed());
-        // The retained probe metadata describes the version diagnostic, not a released target.
-        // Do not let a clean diagnostic process look like target containment evidence.
+        // The held preflight bit proves only that the version diagnostic became quiescent for
+        // scratch cleanup. Do not let its process evidence look like target containment evidence.
         report.process_tree = None;
         report.side_effects = None;
         record_environment_failure(
@@ -3719,6 +3726,16 @@ fn retain_environment_preflight_process_evidence(
         .stdout
         .run_metadata
         .environment_preflight_process_started = evidence.started;
+    report
+        .stdout
+        .run_metadata
+        .environment_preflight_quiescence_verified = evidence.started
+        && evidence
+            .process_tree
+            .is_some_and(ProcessTreeEvidence::is_verified_empty)
+        && evidence
+            .side_effects
+            .is_some_and(SideEffectConfinementEvidence::is_verified);
     if evidence.started {
         report.process_tree = evidence.process_tree;
         report.side_effects = evidence.side_effects;
@@ -4159,6 +4176,79 @@ fn evaluate_environment_requirement(
 }
 
 include!("external_agent/part2.rs");
+
+#[cfg(test)]
+mod preflight_quiescence_regression {
+    use super::*;
+
+    fn explicit_custom_policy_refusal(command: &ExternalAgentCommand) -> ExternalAgentRun {
+        failed_external_environment_run(
+            command,
+            Instant::now(),
+            vec!["codex".to_string(), "--version".to_string()],
+            false,
+            EnvironmentFailureCategory::SandboxUnavailable,
+            Some(EnvironmentRequirement::sandbox(
+                EnvironmentSandboxCapability::VerifiedExternalCodex,
+            )),
+            "explicit custom target refused after version preflight".to_string(),
+        )
+    }
+
+    #[test]
+    fn retained_probe_quiescence_is_live_only_and_target_aware() -> Result<()> {
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            ".",
+            "prompt",
+            "log",
+            "output",
+            Duration::from_secs(1),
+        );
+        let mut verified_probe = EnvironmentPreflightProcessEvidence::default();
+        verified_probe.record(
+            ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService),
+            SideEffectConfinementEvidence::Verified(
+                SideEffectConfinementProfileKind::ExternalCodex,
+            ),
+            true,
+        );
+
+        let mut live_report = explicit_custom_policy_refusal(&command);
+        retain_environment_preflight_process_evidence(&mut live_report, &verified_probe);
+        live_report.process_tree = None;
+        live_report.side_effects = None;
+        assert!(live_report.environment_blocked());
+        assert!(live_report.scratch_quiescence_verified());
+        assert!(live_report.environment_preflight_quiescence_verified());
+
+        let serialized = serde_json::to_string(&live_report)?;
+        assert!(!serialized.contains("environment_preflight_quiescence_verified"));
+        let restored: ExternalAgentRun = serde_json::from_str(&serialized)?;
+        assert!(!restored.scratch_quiescence_verified());
+        assert!(!restored.environment_preflight_quiescence_verified());
+
+        live_report.stdout.target_launch_attempted = true;
+        assert!(!live_report.scratch_quiescence_verified());
+        assert!(!live_report.environment_preflight_quiescence_verified());
+
+        let mut unverified_probe = EnvironmentPreflightProcessEvidence::default();
+        unverified_probe.record(
+            ProcessTreeEvidence::Unverified(ContainmentBackend::SystemdUserService),
+            SideEffectConfinementEvidence::Unverified(
+                SideEffectConfinementProfileKind::ExternalCodex,
+            ),
+            false,
+        );
+        let mut unverified_report = explicit_custom_policy_refusal(&command);
+        retain_environment_preflight_process_evidence(&mut unverified_report, &unverified_probe);
+        unverified_report.process_tree = None;
+        unverified_report.side_effects = None;
+        assert!(!unverified_report.scratch_quiescence_verified());
+        assert!(!unverified_report.environment_preflight_quiescence_verified());
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod tests;
