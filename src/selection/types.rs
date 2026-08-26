@@ -206,15 +206,21 @@ pub struct OperatorConstraints {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ObjectiveProfileRef {
+pub struct SelectorCalibrationRef {
     pub name: String,
     pub version: u32,
     pub expected_digest: Option<String>,
 }
 
+/// Source-compatible name for the legacy selector input field.
+///
+/// This reference selects dated calibration/evidence thresholds. The only
+/// preference-bearing objective is [`ResolvedObjectiveProfile`].
+pub type ObjectiveProfileRef = SelectorCalibrationRef;
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ObjectiveProfile {
+pub struct SelectorCalibration {
     pub name: String,
     pub version: u32,
     pub effective_date: String,
@@ -226,8 +232,6 @@ pub struct ObjectiveProfile {
     pub entitlement_scarcity_full_cost_microunits: u64,
     pub retry_penalty_microunits: u64,
     pub degrade_effort_rank_penalty_microunits: u64,
-    #[serde(default = "crate::objective_profile::historical_zero_switch_costs")]
-    pub switch_costs: ContextSwitchCosts,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -289,7 +293,8 @@ pub struct PriorDataset {
     pub dataset_id: String,
     pub revision: String,
     pub published_on: String,
-    pub objective_profiles: Vec<ObjectiveProfile>,
+    /// Dated selector quality gates and cost calibration, not an objective.
+    pub objective_profiles: Vec<SelectorCalibration>,
     pub models: Vec<ModelPrior>,
 }
 
@@ -465,7 +470,9 @@ pub struct SelectionInput {
     pub quota_source: Option<PoolReference>,
     pub constraints: OperatorConstraints,
     pub priors: PriorDataset,
-    pub objective_profile: ObjectiveProfileRef,
+    /// Legacy wire/source field name for dated selector calibration.
+    /// Preference-bearing weights live only in `resolved_objective_profile`.
+    pub objective_profile: SelectorCalibrationRef,
     pub resolved_objective_profile: ResolvedObjectiveProfile,
     pub outcomes: Vec<OutcomeRecord>,
     pub signals: DynamicSignals,
@@ -495,7 +502,7 @@ pub struct InputDigests {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ObjectiveProfileProvenance {
+pub struct SelectorCalibrationProvenance {
     pub dataset_id: String,
     pub dataset_revision: String,
     pub dataset_published_on: String,
@@ -802,7 +809,8 @@ pub struct SelectionProvenance {
     pub normalized_input: SelectionInput,
     pub normalized_task: TaskProfile,
     pub input_digests: InputDigests,
-    pub objective_profile: ObjectiveProfileProvenance,
+    /// Legacy wire field name retained for selection-artifact compatibility.
+    pub objective_profile: SelectorCalibrationProvenance,
     pub resolved_objective_profile: ResolvedObjectiveProfile,
     pub catalog_revisions: Vec<CatalogRevisionProvenance>,
     pub runtime_operations: Vec<RuntimePoolState>,

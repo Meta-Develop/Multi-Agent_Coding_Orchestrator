@@ -218,7 +218,7 @@ fn operator_constraints() -> Value {
     )
 }
 
-fn objective_profile_ref() -> Value {
+fn selector_calibration_ref() -> Value {
     strict_object!(
         "name" => nonempty_string(),
         "version" => positive_integer(),
@@ -258,6 +258,7 @@ fn routing_objective_profile_binding() -> Value {
         "content_hash" => json!({"type": "string", "pattern": "^[0-9a-f]{64}$"}),
         "quality" => routing_quality_weights(),
         "tradeoffs" => routing_tradeoff_weights(),
+        "switch_costs" => context_switch_costs(),
     )
 }
 
@@ -268,7 +269,7 @@ fn resolved_routing_objective_profile() -> Value {
     )
 }
 
-fn objective_profile() -> Value {
+fn selector_calibration() -> Value {
     strict_object!(
         "name" => nonempty_string(),
         "version" => positive_integer(),
@@ -281,7 +282,6 @@ fn objective_profile() -> Value {
         "entitlement_scarcity_full_cost_microunits" => nonnegative_integer(),
         "retry_penalty_microunits" => nonnegative_integer(),
         "degrade_effort_rank_penalty_microunits" => nonnegative_integer(),
-        "switch_costs" => context_switch_costs(),
     )
 }
 
@@ -339,11 +339,11 @@ fn model_prior() -> Value {
 
 fn prior_dataset() -> Value {
     strict_object!(
-        "schema_version" => positive_integer(),
+        "schema_version" => json!({"type": "integer", "const": 2}),
         "dataset_id" => nonempty_string(),
         "revision" => nonempty_string(),
         "published_on" => date(),
-        "objective_profiles" => array(objective_profile()),
+        "objective_profiles" => array(selector_calibration()),
         "models" => array(model_prior()),
     )
 }
@@ -416,7 +416,7 @@ fn selection_input() -> Value {
         "quota_source" => nullable(pool_reference()),
         "constraints" => operator_constraints(),
         "priors" => prior_dataset(),
-        "objective_profile" => objective_profile_ref(),
+        "objective_profile" => selector_calibration_ref(),
         "resolved_objective_profile" => resolved_routing_objective_profile(),
         "outcomes" => array(outcome_record()),
         "signals" => dynamic_signals(),
@@ -445,7 +445,7 @@ fn input_digests() -> Value {
     )
 }
 
-fn objective_profile_provenance() -> Value {
+fn selector_calibration_provenance() -> Value {
     strict_object!(
         "dataset_id" => nonempty_string(),
         "dataset_revision" => nonempty_string(),
@@ -644,12 +644,12 @@ fn ranked_score() -> Value {
 
 pub(crate) fn selection_provenance_schema_value() -> Value {
     strict_object!(
-        "schema_version" => json!({"type": "integer", "const": 2}),
+        "schema_version" => json!({"type": "integer", "const": 3}),
         "status" => enum_schema(&["selected", "fail_closed"]),
         "normalized_input" => selection_input(),
         "normalized_task" => task_profile(false),
         "input_digests" => input_digests(),
-        "objective_profile" => objective_profile_provenance(),
+        "objective_profile" => selector_calibration_provenance(),
         "resolved_objective_profile" => resolved_routing_objective_profile(),
         "catalog_revisions" => array(catalog_revision_provenance()),
         "runtime_operations" => array(runtime_pool_state()),
@@ -717,10 +717,21 @@ mod tests {
         assert_every_object_is_closed(&event);
 
         let provenance = &event["properties"]["provenance"];
-        assert_eq!(provenance["properties"]["schema_version"]["const"], 2);
-        let profile = &provenance["properties"]["normalized_input"]["properties"]["priors"]
+        assert_eq!(provenance["properties"]["schema_version"]["const"], 3);
+        assert_eq!(
+            provenance["properties"]["normalized_input"]["properties"]["priors"]["properties"]
+                ["schema_version"]["const"],
+            2
+        );
+        let calibration = &provenance["properties"]["normalized_input"]["properties"]["priors"]
             ["properties"]["objective_profiles"]["items"];
-        assert!(profile["required"]
+        assert!(!calibration["properties"]
+            .as_object()
+            .expect("calibration properties")
+            .contains_key("switch_costs"));
+        let resolved_profile = &provenance["properties"]["normalized_input"]["properties"]
+            ["resolved_objective_profile"]["properties"]["profile"];
+        assert!(resolved_profile["required"]
             .as_array()
             .is_some_and(|required| required.iter().any(|field| field == "switch_costs")));
         let score =

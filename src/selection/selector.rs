@@ -8,7 +8,9 @@ use crate::optimizer::quota_pools::{ConsumptionSource, ExhaustionBehavior};
 use super::types::*;
 
 const BUILT_IN_PRIORS: &str = include_str!("data/priors-2026-08-07.json");
-const SELECTION_SCHEMA_VERSION: u32 = 2;
+const PRIOR_DATASET_SCHEMA_VERSION: u32 = 2;
+const SELECTOR_CALIBRATION_VERSION: u32 = 3;
+const SELECTION_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SelectionError {
@@ -41,7 +43,7 @@ pub fn select(input: &SelectionInput) -> Result<SelectionProvenance, SelectionEr
     normalize_input(&mut normalized);
     validate_input(&normalized)?;
 
-    let profile = normalized
+    let calibration = normalized
         .priors
         .objective_profiles
         .iter()
@@ -51,7 +53,7 @@ pub fn select(input: &SelectionInput) -> Result<SelectionProvenance, SelectionEr
         })
         .ok_or_else(|| {
             SelectionError::InvalidInput(format!(
-                "objective profile '{}@{}' is absent from dataset '{}@{}'",
+                "selector calibration '{}@{}' is absent from dataset '{}@{}'",
                 normalized.objective_profile.name,
                 normalized.objective_profile.version,
                 normalized.priors.dataset_id,
@@ -59,7 +61,7 @@ pub fn select(input: &SelectionInput) -> Result<SelectionProvenance, SelectionEr
             ))
         })?;
     let input_digests = input_digests(&normalized)?;
-    let profile_digest = digest(profile)?;
+    let profile_digest = digest(calibration)?;
     if normalized
         .objective_profile
         .expected_digest
@@ -67,8 +69,8 @@ pub fn select(input: &SelectionInput) -> Result<SelectionProvenance, SelectionEr
         .is_some_and(|expected| expected != &profile_digest.value)
     {
         return Err(SelectionError::InvalidInput(format!(
-            "objective profile digest did not match profile '{}@{}'",
-            profile.name, profile.version
+            "selector calibration digest did not match calibration '{}@{}'",
+            calibration.name, calibration.version
         )));
     }
 
@@ -83,7 +85,7 @@ pub fn select(input: &SelectionInput) -> Result<SelectionProvenance, SelectionEr
                 };
                 candidate_set.push(evaluate_candidate(
                     &normalized,
-                    profile,
+                    calibration,
                     catalog,
                     model,
                     candidate,
@@ -226,13 +228,13 @@ pub fn select(input: &SelectionInput) -> Result<SelectionProvenance, SelectionEr
         normalized_input: normalized.clone(),
         normalized_task: normalized.task,
         input_digests,
-        objective_profile: ObjectiveProfileProvenance {
+        objective_profile: SelectorCalibrationProvenance {
             dataset_id: normalized.priors.dataset_id,
             dataset_revision: normalized.priors.revision,
             dataset_published_on: normalized.priors.published_on,
-            profile_name: profile.name.clone(),
-            profile_version: profile.version,
-            profile_effective_date: profile.effective_date.clone(),
+            profile_name: calibration.name.clone(),
+            profile_version: calibration.version,
+            profile_effective_date: calibration.effective_date.clone(),
             profile_digest,
         },
         resolved_objective_profile: normalized.resolved_objective_profile.clone(),
@@ -336,10 +338,16 @@ fn validate_input(input: &SelectionInput) -> Result<(), SelectionError> {
     }
     validate_identifier("priors.dataset_id", &input.priors.dataset_id)?;
     validate_identifier("priors.revision", &input.priors.revision)?;
-    validate_positive("priors.schema_version", input.priors.schema_version)?;
+    if input.priors.schema_version != PRIOR_DATASET_SCHEMA_VERSION
+        || input.objective_profile.version != SELECTOR_CALIBRATION_VERSION
+    {
+        return invalid(format!(
+            "legacy selector wire is incompatible: expected prior schema {PRIOR_DATASET_SCHEMA_VERSION} and selector calibration {SELECTOR_CALIBRATION_VERSION}, got prior schema {} and selector calibration {}; calibration v2 embedded switch-cost objective semantics and cannot be safely replayed after the canonical resolved-objective split",
+            input.priors.schema_version, input.objective_profile.version
+        ));
+    }
     validate_calendar_date("priors.published_on", &input.priors.published_on)?;
     validate_identifier("objective_profile.name", &input.objective_profile.name)?;
-    validate_positive("objective_profile.version", input.objective_profile.version)?;
     if let Some(expected_digest) = &input.objective_profile.expected_digest {
         validate_sha256_digest("objective_profile.expected_digest", expected_digest)?;
     }
@@ -563,21 +571,26 @@ fn validate_input(input: &SelectionInput) -> Result<(), SelectionError> {
     if duplicate_semantic_key(&input.priors.objective_profiles, |profile| {
         (profile.name.clone(), profile.version)
     }) {
-        return invalid("prior dataset contains a duplicate objective profile name/version");
+        return invalid("prior dataset contains a duplicate selector calibration name/version");
     }
     for profile in &input.priors.objective_profiles {
         validate_identifier("objective_profile.name", &profile.name)?;
-        validate_positive("objective_profile.version", profile.version)?;
+        if profile.version != SELECTOR_CALIBRATION_VERSION {
+            return invalid(format!(
+                "selector calibration '{}@{}' is incompatible with calibration version {SELECTOR_CALIBRATION_VERSION}; calibration v2 embedded switch-cost objective semantics",
+                profile.name, profile.version
+            ));
+        }
         validate_calendar_date("objective_profile.effective_date", &profile.effective_date)?;
         if profile.minimum_quality_basis_points > 10_000 {
             return invalid(format!(
-                "objective profile '{}@{}' quality bar exceeds 10000 basis points",
+                "selector calibration '{}@{}' quality bar exceeds 10000 basis points",
                 profile.name, profile.version
             ));
         }
         if profile.minimum_class_fit_samples == 0 || profile.minimum_authority_samples == 0 {
             return invalid(format!(
-                "objective profile '{}@{}' requires nonzero evidence minima",
+                "selector calibration '{}@{}' requires nonzero evidence minima",
                 profile.name, profile.version
             ));
         }
@@ -715,7 +728,7 @@ fn validate_input(input: &SelectionInput) -> Result<(), SelectionError> {
 
 fn evaluate_candidate(
     input: &SelectionInput,
-    profile: &ObjectiveProfile,
+    profile: &SelectorCalibration,
     _catalog: &RuntimeCatalog,
     model: &CatalogModel,
     candidate: CandidateKey,
@@ -919,7 +932,7 @@ fn evaluate_candidate(
                         reject(
                             &mut reasons,
                             IneligibilityCode::ClassFitEvidenceInsufficient,
-                            "class-fit sample count is below the objective profile minimum",
+                            "class-fit sample count is below the selector calibration minimum",
                         );
                     }
                     posterior_quality = posterior_quality_basis_points(class_fit, &ledger)?;
@@ -984,7 +997,7 @@ fn evaluate_candidate(
                             reject(
                                 &mut reasons,
                                 IneligibilityCode::AuthorityEvidenceInsufficient,
-                                "authority sample count is below the objective profile minimum",
+                                "authority sample count is below the selector calibration minimum",
                             );
                         }
                         if evidence.quality_basis_points < profile.minimum_quality_basis_points {
@@ -1014,6 +1027,7 @@ fn evaluate_candidate(
             score_candidate(CandidateScoringInput {
                 profile,
                 routing_weights: &input.resolved_objective_profile.profile.tradeoffs,
+                switch_costs: &input.resolved_objective_profile.profile.switch_costs,
                 pool,
                 candidate: &candidate,
                 signals: &input.signals,
@@ -1257,8 +1271,9 @@ fn quota_decision_provenance(
 }
 
 struct CandidateScoringInput<'a> {
-    profile: &'a ObjectiveProfile,
+    profile: &'a SelectorCalibration,
     routing_weights: &'a crate::objective_profile::TradeoffWeights,
+    switch_costs: &'a ContextSwitchCosts,
     pool: &'a RuntimePoolState,
     candidate: &'a CandidateKey,
     signals: &'a DynamicSignals,
@@ -1273,6 +1288,7 @@ fn score_candidate(input: CandidateScoringInput<'_>) -> Result<ScoreBreakdown, S
     let CandidateScoringInput {
         profile,
         routing_weights,
+        switch_costs,
         pool,
         candidate,
         signals,
@@ -1361,9 +1377,9 @@ fn score_candidate(input: CandidateScoringInput<'_>) -> Result<ScoreBreakdown, S
         | ContextSwitchTransition::Stay
         | ContextSwitchTransition::EffortChangeSameRuntimeModel => 0,
         ContextSwitchTransition::ModelChangeSameRuntime => {
-            profile.switch_costs.model_change_same_runtime_microunits
+            switch_costs.model_change_same_runtime_microunits
         }
-        ContextSwitchTransition::RuntimeChange => profile.switch_costs.runtime_change_microunits,
+        ContextSwitchTransition::RuntimeChange => switch_costs.runtime_change_microunits,
     };
     let switch_cost_microunits = normalize_cost_per_accepted(
         configured_switch_cost_microunits,

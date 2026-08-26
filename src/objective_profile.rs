@@ -167,6 +167,15 @@ pub fn default_objective_profile() -> ObjectiveProfile {
     }
 }
 
+/// Return the built-in objective as the same immutable resolved object used by
+/// repository overrides and downstream evaluation/selection consumers.
+pub fn default_resolved_objective_profile() -> Result<ResolvedObjectiveProfile> {
+    Ok(ResolvedObjectiveProfile {
+        profile: default_objective_profile().binding()?,
+        source: ObjectiveProfileSource::BuiltIn,
+    })
+}
+
 impl ObjectiveProfile {
     pub fn validate(&self) -> Result<()> {
         validate_objective_profile_id(&self.id)?;
@@ -404,7 +413,8 @@ fn validate_weight(name: &str, value: u32) -> Result<()> {
 }
 
 /// Preference-bearing score used only after Pareto evidence is computed.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObjectiveSelection {
     pub profile_id: String,
     pub profile_hash: String,
@@ -417,17 +427,20 @@ pub struct ObjectiveSelection {
 
 /// Choose one frontier point using the profile. Empty frontiers yield `None`.
 pub fn select_from_frontier(
-    profile: &ObjectiveProfile,
+    profile: &ResolvedObjectiveProfile,
     points: &[(String, FrontierAxes)],
 ) -> Result<Option<ObjectiveSelection>> {
-    profile.validate()?;
+    profile.profile.validate()?;
     if points.is_empty() {
         return Ok(None);
     }
     let mut scores = BTreeMap::new();
     let mut ranked = Vec::new();
     for (id, axes) in points {
-        let score = profile.score_axes(axes);
+        if let Err(error) = axes.validate() {
+            bail!("frontier point '{id}' has invalid objective evidence: {error:#}");
+        }
+        let score = profile.profile.score_axes(axes);
         scores.insert(id.clone(), score);
         ranked.push((id.clone(), score));
     }
@@ -442,8 +455,8 @@ pub fn select_from_frontier(
         .context("objective frontier unexpectedly became empty while ranking")?;
     let runner_up = ranked.get(1).cloned();
     Ok(Some(ObjectiveSelection {
-        profile_id: profile.id.clone(),
-        profile_hash: profile.content_hash()?,
+        profile_id: profile.profile.id.clone(),
+        profile_hash: profile.profile.content_hash.clone(),
         selected_profile_id: selected.0,
         selected_score: selected.1,
         runner_up_profile_id: runner_up.as_ref().map(|(id, _)| id.clone()),
@@ -453,8 +466,14 @@ pub fn select_from_frontier(
 }
 
 /// Normalized axes used by the selection policy. Lower is better.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct FrontierAxes {
+    /// Raw preference-free evaluation quality evidence. Higher is better.
+    pub held_out_quality_basis_points: u32,
+    pub breadth_quality_basis_points: u32,
+    pub anti_shortcut_quality_basis_points: u32,
+    /// Normalized operational/economic evidence in `[0, 1]`. Lower is better.
     pub monetary_cost: f64,
     pub quota_consumption: f64,
     pub latency: f64,
@@ -462,14 +481,58 @@ pub struct FrontierAxes {
     pub human_review: f64,
 }
 
-impl ObjectiveProfile {
+impl FrontierAxes {
+    fn validate(&self) -> Result<()> {
+        for (name, value) in [
+            (
+                "held_out_quality_basis_points",
+                self.held_out_quality_basis_points,
+            ),
+            (
+                "breadth_quality_basis_points",
+                self.breadth_quality_basis_points,
+            ),
+            (
+                "anti_shortcut_quality_basis_points",
+                self.anti_shortcut_quality_basis_points,
+            ),
+        ] {
+            if value > 10_000 {
+                bail!("{name} must be at most 10000, got {value}");
+            }
+        }
+        for (name, value) in [
+            ("monetary_cost", self.monetary_cost),
+            ("quota_consumption", self.quota_consumption),
+            ("latency", self.latency),
+            ("retry_rework", self.retry_rework),
+            ("human_review", self.human_review),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                bail!("{name} must be a finite normalized value between 0 and 1");
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ObjectiveProfileBinding {
     fn score_axes(&self, axes: &FrontierAxes) -> f64 {
-        (axes.monetary_cost * f64::from(self.tradeoffs.monetary_cost_percent)
+        let held_out_loss = f64::from(10_000 - axes.held_out_quality_basis_points) / 10_000.0;
+        let breadth_loss = f64::from(10_000 - axes.breadth_quality_basis_points) / 10_000.0;
+        let anti_shortcut_loss =
+            f64::from(10_000 - axes.anti_shortcut_quality_basis_points) / 10_000.0;
+        let quality_loss = (held_out_loss * f64::from(self.quality.held_out_percent)
+            + breadth_loss * f64::from(self.quality.breadth_percent)
+            + anti_shortcut_loss * f64::from(self.quality.anti_shortcut_percent))
+            / 100.0;
+        let tradeoff_loss = (axes.monetary_cost * f64::from(self.tradeoffs.monetary_cost_percent)
             + axes.quota_consumption * f64::from(self.tradeoffs.quota_consumption_percent)
             + axes.latency * f64::from(self.tradeoffs.latency_percent)
             + axes.retry_rework * f64::from(self.tradeoffs.retry_rework_percent)
             + axes.human_review * f64::from(self.tradeoffs.human_review_percent))
-            / 100.0
+            / 100.0;
+        (quality_loss + tradeoff_loss) / 2.0
     }
 }
 
@@ -642,14 +705,17 @@ mod tests {
 
     #[test]
     fn selection_records_profile_hash_and_runner_up() {
-        let profile = default_objective_profile();
+        let profile = default_resolved_objective_profile().expect("resolved default profile");
         let selection = select_from_frontier(
             &profile,
             &[
                 (
                     "cheap".to_string(),
                     FrontierAxes {
-                        monetary_cost: 1.0,
+                        held_out_quality_basis_points: 9_000,
+                        breadth_quality_basis_points: 9_000,
+                        anti_shortcut_quality_basis_points: 9_000,
+                        monetary_cost: 0.1,
                         quota_consumption: 0.0,
                         latency: 0.0,
                         retry_rework: 0.0,
@@ -659,7 +725,10 @@ mod tests {
                 (
                     "expensive".to_string(),
                     FrontierAxes {
-                        monetary_cost: 9.0,
+                        held_out_quality_basis_points: 9_000,
+                        breadth_quality_basis_points: 9_000,
+                        anti_shortcut_quality_basis_points: 9_000,
+                        monetary_cost: 0.9,
                         quota_consumption: 0.0,
                         latency: 0.0,
                         retry_rework: 0.0,
@@ -673,10 +742,135 @@ mod tests {
         assert_eq!(selection.selected_profile_id, "cheap");
         assert_eq!(selection.runner_up_profile_id.as_deref(), Some("expensive"));
         assert_eq!(selection.profile_id, DEFAULT_OBJECTIVE_PROFILE_ID);
-        assert_eq!(
-            selection.profile_hash,
-            profile.content_hash().expect("hash")
+        assert_eq!(selection.profile_hash, profile.profile.content_hash);
+
+        let round_trip: ObjectiveSelection = serde_json::from_value(
+            serde_json::to_value(&selection).expect("serialize objective selection"),
+        )
+        .expect("deserialize objective selection");
+        assert_eq!(round_trip, selection);
+    }
+
+    #[test]
+    fn explicit_frontier_policy_uses_raw_quality_axes_after_frontier_construction() {
+        let profile = default_resolved_objective_profile().expect("resolved default profile");
+        let selection = select_from_frontier(
+            &profile,
+            &[
+                (
+                    "quality".to_string(),
+                    FrontierAxes {
+                        held_out_quality_basis_points: 10_000,
+                        breadth_quality_basis_points: 10_000,
+                        anti_shortcut_quality_basis_points: 10_000,
+                        monetary_cost: 0.1,
+                        quota_consumption: 0.0,
+                        latency: 0.0,
+                        retry_rework: 0.0,
+                        human_review: 0.0,
+                    },
+                ),
+                (
+                    "cheap-low-quality".to_string(),
+                    FrontierAxes {
+                        held_out_quality_basis_points: 0,
+                        breadth_quality_basis_points: 0,
+                        anti_shortcut_quality_basis_points: 0,
+                        monetary_cost: 0.0,
+                        quota_consumption: 0.0,
+                        latency: 0.0,
+                        retry_rework: 0.0,
+                        human_review: 0.0,
+                    },
+                ),
+            ],
+        )
+        .expect("select")
+        .expect("non-empty");
+
+        assert_eq!(selection.selected_profile_id, "quality");
+    }
+
+    #[test]
+    fn quality_component_weights_change_policy_choice_from_raw_evidence() {
+        let default = default_resolved_objective_profile().expect("resolved default profile");
+        let points = [
+            (
+                "held-out".to_string(),
+                FrontierAxes {
+                    held_out_quality_basis_points: 10_000,
+                    breadth_quality_basis_points: 0,
+                    anti_shortcut_quality_basis_points: 5_000,
+                    monetary_cost: 0.0,
+                    quota_consumption: 0.0,
+                    latency: 0.0,
+                    retry_rework: 0.0,
+                    human_review: 0.0,
+                },
+            ),
+            (
+                "breadth".to_string(),
+                FrontierAxes {
+                    held_out_quality_basis_points: 0,
+                    breadth_quality_basis_points: 10_000,
+                    anti_shortcut_quality_basis_points: 5_000,
+                    monetary_cost: 0.0,
+                    quota_consumption: 0.0,
+                    latency: 0.0,
+                    retry_rework: 0.0,
+                    human_review: 0.0,
+                },
+            ),
+        ];
+        let default_selection = select_from_frontier(&default, &points)
+            .expect("default selection")
+            .expect("non-empty");
+        assert_eq!(default_selection.selected_profile_id, "held-out");
+
+        let mut breadth_profile = default_objective_profile();
+        breadth_profile.id = "breadth-first-v1".to_string();
+        breadth_profile.quality = QualityWeights {
+            held_out_percent: 10,
+            breadth_percent: 80,
+            anti_shortcut_percent: 10,
+        };
+        let breadth = ResolvedObjectiveProfile {
+            profile: breadth_profile.binding().expect("breadth profile binding"),
+            source: ObjectiveProfileSource::RepositoryOverride,
+        };
+        let breadth_selection = select_from_frontier(&breadth, &points)
+            .expect("breadth selection")
+            .expect("non-empty");
+        assert_eq!(breadth_selection.selected_profile_id, "breadth");
+        assert_ne!(
+            default_selection.profile_hash,
+            breadth_selection.profile_hash
         );
+    }
+
+    #[test]
+    fn frontier_policy_rejects_out_of_range_typed_evidence() {
+        let profile = default_resolved_objective_profile().expect("resolved default profile");
+        let error = select_from_frontier(
+            &profile,
+            &[(
+                "invalid".to_string(),
+                FrontierAxes {
+                    held_out_quality_basis_points: 10_001,
+                    breadth_quality_basis_points: 10_000,
+                    anti_shortcut_quality_basis_points: 10_000,
+                    monetary_cost: 0.0,
+                    quota_consumption: 0.0,
+                    latency: 0.0,
+                    retry_rework: 0.0,
+                    human_review: 0.0,
+                },
+            )],
+        )
+        .expect_err("out-of-range evidence must fail closed");
+        assert!(error
+            .to_string()
+            .contains("held_out_quality_basis_points must be at most 10000"));
     }
 
     #[test]

@@ -172,9 +172,9 @@ fn base_input() -> SelectionInput {
             allow_debug_override: false,
         },
         priors: built_in_prior_dataset().expect("built-in priors"),
-        objective_profile: ObjectiveProfileRef {
+        objective_profile: SelectorCalibrationRef {
             name: "accepted-task-total-cost".to_string(),
-            version: 2,
+            version: 3,
             expected_digest: None,
         },
         resolved_objective_profile: crate::objective_profile::ResolvedObjectiveProfile {
@@ -212,9 +212,12 @@ fn codex_model_switch_input(model_switch_cost_microunits: u64) -> SelectionInput
         model: "gpt-5.6-sol".to_string(),
         effort: ReasoningEffort::High,
     });
-    input.priors.objective_profiles[0]
-        .switch_costs
-        .model_change_same_runtime_microunits = model_switch_cost_microunits;
+    let mut profile = crate::objective_profile::default_objective_profile();
+    profile.switch_costs.model_change_same_runtime_microunits = model_switch_cost_microunits;
+    input.resolved_objective_profile = resolved_routing_profile(
+        profile,
+        crate::objective_profile::ObjectiveProfileSource::BuiltIn,
+    );
     input
 }
 
@@ -231,7 +234,7 @@ fn resolved_routing_profile(
 #[test]
 fn built_in_routing_objective_preserves_legacy_scores_choice_and_runner_order() {
     let decision = select(&base_input()).expect("default objective selection");
-    assert_eq!(decision.schema_version, 2);
+    assert_eq!(decision.schema_version, 3);
     let mut legacy_ranked = decision
         .candidate_set
         .iter()
@@ -453,23 +456,38 @@ fn resolved_routing_objective_round_trips_and_invalid_binding_fails_closed() {
 }
 
 #[test]
+fn legacy_v2_selector_wire_is_explicitly_rejected_after_objective_split() {
+    let mut legacy = base_input();
+    legacy.priors.schema_version = 1;
+    legacy.objective_profile.version = 2;
+    legacy.priors.objective_profiles[0].version = 2;
+
+    let error = select(&legacy).expect_err("legacy v2 selector semantics must fail closed");
+    assert!(matches!(
+        error,
+        SelectionError::InvalidInput(message)
+            if message.contains("legacy selector wire is incompatible")
+                && message.contains("embedded switch-cost objective semantics")
+    ));
+}
+
+#[test]
 fn built_in_data_is_dated_and_keeps_policy_in_data() {
     let priors = built_in_prior_dataset().expect("built-in priors");
-    assert_eq!(priors.revision, "2026-08-25.1");
-    assert_eq!(priors.published_on, "2026-08-25");
-    assert_eq!(priors.objective_profiles[0].version, 2);
-    assert_eq!(priors.objective_profiles[0].effective_date, "2026-08-25");
+    let _: &SelectorCalibration = &priors.objective_profiles[0];
+    assert_eq!(priors.revision, "2026-08-26.1");
+    assert_eq!(priors.published_on, "2026-08-26");
+    assert_eq!(priors.schema_version, 2);
+    assert_eq!(priors.objective_profiles[0].version, 3);
+    assert_eq!(priors.objective_profiles[0].effective_date, "2026-08-26");
     assert!(priors.models.iter().any(|prior| prior.prohibited));
     assert!(priors
         .models
         .iter()
         .any(|prior| !prior.strong_gate_fallback_efforts.is_empty()));
     assert_eq!(
-        priors.objective_profiles[0].switch_costs,
-        ContextSwitchCosts {
-            model_change_same_runtime_microunits: 10_000,
-            runtime_change_microunits: 25_000,
-        }
+        base_input().resolved_objective_profile.profile.switch_costs,
+        ContextSwitchCosts::default()
     );
 }
 
@@ -683,34 +701,30 @@ fn switch_evidence_round_trips_and_matches_selected_and_runner_up_scores() {
     let round_trip: SelectionProvenance =
         serde_json::from_slice(&json).expect("deserialize selection evidence");
     assert_eq!(round_trip, decision);
-    assert_eq!(round_trip.schema_version, 2);
+    assert_eq!(round_trip.schema_version, 3);
 }
 
 #[test]
-fn historical_profile_omission_is_zero_and_switch_score_overflow_fails_closed() {
+fn selector_calibration_rejects_duplicate_objective_switch_costs() {
     let mut value =
         serde_json::to_value(built_in_prior_dataset().expect("priors")).expect("serialize priors");
-    value["objective_profiles"][0]
-        .as_object_mut()
-        .expect("profile object")
-        .remove("switch_costs");
-    let historical: PriorDataset = serde_json::from_value(value).expect("historical priors");
-    assert_eq!(
-        historical.objective_profiles[0].switch_costs,
-        ContextSwitchCosts::zero()
-    );
+    value["objective_profiles"][0]["switch_costs"] = serde_json::json!({
+        "model_change_same_runtime_microunits": 10_000,
+        "runtime_change_microunits": 25_000
+    });
+    assert!(serde_json::from_value::<PriorDataset>(value).is_err());
+}
 
-    let malformed = include_str!("data/priors-2026-08-07.json").replacen(
-        "\"model_change_same_runtime_microunits\": 10000",
-        "\"model_change_same_runtime_microunits\": -1",
-        1,
-    );
-    assert!(serde_json::from_str::<PriorDataset>(&malformed).is_err());
-
+#[test]
+fn canonical_resolved_objective_switch_score_overflow_fails_closed() {
     let mut overflow = codex_model_switch_input(u64::MAX);
-    overflow.priors.objective_profiles[0]
-        .switch_costs
-        .runtime_change_microunits = u64::MAX;
+    let mut profile = crate::objective_profile::default_objective_profile();
+    profile.switch_costs.model_change_same_runtime_microunits = u64::MAX;
+    profile.switch_costs.runtime_change_microunits = u64::MAX;
+    overflow.resolved_objective_profile = resolved_routing_profile(
+        profile,
+        crate::objective_profile::ObjectiveProfileSource::BuiltIn,
+    );
     assert!(matches!(
         select(&overflow),
         Err(SelectionError::InvalidInput(message)) if message.contains("context-switch cost per accepted task overflowed")
@@ -1731,7 +1745,7 @@ fn quota_provenance_round_trips_and_is_required_by_the_strict_artifact_schema() 
     let decoded = serde_json::from_slice::<SelectionProvenance>(&bytes)
         .expect("strict quota provenance round trip");
     assert_eq!(decoded, decision);
-    assert_eq!(decoded.schema_version, 2);
+    assert_eq!(decoded.schema_version, 3);
 
     let schema = selection_event_schema_value();
     let provenance = &schema["properties"]["provenance"];
