@@ -1201,7 +1201,7 @@ mod tests {
     }
 
     fn evaluate(assignment: &OrchestratorAssignment) -> PreclaimDecision {
-        evaluate_with_requested(assignment, &[assignment.clone()])
+        evaluate_with_requested(assignment, std::slice::from_ref(assignment))
     }
 
     fn evaluate_with_requested(
@@ -1543,7 +1543,7 @@ mod tests {
             ));
             task_candidate
         }] {
-            let decision = evaluate_with_requested(&current, &[requested.clone()]);
+            let decision = evaluate_with_requested(&current, std::slice::from_ref(&requested));
             assert_eq!(decision.disposition, PreclaimDisposition::Park);
             assert_eq!(
                 decision.authority,

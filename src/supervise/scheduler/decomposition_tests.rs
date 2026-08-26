@@ -1507,8 +1507,10 @@ fn preclaim_early_durability_survives_objective_preselection_failure() {
     assert!(plan.role_models.is_empty());
     let catalog = test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
         .expect("construct deterministic Codex selector catalog");
-    let mut plan_metadata = SupervisorPlanMetadata::default();
-    plan_metadata.objective_profile = Some("missing-preclaim-durability-v1".to_string());
+    let plan_metadata = SupervisorPlanMetadata {
+        objective_profile: Some("missing-preclaim-durability-v1".to_string()),
+        ..SupervisorPlanMetadata::default()
+    };
     let run_id = RunId::new("durable-before-preselection-failure")
         .expect("valid failed-preselection run id");
     let mut options = test_options(&repo, run_id.as_str());
