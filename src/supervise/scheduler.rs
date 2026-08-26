@@ -3617,8 +3617,10 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
     let mut field_guide_prompt_slot = None;
     let mut orchestration_journal = None;
     let mut autonomy_kpi_collector = AutonomyKpiCollector::default();
-    let mut collected = CollectedAssignmentOutcomes::default();
-    collected.preclaim_parked_assignment_ids = preclaim_parked_assignment_ids;
+    let mut collected = CollectedAssignmentOutcomes {
+        preclaim_parked_assignment_ids,
+        ..CollectedAssignmentOutcomes::default()
+    };
     collected
         .selection_decisions
         .append(&mut selection_decisions);
