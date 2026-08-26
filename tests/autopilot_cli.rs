@@ -13,6 +13,8 @@ use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
 const COMMAND_DIAGNOSTIC_LIMIT_CHARS: usize = 4096;
+const BOUNDED_STATUS_RUNTIME_ROOT_ENV: &str = "MACO_BOUNDED_STATUS_RUNTIME_ROOT";
+const TEST_CHILD_TMPDIR_NAME: &str = "autopilot-child-tmp";
 
 #[test]
 fn containment_gate_only_skips_without_a_delegated_user_manager() {
@@ -37,6 +39,76 @@ fn containment_gate_only_skips_without_a_delegated_user_manager() {
 fn autopilot_run_cli_requires_machine_global_binding_before_effect_artifacts() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
+    let second_fixture = TempDir::new().context("second fixture tempdir")?;
+    let second_repo = second_fixture.path().join("repo");
+
+    let first = command_with_test_fixture_environment(&repo_path)?;
+    let first_again = command_with_test_fixture_environment(&repo_path)?;
+    let second = command_with_test_fixture_environment(&second_repo)?;
+    let first_tmpdir = command_environment_path(&first, "TMPDIR")?;
+    let first_tmpdir_again = command_environment_path(&first_again, "TMPDIR")?;
+    let second_tmpdir = command_environment_path(&second, "TMPDIR")?;
+
+    assert!(first_tmpdir.is_dir(), "child TMPDIR must exist");
+    assert!(second_tmpdir.is_dir(), "child TMPDIR must exist");
+    assert!(
+        !first_tmpdir.starts_with(&repo_path),
+        "child TMPDIR must remain outside the fixture repository"
+    );
+    assert!(
+        !second_tmpdir.starts_with(&second_repo),
+        "child TMPDIR must remain outside the fixture repository"
+    );
+    assert!(
+        first_tmpdir == temp.path().join(TEST_CHILD_TMPDIR_NAME),
+        "child TMPDIR must derive from the fixture parent"
+    );
+    assert!(
+        second_tmpdir == second_fixture.path().join(TEST_CHILD_TMPDIR_NAME),
+        "child TMPDIR must derive from the fixture parent"
+    );
+    assert!(
+        first_tmpdir == first_tmpdir_again,
+        "one fixture must retain one stable child TMPDIR"
+    );
+    assert!(
+        first_tmpdir != second_tmpdir,
+        "independent fixtures must not share a child TMPDIR"
+    );
+    if let Some(lane_tmpdir) = std::env::var_os("TMPDIR") {
+        assert!(
+            first_tmpdir != lane_tmpdir,
+            "child TMPDIR must not inherit lane-global state"
+        );
+    }
+    assert!(
+        first.get_envs().any(|(name, value)| {
+            name == std::ffi::OsStr::new(BOUNDED_STATUS_RUNTIME_ROOT_ENV) && value.is_none()
+        }),
+        "an ambient explicit bounded-status root must not override fixture isolation"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        for child_tmpdir in [&first_tmpdir, &second_tmpdir] {
+            let metadata = fs::metadata(child_tmpdir).context("inspect child TMPDIR")?;
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let process_uid = fs::metadata("/proc/self")
+            .context("inspect current process owner")?
+            .uid();
+        for child_tmpdir in [&first_tmpdir, &second_tmpdir] {
+            let metadata = fs::metadata(child_tmpdir).context("inspect child TMPDIR owner")?;
+            assert_eq!(metadata.uid(), process_uid);
+        }
+    }
     let mut before = fs::read_dir(&repo_path)
         .context("read repository before refusal")?
         .map(|entry| entry.map(|entry| entry.file_name()))
@@ -57,7 +129,7 @@ fn autopilot_run_cli_requires_machine_global_binding_before_effect_artifacts() -
         ),
     ];
     for (extra, missing_option) in cases {
-        let output = Command::new(BIN)
+        let output = command_with_test_fixture_environment(&repo_path)?
             .args([
                 "autopilot",
                 "run",
@@ -1538,13 +1610,16 @@ fn run_failure_stderr(args: &[&str]) -> Result<String> {
 }
 
 fn command_with_test_machine_global_binding(args: &[&str]) -> Result<Command> {
-    let mut command = Command::new(BIN);
+    let repo = args
+        .windows(2)
+        .find_map(|pair| (pair[0] == "--repo").then_some(Path::new(pair[1])));
+    let mut command = match repo {
+        Some(repo) => command_with_test_fixture_environment(repo)?,
+        None => Command::new(BIN),
+    };
     command.args(args);
     if args.first() == Some(&"autopilot") && args.get(1) == Some(&"run") {
-        let repo = args
-            .windows(2)
-            .find_map(|pair| (pair[0] == "--repo").then_some(Path::new(pair[1])))
-            .context("autopilot run test command must name --repo")?;
+        let repo = repo.context("autopilot run test command must name --repo")?;
         let config = write_test_machine_global_config(repo)?;
         command
             .arg("--machine-global-config")
@@ -1552,6 +1627,48 @@ fn command_with_test_machine_global_binding(args: &[&str]) -> Result<Command> {
             .args(["--machine-global-runtime-root-id", "runtime"]);
     }
     Ok(command)
+}
+
+fn command_with_test_fixture_environment(repo: &Path) -> Result<Command> {
+    let child_tmpdir = test_child_tmpdir(repo)?;
+    let mut command = Command::new(BIN);
+    command
+        .env("TMPDIR", child_tmpdir)
+        .env_remove(BOUNDED_STATUS_RUNTIME_ROOT_ENV);
+    Ok(command)
+}
+
+fn command_environment_path(command: &Command, name: &str) -> Result<PathBuf> {
+    command
+        .get_envs()
+        .find_map(|(candidate, value)| {
+            (candidate == std::ffi::OsStr::new(name)).then(|| value.map(PathBuf::from))
+        })
+        .flatten()
+        .with_context(|| format!("test command must set {name}"))
+}
+
+fn test_child_tmpdir(repo: &Path) -> Result<PathBuf> {
+    let fixture_root = repo.parent().context("test repository parent")?;
+    let child_tmpdir = fixture_root.join(TEST_CHILD_TMPDIR_NAME);
+    match fs::create_dir(&child_tmpdir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).context("create child TMPDIR"),
+    }
+    let metadata = fs::symlink_metadata(&child_tmpdir).context("inspect child TMPDIR type")?;
+    anyhow::ensure!(
+        metadata.file_type().is_dir(),
+        "child TMPDIR must be a real directory"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&child_tmpdir, fs::Permissions::from_mode(0o700))
+            .context("make child TMPDIR private")?;
+    }
+    Ok(child_tmpdir)
 }
 
 #[cfg(target_os = "linux")]
@@ -1607,7 +1724,7 @@ fn create_committed_repo_with_gitignore(
     gitignore_contents: &str,
 ) -> Result<std::path::PathBuf> {
     let repo_path = root.join("repo");
-    let output = Command::new(BIN)
+    let output = command_with_test_fixture_environment(&repo_path)?
         .args(["init", "--repo", path_str(&repo_path)?, "--json"])
         .output()
         .context("init repo")?;
