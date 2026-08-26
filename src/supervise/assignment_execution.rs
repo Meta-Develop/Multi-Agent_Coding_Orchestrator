@@ -236,6 +236,61 @@ fn worktree_writable_admission_record(
     }))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompletedLaunchModelProvenance {
+    launch_runtime: SupervisorRuntime,
+    configured_model: Option<String>,
+    launched_model: Option<String>,
+    resolution_observation: ModelResolutionObservation,
+}
+
+impl CompletedLaunchModelProvenance {
+    fn from_resolution(
+        launch_runtime: SupervisorRuntime,
+        configured: &RoleModelSelection,
+        resolution: &RoleModelResolution,
+    ) -> Self {
+        Self {
+            launch_runtime,
+            configured_model: configured.model.clone(),
+            launched_model: resolution.selection.model.clone(),
+            resolution_observation: resolution.observation,
+        }
+    }
+
+    fn transition_subject_model(&self) -> Option<&str> {
+        if let Some(model) = self.launched_model.as_deref() {
+            return Some(model);
+        }
+        if self.launch_runtime == SupervisorRuntime::Fake
+            && matches!(
+                self.resolution_observation,
+                ModelResolutionObservation::RuntimeDefault
+                    | ModelResolutionObservation::LocalDeterministicFake
+            )
+        {
+            return self.configured_model.as_deref();
+        }
+        None
+    }
+}
+
+// Keep the established command-only helper type-checked for its direct policy
+// regressions. Attempt publication must use the complete resolution below so
+// launch provenance is not recomputed after the command is bound.
+const _: fn(
+    ExternalAgentCommand,
+    &SupervisorPlan,
+    AgentRole,
+    SupervisorRuntime,
+    &RuntimeModelCatalog,
+) -> Result<ExternalAgentCommand> = apply_role_model_selection;
+
+struct BoundSelectedRuntimeLaunch {
+    command: ExternalAgentCommand,
+    model_provenance: CompletedLaunchModelProvenance,
+}
+
 fn bind_selected_runtime_launch(
     mut command: ExternalAgentCommand,
     assignment: &OrchestratorAssignment,
@@ -243,7 +298,11 @@ fn bind_selected_runtime_launch(
     options: &SupervisorRunOptions,
     launch_runtime: SupervisorRuntime,
     catalog: &RuntimeModelCatalog,
-) -> Result<ExternalAgentCommand> {
+) -> Result<BoundSelectedRuntimeLaunch> {
+    let configured = effective_role_model_selection(plan, assignment.role);
+    let resolution = catalog.resolve_role_model_selection(&configured, launch_runtime)?;
+    let model_provenance =
+        CompletedLaunchModelProvenance::from_resolution(launch_runtime, &configured, &resolution);
     if launch_runtime.is_adapter_subprocess() {
         authorize_bounded_leaf_runtime_role(assignment.role).with_context(|| {
             format!(
@@ -263,19 +322,36 @@ fn bind_selected_runtime_launch(
                 crate::runtime_adapter::AdapterId::from_runtime(launch_runtime)
             );
         }
-        let selection = effective_role_model_selection(plan, assignment.role);
-        let model = selection.model.clone().with_context(|| {
+        let model = resolution.selection.model.clone().with_context(|| {
             format!(
                 "selected runtime '{}' assignment '{}' has no model",
                 crate::runtime_adapter::AdapterId::from_runtime(launch_runtime),
                 assignment.id
             )
         })?;
-        command = command.with_model_selection(Some(model), selection.reasoning_effort.clone());
+        command = command
+            .with_model_selection(Some(model), resolution.selection.reasoning_effort.clone());
         prerender_selected_runtime_adapter_command(&command, launch_runtime)?;
-        return Ok(command);
+        return Ok(BoundSelectedRuntimeLaunch {
+            command,
+            model_provenance,
+        });
     }
-    apply_role_model_selection(command, plan, assignment.role, launch_runtime, catalog)
+    authorize_resolved_judgment_model(
+        assignment.role,
+        configured.model.as_deref(),
+        resolution.selection.model.as_deref(),
+        resolution.observation,
+        launch_runtime,
+    )?;
+    command = command.with_model_selection(
+        resolution.selection.model.clone(),
+        resolution.selection.reasoning_effort.clone(),
+    );
+    Ok(BoundSelectedRuntimeLaunch {
+        command,
+        model_provenance,
+    })
 }
 
 #[cfg(test)]
@@ -290,7 +366,7 @@ pub(super) fn bind_selected_assignment_launch_for_test(
     let launch_runtime = assignment_launch_runtime(assignment, options, budget_policy);
     let launch_catalog =
         runtime_model_catalog_for_launch(catalog, options.runtime, launch_runtime)?;
-    let command = bind_selected_runtime_launch(
+    let bound_launch = bind_selected_runtime_launch(
         command,
         assignment,
         plan,
@@ -298,7 +374,7 @@ pub(super) fn bind_selected_assignment_launch_for_test(
         launch_runtime,
         &launch_catalog,
     )?;
-    Ok((launch_runtime, command))
+    Ok((launch_runtime, bound_launch.command))
 }
 
 pub(super) fn prerender_selected_runtime_adapter_command(
@@ -910,6 +986,7 @@ struct PreparedChildAttempt<'a> {
     attempt_artifacts: ChildAttemptArtifacts,
     corrective_retry_used: bool,
     command: ExternalAgentCommand,
+    model_provenance: CompletedLaunchModelProvenance,
     primary_before: PrimaryWorktreeSnapshot,
     primary_scope_before: Option<PrimaryScopeSnapshot>,
     incoming_scratch: ArtifactScratchDirectory,
@@ -1109,7 +1186,7 @@ fn prepare_child_attempt<'a>(
         &attempt_artifacts.report_path,
         Duration::from_secs(budget_plan.child_timeout_seconds),
     );
-    command = bind_selected_runtime_launch(
+    let bound_launch = bind_selected_runtime_launch(
         command,
         assignment,
         &budget_plan,
@@ -1117,6 +1194,7 @@ fn prepare_child_attempt<'a>(
         launch_runtime,
         &launch_catalog,
     )?;
+    command = bound_launch.command;
     command = bind_runtime_output_schema(command, launch_runtime, schema_path)?;
     command = bind_runtime_read_only_schema_files(
         command,
@@ -1326,6 +1404,7 @@ fn prepare_child_attempt<'a>(
             attempt_artifacts,
             corrective_retry_used,
             command,
+            model_provenance: bound_launch.model_provenance,
             primary_before,
             primary_scope_before,
             incoming_scratch,
@@ -1350,6 +1429,7 @@ struct CollectedChildAttempt<'a> {
     attempt_containment_verified: bool,
     attempt_artifacts: ChildAttemptArtifacts,
     corrective_retry_used: bool,
+    model_provenance: CompletedLaunchModelProvenance,
     external_run: ExternalAgentRun,
     _worker_journal_evidence: WorkerExecutionJournalEvidenceSet,
     _primary_after: PrimaryWorktreeSnapshot,
@@ -1429,6 +1509,7 @@ fn dispatch_and_collect_child_attempt<'a>(
     let attempt_artifacts = prepared.attempt_artifacts;
     let corrective_retry_used = prepared.corrective_retry_used;
     let command = prepared.command;
+    let model_provenance = prepared.model_provenance;
     let primary_before = prepared.primary_before;
     let primary_scope_before = prepared.primary_scope_before;
     let incoming_scratch = prepared.incoming_scratch;
@@ -1796,6 +1877,7 @@ fn dispatch_and_collect_child_attempt<'a>(
         attempt_containment_verified,
         attempt_artifacts,
         corrective_retry_used,
+        model_provenance,
         external_run,
         _worker_journal_evidence: worker_journal_evidence,
         _primary_after: primary_after,
@@ -1891,6 +1973,7 @@ fn decide_child_attempt(
         attempt_containment_verified,
         attempt_artifacts,
         corrective_retry_used,
+        model_provenance: _,
         external_run,
         _worker_journal_evidence,
         _primary_after,
@@ -3286,7 +3369,7 @@ fn publish_assignment_report(
     context: &AssignmentExecutionContext<'_, '_>,
     outcome: &mut AssignmentExecutionOutcome,
     preflight: &AssignmentExecutionPreflight<'_>,
-    subject_model: Option<&str>,
+    completed_launch_model_provenance: Option<&CompletedLaunchModelProvenance>,
     journal_parent_id: &str,
     final_report_relative: &Path,
     final_report_path: &Path,
@@ -3297,7 +3380,10 @@ fn publish_assignment_report(
     let assignment = &preflight.assignment;
     outcome.candidate_inspection = completed_candidate_inspection;
     let auditor_selection = effective_role_model_selection(context.plan, AgentRole::Auditor);
-    let subject_authority = model_capability_or_weak(subject_model);
+    let subject_authority = model_capability_or_weak(
+        completed_launch_model_provenance
+            .and_then(CompletedLaunchModelProvenance::transition_subject_model),
+    );
     let auditor_capability = model_capability_or_weak(
         context
             .plan
@@ -3413,7 +3499,7 @@ fn execute_supervisor_assignment_inner(
         child_report,
         completed_candidate_inspection,
         completed_assignment_containment,
-        completed_subject_model,
+        completed_launch_model_provenance,
     ) = 'gate_controller: loop {
         let mut child_result = None;
         let mut child_containment_verified = false;
@@ -3463,7 +3549,7 @@ fn execute_supervisor_assignment_inner(
                 attempt,
                 prepared,
             )?;
-            let attempted_subject_model = collected._command.model.clone();
+            let attempted_launch_model_provenance = collected.model_provenance.clone();
             match decide_child_attempt(
                 context,
                 outcome,
@@ -3481,7 +3567,7 @@ fn execute_supervisor_assignment_inner(
                     containment_verified,
                     gate_terminal,
                 } => {
-                    child_result = Some((report, attempted_subject_model));
+                    child_result = Some((report, attempted_launch_model_provenance));
                     child_containment_verified = containment_verified;
                     child_gate_terminal = gate_terminal;
                     break;
@@ -3489,7 +3575,7 @@ fn execute_supervisor_assignment_inner(
             }
         }
 
-        let Some((mut child_report, child_subject_model)) = child_result else {
+        let Some((mut child_report, child_launch_model_provenance)) = child_result else {
             let error = anyhow!(
                 "child orchestrator '{}' did not produce a collected report after retries",
                 assignment.id
@@ -3798,7 +3884,7 @@ fn execute_supervisor_assignment_inner(
                     report,
                     candidate,
                     containment_verified,
-                    child_subject_model,
+                    child_launch_model_provenance,
                 );
             }
         }
@@ -3807,7 +3893,7 @@ fn execute_supervisor_assignment_inner(
         context,
         outcome,
         &preflight,
-        completed_subject_model.as_deref(),
+        Some(&completed_launch_model_provenance),
         journal_parent_id,
         &final_report_relative,
         &final_report_path,
@@ -4339,6 +4425,86 @@ mod decomposition_tests {
     }
 
     #[test]
+    fn real_runtime_default_launch_provenance_cannot_recover_coordinator_authority() {
+        let provenance = CompletedLaunchModelProvenance {
+            launch_runtime: SupervisorRuntime::Codex,
+            configured_model: Some("gpt-5.6-sol".to_string()),
+            launched_model: None,
+            resolution_observation: ModelResolutionObservation::RuntimeDefault,
+        };
+        let subject = model_capability_or_weak(provenance.transition_subject_model());
+        assert_eq!(subject.model, None);
+        assert_eq!(subject.capability, ModelCapabilityClass::WeakMechanical);
+
+        let transition = execute_judged_role_transition(
+            "phase-child",
+            RoleCategory::NonDelegatingTerminalWorker,
+            RoleCategory::DelegatingCoordinator,
+            "supervisor",
+            "supervisor",
+            subject,
+            &RoleTransitionJudgeVerdict {
+                judge_agent_id: "phase-child-review-auditor-lens-0".to_string(),
+                judge_role: AgentRole::Auditor,
+                judge_capability: ModelCapabilityClass::CriticalJudgment,
+                accepted: true,
+                uncertain: false,
+            },
+        )
+        .expect("weak real-runtime transition must be recorded");
+        assert!(!transition.granted);
+        assert_eq!(transition.record.reason, "weak_model_cannot_delegate");
+        assert_eq!(
+            transition.effective_category,
+            RoleCategory::NonDelegatingTerminalWorker
+        );
+    }
+
+    #[test]
+    fn fake_launch_provenance_reuses_configured_model_only_for_explicit_fake_resolution() {
+        for resolution_observation in [
+            ModelResolutionObservation::RuntimeDefault,
+            ModelResolutionObservation::LocalDeterministicFake,
+        ] {
+            let provenance = CompletedLaunchModelProvenance {
+                launch_runtime: SupervisorRuntime::Fake,
+                configured_model: Some("gpt-5.6-sol".to_string()),
+                launched_model: None,
+                resolution_observation,
+            };
+            let subject = model_capability_or_weak(provenance.transition_subject_model());
+            assert_eq!(subject.model, Some("gpt-5.6-sol"));
+            assert_ne!(subject.capability, ModelCapabilityClass::WeakMechanical);
+        }
+
+        let unresolved = CompletedLaunchModelProvenance {
+            launch_runtime: SupervisorRuntime::Fake,
+            configured_model: Some("gpt-5.6-sol".to_string()),
+            launched_model: None,
+            resolution_observation: ModelResolutionObservation::NotResolved,
+        };
+        let unresolved_subject = model_capability_or_weak(unresolved.transition_subject_model());
+        assert_eq!(unresolved_subject.model, None);
+        assert_eq!(
+            unresolved_subject.capability,
+            ModelCapabilityClass::WeakMechanical
+        );
+
+        let unknown = CompletedLaunchModelProvenance {
+            launch_runtime: SupervisorRuntime::Fake,
+            configured_model: Some("unknown-model".to_string()),
+            launched_model: None,
+            resolution_observation: ModelResolutionObservation::RuntimeDefault,
+        };
+        let unknown_subject = model_capability_or_weak(unknown.transition_subject_model());
+        assert_eq!(unknown_subject.model, Some("unknown-model"));
+        assert_eq!(
+            unknown_subject.capability,
+            ModelCapabilityClass::WeakMechanical
+        );
+    }
+
+    #[test]
     fn publication_uses_final_launch_bound_subject_model_for_transition() {
         let temp = tempfile::tempdir().expect("temporary phase fixture");
         let repo = temp.path().join("repo");
@@ -4576,7 +4742,6 @@ mod decomposition_tests {
             options.machine_global_retention
         );
         assert_eq!(prepared.command.model.as_deref(), Some("gpt-5.6-sol"));
-        let launched_subject_model = prepared.command.model.clone();
         let collected = dispatch_and_collect_child_attempt(
             &context,
             &mut outcome,
@@ -4587,6 +4752,15 @@ mod decomposition_tests {
         )
         .expect("direct child dispatch invocation");
         assert!(collected.attempt_containment_verified);
+        assert_eq!(
+            collected.model_provenance.configured_model.as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            collected.model_provenance.launched_model.as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        let completed_launch_model_provenance = collected.model_provenance.clone();
         assert_eq!(outcome.command_records.len(), 1);
 
         let mut structural_attempt = 1;
@@ -4647,7 +4821,7 @@ mod decomposition_tests {
             &context,
             &mut outcome,
             &preflight,
-            launched_subject_model.as_deref(),
+            Some(&completed_launch_model_provenance),
             options.run_id.as_str(),
             &final_report_relative,
             &final_report_path,
