@@ -17,7 +17,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     cell::RefCell,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -160,6 +160,27 @@ pub fn record_bound_provider_error(error: &ProviderError) -> Result<()> {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 enum BudgetLedgerEvent {
+    Reservation {
+        version: u32,
+        reservation_id: String,
+        tokens: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
+        unix_seconds: u64,
+    },
+    ReservationReconciled {
+        version: u32,
+        reservation_id: String,
+        tokens: usize,
+        requests: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pool: Option<PoolKey>,
+        unix_seconds: u64,
+        #[serde(default, skip_serializing_if = "is_false")]
+        recovered_after_process_death: bool,
+    },
     Consume {
         version: u32,
         run_id: String,
@@ -190,6 +211,8 @@ enum BudgetLedgerEvent {
 impl BudgetLedgerEvent {
     fn phase(&self) -> &'static str {
         match self {
+            Self::Reservation { .. } => "reservation",
+            Self::ReservationReconciled { .. } => "reservation_reconciled",
             Self::Consume { .. } => "consume",
             Self::PoolConsume { .. } => "pool_consume",
             Self::RateLimited { .. } => "rate_limited",
@@ -198,6 +221,12 @@ impl BudgetLedgerEvent {
 
     fn subject(&self) -> Option<&str> {
         match self {
+            Self::Reservation { reservation_id, .. }
+            | Self::ReservationReconciled { reservation_id, .. }
+                if journal_subject_ok(reservation_id) =>
+            {
+                Some(reservation_id.as_str())
+            }
             Self::Consume { run_id, .. } if journal_subject_ok(run_id) => Some(run_id.as_str()),
             Self::PoolConsume { completion_id, .. } if journal_subject_ok(completion_id) => {
                 Some(completion_id.as_str())
@@ -209,7 +238,9 @@ impl BudgetLedgerEvent {
 
     fn unix_seconds(&self) -> u64 {
         match self {
-            Self::Consume { unix_seconds, .. }
+            Self::Reservation { unix_seconds, .. }
+            | Self::ReservationReconciled { unix_seconds, .. }
+            | Self::Consume { unix_seconds, .. }
             | Self::PoolConsume { unix_seconds, .. }
             | Self::RateLimited { unix_seconds, .. } => *unix_seconds,
         }
@@ -258,6 +289,33 @@ pub struct PoolConsumptionUsage {
     pub observation_revision: String,
 }
 
+/// One aggregate admission persisted before the caller may invoke a provider.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DurableBudgetReservation {
+    pub reservation_id: String,
+    pub tokens: usize,
+    pub cost_usd: Option<f64>,
+    pub unix_seconds: u64,
+}
+
+/// One terminal reconciliation. An optional pool makes aggregate and pool
+/// accounting one authenticated event, eliminating a two-append crash window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DurableBudgetReconciliation {
+    pub reservation_id: String,
+    pub tokens: usize,
+    pub requests: u64,
+    pub cost_usd: Option<f64>,
+    pub pool: Option<PoolKey>,
+    pub unix_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableReservationRecordOutcome {
+    Recorded,
+    AlreadyRecorded,
+}
+
 pub struct WorkspaceBudgetLedger {
     journal: BudgetJournal,
     events: Vec<BudgetLedgerEvent>,
@@ -280,7 +338,246 @@ impl WorkspaceBudgetLedger {
         let journal = BudgetJournal::open_or_initialize(authenticator, INSTANCE_ID)
             .context("workspace rolling budget journal is corrupt or unavailable")?;
         let events = replay_events(journal.records())?;
-        Ok(Self { journal, events })
+        let mut ledger = Self { journal, events };
+        ledger.recover_unsettled_reservations()?;
+        Ok(ledger)
+    }
+
+    /// Persist aggregate admission before dispatch can start. The append also
+    /// reserves bounded journal capacity for its eventual terminal event.
+    pub fn record_reservation(
+        &mut self,
+        reservation: DurableBudgetReservation,
+    ) -> Result<DurableReservationRecordOutcome> {
+        validate_durable_reservation(&reservation)?;
+        if let Some(existing) = self.reservation(&reservation.reservation_id) {
+            if existing == reservation && !self.reservation_is_terminal(&reservation.reservation_id)
+            {
+                return Ok(DurableReservationRecordOutcome::AlreadyRecorded);
+            }
+            bail!(
+                "workspace budget reservation id '{}' was already recorded with different or terminal data",
+                reservation.reservation_id
+            );
+        }
+        let pending_after = self
+            .unsettled_reservations()
+            .len()
+            .checked_add(1)
+            .context("workspace budget pending reservation count overflowed")?;
+        self.ensure_append_capacity(pending_after)?;
+        self.publish(BudgetLedgerEvent::Reservation {
+            version: LEDGER_FORMAT_VERSION,
+            reservation_id: reservation.reservation_id,
+            tokens: reservation.tokens,
+            cost_usd: reservation.cost_usd,
+            unix_seconds: reservation.unix_seconds,
+        })?;
+        Ok(DurableReservationRecordOutcome::Recorded)
+    }
+
+    /// Atomically replace one durable reservation with conservative aggregate
+    /// consumption and, when known, the exact quota-pool consumption.
+    pub fn reconcile_reservation(
+        &mut self,
+        reconciliation: DurableBudgetReconciliation,
+    ) -> Result<DurableReservationRecordOutcome> {
+        self.reconcile_reservation_inner(reconciliation, false)
+    }
+
+    fn reconcile_reservation_inner(
+        &mut self,
+        reconciliation: DurableBudgetReconciliation,
+        recovered_after_process_death: bool,
+    ) -> Result<DurableReservationRecordOutcome> {
+        validate_durable_reconciliation(&reconciliation)?;
+        let reservation = self
+            .reservation(&reconciliation.reservation_id)
+            .with_context(|| {
+                format!(
+                    "workspace budget reconciliation references unknown reservation '{}'",
+                    reconciliation.reservation_id
+                )
+            })?;
+        if let Some(terminal) = self.reservation_terminal(&reconciliation.reservation_id) {
+            if matches!(
+                terminal,
+                BudgetLedgerEvent::ReservationReconciled {
+                    tokens,
+                    requests,
+                    cost_usd,
+                    pool,
+                    ..
+                } if *tokens == reconciliation.tokens
+                    && *requests == reconciliation.requests
+                    && *cost_usd == reconciliation.cost_usd
+                    && *pool == reconciliation.pool
+            ) {
+                return Ok(DurableReservationRecordOutcome::AlreadyRecorded);
+            }
+            bail!(
+                "workspace budget reservation '{}' already has a conflicting terminal event",
+                reservation.reservation_id
+            );
+        }
+        let pending_after = self
+            .unsettled_reservations()
+            .len()
+            .checked_sub(1)
+            .context("workspace budget reconciliation lost its pending reservation")?;
+        self.ensure_append_capacity(pending_after)?;
+        self.publish(BudgetLedgerEvent::ReservationReconciled {
+            version: LEDGER_FORMAT_VERSION,
+            reservation_id: reconciliation.reservation_id,
+            tokens: reconciliation.tokens,
+            requests: reconciliation.requests,
+            cost_usd: reconciliation.cost_usd,
+            pool: reconciliation.pool,
+            unix_seconds: reconciliation.unix_seconds.max(reservation.unix_seconds),
+            recovered_after_process_death,
+        })?;
+        Ok(DurableReservationRecordOutcome::Recorded)
+    }
+
+    fn recover_unsettled_reservations(&mut self) -> Result<()> {
+        let pending = self
+            .unsettled_reservations()
+            .into_values()
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let recovered_at = unix_now()
+            .context("failed to timestamp conservative workspace budget crash recovery")?;
+        for reservation in pending {
+            self.reconcile_reservation_inner(
+                DurableBudgetReconciliation {
+                    reservation_id: reservation.reservation_id,
+                    tokens: reservation.tokens,
+                    requests: 0,
+                    cost_usd: reservation.cost_usd,
+                    pool: None,
+                    unix_seconds: recovered_at.max(reservation.unix_seconds),
+                },
+                true,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn reservation(&self, reservation_id: &str) -> Option<DurableBudgetReservation> {
+        self.events.iter().find_map(|event| match event {
+            BudgetLedgerEvent::Reservation {
+                reservation_id: event_id,
+                tokens,
+                cost_usd,
+                unix_seconds,
+                ..
+            } if event_id == reservation_id => Some(DurableBudgetReservation {
+                reservation_id: event_id.clone(),
+                tokens: *tokens,
+                cost_usd: *cost_usd,
+                unix_seconds: *unix_seconds,
+            }),
+            _ => None,
+        })
+    }
+
+    fn reservation_terminal(&self, reservation_id: &str) -> Option<&BudgetLedgerEvent> {
+        self.events.iter().find(|event| match event {
+            BudgetLedgerEvent::ReservationReconciled {
+                reservation_id: event_id,
+                ..
+            } => event_id == reservation_id,
+            _ => false,
+        })
+    }
+
+    fn reservation_is_terminal(&self, reservation_id: &str) -> bool {
+        self.reservation_terminal(reservation_id).is_some()
+    }
+
+    fn unsettled_reservations(&self) -> BTreeMap<String, DurableBudgetReservation> {
+        let mut pending = BTreeMap::new();
+        for event in &self.events {
+            match event {
+                BudgetLedgerEvent::Reservation {
+                    reservation_id,
+                    tokens,
+                    cost_usd,
+                    unix_seconds,
+                    ..
+                } => {
+                    pending.insert(
+                        reservation_id.clone(),
+                        DurableBudgetReservation {
+                            reservation_id: reservation_id.clone(),
+                            tokens: *tokens,
+                            cost_usd: *cost_usd,
+                            unix_seconds: *unix_seconds,
+                        },
+                    );
+                }
+                BudgetLedgerEvent::ReservationReconciled { reservation_id, .. } => {
+                    pending.remove(reservation_id);
+                }
+                BudgetLedgerEvent::Consume { .. }
+                | BudgetLedgerEvent::PoolConsume { .. }
+                | BudgetLedgerEvent::RateLimited { .. } => {}
+            }
+        }
+        pending
+    }
+
+    fn ensure_append_capacity(&self, pending_after: usize) -> Result<()> {
+        let records_after = self
+            .journal
+            .records()
+            .len()
+            .checked_add(1)
+            .context("workspace budget journal record count overflowed")?;
+        let records_with_terminals = records_after
+            .checked_add(pending_after)
+            .context("workspace budget journal terminal reservation count overflowed")?;
+        if records_with_terminals > BudgetLedgerJournalSpec::MAX_RECORDS {
+            bail!(
+                "workspace rolling budget journal has insufficient record capacity for durable reservation reconciliation"
+            );
+        }
+        let used_bytes = self
+            .journal
+            .records()
+            .iter()
+            .try_fold(0_u64, |total, record| {
+                let encoded = serde_json::to_vec(record)
+                    .context("failed to measure workspace budget journal capacity")?;
+                total
+                    .checked_add(
+                        u64::try_from(encoded.len())
+                            .context("workspace budget journal record length overflowed")?
+                            .checked_add(1)
+                            .context("workspace budget encoded record length overflowed")?,
+                    )
+                    .context("workspace budget journal byte count overflowed")
+            })?;
+        let bounded_future_records = u64::try_from(
+            pending_after
+                .checked_add(1)
+                .context("workspace budget journal capacity count overflowed")?,
+        )
+        .context("workspace budget journal capacity does not fit u64")?;
+        let reserved_bytes = bounded_future_records
+            .checked_mul(BudgetLedgerJournalSpec::MAX_RECORD_BYTES)
+            .context("workspace budget journal reserved byte count overflowed")?;
+        if used_bytes
+            .checked_add(reserved_bytes)
+            .is_none_or(|total| total > BudgetLedgerJournalSpec::MAX_TOTAL_BYTES)
+        {
+            bail!(
+                "workspace rolling budget journal has insufficient byte capacity for durable reservation reconciliation"
+            );
+        }
+        Ok(())
     }
 
     pub fn record_consumption(
@@ -303,6 +600,7 @@ impl WorkspaceBudgetLedger {
             cost_usd,
             unix_seconds: now_unix_seconds,
         };
+        self.ensure_append_capacity(self.unsettled_reservations().len())?;
         self.publish(event)
     }
 
@@ -342,6 +640,7 @@ impl WorkspaceBudgetLedger {
                 completion.completion_id
             );
         }
+        self.ensure_append_capacity(self.unsettled_reservations().len())?;
         self.publish(BudgetLedgerEvent::PoolConsume {
             version: LEDGER_FORMAT_VERSION,
             completion_id: completion.completion_id,
@@ -378,6 +677,7 @@ impl WorkspaceBudgetLedger {
             unix_seconds: now_unix_seconds,
             until_unix_seconds,
         };
+        self.ensure_append_capacity(self.unsettled_reservations().len())?;
         self.publish(event)
     }
 
@@ -386,10 +686,31 @@ impl WorkspaceBudgetLedger {
         window_seconds: u64,
         now_unix_seconds: u64,
     ) -> Result<RollingBudgetUsage> {
+        self.usage_in_window_excluding(window_seconds, now_unix_seconds, &BTreeSet::new())
+    }
+
+    /// Project aggregate usage while excluding reservations already represented
+    /// by the current process's in-memory commitment totals.
+    pub fn usage_in_window_excluding(
+        &self,
+        window_seconds: u64,
+        now_unix_seconds: u64,
+        excluded_reservation_ids: &BTreeSet<String>,
+    ) -> Result<RollingBudgetUsage> {
         if window_seconds == 0 {
             bail!("rolling budget window must be greater than zero seconds");
         }
         let start = now_unix_seconds.saturating_sub(window_seconds);
+        let terminal_reservations = self
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                BudgetLedgerEvent::ReservationReconciled { reservation_id, .. } => {
+                    Some(reservation_id.as_str())
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
         let mut tokens = 0_usize;
         let mut cost_usd = 0.0_f64;
         let mut cost_complete = true;
@@ -399,6 +720,38 @@ impl WorkspaceBudgetLedger {
                 continue;
             }
             match event {
+                BudgetLedgerEvent::Reservation {
+                    reservation_id,
+                    tokens: reserved,
+                    cost_usd: estimated,
+                    ..
+                } if !terminal_reservations.contains(reservation_id.as_str())
+                    && !excluded_reservation_ids.contains(reservation_id) =>
+                {
+                    tokens = tokens
+                        .checked_add(*reserved)
+                        .context("rolling reserved token consumption overflowed")?;
+                    match estimated {
+                        Some(cost) => cost_usd = checked_cost_add(cost_usd, *cost)?,
+                        None if *reserved > 0 => cost_complete = false,
+                        None => {}
+                    }
+                }
+                BudgetLedgerEvent::Reservation { .. } => {}
+                BudgetLedgerEvent::ReservationReconciled {
+                    tokens: consumed,
+                    cost_usd: observed,
+                    ..
+                } => {
+                    tokens = tokens
+                        .checked_add(*consumed)
+                        .context("rolling reconciled token consumption overflowed")?;
+                    match observed {
+                        Some(cost) => cost_usd = checked_cost_add(cost_usd, *cost)?,
+                        None if *consumed > 0 => cost_complete = false,
+                        None => {}
+                    }
+                }
                 BudgetLedgerEvent::Consume {
                     tokens: consumed,
                     cost_usd: observed,
@@ -465,33 +818,58 @@ impl WorkspaceBudgetLedger {
         let mut cost_complete = true;
         let mut observation_revision = "authenticated-workspace-ledger-empty".to_string();
         for event in &self.events {
-            let BudgetLedgerEvent::PoolConsume {
-                completion_id,
-                pool: event_pool,
-                tokens: event_tokens,
-                requests: event_requests,
-                cost_usd: event_cost,
-                unix_seconds,
-                ..
-            } = event
-            else {
-                continue;
-            };
-            if event_pool != pool || window_start.is_some_and(|start| *unix_seconds < start) {
+            let (completion_id, event_pool, event_tokens, event_requests, event_cost, unix_seconds) =
+                match event {
+                    BudgetLedgerEvent::PoolConsume {
+                        completion_id,
+                        pool,
+                        tokens,
+                        requests,
+                        cost_usd,
+                        unix_seconds,
+                        ..
+                    } => (
+                        completion_id.as_str(),
+                        pool,
+                        *tokens,
+                        *requests,
+                        *cost_usd,
+                        *unix_seconds,
+                    ),
+                    BudgetLedgerEvent::ReservationReconciled {
+                        reservation_id,
+                        tokens,
+                        requests,
+                        cost_usd,
+                        pool: Some(pool),
+                        unix_seconds,
+                        ..
+                    } => (
+                        reservation_id.as_str(),
+                        pool,
+                        u64::try_from(*tokens).context("reconciled pool tokens do not fit u64")?,
+                        *requests,
+                        *cost_usd,
+                        *unix_seconds,
+                    ),
+                    _ => continue,
+                };
+            if event_pool != pool || window_start.is_some_and(|start| unix_seconds < start) {
                 continue;
             }
             tokens = tokens
-                .checked_add(*event_tokens)
+                .checked_add(event_tokens)
                 .context("quota pool token consumption overflowed")?;
             requests = requests
-                .checked_add(*event_requests)
+                .checked_add(event_requests)
                 .context("quota pool request consumption overflowed")?;
             match event_cost {
-                Some(cost) => cost_usd = checked_cost_add(cost_usd, *cost)?,
-                None if *event_tokens > 0 || *event_requests > 0 => cost_complete = false,
+                Some(cost) => cost_usd = checked_cost_add(cost_usd, cost)?,
+                None if event_tokens > 0 || event_requests > 0 => cost_complete = false,
                 None => {}
             }
-            observation_revision.clone_from(completion_id);
+            observation_revision.clear();
+            observation_revision.push_str(completion_id);
         }
         Ok(PoolConsumptionUsage {
             tokens,
@@ -572,6 +950,8 @@ impl WorkspaceBudgetLedger {
 fn replay_events(records: &[JournalRecord]) -> Result<Vec<BudgetLedgerEvent>> {
     let mut events = Vec::with_capacity(records.len());
     let mut pool_completion_ids = BTreeSet::new();
+    let mut reservations = BTreeMap::new();
+    let mut reservation_terminals = BTreeSet::new();
     for record in records {
         let event = serde_json::from_value::<BudgetLedgerEvent>(record.payload.clone())
             .context("workspace rolling budget journal contains an unknown or corrupt event")?;
@@ -579,6 +959,84 @@ fn replay_events(records: &[JournalRecord]) -> Result<Vec<BudgetLedgerEvent>> {
             bail!("workspace rolling budget journal phase does not match its payload");
         }
         match &event {
+            BudgetLedgerEvent::Reservation {
+                version,
+                reservation_id,
+                tokens,
+                cost_usd,
+                unix_seconds,
+            } => {
+                if *version != LEDGER_FORMAT_VERSION {
+                    bail!("unsupported workspace budget reservation version {version}");
+                }
+                let reservation = DurableBudgetReservation {
+                    reservation_id: reservation_id.clone(),
+                    tokens: *tokens,
+                    cost_usd: *cost_usd,
+                    unix_seconds: *unix_seconds,
+                };
+                validate_durable_reservation(&reservation)?;
+                if reservations
+                    .insert(reservation_id.clone(), reservation)
+                    .is_some()
+                {
+                    bail!(
+                        "workspace budget ledger contains duplicate reservation id '{}'",
+                        reservation_id
+                    );
+                }
+            }
+            BudgetLedgerEvent::ReservationReconciled {
+                version,
+                reservation_id,
+                tokens,
+                requests,
+                cost_usd,
+                pool,
+                unix_seconds,
+                recovered_after_process_death,
+            } => {
+                if *version != LEDGER_FORMAT_VERSION {
+                    bail!("unsupported workspace budget reconciliation version {version}");
+                }
+                validate_durable_reconciliation(&DurableBudgetReconciliation {
+                    reservation_id: reservation_id.clone(),
+                    tokens: *tokens,
+                    requests: *requests,
+                    cost_usd: *cost_usd,
+                    pool: pool.clone(),
+                    unix_seconds: *unix_seconds,
+                })?;
+                let reservation = reservations.get(reservation_id).with_context(|| {
+                    format!(
+                        "workspace budget reconciliation references unknown reservation '{}'",
+                        reservation_id
+                    )
+                })?;
+                if *unix_seconds < reservation.unix_seconds {
+                    bail!(
+                        "workspace budget reconciliation predates reservation '{}'",
+                        reservation_id
+                    );
+                }
+                if *recovered_after_process_death
+                    && (pool.is_some()
+                        || *requests != 0
+                        || *tokens != reservation.tokens
+                        || *cost_usd != reservation.cost_usd)
+                {
+                    bail!(
+                        "workspace budget recovered reconciliation '{}' is not the conservative reservation charge",
+                        reservation_id
+                    );
+                }
+                if !reservation_terminals.insert(reservation_id.clone()) {
+                    bail!(
+                        "workspace budget reservation '{}' has duplicate or conflicting terminal events",
+                        reservation_id
+                    );
+                }
+            }
             BudgetLedgerEvent::Consume {
                 version,
                 run_id,
@@ -643,7 +1101,97 @@ fn replay_events(records: &[JournalRecord]) -> Result<Vec<BudgetLedgerEvent>> {
         }
         events.push(event);
     }
+    let pending = reservations
+        .len()
+        .checked_sub(reservation_terminals.len())
+        .context("workspace budget replay has more terminals than reservations")?;
+    let records_with_terminals = records
+        .len()
+        .checked_add(pending)
+        .context("workspace budget replay terminal count overflowed")?;
+    if records_with_terminals > BudgetLedgerJournalSpec::MAX_RECORDS {
+        bail!(
+            "workspace rolling budget journal cannot reconcile every durable reservation within its record bound"
+        );
+    }
+    let used_bytes = records.iter().try_fold(0_u64, |total, record| {
+        let encoded = serde_json::to_vec(record)
+            .context("failed to measure replayed workspace budget journal")?;
+        total
+            .checked_add(
+                u64::try_from(encoded.len())
+                    .context("workspace budget replay record length overflowed")?
+                    .checked_add(1)
+                    .context("workspace budget replay encoded length overflowed")?,
+            )
+            .context("workspace budget replay byte count overflowed")
+    })?;
+    let terminal_bytes = u64::try_from(pending)
+        .context("workspace budget replay pending count does not fit u64")?
+        .checked_mul(BudgetLedgerJournalSpec::MAX_RECORD_BYTES)
+        .context("workspace budget replay terminal byte reservation overflowed")?;
+    if used_bytes
+        .checked_add(terminal_bytes)
+        .is_none_or(|total| total > BudgetLedgerJournalSpec::MAX_TOTAL_BYTES)
+    {
+        bail!(
+            "workspace rolling budget journal cannot reconcile every durable reservation within its byte bound"
+        );
+    }
     Ok(events)
+}
+
+fn validate_reservation_id(reservation_id: &str) -> Result<()> {
+    if reservation_id.is_empty()
+        || reservation_id.len() > 512
+        || reservation_id.chars().any(char::is_control)
+    {
+        bail!("workspace budget reservation id is invalid");
+    }
+    Ok(())
+}
+
+fn validate_durable_reservation(reservation: &DurableBudgetReservation) -> Result<()> {
+    validate_reservation_id(&reservation.reservation_id)?;
+    if reservation.tokens == 0 {
+        bail!("workspace budget reservation must reserve at least one token");
+    }
+    if reservation
+        .cost_usd
+        .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
+    {
+        bail!("workspace budget reservation cost must be finite and non-negative");
+    }
+    Ok(())
+}
+
+fn validate_durable_reconciliation(reconciliation: &DurableBudgetReconciliation) -> Result<()> {
+    validate_reservation_id(&reconciliation.reservation_id)?;
+    if reconciliation
+        .cost_usd
+        .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
+    {
+        bail!("workspace budget reconciliation cost must be finite and non-negative");
+    }
+    match &reconciliation.pool {
+        Some(pool) => {
+            pool.validate().map_err(|error| {
+                anyhow::anyhow!("workspace budget reconciliation pool is invalid: {error}")
+            })?;
+            if reconciliation.requests == 0 {
+                bail!("workspace budget pool reconciliation must record a request");
+            }
+        }
+        None if reconciliation.requests != 0 => {
+            bail!("workspace budget aggregate reconciliation cannot record pool requests");
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn validate_completed_pool_consumption(completion: &CompletedPoolConsumption) -> Result<()> {
@@ -826,6 +1374,39 @@ mod tests {
         paths
     }
 
+    fn raw_journal(repo: &Path) -> BudgetJournal {
+        let authenticator = repository_auth_writer(repo)
+            .expect("repository auth writer")
+            .into_authenticator()
+            .expect("repository authenticator");
+        BudgetJournal::open_or_initialize(authenticator, INSTANCE_ID).expect("raw budget journal")
+    }
+
+    fn reservation(id: &str, tokens: usize, now: u64) -> DurableBudgetReservation {
+        DurableBudgetReservation {
+            reservation_id: id.to_string(),
+            tokens,
+            cost_usd: Some(tokens as f64 / 100.0),
+            unix_seconds: now,
+        }
+    }
+
+    fn reconciliation(
+        id: &str,
+        tokens: usize,
+        pool: Option<PoolKey>,
+        now: u64,
+    ) -> DurableBudgetReconciliation {
+        DurableBudgetReconciliation {
+            reservation_id: id.to_string(),
+            tokens,
+            requests: if pool.is_some() { 1 } else { 0 },
+            cost_usd: Some(tokens as f64 / 100.0),
+            pool,
+            unix_seconds: now,
+        }
+    }
+
     #[test]
     fn persist_replay_preserves_consumption_across_reopen() {
         let (_temp, repo) = repository();
@@ -852,6 +1433,206 @@ mod tests {
         assert_eq!(usage.tokens, 65);
         assert_eq!(usage.cost_usd, Some(0.65));
         assert!(usage.rate_limited_pools.is_empty());
+    }
+
+    #[test]
+    fn durable_reconciliation_is_atomic_idempotent_and_pool_visible() {
+        let (_temp, repo) = repository();
+        let key = pool("gpt-5.6-sol", ResetWindow::RollingHours { hours: 1 });
+        let reservation_id = "run-a/session-a/reservation/1";
+        {
+            let mut ledger = WorkspaceBudgetLedger::open_or_create(&repo).expect("create");
+            assert_eq!(
+                ledger
+                    .record_reservation(reservation(reservation_id, 40, 10_000))
+                    .expect("reserve"),
+                DurableReservationRecordOutcome::Recorded
+            );
+            let terminal = reconciliation(reservation_id, 12, Some(key.clone()), 10_010);
+            assert_eq!(
+                ledger
+                    .reconcile_reservation(terminal.clone())
+                    .expect("reconcile"),
+                DurableReservationRecordOutcome::Recorded
+            );
+            let mut retry = terminal.clone();
+            retry.unix_seconds = 10_020;
+            assert_eq!(
+                ledger
+                    .reconcile_reservation(retry)
+                    .expect("idempotent reconciliation"),
+                DurableReservationRecordOutcome::AlreadyRecorded
+            );
+            let conflict = reconciliation(reservation_id, 13, Some(key.clone()), 10_020);
+            assert!(ledger
+                .reconcile_reservation(conflict)
+                .expect_err("conflicting reconciliation")
+                .to_string()
+                .contains("conflicting terminal"));
+            assert_eq!(ledger.events.len(), 2, "one reservation and one terminal");
+        }
+
+        let reopened = WorkspaceBudgetLedger::open_or_create(&repo).expect("reopen");
+        let aggregate = reopened.usage_in_window(3_600, 10_100).expect("aggregate");
+        assert_eq!(aggregate.tokens, 12);
+        assert_eq!(aggregate.cost_usd, Some(0.12));
+        let pool_usage = reopened.pool_usage(&key, 10_100).expect("pool usage");
+        assert_eq!(pool_usage.tokens, 12);
+        assert_eq!(pool_usage.requests, 1);
+        assert_eq!(pool_usage.cost_usd, Some(0.12));
+        assert_eq!(pool_usage.observation_revision, reservation_id);
+    }
+
+    #[test]
+    fn unresolved_reservation_recovers_conservatively_and_ages_out() {
+        let (_temp, repo) = repository();
+        let reservation_id = "run-crashed/session-a/reservation/1";
+        {
+            let mut ledger = WorkspaceBudgetLedger::open_or_create(&repo).expect("create");
+            ledger
+                .record_reservation(reservation(reservation_id, 40, 1))
+                .expect("reserve before crash");
+        }
+
+        let reopened = WorkspaceBudgetLedger::open_or_create(&repo).expect("recover");
+        let recovered_at = unix_now().expect("current timestamp");
+        assert_eq!(reopened.events.len(), 2, "one recovery terminal appended");
+        assert!(matches!(
+            reopened.events.last(),
+            Some(BudgetLedgerEvent::ReservationReconciled {
+                reservation_id: recovered_id,
+                tokens: 40,
+                requests: 0,
+                pool: None,
+                recovered_after_process_death: true,
+                ..
+            }) if recovered_id == reservation_id
+        ));
+        assert_eq!(
+            reopened
+                .usage_in_window(DEFAULT_ROLLING_WINDOW_SECONDS, recovered_at)
+                .expect("recovered usage")
+                .tokens,
+            40
+        );
+        assert_eq!(
+            reopened
+                .usage_in_window(
+                    DEFAULT_ROLLING_WINDOW_SECONDS,
+                    recovered_at + DEFAULT_ROLLING_WINDOW_SECONDS + 1,
+                )
+                .expect("aged usage")
+                .tokens,
+            0
+        );
+        drop(reopened);
+
+        let idempotent_reopen =
+            WorkspaceBudgetLedger::open_or_create(&repo).expect("idempotent reopen");
+        assert_eq!(
+            idempotent_reopen.events.len(),
+            2,
+            "reopen must not append a second terminal"
+        );
+    }
+
+    #[test]
+    fn replay_rejects_duplicate_unknown_and_conflicting_reservation_events() {
+        let (_duplicate_temp, duplicate_repo) = repository();
+        {
+            let mut journal = raw_journal(&duplicate_repo);
+            let event = BudgetLedgerEvent::Reservation {
+                version: LEDGER_FORMAT_VERSION,
+                reservation_id: "duplicate/reservation/1".to_string(),
+                tokens: 10,
+                cost_usd: None,
+                unix_seconds: 100,
+            };
+            journal
+                .append(event.phase(), event.subject(), &event)
+                .expect("first reservation");
+            journal
+                .append(event.phase(), event.subject(), &event)
+                .expect("duplicate reservation");
+        }
+        assert!(WorkspaceBudgetLedger::open_or_create(&duplicate_repo)
+            .expect_err("duplicate reservation must fail closed")
+            .to_string()
+            .contains("duplicate reservation"));
+
+        let (_unknown_temp, unknown_repo) = repository();
+        {
+            let mut journal = raw_journal(&unknown_repo);
+            let event = BudgetLedgerEvent::ReservationReconciled {
+                version: LEDGER_FORMAT_VERSION,
+                reservation_id: "unknown/reservation/1".to_string(),
+                tokens: 10,
+                requests: 0,
+                cost_usd: None,
+                pool: None,
+                unix_seconds: 100,
+                recovered_after_process_death: false,
+            };
+            journal
+                .append(event.phase(), event.subject(), &event)
+                .expect("unknown terminal");
+        }
+        assert!(WorkspaceBudgetLedger::open_or_create(&unknown_repo)
+            .expect_err("unknown terminal must fail closed")
+            .to_string()
+            .contains("unknown reservation"));
+
+        let (_terminal_temp, terminal_repo) = repository();
+        {
+            let mut journal = raw_journal(&terminal_repo);
+            let reservation = BudgetLedgerEvent::Reservation {
+                version: LEDGER_FORMAT_VERSION,
+                reservation_id: "terminal/reservation/1".to_string(),
+                tokens: 10,
+                cost_usd: None,
+                unix_seconds: 100,
+            };
+            let first = BudgetLedgerEvent::ReservationReconciled {
+                version: LEDGER_FORMAT_VERSION,
+                reservation_id: "terminal/reservation/1".to_string(),
+                tokens: 4,
+                requests: 0,
+                cost_usd: None,
+                pool: None,
+                unix_seconds: 101,
+                recovered_after_process_death: false,
+            };
+            let conflicting = BudgetLedgerEvent::ReservationReconciled {
+                version: LEDGER_FORMAT_VERSION,
+                reservation_id: "terminal/reservation/1".to_string(),
+                tokens: 5,
+                requests: 0,
+                cost_usd: None,
+                pool: None,
+                unix_seconds: 102,
+                recovered_after_process_death: false,
+            };
+            for event in [reservation, first, conflicting] {
+                journal
+                    .append(event.phase(), event.subject(), &event)
+                    .expect("append replay fixture");
+            }
+        }
+        assert!(WorkspaceBudgetLedger::open_or_create(&terminal_repo)
+            .expect_err("conflicting terminals must fail closed")
+            .to_string()
+            .contains("duplicate or conflicting terminal"));
+    }
+
+    #[test]
+    fn durable_reservation_refuses_without_terminal_journal_capacity() {
+        let (_temp, repo) = repository();
+        let ledger = WorkspaceBudgetLedger::open_or_create(&repo).expect("create");
+        assert!(ledger
+            .ensure_append_capacity(BudgetLedgerJournalSpec::MAX_RECORDS)
+            .expect_err("terminal capacity must be reserved")
+            .to_string()
+            .contains("insufficient record capacity"));
     }
 
     #[test]
