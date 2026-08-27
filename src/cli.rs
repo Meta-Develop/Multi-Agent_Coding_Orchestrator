@@ -811,6 +811,44 @@ impl SuperviseCommand {
     }
 }
 
+/// Machine-readable failure envelope for `supervise plan --json`.
+///
+/// Sibling branch `maco/c26-wiring` owns the same helper as
+/// `supervise::supervisor_plan_error_envelope`. This local equivalent keeps the
+/// JSON shape identical so the call site compiles before merge and continues to
+/// work after the helper becomes visible.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct SupervisorPlanErrorEnvelope {
+    success: bool,
+    status: &'static str,
+    error: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    causes: Vec<String>,
+}
+
+fn supervisor_plan_error_envelope(error: &anyhow::Error) -> SupervisorPlanErrorEnvelope {
+    SupervisorPlanErrorEnvelope {
+        success: false,
+        status: "error",
+        error: error.to_string(),
+        causes: error
+            .chain()
+            .skip(1)
+            .map(|cause| cause.to_string())
+            .collect(),
+    }
+}
+
+fn emit_supervisor_plan_error(error: anyhow::Error, json: bool) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&supervisor_plan_error_envelope(&error))?
+        );
+    }
+    Err(error)
+}
+
 fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
     match command {
         SuperviseSubcommand::Plan(args) => {
@@ -823,11 +861,17 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
             } = args;
             let mut plan = match (task_file, from_goal) {
                 (Some(task_file), None) => {
-                    supervise::supervisor_plan_document_from_task_file(repo, task_file)?
+                    match supervise::supervisor_plan_document_from_task_file(repo, task_file) {
+                        Ok(plan) => plan,
+                        Err(error) => return emit_supervisor_plan_error(error, json),
+                    }
                 }
                 (None, Some(goal_file)) => {
                     let goal_spec = read_supervise_goal_file(&goal_file)?;
-                    supervise::supervisor_plan_document_from_goal_spec(repo, "", &goal_spec)?
+                    match supervise::supervisor_plan_document_from_goal_spec(repo, "", &goal_spec) {
+                        Ok(plan) => plan,
+                        Err(error) => return emit_supervisor_plan_error(error, json),
+                    }
                 }
                 _ => bail!(
                     "supervise plan requires exactly one positional TASK_FILE or --from-goal <FILE>"
@@ -4123,6 +4167,27 @@ mod cli_integration_tests {
         assert_eq!(experiment.family, RescoreResultsFamily::Experiment);
         assert_eq!(experiment.repo, PathBuf::from("."));
         assert!(!experiment.json);
+    }
+
+    #[test]
+    fn supervisor_plan_error_envelope_keeps_error_chain() {
+        let error = anyhow::anyhow!("bounded-status rejects Git object alternates")
+            .context("repository inventory failed");
+        let envelope = supervisor_plan_error_envelope(&error);
+        assert!(!envelope.success);
+        assert_eq!(envelope.status, "error");
+        assert!(envelope.error.contains("repository inventory failed"));
+        assert!(envelope
+            .causes
+            .iter()
+            .any(|cause| cause.contains("bounded-status rejects Git object alternates")));
+        let value = serde_json::to_value(&envelope).expect("serialize envelope");
+        assert_eq!(value["success"], false);
+        assert_eq!(value["status"], "error");
+        assert!(value["error"].as_str().is_some());
+        assert!(value["causes"]
+            .as_array()
+            .is_some_and(|causes| !causes.is_empty()));
     }
 
     #[test]
