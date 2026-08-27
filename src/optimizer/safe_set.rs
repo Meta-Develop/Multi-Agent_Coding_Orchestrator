@@ -12,7 +12,9 @@ use std::sync::Mutex;
 
 use super::error::OptimizerError;
 use super::ids::{PolicyId, ResourceDimensionId, TimestampMillis};
+use super::replay::DecisionSnapshot;
 use super::resources::{Quantity, ResourceVector};
+use super::switch_cost::ReplaySwitchEstimate;
 
 /// Multi-fidelity evaluation ladder from issue #169.
 ///
@@ -130,8 +132,44 @@ pub enum PromotionDecisionKind {
     Promoted,
     RejectedBelowLcb,
     RejectedInsufficientFidelity,
+    RejectedSwitchCostUncorrected,
+    RejectedSwitchCostOverturnsGain,
     Demoted,
     BaselineRetained,
+}
+
+/// Provenance class for a persisted safe-set decision.
+///
+/// `DirectEvaluation` means historical replay did not influence the candidate
+/// or its claimed gain. Replay-influenced promotion must use the distinct
+/// request variant so an absent or unsafe production correction fails closed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PromotionBasis {
+    #[default]
+    DirectEvaluation,
+    ReplayInfluenced,
+    Administrative,
+}
+
+/// Evidence required by the single safe-set promotion entrypoint.
+#[derive(Debug, Clone, Copy)]
+pub enum PromotionEvidence<'a> {
+    DirectEvaluation {
+        fidelity: EvaluationFidelity,
+    },
+    ReplayInfluenced {
+        validation_fidelity: EvaluationFidelity,
+        predicted_gain_micros: i64,
+        snapshot: &'a DecisionSnapshot,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PromotionRequest<'a> {
+    pub policy_id: &'a PolicyId,
+    pub task_class: &'a TaskClass,
+    pub decided_at: TimestampMillis,
+    pub evidence: PromotionEvidence<'a>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +182,10 @@ pub struct PromotionEvent {
     pub threshold_bp: u16,
     pub evidence: CertificationEvidence,
     pub fidelity: EvaluationFidelity,
+    #[serde(default)]
+    pub basis: PromotionBasis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_switch_estimate: Option<ReplaySwitchEstimate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -268,17 +310,51 @@ impl InMemorySafeSetStore {
             .unwrap_or_default())
     }
 
-    pub fn promote(
-        &self,
-        policy_id: &PolicyId,
-        task_class: &TaskClass,
-        at: TimestampMillis,
-        fidelity: EvaluationFidelity,
-    ) -> Result<PromotionEvent, OptimizerError> {
+    /// Canonical safe-set promotion boundary. Replay-influenced candidates
+    /// cannot bypass correction checks through a second, weaker method.
+    pub fn promote(&self, request: PromotionRequest<'_>) -> Result<PromotionEvent, OptimizerError> {
+        let PromotionRequest {
+            policy_id,
+            task_class,
+            decided_at,
+            evidence: promotion_evidence,
+        } = request;
+        let (fidelity, basis, replay) = match promotion_evidence {
+            PromotionEvidence::DirectEvaluation { fidelity } => {
+                (fidelity, PromotionBasis::DirectEvaluation, None)
+            }
+            PromotionEvidence::ReplayInfluenced {
+                validation_fidelity,
+                predicted_gain_micros,
+                snapshot,
+            } => {
+                if snapshot.selected.as_ref() != Some(policy_id) {
+                    return Err(OptimizerError::invalid(
+                        "replay promotion policy does not match the recorded selection",
+                    ));
+                }
+                (
+                    validation_fidelity,
+                    PromotionBasis::ReplayInfluenced,
+                    Some((
+                        predicted_gain_micros,
+                        snapshot.replay_switch_estimate.as_ref(),
+                    )),
+                )
+            }
+        };
         let threshold = self.threshold_for(task_class)?;
         let evidence = self.evidence_for(policy_id, task_class)?;
         let lcb_bp = evidence.wilson_lcb_bp();
-        let kind = if !fidelity.can_promote_to_safe_set() {
+        let kind = if replay.is_some_and(|(_, estimate)| {
+            !estimate.is_some_and(ReplaySwitchEstimate::has_measured_correction)
+        }) {
+            PromotionDecisionKind::RejectedSwitchCostUncorrected
+        } else if replay.is_some_and(|(gain, estimate)| {
+            !estimate.is_some_and(|estimate| estimate.may_promote(gain))
+        }) {
+            PromotionDecisionKind::RejectedSwitchCostOverturnsGain
+        } else if !fidelity.can_promote_to_safe_set() {
             PromotionDecisionKind::RejectedInsufficientFidelity
         } else if lcb_bp >= threshold.lcb_bp {
             let mut membership = self
@@ -296,12 +372,14 @@ impl InMemorySafeSetStore {
         let event = PromotionEvent {
             policy_id: policy_id.clone(),
             task_class: task_class.clone(),
-            decided_at: at,
+            decided_at,
             kind,
             lcb_bp,
             threshold_bp: threshold.lcb_bp,
             evidence,
             fidelity,
+            basis,
+            replay_switch_estimate: replay.and_then(|(_, estimate)| estimate.cloned()),
         };
         self.events
             .lock()
@@ -326,6 +404,8 @@ impl InMemorySafeSetStore {
                 threshold_bp: self.threshold_for(task_class)?.lcb_bp,
                 evidence: CertificationEvidence::default(),
                 fidelity: EvaluationFidelity::F4HiddenValidation,
+                basis: PromotionBasis::Administrative,
+                replay_switch_estimate: None,
             };
             self.events
                 .lock()
@@ -352,6 +432,8 @@ impl InMemorySafeSetStore {
             threshold_bp: self.threshold_for(task_class)?.lcb_bp,
             evidence,
             fidelity: EvaluationFidelity::F4HiddenValidation,
+            basis: PromotionBasis::Administrative,
+            replay_switch_estimate: None,
         };
         self.events
             .lock()
@@ -580,6 +662,20 @@ mod tests {
         vector
     }
 
+    fn direct_promotion<'a>(
+        policy_id: &'a PolicyId,
+        task_class: &'a TaskClass,
+        decided_at: TimestampMillis,
+        fidelity: EvaluationFidelity,
+    ) -> PromotionRequest<'a> {
+        PromotionRequest {
+            policy_id,
+            task_class,
+            decided_at,
+            evidence: PromotionEvidence::DirectEvaluation { fidelity },
+        }
+    }
+
     fn promote_with_successes(
         store: &InMemorySafeSetStore,
         candidate: &PolicyId,
@@ -592,12 +688,12 @@ mod tests {
                 .expect("record");
         }
         store
-            .promote(
+            .promote(direct_promotion(
                 candidate,
                 coding,
                 TimestampMillis::from_millis(1),
                 EvaluationFidelity::F4HiddenValidation,
-            )
+            ))
             .expect("promote");
     }
 
@@ -627,12 +723,12 @@ mod tests {
                 .expect("record");
         }
         let promoted = store
-            .promote(
+            .promote(direct_promotion(
                 &candidate,
                 &coding,
                 TimestampMillis::from_millis(1),
                 EvaluationFidelity::F5ProductionShadow,
-            )
+            ))
             .expect("promote");
         assert_eq!(promoted.kind, PromotionDecisionKind::Promoted);
         assert!(store.contains(&candidate).expect("contains"));
@@ -645,12 +741,12 @@ mod tests {
             .record_outcome(&candidate, &docs, true)
             .expect("record");
         let rejected = store
-            .promote(
+            .promote(direct_promotion(
                 &candidate,
                 &docs,
                 TimestampMillis::from_millis(2),
                 EvaluationFidelity::F4HiddenValidation,
-            )
+            ))
             .expect("promote");
         assert_eq!(rejected.kind, PromotionDecisionKind::RejectedBelowLcb);
         assert!(!store.contains_for_class(&candidate, &docs).expect("class"));
@@ -676,12 +772,12 @@ mod tests {
             EvaluationFidelity::F3HistoricalReplay,
         ] {
             let rejected = store
-                .promote(
+                .promote(direct_promotion(
                     &candidate,
                     &coding,
                     TimestampMillis::from_millis(3),
                     fidelity,
-                )
+                ))
                 .expect("promote");
             assert_eq!(
                 rejected.kind,
@@ -813,12 +909,12 @@ mod tests {
             CertificationEvidence::MAX_WEAK_PRIOR_TRIALS
         );
         let rejected = store
-            .promote(
+            .promote(direct_promotion(
                 &candidate,
                 &coding,
                 TimestampMillis::from_millis(9),
                 EvaluationFidelity::F4HiddenValidation,
-            )
+            ))
             .expect("promote");
         assert_eq!(rejected.kind, PromotionDecisionKind::RejectedBelowLcb);
     }
@@ -837,17 +933,88 @@ mod tests {
                 .expect("record");
         }
         store
-            .promote(
+            .promote(direct_promotion(
                 &candidate,
                 &coding,
                 TimestampMillis::from_millis(9),
                 EvaluationFidelity::F5ProductionShadow,
-            )
+            ))
             .expect("promote");
         let events = store.events_snapshot().expect("events");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, PromotionDecisionKind::Promoted);
         assert_eq!(events[0].policy_id, candidate);
         assert_eq!(events[0].fidelity, EvaluationFidelity::F5ProductionShadow);
+    }
+
+    #[test]
+    fn replay_switch_correction_is_consumed_by_safe_set_promotion() {
+        use crate::optimizer::switch_cost::{
+            ReplayCorrectionEvidence, ReplaySwitchEstimate, REPLAY_UNCORRECTED_LABEL,
+        };
+
+        let store = InMemorySafeSetStore::cold_start(policy("baseline-safe"));
+        let candidate = policy("candidate");
+        let coding = class("coding");
+        store
+            .set_threshold(&coding, PromotionThreshold { lcb_bp: 500 })
+            .expect("threshold");
+        for _ in 0..30 {
+            store
+                .record_outcome(&candidate, &coding, true)
+                .expect("record");
+        }
+
+        let mut replay_snapshot = DecisionSnapshot::new(
+            super::super::ids::CatalogVersion::new("test-catalog").expect("catalog"),
+            1,
+            super::super::objective::PreferenceProfile::shipped_default().attribution(),
+        );
+        replay_snapshot.selected = Some(candidate.clone());
+        replay_snapshot.replay_switch_estimate = Some(ReplaySwitchEstimate::from_replay(1_000));
+        let uncorrected = replay_snapshot
+            .replay_switch_estimate
+            .as_ref()
+            .expect("estimate");
+        assert_eq!(uncorrected.label, REPLAY_UNCORRECTED_LABEL);
+        let rejected = store
+            .promote(PromotionRequest {
+                policy_id: &candidate,
+                task_class: &coding,
+                decided_at: TimestampMillis::from_millis(10),
+                evidence: PromotionEvidence::ReplayInfluenced {
+                    validation_fidelity: EvaluationFidelity::F4HiddenValidation,
+                    predicted_gain_micros: 2_000,
+                    snapshot: &replay_snapshot,
+                },
+            })
+            .expect("promotion decision");
+        assert_eq!(
+            rejected.kind,
+            PromotionDecisionKind::RejectedSwitchCostUncorrected
+        );
+
+        replay_snapshot.replay_switch_estimate =
+            Some(ReplaySwitchEstimate::with_measured_correction(
+                1_000,
+                ReplayCorrectionEvidence::measured(2_500, 8, 2_000, 3_000, "shadow"),
+            ));
+        let rejected = store
+            .promote(PromotionRequest {
+                policy_id: &candidate,
+                task_class: &coding,
+                decided_at: TimestampMillis::from_millis(11),
+                evidence: PromotionEvidence::ReplayInfluenced {
+                    validation_fidelity: EvaluationFidelity::F4HiddenValidation,
+                    predicted_gain_micros: 2_000,
+                    snapshot: &replay_snapshot,
+                },
+            })
+            .expect("promotion decision");
+        assert_eq!(
+            rejected.kind,
+            PromotionDecisionKind::RejectedSwitchCostOverturnsGain
+        );
+        assert!(!store.contains(&candidate).expect("contains"));
     }
 }

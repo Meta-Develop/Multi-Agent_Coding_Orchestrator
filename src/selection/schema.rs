@@ -218,7 +218,7 @@ fn operator_constraints() -> Value {
     )
 }
 
-fn objective_profile_ref() -> Value {
+fn selector_calibration_ref() -> Value {
     strict_object!(
         "name" => nonempty_string(),
         "version" => positive_integer(),
@@ -258,6 +258,7 @@ fn routing_objective_profile_binding() -> Value {
         "content_hash" => json!({"type": "string", "pattern": "^[0-9a-f]{64}$"}),
         "quality" => routing_quality_weights(),
         "tradeoffs" => routing_tradeoff_weights(),
+        "switch_costs" => context_switch_costs(),
     )
 }
 
@@ -268,7 +269,7 @@ fn resolved_routing_objective_profile() -> Value {
     )
 }
 
-fn objective_profile() -> Value {
+fn selector_calibration() -> Value {
     strict_object!(
         "name" => nonempty_string(),
         "version" => positive_integer(),
@@ -281,7 +282,6 @@ fn objective_profile() -> Value {
         "entitlement_scarcity_full_cost_microunits" => nonnegative_integer(),
         "retry_penalty_microunits" => nonnegative_integer(),
         "degrade_effort_rank_penalty_microunits" => nonnegative_integer(),
-        "switch_costs" => context_switch_costs(),
     )
 }
 
@@ -339,11 +339,11 @@ fn model_prior() -> Value {
 
 fn prior_dataset() -> Value {
     strict_object!(
-        "schema_version" => positive_integer(),
+        "schema_version" => json!({"type": "integer", "const": 2}),
         "dataset_id" => nonempty_string(),
         "revision" => nonempty_string(),
         "published_on" => date(),
-        "objective_profiles" => array(objective_profile()),
+        "objective_profiles" => array(selector_calibration()),
         "models" => array(model_prior()),
     )
 }
@@ -416,7 +416,7 @@ fn selection_input() -> Value {
         "quota_source" => nullable(pool_reference()),
         "constraints" => operator_constraints(),
         "priors" => prior_dataset(),
-        "objective_profile" => objective_profile_ref(),
+        "objective_profile" => selector_calibration_ref(),
         "resolved_objective_profile" => resolved_routing_objective_profile(),
         "outcomes" => array(outcome_record()),
         "signals" => dynamic_signals(),
@@ -434,6 +434,7 @@ fn digest_record() -> Value {
 fn input_digests() -> Value {
     strict_object!(
         "normalized_input" => digest_record(),
+        "switch_cost_evidence" => digest_record(),
         "task" => digest_record(),
         "catalogs" => digest_record(),
         "pools" => digest_record(),
@@ -445,7 +446,7 @@ fn input_digests() -> Value {
     )
 }
 
-fn objective_profile_provenance() -> Value {
+fn selector_calibration_provenance() -> Value {
     strict_object!(
         "dataset_id" => nonempty_string(),
         "dataset_revision" => nonempty_string(),
@@ -491,12 +492,74 @@ fn ineligibility_reason() -> Value {
 
 fn context_switch_transition() -> Value {
     enum_schema(&[
-        "initial",
-        "stay",
-        "effort_change_same_runtime_model",
+        "continue",
         "model_change_same_runtime",
-        "runtime_change",
+        "runtime_adapter_change",
+        "fresh_session_or_worktree",
     ])
+}
+
+fn switch_cost_evidence_origin() -> Value {
+    enum_schema(&[
+        "optimizer_estimate",
+        "optimizer_cold_start_prior",
+        "continue_zero",
+    ])
+}
+
+fn configured_switch_cost_origin() -> Value {
+    enum_schema(&["not_applicable", "resolved_profile_inferred_prior"])
+}
+
+fn switch_cost_interval() -> Value {
+    strict_object!(
+        "lower" => nonnegative_integer(),
+        "upper" => nonnegative_integer(),
+    )
+}
+
+fn switch_component_provenance() -> Value {
+    strict_object!(
+        "source" => enum_schema(&[
+            "continue_zero", "explicit_observation", "exact_transition_telemetry",
+            "class_telemetry", "global_telemetry", "cold_start_prior", "legacy_unknown"
+        ]),
+        "sample_count" => nonnegative_integer(),
+        "observation" => enum_schema(&["Measured", "Inferred"]),
+        "uncertainty" => switch_cost_interval(),
+    )
+}
+
+fn switch_cost_provenance() -> Value {
+    strict_object!(
+        "cached_prefix_invalidation" => switch_component_provenance(),
+        "context_reprime" => switch_component_provenance(),
+        "runtime_startup" => switch_component_provenance(),
+        "lost_checkpoint" => switch_component_provenance(),
+    )
+}
+
+fn switch_cost_estimate() -> Value {
+    strict_object!(
+        "class" => context_switch_transition(),
+        "cached_prefix_invalidation_tokens" => nonnegative_integer(),
+        "context_reprime_tokens" => nonnegative_integer(),
+        "runtime_startup_micros" => nonnegative_integer(),
+        "lost_checkpoint_cost_micros" => nonnegative_integer(),
+        "total_cost_micros" => nonnegative_integer(),
+        "observation" => enum_schema(&["Measured", "Inferred"]),
+        "status" => enum_schema(&["measured", "mixed", "inferred"]),
+        "sample_count" => nonnegative_integer(),
+        "uncertainty_micros" => switch_cost_interval(),
+        "provenance" => switch_cost_provenance(),
+    )
+}
+
+fn candidate_switch_cost_evidence() -> Value {
+    strict_object!(
+        "candidate" => candidate_key(),
+        "estimate" => switch_cost_estimate(),
+    )
 }
 
 fn score_breakdown() -> Value {
@@ -511,7 +574,11 @@ fn score_breakdown() -> Value {
         "retry_cost_microunits" => nonnegative_integer(),
         "degrade_cost_microunits" => nonnegative_integer(),
         "switch_transition" => context_switch_transition(),
+        "switch_cost_origin" => switch_cost_evidence_origin(),
+        "switch_cost_estimate" => switch_cost_estimate(),
         "configured_switch_cost_microunits" => nonnegative_integer(),
+        "configured_switch_cost_origin" => configured_switch_cost_origin(),
+        "applied_switch_cost_microunits" => nonnegative_integer(),
         "switch_cost_microunits" => nonnegative_integer(),
         "routing_score_semantics" => enum_schema(&["legacy_baseline_plus_cost_proxy_adjustments_v1"]),
         "routing_tradeoff_weights" => routing_tradeoff_weights(),
@@ -545,7 +612,11 @@ fn selected_choice() -> Value {
     strict_object!(
         "candidate" => candidate_key(),
         "switch_transition" => context_switch_transition(),
+        "switch_cost_origin" => switch_cost_evidence_origin(),
+        "switch_cost_estimate" => switch_cost_estimate(),
         "configured_switch_cost_microunits" => nonnegative_integer(),
+        "configured_switch_cost_origin" => configured_switch_cost_origin(),
+        "applied_switch_cost_microunits" => nonnegative_integer(),
         "switch_cost_microunits" => nonnegative_integer(),
         "total_score_microunits" => nonnegative_integer(),
         "reason" => enum_schema(&[
@@ -636,7 +707,11 @@ fn ranked_score() -> Value {
         "rank" => json!({"type": "integer", "minimum": 2}),
         "candidate" => candidate_key(),
         "switch_transition" => context_switch_transition(),
+        "switch_cost_origin" => switch_cost_evidence_origin(),
+        "switch_cost_estimate" => switch_cost_estimate(),
         "configured_switch_cost_microunits" => nonnegative_integer(),
+        "configured_switch_cost_origin" => configured_switch_cost_origin(),
+        "applied_switch_cost_microunits" => nonnegative_integer(),
         "switch_cost_microunits" => nonnegative_integer(),
         "total_score_microunits" => nonnegative_integer(),
     )
@@ -644,12 +719,13 @@ fn ranked_score() -> Value {
 
 pub(crate) fn selection_provenance_schema_value() -> Value {
     strict_object!(
-        "schema_version" => json!({"type": "integer", "const": 2}),
+        "schema_version" => json!({"type": "integer", "const": 4}),
         "status" => enum_schema(&["selected", "fail_closed"]),
         "normalized_input" => selection_input(),
         "normalized_task" => task_profile(false),
         "input_digests" => input_digests(),
-        "objective_profile" => objective_profile_provenance(),
+        "provided_switch_cost_evidence" => array(candidate_switch_cost_evidence()),
+        "objective_profile" => selector_calibration_provenance(),
         "resolved_objective_profile" => resolved_routing_objective_profile(),
         "catalog_revisions" => array(catalog_revision_provenance()),
         "runtime_operations" => array(runtime_pool_state()),
@@ -717,17 +793,32 @@ mod tests {
         assert_every_object_is_closed(&event);
 
         let provenance = &event["properties"]["provenance"];
-        assert_eq!(provenance["properties"]["schema_version"]["const"], 2);
-        let profile = &provenance["properties"]["normalized_input"]["properties"]["priors"]
+        assert_eq!(provenance["properties"]["schema_version"]["const"], 4);
+        assert_eq!(
+            provenance["properties"]["normalized_input"]["properties"]["priors"]["properties"]
+                ["schema_version"]["const"],
+            2
+        );
+        let calibration = &provenance["properties"]["normalized_input"]["properties"]["priors"]
             ["properties"]["objective_profiles"]["items"];
-        assert!(profile["required"]
+        assert!(!calibration["properties"]
+            .as_object()
+            .expect("calibration properties")
+            .contains_key("switch_costs"));
+        let resolved_profile = &provenance["properties"]["normalized_input"]["properties"]
+            ["resolved_objective_profile"]["properties"]["profile"];
+        assert!(resolved_profile["required"]
             .as_array()
             .is_some_and(|required| required.iter().any(|field| field == "switch_costs")));
         let score =
             &provenance["properties"]["candidate_set"]["items"]["properties"]["score"]["oneOf"][0];
         for field in [
             "switch_transition",
+            "switch_cost_origin",
+            "switch_cost_estimate",
             "configured_switch_cost_microunits",
+            "configured_switch_cost_origin",
+            "applied_switch_cost_microunits",
             "switch_cost_microunits",
             "total_score_microunits",
         ] {

@@ -19,6 +19,7 @@ use super::objective::{
     annotate_explanation_with_profile, ObjectiveValue, PreferenceAttribution, PreferenceProfile,
 };
 use super::resources::ResourceVector;
+use super::switch_cost::ReplaySwitchEstimate;
 use super::telemetry::InvocationRecord;
 
 pub const REPLAY_SCHEMA_VERSION: u32 = 1;
@@ -52,6 +53,11 @@ pub struct DecisionSnapshot {
     pub selected: Option<PolicyId>,
     pub preference: PreferenceAttribution,
     pub decided_at: TimestampMillis,
+    /// Offline replay cannot reproduce live cache/session state. This field is
+    /// absent on legacy snapshots and carries the measured production
+    /// correction required before replay evidence can influence promotion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_switch_estimate: Option<ReplaySwitchEstimate>,
 }
 
 impl DecisionSnapshot {
@@ -75,6 +81,7 @@ impl DecisionSnapshot {
             selected: None,
             preference,
             decided_at: TimestampMillis::from_millis(0),
+            replay_switch_estimate: None,
         }
     }
 }
@@ -679,5 +686,105 @@ mod tests {
             loaded.snapshot.unwrap().schema_version,
             REPLAY_SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn replay_snapshot_carries_measured_switch_correction_provenance() {
+        let correction = super::super::switch_cost::ReplayCorrectionEvidence::measured(
+            2_500,
+            12,
+            2_000,
+            3_000,
+            "production-shadow/session-pairs",
+        );
+        let mut recorded = snapshot("cat-1", "cheap");
+        recorded.replay_switch_estimate = Some(
+            super::super::switch_cost::ReplaySwitchEstimate::with_measured_correction(
+                1_000, correction,
+            ),
+        );
+        let record = record_decision(recorded, explanation(), &profile()).expect("record");
+        let body = serde_json::to_vec(&record).expect("serialize");
+        let restored: ReplayRecord = serde_json::from_slice(&body).expect("restore");
+        let evidence = restored
+            .snapshot
+            .expect("snapshot")
+            .replay_switch_estimate
+            .expect("switch correction");
+        assert_eq!(evidence.correction_sample_count, 12);
+        assert_eq!(
+            evidence.correction_provenance.as_deref(),
+            Some("production-shadow/session-pairs")
+        );
+        assert_eq!(evidence.corrected_cost_micros, Some(2_500));
+    }
+
+    #[test]
+    fn recorded_replay_uses_canonical_safe_set_promotion_entrypoint() {
+        use crate::optimizer::safe_set::{
+            EvaluationFidelity, InMemorySafeSetStore, PromotionDecisionKind, PromotionEvidence,
+            PromotionRequest, PromotionThreshold, SafeSetStore, TaskClass,
+        };
+        use crate::optimizer::switch_cost::{ReplayCorrectionEvidence, ReplaySwitchEstimate};
+
+        let store = InMemorySafeSetStore::cold_start(policy("baseline-safe"));
+        let candidate = policy("cheap");
+        let task_class = TaskClass::new("coding").expect("task class");
+        store
+            .set_threshold(&task_class, PromotionThreshold { lcb_bp: 500 })
+            .expect("threshold");
+        for _ in 0..30 {
+            store
+                .record_outcome(&candidate, &task_class, true)
+                .expect("record outcome");
+        }
+
+        let uncorrected = record_decision(snapshot("cat-1", "cheap"), explanation(), &profile())
+            .expect("record replay");
+        let rejected = store
+            .promote(PromotionRequest {
+                policy_id: &candidate,
+                task_class: &task_class,
+                decided_at: TimestampMillis::from_millis(10),
+                evidence: PromotionEvidence::ReplayInfluenced {
+                    validation_fidelity: EvaluationFidelity::F4HiddenValidation,
+                    predicted_gain_micros: 2_000,
+                    snapshot: uncorrected.snapshot.as_ref().expect("snapshot"),
+                },
+            })
+            .expect("promotion decision");
+        assert_eq!(
+            rejected.kind,
+            PromotionDecisionKind::RejectedSwitchCostUncorrected
+        );
+
+        let mut corrected_snapshot = snapshot("cat-1", "cheap");
+        corrected_snapshot.replay_switch_estimate =
+            Some(ReplaySwitchEstimate::with_measured_correction(
+                1_000,
+                ReplayCorrectionEvidence::measured(
+                    1_500,
+                    8,
+                    1_200,
+                    1_800,
+                    "production-shadow/session-pairs",
+                ),
+            ));
+        let corrected = record_decision(corrected_snapshot, explanation(), &profile())
+            .expect("corrected replay");
+        let promoted = store
+            .promote(PromotionRequest {
+                policy_id: &candidate,
+                task_class: &task_class,
+                decided_at: TimestampMillis::from_millis(11),
+                evidence: PromotionEvidence::ReplayInfluenced {
+                    validation_fidelity: EvaluationFidelity::F4HiddenValidation,
+                    predicted_gain_micros: 2_000,
+                    snapshot: corrected.snapshot.as_ref().expect("snapshot"),
+                },
+            })
+            .expect("promotion decision");
+        assert_eq!(promoted.kind, PromotionDecisionKind::Promoted);
+        assert!(store.contains(&candidate).expect("contains"));
     }
 }

@@ -172,9 +172,9 @@ fn base_input() -> SelectionInput {
             allow_debug_override: false,
         },
         priors: built_in_prior_dataset().expect("built-in priors"),
-        objective_profile: ObjectiveProfileRef {
+        objective_profile: SelectorCalibrationRef {
             name: "accepted-task-total-cost".to_string(),
-            version: 2,
+            version: 3,
             expected_digest: None,
         },
         resolved_objective_profile: crate::objective_profile::ResolvedObjectiveProfile {
@@ -212,9 +212,12 @@ fn codex_model_switch_input(model_switch_cost_microunits: u64) -> SelectionInput
         model: "gpt-5.6-sol".to_string(),
         effort: ReasoningEffort::High,
     });
-    input.priors.objective_profiles[0]
-        .switch_costs
-        .model_change_same_runtime_microunits = model_switch_cost_microunits;
+    let mut profile = crate::objective_profile::default_objective_profile();
+    profile.switch_costs.model_change_same_runtime_microunits = model_switch_cost_microunits;
+    input.resolved_objective_profile = resolved_routing_profile(
+        profile,
+        crate::objective_profile::ObjectiveProfileSource::BuiltIn,
+    );
     input
 }
 
@@ -231,7 +234,7 @@ fn resolved_routing_profile(
 #[test]
 fn built_in_routing_objective_preserves_legacy_scores_choice_and_runner_order() {
     let decision = select(&base_input()).expect("default objective selection");
-    assert_eq!(decision.schema_version, 2);
+    assert_eq!(decision.schema_version, 4);
     let mut legacy_ranked = decision
         .candidate_set
         .iter()
@@ -453,68 +456,329 @@ fn resolved_routing_objective_round_trips_and_invalid_binding_fails_closed() {
 }
 
 #[test]
+fn legacy_v2_selector_wire_is_explicitly_rejected_after_objective_split() {
+    let mut legacy = base_input();
+    legacy.priors.schema_version = 1;
+    legacy.objective_profile.version = 2;
+    legacy.priors.objective_profiles[0].version = 2;
+
+    let error = select(&legacy).expect_err("legacy v2 selector semantics must fail closed");
+    assert!(matches!(
+        error,
+        SelectionError::InvalidInput(message)
+            if message.contains("legacy selector wire is incompatible")
+                && message.contains("embedded switch-cost objective semantics")
+    ));
+}
+
+#[test]
 fn built_in_data_is_dated_and_keeps_policy_in_data() {
     let priors = built_in_prior_dataset().expect("built-in priors");
-    assert_eq!(priors.revision, "2026-08-25.1");
-    assert_eq!(priors.published_on, "2026-08-25");
-    assert_eq!(priors.objective_profiles[0].version, 2);
-    assert_eq!(priors.objective_profiles[0].effective_date, "2026-08-25");
+    let _: &SelectorCalibration = &priors.objective_profiles[0];
+    assert_eq!(priors.revision, "2026-08-26.1");
+    assert_eq!(priors.published_on, "2026-08-26");
+    assert_eq!(priors.schema_version, 2);
+    assert_eq!(priors.objective_profiles[0].version, 3);
+    assert_eq!(priors.objective_profiles[0].effective_date, "2026-08-26");
     assert!(priors.models.iter().any(|prior| prior.prohibited));
     assert!(priors
         .models
         .iter()
         .any(|prior| !prior.strong_gate_fallback_efforts.is_empty()));
     assert_eq!(
-        priors.objective_profiles[0].switch_costs,
-        ContextSwitchCosts {
-            model_change_same_runtime_microunits: 10_000,
-            runtime_change_microunits: 25_000,
-        }
+        base_input().resolved_objective_profile.profile.switch_costs,
+        ContextSwitchCosts::default()
     );
 }
 
 #[test]
-fn configured_model_switch_cost_flips_stay_versus_switch() {
-    let stay = CandidateKey {
-        runtime: "codex".to_string(),
-        model: "gpt-5.6-sol".to_string(),
-        effort: ReasoningEffort::High,
-    };
+fn configured_resolved_prior_and_inferred_evidence_charge_conservative_maximum() {
     let switch = CandidateKey {
         runtime: "codex".to_string(),
         model: "gpt-5.6-luna".to_string(),
         effort: ReasoningEffort::High,
     };
 
-    let dominated = select(&codex_model_switch_input(40_000)).expect("dominating switch cost");
-    assert_eq!(
-        dominated.choice.as_ref().expect("stay choice").candidate,
-        stay
-    );
-    let switch_runner_up = dominated
-        .runner_up_scores
-        .iter()
-        .find(|score| score.candidate == switch)
-        .expect("switch runner-up");
-    assert_eq!(
-        switch_runner_up.switch_transition,
-        ContextSwitchTransition::ModelChangeSameRuntime
-    );
-    assert_eq!(switch_runner_up.configured_switch_cost_microunits, 40_000);
-    assert!(switch_runner_up.switch_cost_microunits >= 40_000);
-
-    for cost in [0, 20_000] {
-        let decision = select(&codex_model_switch_input(cost)).expect("affordable switch");
+    for cost in [0, 20_000, 400_000] {
+        let decision = select(&codex_model_switch_input(cost)).expect("inferred-prior selection");
+        let switch_score = decision
+            .candidate_set
+            .iter()
+            .find(|evaluation| evaluation.candidate == switch)
+            .and_then(|evaluation| evaluation.score.as_ref())
+            .expect("switch score");
+        assert_eq!(switch_score.configured_switch_cost_microunits, cost);
         assert_eq!(
-            decision.choice.as_ref().expect("switch choice").candidate,
-            switch,
-            "configured cost {cost} should stay below the candidate advantage"
+            switch_score.configured_switch_cost_origin,
+            ConfiguredSwitchCostOrigin::ResolvedProfileInferredPrior
         );
+        assert_eq!(
+            switch_score.switch_cost_origin,
+            SwitchCostEvidenceOrigin::OptimizerColdStartPrior
+        );
+        assert_eq!(
+            switch_score.switch_cost_estimate.status,
+            crate::optimizer::switch_cost::SwitchEvidenceStatus::Inferred
+        );
+        let evidence_derived = u64::try_from(
+            switch_score
+                .switch_cost_estimate
+                .explicit_objective_term_micros(),
+        )
+        .expect("nonnegative inferred switch estimate");
+        assert_eq!(
+            switch_score.applied_switch_cost_microunits,
+            evidence_derived.max(cost)
+        );
+        assert!(switch_score.switch_cost_microunits >= switch_score.applied_switch_cost_microunits);
     }
 }
 
 #[test]
-fn initial_stay_effort_model_and_runtime_transitions_are_typed_and_charged() {
+fn measured_optimizer_switch_evidence_is_applied_and_preserved_for_ranking() {
+    let input = codex_model_switch_input(0);
+    let stay = input
+        .signals
+        .previous_choice
+        .clone()
+        .expect("previous candidate");
+    let switch = CandidateKey {
+        runtime: "codex".to_string(),
+        model: "gpt-5.6-luna".to_string(),
+        effort: ReasoningEffort::High,
+    };
+    let measured = crate::optimizer::switch_cost::SwitchCostEstimate::from_explicit_terms(
+        crate::optimizer::switch_cost::TransitionClass::ModelChangeSameRuntime,
+        0,
+        0,
+        0,
+        1_000_000,
+        crate::optimizer::resources::ObservationKind::Measured,
+    );
+
+    let decision = select_with_switch_cost_estimates(
+        &input,
+        &[CandidateSwitchCostEvidence {
+            candidate: switch.clone(),
+            estimate: measured.clone(),
+        }],
+    )
+    .expect("selection with canonical measured switch evidence");
+
+    assert_eq!(
+        decision
+            .choice
+            .as_ref()
+            .expect("measured-cost choice")
+            .candidate,
+        stay,
+        "measured optimizer evidence must be applied to the literal stay/switch comparison"
+    );
+    let runner_up = decision
+        .runner_up_scores
+        .iter()
+        .find(|score| score.candidate == switch)
+        .expect("measured switch runner-up");
+    assert_eq!(
+        runner_up.switch_cost_origin,
+        SwitchCostEvidenceOrigin::OptimizerEstimate
+    );
+    assert_eq!(runner_up.switch_cost_estimate, measured);
+    assert_eq!(runner_up.configured_switch_cost_microunits, 0);
+    assert_eq!(
+        runner_up.configured_switch_cost_origin,
+        ConfiguredSwitchCostOrigin::ResolvedProfileInferredPrior
+    );
+    assert_eq!(runner_up.applied_switch_cost_microunits, 1_000_000);
+    assert!(runner_up.switch_cost_microunits >= 1_000_000);
+    assert_eq!(decision.provided_switch_cost_evidence.len(), 1);
+    let replay = select_with_switch_cost_estimates(
+        &decision.normalized_input,
+        &decision.provided_switch_cost_evidence,
+    )
+    .expect("self-contained switch-evidence replay");
+    assert_eq!(replay, decision);
+}
+
+#[test]
+fn explicit_fresh_session_estimate_overrides_candidate_key_transition_class() {
+    let input = codex_model_switch_input(0);
+    let switch = CandidateKey {
+        runtime: "codex".to_string(),
+        model: "gpt-5.6-luna".to_string(),
+        effort: ReasoningEffort::High,
+    };
+    let fresh = crate::optimizer::switch_cost::SwitchCostEstimate::from_explicit_terms(
+        crate::optimizer::switch_cost::TransitionClass::FreshSessionOrWorktree,
+        0,
+        0,
+        0,
+        1,
+        crate::optimizer::resources::ObservationKind::Measured,
+    );
+    let decision = select_with_switch_cost_estimates(
+        &input,
+        &[CandidateSwitchCostEvidence {
+            candidate: switch.clone(),
+            estimate: fresh.clone(),
+        }],
+    )
+    .expect("fresh-session selection");
+    let choice = decision.choice.expect("fresh-session choice");
+    assert_eq!(choice.candidate, switch);
+    assert_eq!(
+        choice.switch_transition,
+        crate::optimizer::switch_cost::TransitionClass::FreshSessionOrWorktree
+    );
+    assert_eq!(choice.switch_cost_estimate, fresh);
+    assert_eq!(
+        choice.switch_cost_origin,
+        SwitchCostEvidenceOrigin::OptimizerEstimate
+    );
+    assert_eq!(choice.applied_switch_cost_microunits, 1);
+    assert!(choice.switch_cost_microunits >= 1);
+}
+
+#[test]
+fn supplied_inferred_optimizer_estimate_is_charged_without_relabelling() {
+    let input = codex_model_switch_input(0);
+    let switch = CandidateKey {
+        runtime: "codex".to_string(),
+        model: "gpt-5.6-luna".to_string(),
+        effort: ReasoningEffort::High,
+    };
+    let inferred = crate::optimizer::switch_cost::SwitchCostEstimate::from_explicit_terms(
+        crate::optimizer::switch_cost::TransitionClass::ModelChangeSameRuntime,
+        0,
+        0,
+        0,
+        1_000_000,
+        crate::optimizer::resources::ObservationKind::Inferred,
+    );
+    let decision = select_with_switch_cost_estimates(
+        &input,
+        &[CandidateSwitchCostEvidence {
+            candidate: switch.clone(),
+            estimate: inferred.clone(),
+        }],
+    )
+    .expect("inferred-evidence selection");
+    let score = decision
+        .candidate_set
+        .iter()
+        .find(|evaluation| evaluation.candidate == switch)
+        .and_then(|evaluation| evaluation.score.as_ref())
+        .expect("inferred-evidence switch score");
+    assert_eq!(score.switch_cost_estimate, inferred);
+    assert_eq!(
+        score.switch_cost_origin,
+        SwitchCostEvidenceOrigin::OptimizerEstimate
+    );
+    assert_eq!(score.applied_switch_cost_microunits, 1_000_000);
+    assert!(score.switch_cost_microunits >= 1_000_000);
+}
+
+#[test]
+fn supplied_runtime_transition_uses_canonical_runtime_class() {
+    let mut input = base_input();
+    input.signals.previous_choice = Some(CandidateKey {
+        runtime: "codex".to_string(),
+        model: "gpt-5.6-sol".to_string(),
+        effort: ReasoningEffort::High,
+    });
+    let runtime = CandidateKey {
+        runtime: "grok".to_string(),
+        model: "grok-code-fast-1".to_string(),
+        effort: ReasoningEffort::High,
+    };
+    let measured = crate::optimizer::switch_cost::SwitchCostEstimate::from_explicit_terms(
+        crate::optimizer::switch_cost::TransitionClass::RuntimeAdapterChange,
+        0,
+        0,
+        1,
+        0,
+        crate::optimizer::resources::ObservationKind::Measured,
+    );
+    let decision = select_with_switch_cost_estimates(
+        &input,
+        &[CandidateSwitchCostEvidence {
+            candidate: runtime.clone(),
+            estimate: measured.clone(),
+        }],
+    )
+    .expect("runtime evidence selection");
+    let score = decision
+        .candidate_set
+        .iter()
+        .find(|evaluation| evaluation.candidate == runtime)
+        .and_then(|evaluation| evaluation.score.as_ref())
+        .expect("runtime score");
+    assert_eq!(
+        score.switch_transition,
+        TransitionClass::RuntimeAdapterChange
+    );
+    assert_eq!(score.switch_cost_estimate, measured);
+    assert_eq!(score.applied_switch_cost_microunits, 25_000);
+    assert!(score.switch_cost_microunits >= 25_000);
+}
+
+#[test]
+fn duplicate_mismatched_and_invalid_switch_evidence_fail_closed() {
+    let input = codex_model_switch_input(0);
+    let switch = CandidateKey {
+        runtime: "codex".to_string(),
+        model: "gpt-5.6-luna".to_string(),
+        effort: ReasoningEffort::High,
+    };
+    let measured = crate::optimizer::switch_cost::SwitchCostEstimate::from_explicit_terms(
+        TransitionClass::ModelChangeSameRuntime,
+        0,
+        0,
+        0,
+        10,
+        crate::optimizer::resources::ObservationKind::Measured,
+    );
+    let item = CandidateSwitchCostEvidence {
+        candidate: switch.clone(),
+        estimate: measured.clone(),
+    };
+    assert!(matches!(
+        select_with_switch_cost_estimates(&input, &[item.clone(), item]),
+        Err(SelectionError::InvalidInput(message)) if message.contains("duplicate candidate")
+    ));
+
+    let mismatched = CandidateSwitchCostEvidence {
+        candidate: switch.clone(),
+        estimate: crate::optimizer::switch_cost::SwitchCostEstimate::from_explicit_terms(
+            TransitionClass::RuntimeAdapterChange,
+            0,
+            0,
+            10,
+            0,
+            crate::optimizer::resources::ObservationKind::Measured,
+        ),
+    };
+    assert!(matches!(
+        select_with_switch_cost_estimates(&input, &[mismatched]),
+        Err(SelectionError::InvalidInput(message)) if message.contains("candidate keys imply")
+    ));
+
+    let mut invalid = measured;
+    invalid.total_cost_micros += 1;
+    assert!(matches!(
+        select_with_switch_cost_estimates(
+            &input,
+            &[CandidateSwitchCostEvidence {
+                candidate: switch,
+                estimate: invalid,
+            }],
+        ),
+        Err(SelectionError::InvalidInput(message)) if message.contains("aggregate fields conflict")
+    ));
+}
+
+#[test]
+fn continue_model_and_runtime_transitions_are_typed_with_honest_fallbacks() {
     let initial = select(&base_input()).expect("initial selection");
     assert!(initial
         .candidate_set
@@ -567,15 +831,36 @@ fn initial_stay_effort_model_and_runtime_transitions_are_typed_and_charged() {
         ContextSwitchTransition::ModelChangeSameRuntime
     );
     assert_eq!(model.configured_switch_cost_microunits, 10_000);
-    let model_quality = u128::from(model.posterior_quality_basis_points);
-    let expected_model_switch_cost = u128::from(model.configured_switch_cost_microunits)
-        .checked_mul(10_000)
-        .and_then(|scaled| scaled.checked_add(model_quality.checked_sub(1)?))
-        .expect("model switch normalization arithmetic")
-        / model_quality;
     assert_eq!(
-        u128::from(model.switch_cost_microunits),
-        expected_model_switch_cost
+        model.switch_cost_origin,
+        SwitchCostEvidenceOrigin::OptimizerColdStartPrior
+    );
+    assert_eq!(
+        model.configured_switch_cost_origin,
+        ConfiguredSwitchCostOrigin::ResolvedProfileInferredPrior
+    );
+    assert_eq!(
+        model.switch_cost_estimate.status,
+        crate::optimizer::switch_cost::SwitchEvidenceStatus::Inferred
+    );
+    assert_eq!(model.switch_cost_estimate.sample_count, 0);
+    assert!(
+        model
+            .switch_cost_estimate
+            .provenance
+            .cached_prefix_invalidation
+            .source
+            == crate::optimizer::switch_cost::SwitchEvidenceSource::ColdStartPrior
+    );
+    assert!(model.applied_switch_cost_microunits > 0);
+    assert!(model.switch_cost_microunits > 0);
+    assert!(
+        model.switch_cost_estimate.uncertainty_micros.lower
+            < model.switch_cost_estimate.total_cost_micros
+    );
+    assert!(
+        model.switch_cost_estimate.uncertainty_micros.upper
+            > model.switch_cost_estimate.total_cost_micros
     );
 
     let runtime = score_for(&CandidateKey {
@@ -588,47 +873,23 @@ fn initial_stay_effort_model_and_runtime_transitions_are_typed_and_charged() {
         ContextSwitchTransition::RuntimeChange
     );
     assert_eq!(runtime.configured_switch_cost_microunits, 25_000);
-    let runtime_quality = u128::from(runtime.posterior_quality_basis_points);
-    let expected_runtime_switch_cost = u128::from(runtime.configured_switch_cost_microunits)
-        .checked_mul(10_000)
-        .and_then(|scaled| scaled.checked_add(runtime_quality.checked_sub(1)?))
-        .expect("runtime switch normalization arithmetic")
-        / runtime_quality;
     assert_eq!(
-        u128::from(runtime.switch_cost_microunits),
-        expected_runtime_switch_cost
+        runtime.switch_cost_origin,
+        SwitchCostEvidenceOrigin::OptimizerColdStartPrior
     );
+    assert!(runtime.applied_switch_cost_microunits > 0);
+    assert!(runtime.switch_cost_microunits > 0);
 }
 
 #[test]
-fn zero_switch_cost_preserves_candidate_keyed_initial_total_scores_exactly() {
-    let previous_choice = codex_model_switch_input(0);
-    let mut initial = previous_choice.clone();
-    initial.signals.previous_choice = None;
+fn zero_config_still_prices_inferred_switches_and_keeps_continue_zero() {
+    let decision = select(&codex_model_switch_input(0)).expect("zero-config selection");
 
-    let initial = select(&initial).expect("equivalent initial selection");
-    let previous_choice = select(&previous_choice).expect("zero-cost previous-choice selection");
-    assert_eq!(
-        initial.candidate_set.len(),
-        previous_choice.candidate_set.len()
-    );
-
-    for evaluation in &previous_choice.candidate_set {
-        let previous_score = evaluation.score.as_ref().expect("previous-choice score");
-        let initial_score = initial
-            .candidate_set
-            .iter()
-            .find(|candidate| candidate.candidate == evaluation.candidate)
-            .and_then(|candidate| candidate.score.as_ref())
-            .expect("candidate-keyed initial score");
-        assert_eq!(previous_score.configured_switch_cost_microunits, 0);
-        assert_eq!(previous_score.switch_cost_microunits, 0);
-        assert_eq!(initial_score.configured_switch_cost_microunits, 0);
-        assert_eq!(initial_score.switch_cost_microunits, 0);
+    for evaluation in &decision.candidate_set {
+        let score = evaluation.score.as_ref().expect("candidate score");
         assert_eq!(
-            previous_score.total_score_microunits, initial_score.total_score_microunits,
-            "candidate total changed despite a zero switch term: {:?}",
-            evaluation.candidate
+            score.switch_cost_microunits == 0,
+            !score.switch_transition.is_switch()
         );
     }
 }
@@ -645,8 +906,24 @@ fn switch_evidence_round_trips_and_matches_selected_and_runner_up_scores() {
         .expect("selected candidate score");
     assert_eq!(selected.switch_transition, selected_score.switch_transition);
     assert_eq!(
+        selected.switch_cost_origin,
+        selected_score.switch_cost_origin
+    );
+    assert_eq!(
+        selected.switch_cost_estimate,
+        selected_score.switch_cost_estimate
+    );
+    assert_eq!(
         selected.configured_switch_cost_microunits,
         selected_score.configured_switch_cost_microunits
+    );
+    assert_eq!(
+        selected.configured_switch_cost_origin,
+        selected_score.configured_switch_cost_origin
+    );
+    assert_eq!(
+        selected.applied_switch_cost_microunits,
+        selected_score.applied_switch_cost_microunits
     );
     assert_eq!(
         selected.switch_cost_microunits,
@@ -665,9 +942,19 @@ fn switch_evidence_round_trips_and_matches_selected_and_runner_up_scores() {
             .and_then(|evaluation| evaluation.score.as_ref())
             .expect("runner-up score");
         assert_eq!(runner_up.switch_transition, score.switch_transition);
+        assert_eq!(runner_up.switch_cost_origin, score.switch_cost_origin);
+        assert_eq!(runner_up.switch_cost_estimate, score.switch_cost_estimate);
         assert_eq!(
             runner_up.configured_switch_cost_microunits,
             score.configured_switch_cost_microunits
+        );
+        assert_eq!(
+            runner_up.configured_switch_cost_origin,
+            score.configured_switch_cost_origin
+        );
+        assert_eq!(
+            runner_up.applied_switch_cost_microunits,
+            score.applied_switch_cost_microunits
         );
         assert_eq!(
             runner_up.switch_cost_microunits,
@@ -683,37 +970,34 @@ fn switch_evidence_round_trips_and_matches_selected_and_runner_up_scores() {
     let round_trip: SelectionProvenance =
         serde_json::from_slice(&json).expect("deserialize selection evidence");
     assert_eq!(round_trip, decision);
-    assert_eq!(round_trip.schema_version, 2);
+    assert_eq!(round_trip.schema_version, 4);
 }
 
 #[test]
-fn historical_profile_omission_is_zero_and_switch_score_overflow_fails_closed() {
+fn selector_calibration_rejects_duplicate_objective_switch_costs() {
     let mut value =
         serde_json::to_value(built_in_prior_dataset().expect("priors")).expect("serialize priors");
-    value["objective_profiles"][0]
-        .as_object_mut()
-        .expect("profile object")
-        .remove("switch_costs");
-    let historical: PriorDataset = serde_json::from_value(value).expect("historical priors");
-    assert_eq!(
-        historical.objective_profiles[0].switch_costs,
-        ContextSwitchCosts::zero()
-    );
+    value["objective_profiles"][0]["switch_costs"] = serde_json::json!({
+        "model_change_same_runtime_microunits": 10_000,
+        "runtime_change_microunits": 25_000
+    });
+    assert!(serde_json::from_value::<PriorDataset>(value).is_err());
+}
 
-    let malformed = include_str!("data/priors-2026-08-07.json").replacen(
-        "\"model_change_same_runtime_microunits\": 10000",
-        "\"model_change_same_runtime_microunits\": -1",
-        1,
+#[test]
+fn unnormalizable_maximum_resolved_profile_switch_cost_fails_closed() {
+    let mut input = codex_model_switch_input(u64::MAX);
+    let mut profile = crate::objective_profile::default_objective_profile();
+    profile.switch_costs.model_change_same_runtime_microunits = u64::MAX;
+    profile.switch_costs.runtime_change_microunits = u64::MAX;
+    input.resolved_objective_profile = resolved_routing_profile(
+        profile,
+        crate::objective_profile::ObjectiveProfileSource::BuiltIn,
     );
-    assert!(serde_json::from_str::<PriorDataset>(&malformed).is_err());
-
-    let mut overflow = codex_model_switch_input(u64::MAX);
-    overflow.priors.objective_profiles[0]
-        .switch_costs
-        .runtime_change_microunits = u64::MAX;
     assert!(matches!(
-        select(&overflow),
-        Err(SelectionError::InvalidInput(message)) if message.contains("context-switch cost per accepted task overflowed")
+        select(&input),
+        Err(SelectionError::InvalidInput(message))
+            if message.contains("context-switch cost per accepted task overflowed u64")
     ));
 }
 
@@ -1213,7 +1497,8 @@ fn native_environment_rejection_allows_exactly_one_data_declared_fallback() {
         ContextSwitchTransition::ModelChangeSameRuntime
     );
     assert_eq!(choice.configured_switch_cost_microunits, 10_000);
-    assert!(choice.switch_cost_microunits >= 10_000);
+    assert!(choice.applied_switch_cost_microunits > 0);
+    assert!(choice.switch_cost_microunits > 0);
 
     input.signals.environment_rejections[0].fallback_transition_used = true;
     let second = select(&input).expect("post-fallback selection");
@@ -1712,6 +1997,8 @@ fn catalog_withdrawal_reselects_deterministically() {
         replacement.switch_transition,
         ContextSwitchTransition::ModelChangeSameRuntime | ContextSwitchTransition::RuntimeChange
     ));
+    assert!(replacement.configured_switch_cost_microunits > 0);
+    assert!(replacement.applied_switch_cost_microunits > 0);
     assert!(replacement.switch_cost_microunits > 0);
 }
 
@@ -1731,7 +2018,7 @@ fn quota_provenance_round_trips_and_is_required_by_the_strict_artifact_schema() 
     let decoded = serde_json::from_slice::<SelectionProvenance>(&bytes)
         .expect("strict quota provenance round trip");
     assert_eq!(decoded, decision);
-    assert_eq!(decoded.schema_version, 2);
+    assert_eq!(decoded.schema_version, 4);
 
     let schema = selection_event_schema_value();
     let provenance = &schema["properties"]["provenance"];
@@ -1752,6 +2039,60 @@ fn quota_provenance_round_trips_and_is_required_by_the_strict_artifact_schema() 
     ] {
         assert!(pool_required.iter().any(|required| required == field));
     }
+}
+
+#[test]
+fn schema_v3_without_canonical_switch_evidence_is_rejected() {
+    let decision = select(&base_input()).expect("schema-v4 decision");
+    let mut value = serde_json::to_value(decision).expect("selector JSON");
+    let object = value.as_object_mut().expect("selector object");
+    object.insert("schema_version".to_string(), serde_json::json!(3));
+    object.remove("provided_switch_cost_evidence");
+    object["input_digests"]
+        .as_object_mut()
+        .expect("input digests")
+        .remove("switch_cost_evidence");
+    for candidate in object["candidate_set"]
+        .as_array_mut()
+        .expect("candidate set")
+    {
+        if let Some(score) = candidate["score"].as_object_mut() {
+            for field in [
+                "switch_cost_origin",
+                "switch_cost_estimate",
+                "configured_switch_cost_origin",
+                "applied_switch_cost_microunits",
+            ] {
+                score.remove(field);
+            }
+        }
+    }
+    if let Some(choice) = object["choice"].as_object_mut() {
+        for field in [
+            "switch_cost_origin",
+            "switch_cost_estimate",
+            "configured_switch_cost_origin",
+            "applied_switch_cost_microunits",
+        ] {
+            choice.remove(field);
+        }
+    }
+    for runner in object["runner_up_scores"]
+        .as_array_mut()
+        .expect("runner ups")
+    {
+        let runner = runner.as_object_mut().expect("runner-up object");
+        for field in [
+            "switch_cost_origin",
+            "switch_cost_estimate",
+            "configured_switch_cost_origin",
+            "applied_switch_cost_microunits",
+        ] {
+            runner.remove(field);
+        }
+    }
+
+    assert!(serde_json::from_value::<SelectionProvenance>(value).is_err());
 }
 
 #[test]

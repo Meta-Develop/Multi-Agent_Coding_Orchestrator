@@ -15,7 +15,8 @@ pub use quota_input::{
 };
 pub(crate) use schema::selection_event_schema_value;
 pub use selector::{
-    built_in_prior_dataset, measured_authority_eligibility, select, SelectionError,
+    built_in_prior_dataset, measured_authority_eligibility, select,
+    select_with_switch_cost_estimates, SelectionError,
 };
 pub use types::*;
 
