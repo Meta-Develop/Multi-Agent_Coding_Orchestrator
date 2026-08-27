@@ -40,6 +40,97 @@ fn run_evaluation_command(args: RunEvaluationArgs) -> Result<()> {
     print_query_report(&results, args.json)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoredEvaluationResultsFamily {
+    Evaluation,
+    Experiment,
+}
+
+fn run_evaluation_rescore_command(
+    manifest_path: PathBuf,
+    results_path: PathBuf,
+    family: StoredEvaluationResultsFamily,
+    objective_profile: String,
+    repo: PathBuf,
+    json: bool,
+) -> Result<()> {
+    let manifest_bytes =
+        BoundedRegularReader::read_tree_no_follow(&manifest_path, MAX_EVALUATION_MANIFEST_BYTES)
+            .with_context(|| {
+                format!(
+                    "failed to read evaluation manifest {}",
+                    manifest_path.display()
+                )
+            })?;
+    let results_bytes =
+        BoundedRegularReader::read_tree_no_follow(&results_path, MAX_EVALUATION_PLAN_BYTES)
+            .with_context(|| {
+                format!(
+                    "failed to read stored evaluation results {}",
+                    results_path.display()
+                )
+            })?;
+    let applied_profile =
+        crate::objective_profile::resolve_objective_profile(&repo, Some(&objective_profile))
+            .with_context(|| {
+                format!(
+                    "failed to resolve objective profile '{}' from {}",
+                    objective_profile,
+                    repo.display()
+                )
+            })?;
+
+    match family {
+        StoredEvaluationResultsFamily::Evaluation => {
+            let manifest =
+                serde_json::from_slice::<crate::evaluation::EvaluationManifest>(&manifest_bytes)
+                    .with_context(|| {
+                        format!(
+                            "failed to parse evaluation manifest {} as evaluation",
+                            manifest_path.display()
+                        )
+                    })?;
+            let stored_results =
+                serde_json::from_slice::<crate::evaluation::EvaluationResults>(&results_bytes)
+                    .with_context(|| {
+                        format!(
+                            "failed to parse stored evaluation results {} as evaluation",
+                            results_path.display()
+                        )
+                    })?;
+            let rescored = crate::evaluation::rescore::rescore_evaluation_results(
+                &manifest,
+                &stored_results,
+                applied_profile,
+            )?;
+            print_query_report(&rescored, json)
+        }
+        StoredEvaluationResultsFamily::Experiment => {
+            let manifest = crate::evaluation::parse_experiment_manifest(&manifest_bytes)
+                .with_context(|| {
+                    format!(
+                        "failed to parse evaluation manifest {} as experiment",
+                        manifest_path.display()
+                    )
+                })?;
+            let stored_results =
+                serde_json::from_slice::<crate::evaluation::ExperimentResults>(&results_bytes)
+                    .with_context(|| {
+                        format!(
+                            "failed to parse stored evaluation results {} as experiment",
+                            results_path.display()
+                        )
+                    })?;
+            let rescored = crate::evaluation::rescore::rescore_experiment_results(
+                &manifest,
+                &stored_results,
+                applied_profile,
+            )?;
+            print_query_report(&rescored, json)
+        }
+    }
+}
+
 const MAX_OPTIMIZER_JSON_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Args)]
