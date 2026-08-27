@@ -1312,11 +1312,36 @@ fn supervise_plan_inventory_failure_is_strict_in_human_and_json_modes() -> Resul
             !output.status.success(),
             "inventory failure unexpectedly emitted a successful {json:?} plan"
         );
-        assert!(
-            output.stdout.is_empty(),
-            "inventory failure must not emit a clean-looking plan: {}",
-            String::from_utf8_lossy(&output.stdout)
-        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if json {
+            let envelope: Value =
+                serde_json::from_str(&stdout).context("parse json inventory-failure envelope")?;
+            assert_eq!(envelope["success"], false);
+            assert_eq!(envelope["status"], "error");
+            assert!(
+                envelope["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("failed to plan")),
+                "json envelope omitted the top-level error: {envelope}"
+            );
+            let causes = envelope["causes"]
+                .as_array()
+                .context("json envelope omitted causes")?;
+            assert!(
+                causes.iter().any(|cause| cause
+                    .as_str()
+                    .is_some_and(|cause| cause.contains("repository inventory failed")))
+                    && causes.iter().any(|cause| cause.as_str().is_some_and(
+                        |cause| cause.contains("bounded-status rejects Git object alternates")
+                    )),
+                "json envelope omitted the inventory chain: {envelope}"
+            );
+        } else {
+            assert!(
+                stdout.is_empty(),
+                "human inventory failure must not emit a plan: {stdout}"
+            );
+        }
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains("repository inventory failed")

@@ -98,12 +98,19 @@ fn role_category_cli_stamps_stores_and_refuses_weak_coordinator() -> Result<()> 
         automatic_snapshot["assignments"][0]["selection_source"],
         "operator_override"
     );
-    let automatic_text = automatic.to_string();
-    assert!(
-        automatic_text.contains("delegating_coordinator")
-            && (automatic_text.contains("refused at execution admission")
-                || automatic_text.contains("unproven model")),
-        "automatic coordinator default must be admitted as a stored category: {automatic_text}"
+    assert_eq!(
+        automatic["success"], true,
+        "automatic fake coordinator must run after fake-runtime admission skip: {automatic}"
+    );
+    assert_eq!(
+        automatic["role_economics_profile"]["execution"]["assignment_selection_ledger"][0]
+            ["role_assignment"]["category"],
+        "delegating_coordinator"
+    );
+    assert_eq!(
+        automatic["role_economics_profile"]["execution"]["assignment_selection_ledger"][0]
+            ["role_assignment"]["source"],
+        "derived_from_plan_role"
     );
 
     let override_plan = temp.path().join("override.json");
