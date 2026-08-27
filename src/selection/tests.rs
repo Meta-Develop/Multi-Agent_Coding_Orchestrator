@@ -2215,17 +2215,75 @@ fn legacy_unconfigured_zero_remaining_pool_still_fails_exhausted() {
             .any(|reason| { reason.code == IneligibilityCode::EntitlementExhausted })));
 }
 
+fn rust_source_excluding_cfg_test(source: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(idx) = rest.find("#[cfg(test)]") {
+        output.push_str(&rest[..idx]);
+        rest = rest[idx + "#[cfg(test)]".len()..].trim_start();
+        rest = skip_following_rust_item(rest);
+    }
+    output.push_str(rest);
+    output
+}
+
+fn skip_following_rust_item(source: &str) -> &str {
+    let bytes = source.as_bytes();
+    let mut i = 0;
+    let mut depth = 0usize;
+    let mut seen_brace = false;
+    let mut in_string = None;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(quote) = in_string {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == quote {
+                in_string = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' | b'\'' => {
+                in_string = Some(c);
+                i += 1;
+            }
+            b'{' => {
+                depth += 1;
+                seen_brace = true;
+                i += 1;
+            }
+            b'}' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+                i += 1;
+                if seen_brace && depth == 0 {
+                    return &source[i..];
+                }
+            }
+            b';' if !seen_brace && depth == 0 => return &source[i + 1..],
+            _ => i += 1,
+        }
+    }
+    &source[i..]
+}
+
 #[test]
 fn automatic_policy_and_bridge_contain_no_model_slug_constants() {
     let automatic_sources = [
         include_str!("selector.rs"),
         include_str!("../supervise/selection_bridge.rs"),
         include_str!("../optimizer/evaluation_fn.rs"),
-        include_str!("../optimizer/seed_evidence.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("seed evidence production source"),
+        include_str!("../optimizer/seed_evidence.rs"),
     ]
+    .into_iter()
+    .map(rust_source_excluding_cfg_test)
+    .collect::<Vec<_>>()
     .join("\n");
     for slug in [
         "gpt-5.6-sol",
