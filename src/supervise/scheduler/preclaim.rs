@@ -1,9 +1,12 @@
 //! Deterministic pre-claim viability gate.
 //!
-//! Verified execution requires repository-map, risk, and runtime evidence plus
-//! positive answers for limited scope, a clear verification path, and
-//! autonomous completion. A non-claim decision is always a reversible, read-only
-//! park; rejection is classification evidence, never mutation authority.
+//! `NonpublishableSimulation` records a typed, all-positive synthetic viability
+//! assessment without production map/risk/environment inference, then still
+//! applies requested-plan policy binding and operator Park. Verified execution
+//! requires acquired repository-map, risk, and runtime evidence plus real
+//! positive answers for limited scope, a clear verification path, and autonomous
+//! completion. A non-claim decision is always a reversible, read-only park;
+//! rejection is classification evidence, never mutation authority.
 
 use super::*;
 use crate::repo_map::{RepoEntryKind, RepoMap};
@@ -251,25 +254,57 @@ trait PreclaimAssessmentProvider {
     fn assess(
         &self,
         assignment: &OrchestratorAssignment,
+        requested_assignments: &[OrchestratorAssignment],
         repo_map: Option<&RepoMap>,
         risk_report: Option<&SemanticRiskReport>,
-        execution_runtime: SupervisorExecutionRuntime,
     ) -> PreclaimAssessment;
 }
 
 struct DeterministicPreclaimProvider;
 
+struct SyntheticSimulationPreclaimProvider;
+
+impl PreclaimAssessmentProvider for SyntheticSimulationPreclaimProvider {
+    fn assess(
+        &self,
+        _: &OrchestratorAssignment,
+        _: &[OrchestratorAssignment],
+        _: Option<&RepoMap>,
+        _: Option<&SemanticRiskReport>,
+    ) -> PreclaimAssessment {
+        PreclaimAssessment {
+            dimensions: PreclaimViabilityDimensions {
+                limited_scope: ViabilityFinding::Yes,
+                clear_verification_path: ViabilityFinding::Yes,
+                autonomously_completable: ViabilityFinding::Yes,
+            },
+            rejection_bucket: None,
+            confidence: PreclaimConfidence::High,
+            authority: PreclaimDecisionAuthority::DeterministicPolicy,
+            reason: concat!(
+                "synthetic simulation viability dimensions: limited_scope=yes, ",
+                "clear_verification_path=yes, autonomously_completable=yes"
+            )
+            .to_string(),
+        }
+    }
+}
+
 impl PreclaimAssessmentProvider for DeterministicPreclaimProvider {
     fn assess(
         &self,
         assignment: &OrchestratorAssignment,
+        requested_assignments: &[OrchestratorAssignment],
         repo_map: Option<&RepoMap>,
         risk_report: Option<&SemanticRiskReport>,
-        execution_runtime: SupervisorExecutionRuntime,
     ) -> PreclaimAssessment {
         let limited_scope = deterministic_limited_scope(assignment, repo_map);
-        let clear_verification_path =
-            deterministic_verification_path(assignment, repo_map, risk_report, execution_runtime);
+        let clear_verification_path = deterministic_verification_path(
+            assignment,
+            requested_assignments,
+            repo_map,
+            risk_report,
+        );
         let autonomously_completable = deterministic_autonomous_completion(assignment);
         let dimensions = PreclaimViabilityDimensions {
             limited_scope,
@@ -339,11 +374,14 @@ fn deterministic_limited_scope(
 
 fn deterministic_verification_path(
     assignment: &OrchestratorAssignment,
+    requested_assignments: &[OrchestratorAssignment],
     repo_map: Option<&RepoMap>,
     risk_report: Option<&SemanticRiskReport>,
-    execution_runtime: SupervisorExecutionRuntime,
 ) -> ViabilityFinding {
-    if execution_runtime == SupervisorExecutionRuntime::NonpublishableSimulation {
+    // Production callers supply the already validated requested plan. Require
+    // the typed declaration to remain uniquely and exactly bound to that plan;
+    // current assignment input alone cannot manufacture this verification path.
+    if requested_licensed_breakage_contract(assignment, requested_assignments) {
         return ViabilityFinding::Yes;
     }
     let assignment_names_exact_test_target = assignment
@@ -383,6 +421,24 @@ fn deterministic_verification_path(
     } else {
         ViabilityFinding::Unknown
     }
+}
+
+fn requested_licensed_breakage_contract(
+    assignment: &OrchestratorAssignment,
+    requested_assignments: &[OrchestratorAssignment],
+) -> bool {
+    let mut matching = requested_assignments
+        .iter()
+        .filter(|requested| requested.id == assignment.id);
+    let Some(requested) = matching.next() else {
+        return false;
+    };
+    matching.next().is_none()
+        && requested.phase == assignment.phase
+        && requested.role == assignment.role
+        && requested.assigned_paths == assignment.assigned_paths
+        && assignment.licensed_breakage.is_some()
+        && requested.licensed_breakage == assignment.licensed_breakage
 }
 
 fn mapped_regular_file(repo_map: &RepoMap, path: &Path) -> bool {
@@ -449,18 +505,19 @@ fn is_recognized_test_target(path: &Path) -> bool {
 }
 
 fn deterministic_autonomous_completion(assignment: &OrchestratorAssignment) -> ViabilityFinding {
-    let worker_requires_environment = assignment
-        .worker_assignments
-        .iter()
-        .any(|worker| !worker.environment_requirements.is_empty());
-    if assignment.licensed_breakage.is_some()
-        || !assignment.environment_requirements.is_empty()
-        || worker_requires_environment
-    {
+    if assignment_requires_environment(assignment) {
         ViabilityFinding::No
     } else {
         ViabilityFinding::Yes
     }
+}
+
+fn assignment_requires_environment(assignment: &OrchestratorAssignment) -> bool {
+    !assignment.environment_requirements.is_empty()
+        || assignment
+            .worker_assignments
+            .iter()
+            .any(|worker| !worker.environment_requirements.is_empty())
 }
 
 fn deterministic_bucket(
@@ -547,6 +604,25 @@ fn resolve_preclaim_policy(
     }
     if requested.assigned_paths != assignment.assigned_paths {
         mismatches.push("assigned_paths");
+    }
+    if requested.licensed_breakage != assignment.licensed_breakage {
+        mismatches.push("licensed_breakage");
+    }
+    if requested.environment_requirements.is_empty()
+        != assignment.environment_requirements.is_empty()
+    {
+        mismatches.push("environment_requirements");
+    }
+    let requested_worker_requires_environment = requested
+        .worker_assignments
+        .iter()
+        .any(|worker| !worker.environment_requirements.is_empty());
+    let assignment_worker_requires_environment = assignment
+        .worker_assignments
+        .iter()
+        .any(|worker| !worker.environment_requirements.is_empty());
+    if requested_worker_requires_environment != assignment_worker_requires_environment {
+        mismatches.push("worker_environment_requirements");
     }
     if !mismatches.is_empty() {
         return fail_closed_policy(
@@ -688,7 +764,7 @@ fn evaluate_with_provider(
         } else {
             PreclaimEvidenceSource::Acquired
         };
-    let assessment = provider.assess(assignment, repo_map, risk_report, execution_runtime);
+    let assessment = provider.assess(assignment, requested_assignments, repo_map, risk_report);
     let dimensions = assessment.dimensions;
     let rejection_bucket = assessment.rejection_bucket;
     let confidence = assessment.confidence;
@@ -989,15 +1065,26 @@ pub(super) fn evaluate_preclaim_viability(
     runtime: Option<SupervisorRuntime>,
     execution_runtime: SupervisorExecutionRuntime,
 ) -> PreclaimDecision {
-    evaluate_with_provider(
-        assignment,
-        requested_assignments,
-        repo_map,
-        risk_report,
-        runtime,
-        execution_runtime,
-        &DeterministicPreclaimProvider,
-    )
+    match execution_runtime {
+        SupervisorExecutionRuntime::NonpublishableSimulation => evaluate_with_provider(
+            assignment,
+            requested_assignments,
+            repo_map,
+            risk_report,
+            runtime,
+            execution_runtime,
+            &SyntheticSimulationPreclaimProvider,
+        ),
+        SupervisorExecutionRuntime::Verified => evaluate_with_provider(
+            assignment,
+            requested_assignments,
+            repo_map,
+            risk_report,
+            runtime,
+            execution_runtime,
+            &DeterministicPreclaimProvider,
+        ),
+    }
 }
 
 pub(super) fn preclaim_assignment(
@@ -1244,9 +1331,9 @@ mod tests {
         fn assess(
             &self,
             _: &OrchestratorAssignment,
+            _: &[OrchestratorAssignment],
             _: Option<&RepoMap>,
             _: Option<&SemanticRiskReport>,
-            _: SupervisorExecutionRuntime,
         ) -> PreclaimAssessment {
             self.0.clone()
         }
@@ -1565,7 +1652,7 @@ mod tests {
     }
 
     #[test]
-    fn requested_plan_binding_requires_unique_exact_id_phase_role_and_scope() {
+    fn requested_plan_binding_covers_every_deterministic_assessment_input() {
         let candidate = assignment();
         assert_policy_binding_failure(&candidate, &[], "no unique requested-plan identity");
 
@@ -1591,6 +1678,37 @@ mod tests {
         let mut wrong_role = candidate.clone();
         wrong_role.role = AgentRole::Worker;
         assert_policy_binding_failure(&candidate, &[wrong_role], "role binding");
+
+        let mut requested_environment = candidate.clone();
+        requested_environment.environment_requirements = vec![EnvironmentRequirement::network(
+            EnvironmentNetworkAccess::Enabled,
+        )];
+        assert_policy_binding_failure(
+            &candidate,
+            &[requested_environment],
+            "environment_requirements binding",
+        );
+
+        let mut requested_worker_environment = candidate.clone();
+        requested_worker_environment
+            .worker_assignments
+            .push(WorkerAssignment {
+                id: "worker-a".to_string(),
+                role: AgentRole::Worker,
+                assigned_paths: candidate.assigned_paths.clone(),
+                semantic_symbols: Vec::new(),
+                semantic_modules: Vec::new(),
+                task: None,
+                environment_requirements: vec![EnvironmentRequirement::network(
+                    EnvironmentNetworkAccess::Enabled,
+                )],
+                report_path: None,
+            });
+        assert_policy_binding_failure(
+            &candidate,
+            &[requested_worker_environment],
+            "worker_environment_requirements binding",
+        );
     }
 
     #[test]
@@ -1735,6 +1853,79 @@ mod tests {
             ViabilityFinding::Yes
         );
         assert_eq!(decision.disposition, PreclaimDisposition::Claim);
+    }
+
+    #[test]
+    fn verified_requested_plan_bound_licensed_breakage_is_a_verification_contract() {
+        let mut candidate = assignment();
+        candidate.assigned_paths = vec![PathBuf::from("README.md")];
+        candidate.licensed_breakage = Some(LicensedBreakageDeclaration {
+            migration_rationale: "Update the declared dependent after the breaking change"
+                .to_string(),
+            dependents: vec![LicensedBreakageDependentScope {
+                dependent_id: "dependent-a".to_string(),
+                paths: vec![PathBuf::from("src/dependent.rs")],
+                interfaces: vec!["crate::api::renamed".to_string()],
+            }],
+        });
+        let requested = [candidate.clone()];
+        let decision = evaluate_preclaim_viability(
+            &candidate,
+            &requested,
+            Some(&present_map()),
+            Some(&risk_for_path("README.md")),
+            Some(SupervisorRuntime::Codex),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(decision.disposition, PreclaimDisposition::Claim);
+        assert_eq!(
+            decision.dimensions.clear_verification_path,
+            ViabilityFinding::Yes
+        );
+        assert_eq!(
+            decision.dimensions.autonomously_completable,
+            ViabilityFinding::Yes
+        );
+        assert!(decision.map_present && decision.risk_present && decision.runtime_present);
+
+        let mut unbound_requested = candidate.clone();
+        unbound_requested.licensed_breakage = None;
+        let unbound = evaluate_preclaim_viability(
+            &candidate,
+            &[unbound_requested],
+            Some(&present_map()),
+            Some(&risk_for_path("README.md")),
+            Some(SupervisorRuntime::Codex),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(unbound.disposition, PreclaimDisposition::Park);
+        assert_eq!(
+            unbound.authority,
+            PreclaimDecisionAuthority::UntrustedAssignmentInput
+        );
+
+        let mut environment_bound = candidate;
+        environment_bound.environment_requirements = vec![EnvironmentRequirement::network(
+            EnvironmentNetworkAccess::Enabled,
+        )];
+        let environment_requested = [environment_bound.clone()];
+        let parked = evaluate_preclaim_viability(
+            &environment_bound,
+            &environment_requested,
+            Some(&present_map()),
+            Some(&risk_for_path("README.md")),
+            Some(SupervisorRuntime::Codex),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(parked.disposition, PreclaimDisposition::Park);
+        assert_eq!(
+            parked.dimensions.autonomously_completable,
+            ViabilityFinding::No
+        );
+        assert_eq!(
+            parked.rejection_bucket,
+            Some(PreclaimRejectionBucket::NeedsDecision)
+        );
     }
 
     #[test]
@@ -1930,13 +2121,16 @@ mod tests {
     }
 
     #[test]
-    fn simulation_uses_the_injected_runner_as_verification_and_preserves_other_dimensions() {
-        let mut viable_assignment = assignment();
-        viable_assignment.assigned_paths = vec![PathBuf::from("src/lib.rs")];
-        let viable_requested = [viable_assignment.clone()];
+    fn simulation_uses_typed_synthetic_viability_while_preserving_policy_gates() {
+        let mut simulated = assignment();
+        simulated.assigned_paths = vec![PathBuf::from("src/lib.rs")];
+        simulated.environment_requirements = vec![EnvironmentRequirement::network(
+            EnvironmentNetworkAccess::Enabled,
+        )];
+        let requested = [simulated.clone()];
         let viable = evaluate_preclaim_viability(
-            &viable_assignment,
-            &viable_requested,
+            &simulated,
+            &requested,
             None,
             None,
             Some(SupervisorRuntime::Codex),
@@ -1944,51 +2138,65 @@ mod tests {
         );
         assert_eq!(viable.disposition, PreclaimDisposition::Claim);
         assert_eq!(viable.triage_outcome, PreclaimTriageOutcome::Viable);
-        assert_eq!(
-            viable.dimensions.clear_verification_path,
-            ViabilityFinding::Yes
-        );
+        assert!(viable.dimensions.all_positive());
+        assert_eq!(viable.rejection_bucket, None);
         assert_eq!(
             viable.evidence_source,
             PreclaimEvidenceSource::SyntheticSimulation
         );
         assert!(!viable.map_present && !viable.risk_present && viable.runtime_present);
 
-        let mut unviable = viable_assignment.clone();
-        unviable.environment_requirements = vec![EnvironmentRequirement::network(
-            EnvironmentNetworkAccess::Enabled,
-        )];
-        let unviable_requested = [unviable.clone()];
-        let parked = evaluate_preclaim_viability(
-            &unviable,
-            &unviable_requested,
+        let current = simulated.clone();
+        let mut requested_park = current.clone();
+        set_directive(
+            &mut requested_park,
+            r#"{"operator_override":{"disposition":"park","rationale":"Operator preserves the simulation policy boundary"}}"#,
+        );
+        let parked_by_policy = evaluate_preclaim_viability(
+            &current,
+            &[requested_park],
             None,
             None,
             Some(SupervisorRuntime::Codex),
             SupervisorExecutionRuntime::NonpublishableSimulation,
         );
-        assert_eq!(parked.disposition, PreclaimDisposition::Park);
+        assert_eq!(parked_by_policy.disposition, PreclaimDisposition::Park);
         assert_eq!(
-            parked.rejection_bucket,
-            Some(PreclaimRejectionBucket::NeedsDecision)
+            parked_by_policy.triage_outcome,
+            PreclaimTriageOutcome::OperatorOverride
         );
         assert_eq!(
-            parked.dimensions.clear_verification_path,
-            ViabilityFinding::Yes
+            parked_by_policy.authority,
+            PreclaimDecisionAuthority::Operator
         );
+        assert!(parked_by_policy.dimensions.all_positive());
+
+        let trusted_requested = simulated.clone();
+        let mut current_only_directive = simulated.clone();
+        set_directive(
+            &mut current_only_directive,
+            r#"{"operator_override":{"disposition":"claim","rationale":"Current input is not trusted policy"}}"#,
+        );
+        let untrusted = evaluate_preclaim_viability(
+            &current_only_directive,
+            &[trusted_requested],
+            None,
+            None,
+            Some(SupervisorRuntime::Codex),
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+        );
+        assert_eq!(untrusted.disposition, PreclaimDisposition::Park);
         assert_eq!(
-            parked.dimensions.autonomously_completable,
-            ViabilityFinding::No
+            untrusted.authority,
+            PreclaimDecisionAuthority::UntrustedAssignmentInput
         );
-        assert_eq!(
-            parked.evidence_source,
-            PreclaimEvidenceSource::SyntheticSimulation
-        );
+        assert!(untrusted.operator_override.is_none());
+
         assert_eq!(
             viable,
             evaluate_preclaim_viability(
-                &viable_assignment,
-                &viable_requested,
+                &simulated,
+                &requested,
                 None,
                 None,
                 Some(SupervisorRuntime::Codex),
