@@ -130,6 +130,29 @@ pub(super) fn record_supervision_spawn_payload(
     plan_role: AgentRole,
     write_boundary: Vec<String>,
     scope_ref: &str,
+    payload: Value,
+) -> Result<Value> {
+    record_supervision_spawn_payload_with_category(
+        child_agent_id,
+        parent_agent_id,
+        role,
+        plan_role,
+        None,
+        write_boundary,
+        scope_ref,
+        payload,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn record_supervision_spawn_payload_with_category(
+    child_agent_id: &str,
+    parent_agent_id: &str,
+    role: OrchestrationRole,
+    plan_role: AgentRole,
+    category_override: Option<RoleCategory>,
+    write_boundary: Vec<String>,
+    scope_ref: &str,
     mut payload: Value,
 ) -> Result<Value> {
     let edge = SupervisionEdgeRecord::new(
@@ -141,7 +164,12 @@ pub(super) fn record_supervision_spawn_payload(
         scope_ref,
     )?;
     insert_supervision_edge(&mut payload, &edge)?;
-    let assignment = assign_role_category(child_agent_id, plan_role, None)?;
+    let assignment = assign_role_category_with_provenance(
+        child_agent_id,
+        plan_role,
+        category_override,
+        RoleAssignmentProvenance::granted_by(parent_agent_id),
+    )?;
     insert_role_assignment(&mut payload, &assignment)?;
     Ok(payload)
 }
@@ -467,11 +495,13 @@ pub(super) fn record_worker_journal_events(
         let plan_role = worker
             .map(|worker| worker.role)
             .unwrap_or(AgentRole::Worker);
-        match record_supervision_spawn_payload(
+        let category_override = worker.and_then(WorkerAssignment::category_override);
+        match record_supervision_spawn_payload_with_category(
             worker_id,
             &assignment.id,
             OrchestrationRole::Worker,
             plan_role,
+            category_override,
             write_boundary,
             &worker_scope_ref(worker_id),
             json!({}),

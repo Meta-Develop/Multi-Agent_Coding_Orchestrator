@@ -2354,8 +2354,37 @@ fn decision_for_assignment_role<'a>(
     })
 }
 
-fn recorded_role_assignment(assignment_id: &str, role: AgentRole) -> Option<RoleAssignmentRecord> {
-    assign_role_category(assignment_id, role, None).ok()
+fn recorded_role_assignment(
+    assignment_id: &str,
+    role: AgentRole,
+    plan: &SupervisorPlan,
+) -> Option<RoleAssignmentRecord> {
+    let category_override = category_override_from_plan(plan, assignment_id, role);
+    let provenance = if category_override.is_some() {
+        RoleAssignmentProvenance::operator_override()
+    } else {
+        RoleAssignmentProvenance::granted_by("supervisor")
+    };
+    assign_role_category_with_provenance(assignment_id, role, category_override, provenance).ok()
+}
+
+fn category_override_from_plan(
+    plan: &SupervisorPlan,
+    assignment_id: &str,
+    role: AgentRole,
+) -> Option<RoleCategory> {
+    let assignment = plan
+        .assignments
+        .iter()
+        .find(|assignment| assignment.id == assignment_id)?;
+    if role == AgentRole::Worker {
+        return assignment
+            .worker_assignments
+            .iter()
+            .find(|worker| worker.role == AgentRole::Worker)
+            .and_then(WorkerAssignment::category_override);
+    }
+    assignment.category_override()
 }
 
 fn ledger_entry_for_assignment(
@@ -2366,8 +2395,14 @@ fn ledger_entry_for_assignment(
     plan: &SupervisorPlan,
 ) -> AssignmentSelectionLedgerEntry {
     let event = decision_for_assignment_role(decisions, assignment_id, role);
-    let source = selection_source_for(event, runtime);
-    let role_assignment = recorded_role_assignment(assignment_id, role);
+    let role_assignment = recorded_role_assignment(assignment_id, role, plan);
+    let source = selection_source_for(
+        event,
+        runtime,
+        role_assignment
+            .as_ref()
+            .is_some_and(|record| record.source == RoleAssignmentSource::OperatorOverride),
+    );
     if source == AssignmentSelectionSource::LegacyFake {
         let configured = plan.role_models.get(&role);
         return AssignmentSelectionLedgerEntry {
@@ -2520,11 +2555,15 @@ fn cursor_catalog_evidence_gap_for_ledger(provenance: &SelectionProvenance) -> O
 fn selection_source_for(
     event: Option<&SupervisorSelectionEvent>,
     runtime: SupervisorRuntime,
+    operator_category_override: bool,
 ) -> AssignmentSelectionSource {
     if runtime == SupervisorRuntime::Fake {
         return AssignmentSelectionSource::LegacyFake;
     }
     match event.map(|event| event.primary_cause) {
+        Some(SupervisorSelectionEventCause::Initial) if operator_category_override => {
+            AssignmentSelectionSource::OperatorOverride
+        }
         Some(SupervisorSelectionEventCause::Initial) => AssignmentSelectionSource::Automatic,
         Some(SupervisorSelectionEventCause::DebugOverride) => {
             AssignmentSelectionSource::PlanRoleModels
@@ -2533,6 +2572,7 @@ fn selection_source_for(
             AssignmentSelectionSource::BudgetDegrade
         }
         Some(SupervisorSelectionEventCause::Retry) => AssignmentSelectionSource::Retry,
+        None if operator_category_override => AssignmentSelectionSource::OperatorOverride,
         None => AssignmentSelectionSource::Automatic,
     }
 }
@@ -3402,6 +3442,8 @@ mod tests {
             phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
@@ -3535,6 +3577,8 @@ mod tests {
         plan.assignments[0].worker_assignments = vec![WorkerAssignment {
             id: "worker-a".to_string(),
             role: AgentRole::Worker,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
@@ -3581,6 +3625,8 @@ mod tests {
         plan.assignments[0].worker_assignments = vec![WorkerAssignment {
             id: "worker-a".to_string(),
             role: AgentRole::Worker,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
@@ -3677,6 +3723,8 @@ mod tests {
         plan.assignments[0].worker_assignments = vec![WorkerAssignment {
             id: "worker-a".to_string(),
             role: AgentRole::Worker,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
@@ -4541,6 +4589,8 @@ mod tests {
             phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::Worker,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),

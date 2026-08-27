@@ -2782,6 +2782,8 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
             phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
@@ -2789,6 +2791,8 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
             worker_assignments: vec![WorkerAssignment {
                 id: worker_id.to_string(),
                 role: AgentRole::Worker,
+                role_category: None,
+                selection_source: None,
                 assigned_paths: vec![PathBuf::from("README.md")],
                 semantic_symbols: Vec::new(),
                 semantic_modules: Vec::new(),

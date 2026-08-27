@@ -1735,6 +1735,8 @@ fn supervisor_required_optional_and_vector_paths_share_reversible_serialization(
             phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![path.clone()],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
@@ -1742,6 +1744,8 @@ fn supervisor_required_optional_and_vector_paths_share_reversible_serialization(
             worker_assignments: vec![WorkerAssignment {
                 id: "worker-a".to_string(),
                 role: AgentRole::Worker,
+                role_category: None,
+                selection_source: None,
                 assigned_paths: vec![path.clone()],
                 semantic_symbols: Vec::new(),
                 semantic_modules: Vec::new(),

@@ -2133,6 +2133,8 @@ fn admitted_nested_assignment_retains_ordinary_pipeline_and_acceptance_evidence(
     execution.worker_assignments.push(WorkerAssignment {
         id: "execution-child-worker".to_string(),
         role: AgentRole::Worker,
+        role_category: None,
+        selection_source: None,
         assigned_paths: execution.assigned_paths.clone(),
         semantic_symbols: Vec::new(),
         semantic_modules: Vec::new(),

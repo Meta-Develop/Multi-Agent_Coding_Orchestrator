@@ -1795,6 +1795,15 @@ pub struct OrchestratorAssignment {
     pub runtime: Option<RuntimeId>,
     #[serde(default = "child_orchestrator_role")]
     pub role: AgentRole,
+    /// Effective authority category consumed at admission. Absent means derive
+    /// from `role`. An explicit value that differs from the derived category is
+    /// an operator override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_category: Option<RoleCategory>,
+    /// How the category was chosen. Automatic derivation stays the default;
+    /// `operator_override` is a recorded manual designation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_source: Option<AssignmentSelectionSource>,
     #[serde(default, serialize_with = "serialize_paths")]
     pub assigned_paths: Vec<PathBuf>,
     #[serde(default)]
@@ -1811,6 +1820,25 @@ pub struct OrchestratorAssignment {
     pub licensed_breakage: Option<LicensedBreakageDeclaration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+}
+
+impl OrchestratorAssignment {
+    pub fn effective_role_category(&self) -> RoleCategory {
+        self.role_category
+            .unwrap_or_else(|| self.role.authority_category())
+    }
+
+    pub fn category_is_operator_override(&self) -> bool {
+        self.selection_source == Some(AssignmentSelectionSource::OperatorOverride)
+            || self
+                .role_category
+                .is_some_and(|category| category != self.role.authority_category())
+    }
+
+    pub fn category_override(&self) -> Option<RoleCategory> {
+        self.category_is_operator_override()
+            .then_some(self.effective_role_category())
+    }
 }
 
 /// Immutable plan authority for one intentionally breaking assignment.
@@ -2019,6 +2047,10 @@ pub struct WorkerAssignment {
     pub id: String,
     #[serde(default = "worker_role")]
     pub role: AgentRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_category: Option<RoleCategory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_source: Option<AssignmentSelectionSource>,
     #[serde(default, serialize_with = "serialize_paths")]
     pub assigned_paths: Vec<PathBuf>,
     #[serde(default)]
@@ -2035,6 +2067,25 @@ pub struct WorkerAssignment {
         serialize_with = "serialize_optional_path"
     )]
     pub report_path: Option<PathBuf>,
+}
+
+impl WorkerAssignment {
+    pub fn effective_role_category(&self) -> RoleCategory {
+        self.role_category
+            .unwrap_or_else(|| self.role.authority_category())
+    }
+
+    pub fn category_is_operator_override(&self) -> bool {
+        self.selection_source == Some(AssignmentSelectionSource::OperatorOverride)
+            || self
+                .role_category
+                .is_some_and(|category| category != self.role.authority_category())
+    }
+
+    pub fn category_override(&self) -> Option<RoleCategory> {
+        self.category_is_operator_override()
+            .then_some(self.effective_role_category())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]

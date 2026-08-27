@@ -241,6 +241,8 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
             phase: AssignmentPhase::Planning,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
+            role_category: Some(AgentRole::ChildOrchestrator.authority_category()),
+            selection_source: None,
             assigned_paths: assignment.assigned_paths.clone(),
             semantic_symbols: assignment.semantic_symbols.clone(),
             semantic_modules: assignment.semantic_modules.clone(),
@@ -268,6 +270,8 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         let worker = WorkerAssignment {
             id: format!("{}-worker", assignment.id),
             role: AgentRole::Worker,
+            role_category: Some(AgentRole::Worker.authority_category()),
+            selection_source: None,
             assigned_paths: assignment.assigned_paths.clone(),
             semantic_symbols: assignment.semantic_symbols.clone(),
             semantic_modules: assignment.semantic_modules.clone(),
@@ -285,6 +289,8 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
             phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
+            role_category: Some(AgentRole::ChildOrchestrator.authority_category()),
+            selection_source: None,
             assigned_paths: assignment.assigned_paths,
             semantic_symbols: assignment.semantic_symbols,
             semantic_modules: assignment.semantic_modules,
@@ -474,6 +480,8 @@ fn lower_provider_assignment_tree(
         let worker = WorkerAssignment {
             id: format!("{}-worker", node.id),
             role: AgentRole::Worker,
+            role_category: Some(AgentRole::Worker.authority_category()),
+            selection_source: None,
             assigned_paths: node.assigned_paths.clone(),
             semantic_symbols: node.semantic_symbols.clone(),
             semantic_modules: node.semantic_modules.clone(),
@@ -505,6 +513,8 @@ fn lower_provider_assignment_tree(
         },
         runtime: None,
         role: AgentRole::ChildOrchestrator,
+        role_category: Some(AgentRole::ChildOrchestrator.authority_category()),
+        selection_source: None,
         assigned_paths: node.assigned_paths.clone(),
         semantic_symbols: node.semantic_symbols.clone(),
         semantic_modules: node.semantic_modules.clone(),
@@ -1043,7 +1053,8 @@ pub(super) fn parse_supervisor_plan_with_consultant(
     }
     let plan_metadata = supervisor_plan_metadata_from_value(&value, plan.max_depth)?;
     plan.assignments = assignments_from_plan_value(&value)?;
-    let (plan, plan_metadata) = validate_supervisor_plan(plan, plan_metadata)?;
+    let (mut plan, plan_metadata) = validate_supervisor_plan(plan, plan_metadata)?;
+    bind_assignment_role_categories(&mut plan);
     let assignment_metadata = assignment_metadata_from_plan_value(&value, &plan)?;
     validate_consultant_plan(&consultant)?;
     Ok(LoadedSupervisorPlan {
@@ -1081,6 +1092,39 @@ fn assignments_from_plan_value(value: &Value) -> Result<Vec<OrchestratorAssignme
     let mut assignments = Vec::new();
     flatten_assignments_from_value(raw_assignments, &mut assignments)?;
     Ok(assignments)
+}
+
+fn bind_assignment_role_categories(plan: &mut SupervisorPlan) {
+    for assignment in &mut plan.assignments {
+        bind_one_assignment_role_category(assignment);
+        for worker in &mut assignment.worker_assignments {
+            bind_one_worker_role_category(worker);
+        }
+    }
+}
+
+fn bind_one_assignment_role_category(assignment: &mut OrchestratorAssignment) {
+    let derived = assignment.role.authority_category();
+    let requested = assignment.role_category.unwrap_or(derived);
+    let operator_override = assignment.selection_source
+        == Some(AssignmentSelectionSource::OperatorOverride)
+        || requested != derived;
+    assignment.role_category = Some(requested);
+    if operator_override {
+        assignment.selection_source = Some(AssignmentSelectionSource::OperatorOverride);
+    }
+}
+
+fn bind_one_worker_role_category(worker: &mut WorkerAssignment) {
+    let derived = worker.role.authority_category();
+    let requested = worker.role_category.unwrap_or(derived);
+    let operator_override = worker.selection_source
+        == Some(AssignmentSelectionSource::OperatorOverride)
+        || requested != derived;
+    worker.role_category = Some(requested);
+    if operator_override {
+        worker.selection_source = Some(AssignmentSelectionSource::OperatorOverride);
+    }
 }
 
 fn flatten_assignments_from_value(
@@ -3305,5 +3349,91 @@ mod diagnostics_emission_tests {
         let value = serde_json::to_value(&envelope).expect("serialize envelope");
         assert_eq!(value["success"], false);
         assert_eq!(value["status"], "error");
+    }
+
+    fn fixture_plan_json(role_category: &str, selection_source: Option<&str>) -> String {
+        let selection = match selection_source {
+            Some(source) => format!(r#", "selection_source": "{source}""#),
+            None => String::new(),
+        };
+        format!(
+            r#"{{
+                "version": 1,
+                "task": "fixture",
+                "max_depth": 2,
+                "max_child_assignments": 1,
+                "assignments": [{{
+                    "id": "child-a",
+                    "phase": "execution",
+                    "role": "child_orchestrator",
+                    "role_category": "{role_category}"{selection},
+                    "assigned_paths": ["README.md"],
+                    "worker_assignments": [{{
+                        "id": "child-a-worker",
+                        "role": "worker",
+                        "assigned_paths": ["README.md"]
+                    }}]
+                }}],
+                "assignment_schedule": [{{
+                    "assignment_id": "child-a",
+                    "depth": 2,
+                    "flattened_index": 0
+                }}]
+            }}"#
+        )
+    }
+
+    #[test]
+    fn plan_api_records_operator_category_override_and_keeps_automatic_default() {
+        let automatic = parse_supervisor_plan_with_consultant(&fixture_plan_json(
+            "delegating_coordinator",
+            None,
+        ))
+        .expect("automatic plan");
+        let assignment = &automatic.plan.assignments[0];
+        assert_eq!(
+            assignment.effective_role_category(),
+            RoleCategory::DelegatingCoordinator
+        );
+        assert_ne!(
+            assignment.selection_source,
+            Some(AssignmentSelectionSource::OperatorOverride)
+        );
+        assert!(!assignment.category_is_operator_override());
+        assert_eq!(
+            assignment.worker_assignments[0].effective_role_category(),
+            RoleCategory::NonDelegatingTerminalWorker
+        );
+
+        let overridden = parse_supervisor_plan_with_consultant(&fixture_plan_json(
+            "read_only_researcher",
+            Some("operator_override"),
+        ))
+        .expect("override plan");
+        let assignment = &overridden.plan.assignments[0];
+        assert_eq!(
+            assignment.effective_role_category(),
+            RoleCategory::ReadOnlyResearcher
+        );
+        assert_eq!(
+            assignment.selection_source,
+            Some(AssignmentSelectionSource::OperatorOverride)
+        );
+        assert!(assignment.category_is_operator_override());
+
+        let implied = parse_supervisor_plan_with_consultant(&fixture_plan_json(
+            "non_delegating_terminal_worker",
+            None,
+        ))
+        .expect("implied override");
+        let assignment = &implied.plan.assignments[0];
+        assert_eq!(
+            assignment.effective_role_category(),
+            RoleCategory::NonDelegatingTerminalWorker
+        );
+        assert_eq!(
+            assignment.selection_source,
+            Some(AssignmentSelectionSource::OperatorOverride)
+        );
     }
 }

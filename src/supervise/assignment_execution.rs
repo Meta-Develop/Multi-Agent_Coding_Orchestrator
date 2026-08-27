@@ -311,6 +311,26 @@ struct BoundSelectedRuntimeLaunch {
     model_provenance: CompletedLaunchModelProvenance,
 }
 
+fn admit_assignment_role_category(
+    assignment: &OrchestratorAssignment,
+    launch_runtime: SupervisorRuntime,
+    resolution: &RoleModelResolution,
+) -> Result<()> {
+    let category = assignment.effective_role_category();
+    let model = resolution.selection.model.as_deref();
+    match (launch_runtime, resolution.observation) {
+        (SupervisorRuntime::Fake, ModelResolutionObservation::LocalDeterministicFake) => Ok(()),
+        _ => admit_role_category(category, model),
+    }
+    .with_context(|| {
+        format!(
+            "assignment '{}' category '{}' refused at execution admission",
+            assignment.id,
+            category.as_str()
+        )
+    })
+}
+
 fn bind_selected_runtime_launch(
     mut command: ExternalAgentCommand,
     assignment: &OrchestratorAssignment,
@@ -323,6 +343,7 @@ fn bind_selected_runtime_launch(
     let resolution = catalog.resolve_role_model_selection(&configured, launch_runtime)?;
     let model_provenance =
         CompletedLaunchModelProvenance::from_resolution(launch_runtime, &configured, &resolution);
+    admit_assignment_role_category(assignment, launch_runtime, &resolution)?;
     if launch_runtime.is_adapter_subprocess() {
         authorize_bounded_leaf_runtime_role(assignment.role).with_context(|| {
             format!(
@@ -1549,11 +1570,12 @@ fn dispatch_and_collect_child_attempt<'a>(
         Some(journal_parent_id),
         OrchestrationRole::Orchestrator,
         OrchestrationEventKind::Spawn,
-        record_supervision_spawn_payload(
+        record_supervision_spawn_payload_with_category(
             &assignment.id,
             journal_parent_id,
             OrchestrationRole::Orchestrator,
             assignment.role,
+            assignment.category_override(),
             write_boundary_refs(&assignment.assigned_paths),
             &assignment_scope_ref(&assignment.id),
             json!({
@@ -4159,6 +4181,8 @@ mod decomposition_tests {
             phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
@@ -4578,6 +4602,8 @@ mod decomposition_tests {
             phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
@@ -5307,6 +5333,8 @@ done
             phase,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
@@ -5428,6 +5456,8 @@ done
             phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
@@ -5435,6 +5465,8 @@ done
             worker_assignments: vec![WorkerAssignment {
                 id: "nested-worker".to_string(),
                 role: AgentRole::Worker,
+                role_category: None,
+                selection_source: None,
                 assigned_paths: vec![PathBuf::from("README.md")],
                 semantic_symbols: Vec::new(),
                 semantic_modules: Vec::new(),
@@ -5860,6 +5892,8 @@ done
             phase: AssignmentPhase::Execution,
             runtime: Some(SupervisorRuntime::Cursor),
             role: AgentRole::Worker,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
@@ -5881,6 +5915,88 @@ done
             assignment_launch_runtime(&assignment, &options, &budget_policy),
             SupervisorRuntime::ClaudeCode
         );
+        Ok(())
+    }
+
+    #[test]
+    fn admission_consumes_stored_category_and_refuses_luna_coordinator() -> Result<()> {
+        let mut assignment = OrchestratorAssignment {
+            id: "leaf-worker".to_string(),
+            phase: AssignmentPhase::Execution,
+            runtime: None,
+            role: AgentRole::Worker,
+            role_category: None,
+            selection_source: None,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        };
+        assignment.role_category = Some(RoleCategory::DelegatingCoordinator);
+        assignment.selection_source = Some(AssignmentSelectionSource::OperatorOverride);
+        let mut plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "admit stored category".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: 10,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+            assignments: vec![assignment.clone()],
+        };
+        plan.role_models.insert(
+            AgentRole::Worker,
+            RoleModelSelection {
+                model: Some("gpt-5.6-luna".to_string()),
+                reasoning_effort: Some("high".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        let catalog = RuntimeModelCatalog::Codex(
+            CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-luna", "gpt-5.6-sol"])
+                .context("fixture catalog")?,
+        );
+        let options = launch_fixture_options(SupervisorRuntime::Codex);
+        let budget_policy = AssignmentBudgetPolicy::default();
+        let error = bind_selected_assignment_launch_for_test(
+            launch_fixture_command(),
+            &assignment,
+            &budget_policy,
+            &plan,
+            &options,
+            &catalog,
+        )
+        .expect_err("luna cannot hold coordinator category at admission");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("ineligible by measured catalog/evidence")
+                || message.contains("cannot hold")
+                || message.contains("refused at execution admission"),
+            "{message}"
+        );
+
+        assignment.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+        assignment.selection_source = None;
+        plan.assignments[0] = assignment.clone();
+        bind_selected_assignment_launch_for_test(
+            launch_fixture_command(),
+            &assignment,
+            &budget_policy,
+            &plan,
+            &options,
+            &catalog,
+        )
+        .context("luna remains eligible for a terminal worker category")?;
         Ok(())
     }
 
@@ -6131,6 +6247,8 @@ done
             phase: AssignmentPhase::Execution,
             runtime: Some(SupervisorRuntime::Codex),
             role: AgentRole::Worker,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),

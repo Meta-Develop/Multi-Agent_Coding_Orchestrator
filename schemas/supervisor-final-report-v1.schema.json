@@ -1229,11 +1229,46 @@
                     ],
                     "type": "string"
                   },
+                  "decision": {
+                    "enum": [
+                      "granted",
+                      "refused"
+                    ],
+                    "type": "string"
+                  },
+                  "evidence": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "acceptance_grade": {
+                        "type": "boolean"
+                      },
+                      "recorded": {
+                        "type": "boolean"
+                      },
+                      "uncertain": {
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "acceptance_grade",
+                      "recorded",
+                      "uncertain"
+                    ],
+                    "type": "object"
+                  },
+                  "judge_agent_id": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
                   "legacy_role": {
                     "minLength": 1,
                     "type": "string"
                   },
                   "reason": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "requester_agent_id": {
                     "minLength": 1,
                     "type": "string"
                   },
@@ -1250,6 +1285,10 @@
                   "category",
                   "legacy_role",
                   "source",
+                  "requester_agent_id",
+                  "judge_agent_id",
+                  "evidence",
+                  "decision",
                   "reason"
                 ],
                 "type": "object"

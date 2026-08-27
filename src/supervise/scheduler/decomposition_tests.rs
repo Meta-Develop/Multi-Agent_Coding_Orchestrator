@@ -11,6 +11,8 @@ fn test_assignment(id: &str, path: &str) -> OrchestratorAssignment {
         phase: AssignmentPhase::Execution,
         runtime: None,
         role: AgentRole::ChildOrchestrator,
+        role_category: None,
+        selection_source: None,
         assigned_paths: vec![PathBuf::from(path)],
         semantic_symbols: Vec::new(),
         semantic_modules: Vec::new(),
@@ -46,6 +48,8 @@ fn mechanical_assignment(id: &str) -> OrchestratorAssignment {
     assignment.worker_assignments.push(WorkerAssignment {
         id: "mechanical-worker".to_string(),
         role: AgentRole::Worker,
+        role_category: None,
+        selection_source: None,
         assigned_paths: vec![PathBuf::from("mechanical.txt")],
         semantic_symbols: Vec::new(),
         semantic_modules: Vec::new(),
@@ -185,6 +189,8 @@ fn budget_degrade_ladder_applies_worker_model_effort_fanout_then_halts() {
     model_assignment.worker_assignments.push(WorkerAssignment {
         id: "mechanical-worker".to_string(),
         role: AgentRole::Worker,
+        role_category: None,
+        selection_source: None,
         assigned_paths: vec![PathBuf::from("model.txt")],
         semantic_symbols: Vec::new(),
         semantic_modules: Vec::new(),
@@ -509,6 +515,8 @@ fn judgment_assignment_is_not_degraded_by_shared_worker_binding() {
     assignment.worker_assignments.push(WorkerAssignment {
         id: "unmarked-worker".to_string(),
         role: AgentRole::Worker,
+        role_category: None,
+        selection_source: None,
         assigned_paths: vec![PathBuf::from("mechanical.txt")],
         semantic_symbols: Vec::new(),
         semantic_modules: Vec::new(),
