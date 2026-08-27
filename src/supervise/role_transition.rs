@@ -8,7 +8,7 @@
 use super::*;
 use crate::hierarchy_ledger::{
     RoleCategory as LedgerRoleCategory, RoleTransitionDecision as LedgerDecision,
-    RoleTransitionRecord,
+    RoleTransitionEvidenceRecord as LedgerEvidence, RoleTransitionRecord,
 };
 
 /// Third-party verdict that may authorize a role transition.
@@ -34,10 +34,19 @@ pub(super) struct ExecutedRoleTransition {
     pub delegation_stripped: bool,
 }
 
-pub(super) fn model_capability_or_weak(model: Option<&str>) -> ModelCapabilityClass {
-    model
-        .and_then(trusted_model_capability)
-        .unwrap_or(ModelCapabilityClass::WeakMechanical)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ResolvedModelAuthority<'a> {
+    pub model: Option<&'a str>,
+    pub capability: ModelCapabilityClass,
+}
+
+pub(super) fn model_capability_or_weak(model: Option<&str>) -> ResolvedModelAuthority<'_> {
+    ResolvedModelAuthority {
+        model,
+        capability: model
+            .and_then(trusted_model_capability)
+            .unwrap_or(ModelCapabilityClass::WeakMechanical),
+    }
 }
 
 /// Fail-closed execution of one judged promotion or demotion.
@@ -47,10 +56,15 @@ pub(super) fn execute_judged_role_transition(
     to: RoleCategory,
     requester_agent_id: &str,
     parent_agent_id: &str,
-    subject_capability: ModelCapabilityClass,
+    subject: ResolvedModelAuthority<'_>,
     verdict: &RoleTransitionJudgeVerdict,
 ) -> Result<ExecutedRoleTransition> {
     let promoting = grants_authority(from, to);
+    let evidence = RoleTransitionEvidence {
+        acceptance_grade: verdict.accepted && !verdict.uncertain,
+        recorded: true,
+        uncertain: verdict.uncertain,
+    };
     if verdict.judge_agent_id == agent_id {
         return finish_transition(
             agent_id,
@@ -65,6 +79,7 @@ pub(super) fn execute_judged_role_transition(
             },
             false,
             "self_judged",
+            evidence,
         );
     }
     if promoting && requester_agent_id == agent_id {
@@ -77,6 +92,7 @@ pub(super) fn execute_judged_role_transition(
             RoleTransitionKind::Promotion,
             false,
             "self_promotion",
+            evidence,
         );
     }
     if promoting && !is_review_auditor_role(verdict.judge_role) {
@@ -89,6 +105,7 @@ pub(super) fn execute_judged_role_transition(
             RoleTransitionKind::Promotion,
             false,
             "judge_not_auditor",
+            evidence,
         );
     }
 
@@ -101,16 +118,21 @@ pub(super) fn execute_judged_role_transition(
         judge_agent_id: verdict.judge_agent_id.clone(),
         judge_category: verdict.judge_role.authority_category(),
         judge_capability: verdict.judge_capability,
-        subject_capability,
-        evidence: RoleTransitionEvidence {
-            acceptance_grade: verdict.accepted && !verdict.uncertain,
-            recorded: true,
-            uncertain: verdict.uncertain,
-        },
+        subject_capability: subject.capability,
+        evidence,
         reason: "assignment_role_transition".to_string(),
     };
     let decision = evaluate_role_transition(&request)?;
-    let granted = decision.decision == RoleTransitionDecisionKind::Granted;
+    let initially_granted = decision.decision == RoleTransitionDecisionKind::Granted;
+    let subject_model_eligible = !initially_granted
+        || to != RoleCategory::DelegatingCoordinator
+        || validate_known_judgment_role_model(AgentRole::ChildOrchestrator, subject.model).is_ok();
+    let granted = initially_granted && subject_model_eligible;
+    let reason = if initially_granted && !subject_model_eligible {
+        "subject_model_ineligible_for_coordinator"
+    } else {
+        ledger_reason_token(&decision)
+    };
     finish_transition(
         agent_id,
         from,
@@ -119,7 +141,8 @@ pub(super) fn execute_judged_role_transition(
         &verdict.judge_agent_id,
         decision.kind,
         granted,
-        ledger_reason_token(&decision),
+        reason,
+        evidence,
     )
 }
 
@@ -129,7 +152,7 @@ pub(super) fn consider_assignment_role_transition(
     assignment: &OrchestratorAssignment,
     parent_agent_id: &str,
     child_report: &OrchestratorReviewReport,
-    subject_capability: ModelCapabilityClass,
+    subject: ResolvedModelAuthority<'_>,
     auditor_capability: ModelCapabilityClass,
 ) -> Result<Option<ExecutedRoleTransition>> {
     let held = assignment.role.authority_category();
@@ -142,7 +165,7 @@ pub(super) fn consider_assignment_role_transition(
                 RoleCategory::DelegatingCoordinator,
                 parent_agent_id,
                 parent_agent_id,
-                subject_capability,
+                subject,
                 &verdict,
             )
             .map(Some);
@@ -153,7 +176,7 @@ pub(super) fn consider_assignment_role_transition(
             RoleCategory::NonDelegatingTerminalWorker,
             parent_agent_id,
             parent_agent_id,
-            subject_capability,
+            subject,
             &verdict,
         )
         .map(Some);
@@ -167,7 +190,7 @@ pub(super) fn consider_assignment_role_transition(
         RoleCategory::DelegatingCoordinator,
         parent_agent_id,
         parent_agent_id,
-        subject_capability,
+        subject,
         &verdict,
     )
     .map(Some)
@@ -270,6 +293,7 @@ fn finish_transition(
     kind: RoleTransitionKind,
     granted: bool,
     reason: &'static str,
+    evidence: RoleTransitionEvidence,
 ) -> Result<ExecutedRoleTransition> {
     let record = RoleTransitionRecord {
         agent_id: agent_id.to_string(),
@@ -277,6 +301,11 @@ fn finish_transition(
         to_category: to_ledger_category(to),
         requester_agent_id: requester_agent_id.to_string(),
         judge_agent_id: judge_agent_id.to_string(),
+        evidence: LedgerEvidence {
+            acceptance_grade: evidence.acceptance_grade,
+            recorded: evidence.recorded,
+            uncertain: evidence.uncertain,
+        },
         decision: if granted {
             LedgerDecision::Granted
         } else {
@@ -304,6 +333,7 @@ mod tests {
     use super::*;
     use crate::hierarchy_ledger::{
         reconstruct_hierarchy_ledger, role_transition_payload, RoleTransitionDecision,
+        ROLE_TRANSITION_FIELD,
     };
     use crate::orchestration_event::{
         OrchestrationEvent, OrchestrationEventKind, OrchestrationRole,
@@ -340,7 +370,7 @@ mod tests {
             RoleCategory::DelegatingCoordinator,
             "run-1",
             "run-1",
-            ModelCapabilityClass::GeneralJudgment,
+            model_capability_or_weak(Some("gpt-5.6-sol")),
             &auditor_verdict(true),
         )?;
         assert!(executed.granted);
@@ -373,7 +403,7 @@ mod tests {
             RoleCategory::DelegatingCoordinator,
             "run-1",
             "run-1",
-            ModelCapabilityClass::GeneralJudgment,
+            model_capability_or_weak(Some("gpt-5.6-sol")),
             &auditor_verdict(false),
         )?;
         assert!(!executed.granted);
@@ -398,7 +428,7 @@ mod tests {
             RoleCategory::DelegatingCoordinator,
             "run-1",
             "run-1",
-            ModelCapabilityClass::GeneralJudgment,
+            model_capability_or_weak(Some("gpt-5.6-sol")),
             &self_judge,
         )?;
         assert!(!executed.granted);
@@ -411,7 +441,7 @@ mod tests {
             RoleCategory::DelegatingCoordinator,
             "worker-a",
             "run-1",
-            ModelCapabilityClass::GeneralJudgment,
+            model_capability_or_weak(Some("gpt-5.6-sol")),
             &auditor_verdict(true),
         )?;
         assert!(!executed.granted);
@@ -428,7 +458,7 @@ mod tests {
             RoleCategory::DelegatingCoordinator,
             "run-1",
             "run-1",
-            ModelCapabilityClass::WeakMechanical,
+            model_capability_or_weak(None),
             &auditor_verdict(true),
         )?;
         assert!(!executed.granted);
@@ -443,6 +473,71 @@ mod tests {
     }
 
     #[test]
+    fn resolved_luna_cannot_be_promoted_to_coordinator() -> Result<()> {
+        let executed = execute_judged_role_transition(
+            "worker-a",
+            RoleCategory::NonDelegatingTerminalWorker,
+            RoleCategory::DelegatingCoordinator,
+            "run-1",
+            "run-1",
+            model_capability_or_weak(Some("gpt-5.6-luna")),
+            &auditor_verdict(true),
+        )?;
+        assert!(!executed.granted);
+        assert_eq!(
+            executed.record.reason,
+            "subject_model_ineligible_for_coordinator"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn transition_ledger_round_trip_retains_typed_evidence() -> Result<()> {
+        let granted = execute_judged_role_transition(
+            "worker-a",
+            RoleCategory::NonDelegatingTerminalWorker,
+            RoleCategory::DelegatingCoordinator,
+            "run-1",
+            "run-1",
+            model_capability_or_weak(Some("gpt-5.6-sol")),
+            &auditor_verdict(true),
+        )?;
+        let refused = execute_judged_role_transition(
+            "worker-b",
+            RoleCategory::NonDelegatingTerminalWorker,
+            RoleCategory::DelegatingCoordinator,
+            "run-1",
+            "run-1",
+            model_capability_or_weak(Some("gpt-5.6-sol")),
+            &auditor_verdict(false),
+        )?;
+
+        for (executed, acceptance_grade) in [(granted, true), (refused, false)] {
+            let payload = role_transition_payload(&executed.record)?;
+            let evidence = payload
+                .get(ROLE_TRANSITION_FIELD)
+                .and_then(|transition| transition.get("evidence"))
+                .context("transition payload omitted typed evidence")?;
+            assert_eq!(
+                evidence,
+                &serde_json::json!({
+                    "acceptance_grade": acceptance_grade,
+                    "recorded": true,
+                    "uncertain": false,
+                })
+            );
+
+            let snapshot = reconstruct_hierarchy_ledger(&[ledger_event(&executed.record)])?;
+            assert_eq!(snapshot.role_transitions.len(), 1);
+            assert_eq!(
+                role_transition_payload(&snapshot.role_transitions[0])?,
+                payload
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn demotion_strips_delegation_immediately_and_is_recorded() -> Result<()> {
         let executed = execute_judged_role_transition(
             "child-a",
@@ -450,7 +545,7 @@ mod tests {
             RoleCategory::NonDelegatingTerminalWorker,
             "run-1",
             "run-1",
-            ModelCapabilityClass::GeneralJudgment,
+            model_capability_or_weak(Some("gpt-5.6-sol")),
             &auditor_verdict(false),
         )?;
         assert!(executed.granted);
@@ -482,7 +577,7 @@ mod tests {
             RoleCategory::DelegatingCoordinator,
             "other-req",
             "run-1",
-            ModelCapabilityClass::GeneralJudgment,
+            model_capability_or_weak(Some("gpt-5.6-sol")),
             &parent,
         )?;
         assert!(!executed.granted);
