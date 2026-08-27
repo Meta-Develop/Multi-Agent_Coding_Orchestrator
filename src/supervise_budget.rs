@@ -2779,6 +2779,7 @@ mod tests {
                 ..
             }
         ));
+        drop(recovery);
         let recovered_at = unix_now().expect("recovery timestamp");
         let pool = quota_config("codex").pools[0].key();
         let workspace =
