@@ -239,6 +239,10 @@
         "total": 9,
         "count": 3
       },
+      "mean_review_findings": {
+        "total": 3,
+        "count": 3
+      },
       "mean_loc_added": {
         "total": 635,
         "count": 3
@@ -341,6 +345,10 @@
       },
       "mean_conflict_count": {
         "total": 6,
+        "count": 3
+      },
+      "mean_review_findings": {
+        "total": 3,
         "count": 3
       },
       "mean_loc_added": {
@@ -447,6 +455,10 @@
         "total": 9,
         "count": 3
       },
+      "mean_review_findings": {
+        "total": 6,
+        "count": 3
+      },
       "mean_loc_added": {
         "total": 544,
         "count": 3
@@ -549,6 +561,10 @@
       },
       "mean_conflict_count": {
         "total": 9,
+        "count": 3
+      },
+      "mean_review_findings": {
+        "total": 6,
         "count": 3
       },
       "mean_loc_added": {
