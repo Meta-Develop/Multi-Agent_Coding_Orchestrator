@@ -88,12 +88,14 @@ pub struct V2ExecutionRecord {
 #[serde(deny_unknown_fields)]
 pub struct V2RunProvenance {
     pub manifest_digest: String,
+    pub manifest_version: u32,
     pub fixture_digest: String,
     pub fixture_version: u32,
     pub provider_id: String,
     pub deterministic_local_fake: bool,
     pub network_access: bool,
     pub real_provider_adapter_invoked: bool,
+    pub state_isolation: String,
     pub mix_digest: String,
     pub objective_id: String,
     pub objective_hash: String,
@@ -657,12 +659,14 @@ fn execute_record(
         .collect::<Vec<_>>();
     let provenance = V2RunProvenance {
         manifest_digest: manifest_digest.to_string(),
+        manifest_version: manifest.version,
         fixture_digest: fixture_digest.to_string(),
         fixture_version: fixture.version,
         provider_id: LOCAL_FAKE_PROVIDER_ID.to_string(),
         deterministic_local_fake: true,
         network_access: false,
         real_provider_adapter_invoked: false,
+        state_isolation: "equivalent_isolated_in_memory".to_string(),
         mix_digest,
         objective_id: manifest.objective_profile.profile.id.clone(),
         objective_hash: manifest.objective_profile.profile.content_hash.clone(),
@@ -825,9 +829,11 @@ fn validate_structure(
         if run.provenance.manifest_digest.trim().is_empty()
             || run.provenance.fixture_digest.trim().is_empty()
             || run.provenance.objective_hash.trim().is_empty()
+            || run.provenance.manifest_version != manifest.version
             || !run.provenance.deterministic_local_fake
             || run.provenance.network_access
             || run.provenance.real_provider_adapter_invoked
+            || run.provenance.state_isolation != "equivalent_isolated_in_memory"
         {
             return Err(incomparable(
                 "runs.provenance",
