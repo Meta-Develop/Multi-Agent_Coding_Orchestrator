@@ -2914,6 +2914,14 @@ fn persistence_records_gate_before_status_and_finalizes_report() {
     assert!(journal.is_some());
     let plan = test_plan(Vec::new());
     let mut report = build_supervisor_final_report(test_report_construction(&plan, run_id.clone()));
+    report
+        .role_economics_profile
+        .as_mut()
+        .expect("final report carries role economics")
+        .resolved_objective_profile = Some(
+        crate::objective_profile::default_resolved_objective_profile()
+            .expect("default objective profile"),
+    );
     let consultant = SupervisorConsultantPlan::default();
     let assignment_metadata = AssignmentMetadata::new();
     let plan_metadata = SupervisorPlanMetadata::default();
@@ -3002,7 +3010,15 @@ fn persist_releases_terminal_claims_without_checkpoint_writer() {
         .expect("initialize authenticated degraded persist fixture");
     let mut journal = initialize_orchestration_event_journal(&repo, &run_id, None);
     let plan = test_plan(Vec::new());
-    let report = build_supervisor_final_report(test_report_construction(&plan, run_id.clone()));
+    let mut report = build_supervisor_final_report(test_report_construction(&plan, run_id.clone()));
+    report
+        .role_economics_profile
+        .as_mut()
+        .expect("final report carries role economics")
+        .resolved_objective_profile = Some(
+        crate::objective_profile::default_resolved_objective_profile()
+            .expect("default objective profile"),
+    );
     let released = std::sync::atomic::AtomicBool::new(false);
 
     persist_supervisor_final_report(report, &mut journal, writer, None, || {
