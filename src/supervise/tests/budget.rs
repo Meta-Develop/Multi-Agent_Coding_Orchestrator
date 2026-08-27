@@ -1197,3 +1197,68 @@ fn budget_integration_parseable_usage_from_truncated_capture_is_estimated() {
         DispatchBudgetAdmission::Refused(BudgetAdmissionRefusal::NewDispatchStopped)
     ));
 }
+
+#[test]
+fn dispatch_composes_plan_and_cli_token_ceilings_in_all_four_directions() {
+    skip_without_containment!();
+    let _capability = install_budget_fixture_models();
+    for (name, plan_hard, cli_hard, expected) in [
+        ("cli_tighter", Some(100usize), Some(20usize), Some(20usize)),
+        ("plan_tighter", Some(20), Some(100), Some(20)),
+        ("plan_silent", None, Some(20), Some(20)),
+        ("cli_silent", Some(20), None, Some(20)),
+    ] {
+        let (temp, repo_path) = injected_repository();
+        let assignment = injected_assignment(true);
+        let mut plan = injected_plan(assignment.clone(), 0);
+        inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+        let budget = match plan_hard {
+            Some(hard) => injected_run_budget(None, Some(hard), None, None, 10, 10),
+            None => SupervisorBudgetConfig {
+                limits: RunBudgetLimits::default(),
+                role_token_reservations: BTreeMap::from([
+                    (AgentRole::ChildOrchestrator, 10),
+                    (AgentRole::Auditor, 10),
+                ]),
+            },
+        };
+        let mut options = injected_options(&repo_path, temp.path(), &format!("compose-{name}"));
+        options.budget_overrides = RunBudgetLimits {
+            hard_tokens: cli_hard,
+            ..RunBudgetLimits::default()
+        };
+        let mut runner = |command: &ExternalAgentCommand| {
+            let file_name = command
+                .output_last_message
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or_default();
+            if file_name.contains("review-auditor") {
+                let child = injected_child_report(&assignment);
+                write_injected_json(
+                    &command.output_last_message,
+                    &injected_auditor_report(&assignment, &child),
+                );
+            } else {
+                write_injected_assignment_report(command, &assignment);
+            }
+            write_injected_usage(command, 1, 0);
+            injected_verified_run(command)
+        };
+        let report = run_supervisor_plan_with_budget_and_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            budget,
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            &mut runner,
+        )
+        .unwrap_or_else(|error| panic!("{name} dispatch composition failed: {error:#}"));
+        assert!(report.success, "{name} unexpectedly failed: {report:#?}");
+        let run_budget = report.run_budget.expect("composed run budget");
+        assert_eq!(
+            run_budget.limits.hard_tokens, expected,
+            "{name} effective hard token ceiling"
+        );
+    }
+}

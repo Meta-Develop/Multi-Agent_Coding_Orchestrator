@@ -2556,6 +2556,8 @@ fn supervisor_plan_for_attempt(
             phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
             assigned_paths: plan.assigned_paths.clone(),
             semantic_symbols: plan.semantic_symbols.clone(),
             semantic_modules: plan.semantic_modules.clone(),
@@ -2563,6 +2565,8 @@ fn supervisor_plan_for_attempt(
             worker_assignments: vec![WorkerAssignment {
                 id: format!("{agent_id}-worker"),
                 role: AgentRole::Worker,
+                role_category: None,
+                selection_source: None,
                 assigned_paths: plan.assigned_paths.clone(),
                 semantic_symbols: plan.semantic_symbols.clone(),
                 semantic_modules: plan.semantic_modules.clone(),

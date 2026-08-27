@@ -7,6 +7,9 @@
 
 use super::{AgentRole, ModelCapabilityClass};
 use crate::orchestration_event::OrchestrationEvent;
+use crate::selection::{
+    measured_authority_eligibility, AuthorityRole, MeasuredAuthorityEligibility,
+};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -71,6 +74,18 @@ impl RoleCategory {
         }
     }
 
+    /// Measured-authority role used at admission. Coordinator and auditor
+    /// categories never collapse to a terminal-leaf check.
+    pub const fn measured_authority_role(self) -> AuthorityRole {
+        match self {
+            Self::DelegatingCoordinator => AuthorityRole::Delegating,
+            Self::NonDelegatingTerminalWorker | Self::ReadOnlyResearcher => {
+                AuthorityRole::TerminalLeaf
+            }
+            Self::ReadOnlyReviewAuditor => AuthorityRole::ReviewAuditor,
+        }
+    }
+
     const fn authority_bits(self) -> u8 {
         const DELEGATE: u8 = 0b001;
         const WRITE: u8 = 0b010;
@@ -93,6 +108,35 @@ pub enum RoleAssignmentSource {
     OperatorOverride,
 }
 
+/// Spawn/assignment provenance matching the transition-record shape.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RoleAssignmentProvenance {
+    pub requester_agent_id: String,
+    pub judge_agent_id: String,
+    pub evidence: RoleTransitionEvidence,
+    pub decision: RoleTransitionDecisionKind,
+}
+
+impl RoleAssignmentProvenance {
+    pub fn granted_by(parent_agent_id: impl Into<String>) -> Self {
+        let id = parent_agent_id.into();
+        Self {
+            requester_agent_id: id.clone(),
+            judge_agent_id: id,
+            evidence: RoleTransitionEvidence {
+                acceptance_grade: false,
+                recorded: true,
+                uncertain: false,
+            },
+            decision: RoleTransitionDecisionKind::Granted,
+        }
+    }
+
+    pub fn operator_override() -> Self {
+        Self::granted_by("operator")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoleAssignmentRecord {
@@ -100,6 +144,11 @@ pub struct RoleAssignmentRecord {
     pub category: RoleCategory,
     pub legacy_role: String,
     pub source: RoleAssignmentSource,
+    pub requester_agent_id: String,
+    pub judge_agent_id: String,
+    #[serde(default)]
+    pub evidence: RoleTransitionEvidence,
+    pub decision: RoleTransitionDecisionKind,
     pub reason: String,
 }
 
@@ -111,15 +160,16 @@ pub enum RoleTransitionKind {
     Demotion,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoleTransitionDecisionKind {
+    #[default]
     Granted,
     Refused,
 }
 
 /// Acceptance-grade evidence required to execute a promotion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoleTransitionEvidence {
     pub acceptance_grade: bool,
@@ -160,6 +210,8 @@ impl RoleAssignmentRecord {
     fn validate(&self) -> Result<()> {
         require_identifier("agent_id", &self.agent_id)?;
         require_identifier("legacy_role", &self.legacy_role)?;
+        require_identifier("requester_agent_id", &self.requester_agent_id)?;
+        require_identifier("judge_agent_id", &self.judge_agent_id)?;
         require_reason(&self.reason)?;
         Ok(())
     }
@@ -183,8 +235,22 @@ pub fn assign_role_category(
     role: AgentRole,
     category_override: Option<RoleCategory>,
 ) -> Result<RoleAssignmentRecord> {
+    assign_role_category_with_provenance(
+        agent_id,
+        role,
+        category_override,
+        RoleAssignmentProvenance::granted_by("supervisor"),
+    )
+}
+
+pub fn assign_role_category_with_provenance(
+    agent_id: impl Into<String>,
+    role: AgentRole,
+    category_override: Option<RoleCategory>,
+    provenance: RoleAssignmentProvenance,
+) -> Result<RoleAssignmentRecord> {
     let derived = role.authority_category();
-    let (category, source, reason) = match category_override {
+    let (category, source, reason, provenance) = match category_override {
         Some(requested) if requested != derived => (
             requested,
             RoleAssignmentSource::OperatorOverride,
@@ -194,6 +260,11 @@ pub fn assign_role_category(
                 derived.as_str(),
                 requested.as_str()
             ),
+            if provenance.requester_agent_id == "supervisor" {
+                RoleAssignmentProvenance::operator_override()
+            } else {
+                provenance
+            },
         ),
         _ => (
             derived,
@@ -202,6 +273,7 @@ pub fn assign_role_category(
                 "derived from plan role {} without a launch-tier designation",
                 role.as_str()
             ),
+            provenance,
         ),
     };
     let record = RoleAssignmentRecord {
@@ -209,10 +281,66 @@ pub fn assign_role_category(
         category,
         legacy_role: role.as_str().to_string(),
         source,
+        requester_agent_id: provenance.requester_agent_id,
+        judge_agent_id: provenance.judge_agent_id,
+        evidence: provenance.evidence,
+        decision: provenance.decision,
         reason,
     };
     record.validate()?;
     Ok(record)
+}
+
+/// Fail closed so a weak or unproven model cannot hold coordinator or auditor
+/// authority at execution time.
+pub fn admit_role_category(category: RoleCategory, model: Option<&str>) -> Result<()> {
+    let floor = category.subject_capability_floor();
+    let Some(model) = model else {
+        if floor > ModelCapabilityClass::WeakMechanical {
+            bail!(
+                "role category '{}' requires '{}' capability evidence; refusing unproven model",
+                category.as_str(),
+                floor.as_str()
+            );
+        }
+        return Ok(());
+    };
+
+    match measured_authority_eligibility(model, category.measured_authority_role()) {
+        Ok(MeasuredAuthorityEligibility::Ineligible { reason }) => {
+            bail!(
+                "model '{model}' is ineligible by measured catalog/evidence for category '{}': {reason}",
+                category.as_str()
+            );
+        }
+        Ok(
+            MeasuredAuthorityEligibility::Eligible | MeasuredAuthorityEligibility::NoDatedEvidence,
+        ) => {}
+        Err(error) => {
+            bail!(
+                "measured catalog/evidence eligibility could not be loaded for model '{model}': {error}"
+            );
+        }
+    }
+
+    match super::trusted_model_capability(model) {
+        Some(capability) if capability < floor => {
+            bail!(
+                "weak model cannot hold {} authority: capability '{}' is below floor '{}'",
+                category.as_str(),
+                capability.as_str(),
+                floor.as_str()
+            );
+        }
+        Some(_) => Ok(()),
+        None if floor > ModelCapabilityClass::WeakMechanical => {
+            bail!(
+                "model '{model}' has no trusted capability policy for category '{}'",
+                category.as_str()
+            );
+        }
+        None => Ok(()),
+    }
 }
 
 pub fn insert_role_assignment(payload: &mut Value, record: &RoleAssignmentRecord) -> Result<()> {
@@ -499,6 +627,10 @@ mod tests {
         assert_eq!(record.source, RoleAssignmentSource::DerivedFromPlanRole);
         assert!(record.reason.contains("without a launch-tier designation"));
         assert_eq!(record.legacy_role, "child_orchestrator");
+        assert_eq!(record.requester_agent_id, "supervisor");
+        assert_eq!(record.judge_agent_id, "supervisor");
+        assert_eq!(record.decision, RoleTransitionDecisionKind::Granted);
+        assert!(record.evidence.recorded);
         Ok(())
     }
 
@@ -539,6 +671,66 @@ mod tests {
         assert_eq!(record.category, RoleCategory::ReadOnlyResearcher);
         assert_eq!(record.source, RoleAssignmentSource::OperatorOverride);
         assert!(record.reason.contains("operator override"));
+        assert_eq!(record.requester_agent_id, "operator");
+        assert_eq!(record.judge_agent_id, "operator");
+        assert_eq!(record.decision, RoleTransitionDecisionKind::Granted);
+        assert!(record.evidence.recorded);
+        assert!(!record.evidence.uncertain);
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_records_bind_requester_judge_typed_evidence_decision_and_reason() -> Result<()> {
+        let record = assign_role_category_with_provenance(
+            "child-1",
+            AgentRole::ChildOrchestrator,
+            None,
+            RoleAssignmentProvenance::granted_by("run-1"),
+        )?;
+        assert_eq!(record.requester_agent_id, "run-1");
+        assert_eq!(record.judge_agent_id, "run-1");
+        assert_eq!(record.decision, RoleTransitionDecisionKind::Granted);
+        assert_eq!(
+            record.evidence,
+            RoleTransitionEvidence {
+                acceptance_grade: false,
+                recorded: true,
+                uncertain: false,
+            }
+        );
+        assert!(record.reason.contains("derived from plan role"));
+        Ok(())
+    }
+
+    #[test]
+    fn admission_refuses_luna_for_coordinator_and_auditor_categories() -> Result<()> {
+        let coordinator =
+            admit_role_category(RoleCategory::DelegatingCoordinator, Some("gpt-5.6-luna"))
+                .expect_err("luna cannot hold coordinator authority");
+        assert!(
+            coordinator
+                .to_string()
+                .contains("ineligible by measured catalog/evidence")
+                || coordinator.to_string().contains("cannot hold"),
+            "{coordinator:#}"
+        );
+        let auditor =
+            admit_role_category(RoleCategory::ReadOnlyReviewAuditor, Some("gpt-5.6-luna"))
+                .expect_err("luna cannot hold auditor authority");
+        assert!(
+            auditor
+                .to_string()
+                .contains("ineligible by measured catalog/evidence")
+                || auditor.to_string().contains("cannot hold")
+                || auditor.to_string().contains("below floor"),
+            "{auditor:#}"
+        );
+        admit_role_category(
+            RoleCategory::NonDelegatingTerminalWorker,
+            Some("gpt-5.6-luna"),
+        )?;
+        admit_role_category(RoleCategory::DelegatingCoordinator, Some("gpt-5.6-sol"))?;
+        admit_role_category(RoleCategory::ReadOnlyReviewAuditor, Some("gpt-5.6-sol"))?;
         Ok(())
     }
 

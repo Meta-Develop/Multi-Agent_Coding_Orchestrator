@@ -606,7 +606,8 @@ fn propose_task_decomposition_from_fragments(
     body: &str,
 ) -> Result<TaskDecompositionProposal> {
     let mut diagnostics = TaskPathProposalDiagnostics::default();
-    let files = collect_planning_files(repo, title, body, &mut diagnostics)?;
+    let inventory = collect_planning_files(repo, title, body, &mut diagnostics)?;
+    let files = inventory.files;
     let file_set = files.iter().cloned().collect::<BTreeSet<_>>();
     if let Some(assignment) =
         authoritative_single_file_assignment(repo, title, body, &fragments, &files, &file_set)
@@ -627,7 +628,11 @@ fn propose_task_decomposition_from_fragments(
             },
         });
     }
-    let semantic_map = match repo_semantic::scan_repository(repo) {
+    let semantic_map = match repo_semantic::scan_repository_with_exclusions(
+        repo,
+        Some(&file_set),
+        &inventory.nested_repository_boundaries,
+    ) {
         Ok(map) => {
             let allowed_error_count = map
                 .errors
@@ -1266,7 +1271,8 @@ fn collect_provider_semantic_inventory(
     repo: &Path,
     allowed_files: &[PathBuf],
 ) -> ProviderSemanticInventory {
-    let Ok(map) = repo_semantic::scan_repository(repo) else {
+    let allowed = allowed_files.iter().cloned().collect::<BTreeSet<_>>();
+    let Ok(map) = repo_semantic::scan_repository_with_exclusions(repo, Some(&allowed), &[]) else {
         return ProviderSemanticInventory::default();
     };
     let allowed_files = allowed_files.iter().collect::<BTreeSet<_>>();
@@ -2105,7 +2111,8 @@ pub fn propose_task_path_proposal(
     let lowered = text.to_ascii_lowercase();
     let normalized_text = normalize_text(&text);
     let mut diagnostics = TaskPathProposalDiagnostics::default();
-    let files = collect_planning_files(repo, title, body, &mut diagnostics)?;
+    let inventory = collect_planning_files(repo, title, body, &mut diagnostics)?;
+    let files = inventory.files;
     let file_set = files.iter().cloned().collect::<BTreeSet<_>>();
     let mut proposed = BTreeSet::new();
 
@@ -2125,6 +2132,7 @@ pub fn propose_task_path_proposal(
         repo,
         &normalized_text,
         &file_set,
+        &inventory.nested_repository_boundaries,
         &mut proposed,
         &mut diagnostics,
     );
@@ -2195,10 +2203,15 @@ fn propose_rust_paths(
     repo: &Path,
     normalized_text: &str,
     file_set: &BTreeSet<PathBuf>,
+    nested_repository_boundaries: &[PathBuf],
     proposed: &mut BTreeSet<PathBuf>,
     diagnostics: &mut TaskPathProposalDiagnostics,
 ) {
-    match repo_semantic::scan_repository(repo) {
+    match repo_semantic::scan_repository_with_exclusions(
+        repo,
+        Some(file_set),
+        nested_repository_boundaries,
+    ) {
         Ok(map) => {
             for file in &map.files {
                 if !file_set.contains(&file.path) {
@@ -2326,12 +2339,17 @@ fn contains_path_mention(text: &str, path: &str) -> bool {
         || text.contains(&format!("\"{path}\""))
 }
 
+struct PlanningFileInventory {
+    files: Vec<PathBuf>,
+    nested_repository_boundaries: Vec<PathBuf>,
+}
+
 fn collect_planning_files(
     repo: &Path,
     title: &str,
     body: &str,
     diagnostics: &mut TaskPathProposalDiagnostics,
-) -> Result<Vec<PathBuf>> {
+) -> Result<PlanningFileInventory> {
     let RepositoryFileInventory {
         mut files,
         nested_repository_boundaries,
@@ -2355,7 +2373,10 @@ fn collect_planning_files(
         }
     }
     files.sort();
-    Ok(files)
+    Ok(PlanningFileInventory {
+        files,
+        nested_repository_boundaries,
+    })
 }
 
 fn record_nested_repository_boundaries(
@@ -4154,7 +4175,8 @@ Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other 
                 "Keep src/lib.rs working.",
                 &mut diagnostics,
             )
-            .expect("collect planning files");
+            .expect("collect planning files")
+            .files;
             assert!(files.contains(&PathBuf::from("README.md")));
             assert!(files.contains(&PathBuf::from("src/lib.rs")));
             assert!(!diagnostics.degraded);

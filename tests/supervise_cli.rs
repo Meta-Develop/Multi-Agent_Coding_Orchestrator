@@ -820,6 +820,91 @@ fn supervise_run_from_goal_executes_the_same_validated_plan_and_preserves_primar
 }
 
 #[test]
+fn supervise_plan_then_run_with_cli_token_ceiling_completes_without_plan_edit() -> Result<()> {
+    support::require_containment!(
+        "supervise_plan_then_run_with_cli_token_ceiling_completes_without_plan_edit"
+    );
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let goal_path = temp.path().join("budget-goal.md");
+    fs::write(
+        &goal_path,
+        "Coordinate the requested repository work.\n\
+         - Update README.md.\n\
+         - Update the ok function in src/lib.rs.\n",
+    )?;
+    let plan = run_success_json(&[
+        "supervise",
+        "plan",
+        "--from-goal",
+        path_str(&goal_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert_eq!(
+        plan["run_budget"]["role_token_reservations"]["child_orchestrator"],
+        1024
+    );
+    assert_eq!(
+        plan["run_budget"]["role_token_reservations"]["worker"],
+        1024
+    );
+    assert_eq!(
+        plan["run_budget"]["role_token_reservations"]["auditor"],
+        1024
+    );
+    let plan_path = temp.path().join("generated-plan.json");
+    fs::write(&plan_path, serde_json::to_vec_pretty(&plan)?).context("write generated plan")?;
+
+    let output = command_with_test_machine_global_binding(
+        BIN,
+        &[
+            "supervise",
+            "run",
+            path_str(&plan_path)?,
+            "--repo",
+            path_str(&repo_path)?,
+            "--run-id",
+            "goal-plan-max-tokens",
+            "--runtime",
+            "fake",
+            "--max-tokens",
+            "100000",
+            "--max-concurrent-children",
+            "1",
+            "--json",
+        ],
+    )
+    .output()
+    .context("run generated plan under CLI token ceiling")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stdout.contains("no token reservation") && !stderr.contains("no token reservation"),
+        "generated role reservations must admit dispatch under --max-tokens: stdout={stdout} stderr={stderr}"
+    );
+    let report: Value = serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("parse max-tokens run JSON: stdout={stdout} stderr={stderr}"))?;
+    assert_eq!(report["publishable"], false);
+    assert!(
+        report["role_economics_profile"]["execution"]["started_assignment_count"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1,
+        "CLI token ceiling must not block the first fake-backed dispatch: {report}"
+    );
+    let executed_plan: Value = serde_json::from_slice(&fs::read(
+        repo_path.join(".maco/o2/runs/goal-plan-max-tokens/assignments/supervisor-plan.json"),
+    )?)?;
+    assert_eq!(
+        executed_plan["run_budget"]["role_token_reservations"],
+        plan["run_budget"]["role_token_reservations"]
+    );
+    Ok(())
+}
+
+#[test]
 fn supervise_plan_plain_text_without_actionable_workstreams_is_an_error() -> Result<()> {
     support::require_containment!(
         "supervise_plan_plain_text_without_actionable_workstreams_is_an_error"
@@ -1040,6 +1125,54 @@ fn supervise_plan_treats_nested_repositories_as_opaque_outer_inventory_boundarie
         .all(|path| !path
             .as_str()
             .is_some_and(|path| path.contains("excluded.rs"))));
+    assert_eq!(first["path_proposal"]["degraded"], false);
+    let notes = first["path_proposal"]["notes"]
+        .as_array()
+        .context("path_proposal notes")?;
+    assert!(
+        notes.iter().any(|note| {
+            note.as_str().is_some_and(|note| {
+                note.contains("showing first 3 sorted paths")
+                    && note.contains("alpha/nested")
+                    && note.contains("beta/nested")
+                    && note.contains("middle/nested")
+                    && !note.contains("zeta/nested")
+            })
+        }),
+        "JSON plan must keep sorted bounded nested-boundary notes: {notes:?}"
+    );
+    assert!(first["assignments"]
+        .as_array()
+        .context("assignments")?
+        .iter()
+        .filter_map(|assignment| assignment["task"].as_str())
+        .all(|task| !task.contains("Planning inventory diagnostics:")));
+    assert_eq!(first["path_proposal"], second["path_proposal"]);
+
+    let human = command_with_test_machine_global_binding(
+        BIN,
+        &[
+            "supervise",
+            "plan",
+            path_str(&task_path)?,
+            "--repo",
+            path_str(&repo_path)?,
+        ],
+    )
+    .output()
+    .context("run human nested-boundary plan")?;
+    assert!(human.status.success(), "human nested plan failed");
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        human_stdout.contains("\"degraded\": Bool(false)")
+            || human_stdout.contains("degraded: false"),
+        "human plan must surface degraded: false: {human_stdout}"
+    );
+    assert!(
+        human_stdout.contains("showing first 3 sorted paths"),
+        "human plan must surface sorted bounded nested-boundary notes: {human_stdout}"
+    );
+    assert!(!human_stdout.contains("Planning inventory diagnostics:"));
     assert!(!repo_path.join(".maco/o2").exists());
     Ok(())
 }

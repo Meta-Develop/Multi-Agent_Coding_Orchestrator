@@ -1229,11 +1229,46 @@
                     ],
                     "type": "string"
                   },
+                  "decision": {
+                    "enum": [
+                      "granted",
+                      "refused"
+                    ],
+                    "type": "string"
+                  },
+                  "evidence": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "acceptance_grade": {
+                        "type": "boolean"
+                      },
+                      "recorded": {
+                        "type": "boolean"
+                      },
+                      "uncertain": {
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "acceptance_grade",
+                      "recorded",
+                      "uncertain"
+                    ],
+                    "type": "object"
+                  },
+                  "judge_agent_id": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
                   "legacy_role": {
                     "minLength": 1,
                     "type": "string"
                   },
                   "reason": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "requester_agent_id": {
                     "minLength": 1,
                     "type": "string"
                   },
@@ -1250,6 +1285,10 @@
                   "category",
                   "legacy_role",
                   "source",
+                  "requester_agent_id",
+                  "judge_agent_id",
+                  "evidence",
+                  "decision",
                   "reason"
                 ],
                 "type": "object"
@@ -1736,6 +1775,10 @@
                             {
                               "additionalProperties": false,
                               "properties": {
+                                "applied_switch_cost_microunits": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
                                 "authority_quality_basis_points": {
                                   "oneOf": [
                                     {
@@ -1748,11 +1791,18 @@
                                     }
                                   ]
                                 },
-                                "degrade_cost_microunits": {
+                                "configured_switch_cost_microunits": {
                                   "minimum": 0,
                                   "type": "integer"
                                 },
-                                "configured_switch_cost_microunits": {
+                                "configured_switch_cost_origin": {
+                                  "enum": [
+                                    "not_applicable",
+                                    "resolved_profile_inferred_prior"
+                                  ],
+                                  "type": "string"
+                                },
+                                "degrade_cost_microunits": {
                                   "minimum": 0,
                                   "type": "integer"
                                 },
@@ -1796,20 +1846,6 @@
                                 "retry_cost_microunits": {
                                   "minimum": 0,
                                   "type": "integer"
-                                },
-                                "switch_cost_microunits": {
-                                  "minimum": 0,
-                                  "type": "integer"
-                                },
-                                "switch_transition": {
-                                  "enum": [
-                                    "initial",
-                                    "stay",
-                                    "effort_change_same_runtime_model",
-                                    "model_change_same_runtime",
-                                    "runtime_change"
-                                  ],
-                                  "type": "string"
                                 },
                                 "retry_rework_adjustment_microunits": {
                                   "minimum": 0,
@@ -1863,6 +1899,336 @@
                                   ],
                                   "type": "object"
                                 },
+                                "switch_cost_estimate": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "cached_prefix_invalidation_tokens": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "class": {
+                                      "enum": [
+                                        "continue",
+                                        "model_change_same_runtime",
+                                        "runtime_adapter_change",
+                                        "fresh_session_or_worktree"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "context_reprime_tokens": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "lost_checkpoint_cost_micros": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "observation": {
+                                      "enum": [
+                                        "Measured",
+                                        "Inferred"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "provenance": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "cached_prefix_invalidation": {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "observation": {
+                                              "enum": [
+                                                "Measured",
+                                                "Inferred"
+                                              ],
+                                              "type": "string"
+                                            },
+                                            "sample_count": {
+                                              "minimum": 0,
+                                              "type": "integer"
+                                            },
+                                            "source": {
+                                              "enum": [
+                                                "continue_zero",
+                                                "explicit_observation",
+                                                "exact_transition_telemetry",
+                                                "class_telemetry",
+                                                "global_telemetry",
+                                                "cold_start_prior",
+                                                "legacy_unknown"
+                                              ],
+                                              "type": "string"
+                                            },
+                                            "uncertainty": {
+                                              "additionalProperties": false,
+                                              "properties": {
+                                                "lower": {
+                                                  "minimum": 0,
+                                                  "type": "integer"
+                                                },
+                                                "upper": {
+                                                  "minimum": 0,
+                                                  "type": "integer"
+                                                }
+                                              },
+                                              "required": [
+                                                "lower",
+                                                "upper"
+                                              ],
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "source",
+                                            "sample_count",
+                                            "observation",
+                                            "uncertainty"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "context_reprime": {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "observation": {
+                                              "enum": [
+                                                "Measured",
+                                                "Inferred"
+                                              ],
+                                              "type": "string"
+                                            },
+                                            "sample_count": {
+                                              "minimum": 0,
+                                              "type": "integer"
+                                            },
+                                            "source": {
+                                              "enum": [
+                                                "continue_zero",
+                                                "explicit_observation",
+                                                "exact_transition_telemetry",
+                                                "class_telemetry",
+                                                "global_telemetry",
+                                                "cold_start_prior",
+                                                "legacy_unknown"
+                                              ],
+                                              "type": "string"
+                                            },
+                                            "uncertainty": {
+                                              "additionalProperties": false,
+                                              "properties": {
+                                                "lower": {
+                                                  "minimum": 0,
+                                                  "type": "integer"
+                                                },
+                                                "upper": {
+                                                  "minimum": 0,
+                                                  "type": "integer"
+                                                }
+                                              },
+                                              "required": [
+                                                "lower",
+                                                "upper"
+                                              ],
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "source",
+                                            "sample_count",
+                                            "observation",
+                                            "uncertainty"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "lost_checkpoint": {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "observation": {
+                                              "enum": [
+                                                "Measured",
+                                                "Inferred"
+                                              ],
+                                              "type": "string"
+                                            },
+                                            "sample_count": {
+                                              "minimum": 0,
+                                              "type": "integer"
+                                            },
+                                            "source": {
+                                              "enum": [
+                                                "continue_zero",
+                                                "explicit_observation",
+                                                "exact_transition_telemetry",
+                                                "class_telemetry",
+                                                "global_telemetry",
+                                                "cold_start_prior",
+                                                "legacy_unknown"
+                                              ],
+                                              "type": "string"
+                                            },
+                                            "uncertainty": {
+                                              "additionalProperties": false,
+                                              "properties": {
+                                                "lower": {
+                                                  "minimum": 0,
+                                                  "type": "integer"
+                                                },
+                                                "upper": {
+                                                  "minimum": 0,
+                                                  "type": "integer"
+                                                }
+                                              },
+                                              "required": [
+                                                "lower",
+                                                "upper"
+                                              ],
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "source",
+                                            "sample_count",
+                                            "observation",
+                                            "uncertainty"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        "runtime_startup": {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "observation": {
+                                              "enum": [
+                                                "Measured",
+                                                "Inferred"
+                                              ],
+                                              "type": "string"
+                                            },
+                                            "sample_count": {
+                                              "minimum": 0,
+                                              "type": "integer"
+                                            },
+                                            "source": {
+                                              "enum": [
+                                                "continue_zero",
+                                                "explicit_observation",
+                                                "exact_transition_telemetry",
+                                                "class_telemetry",
+                                                "global_telemetry",
+                                                "cold_start_prior",
+                                                "legacy_unknown"
+                                              ],
+                                              "type": "string"
+                                            },
+                                            "uncertainty": {
+                                              "additionalProperties": false,
+                                              "properties": {
+                                                "lower": {
+                                                  "minimum": 0,
+                                                  "type": "integer"
+                                                },
+                                                "upper": {
+                                                  "minimum": 0,
+                                                  "type": "integer"
+                                                }
+                                              },
+                                              "required": [
+                                                "lower",
+                                                "upper"
+                                              ],
+                                              "type": "object"
+                                            }
+                                          },
+                                          "required": [
+                                            "source",
+                                            "sample_count",
+                                            "observation",
+                                            "uncertainty"
+                                          ],
+                                          "type": "object"
+                                        }
+                                      },
+                                      "required": [
+                                        "cached_prefix_invalidation",
+                                        "context_reprime",
+                                        "runtime_startup",
+                                        "lost_checkpoint"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "runtime_startup_micros": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "sample_count": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "status": {
+                                      "enum": [
+                                        "measured",
+                                        "mixed",
+                                        "inferred"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "total_cost_micros": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "uncertainty_micros": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "lower": {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        },
+                                        "upper": {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "lower",
+                                        "upper"
+                                      ],
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "class",
+                                    "cached_prefix_invalidation_tokens",
+                                    "context_reprime_tokens",
+                                    "runtime_startup_micros",
+                                    "lost_checkpoint_cost_micros",
+                                    "total_cost_micros",
+                                    "observation",
+                                    "status",
+                                    "sample_count",
+                                    "uncertainty_micros",
+                                    "provenance"
+                                  ],
+                                  "type": "object"
+                                },
+                                "switch_cost_microunits": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "switch_cost_origin": {
+                                  "enum": [
+                                    "optimizer_estimate",
+                                    "optimizer_cold_start_prior",
+                                    "continue_zero"
+                                  ],
+                                  "type": "string"
+                                },
+                                "switch_transition": {
+                                  "enum": [
+                                    "continue",
+                                    "model_change_same_runtime",
+                                    "runtime_adapter_change",
+                                    "fresh_session_or_worktree"
+                                  ],
+                                  "type": "string"
+                                },
                                 "total_adjustment_microunits": {
                                   "minimum": 0,
                                   "type": "integer"
@@ -1883,7 +2249,11 @@
                                 "retry_cost_microunits",
                                 "degrade_cost_microunits",
                                 "switch_transition",
+                                "switch_cost_origin",
+                                "switch_cost_estimate",
                                 "configured_switch_cost_microunits",
+                                "configured_switch_cost_origin",
+                                "applied_switch_cost_microunits",
                                 "switch_cost_microunits",
                                 "routing_score_semantics",
                                 "routing_tradeoff_weights",
@@ -1954,6 +2324,10 @@
                       {
                         "additionalProperties": false,
                         "properties": {
+                          "applied_switch_cost_microunits": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
                           "candidate": {
                             "additionalProperties": false,
                             "properties": {
@@ -1988,6 +2362,13 @@
                             "minimum": 0,
                             "type": "integer"
                           },
+                          "configured_switch_cost_origin": {
+                            "enum": [
+                              "not_applicable",
+                              "resolved_profile_inferred_prior"
+                            ],
+                            "type": "string"
+                          },
                           "reason": {
                             "enum": [
                               "lowest_expected_total_cost_per_accepted_task",
@@ -1999,17 +2380,333 @@
                             ],
                             "type": "string"
                           },
+                          "switch_cost_estimate": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "cached_prefix_invalidation_tokens": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "class": {
+                                "enum": [
+                                  "continue",
+                                  "model_change_same_runtime",
+                                  "runtime_adapter_change",
+                                  "fresh_session_or_worktree"
+                                ],
+                                "type": "string"
+                              },
+                              "context_reprime_tokens": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "lost_checkpoint_cost_micros": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "observation": {
+                                "enum": [
+                                  "Measured",
+                                  "Inferred"
+                                ],
+                                "type": "string"
+                              },
+                              "provenance": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "cached_prefix_invalidation": {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "observation": {
+                                        "enum": [
+                                          "Measured",
+                                          "Inferred"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      "sample_count": {
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "source": {
+                                        "enum": [
+                                          "continue_zero",
+                                          "explicit_observation",
+                                          "exact_transition_telemetry",
+                                          "class_telemetry",
+                                          "global_telemetry",
+                                          "cold_start_prior",
+                                          "legacy_unknown"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      "uncertainty": {
+                                        "additionalProperties": false,
+                                        "properties": {
+                                          "lower": {
+                                            "minimum": 0,
+                                            "type": "integer"
+                                          },
+                                          "upper": {
+                                            "minimum": 0,
+                                            "type": "integer"
+                                          }
+                                        },
+                                        "required": [
+                                          "lower",
+                                          "upper"
+                                        ],
+                                        "type": "object"
+                                      }
+                                    },
+                                    "required": [
+                                      "source",
+                                      "sample_count",
+                                      "observation",
+                                      "uncertainty"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "context_reprime": {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "observation": {
+                                        "enum": [
+                                          "Measured",
+                                          "Inferred"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      "sample_count": {
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "source": {
+                                        "enum": [
+                                          "continue_zero",
+                                          "explicit_observation",
+                                          "exact_transition_telemetry",
+                                          "class_telemetry",
+                                          "global_telemetry",
+                                          "cold_start_prior",
+                                          "legacy_unknown"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      "uncertainty": {
+                                        "additionalProperties": false,
+                                        "properties": {
+                                          "lower": {
+                                            "minimum": 0,
+                                            "type": "integer"
+                                          },
+                                          "upper": {
+                                            "minimum": 0,
+                                            "type": "integer"
+                                          }
+                                        },
+                                        "required": [
+                                          "lower",
+                                          "upper"
+                                        ],
+                                        "type": "object"
+                                      }
+                                    },
+                                    "required": [
+                                      "source",
+                                      "sample_count",
+                                      "observation",
+                                      "uncertainty"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "lost_checkpoint": {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "observation": {
+                                        "enum": [
+                                          "Measured",
+                                          "Inferred"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      "sample_count": {
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "source": {
+                                        "enum": [
+                                          "continue_zero",
+                                          "explicit_observation",
+                                          "exact_transition_telemetry",
+                                          "class_telemetry",
+                                          "global_telemetry",
+                                          "cold_start_prior",
+                                          "legacy_unknown"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      "uncertainty": {
+                                        "additionalProperties": false,
+                                        "properties": {
+                                          "lower": {
+                                            "minimum": 0,
+                                            "type": "integer"
+                                          },
+                                          "upper": {
+                                            "minimum": 0,
+                                            "type": "integer"
+                                          }
+                                        },
+                                        "required": [
+                                          "lower",
+                                          "upper"
+                                        ],
+                                        "type": "object"
+                                      }
+                                    },
+                                    "required": [
+                                      "source",
+                                      "sample_count",
+                                      "observation",
+                                      "uncertainty"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "runtime_startup": {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "observation": {
+                                        "enum": [
+                                          "Measured",
+                                          "Inferred"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      "sample_count": {
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "source": {
+                                        "enum": [
+                                          "continue_zero",
+                                          "explicit_observation",
+                                          "exact_transition_telemetry",
+                                          "class_telemetry",
+                                          "global_telemetry",
+                                          "cold_start_prior",
+                                          "legacy_unknown"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      "uncertainty": {
+                                        "additionalProperties": false,
+                                        "properties": {
+                                          "lower": {
+                                            "minimum": 0,
+                                            "type": "integer"
+                                          },
+                                          "upper": {
+                                            "minimum": 0,
+                                            "type": "integer"
+                                          }
+                                        },
+                                        "required": [
+                                          "lower",
+                                          "upper"
+                                        ],
+                                        "type": "object"
+                                      }
+                                    },
+                                    "required": [
+                                      "source",
+                                      "sample_count",
+                                      "observation",
+                                      "uncertainty"
+                                    ],
+                                    "type": "object"
+                                  }
+                                },
+                                "required": [
+                                  "cached_prefix_invalidation",
+                                  "context_reprime",
+                                  "runtime_startup",
+                                  "lost_checkpoint"
+                                ],
+                                "type": "object"
+                              },
+                              "runtime_startup_micros": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "sample_count": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "status": {
+                                "enum": [
+                                  "measured",
+                                  "mixed",
+                                  "inferred"
+                                ],
+                                "type": "string"
+                              },
+                              "total_cost_micros": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "uncertainty_micros": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "lower": {
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  },
+                                  "upper": {
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "lower",
+                                  "upper"
+                                ],
+                                "type": "object"
+                              }
+                            },
+                            "required": [
+                              "class",
+                              "cached_prefix_invalidation_tokens",
+                              "context_reprime_tokens",
+                              "runtime_startup_micros",
+                              "lost_checkpoint_cost_micros",
+                              "total_cost_micros",
+                              "observation",
+                              "status",
+                              "sample_count",
+                              "uncertainty_micros",
+                              "provenance"
+                            ],
+                            "type": "object"
+                          },
                           "switch_cost_microunits": {
                             "minimum": 0,
                             "type": "integer"
                           },
+                          "switch_cost_origin": {
+                            "enum": [
+                              "optimizer_estimate",
+                              "optimizer_cold_start_prior",
+                              "continue_zero"
+                            ],
+                            "type": "string"
+                          },
                           "switch_transition": {
                             "enum": [
-                              "initial",
-                              "stay",
-                              "effort_change_same_runtime_model",
+                              "continue",
                               "model_change_same_runtime",
-                              "runtime_change"
+                              "runtime_adapter_change",
+                              "fresh_session_or_worktree"
                             ],
                             "type": "string"
                           },
@@ -2021,7 +2718,11 @@
                         "required": [
                           "candidate",
                           "switch_transition",
+                          "switch_cost_origin",
+                          "switch_cost_estimate",
                           "configured_switch_cost_microunits",
+                          "configured_switch_cost_origin",
+                          "applied_switch_cost_microunits",
                           "switch_cost_microunits",
                           "total_score_microunits",
                           "reason"
@@ -2353,6 +3054,23 @@
                         ],
                         "type": "object"
                       },
+                      "switch_cost_evidence": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "algorithm": {
+                            "const": "sha256"
+                          },
+                          "value": {
+                            "pattern": "^[0-9a-f]{64}$",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "algorithm",
+                          "value"
+                        ],
+                        "type": "object"
+                      },
                       "task": {
                         "additionalProperties": false,
                         "properties": {
@@ -2373,6 +3091,7 @@
                     },
                     "required": [
                       "normalized_input",
+                      "switch_cost_evidence",
                       "task",
                       "catalogs",
                       "pools",
@@ -3475,24 +4194,6 @@
                                   "minimum": 0,
                                   "type": "integer"
                                 },
-                                "switch_costs": {
-                                  "additionalProperties": false,
-                                  "properties": {
-                                    "model_change_same_runtime_microunits": {
-                                      "minimum": 0,
-                                      "type": "integer"
-                                    },
-                                    "runtime_change_microunits": {
-                                      "minimum": 0,
-                                      "type": "integer"
-                                    }
-                                  },
-                                  "required": [
-                                    "model_change_same_runtime_microunits",
-                                    "runtime_change_microunits"
-                                  ],
-                                  "type": "object"
-                                },
                                 "version": {
                                   "minimum": 1,
                                   "type": "integer"
@@ -3509,8 +4210,7 @@
                                 "observed_consumption_unit_cost_microunits",
                                 "entitlement_scarcity_full_cost_microunits",
                                 "retry_penalty_microunits",
-                                "degrade_effort_rank_penalty_microunits",
-                                "switch_costs"
+                                "degrade_effort_rank_penalty_microunits"
                               ],
                               "type": "object"
                             },
@@ -3525,7 +4225,7 @@
                             "type": "string"
                           },
                           "schema_version": {
-                            "minimum": 1,
+                            "const": 2,
                             "type": "integer"
                           }
                         },
@@ -3638,6 +4338,24 @@
                                 ],
                                 "type": "object"
                               },
+                              "switch_costs": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "model_change_same_runtime_microunits": {
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  },
+                                  "runtime_change_microunits": {
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  }
+                                },
+                                "required": [
+                                  "model_change_same_runtime_microunits",
+                                  "runtime_change_microunits"
+                                ],
+                                "type": "object"
+                              },
                               "tradeoffs": {
                                 "additionalProperties": false,
                                 "properties": {
@@ -3686,7 +4404,8 @@
                               "version",
                               "content_hash",
                               "quality",
-                              "tradeoffs"
+                              "tradeoffs",
+                              "switch_costs"
                             ],
                             "type": "object"
                           },
@@ -4036,6 +4755,358 @@
                       "profile_digest"
                     ],
                     "type": "object"
+                  },
+                  "provided_switch_cost_evidence": {
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "candidate": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "effort": {
+                              "enum": [
+                                "low",
+                                "medium",
+                                "high",
+                                "xhigh",
+                                "max",
+                                "ultra"
+                              ],
+                              "type": "string"
+                            },
+                            "model": {
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "runtime": {
+                              "minLength": 1,
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "runtime",
+                            "model",
+                            "effort"
+                          ],
+                          "type": "object"
+                        },
+                        "estimate": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "cached_prefix_invalidation_tokens": {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "class": {
+                              "enum": [
+                                "continue",
+                                "model_change_same_runtime",
+                                "runtime_adapter_change",
+                                "fresh_session_or_worktree"
+                              ],
+                              "type": "string"
+                            },
+                            "context_reprime_tokens": {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "lost_checkpoint_cost_micros": {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "observation": {
+                              "enum": [
+                                "Measured",
+                                "Inferred"
+                              ],
+                              "type": "string"
+                            },
+                            "provenance": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "cached_prefix_invalidation": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "observation": {
+                                      "enum": [
+                                        "Measured",
+                                        "Inferred"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "sample_count": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "source": {
+                                      "enum": [
+                                        "continue_zero",
+                                        "explicit_observation",
+                                        "exact_transition_telemetry",
+                                        "class_telemetry",
+                                        "global_telemetry",
+                                        "cold_start_prior",
+                                        "legacy_unknown"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "uncertainty": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "lower": {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        },
+                                        "upper": {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "lower",
+                                        "upper"
+                                      ],
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "source",
+                                    "sample_count",
+                                    "observation",
+                                    "uncertainty"
+                                  ],
+                                  "type": "object"
+                                },
+                                "context_reprime": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "observation": {
+                                      "enum": [
+                                        "Measured",
+                                        "Inferred"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "sample_count": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "source": {
+                                      "enum": [
+                                        "continue_zero",
+                                        "explicit_observation",
+                                        "exact_transition_telemetry",
+                                        "class_telemetry",
+                                        "global_telemetry",
+                                        "cold_start_prior",
+                                        "legacy_unknown"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "uncertainty": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "lower": {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        },
+                                        "upper": {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "lower",
+                                        "upper"
+                                      ],
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "source",
+                                    "sample_count",
+                                    "observation",
+                                    "uncertainty"
+                                  ],
+                                  "type": "object"
+                                },
+                                "lost_checkpoint": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "observation": {
+                                      "enum": [
+                                        "Measured",
+                                        "Inferred"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "sample_count": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "source": {
+                                      "enum": [
+                                        "continue_zero",
+                                        "explicit_observation",
+                                        "exact_transition_telemetry",
+                                        "class_telemetry",
+                                        "global_telemetry",
+                                        "cold_start_prior",
+                                        "legacy_unknown"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "uncertainty": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "lower": {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        },
+                                        "upper": {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "lower",
+                                        "upper"
+                                      ],
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "source",
+                                    "sample_count",
+                                    "observation",
+                                    "uncertainty"
+                                  ],
+                                  "type": "object"
+                                },
+                                "runtime_startup": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "observation": {
+                                      "enum": [
+                                        "Measured",
+                                        "Inferred"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "sample_count": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "source": {
+                                      "enum": [
+                                        "continue_zero",
+                                        "explicit_observation",
+                                        "exact_transition_telemetry",
+                                        "class_telemetry",
+                                        "global_telemetry",
+                                        "cold_start_prior",
+                                        "legacy_unknown"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "uncertainty": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "lower": {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        },
+                                        "upper": {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "lower",
+                                        "upper"
+                                      ],
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "source",
+                                    "sample_count",
+                                    "observation",
+                                    "uncertainty"
+                                  ],
+                                  "type": "object"
+                                }
+                              },
+                              "required": [
+                                "cached_prefix_invalidation",
+                                "context_reprime",
+                                "runtime_startup",
+                                "lost_checkpoint"
+                              ],
+                              "type": "object"
+                            },
+                            "runtime_startup_micros": {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "sample_count": {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "status": {
+                              "enum": [
+                                "measured",
+                                "mixed",
+                                "inferred"
+                              ],
+                              "type": "string"
+                            },
+                            "total_cost_micros": {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "uncertainty_micros": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "lower": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "upper": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "lower",
+                                "upper"
+                              ],
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "class",
+                            "cached_prefix_invalidation_tokens",
+                            "context_reprime_tokens",
+                            "runtime_startup_micros",
+                            "lost_checkpoint_cost_micros",
+                            "total_cost_micros",
+                            "observation",
+                            "status",
+                            "sample_count",
+                            "uncertainty_micros",
+                            "provenance"
+                          ],
+                          "type": "object"
+                        }
+                      },
+                      "required": [
+                        "candidate",
+                        "estimate"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
                   },
                   "quota": {
                     "oneOf": [
@@ -4405,6 +5476,24 @@
                             ],
                             "type": "object"
                           },
+                          "switch_costs": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "model_change_same_runtime_microunits": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "runtime_change_microunits": {
+                                "minimum": 0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "model_change_same_runtime_microunits",
+                              "runtime_change_microunits"
+                            ],
+                            "type": "object"
+                          },
                           "tradeoffs": {
                             "additionalProperties": false,
                             "properties": {
@@ -4453,7 +5542,8 @@
                           "version",
                           "content_hash",
                           "quality",
-                          "tradeoffs"
+                          "tradeoffs",
+                          "switch_costs"
                         ],
                         "type": "object"
                       },
@@ -4475,6 +5565,10 @@
                     "items": {
                       "additionalProperties": false,
                       "properties": {
+                        "applied_switch_cost_microunits": {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
                         "candidate": {
                           "additionalProperties": false,
                           "properties": {
@@ -4505,25 +5599,348 @@
                           ],
                           "type": "object"
                         },
+                        "configured_switch_cost_microunits": {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "configured_switch_cost_origin": {
+                          "enum": [
+                            "not_applicable",
+                            "resolved_profile_inferred_prior"
+                          ],
+                          "type": "string"
+                        },
                         "rank": {
                           "minimum": 2,
                           "type": "integer"
                         },
-                        "configured_switch_cost_microunits": {
-                          "minimum": 0,
-                          "type": "integer"
+                        "switch_cost_estimate": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "cached_prefix_invalidation_tokens": {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "class": {
+                              "enum": [
+                                "continue",
+                                "model_change_same_runtime",
+                                "runtime_adapter_change",
+                                "fresh_session_or_worktree"
+                              ],
+                              "type": "string"
+                            },
+                            "context_reprime_tokens": {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "lost_checkpoint_cost_micros": {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "observation": {
+                              "enum": [
+                                "Measured",
+                                "Inferred"
+                              ],
+                              "type": "string"
+                            },
+                            "provenance": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "cached_prefix_invalidation": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "observation": {
+                                      "enum": [
+                                        "Measured",
+                                        "Inferred"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "sample_count": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "source": {
+                                      "enum": [
+                                        "continue_zero",
+                                        "explicit_observation",
+                                        "exact_transition_telemetry",
+                                        "class_telemetry",
+                                        "global_telemetry",
+                                        "cold_start_prior",
+                                        "legacy_unknown"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "uncertainty": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "lower": {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        },
+                                        "upper": {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "lower",
+                                        "upper"
+                                      ],
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "source",
+                                    "sample_count",
+                                    "observation",
+                                    "uncertainty"
+                                  ],
+                                  "type": "object"
+                                },
+                                "context_reprime": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "observation": {
+                                      "enum": [
+                                        "Measured",
+                                        "Inferred"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "sample_count": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "source": {
+                                      "enum": [
+                                        "continue_zero",
+                                        "explicit_observation",
+                                        "exact_transition_telemetry",
+                                        "class_telemetry",
+                                        "global_telemetry",
+                                        "cold_start_prior",
+                                        "legacy_unknown"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "uncertainty": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "lower": {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        },
+                                        "upper": {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "lower",
+                                        "upper"
+                                      ],
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "source",
+                                    "sample_count",
+                                    "observation",
+                                    "uncertainty"
+                                  ],
+                                  "type": "object"
+                                },
+                                "lost_checkpoint": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "observation": {
+                                      "enum": [
+                                        "Measured",
+                                        "Inferred"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "sample_count": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "source": {
+                                      "enum": [
+                                        "continue_zero",
+                                        "explicit_observation",
+                                        "exact_transition_telemetry",
+                                        "class_telemetry",
+                                        "global_telemetry",
+                                        "cold_start_prior",
+                                        "legacy_unknown"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "uncertainty": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "lower": {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        },
+                                        "upper": {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "lower",
+                                        "upper"
+                                      ],
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "source",
+                                    "sample_count",
+                                    "observation",
+                                    "uncertainty"
+                                  ],
+                                  "type": "object"
+                                },
+                                "runtime_startup": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "observation": {
+                                      "enum": [
+                                        "Measured",
+                                        "Inferred"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "sample_count": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "source": {
+                                      "enum": [
+                                        "continue_zero",
+                                        "explicit_observation",
+                                        "exact_transition_telemetry",
+                                        "class_telemetry",
+                                        "global_telemetry",
+                                        "cold_start_prior",
+                                        "legacy_unknown"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "uncertainty": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "lower": {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        },
+                                        "upper": {
+                                          "minimum": 0,
+                                          "type": "integer"
+                                        }
+                                      },
+                                      "required": [
+                                        "lower",
+                                        "upper"
+                                      ],
+                                      "type": "object"
+                                    }
+                                  },
+                                  "required": [
+                                    "source",
+                                    "sample_count",
+                                    "observation",
+                                    "uncertainty"
+                                  ],
+                                  "type": "object"
+                                }
+                              },
+                              "required": [
+                                "cached_prefix_invalidation",
+                                "context_reprime",
+                                "runtime_startup",
+                                "lost_checkpoint"
+                              ],
+                              "type": "object"
+                            },
+                            "runtime_startup_micros": {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "sample_count": {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "status": {
+                              "enum": [
+                                "measured",
+                                "mixed",
+                                "inferred"
+                              ],
+                              "type": "string"
+                            },
+                            "total_cost_micros": {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "uncertainty_micros": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "lower": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "upper": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "lower",
+                                "upper"
+                              ],
+                              "type": "object"
+                            }
+                          },
+                          "required": [
+                            "class",
+                            "cached_prefix_invalidation_tokens",
+                            "context_reprime_tokens",
+                            "runtime_startup_micros",
+                            "lost_checkpoint_cost_micros",
+                            "total_cost_micros",
+                            "observation",
+                            "status",
+                            "sample_count",
+                            "uncertainty_micros",
+                            "provenance"
+                          ],
+                          "type": "object"
                         },
                         "switch_cost_microunits": {
                           "minimum": 0,
                           "type": "integer"
                         },
+                        "switch_cost_origin": {
+                          "enum": [
+                            "optimizer_estimate",
+                            "optimizer_cold_start_prior",
+                            "continue_zero"
+                          ],
+                          "type": "string"
+                        },
                         "switch_transition": {
                           "enum": [
-                            "initial",
-                            "stay",
-                            "effort_change_same_runtime_model",
+                            "continue",
                             "model_change_same_runtime",
-                            "runtime_change"
+                            "runtime_adapter_change",
+                            "fresh_session_or_worktree"
                           ],
                           "type": "string"
                         },
@@ -4536,7 +5953,11 @@
                         "rank",
                         "candidate",
                         "switch_transition",
+                        "switch_cost_origin",
+                        "switch_cost_estimate",
                         "configured_switch_cost_microunits",
+                        "configured_switch_cost_origin",
+                        "applied_switch_cost_microunits",
                         "switch_cost_microunits",
                         "total_score_microunits"
                       ],
@@ -4783,7 +6204,7 @@
                     "type": "array"
                   },
                   "schema_version": {
-                    "const": 2,
+                    "const": 4,
                     "type": "integer"
                   },
                   "status": {
@@ -4816,6 +6237,7 @@
                   "normalized_input",
                   "normalized_task",
                   "input_digests",
+                  "provided_switch_cost_evidence",
                   "objective_profile",
                   "resolved_objective_profile",
                   "catalog_revisions",

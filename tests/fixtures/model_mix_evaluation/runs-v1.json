@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "manifest_version": 1,
   "experiment_id": "issue26-phase-a-readme-v1",
   "fake_seed": 26,
@@ -128,9 +128,33 @@
           }
         }
       }
-    ]
+    ],
+    "objective_profile": {
+      "profile": {
+        "id": "maco-default-objective-v2",
+        "version": 2,
+        "content_hash": "82e6de7f5e27768fdad19b5dfa70d70ed1fb9d041262678e3174d5373330b4f9",
+        "quality": {
+          "held_out_percent": 50,
+          "breadth_percent": 25,
+          "anti_shortcut_percent": 25
+        },
+        "tradeoffs": {
+          "monetary_cost_percent": 100,
+          "quota_consumption_percent": 0,
+          "latency_percent": 0,
+          "retry_rework_percent": 0,
+          "human_review_percent": 0
+        },
+        "switch_costs": {
+          "model_change_same_runtime_microunits": 10000,
+          "runtime_change_microunits": 25000
+        }
+      },
+      "source": "built_in"
+    }
   },
-  "declared_inputs_digest": "fnv1a64:e7da008318253760",
+  "declared_inputs_digest": "fnv1a64:d2d6201e928aed5f",
   "dispatch_comparability_claim": {
     "scope": "dispatch",
     "provider_execution_difference_established": false,
@@ -140,7 +164,7 @@
     {
       "profile_id": "frontier-all-v1",
       "repetition": 0,
-      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "declared_inputs_digest": "fnv1a64:d2d6201e928aed5f",
       "synthetic_run_identity": {
         "fake_run_id": "fake-issue26-phase-a-readme-v1-frontier-all-v1-aafd0d6ef73eb2a1-0"
       },
@@ -254,7 +278,7 @@
     {
       "profile_id": "frontier-all-v1",
       "repetition": 1,
-      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "declared_inputs_digest": "fnv1a64:d2d6201e928aed5f",
       "synthetic_run_identity": {
         "fake_run_id": "fake-issue26-phase-a-readme-v1-frontier-all-v1-aafd0d6ef73eb2a1-1"
       },
@@ -371,7 +395,7 @@
     {
       "profile_id": "frontier-all-v1",
       "repetition": 2,
-      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "declared_inputs_digest": "fnv1a64:d2d6201e928aed5f",
       "synthetic_run_identity": {
         "fake_run_id": "fake-issue26-phase-a-readme-v1-frontier-all-v1-aafd0d6ef73eb2a1-2"
       },
@@ -488,7 +512,7 @@
     {
       "profile_id": "hybrid-frontier-economy-v1",
       "repetition": 0,
-      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "declared_inputs_digest": "fnv1a64:d2d6201e928aed5f",
       "synthetic_run_identity": {
         "fake_run_id": "fake-issue26-phase-a-readme-v1-hybrid-frontier-economy-v1-fbfc68c99e967d8b-0"
       },
@@ -602,7 +626,7 @@
     {
       "profile_id": "hybrid-frontier-economy-v1",
       "repetition": 1,
-      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "declared_inputs_digest": "fnv1a64:d2d6201e928aed5f",
       "synthetic_run_identity": {
         "fake_run_id": "fake-issue26-phase-a-readme-v1-hybrid-frontier-economy-v1-fbfc68c99e967d8b-1"
       },
@@ -719,7 +743,7 @@
     {
       "profile_id": "hybrid-frontier-economy-v1",
       "repetition": 2,
-      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "declared_inputs_digest": "fnv1a64:d2d6201e928aed5f",
       "synthetic_run_identity": {
         "fake_run_id": "fake-issue26-phase-a-readme-v1-hybrid-frontier-economy-v1-fbfc68c99e967d8b-2"
       },
@@ -836,7 +860,7 @@
     {
       "profile_id": "balanced-all-v1",
       "repetition": 0,
-      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "declared_inputs_digest": "fnv1a64:d2d6201e928aed5f",
       "synthetic_run_identity": {
         "fake_run_id": "fake-issue26-phase-a-readme-v1-balanced-all-v1-3faf23d5c835dae2-0"
       },
@@ -955,7 +979,7 @@
     {
       "profile_id": "balanced-all-v1",
       "repetition": 1,
-      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "declared_inputs_digest": "fnv1a64:d2d6201e928aed5f",
       "synthetic_run_identity": {
         "fake_run_id": "fake-issue26-phase-a-readme-v1-balanced-all-v1-3faf23d5c835dae2-1"
       },
@@ -1077,7 +1101,7 @@
     {
       "profile_id": "balanced-all-v1",
       "repetition": 2,
-      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "declared_inputs_digest": "fnv1a64:d2d6201e928aed5f",
       "synthetic_run_identity": {
         "fake_run_id": "fake-issue26-phase-a-readme-v1-balanced-all-v1-3faf23d5c835dae2-2"
       },
@@ -1199,7 +1223,7 @@
     {
       "profile_id": "economy-all-v1",
       "repetition": 0,
-      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "declared_inputs_digest": "fnv1a64:d2d6201e928aed5f",
       "synthetic_run_identity": {
         "fake_run_id": "fake-issue26-phase-a-readme-v1-economy-all-v1-f3720f13d72b26ea-0"
       },
@@ -1318,7 +1342,7 @@
     {
       "profile_id": "economy-all-v1",
       "repetition": 1,
-      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "declared_inputs_digest": "fnv1a64:d2d6201e928aed5f",
       "synthetic_run_identity": {
         "fake_run_id": "fake-issue26-phase-a-readme-v1-economy-all-v1-f3720f13d72b26ea-1"
       },
@@ -1440,7 +1464,7 @@
     {
       "profile_id": "economy-all-v1",
       "repetition": 2,
-      "declared_inputs_digest": "fnv1a64:e7da008318253760",
+      "declared_inputs_digest": "fnv1a64:d2d6201e928aed5f",
       "synthetic_run_identity": {
         "fake_run_id": "fake-issue26-phase-a-readme-v1-economy-all-v1-f3720f13d72b26ea-2"
       },
@@ -2133,25 +2157,32 @@
     }
   },
   "pareto_frontier": [],
-  "objective_profile": {
-    "id": "maco-default-objective-v2",
-    "version": 2,
-    "content_hash": "82e6de7f5e27768fdad19b5dfa70d70ed1fb9d041262678e3174d5373330b4f9",
-    "quality": {
-      "held_out_percent": 50,
-      "breadth_percent": 25,
-      "anti_shortcut_percent": 25
-    },
-    "tradeoffs": {
-      "monetary_cost_percent": 100,
-      "quota_consumption_percent": 0,
-      "latency_percent": 0,
-      "retry_rework_percent": 0,
-      "human_review_percent": 0
-    },
-    "switch_costs": {
-      "model_change_same_runtime_microunits": 10000,
-      "runtime_change_microunits": 25000
+  "objective_scoring": {
+    "kind": "original",
+    "applied_profile": {
+      "profile": {
+        "id": "maco-default-objective-v2",
+        "version": 2,
+        "content_hash": "82e6de7f5e27768fdad19b5dfa70d70ed1fb9d041262678e3174d5373330b4f9",
+        "quality": {
+          "held_out_percent": 50,
+          "breadth_percent": 25,
+          "anti_shortcut_percent": 25
+        },
+        "tradeoffs": {
+          "monetary_cost_percent": 100,
+          "quota_consumption_percent": 0,
+          "latency_percent": 0,
+          "retry_rework_percent": 0,
+          "human_review_percent": 0
+        },
+        "switch_costs": {
+          "model_change_same_runtime_microunits": 10000,
+          "runtime_change_microunits": 25000
+        }
+      },
+      "source": "built_in"
     }
-  }
+  },
+  "objective_selection": null
 }

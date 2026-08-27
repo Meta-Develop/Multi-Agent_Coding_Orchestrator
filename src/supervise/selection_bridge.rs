@@ -6,11 +6,36 @@
 
 use super::*;
 use crate::objective_profile::ResolvedObjectiveProfile;
+use crate::optimizer::action::{
+    AgentRole as OptimizerRole, CanonicalEffort, ExecutionBudget, HedgeTopology, ModelAction,
+    PlannerTopology, RestartMode, ReviewTopology, RuntimeModelId, TopologySpec, WorkerTopology,
+};
+use crate::optimizer::explanation::EscalationComparison;
+use crate::optimizer::features::{FeatureValue, TaskFeatures};
+use crate::optimizer::ids::{
+    BackendId, CandidateId, CatalogVersion, FeatureId, ModelFamilyId, PolicyId, PolicyNodeId,
+    ProviderId, RuntimeSlug, TimestampMillis, VerifierProfileId,
+};
+use crate::optimizer::online_router::{
+    CheckpointRouter, RouterConfig, SafeContextualRouter, TailRiskObjective,
+};
+use crate::optimizer::policy::{PolicyGraph, PolicyNode};
+use crate::optimizer::predictor::{feature_keys, HierarchicalPolicyPredictor};
+use crate::optimizer::resources::ResourceVector;
+use crate::optimizer::state::{DecisionHorizon, OptimizerState};
+#[cfg(test)]
+use crate::optimizer::switch_cost::SwitchCostEstimate;
+use crate::optimizer::switch_cost::{SwitchCostModel, SwitchHysteresis, TransitionClass};
+use crate::optimizer::telemetry::{
+    CostClass, DecisionId, InvocationId, InvocationRecord, OptimizationRunId, PolicyExecutionId,
+};
+use crate::optimizer::trajectory::{TrajectoryEvent, TrajectoryObservation};
 use crate::selection::{
     self, AuthorityRole, Boundedness, BudgetSignal, CandidateCapabilities, CandidateKey,
-    CatalogModel, ContextSize, DebugOverride, DecisionStatus, DynamicSignals, ObjectiveProfileRef,
-    OperatorConstraints, ReasoningEffort as SelectorEffort, RiskLevel, RuntimeCatalog,
-    RuntimePoolState, SelectionInput, SelectionProvenance, TaskHorizon, TaskProfile,
+    CandidateSwitchCostEvidence, CatalogModel, ContextSize, DebugOverride, DecisionStatus,
+    DynamicSignals, ObjectiveProfileRef, OperatorConstraints, ReasoningEffort as SelectorEffort,
+    RiskLevel, RuntimeCatalog, RuntimePoolState, SelectionInput, SelectionProvenance, TaskHorizon,
+    TaskProfile,
 };
 use std::path::Path;
 
@@ -554,7 +579,7 @@ pub(super) fn initialize_supervisor_selection_with_quota(
             },
             debug_override,
         })?;
-        let decision = selection::select(&input).map_err(|error| {
+        let decision = select_with_live_switch_cost(&input).map_err(|error| {
             anyhow!(
                 "automatic selector rejected role '{}': {error}",
                 role.as_str()
@@ -898,7 +923,7 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
             )?;
         }
 
-        let decision = selection::select(&input).map_err(|error| {
+        let decision = select_with_live_switch_cost(&input).map_err(|error| {
             anyhow!(
                 "automatic selector replay rejected role '{}': {error}",
                 role.as_str()
@@ -1071,6 +1096,23 @@ struct SelectionInputForRoleArgs<'a> {
     quota_ledger: Option<&'a RunBudgetLedger>,
     signals: DynamicSignals,
     debug_override: Option<DebugOverride>,
+}
+
+fn live_switch_cost_evidence(input: &SelectionInput) -> Vec<CandidateSwitchCostEvidence> {
+    with_live_switch_cost_session(|session| session.evidence_for(input))
+}
+
+fn select_with_live_switch_cost(
+    input: &SelectionInput,
+) -> Result<SelectionProvenance, selection::SelectionError> {
+    let evidence = live_switch_cost_evidence(input);
+    let provenance = selection::select_with_switch_cost_estimates(input, &evidence)?;
+    if let Err(error) = route_live_four_arm_comparison(input) {
+        return Err(selection::SelectionError::InvalidInput(format!(
+            "live online-router four-arm comparison failed: {error:#}"
+        )));
+    }
+    Ok(provenance)
 }
 
 fn selection_input_for_role(args: SelectionInputForRoleArgs<'_>) -> Result<SelectionInput> {
@@ -1693,6 +1735,591 @@ pub(super) fn write_selection_ledger_from_report(
             ArtifactFileDisposition::PrivateEvidence,
         )
         .context("failed to persist assignment selection ledger")?;
+    write_live_switch_cost_evidence(writer)?;
+    Ok(())
+}
+
+thread_local! {
+    static LIVE_SWITCH_COST_SESSION: RefCell<LiveSwitchCostSession> =
+        RefCell::new(LiveSwitchCostSession::default());
+}
+
+#[derive(Debug, Clone)]
+struct LiveSwitchCostSession {
+    config: SupervisorRouterConfig,
+    model: SwitchCostModel,
+    invocations: Vec<InvocationRecord>,
+    trajectory: Vec<String>,
+    comparison: Option<EscalationComparison>,
+    alarms: Vec<OscillationAlarmEvent>,
+}
+
+impl Default for LiveSwitchCostSession {
+    fn default() -> Self {
+        Self {
+            config: SupervisorRouterConfig::default(),
+            model: SwitchCostModel::new(),
+            invocations: Vec::new(),
+            trajectory: Vec::new(),
+            comparison: None,
+            alarms: Vec::new(),
+        }
+    }
+}
+
+impl LiveSwitchCostSession {
+    fn apply_config(&mut self, config: SupervisorRouterConfig) {
+        self.config = config;
+        self.model = self.model.clone().with_hysteresis(SwitchHysteresis {
+            margin_bp: self.config.hysteresis_margin_bp,
+        });
+    }
+
+    fn observe_record(&mut self, record: InvocationRecord) -> Result<()> {
+        record.validate().map_err(|error| {
+            anyhow!("live invocation record failed attribution validation: {error}")
+        })?;
+        self.invocations.push(record);
+        self.model.observe_invocations(&self.invocations);
+        Ok(())
+    }
+
+    fn evidence_for(&self, input: &SelectionInput) -> Vec<CandidateSwitchCostEvidence> {
+        let previous = input.signals.previous_choice.as_ref();
+        let mut evidence = Vec::new();
+        for catalog in &input.catalogs {
+            for listed in &catalog.models {
+                for effort in &listed.supported_efforts {
+                    let class = match previous {
+                        Some(prev)
+                            if prev.runtime == catalog.runtime && prev.model == listed.model =>
+                        {
+                            TransitionClass::Continue
+                        }
+                        Some(prev) if prev.runtime == catalog.runtime => {
+                            TransitionClass::ModelChangeSameRuntime
+                        }
+                        Some(_) => TransitionClass::RuntimeAdapterChange,
+                        None => TransitionClass::Continue,
+                    };
+                    evidence.push(CandidateSwitchCostEvidence {
+                        candidate: CandidateKey {
+                            runtime: catalog.runtime.clone(),
+                            model: listed.model.clone(),
+                            effort: *effort,
+                        },
+                        estimate: self.model.estimate(class),
+                    });
+                }
+            }
+        }
+        evidence
+    }
+
+    fn snapshot(&self) -> LiveSwitchCostArtifact {
+        LiveSwitchCostArtifact {
+            schema_version: LIVE_SWITCH_COST_EVIDENCE_SCHEMA_VERSION,
+            router_config: self.config.clone(),
+            invocations: self.invocations.clone(),
+            router_comparison: self.comparison.clone(),
+            oscillation_alarms: self.alarms.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub(super) struct OscillationAlarmEvent {
+    pub sequence: Vec<String>,
+    pub oscillation_count: u32,
+    pub oscillation_alarm_threshold: u32,
+    pub switch_hysteresis_margin_bp: u16,
+    pub alarmed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub(super) struct LiveSwitchCostArtifact {
+    pub schema_version: u32,
+    pub router_config: SupervisorRouterConfig,
+    pub invocations: Vec<InvocationRecord>,
+    pub router_comparison: Option<EscalationComparison>,
+    pub oscillation_alarms: Vec<OscillationAlarmEvent>,
+}
+
+fn with_live_switch_cost_session<T>(op: impl FnOnce(&mut LiveSwitchCostSession) -> T) -> T {
+    LIVE_SWITCH_COST_SESSION.with(|slot| op(&mut slot.borrow_mut()))
+}
+
+pub(crate) fn bind_live_router_config(config: SupervisorRouterConfig) {
+    with_live_switch_cost_session(|session| session.apply_config(config));
+}
+
+#[cfg(test)]
+pub(super) fn reset_live_switch_cost_session() {
+    with_live_switch_cost_session(|session| *session = LiveSwitchCostSession::default());
+}
+
+#[cfg(test)]
+pub(super) fn push_live_router_identity(identity: impl Into<String>) {
+    with_live_switch_cost_session(|session| session.trajectory.push(identity.into()));
+}
+
+pub(super) fn record_live_invocation(record: InvocationRecord) -> Result<()> {
+    with_live_switch_cost_session(|session| session.observe_record(record))
+}
+
+pub(super) fn live_switch_cost_artifact() -> LiveSwitchCostArtifact {
+    with_live_switch_cost_session(|session| session.snapshot())
+}
+
+#[cfg(test)]
+pub(super) fn live_fitted_switch_estimate(class: TransitionClass) -> SwitchCostEstimate {
+    with_live_switch_cost_session(|session| session.model.estimate(class))
+}
+
+pub(super) fn persist_live_switch_cost_snapshot(
+    writer: &mut crate::artifacts::ArtifactRunWriter,
+) -> Result<()> {
+    write_live_switch_cost_evidence(writer)
+}
+
+fn write_live_switch_cost_evidence(writer: &mut crate::artifacts::ArtifactRunWriter) -> Result<()> {
+    let snapshot = live_switch_cost_artifact();
+    if snapshot.invocations.is_empty()
+        && snapshot.router_comparison.is_none()
+        && snapshot.oscillation_alarms.is_empty()
+    {
+        return Ok(());
+    }
+    writer
+        .write_json(
+            Path::new(LIVE_SWITCH_COST_EVIDENCE_RELATIVE),
+            &snapshot,
+            ArtifactFileDisposition::PrivateEvidence,
+        )
+        .context("failed to persist live switch-cost evidence")?;
+    Ok(())
+}
+
+pub(super) fn persist_live_invocation_row(
+    writer: &mut crate::artifacts::ArtifactRunWriter,
+    record: &InvocationRecord,
+) -> Result<()> {
+    writer
+        .append_json_line(
+            Path::new(LIVE_SWITCH_COST_INVOCATIONS_RELATIVE),
+            record,
+            ArtifactFileDisposition::PrivateEvidence,
+        )
+        .context("failed to append live invocation telemetry")?;
+    Ok(())
+}
+
+pub(super) struct LiveInvocationObservation<'a> {
+    pub run_id: &'a str,
+    pub assignment_id: &'a str,
+    pub attempt: usize,
+    pub role: AgentRole,
+    pub runtime: SupervisorRuntime,
+    pub model: Option<&'a str>,
+    pub effort: Option<&'a str>,
+    pub worktree_id: &'a str,
+    pub usage: Option<&'a Usage>,
+    pub duration_ms: Option<u64>,
+    pub started_at_unix_millis: u64,
+}
+
+pub(super) fn record_supervisor_invocation_observation(
+    observation: LiveInvocationObservation<'_>,
+) -> Result<InvocationRecord> {
+    let invocation_id = format!(
+        "{}:{}:{}:{}",
+        observation.run_id,
+        observation.assignment_id,
+        observation.attempt,
+        observation.role.as_str()
+    );
+    let started = TimestampMillis::from_millis(observation.started_at_unix_millis.max(1));
+    let mut record = InvocationRecord::new(
+        PolicyId::new(format!(
+            "supervise:{}:{}",
+            observation.assignment_id,
+            observation.role.as_str()
+        ))
+        .map_err(|error| anyhow!("live invocation policy id: {error}"))?,
+        CandidateId::new(invocation_id.clone())
+            .map_err(|error| anyhow!("live invocation candidate id: {error}"))?,
+        started,
+        ResourceVector::new().snapshot(started),
+    );
+    let finished_millis = observation
+        .duration_ms
+        .and_then(|duration| observation.started_at_unix_millis.checked_add(duration))
+        .unwrap_or(observation.started_at_unix_millis.max(1));
+    record.finished_at = Some(TimestampMillis::from_millis(
+        finished_millis.max(started.as_millis()),
+    ));
+    record.optimization_run_id = Some(
+        OptimizationRunId::new(observation.run_id)
+            .map_err(|error| anyhow!("live invocation optimization run id: {error}"))?,
+    );
+    record.policy_execution_id = Some(
+        PolicyExecutionId::new(format!(
+            "{}:{}",
+            observation.run_id, observation.assignment_id
+        ))
+        .map_err(|error| anyhow!("live invocation policy execution id: {error}"))?,
+    );
+    record.invocation_id = Some(
+        InvocationId::new(invocation_id).map_err(|error| anyhow!("live invocation id: {error}"))?,
+    );
+    record.root_decision_id = Some(
+        DecisionId::new(format!("{}:root", observation.run_id))
+            .map_err(|error| anyhow!("live invocation decision id: {error}"))?,
+    );
+    record.task_class = Some(AUTOMATIC_SELECTION_TASK_CLASS.to_string());
+    let backend = backend_id_for_runtime(observation.runtime)?;
+    record.backend = Some(backend.clone());
+    record.provider = Some(provider_id_for_runtime(observation.runtime)?);
+    let model = observation
+        .model
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or("unresolved-live-model");
+    let slug =
+        RuntimeSlug::new(model).map_err(|error| anyhow!("live invocation model slug: {error}"))?;
+    record.requested_model = Some(slug.clone());
+    record.resolved_model = Some(slug);
+    record.session_id = Some(observation.run_id.to_string());
+    record.worktree_id = Some(observation.worktree_id.to_string());
+    if let Some(duration_ms) = observation.duration_ms {
+        let micros = i64::try_from(duration_ms.saturating_mul(1_000)).unwrap_or(i64::MAX);
+        if micros >= 0 {
+            record.runtime_startup_micros = Some(micros);
+        }
+    }
+    let effort = canonical_effort_from_label(observation.effort.unwrap_or("high"));
+    record.requested_effort = Some(effort.clone());
+    record.resolved_effort = Some(effort);
+    record.role = Some(optimizer_role(observation.role));
+    if let Some(usage) = observation.usage {
+        record.input_tokens = u64::try_from(usage.input_tokens).ok();
+        record.output_tokens = u64::try_from(usage.output_tokens).ok();
+        // Cached prefix occupancy is unobservable from Usage; leave None so
+        // fitted estimates stay wide/inferred rather than measured-zero.
+    }
+    record.cost_class = Some(match observation.role {
+        AgentRole::Auditor => CostClass::DirectAuditor,
+        AgentRole::Worker => CostClass::DirectWorker,
+        AgentRole::GateClassifier => CostClass::DirectPlanner,
+        AgentRole::ChildOrchestrator | AgentRole::Supervisor => CostClass::DirectPlanner,
+    });
+    record_live_invocation(record.clone())?;
+    Ok(record)
+}
+
+#[cfg(test)]
+pub(super) fn route_live_four_arm_for_test(input: &SelectionInput) -> Result<()> {
+    route_live_four_arm_comparison(input)
+}
+
+fn route_live_four_arm_comparison(input: &SelectionInput) -> Result<()> {
+    let candidates = live_router_candidates(input)?;
+    if candidates.len() < 2 {
+        return Ok(());
+    }
+    let (config, model, trajectory) = with_live_switch_cost_session(|session| {
+        (
+            session.config.clone(),
+            session.model.clone(),
+            session.trajectory.clone(),
+        )
+    });
+    let mut state = live_router_state(input, &trajectory)?;
+    let router = SafeContextualRouter::new(
+        Box::new(HierarchicalPolicyPredictor::new()),
+        Box::new(TailRiskObjective::new()),
+        RouterConfig {
+            oscillation_alarm_threshold: config.oscillation_alarm_threshold,
+            apply_inferred_switch_priors: false,
+            ..RouterConfig::default()
+        },
+    )
+    .with_switch_costs(model.with_hysteresis(SwitchHysteresis {
+        margin_bp: config.hysteresis_margin_bp,
+    }));
+    let decision = CheckpointRouter::new(router)
+        .reoptimize(&mut state, &candidates)
+        .map_err(|error| anyhow!("online router reoptimize failed: {error}"))?;
+    let comparison = decision
+        .escalation
+        .clone()
+        .ok_or_else(|| anyhow!("online router omitted the four-arm comparison"))?;
+    let diagnostics = decision.router.diagnostics();
+    let alarmed = diagnostics.oscillation_alarm.unwrap_or(false);
+    let alarm = OscillationAlarmEvent {
+        sequence: trajectory,
+        oscillation_count: diagnostics.oscillation_count.unwrap_or(0),
+        oscillation_alarm_threshold: diagnostics
+            .oscillation_alarm_threshold
+            .unwrap_or(config.oscillation_alarm_threshold),
+        switch_hysteresis_margin_bp: diagnostics
+            .switch_hysteresis_margin_bp
+            .unwrap_or(config.hysteresis_margin_bp),
+        alarmed,
+    };
+    with_live_switch_cost_session(|session| {
+        if let Some(selected) = decision.router.selected_policy() {
+            session.trajectory.push(selected.as_str().to_string());
+        }
+        session.comparison = Some(comparison);
+        if alarm.alarmed {
+            session.alarms.push(alarm);
+        }
+    });
+    Ok(())
+}
+
+fn live_router_state(input: &SelectionInput, trajectory: &[String]) -> Result<OptimizerState> {
+    let now = TimestampMillis::from_millis(1_000);
+    let mut state = OptimizerState::new(DecisionHorizon {
+        now,
+        deadline: Some(TimestampMillis::from_millis(1_000 + 3_600_000)),
+        next_reset: None,
+    });
+    set_feature_bool(
+        &mut state.task_features,
+        feature_keys::VERIFIER_AVAILABLE,
+        true,
+    )?;
+    set_feature_bool(
+        &mut state.task_features,
+        feature_keys::MODEL_AVAILABLE,
+        true,
+    )?;
+    set_feature_bool(&mut state.task_features, feature_keys::BACKEND_OK, true)?;
+    set_feature_bool(&mut state.task_features, feature_keys::CONTAINMENT_OK, true)?;
+    set_feature_text(
+        &mut state.task_features,
+        feature_keys::TASK_CLASS,
+        &input.task.task_class,
+    )?;
+    if let Some(previous) = input.signals.previous_choice.as_ref() {
+        set_feature_text(
+            &mut state.task_features,
+            feature_keys::CURRENT_POLICY,
+            &policy_id_for_candidate(previous),
+        )?;
+    } else if let Some(first) = trajectory.first() {
+        set_feature_text(
+            &mut state.task_features,
+            feature_keys::CURRENT_POLICY,
+            first,
+        )?;
+    }
+    let node = PolicyNodeId::new("start")
+        .map_err(|error| anyhow!("live router trajectory node: {error}"))?;
+    for (index, identity) in trajectory.iter().enumerate() {
+        let policy_id = PolicyId::new(identity.clone())
+            .map_err(|error| anyhow!("live router trajectory policy: {error}"))?;
+        state.trajectory.push(TrajectoryEvent {
+            at: TimestampMillis::from_millis(now.as_millis().saturating_add(index as u64 + 1)),
+            policy_id,
+            node_id: node.clone(),
+            observation: TrajectoryObservation::Progress,
+            features: TaskFeatures::new(),
+        });
+    }
+    Ok(state)
+}
+
+fn live_router_candidates(input: &SelectionInput) -> Result<Vec<PolicyGraph>> {
+    let previous = input.signals.previous_choice.as_ref();
+    let mut candidates = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut repair_source = None;
+    for catalog in &input.catalogs {
+        for listed in &catalog.models {
+            for effort in &listed.supported_efforts {
+                let key = CandidateKey {
+                    runtime: catalog.runtime.clone(),
+                    model: listed.model.clone(),
+                    effort: *effort,
+                };
+                let policy_id = policy_id_for_candidate(&key);
+                if !seen.insert(policy_id.clone()) {
+                    continue;
+                }
+                let is_continue = previous == Some(&key);
+                if repair_source.is_none() && previous.is_some() && !is_continue {
+                    repair_source = Some(key.clone());
+                }
+                candidates.push(live_policy_graph(
+                    &policy_id,
+                    PolicyNode::Execute(live_model_action(&key, OptimizerRole::Worker)?),
+                    RestartMode::Continuation,
+                )?);
+                if candidates.len() >= 7 {
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(repair) = repair_source {
+        candidates.push(live_policy_graph(
+            &format!("repair:{}", policy_id_for_candidate(&repair)),
+            PolicyNode::Repair(live_model_action(&repair, OptimizerRole::Repairer)?),
+            RestartMode::Continuation,
+        )?);
+    }
+    Ok(candidates)
+}
+
+fn live_policy_graph(
+    policy_id: &str,
+    node: PolicyNode,
+    restart: RestartMode,
+) -> Result<PolicyGraph> {
+    let start =
+        PolicyNodeId::new("start").map_err(|error| anyhow!("live router policy node: {error}"))?;
+    let mut graph = PolicyGraph::new(
+        PolicyId::new(policy_id).map_err(|error| anyhow!("live router policy id: {error}"))?,
+        1,
+        start.clone(),
+        TopologySpec {
+            planner: PlannerTopology::Single,
+            workers: WorkerTopology::One,
+            hedge: HedgeTopology::None,
+            review: ReviewTopology::Independent,
+            restart,
+        },
+    );
+    graph
+        .insert_node(start, node)
+        .map_err(|error| anyhow!("live router policy graph: {error}"))?;
+    Ok(graph)
+}
+
+fn live_model_action(candidate: &CandidateKey, role: OptimizerRole) -> Result<ModelAction> {
+    let backend = backend_id_for_runtime_name(&candidate.runtime)?;
+    let provider = provider_id_for_runtime_name(&candidate.runtime)?;
+    let slug = RuntimeSlug::new(candidate.model.clone())
+        .map_err(|error| anyhow!("live router model slug: {error}"))?;
+    Ok(ModelAction {
+        backend_id: backend.clone(),
+        provider_id: provider.clone(),
+        runtime_model: RuntimeModelId {
+            provider,
+            backend,
+            model_family: ModelFamilyId::new("live")
+                .map_err(|error| anyhow!("live router model family: {error}"))?,
+            runtime_slug: slug.clone(),
+            catalog_version: CatalogVersion::new("v1")
+                .map_err(|error| anyhow!("live router catalog version: {error}"))?,
+            observation_timestamp: TimestampMillis::from_millis(1),
+        },
+        requested_slug: slug,
+        effort: selector_effort_to_canonical(candidate.effort),
+        role,
+        max_turns: ExecutionBudget::default().max_turns,
+        timeout_seconds: 60,
+        tool_budget: None,
+        output_token_budget: None,
+        concurrency: 1,
+        verifier_profile: VerifierProfileId::new("default")
+            .map_err(|error| anyhow!("live router verifier: {error}"))?,
+    })
+}
+
+fn policy_id_for_candidate(candidate: &CandidateKey) -> String {
+    format!(
+        "{}:{}:{}",
+        candidate.runtime,
+        candidate.model,
+        selector_effort_label(candidate.effort)
+    )
+}
+
+fn selector_effort_label(effort: SelectorEffort) -> &'static str {
+    match effort {
+        SelectorEffort::Low => "low",
+        SelectorEffort::Medium => "medium",
+        SelectorEffort::High => "high",
+        SelectorEffort::Xhigh => "xhigh",
+        SelectorEffort::Max => "max",
+        SelectorEffort::Ultra => "ultra",
+    }
+}
+
+fn selector_effort_to_canonical(effort: SelectorEffort) -> CanonicalEffort {
+    match effort {
+        SelectorEffort::Low => CanonicalEffort::Low,
+        SelectorEffort::Medium => CanonicalEffort::Medium,
+        SelectorEffort::High => CanonicalEffort::High,
+        SelectorEffort::Xhigh => CanonicalEffort::XHigh,
+        SelectorEffort::Max => CanonicalEffort::Max,
+        SelectorEffort::Ultra => CanonicalEffort::Max,
+    }
+}
+
+fn canonical_effort_from_label(label: &str) -> CanonicalEffort {
+    match label {
+        "minimal" => CanonicalEffort::Minimal,
+        "low" => CanonicalEffort::Low,
+        "medium" => CanonicalEffort::Medium,
+        "high" => CanonicalEffort::High,
+        "xhigh" => CanonicalEffort::XHigh,
+        "max" => CanonicalEffort::Max,
+        _ => CanonicalEffort::High,
+    }
+}
+
+fn optimizer_role(role: AgentRole) -> OptimizerRole {
+    match role {
+        AgentRole::Supervisor => OptimizerRole::Supervisor,
+        AgentRole::ChildOrchestrator => OptimizerRole::ChildOrchestrator,
+        AgentRole::Worker => OptimizerRole::Worker,
+        AgentRole::GateClassifier => OptimizerRole::GateClassifier,
+        AgentRole::Auditor => OptimizerRole::Auditor,
+    }
+}
+
+fn backend_id_for_runtime(runtime: SupervisorRuntime) -> Result<BackendId> {
+    backend_id_for_runtime_name(runtime_name(runtime))
+}
+
+fn backend_id_for_runtime_name(runtime: &str) -> Result<BackendId> {
+    let name = match runtime {
+        "codex" => BackendId::CODEX_CLI,
+        "cursor" => BackendId::CURSOR_AGENT,
+        "grok" => BackendId::GROK_BUILD_CLI,
+        "fake" => BackendId::FAKE_PROVIDER,
+        other => other,
+    };
+    BackendId::new(name).or_else(|_| Ok(BackendId::well_known(BackendId::FAKE_PROVIDER)))
+}
+
+fn provider_id_for_runtime(runtime: SupervisorRuntime) -> Result<ProviderId> {
+    provider_id_for_runtime_name(runtime_name(runtime))
+}
+
+fn provider_id_for_runtime_name(runtime: &str) -> Result<ProviderId> {
+    let name = match runtime {
+        "codex" => "openai",
+        "cursor" => "cursor",
+        "grok" => "xai",
+        other => other,
+    };
+    ProviderId::new(name).map_err(|error| anyhow!("live invocation provider id: {error}"))
+}
+
+fn set_feature_bool(features: &mut TaskFeatures, key: &str, value: bool) -> Result<()> {
+    let id = FeatureId::new(key).map_err(|error| anyhow!("optimizer feature {key}: {error}"))?;
+    features.insert(id, FeatureValue::Boolean(value));
+    Ok(())
+}
+
+fn set_feature_text(features: &mut TaskFeatures, key: &str, value: &str) -> Result<()> {
+    let id = FeatureId::new(key).map_err(|error| anyhow!("optimizer feature {key}: {error}"))?;
+    features.insert(id, FeatureValue::Text(value.to_string()));
     Ok(())
 }
 
@@ -1727,8 +2354,37 @@ fn decision_for_assignment_role<'a>(
     })
 }
 
-fn recorded_role_assignment(assignment_id: &str, role: AgentRole) -> Option<RoleAssignmentRecord> {
-    assign_role_category(assignment_id, role, None).ok()
+fn recorded_role_assignment(
+    assignment_id: &str,
+    role: AgentRole,
+    plan: &SupervisorPlan,
+) -> Option<RoleAssignmentRecord> {
+    let category_override = category_override_from_plan(plan, assignment_id, role);
+    let provenance = if category_override.is_some() {
+        RoleAssignmentProvenance::operator_override()
+    } else {
+        RoleAssignmentProvenance::granted_by("supervisor")
+    };
+    assign_role_category_with_provenance(assignment_id, role, category_override, provenance).ok()
+}
+
+fn category_override_from_plan(
+    plan: &SupervisorPlan,
+    assignment_id: &str,
+    role: AgentRole,
+) -> Option<RoleCategory> {
+    let assignment = plan
+        .assignments
+        .iter()
+        .find(|assignment| assignment.id == assignment_id)?;
+    if role == AgentRole::Worker {
+        return assignment
+            .worker_assignments
+            .iter()
+            .find(|worker| worker.role == AgentRole::Worker)
+            .and_then(WorkerAssignment::category_override);
+    }
+    assignment.category_override()
 }
 
 fn ledger_entry_for_assignment(
@@ -1739,8 +2395,14 @@ fn ledger_entry_for_assignment(
     plan: &SupervisorPlan,
 ) -> AssignmentSelectionLedgerEntry {
     let event = decision_for_assignment_role(decisions, assignment_id, role);
-    let source = selection_source_for(event, runtime);
-    let role_assignment = recorded_role_assignment(assignment_id, role);
+    let role_assignment = recorded_role_assignment(assignment_id, role, plan);
+    let source = selection_source_for(
+        event,
+        runtime,
+        role_assignment
+            .as_ref()
+            .is_some_and(|record| record.source == RoleAssignmentSource::OperatorOverride),
+    );
     if source == AssignmentSelectionSource::LegacyFake {
         let configured = plan.role_models.get(&role);
         return AssignmentSelectionLedgerEntry {
@@ -1893,11 +2555,15 @@ fn cursor_catalog_evidence_gap_for_ledger(provenance: &SelectionProvenance) -> O
 fn selection_source_for(
     event: Option<&SupervisorSelectionEvent>,
     runtime: SupervisorRuntime,
+    operator_category_override: bool,
 ) -> AssignmentSelectionSource {
     if runtime == SupervisorRuntime::Fake {
         return AssignmentSelectionSource::LegacyFake;
     }
     match event.map(|event| event.primary_cause) {
+        Some(SupervisorSelectionEventCause::Initial) if operator_category_override => {
+            AssignmentSelectionSource::OperatorOverride
+        }
         Some(SupervisorSelectionEventCause::Initial) => AssignmentSelectionSource::Automatic,
         Some(SupervisorSelectionEventCause::DebugOverride) => {
             AssignmentSelectionSource::PlanRoleModels
@@ -1906,6 +2572,7 @@ fn selection_source_for(
             AssignmentSelectionSource::BudgetDegrade
         }
         Some(SupervisorSelectionEventCause::Retry) => AssignmentSelectionSource::Retry,
+        None if operator_category_override => AssignmentSelectionSource::OperatorOverride,
         None => AssignmentSelectionSource::Automatic,
     }
 }
@@ -2775,6 +3442,8 @@ mod tests {
             phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
@@ -2908,6 +3577,8 @@ mod tests {
         plan.assignments[0].worker_assignments = vec![WorkerAssignment {
             id: "worker-a".to_string(),
             role: AgentRole::Worker,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
@@ -2954,6 +3625,8 @@ mod tests {
         plan.assignments[0].worker_assignments = vec![WorkerAssignment {
             id: "worker-a".to_string(),
             role: AgentRole::Worker,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
@@ -3050,6 +3723,8 @@ mod tests {
         plan.assignments[0].worker_assignments = vec![WorkerAssignment {
             id: "worker-a".to_string(),
             role: AgentRole::Worker,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
@@ -3459,7 +4134,7 @@ mod tests {
             SupervisorRuntime::Codex,
             &catalog,
             &[AgentRole::Worker],
-            1,
+            3,
             BudgetSignal::Continue,
             &[],
         )?;
@@ -3488,6 +4163,10 @@ mod tests {
             .context("selected candidate retry score")?;
         assert!(previous_score.retry_cost_microunits > 0);
         assert_eq!(selected_score.retry_cost_microunits, 0);
+        assert!(
+            selected_score.total_score_microunits < previous_score.total_score_microunits,
+            "retry penalty must make the replacement cheaper after conservative switch cost"
+        );
         let expected_transition = if choice.candidate.runtime != previous.runtime {
             selection::ContextSwitchTransition::RuntimeChange
         } else if choice.candidate.model != previous.model {
@@ -3910,6 +4589,8 @@ mod tests {
             phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::Worker,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
@@ -4000,7 +4681,7 @@ mod tests {
             .candidate
             .clone();
         assert_eq!(previous.runtime, "codex");
-        state
+        let codex_pool = state
             .decisions
             .get_mut(&AgentRole::Worker)
             .context("worker replay state")?
@@ -4008,8 +4689,9 @@ mod tests {
             .pools
             .iter_mut()
             .find(|pool| pool.runtime == "codex")
-            .context("Codex replay pool")?
-            .pool_pressure_basis_points = 10_000;
+            .context("Codex replay pool")?;
+        codex_pool.pool_pressure_basis_points = 10_000;
+        codex_pool.marginal_cost_microunits = 3_000_000;
 
         let reselection = reselect_roles_from_supplied_catalog_snapshot(
             &mut state,
@@ -4039,7 +4721,30 @@ mod tests {
             choice.switch_transition,
             selection::ContextSwitchTransition::RuntimeChange
         );
+        assert_eq!(
+            choice.reason,
+            selection::ChoiceReason::LowestExpectedTotalCostPerAcceptedTask
+        );
         assert_eq!(choice.candidate.runtime, "cursor");
+        let previous_score = reselection.decisions[0]
+            .1
+            .candidate_set
+            .iter()
+            .find(|evaluation| evaluation.candidate == previous)
+            .and_then(|evaluation| evaluation.score.as_ref())
+            .context("pressured previous runtime score")?;
+        let selected_score = reselection.decisions[0]
+            .1
+            .candidate_set
+            .iter()
+            .find(|evaluation| evaluation.candidate == choice.candidate)
+            .and_then(|evaluation| evaluation.score.as_ref())
+            .context("selected runtime-switch score")?;
+        assert!(previous_score.marginal_cost_microunits > 0);
+        assert!(
+            selected_score.total_score_microunits < previous_score.total_score_microunits,
+            "bounded Codex pool cost must make the runtime switch cheaper"
+        );
         assert_eq!(
             reselection.runtime_overrides.get(&AgentRole::Worker),
             Some(&SupervisorRuntime::Cursor)
@@ -4621,6 +5326,308 @@ mod tests {
                     .runtime
             )?)
         );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn complete_live_invocation(
+        id: &str,
+        backend: &str,
+        model: &str,
+        started: u64,
+        input: Option<u64>,
+        cached: Option<u64>,
+        session: &str,
+        worktree: &str,
+    ) -> Result<InvocationRecord> {
+        let started_at = TimestampMillis::from_millis(started);
+        let mut record = InvocationRecord::new(
+            PolicyId::new("live-policy").map_err(|error| anyhow!(error))?,
+            CandidateId::new(id).map_err(|error| anyhow!(error))?,
+            started_at,
+            ResourceVector::new().snapshot(started_at),
+        );
+        record.finished_at = Some(TimestampMillis::from_millis(started.saturating_add(1)));
+        record.optimization_run_id =
+            Some(OptimizationRunId::new("live-run").map_err(|error| anyhow!(error))?);
+        record.policy_execution_id =
+            Some(PolicyExecutionId::new("live-exec").map_err(|error| anyhow!(error))?);
+        record.invocation_id = Some(InvocationId::new(id).map_err(|error| anyhow!(error))?);
+        record.root_decision_id =
+            Some(DecisionId::new("live-decision").map_err(|error| anyhow!(error))?);
+        record.backend = Some(BackendId::new(backend).map_err(|error| anyhow!(error))?);
+        record.provider = Some(ProviderId::new("local").map_err(|error| anyhow!(error))?);
+        record.requested_model = Some(RuntimeSlug::new(model).map_err(|error| anyhow!(error))?);
+        record.resolved_model = Some(RuntimeSlug::new(model).map_err(|error| anyhow!(error))?);
+        record.requested_effort = Some(CanonicalEffort::High);
+        record.resolved_effort = Some(CanonicalEffort::High);
+        record.session_id = Some(session.to_string());
+        record.worktree_id = Some(worktree.to_string());
+        record.input_tokens = input;
+        record.cached_input_tokens = cached;
+        record.runtime_startup_micros = Some(1_200);
+        record.lost_checkpoint_cost_micros = Some(400);
+        Ok(record)
+    }
+
+    #[test]
+    fn live_invocations_fit_switch_cost_model_and_preserve_inferred_labels() -> Result<()> {
+        reset_live_switch_cost_session();
+        let cold = live_fitted_switch_estimate(TransitionClass::ModelChangeSameRuntime);
+        assert_eq!(
+            cold.status,
+            crate::optimizer::switch_cost::SwitchEvidenceStatus::Inferred
+        );
+        assert_eq!(
+            cold.observation,
+            crate::optimizer::resources::ObservationKind::Inferred
+        );
+        assert_eq!(cold.sample_count, 0);
+        assert!(cold.uncertainty_micros.lower < cold.total_cost_micros);
+        assert!(cold.uncertainty_micros.upper > cold.total_cost_micros);
+
+        let mut warm = complete_live_invocation(
+            "warm",
+            "adapter-a",
+            "model-a",
+            1,
+            Some(1_000),
+            Some(800),
+            "session-a",
+            "worktree-a",
+        )?;
+        warm.runtime_startup_micros = None;
+        warm.lost_checkpoint_cost_micros = None;
+        record_live_invocation(warm)?;
+        let mut switched = complete_live_invocation(
+            "swap",
+            "adapter-a",
+            "model-b",
+            2,
+            Some(900),
+            Some(0),
+            "session-a",
+            "worktree-a",
+        )?;
+        switched.lost_checkpoint_cost_micros = None;
+        record_live_invocation(switched)?;
+
+        let fitted = live_fitted_switch_estimate(TransitionClass::ModelChangeSameRuntime);
+        assert_ne!(
+            fitted.status,
+            crate::optimizer::switch_cost::SwitchEvidenceStatus::Inferred
+        );
+        assert!(fitted.sample_count > 0);
+        assert_eq!(fitted.runtime_startup_micros, 1_200);
+        assert_eq!(
+            fitted.provenance.lost_checkpoint.observation,
+            crate::optimizer::resources::ObservationKind::Inferred
+        );
+        assert_eq!(
+            live_fitted_switch_estimate(TransitionClass::Continue).total_cost_micros,
+            0
+        );
+        reset_live_switch_cost_session();
+        Ok(())
+    }
+
+    #[test]
+    fn live_online_router_persists_zero_continue_and_priced_switch_arms() -> Result<()> {
+        reset_live_switch_cost_session();
+        bind_live_router_config(SupervisorRouterConfig {
+            hysteresis_margin_bp: 2_500,
+            oscillation_alarm_threshold: 1,
+        });
+        record_live_invocation(complete_live_invocation(
+            "warm",
+            crate::optimizer::ids::BackendId::CODEX_CLI,
+            "gpt-5.6-sol",
+            1,
+            Some(1_000),
+            Some(800),
+            "session-a",
+            "worktree-a",
+        )?)?;
+        record_live_invocation(complete_live_invocation(
+            "swap",
+            crate::optimizer::ids::BackendId::CODEX_CLI,
+            "gpt-5.6-luna",
+            2,
+            Some(900),
+            Some(0),
+            "session-a",
+            "worktree-a",
+        )?)?;
+
+        let catalog = codex_catalog()?;
+        let mut plan = test_plan();
+        let frozen = default_resolved_profile();
+        let resolution = super::initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+            Some(&frozen),
+        )?;
+        let worker = resolution
+            .decisions
+            .iter()
+            .find(|event| event.role == AgentRole::Worker)
+            .context("worker decision")?;
+        let mut input = worker.provenance.normalized_input.clone();
+        let previous = crate::selection::CandidateKey {
+            runtime: "codex".to_string(),
+            model: "gpt-5.6-sol".to_string(),
+            effort: crate::selection::ReasoningEffort::High,
+        };
+        input.signals.previous_choice = Some(previous);
+        let continue_id = "codex:gpt-5.6-sol:high";
+        let switch_id = "codex:gpt-5.6-luna:high";
+        push_live_router_identity(continue_id);
+        push_live_router_identity(switch_id);
+        push_live_router_identity(continue_id);
+        route_live_four_arm_comparison(&input)?;
+        let snapshot = live_switch_cost_artifact();
+        let comparison = snapshot
+            .router_comparison
+            .as_ref()
+            .context("four-arm comparison")?;
+        let continue_arm = comparison.continue_arm.as_ref().context("continue arm")?;
+        assert_eq!(continue_arm.applied_switch_cost_micros, 0);
+        let switch_arm = comparison.switch_arm.as_ref().context("switch arm")?;
+        assert!(switch_arm.applied_switch_cost_micros > 0);
+        assert_eq!(snapshot.router_config.hysteresis_margin_bp, 2_500);
+        assert!(snapshot
+            .oscillation_alarms
+            .iter()
+            .any(|alarm| alarm.alarmed && alarm.switch_hysteresis_margin_bp == 2_500));
+        reset_live_switch_cost_session();
+        Ok(())
+    }
+
+    #[test]
+    fn frozen_resolved_profile_flows_through_selector_and_evaluation_without_drift() -> Result<()> {
+        reset_live_switch_cost_session();
+        let catalog = codex_catalog()?;
+        let mut profile = crate::objective_profile::default_objective_profile();
+        profile.id = "frozen-live-consumption-v1".to_string();
+        profile.tradeoffs.monetary_cost_percent = 75;
+        profile.tradeoffs.human_review_percent = 25;
+        let frozen = ResolvedObjectiveProfile {
+            profile: profile.binding()?,
+            source: crate::objective_profile::ObjectiveProfileSource::RepositoryOverride,
+        };
+        let mut plan = test_plan();
+        let resolution = super::initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+            Some(&frozen),
+        )?;
+        assert!(resolution.decisions.iter().all(|event| {
+            event.provenance.resolved_objective_profile == frozen
+                && event.provenance.normalized_input.resolved_objective_profile == frozen
+        }));
+
+        let labelled_plan = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "evidence": {
+                "kind": "provisional_deterministic_fake_only",
+                "plan_basis": "hand_authored",
+                "real_provider_executed": false,
+                "observed_isolated_repository_state": false,
+                "requirement_four_comparability": "not_established_deferred_to_phase_b",
+                "eligible_for_production_economics": false,
+                "eligible_to_justify_named_default": false,
+                "eligible_for_production_or_default_decisions": false,
+                "notice": crate::evaluation::PROVISIONAL_FAKE_EVIDENCE_NOTICE,
+            },
+            "task": "frozen profile live consumption",
+            "assignments": []
+        }))?;
+        let digest = format!(
+            "sha256:{}",
+            crate::artifacts::state_auth::sha256_hex(&labelled_plan)
+        );
+        let model = |name: &str, effort: &str| RoleModelSelection {
+            model: Some(name.to_string()),
+            reasoning_effort: Some(effort.to_string()),
+            unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+        };
+        let manifest = crate::evaluation::EvaluationManifest {
+            version: crate::evaluation::EVALUATION_MANIFEST_SCHEMA_VERSION,
+            experiment_id: "wiring2-frozen-profile".to_string(),
+            evidence: serde_json::from_value(serde_json::json!({
+                "kind": "provisional_deterministic_fake_only",
+                "plan_basis": "hand_authored",
+                "real_provider_executed": false,
+                "observed_isolated_repository_state": false,
+                "requirement_four_comparability": "not_established_deferred_to_phase_b",
+                "eligible_for_production_economics": false,
+                "eligible_to_justify_named_default": false,
+                "eligible_for_production_or_default_decisions": false,
+                "notice": crate::evaluation::PROVISIONAL_FAKE_EVIDENCE_NOTICE,
+            }))?,
+            target: crate::evaluation::EvaluationTarget {
+                spec_or_goal_id: "wiring2-frozen".to_string(),
+                spec_or_goal_digest:
+                    "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e1bca75d84e1400c421b321"
+                        .to_string(),
+                hand_authored_plan_digest: digest,
+            },
+            repository_base_snapshot: "a".repeat(40),
+            limits: crate::evaluation::EvaluationLimits {
+                wall_time_seconds: 60,
+                max_dispatches: 2,
+            },
+            held_out_validation: vec![
+                crate::evaluation::HeldOutValidation {
+                    id: "unit".to_string(),
+                    command: vec!["true".to_string()],
+                },
+                crate::evaluation::HeldOutValidation {
+                    id: "integration".to_string(),
+                    command: vec!["true".to_string()],
+                },
+            ],
+            repetitions: 1,
+            profiles: vec![
+                crate::evaluation::EvaluationProfile {
+                    id: "mix-a".to_string(),
+                    role_models: BTreeMap::from([
+                        (AgentRole::ChildOrchestrator, model("frontier-v1", "high")),
+                        (AgentRole::Worker, model("fast-v1", "medium")),
+                    ]),
+                },
+                crate::evaluation::EvaluationProfile {
+                    id: "mix-b".to_string(),
+                    role_models: BTreeMap::from([
+                        (AgentRole::ChildOrchestrator, model("frontier-v1", "high")),
+                        (AgentRole::Worker, model("frontier-v1", "high")),
+                    ]),
+                },
+            ],
+            objective_profile: Some(frozen.clone()),
+        };
+        let results = crate::evaluation::run_evaluation(
+            &manifest,
+            &labelled_plan,
+            crate::evaluation::EvaluationRunRequest {
+                fake_seed: 7,
+                ..crate::evaluation::EvaluationRunRequest::default()
+            },
+        )
+        .map_err(|error| anyhow!("evaluation consumption: {error}"))?;
+        match results.objective_scoring {
+            crate::evaluation::EvaluationObjectiveEvidence::Scored(scoring) => {
+                assert_eq!(scoring.applied_profile, frozen);
+            }
+            other => bail!("expected scored objective evidence, got {other:?}"),
+        }
+        reset_live_switch_cost_session();
         Ok(())
     }
 }

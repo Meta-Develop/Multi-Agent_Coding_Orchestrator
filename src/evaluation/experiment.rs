@@ -983,6 +983,8 @@ fn experiment_plan(manifest: &ExperimentManifest, profile: &EvaluationProfile) -
             phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
@@ -990,6 +992,8 @@ fn experiment_plan(manifest: &ExperimentManifest, profile: &EvaluationProfile) -
             worker_assignments: vec![WorkerAssignment {
                 id: "worker-a".to_string(),
                 role: AgentRole::Worker,
+                role_category: None,
+                selection_source: None,
                 assigned_paths: vec![PathBuf::from("README.md")],
                 semantic_symbols: Vec::new(),
                 semantic_modules: Vec::new(),

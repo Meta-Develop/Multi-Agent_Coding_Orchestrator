@@ -439,6 +439,8 @@ pub(super) fn generated_licensed_follow_up_tasks(
                 phase: AssignmentPhase::Execution,
                 runtime: None,
                 role: AgentRole::ChildOrchestrator,
+                role_category: None,
+                selection_source: None,
                 assigned_paths: failure.paths.clone(),
                 semantic_symbols: failure.interfaces.clone(),
                 semantic_modules: Vec::new(),
