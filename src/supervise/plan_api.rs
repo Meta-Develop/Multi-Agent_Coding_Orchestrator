@@ -1129,36 +1129,7 @@ fn assignments_from_plan_value(value: &Value) -> Result<Vec<OrchestratorAssignme
 }
 
 fn bind_assignment_role_categories(plan: &mut SupervisorPlan) {
-    for assignment in &mut plan.assignments {
-        bind_one_assignment_role_category(assignment);
-        for worker in &mut assignment.worker_assignments {
-            bind_one_worker_role_category(worker);
-        }
-    }
-}
-
-fn bind_one_assignment_role_category(assignment: &mut OrchestratorAssignment) {
-    let derived = assignment.role.authority_category();
-    let requested = assignment.role_category.unwrap_or(derived);
-    let operator_override = assignment.selection_source
-        == Some(AssignmentSelectionSource::OperatorOverride)
-        || requested != derived;
-    assignment.role_category = Some(requested);
-    if operator_override {
-        assignment.selection_source = Some(AssignmentSelectionSource::OperatorOverride);
-    }
-}
-
-fn bind_one_worker_role_category(worker: &mut WorkerAssignment) {
-    let derived = worker.role.authority_category();
-    let requested = worker.role_category.unwrap_or(derived);
-    let operator_override = worker.selection_source
-        == Some(AssignmentSelectionSource::OperatorOverride)
-        || requested != derived;
-    worker.role_category = Some(requested);
-    if operator_override {
-        worker.selection_source = Some(AssignmentSelectionSource::OperatorOverride);
-    }
+    plan.bind_assignment_role_categories();
 }
 
 fn flatten_assignments_from_value(

@@ -1839,6 +1839,21 @@ impl OrchestratorAssignment {
         self.category_is_operator_override()
             .then_some(self.effective_role_category())
     }
+
+    fn bind_role_category(&mut self) {
+        let derived = self.role.authority_category();
+        let requested = self.role_category.unwrap_or(derived);
+        let operator_override = self.selection_source
+            == Some(AssignmentSelectionSource::OperatorOverride)
+            || requested != derived;
+        self.role_category = Some(requested);
+        if operator_override {
+            self.selection_source = Some(AssignmentSelectionSource::OperatorOverride);
+        }
+        for worker in &mut self.worker_assignments {
+            worker.bind_role_category();
+        }
+    }
 }
 
 /// Immutable plan authority for one intentionally breaking assignment.
@@ -1941,8 +1956,14 @@ pub struct GeneratedFollowUpSupervisorPlan {
 }
 
 impl GeneratedFollowUpSupervisorPlan {
-    fn ordinary_plan(&self) -> SupervisorPlan {
-        SupervisorPlan {
+    fn bind_assignment_role_categories(&mut self) {
+        for assignment in &mut self.assignments {
+            assignment.bind_role_category();
+        }
+    }
+
+    pub(crate) fn ordinary_plan(&self) -> SupervisorPlan {
+        let mut plan = SupervisorPlan {
             version: self.version,
             task: self.task.clone(),
             task_file: self.task_file.clone(),
@@ -1957,7 +1978,12 @@ impl GeneratedFollowUpSupervisorPlan {
             review_lenses: self.review_lenses.clone(),
             review_aggregation_policy: self.review_aggregation_policy,
             assignments: self.assignments.clone(),
-        }
+        };
+        // Materialize the same derived role-category authority the ordinary
+        // full-document loader stamps. Implicit `None` means "derive from
+        // role"; that is not an authority change.
+        plan.bind_assignment_role_categories();
+        plan
     }
 
     fn assignment(&self) -> Result<&OrchestratorAssignment> {
@@ -2085,6 +2111,18 @@ impl WorkerAssignment {
     pub fn category_override(&self) -> Option<RoleCategory> {
         self.category_is_operator_override()
             .then_some(self.effective_role_category())
+    }
+
+    fn bind_role_category(&mut self) {
+        let derived = self.role.authority_category();
+        let requested = self.role_category.unwrap_or(derived);
+        let operator_override = self.selection_source
+            == Some(AssignmentSelectionSource::OperatorOverride)
+            || requested != derived;
+        self.role_category = Some(requested);
+        if operator_override {
+            self.selection_source = Some(AssignmentSelectionSource::OperatorOverride);
+        }
     }
 }
 
@@ -3651,6 +3689,12 @@ struct ReviewLensAuditorPromptContext<'a> {
 }
 
 impl SupervisorPlan {
+    fn bind_assignment_role_categories(&mut self) {
+        for assignment in &mut self.assignments {
+            assignment.bind_role_category();
+        }
+    }
+
     pub fn effective_role_economics_profile(&self) -> RoleEconomicsProfile {
         let mut role_models = provisional_default_role_models();
         for (role, selection) in &self.role_models {
