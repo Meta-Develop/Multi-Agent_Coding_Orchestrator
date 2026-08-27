@@ -95,16 +95,54 @@ pub(super) fn execute_judged_role_transition(
             evidence,
         );
     }
-    if promoting && !is_review_auditor_role(verdict.judge_role) {
+    if !is_review_auditor_role(verdict.judge_role) {
         return finish_transition(
             agent_id,
             from,
             to,
             requester_agent_id,
             &verdict.judge_agent_id,
-            RoleTransitionKind::Promotion,
+            if promoting {
+                RoleTransitionKind::Promotion
+            } else {
+                RoleTransitionKind::Demotion
+            },
             false,
             "judge_not_auditor",
+            evidence,
+        );
+    }
+    if verdict.judge_agent_id == parent_agent_id || verdict.judge_agent_id == requester_agent_id {
+        return finish_transition(
+            agent_id,
+            from,
+            to,
+            requester_agent_id,
+            &verdict.judge_agent_id,
+            if promoting {
+                RoleTransitionKind::Promotion
+            } else {
+                RoleTransitionKind::Demotion
+            },
+            false,
+            "judge_not_third_party",
+            evidence,
+        );
+    }
+    if verdict.judge_capability < ModelCapabilityClass::CriticalJudgment {
+        return finish_transition(
+            agent_id,
+            from,
+            to,
+            requester_agent_id,
+            &verdict.judge_agent_id,
+            if promoting {
+                RoleTransitionKind::Promotion
+            } else {
+                RoleTransitionKind::Demotion
+            },
+            false,
+            "weak_model_judge",
             evidence,
         );
     }
@@ -581,6 +619,30 @@ mod tests {
             &parent,
         )?;
         assert!(!executed.granted);
+        assert_eq!(executed.record.reason, "judge_not_auditor");
+        Ok(())
+    }
+
+    #[test]
+    fn parent_coordinator_cannot_grant_demotion_without_third_party_auditor() -> Result<()> {
+        let parent = RoleTransitionJudgeVerdict {
+            judge_agent_id: "run-1".into(),
+            judge_role: AgentRole::Supervisor,
+            judge_capability: ModelCapabilityClass::CriticalJudgment,
+            accepted: false,
+            uncertain: false,
+        };
+        let executed = execute_judged_role_transition(
+            "child-a",
+            RoleCategory::DelegatingCoordinator,
+            RoleCategory::NonDelegatingTerminalWorker,
+            "run-1",
+            "run-1",
+            model_capability_or_weak(Some("gpt-5.6-sol")),
+            &parent,
+        )?;
+        assert!(!executed.granted);
+        assert!(!executed.delegation_stripped);
         assert_eq!(executed.record.reason, "judge_not_auditor");
         Ok(())
     }

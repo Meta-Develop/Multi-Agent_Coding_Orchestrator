@@ -14,8 +14,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use thiserror::Error;
 
+mod issue26;
 #[cfg(test)]
 mod tests;
+
+pub use issue26::{
+    execute_v2_local_fake, validate_v2_execution_results, EvalHarnessV2ExecutionError,
+    EvalHarnessV2ExecutionResults, V2ComparabilityStatus,
+};
 
 pub const EVAL_HARNESS_MANIFEST_VERSION: u32 = 1;
 pub const EVAL_HARNESS_RESULT_VERSION: u32 = 1;
