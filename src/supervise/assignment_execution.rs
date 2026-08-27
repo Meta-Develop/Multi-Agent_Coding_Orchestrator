@@ -317,10 +317,12 @@ fn admit_assignment_role_category(
     resolution: &RoleModelResolution,
 ) -> Result<()> {
     let category = assignment.effective_role_category();
-    let model = resolution.selection.model.as_deref();
-    match (launch_runtime, resolution.observation) {
-        (SupervisorRuntime::Fake, ModelResolutionObservation::LocalDeterministicFake) => Ok(()),
-        _ => admit_role_category(category, model),
+    match launch_runtime {
+        // The fake runtime never executes a provider model. Catalog observation
+        // may be `runtime_default` on the CLI path; still skip capability
+        // admission so simulation-only runs can store and exercise categories.
+        SupervisorRuntime::Fake => Ok(()),
+        _ => admit_role_category(category, resolution.selection.model.as_deref()),
     }
     .with_context(|| {
         format!(
