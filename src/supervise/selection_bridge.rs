@@ -6,11 +6,13 @@
 
 use super::*;
 use crate::objective_profile::ResolvedObjectiveProfile;
+use crate::optimizer::switch_cost::{SwitchCostModel, TransitionClass};
 use crate::selection::{
     self, AuthorityRole, Boundedness, BudgetSignal, CandidateCapabilities, CandidateKey,
-    CatalogModel, ContextSize, DebugOverride, DecisionStatus, DynamicSignals, ObjectiveProfileRef,
-    OperatorConstraints, ReasoningEffort as SelectorEffort, RiskLevel, RuntimeCatalog,
-    RuntimePoolState, SelectionInput, SelectionProvenance, TaskHorizon, TaskProfile,
+    CandidateSwitchCostEvidence, CatalogModel, ContextSize, DebugOverride, DecisionStatus,
+    DynamicSignals, ObjectiveProfileRef, OperatorConstraints, ReasoningEffort as SelectorEffort,
+    RiskLevel, RuntimeCatalog, RuntimePoolState, SelectionInput, SelectionProvenance, TaskHorizon,
+    TaskProfile,
 };
 use std::path::Path;
 
@@ -554,7 +556,7 @@ pub(super) fn initialize_supervisor_selection_with_quota(
             },
             debug_override,
         })?;
-        let decision = selection::select(&input).map_err(|error| {
+        let decision = select_with_live_switch_cost(&input).map_err(|error| {
             anyhow!(
                 "automatic selector rejected role '{}': {error}",
                 role.as_str()
@@ -898,7 +900,7 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
             )?;
         }
 
-        let decision = selection::select(&input).map_err(|error| {
+        let decision = select_with_live_switch_cost(&input).map_err(|error| {
             anyhow!(
                 "automatic selector replay rejected role '{}': {error}",
                 role.as_str()
@@ -1071,6 +1073,48 @@ struct SelectionInputForRoleArgs<'a> {
     quota_ledger: Option<&'a RunBudgetLedger>,
     signals: DynamicSignals,
     debug_override: Option<DebugOverride>,
+}
+
+fn live_switch_cost_evidence(input: &SelectionInput) -> Vec<CandidateSwitchCostEvidence> {
+    let model = SwitchCostModel::new();
+    let previous = input.signals.previous_choice.as_ref();
+    let mut evidence = Vec::new();
+    for catalog in &input.catalogs {
+        for listed in &catalog.models {
+            for effort in &listed.supported_efforts {
+                let class = match previous {
+                    Some(prev)
+                        if prev.runtime == catalog.runtime
+                            && prev.model == listed.model
+                            && prev.effort == *effort =>
+                    {
+                        TransitionClass::Continue
+                    }
+                    Some(prev) if prev.runtime == catalog.runtime => {
+                        TransitionClass::ModelChangeSameRuntime
+                    }
+                    Some(_) => TransitionClass::RuntimeAdapterChange,
+                    None => TransitionClass::Continue,
+                };
+                evidence.push(CandidateSwitchCostEvidence {
+                    candidate: CandidateKey {
+                        runtime: catalog.runtime.clone(),
+                        model: listed.model.clone(),
+                        effort: *effort,
+                    },
+                    estimate: model.estimate(class),
+                });
+            }
+        }
+    }
+    evidence
+}
+
+fn select_with_live_switch_cost(
+    input: &SelectionInput,
+) -> Result<SelectionProvenance, selection::SelectionError> {
+    let evidence = live_switch_cost_evidence(input);
+    selection::select_with_switch_cost_estimates(input, &evidence)
 }
 
 fn selection_input_for_role(args: SelectionInputForRoleArgs<'_>) -> Result<SelectionInput> {

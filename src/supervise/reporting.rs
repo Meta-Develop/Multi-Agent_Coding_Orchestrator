@@ -1802,8 +1802,10 @@ pub(super) fn role_usage_report(
         let sample_cost_usd = sample
             .model
             .as_ref()
-            .and_then(|model| plan.model_pricing.get(model))
-            .map(|pricing| pricing.cost_usd(sample.usage))
+            .and_then(|model| {
+                crate::llm::provider::resolve_model_pricing(&plan.model_pricing, model)
+                    .map(|resolved| resolved.pricing.cost_usd(sample.usage))
+            })
             .filter(|cost| cost.is_finite());
         if let Some(lens_id) = sample.lens_id.as_deref() {
             if sample.role != AgentRole::Auditor {

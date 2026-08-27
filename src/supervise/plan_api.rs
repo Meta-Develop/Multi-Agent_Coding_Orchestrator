@@ -328,7 +328,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         spec_fragment_ids_by_assignment,
         assignment_schedule,
         coverage_gaps: Vec::new(),
-        run_budget: SupervisorBudgetConfig::default(),
+        run_budget: conservative_generated_role_budget(),
         run_budget_max_duration_seconds: None,
         admission: SupervisorAdmissionConfig::default(),
         evidence_only_reaudit: None,
@@ -342,6 +342,32 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         assignment_metadata,
         plan_metadata,
     })
+}
+
+const CONSERVATIVE_GENERATED_ROLE_RESERVATION_TOKENS: usize = 1_024;
+
+fn conservative_generated_role_budget() -> SupervisorBudgetConfig {
+    SupervisorBudgetConfig {
+        limits: RunBudgetLimits::default(),
+        role_token_reservations: BTreeMap::from([
+            (
+                AgentRole::ChildOrchestrator,
+                CONSERVATIVE_GENERATED_ROLE_RESERVATION_TOKENS,
+            ),
+            (
+                AgentRole::Worker,
+                CONSERVATIVE_GENERATED_ROLE_RESERVATION_TOKENS,
+            ),
+            (
+                AgentRole::Auditor,
+                CONSERVATIVE_GENERATED_ROLE_RESERVATION_TOKENS,
+            ),
+            (
+                AgentRole::GateClassifier,
+                CONSERVATIVE_GENERATED_ROLE_RESERVATION_TOKENS,
+            ),
+        ]),
+    }
 }
 
 fn supervisor_plan_and_consultant_from_provider_session(
@@ -403,7 +429,7 @@ fn supervisor_plan_and_consultant_from_provider_session(
         spec_fragment_ids_by_assignment,
         assignment_schedule,
         coverage_gaps: Vec::new(),
-        run_budget: SupervisorBudgetConfig::default(),
+        run_budget: conservative_generated_role_budget(),
         run_budget_max_duration_seconds: None,
         admission: SupervisorAdmissionConfig::default(),
         evidence_only_reaudit: None,
@@ -3230,6 +3256,18 @@ mod diagnostics_emission_tests {
         assert_eq!(round_trip["path_proposal"], document["path_proposal"]);
         assert_eq!(round_trip["path_proposal"]["degraded"], false);
         assert_eq!(round_trip["assignments"], document["assignments"]);
+        assert_eq!(
+            document["run_budget"]["role_token_reservations"]["child_orchestrator"],
+            CONSERVATIVE_GENERATED_ROLE_RESERVATION_TOKENS
+        );
+        assert_eq!(
+            document["run_budget"]["role_token_reservations"]["worker"],
+            CONSERVATIVE_GENERATED_ROLE_RESERVATION_TOKENS
+        );
+        assert_eq!(
+            document["run_budget"]["role_token_reservations"]["auditor"],
+            CONSERVATIVE_GENERATED_ROLE_RESERVATION_TOKENS
+        );
     }
 
     #[test]

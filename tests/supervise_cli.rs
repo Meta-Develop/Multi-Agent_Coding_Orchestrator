@@ -820,6 +820,72 @@ fn supervise_run_from_goal_executes_the_same_validated_plan_and_preserves_primar
 }
 
 #[test]
+fn supervise_plan_then_run_with_cli_token_ceiling_completes_without_plan_edit() -> Result<()> {
+    support::require_containment!(
+        "supervise_plan_then_run_with_cli_token_ceiling_completes_without_plan_edit"
+    );
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let goal_path = temp.path().join("budget-goal.md");
+    fs::write(
+        &goal_path,
+        "Coordinate the requested repository work.\n\
+         - Update README.md.\n\
+         - Update the ok function in src/lib.rs.\n",
+    )?;
+    let plan = run_success_json(&[
+        "supervise",
+        "plan",
+        "--from-goal",
+        path_str(&goal_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert_eq!(
+        plan["run_budget"]["role_token_reservations"]["child_orchestrator"],
+        1024
+    );
+    assert_eq!(
+        plan["run_budget"]["role_token_reservations"]["worker"],
+        1024
+    );
+    assert_eq!(
+        plan["run_budget"]["role_token_reservations"]["auditor"],
+        1024
+    );
+    let plan_path = temp.path().join("generated-plan.json");
+    fs::write(&plan_path, serde_json::to_vec_pretty(&plan)?).context("write generated plan")?;
+
+    let report = run_success_json(&[
+        "supervise",
+        "run",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "goal-plan-max-tokens",
+        "--runtime",
+        "fake",
+        "--max-tokens",
+        "100000",
+        "--max-concurrent-children",
+        "1",
+        "--json",
+    ])?;
+    assert_eq!(report["success"], true);
+    assert_eq!(report["publishable"], false);
+    let executed_plan: Value = serde_json::from_slice(&fs::read(
+        repo_path.join(".maco/o2/runs/goal-plan-max-tokens/assignments/supervisor-plan.json"),
+    )?)?;
+    assert_eq!(
+        executed_plan["run_budget"]["role_token_reservations"],
+        plan["run_budget"]["role_token_reservations"]
+    );
+    Ok(())
+}
+
+#[test]
 fn supervise_plan_plain_text_without_actionable_workstreams_is_an_error() -> Result<()> {
     support::require_containment!(
         "supervise_plan_plain_text_without_actionable_workstreams_is_an_error"
