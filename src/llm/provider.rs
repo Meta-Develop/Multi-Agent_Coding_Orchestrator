@@ -309,13 +309,15 @@ pub struct ResolvedModelPricing {
 }
 
 pub fn default_model_pricing_catalog() -> ModelPricingCatalog {
-    let entries = BTreeMap::from([(
-        "fake".to_string(),
-        ModelPricing {
-            input_usd_per_million_tokens: 0.0,
-            output_usd_per_million_tokens: 0.0,
-        },
-    )]);
+    let placeholder = ModelPricing {
+        input_usd_per_million_tokens: 0.0,
+        output_usd_per_million_tokens: 0.0,
+    };
+    let entries = BTreeMap::from([
+        ("fake".to_string(), placeholder),
+        ("gpt-5.6-sol".to_string(), placeholder),
+        ("gpt-5.6-luna".to_string(), placeholder),
+    ]);
     let mut catalog = ModelPricingCatalog {
         catalog_id: DEFAULT_MODEL_PRICING_CATALOG_ID.to_string(),
         catalog_version: DEFAULT_MODEL_PRICING_CATALOG_VERSION,

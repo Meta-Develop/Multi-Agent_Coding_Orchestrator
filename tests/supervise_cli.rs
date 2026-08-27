@@ -857,24 +857,43 @@ fn supervise_plan_then_run_with_cli_token_ceiling_completes_without_plan_edit() 
     let plan_path = temp.path().join("generated-plan.json");
     fs::write(&plan_path, serde_json::to_vec_pretty(&plan)?).context("write generated plan")?;
 
-    let report = run_success_json(&[
-        "supervise",
-        "run",
-        path_str(&plan_path)?,
-        "--repo",
-        path_str(&repo_path)?,
-        "--run-id",
-        "goal-plan-max-tokens",
-        "--runtime",
-        "fake",
-        "--max-tokens",
-        "100000",
-        "--max-concurrent-children",
-        "1",
-        "--json",
-    ])?;
-    assert_eq!(report["success"], true);
+    let output = command_with_test_machine_global_binding(
+        BIN,
+        &[
+            "supervise",
+            "run",
+            path_str(&plan_path)?,
+            "--repo",
+            path_str(&repo_path)?,
+            "--run-id",
+            "goal-plan-max-tokens",
+            "--runtime",
+            "fake",
+            "--max-tokens",
+            "100000",
+            "--max-concurrent-children",
+            "1",
+            "--json",
+        ],
+    )
+    .output()
+    .context("run generated plan under CLI token ceiling")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stdout.contains("no token reservation") && !stderr.contains("no token reservation"),
+        "generated role reservations must admit dispatch under --max-tokens: stdout={stdout} stderr={stderr}"
+    );
+    let report: Value = serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("parse max-tokens run JSON: stdout={stdout} stderr={stderr}"))?;
     assert_eq!(report["publishable"], false);
+    assert!(
+        report["role_economics_profile"]["execution"]["started_assignment_count"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1,
+        "CLI token ceiling must not block the first fake-backed dispatch: {report}"
+    );
     let executed_plan: Value = serde_json::from_slice(&fs::read(
         repo_path.join(".maco/o2/runs/goal-plan-max-tokens/assignments/supervisor-plan.json"),
     )?)?;
@@ -1145,7 +1164,8 @@ fn supervise_plan_treats_nested_repositories_as_opaque_outer_inventory_boundarie
     assert!(human.status.success(), "human nested plan failed");
     let human_stdout = String::from_utf8_lossy(&human.stdout);
     assert!(
-        human_stdout.contains("degraded: false") || human_stdout.contains("degraded: Bool(false)"),
+        human_stdout.contains("\"degraded\": Bool(false)")
+            || human_stdout.contains("degraded: false"),
         "human plan must surface degraded: false: {human_stdout}"
     );
     assert!(
