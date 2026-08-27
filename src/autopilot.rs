@@ -1002,6 +1002,7 @@ fn autopilot_authority_plan(
         for lens in &effective_plan.review_lenses {
             let requested_model = Some(lens.backend.model().to_string());
             if refusal_reason.is_none()
+                && trusted_model_capability(lens.backend.model()).is_some()
                 && validate_known_judgment_role_model(
                     AgentRole::Auditor,
                     Some(lens.backend.model()),
@@ -1610,41 +1611,6 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         requested_profile,
         &effective_supervisor_plan,
     );
-    if authority_plan.refusal_reason.is_some() {
-        let denial = GateDenial::from_approval_review(
-            options.run_id.as_str(),
-            "maco-autopilot",
-            ApprovalReviewDenial::PermissionExpansion,
-            &plan.assigned_paths,
-        )?;
-        let mut authority_safety = pre_dispatch_safety;
-        authority_safety.gate_denials.insert(0, denial.clone());
-        authority_safety.refused = true;
-        write_skipped_stage_reports(&mut artifact_writer, "launch_authority_refused")?;
-        let report = final_report(FinalReportInput {
-            run_id: &options.run_id,
-            status: AutopilotRunStatus::Refused,
-            attempt_count: 0,
-            max_repair_attempts: plan.max_repair_attempts,
-            artifacts,
-            plan: plan_summary(&plan),
-            profile_binding,
-            safety: authority_safety,
-            authority_plan: Some(authority_plan),
-            validation: skipped_autopilot_validation(),
-            pr: None,
-            review: None,
-            attempts: Vec::new(),
-            supervisor: None,
-            gate_denials: vec![denial],
-            primary_worktree_untouched: false,
-            next_action: "remove the ineligible authority request or bind it to an eligible category/model before starting a new run",
-            auto_merge_requested: plan.auto_merge,
-            generated_follow_up_dispatch_performed: false,
-        });
-        finalize_autopilot_run_artifacts(artifact_writer, &report, false)?;
-        return Ok(report);
-    }
     if !profile_binding.permits_dispatch() {
         write_failed_report(
             &mut artifact_writer,
@@ -1680,6 +1646,41 @@ fn run_autopilot_with_profile_retention_and_dispatch(
             gate_denials: Vec::new(),
             primary_worktree_untouched: false,
             next_action: "correct the typed requested/effective profile mismatch; no supervisor dispatch, publication, merge, or follow-up dispatch was attempted",
+            auto_merge_requested: plan.auto_merge,
+            generated_follow_up_dispatch_performed: false,
+        });
+        finalize_autopilot_run_artifacts(artifact_writer, &report, false)?;
+        return Ok(report);
+    }
+    if authority_plan.refusal_reason.is_some() {
+        let denial = GateDenial::from_approval_review(
+            options.run_id.as_str(),
+            "maco-autopilot",
+            ApprovalReviewDenial::PermissionExpansion,
+            &plan.assigned_paths,
+        )?;
+        let mut authority_safety = pre_dispatch_safety;
+        authority_safety.gate_denials.insert(0, denial.clone());
+        authority_safety.refused = true;
+        write_skipped_stage_reports(&mut artifact_writer, "launch_authority_refused")?;
+        let report = final_report(FinalReportInput {
+            run_id: &options.run_id,
+            status: AutopilotRunStatus::Refused,
+            attempt_count: 0,
+            max_repair_attempts: plan.max_repair_attempts,
+            artifacts,
+            plan: plan_summary(&plan),
+            profile_binding,
+            safety: authority_safety,
+            authority_plan: Some(authority_plan),
+            validation: skipped_autopilot_validation(),
+            pr: None,
+            review: None,
+            attempts: Vec::new(),
+            supervisor: None,
+            gate_denials: vec![denial],
+            primary_worktree_untouched: false,
+            next_action: "remove the ineligible authority request or bind it to an eligible category/model before starting a new run",
             auto_merge_requested: plan.auto_merge,
             generated_follow_up_dispatch_performed: false,
         });
