@@ -157,6 +157,21 @@ pub fn record_bound_provider_error(error: &ProviderError) -> Result<()> {
     )
 }
 
+/// Records a typed provider error against the bound workspace ledger and
+/// returns an `anyhow` error that remains downcastable to the original type.
+///
+/// Recording failures are retained as named context around the provider error
+/// instead of replacing it, so callers can still classify the exact provider
+/// failure while reporting why the fail-closed latch could not be persisted.
+pub fn record_bound_provider_error_preserving_source(error: ProviderError) -> anyhow::Error {
+    match record_bound_provider_error(&error) {
+        Ok(()) => anyhow::Error::new(error),
+        Err(recording_error) => anyhow::Error::new(error).context(format!(
+            "failed to record provider error on bound workspace rolling budget ledger: {recording_error:#}"
+        )),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 enum BudgetLedgerEvent {
@@ -1843,6 +1858,23 @@ mod tests {
         assert!(ledger
             .active_rate_limit(DEFAULT_RATE_LIMIT_POOL, unix_now().expect("now"))
             .is_some());
+    }
+
+    #[test]
+    fn bound_provider_recording_failure_preserves_typed_source_and_named_context() {
+        let detail = "retry after 60 seconds";
+        let error = record_bound_provider_error_preserving_source(ProviderError::RateLimited(
+            detail.to_string(),
+        ));
+
+        assert_eq!(
+            error.downcast_ref::<ProviderError>(),
+            Some(&ProviderError::RateLimited(detail.to_string()))
+        );
+        let message = format!("{error:#}");
+        assert!(message
+            .contains("failed to record provider error on bound workspace rolling budget ledger"));
+        assert!(message.contains("no workspace rolling budget bound"));
     }
 
     #[test]

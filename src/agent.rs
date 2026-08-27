@@ -306,10 +306,10 @@ where
     )?;
     let request = LlmRequest::new(run.request_id.clone(), run.model.clone(), prompt)
         .with_budget(RequestBudget::default());
-    let response = run
-        .provider
-        .complete(request)
-        .with_context(|| format!("provider '{}' failed", run.provider.provider_id()))?;
+    let response = run.provider.complete(request).map_err(|error| {
+        crate::budget_ledger::record_bound_provider_error_preserving_source(error)
+            .context(format!("provider '{}' failed", run.provider.provider_id()))
+    })?;
 
     let mut patch_results = Vec::new();
     let mut command_results = Vec::new();
@@ -1181,9 +1181,69 @@ fn display_paths(paths: &[PathBuf]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::{FakeProvider, ProposedCommand, ProposedPatch, WorkProposal};
+    use crate::llm::{
+        FakeOutcome, FakeProvider, ProposedCommand, ProposedPatch, ProviderError, WorkProposal,
+    };
     use git2::{Oid, Signature};
     use tempfile::TempDir;
+
+    #[test]
+    fn provider_rate_limit_crosses_agent_boundary_and_latches_workspace_pool() -> Result<()> {
+        let temp = TempDir::new().context("tempdir")?;
+        let repo_path = create_committed_repo(temp.path())?;
+        let detail = "agent tokens per minute";
+        let rolling_guard = crate::budget_ledger::bind_rolling_budget(
+            &repo_path,
+            crate::budget_ledger::RollingBudgetQuota {
+                max_tokens: Some(10_000),
+                max_cost_usd: None,
+                window_seconds: 60,
+            },
+            "agent-rate-limit-run",
+        )?;
+        let mut provider = FakeProvider::new("fake", DEFAULT_MODEL);
+        provider.push_outcome(
+            "agent-run-rate-limit-agent",
+            FakeOutcome::Failure(ProviderError::RateLimited(detail.to_string())),
+        );
+
+        let error = run_agent_with_provider(
+            AgentRunOptions {
+                repo: repo_path.clone(),
+                agent_id: "rate-limit-agent".to_string(),
+                task: "Exercise the typed provider boundary".to_string(),
+                request_id: None,
+                model: None,
+                claimed_paths: vec![PathBuf::from("README.md")],
+                validation_commands: Vec::new(),
+                keep_claims: false,
+                worktree_reuse: AgentWorktreeReusePolicy::Clean,
+                provider_command_policy: ProviderCommandPolicy::Disabled,
+                command_timeout: DEFAULT_COMMAND_TIMEOUT,
+            },
+            &mut provider,
+        )
+        .expect_err("rate-limited provider must fail the agent run");
+        assert_eq!(
+            error.downcast_ref::<ProviderError>(),
+            Some(&ProviderError::RateLimited(detail.to_string()))
+        );
+        assert!(SyncStore::open(&repo_path)?.snapshot()?.is_empty());
+        drop(rolling_guard);
+
+        let ledger = crate::budget_ledger::WorkspaceBudgetLedger::open_or_create(&repo_path)?;
+        let latch = ledger
+            .active_rate_limit(
+                crate::budget_ledger::DEFAULT_RATE_LIMIT_POOL,
+                crate::budget_ledger::unix_now()?,
+            )
+            .context("agent provider boundary must latch the default workspace pool")?;
+        assert_eq!(latch.pool, crate::budget_ledger::DEFAULT_RATE_LIMIT_POOL);
+        assert_eq!(latch.detail, detail);
+        assert_eq!(provider.calls().len(), 1);
+
+        Ok(())
+    }
 
     #[test]
     fn fake_provider_agent_run_edits_only_agent_worktree_and_releases_claim() -> Result<()> {
