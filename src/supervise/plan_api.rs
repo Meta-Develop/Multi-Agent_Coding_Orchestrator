@@ -1,5 +1,39 @@
 use super::*;
 use crate::follow_up_queue::GeneratedFollowUpQueueEntrypoint;
+use crate::hierarchy_ledger::{observe_hierarchy, ObservedHierarchyNode};
+
+/// Planner/executor coordination-depth output. Depth is derived from the
+/// assignment graph; it is not an operator-selected input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CoordinationTopology {
+    pub derived_coordination_depth: u32,
+    pub caller_selected_coordination_depth: bool,
+    pub planned_max_depth: u8,
+}
+
+pub fn coordination_topology_from_plan(
+    plan: &SupervisorPlan,
+    schedule: &[AssignmentScheduleEntry],
+) -> CoordinationTopology {
+    let observed = observe_hierarchy(schedule.iter().filter_map(|entry| {
+        let assignment = plan
+            .assignments
+            .iter()
+            .find(|assignment| assignment.id == entry.assignment_id)?;
+        Some(ObservedHierarchyNode {
+            id: assignment.id.as_str(),
+            parent: entry.parent_assignment_id.as_deref(),
+            coordinator: assignment.effective_role_category()
+                == RoleCategory::DelegatingCoordinator,
+        })
+    }));
+    let schedule_max = schedule.iter().map(|entry| entry.depth).max().unwrap_or(0);
+    CoordinationTopology {
+        derived_coordination_depth: observed.coordination_depth,
+        caller_selected_coordination_depth: plan.max_depth != schedule_max,
+        planned_max_depth: plan.max_depth,
+    }
+}
 
 fn apply_objective_profile_override(
     loaded: &mut LoadedSupervisorPlan,
@@ -1684,6 +1718,14 @@ pub(super) fn supervisor_plan_value(
         "assignment_schedule".to_string(),
         serde_json::to_value(&plan_metadata.assignment_schedule)
             .context("failed to serialize assignment schedule")?,
+    );
+    object.insert(
+        "coordination_topology".to_string(),
+        serde_json::to_value(coordination_topology_from_plan(
+            plan,
+            &plan_metadata.assignment_schedule,
+        ))
+        .context("failed to serialize coordination topology")?,
     );
     if !plan_metadata.coverage_gaps.is_empty() {
         object.insert(
@@ -3434,6 +3476,68 @@ mod diagnostics_emission_tests {
         assert_eq!(
             assignment.selection_source,
             Some(AssignmentSelectionSource::OperatorOverride)
+        );
+    }
+
+    #[test]
+    fn plan_api_emits_non_default_coordination_depth_as_planner_output() {
+        let document = r#"{
+            "version": 1,
+            "task": "three-layer topology",
+            "max_depth": 4,
+            "max_child_assignments": 3,
+            "assignments": [{
+                "id": "layer-0",
+                "phase": "planning",
+                "role": "child_orchestrator",
+                "assigned_paths": ["README.md"],
+                "worker_assignments": [],
+                "child_assignments": [{
+                    "id": "layer-1",
+                    "phase": "execution",
+                    "role": "child_orchestrator",
+                    "assigned_paths": ["README.md"],
+                    "worker_assignments": [],
+                    "child_assignments": [{
+                        "id": "layer-2",
+                        "phase": "execution",
+                        "role": "child_orchestrator",
+                        "assigned_paths": ["src/lib.rs"],
+                        "worker_assignments": []
+                    }]
+                }]
+            }]
+        }"#;
+        let loaded = parse_supervisor_plan_with_consultant(document).expect("three-layer plan");
+        let topology = coordination_topology_from_plan(
+            &loaded.plan,
+            &loaded.plan_metadata.assignment_schedule,
+        );
+        assert_eq!(topology.derived_coordination_depth, 3);
+        assert_eq!(topology.planned_max_depth, 4);
+        assert!(
+            topology.derived_coordination_depth > 2,
+            "fixture must be a non-default coordination depth, got {topology:?}"
+        );
+
+        let emitted = supervisor_plan_value(
+            &loaded.plan,
+            &loaded.consultant,
+            &loaded.assignment_metadata,
+            &loaded.plan_metadata,
+        )
+        .expect("emit topology");
+        assert_eq!(
+            emitted["coordination_topology"]["derived_coordination_depth"],
+            3
+        );
+        assert_eq!(
+            emitted["coordination_topology"]["caller_selected_coordination_depth"],
+            topology.caller_selected_coordination_depth
+        );
+        assert_ne!(
+            emitted["coordination_topology"]["derived_coordination_depth"], emitted["max_depth"],
+            "derived depth is planner output, not a copy of operator max_depth"
         );
     }
 }

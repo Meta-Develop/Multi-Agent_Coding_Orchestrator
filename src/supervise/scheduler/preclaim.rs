@@ -1176,6 +1176,8 @@ mod tests {
             phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("tests/preclaim.rs")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
@@ -1695,6 +1697,8 @@ mod tests {
             .push(WorkerAssignment {
                 id: "worker-a".to_string(),
                 role: AgentRole::Worker,
+                role_category: None,
+                selection_source: None,
                 assigned_paths: candidate.assigned_paths.clone(),
                 semantic_symbols: Vec::new(),
                 semantic_modules: Vec::new(),

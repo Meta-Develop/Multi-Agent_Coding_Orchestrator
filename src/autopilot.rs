@@ -1021,6 +1021,9 @@ fn autopilot_authority_plan(
         }
     }
 
+    // Planner output uses the same observe_hierarchy layer count via
+    // `supervise::coordination_topology_from_plan`; this executor record is the
+    // launched-graph counterpart of that topology.
     let observed = observe_hierarchy(assignments.iter().map(|assignment| ObservedHierarchyNode {
         id: assignment.id.as_str(),
         parent: assignment.parent_id.as_deref(),
