@@ -30,23 +30,27 @@ fn eval_harness_run_v2_emits_machine_readable_local_fake_json() -> Result<()> {
         let results: Value =
             serde_json::from_slice(&output.stdout).context("parse eval harness v2 JSON")?;
         assert_eq!(results["version"], 2);
-        assert_eq!(results["schema"], "eval_harness_result_v2");
+        assert_eq!(results["schema"], "eval_harness_comparable_fake_results_v2");
         assert_eq!(results["experiment_id"], "issue26-cli-operator-path-v2");
         assert_eq!(results["provider"]["kind"], "local_fake");
         assert_eq!(results["provider"]["network_providers"], false);
-        assert_eq!(results["input_binding"]["manifest_version"], 2);
-        assert_eq!(
-            results["input_binding"]["manifest_schema"],
-            "eval_harness_manifest_v2"
-        );
-        assert_eq!(results["input_binding"]["digest_algorithm"], "sha256");
-        assert!(results["input_binding"]["digest"]
+        assert_eq!(results["manifest_schema"], "eval_harness_manifest_v2");
+        assert!(results["manifest_digest"]
             .as_str()
             .is_some_and(|digest| digest.len() == 64));
         assert_eq!(
             results["objective_profile"]["profile"]["id"],
             "maco-default-objective-v2"
         );
+        assert_eq!(results["production_eligible"], false);
+        assert_eq!(results["comparability"]["status"], "comparable");
+        assert_eq!(results["comparability"]["replay_verified"], true);
+        assert!(results["pareto_frontier"]
+            .as_array()
+            .is_some_and(|frontier| !frontier.is_empty()));
+        assert!(results["objective_selection"]["selected_profile_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()));
     }
 
     assert_eq!(

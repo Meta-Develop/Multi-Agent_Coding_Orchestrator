@@ -1,0 +1,56 @@
+{
+  "version": 2,
+  "schema": "eval_harness_comparable_fake_results_v2",
+  "experiment_id": "issue26-cli-operator-path-v2",
+  "manifest_schema": "eval_harness_manifest_v2",
+  "manifest_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "fixture": {
+    "schema": "eval_harness_fake_execution_fixture_v1",
+    "version": 1,
+    "id": "issue26-local-fake-lifecycle-v1",
+    "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "provider": {
+    "kind": "local_fake",
+    "network_providers": false
+  },
+  "objective_profile": {
+    "profile": {
+      "id": "maco-default-objective-v2",
+      "version": 2,
+      "content_hash": "82e6de7f5e27768fdad19b5dfa70d70ed1fb9d041262678e3174d5373330b4f9"
+    },
+    "source": "built_in"
+  },
+  "objective_citation": {
+    "id": "maco-default-objective-v2",
+    "version": 2,
+    "content_hash": "82e6de7f5e27768fdad19b5dfa70d70ed1fb9d041262678e3174d5373330b4f9",
+    "source": "built_in"
+  },
+  "runs": [
+    { "profile_id": "economy-mix" }
+  ],
+  "profile_summaries": [
+    { "profile_id": "economy-mix" }
+  ],
+  "pareto_frontier": ["economy-mix"],
+  "objective_selection": {
+    "profile_id": "maco-default-objective-v2",
+    "profile_hash": "82e6de7f5e27768fdad19b5dfa70d70ed1fb9d041262678e3174d5373330b4f9",
+    "selected_profile_id": "economy-mix",
+    "selected_score": 0.5,
+    "runner_up_profile_id": null,
+    "runner_up_score": null,
+    "scores": { "economy-mix": 0.5 }
+  },
+  "comparability": {
+    "status": "comparable",
+    "equivalent_initial_state_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "expected_run_count": 1,
+    "validated_run_count": 1,
+    "replay_verified": true
+  },
+  "production_eligible": false,
+  "production_default_claim": "ineligible_to_justify_production_default"
+}

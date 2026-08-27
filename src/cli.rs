@@ -811,39 +811,11 @@ impl SuperviseCommand {
     }
 }
 
-/// Machine-readable failure envelope for `supervise plan --json`.
-///
-/// Sibling branch `maco/c26-wiring` owns the same helper as
-/// `supervise::supervisor_plan_error_envelope`. This local equivalent keeps the
-/// JSON shape identical so the call site compiles before merge and continues to
-/// work after the helper becomes visible.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-struct SupervisorPlanErrorEnvelope {
-    success: bool,
-    status: &'static str,
-    error: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    causes: Vec<String>,
-}
-
-fn supervisor_plan_error_envelope(error: &anyhow::Error) -> SupervisorPlanErrorEnvelope {
-    SupervisorPlanErrorEnvelope {
-        success: false,
-        status: "error",
-        error: error.to_string(),
-        causes: error
-            .chain()
-            .skip(1)
-            .map(|cause| cause.to_string())
-            .collect(),
-    }
-}
-
 fn emit_supervisor_plan_error(error: anyhow::Error, json: bool) -> Result<()> {
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&supervisor_plan_error_envelope(&error))?
+            serde_json::to_string_pretty(&supervise::supervisor_plan_error_envelope(&error))?
         );
     }
     Err(error)
@@ -4288,17 +4260,12 @@ fn run_eval_harness_v2_command(path: &Path, manifest_bytes: &[u8], json: bool) -
     print_query_report(&results, json)
 }
 
-/// Route the #26 v2 operator path.
-///
-/// Sibling `maco/c26-triagedone` publishes `eval_harness::execute_v2_local_fake`
-/// from forbidden `src/eval_harness/issue26.rs`. That symbol is not on this
-/// branch. The visible public v2 surface is `parse_manifest_v2` plus
-/// `bind_v2_experiment`. After merge, replace the body with:
-/// `serde_json::to_value(crate::eval_harness::execute_v2_local_fake(manifest)?)`.
+/// Route the #26 v2 operator path through the comparable local-fake executor.
 fn execute_eval_harness_v2_operator_path(
     manifest: &crate::eval_harness::EvalHarnessManifestV2,
 ) -> Result<Value> {
-    let results = crate::eval_harness::bind_v2_experiment(manifest).map_err(anyhow::Error::from)?;
+    let results =
+        crate::eval_harness::execute_v2_local_fake(manifest).map_err(anyhow::Error::from)?;
     serde_json::to_value(results).context("failed to serialize eval-harness v2 result")
 }
 
@@ -4435,7 +4402,7 @@ mod cli_integration_tests {
     fn supervisor_plan_error_envelope_keeps_error_chain() {
         let error = anyhow::anyhow!("bounded-status rejects Git object alternates")
             .context("repository inventory failed");
-        let envelope = supervisor_plan_error_envelope(&error);
+        let envelope = supervise::supervisor_plan_error_envelope(&error);
         assert!(!envelope.success);
         assert_eq!(envelope.status, "error");
         assert!(envelope.error.contains("repository inventory failed"));

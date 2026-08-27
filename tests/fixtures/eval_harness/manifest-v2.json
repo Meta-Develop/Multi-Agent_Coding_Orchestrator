@@ -32,14 +32,18 @@
       "id": "economy-mix",
       "mix": [
         { "role": "planner", "model": "fake-economy" },
-        { "role": "worker", "model": "fake-economy" }
+        { "role": "worker", "model": "fake-economy" },
+        { "role": "supervisor", "model": "fake-economy" },
+        { "role": "auditor", "model": "fake-economy" }
       ]
     },
     {
       "id": "quality-mix",
       "mix": [
         { "role": "planner", "model": "fake-quality" },
-        { "role": "worker", "model": "fake-quality" }
+        { "role": "worker", "model": "fake-quality" },
+        { "role": "supervisor", "model": "fake-quality" },
+        { "role": "auditor", "model": "fake-quality" }
       ]
     }
   ],
