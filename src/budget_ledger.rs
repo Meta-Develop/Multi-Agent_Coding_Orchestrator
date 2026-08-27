@@ -179,8 +179,12 @@ enum BudgetLedgerEvent {
         version: u32,
         reservation_id: String,
         tokens: usize,
+        #[serde(default)]
+        requests: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cost_usd: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pool: Option<PoolKey>,
         unix_seconds: u64,
     },
     ReservationReconciled {
@@ -309,7 +313,9 @@ pub struct PoolConsumptionUsage {
 pub struct DurableBudgetReservation {
     pub reservation_id: String,
     pub tokens: usize,
+    pub requests: u64,
     pub cost_usd: Option<f64>,
+    pub pool: Option<PoolKey>,
     pub unix_seconds: u64,
 }
 
@@ -385,7 +391,9 @@ impl WorkspaceBudgetLedger {
             version: LEDGER_FORMAT_VERSION,
             reservation_id: reservation.reservation_id,
             tokens: reservation.tokens,
+            requests: reservation.requests,
             cost_usd: reservation.cost_usd,
+            pool: reservation.pool,
             unix_seconds: reservation.unix_seconds,
         })?;
         Ok(DurableReservationRecordOutcome::Recorded)
@@ -469,9 +477,9 @@ impl WorkspaceBudgetLedger {
                 DurableBudgetReconciliation {
                     reservation_id: reservation.reservation_id,
                     tokens: reservation.tokens,
-                    requests: 0,
+                    requests: reservation.requests,
                     cost_usd: reservation.cost_usd,
-                    pool: None,
+                    pool: reservation.pool,
                     unix_seconds: recovered_at.max(reservation.unix_seconds),
                 },
                 true,
@@ -485,13 +493,17 @@ impl WorkspaceBudgetLedger {
             BudgetLedgerEvent::Reservation {
                 reservation_id: event_id,
                 tokens,
+                requests,
                 cost_usd,
+                pool,
                 unix_seconds,
                 ..
             } if event_id == reservation_id => Some(DurableBudgetReservation {
                 reservation_id: event_id.clone(),
                 tokens: *tokens,
+                requests: *requests,
                 cost_usd: *cost_usd,
+                pool: pool.clone(),
                 unix_seconds: *unix_seconds,
             }),
             _ => None,
@@ -519,7 +531,9 @@ impl WorkspaceBudgetLedger {
                 BudgetLedgerEvent::Reservation {
                     reservation_id,
                     tokens,
+                    requests,
                     cost_usd,
+                    pool,
                     unix_seconds,
                     ..
                 } => {
@@ -528,7 +542,9 @@ impl WorkspaceBudgetLedger {
                         DurableBudgetReservation {
                             reservation_id: reservation_id.clone(),
                             tokens: *tokens,
+                            requests: *requests,
                             cost_usd: *cost_usd,
+                            pool: pool.clone(),
                             unix_seconds: *unix_seconds,
                         },
                     );
@@ -978,7 +994,9 @@ fn replay_events(records: &[JournalRecord]) -> Result<Vec<BudgetLedgerEvent>> {
                 version,
                 reservation_id,
                 tokens,
+                requests,
                 cost_usd,
+                pool,
                 unix_seconds,
             } => {
                 if *version != LEDGER_FORMAT_VERSION {
@@ -987,7 +1005,9 @@ fn replay_events(records: &[JournalRecord]) -> Result<Vec<BudgetLedgerEvent>> {
                 let reservation = DurableBudgetReservation {
                     reservation_id: reservation_id.clone(),
                     tokens: *tokens,
+                    requests: *requests,
                     cost_usd: *cost_usd,
+                    pool: pool.clone(),
                     unix_seconds: *unix_seconds,
                 };
                 validate_durable_reservation(&reservation)?;
@@ -1035,8 +1055,8 @@ fn replay_events(records: &[JournalRecord]) -> Result<Vec<BudgetLedgerEvent>> {
                     );
                 }
                 if *recovered_after_process_death
-                    && (pool.is_some()
-                        || *requests != 0
+                    && (*pool != reservation.pool
+                        || *requests != reservation.requests
                         || *tokens != reservation.tokens
                         || *cost_usd != reservation.cost_usd)
                 {
@@ -1176,6 +1196,20 @@ fn validate_durable_reservation(reservation: &DurableBudgetReservation) -> Resul
         .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
     {
         bail!("workspace budget reservation cost must be finite and non-negative");
+    }
+    match &reservation.pool {
+        Some(pool) => {
+            pool.validate().map_err(|error| {
+                anyhow::anyhow!("workspace budget reservation pool is invalid: {error}")
+            })?;
+            if reservation.requests == 0 {
+                bail!("workspace budget pool reservation must record a request");
+            }
+        }
+        None if reservation.requests != 0 => {
+            bail!("workspace budget aggregate reservation cannot record pool requests");
+        }
+        None => {}
     }
     Ok(())
 }
@@ -1401,7 +1435,25 @@ mod tests {
         DurableBudgetReservation {
             reservation_id: id.to_string(),
             tokens,
+            requests: 0,
             cost_usd: Some(tokens as f64 / 100.0),
+            pool: None,
+            unix_seconds: now,
+        }
+    }
+
+    fn reservation_for_pool(
+        id: &str,
+        tokens: usize,
+        pool: PoolKey,
+        now: u64,
+    ) -> DurableBudgetReservation {
+        DurableBudgetReservation {
+            reservation_id: id.to_string(),
+            tokens,
+            requests: 1,
+            cost_usd: Some(tokens as f64 / 100.0),
+            pool: Some(pool),
             unix_seconds: now,
         }
     }
@@ -1552,6 +1604,36 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_reservation_recovers_recorded_pool_and_request_attribution() {
+        let (_temp, repo) = repository();
+        let reservation_id = "run-crashed/session-a/reservation/pool";
+        let key = pool("codex", ResetWindow::None);
+        {
+            let mut ledger = WorkspaceBudgetLedger::open_or_create(&repo).expect("create");
+            ledger
+                .record_reservation(reservation_for_pool(reservation_id, 40, key.clone(), 1))
+                .expect("reserve before crash with pool attribution");
+        }
+
+        let reopened = WorkspaceBudgetLedger::open_or_create(&repo).expect("recover");
+        assert!(matches!(
+            reopened.events.last(),
+            Some(BudgetLedgerEvent::ReservationReconciled {
+                reservation_id: recovered_id,
+                tokens: 40,
+                requests: 1,
+                pool: Some(recovered_pool),
+                recovered_after_process_death: true,
+                ..
+            }) if recovered_id == reservation_id && recovered_pool == &key
+        ));
+        let recovered_at = unix_now().expect("current timestamp");
+        let pool_usage = reopened.pool_usage(&key, recovered_at).expect("pool usage");
+        assert_eq!(pool_usage.tokens, 40);
+        assert_eq!(pool_usage.requests, 1);
+    }
+
+    #[test]
     fn replay_rejects_duplicate_unknown_and_conflicting_reservation_events() {
         let (_duplicate_temp, duplicate_repo) = repository();
         {
@@ -1560,7 +1642,9 @@ mod tests {
                 version: LEDGER_FORMAT_VERSION,
                 reservation_id: "duplicate/reservation/1".to_string(),
                 tokens: 10,
+                requests: 0,
                 cost_usd: None,
+                pool: None,
                 unix_seconds: 100,
             };
             journal
@@ -1604,7 +1688,9 @@ mod tests {
                 version: LEDGER_FORMAT_VERSION,
                 reservation_id: "terminal/reservation/1".to_string(),
                 tokens: 10,
+                requests: 0,
                 cost_usd: None,
+                pool: None,
                 unix_seconds: 100,
             };
             let first = BudgetLedgerEvent::ReservationReconciled {
