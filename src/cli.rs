@@ -74,7 +74,7 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::BTreeSet,
@@ -951,11 +951,24 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
             });
             let json = args.json;
             let objective_profile_override = args.objective_profile.clone();
+            let role_category_override = args.role_category_override.role_category;
             if resume_existing && objective_profile_override.is_some() {
                 bail!(
                     "--objective-profile cannot change an existing supervise run; resume uses its frozen objective profile"
                 );
             }
+            if resume_existing && role_category_override.is_some() {
+                bail!(
+                    "--role-category cannot change an existing supervise run; resume uses its frozen role categories"
+                );
+            }
+            let (plan_file, goal_spec) = materialize_launch_plan_for_operator_role_category(
+                plan_file,
+                goal_spec,
+                &resolved_repo,
+                resolved_run_id.as_str(),
+                role_category_override,
+            )?;
             let reap_repo = resolved_repo.clone();
             let _rolling_guard = rolling_quota
                 .map(|quota| {
@@ -1230,6 +1243,174 @@ impl RunBudgetArgs {
     }
 }
 
+/// Recorded operator role-category override. Automatic selection stays the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperatorRoleCategory {
+    DelegatingCoordinator,
+    NonDelegatingTerminalWorker,
+    ReadOnlyResearcher,
+    ReadOnlyReviewAuditor,
+}
+
+impl OperatorRoleCategory {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::DelegatingCoordinator => "delegating_coordinator",
+            Self::NonDelegatingTerminalWorker => "non_delegating_terminal_worker",
+            Self::ReadOnlyResearcher => "read_only_researcher",
+            Self::ReadOnlyReviewAuditor => "read_only_review_auditor",
+        }
+    }
+}
+
+fn parse_operator_role_category(value: &str) -> std::result::Result<OperatorRoleCategory, String> {
+    match value {
+        "delegating_coordinator" | "delegating-coordinator" => {
+            Ok(OperatorRoleCategory::DelegatingCoordinator)
+        }
+        "non_delegating_terminal_worker" | "non-delegating-terminal-worker" => {
+            Ok(OperatorRoleCategory::NonDelegatingTerminalWorker)
+        }
+        "read_only_researcher" | "read-only-researcher" => {
+            Ok(OperatorRoleCategory::ReadOnlyResearcher)
+        }
+        "read_only_review_auditor" | "read-only-review-auditor" => {
+            Ok(OperatorRoleCategory::ReadOnlyReviewAuditor)
+        }
+        other => Err(format!(
+            "unknown role category '{other}'; expected delegating_coordinator, non_delegating_terminal_worker, read_only_researcher, or read_only_review_auditor"
+        )),
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Args)]
+struct OperatorRoleCategoryArgs {
+    /// Operator role-category override recorded as `selection_source=operator_override`.
+    ///
+    /// Omitted keeps automatic selection derived from the plan role. This is the
+    /// CLI launch flag; `maco/c26-wiring` `plan_api.rs` consumes the stamped
+    /// assignment fields after merge.
+    #[arg(
+        long = "role-category",
+        value_name = "CATEGORY",
+        value_parser = parse_operator_role_category
+    )]
+    role_category: Option<OperatorRoleCategory>,
+}
+
+const OPERATOR_OVERRIDE_SELECTION_SOURCE: &str = "operator_override";
+
+fn stamp_operator_role_category_override(
+    plan: &mut Value,
+    category: OperatorRoleCategory,
+) -> Result<()> {
+    let assignments = plan
+        .get_mut("assignments")
+        .and_then(Value::as_array_mut)
+        .context("operator --role-category requires a JSON plan with an assignments array")?;
+    for assignment in assignments {
+        stamp_role_category_on_assignment(assignment, category)?;
+    }
+    Ok(())
+}
+
+fn stamp_role_category_on_assignment(
+    assignment: &mut Value,
+    category: OperatorRoleCategory,
+) -> Result<()> {
+    let object = assignment
+        .as_object_mut()
+        .context("operator --role-category assignment must be a JSON object")?;
+    object.insert(
+        "role_category".to_string(),
+        Value::String(category.as_str().to_string()),
+    );
+    object.insert(
+        "selection_source".to_string(),
+        Value::String(OPERATOR_OVERRIDE_SELECTION_SOURCE.to_string()),
+    );
+    if let Some(workers) = object
+        .get_mut("worker_assignments")
+        .and_then(Value::as_array_mut)
+    {
+        for worker in workers {
+            let worker_object = worker
+                .as_object_mut()
+                .context("operator --role-category worker assignment must be a JSON object")?;
+            worker_object.insert(
+                "role_category".to_string(),
+                Value::String(category.as_str().to_string()),
+            );
+            worker_object.insert(
+                "selection_source".to_string(),
+                Value::String(OPERATOR_OVERRIDE_SELECTION_SOURCE.to_string()),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn write_stamped_operator_role_category_plan(run_id: &str, plan: &Value) -> Result<PathBuf> {
+    let output = std::env::temp_dir().join(format!("maco-operator-role-category-{run_id}.json"));
+    std::fs::write(
+        &output,
+        serde_json::to_vec_pretty(plan)
+            .context("failed to serialize stamped operator-override plan")?,
+    )
+    .with_context(|| {
+        format!(
+            "failed to write stamped operator-override plan {}",
+            output.display()
+        )
+    })?;
+    Ok(output)
+}
+
+fn materialize_operator_role_category_plan(
+    source_plan: &Path,
+    run_id: &str,
+    category: OperatorRoleCategory,
+) -> Result<PathBuf> {
+    let bytes =
+        BoundedRegularReader::read_tree_no_follow(source_plan, MAX_SUPERVISE_GOAL_FILE_BYTES)
+            .with_context(|| {
+                format!(
+                    "failed to read supervisor plan {} for operator --role-category",
+                    source_plan.display()
+                )
+            })?;
+    let mut plan: Value = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "operator --role-category requires JSON plan {}",
+            source_plan.display()
+        )
+    })?;
+    stamp_operator_role_category_override(&mut plan, category)?;
+    write_stamped_operator_role_category_plan(run_id, &plan)
+}
+
+fn materialize_launch_plan_for_operator_role_category(
+    plan_file: PathBuf,
+    goal_spec: Option<String>,
+    repo: &Path,
+    run_id: &str,
+    category: Option<OperatorRoleCategory>,
+) -> Result<(PathBuf, Option<String>)> {
+    let Some(category) = category else {
+        return Ok((plan_file, goal_spec));
+    };
+    let stamped = match goal_spec {
+        Some(spec) => {
+            let mut plan = supervise::supervisor_plan_document_from_goal_spec(repo, "", &spec)
+                .context("failed to materialize supervisor plan for operator --role-category")?;
+            stamp_operator_role_category_override(&mut plan, category)?;
+            write_stamped_operator_role_category_plan(run_id, &plan)?
+        }
+        None => materialize_operator_role_category_plan(&plan_file, run_id, category)?,
+    };
+    Ok((stamped, None))
+}
+
 #[derive(Debug, Args)]
 struct RunSuperviseArgs {
     /// JSON supervisor plan file to run.
@@ -1305,6 +1486,8 @@ struct RunSuperviseArgs {
     host_fallback_children: Option<usize>,
     #[command(flatten)]
     budget: RunBudgetArgs,
+    #[command(flatten)]
+    role_category_override: OperatorRoleCategoryArgs,
     /// Exact reviewed config used to gate private runtime output-staging cleanup.
     #[arg(long, required = true)]
     machine_global_config: PathBuf,
@@ -2063,6 +2246,13 @@ impl AutopilotCommand {
                     args.json,
                 )?;
                 let parent_node = args.parent_node.map(Into::into);
+                let (plan_file, goal_spec) = materialize_launch_plan_for_operator_role_category(
+                    plan_file,
+                    goal_spec,
+                    &resolved.repo,
+                    resolved.run_id.as_str(),
+                    args.role_category_override.role_category,
+                )?;
                 let reap_repo = resolved.repo.clone();
                 let _rolling_guard = rolling_quota
                     .map(|quota| {
@@ -2218,6 +2408,8 @@ struct RunAutopilotArgs {
     quota_config: Option<PathBuf>,
     #[command(flatten)]
     budget: RunBudgetArgs,
+    #[command(flatten)]
+    role_category_override: OperatorRoleCategoryArgs,
     /// Exact reviewed config used to gate private runtime output-staging cleanup.
     #[arg(long, required = true)]
     machine_global_config: PathBuf,
@@ -4000,6 +4192,7 @@ impl EvalHarnessCommand {
     fn run(self) -> Result<()> {
         match self.command {
             EvalHarnessSubcommand::Run(args) => run_eval_harness_command(args),
+            EvalHarnessSubcommand::RunV2(args) => run_eval_harness_v2_from_args(args),
         }
     }
 }
@@ -4007,7 +4200,13 @@ impl EvalHarnessCommand {
 #[derive(Debug, Subcommand)]
 enum EvalHarnessSubcommand {
     /// Complete each role in a mix through the local fake provider and record outcomes.
+    ///
+    /// Version 1 manifests run the v1 local-fake path. Version 2 manifests are
+    /// routed to the #26 v2 operator path.
     Run(RunEvalHarnessArgs),
+    /// Run the #26 eval-harness v2 local-fake operator path with machine-readable output.
+    #[command(name = "run-v2")]
+    RunV2(RunEvalHarnessArgs),
 }
 
 #[derive(Debug, Args)]
@@ -4017,6 +4216,17 @@ struct RunEvalHarnessArgs {
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct EvalHarnessManifestVersionProbe {
+    version: u32,
+}
+
+fn eval_harness_manifest_version(bytes: &[u8]) -> Result<u32> {
+    let probe = serde_json::from_slice::<EvalHarnessManifestVersionProbe>(bytes)
+        .context("failed to parse eval harness manifest version")?;
+    Ok(probe.version)
 }
 
 fn run_eval_harness_command(args: RunEvalHarnessArgs) -> Result<()> {
@@ -4030,14 +4240,66 @@ fn run_eval_harness_command(args: RunEvalHarnessArgs) -> Result<()> {
             args.manifest.display()
         )
     })?;
-    let manifest = crate::eval_harness::parse_manifest(&manifest_bytes).with_context(|| {
+    match eval_harness_manifest_version(&manifest_bytes)? {
+        crate::eval_harness::EVAL_HARNESS_MANIFEST_VERSION => {
+            let manifest =
+                crate::eval_harness::parse_manifest(&manifest_bytes).with_context(|| {
+                    format!(
+                        "failed to parse eval harness manifest {}",
+                        args.manifest.display()
+                    )
+                })?;
+            let results = crate::eval_harness::run_local_fake_harness(&manifest)?;
+            print_query_report(&results, args.json)
+        }
+        crate::eval_harness::EVAL_HARNESS_MANIFEST_V2_VERSION => {
+            run_eval_harness_v2_command(&args.manifest, &manifest_bytes, args.json)
+        }
+        found => bail!(
+            "unsupported eval harness manifest version {found}; supported versions are {} and {}",
+            crate::eval_harness::EVAL_HARNESS_MANIFEST_VERSION,
+            crate::eval_harness::EVAL_HARNESS_MANIFEST_V2_VERSION
+        ),
+    }
+}
+
+fn run_eval_harness_v2_from_args(args: RunEvalHarnessArgs) -> Result<()> {
+    let manifest_bytes = BoundedRegularReader::read_tree_no_follow(
+        &args.manifest,
+        crate::eval_harness::MAX_MANIFEST_BYTES,
+    )
+    .with_context(|| {
         format!(
-            "failed to parse eval harness manifest {}",
+            "failed to read eval harness v2 manifest {}",
             args.manifest.display()
         )
     })?;
-    let results = crate::eval_harness::run_local_fake_harness(&manifest)?;
-    print_query_report(&results, args.json)
+    run_eval_harness_v2_command(&args.manifest, &manifest_bytes, args.json)
+}
+
+fn run_eval_harness_v2_command(path: &Path, manifest_bytes: &[u8], json: bool) -> Result<()> {
+    let manifest = crate::eval_harness::parse_manifest_v2(manifest_bytes).with_context(|| {
+        format!(
+            "failed to parse eval harness v2 manifest {}",
+            path.display()
+        )
+    })?;
+    let results = execute_eval_harness_v2_operator_path(&manifest)?;
+    print_query_report(&results, json)
+}
+
+/// Route the #26 v2 operator path.
+///
+/// Sibling `maco/c26-triagedone` publishes `eval_harness::execute_v2_local_fake`
+/// from forbidden `src/eval_harness/issue26.rs`. That symbol is not on this
+/// branch. The visible public v2 surface is `parse_manifest_v2` plus
+/// `bind_v2_experiment`. After merge, replace the body with:
+/// `serde_json::to_value(crate::eval_harness::execute_v2_local_fake(manifest)?)`.
+fn execute_eval_harness_v2_operator_path(
+    manifest: &crate::eval_harness::EvalHarnessManifestV2,
+) -> Result<Value> {
+    let results = crate::eval_harness::bind_v2_experiment(manifest).map_err(anyhow::Error::from)?;
+    serde_json::to_value(results).context("failed to serialize eval-harness v2 result")
 }
 
 include!("cli/part2.rs");
@@ -4241,6 +4503,215 @@ mod cli_integration_tests {
                 "missing or invalid rescore arguments must be rejected"
             );
         }
+    }
+
+    fn supervise_run_args(argv: &[&str]) -> RunSuperviseArgs {
+        let parsed = Cli::try_parse_from(argv).expect("supervise run arguments should parse");
+        let Command::Supervise(SuperviseCommand {
+            command: SuperviseSubcommand::Run(args),
+        }) = parsed.command
+        else {
+            panic!("expected supervise run command");
+        };
+        args
+    }
+
+    fn autopilot_run_args(argv: &[&str]) -> Box<RunAutopilotArgs> {
+        let parsed = Cli::try_parse_from(argv).expect("autopilot run arguments should parse");
+        let Command::Autopilot(AutopilotCommand {
+            command: AutopilotSubcommand::Run(args),
+        }) = parsed.command
+        else {
+            panic!("expected autopilot run command");
+        };
+        args
+    }
+
+    const LAUNCH_RETENTION: [&str; 4] = [
+        "--machine-global-config",
+        "/tmp/maco-machine-global.json",
+        "--machine-global-runtime-root-id",
+        "runtime",
+    ];
+
+    #[test]
+    fn supervise_and_autopilot_role_category_override_defaults_to_automatic() {
+        let supervise = supervise_run_args(&[
+            "maco",
+            "supervise",
+            "run",
+            "plan.json",
+            LAUNCH_RETENTION[0],
+            LAUNCH_RETENTION[1],
+            LAUNCH_RETENTION[2],
+            LAUNCH_RETENTION[3],
+        ]);
+        assert_eq!(supervise.role_category_override.role_category, None);
+
+        let autopilot = autopilot_run_args(&[
+            "maco",
+            "autopilot",
+            "run",
+            "plan.json",
+            LAUNCH_RETENTION[0],
+            LAUNCH_RETENTION[1],
+            LAUNCH_RETENTION[2],
+            LAUNCH_RETENTION[3],
+        ]);
+        assert_eq!(autopilot.role_category_override.role_category, None);
+    }
+
+    #[test]
+    fn supervise_and_autopilot_role_category_override_parses_operator_values() {
+        let supervise = supervise_run_args(&[
+            "maco",
+            "supervise",
+            "run",
+            "plan.json",
+            "--role-category",
+            "read_only_researcher",
+            LAUNCH_RETENTION[0],
+            LAUNCH_RETENTION[1],
+            LAUNCH_RETENTION[2],
+            LAUNCH_RETENTION[3],
+        ]);
+        assert_eq!(
+            supervise.role_category_override.role_category,
+            Some(OperatorRoleCategory::ReadOnlyResearcher)
+        );
+
+        let autopilot = autopilot_run_args(&[
+            "maco",
+            "autopilot",
+            "run",
+            "plan.json",
+            "--role-category",
+            "non-delegating-terminal-worker",
+            LAUNCH_RETENTION[0],
+            LAUNCH_RETENTION[1],
+            LAUNCH_RETENTION[2],
+            LAUNCH_RETENTION[3],
+        ]);
+        assert_eq!(
+            autopilot.role_category_override.role_category,
+            Some(OperatorRoleCategory::NonDelegatingTerminalWorker)
+        );
+    }
+
+    #[test]
+    fn supervise_and_autopilot_reject_unknown_role_category() {
+        for command in ["supervise", "autopilot"] {
+            let argv = [
+                "maco",
+                command,
+                "run",
+                "plan.json",
+                "--role-category",
+                "weak_model",
+                LAUNCH_RETENTION[0],
+                LAUNCH_RETENTION[1],
+                LAUNCH_RETENTION[2],
+                LAUNCH_RETENTION[3],
+            ];
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "{command} must reject an unknown role category"
+            );
+        }
+    }
+
+    #[test]
+    fn operator_role_category_stamp_records_operator_override_and_keeps_automatic_default() {
+        let mut plan = serde_json::json!({
+            "assignments": [
+                {
+                    "id": "child-1",
+                    "role": "child_orchestrator",
+                    "worker_assignments": [
+                        {"id": "worker-1", "role": "worker"}
+                    ]
+                }
+            ]
+        });
+        stamp_operator_role_category_override(
+            &mut plan,
+            OperatorRoleCategory::ReadOnlyReviewAuditor,
+        )
+        .expect("stamp override");
+
+        assert_eq!(
+            plan["assignments"][0]["role_category"],
+            "read_only_review_auditor"
+        );
+        assert_eq!(
+            plan["assignments"][0]["selection_source"],
+            OPERATOR_OVERRIDE_SELECTION_SOURCE
+        );
+        assert_eq!(
+            plan["assignments"][0]["worker_assignments"][0]["role_category"],
+            "read_only_review_auditor"
+        );
+        assert_eq!(
+            plan["assignments"][0]["worker_assignments"][0]["selection_source"],
+            "operator_override"
+        );
+        assert_eq!(
+            serde_json::to_value(supervise::AssignmentSelectionSource::OperatorOverride)
+                .expect("serialize selection source"),
+            "operator_override"
+        );
+        assert_eq!(
+            serde_json::to_value(supervise::AssignmentSelectionSource::Automatic)
+                .expect("serialize automatic source"),
+            "automatic"
+        );
+    }
+
+    fn eval_harness_run_args(argv: &[&str]) -> RunEvalHarnessArgs {
+        let parsed = Cli::try_parse_from(argv).expect("eval-harness arguments should parse");
+        match parsed.command {
+            Command::EvalHarness(EvalHarnessCommand {
+                command: EvalHarnessSubcommand::Run(args) | EvalHarnessSubcommand::RunV2(args),
+            }) => args,
+            _ => panic!("expected eval-harness run command"),
+        }
+    }
+
+    #[test]
+    fn eval_harness_run_v2_subcommand_parses_manifest_and_json_flag() {
+        let run = eval_harness_run_args(&[
+            "maco",
+            "eval-harness",
+            "run-v2",
+            "tests/fixtures/eval_harness/manifest-v2.json",
+            "--json",
+        ]);
+        assert_eq!(
+            run.manifest,
+            PathBuf::from("tests/fixtures/eval_harness/manifest-v2.json")
+        );
+        assert!(run.json);
+
+        let auto = eval_harness_run_args(&[
+            "maco",
+            "eval-harness",
+            "run",
+            "tests/fixtures/eval_harness/manifest-v2.json",
+        ]);
+        assert!(!auto.json);
+    }
+
+    #[test]
+    fn eval_harness_v2_version_probe_distinguishes_v1_and_v2() {
+        assert_eq!(
+            eval_harness_manifest_version(br#"{"version":1,"experiment_id":"x"}"#).expect("v1"),
+            1
+        );
+        assert_eq!(
+            eval_harness_manifest_version(br#"{"version":2,"experiment_id":"x"}"#).expect("v2"),
+            2
+        );
+        assert!(eval_harness_manifest_version(br#"{"experiment_id":"x"}"#).is_err());
     }
 }
 
