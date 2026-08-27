@@ -1035,7 +1035,7 @@ fn protected_alias_scan_skips_disjoint_read_only_roots_when_writable_files_are_s
 #[cfg(target_os = "linux")]
 #[test]
 fn protected_alias_scan_ignores_special_entries_but_preserves_writable_checks() {
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::fs::FileTypeExt;
 
     let temp = tempfile::tempdir().expect("tempdir");
     let protected_root = temp.path().join("protected");
@@ -1043,7 +1043,15 @@ fn protected_alias_scan_ignores_special_entries_but_preserves_writable_checks() 
     fs::create_dir(&protected_root).expect("protected root");
     fs::create_dir(&writable_root).expect("writable root");
     let socket_path = protected_root.join("socket");
-    let _socket = UnixListener::bind(&socket_path).expect("protected socket");
+    let _socket =
+        crate::test_support::bind_test_unix_socket(&socket_path).expect("protected socket");
+    assert!(
+        fs::symlink_metadata(&socket_path)
+            .expect("protected socket metadata")
+            .file_type()
+            .is_socket(),
+        "protected fixture entry must remain a socket"
+    );
     let protected_file = protected_root.join("policy.md");
     fs::write(&protected_file, "policy\n").expect("protected file");
     let sandbox = ResolvedSystemdSandbox {

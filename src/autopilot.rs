@@ -1212,6 +1212,11 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         crate::run_ops::register_current_supervisor_process(&repo, "autopilot", &options.run_id)
             .ok()
             .flatten();
+    let selected_supervisor_runtime = if options.codex_bin.is_some() {
+        SupervisorRuntime::Codex
+    } else {
+        SupervisorRuntime::Fake
+    };
     let source_is_goal_derived = matches!(&source, AutopilotRunSource::GoalSpec { .. });
     let LoadedAutopilotPlan {
         plan,
@@ -1245,6 +1250,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         &options.run_id,
         options.allow_dirty_primary,
         &plan.assigned_paths,
+        selected_supervisor_runtime,
     )?;
     apply_autopilot_input_shape_gate(
         &mut safety,
@@ -1319,6 +1325,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         &options.run_id,
         options.allow_dirty_primary,
         &plan.assigned_paths,
+        selected_supervisor_runtime,
     )?;
     pre_dispatch_bindings
         .verify()
@@ -1424,6 +1431,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         Some(codex_bin) => (codex_bin, SupervisorRuntime::Codex),
         None => (PathBuf::from("codex-not-executed"), SupervisorRuntime::Fake),
     };
+    debug_assert_eq!(runtime, selected_supervisor_runtime);
     let mut attempt = AutopilotAttemptSummary {
         attempt: 1,
         supervisor_run_id: supervisor_run_id.as_str().to_string(),
@@ -1473,7 +1481,12 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     let mut admitted_child_dispatches = 0_usize;
     let error_evidence_source_plan_sha256 =
         supervise::normalized_supervisor_plan_file_sha256(&supervisor_options.plan_file)?;
-    let command_primary_baseline = supervise::verified_whole_primary_snapshot_sha256(&repo)?;
+    let command_primary_baseline = match runtime {
+        SupervisorRuntime::Fake => {
+            supervise::nonpublishable_simulation_whole_primary_snapshot_sha256(&repo)?
+        }
+        _ => supervise::verified_whole_primary_snapshot_sha256(&repo)?,
+    };
     let error_evidence_source_run_id = supervisor_options.run_id.clone();
     let supervisor_result = {
         let mut follow_up_profile_gate = |effective: &SupervisorPlan| {
@@ -1565,7 +1578,12 @@ fn run_autopilot_with_profile_retention_and_dispatch(
             ),
         }
     };
-    let command_primary_final = supervise::verified_whole_primary_snapshot_sha256(&repo)?;
+    let command_primary_final = match runtime {
+        SupervisorRuntime::Fake => {
+            supervise::nonpublishable_simulation_whole_primary_snapshot_sha256(&repo)?
+        }
+        _ => supervise::verified_whole_primary_snapshot_sha256(&repo)?,
+    };
     let command_primary_worktree_untouched = command_primary_final == command_primary_baseline;
     if let Some(refusal) = follow_up_profile_refusal.take() {
         profile_binding = refusal;
@@ -1829,6 +1847,11 @@ fn run_autopilot_plan_file_disabled_legacy(
     }
     let artifacts = artifact_paths();
     let real_runtime_requested = options.codex_bin.is_some();
+    let selected_supervisor_runtime = if real_runtime_requested {
+        SupervisorRuntime::Codex
+    } else {
+        SupervisorRuntime::Fake
+    };
     let mut artifact_writer = ArtifactRunWriter::reserve(
         &repo,
         RunArtifactFamily::Autopilot,
@@ -1843,6 +1866,7 @@ fn run_autopilot_plan_file_disabled_legacy(
         &options.run_id,
         options.allow_dirty_primary,
         &plan.assigned_paths,
+        selected_supervisor_runtime,
     )?;
     let repository_bindings = RepositoryPathBindings::bind(&repo)?;
     verify_after_autopilot_safety(&repository_bindings)?;
@@ -1940,7 +1964,7 @@ fn run_autopilot_plan_file_disabled_legacy(
                 SupervisorRuntime::Fake,
             ),
         };
-        if !options.allow_dirty_primary && !dirty_primary_paths(&repo)?.is_empty() {
+        if !options.allow_dirty_primary && !dirty_primary_paths(&repo, runtime)?.is_empty() {
             bail!("primary worktree changed after safety preflight and before supervisor start");
         }
         repository_bindings
@@ -2422,10 +2446,11 @@ fn safety_report(
     run_id: &RunId,
     allow_dirty_primary: bool,
     target_paths: &[PathBuf],
+    runtime: SupervisorRuntime,
 ) -> Result<AutopilotSafetyReport> {
     let mut gate_denials = Vec::new();
     if !allow_dirty_primary {
-        let dirty_paths = dirty_primary_paths(repo)?;
+        let dirty_paths = dirty_primary_paths(repo, runtime)?;
         if !dirty_paths.is_empty() {
             gate_denials.push(GateDenial::from_apply_blocker(
                 run_id.as_str(),

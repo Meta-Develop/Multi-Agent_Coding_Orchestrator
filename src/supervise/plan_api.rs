@@ -1660,11 +1660,9 @@ pub fn run_supervisor_plan_file(options: SupervisorRunOptions) -> Result<Supervi
     )
 }
 
-/// Runs a Fake plan-file experiment through the hermetic unit-test worktree path.
-///
-/// This helper is absent from production builds. Production plan-file execution
-/// continues to acquire the bounded repository-cleanliness capability and fails
-/// closed when its sandbox is unavailable.
+/// Runs a Fake plan-file experiment through the nonpublishable-simulation
+/// worktree path. This test wrapper verifies the same production seam used by
+/// Fake autopilot while keeping direct Fake plan-file execution unavailable.
 #[cfg(test)]
 pub(crate) fn run_fake_supervisor_plan_file_for_test(
     options: SupervisorRunOptions,
@@ -1687,7 +1685,7 @@ pub(crate) fn run_fake_supervisor_plan_file_for_test(
         options,
         1,
         SupervisorExecutionRuntime::NonpublishableSimulation,
-        SupervisorWorktreeCreation::TestOnly,
+        SupervisorWorktreeCreation::NonpublishableSimulation,
         Ok(runtime_model_catalog),
         &no_external_runner,
     )
@@ -2021,7 +2019,26 @@ fn run_supervisor_plan_file_cascade_with_gate(
     if let Some(source_dispatch_started) = source_dispatch_started {
         source_dispatch_started.store(true, Ordering::SeqCst);
     }
-    let source_report = if source_loaded.plan_metadata.execution_target.is_some() {
+    let source_report = if template.runtime == SupervisorRuntime::Fake {
+        if source_loaded.plan_metadata.execution_target.is_some() {
+            bail!("nonpublishable Fake cascade cannot use primary-worktree execution");
+        }
+        let no_external_runner = |_command: &ExternalAgentCommand,
+                                  _cancellation: &ProcessCancellation,
+                                  _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>|
+         -> ExternalAgentRun {
+            panic!("nonpublishable Fake cascade must not launch an external process")
+        };
+        run_supervisor_plan_with_runner_and_creation(
+            loaded,
+            options,
+            max_concurrent_children,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            SupervisorWorktreeCreation::NonpublishableSimulation,
+            runtime_model_catalog,
+            &no_external_runner,
+        )?
+    } else if source_loaded.plan_metadata.execution_target.is_some() {
         run_supervisor_plan_with_runner_and_creation(
             loaded,
             options,

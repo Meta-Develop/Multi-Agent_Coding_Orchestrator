@@ -848,6 +848,7 @@ pub(crate) struct RepositoryCleanlinessCapability {
 #[derive(Debug, Clone, Copy)]
 enum CreationCleanliness<'a> {
     Bound(&'a RepositoryCleanlinessCapability),
+    NonpublishableSimulation,
     #[cfg(test)]
     TestOnly,
 }
@@ -2286,6 +2287,22 @@ impl WorktreeManager {
             Ok(record)
         })();
         finish_with_neutral_claim_lock_verification(result, claim_boundary.verify())
+    }
+
+    /// Creates a managed child for an explicitly nonpublishable simulation.
+    ///
+    /// This reuses the internal durable worktree machinery without claiming a
+    /// verified repository-cleanliness capability. Callers must bind it to a
+    /// runtime that cannot launch an external process or publish acceptance.
+    pub(crate) fn create_for_nonpublishable_simulation(
+        &self,
+        options: WorktreeCreateOptions,
+    ) -> Result<WorktreeRecord> {
+        self.create_disabled_legacy(
+            options,
+            CreationCleanliness::NonpublishableSimulation,
+            WorktreeCreationPolicy::Standard,
+        )
     }
 
     /// Unit-test-only capability seam for exercising the internal durable

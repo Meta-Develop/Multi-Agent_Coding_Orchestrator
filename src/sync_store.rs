@@ -2320,14 +2320,251 @@ mod tests {
         worktree::WorktreeManager,
     };
     use git2::{Oid, Repository, Signature};
-    #[cfg(target_os = "linux")]
-    use std::process::{Child, Command};
+    #[cfg(unix)]
+    use std::{
+        env,
+        ffi::OsString,
+        io,
+        process::{Child, Command, ExitStatus, Stdio},
+        time::{Duration, Instant},
+    };
     use tempfile::TempDir;
 
     const ISSUE33_CLAIMS_V1: &[u8] =
         include_bytes!("../tests/fixtures/issue33/agent-files-claims-v1.json");
     const ISSUE33_CLAIMS_V1_SHA256: &str =
         "58076fb067d6bbc560926628b8930075d0674eae025b945619f0890000995291";
+
+    #[cfg(unix)]
+    const WATCHDOG_COMPLETION_RECEIPT: &[u8] = b"sync-store-test-complete-v1\n";
+    #[cfg(unix)]
+    const WATCHDOG_RECEIPT_PATH_ENV: &str = "MACO_SYNC_STORE_TEST_RECEIPT_PATH";
+    #[cfg(unix)]
+    const WATCHDOG_FORCE_STALL_ENV: &str = "MACO_SYNC_STORE_TEST_FORCE_STALL";
+    #[cfg(unix)]
+    const WATCHDOG_STALL_READY_PATH_ENV: &str = "MACO_SYNC_STORE_TEST_STALL_READY_PATH";
+    #[cfg(unix)]
+    const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+    #[cfg(unix)]
+    #[derive(Debug, Eq, PartialEq)]
+    enum CompletionReceipt {
+        Confirmed,
+        Missing,
+        Invalid,
+    }
+
+    #[cfg(unix)]
+    #[derive(Debug)]
+    enum ExactTestOutcome {
+        Completed {
+            status: ExitStatus,
+            receipt: CompletionReceipt,
+        },
+        TimedOut {
+            pid: u32,
+            status: ExitStatus,
+        },
+    }
+
+    #[cfg(unix)]
+    struct KillOnDropChild {
+        child: Child,
+        reaped: bool,
+    }
+
+    #[cfg(unix)]
+    impl KillOnDropChild {
+        fn spawn(command: &mut Command) -> io::Result<Self> {
+            Ok(Self {
+                child: command.spawn()?,
+                reaped: false,
+            })
+        }
+
+        fn id(&self) -> u32 {
+            self.child.id()
+        }
+
+        fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+            let status = self.child.try_wait()?;
+            self.reaped = status.is_some();
+            Ok(status)
+        }
+
+        fn kill_and_reap(&mut self) -> io::Result<ExitStatus> {
+            let kill_result = self.child.kill();
+            let wait_result = self.child.wait();
+            if wait_result.is_ok() {
+                self.reaped = true;
+            }
+            match (kill_result, wait_result) {
+                (_, Ok(status)) => Ok(status),
+                (Ok(()), Err(error)) => Err(error),
+                (Err(kill_error), Err(wait_error)) => Err(io::Error::new(
+                    wait_error.kind(),
+                    format!(
+                        "failed to kill watched child ({kill_error}) and failed to reap it ({wait_error})"
+                    ),
+                )),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for KillOnDropChild {
+        fn drop(&mut self) {
+            if self.reaped {
+                return;
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[cfg(unix)]
+    fn completion_receipt(path: &Path) -> io::Result<CompletionReceipt> {
+        match fs::read(path) {
+            Ok(contents) if contents == WATCHDOG_COMPLETION_RECEIPT => {
+                Ok(CompletionReceipt::Confirmed)
+            }
+            Ok(_) => Ok(CompletionReceipt::Invalid),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(CompletionReceipt::Missing),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_completion_receipt_if_requested() {
+        if let Some(path) = env::var_os(WATCHDOG_RECEIPT_PATH_ENV) {
+            fs::write(PathBuf::from(path), WATCHDOG_COMPLETION_RECEIPT)
+                .expect("write sync-store child completion receipt");
+        }
+    }
+
+    #[cfg(unix)]
+    fn run_exact_current_test_with_watchdog(
+        test_name: &str,
+        timeout: Duration,
+        child_environment: &[(&str, OsString)],
+        receipt_path: &Path,
+    ) -> io::Result<ExactTestOutcome> {
+        if receipt_path.try_exists()? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "sync-store child receipt path must start absent",
+            ));
+        }
+        let mut command = Command::new(env::current_exe()?);
+        command
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .envs(child_environment.iter().map(|(name, value)| (*name, value)))
+            .env(WATCHDOG_RECEIPT_PATH_ENV, receipt_path)
+            .stdin(Stdio::null());
+        let mut child = KillOnDropChild::spawn(&mut command)?;
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sync-store child watchdog duration overflowed",
+            )
+        })?;
+
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                let pid = child.id();
+                let status = child.kill_and_reap()?;
+                return Ok(ExactTestOutcome::TimedOut { pid, status });
+            }
+            if let Some(status) = child.try_wait()? {
+                return Ok(ExactTestOutcome::Completed {
+                    status,
+                    receipt: completion_receipt(receipt_path)?,
+                });
+            }
+            std::thread::sleep(WATCHDOG_POLL_INTERVAL.min(deadline.duration_since(now)));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watchdog_forced_stall_child() {
+        if env::var_os(WATCHDOG_FORCE_STALL_ENV).is_some() {
+            let ready_path = env::var_os(WATCHDOG_STALL_READY_PATH_ENV)
+                .expect("forced-stall child requires a ready-marker path");
+            fs::write(ready_path, b"stalled\n").expect("publish forced-stall readiness");
+            loop {
+                std::thread::park();
+            }
+        }
+        write_completion_receipt_if_requested();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_test_watchdog_times_out_and_reaps_stalled_child() {
+        const CHILD_TEST: &str = "sync_store::tests::watchdog_forced_stall_child";
+        let temp = TempDir::new().expect("watchdog tempdir");
+        let receipt_path = temp.path().join("completion-receipt");
+        let ready_path = temp.path().join("stall-ready");
+        let timeout = Duration::from_secs(1);
+        let child_environment = [
+            (WATCHDOG_FORCE_STALL_ENV, OsString::from("1")),
+            (
+                WATCHDOG_STALL_READY_PATH_ENV,
+                ready_path.as_os_str().to_owned(),
+            ),
+        ];
+
+        let started = Instant::now();
+        let outcome = run_exact_current_test_with_watchdog(
+            CHILD_TEST,
+            timeout,
+            &child_environment,
+            &receipt_path,
+        )
+        .expect("watch forced-stall child");
+        let elapsed = started.elapsed();
+
+        let (pid, status) = match outcome {
+            ExactTestOutcome::TimedOut { pid, status } => (pid, status),
+            ExactTestOutcome::Completed { status, receipt } => {
+                panic!("forced-stall child completed: status={status}, receipt={receipt:?}")
+            }
+        };
+        assert!(!status.success(), "killed child reported success: {status}");
+        assert_eq!(
+            fs::read(&ready_path).expect("read forced-stall readiness"),
+            b"stalled\n"
+        );
+        assert_eq!(
+            completion_receipt(&receipt_path).expect("inspect absent completion receipt"),
+            CompletionReceipt::Missing
+        );
+        assert!(elapsed >= timeout, "watchdog returned before its deadline");
+        assert!(
+            elapsed < timeout + Duration::from_secs(5),
+            "watchdog exceeded its short containment bound: {elapsed:?}"
+        );
+
+        let mut wait_status = 0;
+        // SAFETY: `pid` came from our child, and the status pointer is valid for this call.
+        let child_pid = libc::pid_t::try_from(pid).expect("child PID fits pid_t");
+        let wait_result = unsafe { libc::waitpid(child_pid, &mut wait_status, libc::WNOHANG) };
+        let wait_error = io::Error::last_os_error();
+        assert_eq!(
+            wait_result, -1,
+            "child remained waitable after watchdog reap"
+        );
+        assert_eq!(
+            wait_error.raw_os_error(),
+            Some(libc::ECHILD),
+            "watchdog did not fully reap child {pid}: {wait_error}"
+        );
+    }
 
     #[cfg(target_os = "linux")]
     struct SleepChild(Child);
@@ -3787,6 +4024,32 @@ mod tests {
 
     #[test]
     fn concurrent_claims_are_serialized_without_lost_updates() {
+        #[cfg(unix)]
+        if env::var_os(WATCHDOG_RECEIPT_PATH_ENV).is_none() {
+            const CHILD_TEST: &str =
+                "sync_store::tests::concurrent_claims_are_serialized_without_lost_updates";
+            const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
+            let temp = TempDir::new().expect("concurrent claims watchdog tempdir");
+            let receipt_path = temp.path().join("completion-receipt");
+            let outcome =
+                run_exact_current_test_with_watchdog(CHILD_TEST, CHILD_TIMEOUT, &[], &receipt_path)
+                    .expect("run concurrent claims child under watchdog");
+            match outcome {
+                ExactTestOutcome::Completed { status, receipt } => {
+                    assert!(
+                        status.success() && receipt == CompletionReceipt::Confirmed,
+                        "{CHILD_TEST} completed without exact success evidence: status={status}, receipt={receipt:?}"
+                    );
+                }
+                ExactTestOutcome::TimedOut { pid, status } => {
+                    panic!(
+                        "{CHILD_TEST} exceeded its {CHILD_TIMEOUT:?} bound; killed and reaped PID {pid} with status {status}"
+                    );
+                }
+            }
+            return;
+        }
+
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
@@ -3801,12 +4064,29 @@ mod tests {
                 )
             }));
         }
-        for worker in workers {
-            worker.join().expect("worker thread").expect("claim");
-        }
+        let outcomes = workers
+            .into_iter()
+            .enumerate()
+            .map(|(index, worker)| (index, worker.join()))
+            .collect::<Vec<_>>();
+        let failures = outcomes
+            .into_iter()
+            .filter_map(|(index, outcome)| match outcome {
+                Ok(Ok(_)) => None,
+                Ok(Err(error)) => Some(format!("worker {index} claim failed: {error:#}")),
+                Err(_) => Some(format!("worker {index} panicked")),
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            failures.is_empty(),
+            "concurrent claim workers failed after all joins:\n{}",
+            failures.join("\n")
+        );
 
         let claims = store.snapshot().expect("snapshot");
         assert_eq!(claims.len(), 16);
+        #[cfg(unix)]
+        write_completion_receipt_if_requested();
     }
 
     #[test]

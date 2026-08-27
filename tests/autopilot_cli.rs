@@ -7,11 +7,14 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
 };
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
+const COMMAND_DIAGNOSTIC_LIMIT_CHARS: usize = 4096;
+const BOUNDED_STATUS_RUNTIME_ROOT_ENV: &str = "MACO_BOUNDED_STATUS_RUNTIME_ROOT";
+const TEST_CHILD_TMPDIR_NAME: &str = "autopilot-child-tmp";
 
 #[test]
 fn containment_gate_only_skips_without_a_delegated_user_manager() {
@@ -36,6 +39,76 @@ fn containment_gate_only_skips_without_a_delegated_user_manager() {
 fn autopilot_run_cli_requires_machine_global_binding_before_effect_artifacts() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
+    let second_fixture = TempDir::new().context("second fixture tempdir")?;
+    let second_repo = second_fixture.path().join("repo");
+
+    let first = command_with_test_fixture_environment(&repo_path)?;
+    let first_again = command_with_test_fixture_environment(&repo_path)?;
+    let second = command_with_test_fixture_environment(&second_repo)?;
+    let first_tmpdir = command_environment_path(&first, "TMPDIR")?;
+    let first_tmpdir_again = command_environment_path(&first_again, "TMPDIR")?;
+    let second_tmpdir = command_environment_path(&second, "TMPDIR")?;
+
+    assert!(first_tmpdir.is_dir(), "child TMPDIR must exist");
+    assert!(second_tmpdir.is_dir(), "child TMPDIR must exist");
+    assert!(
+        !first_tmpdir.starts_with(&repo_path),
+        "child TMPDIR must remain outside the fixture repository"
+    );
+    assert!(
+        !second_tmpdir.starts_with(&second_repo),
+        "child TMPDIR must remain outside the fixture repository"
+    );
+    assert!(
+        first_tmpdir == temp.path().join(TEST_CHILD_TMPDIR_NAME),
+        "child TMPDIR must derive from the fixture parent"
+    );
+    assert!(
+        second_tmpdir == second_fixture.path().join(TEST_CHILD_TMPDIR_NAME),
+        "child TMPDIR must derive from the fixture parent"
+    );
+    assert!(
+        first_tmpdir == first_tmpdir_again,
+        "one fixture must retain one stable child TMPDIR"
+    );
+    assert!(
+        first_tmpdir != second_tmpdir,
+        "independent fixtures must not share a child TMPDIR"
+    );
+    if let Some(lane_tmpdir) = std::env::var_os("TMPDIR") {
+        assert!(
+            first_tmpdir != lane_tmpdir,
+            "child TMPDIR must not inherit lane-global state"
+        );
+    }
+    assert!(
+        first.get_envs().any(|(name, value)| {
+            name == std::ffi::OsStr::new(BOUNDED_STATUS_RUNTIME_ROOT_ENV) && value.is_none()
+        }),
+        "an ambient explicit bounded-status root must not override fixture isolation"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        for child_tmpdir in [&first_tmpdir, &second_tmpdir] {
+            let metadata = fs::metadata(child_tmpdir).context("inspect child TMPDIR")?;
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let process_uid = fs::metadata("/proc/self")
+            .context("inspect current process owner")?
+            .uid();
+        for child_tmpdir in [&first_tmpdir, &second_tmpdir] {
+            let metadata = fs::metadata(child_tmpdir).context("inspect child TMPDIR owner")?;
+            assert_eq!(metadata.uid(), process_uid);
+        }
+    }
     let mut before = fs::read_dir(&repo_path)
         .context("read repository before refusal")?
         .map(|entry| entry.map(|entry| entry.file_name()))
@@ -56,7 +129,7 @@ fn autopilot_run_cli_requires_machine_global_binding_before_effect_artifacts() -
         ),
     ];
     for (extra, missing_option) in cases {
-        let output = Command::new(BIN)
+        let output = command_with_test_fixture_environment(&repo_path)?
             .args([
                 "autopilot",
                 "run",
@@ -184,7 +257,6 @@ fn autopilot_plan_json_normalizes_defaults_and_aliases() -> Result<()> {
 
 #[test]
 fn autopilot_plan_proposes_paths_from_plain_and_empty_tasks() -> Result<()> {
-    support::require_containment!("autopilot_plan_proposes_paths_from_plain_and_empty_tasks");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     write_file(&repo_path.join("src/inbox.rs"), "pub struct InboxRepair;\n")?;
@@ -238,9 +310,6 @@ fn autopilot_plan_proposes_paths_from_plain_and_empty_tasks() -> Result<()> {
 
 #[test]
 fn fake_autopilot_depth_two_e2e_is_gated_durable_and_primary_untouched() -> Result<()> {
-    support::require_containment!(
-        "fake_autopilot_depth_two_e2e_is_gated_durable_and_primary_untouched"
-    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let task_path = temp.path().join("autopilot-plan.json");
@@ -330,9 +399,6 @@ fn fake_autopilot_depth_two_e2e_is_gated_durable_and_primary_untouched() -> Resu
 
 #[test]
 fn fake_autopilot_goal_run_dispatches_exact_derived_tree_and_preserves_primary() -> Result<()> {
-    support::require_containment!(
-        "fake_autopilot_goal_run_dispatches_exact_derived_tree_and_preserves_primary"
-    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let goal_path = temp.path().join("autopilot-goal.md");
@@ -401,9 +467,6 @@ fn fake_autopilot_goal_run_dispatches_exact_derived_tree_and_preserves_primary()
 
 #[test]
 fn autopilot_goal_run_refuses_profile_that_would_mutate_the_derived_plan() -> Result<()> {
-    support::require_containment!(
-        "autopilot_goal_run_refuses_profile_that_would_mutate_the_derived_plan"
-    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let goal_path = temp.path().join("profile-refusal-goal.md");
@@ -451,9 +514,6 @@ fn autopilot_goal_run_refuses_profile_that_would_mutate_the_derived_plan() -> Re
 
 #[test]
 fn fake_autopilot_run_reports_configured_but_execution_incomparable_profile() -> Result<()> {
-    support::require_containment!(
-        "fake_autopilot_run_reports_configured_but_execution_incomparable_profile"
-    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("profiled-plan.json");
@@ -633,9 +693,6 @@ fn fake_autopilot_run_reports_configured_but_execution_incomparable_profile() ->
 
 #[test]
 fn autopilot_run_refuses_max_depth_three_with_typed_permission_expansion() -> Result<()> {
-    support::require_containment!(
-        "autopilot_run_refuses_max_depth_three_with_typed_permission_expansion"
-    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("depth-three.json");
@@ -667,9 +724,6 @@ fn autopilot_run_refuses_max_depth_three_with_typed_permission_expansion() -> Re
 
 #[test]
 fn autopilot_run_refuses_recursive_assignments_with_typed_permission_expansion() -> Result<()> {
-    support::require_containment!(
-        "autopilot_run_refuses_recursive_assignments_with_typed_permission_expansion"
-    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("recursive-assignments.json");
@@ -773,7 +827,6 @@ fn primary_git_snapshot_detects_complete_state_drift() -> Result<()> {
 
 #[test]
 fn autopilot_run_without_run_id_generates_finalized_artifacts() -> Result<()> {
-    support::require_containment!("autopilot_run_without_run_id_generates_finalized_artifacts");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let task_path = temp.path().join("task.md");
@@ -866,9 +919,6 @@ fn autopilot_prune_deletes_only_finalized_runs() -> Result<()> {
 #[test]
 fn fake_autopilot_nonpublishable_run_ignores_local_runtime_state_without_gitignore_entry(
 ) -> Result<()> {
-    support::require_containment!(
-        "fake_autopilot_nonpublishable_run_ignores_local_runtime_state_without_gitignore_entry"
-    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo_without_maco_ignore(temp.path())?;
     let readme_before = fs::read_to_string(repo_path.join("README.md")).context("read readme")?;
@@ -906,9 +956,6 @@ fn fake_autopilot_nonpublishable_run_ignores_local_runtime_state_without_gitigno
 
 #[test]
 fn fake_supervise_flow_completes_and_legacy_pr_review_stays_unreachable() -> Result<()> {
-    support::require_containment!(
-        "fake_supervise_flow_completes_and_legacy_pr_review_stays_unreachable"
-    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("plan.json");
@@ -948,9 +995,6 @@ fn fake_supervise_flow_completes_and_legacy_pr_review_stays_unreachable() -> Res
 
 #[test]
 fn legacy_blocking_review_configuration_cannot_start_an_outer_repair_loop() -> Result<()> {
-    support::require_containment!(
-        "legacy_blocking_review_configuration_cannot_start_an_outer_repair_loop"
-    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("blocking-review.json");
@@ -994,7 +1038,6 @@ fn legacy_blocking_review_configuration_cannot_start_an_outer_repair_loop() -> R
 
 #[test]
 fn legacy_outer_validation_command_cannot_start_a_repair_loop() -> Result<()> {
-    support::require_containment!("legacy_outer_validation_command_cannot_start_a_repair_loop");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("validation-fails.json");
@@ -1032,7 +1075,6 @@ fn legacy_outer_validation_command_cannot_start_a_repair_loop() -> Result<()> {
 
 #[test]
 fn dirty_primary_refusal_emits_public_json() -> Result<()> {
-    support::require_containment!("dirty_primary_refusal_emits_public_json");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo_without_maco_ignore(temp.path())?;
     let task_path = temp.path().join("task.md");
@@ -1195,7 +1237,6 @@ fn status_and_collect_require_verified_finalization_and_distinguish_active_runs(
 
 #[test]
 fn active_sync_claim_is_a_typed_preflight_refusal() -> Result<()> {
-    support::require_containment!("active_sync_claim_is_a_typed_preflight_refusal");
     let temp = TempDir::new().context("tempdir")?;
     let sync_repo = create_committed_repo(temp.path())?;
     run_success_json(&[
@@ -1215,7 +1256,6 @@ fn active_sync_claim_is_a_typed_preflight_refusal() -> Result<()> {
 
 #[test]
 fn active_semantic_intent_is_a_typed_preflight_refusal() -> Result<()> {
-    support::require_containment!("active_semantic_intent_is_a_typed_preflight_refusal");
     let temp = TempDir::new().context("tempdir")?;
     let semantic_repo = create_committed_repo(temp.path())?;
     run_success_json(&[
@@ -1236,7 +1276,6 @@ fn active_semantic_intent_is_a_typed_preflight_refusal() -> Result<()> {
 
 #[test]
 fn active_live_lock_is_a_typed_preflight_refusal() -> Result<()> {
-    support::require_containment!("active_live_lock_is_a_typed_preflight_refusal");
     let temp = TempDir::new().context("tempdir")?;
     let live_repo = create_committed_repo(temp.path())?;
     write_live_claim(&live_repo, "active-live", "active", "README.md")?;
@@ -1248,9 +1287,6 @@ fn active_live_lock_is_a_typed_preflight_refusal() -> Result<()> {
 
 #[test]
 fn non_overlapping_locks_do_not_refuse_nonpublishable_fake_autopilot() -> Result<()> {
-    support::require_containment!(
-        "non_overlapping_locks_do_not_refuse_nonpublishable_fake_autopilot"
-    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     run_success_json(&[
@@ -1299,7 +1335,6 @@ fn non_overlapping_locks_do_not_refuse_nonpublishable_fake_autopilot() -> Result
 
 #[test]
 fn auto_merge_request_is_recorded_but_never_performed() -> Result<()> {
-    support::require_containment!("auto_merge_request_is_recorded_but_never_performed");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let plan_path = temp.path().join("auto-merge.json");
@@ -1342,7 +1377,6 @@ fn auto_merge_request_is_recorded_but_never_performed() -> Result<()> {
 
 #[test]
 fn public_json_shape_is_stable_and_sanitized() -> Result<()> {
-    support::require_containment!("public_json_shape_is_stable_and_sanitized");
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let task_path = temp.path().join("task.md");
@@ -1459,12 +1493,94 @@ fn run_success_json(args: &[&str]) -> Result<Value> {
         .context("run maco")?;
     if !output.status.success() {
         anyhow::bail!(
-            "maco command failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            "maco command failed: {}",
+            command_failure_diagnostics(args, &output)
         );
     }
     serde_json::from_slice(&output.stdout).context("parse json")
+}
+
+fn command_failure_diagnostics(args: &[&str], output: &Output) -> String {
+    let repo = option_value(args, "--repo").map(Path::new);
+    let mut detail = format!(
+        "status={}; stdout={}; stderr={}",
+        output.status,
+        bounded_diagnostic(&output.stdout, repo),
+        bounded_diagnostic(&output.stderr, repo)
+    );
+    let public_run_id = serde_json::from_slice::<Value>(&output.stdout)
+        .ok()
+        .and_then(|report| report["run_id"].as_str().map(str::to_string));
+    let run_id = option_value(args, "--run-id")
+        .map(str::to_string)
+        .or(public_run_id);
+    let Some((repo, run_id)) = repo.zip(run_id) else {
+        return detail;
+    };
+    if Path::new(&run_id)
+        .file_name()
+        .and_then(|name| name.to_str())
+        != Some(run_id.as_str())
+    {
+        detail.push_str("; artifacts=<unsafe or unavailable run id>");
+        return detail;
+    }
+    let nested_id = format!("{run_id}-supervise");
+    let paths = [
+        PathBuf::from(format!(
+            ".maco/autopilot/runs/{run_id}/supervisor-report.json"
+        )),
+        PathBuf::from(format!(".maco/autopilot/runs/{run_id}/final-report.json")),
+        PathBuf::from(format!(
+            ".maco/o2/runs/{nested_id}/reports/supervisor-final.json"
+        )),
+        PathBuf::from(format!(
+            ".git/maco/state/orchestration-checkpoints-v3/{nested_id}/.head.json"
+        )),
+    ];
+    for path in paths {
+        detail.push_str("; ");
+        detail.push_str(&artifact_diagnostic(repo, &path));
+    }
+    detail
+}
+
+fn option_value<'a>(args: &'a [&str], option: &str) -> Option<&'a str> {
+    args.windows(2)
+        .find_map(|pair| (pair[0] == option).then_some(pair[1]))
+}
+
+fn artifact_diagnostic(repo: &Path, relative: &Path) -> String {
+    match fs::read(repo.join(relative)) {
+        Ok(bytes) => format!(
+            "{} exists=true readable=true content={}",
+            relative.display(),
+            bounded_diagnostic(&bytes, Some(repo))
+        ),
+        Err(error) => format!(
+            "{} exists={} readable=false reason={}",
+            relative.display(),
+            error.kind() != std::io::ErrorKind::NotFound,
+            error.kind()
+        ),
+    }
+}
+
+fn bounded_diagnostic(bytes: &[u8], repo: Option<&Path>) -> String {
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    if let Some(repo) = repo {
+        for root in [Some(repo), repo.parent()].into_iter().flatten() {
+            text = text.replace(root.to_string_lossy().as_ref(), "<private-root>");
+        }
+    }
+    let mut bounded = text
+        .chars()
+        .take(COMMAND_DIAGNOSTIC_LIMIT_CHARS)
+        .collect::<String>();
+    if text.chars().count() > COMMAND_DIAGNOSTIC_LIMIT_CHARS {
+        bounded.push_str("...<truncated>");
+    }
+    bounded
 }
 
 fn run_failure_json(args: &[&str]) -> Result<Value> {
@@ -1494,13 +1610,16 @@ fn run_failure_stderr(args: &[&str]) -> Result<String> {
 }
 
 fn command_with_test_machine_global_binding(args: &[&str]) -> Result<Command> {
-    let mut command = Command::new(BIN);
+    let repo = args
+        .windows(2)
+        .find_map(|pair| (pair[0] == "--repo").then_some(Path::new(pair[1])));
+    let mut command = match repo {
+        Some(repo) => command_with_test_fixture_environment(repo)?,
+        None => Command::new(BIN),
+    };
     command.args(args);
     if args.first() == Some(&"autopilot") && args.get(1) == Some(&"run") {
-        let repo = args
-            .windows(2)
-            .find_map(|pair| (pair[0] == "--repo").then_some(Path::new(pair[1])))
-            .context("autopilot run test command must name --repo")?;
+        let repo = repo.context("autopilot run test command must name --repo")?;
         let config = write_test_machine_global_config(repo)?;
         command
             .arg("--machine-global-config")
@@ -1508,6 +1627,48 @@ fn command_with_test_machine_global_binding(args: &[&str]) -> Result<Command> {
             .args(["--machine-global-runtime-root-id", "runtime"]);
     }
     Ok(command)
+}
+
+fn command_with_test_fixture_environment(repo: &Path) -> Result<Command> {
+    let child_tmpdir = test_child_tmpdir(repo)?;
+    let mut command = Command::new(BIN);
+    command
+        .env("TMPDIR", child_tmpdir)
+        .env_remove(BOUNDED_STATUS_RUNTIME_ROOT_ENV);
+    Ok(command)
+}
+
+fn command_environment_path(command: &Command, name: &str) -> Result<PathBuf> {
+    command
+        .get_envs()
+        .find_map(|(candidate, value)| {
+            (candidate == std::ffi::OsStr::new(name)).then(|| value.map(PathBuf::from))
+        })
+        .flatten()
+        .with_context(|| format!("test command must set {name}"))
+}
+
+fn test_child_tmpdir(repo: &Path) -> Result<PathBuf> {
+    let fixture_root = repo.parent().context("test repository parent")?;
+    let child_tmpdir = fixture_root.join(TEST_CHILD_TMPDIR_NAME);
+    match fs::create_dir(&child_tmpdir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).context("create child TMPDIR"),
+    }
+    let metadata = fs::symlink_metadata(&child_tmpdir).context("inspect child TMPDIR type")?;
+    anyhow::ensure!(
+        metadata.file_type().is_dir(),
+        "child TMPDIR must be a real directory"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&child_tmpdir, fs::Permissions::from_mode(0o700))
+            .context("make child TMPDIR private")?;
+    }
+    Ok(child_tmpdir)
 }
 
 #[cfg(target_os = "linux")]
@@ -1563,7 +1724,7 @@ fn create_committed_repo_with_gitignore(
     gitignore_contents: &str,
 ) -> Result<std::path::PathBuf> {
     let repo_path = root.join("repo");
-    let output = Command::new(BIN)
+    let output = command_with_test_fixture_environment(&repo_path)?
         .args(["init", "--repo", path_str(&repo_path)?, "--json"])
         .output()
         .context("init repo")?;

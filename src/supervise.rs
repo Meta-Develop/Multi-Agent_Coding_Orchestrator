@@ -503,6 +503,35 @@ pub(crate) fn verified_whole_primary_snapshot_sha256(repo: &Path) -> Result<Stri
     primary_worktree_snapshot_sha256(&repo, SupervisorExecutionRuntime::Verified)
 }
 
+/// Captures the whole-primary digest for an explicitly nonpublishable Fake
+/// autopilot run without requiring delegated-systemd containment. The same
+/// bounded Git capture limits and sanitized environment still apply.
+pub(crate) fn nonpublishable_simulation_whole_primary_snapshot_sha256(
+    repo: &Path,
+) -> Result<String> {
+    let repo = discover_repo_root(repo)?;
+    primary_worktree_snapshot_sha256(&repo, SupervisorExecutionRuntime::NonpublishableSimulation)
+}
+
+/// Captures Git-visible dirty paths for an explicitly nonpublishable Fake
+/// autopilot preflight using bounded, trusted best-effort subprocesses.
+pub(crate) fn nonpublishable_simulation_dirty_primary_paths(repo: &Path) -> Result<Vec<PathBuf>> {
+    let repo = discover_repo_root(repo)?;
+    let status =
+        primary_status_snapshot(&repo, SupervisorExecutionRuntime::NonpublishableSimulation)?;
+    let mut paths = status
+        .into_iter()
+        .flat_map(|(path, state)| std::iter::once(path).chain(state.original_path))
+        .map(|path| {
+            normalize_repo_relative_path(repo_relative_path_from_git_bytes(&path))
+                .map_err(anyhow::Error::from)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
 #[derive(Debug, Clone)]
 pub struct SupervisorEvidenceOnlyReauditOptions {
     pub repo: PathBuf,
@@ -3715,6 +3744,7 @@ enum SupervisorWorktreeCreation<'a> {
     Bound(&'a RepositoryCleanlinessCapability),
     ExistingOnly,
     PrimaryWorktree,
+    NonpublishableSimulation,
     #[cfg(test)]
     TestOnly,
     #[cfg(test)]
@@ -3722,6 +3752,17 @@ enum SupervisorWorktreeCreation<'a> {
 }
 
 impl SupervisorWorktreeCreation<'_> {
+    fn is_nonpublishable_simulation(self) -> bool {
+        if matches!(self, Self::NonpublishableSimulation) {
+            return true;
+        }
+        #[cfg(test)]
+        if matches!(self, Self::TestOnly) {
+            return true;
+        }
+        false
+    }
+
     fn bypass_verified_admission_for_test(self) -> bool {
         #[cfg(test)]
         {

@@ -1086,7 +1086,7 @@ fn inventory_limits(max_entries: usize) -> BoundedTreeWalkLimits {
 #[cfg(unix)]
 #[test]
 fn bounded_tree_walk_records_but_never_follows_unsafe_entries() {
-    use std::os::unix::{fs::symlink, net::UnixListener};
+    use std::os::unix::fs::{symlink, FileTypeExt};
 
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().join("repo");
@@ -1097,7 +1097,15 @@ fn bounded_tree_walk_records_but_never_follows_unsafe_entries() {
     fs::write(outside.join("secret"), "outside\n").expect("outside secret");
     fs::hard_link(root.join("src/lib.rs"), root.join("hardlink.rs")).expect("hardlink");
     symlink(&outside, root.join("outside-link")).expect("outside symlink");
-    let _socket = UnixListener::bind(root.join("socket")).expect("unix socket");
+    let socket_path = root.join("socket");
+    let _socket = crate::test_support::bind_test_unix_socket(&socket_path).expect("unix socket");
+    assert!(
+        fs::symlink_metadata(&socket_path)
+            .expect("socket metadata")
+            .file_type()
+            .is_socket(),
+        "fixture socket must remain a socket entry"
+    );
 
     let entries = BoundedTreeWalker::walk(&root, inventory_limits(32)).expect("inventory");
     assert!(entries.iter().any(|entry| {
@@ -1166,7 +1174,7 @@ fn bounded_tree_walk_checks_deadline_after_callback() {
 #[cfg(unix)]
 #[test]
 fn optional_relative_reader_preserves_scopes_and_rejects_unsafe_files() {
-    use std::os::unix::{fs::symlink, net::UnixListener};
+    use std::os::unix::fs::{symlink, FileTypeExt};
 
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().join("repo");
@@ -1174,7 +1182,15 @@ fn optional_relative_reader_preserves_scopes_and_rejects_unsafe_files() {
     fs::write(root.join("src/lib.rs"), "source\n").expect("source");
     fs::hard_link(root.join("src/lib.rs"), root.join("hardlink.rs")).expect("hardlink");
     symlink("src/lib.rs", root.join("link.rs")).expect("symlink");
-    let _socket = UnixListener::bind(root.join("socket")).expect("unix socket");
+    let socket_path = root.join("socket");
+    let _socket = crate::test_support::bind_test_unix_socket(&socket_path).expect("unix socket");
+    assert!(
+        fs::symlink_metadata(&socket_path)
+            .expect("socket metadata")
+            .file_type()
+            .is_socket(),
+        "fixture socket must remain a socket entry"
+    );
 
     assert_eq!(
         BoundedRegularReader::read_relative_optional_utf8(&root, "missing.rs", 64)
