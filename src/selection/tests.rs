@@ -192,6 +192,7 @@ fn base_input() -> SelectionInput {
             environment_rejections: Vec::new(),
         },
         debug_override: None,
+        operational_observations: None,
     }
 }
 
@@ -312,6 +313,44 @@ fn unsupported_quota_and_latency_weights_fail_closed_without_numeric_zero_eviden
         Err(SelectionError::InvalidInput(message))
             if message == "resolved objective profile requests latency_percent=25 but typed per-candidate observed or predicted latency evidence is unavailable"
     ));
+}
+
+#[test]
+fn typed_quota_and_latency_observations_admit_nonzero_profile_weights() {
+    let mut input = base_input();
+    let mut quota_profile = crate::objective_profile::default_objective_profile();
+    quota_profile.id = "quota-first-routing-v1".to_string();
+    quota_profile.tradeoffs.monetary_cost_percent = 75;
+    quota_profile.tradeoffs.quota_consumption_percent = 25;
+    input.resolved_objective_profile = resolved_routing_profile(
+        quota_profile,
+        crate::objective_profile::ObjectiveProfileSource::RepositoryOverride,
+    );
+    input.operational_observations = Some(LiveOperationalObservations {
+        quota: Some(TypedAxisObservation {
+            kind: TypedObservationKind::Measured,
+            unit: "entitlement_consumed_fraction_bp".to_string(),
+            value_basis_points: 2_500,
+        }),
+        latency: Some(TypedAxisObservation {
+            kind: TypedObservationKind::Measured,
+            unit: "wall_time_ms".to_string(),
+            value_basis_points: 1_000,
+        }),
+        retry_rate: None,
+        review_load: None,
+    });
+    select(&input).expect("typed quota observation licenses the quota weight");
+
+    let mut latency_profile = crate::objective_profile::default_objective_profile();
+    latency_profile.id = "latency-first-routing-v1".to_string();
+    latency_profile.tradeoffs.monetary_cost_percent = 75;
+    latency_profile.tradeoffs.latency_percent = 25;
+    input.resolved_objective_profile = resolved_routing_profile(
+        latency_profile,
+        crate::objective_profile::ObjectiveProfileSource::RepositoryOverride,
+    );
+    select(&input).expect("typed latency observation licenses the latency weight");
 }
 
 #[test]

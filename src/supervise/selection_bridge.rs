@@ -33,9 +33,9 @@ use crate::optimizer::trajectory::{TrajectoryEvent, TrajectoryObservation};
 use crate::selection::{
     self, AuthorityRole, Boundedness, BudgetSignal, CandidateCapabilities, CandidateKey,
     CandidateSwitchCostEvidence, CatalogModel, ContextSize, DebugOverride, DecisionStatus,
-    DynamicSignals, ObjectiveProfileRef, OperatorConstraints, ReasoningEffort as SelectorEffort,
-    RiskLevel, RuntimeCatalog, RuntimePoolState, SelectionInput, SelectionProvenance, TaskHorizon,
-    TaskProfile,
+    DynamicSignals, LiveOperationalObservations, ObjectiveProfileRef, OperatorConstraints,
+    ReasoningEffort as SelectorEffort, RiskLevel, RuntimeCatalog, RuntimePoolState, SelectionInput,
+    SelectionProvenance, TaskHorizon, TaskProfile, TypedAxisObservation, TypedObservationKind,
 };
 use std::path::Path;
 
@@ -1196,11 +1196,82 @@ fn selection_input_for_role(args: SelectionInputForRoleArgs<'_>) -> Result<Selec
         outcomes: Vec::new(),
         signals,
         debug_override,
+        operational_observations: None,
     };
     if let Some(quota_context) = quota_context {
         apply_live_quota_selection_input(&mut input, quota_context, quota_ledger, runtime_name)?;
     }
+    input.operational_observations = Some(live_operational_observations(&input));
     Ok(input)
+}
+
+fn live_operational_observations(input: &SelectionInput) -> LiveOperationalObservations {
+    let quota = input
+        .quota_source
+        .as_ref()
+        .and_then(|source| {
+            input.pools.iter().find(|pool| {
+                pool.pool_reference.as_ref() == Some(source)
+                    && pool.entitlement_bounded
+                    && pool.observation_source.is_some()
+            })
+        })
+        .map(|pool| {
+            let consumed = pool
+                .entitlement_capacity_units
+                .saturating_sub(pool.entitlement_remaining_units);
+            let value_basis_points = if pool.entitlement_capacity_units == 0 {
+                0
+            } else {
+                u16::try_from(consumed.saturating_mul(10_000) / pool.entitlement_capacity_units)
+                    .unwrap_or(10_000)
+            };
+            TypedAxisObservation {
+                kind: TypedObservationKind::Measured,
+                unit: "entitlement_consumed_fraction_bp".to_string(),
+                value_basis_points,
+            }
+        });
+    let retry_rate = Some(TypedAxisObservation {
+        kind: TypedObservationKind::Measured,
+        unit: "retry_count".to_string(),
+        value_basis_points: u16::try_from(input.signals.retry_count.saturating_mul(1_000))
+            .unwrap_or(u16::MAX),
+    });
+    let review_load = input
+        .outcomes
+        .iter()
+        .max_by_key(|outcome| {
+            outcome
+                .review_cost_microunits
+                .saturating_add(outcome.rereview_cost_microunits)
+        })
+        .map(|outcome| {
+            let review = outcome
+                .review_cost_microunits
+                .saturating_add(outcome.rereview_cost_microunits);
+            let total = outcome
+                .execution_cost_microunits
+                .saturating_add(review)
+                .saturating_add(outcome.rework_cost_microunits)
+                .saturating_add(outcome.environment_cost_microunits);
+            let value_basis_points = if total == 0 {
+                0
+            } else {
+                u16::try_from(review.saturating_mul(10_000) / total).unwrap_or(10_000)
+            };
+            TypedAxisObservation {
+                kind: TypedObservationKind::Measured,
+                unit: "review_cost_fraction_bp".to_string(),
+                value_basis_points,
+            }
+        });
+    LiveOperationalObservations {
+        quota,
+        latency: None,
+        retry_rate,
+        review_load,
+    }
 }
 
 fn apply_live_quota_selection_input(

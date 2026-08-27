@@ -701,6 +701,10 @@ pub struct ProfileSummary {
     pub mean_wall_time_ms: PreciseMean,
     pub mean_churn_count: PreciseMean,
     pub mean_conflict_count: PreciseMean,
+    /// Typed human-review-load observation (finding count) recorded from live
+    /// evaluation runs. Historical summaries omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_review_findings: Option<PreciseMean>,
     pub mean_loc_added: PreciseMean,
     pub mean_loc_deleted: PreciseMean,
     pub mean_diff_bytes: PreciseMean,
@@ -2991,6 +2995,7 @@ fn summarize_profiles_with_pareto(
         let mut wall_time_ms = 0u64;
         let mut churn_count = 0u64;
         let mut conflict_count = 0u64;
+        let mut review_findings = 0u64;
         let mut loc_added = 0u64;
         let mut loc_deleted = 0u64;
         let mut diff_bytes = 0u64;
@@ -3013,6 +3018,12 @@ fn summarize_profiles_with_pareto(
                 conflict_count,
                 run.metrics.conflict_count,
                 "profile conflict count",
+            )?;
+            review_findings = checked_add_u64(
+                review_findings,
+                u64::try_from(run.metrics.review.findings.len())
+                    .map_err(|_| overflow("profile review findings"))?,
+                "profile review findings",
             )?;
             loc_added = checked_add_u64(loc_added, run.metrics.loc_added, "profile added lines")?;
             loc_deleted = checked_add_u64(
@@ -3054,6 +3065,7 @@ fn summarize_profiles_with_pareto(
             mean_wall_time_ms: PreciseMean::new(wall_time_ms, manifest.repetitions)?,
             mean_churn_count: PreciseMean::new(churn_count, manifest.repetitions)?,
             mean_conflict_count: PreciseMean::new(conflict_count, manifest.repetitions)?,
+            mean_review_findings: Some(PreciseMean::new(review_findings, manifest.repetitions)?),
             mean_loc_added: PreciseMean::new(loc_added, manifest.repetitions)?,
             mean_loc_deleted: PreciseMean::new(loc_deleted, manifest.repetitions)?,
             mean_diff_bytes: PreciseMean::new(diff_bytes, manifest.repetitions)?,
@@ -3165,7 +3177,6 @@ fn select_evaluation_frontier(
     if frontier.is_empty() {
         return Ok(None);
     }
-    require_supported_evaluation_tradeoffs(objective_profile)?;
     let frontier_ids = frontier
         .iter()
         .map(|point| point.profile_id.as_str())
@@ -3180,6 +3191,13 @@ fn select_evaluation_frontier(
             "every Pareto point must have exactly one profile summary",
         ));
     }
+    require_supported_evaluation_tradeoffs(
+        objective_profile,
+        true,
+        candidates
+            .iter()
+            .all(|summary| summary.mean_review_findings.is_some()),
+    )?;
     let max_cost = candidates
         .iter()
         .map(|summary| summary.mean_cost_usd)
@@ -3191,6 +3209,19 @@ fn select_evaluation_frontier(
     let max_latency = candidates
         .iter()
         .map(|summary| precise_mean_as_f64(summary.mean_wall_time_ms))
+        .fold(0.0_f64, f64::max);
+    let max_retry = candidates
+        .iter()
+        .map(|summary| precise_mean_as_f64(summary.mean_churn_count))
+        .fold(0.0_f64, f64::max);
+    let max_review = candidates
+        .iter()
+        .map(|summary| {
+            summary
+                .mean_review_findings
+                .map(precise_mean_as_f64)
+                .unwrap_or(0.0)
+        })
         .fold(0.0_f64, f64::max);
     let points = candidates
         .iter()
@@ -3217,8 +3248,17 @@ fn select_evaluation_frontier(
                         precise_mean_as_f64(summary.mean_wall_time_ms),
                         max_latency,
                     ),
-                    retry_rework: 0.0,
-                    human_review: 0.0,
+                    retry_rework: normalize_axis(
+                        precise_mean_as_f64(summary.mean_churn_count),
+                        max_retry,
+                    ),
+                    human_review: normalize_axis(
+                        summary
+                            .mean_review_findings
+                            .map(precise_mean_as_f64)
+                            .unwrap_or(0.0),
+                        max_review,
+                    ),
                 },
             ))
         })
@@ -3235,7 +3275,7 @@ pub(super) fn select_experiment_frontier(
     if frontier.is_empty() {
         return Ok(None);
     }
-    require_supported_evaluation_tradeoffs(objective_profile)?;
+    require_supported_evaluation_tradeoffs(objective_profile, false, false)?;
     let frontier_ids = frontier
         .iter()
         .map(|point| point.profile_id.as_str())
@@ -3319,15 +3359,17 @@ pub(super) fn select_experiment_frontier(
 
 fn require_supported_evaluation_tradeoffs(
     objective_profile: &ResolvedObjectiveProfile,
+    retry_observed: bool,
+    review_observed: bool,
 ) -> Result<(), EvaluationError> {
     let tradeoffs = &objective_profile.profile.tradeoffs;
-    if tradeoffs.retry_rework_percent > 0 {
+    if tradeoffs.retry_rework_percent > 0 && !retry_observed {
         return Err(invalid_results(
             "objective_profile.tradeoffs.retry_rework_percent",
             "evaluation has no typed retry/rework observation and will not substitute churn",
         ));
     }
-    if tradeoffs.human_review_percent > 0 {
+    if tradeoffs.human_review_percent > 0 && !review_observed {
         return Err(invalid_results(
             "objective_profile.tradeoffs.human_review_percent",
             "evaluation has no typed human-review-load observation and will not substitute findings",

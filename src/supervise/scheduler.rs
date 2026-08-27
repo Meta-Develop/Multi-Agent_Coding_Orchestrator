@@ -2726,6 +2726,34 @@ fn supervisor_report_paths(
     (report_plan_file, report_run_dir)
 }
 
+fn require_live_supervisor_final_profile_and_scores(report: &SupervisorFinalReport) -> Result<()> {
+    let profile = report
+        .role_economics_profile
+        .as_ref()
+        .context("newly finalized supervisor reports require role_economics_profile")?;
+    let resolved = profile
+        .resolved_objective_profile
+        .as_ref()
+        .context("newly finalized supervisor reports require resolved_objective_profile")?;
+    resolved
+        .profile
+        .validate()
+        .context("newly finalized supervisor reports require a valid resolved_objective_profile")?;
+    if let Some(execution) = profile.execution.as_ref() {
+        for event in &execution.selection_decisions {
+            event
+                .provenance
+                .resolved_objective_profile
+                .profile
+                .validate()
+                .context(
+                    "newly finalized supervisor reports require scored selector profile evidence",
+                )?;
+        }
+    }
+    Ok(())
+}
+
 fn persist_supervisor_final_report(
     mut final_report: SupervisorFinalReport,
     orchestration_journal: &mut Option<OrchestrationEventJournal>,
@@ -2774,6 +2802,7 @@ fn persist_supervisor_final_report(
     }
     #[cfg(test)]
     run_before_supervisor_final_report_persist_hook(&mut final_report);
+    require_live_supervisor_final_profile_and_scores(&final_report)?;
     crate::run_ops::append_run_heartbeat_best_effort(
         &mut artifact_writer,
         "finalizing",

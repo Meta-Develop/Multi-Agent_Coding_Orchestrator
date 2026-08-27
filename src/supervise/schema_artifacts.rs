@@ -353,6 +353,15 @@ fn resolved_objective_profile_schema_value() -> serde_json::Value {
                             "retry_rework_percent": {"type": "integer", "minimum": 0, "maximum": 100},
                             "human_review_percent": {"type": "integer", "minimum": 0, "maximum": 100}
                         }
+                    },
+                    "quality_operations_balance": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["quality_percent", "operations_percent"],
+                        "properties": {
+                            "quality_percent": {"type": "integer", "minimum": 0, "maximum": 100},
+                            "operations_percent": {"type": "integer", "minimum": 0, "maximum": 100}
+                        }
                     }
                 }
             }

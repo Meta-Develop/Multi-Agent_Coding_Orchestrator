@@ -301,6 +301,7 @@ mod tests {
                 environment_rejections: Vec::new(),
             },
             debug_override: None,
+            operational_observations: None,
         }
     }
 

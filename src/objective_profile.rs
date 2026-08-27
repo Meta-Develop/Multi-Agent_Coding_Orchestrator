@@ -16,6 +16,8 @@ pub const BREADTH_WEIGHT_PERCENT: u32 = 25;
 pub const ANTI_SHORTCUT_WEIGHT_PERCENT: u32 = 25;
 pub const DEFAULT_MODEL_CHANGE_SWITCH_COST_MICROUNITS: u64 = 10_000;
 pub const DEFAULT_RUNTIME_CHANGE_SWITCH_COST_MICROUNITS: u64 = 25_000;
+pub const DEFAULT_QUALITY_BALANCE_PERCENT: u32 = 50;
+pub const DEFAULT_OPERATIONS_BALANCE_PERCENT: u32 = 50;
 
 const OBJECTIVE_PROFILE_DOCUMENT_SCHEMA_VERSION: u32 = 1;
 const MAX_OBJECTIVE_PROFILE_FILE_BYTES: u64 = 256 * 1024;
@@ -58,6 +60,12 @@ pub struct ObjectiveProfile {
     pub tradeoffs: TradeoffWeights,
     #[serde(default = "historical_zero_switch_costs")]
     pub switch_costs: ContextSwitchCosts,
+    /// Top-level mix between quality loss and operational/economic loss.
+    ///
+    /// Omitted historical profiles keep the original 50/50 semantics and the
+    /// same content hash. An explicit pair must sum to 100.
+    #[serde(default, skip_serializing_if = "is_default_quality_operations_balance")]
+    pub quality_operations_balance: QualityOperationsBalance,
 }
 
 /// Conservative, operator-tunable re-priming costs for automatic routing.
@@ -133,6 +141,27 @@ impl Default for TradeoffWeights {
     }
 }
 
+/// Operator-tunable mix between quality evidence and operational axes.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QualityOperationsBalance {
+    pub quality_percent: u32,
+    pub operations_percent: u32,
+}
+
+impl Default for QualityOperationsBalance {
+    fn default() -> Self {
+        Self {
+            quality_percent: DEFAULT_QUALITY_BALANCE_PERCENT,
+            operations_percent: DEFAULT_OPERATIONS_BALANCE_PERCENT,
+        }
+    }
+}
+
+fn is_default_quality_operations_balance(balance: &QualityOperationsBalance) -> bool {
+    *balance == QualityOperationsBalance::default()
+}
+
 /// Binding recorded beside an experiment so re-weighting cannot silently
 /// invalidate past conclusions.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -145,6 +174,8 @@ pub struct ObjectiveProfileBinding {
     pub tradeoffs: TradeoffWeights,
     #[serde(default = "historical_zero_switch_costs")]
     pub switch_costs: ContextSwitchCosts,
+    #[serde(default, skip_serializing_if = "is_default_quality_operations_balance")]
+    pub quality_operations_balance: QualityOperationsBalance,
 }
 
 impl Default for ObjectiveProfile {
@@ -164,6 +195,7 @@ pub fn default_objective_profile() -> ObjectiveProfile {
         },
         tradeoffs: TradeoffWeights::default(),
         switch_costs: ContextSwitchCosts::default(),
+        quality_operations_balance: QualityOperationsBalance::default(),
     }
 }
 
@@ -225,6 +257,22 @@ impl ObjectiveProfile {
         if tradeoff_total != 100 {
             bail!("objective tradeoff weights must sum to 100, got {tradeoff_total}");
         }
+        validate_weight(
+            "quality_operations_balance.quality_percent",
+            self.quality_operations_balance.quality_percent,
+        )?;
+        validate_weight(
+            "quality_operations_balance.operations_percent",
+            self.quality_operations_balance.operations_percent,
+        )?;
+        let balance_total = self
+            .quality_operations_balance
+            .quality_percent
+            .checked_add(self.quality_operations_balance.operations_percent)
+            .context("objective quality/operations balance overflowed")?;
+        if balance_total != 100 {
+            bail!("objective quality/operations balance must sum to 100, got {balance_total}");
+        }
         Ok(())
     }
 
@@ -242,6 +290,7 @@ impl ObjectiveProfile {
             quality: self.quality.clone(),
             tradeoffs: self.tradeoffs.clone(),
             switch_costs: self.switch_costs.clone(),
+            quality_operations_balance: self.quality_operations_balance.clone(),
         })
     }
 
@@ -274,6 +323,7 @@ impl ObjectiveProfileBinding {
             quality: self.quality.clone(),
             tradeoffs: self.tradeoffs.clone(),
             switch_costs: self.switch_costs.clone(),
+            quality_operations_balance: self.quality_operations_balance.clone(),
         };
         profile.validate()?;
         if self.content_hash.len() != 64
@@ -532,7 +582,13 @@ impl ObjectiveProfileBinding {
             + axes.retry_rework * f64::from(self.tradeoffs.retry_rework_percent)
             + axes.human_review * f64::from(self.tradeoffs.human_review_percent))
             / 100.0;
-        (quality_loss + tradeoff_loss) / 2.0
+        if is_default_quality_operations_balance(&self.quality_operations_balance) {
+            (quality_loss + tradeoff_loss) / 2.0
+        } else {
+            let quality_percent = f64::from(self.quality_operations_balance.quality_percent);
+            let operations_percent = f64::from(self.quality_operations_balance.operations_percent);
+            (quality_loss * quality_percent + tradeoff_loss * operations_percent) / 100.0
+        }
     }
 }
 
@@ -558,6 +614,7 @@ mod tests {
                 human_review_percent: 5,
             },
             switch_costs: ContextSwitchCosts::default(),
+            quality_operations_balance: QualityOperationsBalance::default(),
         }
     }
 
@@ -609,6 +666,78 @@ mod tests {
             serde_json::from_slice(&encoded).expect("deserialize binding");
         assert_eq!(decoded, binding);
         decoded.validate().expect("round-tripped binding");
+        assert_eq!(
+            first,
+            "82e6de7f5e27768fdad19b5dfa70d70ed1fb9d041262678e3174d5373330b4f9"
+        );
+        assert_eq!(
+            profile.quality_operations_balance,
+            QualityOperationsBalance::default()
+        );
+    }
+
+    #[test]
+    fn quality_versus_operations_balance_is_tunable_and_defaults_to_even_split() {
+        let default_profile = default_resolved_objective_profile().expect("default");
+        let points = [
+            (
+                "high-quality".to_string(),
+                FrontierAxes {
+                    held_out_quality_basis_points: 9_900,
+                    breadth_quality_basis_points: 9_900,
+                    anti_shortcut_quality_basis_points: 9_900,
+                    monetary_cost: 0.9,
+                    quota_consumption: 0.0,
+                    latency: 0.0,
+                    retry_rework: 0.0,
+                    human_review: 0.0,
+                },
+            ),
+            (
+                "cheap".to_string(),
+                FrontierAxes {
+                    held_out_quality_basis_points: 1_000,
+                    breadth_quality_basis_points: 1_000,
+                    anti_shortcut_quality_basis_points: 1_000,
+                    monetary_cost: 0.1,
+                    quota_consumption: 0.0,
+                    latency: 0.0,
+                    retry_rework: 0.0,
+                    human_review: 0.0,
+                },
+            ),
+        ];
+        let default_selection = select_from_frontier(&default_profile, &points)
+            .expect("select default")
+            .expect("non-empty");
+        assert_eq!(default_selection.selected_profile_id, "high-quality");
+
+        let mut operations_first = default_objective_profile();
+        operations_first.id = "operations-first-v1".to_string();
+        operations_first.quality_operations_balance = QualityOperationsBalance {
+            quality_percent: 0,
+            operations_percent: 100,
+        };
+        let operations = ResolvedObjectiveProfile {
+            profile: operations_first.binding().expect("bind operations-first"),
+            source: ObjectiveProfileSource::RepositoryOverride,
+        };
+        let operations_selection = select_from_frontier(&operations, &points)
+            .expect("select operations-first")
+            .expect("non-empty");
+        assert_eq!(operations_selection.selected_profile_id, "cheap");
+        assert_ne!(
+            default_selection.profile_hash,
+            operations_selection.profile_hash
+        );
+
+        let mut invalid = default_objective_profile();
+        invalid.quality_operations_balance.quality_percent = 40;
+        invalid.quality_operations_balance.operations_percent = 40;
+        let error = invalid.validate().expect_err("unbalanced mix must fail");
+        assert!(error
+            .to_string()
+            .contains("quality/operations balance must sum to 100"));
     }
 
     #[test]

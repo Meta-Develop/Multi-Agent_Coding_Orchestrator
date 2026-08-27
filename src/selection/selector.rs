@@ -368,7 +368,7 @@ fn validate_input(input: &SelectionInput) -> Result<(), SelectionError> {
     if let Some(expected_digest) = &input.objective_profile.expected_digest {
         validate_sha256_digest("objective_profile.expected_digest", expected_digest)?;
     }
-    validate_resolved_objective_profile(&input.resolved_objective_profile)?;
+    validate_resolved_objective_profile(input)?;
     if input.catalogs.is_empty() {
         return invalid("at least one runtime catalog is required");
     }
@@ -2049,9 +2049,8 @@ fn input_digests(
     })
 }
 
-fn validate_resolved_objective_profile(
-    resolved: &crate::objective_profile::ResolvedObjectiveProfile,
-) -> Result<(), SelectionError> {
+fn validate_resolved_objective_profile(input: &SelectionInput) -> Result<(), SelectionError> {
+    let resolved = &input.resolved_objective_profile;
     let binding = &resolved.profile;
     validate_identifier("resolved_objective_profile.profile.id", &binding.id)?;
     validate_positive(
@@ -2068,6 +2067,7 @@ fn validate_resolved_objective_profile(
         quality: binding.quality.clone(),
         tradeoffs: binding.tradeoffs.clone(),
         switch_costs: binding.switch_costs.clone(),
+        quality_operations_balance: binding.quality_operations_balance.clone(),
     };
     let expected = reconstructed.binding().map_err(|error| {
         SelectionError::InvalidInput(format!(
@@ -2080,13 +2080,22 @@ fn validate_resolved_objective_profile(
         );
     }
     let weights = &binding.tradeoffs;
-    if weights.quota_consumption_percent != 0 {
+    let observations = input.operational_observations.as_ref();
+    if weights.quota_consumption_percent != 0
+        && observations
+            .and_then(|observation| observation.quota.as_ref())
+            .is_none()
+    {
         return invalid(format!(
             "resolved objective profile requests quota_consumption_percent={} but typed contract-backed per-runtime quota evidence is unavailable",
             weights.quota_consumption_percent
         ));
     }
-    if weights.latency_percent != 0 {
+    if weights.latency_percent != 0
+        && observations
+            .and_then(|observation| observation.latency.as_ref())
+            .is_none()
+    {
         return invalid(format!(
             "resolved objective profile requests latency_percent={} but typed per-candidate observed or predicted latency evidence is unavailable",
             weights.latency_percent

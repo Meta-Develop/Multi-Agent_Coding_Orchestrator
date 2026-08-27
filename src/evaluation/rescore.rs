@@ -286,6 +286,8 @@ mod tests {
                 human_review_percent: 0,
             },
             switch_costs: ContextSwitchCosts::zero(),
+            quality_operations_balance: crate::objective_profile::QualityOperationsBalance::default(
+            ),
         };
         ResolvedObjectiveProfile {
             profile: profile.binding().expect("bind test objective profile"),

@@ -487,6 +487,39 @@ pub struct SelectionInput {
     pub outcomes: Vec<OutcomeRecord>,
     pub signals: DynamicSignals,
     pub debug_override: Option<DebugOverride>,
+    /// Typed quota/latency/retry-rate/review-load observations from the live
+    /// path. Absent means the profile axes that require them must fail closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operational_observations: Option<LiveOperationalObservations>,
+}
+
+/// Measured operational axes consumed by preference-bearing objective weights.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveOperationalObservations {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<TypedAxisObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency: Option<TypedAxisObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_rate: Option<TypedAxisObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_load: Option<TypedAxisObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypedAxisObservation {
+    pub kind: TypedObservationKind,
+    pub unit: String,
+    /// Normalized `[0, 10000]` basis points. Lower is better for operational axes.
+    pub value_basis_points: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypedObservationKind {
+    Measured,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
