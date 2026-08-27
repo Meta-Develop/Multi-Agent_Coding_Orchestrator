@@ -1,29 +1,238 @@
     #[cfg(unix)]
     #[test]
-    fn codex_auth_accepts_only_bounded_private_single_link_regular_file() -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
+    fn codex_auth_directory_trust_decisions_reject_writable_ancestors_and_accept_a_safe_resolved_chain(
+    ) {
+        use CodexAuthDirectoryTrustDecision::{
+            Accept as AcceptDirectory, RejectOwnership as RejectDirectoryOwnership,
+            RejectWritable,
+        };
+
+        let effective_uid = 1000;
+        // The selected /home/user/.codex symlink is canonicalized before this
+        // production decision helper evaluates its safe owner-controlled target.
+        let legitimate_resolved_home_chain = [
+            ("/", 0o755, 0),
+            ("/home", 0o755, 0),
+            ("/home/user", 0o700, effective_uid),
+            ("/home/user/.d-app-state", 0o700, effective_uid),
+            (
+                "/home/user/.d-app-state/.codex",
+                0o700,
+                effective_uid,
+            ),
+        ];
+        for (ancestor, mode, uid) in legitimate_resolved_home_chain {
+            assert_eq!(
+                codex_auth_directory_trust_decision(mode, uid, true, effective_uid),
+                AcceptDirectory,
+                "legitimate resolved Codex-home ancestor must remain trusted: {ancestor}"
+            );
+        }
+
+        assert_eq!(
+            codex_auth_directory_trust_decision(0o1777, 0, true, effective_uid),
+            RejectWritable
+        );
+        assert_eq!(
+            codex_auth_directory_trust_decision(0o0777, effective_uid, true, effective_uid),
+            RejectWritable
+        );
+        assert_eq!(
+            codex_auth_directory_trust_decision(0o0755, 1001, true, effective_uid),
+            RejectDirectoryOwnership
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_auth_file_trust_decisions_preserve_strict_auth_json_invariants() {
+        use CodexAuthFileTrustDecision::{
+            Accept as AcceptFile, RejectLinkCount, RejectMode, RejectNotRegular,
+            RejectOwnership as RejectFileOwnership,
+        };
+
+        let effective_uid = 1000;
+        assert_eq!(
+            codex_auth_file_trust_decision(true, effective_uid, effective_uid, 0o600, 1),
+            AcceptFile
+        );
+        assert_eq!(
+            codex_auth_file_trust_decision(false, effective_uid, effective_uid, 0o600, 1),
+            RejectNotRegular
+        );
+        assert_eq!(
+            codex_auth_file_trust_decision(true, 1001, effective_uid, 0o600, 1),
+            RejectFileOwnership
+        );
+        assert_eq!(
+            codex_auth_file_trust_decision(true, effective_uid, effective_uid, 0o640, 1),
+            RejectMode
+        );
+        assert_eq!(
+            codex_auth_file_trust_decision(true, effective_uid, effective_uid, 0o600, 2),
+            RejectLinkCount
+        );
+    }
+
+    #[test]
+    fn codex_auth_and_catalog_failure_summaries_name_cause_without_sensitive_detail() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let owner_local_path = temp
+            .path()
+            .join("owner-local")
+            .join("auth.json")
+            .display()
+            .to_string();
+        let credential_fixture = "credential-fixture-secret-value";
+        let detail = anyhow::anyhow!(
+            "unsafe detail path={owner_local_path} credential={credential_fixture}"
+        )
+        .context(CodexAuthValidationFailureCause::AuthFileOwnerMismatch);
+
+        let auth_summary = sanitized_codex_auth_validation_summary(&detail);
+        assert_eq!(
+            auth_summary,
+            "codex_auth_preflight_cause=auth_file_owner_mismatch"
+        );
+
+        let catalog_failure = codex_runtime_model_catalog_failure(&detail);
+        assert_eq!(
+            catalog_failure.category,
+            EnvironmentFailureCategory::RuntimeModelCatalogUnavailable
+        );
+        assert!(catalog_failure
+            .summary
+            .contains("cause=auth_file_owner_mismatch"));
+        let process_error = ProcessRunError::ContainmentUnavailable {
+            label: owner_local_path.clone(),
+            command: credential_fixture.to_string(),
+            source: std::io::Error::other(format!(
+                "unsafe process detail path={owner_local_path} credential={credential_fixture}"
+            )),
+        };
+        let process_cause =
+            codex_runtime_model_catalog_process_failure_cause(&process_error).to_string();
+        assert_eq!(process_cause, "catalog_process_containment_unavailable");
+        for summary in [&auth_summary, &catalog_failure.summary, &process_cause] {
+            assert!(!summary.contains(&owner_local_path));
+            assert!(!summary.contains(credential_fixture));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_process_root_ignores_caller_workspace_with_dangling_symlink() -> Result<()> {
+        use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir()?;
-        let home = temp.path().join("codex-home");
-        fs::create_dir(&home)?;
-        let auth = home.join("auth.json");
+        let caller_workspace = temp.path().join("caller-workspace");
+        fs::create_dir(&caller_workspace)?;
+        symlink(
+            caller_workspace.join("missing-target"),
+            caller_workspace.join("dangling"),
+        )?;
+
+        let trusted_program_dir = temp.path().join("trusted-program-dir");
+        fs::create_dir(&trusted_program_dir)?;
+        let canonical_program_dir = fs::canonicalize(&trusted_program_dir)?;
+        let resolved_program = canonical_program_dir.join("codex");
+
+        assert_eq!(
+            codex_runtime_model_catalog_process_root(&resolved_program)?,
+            canonical_program_dir
+        );
+        assert_ne!(
+            codex_runtime_model_catalog_process_root(&resolved_program)?,
+            fs::canonicalize(&caller_workspace)?
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn codex_auth_symlink_home_resolved_beneath_root_sticky_temp_is_rejected() -> Result<()> {
+        use std::os::unix::{
+            fs::{MetadataExt, PermissionsExt, symlink},
+        };
+
+        let system_temp = Path::new("/tmp");
+        let system_temp_metadata = fs::symlink_metadata(system_temp)?;
+        // SAFETY: geteuid has no preconditions and does not access Rust memory.
+        let effective_uid = unsafe { libc::geteuid() };
+        assert_eq!(
+            codex_auth_directory_trust_decision(
+                system_temp_metadata.permissions().mode(),
+                system_temp_metadata.uid(),
+                system_temp_metadata.is_dir(),
+                effective_uid,
+            ),
+            CodexAuthDirectoryTrustDecision::RejectWritable
+        );
+        assert_ne!(system_temp_metadata.permissions().mode() & 0o002, 0);
+
+        let target_guard = tempfile::tempdir_in(system_temp)?;
+        let target = target_guard.path().join("resolved-codex-home");
+        fs::create_dir(&target)?;
+        let auth = target.join("auth.json");
+        let credential_fixture = "synthetic-auth-fixture-only";
+        fs::write(&auth, format!(r#"{{"token":"{credential_fixture}"}}"#))?;
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600))?;
+
+        let selection_guard = tempfile::tempdir_in(system_temp)?;
+        let selected = selection_guard.path().join("selected-codex-home");
+        symlink(&target, &selected)?;
+        assert_eq!(fs::canonicalize(&selected)?, fs::canonicalize(&target)?);
+
+        let error = ValidatedCodexAuth::load_from_home(&selected)
+            .expect_err("a Codex home resolved beneath /tmp must be refused");
+        assert_eq!(
+            error
+                .downcast_ref::<CodexAuthValidationFailureCause>()
+                .copied(),
+            Some(CodexAuthValidationFailureCause::HomeAncestorWritable)
+        );
+        let rendered = format!("{error:#}");
+        assert_eq!(rendered, "auth_home_ancestor_writable");
+        assert_eq!(
+            sanitized_codex_auth_validation_summary(&error),
+            "codex_auth_preflight_cause=auth_home_ancestor_writable"
+        );
+        assert!(!rendered.contains("/tmp"));
+        assert!(!rendered.contains(credential_fixture));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_auth_checks_resolved_home_and_rejects_nonsticky_writable_ancestor() -> Result<()> {
+        use std::os::unix::{fs::symlink, fs::PermissionsExt};
+
+        let temp = tempfile::tempdir()?;
+        let writable_ancestor = temp.path().join("world-writable-ancestor");
+        fs::create_dir(&writable_ancestor)?;
+        fs::set_permissions(
+            &writable_ancestor,
+            fs::Permissions::from_mode(0o777),
+        )?;
+        let target = writable_ancestor.join("resolved-codex-home");
+        fs::create_dir(&target)?;
+        let auth = target.join("auth.json");
         fs::write(&auth, br#"{"token":"redacted"}"#)?;
         fs::set_permissions(&auth, fs::Permissions::from_mode(0o600))?;
-        let validated =
-            ValidatedCodexAuth::load_from_home(&home)?.context("validated auth source")?;
-        assert_eq!(validated.bytes, br#"{"token":"redacted"}"#);
-        validated.verify_source_unchanged()?;
+        let selected = temp.path().join("selected-codex-home");
+        symlink(&target, &selected)?;
+        assert_eq!(fs::canonicalize(&selected)?, fs::canonicalize(&target)?);
 
-        fs::set_permissions(&auth, fs::Permissions::from_mode(0o644))?;
-        assert!(ValidatedCodexAuth::load_from_home(&home).is_err());
-        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600))?;
-        let alias = home.join("auth-alias");
-        fs::hard_link(&auth, &alias)?;
-        assert!(ValidatedCodexAuth::load_from_home(&home).is_err());
-        fs::remove_file(&alias)?;
-        fs::remove_file(&auth)?;
-        std::os::unix::fs::symlink("missing-auth", &auth)?;
-        assert!(ValidatedCodexAuth::load_from_home(&home).is_err());
+        let error = ValidatedCodexAuth::load_from_home(&selected)
+            .expect_err("the resolved writable ancestor must be refused");
+        assert_eq!(
+            error
+                .downcast_ref::<CodexAuthValidationFailureCause>()
+                .copied(),
+            Some(CodexAuthValidationFailureCause::HomeAncestorWritable)
+        );
+        assert!(!format!("{error:#}").contains(&temp.path().display().to_string()));
         Ok(())
     }
 

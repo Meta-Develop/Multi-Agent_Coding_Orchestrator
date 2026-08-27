@@ -2732,7 +2732,7 @@ fn runtime_model_catalog_rejects_custom_executable_with_typed_failure() {
     assert!(failure.requirement.is_none());
     assert!(failure
         .summary
-        .contains("explicit custom executables receive no auth or provider network access"));
+        .contains("cause=untrusted_custom_executable"));
     assert!(!failure.remediation.is_empty());
 }
 
