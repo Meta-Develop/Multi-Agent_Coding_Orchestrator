@@ -147,6 +147,7 @@ pub struct RoleTransitionRecord {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HierarchyLedgerSnapshot {
     pub edges: BTreeMap<String, SupervisionEdgeRecord>,
+    pub effective_categories: BTreeMap<String, RoleCategory>,
     pub gate_owners: BTreeMap<String, GateOwnershipRecord>,
     pub gate_history: Vec<GateOwnershipRecord>,
     pub role_transitions: Vec<RoleTransitionRecord>,
@@ -329,6 +330,23 @@ pub fn reconstruct_hierarchy_ledger(
                     event.parent
                 );
             }
+            if let Some(current) = snapshot
+                .effective_categories
+                .get(&edge.child_agent_id)
+                .copied()
+            {
+                if current != edge.role_category {
+                    bail!(
+                        "supervision edge for agent '{}' conflicts with effective category '{}'",
+                        edge.child_agent_id,
+                        current.as_str()
+                    );
+                }
+            } else {
+                snapshot
+                    .effective_categories
+                    .insert(edge.child_agent_id.clone(), edge.role_category);
+            }
             snapshot.edges.insert(edge.child_agent_id.clone(), edge);
         }
         if let Some(value) = event.payload.get(GATE_OWNERSHIP_FIELD) {
@@ -341,10 +359,33 @@ pub fn reconstruct_hierarchy_ledger(
             let record: RoleTransitionRecord = serde_json::from_value(value.clone())
                 .context("role-transition payload is not a valid ledger record")?;
             record.validate()?;
-            snapshot.role_transitions.push(record);
+            apply_role_transition(&mut snapshot, record)?;
         }
     }
     Ok(snapshot)
+}
+
+fn apply_role_transition(
+    snapshot: &mut HierarchyLedgerSnapshot,
+    record: RoleTransitionRecord,
+) -> Result<()> {
+    let effective = snapshot
+        .effective_categories
+        .entry(record.agent_id.clone())
+        .or_insert(record.from_category);
+    if *effective != record.from_category {
+        bail!(
+            "role transition for agent '{}' expected effective category '{}', found stale from_category '{}'",
+            record.agent_id,
+            effective.as_str(),
+            record.from_category.as_str()
+        );
+    }
+    if record.decision == RoleTransitionDecision::Granted {
+        *effective = record.to_category;
+    }
+    snapshot.role_transitions.push(record);
+    Ok(())
 }
 
 fn apply_gate_ownership(
@@ -889,6 +930,68 @@ mod tests {
             reason: "granted_demotion".to_string(),
         };
         granted.validate()
+    }
+
+    #[test]
+    fn reconstructed_effective_category_rejects_a_stale_transition_source() -> Result<()> {
+        let edge = SupervisionEdgeRecord::new(
+            "child-a",
+            "run-1",
+            OrchestrationRole::Orchestrator,
+            "child_orchestrator",
+            vec!["src/lib.rs".to_string()],
+            "assignment:child-a",
+        )?;
+        let mut spawn_payload = json!({});
+        insert_supervision_edge(&mut spawn_payload, &edge)?;
+        let demotion = RoleTransitionRecord {
+            agent_id: "child-a".to_string(),
+            from_category: RoleCategory::DelegatingCoordinator,
+            to_category: RoleCategory::NonDelegatingTerminalWorker,
+            requester_agent_id: "run-1".to_string(),
+            judge_agent_id: "third-party-auditor".to_string(),
+            evidence: RoleTransitionEvidenceRecord {
+                acceptance_grade: false,
+                recorded: true,
+                uncertain: false,
+            },
+            decision: RoleTransitionDecision::Granted,
+            reason: "granted_demotion".to_string(),
+        };
+        let stale = RoleTransitionRecord {
+            from_category: RoleCategory::DelegatingCoordinator,
+            to_category: RoleCategory::NonDelegatingTerminalWorker,
+            ..demotion.clone()
+        };
+        let error = reconstruct_hierarchy_ledger(&[
+            event(
+                "child-a",
+                Some("run-1"),
+                OrchestrationRole::Orchestrator,
+                OrchestrationEventKind::Spawn,
+                spawn_payload,
+            ),
+            event(
+                "child-a",
+                Some("run-1"),
+                OrchestrationRole::Orchestrator,
+                OrchestrationEventKind::Journal,
+                role_transition_payload(&demotion)?,
+            ),
+            event(
+                "child-a",
+                Some("run-1"),
+                OrchestrationRole::Orchestrator,
+                OrchestrationEventKind::Journal,
+                role_transition_payload(&stale)?,
+            ),
+        ])
+        .expect_err("stale transition source must fail closed");
+        assert!(
+            error.to_string().contains("effective category"),
+            "{error:#}"
+        );
+        Ok(())
     }
 
     #[test]

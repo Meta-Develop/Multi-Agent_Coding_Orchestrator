@@ -1,9 +1,14 @@
 use crate::{
     artifacts::discover_repo_root,
+    hierarchy_ledger::RoleCategory,
     safe_state::{AtomicStateWriter, BoundedRegularReader, KernelStateLock, SafeRoot},
+    supervise::{
+        trusted_model_capability, validate_known_judgment_role_model, AgentRole,
+        ModelCapabilityClass,
+    },
 };
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{ser::SerializeStruct, Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     path::{Path, PathBuf},
     thread,
@@ -93,19 +98,52 @@ impl AgentLaunchMetadata {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentProcessRecord {
     pub pid: u32,
     pub process_start_time: String,
     pub role: String,
     pub run_id: String,
     pub task_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
     pub repo: PathBuf,
     pub argv: Vec<String>,
     pub launch_timestamp_ms: u64,
+}
+
+/// Authority MACO derived from the declared lifecycle role and the exact
+/// launched argv. This is deliberately not caller-authored lifecycle input.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchAuthorityBinding {
+    pub category: RoleCategory,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_capability: Option<ModelCapabilityClass>,
+    pub may_delegate: bool,
+    pub may_write: bool,
+    pub may_judge_acceptance: bool,
+    pub may_mutate_git_history: bool,
+    pub probe_only: bool,
+    pub source: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentProcessRecordWire {
+    pid: u32,
+    process_start_time: String,
+    role: String,
+    run_id: String,
+    task_id: String,
+    #[serde(default)]
+    parent: Option<String>,
+    repo: PathBuf,
+    argv: Vec<String>,
+    launch_timestamp_ms: u64,
+    #[serde(default)]
+    launch_authority: Option<LaunchAuthorityBinding>,
 }
 
 impl AgentProcessRecord {
@@ -139,7 +177,17 @@ impl AgentProcessRecord {
                 bail!("agent registry argv entry exceeds its safety bound");
             }
         }
+        self.launch_authority()?;
         Ok(())
+    }
+
+    /// Reconstruct and validate launch authority from immutable record fields.
+    ///
+    /// Version probes carry no authority. Actual coordinator and acceptance
+    /// judge launches require an explicit model accepted by the model policy.
+    /// Git mutation is never granted by lifecycle registration alone.
+    pub fn launch_authority(&self) -> Result<LaunchAuthorityBinding> {
+        derive_launch_authority(&self.role, &self.argv)
     }
 
     fn summary(&self) -> String {
@@ -152,6 +200,219 @@ impl AgentProcessRecord {
             self.parent.as_deref().unwrap_or("-")
         )
     }
+}
+
+impl Serialize for AgentProcessRecord {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let launch_authority = self.launch_authority().map_err(serde::ser::Error::custom)?;
+        let mut state = serializer.serialize_struct("AgentProcessRecord", 10)?;
+        state.serialize_field("pid", &self.pid)?;
+        state.serialize_field("process_start_time", &self.process_start_time)?;
+        state.serialize_field("role", &self.role)?;
+        state.serialize_field("run_id", &self.run_id)?;
+        state.serialize_field("task_id", &self.task_id)?;
+        if self.parent.is_some() {
+            state.serialize_field("parent", &self.parent)?;
+        }
+        state.serialize_field("repo", &self.repo)?;
+        state.serialize_field("argv", &self.argv)?;
+        state.serialize_field("launch_timestamp_ms", &self.launch_timestamp_ms)?;
+        state.serialize_field("launch_authority", &launch_authority)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentProcessRecord {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AgentProcessRecordWire::deserialize(deserializer)?;
+        let supplied_authority = wire.launch_authority;
+        let record = Self {
+            pid: wire.pid,
+            process_start_time: wire.process_start_time,
+            role: wire.role,
+            run_id: wire.run_id,
+            task_id: wire.task_id,
+            parent: wire.parent,
+            repo: wire.repo,
+            argv: wire.argv,
+            launch_timestamp_ms: wire.launch_timestamp_ms,
+        };
+        if let Some(supplied_authority) = supplied_authority {
+            let reconstructed = record
+                .launch_authority()
+                .map_err(serde::de::Error::custom)?;
+            if supplied_authority != reconstructed {
+                return Err(serde::de::Error::custom(
+                    "agent launch authority does not match immutable role/argv evidence",
+                ));
+            }
+        }
+        Ok(record)
+    }
+}
+
+fn derive_launch_authority(role: &str, argv: &[String]) -> Result<LaunchAuthorityBinding> {
+    let category = lifecycle_role_category(role)?;
+    if is_version_probe(argv) {
+        return Ok(LaunchAuthorityBinding {
+            category,
+            requested_model: None,
+            model_capability: None,
+            may_delegate: false,
+            may_write: false,
+            may_judge_acceptance: false,
+            may_mutate_git_history: false,
+            probe_only: true,
+            source: "verified_version_probe".to_string(),
+        });
+    }
+    if matches!(role, "supervise" | "autopilot") {
+        return Ok(LaunchAuthorityBinding {
+            category,
+            requested_model: None,
+            model_capability: None,
+            may_delegate: true,
+            may_write: true,
+            may_judge_acceptance: false,
+            may_mutate_git_history: false,
+            probe_only: false,
+            source: "host_control_plane".to_string(),
+        });
+    }
+
+    if !is_agent_runtime_program(&argv[0]) {
+        return Ok(LaunchAuthorityBinding {
+            category,
+            requested_model: None,
+            model_capability: None,
+            may_delegate: false,
+            may_write: false,
+            may_judge_acceptance: false,
+            may_mutate_git_history: false,
+            probe_only: false,
+            source: "non_agent_simulation".to_string(),
+        });
+    }
+
+    let model = configured_model_from_argv(argv)?;
+    let policy_role = lifecycle_policy_role(role);
+    match (role, policy_role, model.as_deref()) {
+        ("researcher", None, Some(model)) => {
+            validate_known_judgment_role_model(AgentRole::Worker, Some(model))?;
+        }
+        ("researcher", None, None) | (_, Some(AgentRole::Worker), None) => {}
+        (_, Some(policy_role), model) => {
+            validate_known_judgment_role_model(policy_role, model)?;
+        }
+        _ => bail!("agent lifecycle role {role:?} has no launch authority policy"),
+    }
+    let model_capability = model.as_deref().and_then(trusted_model_capability);
+    Ok(LaunchAuthorityBinding {
+        category,
+        requested_model: model,
+        model_capability,
+        may_delegate: category == RoleCategory::DelegatingCoordinator,
+        may_write: matches!(
+            category,
+            RoleCategory::DelegatingCoordinator | RoleCategory::NonDelegatingTerminalWorker
+        ),
+        may_judge_acceptance: category == RoleCategory::ReadOnlyReviewAuditor,
+        may_mutate_git_history: false,
+        probe_only: false,
+        source: "role_and_exact_requested_argv".to_string(),
+    })
+}
+
+fn is_agent_runtime_program(program: &str) -> bool {
+    Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "codex" | "claude" | "gemini"
+            )
+        })
+}
+
+fn lifecycle_role_category(role: &str) -> Result<RoleCategory> {
+    match role {
+        "supervise" | "autopilot" => Ok(RoleCategory::DelegatingCoordinator),
+        other => RoleCategory::from_legacy_role(other),
+    }
+}
+
+fn lifecycle_policy_role(role: &str) -> Option<AgentRole> {
+    match role {
+        "supervisor" => Some(AgentRole::Supervisor),
+        "child_orchestrator" | "orchestrator" | "root" => Some(AgentRole::ChildOrchestrator),
+        "worker" => Some(AgentRole::Worker),
+        "gate_classifier" => Some(AgentRole::GateClassifier),
+        "auditor" => Some(AgentRole::Auditor),
+        _ => None,
+    }
+}
+
+fn is_version_probe(argv: &[String]) -> bool {
+    let args = argv.iter().skip(1).map(String::as_str).collect::<Vec<_>>();
+    args.len() <= 3
+        && args
+            .iter()
+            .any(|argument| matches!(*argument, "--version" | "-V" | "version"))
+        && !args
+            .iter()
+            .any(|argument| matches!(*argument, "exec" | "app-server"))
+}
+
+fn configured_model_from_argv(argv: &[String]) -> Result<Option<String>> {
+    let mut resolved = None;
+    let mut index = 1;
+    while index < argv.len() {
+        let argument = argv[index].as_str();
+        let candidate = if matches!(argument, "-m" | "--model") {
+            index += 1;
+            Some(
+                argv.get(index)
+                    .context("model option in agent argv is missing its value")?
+                    .as_str(),
+            )
+        } else if let Some(model) = argument.strip_prefix("--model=") {
+            Some(model)
+        } else if matches!(argument, "-c" | "--config") {
+            index += 1;
+            argv.get(index)
+                .context("config option in agent argv is missing its value")?
+                .split_once('=')
+                .filter(|(key, _)| key.trim() == "model")
+                .map(|(_, value)| value.trim())
+        } else {
+            None
+        };
+        if let Some(candidate) = candidate {
+            let candidate = candidate
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .unwrap_or(candidate);
+            if candidate.is_empty() {
+                bail!("agent argv contains an empty model identity");
+            }
+            match &resolved {
+                Some(existing) if existing != candidate => {
+                    bail!("agent argv contains conflicting model identities")
+                }
+                Some(_) => {}
+                None => resolved = Some(candidate.to_string()),
+            }
+        }
+        index += 1;
+    }
+    Ok(resolved)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
