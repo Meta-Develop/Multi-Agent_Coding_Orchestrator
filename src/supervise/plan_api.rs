@@ -334,6 +334,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         evidence_only_reaudit: None,
         generated_follow_up: None,
         path_proposal: proposal.diagnostics.clone(),
+        router: SupervisorRouterConfig::default(),
     };
     let (plan, plan_metadata) = validate_supervisor_plan(plan, metadata)?;
     Ok(LoadedSupervisorPlan {
@@ -435,6 +436,7 @@ fn supervisor_plan_and_consultant_from_provider_session(
         evidence_only_reaudit: None,
         generated_follow_up: None,
         path_proposal: session.proposal().diagnostics.clone(),
+        router: SupervisorRouterConfig::default(),
     };
     let (plan, plan_metadata) = validate_supervisor_plan(plan, metadata)
         .context("validated provider planning session could not be lowered safely")?;
@@ -1182,6 +1184,14 @@ fn supervisor_plan_metadata_from_value(
         })
         .transpose()?
         .unwrap_or_default();
+    let router = value
+        .get("router")
+        .map(|config| {
+            serde_json::from_value::<SupervisorRouterConfig>(config.clone())
+                .context("router is invalid")
+        })
+        .transpose()?
+        .unwrap_or_default();
     let raw_assignments = value
         .get("assignments")
         .and_then(Value::as_array)
@@ -1196,8 +1206,10 @@ fn supervisor_plan_metadata_from_value(
         generated_follow_up,
         execution_target,
         path_proposal,
+        router,
         ..SupervisorPlanMetadata::default()
     };
+    bind_live_router_config(metadata.router.clone());
     collect_assignment_plan_metadata(
         raw_assignments,
         None,
@@ -1666,6 +1678,13 @@ pub(super) fn supervisor_plan_value(
             "path_proposal".to_string(),
             serde_json::to_value(&plan_metadata.path_proposal)
                 .context("failed to serialize path_proposal plan field")?,
+        );
+    }
+    if !plan_metadata.router.is_default() {
+        object.insert(
+            "router".to_string(),
+            serde_json::to_value(&plan_metadata.router)
+                .context("failed to serialize router plan field")?,
         );
     }
     if let Some(operation) = &plan_metadata.evidence_only_reaudit {
@@ -2382,6 +2401,7 @@ pub(super) fn evidence_only_reaudit_plan_from_source(
         generated_follow_up: None,
         execution_target: None,
         path_proposal: source_loaded.plan_metadata.path_proposal.clone(),
+        router: source_loaded.plan_metadata.router.clone(),
     };
     let (plan, plan_metadata) = validate_supervisor_plan(plan, plan_metadata)?;
     Ok(LoadedSupervisorPlan {

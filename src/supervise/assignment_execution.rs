@@ -1,5 +1,25 @@
 use super::*;
 
+fn live_invocation_started_millis(duration_ms: u64) -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(1)
+        .max(1);
+    now.saturating_sub(duration_ms).max(1)
+}
+
+fn record_and_persist_live_invocation(
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    observation: LiveInvocationObservation<'_>,
+) -> Result<()> {
+    let record = record_supervisor_invocation_observation(observation)?;
+    with_supervisor_artifacts(artifacts, |writer, _| {
+        persist_live_invocation_row(writer, &record)?;
+        persist_live_switch_cost_snapshot(writer)
+    })
+}
+
 fn assignment_launch_runtime(
     assignment: &OrchestratorAssignment,
     options: &SupervisorRunOptions,
@@ -1670,12 +1690,32 @@ fn dispatch_and_collect_child_attempt<'a>(
     let environment_blocked = external_run.environment_blocked();
     let usage_settlement = budget_reservation.settle_bound_runtime(&external_run, &command)?;
     match usage_settlement.reliable_usage() {
-        Some(usage) => outcome.usage_samples.push(RoleUsageSample {
-            role: AgentRole::ChildOrchestrator,
-            lens_id: None,
-            model: command.model.clone(),
-            usage,
-        }),
+        Some(usage) => {
+            outcome.usage_samples.push(RoleUsageSample {
+                role: AgentRole::ChildOrchestrator,
+                lens_id: None,
+                model: command.model.clone(),
+                usage,
+            });
+            record_and_persist_live_invocation(
+                artifacts,
+                LiveInvocationObservation {
+                    run_id: options.run_id.as_str(),
+                    assignment_id: &assignment.id,
+                    attempt,
+                    role: assignment.role,
+                    runtime: launch_runtime,
+                    model: command.model.as_deref(),
+                    effort: command.reasoning_effort.as_deref(),
+                    worktree_id: &worktree.name,
+                    usage: Some(&usage),
+                    duration_ms: Some(external_run.duration_ms),
+                    started_at_unix_millis: live_invocation_started_millis(
+                        external_run.duration_ms,
+                    ),
+                },
+            )?;
+        }
         None if usage_settlement.is_degraded() => outcome.usage_incomplete = true,
         None => {}
     }
@@ -2925,12 +2965,30 @@ fn dispatch_and_collect_parent_auditor(
     let usage_settlement =
         auditor_budget_reservation.settle_bound_runtime(&auditor_run, &auditor_command)?;
     match usage_settlement.reliable_usage() {
-        Some(usage) => outcome.usage_samples.push(RoleUsageSample {
-            role: AgentRole::Auditor,
-            lens_id: Some(lens.id.clone()),
-            model: auditor_command.model.clone(),
-            usage,
-        }),
+        Some(usage) => {
+            outcome.usage_samples.push(RoleUsageSample {
+                role: AgentRole::Auditor,
+                lens_id: Some(lens.id.clone()),
+                model: auditor_command.model.clone(),
+                usage,
+            });
+            record_and_persist_live_invocation(
+                artifacts,
+                LiveInvocationObservation {
+                    run_id: options.run_id.as_str(),
+                    assignment_id: &assignment.id,
+                    attempt: auditor_attempt,
+                    role: AgentRole::Auditor,
+                    runtime: options.runtime,
+                    model: auditor_command.model.as_deref(),
+                    effort: auditor_command.reasoning_effort.as_deref(),
+                    worktree_id: &assignment.id,
+                    usage: Some(&usage),
+                    duration_ms: Some(auditor_run.duration_ms),
+                    started_at_unix_millis: live_invocation_started_millis(auditor_run.duration_ms),
+                },
+            )?;
+        }
         None if usage_settlement.is_degraded() => outcome.usage_incomplete = true,
         None => {}
     }

@@ -1275,6 +1275,44 @@ pub struct SupervisorExecutionMetadata {
 
 pub const ASSIGNMENT_SELECTION_LEDGER_SCHEMA_VERSION: u32 = 2;
 pub const SELECTION_LEDGER_RELATIVE: &str = "selection/assignment-selection-ledger.json";
+pub const LIVE_SWITCH_COST_EVIDENCE_RELATIVE: &str = "switch-cost/live-evidence.json";
+pub const LIVE_SWITCH_COST_INVOCATIONS_RELATIVE: &str = "switch-cost/invocation-telemetry.jsonl";
+pub const LIVE_SWITCH_COST_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+
+/// Operator-reachable online-router hysteresis and oscillation alarm config.
+///
+/// Plans expose this as a first-class `router` object. Defaults match the
+/// optimizer's shipped hysteresis margin and A→B→A alarm threshold.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SupervisorRouterConfig {
+    #[serde(default = "default_hysteresis_margin_bp")]
+    pub hysteresis_margin_bp: u16,
+    #[serde(default = "default_oscillation_alarm_threshold")]
+    pub oscillation_alarm_threshold: u32,
+}
+
+fn default_hysteresis_margin_bp() -> u16 {
+    crate::optimizer::switch_cost::DEFAULT_HYSTERESIS_BP
+}
+
+fn default_oscillation_alarm_threshold() -> u32 {
+    crate::optimizer::switch_cost::DEFAULT_OSCILLATION_ALARM
+}
+
+impl Default for SupervisorRouterConfig {
+    fn default() -> Self {
+        Self {
+            hysteresis_margin_bp: default_hysteresis_margin_bp(),
+            oscillation_alarm_threshold: default_oscillation_alarm_threshold(),
+        }
+    }
+}
+
+impl SupervisorRouterConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1708,6 +1746,7 @@ struct SupervisorPlanMetadata {
     generated_follow_up: Option<GeneratedFollowUpPlanContext>,
     execution_target: Option<SupervisorExecutionTarget>,
     path_proposal: planning::TaskPathProposalDiagnostics,
+    router: SupervisorRouterConfig,
 }
 
 #[derive(Debug, Clone)]

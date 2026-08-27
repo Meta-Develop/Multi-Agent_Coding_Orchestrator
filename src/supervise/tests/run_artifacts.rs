@@ -183,6 +183,216 @@ fn finalized_artifacts_round_trip_typed_context_switch_selection_evidence() {
 }
 
 #[test]
+fn finalized_artifacts_round_trip_live_four_arm_router_and_oscillation_alarm() {
+    reset_live_switch_cost_session();
+    bind_live_router_config(SupervisorRouterConfig {
+        hysteresis_margin_bp: 2_500,
+        oscillation_alarm_threshold: 1,
+    });
+
+    let (_temp, repo_path) = injected_repository();
+    let run_id = RunId::new("artifact-live-four-arm").expect("valid run id");
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        run_id.clone(),
+        "supervise-test",
+    )
+    .expect("reserve supervise artifact run");
+
+    let mut plan = injected_plan(injected_assignment(true), 0);
+    let catalog = injected_codex_runtime_catalog(&["gpt-5.6-sol", "gpt-5.6-luna"]);
+    let admission = SupervisorAdmissionPolicyInput::resolve(
+        &repo_path,
+        1,
+        SupervisorAdmissionConfig::default(),
+        SupervisorAdmissionConfig::default(),
+    )
+    .expect("resolve selector admission fixture");
+    let resolved_objective_profile = ResolvedObjectiveProfile {
+        profile: crate::objective_profile::default_objective_profile()
+            .binding()
+            .expect("default objective binding"),
+        source: crate::objective_profile::ObjectiveProfileSource::BuiltIn,
+    };
+    let started = crate::optimizer::ids::TimestampMillis::from_millis(1);
+    let mut warm = crate::optimizer::telemetry::InvocationRecord::new(
+        crate::optimizer::ids::PolicyId::new("live-policy").expect("policy"),
+        crate::optimizer::ids::CandidateId::new("warm").expect("cand"),
+        started,
+        crate::optimizer::resources::ResourceVector::new().snapshot(started),
+    );
+    warm.finished_at = Some(crate::optimizer::ids::TimestampMillis::from_millis(2));
+    warm.optimization_run_id = Some(
+        crate::optimizer::telemetry::OptimizationRunId::new("artifact-live-four-arm").expect("run"),
+    );
+    warm.policy_execution_id =
+        Some(crate::optimizer::telemetry::PolicyExecutionId::new("exec-1").expect("exec"));
+    warm.invocation_id = Some(crate::optimizer::telemetry::InvocationId::new("warm").expect("id"));
+    warm.root_decision_id =
+        Some(crate::optimizer::telemetry::DecisionId::new("decision-1").expect("decision"));
+    warm.backend = Some(crate::optimizer::ids::BackendId::well_known(
+        crate::optimizer::ids::BackendId::CODEX_CLI,
+    ));
+    warm.provider = Some(crate::optimizer::ids::ProviderId::new("openai").expect("provider"));
+    warm.requested_model =
+        Some(crate::optimizer::ids::RuntimeSlug::new("gpt-5.6-sol").expect("slug"));
+    warm.resolved_model =
+        Some(crate::optimizer::ids::RuntimeSlug::new("gpt-5.6-sol").expect("slug"));
+    warm.requested_effort = Some(crate::optimizer::action::CanonicalEffort::High);
+    warm.resolved_effort = Some(crate::optimizer::action::CanonicalEffort::High);
+    warm.session_id = Some("session-a".to_string());
+    warm.worktree_id = Some("worktree-a".to_string());
+    warm.input_tokens = Some(1_000);
+    warm.cached_input_tokens = Some(800);
+    record_live_invocation(warm).expect("record warm invocation");
+
+    let switched_at = crate::optimizer::ids::TimestampMillis::from_millis(3);
+    let mut switched = crate::optimizer::telemetry::InvocationRecord::new(
+        crate::optimizer::ids::PolicyId::new("live-policy").expect("policy"),
+        crate::optimizer::ids::CandidateId::new("swap").expect("cand"),
+        switched_at,
+        crate::optimizer::resources::ResourceVector::new().snapshot(switched_at),
+    );
+    switched.finished_at = Some(crate::optimizer::ids::TimestampMillis::from_millis(4));
+    switched.optimization_run_id = Some(
+        crate::optimizer::telemetry::OptimizationRunId::new("artifact-live-four-arm").expect("run"),
+    );
+    switched.policy_execution_id =
+        Some(crate::optimizer::telemetry::PolicyExecutionId::new("exec-1").expect("exec"));
+    switched.invocation_id =
+        Some(crate::optimizer::telemetry::InvocationId::new("swap").expect("id"));
+    switched.root_decision_id =
+        Some(crate::optimizer::telemetry::DecisionId::new("decision-1").expect("decision"));
+    switched.backend = Some(crate::optimizer::ids::BackendId::well_known(
+        crate::optimizer::ids::BackendId::CODEX_CLI,
+    ));
+    switched.provider = Some(crate::optimizer::ids::ProviderId::new("openai").expect("provider"));
+    switched.requested_model =
+        Some(crate::optimizer::ids::RuntimeSlug::new("gpt-5.6-luna").expect("slug"));
+    switched.resolved_model =
+        Some(crate::optimizer::ids::RuntimeSlug::new("gpt-5.6-luna").expect("slug"));
+    switched.requested_effort = Some(crate::optimizer::action::CanonicalEffort::High);
+    switched.resolved_effort = Some(crate::optimizer::action::CanonicalEffort::High);
+    switched.session_id = Some("session-a".to_string());
+    switched.worktree_id = Some("worktree-a".to_string());
+    switched.input_tokens = Some(900);
+    switched.cached_input_tokens = Some(0);
+    switched.runtime_startup_micros = Some(1_200);
+    record_live_invocation(switched).expect("record switched invocation");
+
+    let resolution = initialize_supervisor_selection(
+        &mut plan,
+        SupervisorRuntime::Codex,
+        &catalog,
+        &admission,
+        &AdvertisedCatalogSet::empty(),
+        Some(&resolved_objective_profile),
+    )
+    .expect("initialize selector evidence fixture");
+    let initial = resolution
+        .decisions
+        .iter()
+        .find(|event| event.role == AgentRole::Worker)
+        .expect("worker selection event");
+    let mut input = initial.provenance.normalized_input.clone();
+    input.signals.previous_choice = Some(crate::selection::CandidateKey {
+        runtime: "codex".to_string(),
+        model: "gpt-5.6-sol".to_string(),
+        effort: crate::selection::ReasoningEffort::High,
+    });
+    push_live_router_identity("codex:gpt-5.6-sol:high");
+    push_live_router_identity("codex:gpt-5.6-luna:high");
+    push_live_router_identity("codex:gpt-5.6-sol:high");
+    route_live_four_arm_for_test(&input).expect("route four-arm comparison");
+
+    let mut profile = plan.effective_role_economics_profile();
+    profile.execution = Some(SupervisorExecutionMetadata {
+        assignment_count: 1,
+        started_assignment_count: 1,
+        completed_assignment_count: 1,
+        concurrency: SupervisorConcurrencyReport {
+            configured_max_concurrent_children: 1,
+            policy_input_observation: ProcessObservation::SchedulerObserved,
+            policy_input: None,
+            policy_input_details: None,
+            policy_input_unavailable_reason: None,
+            achieved_max_concurrent_children: 1,
+            achieved_mean_concurrent_children: Some(1.0),
+            achieved_mean_observation: ProcessObservation::SchedulerObserved,
+            achieved_mean_unavailable_reason: None,
+        },
+        role_bindings: BTreeMap::new(),
+        assignment_effort_bindings: Vec::new(),
+        budget_degradations: Vec::new(),
+        selection_decisions: vec![initial.clone()],
+        assignment_selection_ledger: build_assignment_selection_ledger(
+            &plan,
+            std::slice::from_ref(initial),
+            SupervisorRuntime::Codex,
+        ),
+        usage: SupervisorExecutionUsageReport {
+            total_usage: None,
+            total_cost_usd: None,
+            usage_complete: false,
+            observation: RoleUsageObservation::NotProcessObservable,
+            unavailable_reason: Some("artifact round-trip fixture".to_string()),
+        },
+    });
+    let mut final_report = artifact_test_final_report(&run_id);
+    final_report.role_economics_profile = Some(profile);
+    write_selection_ledger_from_report(&mut writer, &final_report)
+        .expect("write live switch-cost evidence");
+    write_final_report(&mut writer, &final_report).expect("write final report");
+    writer
+        .finalize(
+            RunArtifactFamily::Supervise.final_report_relative_path(),
+            false,
+        )
+        .expect("finalize live four-arm artifact");
+
+    let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+        .expect("open finalized live four-arm artifact");
+    let restored: LiveSwitchCostArtifact = serde_json::from_slice(
+        &reader
+            .read(std::path::Path::new(LIVE_SWITCH_COST_EVIDENCE_RELATIVE))
+            .expect("read live switch-cost evidence"),
+    )
+    .expect("decode live switch-cost evidence");
+    assert_eq!(
+        restored.schema_version,
+        LIVE_SWITCH_COST_EVIDENCE_SCHEMA_VERSION
+    );
+    assert_eq!(restored.router_config.hysteresis_margin_bp, 2_500);
+    assert_eq!(restored.invocations.len(), 2);
+    let comparison = restored
+        .router_comparison
+        .as_ref()
+        .expect("restored four-arm comparison");
+    assert_eq!(
+        comparison
+            .continue_arm
+            .as_ref()
+            .expect("continue")
+            .applied_switch_cost_micros,
+        0
+    );
+    assert!(
+        comparison
+            .switch_arm
+            .as_ref()
+            .expect("switch")
+            .applied_switch_cost_micros
+            > 0
+    );
+    assert!(restored
+        .oscillation_alarms
+        .iter()
+        .any(|alarm| alarm.alarmed));
+    reset_live_switch_cost_session();
+}
+
+#[test]
 #[cfg(unix)]
 fn worker_journals_are_precreated_as_private_exact_files() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
