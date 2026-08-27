@@ -1040,6 +1040,53 @@ fn supervise_plan_treats_nested_repositories_as_opaque_outer_inventory_boundarie
         .all(|path| !path
             .as_str()
             .is_some_and(|path| path.contains("excluded.rs"))));
+    assert_eq!(first["path_proposal"]["degraded"], false);
+    let notes = first["path_proposal"]["notes"]
+        .as_array()
+        .context("path_proposal notes")?;
+    assert!(
+        notes.iter().any(|note| {
+            note.as_str().is_some_and(|note| {
+                note.contains("showing first 3 sorted paths")
+                    && note.contains("alpha/nested")
+                    && note.contains("beta/nested")
+                    && note.contains("middle/nested")
+                    && !note.contains("zeta/nested")
+            })
+        }),
+        "JSON plan must keep sorted bounded nested-boundary notes: {notes:?}"
+    );
+    assert!(first["assignments"]
+        .as_array()
+        .context("assignments")?
+        .iter()
+        .filter_map(|assignment| assignment["task"].as_str())
+        .all(|task| !task.contains("Planning inventory diagnostics:")));
+    assert_eq!(first["path_proposal"], second["path_proposal"]);
+
+    let human = command_with_test_machine_global_binding(
+        BIN,
+        &[
+            "supervise",
+            "plan",
+            path_str(&task_path)?,
+            "--repo",
+            path_str(&repo_path)?,
+        ],
+    )
+    .output()
+    .context("run human nested-boundary plan")?;
+    assert!(human.status.success(), "human nested plan failed");
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        human_stdout.contains("degraded: false") || human_stdout.contains("degraded: Bool(false)"),
+        "human plan must surface degraded: false: {human_stdout}"
+    );
+    assert!(
+        human_stdout.contains("showing first 3 sorted paths"),
+        "human plan must surface sorted bounded nested-boundary notes: {human_stdout}"
+    );
+    assert!(!human_stdout.contains("Planning inventory diagnostics:"));
     assert!(!repo_path.join(".maco/o2").exists());
     Ok(())
 }

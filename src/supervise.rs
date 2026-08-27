@@ -1707,6 +1707,7 @@ struct SupervisorPlanMetadata {
     evidence_only_reaudit: Option<EvidenceOnlyReauditPlan>,
     generated_follow_up: Option<GeneratedFollowUpPlanContext>,
     execution_target: Option<SupervisorExecutionTarget>,
+    path_proposal: planning::TaskPathProposalDiagnostics,
 }
 
 #[derive(Debug, Clone)]

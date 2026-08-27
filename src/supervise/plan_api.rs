@@ -73,6 +73,33 @@ pub fn supervisor_plan_document_from_task_file(
     )
 }
 
+/// Machine-readable failure envelope for `supervise plan --json`.
+///
+/// The CLI still prints the full error chain on stderr and exits nonzero.
+/// This envelope is the stdout payload for inventory and other planning
+/// failures; it does not recover or fall back to a degraded plan.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SupervisorPlanErrorEnvelope {
+    pub success: bool,
+    pub status: &'static str,
+    pub error: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub causes: Vec<String>,
+}
+
+pub fn supervisor_plan_error_envelope(error: &anyhow::Error) -> SupervisorPlanErrorEnvelope {
+    SupervisorPlanErrorEnvelope {
+        success: false,
+        status: "error",
+        error: error.to_string(),
+        causes: error
+            .chain()
+            .skip(1)
+            .map(|cause| cause.to_string())
+            .collect(),
+    }
+}
+
 pub(super) fn supervisor_plan_and_consultant_from_task_file(
     repo: impl AsRef<Path>,
     task_file: impl AsRef<Path>,
@@ -306,6 +333,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         admission: SupervisorAdmissionConfig::default(),
         evidence_only_reaudit: None,
         generated_follow_up: None,
+        path_proposal: proposal.diagnostics.clone(),
     };
     let (plan, plan_metadata) = validate_supervisor_plan(plan, metadata)?;
     Ok(LoadedSupervisorPlan {
@@ -380,6 +408,7 @@ fn supervisor_plan_and_consultant_from_provider_session(
         admission: SupervisorAdmissionConfig::default(),
         evidence_only_reaudit: None,
         generated_follow_up: None,
+        path_proposal: session.proposal().diagnostics.clone(),
     };
     let (plan, plan_metadata) = validate_supervisor_plan(plan, metadata)
         .context("validated provider planning session could not be lowered safely")?;
@@ -1119,6 +1148,14 @@ fn supervisor_plan_metadata_from_value(
                 .context("execution_target is invalid")
         })
         .transpose()?;
+    let path_proposal = value
+        .get("path_proposal")
+        .map(|diagnostics| {
+            serde_json::from_value::<planning::TaskPathProposalDiagnostics>(diagnostics.clone())
+                .context("path_proposal is invalid")
+        })
+        .transpose()?
+        .unwrap_or_default();
     let raw_assignments = value
         .get("assignments")
         .and_then(Value::as_array)
@@ -1132,6 +1169,7 @@ fn supervisor_plan_metadata_from_value(
         evidence_only_reaudit,
         generated_follow_up,
         execution_target,
+        path_proposal,
         ..SupervisorPlanMetadata::default()
     };
     collect_assignment_plan_metadata(
@@ -1595,6 +1633,13 @@ pub(super) fn supervisor_plan_value(
             "execution_target".to_string(),
             serde_json::to_value(execution_target)
                 .context("failed to serialize execution_target plan field")?,
+        );
+    }
+    if !plan_metadata.path_proposal.is_empty() {
+        object.insert(
+            "path_proposal".to_string(),
+            serde_json::to_value(&plan_metadata.path_proposal)
+                .context("failed to serialize path_proposal plan field")?,
         );
     }
     if let Some(operation) = &plan_metadata.evidence_only_reaudit {
@@ -2310,6 +2355,7 @@ pub(super) fn evidence_only_reaudit_plan_from_source(
         evidence_only_reaudit: Some(operation),
         generated_follow_up: None,
         execution_target: None,
+        path_proposal: source_loaded.plan_metadata.path_proposal.clone(),
     };
     let (plan, plan_metadata) = validate_supervisor_plan(plan, plan_metadata)?;
     Ok(LoadedSupervisorPlan {
@@ -3076,4 +3122,130 @@ pub fn verified_megafile_decomposition_evidence(
         replacement_paths: completion.replacement_paths,
         supervisor_candidate_binding,
     })
+}
+
+#[cfg(test)]
+mod diagnostics_emission_tests {
+    use super::*;
+    use git2::Signature;
+    use tempfile::TempDir;
+
+    fn commit_all(repo: &git2::Repository, message: &str) {
+        let mut index = repo.index().expect("index");
+        index
+            .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+            .expect("stage");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("tree");
+        let tree = repo.find_tree(tree_id).expect("find tree");
+        let signature = Signature::now("maco test", "maco-test@example.invalid").expect("sig");
+        let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
+        let parents = parent.iter().collect::<Vec<_>>();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parents,
+        )
+        .expect("commit");
+    }
+
+    fn nested_planning_repo() -> (TempDir, PathBuf) {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        fs::create_dir_all(repo_path.join("src")).expect("src");
+        fs::write(repo_path.join("README.md"), "hello\n").expect("readme");
+        fs::write(repo_path.join("src/lib.rs"), "pub fn ok() {}\n").expect("lib");
+        let repo = git2::Repository::init(&repo_path).expect("init");
+        commit_all(&repo, "outer");
+        for boundary in [
+            "zeta/nested",
+            "alpha/nested",
+            "middle/nested",
+            "beta/nested",
+        ] {
+            let nested_path = repo_path.join(boundary);
+            fs::create_dir_all(nested_path.join("src")).expect("nested src");
+            fs::write(
+                nested_path.join("src/excluded.rs"),
+                "pub fn nested_only() {}\n",
+            )
+            .expect("excluded");
+            let nested = git2::Repository::init(&nested_path).expect("nested init");
+            commit_all(&nested, "nested");
+        }
+        (temp, repo_path)
+    }
+
+    #[test]
+    fn goal_derived_plan_preserves_sorted_nested_boundary_diagnostics() {
+        let (_temp, repo_path) = nested_planning_repo();
+        let document = supervisor_plan_document_from_goal_spec(
+            &repo_path,
+            "Update README.md",
+            "Keep src/lib.rs working.",
+        )
+        .expect("plan nested repository");
+        let diagnostics = document
+            .get("path_proposal")
+            .expect("path_proposal must be first-class");
+        assert_eq!(diagnostics["degraded"], false);
+        let notes = diagnostics["notes"]
+            .as_array()
+            .expect("notes")
+            .iter()
+            .map(|note| note.as_str().expect("note").to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            notes.iter().any(|note| {
+                note.contains("showing first 3 sorted paths")
+                    && note.contains("alpha/nested")
+                    && note.contains("beta/nested")
+                    && note.contains("middle/nested")
+                    && !note.contains("zeta/nested")
+            }),
+            "sorted bounded notes missing: {notes:?}"
+        );
+        let assignment_tasks = document["assignments"]
+            .as_array()
+            .expect("assignments")
+            .iter()
+            .filter_map(|assignment| assignment["task"].as_str())
+            .collect::<Vec<_>>();
+        assert!(assignment_tasks
+            .iter()
+            .all(|task| !task.contains("Planning inventory diagnostics:")));
+
+        let serialized = serde_json::to_string(&document).expect("serialize");
+        let reloaded = parse_supervisor_plan_with_consultant(&serialized).expect("reload");
+        let round_trip = supervisor_plan_value(
+            &reloaded.plan,
+            &reloaded.consultant,
+            &reloaded.assignment_metadata,
+            &reloaded.plan_metadata,
+        )
+        .expect("re-emit");
+        assert_eq!(round_trip["path_proposal"], document["path_proposal"]);
+        assert_eq!(round_trip["path_proposal"]["degraded"], false);
+        assert_eq!(round_trip["assignments"], document["assignments"]);
+    }
+
+    #[test]
+    fn inventory_failure_envelope_keeps_error_chain() {
+        let error = anyhow::anyhow!("bounded-status rejects Git object alternates")
+            .context("repository inventory failed");
+        let envelope = supervisor_plan_error_envelope(&error);
+        assert!(!envelope.success);
+        assert_eq!(envelope.status, "error");
+        assert!(envelope.error.contains("repository inventory failed"));
+        assert!(envelope
+            .causes
+            .iter()
+            .any(|cause| cause.contains("bounded-status rejects Git object alternates")));
+        let value = serde_json::to_value(&envelope).expect("serialize envelope");
+        assert_eq!(value["success"], false);
+        assert_eq!(value["status"], "error");
+    }
 }

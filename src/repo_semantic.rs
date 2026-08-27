@@ -50,6 +50,54 @@ const DEFAULT_SEMANTIC_SCAN_LIMITS: SemanticScanLimits = SemanticScanLimits {
     max_retained_path_bytes: MAX_SEMANTIC_RETAINED_PATH_BYTES,
 };
 
+#[derive(Clone, Copy)]
+struct SemanticScanExclusions<'a> {
+    allowed_files: Option<&'a BTreeSet<PathBuf>>,
+    nested_repository_boundaries: &'a [PathBuf],
+}
+
+impl SemanticScanExclusions<'static> {
+    const fn none() -> Self {
+        const EMPTY: &[PathBuf] = &[];
+        Self {
+            allowed_files: None,
+            nested_repository_boundaries: EMPTY,
+        }
+    }
+}
+
+impl SemanticScanExclusions<'_> {
+    fn skips_directory(self, relative: &Path) -> bool {
+        if self.is_nested_boundary(relative) {
+            return true;
+        }
+        match self.allowed_files {
+            Some(allowed) if !relative.as_os_str().is_empty() => {
+                !allowed.iter().any(|file| file.starts_with(relative))
+            }
+            _ => false,
+        }
+    }
+
+    fn skips_file(self, relative: &Path) -> bool {
+        if self
+            .nested_repository_boundaries
+            .iter()
+            .any(|boundary| relative == boundary.as_path() || relative.starts_with(boundary))
+        {
+            return true;
+        }
+        self.allowed_files
+            .is_some_and(|allowed| !allowed.contains(relative))
+    }
+
+    fn is_nested_boundary(self, relative: &Path) -> bool {
+        self.nested_repository_boundaries
+            .iter()
+            .any(|boundary| relative == boundary.as_path() || relative.starts_with(boundary))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SemanticRepoMap {
     pub root: PathBuf,
@@ -191,9 +239,34 @@ pub fn scan_repository(repo_path: impl AsRef<Path>) -> Result<SemanticRepoMap> {
     scan_repository_with_limits(repo_path.as_ref(), DEFAULT_SEMANTIC_SCAN_LIMITS)
 }
 
+/// Scan only outer-inventory files and skip nested-repository trees before
+/// spending entry, depth, byte, or parse budgets inside them.
+pub fn scan_repository_with_exclusions(
+    repo_path: impl AsRef<Path>,
+    allowed_files: Option<&BTreeSet<PathBuf>>,
+    nested_repository_boundaries: &[PathBuf],
+) -> Result<SemanticRepoMap> {
+    scan_repository_with_limits_and_exclusions(
+        repo_path.as_ref(),
+        DEFAULT_SEMANTIC_SCAN_LIMITS,
+        SemanticScanExclusions {
+            allowed_files,
+            nested_repository_boundaries,
+        },
+    )
+}
+
 fn scan_repository_with_limits(
     repo_path: &Path,
     limits: SemanticScanLimits,
+) -> Result<SemanticRepoMap> {
+    scan_repository_with_limits_and_exclusions(repo_path, limits, SemanticScanExclusions::none())
+}
+
+fn scan_repository_with_limits_and_exclusions(
+    repo_path: &Path,
+    limits: SemanticScanLimits,
+    exclusions: SemanticScanExclusions<'_>,
 ) -> Result<SemanticRepoMap> {
     let repo = crate::git_repository::discover(repo_path)
         .with_context(|| format!("failed to discover repository from {}", repo_path.display()))?;
@@ -213,7 +286,7 @@ fn scan_repository_with_limits(
     };
 
     let mut rust_files = Vec::new();
-    collect_rust_files(&root, &mut rust_files, limits)?;
+    collect_rust_files(&root, &mut rust_files, limits, exclusions)?;
     rust_files.sort();
 
     let mut total_source_bytes = 0u64;
@@ -320,6 +393,7 @@ fn collect_rust_files(
     root: &Path,
     files: &mut Vec<PathBuf>,
     limits: SemanticScanLimits,
+    exclusions: SemanticScanExclusions<'_>,
 ) -> Result<()> {
     if limits.max_file_bytes == 0
         || limits.max_total_bytes == 0
@@ -333,7 +407,14 @@ fn collect_rust_files(
     }
     let mut entries = 0usize;
     let mut retained_path_bytes = 0usize;
-    collect_rust_files_bounded(root, files, &mut entries, &mut retained_path_bytes, limits)
+    collect_rust_files_bounded(
+        root,
+        files,
+        &mut entries,
+        &mut retained_path_bytes,
+        limits,
+        exclusions,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -343,6 +424,7 @@ fn collect_rust_files_bounded(
     entries: &mut usize,
     retained_path_bytes: &mut usize,
     limits: SemanticScanLimits,
+    exclusions: SemanticScanExclusions<'_>,
 ) -> Result<()> {
     let directory = open_semantic_directory(root)?;
     collect_rust_files_from_directory(
@@ -353,6 +435,7 @@ fn collect_rust_files_bounded(
         entries,
         retained_path_bytes,
         limits,
+        exclusions,
     )
 }
 
@@ -365,6 +448,7 @@ fn collect_rust_files_from_directory(
     entries: &mut usize,
     retained_path_bytes: &mut usize,
     limits: SemanticScanLimits,
+    exclusions: SemanticScanExclusions<'_>,
 ) -> Result<()> {
     if depth > limits.max_depth {
         bail!("semantic repository scan exceeded its directory depth limit");
@@ -395,10 +479,16 @@ fn collect_rust_files_from_directory(
         let stat = semantic_fstatat_no_follow(directory.as_raw_fd(), &name_c)?;
         match stat.st_mode & libc::S_IFMT {
             libc::S_IFDIR => {
+                if exclusions.skips_directory(&relative) {
+                    continue;
+                }
                 if depth >= limits.max_depth {
                     bail!("semantic repository scan exceeded its directory depth limit");
                 }
                 let child = open_semantic_child_directory(directory, &name_c, &stat)?;
+                if nested_semantic_repository_marker_exists(&child)? {
+                    continue;
+                }
                 collect_rust_files_from_directory(
                     &child,
                     &relative,
@@ -407,9 +497,13 @@ fn collect_rust_files_from_directory(
                     entries,
                     retained_path_bytes,
                     limits,
+                    exclusions,
                 )?;
             }
             libc::S_IFREG if has_rust_extension(&relative) => {
+                if exclusions.skips_file(&relative) {
+                    continue;
+                }
                 retain_semantic_path(files, relative, retained_path_bytes, limits)?;
             }
             libc::S_IFREG | libc::S_IFLNK => {}
@@ -467,6 +561,27 @@ fn open_semantic_child_directory(
 }
 
 #[cfg(target_os = "linux")]
+fn nested_semantic_repository_marker_exists(directory: &File) -> Result<bool> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            c".git".as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == 0
+    {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        Ok(false)
+    } else {
+        Err(error).context("failed to probe nested semantic repository marker")
+    }
+}
+
 fn semantic_fstatat_no_follow(fd: i32, name: &std::ffi::CStr) -> Result<libc::stat> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     if unsafe {
@@ -491,8 +606,18 @@ fn collect_rust_files_bounded(
     entries: &mut usize,
     retained_path_bytes: &mut usize,
     limits: SemanticScanLimits,
+    exclusions: SemanticScanExclusions<'_>,
 ) -> Result<()> {
-    collect_rust_files_portable(root, root, 0, files, entries, retained_path_bytes, limits)
+    collect_rust_files_portable(
+        root,
+        root,
+        0,
+        files,
+        entries,
+        retained_path_bytes,
+        limits,
+        exclusions,
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -504,6 +629,7 @@ fn collect_rust_files_portable(
     entries: &mut usize,
     retained_path_bytes: &mut usize,
     limits: SemanticScanLimits,
+    exclusions: SemanticScanExclusions<'_>,
 ) -> Result<()> {
     if depth > limits.max_depth {
         bail!("semantic repository scan exceeded its directory depth limit");
@@ -542,6 +668,19 @@ fn collect_rust_files_portable(
             continue;
         }
         if metadata.is_dir() {
+            if exclusions.skips_directory(&relative) {
+                continue;
+            }
+            if depth > 0 || !relative.as_os_str().is_empty() {
+                match fs::symlink_metadata(path.join(".git")) {
+                    Ok(_) => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error)
+                            .context("failed to probe nested semantic repository marker");
+                    }
+                }
+            }
             collect_rust_files_portable(
                 root,
                 &path,
@@ -550,8 +689,12 @@ fn collect_rust_files_portable(
                 entries,
                 retained_path_bytes,
                 limits,
+                exclusions,
             )?;
         } else if metadata.is_file() && has_rust_extension(&relative) {
+            if exclusions.skips_file(&relative) {
+                continue;
+            }
             retain_semantic_path(files, relative, retained_path_bytes, limits)?;
         }
     }
@@ -1663,6 +1806,96 @@ mod tests {
         )
         .expect_err("depth budget must fail closed");
         assert!(depth.to_string().contains("depth limit"));
+    }
+
+    #[test]
+    fn nested_repository_trees_do_not_spend_entry_depth_byte_or_parse_budgets() {
+        let (_temp, repo) = init_repo();
+        write_file(&repo, "src/lib.rs", "pub fn outer() {}\n");
+
+        let nested = repo.join("vendor/sdk");
+        fs::create_dir_all(nested.join("src")).expect("nested tree");
+        Repository::init(&nested).expect("init nested repository");
+        write_file(
+            &repo,
+            "vendor/sdk/src/excluded.rs",
+            "pub fn nested_only() {}\n",
+        );
+        let huge = repo.join("vendor/sdk/src/huge.rs");
+        File::create(&huge)
+            .expect("create nested huge source")
+            .set_len(MAX_SEMANTIC_FILE_BYTES + 1)
+            .expect("size nested huge source");
+
+        let probed = scan_repository(&repo).expect("nested git trees must be skipped before parse");
+        assert_eq!(
+            probed
+                .files
+                .iter()
+                .map(|file| file.path.as_path())
+                .collect::<Vec<_>>(),
+            vec![Path::new("src/lib.rs")]
+        );
+        assert!(probed
+            .symbols
+            .iter()
+            .all(|symbol| symbol.name != "nested_only"));
+        assert!(probed
+            .errors
+            .iter()
+            .all(|error| !error.file.starts_with("vendor/sdk")));
+
+        for index in 0..32 {
+            write_file(
+                &repo,
+                &format!("bulk/src/file_{index}.rs"),
+                &format!("pub fn bulk_{index}() {{}}\n"),
+            );
+        }
+        let tight = SemanticScanLimits {
+            max_file_bytes: 64,
+            max_total_bytes: 256,
+            max_entries: 12,
+            max_depth: 3,
+            max_path_bytes: 64,
+            max_path_components: 8,
+            max_retained_path_bytes: 256,
+        };
+        scan_repository_with_limits(&repo, tight)
+            .expect_err("unexcluded sibling trees must still spend the entry budget");
+
+        let allowed = BTreeSet::from([PathBuf::from("src/lib.rs")]);
+        let allowed_map = scan_repository_with_limits_and_exclusions(
+            &repo,
+            tight,
+            SemanticScanExclusions {
+                allowed_files: Some(&allowed),
+                nested_repository_boundaries: &[],
+            },
+        )
+        .expect("allowed-file exclusions must skip unlisted trees before budget spend");
+        assert_eq!(
+            allowed_map
+                .files
+                .iter()
+                .map(|file| file.path.as_path())
+                .collect::<Vec<_>>(),
+            vec![Path::new("src/lib.rs")]
+        );
+
+        let boundary_map = scan_repository_with_limits_and_exclusions(
+            &repo,
+            tight,
+            SemanticScanExclusions {
+                allowed_files: None,
+                nested_repository_boundaries: &[PathBuf::from("bulk")],
+            },
+        )
+        .expect("named nested-boundary exclusions must skip the tree before budget spend");
+        assert!(boundary_map
+            .files
+            .iter()
+            .all(|file| !file.path.starts_with("bulk")));
     }
 
     #[test]
