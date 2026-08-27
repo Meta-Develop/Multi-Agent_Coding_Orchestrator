@@ -36,7 +36,7 @@ fn unreadable_authenticated_rolling_budget_record_fails_closed_with_named_cli_ca
 fn authenticated_rolling_budget_record_tamper_fails_closed_with_named_cli_cause() -> Result<()> {
     let fixture = BudgetCliFixture::seed("tamper")?;
     let record = fixture.first_record()?;
-    replace_record_mac_with_zeros(&record)?;
+    tamper_record_payload_without_resigning(&record)?;
 
     let output = fixture.run("tamper-reopen")?;
     assert_budget_ledger_refusal(output, "repository authentication tag verification failed")
@@ -140,13 +140,15 @@ fn assert_budget_ledger_refusal(output: Output, terminal_cause: &str) -> Result<
     Ok(())
 }
 
-fn replace_record_mac_with_zeros(record: &Path) -> Result<()> {
+fn tamper_record_payload_without_resigning(record: &Path) -> Result<()> {
     let original =
         fs::read_to_string(record).context("read authenticated rolling-budget record")?;
-    let value: Value = serde_json::from_str(&original).context("parse rolling-budget record")?;
+    let mut value: Value =
+        serde_json::from_str(&original).context("parse rolling-budget record")?;
     let mac = value["mac"]
         .as_str()
-        .context("rolling-budget record has a string mac")?;
+        .context("rolling-budget record has a string mac")?
+        .to_string();
     if mac.len() != 64
         || !mac
             .bytes()
@@ -154,12 +156,29 @@ fn replace_record_mac_with_zeros(record: &Path) -> Result<()> {
     {
         bail!("rolling-budget record mac is not canonical lowercase hex");
     }
-    let needle = format!("\"mac\":\"{mac}\"");
-    if original.matches(&needle).count() != 1 {
-        bail!("rolling-budget record does not contain one canonical mac field");
-    }
-    let tampered = original.replacen(&needle, &format!("\"mac\":\"{}\"", "0".repeat(64)), 1);
-    fs::write(record, tampered).context("replace rolling-budget record mac")
+    let original_tokens = value
+        .pointer("/payload/tokens")
+        .and_then(Value::as_u64)
+        .context("rolling-budget record payload has numeric tokens")?;
+    let tampered_tokens = original_tokens
+        .checked_add(1)
+        .context("rolling-budget record token tamper overflowed")?;
+    value["payload"]["tokens"] = Value::from(tampered_tokens);
+    assert_eq!(value["mac"], mac);
+
+    fs::write(record, serde_json::to_vec(&value)?)
+        .context("tamper rolling-budget payload without resigning")?;
+    let rewritten = fs::read(record).context("reread tampered rolling-budget record")?;
+    let reparsed: Value = serde_json::from_slice(&rewritten)
+        .context("tampered rolling-budget record remains JSON")?;
+    assert_eq!(reparsed["payload"]["tokens"], tampered_tokens);
+    assert_eq!(reparsed["mac"], mac);
+    assert_eq!(
+        fs::metadata(record)?.permissions().mode() & 0o777,
+        0o600,
+        "tampered rolling-budget record must remain a bounded private regular file"
+    );
+    Ok(())
 }
 
 fn write_fake_plan(path: &Path) -> Result<()> {
