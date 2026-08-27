@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "schema": "eval_harness_fake_execution_fixture_v1",
+  "id": "issue26-local-fake-lifecycle-v1",
+  "state_seed": "committed-equivalent-in-memory-state-v1",
+  "logical_tick_ms": 25,
+  "input_token_cost_microusd": 2,
+  "output_token_cost_microusd": 4,
+  "models": [
+    {
+      "id": "fake-economy",
+      "response_padding": "bounded",
+      "held_out_basis_points": 9000,
+      "breadth_basis_points": 8800,
+      "anti_shortcut_basis_points": 8700,
+      "churn_count": 1,
+      "conflict_count": 0,
+      "loc_added": 8,
+      "loc_deleted": 2,
+      "diff_bytes": 480
+    },
+    {
+      "id": "fake-quality",
+      "response_padding": "deliberate complete review-backed response padding for higher deterministic fixture cost",
+      "held_out_basis_points": 9800,
+      "breadth_basis_points": 9700,
+      "anti_shortcut_basis_points": 9600,
+      "churn_count": 2,
+      "conflict_count": 0,
+      "loc_added": 12,
+      "loc_deleted": 3,
+      "diff_bytes": 720
+    }
+  ]
+}
