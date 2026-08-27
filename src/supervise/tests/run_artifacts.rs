@@ -72,6 +72,7 @@ fn finalized_artifacts_round_trip_typed_context_switch_selection_evidence() {
         primary_cause: SupervisorSelectionEventCause::Retry,
         provenance,
     };
+    let source_selection_schema_version = event.provenance.schema_version;
     let assignment_selection_ledger = build_assignment_selection_ledger(
         &plan,
         std::slice::from_ref(&event),
@@ -136,7 +137,10 @@ fn finalized_artifacts_round_trip_typed_context_switch_selection_evidence() {
         .selection_decisions
         .first()
         .expect("restored selection event");
-    assert_eq!(restored_event.provenance.schema_version, 2);
+    assert_eq!(
+        restored_event.provenance.schema_version,
+        source_selection_schema_version
+    );
     assert_eq!(
         restored_event
             .provenance

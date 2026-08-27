@@ -3459,7 +3459,7 @@ mod tests {
             SupervisorRuntime::Codex,
             &catalog,
             &[AgentRole::Worker],
-            1,
+            3,
             BudgetSignal::Continue,
             &[],
         )?;
@@ -3488,6 +3488,10 @@ mod tests {
             .context("selected candidate retry score")?;
         assert!(previous_score.retry_cost_microunits > 0);
         assert_eq!(selected_score.retry_cost_microunits, 0);
+        assert!(
+            selected_score.total_score_microunits < previous_score.total_score_microunits,
+            "retry penalty must make the replacement cheaper after conservative switch cost"
+        );
         let expected_transition = if choice.candidate.runtime != previous.runtime {
             selection::ContextSwitchTransition::RuntimeChange
         } else if choice.candidate.model != previous.model {
@@ -4000,7 +4004,7 @@ mod tests {
             .candidate
             .clone();
         assert_eq!(previous.runtime, "codex");
-        state
+        let codex_pool = state
             .decisions
             .get_mut(&AgentRole::Worker)
             .context("worker replay state")?
@@ -4008,8 +4012,9 @@ mod tests {
             .pools
             .iter_mut()
             .find(|pool| pool.runtime == "codex")
-            .context("Codex replay pool")?
-            .pool_pressure_basis_points = 10_000;
+            .context("Codex replay pool")?;
+        codex_pool.pool_pressure_basis_points = 10_000;
+        codex_pool.marginal_cost_microunits = 3_000_000;
 
         let reselection = reselect_roles_from_supplied_catalog_snapshot(
             &mut state,
@@ -4039,7 +4044,30 @@ mod tests {
             choice.switch_transition,
             selection::ContextSwitchTransition::RuntimeChange
         );
+        assert_eq!(
+            choice.reason,
+            selection::ChoiceReason::LowestExpectedTotalCostPerAcceptedTask
+        );
         assert_eq!(choice.candidate.runtime, "cursor");
+        let previous_score = reselection.decisions[0]
+            .1
+            .candidate_set
+            .iter()
+            .find(|evaluation| evaluation.candidate == previous)
+            .and_then(|evaluation| evaluation.score.as_ref())
+            .context("pressured previous runtime score")?;
+        let selected_score = reselection.decisions[0]
+            .1
+            .candidate_set
+            .iter()
+            .find(|evaluation| evaluation.candidate == choice.candidate)
+            .and_then(|evaluation| evaluation.score.as_ref())
+            .context("selected runtime-switch score")?;
+        assert!(previous_score.marginal_cost_microunits > 0);
+        assert!(
+            selected_score.total_score_microunits < previous_score.total_score_microunits,
+            "bounded Codex pool cost must make the runtime switch cheaper"
+        );
         assert_eq!(
             reselection.runtime_overrides.get(&AgentRole::Worker),
             Some(&SupervisorRuntime::Cursor)
