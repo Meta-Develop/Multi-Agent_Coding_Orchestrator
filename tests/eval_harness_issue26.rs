@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use multi_agent_coding_orchestrator::eval_harness::{
     execute_v2_local_fake, parse_manifest_v2, validate_v2_execution_results,
-    EvalHarnessV2ExecutionError, V2ComparabilityStatus,
+    EvalHarnessProviderKind, EvalHarnessV2ExecutionError, V2ComparabilityStatus,
 };
 use serde_json::json;
 
@@ -93,7 +93,26 @@ fn issue26_validator_refuses_incomparable_and_tampered_inputs() -> Result<()> {
 }
 
 #[test]
-#[ignore = "operator entrypoint: emits the committed deterministic Fake evidence"]
+fn issue26_execution_refuses_real_provider_and_incomplete_in_memory_inputs() -> Result<()> {
+    let (mut manifest, _) = execute()?;
+    manifest.provider_request.kind = EvalHarnessProviderKind::RealProvider;
+    let error = execute_v2_local_fake(&manifest).expect_err("real provider must stay inert");
+    assert!(matches!(
+        error,
+        EvalHarnessV2ExecutionError::Incomparable { .. }
+    ));
+
+    let (mut incomplete, _) = execute()?;
+    incomplete.profiles.pop();
+    let error = execute_v2_local_fake(&incomplete).expect_err("one mix is not comparable");
+    assert!(matches!(
+        error,
+        EvalHarnessV2ExecutionError::Incomparable { .. }
+    ));
+    Ok(())
+}
+
+#[test]
 fn issue26_fake_operator_entrypoint_runs_end_to_end() -> Result<()> {
     let (manifest, results) = execute()?;
     let repeated = execute_v2_local_fake(&manifest).context("repeat operator execution")?;
