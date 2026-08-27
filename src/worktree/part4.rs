@@ -490,7 +490,6 @@ fn validate_bounded_index_bytes(bytes: &[u8]) -> Result<()> {
     const CHECKSUM_BYTES: usize = 20;
     const CE_EXTENDED: u16 = 0x4000;
     const CE_VALID: u16 = 0x8000;
-    const GITLINK_MODE: u32 = 0o160000;
     const SPARSE_DIRECTORY_MODE: u32 = 0o040000;
 
     if bytes.len() < HEADER_BYTES.saturating_add(CHECKSUM_BYTES) || &bytes[..4] != b"DIRC" {
@@ -525,8 +524,8 @@ fn validate_bounded_index_bytes(bytes: &[u8]) -> Result<()> {
             bail!("bounded-status index entry is truncated");
         }
         let mode = bounded_index_u32(bytes, cursor + 24)?;
-        if matches!(mode, GITLINK_MODE | SPARSE_DIRECTORY_MODE) {
-            bail!("bounded-status rejects gitlink and sparse-directory index entries");
+        if mode == SPARSE_DIRECTORY_MODE {
+            bail!("bounded-status rejects sparse-directory index entries");
         }
         let flags = bounded_index_u16(bytes, cursor + 60)?;
         if flags & CE_VALID != 0 {
@@ -719,17 +718,17 @@ fn validate_bounded_git_index_records(bytes: &[u8], max_entries: usize) -> Resul
             bail!("bounded-status index validation returned a malformed header");
         }
         let tag = header[0];
-        if tag == b'S' || tag.is_ascii_lowercase() {
-            bail!("bounded-status rejects hidden index-entry state");
-        }
         let header = std::str::from_utf8(&header[2..])
             .context("bounded-status index validation header is not ASCII")?;
         let mode = header
             .split_ascii_whitespace()
             .next()
             .context("bounded-status index validation omitted an entry mode")?;
-        if matches!(mode, "160000" | "040000") {
-            bail!("bounded-status rejects gitlink and sparse-directory index entries");
+        if mode == "040000" {
+            bail!("bounded-status rejects sparse-directory index entries");
+        }
+        if tag == b'S' || tag.is_ascii_lowercase() {
+            bail!("bounded-status rejects hidden index-entry state");
         }
     }
     Ok(())
@@ -860,7 +859,7 @@ fn validate_bounded_git_text_inputs_bound(
     {
         bail!("bounded-status rejects Git object alternates");
     }
-    let inventory = BoundedTreeWalker::walk_bound_with(
+    let inventory = BoundedTreeWalker::walk_bound_with_options(
         repository.worktree_binding(),
         BoundedTreeWalkLimits {
             max_depth: 128,
@@ -873,29 +872,30 @@ fn validate_bounded_git_text_inputs_bound(
             )?,
             same_device: true,
         },
+        crate::safe_state::BoundedTreeWalkOptions {
+            stop_at_nested_repositories: true,
+        },
         |entry| {
             if entry.relative_path == Path::new(".git") {
                 return Ok(BoundedTreeWalkAction::Skip);
             }
             // Treat managed-worktree stores and other runtime roots as walk
-            // boundaries before the nested-marker check so ignored
-            // `.worktrees/` gitfiles do not fail closed and the walker never
-            // descends those trees.
+            // boundaries so the walker never descends those trees.
             if is_bounded_status_runtime_path(&entry.relative_path) {
                 return Ok(BoundedTreeWalkAction::Skip);
-            }
-            if entry.relative_path.file_name() == Some(OsStr::new(".git")) {
-                bail!("bounded-status rejects nested Git repository markers");
-            }
-            if entry.relative_path.file_name() == Some(OsStr::new(".gitmodules")) {
-                bail!("bounded-status rejects submodule metadata");
             }
             if entry.kind == BoundedTreeEntryKind::Directory {
                 return Ok(BoundedTreeWalkAction::RecordAndDescend);
             }
-            if entry.relative_path.file_name() == Some(OsStr::new(".gitignore")) {
+            let file_name = entry.relative_path.file_name();
+            let is_gitignore = file_name == Some(OsStr::new(".gitignore"));
+            let is_gitmodules = file_name == Some(OsStr::new(".gitmodules"));
+            if is_gitignore || is_gitmodules {
                 if !entry.is_safe_regular_file() {
-                    bail!("Git ignore input is not a safe single-link regular file");
+                    if is_gitignore {
+                        bail!("Git ignore input is not a safe single-link regular file");
+                    }
+                    bail!("Git submodule metadata is not a safe single-link regular file");
                 }
                 return Ok(BoundedTreeWalkAction::Record);
             }
