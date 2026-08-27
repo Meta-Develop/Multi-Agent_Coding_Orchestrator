@@ -1806,12 +1806,12 @@ mod tests {
             .expect_err("tampered journal must fail closed");
         let message = format!("{error:#}");
         assert!(
-            message.contains("corrupt")
-                || message.contains("malformed")
-                || message.contains("truncated")
-                || message.contains("unavailable")
-                || message.contains("invalid"),
-            "unexpected corruption error: {message}"
+            message.contains("workspace rolling budget journal is corrupt or unavailable"),
+            "missing workspace journal corruption cause: {message}"
+        );
+        assert!(
+            message.contains("checkpoint journal contains a truncated or malformed record"),
+            "missing malformed-record cause: {message}"
         );
     }
 
