@@ -1810,8 +1810,8 @@ mod tests {
             "missing workspace journal corruption cause: {message}"
         );
         assert!(
-            message.contains("checkpoint journal contains a truncated or malformed record"),
-            "missing malformed-record cause: {message}"
+            message.contains("workspace_rolling_budget first record locator is malformed"),
+            "missing locator-malformed cause: {message}"
         );
     }
 
