@@ -811,6 +811,44 @@ impl SuperviseCommand {
     }
 }
 
+/// Machine-readable failure envelope for `supervise plan --json`.
+///
+/// Sibling branch `maco/c26-wiring` owns the same helper as
+/// `supervise::supervisor_plan_error_envelope`. This local equivalent keeps the
+/// JSON shape identical so the call site compiles before merge and continues to
+/// work after the helper becomes visible.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct SupervisorPlanErrorEnvelope {
+    success: bool,
+    status: &'static str,
+    error: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    causes: Vec<String>,
+}
+
+fn supervisor_plan_error_envelope(error: &anyhow::Error) -> SupervisorPlanErrorEnvelope {
+    SupervisorPlanErrorEnvelope {
+        success: false,
+        status: "error",
+        error: error.to_string(),
+        causes: error
+            .chain()
+            .skip(1)
+            .map(|cause| cause.to_string())
+            .collect(),
+    }
+}
+
+fn emit_supervisor_plan_error(error: anyhow::Error, json: bool) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&supervisor_plan_error_envelope(&error))?
+        );
+    }
+    Err(error)
+}
+
 fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
     match command {
         SuperviseSubcommand::Plan(args) => {
@@ -823,11 +861,17 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
             } = args;
             let mut plan = match (task_file, from_goal) {
                 (Some(task_file), None) => {
-                    supervise::supervisor_plan_document_from_task_file(repo, task_file)?
+                    match supervise::supervisor_plan_document_from_task_file(repo, task_file) {
+                        Ok(plan) => plan,
+                        Err(error) => return emit_supervisor_plan_error(error, json),
+                    }
                 }
                 (None, Some(goal_file)) => {
                     let goal_spec = read_supervise_goal_file(&goal_file)?;
-                    supervise::supervisor_plan_document_from_goal_spec(repo, "", &goal_spec)?
+                    match supervise::supervisor_plan_document_from_goal_spec(repo, "", &goal_spec) {
+                        Ok(plan) => plan,
+                        Err(error) => return emit_supervisor_plan_error(error, json),
+                    }
                 }
                 _ => bail!(
                     "supervise plan requires exactly one positional TASK_FILE or --from-goal <FILE>"
@@ -1462,19 +1506,22 @@ impl InboxCommand {
                     args.run_id.as_deref(),
                     args.json,
                 )?;
-                let report = inbox::run_inbox(InboxRunOptions {
-                    repo: args.repo,
-                    run_id: resolved.run_id,
-                    github: args.github,
-                    permission_mode: args.permission,
-                    dry_run: args.dry_run,
-                    max_items: args.max_items,
-                    codex_bin: args.codex_bin,
-                    machine_global: inbox_machine_global_input(
-                        args.machine_global_config,
-                        args.machine_global_runtime_root_id,
-                    ),
-                })?;
+                let report = inbox::run_inbox_with_rolling_budget(
+                    InboxRunOptions {
+                        repo: args.repo,
+                        run_id: resolved.run_id,
+                        github: args.github,
+                        permission_mode: args.permission,
+                        dry_run: args.dry_run,
+                        max_items: args.max_items,
+                        codex_bin: args.codex_bin,
+                        machine_global: inbox_machine_global_input(
+                            args.machine_global_config,
+                            args.machine_global_runtime_root_id,
+                        ),
+                    },
+                    args.rolling_budget.quota(),
+                )?;
                 print_query_report(&report, args.json)?;
                 if !report.success {
                     bail!("inbox run failed");
@@ -1864,6 +1911,8 @@ struct RunInboxArgs {
     /// Codex-compatible executable to invoke. Omit for deterministic local fake mode.
     #[arg(long)]
     codex_bin: Option<PathBuf>,
+    #[command(flatten)]
+    rolling_budget: InboxRollingBudgetArgs,
     /// Exact reviewed config used to gate private runtime output-staging cleanup for item autopilot dispatch.
     #[arg(long, requires = "machine_global_runtime_root_id")]
     machine_global_config: Option<PathBuf>,
@@ -1873,6 +1922,43 @@ struct RunInboxArgs {
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Args)]
+struct InboxRollingBudgetArgs {
+    /// Hard ceiling for provider tokens consumed across inbox autopilot runs
+    /// in the workspace rolling window (default 24h).
+    #[arg(long = "max-rolling-tokens", value_parser = parse_positive_usize)]
+    max_rolling_tokens: Option<usize>,
+    /// Hard ceiling for provider cost consumed across inbox autopilot runs
+    /// in the workspace rolling window, in USD.
+    #[arg(
+        long = "max-rolling-cost-usd",
+        value_parser = parse_positive_finite_f64
+    )]
+    max_rolling_cost_usd: Option<f64>,
+    /// Rolling window used with `--max-rolling-tokens` / `--max-rolling-cost-usd`.
+    /// Defaults to 86400 seconds (24 hours) when a rolling ceiling is set.
+    #[arg(
+        long = "rolling-window-seconds",
+        value_parser = parse_positive_seconds
+    )]
+    rolling_window_seconds: Option<u64>,
+}
+
+impl InboxRollingBudgetArgs {
+    fn quota(self) -> Option<inbox::InboxRollingBudgetQuota> {
+        if self.max_rolling_tokens.is_none() && self.max_rolling_cost_usd.is_none() {
+            return None;
+        }
+        Some(inbox::InboxRollingBudgetQuota {
+            max_tokens: self.max_rolling_tokens,
+            max_cost_usd: self.max_rolling_cost_usd,
+            window_seconds: self
+                .rolling_window_seconds
+                .unwrap_or(inbox::DEFAULT_ROLLING_WINDOW_SECONDS),
+        })
+    }
 }
 
 #[derive(Debug, Args)]
@@ -3768,6 +3854,17 @@ impl EvaluationCommand {
     fn run(self) -> Result<()> {
         match self.command {
             EvaluationSubcommand::Run(args) => run_evaluation_command(args),
+            EvaluationSubcommand::Rescore(args) => run_evaluation_rescore_command(
+                args.manifest,
+                args.results,
+                match args.family {
+                    RescoreResultsFamily::Evaluation => StoredEvaluationResultsFamily::Evaluation,
+                    RescoreResultsFamily::Experiment => StoredEvaluationResultsFamily::Experiment,
+                },
+                args.objective_profile,
+                args.repo,
+                args.json,
+            ),
             EvaluationSubcommand::Experiment(args) => run_evaluation_experiment_command(args),
         }
     }
@@ -3777,6 +3874,8 @@ impl EvaluationCommand {
 enum EvaluationSubcommand {
     /// Generate deterministic fixture output for every manifest profile and repetition.
     Run(RunEvaluationArgs),
+    /// Re-score validated stored results under a different named objective profile.
+    Rescore(RescoreEvaluationArgs),
     /// Run the same goal/spec under multiple profiles through isolated Fake supervise.
     Experiment(RunExperimentArgs),
 }
@@ -3807,6 +3906,36 @@ struct RunEvaluationArgs {
         default_value_t = crate::evaluation::COMMITTED_FIXTURE_FAKE_SEED
     )]
     fake_seed: u64,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum RescoreResultsFamily {
+    /// Stored `EvaluationResults` schema v4 plus an `EvaluationManifest`.
+    Evaluation,
+    /// Stored `ExperimentResults` schema v2 plus an `ExperimentManifest`.
+    Experiment,
+}
+
+#[derive(Debug, Args)]
+struct RescoreEvaluationArgs {
+    /// Versioned manifest matching the selected stored-result family.
+    #[arg(value_name = "MANIFEST")]
+    manifest: PathBuf,
+    /// Validated stored evaluation results to re-score; the input is never overwritten.
+    #[arg(long, value_name = "RESULTS")]
+    results: PathBuf,
+    /// Strict stored-result and manifest schema family.
+    #[arg(long, value_enum)]
+    family: RescoreResultsFamily,
+    /// Named objective profile resolved from the repository override or built-ins.
+    #[arg(long, value_name = "NAME")]
+    objective_profile: String,
+    /// Repository path used only to resolve the named objective profile.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -3912,6 +4041,208 @@ fn run_eval_harness_command(args: RunEvalHarnessArgs) -> Result<()> {
 }
 
 include!("cli/part2.rs");
+
+#[cfg(test)]
+mod cli_integration_tests {
+    use super::*;
+
+    fn inbox_run_args(argv: &[&str]) -> RunInboxArgs {
+        let parsed = Cli::try_parse_from(argv).expect("inbox run arguments should parse");
+        let Command::Inbox(InboxCommand {
+            command: InboxSubcommand::Run(args),
+        }) = parsed.command
+        else {
+            panic!("expected inbox run command");
+        };
+        args
+    }
+
+    fn rescore_args(argv: &[&str]) -> RescoreEvaluationArgs {
+        let parsed = Cli::try_parse_from(argv).expect("evaluation rescore arguments should parse");
+        let Command::Evaluation(EvaluationCommand {
+            command: EvaluationSubcommand::Rescore(args),
+        }) = parsed.command
+        else {
+            panic!("expected evaluation rescore command");
+        };
+        args
+    }
+
+    #[test]
+    fn inbox_run_rolling_quota_maps_default_and_explicit_windows() {
+        let default_window = inbox_run_args(&[
+            "maco",
+            "inbox",
+            "run",
+            "--max-rolling-tokens",
+            "42000",
+            "--max-rolling-cost-usd",
+            "12.5",
+        ]);
+        assert_eq!(
+            default_window.rolling_budget.quota(),
+            Some(inbox::InboxRollingBudgetQuota {
+                max_tokens: Some(42_000),
+                max_cost_usd: Some(12.5),
+                window_seconds: inbox::DEFAULT_ROLLING_WINDOW_SECONDS,
+            })
+        );
+
+        let explicit_window = inbox_run_args(&[
+            "maco",
+            "inbox",
+            "run",
+            "--max-rolling-cost-usd",
+            "2.75",
+            "--rolling-window-seconds",
+            "3600",
+        ]);
+        assert_eq!(
+            explicit_window.rolling_budget.quota(),
+            Some(inbox::InboxRollingBudgetQuota {
+                max_tokens: None,
+                max_cost_usd: Some(2.75),
+                window_seconds: 3_600,
+            })
+        );
+
+        let window_only =
+            inbox_run_args(&["maco", "inbox", "run", "--rolling-window-seconds", "3600"]);
+        assert_eq!(window_only.rolling_budget.quota(), None);
+    }
+
+    #[test]
+    fn inbox_run_rolling_quota_rejects_invalid_and_supervise_only_flags() {
+        for argv in [
+            vec!["maco", "inbox", "run", "--max-rolling-tokens", "0"],
+            vec!["maco", "inbox", "run", "--max-rolling-cost-usd", "NaN"],
+            vec!["maco", "inbox", "run", "--rolling-window-seconds", "0"],
+            vec!["maco", "inbox", "run", "--max-tokens", "100"],
+            vec!["maco", "inbox", "run", "--max-cost-usd", "1.0"],
+            vec!["maco", "inbox", "run", "--max-duration-seconds", "60"],
+        ] {
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "invalid or unrelated inbox budget flag must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn evaluation_rescore_parses_both_strict_result_families() {
+        let evaluation = rescore_args(&[
+            "maco",
+            "evaluation",
+            "rescore",
+            "manifest.json",
+            "--results",
+            "results.json",
+            "--family",
+            "evaluation",
+            "--objective-profile",
+            "balanced-v1",
+            "--repo",
+            "repo",
+            "--json",
+        ]);
+        assert_eq!(evaluation.manifest, PathBuf::from("manifest.json"));
+        assert_eq!(evaluation.results, PathBuf::from("results.json"));
+        assert_eq!(evaluation.family, RescoreResultsFamily::Evaluation);
+        assert_eq!(evaluation.objective_profile, "balanced-v1");
+        assert_eq!(evaluation.repo, PathBuf::from("repo"));
+        assert!(evaluation.json);
+
+        let experiment = rescore_args(&[
+            "maco",
+            "evaluation",
+            "rescore",
+            "experiment-manifest.json",
+            "--results",
+            "experiment-results.json",
+            "--family",
+            "experiment",
+            "--objective-profile",
+            "quality-first-v1",
+        ]);
+        assert_eq!(experiment.family, RescoreResultsFamily::Experiment);
+        assert_eq!(experiment.repo, PathBuf::from("."));
+        assert!(!experiment.json);
+    }
+
+    #[test]
+    fn supervisor_plan_error_envelope_keeps_error_chain() {
+        let error = anyhow::anyhow!("bounded-status rejects Git object alternates")
+            .context("repository inventory failed");
+        let envelope = supervisor_plan_error_envelope(&error);
+        assert!(!envelope.success);
+        assert_eq!(envelope.status, "error");
+        assert!(envelope.error.contains("repository inventory failed"));
+        assert!(envelope
+            .causes
+            .iter()
+            .any(|cause| cause.contains("bounded-status rejects Git object alternates")));
+        let value = serde_json::to_value(&envelope).expect("serialize envelope");
+        assert_eq!(value["success"], false);
+        assert_eq!(value["status"], "error");
+        assert!(value["error"].as_str().is_some());
+        assert!(value["causes"]
+            .as_array()
+            .is_some_and(|causes| !causes.is_empty()));
+    }
+
+    #[test]
+    fn evaluation_rescore_requires_results_family_and_objective_profile() {
+        for argv in [
+            vec![
+                "maco",
+                "evaluation",
+                "rescore",
+                "manifest.json",
+                "--family",
+                "evaluation",
+                "--objective-profile",
+                "balanced-v1",
+            ],
+            vec![
+                "maco",
+                "evaluation",
+                "rescore",
+                "manifest.json",
+                "--results",
+                "results.json",
+                "--objective-profile",
+                "balanced-v1",
+            ],
+            vec![
+                "maco",
+                "evaluation",
+                "rescore",
+                "manifest.json",
+                "--results",
+                "results.json",
+                "--family",
+                "evaluation",
+            ],
+            vec![
+                "maco",
+                "evaluation",
+                "rescore",
+                "manifest.json",
+                "--results",
+                "results.json",
+                "--family",
+                "unknown",
+                "--objective-profile",
+                "balanced-v1",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "missing or invalid rescore arguments must be rejected"
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests;

@@ -730,7 +730,7 @@ impl RunBudgetLedger {
         id: BudgetReservationId,
         measurement: UsageMeasurement,
     ) -> Result<BudgetReconciliation> {
-        self.reconcile_with_pool(id, measurement, None)
+        self.reconcile_with_pool(id, measurement, None, None)
     }
 
     /// Reconcile a completed dispatch into both the run budget and the unique
@@ -751,7 +751,7 @@ impl RunBudgetLedger {
                 .cloned()
                 .ok_or_else(|| BudgetError::QuotaPoolUnavailable(runtime.to_string()))?
         };
-        self.reconcile_with_pool(id, measurement, Some(pool))
+        self.reconcile_with_pool(id, measurement, Some(pool), Some(runtime))
     }
 
     /// Reconcile through the configured per-runtime pool when a quota config
@@ -770,6 +770,8 @@ impl RunBudgetLedger {
                 BudgetError::QuotaPoolUnavailable("<missing-runtime>".to_string())
             })?;
             self.reconcile_quota_runtime(id, measurement, runtime)
+        } else if runtime.is_some() {
+            self.reconcile_with_pool(id, measurement, None, runtime)
         } else {
             self.reconcile(id, measurement)
         }
@@ -803,6 +805,7 @@ impl RunBudgetLedger {
         id: BudgetReservationId,
         measurement: UsageMeasurement,
         pool: Option<PoolKey>,
+        runtime: Option<&str>,
     ) -> Result<BudgetReconciliation> {
         validate_measurement(&measurement)?;
         let mut state = self.lock_state()?;
@@ -811,7 +814,7 @@ impl RunBudgetLedger {
             .get(&id)
             .cloned()
             .ok_or(BudgetError::UnknownReservation(id.get()))?;
-        let charge = reconciliation_charge(&reservation, &measurement)?;
+        let charge = reconciliation_charge_for_runtime(&reservation, &measurement, runtime)?;
         let mut next = state.clone();
         remove_reservation(&mut next, id)?;
         apply_charge(&mut next, reservation.role, &charge, self.limits)?;
@@ -995,12 +998,19 @@ impl RunBudgetLedger {
         let now = unix_now().map_err(rolling_ledger_error)?;
         let reservation_id =
             durable_reservation_id(&rolling.run_id, &self.session_id, reservation.id);
+        let (pool, requests) = if rolling.quota_pools.len() == 1 {
+            (rolling.quota_pools.values().next().cloned(), 1_u64)
+        } else {
+            (None, 0)
+        };
         rolling
             .ledger
             .record_reservation(DurableBudgetReservation {
                 reservation_id,
                 tokens: reservation.tokens,
+                requests,
                 cost_usd: reservation.cost_usd,
+                pool,
                 unix_seconds: now,
             })
             .map_err(rolling_ledger_error)?;
@@ -1270,6 +1280,28 @@ fn remove_reservation(
         .checked_sub(1)
         .ok_or(BudgetError::InconsistentState)?;
     Ok(reservation)
+}
+
+fn is_fake_backed_runtime(runtime: Option<&str>) -> bool {
+    runtime.is_some_and(|name| name == "fake")
+}
+
+fn reconciliation_charge_for_runtime(
+    reservation: &BudgetReservation,
+    measurement: &UsageMeasurement,
+    runtime: Option<&str>,
+) -> Result<ReconciliationCharge> {
+    if matches!(measurement, UsageMeasurement::Missing) && is_fake_backed_runtime(runtime) {
+        return Ok(ReconciliationCharge {
+            tokens: reservation.tokens,
+            cost_usd: observed_cost_or_reserved(None, reservation.cost_usd),
+            usage_complete: true,
+            cost_complete: reservation.cost_usd.is_some(),
+            reason: None,
+            stop_for_uncertainty: false,
+        });
+    }
+    reconciliation_charge(reservation, measurement)
 }
 
 fn reconciliation_charge(
@@ -2156,6 +2188,60 @@ mod tests {
     }
 
     #[test]
+    fn fake_backed_missing_usage_under_a_hard_ceiling_does_not_stop_dispatch() {
+        let ledger = RunBudgetLedger::new(token_limits(500, 1_000)).expect("ledger");
+        let reservation =
+            admitted_reservation(ledger.reserve(request(250, Some(2.5))).expect("reserve"));
+        let reconciliation = ledger
+            .reconcile_for_runtime_if_configured(
+                reservation.id,
+                UsageMeasurement::Missing,
+                Some("fake"),
+            )
+            .expect("reconcile fake-backed assignment");
+
+        assert_eq!(reconciliation.charged.tokens, 250);
+        assert!(reconciliation.report.usage_complete);
+        assert!(!reconciliation
+            .report
+            .reasons
+            .contains(&BudgetReason::MissingProviderUsage));
+        assert!(reconciliation.report.new_dispatch_allowed);
+
+        let second = ledger
+            .reserve(request(100, Some(1.0)))
+            .expect("second fake-backed reservation after missing usage");
+        assert!(second.reservation().is_some());
+    }
+
+    #[test]
+    fn real_provider_missing_usage_under_a_hard_ceiling_stays_fail_closed() {
+        let ledger = RunBudgetLedger::new(token_limits(500, 1_000)).expect("ledger");
+        let reservation =
+            admitted_reservation(ledger.reserve(request(250, Some(2.5))).expect("reserve"));
+        let reconciliation = ledger
+            .reconcile_for_runtime_if_configured(
+                reservation.id,
+                UsageMeasurement::Missing,
+                Some("codex"),
+            )
+            .expect("reconcile real provider missing usage");
+
+        assert!(reconciliation
+            .report
+            .reasons
+            .contains(&BudgetReason::MissingProviderUsage));
+        assert!(!reconciliation.report.new_dispatch_allowed);
+        assert!(matches!(
+            ledger.reserve(request(1, Some(0.01))).expect("refuse next"),
+            BudgetAdmission::Refused {
+                refusal: BudgetAdmissionRefusal::NewDispatchStopped,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn missing_pricing_is_refused_when_cost_is_enforced_and_explicit_otherwise() {
         let cost_ledger = RunBudgetLedger::new(RunBudgetLimits {
             soft_tokens: None,
@@ -2561,8 +2647,15 @@ mod tests {
             let _guard =
                 crate::budget_ledger::bind_rolling_budget(&repo, rolling_quota(50), "killed-run")
                     .expect("bind child rolling quota");
-            let ledger =
+            let mut ledger =
                 RunBudgetLedger::new(RunBudgetLimits::default()).expect("open child run ledger");
+            ledger
+                .attach_quota_config(
+                    std::path::Path::new(&repo),
+                    "killed-run",
+                    &quota_config("codex"),
+                )
+                .expect("attach child quota pool so the reservation records pool attribution");
             let reservation = admitted_reservation(
                 ledger
                     .reserve(request(40, None))
@@ -2686,6 +2779,16 @@ mod tests {
                 ..
             }
         ));
+        drop(recovery);
+        let recovered_at = unix_now().expect("recovery timestamp");
+        let pool = quota_config("codex").pools[0].key();
+        let workspace =
+            WorkspaceBudgetLedger::open_or_create(&repo).expect("inspect recovered ledger");
+        let pool_usage = workspace
+            .pool_usage(&pool, recovered_at)
+            .expect("recovered pool attribution");
+        assert_eq!(pool_usage.tokens, 40);
+        assert_eq!(pool_usage.requests, 1);
     }
 
     #[test]

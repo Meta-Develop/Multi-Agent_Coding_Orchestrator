@@ -1228,11 +1228,11 @@ fn complete_provider_planning_request<P: LlmProvider + ?Sized>(
     request
         .metadata
         .insert("planning_operation".to_string(), operation.to_string());
-    let response = provider.complete(request).with_context(|| {
-        format!(
+    let response = provider.complete(request).map_err(|error| {
+        crate::budget_ledger::record_bound_provider_error_preserving_source(error).context(format!(
             "provider '{}' failed during {operation}",
             provider.provider_id()
-        )
+        ))
     })?;
     if response.request_id != request_id {
         anyhow::bail!(
@@ -2907,7 +2907,7 @@ fn collapse_covered_paths(paths: BTreeSet<PathBuf>) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::FakeProvider;
+    use crate::llm::{FakeOutcome, FakeProvider, ProviderError};
     use std::fs;
 
     const CONTENTION_RESILIENT_INVENTORY_DURATION: Duration = Duration::from_secs(600);
@@ -2944,6 +2944,56 @@ mod tests {
         let result = test();
         drop(lock);
         result
+    }
+
+    #[test]
+    fn provider_rate_limit_crosses_planning_boundary_and_latches_workspace_pool() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        git2::Repository::init(repo).expect("init repo");
+        let detail = "planner tokens per minute";
+        let rolling_guard = crate::budget_ledger::bind_rolling_budget(
+            repo,
+            crate::budget_ledger::RollingBudgetQuota {
+                max_tokens: Some(10_000),
+                max_cost_usd: None,
+                window_seconds: 60,
+            },
+            "planning-rate-limit-run",
+        )
+        .expect("bind rolling workspace budget");
+        let config = ProviderPlanningConfig::new("rate-limited", "planner-model");
+        let mut provider = FakeProvider::new("fake-planner", "planner-model");
+        provider.push_outcome(
+            "rate-limited-proposal",
+            FakeOutcome::Failure(ProviderError::RateLimited(detail.to_string())),
+        );
+
+        let error = complete_provider_planning_request(
+            &mut provider,
+            &config,
+            "rate-limited-proposal".to_string(),
+            "provider task decomposition",
+            serde_json::json!({"fixture": "rate_limit"}),
+        )
+        .expect_err("rate-limited provider must fail planning");
+        assert_eq!(
+            error.downcast_ref::<ProviderError>(),
+            Some(&ProviderError::RateLimited(detail.to_string()))
+        );
+        drop(rolling_guard);
+
+        let ledger = crate::budget_ledger::WorkspaceBudgetLedger::open_or_create(repo)
+            .expect("reopen workspace ledger");
+        let latch = ledger
+            .active_rate_limit(
+                crate::budget_ledger::DEFAULT_RATE_LIMIT_POOL,
+                crate::budget_ledger::unix_now().expect("current time"),
+            )
+            .expect("planning provider boundary must latch the default workspace pool");
+        assert_eq!(latch.pool, crate::budget_ledger::DEFAULT_RATE_LIMIT_POOL);
+        assert_eq!(latch.detail, detail);
+        assert_eq!(provider.calls().len(), 1);
     }
 
     #[test]

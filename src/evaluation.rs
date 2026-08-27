@@ -3679,6 +3679,7 @@ impl fmt::Display for EvaluationEvidenceKind {
 }
 
 mod experiment;
+pub mod rescore;
 pub use experiment::{
     parse_experiment_manifest, run_fake_supervise_experiment, ExperimentEvidence,
     ExperimentEvidenceKind, ExperimentManifest, ExperimentProfileSummary, ExperimentResults,
