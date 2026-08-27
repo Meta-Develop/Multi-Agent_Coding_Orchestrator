@@ -440,6 +440,7 @@ fn collect_rust_files_bounded(
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn collect_rust_files_from_directory(
     directory: &File,
     relative_directory: &Path,
@@ -621,6 +622,7 @@ fn collect_rust_files_bounded(
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
 fn collect_rust_files_portable(
     root: &Path,
     directory: &Path,
