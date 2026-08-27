@@ -102,6 +102,8 @@ impl BudgetCliFixture {
                 "--json",
             ])
             .env_remove("RUST_LOG")
+            .env_remove("RUST_BACKTRACE")
+            .env_remove("RUST_LIB_BACKTRACE")
             .output()
             .context("run fake supervise CLI fixture")
     }
@@ -230,6 +232,8 @@ fn create_committed_repo(root: &Path) -> Result<PathBuf> {
     let output = Command::new(BIN)
         .args(["init", "--repo", path_str(&repo)?, "--json"])
         .env_remove("RUST_LOG")
+        .env_remove("RUST_BACKTRACE")
+        .env_remove("RUST_LIB_BACKTRACE")
         .output()
         .context("initialize budget CLI fixture repository")?;
     if !output.status.success() {
