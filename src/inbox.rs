@@ -120,7 +120,6 @@ pub struct InboxRunOptions {
     pub max_items: Option<usize>,
     pub codex_bin: Option<PathBuf>,
     pub machine_global: Option<InboxMachineGlobalInput>,
-    pub rolling_budget_quota: Option<InboxRollingBudgetQuota>,
 }
 
 /// Operator-configured aggregate quota shared by sequential inbox autopilot runs.
@@ -1433,11 +1432,23 @@ fn scan_inbox_with_overrides(
 }
 
 pub fn run_inbox(options: InboxRunOptions) -> Result<InboxRunReport> {
-    run_inbox_with_overrides(options, InboxConfigOverrides::default())
+    run_inbox_with_rolling_budget(options, None)
+}
+
+pub fn run_inbox_with_rolling_budget(
+    options: InboxRunOptions,
+    rolling_budget_quota: Option<InboxRollingBudgetQuota>,
+) -> Result<InboxRunReport> {
+    run_inbox_with_overrides(
+        options,
+        rolling_budget_quota,
+        InboxConfigOverrides::default(),
+    )
 }
 
 fn run_inbox_with_overrides(
     options: InboxRunOptions,
+    rolling_budget_quota: Option<InboxRollingBudgetQuota>,
     mut overrides: InboxConfigOverrides,
 ) -> Result<InboxRunReport> {
     validate_cli_source_options(
@@ -1446,8 +1457,7 @@ fn run_inbox_with_overrides(
         options.max_items,
         options.codex_bin.as_deref(),
     )?;
-    let rolling_budget_quota = options
-        .rolling_budget_quota
+    let rolling_budget_quota = rolling_budget_quota
         .map(InboxRollingBudgetQuota::into_rolling_budget_quota)
         .transpose()?;
     let repo = discover_repo_root(&options.repo)?;
@@ -1721,7 +1731,6 @@ pub fn watch_inbox(options: InboxWatchOptions) -> Result<InboxWatchReport> {
             max_items: options.max_items,
             codex_bin: options.codex_bin.clone(),
             machine_global: options.machine_global.clone(),
-            rolling_budget_quota: None,
         })?;
         runs.push(report);
         if options.once {
@@ -1813,8 +1822,8 @@ pub fn run_workspace_inbox(options: InboxWorkspaceRunOptions) -> Result<InboxWor
                 max_items: None,
                 codex_bin: options.codex_bin.clone(),
                 machine_global: options.machine_global.clone(),
-                rolling_budget_quota: None,
             },
+            None,
             workspace_overrides_for_repo(&spec),
         );
         match run_result {
