@@ -343,17 +343,13 @@ fn deterministic_verification_path(
     risk_report: Option<&SemanticRiskReport>,
     execution_runtime: SupervisorExecutionRuntime,
 ) -> ViabilityFinding {
+    if execution_runtime == SupervisorExecutionRuntime::NonpublishableSimulation {
+        return ViabilityFinding::Yes;
+    }
     let assignment_names_exact_test_target = assignment
         .assigned_paths
         .iter()
         .any(|path| is_recognized_test_target(path));
-    if execution_runtime == SupervisorExecutionRuntime::NonpublishableSimulation {
-        return if assignment_names_exact_test_target {
-            ViabilityFinding::Yes
-        } else {
-            ViabilityFinding::Unknown
-        };
-    }
 
     let Some(repo_map) = repo_map else {
         return ViabilityFinding::Unknown;
@@ -1704,44 +1700,19 @@ mod tests {
     }
 
     #[test]
-    fn test_target_classification_accepts_runnable_sources_and_rejects_fixture_files() {
+    fn test_target_classifier_accepts_runnable_sources_and_rejects_fixture_files() {
         for path in ["tests/preclaim.rs", "tests/test_generator.py"] {
-            let mut candidate = assignment();
-            candidate.assigned_paths = vec![PathBuf::from(path)];
-            let requested = [candidate.clone()];
-            let decision = evaluate_preclaim_viability(
-                &candidate,
-                &requested,
-                None,
-                None,
-                Some(SupervisorRuntime::Fake),
-                SupervisorExecutionRuntime::NonpublishableSimulation,
-            );
-            assert_eq!(
-                decision.disposition,
-                PreclaimDisposition::Claim,
+            assert!(
+                is_recognized_test_target(Path::new(path)),
                 "runnable test source should be recognized: {path}"
             );
         }
 
         for path in ["tests/fixtures/input.json", "tests/README.md"] {
-            let mut candidate = assignment();
-            candidate.assigned_paths = vec![PathBuf::from(path)];
-            let requested = [candidate.clone()];
-            let decision = evaluate_preclaim_viability(
-                &candidate,
-                &requested,
-                None,
-                None,
-                Some(SupervisorRuntime::Fake),
-                SupervisorExecutionRuntime::NonpublishableSimulation,
-            );
-            assert_eq!(
-                decision.dimensions.clear_verification_path,
-                ViabilityFinding::Unknown,
+            assert!(
+                !is_recognized_test_target(Path::new(path)),
                 "non-runnable fixture must not be a verification target: {path}"
             );
-            assert_eq!(decision.disposition, PreclaimDisposition::Park);
         }
     }
 
@@ -1959,37 +1930,59 @@ mod tests {
     }
 
     #[test]
-    fn simulation_requires_an_assignment_specific_test_target_and_is_deterministic() {
-        let viable_assignment = assignment();
+    fn simulation_uses_the_injected_runner_as_verification_and_preserves_other_dimensions() {
+        let mut viable_assignment = assignment();
+        viable_assignment.assigned_paths = vec![PathBuf::from("src/lib.rs")];
         let viable_requested = [viable_assignment.clone()];
         let viable = evaluate_preclaim_viability(
             &viable_assignment,
             &viable_requested,
             None,
             None,
-            Some(SupervisorRuntime::Fake),
+            Some(SupervisorRuntime::Codex),
             SupervisorExecutionRuntime::NonpublishableSimulation,
         );
         assert_eq!(viable.disposition, PreclaimDisposition::Claim);
-        let mut unviable = assignment();
-        unviable.assigned_paths = vec![PathBuf::from("README.md")];
+        assert_eq!(viable.triage_outcome, PreclaimTriageOutcome::Viable);
+        assert_eq!(
+            viable.dimensions.clear_verification_path,
+            ViabilityFinding::Yes
+        );
+        assert_eq!(
+            viable.evidence_source,
+            PreclaimEvidenceSource::SyntheticSimulation
+        );
+        assert!(!viable.map_present && !viable.risk_present && viable.runtime_present);
+
+        let mut unviable = viable_assignment.clone();
+        unviable.environment_requirements = vec![EnvironmentRequirement::network(
+            EnvironmentNetworkAccess::Enabled,
+        )];
         let unviable_requested = [unviable.clone()];
         let parked = evaluate_preclaim_viability(
             &unviable,
             &unviable_requested,
             None,
             None,
-            Some(SupervisorRuntime::Fake),
+            Some(SupervisorRuntime::Codex),
             SupervisorExecutionRuntime::NonpublishableSimulation,
         );
         assert_eq!(parked.disposition, PreclaimDisposition::Park);
         assert_eq!(
             parked.rejection_bucket,
-            Some(PreclaimRejectionBucket::Unclear)
+            Some(PreclaimRejectionBucket::NeedsDecision)
         );
         assert_eq!(
             parked.dimensions.clear_verification_path,
-            ViabilityFinding::Unknown
+            ViabilityFinding::Yes
+        );
+        assert_eq!(
+            parked.dimensions.autonomously_completable,
+            ViabilityFinding::No
+        );
+        assert_eq!(
+            parked.evidence_source,
+            PreclaimEvidenceSource::SyntheticSimulation
         );
         assert_eq!(
             viable,
@@ -1998,7 +1991,7 @@ mod tests {
                 &viable_requested,
                 None,
                 None,
-                Some(SupervisorRuntime::Fake),
+                Some(SupervisorRuntime::Codex),
                 SupervisorExecutionRuntime::NonpublishableSimulation,
             )
         );
