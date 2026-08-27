@@ -2258,9 +2258,7 @@ fn skip_following_rust_item(source: &str) -> &str {
                 i += 1;
             }
             b'}' => {
-                if depth > 0 {
-                    depth -= 1;
-                }
+                depth = depth.saturating_sub(1);
                 i += 1;
                 if seen_brace && depth == 0 {
                     return &source[i..];
