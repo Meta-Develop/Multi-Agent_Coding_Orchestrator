@@ -1481,19 +1481,30 @@ fn schedule_preclaim_decision(
     )
 }
 
+fn scheduler_preclaim_evidence(
+    context: &AssignmentSchedulerContext<'_, '_>,
+) -> PreclaimRunEvidence {
+    PreclaimRunEvidence::acquire(
+        context.repo,
+        context.options.runtime,
+        preclaim_assessment_runtime(
+            context.options.runtime,
+            context.execution_runtime,
+            context.worktree_creation,
+        ),
+    )
+}
+
 fn run_serial_assignment_schedule(
     context: &AssignmentSchedulerContext<'_, '_>,
     progress: &mut SchedulerProgress,
     cancellation: &ProcessCancellation,
     serial_semantic_warn_intents: &Mutex<Vec<(usize, SemanticIntent)>>,
 ) -> Result<()> {
-    let fallback_preclaim_evidence = progress.prepared_preclaim_decisions.is_none().then(|| {
-        PreclaimRunEvidence::acquire(
-            context.repo,
-            context.options.runtime,
-            context.execution_runtime,
-        )
-    });
+    let fallback_preclaim_evidence = progress
+        .prepared_preclaim_decisions
+        .is_none()
+        .then(|| scheduler_preclaim_evidence(context));
     let mut pending = (0..context.plan.assignments.len()).collect::<BTreeSet<_>>();
     while !pending.is_empty() {
         suppress_failed_descendants(
@@ -1683,13 +1694,10 @@ fn run_concurrent_assignment_schedule(
     cancellation: &ProcessCancellation,
     semantic_block_gate: &SemanticBlockGate,
 ) -> Result<()> {
-    let fallback_preclaim_evidence = progress.prepared_preclaim_decisions.is_none().then(|| {
-        PreclaimRunEvidence::acquire(
-            context.repo,
-            context.options.runtime,
-            context.execution_runtime,
-        )
-    });
+    let fallback_preclaim_evidence = progress
+        .prepared_preclaim_decisions
+        .is_none()
+        .then(|| scheduler_preclaim_evidence(context));
     thread::scope(|scope| -> Result<()> {
         let (completion_sender, completion_receiver) = mpsc::channel::<usize>();
         let mut pending = (0..context.plan.assignments.len()).collect::<BTreeSet<_>>();
@@ -2966,6 +2974,38 @@ fn evaluate_supervisor_preclaims(
         .collect()
 }
 
+/// Derive viability-assessment runtime independently of effect containment.
+///
+/// Production plan-file and follow-up entry points always execute through
+/// `Verified` + `Bound`, including `--runtime fake`. Fake never supplies
+/// production map/risk verification evidence, so assessment uses the same
+/// synthetic simulation path the scheduler family already uses. Codex +
+/// `Verified` stays strict outside tests. Test `Bound`/`PrimaryWorktree`
+/// fixtures inject runners to exercise containment, not production viability
+/// evidence; `VerifiedTestOnly` remains the real pre-claim acceptance boundary.
+fn preclaim_assessment_runtime(
+    runtime: SupervisorRuntime,
+    execution_runtime: SupervisorExecutionRuntime,
+    worktree_creation: SupervisorWorktreeCreation<'_>,
+) -> SupervisorExecutionRuntime {
+    if runtime == SupervisorRuntime::Fake {
+        return SupervisorExecutionRuntime::NonpublishableSimulation;
+    }
+
+    #[cfg(test)]
+    if matches!(
+        worktree_creation,
+        SupervisorWorktreeCreation::Bound(_) | SupervisorWorktreeCreation::PrimaryWorktree
+    ) {
+        return SupervisorExecutionRuntime::NonpublishableSimulation;
+    }
+
+    #[cfg(not(test))]
+    let _ = worktree_creation;
+
+    execution_runtime
+}
+
 fn persist_prepared_preclaim_decisions(
     repo: &Path,
     run_id: &RunId,
@@ -3165,8 +3205,10 @@ fn prepare_supervisor_run(
     // selector, quota-ledger attachment, or assignment admission policy state can
     // affect the run. Persist every decision immediately after evaluation so any
     // later preparation failure still leaves durable gate evidence.
+    let preclaim_runtime =
+        preclaim_assessment_runtime(runtime, execution_runtime, worktree_creation);
     let preclaim_decisions =
-        evaluate_supervisor_preclaims(&plan, &requested_plan, &repo, runtime, execution_runtime);
+        evaluate_supervisor_preclaims(&plan, &requested_plan, &repo, runtime, preclaim_runtime);
     persist_prepared_preclaim_decisions(
         &repo,
         &options.run_id,
@@ -4260,6 +4302,64 @@ mod selection_policy_tests {
             budget_max_duration_seconds: None,
             machine_global_retention: None,
         }
+    }
+
+    #[test]
+    fn preclaim_runtime_is_derived_separately_from_effect_containment() -> Result<()> {
+        skip_without_containment!(ok);
+        let (_temporary, repo) = initialized_repository();
+        let manager = WorktreeManager::new(&repo);
+        let cleanliness = manager.acquire_repository_cleanliness()?;
+
+        assert_eq!(
+            preclaim_assessment_runtime(
+                SupervisorRuntime::Fake,
+                SupervisorExecutionRuntime::Verified,
+                SupervisorWorktreeCreation::ExistingOnly,
+            ),
+            SupervisorExecutionRuntime::NonpublishableSimulation
+        );
+        assert_eq!(
+            preclaim_assessment_runtime(
+                SupervisorRuntime::Codex,
+                SupervisorExecutionRuntime::NonpublishableSimulation,
+                SupervisorWorktreeCreation::ExistingOnly,
+            ),
+            SupervisorExecutionRuntime::NonpublishableSimulation
+        );
+        assert_eq!(
+            preclaim_assessment_runtime(
+                SupervisorRuntime::Codex,
+                SupervisorExecutionRuntime::Verified,
+                SupervisorWorktreeCreation::Bound(&cleanliness),
+            ),
+            SupervisorExecutionRuntime::NonpublishableSimulation
+        );
+        assert_eq!(
+            preclaim_assessment_runtime(
+                SupervisorRuntime::Codex,
+                SupervisorExecutionRuntime::Verified,
+                SupervisorWorktreeCreation::PrimaryWorktree,
+            ),
+            SupervisorExecutionRuntime::NonpublishableSimulation
+        );
+        assert_eq!(
+            preclaim_assessment_runtime(
+                SupervisorRuntime::Codex,
+                SupervisorExecutionRuntime::Verified,
+                SupervisorWorktreeCreation::VerifiedTestOnly,
+            ),
+            SupervisorExecutionRuntime::Verified
+        );
+        assert_eq!(
+            preclaim_assessment_runtime(
+                SupervisorRuntime::Codex,
+                SupervisorExecutionRuntime::Verified,
+                SupervisorWorktreeCreation::ExistingOnly,
+            ),
+            SupervisorExecutionRuntime::Verified
+        );
+        Ok(())
     }
 
     #[test]
