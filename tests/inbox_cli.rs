@@ -274,6 +274,110 @@ fn run_processes_default_fake_items_and_writes_expected_artifacts() -> Result<()
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn sequential_inbox_runs_draw_down_rolling_quota_then_refuse_before_dispatch() -> Result<()> {
+    support::require_containment!(
+        "sequential_inbox_runs_draw_down_rolling_quota_then_refuse_before_dispatch"
+    );
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let machine_global_config = write_test_machine_global_config(temp.path())?;
+
+    let first = run_success_json(&[
+        "inbox",
+        "run",
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "rolling-quota-first",
+        "--max-items",
+        "1",
+        "--max-rolling-tokens",
+        "2",
+        "--rolling-window-seconds",
+        "86400",
+        "--machine-global-config",
+        path_str(&machine_global_config)?,
+        "--machine-global-runtime-root-id",
+        "runtime",
+        "--json",
+    ])?;
+
+    assert_eq!(first["status"], "succeeded");
+    assert_eq!(first["success"], true);
+    assert_eq!(first["item_reports"].as_array().map(Vec::len), Some(1));
+    assert_eq!(first["item_reports"][0]["item_id"], "issue-101");
+    let first_autopilot = read_json_file(
+        &repo_path.join(".maco/inbox/runs/rolling-quota-first/item-1-autopilot-report.json"),
+    )?;
+    let first_budget = &first_autopilot["supervisor"]["run_budget"];
+    assert_eq!(first_budget["consumed"]["tokens"], 2);
+    assert_eq!(first_budget["usage_complete"], false);
+    assert!(array_contains(
+        &first_budget["reasons"],
+        "missing_provider_usage"
+    )?);
+
+    let second = run_failure_json(&[
+        "inbox",
+        "run",
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "rolling-quota-second",
+        "--max-items",
+        "1",
+        "--max-rolling-tokens",
+        "2",
+        "--max-rolling-cost-usd",
+        "1000000",
+        "--rolling-window-seconds",
+        "86400",
+        "--machine-global-config",
+        path_str(&machine_global_config)?,
+        "--machine-global-runtime-root-id",
+        "runtime",
+        "--json",
+    ])?;
+
+    assert_eq!(second["status"], "refused");
+    assert_eq!(second["success"], false);
+    assert_eq!(second["item_reports"].as_array().map(Vec::len), Some(1));
+    assert_eq!(second["item_reports"][0]["item_id"], "pr-202");
+    assert_eq!(second["item_reports"][0]["status"], "refused");
+    assert_eq!(second["refusals"].as_array().map(Vec::len), Some(1));
+    assert_eq!(second["refusals"][0]["kind"], "hard_token_ceiling");
+    let second_autopilot = read_json_file(
+        &repo_path.join(".maco/inbox/runs/rolling-quota-second/item-1-autopilot-report.json"),
+    )?;
+    assert_eq!(second_autopilot["status"], "failed");
+    assert_eq!(second_autopilot["success"], false);
+    assert_eq!(
+        second_autopilot["supervisor"]["run_budget"]["consumed"]["tokens"],
+        0
+    );
+    assert!(second_autopilot["supervisor"]["total_usage"].is_null());
+    assert!(array_contains(
+        &second_autopilot["supervisor"]["run_budget"]["reasons"],
+        "hard_token_ceiling_reached"
+    )?);
+    let budget_gate_denials = second_autopilot["gate_denials"]
+        .as_array()
+        .context("second autopilot gate denials")?;
+    assert!(budget_gate_denials.iter().any(|denial| {
+        denial["reason"]["family"] == "budget_admission"
+            && denial["reason"]["denial"] == "new_dispatch_stopped"
+    }));
+    let second_github = read_json_file(
+        &repo_path.join(".maco/inbox/runs/rolling-quota-second/item-1-github-report.json"),
+    )?;
+    assert_eq!(second_github["status"], "skipped");
+    assert_eq!(second_github["success"], false);
+
+    Ok(())
+}
+
 #[test]
 fn inbox_generates_run_ids_refuses_reuse_and_prunes_only_run_dirs() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;

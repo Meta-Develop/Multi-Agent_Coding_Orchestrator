@@ -7,8 +7,9 @@ use crate::{
     },
     autopilot::{
         self, AutopilotForgeMode, AutopilotPlan, AutopilotPublishMode, AutopilotRunOptions,
-        AutopilotTask, AutopilotValidationCommand,
+        AutopilotRunStatus, AutopilotTask, AutopilotValidationCommand,
     },
+    gate_denial::GateDenialReason,
     live_claim::{self, LiveClock},
     llm::{RedactionSummary, Redactor},
     machine_global::MachineGlobalRetentionBinding,
@@ -78,6 +79,9 @@ const GH_DIAGNOSTIC_LIMIT: usize = 4 * 1024;
 const COMMENT_BODY_LIMIT: usize = 6 * 1024;
 const ARTIFACT_FINAL_MARKER: &str = ".maco-artifact-final.json";
 
+pub const DEFAULT_ROLLING_WINDOW_SECONDS: u64 =
+    crate::budget_ledger::DEFAULT_ROLLING_WINDOW_SECONDS;
+
 #[derive(Debug, Clone)]
 pub struct InboxScanOptions {
     pub repo: PathBuf,
@@ -116,6 +120,30 @@ pub struct InboxRunOptions {
     pub max_items: Option<usize>,
     pub codex_bin: Option<PathBuf>,
     pub machine_global: Option<InboxMachineGlobalInput>,
+    pub rolling_budget_quota: Option<InboxRollingBudgetQuota>,
+}
+
+/// Operator-configured aggregate quota shared by sequential inbox autopilot runs.
+///
+/// This inbox-owned value keeps the crate-private durable-ledger type out of the
+/// public API. Each effectful item converts and binds it to the nested autopilot
+/// run id so the supervisor run-budget ledger owns admission and reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InboxRollingBudgetQuota {
+    pub max_tokens: Option<usize>,
+    pub max_cost_usd: Option<f64>,
+    pub window_seconds: u64,
+}
+
+impl InboxRollingBudgetQuota {
+    fn into_rolling_budget_quota(self) -> Result<crate::budget_ledger::RollingBudgetQuota> {
+        crate::budget_ledger::RollingBudgetQuota {
+            max_tokens: self.max_tokens,
+            max_cost_usd: self.max_cost_usd,
+            window_seconds: self.window_seconds,
+        }
+        .validate()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1418,6 +1446,10 @@ fn run_inbox_with_overrides(
         options.max_items,
         options.codex_bin.as_deref(),
     )?;
+    let rolling_budget_quota = options
+        .rolling_budget_quota
+        .map(InboxRollingBudgetQuota::into_rolling_budget_quota)
+        .transpose()?;
     let repo = discover_repo_root(&options.repo)?;
     if options.max_items.is_some() {
         overrides.max_items = options.max_items;
@@ -1565,11 +1597,13 @@ fn run_inbox_with_overrides(
             .clone()
             .or_else(|| loaded.config.codex_bin.clone()),
         machine_global: options.machine_global.clone(),
+        rolling_budget_quota,
     };
     let mut item_reports = Vec::new();
+    let mut refusals = Vec::new();
     for (zero_index, item) in selected_items.iter().enumerate() {
         let item_index = zero_index.saturating_add(1);
-        let item_report = run_inbox_item(
+        let outcome = run_inbox_item(
             &mut artifact_writer,
             InboxItemRunInput {
                 context: &item_context,
@@ -1577,11 +1611,17 @@ fn run_inbox_with_overrides(
                 item,
             },
         )?;
-        item_reports.push(item_report);
+        item_reports.push(outcome.report);
+        if let Some(refusal) = outcome.refusal {
+            refusals.push(refusal);
+            break;
+        }
     }
 
-    let success = item_reports.iter().all(|report| report.success);
-    let status = if action_policy == InboxActionPolicy::DryRun {
+    let success = refusals.is_empty() && item_reports.iter().all(|report| report.success);
+    let status = if !refusals.is_empty() {
+        InboxRunStatus::Refused
+    } else if action_policy == InboxActionPolicy::DryRun {
         InboxRunStatus::DryRun
     } else if !permission_mode.launches_autopilot() {
         InboxRunStatus::Planned
@@ -1599,12 +1639,14 @@ fn run_inbox_with_overrides(
         github_enabled: scan.github_enabled,
         success,
         status,
-        refusals: Vec::new(),
+        refusals,
         artifacts,
         selected_item_count: selected_items.len(),
         item_reports,
         auto_merge_performed: false,
-        next_action: if success {
+        next_action: if status == InboxRunStatus::Refused {
+            "increase or wait for the rolling inbox quota before starting another run".to_string()
+        } else if success {
             "review inbox item reports; no automatic merge was performed".to_string()
         } else {
             "inspect failed item reports and rerun after repair".to_string()
@@ -1679,6 +1721,7 @@ pub fn watch_inbox(options: InboxWatchOptions) -> Result<InboxWatchReport> {
             max_items: options.max_items,
             codex_bin: options.codex_bin.clone(),
             machine_global: options.machine_global.clone(),
+            rolling_budget_quota: None,
         })?;
         runs.push(report);
         if options.once {
@@ -1770,6 +1813,7 @@ pub fn run_workspace_inbox(options: InboxWorkspaceRunOptions) -> Result<InboxWor
                 max_items: None,
                 codex_bin: options.codex_bin.clone(),
                 machine_global: options.machine_global.clone(),
+                rolling_budget_quota: None,
             },
             workspace_overrides_for_repo(&spec),
         );
@@ -2381,6 +2425,12 @@ struct InboxItemRunContext<'a> {
     permission_mode: InboxPermissionMode,
     codex_bin: Option<PathBuf>,
     machine_global: Option<InboxMachineGlobalInput>,
+    rolling_budget_quota: Option<crate::budget_ledger::RollingBudgetQuota>,
+}
+
+struct InboxItemRunOutcome {
+    report: InboxItemRunReport,
+    refusal: Option<InboxRefusal>,
 }
 
 struct InboxItemRunInput<'a> {
@@ -2392,7 +2442,7 @@ struct InboxItemRunInput<'a> {
 fn run_inbox_item(
     writer: &mut ArtifactRunWriter,
     input: InboxItemRunInput<'_>,
-) -> Result<InboxItemRunReport> {
+) -> Result<InboxItemRunOutcome> {
     let context = input.context;
     let item_index = input.item_index;
     let item = input.item;
@@ -2449,35 +2499,38 @@ fn run_inbox_item(
             }),
         };
         write_private_artifact_json(writer, &github_report_relative, &github_report)?;
-        return Ok(InboxItemRunReport {
-            item_index,
-            item_id: item.item_id.clone(),
-            kind: item.kind,
-            title: item.title.clone(),
-            success: true,
-            status: if planned_only {
-                "planned".to_string()
-            } else {
-                "dry_run".to_string()
+        return Ok(InboxItemRunOutcome {
+            report: InboxItemRunReport {
+                item_index,
+                item_id: item.item_id.clone(),
+                kind: item.kind,
+                title: item.title.clone(),
+                success: true,
+                status: if planned_only {
+                    "planned".to_string()
+                } else {
+                    "dry_run".to_string()
+                },
+                plan_path: public_item_path(run_id, &format!("item-{item_index}-plan.json")),
+                autopilot_run_id: autopilot_run_id.as_str().to_string(),
+                autopilot_report_path: public_item_path(
+                    run_id,
+                    &format!("item-{item_index}-autopilot-report.json"),
+                ),
+                github_report_path: public_item_path(
+                    run_id,
+                    &format!("item-{item_index}-github-report.json"),
+                ),
+                autopilot_success: None,
+                github_success: true,
+                review_loop,
+                next_action: if planned_only {
+                    "review the plan; this permission mode does not launch work".to_string()
+                } else {
+                    "review the dry-run plan; no work was launched".to_string()
+                },
             },
-            plan_path: public_item_path(run_id, &format!("item-{item_index}-plan.json")),
-            autopilot_run_id: autopilot_run_id.as_str().to_string(),
-            autopilot_report_path: public_item_path(
-                run_id,
-                &format!("item-{item_index}-autopilot-report.json"),
-            ),
-            github_report_path: public_item_path(
-                run_id,
-                &format!("item-{item_index}-github-report.json"),
-            ),
-            autopilot_success: None,
-            github_success: true,
-            review_loop,
-            next_action: if planned_only {
-                "review the plan; this permission mode does not launch work".to_string()
-            } else {
-                "review the dry-run plan; no work was launched".to_string()
-            },
+            refusal: None,
         });
     }
 
@@ -2487,26 +2540,36 @@ fn run_inbox_item(
         .machine_global
         .as_ref()
         .map(|input| input.retention_binding_for_run(&autopilot_run_id));
-    let autopilot_result = autopilot::run_autopilot_plan_file_with_retention(
-        AutopilotRunOptions {
-            repo: repo.to_path_buf(),
-            plan_file: plan_path.clone(),
-            run_id: autopilot_run_id.clone(),
-            codex_bin: context.codex_bin.clone(),
-            reviewer_command: None,
-            allow_dirty_primary: false,
-            allow_live_run_collision: false,
-            max_child_dispatches: None,
-            budget_overrides: crate::supervise::RunBudgetLimits::default(),
-            budget_max_duration_seconds: None,
-            cancellation: None,
-        },
-        machine_global_retention,
-    );
+    let autopilot_result = {
+        let _rolling_guard = context
+            .rolling_budget_quota
+            .map(|quota| {
+                crate::budget_ledger::bind_rolling_budget(repo, quota, autopilot_run_id.as_str())
+            })
+            .transpose()?;
+        autopilot::run_autopilot_plan_file_with_retention(
+            AutopilotRunOptions {
+                repo: repo.to_path_buf(),
+                plan_file: plan_path.clone(),
+                run_id: autopilot_run_id.clone(),
+                codex_bin: context.codex_bin.clone(),
+                reviewer_command: None,
+                allow_dirty_primary: false,
+                allow_live_run_collision: false,
+                max_child_dispatches: None,
+                budget_overrides: crate::supervise::RunBudgetLimits::default(),
+                budget_max_duration_seconds: None,
+                cancellation: None,
+            },
+            machine_global_retention,
+        )
+    };
+    let mut refusal = None;
     let (autopilot_success, autopilot_message) = match autopilot_result {
         Ok(report) => {
             let success = report.success;
             let message = report.next_action.clone();
+            refusal = inbox_budget_refusal(&report);
             write_private_artifact_json(writer, &autopilot_report_relative, &report)?;
             (success, Some(message))
         }
@@ -2528,46 +2591,106 @@ fn run_inbox_item(
         }
     };
 
-    let github_report = github_action_for_item(
-        repo,
-        config,
-        action_policy,
-        permission_mode,
-        item,
-        autopilot_success,
-        autopilot_message,
-    );
+    let github_report = if refusal.is_some() {
+        InboxGithubActionReport {
+            mode: action_policy,
+            permission_mode,
+            status: "skipped".to_string(),
+            success: false,
+            target: item_target(item),
+            comment_url: None,
+            message: Some(
+                "autopilot budget refusal stopped the downstream GitHub action".to_string(),
+            ),
+        }
+    } else {
+        github_action_for_item(
+            repo,
+            config,
+            action_policy,
+            permission_mode,
+            item,
+            autopilot_success,
+            autopilot_message,
+        )
+    };
     write_private_artifact_json(writer, &github_report_relative, &github_report)?;
     let success = autopilot_success && github_report.success;
-    Ok(InboxItemRunReport {
-        item_index,
-        item_id: item.item_id.clone(),
-        kind: item.kind,
-        title: item.title.clone(),
-        success,
-        status: if success {
-            "succeeded".to_string()
-        } else {
-            "failed".to_string()
+    Ok(InboxItemRunOutcome {
+        report: InboxItemRunReport {
+            item_index,
+            item_id: item.item_id.clone(),
+            kind: item.kind,
+            title: item.title.clone(),
+            success,
+            status: if refusal.is_some() {
+                "refused".to_string()
+            } else if success {
+                "succeeded".to_string()
+            } else {
+                "failed".to_string()
+            },
+            plan_path: public_item_path(run_id, &format!("item-{item_index}-plan.json")),
+            autopilot_run_id: autopilot_run_id.as_str().to_string(),
+            autopilot_report_path: public_item_path(
+                run_id,
+                &format!("item-{item_index}-autopilot-report.json"),
+            ),
+            github_report_path: public_item_path(
+                run_id,
+                &format!("item-{item_index}-github-report.json"),
+            ),
+            autopilot_success: Some(autopilot_success),
+            github_success: github_report.success,
+            review_loop,
+            next_action: if refusal.is_some() {
+                "wait for or increase the rolling inbox quota before retrying".to_string()
+            } else if success {
+                "review the generated autopilot and GitHub reports".to_string()
+            } else {
+                "inspect the item autopilot and GitHub reports before retrying".to_string()
+            },
         },
-        plan_path: public_item_path(run_id, &format!("item-{item_index}-plan.json")),
-        autopilot_run_id: autopilot_run_id.as_str().to_string(),
-        autopilot_report_path: public_item_path(
-            run_id,
-            &format!("item-{item_index}-autopilot-report.json"),
-        ),
-        github_report_path: public_item_path(
-            run_id,
-            &format!("item-{item_index}-github-report.json"),
-        ),
-        autopilot_success: Some(autopilot_success),
-        github_success: github_report.success,
-        review_loop,
-        next_action: if success {
-            "review the generated autopilot and GitHub reports".to_string()
+        refusal,
+    })
+}
+
+fn inbox_budget_refusal(report: &autopilot::AutopilotFinalReport) -> Option<InboxRefusal> {
+    if !matches!(
+        report.status,
+        AutopilotRunStatus::Failed | AutopilotRunStatus::Refused
+    ) {
+        return None;
+    }
+    let supervisor = report.supervisor.as_ref()?;
+    let has_budget_admission_denial = report
+        .gate_denials
+        .iter()
+        .chain(supervisor.gate_denials.iter())
+        .any(|denial| matches!(&denial.reason, GateDenialReason::BudgetAdmission { .. }));
+    if !has_budget_admission_denial {
+        return None;
+    }
+    let reasons = &supervisor.run_budget.as_ref()?.reasons;
+    let (kind, message) =
+        if reasons.contains(&crate::supervise::BudgetReason::HardTokenCeilingReached) {
+            (
+                "hard_token_ceiling",
+                "the rolling token quota refused this inbox autopilot dispatch",
+            )
+        } else if reasons.contains(&crate::supervise::BudgetReason::HardCostCeilingReached) {
+            (
+                "hard_cost_ceiling",
+                "the rolling cost quota refused this inbox autopilot dispatch",
+            )
         } else {
-            "inspect the item autopilot and GitHub reports before retrying".to_string()
-        },
+            return None;
+        };
+    Some(InboxRefusal {
+        kind: kind.to_string(),
+        message: message.to_string(),
+        paths: Vec::new(),
+        lock_details: Vec::new(),
     })
 }
 
