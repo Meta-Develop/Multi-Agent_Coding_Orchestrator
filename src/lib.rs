@@ -51,6 +51,7 @@ pub mod run_ops;
 pub mod runtime_adapter;
 pub mod safe_state;
 pub mod scope;
+pub mod secret_lifecycle;
 pub mod selection;
 pub mod semantic_coord;
 pub mod steering;
