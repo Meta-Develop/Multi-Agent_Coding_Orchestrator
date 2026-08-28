@@ -66,7 +66,7 @@ pub enum TurnRole {
     Tool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Redactor {
     rules: Vec<RedactionRule>,
     redact_secret_assignments: bool,
@@ -139,10 +139,50 @@ impl Default for Redactor {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl std::fmt::Debug for Redactor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Redactor")
+            .field(
+                "rules",
+                &self
+                    .rules
+                    .iter()
+                    .map(|rule| format!("<redacted:{}>", rule.label))
+                    .collect::<Vec<_>>(),
+            )
+            .field("redact_secret_assignments", &self.redact_secret_assignments)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct RedactionRule {
     pub label: String,
     pub value: String,
+}
+
+impl std::fmt::Debug for RedactionRule {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RedactionRule")
+            .field("label", &self.label)
+            .field("value", &format!("<redacted:{}>", self.label))
+            .finish()
+    }
+}
+
+impl Drop for RedactionRule {
+    fn drop(&mut self) {
+        zeroize_string(&mut self.value);
+    }
+}
+
+fn zeroize_string(value: &mut String) {
+    let mut bytes = std::mem::take(value).into_bytes();
+    bytes.fill(0);
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    bytes.clear();
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -381,5 +421,27 @@ mod tests {
         let unchanged = redactor.redact(r#"{"user":"a","name":"visible"}"#);
         assert_eq!(unchanged.text, r#"{"user":"a","name":"visible"}"#);
         assert_eq!(unchanged.summary.total_replacements, 0);
+    }
+
+    #[test]
+    fn redactor_debug_and_error_formatting_omit_private_values() {
+        let placeholder = "placeholder.lifecycle.test-value.v1";
+        let redactor = Redactor::new().with_private_value("fixture", placeholder);
+        let debug = format!("{redactor:?}");
+        let display = format!("{redactor:?}");
+        let error_text = format!("redactor failed: {redactor:?}");
+
+        assert!(!debug.contains(placeholder));
+        assert!(!display.contains(placeholder));
+        assert!(!error_text.contains(placeholder));
+        assert!(debug.contains("<redacted:fixture>"));
+
+        let rule = RedactionRule {
+            label: "fixture".to_string(),
+            value: placeholder.to_string(),
+        };
+        let rule_debug = format!("{rule:?}");
+        assert!(!rule_debug.contains(placeholder));
+        assert!(rule_debug.contains("<redacted:fixture>"));
     }
 }
