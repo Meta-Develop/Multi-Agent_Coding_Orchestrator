@@ -312,6 +312,63 @@ fn cli_semantic_coord_symbol_only_preview_reports_impacted_active_path() -> Resu
     Ok(())
 }
 
+#[test]
+fn cli_semantic_risk_maps_python_and_marks_unknown_language_paths() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(repo_path.join("src")).context("create src")?;
+    fs::create_dir_all(repo_path.join("pkg")).context("create pkg")?;
+    fs::create_dir_all(repo_path.join("web")).context("create web")?;
+    Repository::init(&repo_path).context("init repo")?;
+    fs::write(repo_path.join("src/lib.rs"), "pub fn rust_entry() {}\n").context("write rust")?;
+    fs::write(repo_path.join("pkg/util.py"), "def util():\n    return 1\n")
+        .context("write python")?;
+    fs::write(
+        repo_path.join("web/app.ts"),
+        "export function hidden() { return 1; }\n",
+    )
+    .context("write typescript")?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+
+    let report = run_success_json([
+        "repo",
+        "query",
+        "risk",
+        "--path",
+        "src/lib.rs",
+        "--path",
+        "pkg/util.py",
+        "--path",
+        "web/app.ts",
+        "--repo",
+        repo,
+        "--json",
+    ])?;
+
+    assert!(report["touched_symbols"]
+        .as_array()
+        .context("touched symbols")?
+        .iter()
+        .any(|symbol| symbol["name"] == "rust_entry"));
+    assert!(report["touched_symbols"]
+        .as_array()
+        .context("touched symbols")?
+        .iter()
+        .any(|symbol| symbol["name"] == "util"));
+    assert!(report["touched_symbols"]
+        .as_array()
+        .context("touched symbols")?
+        .iter()
+        .all(|symbol| symbol["span"]["signature_end_line"].is_number()));
+    assert!(report["errors"]
+        .as_array()
+        .context("errors")?
+        .iter()
+        .any(|error| { error["file"] == "web/app.ts" && error["kind"] == "unsupported" }));
+
+    Ok(())
+}
+
 fn run_success_json<const N: usize>(args: [&str; N]) -> Result<Value> {
     let output = Command::new(BIN).args(args).output().context("run maco")?;
     if !output.status.success() {
