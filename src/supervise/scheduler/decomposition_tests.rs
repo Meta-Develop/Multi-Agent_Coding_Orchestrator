@@ -1931,7 +1931,50 @@ fn assert_authenticated_park_has_no_assignment_side_effects(
         },
         SupervisorRuntime::Codex,
     );
-    set_preclaim_run_evidence_override(preclaim_evidence);
+    let injected_oid = |value: &str| {
+        git2::Oid::hash_object(git2::ObjectType::Blob, value.as_bytes())
+            .expect("hash deterministic primary snapshot object")
+    };
+    let baseline_oid = injected_oid("hermetic-preclaim-baseline");
+    let primary_snapshot = PrimaryWorktreeSnapshot {
+        head: PrimaryHeadSnapshot {
+            detached: false,
+            reference_name: Some(b"refs/heads/hermetic-preclaim".to_vec()),
+            symbolic_target: None,
+            target: Some(injected_oid("hermetic-preclaim-head")),
+        },
+        index: BTreeMap::from([(
+            PrimaryIndexEntryKey {
+                path: b"tests/scheduler_preclaim.rs".to_vec(),
+                stage: 0,
+            },
+            PrimaryIndexEntryState {
+                id: baseline_oid,
+                mode: 0o100644,
+                tag: b'H',
+            },
+        )]),
+        index_storage: PrimaryIndexStorageSnapshot {
+            worktree_index: IndexFileSnapshot::Present {
+                bytes: 24,
+                digest: injected_oid("hermetic-preclaim-index"),
+            },
+            shared_index: None,
+        },
+        status: BTreeMap::new(),
+        worktree: BTreeMap::from([(
+            b"tests/scheduler_preclaim.rs".to_vec(),
+            PrimaryPathState::File {
+                id: baseline_oid,
+                mode: 0o100644,
+            },
+        )]),
+        inspection_error: None,
+    };
+    let evidence_provider = set_supervisor_evidence_provider_for_test(
+        preclaim_evidence,
+        [primary_snapshot.clone(), primary_snapshot],
+    );
     let report = run_supervisor_plan_with_runner_and_creation(
         loaded,
         options,
@@ -1942,6 +1985,7 @@ fn assert_authenticated_park_has_no_assignment_side_effects(
         &runner,
     )
     .expect("parked assignment finalizes an authenticated supervisor report");
+    drop(evidence_provider);
 
     assert!(!report.success);
     assert!(report.rejected);
