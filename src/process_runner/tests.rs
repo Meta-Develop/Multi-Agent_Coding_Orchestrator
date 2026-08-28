@@ -285,6 +285,7 @@ fn missing_delegated_user_manager_is_a_typed_pre_spawn_environment_failure() {
             && failure.summary
                 == "current cgroup /system.slice/hosted-compute-agent.service is not inside a delegated systemd user manager"
     ));
+    assert!(error.is_missing_delegated_user_manager());
     assert!(is_verified_backend_unavailable(&error));
 }
 

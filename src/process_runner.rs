@@ -1747,6 +1747,19 @@ pub enum ProcessRunError {
     },
 }
 
+impl ProcessRunError {
+    /// Typed pre-spawn failure when Required Linux containment cannot find a
+    /// delegated systemd user manager.
+    ///
+    /// GitHub-hosted runners typically land in
+    /// `/system.slice/hosted-compute-agent.service`. Callers that can honestly
+    /// continue under [`ContainmentPolicy::TrustedBestEffort`] should branch on
+    /// this instead of skipping the requested body.
+    pub fn is_missing_delegated_user_manager(&self) -> bool {
+        missing_delegated_user_manager_failure(self).is_some()
+    }
+}
+
 pub fn run_process(spec: ProcessSpec) -> Result<ProcessOutput, ProcessRunError> {
     run_process_cancellable(spec, &ProcessCancellation::new())
 }
@@ -3039,7 +3052,6 @@ pub(crate) fn is_verified_backend_unavailable(error: &ProcessRunError) -> bool {
     }
 }
 
-#[cfg(test)]
 fn missing_delegated_user_manager_failure(error: &ProcessRunError) -> Option<&EnvironmentFailure> {
     match error {
         ProcessRunError::EnvironmentFailure {
