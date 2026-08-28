@@ -39,6 +39,22 @@ the Multi-Agent Coding Orchestrator.
 - Focused inbox unit tests cover the reaction loop and fixed two exposed bugs:
   token-like `privacy_scan` predicate matching and `.maco` runtime-path
   filtering in lock-overlap checks.
+- `maco inbox run` / `inbox watch` and `maco inbox workspace run` / `workspace
+  watch` execute. `inbox run` accepts optional rolling-quota ceilings
+  `--max-rolling-tokens`, `--max-rolling-cost-usd`, and
+  `--rolling-window-seconds`. A quota is bound only when at least one ceiling
+  is set; the window defaults to 86400 seconds. `inbox watch` and workspace
+  run/watch do not expose those flags. Non-dry-run `github_git`, `github_pr`,
+  and `github_full` still fail closed until an external reviewer is bound.
+- `maco supervise run` and `maco autopilot run` accept optional
+  `--role-category` (`delegating_coordinator`,
+  `non_delegating_terminal_worker`, `read_only_researcher`,
+  `read_only_review_auditor`). Resume of an existing supervise run refuses a
+  new override.
+- `maco eval-harness run-v2` always parses the v2 manifest schema. `maco
+  evaluation rescore` re-scores a stored results document under a named
+  objective profile without overwriting the stored file. Real network
+  providers remain refused.
 - `maco worktree remove --force` has a hardened removal fallback and
   idempotent re-removal behavior for safer cleanup of stale or partially
   removed agent worktrees.
@@ -69,11 +85,12 @@ Nix shell.
 - Consultant results are advisory evidence only. Real Codex and Claude
   consultant adapters are explicit local-process opt-ins, remain read-only, and
   do not override assigned ownership, validation, review, or merge gates.
-- Effectful `maco supervise run` remains temporarily refused before artifact,
-  claim, or worktree reservation because managed-worktree creation still needs
-  its capability-bound repository input. The bounded scheduler is implemented
-  behind that separate gate; plan, status, collect, and artifact inspection
-  remain available.
+- Effectful `maco supervise run` executes through the live supervisor gates
+  after acquiring the capability-bound repository-cleanliness input and
+  creating managed child worktrees. A dirty primary fails with the required
+  remedy before worktree creation. The in-process Fake runtime is always
+  non-publishable. Plan, status, collect, resume, re-audit, and artifact
+  inspection remain available.
 - PR and issue publication remain intentionally narrow and opt-in for live
   GitHub paths. Fake forge and fake inbox data stay the no-network defaults.
 - Real network LLM providers remain absent from `maco agent run` and must be

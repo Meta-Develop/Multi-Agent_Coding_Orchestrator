@@ -161,8 +161,9 @@ The current implementation covers a local-first command-line slice:
   ceilings `--max-rolling-tokens`, `--max-rolling-cost-usd`, and
   `--rolling-window-seconds`.
 - `maco inbox workspace scan/run/watch` supervises the same inbox loop across
-  a workspace JSON of repositories. `run` and `watch` execute; they do not
-  return `Unsupported`.
+  a workspace JSON of repositories. `scan` reports per-repository intake
+  without launching Autopilot; `run` and `watch` execute the same per-repository
+  inbox path used by `maco inbox run`.
 - `maco inbox artifacts list/latest/prune` inspects or prunes durable inbox run
   artifacts.
 - `maco evaluation run` generates deterministic fake model-mix fixture results
