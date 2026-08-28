@@ -421,6 +421,8 @@ impl SystemdUnit {
         let sequence = NEXT_SYSTEMD_UNIT_ID.fetch_add(1, Ordering::Relaxed);
         let runner_pid = std::process::id();
         let name = format!("maco-process-{runner_pid}-{sequence}.service");
+        #[cfg(test)]
+        record_systemd_unit_name_for_test(&name);
         let cgroup_path = manager_path.join("app.slice").join(&name);
         let runtime_dir = client_runtime
             .clone()
