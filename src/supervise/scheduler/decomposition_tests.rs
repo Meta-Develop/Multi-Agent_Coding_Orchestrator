@@ -1931,10 +1931,32 @@ fn assert_authenticated_park_has_no_assignment_side_effects(
     assert!(report.commands_run.is_empty());
     assert!(report.environment_failures.is_empty());
     assert!(report.gate_denials.is_empty());
-    assert!(report.findings.iter().any(|finding| {
-        finding.message.contains("pre-claim viability parked")
-            && finding.message.contains("autonomously_completable=no")
-    }));
+    let run_dir = repo
+        .join(RunArtifactFamily::Supervise.run_root())
+        .join(run_id.as_str());
+    let persisted_preclaim_decisions = read_recorded_preclaim_decisions(&run_dir);
+    let [persisted_preclaim_decision] = persisted_preclaim_decisions.as_slice() else {
+        panic!("parked assignment must persist exactly one pre-claim decision");
+    };
+    let finding_messages = report
+        .findings
+        .iter()
+        .map(|finding| finding.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        report.findings.iter().any(|finding| {
+            finding.message.contains("pre-claim viability parked")
+                && finding.message.contains("autonomously_completable=no")
+        }),
+        "expected a typed pre-claim park finding containing \
+         `pre-claim viability parked` and `autonomously_completable=no`; \
+         every finding message:\n{finding_messages}\n\
+         persisted decision dimensions: {:?}\n\
+         persisted decision reason: {}",
+        persisted_preclaim_decision.dimensions,
+        persisted_preclaim_decision.reason,
+    );
 
     let execution = report
         .role_economics_profile
@@ -2029,9 +2051,6 @@ fn assert_authenticated_park_has_no_assignment_side_effects(
         .expect("list parked managed worktrees")
         .is_empty());
 
-    let run_dir = repo
-        .join(RunArtifactFamily::Supervise.run_root())
-        .join(run_id.as_str());
     let forbidden_assignment_artifacts = [
         PathBuf::from(format!("assignments/{assignment_id}.prompt.md")),
         PathBuf::from(format!(
