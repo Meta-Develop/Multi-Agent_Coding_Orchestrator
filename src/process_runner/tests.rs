@@ -3744,8 +3744,12 @@ fn captured_systemd_unit_residue(unit_names: &[String]) -> Vec<String> {
         ],
     )
     .expect("trusted systemctl");
+    let runtime_root = trusted_linux_runtime_root().expect("trusted runtime root");
     for unit_name in unit_names {
         let units = Command::new(&systemctl)
+            .env_clear()
+            .env("XDG_RUNTIME_DIR", &runtime_root)
+            .stdin(Stdio::null())
             .args([
                 "--user",
                 "list-units",
@@ -3758,9 +3762,11 @@ fn captured_systemd_unit_residue(unit_names: &[String]) -> Vec<String> {
             .output()
             .expect("list captured runner unit");
         if !units.status.success() {
+            let stderr = String::from_utf8_lossy(&units.stderr);
             residue.push(format!(
-                "systemctl for {unit_name} exited with {}",
-                units.status
+                "systemctl observation error for {unit_name}: status {}; stderr={:?}",
+                units.status,
+                stderr.trim()
             ));
         } else {
             residue.extend(
@@ -3780,7 +3786,6 @@ fn captured_systemd_unit_residue(unit_names: &[String]) -> Vec<String> {
                 .to_owned()
         })
         .collect::<BTreeSet<_>>();
-    let runtime_root = trusted_linux_runtime_root().expect("trusted runtime root");
     residue.extend(
         fs::read_dir(runtime_root)
             .expect("read runtime root")
