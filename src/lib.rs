@@ -28,6 +28,7 @@ pub mod inbox;
 pub mod lane_build;
 pub mod live_claim;
 pub mod llm;
+pub mod loop_guard;
 pub mod machine_global;
 pub mod megafile;
 pub mod merge;
