@@ -71,6 +71,92 @@ thread_local! {
 }
 
 #[cfg(test)]
+thread_local! {
+    static SUPERVISOR_EVIDENCE_PROVIDER: std::cell::RefCell<Option<SupervisorEvidenceProvider>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct SupervisorEvidenceProvider {
+    preclaim_run_evidence: Option<PreclaimRunEvidence>,
+    primary_worktree_snapshots: std::collections::VecDeque<PrimaryWorktreeSnapshot>,
+}
+
+#[cfg(test)]
+static SUPERVISOR_EVIDENCE_PROVIDER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+struct SupervisorEvidenceProviderGuard {
+    _serialized: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for SupervisorEvidenceProviderGuard {
+    fn drop(&mut self) {
+        let remaining = SUPERVISOR_EVIDENCE_PROVIDER.with(|slot| slot.borrow_mut().take());
+        if !std::thread::panicking() {
+            let remaining = remaining.expect("supervisor evidence provider disappeared");
+            assert!(
+                remaining.preclaim_run_evidence.is_none()
+                    && remaining.primary_worktree_snapshots.is_empty(),
+                "injected supervisor evidence was not consumed: preclaim={}, primary_snapshots={}",
+                usize::from(remaining.preclaim_run_evidence.is_some()),
+                remaining.primary_worktree_snapshots.len(),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+fn set_supervisor_evidence_provider_for_test(
+    preclaim_run_evidence: PreclaimRunEvidence,
+    primary_worktree_snapshots: [PrimaryWorktreeSnapshot; 2],
+) -> SupervisorEvidenceProviderGuard {
+    assert!(
+        SUPERVISOR_EVIDENCE_PROVIDER.with(|slot| slot.borrow().is_none()),
+        "supervisor evidence provider is already active on this test thread"
+    );
+    let serialized = SUPERVISOR_EVIDENCE_PROVIDER_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    SUPERVISOR_EVIDENCE_PROVIDER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        debug_assert!(slot.is_none());
+        *slot = Some(SupervisorEvidenceProvider {
+            preclaim_run_evidence: Some(preclaim_run_evidence),
+            primary_worktree_snapshots: primary_worktree_snapshots.into_iter().collect(),
+        });
+    });
+    SupervisorEvidenceProviderGuard {
+        _serialized: serialized,
+    }
+}
+
+#[cfg(test)]
+fn take_supervisor_preclaim_run_evidence() -> Option<PreclaimRunEvidence> {
+    SUPERVISOR_EVIDENCE_PROVIDER.with(|slot| {
+        slot.borrow_mut().as_mut().map(|provider| {
+            provider
+                .preclaim_run_evidence
+                .take()
+                .expect("injected supervisor pre-claim evidence was already consumed")
+        })
+    })
+}
+
+#[cfg(test)]
+fn take_supervisor_primary_worktree_snapshot() -> Option<PrimaryWorktreeSnapshot> {
+    SUPERVISOR_EVIDENCE_PROVIDER.with(|slot| {
+        slot.borrow_mut().as_mut().map(|provider| {
+            provider
+                .primary_worktree_snapshots
+                .pop_front()
+                .expect("injected supervisor primary-worktree snapshots were exhausted")
+        })
+    })
+}
+
+#[cfg(test)]
 pub(crate) fn set_before_supervisor_final_report_persist_hook(
     hook: impl FnMut(&mut SupervisorFinalReport) + 'static,
 ) {
@@ -2980,8 +3066,10 @@ fn initialize_scheduler_evidence(
         lifecycle_event_payload("running", None, None),
     );
 
-    let baseline =
-        primary_worktree_snapshot(initialization.repo, initialization.execution_runtime)?;
+    let baseline = supervisor_primary_worktree_snapshot(
+        initialization.repo,
+        initialization.execution_runtime,
+    )?;
     if let Some(error) = baseline.inspection_problem() {
         bail!(
             "refusing to launch supervised work without a complete primary integrity snapshot: {error}"
@@ -2998,7 +3086,7 @@ fn evaluate_supervisor_preclaims(
     runtime: SupervisorRuntime,
     execution_runtime: SupervisorExecutionRuntime,
 ) -> Vec<PreclaimDecision> {
-    let evidence = PreclaimRunEvidence::acquire(repo, runtime, execution_runtime);
+    let evidence = supervisor_preclaim_run_evidence(repo, runtime, execution_runtime);
     plan.assignments
         .iter()
         .map(|assignment| {
@@ -3013,6 +3101,29 @@ fn evaluate_supervisor_preclaims(
             )
         })
         .collect()
+}
+
+fn supervisor_preclaim_run_evidence(
+    repo: &Path,
+    runtime: SupervisorRuntime,
+    execution_runtime: SupervisorExecutionRuntime,
+) -> PreclaimRunEvidence {
+    #[cfg(test)]
+    if let Some(evidence) = take_supervisor_preclaim_run_evidence() {
+        return evidence;
+    }
+    PreclaimRunEvidence::acquire(repo, runtime, execution_runtime)
+}
+
+fn supervisor_primary_worktree_snapshot(
+    repo: &Path,
+    execution_runtime: SupervisorExecutionRuntime,
+) -> Result<PrimaryWorktreeSnapshot> {
+    #[cfg(test)]
+    if let Some(snapshot) = take_supervisor_primary_worktree_snapshot() {
+        return Ok(snapshot);
+    }
+    primary_worktree_snapshot(repo, execution_runtime)
 }
 
 /// Derive viability-assessment runtime independently of effect containment.
@@ -3917,7 +4028,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         semantic_release_errors,
     } = planned_scheduler_resources.clone();
     let final_primary_integrity_failed = match primary_run_baseline.as_ref() {
-        Some(baseline) => match primary_worktree_snapshot(&repo, execution_runtime) {
+        Some(baseline) => match supervisor_primary_worktree_snapshot(&repo, execution_runtime) {
             Ok(final_snapshot) => {
                 if let Some(error) = final_snapshot.inspection_problem() {
                     collected.findings.push(Finding {

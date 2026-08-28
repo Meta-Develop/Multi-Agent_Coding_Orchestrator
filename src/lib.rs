@@ -51,6 +51,7 @@ pub mod safe_state;
 pub mod scope;
 pub mod selection;
 pub mod semantic_coord;
+pub mod steering;
 pub mod supervise;
 pub mod swarm_health;
 pub mod sync;

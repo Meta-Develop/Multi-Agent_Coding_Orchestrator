@@ -1,5 +1,7 @@
 use super::*;
 use crate::orchestration_event::{OrchestrationEvent, ORCHESTRATION_EVENT_PATH};
+use crate::repo_map::{RepoEntryKind, RepoGitStatus, RepoMap, RepoMapEntry};
+use crate::repo_semantic::SemanticRepoMap;
 use git2::Signature;
 
 static TEST_RUNTIME_MODEL_CATALOG: RuntimeModelCatalog =
@@ -1907,6 +1909,72 @@ fn assert_authenticated_park_has_no_assignment_side_effects(
         panic!("parked assignment must not invoke the child runner")
     };
 
+    let preclaim_evidence = PreclaimRunEvidence::verified_for_test(
+        RepoMap {
+            root: repo.clone(),
+            entries: vec![RepoMapEntry {
+                path: PathBuf::from("tests/scheduler_preclaim.rs"),
+                kind: RepoEntryKind::File,
+                size_bytes: Some(1),
+                category: "source".to_string(),
+                git_status: RepoGitStatus::Clean,
+            }],
+        },
+        SemanticRepoMap {
+            root: repo.clone(),
+            files: Vec::new(),
+            symbols: Vec::new(),
+            imports: Vec::new(),
+            re_exports: Vec::new(),
+            dependencies: Vec::new(),
+            errors: Vec::new(),
+        },
+        SupervisorRuntime::Codex,
+    );
+    let injected_oid = |value: &str| {
+        git2::Oid::hash_object(git2::ObjectType::Blob, value.as_bytes())
+            .expect("hash deterministic primary snapshot object")
+    };
+    let baseline_oid = injected_oid("hermetic-preclaim-baseline");
+    let primary_snapshot = PrimaryWorktreeSnapshot {
+        head: PrimaryHeadSnapshot {
+            detached: false,
+            reference_name: Some(b"refs/heads/hermetic-preclaim".to_vec()),
+            symbolic_target: None,
+            target: Some(injected_oid("hermetic-preclaim-head")),
+        },
+        index: BTreeMap::from([(
+            PrimaryIndexEntryKey {
+                path: b"tests/scheduler_preclaim.rs".to_vec(),
+                stage: 0,
+            },
+            PrimaryIndexEntryState {
+                id: baseline_oid,
+                mode: 0o100644,
+                tag: b'H',
+            },
+        )]),
+        index_storage: PrimaryIndexStorageSnapshot {
+            worktree_index: IndexFileSnapshot::Present {
+                bytes: 24,
+                digest: injected_oid("hermetic-preclaim-index"),
+            },
+            shared_index: None,
+        },
+        status: BTreeMap::new(),
+        worktree: BTreeMap::from([(
+            b"tests/scheduler_preclaim.rs".to_vec(),
+            PrimaryPathState::File {
+                id: baseline_oid,
+                mode: 0o100644,
+            },
+        )]),
+        inspection_error: None,
+    };
+    let evidence_provider = set_supervisor_evidence_provider_for_test(
+        preclaim_evidence,
+        [primary_snapshot.clone(), primary_snapshot],
+    );
     let report = run_supervisor_plan_with_runner_and_creation(
         loaded,
         options,
@@ -1917,6 +1985,7 @@ fn assert_authenticated_park_has_no_assignment_side_effects(
         &runner,
     )
     .expect("parked assignment finalizes an authenticated supervisor report");
+    drop(evidence_provider);
 
     assert!(!report.success);
     assert!(report.rejected);
@@ -1931,10 +2000,32 @@ fn assert_authenticated_park_has_no_assignment_side_effects(
     assert!(report.commands_run.is_empty());
     assert!(report.environment_failures.is_empty());
     assert!(report.gate_denials.is_empty());
-    assert!(report.findings.iter().any(|finding| {
-        finding.message.contains("pre-claim viability parked")
-            && finding.message.contains("autonomously_completable=no")
-    }));
+    let run_dir = repo
+        .join(RunArtifactFamily::Supervise.run_root())
+        .join(run_id.as_str());
+    let persisted_preclaim_decisions = read_recorded_preclaim_decisions(&run_dir);
+    let [persisted_preclaim_decision] = persisted_preclaim_decisions.as_slice() else {
+        panic!("parked assignment must persist exactly one pre-claim decision");
+    };
+    let finding_messages = report
+        .findings
+        .iter()
+        .map(|finding| finding.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        report.findings.iter().any(|finding| {
+            finding.message.contains("pre-claim viability parked")
+                && finding.message.contains("autonomously_completable=no")
+        }),
+        "expected a typed pre-claim park finding containing \
+         `pre-claim viability parked` and `autonomously_completable=no`; \
+         every finding message:\n{finding_messages}\n\
+         persisted decision dimensions: {:?}\n\
+         persisted decision reason: {}",
+        persisted_preclaim_decision.dimensions,
+        persisted_preclaim_decision.reason,
+    );
 
     let execution = report
         .role_economics_profile
@@ -2029,9 +2120,6 @@ fn assert_authenticated_park_has_no_assignment_side_effects(
         .expect("list parked managed worktrees")
         .is_empty());
 
-    let run_dir = repo
-        .join(RunArtifactFamily::Supervise.run_root())
-        .join(run_id.as_str());
     let forbidden_assignment_artifacts = [
         PathBuf::from(format!("assignments/{assignment_id}.prompt.md")),
         PathBuf::from(format!(
@@ -2080,6 +2168,37 @@ fn assert_authenticated_park_has_no_assignment_side_effects(
     assert_eq!(
         preclaim_decision.disposition,
         preclaim::PreclaimDisposition::Park
+    );
+    assert_eq!(
+        preclaim_decision.dimensions,
+        preclaim::PreclaimViabilityDimensions {
+            limited_scope: preclaim::ViabilityFinding::Yes,
+            clear_verification_path: preclaim::ViabilityFinding::Yes,
+            autonomously_completable: preclaim::ViabilityFinding::No,
+        }
+    );
+    assert_eq!(
+        preclaim_decision.rejection_bucket,
+        Some(preclaim::PreclaimRejectionBucket::NeedsDecision)
+    );
+    assert_eq!(
+        preclaim_decision.confidence,
+        preclaim::PreclaimConfidence::High
+    );
+    assert_eq!(
+        preclaim_decision.authority,
+        preclaim::PreclaimDecisionAuthority::DeterministicPolicy
+    );
+    assert_eq!(
+        preclaim_decision.triage_outcome,
+        preclaim::PreclaimTriageOutcome::Rejected
+    );
+    assert!(preclaim_decision.map_present);
+    assert!(preclaim_decision.risk_present);
+    assert!(preclaim_decision.runtime_present);
+    assert_eq!(
+        preclaim_decision.evidence_source,
+        preclaim::PreclaimEvidenceSource::Acquired
     );
 
     let orchestration_event_bytes = reader
@@ -2174,7 +2293,7 @@ fn preclaim_concurrent_park_has_authenticated_pending_checkpoint_and_no_assignme
 }
 
 #[test]
-fn missing_map_risk_runtime_parks_before_claiming_paths() {
+fn preclaim_missing_map_risk_runtime_parks_before_claiming_paths() {
     with_valid_schedule_context!(
         context,
         vec![test_assignment("parked-child", "README.md")],
@@ -2197,8 +2316,8 @@ fn missing_map_risk_runtime_parks_before_claiming_paths() {
             assert!(parked.claimed_paths.is_empty());
             assert!(parked.released_claims.is_empty());
             assert!(parked.findings.iter().any(|finding| {
-                finding.message.contains("pre-claim viability parked")
-                    && finding.message.contains("missing map, risk, runtime")
+                finding.message
+                    == "pre-claim viability parked 'parked-child': verdict=park, limited_scope=yes, clear_verification_path=unknown, autonomously_completable=yes; reason: assignment 'parked-child' failed closed before path claim because required evidence is missing map, risk, runtime"
             }));
 
             let decisions =
