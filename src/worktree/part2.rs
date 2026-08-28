@@ -1996,13 +1996,41 @@ enum WorktreeGcDirtiness {
 }
 
 fn gc_worktree_dirtiness(path: &Path) -> Result<WorktreeGcDirtiness> {
-    let status = bounded_repository_gc_status_paths(
+    let status = match bounded_repository_gc_status_paths(
         path,
         MAX_WORKTREE_STATUS_ENTRIES,
         MAX_WORKTREE_STATUS_OUTPUT_BYTES,
         WORKTREE_GC_STATUS_TIMEOUT,
-    )?;
+    ) {
+        Ok(status) => status,
+        Err(error) if gc_status_failed_without_delegated_user_manager(&error) => {
+            bounded_repository_gc_status_paths_trusted(
+                path,
+                MAX_WORKTREE_STATUS_ENTRIES,
+                MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+                WORKTREE_GC_STATUS_TIMEOUT,
+            )
+            .with_context(|| {
+                format!(
+                    "verified GC dirtiness is unavailable without a delegated systemd user manager; trusted fallback also failed for {}",
+                    path.display()
+                )
+            })?
+        }
+        Err(error) => return Err(error),
+    };
     gc_dirtiness_from_status(status)
+}
+
+fn gc_status_failed_without_delegated_user_manager(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<ProcessRunError>()
+            .is_some_and(ProcessRunError::is_missing_delegated_user_manager)
+            || cause
+                .to_string()
+                .contains("is not inside a delegated systemd user manager")
+    })
 }
 
 fn gc_dirtiness_from_status(status: BoundedStatusPathRecords) -> Result<WorktreeGcDirtiness> {

@@ -13,8 +13,8 @@ use crate::{
         RetentionOperationId,
     },
     process_runner::{
-        run_process, ContainmentPolicy, EnvironmentMode, ProcessOutput, ProcessSpec,
-        SideEffectConfinementProfile, StdinMode, StrictOfflineWorkspaceProfile,
+        run_process, ContainmentPolicy, EnvironmentMode, ProcessOutput, ProcessRunError,
+        ProcessSpec, SideEffectConfinementProfile, StdinMode, StrictOfflineWorkspaceProfile,
     },
     safe_state::{
         identity_for_path, quarantine_direct_child_directory, remove_direct_child_tree,
