@@ -36,13 +36,44 @@ fn bounded_worktree_records_with_ignored(
     max_output_bytes: usize,
     timeout: Duration,
 ) -> Result<BoundedWorktreeRecords> {
+    bounded_worktree_records_with_ignored_isolation(
+        path,
+        max_entries,
+        max_output_bytes,
+        timeout,
+        BoundedGitIsolation::Verified,
+    )
+}
+
+fn bounded_worktree_records_with_ignored_trusted(
+    path: &Path,
+    max_entries: usize,
+    max_output_bytes: usize,
+    timeout: Duration,
+) -> Result<BoundedWorktreeRecords> {
+    bounded_worktree_records_with_ignored_isolation(
+        path,
+        max_entries,
+        max_output_bytes,
+        timeout,
+        BoundedGitIsolation::Trusted,
+    )
+}
+
+fn bounded_worktree_records_with_ignored_isolation(
+    path: &Path,
+    max_entries: usize,
+    max_output_bytes: usize,
+    timeout: Duration,
+    isolation: BoundedGitIsolation,
+) -> Result<BoundedWorktreeRecords> {
     bounded_worktree_records_mode(
         path,
         max_entries,
         max_output_bytes,
         timeout,
         true,
-        BoundedGitIsolation::Verified,
+        isolation,
     )
 }
 
