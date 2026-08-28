@@ -583,6 +583,7 @@ fn nested_semantic_repository_marker_exists(directory: &File) -> Result<bool> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn semantic_fstatat_no_follow(fd: i32, name: &std::ffi::CStr) -> Result<libc::stat> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     if unsafe {
