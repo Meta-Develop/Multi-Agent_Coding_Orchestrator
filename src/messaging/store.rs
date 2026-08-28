@@ -618,10 +618,10 @@ impl StorePathBinding {
         self.verify_parent()?;
         #[cfg(unix)]
         {
-            let source_name = unix_name(source).map_err(|source| StoreError::Io {
+            let source_name = unix_name(source).map_err(|io_error| StoreError::Io {
                 operation: "encoding tail-anchor publication source at",
                 path: self.child_path(source),
-                source,
+                source: io_error,
             })?;
             let destination_name = unix_name(destination).map_err(|source| StoreError::Io {
                 operation: "encoding tail-anchor publication destination at",
@@ -1128,8 +1128,8 @@ impl ReplayedState {
                         detail: "delivery attempt references a non-recipient, acknowledged recipient, or exhausted counter",
                     },
                 )?;
-                if usize::try_from(expected_attempt)
-                    .map_or(true, |value| value > header.limits.max_delivery_attempts)
+                if !usize::try_from(expected_attempt)
+                    .is_ok_and(|value| value <= header.limits.max_delivery_attempts)
                 {
                     return Err(StoreError::InvalidStateTransition {
                         detail: "delivery attempt references a non-recipient, acknowledged recipient, or exhausted counter",
@@ -1451,7 +1451,7 @@ impl MessagingStore {
                 max: expected_limits.max_journal_bytes,
             })?;
         let mut bytes = Vec::with_capacity(file_bytes);
-        file.by_ref()
+        Read::by_ref(&mut file)
             .take(read_limit)
             .read_to_end(&mut bytes)
             .map_err(|source| StoreError::Io {
@@ -1623,7 +1623,7 @@ impl MessagingStore {
                     .broker_instance_id
                     .strip_prefix(expected_broker_binding)
                     .and_then(|suffix| suffix.strip_prefix('-'));
-                if generation.map_or(true, str::is_empty) {
+                if generation.is_none_or(str::is_empty) {
                     return Err(StoreError::BrokerBindingMismatch);
                 }
                 if recovered_header.authority_binding != *expected_authority_binding {
@@ -2379,8 +2379,8 @@ fn validate_event_shape(event: &StoreEvent, header: &StoreHeader) -> Result<(), 
             validate_message_and_recipient(message_id, recipient_id, limits)?;
             validate_known_identity(recipient_id, &header.authority_binding)?;
             if *attempt == 0
-                || usize::try_from(*attempt)
-                    .map_or(true, |value| value > limits.max_delivery_attempts)
+                || !usize::try_from(*attempt)
+                    .is_ok_and(|value| value <= limits.max_delivery_attempts)
             {
                 return Err(StoreError::InvalidEvent {
                     detail: "delivery attempt must be within the configured bound".to_string(),
@@ -2541,6 +2541,7 @@ fn encoded_tail_anchor(
     Ok(bytes)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_new_tail_anchor(
     binding: &StorePathBinding,
     name: &OsStr,
@@ -2604,7 +2605,7 @@ fn write_new_tail_anchor(
 
 fn prepare_tail_anchor_replacement(
     binding: &StorePathBinding,
-    anchor_path: &Path,
+    _anchor_path: &Path,
     integrity_key: &StoreIntegrityKey,
     journal_bytes: usize,
     last_sequence: u64,
@@ -2842,6 +2843,7 @@ fn publish_prepared_tail_anchor(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn replace_tail_anchor(
     binding: &StorePathBinding,
     current_file: &File,
