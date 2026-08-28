@@ -1956,21 +1956,41 @@ pub fn run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_work
     let mut loaded = supervisor_plan_and_consultant_from_goal_spec(&repo, goal, spec, None)?;
     apply_objective_profile_override(&mut loaded, objective_profile_override.as_deref());
     validate_execution_target_pre_dispatch(&loaded, allow_primary_worktree)?;
-    let manager = WorktreeManager::new(&repo);
-    let cleanliness = manager.acquire_repository_cleanliness()?;
     let source_loaded = loaded.clone();
     let template = options.clone();
     let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
-    let source_report = run_supervisor_plan_with_runner_and_creation(
-        loaded,
-        options,
-        max_concurrent_children,
-        SupervisorExecutionRuntime::Verified,
-        SupervisorWorktreeCreation::Bound(&cleanliness),
-        runtime_model_catalog,
-        &run_external_agent_cancellable_reviewed,
-    )?;
-    drop(cleanliness);
+    let source_report = if template.runtime == SupervisorRuntime::Fake {
+        if source_loaded.plan_metadata.execution_target.is_some() {
+            bail!("nonpublishable Fake cascade cannot use primary-worktree execution");
+        }
+        let no_external_runner = |_command: &ExternalAgentCommand,
+                                  _cancellation: &ProcessCancellation,
+                                  _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>|
+         -> ExternalAgentRun {
+            panic!("nonpublishable Fake cascade must not launch an external process")
+        };
+        run_supervisor_plan_with_runner_and_creation(
+            loaded,
+            options,
+            max_concurrent_children,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            SupervisorWorktreeCreation::NonpublishableSimulation,
+            runtime_model_catalog,
+            &no_external_runner,
+        )?
+    } else {
+        let manager = WorktreeManager::new(&repo);
+        let cleanliness = manager.acquire_repository_cleanliness()?;
+        run_supervisor_plan_with_runner_and_creation(
+            loaded,
+            options,
+            max_concurrent_children,
+            SupervisorExecutionRuntime::Verified,
+            SupervisorWorktreeCreation::Bound(&cleanliness),
+            runtime_model_catalog,
+            &run_external_agent_cancellable_reviewed,
+        )?
+    };
     let mut permit = |_plan: &SupervisorPlan| Ok(None);
     let cancellation_observed = AtomicBool::new(false);
     run_generated_follow_up_cascade(

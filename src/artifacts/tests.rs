@@ -66,14 +66,14 @@ fn terminal_supervisor_cleanup_preserves_foreign_leak_and_finalization_cause() {
         )
         .expect("write final report");
     let incoming = writer
-        .create_scratch_dir("incoming-assignment-0001-attempt-01")
+        .create_supervisor_invocation_scratch_dir("incoming-assignment-0001-attempt-01")
         .expect("reserve incoming invocation scratch");
     let capture = writer
-        .create_scratch_dir("capture-assignment-0001-attempt-01")
+        .create_supervisor_invocation_scratch_dir("capture-assignment-0001-attempt-01")
         .expect("reserve capture invocation scratch");
     let foreign = writer
-        .create_scratch_dir("foreign-leak")
-        .expect("reserve foreign scratch fixture");
+        .create_scratch_dir("incoming-assignment-0002-attempt-01")
+        .expect("reserve canonical-named foreign scratch fixture");
     fs::write(foreign.path().join("sentinel"), b"preserve\n")
         .expect("write foreign scratch sentinel");
     let run = writer.run_dir().to_path_buf();
@@ -91,6 +91,13 @@ fn terminal_supervisor_cleanup_preserves_foreign_leak_and_finalization_cause() {
     assert_eq!(
         fs::read(foreign.path().join("sentinel")).expect("read preserved foreign sentinel"),
         b"preserve\n"
+    );
+    let resume_error = writer
+        .resume_binding()
+        .expect_err("canonical-named foreign scratch must block resume");
+    assert_eq!(
+        resume_error.to_string(),
+        "artifact run is not at a resumable manifest boundary"
     );
 
     let error = writer

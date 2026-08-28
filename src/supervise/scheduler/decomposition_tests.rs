@@ -2959,6 +2959,15 @@ fn persistence_records_gate_before_status_and_finalizes_report() {
             budget_ledger.report().expect("scheduler close budget"),
         )
         .expect("close checkpoint scheduler");
+    let (incoming_scratch, capture_scratch) =
+        crate::supervise::reporting::create_named_invocation_scratches(
+            &mut writer,
+            Path::new("incoming-assignment-0001-attempt-01"),
+            Path::new("capture-assignment-0001-attempt-01"),
+        )
+        .expect("reserve tagged invocation scratches before terminal persistence");
+    let incoming_scratch_path = incoming_scratch.path().to_path_buf();
+    let capture_scratch_path = capture_scratch.path().to_path_buf();
 
     let persisted = persist_supervisor_final_report(
         report,
@@ -2971,6 +2980,8 @@ fn persistence_records_gate_before_status_and_finalizes_report() {
     .expect("persist scheduler final report directly");
 
     assert_eq!(persisted.run_id, run_id);
+    assert!(!incoming_scratch_path.exists());
+    assert!(!capture_scratch_path.exists());
     let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)
         .expect("open finalized scheduler artifacts");
     let journal_bytes = reader

@@ -476,10 +476,22 @@ pub struct ArtifactRunWriter {
     provenance: ArtifactProvenance,
     writer_evidence: ArtifactWriterEvidence,
     files: BTreeMap<PathBuf, ArtifactFileRecord>,
-    outstanding_scratches: BTreeMap<PathBuf, FileIdentity>,
+    outstanding_scratches: BTreeMap<PathBuf, ArtifactScratchReservation>,
     poisoned_appends: BTreeSet<PathBuf>,
     total_bytes: u64,
     run_lock: BoundArtifactLock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactScratchKind {
+    Generic,
+    SupervisorInvocation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArtifactScratchReservation {
+    identity: FileIdentity,
+    kind: ArtifactScratchKind,
 }
 
 /// Authenticated-journal payload required to reopen one unfinalized artifact run.
@@ -885,6 +897,34 @@ impl ArtifactRunWriter {
         &mut self,
         name: impl AsRef<Path>,
     ) -> Result<ArtifactScratchDirectory> {
+        self.create_scratch_dir_with_kind(name, ArtifactScratchKind::Generic)
+    }
+
+    /// Reserves a scratch directory whose ownership is explicitly bound to a
+    /// supervisor invocation. Canonical naming is validated for consistency,
+    /// but the stored reservation kind is the sole cleanup authority.
+    pub(crate) fn create_supervisor_invocation_scratch_dir(
+        &mut self,
+        name: impl AsRef<Path>,
+    ) -> Result<ArtifactScratchDirectory> {
+        if self.family != RunArtifactFamily::Supervise {
+            bail!("supervisor invocation scratch requires a supervise artifact run");
+        }
+        let name = name.as_ref();
+        if !is_supervisor_invocation_scratch_name(name) {
+            bail!(
+                "supervisor invocation scratch name is not canonical: {}",
+                name.display()
+            );
+        }
+        self.create_scratch_dir_with_kind(name, ArtifactScratchKind::SupervisorInvocation)
+    }
+
+    fn create_scratch_dir_with_kind(
+        &mut self,
+        name: impl AsRef<Path>,
+        kind: ArtifactScratchKind,
+    ) -> Result<ArtifactScratchDirectory> {
         self.run_lock.verify(&self.run)?;
         let result = (|| -> Result<ArtifactScratchDirectory> {
             let name = validate_artifact_scratch_name(name.as_ref())?;
@@ -914,8 +954,13 @@ impl ArtifactRunWriter {
             let reservation = self.run.reserve_direct_child_directory(name.as_os_str())?;
             reservation.verify(&self.run)?;
             let identity = reservation.identity().clone();
-            self.outstanding_scratches
-                .insert(name.clone(), identity.clone());
+            self.outstanding_scratches.insert(
+                name.clone(),
+                ArtifactScratchReservation {
+                    identity: identity.clone(),
+                    kind,
+                },
+            );
             Ok(ArtifactScratchDirectory {
                 path: reservation.path().to_path_buf(),
                 name,
@@ -961,8 +1006,10 @@ impl ArtifactRunWriter {
             let invocation_scratches = self
                 .outstanding_scratches
                 .iter()
-                .filter(|(name, _)| is_supervisor_invocation_scratch_name(name))
-                .map(|(name, identity)| (name.clone(), identity.clone()))
+                .filter(|(_, reservation)| {
+                    reservation.kind == ArtifactScratchKind::SupervisorInvocation
+                })
+                .map(|(name, reservation)| (name.clone(), reservation.identity.clone()))
                 .collect::<Vec<_>>();
             for (name, identity) in &invocation_scratches {
                 self.discard_tracked_scratch(name, identity)?;
@@ -989,7 +1036,7 @@ impl ArtifactRunWriter {
             .outstanding_scratches
             .remove(name)
             .context("artifact scratch tracking disappeared during cleanup")?;
-        if &removed != identity {
+        if &removed.identity != identity {
             bail!("artifact scratch tracking identity changed during cleanup");
         }
         Ok(())
@@ -1006,7 +1053,9 @@ impl ArtifactRunWriter {
             .outstanding_scratches
             .get(&scratch.name)
             .context("artifact scratch capability is no longer outstanding")?;
-        if tracked != &scratch.identity || scratch.reservation.identity() != &scratch.identity {
+        if tracked.identity != scratch.identity
+            || scratch.reservation.identity() != &scratch.identity
+        {
             bail!("artifact scratch capability identity does not match the tracked reservation");
         }
         Ok(())

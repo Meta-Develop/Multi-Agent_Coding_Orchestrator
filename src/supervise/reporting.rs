@@ -519,8 +519,8 @@ pub(super) fn create_named_invocation_scratches(
     incoming_name: &Path,
     capture_name: &Path,
 ) -> Result<(ArtifactScratchDirectory, ArtifactScratchDirectory)> {
-    let incoming = writer.create_scratch_dir(incoming_name)?;
-    match writer.create_scratch_dir(capture_name) {
+    let incoming = writer.create_supervisor_invocation_scratch_dir(incoming_name)?;
+    match writer.create_supervisor_invocation_scratch_dir(capture_name) {
         Ok(capture) => Ok((incoming, capture)),
         Err(error) => {
             writer.discard_scratch(&incoming)?;
