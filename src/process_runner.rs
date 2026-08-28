@@ -26,6 +26,15 @@ use crate::{
     },
 };
 
+mod nested_usage;
+pub use nested_usage::{
+    encode_nested_usage_record, harvest_nested_usage_journal, parent_span_id,
+    prepare_nested_usage_journal, reconcile_nested_usage, stamp_nested_usage_environment,
+    NestedUsageCompleteness, NestedUsageObservation, NestedUsageReconciliation, NestedUsageRequest,
+    NestedUsageRuntimeKind, NestedWorkerUsageRecord, MACO_NESTED_USAGE_JOURNAL_ENV,
+    MACO_PARENT_SPAN_ID_ENV, NESTED_USAGE_SCHEMA_V1,
+};
+
 const PIPE_READ_CHUNK_SIZE: usize = 8 * 1024;
 const PIPE_CHANNEL_CAPACITY: usize = 8;
 const MAX_PIPE_EVENTS_PER_POLL: usize = PIPE_CHANNEL_CAPACITY * 2;
@@ -679,21 +688,25 @@ pub enum StdinMode {
 
 /// Selects the ownership guarantee that must be established before a command executes.
 ///
-/// A required run fails before releasing the requested command when the host cannot provide the
-/// backend. Linux requires a trusted user-systemd service manager on cgroup v2; Windows uses
-/// suspended creation followed by Job Object assignment. Other Unix platforms currently require
-/// the caller to opt into the weaker compatibility policy explicitly. The Linux service also has
-/// an orphan-only runtime fuse: the requested timeout plus 30 seconds, or 24 hours when no command
-/// timeout is requested. This finite fuse is a last-resort cleanup boundary, not the command
-/// timeout reported by [`ProcessOutput::timed_out`].
+/// A required run fails before releasing the requested command when the host cannot provide a
+/// reviewed backend. The only reviewed writable-runtime profile is Linux user-systemd on cgroup
+/// v2; macOS, Windows, and other Unix hosts refuse Required admission with a typed cause rather
+/// than treating a process group, Job Object, or Git worktree as verified side-effect
+/// confinement. TrustedBestEffort remains the explicit compatibility path for Fake/simulation
+/// and other trusted commands: Unix process groups and Windows Job Objects never upgrade that
+/// path to verified confinement. The Linux service also has an orphan-only runtime fuse: the
+/// requested timeout plus 30 seconds, or 24 hours when no command timeout is requested. This
+/// finite fuse is a last-resort cleanup boundary, not the command timeout reported by
+/// [`ProcessOutput::timed_out`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ContainmentPolicy {
-    /// Require a backend that places the child before execution and proves the complete subtree
-    /// empty before success. Unsupported hosts fail before the requested command is spawned.
+    /// Require a reviewed backend that places the child before execution and proves the complete
+    /// subtree empty before success. Hosts without a reviewed profile fail closed before spawn.
     #[default]
     Required,
     /// Explicit compatibility mode for trusted commands. Unix process groups do not contain
-    /// descendants that deliberately call `setsid` or move to another process group.
+    /// descendants that deliberately call `setsid` or move to another process group, and a
+    /// Windows Job Object is not verified side-effect confinement.
     TrustedBestEffort,
 }
 
@@ -1312,6 +1325,10 @@ pub struct ProcessSpec {
     pub timeout: Option<Duration>,
     pub stdout: StreamCapture,
     pub stderr: StreamCapture,
+    /// Optional nested-worker usage journal harvested after the child returns. When set, the
+    /// runner stamps [`MACO_NESTED_USAGE_JOURNAL_ENV`] and [`MACO_PARENT_SPAN_ID_ENV`] so a nested
+    /// Fake or CLI worker can emit role-tagged usage across the process boundary.
+    pub nested_usage: Option<NestedUsageRequest>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1388,6 +1405,7 @@ impl ProcessSpec {
             timeout: None,
             stdout: StreamCapture::bounded(capture_limit_bytes),
             stderr: StreamCapture::bounded(capture_limit_bytes),
+            nested_usage: None,
         }
     }
 
@@ -1422,6 +1440,7 @@ impl ProcessSpec {
             timeout: None,
             stdout: StreamCapture::bounded(capture_limit_bytes),
             stderr: StreamCapture::bounded(capture_limit_bytes),
+            nested_usage: None,
         }
     }
 
@@ -1538,6 +1557,13 @@ impl ProcessSpec {
 
     pub fn with_stderr(mut self, stderr: StreamCapture) -> Self {
         self.stderr = stderr;
+        self
+    }
+
+    /// Observe nested-worker usage through a parent-owned journal after the child returns.
+    pub fn with_nested_usage(mut self, request: NestedUsageRequest) -> Self {
+        stamp_nested_usage_environment(&mut self.environment, &request);
+        self.nested_usage = Some(request);
         self
     }
 }
@@ -1828,6 +1854,9 @@ fn run_process_cancellable_with_interaction(
     }
     if let Some(metadata) = &spec.agent_lifecycle {
         stamp_agent_lifecycle_environment(&mut spec.environment, metadata);
+    }
+    if let Some(request) = &spec.nested_usage {
+        stamp_nested_usage_environment(&mut spec.environment, request);
     }
     let command_display = spec.command_display();
     validate_process_spec_bounds(&spec).map_err(|source| ProcessRunError::Spawn {
@@ -2436,6 +2465,24 @@ fn validate_process_spec_bounds(spec: &ProcessSpec) -> std::io::Result<()> {
         metadata
             .validate()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    }
+    if let Some(request) = &spec.nested_usage {
+        if request.parent_span_id.is_empty()
+            || request.parent_span_id.len() > MAX_PROCESS_LABEL_BYTES
+            || contains_ascii_control(request.parent_span_id.as_bytes())
+        {
+            return Err(std::io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "nested usage parent span is empty or exceeds its safety bound",
+            ));
+        }
+        validate_bounded_path(&request.journal_path, "nested usage journal path")?;
+        if !request.journal_path.is_absolute() {
+            return Err(std::io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "nested usage journal path must be absolute",
+            ));
+        }
     }
     let mut argument_count = 0usize;
     let mut argument_bytes = 0usize;

@@ -1052,6 +1052,128 @@
     }
 
     #[test]
+    fn required_containment_platform_contract_is_explicit_and_fail_closed() {
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            RequiredContainmentPlatform::current(),
+            RequiredContainmentPlatform::Linux
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            RequiredContainmentPlatform::current(),
+            RequiredContainmentPlatform::MacOs
+        );
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            RequiredContainmentPlatform::current(),
+            RequiredContainmentPlatform::Windows
+        );
+        assert_eq!(
+            classify_required_containment_backend(RequiredContainmentPlatform::Linux),
+            Ok(ReviewedRequiredContainmentBackend::LinuxSystemdCgroupV2)
+        );
+        assert_eq!(
+            classify_required_containment_backend(RequiredContainmentPlatform::MacOs),
+            Err(RequiredContainmentRefusal::MacOsHasNoReviewedProfile)
+        );
+        assert_eq!(
+            classify_required_containment_backend(RequiredContainmentPlatform::Windows),
+            Err(RequiredContainmentRefusal::WindowsHasNoReviewedProfile)
+        );
+        assert_eq!(
+            classify_required_containment_backend(RequiredContainmentPlatform::OtherUnix),
+            Err(RequiredContainmentRefusal::OtherUnixHasNoReviewedProfile)
+        );
+        assert_eq!(
+            classify_required_containment_backend(RequiredContainmentPlatform::Other),
+            Err(RequiredContainmentRefusal::PlatformHasNoReviewedProfile)
+        );
+    }
+
+    #[test]
+    fn unsupported_writable_platform_refusal_is_typed_and_user_visible() {
+        for (platform, platform_name, rejected_primitive) in [
+            (RequiredContainmentPlatform::MacOs, "macOS", "process group"),
+            (
+                RequiredContainmentPlatform::Windows,
+                "Windows",
+                "Job Object alone",
+            ),
+        ] {
+            let error = select_required_containment_backend(
+                platform,
+                "writable runtime",
+                "must-not-spawn",
+            )
+            .expect_err("unsupported writable platform must refuse");
+            let ProcessRunError::ContainmentUnavailable { source, .. } = &error else {
+                panic!("platform refusal must remain a containment-unavailable error");
+            };
+            let refusal = source
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<RequiredContainmentRefusal>());
+            assert!(refusal.is_some(), "refusal source must retain its type");
+            let rendered = error.to_string();
+            assert!(rendered.contains(platform_name));
+            assert!(rendered.contains("refused before spawn"));
+            assert!(rendered.contains(rejected_primitive));
+            assert!(rendered.contains("not verified side-effect confinement"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_user_systemd_manager_remains_a_typed_pre_spawn_refusal() {
+        let source = delegated_systemd_user_manager_cgroup(
+            "0::/system.slice/issue-339-hosted-runner.service\n",
+        )
+        .expect_err("system service cgroup must not satisfy strict containment");
+        let error = containment_setup_error(
+            "issue 339 strict runtime".to_string(),
+            "must-not-spawn".to_string(),
+            source,
+        );
+
+        assert!(matches!(
+            &error,
+            ProcessRunError::EnvironmentFailure {
+                failure,
+                target_process_started: false,
+                ..
+            } if failure.category
+                == crate::external_agent::EnvironmentFailureCategory::SandboxUnavailable
+                && failure.summary.contains("not inside a delegated systemd user manager")
+        ));
+        assert!(error.to_string().contains("must-not-spawn"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_best_effort_preparation_does_not_require_user_systemd() {
+        let cancellation = ProcessCancellation::new();
+        let prepared = PreparedProcessTree::prepare(
+            ContainmentPolicy::TrustedBestEffort,
+            &SideEffectConfinementProfile::TrustedCompatibility,
+            "simulated runtime",
+            "no-systemd-probe",
+            None,
+            &cancellation,
+        )
+        .expect("trusted simulation compatibility must not require systemd");
+
+        assert!(matches!(
+            prepared.backend,
+            PreparedContainmentBackend::UnixProcessGroup
+        ));
+        assert_eq!(
+            prepared.side_effects,
+            SideEffectConfinementEvidence::TrustedBestEffort(
+                SideEffectConfinementProfileKind::TrustedCompatibility
+            )
+        );
+    }
+
+    #[test]
     fn ownership_setup_errors_preserve_cleanup_diagnostics() {
         let error = ProcessRunError::ProcessOwnership {
             label: "child".to_string(),
@@ -1063,4 +1185,138 @@
         let rendered = error.to_string();
         assert!(rendered.contains("attach failed"));
         assert!(rendered.contains("kill failed; reap failed"));
+    }
+
+    #[cfg(unix)]
+    fn nested_usage_record(
+        parent: &str,
+        child: &str,
+        runtime: NestedUsageRuntimeKind,
+        input: usize,
+        output: usize,
+        cost_usd: f64,
+    ) -> NestedWorkerUsageRecord {
+        NestedWorkerUsageRecord {
+            schema: NESTED_USAGE_SCHEMA_V1.to_string(),
+            parent_span_id: parent.to_string(),
+            child_span_id: child.to_string(),
+            role: "worker".to_string(),
+            runtime,
+            model: Some("gpt-5.6-sol".to_string()),
+            usage: Some(crate::llm::Usage {
+                input_tokens: input,
+                output_tokens: output,
+                total_tokens: input + output,
+            }),
+            cost_usd: Some(cost_usd),
+            duration_ms: Some(8),
+            complete: true,
+            incomplete_reason: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_worker_usage_is_harvested_across_fake_and_cli_process_boundary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let journal_path = temp.path().join("nested-usage.jsonl");
+        let payload_path = temp.path().join("payload.jsonl");
+        let parent = parent_span_id("run-337", "child-o1");
+        let payload = format!(
+            "{}\n{}\n",
+            encode_nested_usage_record(&nested_usage_record(
+                &parent,
+                "worker-fake",
+                NestedUsageRuntimeKind::Fake,
+                11,
+                4,
+                0.011,
+            ))
+            .expect("encode fake record"),
+            encode_nested_usage_record(&nested_usage_record(
+                &parent,
+                "worker-codex",
+                NestedUsageRuntimeKind::Codex,
+                30,
+                6,
+                0.022,
+            ))
+            .expect("encode cli record"),
+        );
+        std::fs::write(&payload_path, payload).expect("write nested usage payload");
+        prepare_nested_usage_journal(&journal_path).expect("exclusive-create journal");
+
+        let output = run_process(
+            ProcessSpec::shell(
+                "nested usage cli child",
+                Shell::UnixSh,
+                format!(
+                    "test \"${{{MACO_PARENT_SPAN_ID_ENV}}}\" = '{parent}' && cat '{}' >> \"${{{MACO_NESTED_USAGE_JOURNAL_ENV}}}\"",
+                    payload_path.display()
+                ),
+                temp.path(),
+                1024,
+            )
+            .with_containment(ContainmentPolicy::TrustedBestEffort)
+            .with_nested_usage(NestedUsageRequest {
+                journal_path: journal_path.clone(),
+                parent_span_id: parent.clone(),
+            }),
+        )
+        .expect("trusted nested-usage child must run without user-systemd");
+        assert!(output.status.is_some_and(|status| status.success()));
+        assert!(matches!(
+            output.process_tree,
+            ProcessTreeEvidence::TrustedBestEffort(ContainmentBackend::UnixProcessGroup)
+        ));
+
+        let observation = harvest_nested_usage_journal(&journal_path, &parent);
+        assert!(observation.completeness.is_process_observed());
+        assert_eq!(observation.records.len(), 2);
+        assert_eq!(
+            observation.records[0].runtime,
+            NestedUsageRuntimeKind::Fake
+        );
+        assert_eq!(
+            observation.records[1].runtime,
+            NestedUsageRuntimeKind::Codex
+        );
+        assert!(observation
+            .records
+            .iter()
+            .all(|record| record.parent_span_id == parent));
+
+        let reconciled = reconcile_nested_usage(&observation);
+        assert_eq!(reconciled.rolling.tokens, 51);
+        assert_eq!(reconciled.rolling.cost_usd, Some(0.033));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_usage_env_is_stamped_for_clear_and_set_child_environments() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let journal_path = temp.path().join("nested-usage.jsonl");
+        let parent = parent_span_id("run-337", "task-env");
+        prepare_nested_usage_journal(&journal_path).expect("exclusive-create journal");
+        let output = run_process(
+            ProcessSpec::shell(
+                "nested usage env probe",
+                Shell::UnixSh,
+                format!(
+                    "printf '%s\\n%s\\n' \"${{{MACO_NESTED_USAGE_JOURNAL_ENV}}}\" \"${{{MACO_PARENT_SPAN_ID_ENV}}}\""
+                ),
+                temp.path(),
+                1024,
+            )
+            .with_environment(EnvironmentMode::ClearAndSet(BTreeMap::new()))
+            .with_containment(ContainmentPolicy::TrustedBestEffort)
+            .with_nested_usage(NestedUsageRequest {
+                journal_path: journal_path.clone(),
+                parent_span_id: parent.clone(),
+            }),
+        )
+        .expect("env probe");
+        let stdout = String::from_utf8_lossy(output.stdout.as_bytes());
+        assert!(stdout.contains(&journal_path.to_string_lossy().into_owned()));
+        assert!(stdout.contains(&parent));
     }
