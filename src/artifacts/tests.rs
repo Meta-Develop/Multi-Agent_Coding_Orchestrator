@@ -11,6 +11,101 @@ fn sha256_matches_standard_vector() {
     );
 }
 
+#[test]
+fn supervisor_invocation_scratch_names_require_the_full_canonical_grammar() {
+    let valid = [
+        "incoming",
+        "capture",
+        "incoming-assignment-0001-attempt-01",
+        "capture-assignment-12345-attempt-123",
+        "incoming-assignment-0000-auditor",
+        "capture-assignment-12345-auditor",
+    ];
+    for name in valid {
+        assert!(
+            is_supervisor_invocation_scratch_name(Path::new(name)),
+            "canonical invocation scratch was rejected: {name}"
+        );
+    }
+
+    let invalid = [
+        "foreign-incoming",
+        "incoming-extra",
+        "capture-assignment-0001",
+        "incoming-assignment-1-attempt-01",
+        "incoming-assignment-0001-attempt-1",
+        "incoming-assignment-00x1-attempt-01",
+        "incoming-assignment-0001-attempt-01-extra",
+        "capture-assignment-0001-auditor-extra",
+    ];
+    for name in invalid {
+        assert!(
+            !is_supervisor_invocation_scratch_name(Path::new(name)),
+            "near-match invocation scratch was accepted: {name}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn terminal_supervisor_cleanup_preserves_foreign_leak_and_finalization_cause() {
+    let (_temp, repo) = committed_repo();
+    let run_id = RunId::new("supervisor-owned-and-foreign-scratch").expect("run id");
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo,
+        RunArtifactFamily::Supervise,
+        run_id,
+        "maco-supervise",
+    )
+    .expect("reserve supervise writer");
+    writer
+        .write_json(
+            RunArtifactFamily::Supervise.final_report_relative_path(),
+            &serde_json::json!({"status":"failed"}),
+            ArtifactFileDisposition::PrivateEvidence,
+        )
+        .expect("write final report");
+    let incoming = writer
+        .create_scratch_dir("incoming-assignment-0001-attempt-01")
+        .expect("reserve incoming invocation scratch");
+    let capture = writer
+        .create_scratch_dir("capture-assignment-0001-attempt-01")
+        .expect("reserve capture invocation scratch");
+    let foreign = writer
+        .create_scratch_dir("foreign-leak")
+        .expect("reserve foreign scratch fixture");
+    fs::write(foreign.path().join("sentinel"), b"preserve\n")
+        .expect("write foreign scratch sentinel");
+    let run = writer.run_dir().to_path_buf();
+
+    assert_eq!(
+        writer
+            .discard_supervisor_invocation_scratches_after_quiescence(
+                ArtifactScratchQuiescence::Verified,
+            )
+            .expect("discard verified-quiescent invocation scratches"),
+        2
+    );
+    assert!(!incoming.path().exists());
+    assert!(!capture.path().exists());
+    assert_eq!(
+        fs::read(foreign.path().join("sentinel")).expect("read preserved foreign sentinel"),
+        b"preserve\n"
+    );
+
+    let error = writer
+        .finalize(
+            RunArtifactFamily::Supervise.final_report_relative_path(),
+            false,
+        )
+        .expect_err("foreign scratch must keep finalization fail closed");
+    assert_eq!(
+        error.to_string(),
+        "artifact run has 1 outstanding scratch directory; discard every scratch tree before finalization"
+    );
+    assert!(!run.join(FINALIZATION_MARKER).exists());
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn live_scratch_blocks_marker_and_discarded_scratch_finalizes_marker_last() {

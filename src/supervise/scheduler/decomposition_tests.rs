@@ -2965,6 +2965,7 @@ fn persistence_records_gate_before_status_and_finalizes_report() {
         &mut journal,
         writer,
         Some(&mut checkpoint),
+        Some(crate::artifacts::ArtifactScratchQuiescence::Verified),
         || Ok(()),
     )
     .expect("persist scheduler final report directly");
@@ -3021,10 +3022,17 @@ fn persist_releases_terminal_claims_without_checkpoint_writer() {
     );
     let released = std::sync::atomic::AtomicBool::new(false);
 
-    persist_supervisor_final_report(report, &mut journal, writer, None, || {
-        released.store(true, std::sync::atomic::Ordering::SeqCst);
-        Ok(())
-    })
+    persist_supervisor_final_report(
+        report,
+        &mut journal,
+        writer,
+        None,
+        Some(crate::artifacts::ArtifactScratchQuiescence::Verified),
+        || {
+            released.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+    )
     .expect("persist without a checkpoint writer");
 
     assert!(
