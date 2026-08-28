@@ -285,6 +285,7 @@ fn missing_delegated_user_manager_is_a_typed_pre_spawn_environment_failure() {
             && failure.summary
                 == "current cgroup /system.slice/hosted-compute-agent.service is not inside a delegated systemd user manager"
     ));
+    assert!(error.is_missing_delegated_user_manager());
     assert!(is_verified_backend_unavailable(&error));
 }
 
@@ -466,15 +467,18 @@ fn verified_contained_interactive_session_proves_tree_and_side_effects() {
         )
         .with_stdin_limit(1024)
         .with_timeout(Some(CONTENTION_RESILIENT_PROCESS_TEST_TIMEOUT));
-    let result = match run_process_interactive(spec, &ProcessCancellation::new(), |session| {
+    let unit_capture = TestSystemdUnitNameCapture::start();
+    let result = run_process_interactive(spec, &ProcessCancellation::new(), |session| {
         session.send_line(br#"{"request":1}"#)?;
         let mut response = Vec::new();
         let read = session.receive_line(Duration::from_secs(1), 1024, &mut response)?;
         Ok((read, response))
-    }) {
+    });
+    let unit_names = unit_capture.finish();
+    let result = match result {
         Ok(result) => result,
         Err(error) if is_verified_backend_unavailable(&error) => {
-            report_verified_backend_unavailable_skip(&error);
+            report_verified_backend_unavailable_skip(&error, &unit_names);
             return;
         }
         Err(error) => panic!("verified interactive runner failed: {error:?}"),
@@ -1441,25 +1445,27 @@ fn external_codex_outer_sandbox_enforces_control_and_report_write_boundaries() {
         .with_visible_read_only_file(&ignore_control)
         .with_writable_artifact_root(&incoming)
         .with_hidden_root(&primary);
+    let unit_capture = TestSystemdUnitNameCapture::start();
     let output = run_process(
-            ProcessSpec::direct(
-                "ExternalCodex live write-boundary probe",
-                env::current_exe().expect("current test executable"),
-                [
-                    OsString::from("--exact"),
-                    OsString::from(
-                        "process_runner::tests::external_codex_outer_sandbox_enforces_control_and_report_write_boundaries",
-                    ),
-                ],
-                &workspace,
-                4 * 1024,
-            )
-            .with_environment(EnvironmentMode::InheritAndSet(environment))
-            .with_stdin(StdinMode::Null)
-            .with_timeout(Some(CONTENTION_RESILIENT_PROCESS_TEST_TIMEOUT))
-            .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(profile)),
+        ProcessSpec::direct(
+            "ExternalCodex live write-boundary probe",
+            env::current_exe().expect("current test executable"),
+            [
+                OsString::from("--exact"),
+                OsString::from(
+                    "process_runner::tests::external_codex_outer_sandbox_enforces_control_and_report_write_boundaries",
+                ),
+            ],
+            &workspace,
+            4 * 1024,
         )
-        .expect("run ExternalCodex live write-boundary probe");
+        .with_environment(EnvironmentMode::InheritAndSet(environment))
+        .with_stdin(StdinMode::Null)
+        .with_timeout(Some(CONTENTION_RESILIENT_PROCESS_TEST_TIMEOUT))
+        .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(profile)),
+    );
+    let unit_names = unit_capture.finish();
+    let output = output.expect("run ExternalCodex live write-boundary probe");
 
     assert!(output.status.is_some_and(|status| status.success()));
     assert!(output.safety_evidence_verified());
@@ -1498,7 +1504,11 @@ fn external_codex_outer_sandbox_enforces_control_and_report_write_boundaries() {
         fs::read_to_string(&report).expect("incoming report evidence"),
         "incoming writable\n"
     );
-    assert_current_runner_has_no_systemd_residue();
+    assert!(
+        !unit_names.is_empty(),
+        "strict run allocated no systemd unit"
+    );
+    assert_systemd_units_have_no_residue(&unit_names);
 }
 
 #[cfg(target_os = "linux")]
@@ -2571,7 +2581,8 @@ fn normal_exit_kills_delayed_background_mutation_before_return() {
 #[ignore = "requires the trusted user-systemd/cgroup runtime; compile-only in claimed validation waves"]
 fn required_containment_verifies_normal_nonzero_and_timeout_units_empty() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let normal = match run_process(
+    let unit_capture = TestSystemdUnitNameCapture::start();
+    let normal = run_process(
         ProcessSpec::shell(
             "normal contained command",
             Shell::UnixSh,
@@ -2580,10 +2591,12 @@ fn required_containment_verifies_normal_nonzero_and_timeout_units_empty() {
             128,
         )
         .with_timeout(Some(Duration::from_secs(2))),
-    ) {
+    );
+    let unit_names = unit_capture.finish();
+    let normal = match normal {
         Ok(output) => output,
         Err(error) if is_verified_backend_unavailable(&error) => {
-            report_verified_backend_unavailable_skip(&error);
+            report_verified_backend_unavailable_skip(&error, &unit_names);
             return;
         }
         Err(error) => panic!("run normal contained command: {error:?}"),
@@ -2631,6 +2644,7 @@ fn unsupported_path_masking_refuses_before_target_and_leaves_no_residue() {
     skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let marker = temp.path().join("target-ran");
+    let unit_capture = TestSystemdUnitNameCapture::start();
     let result = run_process(
         ProcessSpec::shell(
             "path-mask enforcement probe",
@@ -2641,6 +2655,7 @@ fn unsupported_path_masking_refuses_before_target_and_leaves_no_residue() {
         )
         .with_timeout(Some(CONTENTION_RESILIENT_PROCESS_TEST_TIMEOUT)),
     );
+    let unit_names = unit_capture.finish();
 
     match result {
         Ok(output) => {
@@ -2649,7 +2664,7 @@ fn unsupported_path_masking_refuses_before_target_and_leaves_no_residue() {
         }
         Err(error) if is_verified_backend_unavailable(&error) => {
             assert!(!marker.exists());
-            report_verified_backend_unavailable_skip(&error);
+            report_verified_backend_unavailable_skip(&error, &unit_names);
         }
         Err(error) => panic!("unexpected strict backend probe failure: {error:?}"),
     }
@@ -2702,30 +2717,36 @@ fn inaccessible_placeholder_blocks_nix_daemon_socket_access() {
         "MACO_TEST_INACCESSIBLE_SOCKET_MARKER".to_string(),
         marker.display().to_string(),
     );
+    let unit_capture = TestSystemdUnitNameCapture::start();
     let output = run_process(
-            ProcessSpec::direct(
-                "inaccessible socket placeholder probe",
-                env::current_exe().expect("current test executable"),
-                [
-                    OsString::from("--exact"),
-                    OsString::from(
-                        "process_runner::tests::inaccessible_placeholder_blocks_nix_daemon_socket_access",
-                    ),
-                ],
-                temp.path(),
-                4 * 1024,
-            )
-            .with_environment(EnvironmentMode::InheritAndSet(environment))
-            .with_timeout(Some(Duration::from_secs(5))),
+        ProcessSpec::direct(
+            "inaccessible socket placeholder probe",
+            env::current_exe().expect("current test executable"),
+            [
+                OsString::from("--exact"),
+                OsString::from(
+                    "process_runner::tests::inaccessible_placeholder_blocks_nix_daemon_socket_access",
+                ),
+            ],
+            temp.path(),
+            4 * 1024,
         )
-        .expect("run inaccessible socket placeholder probe");
+        .with_environment(EnvironmentMode::InheritAndSet(environment))
+        .with_timeout(Some(Duration::from_secs(5))),
+    );
+    let unit_names = unit_capture.finish();
+    let output = output.expect("run inaccessible socket placeholder probe");
 
     assert!(output.status.is_some_and(|status| status.success()));
     assert!(output.safety_evidence_verified());
     let evidence = fs::read_to_string(&marker).expect("socket denial evidence");
     assert!(evidence.contains("open=Some("));
     assert!(evidence.contains("connect=Some("));
-    assert_current_runner_has_no_systemd_residue();
+    assert!(
+        !unit_names.is_empty(),
+        "strict run allocated no systemd unit"
+    );
+    assert_systemd_units_have_no_residue(&unit_names);
 }
 
 #[cfg(target_os = "linux")]
@@ -2742,7 +2763,8 @@ fn one_cancellation_cleans_two_simultaneous_strict_process_trees() {
         let workdir = temp.path().to_path_buf();
         let worker_cancellation = cancellation.clone();
         workers.push(thread::spawn(move || {
-            run_process_cancellable(
+            let unit_capture = TestSystemdUnitNameCapture::start();
+            let result = run_process_cancellable(
                 ProcessSpec::shell(
                     format!("simultaneous cancellable process {index}"),
                     Shell::UnixSh,
@@ -2755,7 +2777,8 @@ fn one_cancellation_cleans_two_simultaneous_strict_process_trees() {
                 )
                 .with_timeout(Some(Duration::from_secs(10))),
                 &worker_cancellation,
-            )
+            );
+            (result, unit_capture.finish())
         }));
     }
 
@@ -2773,17 +2796,21 @@ fn one_cancellation_cleans_two_simultaneous_strict_process_trees() {
                 .unwrap_or_else(|_| panic!("strict cancellation worker panicked"))
         })
         .collect::<Vec<_>>();
+    let unit_names = results
+        .iter()
+        .flat_map(|(_, unit_names)| unit_names.iter().cloned())
+        .collect::<Vec<_>>();
 
     if let Some(error) = results
         .iter()
-        .filter_map(|result| result.as_ref().err())
+        .filter_map(|(result, _)| result.as_ref().err())
         .find(|error| is_verified_backend_unavailable(error))
     {
-        report_verified_backend_unavailable_skip(error);
+        report_verified_backend_unavailable_skip(error, &unit_names);
         return;
     }
     assert!(ready_paths.iter().all(|path| path.exists()));
-    for output in results {
+    for (output, _) in results {
         let output = output.expect("cancel strict contained process");
         assert!(output.process_tree.is_verified_empty());
         assert!(output.side_effects.is_verified());
@@ -2792,7 +2819,11 @@ fn one_cancellation_cleans_two_simultaneous_strict_process_trees() {
             .as_deref()
             .is_some_and(|error| error.contains("cancelled")));
     }
-    assert_current_runner_has_no_systemd_residue();
+    assert!(
+        !unit_names.is_empty(),
+        "strict runs allocated no systemd units"
+    );
+    assert_systemd_units_have_no_residue(&unit_names);
 }
 
 #[cfg(target_os = "linux")]
@@ -2825,6 +2856,7 @@ fn exact_git_read_roots_do_not_expose_private_tmp_sibling() {
     let profile = StrictOfflineWorkspaceProfile::read_write(&workspace)
         .with_visible_read_only_root(&worktree)
         .with_visible_read_only_root(&objects);
+    let unit_capture = TestSystemdUnitNameCapture::start();
     let output = run_process(
         ProcessSpec::shell(
             "exact bounded Git read roots",
@@ -2837,8 +2869,9 @@ fn exact_git_read_roots_do_not_expose_private_tmp_sibling() {
             profile,
         ))
         .with_timeout(Some(Duration::from_secs(3))),
-    )
-    .expect("run exact bounded Git read-root probe");
+    );
+    let unit_names = unit_capture.finish();
+    let output = output.expect("run exact bounded Git read-root probe");
 
     assert!(output.status.is_some_and(|status| status.success()));
     assert!(output.safety_evidence_verified());
@@ -2847,7 +2880,11 @@ fn exact_git_read_roots_do_not_expose_private_tmp_sibling() {
         fs::read_to_string(sibling.join("sentinel")).expect("preserved sibling sentinel"),
         "untouched\n"
     );
-    assert_current_runner_has_no_systemd_residue();
+    assert!(
+        !unit_names.is_empty(),
+        "strict run allocated no systemd unit"
+    );
+    assert_systemd_units_have_no_residue(&unit_names);
 }
 
 #[cfg(target_os = "linux")]
@@ -3002,6 +3039,7 @@ for name, arguments, cleanup in probes:
 
 pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
 "#;
+    let unit_capture = TestSystemdUnitNameCapture::start();
     let result = run_process(
         ProcessSpec::direct(
             "network and SysV IPC denial probe",
@@ -3016,6 +3054,7 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
         )
         .with_timeout(Some(Duration::from_secs(3))),
     );
+    let unit_names = unit_capture.finish();
 
     match result {
         Ok(output) => {
@@ -3028,7 +3067,7 @@ pathlib.Path(sys.argv[1]).write_text("blocked\n", encoding="utf-8")
         }
         Err(error) if is_verified_backend_unavailable(&error) => {
             assert!(!marker.exists());
-            report_verified_backend_unavailable_skip(&error);
+            report_verified_backend_unavailable_skip(&error, &unit_names);
         }
         Err(error) => panic!("unexpected denial probe failure: {error:?}"),
     }
@@ -3626,7 +3665,8 @@ fn strict_backend_available_for_tests() -> bool {
     match AVAILABILITY.get_or_init(|| {
         let temp = tempfile::tempdir().expect("strict backend probe tempdir");
         let marker = temp.path().join("target-ran");
-        match run_process(
+        let unit_capture = TestSystemdUnitNameCapture::start();
+        let result = run_process(
             ProcessSpec::shell(
                 "cached strict backend capability probe",
                 Shell::UnixSh,
@@ -3635,7 +3675,9 @@ fn strict_backend_available_for_tests() -> bool {
                 128,
             )
             .with_timeout(Some(CONTENTION_RESILIENT_PROCESS_TEST_TIMEOUT)),
-        ) {
+        );
+        let unit_names = unit_capture.finish();
+        match result {
             Ok(output) => {
                 assert!(output.safety_evidence_verified());
                 assert!(marker.exists());
@@ -3650,7 +3692,7 @@ fn strict_backend_available_for_tests() -> bool {
             }
             Err(error) if is_verified_backend_unavailable(&error) => {
                 assert!(!marker.exists());
-                assert_current_runner_has_no_systemd_residue();
+                assert_systemd_units_have_no_residue(&unit_names);
                 Err(error.to_string())
             }
             Err(error) => panic!("unexpected strict backend capability failure: {error:?}"),
@@ -3672,7 +3714,7 @@ fn strict_backend_available_for_tests() -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn report_verified_backend_unavailable_skip(error: &ProcessRunError) {
+fn report_verified_backend_unavailable_skip(error: &ProcessRunError, unit_names: &[String]) {
     if let Some(failure) = missing_delegated_user_manager_failure(error) {
         eprintln!(
             "skipping containment-dependent test: delegated systemd user manager unavailable: {}",
@@ -3680,27 +3722,202 @@ fn report_verified_backend_unavailable_skip(error: &ProcessRunError) {
         );
         return;
     }
-    assert_current_runner_has_no_systemd_residue();
+    assert_systemd_units_have_no_residue(unit_names);
     eprintln!(
         "skipping containment-dependent test: verified containment backend unavailable: {error}"
     );
 }
 
 #[cfg(target_os = "linux")]
-fn assert_current_runner_has_no_systemd_residue() {
+fn assert_systemd_units_have_no_residue(unit_names: &[String]) {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        let residue = systemd_runner_residue(std::process::id());
+        let residue = captured_systemd_unit_residue(unit_names);
         if residue.is_empty() {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "strict backend refusal left containment residue: {}",
+            "strict backend left captured containment residue: {}",
             residue.join("; ")
         );
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+#[cfg(target_os = "linux")]
+fn captured_systemd_unit_residue(unit_names: &[String]) -> Vec<String> {
+    let mut residue = Vec::new();
+    let systemctl = find_trusted_unix_executable(
+        "systemctl",
+        &[
+            "/usr/bin/systemctl",
+            "/bin/systemctl",
+            "/run/current-system/sw/bin/systemctl",
+        ],
+    )
+    .expect("trusted systemctl");
+    let runtime_root = trusted_linux_runtime_root().expect("trusted runtime root");
+    for unit_name in unit_names {
+        let units = Command::new(&systemctl)
+            .env_clear()
+            .env("XDG_RUNTIME_DIR", &runtime_root)
+            .stdin(Stdio::null())
+            .args([
+                "--user",
+                "list-units",
+                unit_name,
+                "--all",
+                "--no-legend",
+                "--no-pager",
+                "--plain",
+            ])
+            .output()
+            .expect("list captured runner unit");
+        if !units.status.success() {
+            let stderr = String::from_utf8_lossy(&units.stderr);
+            residue.push(format!(
+                "systemctl observation error for {unit_name}: status {}; stderr={:?}",
+                units.status,
+                stderr.trim()
+            ));
+        } else {
+            residue.extend(
+                String::from_utf8_lossy(&units.stdout)
+                    .lines()
+                    .map(|line| format!("unit {line}")),
+            );
+        }
+    }
+
+    let runtime_names = unit_names
+        .iter()
+        .map(|unit_name| {
+            unit_name
+                .strip_suffix(".service")
+                .unwrap_or(unit_name)
+                .to_owned()
+        })
+        .collect::<BTreeSet<_>>();
+    residue.extend(
+        fs::read_dir(runtime_root)
+            .expect("read runtime root")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| runtime_names.contains(name))
+            .map(|name| format!("runtime {name}")),
+    );
+
+    let captured_names = unit_names
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let manager = systemd_user_manager_cgroup().expect("systemd user manager cgroup");
+    let app_slice = Path::new("/sys/fs/cgroup")
+        .join(manager.strip_prefix("/").unwrap_or(&manager))
+        .join("app.slice");
+    residue.extend(
+        fs::read_dir(app_slice)
+            .expect("read user app.slice")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| captured_names.contains(name.as_str()))
+            .map(|name| format!("cgroup {name}")),
+    );
+
+    for entry in fs::read_dir("/proc").expect("read proc") {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+            continue;
+        }
+        let Ok(command_line) = fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        for unit_name in unit_names {
+            if command_line_references_systemd_unit(&command_line, unit_name) {
+                residue.push(format!(
+                    "process {} for {unit_name}",
+                    entry.file_name().to_string_lossy()
+                ));
+            }
+        }
+    }
+    residue
+}
+
+#[cfg(target_os = "linux")]
+fn command_line_references_systemd_unit(command_line: &[u8], unit_name: &str) -> bool {
+    if command_line
+        .split(|byte| *byte == 0)
+        .any(|argument| argument == unit_name.as_bytes())
+    {
+        return true;
+    }
+    let runtime_name = unit_name.strip_suffix(".service").unwrap_or(unit_name);
+    let runtime_name = runtime_name.as_bytes();
+    command_line
+        .windows(runtime_name.len())
+        .enumerate()
+        .any(|(index, candidate)| {
+            if candidate != runtime_name {
+                return false;
+            }
+            let before_is_boundary = index == 0 || matches!(command_line[index - 1], b'/' | b'\0');
+            let after = index + runtime_name.len();
+            let after_is_boundary =
+                after == command_line.len() || matches!(command_line[after], b'/' | b'\0');
+            before_is_boundary && after_is_boundary
+        })
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn systemd_unit_name_capture_is_thread_local_and_raii_scoped() {
+    let main_capture = TestSystemdUnitNameCapture::start();
+    record_systemd_unit_name_for_test("maco-process-1-26.service");
+    let child_names = thread::spawn(|| {
+        record_systemd_unit_name_for_test("maco-process-1-ignored.service");
+        let child_capture = TestSystemdUnitNameCapture::start();
+        record_systemd_unit_name_for_test("maco-process-1-260.service");
+        child_capture.finish()
+    })
+    .join()
+    .expect("join isolated unit-name capture");
+    record_systemd_unit_name_for_test("maco-process-1-27.service");
+
+    assert_eq!(child_names, vec!["maco-process-1-260.service".to_string()]);
+    assert_eq!(
+        main_capture.finish(),
+        vec![
+            "maco-process-1-26.service".to_string(),
+            "maco-process-1-27.service".to_string()
+        ]
+    );
+    let runtime_260 = b"/run/user/1000/maco-process-1-260/environment\0target\0";
+    assert!(!command_line_references_systemd_unit(
+        runtime_260,
+        "maco-process-1-26.service"
+    ));
+    assert!(command_line_references_systemd_unit(
+        runtime_260,
+        "maco-process-1-260.service"
+    ));
+    assert!(command_line_references_systemd_unit(
+        b"systemd-run\0--unit\0maco-process-1-26.service\0",
+        "maco-process-1-26.service"
+    ));
+
+    let abandoned_capture = TestSystemdUnitNameCapture::start();
+    record_systemd_unit_name_for_test("maco-process-1-abandoned.service");
+    drop(abandoned_capture);
+    let fresh_capture = TestSystemdUnitNameCapture::start();
+    record_systemd_unit_name_for_test("maco-process-1-fresh.service");
+    assert_eq!(
+        fresh_capture.finish(),
+        vec!["maco-process-1-fresh.service".to_string()]
+    );
 }
 
 #[cfg(target_os = "linux")]

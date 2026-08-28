@@ -2481,6 +2481,28 @@ fn gc_protects_ignored_only_output_until_its_exact_path_is_allowed() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn hosted_runner_cgroup_is_classified_as_gc_trusted_fallback() {
+    let hosted = anyhow::Error::from(ProcessRunError::EnvironmentFailure {
+        label: "bounded managed-worktree index listing".to_string(),
+        command: "/usr/bin/git ls-files".to_string(),
+        failure: Box::new(
+            crate::external_agent::EnvironmentFailure::sandbox_unavailable(
+                "current cgroup /system.slice/hosted-compute-agent.service is not inside a delegated systemd user manager"
+                    .to_string(),
+            ),
+        ),
+        target_process_started: false,
+    })
+    .context("bounded worktree status command failed")
+    .context("merged-lane worktree reaping failed");
+    assert!(gc_status_failed_without_delegated_user_manager(&hosted));
+    assert!(!gc_status_failed_without_delegated_user_manager(
+        &anyhow::Error::msg("bounded worktree status command failed: dirty index")
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn gc_refuses_late_ignored_output_after_reviewed_snapshot() {
     skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");
