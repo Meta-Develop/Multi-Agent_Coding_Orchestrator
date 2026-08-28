@@ -1,6 +1,9 @@
 mod support;
 
 use anyhow::{Context, Result};
+use multi_agent_coding_orchestrator::evaluation::{
+    EXPERIMENT_RESULTS_SCHEMA_VERSION, EXPERIMENT_RESULT_SCHEMA,
+};
 use serde_json::Value;
 use std::{fs, path::PathBuf, process::Command};
 use tempfile::TempDir;
@@ -209,7 +212,8 @@ fn evaluation_experiment_cli_runs_two_profiles_as_json() -> Result<()> {
     );
     let results: Value =
         serde_json::from_slice(&output.stdout).context("parse experiment results JSON")?;
-    assert_eq!(results["schema"], "evaluation_experiment_result_v1");
+    assert_eq!(results["version"], EXPERIMENT_RESULTS_SCHEMA_VERSION);
+    assert_eq!(results["schema"], EXPERIMENT_RESULT_SCHEMA);
     assert_eq!(results["evidence"]["production_eligible"], false);
     assert_eq!(results["evidence"]["real_provider_executed"], false);
     assert_eq!(results["evidence"]["isolated_fake_supervise_state"], true);
