@@ -1503,10 +1503,11 @@ fn run_success_json(args: &[&str]) -> Result<Value> {
 fn command_failure_diagnostics(args: &[&str], output: &Output) -> String {
     let repo = option_value(args, "--repo").map(Path::new);
     let mut detail = format!(
-        "status={}; stdout={}; stderr={}",
+        "status={}; env={}; stderr={}; stdout={}",
         output.status,
-        bounded_diagnostic(&output.stdout, repo),
-        bounded_diagnostic(&output.stderr, repo)
+        host_containment_diagnostic(),
+        bounded_diagnostic(&output.stderr, repo),
+        bounded_diagnostic(&output.stdout, repo)
     );
     let public_run_id = serde_json::from_slice::<Value>(&output.stdout)
         .ok()
@@ -1563,6 +1564,31 @@ fn artifact_diagnostic(repo: &Path, relative: &Path) -> String {
             error.kind() != std::io::ErrorKind::NotFound,
             error.kind()
         ),
+    }
+}
+
+fn host_containment_diagnostic() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        use support::containment::delegated_user_manager_available;
+
+        match fs::read_to_string("/proc/self/cgroup") {
+            Ok(contents) => {
+                let current = contents
+                    .lines()
+                    .find_map(|line| line.strip_prefix("0::"))
+                    .unwrap_or("<unified cgroup v2 entry absent>");
+                format!(
+                    "cgroup={current}; delegated_user_manager={}",
+                    delegated_user_manager_available(&contents)
+                )
+            }
+            Err(error) => format!("cgroup=unreadable:{error}"),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        "cgroup=not-linux".to_string()
     }
 }
 
