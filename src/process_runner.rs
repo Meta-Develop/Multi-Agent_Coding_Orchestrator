@@ -503,6 +503,55 @@ static NEXT_TEE_BACKUP_ID: AtomicU64 = AtomicU64::new(1);
 #[cfg(target_os = "linux")]
 static NEXT_SYSTEMD_UNIT_ID: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(all(test, target_os = "linux"))]
+std::thread_local! {
+    static TEST_SYSTEMD_UNIT_NAMES: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+struct TestSystemdUnitNameCapture {
+    active: bool,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl TestSystemdUnitNameCapture {
+    fn start() -> Self {
+        TEST_SYSTEMD_UNIT_NAMES.with(|names| {
+            let mut names = names.borrow_mut();
+            assert!(names.is_none(), "systemd unit-name captures cannot be nested");
+            *names = Some(Vec::new());
+        });
+        Self { active: true }
+    }
+
+    fn finish(mut self) -> Vec<String> {
+        let names = TEST_SYSTEMD_UNIT_NAMES.with(|names| names.borrow_mut().take());
+        self.active = false;
+        names.unwrap_or_else(|| panic!("systemd unit-name capture was not active"))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for TestSystemdUnitNameCapture {
+    fn drop(&mut self) {
+        if self.active {
+            TEST_SYSTEMD_UNIT_NAMES.with(|names| {
+                names.borrow_mut().take();
+            });
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn record_systemd_unit_name_for_test(name: &str) {
+    TEST_SYSTEMD_UNIT_NAMES.with(|names| {
+        if let Some(names) = names.borrow_mut().as_mut() {
+            names.push(name.to_owned());
+        }
+    });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shell {
     UnixSh,
