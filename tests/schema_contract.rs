@@ -282,3 +282,73 @@ fn published_schemas_and_fixtures_follow_the_manifest_contract() -> Result<()> {
     assert_eq!(seen_schemas, 6);
     Ok(())
 }
+
+#[test]
+fn live_semantic_risk_report_serializes_against_the_published_schema() -> Result<()> {
+    use git2::Repository;
+    use multi_agent_coding_orchestrator::repo_semantic::{risk_report_for_paths, scan_repository};
+    use tempfile::TempDir;
+
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(repo_path.join("src")).context("create src")?;
+    fs::create_dir_all(repo_path.join("pkg")).context("create pkg")?;
+    Repository::init(&repo_path).context("init repo")?;
+    fs::write(
+        repo_path.join("src/lib.rs"),
+        "pub mod api;\npub use crate::api::endpoint;\n",
+    )
+    .context("write lib")?;
+    fs::write(
+        repo_path.join("src/api.rs"),
+        "pub struct Api;\npub fn endpoint(\n    x: i32,\n) -> i32 {\n    x\n}\n",
+    )
+    .context("write api")?;
+    fs::write(repo_path.join("pkg/util.py"), "def util():\n    return 1\n")
+        .context("write python")?;
+
+    let map = scan_repository(&repo_path).context("scan live semantic map")?;
+    let report = risk_report_for_paths(&map, ["src/api.rs", "pkg/util.py"]);
+    let mut instance = serde_json::to_value(&report).context("serialize live risk report")?;
+    // Published CLI risk JSON is SemanticRiskReport flattened with megafile_hotspots.
+    instance
+        .as_object_mut()
+        .context("risk report JSON object")?
+        .insert("megafile_hotspots".to_string(), serde_json::json!([]));
+
+    let spans = instance
+        .pointer("/touched_symbols")
+        .and_then(Value::as_array)
+        .context("live touched_symbols")?;
+    assert!(
+        spans.iter().any(|symbol| symbol
+            .pointer("/span/signature_end_line")
+            .and_then(Value::as_u64)
+            .is_some_and(|line| line >= 1)),
+        "live SourceSpan JSON must emit signature_end_line: {instance}"
+    );
+    assert!(
+        spans.iter().any(|symbol| symbol["name"] == "util"),
+        "live mixed-language report must include Python symbols: {instance}"
+    );
+
+    let schema = load_json(&repo_root().join("schemas/semantic-risk-report-v1.schema.json"))?;
+    let schemas = std::collections::BTreeMap::from([(
+        "semantic-risk-report-v1.schema.json".to_string(),
+        schema.clone(),
+    )]);
+    let span_schema = schema
+        .pointer("/$defs/sourceSpan")
+        .cloned()
+        .context("published sourceSpan definition")?;
+    for symbol in &report.touched_symbols {
+        let span = serde_json::to_value(symbol.span).context("serialize live SourceSpan")?;
+        validate(&span_schema, &span, &schemas).map_err(|error| {
+            anyhow::anyhow!("live SourceSpan JSON failed $defs.sourceSpan: {error}")
+        })?;
+    }
+    validate(&schema, &instance, &schemas).map_err(|error| {
+        anyhow::anyhow!("live SemanticRiskReport JSON failed the published schema: {error}")
+    })?;
+    Ok(())
+}

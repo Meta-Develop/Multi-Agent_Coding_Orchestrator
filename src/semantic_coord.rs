@@ -1105,6 +1105,7 @@ fn scan_error_kind_name(kind: repo_semantic::SemanticScanErrorKind) -> &'static 
     match kind {
         repo_semantic::SemanticScanErrorKind::Read => "read",
         repo_semantic::SemanticScanErrorKind::Parse => "parse",
+        repo_semantic::SemanticScanErrorKind::Unsupported => "unsupported",
     }
 }
 

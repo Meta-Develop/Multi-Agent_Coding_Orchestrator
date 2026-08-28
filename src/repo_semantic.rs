@@ -1,9 +1,35 @@
+//! Repository semantic maps and risk reports.
+//!
+//! # Language coverage
+//!
+//! Built-in adapters currently parse:
+//!
+//! - **Rust** (`.rs`): `syn`-backed modules, symbols, impls, imports, re-exports,
+//!   and module-declaration dependencies.
+//! - **Python** (`.py`, `.pyi`): parser-backed module/class `class` / `def` /
+//!   `async def` symbols plus `import` / `from ... import` edges, including
+//!   relative imports. Nested functions inside function bodies are ignored.
+//!   This is not a full CPython grammar.
+//!
+//! Additional languages can be added as new files under `src/repo_semantic/`
+//! that implement the language-adapter trait and register in the built-in
+//! adapter table. The core scan loop does not need to change.
+//!
+//! # Unsupported files
+//!
+//! Programming-language files without an adapter (for example `.ts`, `.go`,
+//! `.java`) are recorded as typed [`SemanticScanErrorKind::Unsupported`]
+//! errors. The rest of the scan continues; an unknown language never fails the
+//! whole repository map. Risk reports for a mixed change set therefore include
+//! those unsupported paths instead of silently presenting a Rust-only view.
+//! Non-source files such as Markdown or lockfiles are not claimed as semantic
+//! sources and are not marked unsupported.
+
 use crate::safe_state::BoundedRegularReader;
 use anyhow::{bail, Context, Result};
 #[cfg(test)]
 use git2::Repository;
 use proc_macro2::{LineColumn, Span};
-use quote::ToTokens;
 use serde::Serialize;
 use std::{
     collections::BTreeSet,
@@ -17,8 +43,13 @@ use std::os::unix::{
     fs::OpenOptionsExt,
     io::{AsRawFd, FromRawFd},
 };
-use syn::{
-    spanned::Spanned, Attribute, Expr, ImplItem, Item, Lit, Meta, TraitItem, UseTree, Visibility,
+
+mod adapter;
+mod python;
+mod rust;
+
+use adapter::{
+    adapter_for, is_semantic_candidate, unsupported_language_label, AdapterOutput, LanguageAdapter,
 };
 
 const MAX_SEMANTIC_FILE_BYTES: u64 = 8 * 1024 * 1024;
@@ -190,6 +221,7 @@ pub struct SemanticDependency {
 pub enum SemanticScanErrorKind {
     Read,
     Parse,
+    Unsupported,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -285,20 +317,32 @@ fn scan_repository_with_limits_and_exclusions(
         errors: Vec::new(),
     };
 
-    let mut rust_files = Vec::new();
-    collect_rust_files(&root, &mut rust_files, limits, exclusions)?;
-    rust_files.sort();
+    let mut source_files = Vec::new();
+    collect_semantic_files(&root, &mut source_files, limits, exclusions)?;
+    source_files.sort();
 
     let mut total_source_bytes = 0u64;
-    for file in &rust_files {
-        scan_rust_file(
-            &root,
-            file,
-            &rust_files,
-            &mut map,
-            &mut total_source_bytes,
-            limits,
-        )?;
+    for file in &source_files {
+        match adapter_for(file) {
+            Some(adapter) => scan_adapted_file(
+                &root,
+                file,
+                adapter,
+                &source_files,
+                &mut map,
+                &mut total_source_bytes,
+                limits,
+            )?,
+            None => map.errors.push(SemanticScanError {
+                file: file.to_path_buf(),
+                kind: SemanticScanErrorKind::Unsupported,
+                message: format!(
+                    "no language adapter is registered for {}",
+                    unsupported_language_label(file)
+                ),
+                span: None,
+            }),
+        }
     }
 
     sort_map(&mut map);
@@ -389,7 +433,7 @@ where
     }
 }
 
-fn collect_rust_files(
+fn collect_semantic_files(
     root: &Path,
     files: &mut Vec<PathBuf>,
     limits: SemanticScanLimits,
@@ -407,7 +451,7 @@ fn collect_rust_files(
     }
     let mut entries = 0usize;
     let mut retained_path_bytes = 0usize;
-    collect_rust_files_bounded(
+    collect_semantic_files_bounded(
         root,
         files,
         &mut entries,
@@ -418,7 +462,7 @@ fn collect_rust_files(
 }
 
 #[cfg(target_os = "linux")]
-fn collect_rust_files_bounded(
+fn collect_semantic_files_bounded(
     root: &Path,
     files: &mut Vec<PathBuf>,
     entries: &mut usize,
@@ -427,7 +471,7 @@ fn collect_rust_files_bounded(
     exclusions: SemanticScanExclusions<'_>,
 ) -> Result<()> {
     let directory = open_semantic_directory(root)?;
-    collect_rust_files_from_directory(
+    collect_semantic_files_from_directory(
         &directory,
         Path::new(""),
         0,
@@ -441,7 +485,7 @@ fn collect_rust_files_bounded(
 
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
-fn collect_rust_files_from_directory(
+fn collect_semantic_files_from_directory(
     directory: &File,
     relative_directory: &Path,
     depth: usize,
@@ -490,7 +534,7 @@ fn collect_rust_files_from_directory(
                 if nested_semantic_repository_marker_exists(&child)? {
                     continue;
                 }
-                collect_rust_files_from_directory(
+                collect_semantic_files_from_directory(
                     &child,
                     &relative,
                     depth + 1,
@@ -501,7 +545,7 @@ fn collect_rust_files_from_directory(
                     exclusions,
                 )?;
             }
-            libc::S_IFREG if has_rust_extension(&relative) => {
+            libc::S_IFREG if is_semantic_candidate(&relative) => {
                 if exclusions.skips_file(&relative) {
                     continue;
                 }
@@ -602,7 +646,7 @@ fn semantic_fstatat_no_follow(fd: i32, name: &std::ffi::CStr) -> Result<libc::st
 }
 
 #[cfg(not(target_os = "linux"))]
-fn collect_rust_files_bounded(
+fn collect_semantic_files_bounded(
     root: &Path,
     files: &mut Vec<PathBuf>,
     entries: &mut usize,
@@ -610,7 +654,7 @@ fn collect_rust_files_bounded(
     limits: SemanticScanLimits,
     exclusions: SemanticScanExclusions<'_>,
 ) -> Result<()> {
-    collect_rust_files_portable(
+    collect_semantic_files_portable(
         root,
         root,
         0,
@@ -624,7 +668,7 @@ fn collect_rust_files_bounded(
 
 #[cfg(not(target_os = "linux"))]
 #[allow(clippy::too_many_arguments)]
-fn collect_rust_files_portable(
+fn collect_semantic_files_portable(
     root: &Path,
     directory: &Path,
     depth: usize,
@@ -684,7 +728,7 @@ fn collect_rust_files_portable(
                     }
                 }
             }
-            collect_rust_files_portable(
+            collect_semantic_files_portable(
                 root,
                 &path,
                 depth + 1,
@@ -694,7 +738,7 @@ fn collect_rust_files_portable(
                 limits,
                 exclusions,
             )?;
-        } else if metadata.is_file() && has_rust_extension(&relative) {
+        } else if metadata.is_file() && is_semantic_candidate(&relative) {
             if exclusions.skips_file(&relative) {
                 continue;
             }
@@ -704,9 +748,10 @@ fn collect_rust_files_portable(
     Ok(())
 }
 
-fn scan_rust_file(
+fn scan_adapted_file(
     root: &Path,
     file: &Path,
+    adapter: &dyn LanguageAdapter,
     repository_files: &[PathBuf],
     map: &mut SemanticRepoMap,
     total_source_bytes: &mut u64,
@@ -734,38 +779,34 @@ fn scan_rust_file(
     }
     *total_source_bytes = new_total;
 
-    let module_path = module_path_for_file(file);
     map.files.push(SemanticFile {
         path: file.to_path_buf(),
-        module_path: module_path.clone(),
+        module_path: adapter.module_path(file),
         byte_len: source.len(),
         line_count: line_count(&source),
     });
 
-    let source_index = SourceIndex::new(&source);
-    let syntax = match syn::parse_file(&source) {
-        Ok(syntax) => syntax,
-        Err(error) => {
-            map.errors.push(SemanticScanError {
-                file: file.to_path_buf(),
-                kind: SemanticScanErrorKind::Parse,
-                message: error.to_string(),
-                span: Some(source_index.span(error.span())),
-            });
-            return Ok(());
-        }
-    };
-
-    let mut scanner = FileScanner {
+    let mut parse_error = None;
+    adapter.parse(
         file,
+        &source,
         repository_files,
-        source_index,
-        symbols: &mut map.symbols,
-        imports: &mut map.imports,
-        re_exports: &mut map.re_exports,
-        dependencies: &mut map.dependencies,
-    };
-    scanner.scan_items(&syntax.items, &module_path, None);
+        AdapterOutput {
+            symbols: &mut map.symbols,
+            imports: &mut map.imports,
+            re_exports: &mut map.re_exports,
+            dependencies: &mut map.dependencies,
+            parse_error: &mut parse_error,
+        },
+    );
+    tracing::debug!(
+        language = adapter.language_id(),
+        file = %file.display(),
+        "scanned semantic source through a language adapter"
+    );
+    if let Some(error) = parse_error {
+        map.errors.push(error);
+    }
     Ok(())
 }
 
@@ -816,372 +857,14 @@ fn retain_semantic_path(
     Ok(())
 }
 
-struct FileScanner<'a> {
-    file: &'a Path,
-    repository_files: &'a [PathBuf],
-    source_index: SourceIndex,
-    symbols: &'a mut Vec<SemanticSymbol>,
-    imports: &'a mut Vec<SemanticImport>,
-    re_exports: &'a mut Vec<SemanticReExport>,
-    dependencies: &'a mut Vec<SemanticDependency>,
-}
-
-impl FileScanner<'_> {
-    fn scan_items(&mut self, items: &[Item], module_path: &[String], parent_symbol: Option<&str>) {
-        for item in items {
-            self.scan_item(item, module_path, parent_symbol);
-        }
-    }
-
-    fn scan_item(&mut self, item: &Item, module_path: &[String], parent_symbol: Option<&str>) {
-        match item {
-            Item::Mod(item_mod) => {
-                let name = item_mod.ident.to_string();
-                let qualified_path = child_path(module_path, &name);
-                let span = self.source_index.span(item_mod.span());
-                let symbol_id = self.push_symbol(SymbolInput {
-                    name: name.clone(),
-                    qualified_path: qualified_path.clone(),
-                    kind: SemanticSymbolKind::Module,
-                    visibility: visibility_text(&item_mod.vis),
-                    parent_symbol: parent_symbol.map(str::to_string),
-                    impl_target: None,
-                    impl_trait: None,
-                    span,
-                });
-
-                let dependency_kind = if item_mod.content.is_some() {
-                    SemanticDependencyKind::InlineModule
-                } else {
-                    SemanticDependencyKind::ModuleDeclaration
-                };
-                self.dependencies.push(SemanticDependency {
-                    from_file: self.file.to_path_buf(),
-                    from_module: module_path.to_vec(),
-                    to: qualified_path.join("::"),
-                    to_file: if item_mod.content.is_some() {
-                        None
-                    } else {
-                        resolve_module_file(
-                            self.repository_files,
-                            self.file,
-                            &name,
-                            module_path_attribute(&item_mod.attrs),
-                        )
-                    },
-                    kind: dependency_kind,
-                    span,
-                });
-
-                if let Some((_, items)) = &item_mod.content {
-                    self.scan_items(items, &qualified_path, Some(&symbol_id));
-                }
-            }
-            Item::Fn(item_fn) => {
-                let name = item_fn.sig.ident.to_string();
-                self.push_symbol(SymbolInput {
-                    name: name.clone(),
-                    qualified_path: child_path(module_path, &name),
-                    kind: SemanticSymbolKind::Function,
-                    visibility: visibility_text(&item_fn.vis),
-                    parent_symbol: parent_symbol.map(str::to_string),
-                    impl_target: None,
-                    impl_trait: None,
-                    span: self.source_index.span(item_fn.span()),
-                });
-            }
-            Item::Struct(item_struct) => {
-                let name = item_struct.ident.to_string();
-                self.push_symbol(SymbolInput {
-                    name: name.clone(),
-                    qualified_path: child_path(module_path, &name),
-                    kind: SemanticSymbolKind::Struct,
-                    visibility: visibility_text(&item_struct.vis),
-                    parent_symbol: parent_symbol.map(str::to_string),
-                    impl_target: None,
-                    impl_trait: None,
-                    span: self.source_index.span(item_struct.span()),
-                });
-            }
-            Item::Enum(item_enum) => {
-                let name = item_enum.ident.to_string();
-                self.push_symbol(SymbolInput {
-                    name: name.clone(),
-                    qualified_path: child_path(module_path, &name),
-                    kind: SemanticSymbolKind::Enum,
-                    visibility: visibility_text(&item_enum.vis),
-                    parent_symbol: parent_symbol.map(str::to_string),
-                    impl_target: None,
-                    impl_trait: None,
-                    span: self.source_index.span(item_enum.span()),
-                });
-            }
-            Item::Trait(item_trait) => {
-                let name = item_trait.ident.to_string();
-                let qualified_path = child_path(module_path, &name);
-                let symbol_id = self.push_symbol(SymbolInput {
-                    name: name.clone(),
-                    qualified_path: qualified_path.clone(),
-                    kind: SemanticSymbolKind::Trait,
-                    visibility: visibility_text(&item_trait.vis),
-                    parent_symbol: parent_symbol.map(str::to_string),
-                    impl_target: None,
-                    impl_trait: None,
-                    span: self.source_index.span(item_trait.span()),
-                });
-                self.scan_trait_items(&item_trait.items, &qualified_path, &symbol_id);
-            }
-            Item::Impl(item_impl) => {
-                let impl_target = type_to_string(&item_impl.self_ty);
-                let impl_trait = item_impl
-                    .trait_
-                    .as_ref()
-                    .map(|(_, path, _)| path_to_string(path));
-                let name = match &impl_trait {
-                    Some(trait_name) => format!("impl {trait_name} for {impl_target}"),
-                    None => format!("impl {impl_target}"),
-                };
-                let qualified_path = child_path(module_path, &name);
-                let span = self.source_index.span(item_impl.span());
-                let symbol_id = self.push_symbol(SymbolInput {
-                    name,
-                    qualified_path: qualified_path.clone(),
-                    kind: SemanticSymbolKind::Impl,
-                    visibility: "inherent".to_string(),
-                    parent_symbol: parent_symbol.map(str::to_string),
-                    impl_target: Some(impl_target.clone()),
-                    impl_trait: impl_trait.clone(),
-                    span,
-                });
-                self.scan_impl_items(
-                    &item_impl.items,
-                    &qualified_path,
-                    &symbol_id,
-                    &impl_target,
-                    impl_trait,
-                );
-            }
-            Item::Const(item_const) => {
-                let name = item_const.ident.to_string();
-                self.push_symbol(SymbolInput {
-                    name: name.clone(),
-                    qualified_path: child_path(module_path, &name),
-                    kind: SemanticSymbolKind::Const,
-                    visibility: visibility_text(&item_const.vis),
-                    parent_symbol: parent_symbol.map(str::to_string),
-                    impl_target: None,
-                    impl_trait: None,
-                    span: self.source_index.span(item_const.span()),
-                });
-            }
-            Item::Type(item_type) => {
-                let name = item_type.ident.to_string();
-                self.push_symbol(SymbolInput {
-                    name: name.clone(),
-                    qualified_path: child_path(module_path, &name),
-                    kind: SemanticSymbolKind::TypeAlias,
-                    visibility: visibility_text(&item_type.vis),
-                    parent_symbol: parent_symbol.map(str::to_string),
-                    impl_target: None,
-                    impl_trait: None,
-                    span: self.source_index.span(item_type.span()),
-                });
-            }
-            Item::Use(item_use) => {
-                self.scan_use_tree(&item_use.tree, &item_use.vis, module_path, item_use.span());
-            }
-            _ => {}
-        }
-    }
-
-    fn scan_trait_items(&mut self, items: &[TraitItem], trait_path: &[String], trait_symbol: &str) {
-        for item in items {
-            match item {
-                TraitItem::Fn(item_fn) => {
-                    let name = item_fn.sig.ident.to_string();
-                    self.push_symbol(SymbolInput {
-                        name: name.clone(),
-                        qualified_path: child_path(trait_path, &name),
-                        kind: SemanticSymbolKind::Method,
-                        visibility: "trait".to_string(),
-                        parent_symbol: Some(trait_symbol.to_string()),
-                        impl_target: None,
-                        impl_trait: Some(trait_path.join("::")),
-                        span: self.source_index.span(item_fn.span()),
-                    });
-                }
-                TraitItem::Const(item_const) => {
-                    let name = item_const.ident.to_string();
-                    self.push_symbol(SymbolInput {
-                        name: name.clone(),
-                        qualified_path: child_path(trait_path, &name),
-                        kind: SemanticSymbolKind::Const,
-                        visibility: "trait".to_string(),
-                        parent_symbol: Some(trait_symbol.to_string()),
-                        impl_target: None,
-                        impl_trait: Some(trait_path.join("::")),
-                        span: self.source_index.span(item_const.span()),
-                    });
-                }
-                TraitItem::Type(item_type) => {
-                    let name = item_type.ident.to_string();
-                    self.push_symbol(SymbolInput {
-                        name: name.clone(),
-                        qualified_path: child_path(trait_path, &name),
-                        kind: SemanticSymbolKind::TypeAlias,
-                        visibility: "trait".to_string(),
-                        parent_symbol: Some(trait_symbol.to_string()),
-                        impl_target: None,
-                        impl_trait: Some(trait_path.join("::")),
-                        span: self.source_index.span(item_type.span()),
-                    });
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn scan_impl_items(
-        &mut self,
-        items: &[ImplItem],
-        impl_path: &[String],
-        impl_symbol: &str,
-        impl_target: &str,
-        impl_trait: Option<String>,
-    ) {
-        for item in items {
-            match item {
-                ImplItem::Fn(item_fn) => {
-                    let name = item_fn.sig.ident.to_string();
-                    self.push_symbol(SymbolInput {
-                        name: name.clone(),
-                        qualified_path: child_path(impl_path, &name),
-                        kind: SemanticSymbolKind::Method,
-                        visibility: visibility_text(&item_fn.vis),
-                        parent_symbol: Some(impl_symbol.to_string()),
-                        impl_target: Some(impl_target.to_string()),
-                        impl_trait: impl_trait.clone(),
-                        span: self.source_index.span(item_fn.span()),
-                    });
-                }
-                ImplItem::Const(item_const) => {
-                    let name = item_const.ident.to_string();
-                    self.push_symbol(SymbolInput {
-                        name: name.clone(),
-                        qualified_path: child_path(impl_path, &name),
-                        kind: SemanticSymbolKind::Const,
-                        visibility: visibility_text(&item_const.vis),
-                        parent_symbol: Some(impl_symbol.to_string()),
-                        impl_target: Some(impl_target.to_string()),
-                        impl_trait: impl_trait.clone(),
-                        span: self.source_index.span(item_const.span()),
-                    });
-                }
-                ImplItem::Type(item_type) => {
-                    let name = item_type.ident.to_string();
-                    self.push_symbol(SymbolInput {
-                        name: name.clone(),
-                        qualified_path: child_path(impl_path, &name),
-                        kind: SemanticSymbolKind::TypeAlias,
-                        visibility: "inherited".to_string(),
-                        parent_symbol: Some(impl_symbol.to_string()),
-                        impl_target: Some(impl_target.to_string()),
-                        impl_trait: impl_trait.clone(),
-                        span: self.source_index.span(item_type.span()),
-                    });
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn scan_use_tree(
-        &mut self,
-        tree: &UseTree,
-        visibility: &Visibility,
-        module_path: &[String],
-        span: Span,
-    ) {
-        let span = self.source_index.span(span);
-        let visibility_text = visibility_text(visibility);
-        let imports = flatten_use_tree(tree);
-        for import in imports {
-            let to_file = resolve_import_file(self.repository_files, module_path, &import.path);
-            self.imports.push(SemanticImport {
-                file: self.file.to_path_buf(),
-                module_path: module_path.to_vec(),
-                path: import.path.clone(),
-                alias: import.alias.clone(),
-                glob: import.glob,
-                visibility: visibility_text.clone(),
-                span,
-            });
-            if !matches!(visibility, Visibility::Inherited) {
-                self.re_exports.push(SemanticReExport {
-                    file: self.file.to_path_buf(),
-                    module_path: module_path.to_vec(),
-                    path: import.path.clone(),
-                    alias: import.alias.clone(),
-                    glob: import.glob,
-                    visibility: visibility_text.clone(),
-                    span,
-                });
-            }
-            self.dependencies.push(SemanticDependency {
-                from_file: self.file.to_path_buf(),
-                from_module: module_path.to_vec(),
-                to: import.path,
-                to_file,
-                kind: SemanticDependencyKind::Import,
-                span,
-            });
-        }
-    }
-
-    fn push_symbol(&mut self, input: SymbolInput) -> String {
-        let id = symbol_id(self.file, input.kind, &input.qualified_path, input.span);
-        self.symbols.push(SemanticSymbol {
-            id: id.clone(),
-            file: self.file.to_path_buf(),
-            name: input.name,
-            qualified_path: input.qualified_path,
-            kind: input.kind,
-            visibility: input.visibility,
-            parent_symbol: input.parent_symbol,
-            impl_target: input.impl_target,
-            impl_trait: input.impl_trait,
-            span: input.span,
-        });
-        id
-    }
-}
-
-struct SymbolInput {
-    name: String,
-    qualified_path: Vec<String>,
-    kind: SemanticSymbolKind,
-    visibility: String,
-    parent_symbol: Option<String>,
-    impl_target: Option<String>,
-    impl_trait: Option<String>,
-    span: SourceSpan,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct UseImport {
-    path: String,
-    alias: Option<String>,
-    glob: bool,
-}
-
 #[derive(Debug, Clone)]
-struct SourceIndex {
+pub(super) struct SourceIndex {
     source: String,
     line_starts: Vec<usize>,
 }
 
 impl SourceIndex {
-    fn new(source: &str) -> Self {
+    pub(super) fn new(source: &str) -> Self {
         let mut line_starts = vec![0];
         for (index, byte) in source.bytes().enumerate() {
             if byte == b'\n' {
@@ -1195,7 +878,7 @@ impl SourceIndex {
         }
     }
 
-    fn span(&self, span: Span) -> SourceSpan {
+    pub(super) fn span(&self, span: Span) -> SourceSpan {
         let start = span.start();
         let end = span.end();
         let start_byte = self.offset(start);
@@ -1208,6 +891,27 @@ impl SourceIndex {
             start_line,
             end_line,
             signature_end_line: self.signature_end_line(start_byte, end_byte, start_line),
+        }
+    }
+
+    pub(super) fn span_bytes(&self, start_byte: usize, end_byte: usize) -> SourceSpan {
+        let start_byte = start_byte.min(self.source.len());
+        let end_byte = end_byte.max(start_byte).min(self.source.len());
+        let start_line = self.line_of(start_byte);
+        let end_line = self.line_of(end_byte.saturating_sub(1).max(start_byte));
+        SourceSpan {
+            start_byte,
+            end_byte,
+            start_line,
+            end_line,
+            signature_end_line: self.signature_end_line(start_byte, end_byte, start_line),
+        }
+    }
+
+    pub(super) fn line_of(&self, byte: usize) -> usize {
+        match self.line_starts.binary_search(&byte) {
+            Ok(index) => index + 1,
+            Err(index) => index.max(1),
         }
     }
 
@@ -1250,266 +954,7 @@ impl SourceIndex {
     }
 }
 
-fn flatten_use_tree(tree: &UseTree) -> Vec<UseImport> {
-    let mut imports = Vec::new();
-    collect_use_tree(tree, Vec::new(), &mut imports);
-    imports.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then_with(|| left.alias.cmp(&right.alias))
-            .then_with(|| left.glob.cmp(&right.glob))
-    });
-    imports
-}
-
-fn collect_use_tree(tree: &UseTree, prefix: Vec<String>, imports: &mut Vec<UseImport>) {
-    match tree {
-        UseTree::Path(path) => {
-            let mut next = prefix;
-            next.push(path.ident.to_string());
-            collect_use_tree(&path.tree, next, imports);
-        }
-        UseTree::Name(name) => {
-            imports.push(UseImport {
-                path: use_path_with_ident(&prefix, &name.ident.to_string()),
-                alias: None,
-                glob: false,
-            });
-        }
-        UseTree::Rename(rename) => {
-            imports.push(UseImport {
-                path: use_path_with_ident(&prefix, &rename.ident.to_string()),
-                alias: Some(rename.rename.to_string()),
-                glob: false,
-            });
-        }
-        UseTree::Glob(_) => {
-            imports.push(UseImport {
-                path: prefix.join("::"),
-                alias: None,
-                glob: true,
-            });
-        }
-        UseTree::Group(group) => {
-            for item in &group.items {
-                collect_use_tree(item, prefix.clone(), imports);
-            }
-        }
-    }
-}
-
-fn use_path_with_ident(prefix: &[String], ident: &str) -> String {
-    if ident == "self" {
-        if prefix.is_empty() {
-            ident.to_string()
-        } else {
-            prefix.join("::")
-        }
-    } else {
-        let mut path = prefix.to_vec();
-        path.push(ident.to_string());
-        path.join("::")
-    }
-}
-
-fn resolve_module_file(
-    repository_files: &[PathBuf],
-    file: &Path,
-    module_name: &str,
-    path_attribute: Option<String>,
-) -> Option<PathBuf> {
-    if let Some(path_attribute) = path_attribute {
-        return resolve_path_attribute_file(repository_files, file, &path_attribute);
-    }
-
-    let base = module_base_path(file);
-    let flat = base.join(format!("{module_name}.rs"));
-    if repository_files.binary_search(&flat).is_ok() {
-        return Some(flat);
-    }
-
-    let nested = base.join(module_name).join("mod.rs");
-    if repository_files.binary_search(&nested).is_ok() {
-        return Some(nested);
-    }
-
-    None
-}
-
-fn module_path_attribute(attrs: &[Attribute]) -> Option<String> {
-    attrs.iter().find_map(|attr| {
-        if !attr.path().is_ident("path") {
-            return None;
-        }
-
-        match &attr.meta {
-            Meta::NameValue(meta) => match &meta.value {
-                Expr::Lit(expr_lit) => match &expr_lit.lit {
-                    Lit::Str(value) => Some(value.value()),
-                    _ => None,
-                },
-                _ => None,
-            },
-            _ => None,
-        }
-    })
-}
-
-fn resolve_path_attribute_file(
-    repository_files: &[PathBuf],
-    file: &Path,
-    path_attribute: &str,
-) -> Option<PathBuf> {
-    let base = file.parent().unwrap_or_else(|| Path::new(""));
-    let candidate = normalize_relative_path(&base.join(path_attribute));
-    if repository_files.binary_search(&candidate).is_ok() {
-        Some(candidate)
-    } else {
-        None
-    }
-}
-
-fn resolve_import_file(
-    repository_files: &[PathBuf],
-    module_path: &[String],
-    import_path: &str,
-) -> Option<PathBuf> {
-    let absolute_path = absolute_import_path(module_path, import_path)?;
-    resolve_module_segments(repository_files, &absolute_path)
-}
-
-fn absolute_import_path(module_path: &[String], import_path: &str) -> Option<Vec<String>> {
-    let mut segments = import_path
-        .split("::")
-        .filter(|segment| !segment.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    let first = segments.first()?.as_str();
-
-    match first {
-        "crate" => Some(segments),
-        "self" => {
-            segments.remove(0);
-            let mut absolute = module_path.to_vec();
-            absolute.extend(segments);
-            Some(absolute)
-        }
-        "super" => {
-            let mut absolute = module_path.to_vec();
-            while segments.first().is_some_and(|segment| segment == "super") {
-                if absolute.len() > 1 {
-                    absolute.pop();
-                }
-                segments.remove(0);
-            }
-            absolute.extend(segments);
-            Some(absolute)
-        }
-        _ => None,
-    }
-}
-
-fn resolve_module_segments(
-    repository_files: &[PathBuf],
-    absolute_path: &[String],
-) -> Option<PathBuf> {
-    if absolute_path.first().map(String::as_str) != Some("crate") {
-        return None;
-    }
-
-    for end in (1..=absolute_path.len()).rev() {
-        if let Some(file) = module_segments_to_file(repository_files, &absolute_path[..end]) {
-            return Some(file);
-        }
-    }
-
-    None
-}
-
-fn module_segments_to_file(repository_files: &[PathBuf], segments: &[String]) -> Option<PathBuf> {
-    if segments.first().map(String::as_str) != Some("crate") {
-        return None;
-    }
-
-    if segments.len() == 1 {
-        for candidate in [PathBuf::from("src/lib.rs"), PathBuf::from("src/main.rs")] {
-            if repository_files.binary_search(&candidate).is_ok() {
-                return Some(candidate);
-            }
-        }
-        return None;
-    }
-
-    let module_segments = &segments[1..];
-    let mut flat = PathBuf::from("src");
-    for segment in module_segments {
-        flat.push(segment);
-    }
-    flat.set_extension("rs");
-    if repository_files.binary_search(&flat).is_ok() {
-        return Some(flat);
-    }
-
-    let mut nested = PathBuf::from("src");
-    for segment in module_segments {
-        nested.push(segment);
-    }
-    nested.push("mod.rs");
-    if repository_files.binary_search(&nested).is_ok() {
-        return Some(nested);
-    }
-
-    None
-}
-
-fn module_base_path(file: &Path) -> PathBuf {
-    match file.file_name().and_then(|name| name.to_str()) {
-        Some("lib.rs" | "main.rs" | "mod.rs") => {
-            file.parent().unwrap_or_else(|| Path::new("")).to_path_buf()
-        }
-        _ => file.with_extension(""),
-    }
-}
-
-fn module_path_for_file(file: &Path) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut components = file
-        .components()
-        .filter_map(|component| component.as_os_str().to_str().map(str::to_string))
-        .collect::<Vec<_>>();
-
-    let under_src = components
-        .first()
-        .is_some_and(|component| component == "src");
-    if under_src {
-        parts.push("crate".to_string());
-        components.remove(0);
-    }
-
-    if let Some(last) = components.last_mut() {
-        if let Some(stripped) = last.strip_suffix(".rs") {
-            *last = stripped.to_string();
-        }
-    }
-
-    let last_index = components.len().saturating_sub(1);
-    for (index, component) in components.into_iter().enumerate() {
-        // Only the file-stem component is a crate root alias. Directories named
-        // lib/main/mod are real modules and must stay in the path.
-        if index == last_index && matches!(component.as_str(), "lib" | "main" | "mod") {
-            continue;
-        }
-        parts.push(component);
-    }
-
-    if parts.is_empty() {
-        parts.push("crate".to_string());
-    }
-
-    parts
-}
-
-fn symbol_id(
+pub(super) fn symbol_id(
     file: &Path,
     kind: SemanticSymbolKind,
     qualified_path: &[String],
@@ -1540,51 +985,10 @@ impl SemanticSymbolKind {
     }
 }
 
-fn child_path(parent: &[String], child: &str) -> Vec<String> {
+pub(super) fn child_path(parent: &[String], child: &str) -> Vec<String> {
     let mut path = parent.to_vec();
     path.push(child.to_string());
     path
-}
-
-fn path_to_string(path: &syn::Path) -> String {
-    let mut value = String::new();
-    if path.leading_colon.is_some() {
-        value.push_str("::");
-    }
-    value.push_str(
-        &path
-            .segments
-            .iter()
-            .map(|segment| segment.ident.to_string())
-            .collect::<Vec<_>>()
-            .join("::"),
-    );
-    value
-}
-
-fn type_to_string(ty: &syn::Type) -> String {
-    ty.to_token_stream().to_string()
-}
-
-fn visibility_text(visibility: &Visibility) -> String {
-    match visibility {
-        Visibility::Public(_) => "public".to_string(),
-        Visibility::Restricted(restricted) => {
-            let path = restricted.path.to_token_stream().to_string();
-            if path == "crate" {
-                "crate".to_string()
-            } else {
-                format!("restricted({path})")
-            }
-        }
-        Visibility::Inherited => "private".to_string(),
-    }
-}
-
-fn has_rust_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension == "rs")
 }
 
 fn is_ignored_path(path: &Path) -> bool {
@@ -1600,7 +1004,7 @@ fn normalize_query_path(root: &Path, path: &Path) -> PathBuf {
     normalize_relative_path(repo_relative)
 }
 
-fn normalize_relative_path(path: &Path) -> PathBuf {
+pub(super) fn normalize_relative_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -2294,15 +1698,15 @@ pub fn endpoint() {}
     #[test]
     fn module_path_strips_lib_main_mod_only_from_the_file_stem() {
         assert_eq!(
-            module_path_for_file(Path::new("src/lib.rs")),
+            rust::module_path_for_file(Path::new("src/lib.rs")),
             vec!["crate".to_string()]
         );
         assert_eq!(
-            module_path_for_file(Path::new("src/main.rs")),
+            rust::module_path_for_file(Path::new("src/main.rs")),
             vec!["crate".to_string()]
         );
         assert_eq!(
-            module_path_for_file(Path::new("src/main/config.rs")),
+            rust::module_path_for_file(Path::new("src/main/config.rs")),
             vec![
                 "crate".to_string(),
                 "main".to_string(),
@@ -2310,7 +1714,7 @@ pub fn endpoint() {}
             ]
         );
         assert_eq!(
-            module_path_for_file(Path::new("src/lib/helpers.rs")),
+            rust::module_path_for_file(Path::new("src/lib/helpers.rs")),
             vec![
                 "crate".to_string(),
                 "lib".to_string(),
@@ -2318,15 +1722,15 @@ pub fn endpoint() {}
             ]
         );
         assert_eq!(
-            module_path_for_file(Path::new("src/main/mod.rs")),
+            rust::module_path_for_file(Path::new("src/main/mod.rs")),
             vec!["crate".to_string(), "main".to_string()]
         );
         assert_eq!(
-            module_path_for_file(Path::new("tests/main.rs")),
+            rust::module_path_for_file(Path::new("tests/main.rs")),
             vec!["tests".to_string()]
         );
         assert_eq!(
-            module_path_for_file(Path::new("src/mod/inner.rs")),
+            rust::module_path_for_file(Path::new("src/mod/inner.rs")),
             vec!["crate".to_string(), "mod".to_string(), "inner".to_string()]
         );
     }
@@ -2389,5 +1793,192 @@ pub fn endpoint() {}
         assert_eq!(function.span.start_line, 1);
         assert_eq!(function.span.signature_end_line, 4);
         assert!(function.span.end_line > function.span.signature_end_line);
+    }
+
+    #[test]
+    fn builtin_adapters_have_unique_language_ids() {
+        let mut ids = adapter::builtin_adapters()
+            .iter()
+            .map(|adapter| adapter.language_id())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        let unique = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), unique);
+        assert!(ids.contains(&"rust"));
+        assert!(ids.contains(&"python"));
+    }
+
+    #[test]
+    fn python_adapter_maps_classes_functions_and_import_impact() {
+        let (_temp, repo) = init_repo();
+        write_file(&repo, "src/lib.rs", "pub fn rust_entry() {}\n");
+        write_file(&repo, "pkg/__init__.py", "from .api import endpoint\n");
+        write_file(
+            &repo,
+            "pkg/api.py",
+            "class Api:\n    def method(self):\n        return 1\n\ndef endpoint(x):\n    return x\n",
+        );
+
+        let map = scan_repository(&repo).expect("scan mixed repository");
+        assert!(map
+            .files
+            .iter()
+            .any(|file| file.path == Path::new("src/lib.rs")));
+        assert!(map
+            .files
+            .iter()
+            .any(|file| file.path == Path::new("pkg/api.py")));
+        assert!(map.symbols.iter().any(|symbol| {
+            symbol.name == "Api"
+                && symbol.kind == SemanticSymbolKind::Struct
+                && symbol.file == Path::new("pkg/api.py")
+        }));
+        assert!(map.symbols.iter().any(|symbol| {
+            symbol.name == "method"
+                && symbol.kind == SemanticSymbolKind::Method
+                && symbol.file == Path::new("pkg/api.py")
+        }));
+        assert!(map.symbols.iter().any(|symbol| {
+            symbol.name == "endpoint"
+                && symbol.kind == SemanticSymbolKind::Function
+                && symbol.file == Path::new("pkg/api.py")
+        }));
+        assert!(map.imports.iter().any(|import| {
+            import.file == Path::new("pkg/__init__.py") && import.path.contains("api")
+        }));
+
+        let report = risk_report_for_paths(&map, ["pkg/api.py"]);
+        assert!(report
+            .touched_symbols
+            .iter()
+            .any(|symbol| symbol.name == "Api"));
+        assert!(report.dependency_impacts.iter().any(|impact| {
+            impact.direction == SemanticDependencyDirection::Incoming
+                && impact.related_file.as_deref() == Some(Path::new("pkg/__init__.py"))
+        }));
+        assert!(report
+            .impacted_files
+            .contains(&PathBuf::from("pkg/__init__.py")));
+        assert!(report.errors.is_empty());
+    }
+
+    #[test]
+    fn python_adapter_skips_nested_functions_and_quoted_or_commented_defs() {
+        let (_temp, repo) = init_repo();
+        write_file(
+            &repo,
+            "pkg/util.py",
+            concat!(
+                "\"\"\"\n",
+                "def hidden_in_string():\n",
+                "    return 0\n",
+                "\"\"\"\n",
+                "# def hidden_in_comment():\n",
+                "def outer():\n",
+                "    def inner():\n",
+                "        return 1\n",
+                "    return inner\n",
+            ),
+        );
+
+        let map = scan_repository(&repo).expect("scan python");
+        let names = map
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.file == Path::new("pkg/util.py"))
+            .map(|symbol| symbol.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["outer"]);
+    }
+
+    #[test]
+    fn non_source_files_are_not_marked_unsupported() {
+        let (_temp, repo) = init_repo();
+        write_file(&repo, "src/lib.rs", "pub fn rust_ok() {}\n");
+        write_file(&repo, "README.md", "# docs\n");
+        write_file(&repo, "Cargo.lock", "# lockfile\n");
+
+        let map = scan_repository(&repo).expect("scan");
+        assert!(map.errors.is_empty(), "unexpected errors: {:?}", map.errors);
+        assert!(map.files.iter().all(
+            |file| file.path != Path::new("README.md") && file.path != Path::new("Cargo.lock")
+        ));
+        assert!(map.symbols.iter().any(|symbol| symbol.name == "rust_ok"));
+    }
+
+    #[test]
+    fn unknown_language_is_typed_unsupported_and_does_not_fail_the_scan() {
+        let (_temp, repo) = init_repo();
+        write_file(&repo, "src/lib.rs", "pub fn rust_ok() {}\n");
+        write_file(
+            &repo,
+            "web/app.ts",
+            "export function hidden() { return 1; }\n",
+        );
+        write_file(&repo, "pkg/util.py", "def util():\n    return 2\n");
+
+        let map = scan_repository(&repo).expect("mixed scan must succeed");
+        assert!(map.symbols.iter().any(|symbol| symbol.name == "rust_ok"));
+        assert!(map.symbols.iter().any(|symbol| symbol.name == "util"));
+        assert!(map.symbols.iter().all(|symbol| symbol.name != "hidden"));
+        assert_eq!(
+            map.errors
+                .iter()
+                .filter(|error| error.kind == SemanticScanErrorKind::Unsupported)
+                .map(|error| error.file.as_path())
+                .collect::<Vec<_>>(),
+            vec![Path::new("web/app.ts")]
+        );
+
+        let report = risk_report_for_paths(&map, ["src/lib.rs", "web/app.ts", "pkg/util.py"]);
+        assert!(report
+            .touched_symbols
+            .iter()
+            .any(|symbol| symbol.name == "rust_ok"));
+        assert!(report
+            .touched_symbols
+            .iter()
+            .any(|symbol| symbol.name == "util"));
+        assert!(report.errors.iter().any(|error| {
+            error.file == Path::new("web/app.ts")
+                && error.kind == SemanticScanErrorKind::Unsupported
+        }));
+        assert!(
+            report
+                .touched_files
+                .iter()
+                .any(|file| file.path == Path::new("pkg/util.py")),
+            "python path in a mixed change set must appear as a touched file"
+        );
+    }
+
+    #[test]
+    fn live_source_span_json_includes_signature_end_line() {
+        let span = SourceSpan {
+            start_byte: 0,
+            end_byte: 8,
+            start_line: 1,
+            end_line: 2,
+            signature_end_line: 1,
+        };
+        let value = serde_json::to_value(span).expect("serialize SourceSpan");
+        assert_eq!(value["signature_end_line"], 1);
+        let keys = value
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            BTreeSet::from([
+                "start_byte".to_string(),
+                "end_byte".to_string(),
+                "start_line".to_string(),
+                "end_line".to_string(),
+                "signature_end_line".to_string(),
+            ])
+        );
     }
 }
