@@ -1561,6 +1561,7 @@ fn run_bounded_git_records<const N: usize>(
     Ok(bytes.to_vec())
 }
 
+#[cfg(test)]
 fn require_verified_worktree_status_process(output: &ProcessOutput) -> Result<()> {
     require_bounded_git_process(output, BoundedGitIsolation::Verified)
 }
