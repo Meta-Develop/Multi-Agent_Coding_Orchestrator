@@ -137,22 +137,27 @@ the parkfix lane.
 ## Task and model ledger
 
 All launched orchestrators and leaves used `gpt-5.6-sol`, `xhigh` reasoning,
-and `service_tier=default`. Fast/priority service was never selected or
-retained. Terra and Luna were not used. Native leaf execution did not expose
-reliable per-agent token or monetary totals, so execution cost is reported as
-concrete validation attempts and review passes rather than invented figures.
+and `service_tier=default`. The inherited user Codex config exposed
+`service_tier="priority"`; that setting was observed and reported, and every
+O1/child launch explicitly overrode it with `service_tier="default"`.
+Fast/priority service therefore was not retained or used. Terra and Luna were
+not used. Native leaf execution did not expose reliable per-agent token or
+monetary totals, so execution cost is reported as concrete validation attempts
+and review passes rather than invented figures.
 
 | Task / agent | Role and bounded cost | Outcome | Review / rework |
 | --- | --- | --- | --- |
-| Initial shell composition | MACO composition preflight; no model leaf and 0 validation attempts | Environment rejection because the expected local external orchestrator manifest was absent. The approved native-leaf fallback was used; MACO was not repaired in this lane. | Not a model-quality failure. |
+| MACO preflight | `.agents/scripts/maco` launch preflight; no model leaf and 0 validation attempts | Environment rejection because `.agents/external/multi-agent-coding-orchestrator/Cargo.toml` was absent. Switched once to the approved Codex O1 fallback; MACO was not repaired in this lane. | Not a model-quality failure. |
+| Initial O1 shell composition | O1 fallback launcher construction; no model launch and 0 validation attempts | A missing newline after `set -o pipefail` joined shell tokens, so no model launched and no final or other model evidence was produced. Corrected once and relaunched. | Shell-construction failure, not a model-quality failure; consumed 0/10 fuse. |
 | O1 attempt 1 | O1 child orchestrator; instruction/preflight work only, 0 validation attempts | Rejected for orchestration execution: it claimed three active leaves but emitted zero native spawn events and three waits with empty receiver/state evidence, then stopped before source mutation. | Environment/orchestration rejection, not model-quality failure; consumed 0/10 fuse. |
-| O1 attempt 2 (`/root`) | O1 child orchestrator; manager-only coordination of six native leaves and the fixed 10-attempt fuse | Corrected dispatch: concrete canonical native IDs were returned by `spawn_agent`, verified live with `list_agents`, and stated with roles before broad inspection, testing, or mutation. No wait occurred with an empty live-agent set. | Consolidated research, authorized one minimal implementation, accepted independent audit as partial-gate, and withheld DONE. |
+| O1 attempt 2 (`/root`) | O1 child orchestrator; manager-only coordination of six native leaves and the fixed 10-attempt fuse | Corrected dispatch: actual native agents and work were proven live by concrete canonical task names, child processes, and delegated outputs. Its JSON event stream nevertheless repeatedly serialized wait telemetry with `receiver_thread_ids=[]` and `agents_states={}`; that is a telemetry limitation/defect, not evidence that the agents were absent. | Consolidated research, authorized one minimal implementation, accepted independent audit as partial-gate, and withheld DONE. |
 | `/root/ci_log_forensics` | RESEARCHER; one read-only CI-log analysis, 0 validation attempts | Recovered the exact 2,501 / 2 / 15 baseline, both failing assertions, and proof that lower-level preclaim behavior passed. | Consolidated by O1; no rework. |
 | `/root/scheduler_trace` | RESEARCHER; one read-only owned-source trace, 0 validation attempts | Mapped typed decisions, every Park constructor, persistence, finding conversion, serial/concurrent exits, evidence-sensitive branch, and ordering/authority invariants. | Consolidated by O1; no rework. |
 | `/root/reproduce_env` | TERMINAL_WORKER; attempts 1-3 plus task-local ledger | Focused defect did not reproduce in either session shape or CI-shaped default parallelism; proposed and executed only the authorized bounded widening. | Evidence accepted by O1; no rework. |
 | `/root/implement_park_finding` | TERMINAL_WORKER; two owned files, attempts 4-10, tool-version capture, and one source commit | Implemented the 14-insertion/5-deletion cause fix and regression; focused and static gates passed; full-library gate remained partial only on unowned failures. Source commit `9152ec51efa61b61c26144579370cde68cdaa273`. | Reviewed independently; no implementation rework. |
 | `/root/review_auditor` | REVIEW_AUDITOR; one read-only diff/evidence pass, 0 new validation attempts | `ACCEPT_WITH_PARTIAL_GATE`; no owned-code, scope, privacy, ordering, authority, or production panic-policy finding. | No re-review or rework cycle required. |
 | `/root/report_parkfix` | TERMINAL_WORKER; one report-only synthesis and scoped report commit, 0 validation attempts | Produced this VERIFIED/PARTIAL/MISSING report without source, evidence, DONE, or remote mutation. | Parent O1 retains final acceptance; no rework in this lane. |
+| `/root/report_correction` | TERMINAL_WORKER; Sol, `xhigh`, default tier; one nondelegating report-only correction, 0 validation attempts | Accepted subject to root read-only audit. This single direct-O2 leaf exception was justified by the tiny bounded report-only scope and the greater cost of O1 wrapping; it changed no source, evidence, DONE marker, or remote state. | Root performs the final read-only audit; no validation or fuse use. |
 
 Total measurable execution cost was 10 validation attempts: six test-suite
 invocations and three static gates plus the final full-library invocation as
