@@ -225,6 +225,20 @@ impl PreclaimRunEvidence {
     }
 
     #[cfg(test)]
+    pub(super) fn verified_for_test(
+        repo_map: RepoMap,
+        semantic_map: SemanticRepoMap,
+        runtime: SupervisorRuntime,
+    ) -> Self {
+        Self {
+            repo_map: Some(repo_map),
+            semantic_map: Some(semantic_map),
+            runtime: Some(runtime),
+            execution_runtime: SupervisorExecutionRuntime::Verified,
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn missing() -> Self {
         Self {
             repo_map: None,

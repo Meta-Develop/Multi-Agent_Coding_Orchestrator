@@ -1,5 +1,7 @@
 use super::*;
 use crate::orchestration_event::{OrchestrationEvent, ORCHESTRATION_EVENT_PATH};
+use crate::repo_map::{RepoEntryKind, RepoGitStatus, RepoMap, RepoMapEntry};
+use crate::repo_semantic::SemanticRepoMap;
 use git2::Signature;
 
 static TEST_RUNTIME_MODEL_CATALOG: RuntimeModelCatalog =
@@ -1907,6 +1909,29 @@ fn assert_authenticated_park_has_no_assignment_side_effects(
         panic!("parked assignment must not invoke the child runner")
     };
 
+    let preclaim_evidence = PreclaimRunEvidence::verified_for_test(
+        RepoMap {
+            root: repo.clone(),
+            entries: vec![RepoMapEntry {
+                path: PathBuf::from("tests/scheduler_preclaim.rs"),
+                kind: RepoEntryKind::File,
+                size_bytes: Some(1),
+                category: "source".to_string(),
+                git_status: RepoGitStatus::Clean,
+            }],
+        },
+        SemanticRepoMap {
+            root: repo.clone(),
+            files: Vec::new(),
+            symbols: Vec::new(),
+            imports: Vec::new(),
+            re_exports: Vec::new(),
+            dependencies: Vec::new(),
+            errors: Vec::new(),
+        },
+        SupervisorRuntime::Codex,
+    );
+    set_preclaim_run_evidence_override(preclaim_evidence);
     let report = run_supervisor_plan_with_runner_and_creation(
         loaded,
         options,
@@ -2099,6 +2124,37 @@ fn assert_authenticated_park_has_no_assignment_side_effects(
     assert_eq!(
         preclaim_decision.disposition,
         preclaim::PreclaimDisposition::Park
+    );
+    assert_eq!(
+        preclaim_decision.dimensions,
+        preclaim::PreclaimViabilityDimensions {
+            limited_scope: preclaim::ViabilityFinding::Yes,
+            clear_verification_path: preclaim::ViabilityFinding::Yes,
+            autonomously_completable: preclaim::ViabilityFinding::No,
+        }
+    );
+    assert_eq!(
+        preclaim_decision.rejection_bucket,
+        Some(preclaim::PreclaimRejectionBucket::NeedsDecision)
+    );
+    assert_eq!(
+        preclaim_decision.confidence,
+        preclaim::PreclaimConfidence::High
+    );
+    assert_eq!(
+        preclaim_decision.authority,
+        preclaim::PreclaimDecisionAuthority::DeterministicPolicy
+    );
+    assert_eq!(
+        preclaim_decision.triage_outcome,
+        preclaim::PreclaimTriageOutcome::Rejected
+    );
+    assert!(preclaim_decision.map_present);
+    assert!(preclaim_decision.risk_present);
+    assert!(preclaim_decision.runtime_present);
+    assert_eq!(
+        preclaim_decision.evidence_source,
+        preclaim::PreclaimEvidenceSource::Acquired
     );
 
     let orchestration_event_bytes = reader

@@ -71,6 +71,22 @@ thread_local! {
 }
 
 #[cfg(test)]
+thread_local! {
+    static PRECLAIM_RUN_EVIDENCE_OVERRIDE: std::cell::RefCell<Option<PreclaimRunEvidence>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_preclaim_run_evidence_override(evidence: PreclaimRunEvidence) {
+    PRECLAIM_RUN_EVIDENCE_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(evidence));
+}
+
+#[cfg(test)]
+fn take_preclaim_run_evidence_override() -> Option<PreclaimRunEvidence> {
+    PRECLAIM_RUN_EVIDENCE_OVERRIDE.with(|slot| slot.borrow_mut().take())
+}
+
+#[cfg(test)]
 pub(crate) fn set_before_supervisor_final_report_persist_hook(
     hook: impl FnMut(&mut SupervisorFinalReport) + 'static,
 ) {
@@ -2986,7 +3002,7 @@ fn evaluate_supervisor_preclaims(
     runtime: SupervisorRuntime,
     execution_runtime: SupervisorExecutionRuntime,
 ) -> Vec<PreclaimDecision> {
-    let evidence = PreclaimRunEvidence::acquire(repo, runtime, execution_runtime);
+    let evidence = supervisor_preclaim_run_evidence(repo, runtime, execution_runtime);
     plan.assignments
         .iter()
         .map(|assignment| {
@@ -3001,6 +3017,18 @@ fn evaluate_supervisor_preclaims(
             )
         })
         .collect()
+}
+
+fn supervisor_preclaim_run_evidence(
+    repo: &Path,
+    runtime: SupervisorRuntime,
+    execution_runtime: SupervisorExecutionRuntime,
+) -> PreclaimRunEvidence {
+    #[cfg(test)]
+    if let Some(evidence) = take_preclaim_run_evidence_override() {
+        return evidence;
+    }
+    PreclaimRunEvidence::acquire(repo, runtime, execution_runtime)
 }
 
 /// Derive viability-assessment runtime independently of effect containment.
