@@ -2845,8 +2845,20 @@ fn persist_supervisor_final_report(
     orchestration_journal: &mut Option<OrchestrationEventJournal>,
     mut artifact_writer: ArtifactRunWriter,
     checkpoint_writer: Option<&mut SupervisorCheckpointWriter>,
+    invocation_scratch_quiescence: Option<crate::artifacts::ArtifactScratchQuiescence>,
     release_after_terminal_record: impl FnOnce() -> Result<()>,
 ) -> Result<SupervisorFinalReport> {
+    if let Some(quiescence) = invocation_scratch_quiescence {
+        // Incoming/capture trees are identity-bound reservations counted by the
+        // artifact writer, even when a post-reservation admission check returns
+        // before the normal import/discard path. This terminal boundary receives
+        // proof only after every invocation has joined (or no child launched), so
+        // it can discard those run-owned trees without weakening the gate for
+        // unverified or foreign scratch.
+        artifact_writer
+            .discard_supervisor_invocation_scratches_after_quiescence(quiescence)
+            .context("failed to discard quiescent supervisor invocation scratches")?;
+    }
     enforce_supervisor_final_environment_failure_outcome(&mut final_report);
     record_orchestration_event(
         orchestration_journal,
@@ -3707,6 +3719,7 @@ fn persist_supervisor_predispatch_failure(
         &mut orchestration_journal,
         artifact_writer,
         Some(checkpoint_writer),
+        Some(crate::artifacts::ArtifactScratchQuiescence::Verified),
         || Ok(()),
     )
 }
@@ -4287,6 +4300,8 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         &mut orchestration_journal,
         artifact_writer,
         checkpoint_finalization.then_some(&mut checkpoint_writer),
+        (!external_containment_failed)
+            .then_some(crate::artifacts::ArtifactScratchQuiescence::Verified),
         || {
             let released = release_collected_scheduler_resources(
                 sync_store_slot.as_ref(),

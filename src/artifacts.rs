@@ -476,10 +476,22 @@ pub struct ArtifactRunWriter {
     provenance: ArtifactProvenance,
     writer_evidence: ArtifactWriterEvidence,
     files: BTreeMap<PathBuf, ArtifactFileRecord>,
-    outstanding_scratches: BTreeMap<PathBuf, FileIdentity>,
+    outstanding_scratches: BTreeMap<PathBuf, ArtifactScratchReservation>,
     poisoned_appends: BTreeSet<PathBuf>,
     total_bytes: u64,
     run_lock: BoundArtifactLock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactScratchKind {
+    Generic,
+    SupervisorInvocation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArtifactScratchReservation {
+    identity: FileIdentity,
+    kind: ArtifactScratchKind,
 }
 
 /// Authenticated-journal payload required to reopen one unfinalized artifact run.
@@ -503,6 +515,14 @@ pub(crate) struct ArtifactRecoveryFile<'a> {
     pub(crate) relative: &'a Path,
     pub(crate) contents: &'a [u8],
     pub(crate) disposition: ArtifactFileDisposition,
+}
+
+/// Proof supplied by an orchestration boundary after every process that could
+/// mutate the run's invocation scratches has been joined or otherwise verified
+/// quiescent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArtifactScratchQuiescence {
+    Verified,
 }
 
 /// An identity-bound capability for a child-writable directory reserved inside
@@ -877,6 +897,34 @@ impl ArtifactRunWriter {
         &mut self,
         name: impl AsRef<Path>,
     ) -> Result<ArtifactScratchDirectory> {
+        self.create_scratch_dir_with_kind(name, ArtifactScratchKind::Generic)
+    }
+
+    /// Reserves a scratch directory whose ownership is explicitly bound to a
+    /// supervisor invocation. Canonical naming is validated for consistency,
+    /// but the stored reservation kind is the sole cleanup authority.
+    pub(crate) fn create_supervisor_invocation_scratch_dir(
+        &mut self,
+        name: impl AsRef<Path>,
+    ) -> Result<ArtifactScratchDirectory> {
+        if self.family != RunArtifactFamily::Supervise {
+            bail!("supervisor invocation scratch requires a supervise artifact run");
+        }
+        let name = name.as_ref();
+        if !is_supervisor_invocation_scratch_name(name) {
+            bail!(
+                "supervisor invocation scratch name is not canonical: {}",
+                name.display()
+            );
+        }
+        self.create_scratch_dir_with_kind(name, ArtifactScratchKind::SupervisorInvocation)
+    }
+
+    fn create_scratch_dir_with_kind(
+        &mut self,
+        name: impl AsRef<Path>,
+        kind: ArtifactScratchKind,
+    ) -> Result<ArtifactScratchDirectory> {
         self.run_lock.verify(&self.run)?;
         let result = (|| -> Result<ArtifactScratchDirectory> {
             let name = validate_artifact_scratch_name(name.as_ref())?;
@@ -906,8 +954,13 @@ impl ArtifactRunWriter {
             let reservation = self.run.reserve_direct_child_directory(name.as_os_str())?;
             reservation.verify(&self.run)?;
             let identity = reservation.identity().clone();
-            self.outstanding_scratches
-                .insert(name.clone(), identity.clone());
+            self.outstanding_scratches.insert(
+                name.clone(),
+                ArtifactScratchReservation {
+                    identity: identity.clone(),
+                    kind,
+                },
+            );
             Ok(ArtifactScratchDirectory {
                 path: reservation.path().to_path_buf(),
                 name,
@@ -932,29 +985,61 @@ impl ArtifactRunWriter {
             if self.run.direct_child_exists(scratch.name.as_os_str())? {
                 scratch.reservation.verify(&self.run)?;
             }
-            remove_artifact_scratch_tree(&self.run, scratch.name.as_os_str(), &scratch.identity)
-                .with_context(|| {
-                    format!(
-                        "failed to safely discard artifact scratch directory {}",
-                        scratch.name.display()
-                    )
-                })?;
-            if self.run.direct_child_exists(scratch.name.as_os_str())? {
-                bail!(
-                    "artifact scratch source name reappeared after cleanup: {}",
-                    scratch.name.display()
-                );
-            }
-            let removed = self
-                .outstanding_scratches
-                .remove(&scratch.name)
-                .context("artifact scratch tracking disappeared during cleanup")?;
-            if removed != scratch.identity {
-                bail!("artifact scratch tracking identity changed during cleanup");
-            }
-            Ok(())
+            self.discard_tracked_scratch(&scratch.name, &scratch.identity)
         })();
         finish_with_artifact_lock_verification(result, self.run_lock.verify(&self.run))
+    }
+
+    /// Discards only this supervise writer's identity-bound invocation scratch
+    /// reservations after the caller proves every possible scratch writer is
+    /// quiescent. Other tracked scratch remains outstanding so resume and
+    /// finalization continue to fail closed over foreign or leaked state.
+    pub(crate) fn discard_supervisor_invocation_scratches_after_quiescence(
+        &mut self,
+        _quiescence: ArtifactScratchQuiescence,
+    ) -> Result<usize> {
+        self.run_lock.verify(&self.run)?;
+        let result = (|| -> Result<usize> {
+            if self.family != RunArtifactFamily::Supervise {
+                bail!("supervisor invocation scratch cleanup requires a supervise artifact run");
+            }
+            let invocation_scratches = self
+                .outstanding_scratches
+                .iter()
+                .filter(|(_, reservation)| {
+                    reservation.kind == ArtifactScratchKind::SupervisorInvocation
+                })
+                .map(|(name, reservation)| (name.clone(), reservation.identity.clone()))
+                .collect::<Vec<_>>();
+            for (name, identity) in &invocation_scratches {
+                self.discard_tracked_scratch(name, identity)?;
+            }
+            Ok(invocation_scratches.len())
+        })();
+        finish_with_artifact_lock_verification(result, self.run_lock.verify(&self.run))
+    }
+
+    fn discard_tracked_scratch(&mut self, name: &Path, identity: &FileIdentity) -> Result<()> {
+        remove_artifact_scratch_tree(&self.run, name.as_os_str(), identity).with_context(|| {
+            format!(
+                "failed to safely discard artifact scratch directory {}",
+                name.display()
+            )
+        })?;
+        if self.run.direct_child_exists(name.as_os_str())? {
+            bail!(
+                "artifact scratch source name reappeared after cleanup: {}",
+                name.display()
+            );
+        }
+        let removed = self
+            .outstanding_scratches
+            .remove(name)
+            .context("artifact scratch tracking disappeared during cleanup")?;
+        if &removed.identity != identity {
+            bail!("artifact scratch tracking identity changed during cleanup");
+        }
+        Ok(())
     }
 
     fn verify_scratch_capability(&self, scratch: &ArtifactScratchDirectory) -> Result<()> {
@@ -968,7 +1053,9 @@ impl ArtifactRunWriter {
             .outstanding_scratches
             .get(&scratch.name)
             .context("artifact scratch capability is no longer outstanding")?;
-        if tracked != &scratch.identity || scratch.reservation.identity() != &scratch.identity {
+        if tracked.identity != scratch.identity
+            || scratch.reservation.identity() != &scratch.identity
+        {
             bail!("artifact scratch capability identity does not match the tracked reservation");
         }
         Ok(())
@@ -3399,6 +3486,42 @@ fn validate_artifact_scratch_name(path: &Path) -> Result<PathBuf> {
 
 fn artifact_path_starts_with(path: &Path, scratch_name: &Path) -> bool {
     path.starts_with(scratch_name)
+}
+
+fn is_supervisor_invocation_scratch_name(path: &Path) -> bool {
+    let Some(name) = path.to_str() else {
+        return false;
+    };
+    if matches!(name, "incoming" | "capture") {
+        return true;
+    }
+    let Some(suffix) = name
+        .strip_prefix("incoming-")
+        .or_else(|| name.strip_prefix("capture-"))
+    else {
+        return false;
+    };
+    let mut components = suffix.split('-');
+    if components.next() != Some("assignment") {
+        return false;
+    }
+    let Some(assignment_index) = components.next() else {
+        return false;
+    };
+    if !is_canonical_scratch_ordinal(assignment_index, 4) {
+        return false;
+    }
+    match components.next() {
+        Some("auditor") => components.next().is_none(),
+        Some("attempt") => components.next().is_some_and(|attempt| {
+            is_canonical_scratch_ordinal(attempt, 2) && components.next().is_none()
+        }),
+        _ => false,
+    }
+}
+
+fn is_canonical_scratch_ordinal(value: &str, minimum_width: usize) -> bool {
+    value.len() >= minimum_width && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn remove_artifact_scratch_tree(
