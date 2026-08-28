@@ -1503,7 +1503,10 @@ fn external_codex_outer_sandbox_enforces_control_and_report_write_boundaries() {
         fs::read_to_string(&report).expect("incoming report evidence"),
         "incoming writable\n"
     );
-    assert!(!unit_names.is_empty(), "strict run allocated no systemd unit");
+    assert!(
+        !unit_names.is_empty(),
+        "strict run allocated no systemd unit"
+    );
     assert_systemd_units_have_no_residue(&unit_names);
 }
 
@@ -2738,7 +2741,10 @@ fn inaccessible_placeholder_blocks_nix_daemon_socket_access() {
     let evidence = fs::read_to_string(&marker).expect("socket denial evidence");
     assert!(evidence.contains("open=Some("));
     assert!(evidence.contains("connect=Some("));
-    assert!(!unit_names.is_empty(), "strict run allocated no systemd unit");
+    assert!(
+        !unit_names.is_empty(),
+        "strict run allocated no systemd unit"
+    );
     assert_systemd_units_have_no_residue(&unit_names);
 }
 
@@ -2812,7 +2818,10 @@ fn one_cancellation_cleans_two_simultaneous_strict_process_trees() {
             .as_deref()
             .is_some_and(|error| error.contains("cancelled")));
     }
-    assert!(!unit_names.is_empty(), "strict runs allocated no systemd units");
+    assert!(
+        !unit_names.is_empty(),
+        "strict runs allocated no systemd units"
+    );
     assert_systemd_units_have_no_residue(&unit_names);
 }
 
@@ -2870,7 +2879,10 @@ fn exact_git_read_roots_do_not_expose_private_tmp_sibling() {
         fs::read_to_string(sibling.join("sentinel")).expect("preserved sibling sentinel"),
         "untouched\n"
     );
-    assert!(!unit_names.is_empty(), "strict run allocated no systemd unit");
+    assert!(
+        !unit_names.is_empty(),
+        "strict run allocated no systemd unit"
+    );
     assert_systemd_units_have_no_residue(&unit_names);
 }
 
@@ -3795,7 +3807,10 @@ fn captured_systemd_unit_residue(unit_names: &[String]) -> Vec<String> {
             .map(|name| format!("runtime {name}")),
     );
 
-    let captured_names = unit_names.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let captured_names = unit_names
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
     let manager = systemd_user_manager_cgroup().expect("systemd user manager cgroup");
     let app_slice = Path::new("/sys/fs/cgroup")
         .join(manager.strip_prefix("/").unwrap_or(&manager))
@@ -3848,8 +3863,7 @@ fn command_line_references_systemd_unit(command_line: &[u8], unit_name: &str) ->
             if candidate != runtime_name {
                 return false;
             }
-            let before_is_boundary =
-                index == 0 || matches!(command_line[index - 1], b'/' | b'\0');
+            let before_is_boundary = index == 0 || matches!(command_line[index - 1], b'/' | b'\0');
             let after = index + runtime_name.len();
             let after_is_boundary =
                 after == command_line.len() || matches!(command_line[after], b'/' | b'\0');
@@ -3899,7 +3913,10 @@ fn systemd_unit_name_capture_is_thread_local_and_raii_scoped() {
     drop(abandoned_capture);
     let fresh_capture = TestSystemdUnitNameCapture::start();
     record_systemd_unit_name_for_test("maco-process-1-fresh.service");
-    assert_eq!(fresh_capture.finish(), vec!["maco-process-1-fresh.service".to_string()]);
+    assert_eq!(
+        fresh_capture.finish(),
+        vec!["maco-process-1-fresh.service".to_string()]
+    );
 }
 
 #[cfg(target_os = "linux")]

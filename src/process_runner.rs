@@ -519,7 +519,10 @@ impl TestSystemdUnitNameCapture {
     fn start() -> Self {
         TEST_SYSTEMD_UNIT_NAMES.with(|names| {
             let mut names = names.borrow_mut();
-            assert!(names.is_none(), "systemd unit-name captures cannot be nested");
+            assert!(
+                names.is_none(),
+                "systemd unit-name captures cannot be nested"
+            );
             *names = Some(Vec::new());
         });
         Self { active: true }
