@@ -2174,7 +2174,7 @@ fn preclaim_concurrent_park_has_authenticated_pending_checkpoint_and_no_assignme
 }
 
 #[test]
-fn missing_map_risk_runtime_parks_before_claiming_paths() {
+fn preclaim_missing_map_risk_runtime_parks_before_claiming_paths() {
     with_valid_schedule_context!(
         context,
         vec![test_assignment("parked-child", "README.md")],
@@ -2197,8 +2197,8 @@ fn missing_map_risk_runtime_parks_before_claiming_paths() {
             assert!(parked.claimed_paths.is_empty());
             assert!(parked.released_claims.is_empty());
             assert!(parked.findings.iter().any(|finding| {
-                finding.message.contains("pre-claim viability parked")
-                    && finding.message.contains("missing map, risk, runtime")
+                finding.message
+                    == "pre-claim viability parked 'parked-child': verdict=park, limited_scope=yes, clear_verification_path=unknown, autonomously_completable=yes; reason: assignment 'parked-child' failed closed before path claim because required evidence is missing map, risk, runtime"
             }));
 
             let decisions =

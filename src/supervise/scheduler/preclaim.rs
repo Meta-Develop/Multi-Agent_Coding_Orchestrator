@@ -1146,13 +1146,22 @@ pub(super) fn parked_preclaim_outcome(
     assignment: &OrchestratorAssignment,
     decision: &PreclaimDecision,
 ) -> AssignmentExecutionOutcome {
+    let verdict = match decision.disposition {
+        PreclaimDisposition::Claim => "claim",
+        PreclaimDisposition::Park => "park",
+    };
     AssignmentExecutionOutcome {
         assignment_failed: true,
         findings: vec![Finding {
             severity: FindingSeverity::Error,
             message: format!(
-                "pre-claim viability parked '{}': {}",
-                assignment.id, decision.reason
+                "pre-claim viability parked '{}': verdict={}, limited_scope={}, clear_verification_path={}, autonomously_completable={}; reason: {}",
+                assignment.id,
+                verdict,
+                finding_name(decision.dimensions.limited_scope),
+                finding_name(decision.dimensions.clear_verification_path),
+                finding_name(decision.dimensions.autonomously_completable),
+                decision.reason,
             ),
             paths: assignment.assigned_paths.clone(),
         }],
