@@ -3,6 +3,8 @@
 #[cfg(test)]
 #[macro_use]
 mod test_containment;
+#[cfg(all(test, unix))]
+mod test_support;
 
 pub mod agent;
 pub mod agent_lifecycle;

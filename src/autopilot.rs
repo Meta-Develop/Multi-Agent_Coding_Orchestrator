@@ -4,6 +4,9 @@ use crate::{
         ApprovalReviewDenial, BudgetAdmissionDenial, GateCheckSource, GateDenial, GateDenialReason,
         VerifiedGateContext,
     },
+    hierarchy_ledger::{
+        observe_hierarchy, ObservedHierarchyNode, RoleCategory as AuthorityRoleCategory,
+    },
     live_claim::{self, LiveClock},
     llm::{provider::ModelPricing, Redactor},
     machine_global::MachineGlobalRetentionBinding,
@@ -36,11 +39,12 @@ use crate::{
     },
     semantic_coord::SemanticIntentStore,
     supervise::{
-        self, AgentRole, AssignmentPhase, CommandRunRecord, FindingSeverity,
-        OrchestratorAssignment, ReviewLensUsageReport, ReviewStatus, RoleModelSelection,
-        RoleUsageObservation, RoleUsageReport, RunBudgetLimits, SupervisorConcurrencyPolicy,
-        SupervisorFinalReport, SupervisorPlan, SupervisorRunOptions, SupervisorRuntime,
-        ValidationResult, WorkerAssignment,
+        self, trusted_model_capability, validate_known_judgment_role_model, AgentRole,
+        AssignmentPhase, AssignmentScheduleEntry, CommandRunRecord, FindingSeverity,
+        ModelCapabilityClass, OrchestratorAssignment, ReviewLensUsageReport, ReviewStatus,
+        RoleModelSelection, RoleUsageObservation, RoleUsageReport, RunBudgetLimits,
+        SupervisorConcurrencyPolicy, SupervisorFinalReport, SupervisorPlan, SupervisorRunOptions,
+        SupervisorRuntime, ValidationResult, WorkerAssignment,
     },
     sync::normalize_repo_relative_path,
     sync_store::SyncStore,
@@ -267,6 +271,8 @@ pub struct AutopilotFinalReport {
     pub plan: AutopilotPlanSummary,
     pub profile_binding: AutopilotProfileBindingReport,
     pub safety: AutopilotSafetyReport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_plan: Option<AutopilotAuthorityPlan>,
     #[serde(default)]
     pub gate_denials: Vec<GateDenial>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -284,6 +290,43 @@ pub struct AutopilotFinalReport {
     pub auto_merge_performed: bool,
     pub generated_follow_up_dispatch_performed: bool,
     pub next_action: String,
+}
+
+/// Effective category and topology output bound before supervisor dispatch.
+///
+/// This record is derived from the normalized supervisor plan. It is not a
+/// caller-authored grant and it never grants Git history mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AutopilotAuthorityPlan {
+    pub selection_source: String,
+    pub caller_selected_category: bool,
+    pub caller_selected_coordination_depth: bool,
+    pub planned_max_depth: u8,
+    pub derived_coordination_depth: u32,
+    pub forge_mode: AutopilotForgeMode,
+    pub git_history_mutation_granted: bool,
+    pub permitted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal_reason: Option<String>,
+    pub assignments: Vec<AutopilotAuthorityAssignment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AutopilotAuthorityAssignment {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    pub role: AgentRole,
+    pub category: AuthorityRoleCategory,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_capability: Option<ModelCapabilityClass>,
+    pub may_delegate: bool,
+    pub may_write: bool,
+    pub may_judge_acceptance: bool,
+    pub may_mutate_git_history: bool,
+    pub authority_source: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -907,6 +950,180 @@ fn apply_autopilot_input_shape_gate(
     Ok(())
 }
 
+fn autopilot_authority_plan(
+    plan: &AutopilotPlan,
+    effective_plan_value: &Value,
+    effective_plan: &SupervisorPlan,
+    input_shape: &AutopilotInputShape,
+    planner_derived: bool,
+) -> Result<AutopilotAuthorityPlan> {
+    let schedule = effective_plan_value
+        .get("assignment_schedule")
+        .cloned()
+        .map(serde_json::from_value::<Vec<AssignmentScheduleEntry>>)
+        .transpose()
+        .context("effective supervisor assignment_schedule is invalid")?
+        .unwrap_or_default();
+    let parents = schedule
+        .into_iter()
+        .map(|entry| (entry.assignment_id, entry.parent_assignment_id))
+        .collect::<BTreeMap<_, _>>();
+    let mut assignments = Vec::new();
+    let mut refusal_reason = None;
+
+    for assignment in &effective_plan.assignments {
+        let requested_model = effective_plan
+            .role_models
+            .get(&assignment.role)
+            .and_then(|selection| selection.model.clone());
+        if refusal_reason.is_none() {
+            refusal_reason = role_model_refusal_reason(assignment.role, requested_model.as_deref());
+        }
+        assignments.push(authority_assignment(
+            assignment.id.clone(),
+            parents.get(&assignment.id).cloned().flatten(),
+            assignment.role,
+            requested_model,
+            false,
+        )?);
+        for worker in &assignment.worker_assignments {
+            let requested_model = effective_plan
+                .role_models
+                .get(&worker.role)
+                .and_then(|selection| selection.model.clone());
+            assignments.push(authority_assignment(
+                worker.id.clone(),
+                Some(assignment.id.clone()),
+                worker.role,
+                requested_model,
+                false,
+            )?);
+        }
+        for lens in &effective_plan.review_lenses {
+            let requested_model = Some(lens.backend.model().to_string());
+            if refusal_reason.is_none()
+                && trusted_model_capability(lens.backend.model()).is_some()
+                && validate_known_judgment_role_model(
+                    AgentRole::Auditor,
+                    Some(lens.backend.model()),
+                )
+                .is_err()
+            {
+                refusal_reason = Some("model_ineligible_for_review_auditor".to_string());
+            }
+            assignments.push(authority_assignment(
+                format!("{}:review:{}", assignment.id, lens.id),
+                Some(assignment.id.clone()),
+                AgentRole::Auditor,
+                requested_model,
+                true,
+            )?);
+        }
+    }
+
+    // Planner output uses the same observe_hierarchy layer count via
+    // `supervise::coordination_topology_from_plan`; this executor record is the
+    // launched-graph counterpart of that topology.
+    let observed = observe_hierarchy(assignments.iter().map(|assignment| ObservedHierarchyNode {
+        id: assignment.id.as_str(),
+        parent: assignment.parent_id.as_deref(),
+        coordinator: assignment.category == AuthorityRoleCategory::DelegatingCoordinator,
+    }));
+    Ok(AutopilotAuthorityPlan {
+        selection_source: if planner_derived {
+            "effective_planner_output"
+        } else {
+            "effective_autopilot_spine"
+        }
+        .to_string(),
+        caller_selected_category: false,
+        caller_selected_coordination_depth: input_shape.requested_max_depth.is_some(),
+        planned_max_depth: effective_plan.max_depth,
+        derived_coordination_depth: observed.coordination_depth,
+        forge_mode: plan.forge_mode,
+        git_history_mutation_granted: false,
+        permitted: refusal_reason.is_none(),
+        refusal_reason,
+        assignments,
+    })
+}
+
+fn authority_assignment(
+    id: String,
+    parent_id: Option<String>,
+    role: AgentRole,
+    requested_model: Option<String>,
+    review_lens: bool,
+) -> Result<AutopilotAuthorityAssignment> {
+    let category = AuthorityRoleCategory::from_legacy_role(agent_role_label(role))?;
+    let model_capability = requested_model
+        .as_deref()
+        .and_then(trusted_model_capability);
+    let model_authoritative = requested_model.is_none()
+        || model_capability.is_some_and(|capability| {
+            validate_known_judgment_role_model(role, requested_model.as_deref()).is_ok()
+                && capability >= minimum_authority_capability(role)
+        });
+    Ok(AutopilotAuthorityAssignment {
+        id,
+        parent_id,
+        role,
+        category,
+        requested_model,
+        model_capability,
+        may_delegate: category == AuthorityRoleCategory::DelegatingCoordinator
+            && model_authoritative,
+        may_write: matches!(
+            category,
+            AuthorityRoleCategory::DelegatingCoordinator
+                | AuthorityRoleCategory::NonDelegatingTerminalWorker
+        ) && model_authoritative,
+        may_judge_acceptance: category == AuthorityRoleCategory::ReadOnlyReviewAuditor
+            && model_authoritative,
+        may_mutate_git_history: false,
+        authority_source: if review_lens {
+            "effective_review_lens_role_mapping"
+        } else {
+            "effective_assignment_role_mapping"
+        }
+        .to_string(),
+    })
+}
+
+fn role_model_refusal_reason(role: AgentRole, model: Option<&str>) -> Option<String> {
+    let model = model?;
+    let reason = match role {
+        AgentRole::Supervisor | AgentRole::ChildOrchestrator => {
+            "model_ineligible_for_delegating_coordinator"
+        }
+        AgentRole::Auditor | AgentRole::GateClassifier => "model_ineligible_for_review_auditor",
+        AgentRole::Worker => return None,
+    };
+    validate_known_judgment_role_model(role, Some(model))
+        .is_err()
+        .then(|| reason.to_string())
+}
+
+fn minimum_authority_capability(role: AgentRole) -> ModelCapabilityClass {
+    match role {
+        AgentRole::Worker => ModelCapabilityClass::WeakMechanical,
+        AgentRole::Supervisor | AgentRole::ChildOrchestrator => {
+            ModelCapabilityClass::GeneralJudgment
+        }
+        AgentRole::Auditor | AgentRole::GateClassifier => ModelCapabilityClass::CriticalJudgment,
+    }
+}
+
+fn agent_role_label(role: AgentRole) -> &'static str {
+    match role {
+        AgentRole::Supervisor => "supervisor",
+        AgentRole::ChildOrchestrator => "child_orchestrator",
+        AgentRole::Worker => "worker",
+        AgentRole::GateClassifier => "gate_classifier",
+        AgentRole::Auditor => "auditor",
+    }
+}
+
 pub fn run_autopilot_plan_file(options: AutopilotRunOptions) -> Result<AutopilotFinalReport> {
     run_autopilot_plan_file_with_profile_and_retention(options, None, None)
 }
@@ -1212,6 +1429,11 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         crate::run_ops::register_current_supervisor_process(&repo, "autopilot", &options.run_id)
             .ok()
             .flatten();
+    let selected_supervisor_runtime = if options.codex_bin.is_some() {
+        SupervisorRuntime::Codex
+    } else {
+        SupervisorRuntime::Fake
+    };
     let source_is_goal_derived = matches!(&source, AutopilotRunSource::GoalSpec { .. });
     let LoadedAutopilotPlan {
         plan,
@@ -1245,6 +1467,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         &options.run_id,
         options.allow_dirty_primary,
         &plan.assigned_paths,
+        selected_supervisor_runtime,
     )?;
     apply_autopilot_input_shape_gate(
         &mut safety,
@@ -1295,6 +1518,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                 requested_profile.clone(),
             ),
             safety,
+            authority_plan: None,
             validation: skipped_autopilot_validation(),
             pr: None,
             review: None,
@@ -1319,6 +1543,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         &options.run_id,
         options.allow_dirty_primary,
         &plan.assigned_paths,
+        selected_supervisor_runtime,
     )?;
     pre_dispatch_bindings
         .verify()
@@ -1337,6 +1562,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                 requested_profile.clone(),
             ),
             safety: pre_dispatch_safety,
+            authority_plan: None,
             validation: skipped_autopilot_validation(),
             pr: None,
             review: None,
@@ -1375,6 +1601,14 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     let supervisor_plan_path = run_dir.join(&supervisor_plan_relative);
     let effective_supervisor_plan = supervise::load_supervisor_plan_file(&supervisor_plan_path)
         .context("failed to verify the effective autopilot supervisor profile")?;
+    let authority_plan = autopilot_authority_plan(
+        &plan,
+        &supervisor_plan,
+        &effective_supervisor_plan,
+        &input_shape,
+        goal_derived_supervisor_plan,
+    )?;
+    write_private_json(&mut artifact_writer, "authority-plan.json", &authority_plan)?;
     let follow_up_requested_profile = requested_profile.clone();
     let mut profile_binding = AutopilotProfileBindingReport::from_effective(
         requested_profile,
@@ -1406,6 +1640,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
             plan: plan_summary(&plan),
             profile_binding,
             safety: pre_dispatch_safety,
+            authority_plan: Some(authority_plan),
             validation: skipped_autopilot_validation(),
             pr: None,
             review: None,
@@ -1420,10 +1655,46 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         finalize_autopilot_run_artifacts(artifact_writer, &report, false)?;
         return Ok(report);
     }
+    if authority_plan.refusal_reason.is_some() {
+        let denial = GateDenial::from_approval_review(
+            options.run_id.as_str(),
+            "maco-autopilot",
+            ApprovalReviewDenial::PermissionExpansion,
+            &plan.assigned_paths,
+        )?;
+        let mut authority_safety = pre_dispatch_safety;
+        authority_safety.gate_denials.insert(0, denial.clone());
+        authority_safety.refused = true;
+        write_skipped_stage_reports(&mut artifact_writer, "launch_authority_refused")?;
+        let report = final_report(FinalReportInput {
+            run_id: &options.run_id,
+            status: AutopilotRunStatus::Refused,
+            attempt_count: 0,
+            max_repair_attempts: plan.max_repair_attempts,
+            artifacts,
+            plan: plan_summary(&plan),
+            profile_binding,
+            safety: authority_safety,
+            authority_plan: Some(authority_plan),
+            validation: skipped_autopilot_validation(),
+            pr: None,
+            review: None,
+            attempts: Vec::new(),
+            supervisor: None,
+            gate_denials: vec![denial],
+            primary_worktree_untouched: false,
+            next_action: "remove the ineligible authority request or bind it to an eligible category/model before starting a new run",
+            auto_merge_requested: plan.auto_merge,
+            generated_follow_up_dispatch_performed: false,
+        });
+        finalize_autopilot_run_artifacts(artifact_writer, &report, false)?;
+        return Ok(report);
+    }
     let (codex_bin, runtime) = match options.codex_bin {
         Some(codex_bin) => (codex_bin, SupervisorRuntime::Codex),
         None => (PathBuf::from("codex-not-executed"), SupervisorRuntime::Fake),
     };
+    debug_assert_eq!(runtime, selected_supervisor_runtime);
     let mut attempt = AutopilotAttemptSummary {
         attempt: 1,
         supervisor_run_id: supervisor_run_id.as_str().to_string(),
@@ -1473,7 +1744,12 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     let mut admitted_child_dispatches = 0_usize;
     let error_evidence_source_plan_sha256 =
         supervise::normalized_supervisor_plan_file_sha256(&supervisor_options.plan_file)?;
-    let command_primary_baseline = supervise::verified_whole_primary_snapshot_sha256(&repo)?;
+    let command_primary_baseline = match runtime {
+        SupervisorRuntime::Fake => {
+            supervise::nonpublishable_simulation_whole_primary_snapshot_sha256(&repo)?
+        }
+        _ => supervise::verified_whole_primary_snapshot_sha256(&repo)?,
+    };
     let error_evidence_source_run_id = supervisor_options.run_id.clone();
     let supervisor_result = {
         let mut follow_up_profile_gate = |effective: &SupervisorPlan| {
@@ -1565,7 +1841,12 @@ fn run_autopilot_with_profile_retention_and_dispatch(
             ),
         }
     };
-    let command_primary_final = supervise::verified_whole_primary_snapshot_sha256(&repo)?;
+    let command_primary_final = match runtime {
+        SupervisorRuntime::Fake => {
+            supervise::nonpublishable_simulation_whole_primary_snapshot_sha256(&repo)?
+        }
+        _ => supervise::verified_whole_primary_snapshot_sha256(&repo)?,
+    };
     let command_primary_worktree_untouched = command_primary_final == command_primary_baseline;
     if let Some(refusal) = follow_up_profile_refusal.take() {
         profile_binding = refusal;
@@ -1671,6 +1952,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                 plan: plan_summary(&plan),
                 profile_binding: profile_binding.clone(),
                 safety: pre_dispatch_safety,
+                authority_plan: Some(authority_plan.clone()),
                 validation: skipped_autopilot_validation(),
                 pr: None,
                 review: None,
@@ -1798,6 +2080,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         plan: plan_summary(&plan),
         profile_binding,
         safety: pre_dispatch_safety,
+        authority_plan: Some(authority_plan),
         validation: skipped_autopilot_validation(),
         pr: None,
         review: None,
@@ -1829,6 +2112,11 @@ fn run_autopilot_plan_file_disabled_legacy(
     }
     let artifacts = artifact_paths();
     let real_runtime_requested = options.codex_bin.is_some();
+    let selected_supervisor_runtime = if real_runtime_requested {
+        SupervisorRuntime::Codex
+    } else {
+        SupervisorRuntime::Fake
+    };
     let mut artifact_writer = ArtifactRunWriter::reserve(
         &repo,
         RunArtifactFamily::Autopilot,
@@ -1843,6 +2131,7 @@ fn run_autopilot_plan_file_disabled_legacy(
         &options.run_id,
         options.allow_dirty_primary,
         &plan.assigned_paths,
+        selected_supervisor_runtime,
     )?;
     let repository_bindings = RepositoryPathBindings::bind(&repo)?;
     verify_after_autopilot_safety(&repository_bindings)?;
@@ -1864,6 +2153,7 @@ fn run_autopilot_plan_file_disabled_legacy(
                 AutopilotProfile::default(),
             ),
             safety,
+            authority_plan: None,
             validation,
             pr: None,
             review: None,
@@ -1940,7 +2230,7 @@ fn run_autopilot_plan_file_disabled_legacy(
                 SupervisorRuntime::Fake,
             ),
         };
-        if !options.allow_dirty_primary && !dirty_primary_paths(&repo)?.is_empty() {
+        if !options.allow_dirty_primary && !dirty_primary_paths(&repo, runtime)?.is_empty() {
             bail!("primary worktree changed after safety preflight and before supervisor start");
         }
         repository_bindings
@@ -2182,6 +2472,7 @@ fn run_autopilot_plan_file_disabled_legacy(
         plan: plan_summary(&plan),
         profile_binding: AutopilotProfileBindingReport::not_dispatched(AutopilotProfile::default()),
         safety,
+        authority_plan: None,
         validation: last_validation,
         pr: last_pr,
         review: last_review,
@@ -2422,10 +2713,11 @@ fn safety_report(
     run_id: &RunId,
     allow_dirty_primary: bool,
     target_paths: &[PathBuf],
+    runtime: SupervisorRuntime,
 ) -> Result<AutopilotSafetyReport> {
     let mut gate_denials = Vec::new();
     if !allow_dirty_primary {
-        let dirty_paths = dirty_primary_paths(repo)?;
+        let dirty_paths = dirty_primary_paths(repo, runtime)?;
         if !dirty_paths.is_empty() {
             gate_denials.push(GateDenial::from_apply_blocker(
                 run_id.as_str(),
@@ -2531,6 +2823,8 @@ fn supervisor_plan_for_attempt(
             phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
             assigned_paths: plan.assigned_paths.clone(),
             semantic_symbols: plan.semantic_symbols.clone(),
             semantic_modules: plan.semantic_modules.clone(),
@@ -2538,6 +2832,8 @@ fn supervisor_plan_for_attempt(
             worker_assignments: vec![WorkerAssignment {
                 id: format!("{agent_id}-worker"),
                 role: AgentRole::Worker,
+                role_category: None,
+                selection_source: None,
                 assigned_paths: plan.assigned_paths.clone(),
                 semantic_symbols: plan.semantic_symbols.clone(),
                 semantic_modules: plan.semantic_modules.clone(),

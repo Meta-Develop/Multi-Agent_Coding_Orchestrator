@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use super::action::{AgentRole, CanonicalEffort, ModelAction};
 use super::ids::{PolicyId, TimestampMillis};
 use super::resources::{DispatchDecision, Quantity, ResourceSnapshot};
+use super::switch_cost::SwitchCostEstimate;
 
 /// Stable envelope stored on [`super::replay::ReplayRecord`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,7 +91,17 @@ pub struct DecisionDiagnostics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub switch_observation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_cost_applied_micros: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_cost_evidence: Option<SwitchCostEstimate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_hysteresis_margin_bp: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oscillation_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oscillation_alarm_threshold: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oscillation_alarm: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -133,7 +144,12 @@ impl DecisionDiagnostics {
             switch_cost_micros: None,
             switch_class: None,
             switch_observation: None,
+            switch_cost_applied_micros: None,
+            switch_cost_evidence: None,
+            switch_hysteresis_margin_bp: None,
             oscillation_count: None,
+            oscillation_alarm_threshold: None,
+            oscillation_alarm: None,
             stage_path: None,
             difficulty_score_bp: None,
             difficulty_lower_bp: None,
@@ -214,10 +230,14 @@ pub struct CandidatePrediction {
 /// Four-way comparison recorded on every effort-escalation decision (#168).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EscalationComparison {
-    pub same_model_higher_effort: Option<ComparedPolicy>,
-    pub different_model_same_effort: Option<ComparedPolicy>,
-    pub different_model_higher_effort: Option<ComparedPolicy>,
-    pub clean_restart: Option<ComparedPolicy>,
+    #[serde(default)]
+    pub continue_arm: Option<ComparedPolicy>,
+    #[serde(default, alias = "same_model_higher_effort")]
+    pub escalate_arm: Option<ComparedPolicy>,
+    #[serde(default, alias = "different_model_same_effort")]
+    pub switch_arm: Option<ComparedPolicy>,
+    #[serde(default)]
+    pub repair_arm: Option<ComparedPolicy>,
     pub selected: Option<PolicyId>,
 }
 
@@ -226,10 +246,14 @@ pub struct ComparedPolicy {
     pub policy: PolicyId,
     pub model: String,
     pub effort: String,
+    #[serde(default)]
+    pub base_objective_value_micros: i64,
     pub objective_value_micros: i64,
     pub quality_lcb_bp: u16,
     #[serde(default)]
-    pub switch_cost_micros: i64,
+    pub applied_switch_cost_micros: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_evidence: Option<SwitchCostEstimate>,
 }
 
 pub(crate) fn role_label(role: &AgentRole) -> String {

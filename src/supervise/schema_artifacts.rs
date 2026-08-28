@@ -353,6 +353,15 @@ fn resolved_objective_profile_schema_value() -> serde_json::Value {
                             "retry_rework_percent": {"type": "integer", "minimum": 0, "maximum": 100},
                             "human_review_percent": {"type": "integer", "minimum": 0, "maximum": 100}
                         }
+                    },
+                    "quality_operations_balance": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["quality_percent", "operations_percent"],
+                        "properties": {
+                            "quality_percent": {"type": "integer", "minimum": 0, "maximum": 100},
+                            "operations_percent": {"type": "integer", "minimum": 0, "maximum": 100}
+                        }
                     }
                 }
             }
@@ -371,7 +380,10 @@ fn role_assignment_schema_value() -> serde_json::Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["agent_id", "category", "legacy_role", "source", "reason"],
+        "required": [
+            "agent_id", "category", "legacy_role", "source",
+            "requester_agent_id", "judge_agent_id", "evidence", "decision", "reason"
+        ],
         "properties": {
             "agent_id": {"type": "string", "minLength": 1},
             "category": {
@@ -387,6 +399,22 @@ fn role_assignment_schema_value() -> serde_json::Value {
             "source": {
                 "type": "string",
                 "enum": ["derived_from_plan_role", "operator_override"]
+            },
+            "requester_agent_id": {"type": "string", "minLength": 1},
+            "judge_agent_id": {"type": "string", "minLength": 1},
+            "evidence": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["acceptance_grade", "recorded", "uncertain"],
+                "properties": {
+                    "acceptance_grade": {"type": "boolean"},
+                    "recorded": {"type": "boolean"},
+                    "uncertain": {"type": "boolean"}
+                }
+            },
+            "decision": {
+                "type": "string",
+                "enum": ["granted", "refused"]
             },
             "reason": {"type": "string", "minLength": 1}
         }

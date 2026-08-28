@@ -820,6 +820,91 @@ fn supervise_run_from_goal_executes_the_same_validated_plan_and_preserves_primar
 }
 
 #[test]
+fn supervise_plan_then_run_with_cli_token_ceiling_completes_without_plan_edit() -> Result<()> {
+    support::require_containment!(
+        "supervise_plan_then_run_with_cli_token_ceiling_completes_without_plan_edit"
+    );
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let goal_path = temp.path().join("budget-goal.md");
+    fs::write(
+        &goal_path,
+        "Coordinate the requested repository work.\n\
+         - Update README.md.\n\
+         - Update the ok function in src/lib.rs.\n",
+    )?;
+    let plan = run_success_json(&[
+        "supervise",
+        "plan",
+        "--from-goal",
+        path_str(&goal_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    assert_eq!(
+        plan["run_budget"]["role_token_reservations"]["child_orchestrator"],
+        1024
+    );
+    assert_eq!(
+        plan["run_budget"]["role_token_reservations"]["worker"],
+        1024
+    );
+    assert_eq!(
+        plan["run_budget"]["role_token_reservations"]["auditor"],
+        1024
+    );
+    let plan_path = temp.path().join("generated-plan.json");
+    fs::write(&plan_path, serde_json::to_vec_pretty(&plan)?).context("write generated plan")?;
+
+    let output = command_with_test_machine_global_binding(
+        BIN,
+        &[
+            "supervise",
+            "run",
+            path_str(&plan_path)?,
+            "--repo",
+            path_str(&repo_path)?,
+            "--run-id",
+            "goal-plan-max-tokens",
+            "--runtime",
+            "fake",
+            "--max-tokens",
+            "100000",
+            "--max-concurrent-children",
+            "1",
+            "--json",
+        ],
+    )
+    .output()
+    .context("run generated plan under CLI token ceiling")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stdout.contains("no token reservation") && !stderr.contains("no token reservation"),
+        "generated role reservations must admit dispatch under --max-tokens: stdout={stdout} stderr={stderr}"
+    );
+    let report: Value = serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("parse max-tokens run JSON: stdout={stdout} stderr={stderr}"))?;
+    assert_eq!(report["publishable"], false);
+    assert!(
+        report["role_economics_profile"]["execution"]["started_assignment_count"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1,
+        "CLI token ceiling must not block the first fake-backed dispatch: {report}"
+    );
+    let executed_plan: Value = serde_json::from_slice(&fs::read(
+        repo_path.join(".maco/o2/runs/goal-plan-max-tokens/assignments/supervisor-plan.json"),
+    )?)?;
+    assert_eq!(
+        executed_plan["run_budget"]["role_token_reservations"],
+        plan["run_budget"]["role_token_reservations"]
+    );
+    Ok(())
+}
+
+#[test]
 fn supervise_plan_plain_text_without_actionable_workstreams_is_an_error() -> Result<()> {
     support::require_containment!(
         "supervise_plan_plain_text_without_actionable_workstreams_is_an_error"
@@ -964,6 +1049,310 @@ fn supervise_plan_plain_text_gitignored_policy_path_emits_workstream() -> Result
             ".agents/skills/agent-orchestration/SKILL.md".to_string()
         ]])
     );
+    assert!(!repo_path.join(".maco/o2").exists());
+    Ok(())
+}
+
+#[test]
+fn supervise_plan_treats_nested_repositories_as_opaque_outer_inventory_boundaries() -> Result<()> {
+    support::require_containment!(
+        "supervise_plan_treats_nested_repositories_as_opaque_outer_inventory_boundaries"
+    );
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    for boundary in [
+        "zeta/nested",
+        "alpha/nested",
+        "middle/nested",
+        "beta/nested",
+    ] {
+        let nested_path = repo_path.join(boundary);
+        fs::create_dir_all(nested_path.parent().context("nested repository parent")?)?;
+        let nested = Repository::init(&nested_path)?;
+        fs::create_dir_all(nested_path.join("src"))?;
+        fs::write(
+            nested_path.join("src/excluded.rs"),
+            "pub fn nested_only() {}\n",
+        )?;
+        commit_all(&nested, "nested fixture")?;
+    }
+    let task_path = temp.path().join("nested-repository-task.md");
+    fs::write(
+        &task_path,
+        "- Update `README.md`.\n- Update `src/lib.rs`.\n",
+    )?;
+
+    let args = [
+        "supervise",
+        "plan",
+        path_str(&task_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ];
+    let first = run_success_json(&args)?;
+    let second = run_success_json(&args)?;
+    assert_eq!(
+        first, second,
+        "nested-boundary planning must be deterministic"
+    );
+
+    let mut assigned_paths = BTreeSet::new();
+    for assignment in first["assignments"].as_array().context("assignments")? {
+        for path in assignment["assigned_paths"]
+            .as_array()
+            .context("assigned_paths")?
+        {
+            assigned_paths.insert(
+                path.as_str()
+                    .context("assigned path must be a string")?
+                    .to_string(),
+            );
+        }
+    }
+    assert_eq!(
+        assigned_paths,
+        BTreeSet::from(["README.md".to_string(), "src/lib.rs".to_string()])
+    );
+    assert!(first["assignments"]
+        .as_array()
+        .context("assignments")?
+        .iter()
+        .flat_map(|assignment| assignment["assigned_paths"]
+            .as_array()
+            .into_iter()
+            .flatten())
+        .all(|path| !path
+            .as_str()
+            .is_some_and(|path| path.contains("excluded.rs"))));
+    assert_eq!(first["path_proposal"]["degraded"], false);
+    let notes = first["path_proposal"]["notes"]
+        .as_array()
+        .context("path_proposal notes")?;
+    assert!(
+        notes.iter().any(|note| {
+            note.as_str().is_some_and(|note| {
+                note.contains("showing first 3 sorted paths")
+                    && note.contains("alpha/nested")
+                    && note.contains("beta/nested")
+                    && note.contains("middle/nested")
+                    && !note.contains("zeta/nested")
+            })
+        }),
+        "JSON plan must keep sorted bounded nested-boundary notes: {notes:?}"
+    );
+    assert!(first["assignments"]
+        .as_array()
+        .context("assignments")?
+        .iter()
+        .filter_map(|assignment| assignment["task"].as_str())
+        .all(|task| !task.contains("Planning inventory diagnostics:")));
+    assert_eq!(first["path_proposal"], second["path_proposal"]);
+
+    let human = command_with_test_machine_global_binding(
+        BIN,
+        &[
+            "supervise",
+            "plan",
+            path_str(&task_path)?,
+            "--repo",
+            path_str(&repo_path)?,
+        ],
+    )
+    .output()
+    .context("run human nested-boundary plan")?;
+    assert!(human.status.success(), "human nested plan failed");
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        human_stdout.contains("\"degraded\": Bool(false)")
+            || human_stdout.contains("degraded: false"),
+        "human plan must surface degraded: false: {human_stdout}"
+    );
+    assert!(
+        human_stdout.contains("showing first 3 sorted paths"),
+        "human plan must surface sorted bounded nested-boundary notes: {human_stdout}"
+    );
+    assert!(!human_stdout.contains("Planning inventory diagnostics:"));
+    assert!(!repo_path.join(".maco/o2").exists());
+    Ok(())
+}
+
+#[test]
+fn supervise_plan_accepts_real_gitlink_and_root_gitmodules_without_nested_descent() -> Result<()> {
+    support::require_containment!(
+        "supervise_plan_accepts_real_gitlink_and_root_gitmodules_without_nested_descent"
+    );
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let outer = Repository::open(&repo_path)?;
+    fs::write(
+        repo_path.join(".gitmodules"),
+        "[submodule \"vendor/sdk\"]\n\tpath = vendor/sdk\n\turl = ../sdk\n",
+    )?;
+
+    let nested_path = repo_path.join("vendor/sdk");
+    fs::create_dir_all(nested_path.parent().context("gitlink parent")?)?;
+    let nested = Repository::init(&nested_path)?;
+    fs::create_dir_all(nested_path.join("src"))?;
+    fs::write(
+        nested_path.join("src/excluded.rs"),
+        "pub fn submodule_only() {}\n",
+    )?;
+    let nested_oid = commit_all(&nested, "submodule fixture")?;
+
+    let mut index = outer.index()?;
+    index.add_path(Path::new(".gitmodules"))?;
+    index.add(&git2::IndexEntry {
+        ctime: git2::IndexTime::new(0, 0),
+        mtime: git2::IndexTime::new(0, 0),
+        dev: 0,
+        ino: 0,
+        mode: 0o160000,
+        uid: 0,
+        gid: 0,
+        file_size: 0,
+        id: nested_oid,
+        flags: 0,
+        flags_extended: 0,
+        path: b"vendor/sdk".to_vec(),
+    })?;
+    index.write()?;
+    let tree_id = index.write_tree()?;
+    let tree = outer.find_tree(tree_id)?;
+    let signature = Signature::now("maco test", "maco-test@example.invalid")?;
+    let parent = outer.head()?.peel_to_commit()?;
+    outer.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        "add real gitlink fixture",
+        &tree,
+        &[&parent],
+    )?;
+    let gitlink = outer
+        .index()?
+        .get_path(Path::new("vendor/sdk"), 0)
+        .context("gitlink index entry")?;
+    assert_eq!(
+        gitlink.mode, 0o160000,
+        "fixture must contain a real gitlink"
+    );
+
+    let task_path = temp.path().join("gitlink-task.md");
+    fs::write(
+        &task_path,
+        "- Update `.gitmodules`.\n- Update `README.md`.\n- Update `src/lib.rs`.\n",
+    )?;
+    let plan = run_success_json(&[
+        "supervise",
+        "plan",
+        path_str(&task_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+
+    let mut assigned_paths = BTreeSet::new();
+    for assignment in plan["assignments"].as_array().context("assignments")? {
+        for path in assignment["assigned_paths"]
+            .as_array()
+            .context("assigned_paths")?
+        {
+            assigned_paths.insert(
+                path.as_str()
+                    .context("assigned path must be a string")?
+                    .to_string(),
+            );
+        }
+    }
+    assert_eq!(
+        assigned_paths,
+        BTreeSet::from([
+            ".gitmodules".to_string(),
+            "README.md".to_string(),
+            "src/lib.rs".to_string(),
+        ])
+    );
+    assert!(assigned_paths
+        .iter()
+        .all(|path| !path.starts_with("vendor/sdk")));
+    assert!(!repo_path.join(".maco/o2").exists());
+    Ok(())
+}
+
+#[test]
+fn supervise_plan_inventory_failure_is_strict_in_human_and_json_modes() -> Result<()> {
+    support::require_containment!(
+        "supervise_plan_inventory_failure_is_strict_in_human_and_json_modes"
+    );
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = Repository::open(&repo_path)?;
+    let alternates = repo.path().join("objects/info/alternates");
+    fs::create_dir_all(alternates.parent().context("alternates parent")?)?;
+    fs::write(&alternates, "/untrusted/object-store\n")?;
+    let task_path = temp.path().join("failed-inventory-task.md");
+    fs::write(&task_path, "Update README.md.\n")?;
+
+    for json in [false, true] {
+        let mut args = vec![
+            "supervise",
+            "plan",
+            path_str(&task_path)?,
+            "--repo",
+            path_str(&repo_path)?,
+        ];
+        if json {
+            args.push("--json");
+        }
+        let output = command_with_test_machine_global_binding(BIN, &args)
+            .output()
+            .context("run strict inventory-failure plan")?;
+        assert!(
+            !output.status.success(),
+            "inventory failure unexpectedly emitted a successful {json:?} plan"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if json {
+            let envelope: Value =
+                serde_json::from_str(&stdout).context("parse json inventory-failure envelope")?;
+            assert_eq!(envelope["success"], false);
+            assert_eq!(envelope["status"], "error");
+            assert!(
+                envelope["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("failed to plan")),
+                "json envelope omitted the top-level error: {envelope}"
+            );
+            let causes = envelope["causes"]
+                .as_array()
+                .context("json envelope omitted causes")?;
+            assert!(
+                causes.iter().any(|cause| cause
+                    .as_str()
+                    .is_some_and(|cause| cause.contains("repository inventory failed")))
+                    && causes.iter().any(|cause| cause.as_str().is_some_and(
+                        |cause| cause.contains("bounded-status rejects Git object alternates")
+                    )),
+                "json envelope omitted the inventory chain: {envelope}"
+            );
+        } else {
+            assert!(
+                stdout.is_empty(),
+                "human inventory failure must not emit a plan: {stdout}"
+            );
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("repository inventory failed")
+                && stderr.contains("bounded-status rejects Git object alternates"),
+            "unexpected strict inventory-failure stderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains("using 1 explicitly named repository path(s)"),
+            "strict default must not silently fall back to prose-named paths: {stderr}"
+        );
+    }
     assert!(!repo_path.join(".maco/o2").exists());
     Ok(())
 }

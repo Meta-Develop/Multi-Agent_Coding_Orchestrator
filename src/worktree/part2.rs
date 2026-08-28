@@ -1996,13 +1996,41 @@ enum WorktreeGcDirtiness {
 }
 
 fn gc_worktree_dirtiness(path: &Path) -> Result<WorktreeGcDirtiness> {
-    let status = bounded_repository_gc_status_paths(
+    let status = match bounded_repository_gc_status_paths(
         path,
         MAX_WORKTREE_STATUS_ENTRIES,
         MAX_WORKTREE_STATUS_OUTPUT_BYTES,
         WORKTREE_GC_STATUS_TIMEOUT,
-    )?;
+    ) {
+        Ok(status) => status,
+        Err(error) if gc_status_failed_without_delegated_user_manager(&error) => {
+            bounded_repository_gc_status_paths_trusted(
+                path,
+                MAX_WORKTREE_STATUS_ENTRIES,
+                MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+                WORKTREE_GC_STATUS_TIMEOUT,
+            )
+            .with_context(|| {
+                format!(
+                    "verified GC dirtiness is unavailable without a delegated systemd user manager; trusted fallback also failed for {}",
+                    path.display()
+                )
+            })?
+        }
+        Err(error) => return Err(error),
+    };
     gc_dirtiness_from_status(status)
+}
+
+fn gc_status_failed_without_delegated_user_manager(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<ProcessRunError>()
+            .is_some_and(ProcessRunError::is_missing_delegated_user_manager)
+            || cause
+                .to_string()
+                .contains("is not inside a delegated systemd user manager")
+    })
 }
 
 fn gc_dirtiness_from_status(status: BoundedStatusPathRecords) -> Result<WorktreeGcDirtiness> {
@@ -2759,12 +2787,37 @@ fn linux_process_target_liveness(
         return WorktreeTargetLiveness::Clear;
     }
     let cargo_like = linux_process_is_cargo_like(process_root);
-    if !cargo_like && linux_process_is_non_build_user_service(process_root) {
+    let environment = linux_process_environ(process_root);
+    let (has_explicit_target_dir, has_empty_target_dir) = match &environment {
+        Ok(Some(environ)) => environ.split(|byte| *byte == 0).fold(
+            (false, false),
+            |(has_explicit, has_empty), variable| {
+                let Some(value) = variable.strip_prefix(b"CARGO_TARGET_DIR=") else {
+                    return (has_explicit, has_empty);
+                };
+                (true, has_empty || value.is_empty())
+            },
+        ),
+        Ok(None) | Err(_) => (false, false),
+    };
+    if has_empty_target_dir {
+        return WorktreeTargetLiveness::Unknown(target_liveness_evidence(
+            Some(pid),
+            WorktreeTargetLivenessSource::ProcessEnvironment,
+            WorktreeTargetLivenessCause::InvalidValue,
+        ));
+    }
+    if !cargo_like
+        && !has_explicit_target_dir
+        && linux_process_is_non_build_user_service(process_root)
+    {
         // Non-dumpable user services commonly deny environ/root/ns reads. The
         // service process itself is not a build process; any cargo/rustc child
-        // remains a separate /proc entry and is scanned normally. Limit this
-        // exception to an exact systemd user-service cgroup and a readable,
-        // non-empty command line.
+        // remains a separate /proc entry and is scanned normally. A readable
+        // explicit target directory means the service-launched process itself
+        // carries build-target authority and must be evaluated. Limit this
+        // exception to an exact systemd user-service cgroup, no such explicit
+        // target, and a readable, non-empty command line.
         return WorktreeTargetLiveness::Clear;
     }
     let process_view = match LinuxProcessView::open(process_root) {
@@ -2772,6 +2825,7 @@ fn linux_process_target_liveness(
         Ok(None) => return WorktreeTargetLiveness::Clear,
         Err(_)
             if !cargo_like
+                && !has_explicit_target_dir
                 && linux_process_cmdline(process_root)
                     .ok()
                     .flatten()
@@ -2792,7 +2846,7 @@ fn linux_process_target_liveness(
         }
     };
     let mut environment_unknown = None;
-    match linux_process_environ(process_root) {
+    match environment {
         Ok(Some(environ)) => {
             for variable in environ.split(|byte| *byte == 0) {
                 let Some(value) = variable.strip_prefix(b"CARGO_TARGET_DIR=") else {

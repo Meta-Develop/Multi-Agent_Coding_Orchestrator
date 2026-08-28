@@ -1,0 +1,74 @@
+{
+  "version": 2,
+  "experiment_id": "issue26-cli-operator-path-v2",
+  "spec": {
+    "id": "github-issue-26",
+    "content_digest": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "goal": {
+    "id": "reproducible-model-mix-evaluation",
+    "content_digest": "2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "repository_base": {
+    "object_id": "02360b59844511cab4123031865361d76aa663ad"
+  },
+  "limits": {
+    "wall_time_seconds": 60,
+    "dispatch_limit": 32
+  },
+  "held_out_validations": [
+    {
+      "id": "issue26-comparability-contract",
+      "content_digest": "3333333333333333333333333333333333333333333333333333333333333333"
+    }
+  ],
+  "repetition_count": 2,
+  "provider_request": {
+    "kind": "local_fake",
+    "allow_real_provider": false
+  },
+  "profiles": [
+    {
+      "id": "economy-mix",
+      "mix": [
+        { "role": "planner", "model": "fake-economy" },
+        { "role": "worker", "model": "fake-economy" },
+        { "role": "supervisor", "model": "fake-economy" },
+        { "role": "auditor", "model": "fake-economy" }
+      ]
+    },
+    {
+      "id": "quality-mix",
+      "mix": [
+        { "role": "planner", "model": "fake-quality" },
+        { "role": "worker", "model": "fake-quality" },
+        { "role": "supervisor", "model": "fake-quality" },
+        { "role": "auditor", "model": "fake-quality" }
+      ]
+    }
+  ],
+  "objective_profile": {
+    "profile": {
+      "id": "maco-default-objective-v2",
+      "version": 2,
+      "content_hash": "82e6de7f5e27768fdad19b5dfa70d70ed1fb9d041262678e3174d5373330b4f9",
+      "quality": {
+        "held_out_percent": 50,
+        "breadth_percent": 25,
+        "anti_shortcut_percent": 25
+      },
+      "tradeoffs": {
+        "monetary_cost_percent": 100,
+        "quota_consumption_percent": 0,
+        "latency_percent": 0,
+        "retry_rework_percent": 0,
+        "human_review_percent": 0
+      },
+      "switch_costs": {
+        "model_change_same_runtime_microunits": 10000,
+        "runtime_change_microunits": 25000
+      }
+    },
+    "source": "built_in"
+  }
+}

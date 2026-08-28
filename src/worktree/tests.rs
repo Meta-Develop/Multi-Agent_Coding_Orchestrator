@@ -308,15 +308,68 @@ fn bounded_index_accepts_only_plain_entries_and_safe_optional_caches() {
     tampered[12 + 24] ^= 1;
     assert!(validate_bounded_index_bytes(&tampered).is_err());
 
+    let mut gitlink = entry.clone();
+    gitlink[12 + 24..12 + 28].copy_from_slice(&0o160000_u32.to_be_bytes());
+    refresh_bounded_index_checksum(&mut gitlink);
+    validate_bounded_index_bytes(&gitlink).expect("gitlink is an opaque index path");
+
+    let mut sparse_directory = entry.clone();
+    sparse_directory[12 + 24..12 + 28].copy_from_slice(&0o040000_u32.to_be_bytes());
+    refresh_bounded_index_checksum(&mut sparse_directory);
+    let sparse_error = validate_bounded_index_bytes(&sparse_directory)
+        .expect_err("sparse-directory entry must fail closed");
+    assert_eq!(
+        sparse_error.to_string(),
+        "bounded-status rejects sparse-directory index entries"
+    );
+
     let mut assume_unchanged = entry.clone();
     assume_unchanged[12 + 60..12 + 62].copy_from_slice(&(0x8000_u16 | 1).to_be_bytes());
     refresh_bounded_index_checksum(&mut assume_unchanged);
-    assert!(validate_bounded_index_bytes(&assume_unchanged).is_err());
+    let assume_unchanged_error = validate_bounded_index_bytes(&assume_unchanged)
+        .expect_err("assume-unchanged entry must fail closed");
+    assert_eq!(
+        assume_unchanged_error.to_string(),
+        "bounded-status rejects assume-unchanged index entries"
+    );
 
     let mut extended = entry;
     extended[12 + 60..12 + 62].copy_from_slice(&(0x4000_u16 | 1).to_be_bytes());
     refresh_bounded_index_checksum(&mut extended);
-    assert!(validate_bounded_index_bytes(&extended).is_err());
+    let extended_error =
+        validate_bounded_index_bytes(&extended).expect_err("extended entry must fail closed");
+    assert_eq!(
+        extended_error.to_string(),
+        "bounded-status rejects extended index flags"
+    );
+}
+
+#[test]
+fn bounded_git_index_records_accept_gitlinks_but_reject_sparse_directories_and_hidden_state() {
+    let oid = "0000000000000000000000000000000000000000";
+    let gitlink = format!("H 160000 {oid} 0\tvendor/sdk\0");
+    validate_bounded_git_index_records(gitlink.as_bytes(), 1)
+        .expect("gitlink record is an opaque index path");
+
+    let sparse_directory = format!("S 040000 {oid} 0\tsparse-directory\0");
+    let error = validate_bounded_git_index_records(sparse_directory.as_bytes(), 1)
+        .expect_err("sparse-directory record must fail closed");
+    assert_eq!(
+        error.to_string(),
+        "bounded-status rejects sparse-directory index entries"
+    );
+
+    for hidden in [
+        format!("S 100644 {oid} 0\tskip-worktree\0"),
+        format!("h 100644 {oid} 0\tassume-unchanged\0"),
+    ] {
+        let error = validate_bounded_git_index_records(hidden.as_bytes(), 1)
+            .expect_err("hidden index state must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "bounded-status rejects hidden index-entry state"
+        );
+    }
 }
 
 #[test]
@@ -327,6 +380,18 @@ fn internal_sha1_matches_nist_abc_vector() {
             0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a, 0xba, 0x3e, 0x25, 0x71, 0x78, 0x50,
             0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d,
         ]
+    );
+}
+
+#[test]
+fn bounded_head_rejects_sha256_shaped_direct_object_ids() {
+    let sha256_head = format!("{}\n", "a".repeat(64));
+    let error = validate_bounded_head(sha256_head.as_bytes())
+        .expect_err("SHA-256-shaped direct HEAD must fail closed");
+
+    assert_eq!(
+        error.to_string(),
+        "bounded-status supports only SHA-1 repositories"
     );
 }
 
@@ -1030,7 +1095,7 @@ fn linked_worktree_rejects_shadow_branch_and_exclude_authority() {
 
 #[cfg(unix)]
 #[test]
-fn bounded_git_input_preflight_rejects_oversized_and_linked_ignore_files() {
+fn bounded_git_input_preflight_rejects_unsafe_ignore_and_gitmodules_files() {
     use std::os::unix::fs::symlink;
 
     let temp = TempDir::new().expect("tempdir");
@@ -1053,38 +1118,107 @@ fn bounded_git_input_preflight_rejects_oversized_and_linked_ignore_files() {
     fs::write(&outside, "target/\n").expect("write outside ignore");
     symlink(&outside, &ignore).expect("link ignore");
     let deadline = Instant::now() + Duration::from_secs(2);
-    assert!(
-        validate_bounded_git_text_inputs(&repo_path, repo.path(), repo.commondir(), deadline,)
-            .is_err()
+    let linked_ignore_error =
+        validate_bounded_git_text_inputs(&repo_path, repo.path(), repo.commondir(), deadline);
+    assert_eq!(
+        linked_ignore_error
+            .err()
+            .expect("symlinked ignore file must fail closed")
+            .to_string(),
+        "Git ignore input is not a safe single-link regular file"
     );
 
     fs::remove_file(&ignore).expect("remove linked ignore");
     let gitmodules = repo_path.join(".gitmodules");
-    fs::write(&gitmodules, b"[submodule \"unsafe\"]\n").expect("write gitmodules");
-    assert!(validate_bounded_git_text_inputs(
+    fs::write(
+        &gitmodules,
+        b"[submodule \"vendor/sdk\"]\n\tpath = vendor/sdk\n\turl = ../sdk\n",
+    )
+    .expect("write gitmodules");
+    validate_bounded_git_text_inputs(
         &repo_path,
         repo.path(),
         repo.commondir(),
         Instant::now() + Duration::from_secs(2),
     )
-    .is_err());
+    .expect("safe root gitmodules must be tolerated as bounded text input");
 
-    fs::remove_file(&gitmodules).expect("remove gitmodules");
+    let oversized_gitmodules = fs::File::create(&gitmodules).expect("recreate gitmodules");
+    oversized_gitmodules
+        .set_len(MAX_WORKTREE_GIT_TEXT_FILE_BYTES + 1)
+        .expect("size gitmodules");
+    validate_bounded_git_text_inputs(
+        &repo_path,
+        repo.path(),
+        repo.commondir(),
+        Instant::now() + Duration::from_secs(2),
+    )
+    .err()
+    .expect("oversized gitmodules must retain the bounded text-input cap");
+
+    fs::remove_file(&gitmodules).expect("remove oversized gitmodules");
+    let outside_gitmodules = temp.path().join("outside-gitmodules");
+    fs::write(&outside_gitmodules, b"[submodule \"vendor/sdk\"]\n")
+        .expect("write outside gitmodules");
+    symlink(&outside_gitmodules, &gitmodules).expect("link gitmodules");
+    let linked_gitmodules_error = validate_bounded_git_text_inputs(
+        &repo_path,
+        repo.path(),
+        repo.commondir(),
+        Instant::now() + Duration::from_secs(2),
+    )
+    .err()
+    .expect("symlinked gitmodules must fail closed");
+    assert_eq!(
+        linked_gitmodules_error.to_string(),
+        "Git submodule metadata is not a safe single-link regular file"
+    );
+
+    fs::remove_file(&gitmodules).expect("remove linked gitmodules");
+    fs::hard_link(&outside_gitmodules, &gitmodules).expect("hard-link gitmodules");
+    let hard_linked_gitmodules_error = validate_bounded_git_text_inputs(
+        &repo_path,
+        repo.path(),
+        repo.commondir(),
+        Instant::now() + Duration::from_secs(2),
+    )
+    .err()
+    .expect("multi-link gitmodules must fail closed");
+    assert_eq!(
+        hard_linked_gitmodules_error.to_string(),
+        "Git submodule metadata is not a safe single-link regular file"
+    );
+
+    fs::remove_file(&gitmodules).expect("remove hard-linked gitmodules");
+    fs::write(&gitmodules, b"[submodule \"vendor/sdk\"]\n").expect("restore safe gitmodules");
+    validate_bounded_git_text_inputs(
+        &repo_path,
+        repo.path(),
+        repo.commondir(),
+        Instant::now() + Duration::from_secs(2),
+    )
+    .expect("restored safe root gitmodules must pass prevalidation");
+
     let alternates = repo.commondir().join("objects/info/alternates");
     fs::create_dir_all(alternates.parent().expect("alternates parent"))
         .expect("create alternates parent");
     fs::write(&alternates, b"/tmp/objects\n").expect("write alternates");
-    assert!(validate_bounded_git_text_inputs(
+    let alternates_error = validate_bounded_git_text_inputs(
         &repo_path,
         repo.path(),
         repo.commondir(),
         Instant::now() + Duration::from_secs(2),
     )
-    .is_err());
+    .err()
+    .expect("Git object alternates must fail closed");
+    assert_eq!(
+        alternates_error.to_string(),
+        "bounded-status rejects Git object alternates"
+    );
 }
 
 #[test]
-fn bounded_git_input_preflight_skips_ignored_worktree_store_git_markers() {
+fn bounded_git_input_preflight_tolerates_nested_repository_boundaries() {
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
@@ -1116,18 +1250,159 @@ fn bounded_git_input_preflight_skips_ignored_worktree_store_git_markers() {
     fs::create_dir_all(repo_path.join("vendor")).expect("create vendor");
     fs::write(repo_path.join("vendor/.git"), "gitdir: /tmp/unsafe\n")
         .expect("write vendor gitfile");
-    let error = match validate_bounded_git_text_inputs(
+    validate_bounded_git_text_inputs(
         &repo_path,
         repo.path(),
         repo.commondir(),
         Instant::now() + Duration::from_secs(2),
-    ) {
-        Ok(_) => panic!("nested git markers outside worktree stores must still fail"),
-        Err(error) => error,
-    };
-    assert!(error
-        .to_string()
-        .contains("bounded-status rejects nested Git repository markers"));
+    )
+    .expect("nested repositories outside runtime stores must be walk boundaries");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bounded_status_tolerates_nested_repository_directories_at_depth_and_as_siblings() {
+    skip_without_containment!();
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init outer repo");
+    let outer = crate::git_repository::open(&repo_path).expect("open outer repo");
+    commit_readme(&outer).expect("commit outer README");
+    fs::write(repo_path.join("outer-visible.txt"), "outer\n").expect("write outer file");
+
+    for relative in ["vendor/sdk-a", "vendor/sdk-b", "a/b/c"] {
+        let nested_path = repo_path.join(relative);
+        fs::create_dir_all(nested_path.parent().expect("nested parent"))
+            .expect("create nested parent");
+        let nested = Repository::init(&nested_path).expect("init nested repository");
+        commit_readme(&nested).expect("commit nested README");
+    }
+
+    let records = bounded_worktree_records(
+        &repo_path,
+        MAX_WORKTREE_STATUS_ENTRIES,
+        MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+        WORKTREE_STATUS_TIMEOUT,
+    )
+    .expect("bounded status with nested repository directories");
+    let visible = parse_nul_paths(&records.visible, MAX_WORKTREE_STATUS_ENTRIES)
+        .expect("parse bounded visible paths");
+
+    assert!(visible.contains(&PathBuf::from("README.md")));
+    assert!(visible.contains(&PathBuf::from("outer-visible.txt")));
+    for nested_file in [
+        "vendor/sdk-a/README.md",
+        "vendor/sdk-b/README.md",
+        "a/b/c/README.md",
+    ] {
+        assert!(
+            !visible.contains(&PathBuf::from(nested_file)),
+            "nested repository content escaped the boundary: {nested_file}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bounded_status_tolerates_nested_repository_gitfiles() {
+    skip_without_containment!();
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init outer repo");
+    let outer = crate::git_repository::open(&repo_path).expect("open outer repo");
+    commit_readme(&outer).expect("commit outer README");
+    fs::write(repo_path.join("outer-visible.txt"), "outer\n").expect("write outer file");
+
+    let nested_source = temp.path().join("nested-source");
+    WorktreeManager::init_repository(&nested_source, "main").expect("init nested source");
+    let nested = crate::git_repository::open(&nested_source).expect("open nested source");
+    let nested_head = commit_readme(&nested).expect("commit nested README");
+    let nested_commit = nested.find_commit(nested_head).expect("find nested commit");
+    let nested_branch = nested
+        .branch("linked", &nested_commit, false)
+        .expect("create nested linked branch")
+        .into_reference();
+    let linked_path = repo_path.join("vendor/linked-sdk");
+    fs::create_dir_all(linked_path.parent().expect("linked parent")).expect("create linked parent");
+    let mut options = WorktreeAddOptions::new();
+    options.reference(Some(&nested_branch));
+    nested
+        .worktree("linked-sdk", &linked_path, Some(&options))
+        .expect("create linked nested worktree");
+    assert!(linked_path.join(".git").is_file());
+
+    let records = bounded_worktree_records(
+        &repo_path,
+        MAX_WORKTREE_STATUS_ENTRIES,
+        MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+        WORKTREE_STATUS_TIMEOUT,
+    )
+    .expect("bounded status with nested repository gitfile");
+    let visible = parse_nul_paths(&records.visible, MAX_WORKTREE_STATUS_ENTRIES)
+        .expect("parse bounded visible paths");
+
+    assert!(visible.contains(&PathBuf::from("README.md")));
+    assert!(visible.contains(&PathBuf::from("outer-visible.txt")));
+    assert!(!visible.contains(&PathBuf::from("vendor/linked-sdk/README.md")));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bounded_status_accepts_real_gitlink_and_root_gitmodules_as_opaque_paths() {
+    skip_without_containment!();
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init outer repo");
+    let outer = crate::git_repository::open(&repo_path).expect("open outer repo");
+    commit_readme(&outer).expect("commit outer README");
+
+    let nested_path = repo_path.join("vendor/sdk");
+    fs::create_dir_all(nested_path.parent().expect("nested parent")).expect("create nested parent");
+    let nested = Repository::init(&nested_path).expect("init nested repository");
+    let nested_oid = commit_readme(&nested).expect("commit nested README");
+    fs::write(
+        repo_path.join(".gitmodules"),
+        "[submodule \"vendor/sdk\"]\n\tpath = vendor/sdk\n\turl = ../sdk\n",
+    )
+    .expect("write root gitmodules");
+
+    let mut index = outer.index().expect("open outer index");
+    index
+        .add_path(Path::new(".gitmodules"))
+        .expect("add gitmodules");
+    let gitlink_path = b"vendor/sdk".to_vec();
+    index
+        .add(&git2::IndexEntry {
+            ctime: git2::IndexTime::new(0, 0),
+            mtime: git2::IndexTime::new(0, 0),
+            dev: 0,
+            ino: 0,
+            mode: 0o160000,
+            uid: 0,
+            gid: 0,
+            file_size: 0,
+            id: nested_oid,
+            flags: u16::try_from(gitlink_path.len()).expect("gitlink path length"),
+            flags_extended: 0,
+            path: gitlink_path,
+        })
+        .expect("add real gitlink index entry");
+    index.write().expect("write outer index");
+
+    let records = bounded_worktree_records(
+        &repo_path,
+        MAX_WORKTREE_STATUS_ENTRIES,
+        MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+        WORKTREE_STATUS_TIMEOUT,
+    )
+    .expect("bounded status with gitlink and root gitmodules");
+    let visible = parse_nul_paths(&records.visible, MAX_WORKTREE_STATUS_ENTRIES)
+        .expect("parse bounded visible paths");
+
+    assert!(visible.contains(&PathBuf::from("README.md")));
+    assert!(visible.contains(&PathBuf::from(".gitmodules")));
+    assert!(visible.contains(&PathBuf::from("vendor/sdk")));
+    assert!(!visible.contains(&PathBuf::from("vendor/sdk/README.md")));
 }
 
 #[cfg(unix)]
@@ -2202,6 +2477,28 @@ fn gc_protects_ignored_only_output_until_its_exact_path_is_allowed() {
     let reclaimed = manager.gc(allowed).expect("exact ignored path reclaim");
     assert_eq!(reclaimed.removed_count, 1, "{reclaimed:#?}");
     assert!(!created.path.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn hosted_runner_cgroup_is_classified_as_gc_trusted_fallback() {
+    let hosted = anyhow::Error::from(ProcessRunError::EnvironmentFailure {
+        label: "bounded managed-worktree index listing".to_string(),
+        command: "/usr/bin/git ls-files".to_string(),
+        failure: Box::new(
+            crate::external_agent::EnvironmentFailure::sandbox_unavailable(
+                "current cgroup /system.slice/hosted-compute-agent.service is not inside a delegated systemd user manager"
+                    .to_string(),
+            ),
+        ),
+        target_process_started: false,
+    })
+    .context("bounded worktree status command failed")
+    .context("merged-lane worktree reaping failed");
+    assert!(gc_status_failed_without_delegated_user_manager(&hosted));
+    assert!(!gc_status_failed_without_delegated_user_manager(
+        &anyhow::Error::msg("bounded worktree status command failed: dirty index")
+    ));
 }
 
 #[cfg(target_os = "linux")]

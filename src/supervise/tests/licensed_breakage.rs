@@ -150,6 +150,8 @@ fn licensed_follow_up_assignment() -> OrchestratorAssignment {
         phase: AssignmentPhase::Execution,
         runtime: None,
         role: AgentRole::ChildOrchestrator,
+        role_category: None,
+        selection_source: None,
         assigned_paths: vec![PathBuf::from("src/client.rs")],
         semantic_symbols: vec![LICENSED_INTERFACE.to_string()],
         semantic_modules: Vec::new(),
@@ -598,6 +600,8 @@ fn licensed_worker_failure_remains_subject_to_child_and_parent_auditor_gates() {
     assignment.worker_assignments = vec![WorkerAssignment {
         id: "worker-a".to_string(),
         role: AgentRole::Worker,
+        role_category: None,
+        selection_source: None,
         assigned_paths: vec![PathBuf::from("README.md")],
         semantic_symbols: Vec::new(),
         semantic_modules: Vec::new(),

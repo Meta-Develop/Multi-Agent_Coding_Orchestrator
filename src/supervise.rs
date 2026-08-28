@@ -503,6 +503,35 @@ pub(crate) fn verified_whole_primary_snapshot_sha256(repo: &Path) -> Result<Stri
     primary_worktree_snapshot_sha256(&repo, SupervisorExecutionRuntime::Verified)
 }
 
+/// Captures the whole-primary digest for an explicitly nonpublishable Fake
+/// autopilot run without requiring delegated-systemd containment. The same
+/// bounded Git capture limits and sanitized environment still apply.
+pub(crate) fn nonpublishable_simulation_whole_primary_snapshot_sha256(
+    repo: &Path,
+) -> Result<String> {
+    let repo = discover_repo_root(repo)?;
+    primary_worktree_snapshot_sha256(&repo, SupervisorExecutionRuntime::NonpublishableSimulation)
+}
+
+/// Captures Git-visible dirty paths for an explicitly nonpublishable Fake
+/// autopilot preflight using bounded, trusted best-effort subprocesses.
+pub(crate) fn nonpublishable_simulation_dirty_primary_paths(repo: &Path) -> Result<Vec<PathBuf>> {
+    let repo = discover_repo_root(repo)?;
+    let status =
+        primary_status_snapshot(&repo, SupervisorExecutionRuntime::NonpublishableSimulation)?;
+    let mut paths = status
+        .into_iter()
+        .flat_map(|(path, state)| std::iter::once(path).chain(state.original_path))
+        .map(|path| {
+            normalize_repo_relative_path(repo_relative_path_from_git_bytes(&path))
+                .map_err(anyhow::Error::from)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
 #[derive(Debug, Clone)]
 pub struct SupervisorEvidenceOnlyReauditOptions {
     pub repo: PathBuf,
@@ -1246,6 +1275,44 @@ pub struct SupervisorExecutionMetadata {
 
 pub const ASSIGNMENT_SELECTION_LEDGER_SCHEMA_VERSION: u32 = 2;
 pub const SELECTION_LEDGER_RELATIVE: &str = "selection/assignment-selection-ledger.json";
+pub const LIVE_SWITCH_COST_EVIDENCE_RELATIVE: &str = "switch-cost/live-evidence.json";
+pub const LIVE_SWITCH_COST_INVOCATIONS_RELATIVE: &str = "switch-cost/invocation-telemetry.jsonl";
+pub const LIVE_SWITCH_COST_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+
+/// Operator-reachable online-router hysteresis and oscillation alarm config.
+///
+/// Plans expose this as a first-class `router` object. Defaults match the
+/// optimizer's shipped hysteresis margin and A→B→A alarm threshold.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SupervisorRouterConfig {
+    #[serde(default = "default_hysteresis_margin_bp")]
+    pub hysteresis_margin_bp: u16,
+    #[serde(default = "default_oscillation_alarm_threshold")]
+    pub oscillation_alarm_threshold: u32,
+}
+
+fn default_hysteresis_margin_bp() -> u16 {
+    crate::optimizer::switch_cost::DEFAULT_HYSTERESIS_BP
+}
+
+fn default_oscillation_alarm_threshold() -> u32 {
+    crate::optimizer::switch_cost::DEFAULT_OSCILLATION_ALARM
+}
+
+impl Default for SupervisorRouterConfig {
+    fn default() -> Self {
+        Self {
+            hysteresis_margin_bp: default_hysteresis_margin_bp(),
+            oscillation_alarm_threshold: default_oscillation_alarm_threshold(),
+        }
+    }
+}
+
+impl SupervisorRouterConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1678,6 +1745,8 @@ struct SupervisorPlanMetadata {
     evidence_only_reaudit: Option<EvidenceOnlyReauditPlan>,
     generated_follow_up: Option<GeneratedFollowUpPlanContext>,
     execution_target: Option<SupervisorExecutionTarget>,
+    path_proposal: planning::TaskPathProposalDiagnostics,
+    router: SupervisorRouterConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -1726,6 +1795,15 @@ pub struct OrchestratorAssignment {
     pub runtime: Option<RuntimeId>,
     #[serde(default = "child_orchestrator_role")]
     pub role: AgentRole,
+    /// Effective authority category consumed at admission. Absent means derive
+    /// from `role`. An explicit value that differs from the derived category is
+    /// an operator override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_category: Option<RoleCategory>,
+    /// How the category was chosen. Automatic derivation stays the default;
+    /// `operator_override` is a recorded manual designation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_source: Option<AssignmentSelectionSource>,
     #[serde(default, serialize_with = "serialize_paths")]
     pub assigned_paths: Vec<PathBuf>,
     #[serde(default)]
@@ -1742,6 +1820,40 @@ pub struct OrchestratorAssignment {
     pub licensed_breakage: Option<LicensedBreakageDeclaration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+}
+
+impl OrchestratorAssignment {
+    pub fn effective_role_category(&self) -> RoleCategory {
+        self.role_category
+            .unwrap_or_else(|| self.role.authority_category())
+    }
+
+    pub fn category_is_operator_override(&self) -> bool {
+        self.selection_source == Some(AssignmentSelectionSource::OperatorOverride)
+            || self
+                .role_category
+                .is_some_and(|category| category != self.role.authority_category())
+    }
+
+    pub fn category_override(&self) -> Option<RoleCategory> {
+        self.category_is_operator_override()
+            .then_some(self.effective_role_category())
+    }
+
+    fn bind_role_category(&mut self) {
+        let derived = self.role.authority_category();
+        let requested = self.role_category.unwrap_or(derived);
+        let operator_override = self.selection_source
+            == Some(AssignmentSelectionSource::OperatorOverride)
+            || requested != derived;
+        self.role_category = Some(requested);
+        if operator_override {
+            self.selection_source = Some(AssignmentSelectionSource::OperatorOverride);
+        }
+        for worker in &mut self.worker_assignments {
+            worker.bind_role_category();
+        }
+    }
 }
 
 /// Immutable plan authority for one intentionally breaking assignment.
@@ -1844,8 +1956,14 @@ pub struct GeneratedFollowUpSupervisorPlan {
 }
 
 impl GeneratedFollowUpSupervisorPlan {
-    fn ordinary_plan(&self) -> SupervisorPlan {
-        SupervisorPlan {
+    fn bind_assignment_role_categories(&mut self) {
+        for assignment in &mut self.assignments {
+            assignment.bind_role_category();
+        }
+    }
+
+    pub(crate) fn ordinary_plan(&self) -> SupervisorPlan {
+        let mut plan = SupervisorPlan {
             version: self.version,
             task: self.task.clone(),
             task_file: self.task_file.clone(),
@@ -1860,7 +1978,12 @@ impl GeneratedFollowUpSupervisorPlan {
             review_lenses: self.review_lenses.clone(),
             review_aggregation_policy: self.review_aggregation_policy,
             assignments: self.assignments.clone(),
-        }
+        };
+        // Materialize the same derived role-category authority the ordinary
+        // full-document loader stamps. Implicit `None` means "derive from
+        // role"; that is not an authority change.
+        plan.bind_assignment_role_categories();
+        plan
     }
 
     fn assignment(&self) -> Result<&OrchestratorAssignment> {
@@ -1950,6 +2073,10 @@ pub struct WorkerAssignment {
     pub id: String,
     #[serde(default = "worker_role")]
     pub role: AgentRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_category: Option<RoleCategory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_source: Option<AssignmentSelectionSource>,
     #[serde(default, serialize_with = "serialize_paths")]
     pub assigned_paths: Vec<PathBuf>,
     #[serde(default)]
@@ -1966,6 +2093,37 @@ pub struct WorkerAssignment {
         serialize_with = "serialize_optional_path"
     )]
     pub report_path: Option<PathBuf>,
+}
+
+impl WorkerAssignment {
+    pub fn effective_role_category(&self) -> RoleCategory {
+        self.role_category
+            .unwrap_or_else(|| self.role.authority_category())
+    }
+
+    pub fn category_is_operator_override(&self) -> bool {
+        self.selection_source == Some(AssignmentSelectionSource::OperatorOverride)
+            || self
+                .role_category
+                .is_some_and(|category| category != self.role.authority_category())
+    }
+
+    pub fn category_override(&self) -> Option<RoleCategory> {
+        self.category_is_operator_override()
+            .then_some(self.effective_role_category())
+    }
+
+    fn bind_role_category(&mut self) {
+        let derived = self.role.authority_category();
+        let requested = self.role_category.unwrap_or(derived);
+        let operator_override = self.selection_source
+            == Some(AssignmentSelectionSource::OperatorOverride)
+            || requested != derived;
+        self.role_category = Some(requested);
+        if operator_override {
+            self.selection_source = Some(AssignmentSelectionSource::OperatorOverride);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -3531,6 +3689,12 @@ struct ReviewLensAuditorPromptContext<'a> {
 }
 
 impl SupervisorPlan {
+    fn bind_assignment_role_categories(&mut self) {
+        for assignment in &mut self.assignments {
+            assignment.bind_role_category();
+        }
+    }
+
     pub fn effective_role_economics_profile(&self) -> RoleEconomicsProfile {
         let mut role_models = provisional_default_role_models();
         for (role, selection) in &self.role_models {
@@ -3715,6 +3879,7 @@ enum SupervisorWorktreeCreation<'a> {
     Bound(&'a RepositoryCleanlinessCapability),
     ExistingOnly,
     PrimaryWorktree,
+    NonpublishableSimulation,
     #[cfg(test)]
     TestOnly,
     #[cfg(test)]
@@ -3722,6 +3887,17 @@ enum SupervisorWorktreeCreation<'a> {
 }
 
 impl SupervisorWorktreeCreation<'_> {
+    fn is_nonpublishable_simulation(self) -> bool {
+        if matches!(self, Self::NonpublishableSimulation) {
+            return true;
+        }
+        #[cfg(test)]
+        if matches!(self, Self::TestOnly) {
+            return true;
+        }
+        false
+    }
+
     fn bypass_verified_admission_for_test(self) -> bool {
         #[cfg(test)]
         {

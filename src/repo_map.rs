@@ -174,7 +174,7 @@ fn capture_repository_map_snapshot(
     deadline: &mut Instant,
 ) -> Result<RepositoryMapSnapshot> {
     let (statuses, process_queue_wait) =
-        crate::worktree::bounded_repository_status_paths_bound_with_process_wait(
+        crate::worktree::bounded_repository_status_paths_bound_with_process_wait_trusted(
             binding,
             REPOSITORY_MAP_MAX_ENTRIES,
             REPOSITORY_MAP_MAX_TOTAL_PATH_BYTES,
@@ -571,7 +571,7 @@ mod tests {
     #[test]
     fn scan_reports_but_never_follows_links_or_special_files() {
         skip_without_containment!();
-        use std::os::unix::{fs::symlink, net::UnixListener};
+        use std::os::unix::fs::{symlink, FileTypeExt};
 
         let temp = tempfile::tempdir().expect("tempdir");
         let repo_path = temp.path().join("repo");
@@ -580,7 +580,15 @@ mod tests {
         fs::create_dir_all(&outside).expect("outside");
         fs::write(outside.join("secret"), "secret\n").expect("secret");
         symlink(&outside, repo_path.join("outside-link")).expect("outside link");
-        let _socket = UnixListener::bind(repo_path.join("socket")).expect("socket");
+        let socket_path = repo_path.join("socket");
+        let _socket = crate::test_support::bind_test_unix_socket(&socket_path).expect("socket");
+        assert!(
+            fs::symlink_metadata(&socket_path)
+                .expect("socket metadata")
+                .file_type()
+                .is_socket(),
+            "fixture socket must remain a socket entry"
+        );
 
         let map = scan_repository(&repo_path).expect("scan");
         assert!(map.entries.iter().any(|entry| {

@@ -1071,7 +1071,7 @@ fn deadline_interrupted_scavenge_resumes_from_authenticated_quarantine() {
     assert_eq!(entries, vec![OsString::from("bounded-status.lock")]);
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn inventory_limits(max_entries: usize) -> BoundedTreeWalkLimits {
     BoundedTreeWalkLimits {
         max_depth: 16,
@@ -1083,10 +1083,226 @@ fn inventory_limits(max_entries: usize) -> BoundedTreeWalkLimits {
     }
 }
 
+#[cfg(any(unix, windows))]
+fn nested_repository_options() -> BoundedTreeWalkOptions {
+    BoundedTreeWalkOptions {
+        stop_at_nested_repositories: true,
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn bounded_tree_walk_stops_at_nested_repository_markers_and_keeps_root_traversal() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("repo");
+    fs::create_dir_all(root.join(".git")).expect("root marker directory");
+    fs::write(root.join(".git/root-metadata"), "root metadata\n").expect("root metadata");
+    fs::write(root.join("outer.txt"), "outer\n").expect("outer file");
+    fs::create_dir_all(root.join("vendor/sdk/.git")).expect("nested marker directory");
+    fs::write(root.join("vendor/sdk/.git/config"), "nested config\n").expect("nested config");
+    fs::write(root.join("vendor/sdk/payload.bin"), "nested payload\n").expect("nested payload");
+    fs::create_dir_all(root.join("vendor/peer/.git")).expect("sibling marker directory");
+    fs::write(root.join("vendor/peer/peer.bin"), "sibling payload\n").expect("sibling payload");
+    fs::create_dir_all(root.join("a/b/c")).expect("deep nested repository");
+    fs::write(root.join("a/b/c/.git"), "gitdir: elsewhere\n").expect("nested marker file");
+    fs::write(root.join("a/b/c/deep.bin"), "deep payload\n").expect("deep payload");
+    fs::write(root.join("a/b/sibling.txt"), "visible sibling\n").expect("visible sibling");
+
+    let binding = DirectoryBindingGuard::bind(&root).expect("bind repository root");
+    let result = BoundedTreeWalker::walk_bound_with_options_detailed(
+        &binding,
+        inventory_limits(64),
+        nested_repository_options(),
+        |entry| {
+            Ok(if entry.kind == BoundedTreeEntryKind::Directory {
+                BoundedTreeWalkAction::RecordAndDescend
+            } else {
+                BoundedTreeWalkAction::Record
+            })
+        },
+    )
+    .expect("bounded nested-repository inventory");
+    assert_eq!(
+        result.nested_repository_boundaries,
+        vec![
+            PathBuf::from("a/b/c"),
+            PathBuf::from("vendor/peer"),
+            PathBuf::from("vendor/sdk"),
+        ]
+    );
+    let paths = result
+        .entries
+        .iter()
+        .map(|entry| entry.relative_path.as_path())
+        .collect::<Vec<_>>();
+
+    for expected in [
+        Path::new("outer.txt"),
+        Path::new(".git"),
+        Path::new(".git/root-metadata"),
+        Path::new("vendor/sdk"),
+        Path::new("vendor/peer"),
+        Path::new("a/b/c"),
+        Path::new("a/b/sibling.txt"),
+    ] {
+        assert!(paths.contains(&expected), "missing {}", expected.display());
+    }
+    for excluded in [
+        Path::new("vendor/sdk/.git"),
+        Path::new("vendor/sdk/.git/config"),
+        Path::new("vendor/sdk/payload.bin"),
+        Path::new("vendor/peer/.git"),
+        Path::new("vendor/peer/peer.bin"),
+        Path::new("a/b/c/.git"),
+        Path::new("a/b/c/deep.bin"),
+    ] {
+        assert!(
+            !paths.contains(&excluded),
+            "unexpected nested path {}",
+            excluded.display()
+        );
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn bounded_tree_walk_default_still_descends_into_nested_repositories() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("repo");
+    fs::create_dir_all(root.join("vendor/sdk/.git")).expect("nested marker directory");
+    fs::write(root.join("vendor/sdk/.git/config"), "nested config\n").expect("nested config");
+    fs::write(root.join("vendor/sdk/payload.bin"), "nested payload\n").expect("nested payload");
+
+    let entries =
+        BoundedTreeWalker::walk(&root, inventory_limits(16)).expect("default bounded inventory");
+
+    assert!(entries
+        .iter()
+        .any(|entry| entry.relative_path == Path::new("vendor/sdk/.git/config")));
+    assert!(entries
+        .iter()
+        .any(|entry| entry.relative_path == Path::new("vendor/sdk/payload.bin")));
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn bounded_tree_walk_nested_boundaries_do_not_spend_content_budgets() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("repo");
+    let nested = root.join("vendor/sdk");
+    fs::create_dir_all(&nested).expect("nested repository directory");
+    fs::write(nested.join(".git"), "gitdir: elsewhere\n").expect("nested marker file");
+    for index in 0..32 {
+        fs::write(
+            nested.join(format!("payload-{index:02}.bin")),
+            "nested payload\n",
+        )
+        .expect("nested payload");
+    }
+
+    let binding = DirectoryBindingGuard::bind(&root).expect("bind repository root");
+    let entry_limits = inventory_limits(2);
+    let entry_result = BoundedTreeWalker::walk_bound_with_options_detailed(
+        &binding,
+        entry_limits,
+        nested_repository_options(),
+        |entry| {
+            Ok(if entry.kind == BoundedTreeEntryKind::Directory {
+                BoundedTreeWalkAction::RecordAndDescend
+            } else {
+                BoundedTreeWalkAction::Record
+            })
+        },
+    )
+    .expect("nested content must not spend the remaining entry budget");
+    assert_eq!(
+        entry_result.nested_repository_boundaries,
+        vec![PathBuf::from("vendor/sdk")]
+    );
+    let default_entry_error = BoundedTreeWalker::walk(&root, entry_limits)
+        .expect_err("default traversal must retain ordinary entry accounting");
+    assert!(format!("{default_entry_error:#}").contains("entry limit"));
+
+    let outer = PathBuf::from("vendor");
+    let boundary = outer.join("sdk");
+    let outer_path_bytes = outer
+        .as_os_str()
+        .len()
+        .saturating_add(boundary.as_os_str().len());
+    let mut path_limits = inventory_limits(64);
+    path_limits.max_total_path_bytes = outer_path_bytes;
+    let path_result = BoundedTreeWalker::walk_bound_with_options_detailed(
+        &binding,
+        path_limits,
+        nested_repository_options(),
+        |entry| {
+            Ok(if entry.kind == BoundedTreeEntryKind::Directory {
+                BoundedTreeWalkAction::RecordAndDescend
+            } else {
+                BoundedTreeWalkAction::Record
+            })
+        },
+    )
+    .expect("nested content must not spend the remaining path-byte budget");
+    assert_eq!(
+        path_result.nested_repository_boundaries,
+        vec![PathBuf::from("vendor/sdk")]
+    );
+    let default_path_error = BoundedTreeWalker::walk(&root, path_limits)
+        .expect_err("default traversal must retain ordinary path-byte accounting");
+    assert!(format!("{default_path_error:#}").contains("aggregate"));
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn bounded_tree_walk_probes_nested_boundary_before_enforcing_descent_depth() {
+    let temp = TempDir::new().expect("tempdir");
+    let boundary_root = temp.path().join("boundary-root");
+    fs::create_dir_all(boundary_root.join("nested/.git")).expect("boundary at maximum depth");
+    let mut limits = inventory_limits(8);
+    limits.max_depth = 1;
+    let binding = DirectoryBindingGuard::bind(&boundary_root).expect("bind boundary root");
+    let result = BoundedTreeWalker::walk_bound_with_options_detailed(
+        &binding,
+        limits,
+        nested_repository_options(),
+        |entry| {
+            Ok(if entry.kind == BoundedTreeEntryKind::Directory {
+                BoundedTreeWalkAction::RecordAndDescend
+            } else {
+                BoundedTreeWalkAction::Record
+            })
+        },
+    )
+    .expect("boundary exactly at maximum depth must terminate successfully");
+    assert_eq!(
+        result.nested_repository_boundaries,
+        vec![PathBuf::from("nested")]
+    );
+
+    let ordinary_root = temp.path().join("ordinary-root");
+    fs::create_dir_all(ordinary_root.join("ordinary")).expect("ordinary maximum-depth directory");
+    let ordinary_binding = DirectoryBindingGuard::bind(&ordinary_root).expect("bind ordinary root");
+    let error = BoundedTreeWalker::walk_bound_with_options_detailed(
+        &ordinary_binding,
+        limits,
+        nested_repository_options(),
+        |entry| {
+            Ok(if entry.kind == BoundedTreeEntryKind::Directory {
+                BoundedTreeWalkAction::RecordAndDescend
+            } else {
+                BoundedTreeWalkAction::Record
+            })
+        },
+    )
+    .expect_err("ordinary descent at the maximum depth must still fail closed");
+    assert!(format!("{error:#}").contains("depth"));
+}
+
 #[cfg(unix)]
 #[test]
 fn bounded_tree_walk_records_but_never_follows_unsafe_entries() {
-    use std::os::unix::{fs::symlink, net::UnixListener};
+    use std::os::unix::fs::{symlink, FileTypeExt};
 
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().join("repo");
@@ -1097,7 +1313,15 @@ fn bounded_tree_walk_records_but_never_follows_unsafe_entries() {
     fs::write(outside.join("secret"), "outside\n").expect("outside secret");
     fs::hard_link(root.join("src/lib.rs"), root.join("hardlink.rs")).expect("hardlink");
     symlink(&outside, root.join("outside-link")).expect("outside symlink");
-    let _socket = UnixListener::bind(root.join("socket")).expect("unix socket");
+    let socket_path = root.join("socket");
+    let _socket = crate::test_support::bind_test_unix_socket(&socket_path).expect("unix socket");
+    assert!(
+        fs::symlink_metadata(&socket_path)
+            .expect("socket metadata")
+            .file_type()
+            .is_socket(),
+        "fixture socket must remain a socket entry"
+    );
 
     let entries = BoundedTreeWalker::walk(&root, inventory_limits(32)).expect("inventory");
     assert!(entries.iter().any(|entry| {
@@ -1166,7 +1390,7 @@ fn bounded_tree_walk_checks_deadline_after_callback() {
 #[cfg(unix)]
 #[test]
 fn optional_relative_reader_preserves_scopes_and_rejects_unsafe_files() {
-    use std::os::unix::{fs::symlink, net::UnixListener};
+    use std::os::unix::fs::{symlink, FileTypeExt};
 
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().join("repo");
@@ -1174,7 +1398,15 @@ fn optional_relative_reader_preserves_scopes_and_rejects_unsafe_files() {
     fs::write(root.join("src/lib.rs"), "source\n").expect("source");
     fs::hard_link(root.join("src/lib.rs"), root.join("hardlink.rs")).expect("hardlink");
     symlink("src/lib.rs", root.join("link.rs")).expect("symlink");
-    let _socket = UnixListener::bind(root.join("socket")).expect("unix socket");
+    let socket_path = root.join("socket");
+    let _socket = crate::test_support::bind_test_unix_socket(&socket_path).expect("unix socket");
+    assert!(
+        fs::symlink_metadata(&socket_path)
+            .expect("socket metadata")
+            .file_type()
+            .is_socket(),
+        "fixture socket must remain a socket entry"
+    );
 
     assert_eq!(
         BoundedRegularReader::read_relative_optional_utf8(&root, "missing.rs", 64)

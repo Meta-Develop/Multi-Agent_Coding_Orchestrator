@@ -276,6 +276,100 @@ impl ModelPricing {
     }
 }
 
+pub const DEFAULT_MODEL_PRICING_CATALOG_ID: &str = "maco-policy-default";
+pub const DEFAULT_MODEL_PRICING_CATALOG_VERSION: u32 = 1;
+pub const DEFAULT_MODEL_PRICING_CATALOG_REVISION: &str = "2026-08-26";
+pub const DEFAULT_MODEL_PRICING_CATALOG_EFFECTIVE_DATE: &str = "2026-08-26";
+pub const DEFAULT_MODEL_PRICING_CATALOG_NOTICE: &str =
+    "Project policy placeholder rates for offline admission and reporting. These are not vendor list prices.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelPricingProvenance {
+    ProjectPolicyDefault,
+    PlanOverride,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct ModelPricingCatalog {
+    pub catalog_id: String,
+    pub catalog_version: u32,
+    pub revision: String,
+    pub effective_date: String,
+    pub content_sha256: String,
+    pub provenance: ModelPricingProvenance,
+    pub notice: String,
+    pub entries: BTreeMap<String, ModelPricing>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResolvedModelPricing {
+    pub pricing: ModelPricing,
+    pub provenance: ModelPricingProvenance,
+}
+
+pub fn default_model_pricing_catalog() -> ModelPricingCatalog {
+    let placeholder = ModelPricing {
+        input_usd_per_million_tokens: 0.0,
+        output_usd_per_million_tokens: 0.0,
+    };
+    let entries = BTreeMap::from([
+        ("fake".to_string(), placeholder),
+        ("gpt-5.6-sol".to_string(), placeholder),
+        ("gpt-5.6-luna".to_string(), placeholder),
+    ]);
+    let mut catalog = ModelPricingCatalog {
+        catalog_id: DEFAULT_MODEL_PRICING_CATALOG_ID.to_string(),
+        catalog_version: DEFAULT_MODEL_PRICING_CATALOG_VERSION,
+        revision: DEFAULT_MODEL_PRICING_CATALOG_REVISION.to_string(),
+        effective_date: DEFAULT_MODEL_PRICING_CATALOG_EFFECTIVE_DATE.to_string(),
+        content_sha256: String::new(),
+        provenance: ModelPricingProvenance::ProjectPolicyDefault,
+        notice: DEFAULT_MODEL_PRICING_CATALOG_NOTICE.to_string(),
+        entries,
+    };
+    catalog.content_sha256 = model_pricing_catalog_content_sha256(&catalog);
+    catalog
+}
+
+pub fn resolve_model_pricing(
+    plan_pricing: &BTreeMap<String, ModelPricing>,
+    model: &str,
+) -> Option<ResolvedModelPricing> {
+    let normalized = model.trim();
+    if normalized.is_empty() {
+        return None;
+    }
+    if let Some(pricing) = plan_pricing.get(normalized).copied() {
+        return pricing.is_valid().then_some(ResolvedModelPricing {
+            pricing,
+            provenance: ModelPricingProvenance::PlanOverride,
+        });
+    }
+    default_model_pricing_catalog()
+        .entries
+        .get(normalized)
+        .copied()
+        .filter(|pricing| pricing.is_valid())
+        .map(|pricing| ResolvedModelPricing {
+            pricing,
+            provenance: ModelPricingProvenance::ProjectPolicyDefault,
+        })
+}
+
+fn model_pricing_catalog_content_sha256(catalog: &ModelPricingCatalog) -> String {
+    let payload = serde_json::json!({
+        "catalog_id": catalog.catalog_id,
+        "catalog_version": catalog.catalog_version,
+        "revision": catalog.revision,
+        "effective_date": catalog.effective_date,
+        "provenance": catalog.provenance,
+        "notice": catalog.notice,
+        "entries": catalog.entries,
+    });
+    crate::artifacts::state_auth::sha256_hex(payload.to_string().as_bytes())
+}
+
 fn estimate_tokens(chars: usize) -> usize {
     chars.saturating_add(3) / 4
 }
@@ -319,4 +413,47 @@ pub fn validate_request(request: &LlmRequest) -> Result<(), ProviderError> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod pricing_catalog_tests {
+    use super::*;
+
+    #[test]
+    fn default_catalog_is_versioned_policy_placeholder_not_vendor_prices() {
+        let catalog = default_model_pricing_catalog();
+        assert_eq!(catalog.catalog_id, DEFAULT_MODEL_PRICING_CATALOG_ID);
+        assert_eq!(
+            catalog.catalog_version,
+            DEFAULT_MODEL_PRICING_CATALOG_VERSION
+        );
+        assert!(!catalog.content_sha256.is_empty());
+        assert_eq!(
+            catalog.provenance,
+            ModelPricingProvenance::ProjectPolicyDefault
+        );
+        assert!(catalog.notice.contains("not vendor list prices"));
+        let fake = catalog.entries.get("fake").expect("fake placeholder");
+        assert_eq!(fake.input_usd_per_million_tokens, 0.0);
+        assert_eq!(fake.output_usd_per_million_tokens, 0.0);
+    }
+
+    #[test]
+    fn plan_override_beats_policy_default_and_unknown_models_stay_unpriced() {
+        let override_pricing = ModelPricing {
+            input_usd_per_million_tokens: 1.5,
+            output_usd_per_million_tokens: 2.5,
+        };
+        let plan = BTreeMap::from([("fake".to_string(), override_pricing)]);
+        let resolved = resolve_model_pricing(&plan, "fake").expect("plan override");
+        assert_eq!(resolved.pricing, override_pricing);
+        assert_eq!(resolved.provenance, ModelPricingProvenance::PlanOverride);
+
+        let defaulted = resolve_model_pricing(&BTreeMap::new(), "fake").expect("policy default");
+        assert_eq!(
+            defaulted.provenance,
+            ModelPricingProvenance::ProjectPolicyDefault
+        );
+        assert!(resolve_model_pricing(&BTreeMap::new(), "unknown-model").is_none());
+    }
 }

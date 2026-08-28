@@ -233,7 +233,7 @@ fn published_schemas_and_fixtures_follow_the_manifest_contract() -> Result<()> {
     let fixture_dir = root.join("fixtures/schemas");
     let manifest: Manifest = serde_json::from_slice(&fs::read(fixture_dir.join("manifest.json"))?)?;
     assert_eq!(manifest.version, 1);
-    assert_eq!(manifest.contracts.len(), 5);
+    assert_eq!(manifest.contracts.len(), 6);
     let mut schemas = std::collections::BTreeMap::new();
     for contract in &manifest.contracts {
         schemas.insert(
@@ -279,6 +279,6 @@ fn published_schemas_and_fixtures_follow_the_manifest_contract() -> Result<()> {
             }
         }
     }
-    assert_eq!(seen_schemas, 5);
+    assert_eq!(seen_schemas, 6);
     Ok(())
 }

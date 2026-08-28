@@ -313,8 +313,6 @@ fn environment_preflight_refusal_is_typed_terminal_and_not_malformed_or_containm
     let mut run_value = serde_json::to_value(injected_verified_run_without_journals(&command))
         .expect("serialize injected run");
     run_value["exit_code"] = Value::Null;
-    run_value["process_tree"] = Value::Null;
-    run_value["side_effects"] = Value::Null;
     run_value["publishable"] = Value::Bool(false);
     run_value["codex_permissions"] = Value::Null;
     run_value["environment_preflight_results"] =

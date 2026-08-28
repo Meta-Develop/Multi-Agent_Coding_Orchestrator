@@ -1,5 +1,25 @@
 use super::*;
 
+fn live_invocation_started_millis(duration_ms: u64) -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(1)
+        .max(1);
+    now.saturating_sub(duration_ms).max(1)
+}
+
+fn record_and_persist_live_invocation(
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    observation: LiveInvocationObservation<'_>,
+) -> Result<()> {
+    let record = record_supervisor_invocation_observation(observation)?;
+    with_supervisor_artifacts(artifacts, |writer, _| {
+        persist_live_invocation_row(writer, &record)?;
+        persist_live_switch_cost_snapshot(writer)
+    })
+}
+
 fn assignment_launch_runtime(
     assignment: &OrchestratorAssignment,
     options: &SupervisorRunOptions,
@@ -236,6 +256,83 @@ fn worktree_writable_admission_record(
     }))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompletedLaunchModelProvenance {
+    launch_runtime: SupervisorRuntime,
+    configured_model: Option<String>,
+    launched_model: Option<String>,
+    resolution_observation: ModelResolutionObservation,
+}
+
+impl CompletedLaunchModelProvenance {
+    fn from_resolution(
+        launch_runtime: SupervisorRuntime,
+        configured: &RoleModelSelection,
+        resolution: &RoleModelResolution,
+    ) -> Self {
+        Self {
+            launch_runtime,
+            configured_model: configured.model.clone(),
+            launched_model: resolution.selection.model.clone(),
+            resolution_observation: resolution.observation,
+        }
+    }
+
+    fn transition_subject_model(&self) -> Option<&str> {
+        if let Some(model) = self.launched_model.as_deref() {
+            return Some(model);
+        }
+        if self.launch_runtime == SupervisorRuntime::Fake
+            && matches!(
+                self.resolution_observation,
+                ModelResolutionObservation::RuntimeDefault
+                    | ModelResolutionObservation::LocalDeterministicFake
+            )
+        {
+            return self.configured_model.as_deref();
+        }
+        None
+    }
+}
+
+// Keep the established command-only helper type-checked for its direct policy
+// regressions. Attempt publication must use the complete resolution below so
+// launch provenance is not recomputed after the command is bound.
+const _: fn(
+    ExternalAgentCommand,
+    &SupervisorPlan,
+    AgentRole,
+    SupervisorRuntime,
+    &RuntimeModelCatalog,
+) -> Result<ExternalAgentCommand> = apply_role_model_selection;
+
+struct BoundSelectedRuntimeLaunch {
+    command: ExternalAgentCommand,
+    model_provenance: CompletedLaunchModelProvenance,
+}
+
+fn admit_assignment_role_category(
+    assignment: &OrchestratorAssignment,
+    launch_runtime: SupervisorRuntime,
+    resolution: &RoleModelResolution,
+) -> Result<()> {
+    let category = assignment.effective_role_category();
+    match launch_runtime {
+        // The fake runtime never executes a provider model. Catalog observation
+        // may be `runtime_default` on the CLI path; still skip capability
+        // admission so simulation-only runs can store and exercise categories.
+        SupervisorRuntime::Fake => Ok(()),
+        _ => admit_role_category(category, resolution.selection.model.as_deref()),
+    }
+    .with_context(|| {
+        format!(
+            "assignment '{}' category '{}' refused at execution admission",
+            assignment.id,
+            category.as_str()
+        )
+    })
+}
+
 fn bind_selected_runtime_launch(
     mut command: ExternalAgentCommand,
     assignment: &OrchestratorAssignment,
@@ -243,7 +340,12 @@ fn bind_selected_runtime_launch(
     options: &SupervisorRunOptions,
     launch_runtime: SupervisorRuntime,
     catalog: &RuntimeModelCatalog,
-) -> Result<ExternalAgentCommand> {
+) -> Result<BoundSelectedRuntimeLaunch> {
+    let configured = effective_role_model_selection(plan, assignment.role);
+    let resolution = catalog.resolve_role_model_selection(&configured, launch_runtime)?;
+    let model_provenance =
+        CompletedLaunchModelProvenance::from_resolution(launch_runtime, &configured, &resolution);
+    admit_assignment_role_category(assignment, launch_runtime, &resolution)?;
     if launch_runtime.is_adapter_subprocess() {
         authorize_bounded_leaf_runtime_role(assignment.role).with_context(|| {
             format!(
@@ -263,19 +365,36 @@ fn bind_selected_runtime_launch(
                 crate::runtime_adapter::AdapterId::from_runtime(launch_runtime)
             );
         }
-        let selection = effective_role_model_selection(plan, assignment.role);
-        let model = selection.model.clone().with_context(|| {
+        let model = resolution.selection.model.clone().with_context(|| {
             format!(
                 "selected runtime '{}' assignment '{}' has no model",
                 crate::runtime_adapter::AdapterId::from_runtime(launch_runtime),
                 assignment.id
             )
         })?;
-        command = command.with_model_selection(Some(model), selection.reasoning_effort.clone());
+        command = command
+            .with_model_selection(Some(model), resolution.selection.reasoning_effort.clone());
         prerender_selected_runtime_adapter_command(&command, launch_runtime)?;
-        return Ok(command);
+        return Ok(BoundSelectedRuntimeLaunch {
+            command,
+            model_provenance,
+        });
     }
-    apply_role_model_selection(command, plan, assignment.role, launch_runtime, catalog)
+    authorize_resolved_judgment_model(
+        assignment.role,
+        configured.model.as_deref(),
+        resolution.selection.model.as_deref(),
+        resolution.observation,
+        launch_runtime,
+    )?;
+    command = command.with_model_selection(
+        resolution.selection.model.clone(),
+        resolution.selection.reasoning_effort.clone(),
+    );
+    Ok(BoundSelectedRuntimeLaunch {
+        command,
+        model_provenance,
+    })
 }
 
 #[cfg(test)]
@@ -290,7 +409,7 @@ pub(super) fn bind_selected_assignment_launch_for_test(
     let launch_runtime = assignment_launch_runtime(assignment, options, budget_policy);
     let launch_catalog =
         runtime_model_catalog_for_launch(catalog, options.runtime, launch_runtime)?;
-    let command = bind_selected_runtime_launch(
+    let bound_launch = bind_selected_runtime_launch(
         command,
         assignment,
         plan,
@@ -298,7 +417,7 @@ pub(super) fn bind_selected_assignment_launch_for_test(
         launch_runtime,
         &launch_catalog,
     )?;
-    Ok((launch_runtime, command))
+    Ok((launch_runtime, bound_launch.command))
 }
 
 pub(super) fn prerender_selected_runtime_adapter_command(
@@ -649,6 +768,9 @@ fn prepare_assignment_execution<'a>(
             SupervisorWorktreeCreation::PrimaryWorktree => {
                 bail!("primary-worktree execution does not create a managed child worktree")
             }
+            SupervisorWorktreeCreation::NonpublishableSimulation => {
+                manager.create_for_nonpublishable_simulation(create_options)
+            }
             #[cfg(test)]
             SupervisorWorktreeCreation::TestOnly | SupervisorWorktreeCreation::VerifiedTestOnly => {
                 manager.create_for_test(create_options)
@@ -910,6 +1032,7 @@ struct PreparedChildAttempt<'a> {
     attempt_artifacts: ChildAttemptArtifacts,
     corrective_retry_used: bool,
     command: ExternalAgentCommand,
+    model_provenance: CompletedLaunchModelProvenance,
     primary_before: PrimaryWorktreeSnapshot,
     primary_scope_before: Option<PrimaryScopeSnapshot>,
     incoming_scratch: ArtifactScratchDirectory,
@@ -1109,7 +1232,7 @@ fn prepare_child_attempt<'a>(
         &attempt_artifacts.report_path,
         Duration::from_secs(budget_plan.child_timeout_seconds),
     );
-    command = bind_selected_runtime_launch(
+    let bound_launch = bind_selected_runtime_launch(
         command,
         assignment,
         &budget_plan,
@@ -1117,6 +1240,7 @@ fn prepare_child_attempt<'a>(
         launch_runtime,
         &launch_catalog,
     )?;
+    command = bound_launch.command;
     command = bind_runtime_output_schema(command, launch_runtime, schema_path)?;
     command = bind_runtime_read_only_schema_files(
         command,
@@ -1326,6 +1450,7 @@ fn prepare_child_attempt<'a>(
             attempt_artifacts,
             corrective_retry_used,
             command,
+            model_provenance: bound_launch.model_provenance,
             primary_before,
             primary_scope_before,
             incoming_scratch,
@@ -1350,6 +1475,7 @@ struct CollectedChildAttempt<'a> {
     attempt_containment_verified: bool,
     attempt_artifacts: ChildAttemptArtifacts,
     corrective_retry_used: bool,
+    model_provenance: CompletedLaunchModelProvenance,
     external_run: ExternalAgentRun,
     _worker_journal_evidence: WorkerExecutionJournalEvidenceSet,
     _primary_after: PrimaryWorktreeSnapshot,
@@ -1429,6 +1555,7 @@ fn dispatch_and_collect_child_attempt<'a>(
     let attempt_artifacts = prepared.attempt_artifacts;
     let corrective_retry_used = prepared.corrective_retry_used;
     let command = prepared.command;
+    let model_provenance = prepared.model_provenance;
     let primary_before = prepared.primary_before;
     let primary_scope_before = prepared.primary_scope_before;
     let incoming_scratch = prepared.incoming_scratch;
@@ -1445,11 +1572,12 @@ fn dispatch_and_collect_child_attempt<'a>(
         Some(journal_parent_id),
         OrchestrationRole::Orchestrator,
         OrchestrationEventKind::Spawn,
-        record_supervision_spawn_payload(
+        record_supervision_spawn_payload_with_category(
             &assignment.id,
             journal_parent_id,
             OrchestrationRole::Orchestrator,
             assignment.role,
+            assignment.category_override(),
             write_boundary_refs(&assignment.assigned_paths),
             &assignment_scope_ref(&assignment.id),
             json!({
@@ -1586,12 +1714,32 @@ fn dispatch_and_collect_child_attempt<'a>(
     let environment_blocked = external_run.environment_blocked();
     let usage_settlement = budget_reservation.settle_bound_runtime(&external_run, &command)?;
     match usage_settlement.reliable_usage() {
-        Some(usage) => outcome.usage_samples.push(RoleUsageSample {
-            role: AgentRole::ChildOrchestrator,
-            lens_id: None,
-            model: command.model.clone(),
-            usage,
-        }),
+        Some(usage) => {
+            outcome.usage_samples.push(RoleUsageSample {
+                role: AgentRole::ChildOrchestrator,
+                lens_id: None,
+                model: command.model.clone(),
+                usage,
+            });
+            record_and_persist_live_invocation(
+                artifacts,
+                LiveInvocationObservation {
+                    run_id: options.run_id.as_str(),
+                    assignment_id: &assignment.id,
+                    attempt,
+                    role: assignment.role,
+                    runtime: launch_runtime,
+                    model: command.model.as_deref(),
+                    effort: command.reasoning_effort.as_deref(),
+                    worktree_id: &worktree.name,
+                    usage: Some(&usage),
+                    duration_ms: Some(external_run.duration_ms),
+                    started_at_unix_millis: live_invocation_started_millis(
+                        external_run.duration_ms,
+                    ),
+                },
+            )?;
+        }
         None if usage_settlement.is_degraded() => outcome.usage_incomplete = true,
         None => {}
     }
@@ -1796,6 +1944,7 @@ fn dispatch_and_collect_child_attempt<'a>(
         attempt_containment_verified,
         attempt_artifacts,
         corrective_retry_used,
+        model_provenance,
         external_run,
         _worker_journal_evidence: worker_journal_evidence,
         _primary_after: primary_after,
@@ -1891,6 +2040,7 @@ fn decide_child_attempt(
         attempt_containment_verified,
         attempt_artifacts,
         corrective_retry_used,
+        model_provenance: _,
         external_run,
         _worker_journal_evidence,
         _primary_after,
@@ -2839,12 +2989,30 @@ fn dispatch_and_collect_parent_auditor(
     let usage_settlement =
         auditor_budget_reservation.settle_bound_runtime(&auditor_run, &auditor_command)?;
     match usage_settlement.reliable_usage() {
-        Some(usage) => outcome.usage_samples.push(RoleUsageSample {
-            role: AgentRole::Auditor,
-            lens_id: Some(lens.id.clone()),
-            model: auditor_command.model.clone(),
-            usage,
-        }),
+        Some(usage) => {
+            outcome.usage_samples.push(RoleUsageSample {
+                role: AgentRole::Auditor,
+                lens_id: Some(lens.id.clone()),
+                model: auditor_command.model.clone(),
+                usage,
+            });
+            record_and_persist_live_invocation(
+                artifacts,
+                LiveInvocationObservation {
+                    run_id: options.run_id.as_str(),
+                    assignment_id: &assignment.id,
+                    attempt: auditor_attempt,
+                    role: AgentRole::Auditor,
+                    runtime: options.runtime,
+                    model: auditor_command.model.as_deref(),
+                    effort: auditor_command.reasoning_effort.as_deref(),
+                    worktree_id: &assignment.id,
+                    usage: Some(&usage),
+                    duration_ms: Some(auditor_run.duration_ms),
+                    started_at_unix_millis: live_invocation_started_millis(auditor_run.duration_ms),
+                },
+            )?;
+        }
         None if usage_settlement.is_degraded() => outcome.usage_incomplete = true,
         None => {}
     }
@@ -3286,6 +3454,7 @@ fn publish_assignment_report(
     context: &AssignmentExecutionContext<'_, '_>,
     outcome: &mut AssignmentExecutionOutcome,
     preflight: &AssignmentExecutionPreflight<'_>,
+    completed_launch_model_provenance: Option<&CompletedLaunchModelProvenance>,
     journal_parent_id: &str,
     final_report_relative: &Path,
     final_report_path: &Path,
@@ -3295,9 +3464,11 @@ fn publish_assignment_report(
 ) -> Result<()> {
     let assignment = &preflight.assignment;
     outcome.candidate_inspection = completed_candidate_inspection;
-    let subject_selection = effective_role_model_selection(context.plan, assignment.role);
     let auditor_selection = effective_role_model_selection(context.plan, AgentRole::Auditor);
-    let subject_capability = model_capability_or_weak(subject_selection.model.as_deref());
+    let subject_authority = model_capability_or_weak(
+        completed_launch_model_provenance
+            .and_then(CompletedLaunchModelProvenance::transition_subject_model),
+    );
     let auditor_capability = model_capability_or_weak(
         context
             .plan
@@ -3305,12 +3476,13 @@ fn publish_assignment_report(
             .first()
             .map(|lens| lens.backend.model())
             .or(auditor_selection.model.as_deref()),
-    );
+    )
+    .capability;
     let role_transition = consider_assignment_role_transition(
         assignment,
         journal_parent_id,
         &child_report,
-        subject_capability,
+        subject_authority,
         auditor_capability,
     )?;
     with_supervisor_artifacts(context.artifacts, |writer, journal| {
@@ -3408,8 +3580,13 @@ fn execute_supervisor_assignment_inner(
         .saturating_add(1);
     let mut next_attempt = 1usize;
     let mut auditor_attempt = 0usize;
-    let (child_report, completed_candidate_inspection, completed_assignment_containment) = 'gate_controller: loop {
-        let mut child_report = None;
+    let (
+        child_report,
+        completed_candidate_inspection,
+        completed_assignment_containment,
+        completed_launch_model_provenance,
+    ) = 'gate_controller: loop {
+        let mut child_result = None;
         let mut child_containment_verified = false;
         let mut child_gate_terminal = false;
         let first_attempt = next_attempt;
@@ -3457,6 +3634,7 @@ fn execute_supervisor_assignment_inner(
                 attempt,
                 prepared,
             )?;
+            let attempted_launch_model_provenance = collected.model_provenance.clone();
             match decide_child_attempt(
                 context,
                 outcome,
@@ -3474,7 +3652,7 @@ fn execute_supervisor_assignment_inner(
                     containment_verified,
                     gate_terminal,
                 } => {
-                    child_report = Some(report);
+                    child_result = Some((report, attempted_launch_model_provenance));
                     child_containment_verified = containment_verified;
                     child_gate_terminal = gate_terminal;
                     break;
@@ -3482,7 +3660,7 @@ fn execute_supervisor_assignment_inner(
             }
         }
 
-        let Some(mut child_report) = child_report else {
+        let Some((mut child_report, child_launch_model_provenance)) = child_result else {
             let error = anyhow!(
                 "child orchestrator '{}' did not produce a collected report after retries",
                 assignment.id
@@ -3787,7 +3965,12 @@ fn execute_supervisor_assignment_inner(
                 candidate,
                 containment_verified,
             } => {
-                break 'gate_controller (report, candidate, containment_verified);
+                break 'gate_controller (
+                    report,
+                    candidate,
+                    containment_verified,
+                    child_launch_model_provenance,
+                );
             }
         }
     };
@@ -3795,6 +3978,7 @@ fn execute_supervisor_assignment_inner(
         context,
         outcome,
         &preflight,
+        Some(&completed_launch_model_provenance),
         journal_parent_id,
         &final_report_relative,
         &final_report_path,
@@ -3999,6 +4183,8 @@ mod decomposition_tests {
             phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
@@ -4311,6 +4497,7 @@ mod decomposition_tests {
             &context,
             &mut outcome,
             &preflight,
+            None,
             options.run_id.as_str(),
             &final_report_relative,
             &final_report_path,
@@ -4322,6 +4509,437 @@ mod decomposition_tests {
         assert!(outcome.report.is_some());
         assert_eq!(outcome.command_records.len(), 2);
         assert!(!outcome.external_containment_failed);
+    }
+
+    #[test]
+    fn real_runtime_default_launch_provenance_cannot_recover_coordinator_authority() {
+        let provenance = CompletedLaunchModelProvenance {
+            launch_runtime: SupervisorRuntime::Codex,
+            configured_model: Some("gpt-5.6-sol".to_string()),
+            launched_model: None,
+            resolution_observation: ModelResolutionObservation::RuntimeDefault,
+        };
+        let subject = model_capability_or_weak(provenance.transition_subject_model());
+        assert_eq!(subject.model, None);
+        assert_eq!(subject.capability, ModelCapabilityClass::WeakMechanical);
+
+        let transition = execute_judged_role_transition(
+            "phase-child",
+            RoleCategory::NonDelegatingTerminalWorker,
+            RoleCategory::DelegatingCoordinator,
+            "supervisor",
+            "supervisor",
+            subject,
+            &RoleTransitionJudgeVerdict {
+                judge_agent_id: "phase-child-review-auditor-lens-0".to_string(),
+                judge_role: AgentRole::Auditor,
+                judge_capability: ModelCapabilityClass::CriticalJudgment,
+                accepted: true,
+                uncertain: false,
+            },
+        )
+        .expect("weak real-runtime transition must be recorded");
+        assert!(!transition.granted);
+        assert_eq!(transition.record.reason, "weak_model_cannot_delegate");
+        assert_eq!(
+            transition.effective_category,
+            RoleCategory::NonDelegatingTerminalWorker
+        );
+    }
+
+    #[test]
+    fn fake_launch_provenance_reuses_configured_model_only_for_explicit_fake_resolution() {
+        for resolution_observation in [
+            ModelResolutionObservation::RuntimeDefault,
+            ModelResolutionObservation::LocalDeterministicFake,
+        ] {
+            let provenance = CompletedLaunchModelProvenance {
+                launch_runtime: SupervisorRuntime::Fake,
+                configured_model: Some("gpt-5.6-sol".to_string()),
+                launched_model: None,
+                resolution_observation,
+            };
+            let subject = model_capability_or_weak(provenance.transition_subject_model());
+            assert_eq!(subject.model, Some("gpt-5.6-sol"));
+            assert_ne!(subject.capability, ModelCapabilityClass::WeakMechanical);
+        }
+
+        let unresolved = CompletedLaunchModelProvenance {
+            launch_runtime: SupervisorRuntime::Fake,
+            configured_model: Some("gpt-5.6-sol".to_string()),
+            launched_model: None,
+            resolution_observation: ModelResolutionObservation::NotResolved,
+        };
+        let unresolved_subject = model_capability_or_weak(unresolved.transition_subject_model());
+        assert_eq!(unresolved_subject.model, None);
+        assert_eq!(
+            unresolved_subject.capability,
+            ModelCapabilityClass::WeakMechanical
+        );
+
+        let unknown = CompletedLaunchModelProvenance {
+            launch_runtime: SupervisorRuntime::Fake,
+            configured_model: Some("unknown-model".to_string()),
+            launched_model: None,
+            resolution_observation: ModelResolutionObservation::RuntimeDefault,
+        };
+        let unknown_subject = model_capability_or_weak(unknown.transition_subject_model());
+        assert_eq!(unknown_subject.model, Some("unknown-model"));
+        assert_eq!(
+            unknown_subject.capability,
+            ModelCapabilityClass::WeakMechanical
+        );
+    }
+
+    #[test]
+    fn publication_uses_final_launch_bound_subject_model_for_transition() {
+        let temp = tempfile::tempdir().expect("temporary phase fixture");
+        let repo = temp.path().join("repo");
+        Repository::init(&repo).expect("initialize phase fixture repository");
+        fs::write(repo.join("README.md"), "baseline\n").expect("write fixture file");
+        commit_fixture_repository(&repo);
+
+        let assignment = OrchestratorAssignment {
+            id: "phase-child".to_string(),
+            phase: AssignmentPhase::Execution,
+            runtime: None,
+            role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        };
+        let mut plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "direct phase exercise".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: 10,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+            assignments: vec![assignment.clone()],
+        };
+        plan.role_models.insert(
+            AgentRole::ChildOrchestrator,
+            RoleModelSelection {
+                model: Some("gpt-5.6-luna".to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        let budget_config = SupervisorBudgetConfig::default();
+        let consultant = SupervisorConsultantPlan::default();
+        let assignment_metadata = AssignmentMetadata::new();
+        let options = SupervisorRunOptions {
+            repo: repo.clone(),
+            plan_file: temp.path().join("plan.json"),
+            run_id: RunId::new("direct-assignment-phases").expect("valid fixture run id"),
+            parent_node: None,
+            codex_bin: PathBuf::from("unused-codex"),
+            runtime: SupervisorRuntime::Codex,
+            allow_dirty_primary: false,
+            allow_live_run_collision: false,
+            admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+            budget_overrides: crate::supervise::RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
+            machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
+                config: temp.path().join("unused-machine-global.json"),
+                root_id: "runtime".to_string(),
+                owner: "maco-supervise".to_string(),
+                correction_correlation_id: "direct-assignment-phases".to_string(),
+            }),
+        };
+        let mut artifact_writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            options.run_id.clone(),
+            "assignment-phase-test",
+        )
+        .expect("reserve phase artifacts");
+        let run_dir = artifact_writer.run_dir().to_path_buf();
+        let dirs = RunDirs::for_writer(&artifact_writer);
+        let manager = WorktreeManager::new(&repo);
+        let sync_store = SyncStore::open(&repo).expect("open fixture sync store");
+        let semantic_store = SemanticIntentStore::open(&repo).expect("open fixture semantic store");
+        let assignment_schedule = vec![AssignmentScheduleEntry {
+            assignment_id: assignment.id.clone(),
+            parent_assignment_id: None,
+            depth: 1,
+            flattened_index: 0,
+        }];
+        let field_guide = SupervisorFieldGuidePrompt::empty().expect("empty fixture field guide");
+        let budget_ledger =
+            RunBudgetLedger::new(RunBudgetLimits::default()).expect("fixture budget ledger");
+        let runtime_model_catalog = RuntimeModelCatalog::Codex(
+            CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-luna", "gpt-5.6-sol"])
+                .expect("fixture runtime model catalog"),
+        );
+        let cancellation = ProcessCancellation::new();
+        let mut journal = initialize_orchestration_event_journal(
+            &repo,
+            &options.run_id,
+            options.parent_node.as_deref(),
+        );
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut artifact_writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let runner = |command: &ExternalAgentCommand,
+                      _cancellation: &ProcessCancellation,
+                      _review: Option<ExternalPreActionReviewRuntime<'_>>| {
+            let mut report_command = command.clone();
+            report_command.model = None;
+            let mut run = deterministic_fake_child_run(
+                &report_command,
+                &assignment,
+                &assignment_metadata,
+                1,
+                None,
+            )
+            .expect("fixture child report");
+            run.process_tree = Some(ProcessTreeEvidence::VerifiedEmpty(
+                crate::process_runner::ContainmentBackend::SystemdUserService,
+            ));
+            run.side_effects = Some(SideEffectConfinementEvidence::Verified(
+                crate::process_runner::SideEffectConfinementProfileKind::ExternalCodex,
+            ));
+            run.publishable = true;
+            run.program_trust = ExternalProgramTrust::TrustedSystemCodex;
+            run.codex_permissions = Some(crate::external_agent::CodexPermissionEvidence {
+                codex_version: "0.142.3".to_string(),
+                minimum_version: "0.138.0".to_string(),
+                permission_profile: "maco_external_codex".to_string(),
+                workspace_access: command.workspace_access,
+                network_enabled: false,
+                argv_digest: "fixture-digest".to_string(),
+                executable_identity: "fixture-identity".to_string(),
+            });
+            run
+        };
+        let mut launch_budget_policy = AssignmentBudgetPolicy::default();
+        launch_budget_policy.set_selector_binding_for_test(
+            AgentRole::ChildOrchestrator,
+            SupervisorRuntime::Codex,
+            RoleModelSelection {
+                model: Some("gpt-5.6-sol".to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        assert_eq!(
+            effective_role_model_selection(&plan, AgentRole::ChildOrchestrator)
+                .model
+                .as_deref(),
+            Some("gpt-5.6-luna")
+        );
+        let context = AssignmentExecutionContext {
+            index: 0,
+            concurrent_mode: false,
+            plan: &plan,
+            requested_plan: &plan,
+            execution_target: None,
+            budget_config: &budget_config,
+            consultant: &consultant,
+            assignment_metadata: &assignment_metadata,
+            assignment: &assignment,
+            evidence_only_reaudit: None,
+            options: &options,
+            repo: &repo,
+            run_dir: &run_dir,
+            dirs: &dirs,
+            execution_runtime: SupervisorExecutionRuntime::NonpublishableSimulation,
+            worktree_creation: SupervisorWorktreeCreation::TestOnly,
+            manager: &manager,
+            reused: false,
+            sync_store: &sync_store,
+            semantic_store: &semantic_store,
+            prepared_semantic_token: None,
+            prepared_semantic_findings: &[],
+            prepared_semantic_signals: &[],
+            prepared_semantic_failed: false,
+            assignment_schedule: &assignment_schedule,
+            field_guide: &field_guide,
+            serial_semantic_warn_intents: None,
+            semantic_block_order: None,
+            semantic_block_gate: None,
+            artifacts: &artifacts,
+            budget_ledger: &budget_ledger,
+            budget_policy: launch_budget_policy,
+            admission_commit: None,
+            runtime_model_catalog: &runtime_model_catalog,
+            cancellation,
+            external_runner: &runner,
+        };
+        let mut outcome = AssignmentExecutionOutcome {
+            gate_tracker: Some(GateCorrectionTracker::new(plan.max_gate_corrections)),
+            ..AssignmentExecutionOutcome::default()
+        };
+        let preflight = match prepare_assignment_execution(&context, &mut outcome)
+            .expect("direct preflight invocation")
+        {
+            AssignmentExecutionDisposition::Continue(preflight) => preflight,
+            AssignmentExecutionDisposition::Complete => panic!("preflight unexpectedly completed"),
+        };
+        assert_eq!(preflight.claim.agent_id, assignment.id);
+        assert_eq!(outcome.claim_tokens, vec![preflight.claim.token]);
+
+        let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
+        let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
+        let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
+        fs::create_dir_all(&dirs.schemas).expect("create direct phase schema directory");
+        fs::write(&auditor_schema_path, "{\"type\":\"object\"}\n")
+            .expect("materialize direct phase auditor schema");
+        let prepared = match prepare_child_attempt(
+            &context,
+            &mut outcome,
+            &context.budget_policy,
+            &preflight,
+            options.run_id.as_str(),
+            1,
+            1,
+            &None,
+            &schema_path,
+            &worker_schema_path,
+            &auditor_schema_path,
+        )
+        .expect("direct child preparation invocation")
+        {
+            AssignmentExecutionDisposition::Continue(prepared) => prepared,
+            AssignmentExecutionDisposition::Complete => {
+                panic!("child preparation unexpectedly completed")
+            }
+        };
+        assert!(prepared.attempt_artifacts.prompt_path.exists());
+        assert!(!prepared.corrective_retry_used);
+        assert_eq!(
+            prepared.command.machine_global_retention,
+            options.machine_global_retention
+        );
+        assert_eq!(prepared.command.model.as_deref(), Some("gpt-5.6-sol"));
+        let collected = dispatch_and_collect_child_attempt(
+            &context,
+            &mut outcome,
+            &preflight,
+            options.run_id.as_str(),
+            1,
+            prepared,
+        )
+        .expect("direct child dispatch invocation");
+        assert!(collected.attempt_containment_verified);
+        assert_eq!(
+            collected.model_provenance.configured_model.as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            collected.model_provenance.launched_model.as_deref(),
+            Some("gpt-5.6-sol")
+        );
+        let completed_launch_model_provenance = collected.model_provenance.clone();
+        assert_eq!(outcome.command_records.len(), 1);
+
+        let mut structural_attempt = 1;
+        let mut retry_feedback = None;
+        let mut attempt_history = Vec::new();
+        let mut child_report = match decide_child_attempt(
+            &context,
+            &mut outcome,
+            &preflight,
+            options.run_id.as_str(),
+            1,
+            &mut structural_attempt,
+            &mut retry_feedback,
+            &mut attempt_history,
+            collected,
+        )
+        .expect("direct child gate invocation")
+        {
+            ChildAttemptDisposition::Finish {
+                report,
+                containment_verified,
+                gate_terminal,
+            } => {
+                assert!(containment_verified);
+                assert!(!gate_terminal);
+                report
+            }
+            ChildAttemptDisposition::Retry => panic!("child gate unexpectedly retried"),
+        };
+        assert_eq!(attempt_history.len(), 1);
+
+        let final_report_relative = PathBuf::from("reports").join("phase-child.json");
+        let final_report_path = dirs.reports.join("phase-child.json");
+        child_report.audit_reports.push(AuditorReport {
+            id: review_lens_auditor_id(&assignment, 0),
+            role: AgentRole::Auditor,
+            reviewed_worker_ids: Vec::new(),
+            reviewed_paths: assignment.assigned_paths.clone(),
+            commands_run: Vec::new(),
+            environment_failures: Vec::new(),
+            validation_results: vec![ValidationResult {
+                name: "fixture auditor validation".to_string(),
+                status: ReviewStatus::Succeeded,
+                command: Vec::new(),
+                message: None,
+            }],
+            findings: Vec::new(),
+            rejection_kind: None,
+            no_further_delegation: Some(true),
+            read_only: true,
+            accepted: true,
+            rejected: false,
+            status: ReviewStatus::Succeeded,
+            remaining_risk: "none".to_string(),
+            next_safe_action: "publish".to_string(),
+        });
+        publish_assignment_report(
+            &context,
+            &mut outcome,
+            &preflight,
+            Some(&completed_launch_model_provenance),
+            options.run_id.as_str(),
+            &final_report_relative,
+            &final_report_path,
+            child_report,
+            None,
+            true,
+        )
+        .expect("direct final publication invocation");
+        assert!(outcome.report.is_some());
+        assert_eq!(outcome.command_records.len(), 1);
+        assert!(!outcome.external_containment_failed);
+        let journal_contents =
+            fs::read_to_string(run_dir.join(crate::orchestration_event::ORCHESTRATION_EVENT_PATH))
+                .expect("read direct phase orchestration journal");
+        let transition = journal_contents
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<crate::orchestration_event::OrchestrationEvent>(line)
+                    .expect("parse direct phase orchestration event")
+            })
+            .find_map(|event| {
+                event
+                    .payload
+                    .get(crate::hierarchy_ledger::ROLE_TRANSITION_FIELD)
+                    .cloned()
+            })
+            .expect("publication must record a role transition");
+        assert_eq!(transition["decision"], "granted");
+        assert_eq!(transition["reason"], "granted_promotion");
     }
 
     #[test]
@@ -4717,6 +5335,8 @@ done
             phase,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
@@ -4838,6 +5458,8 @@ done
             phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
@@ -4845,6 +5467,8 @@ done
             worker_assignments: vec![WorkerAssignment {
                 id: "nested-worker".to_string(),
                 role: AgentRole::Worker,
+                role_category: None,
+                selection_source: None,
                 assigned_paths: vec![PathBuf::from("README.md")],
                 semantic_symbols: Vec::new(),
                 semantic_modules: Vec::new(),
@@ -5270,6 +5894,8 @@ done
             phase: AssignmentPhase::Execution,
             runtime: Some(SupervisorRuntime::Cursor),
             role: AgentRole::Worker,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
@@ -5291,6 +5917,88 @@ done
             assignment_launch_runtime(&assignment, &options, &budget_policy),
             SupervisorRuntime::ClaudeCode
         );
+        Ok(())
+    }
+
+    #[test]
+    fn admission_consumes_stored_category_and_refuses_luna_coordinator() -> Result<()> {
+        let mut assignment = OrchestratorAssignment {
+            id: "leaf-worker".to_string(),
+            phase: AssignmentPhase::Execution,
+            runtime: None,
+            role: AgentRole::Worker,
+            role_category: None,
+            selection_source: None,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        };
+        assignment.role_category = Some(RoleCategory::DelegatingCoordinator);
+        assignment.selection_source = Some(AssignmentSelectionSource::OperatorOverride);
+        let mut plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "admit stored category".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: 10,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+            assignments: vec![assignment.clone()],
+        };
+        plan.role_models.insert(
+            AgentRole::Worker,
+            RoleModelSelection {
+                model: Some("gpt-5.6-luna".to_string()),
+                reasoning_effort: Some("high".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        let catalog = RuntimeModelCatalog::Codex(
+            CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-luna", "gpt-5.6-sol"])
+                .context("fixture catalog")?,
+        );
+        let options = launch_fixture_options(SupervisorRuntime::Codex);
+        let budget_policy = AssignmentBudgetPolicy::default();
+        let error = bind_selected_assignment_launch_for_test(
+            launch_fixture_command(),
+            &assignment,
+            &budget_policy,
+            &plan,
+            &options,
+            &catalog,
+        )
+        .expect_err("luna cannot hold coordinator category at admission");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("ineligible by measured catalog/evidence")
+                || message.contains("cannot hold")
+                || message.contains("refused at execution admission"),
+            "{message}"
+        );
+
+        assignment.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+        assignment.selection_source = None;
+        plan.assignments[0] = assignment.clone();
+        bind_selected_assignment_launch_for_test(
+            launch_fixture_command(),
+            &assignment,
+            &budget_policy,
+            &plan,
+            &options,
+            &catalog,
+        )
+        .context("luna remains eligible for a terminal worker category")?;
         Ok(())
     }
 
@@ -5541,6 +6249,8 @@ done
             phase: AssignmentPhase::Execution,
             runtime: Some(SupervisorRuntime::Codex),
             role: AgentRole::Worker,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),

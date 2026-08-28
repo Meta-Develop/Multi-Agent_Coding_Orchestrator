@@ -439,6 +439,8 @@ pub(super) fn generated_licensed_follow_up_tasks(
                 phase: AssignmentPhase::Execution,
                 runtime: None,
                 role: AgentRole::ChildOrchestrator,
+                role_category: None,
+                selection_source: None,
                 assigned_paths: failure.paths.clone(),
                 semantic_symbols: failure.interfaces.clone(),
                 semantic_modules: Vec::new(),
@@ -496,7 +498,7 @@ pub(super) fn generated_licensed_follow_up_tasks(
                 handoff: handoff.clone(),
                 operator_defaults: generated_follow_up_operator_defaults(),
             };
-            let supervisor_plan = GeneratedFollowUpSupervisorPlan {
+            let mut supervisor_plan = GeneratedFollowUpSupervisorPlan {
                 version: ordinary_plan.version,
                 task: ordinary_plan.task.clone(),
                 task_file: ordinary_plan.task_file.clone(),
@@ -517,6 +519,7 @@ pub(super) fn generated_licensed_follow_up_tasks(
                 consultant: consultant.clone(),
                 generated_follow_up: generated_context,
             };
+            supervisor_plan.bind_assignment_role_categories();
             let serialized_plan = serde_json::to_string(&supervisor_plan)
                 .context("failed to serialize generated follow-up supervisor plan")?;
             let loaded = parse_supervisor_plan_with_consultant(&serialized_plan)

@@ -4,7 +4,30 @@ fn bounded_worktree_records(
     max_output_bytes: usize,
     timeout: Duration,
 ) -> Result<BoundedWorktreeRecords> {
-    bounded_worktree_records_mode(path, max_entries, max_output_bytes, timeout, false)
+    bounded_worktree_records_mode(
+        path,
+        max_entries,
+        max_output_bytes,
+        timeout,
+        false,
+        BoundedGitIsolation::Verified,
+    )
+}
+
+fn bounded_worktree_records_trusted(
+    path: &Path,
+    max_entries: usize,
+    max_output_bytes: usize,
+    timeout: Duration,
+) -> Result<BoundedWorktreeRecords> {
+    bounded_worktree_records_mode(
+        path,
+        max_entries,
+        max_output_bytes,
+        timeout,
+        false,
+        BoundedGitIsolation::Trusted,
+    )
 }
 
 fn bounded_worktree_records_with_ignored(
@@ -13,7 +36,45 @@ fn bounded_worktree_records_with_ignored(
     max_output_bytes: usize,
     timeout: Duration,
 ) -> Result<BoundedWorktreeRecords> {
-    bounded_worktree_records_mode(path, max_entries, max_output_bytes, timeout, true)
+    bounded_worktree_records_with_ignored_isolation(
+        path,
+        max_entries,
+        max_output_bytes,
+        timeout,
+        BoundedGitIsolation::Verified,
+    )
+}
+
+fn bounded_worktree_records_with_ignored_trusted(
+    path: &Path,
+    max_entries: usize,
+    max_output_bytes: usize,
+    timeout: Duration,
+) -> Result<BoundedWorktreeRecords> {
+    bounded_worktree_records_with_ignored_isolation(
+        path,
+        max_entries,
+        max_output_bytes,
+        timeout,
+        BoundedGitIsolation::Trusted,
+    )
+}
+
+fn bounded_worktree_records_with_ignored_isolation(
+    path: &Path,
+    max_entries: usize,
+    max_output_bytes: usize,
+    timeout: Duration,
+    isolation: BoundedGitIsolation,
+) -> Result<BoundedWorktreeRecords> {
+    bounded_worktree_records_mode(
+        path,
+        max_entries,
+        max_output_bytes,
+        timeout,
+        true,
+        isolation,
+    )
 }
 
 fn bounded_worktree_records_mode(
@@ -22,6 +83,7 @@ fn bounded_worktree_records_mode(
     max_output_bytes: usize,
     timeout: Duration,
     collect_ignored: bool,
+    isolation: BoundedGitIsolation,
 ) -> Result<BoundedWorktreeRecords> {
     let (_process_lock, deadline, process_queue_wait) =
         enter_bounded_status_process_scope(timeout)?;
@@ -36,6 +98,7 @@ fn bounded_worktree_records_mode(
         |_| Ok(()),
         deadline,
         collect_ignored,
+        isolation,
     )?;
     records.process_queue_wait = process_queue_wait;
     Ok(records)
@@ -81,6 +144,7 @@ where
         after_index_snapshot,
         deadline,
         false,
+        BoundedGitIsolation::Verified,
     )
     .map(|records| records.status.is_empty())
 }
@@ -106,10 +170,12 @@ where
         after_index_snapshot,
         deadline,
         false,
+        BoundedGitIsolation::Verified,
     )
     .map(|records| records.status.is_empty())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bounded_worktree_status_in_runtime_until<F>(
     path: &Path,
     max_entries: usize,
@@ -118,6 +184,7 @@ fn bounded_worktree_status_in_runtime_until<F>(
     after_index_snapshot: F,
     deadline: Instant,
     collect_ignored: bool,
+    isolation: BoundedGitIsolation,
 ) -> Result<BoundedWorktreeRecords>
 where
     F: FnOnce(&SafeRoot) -> Result<()>,
@@ -201,6 +268,7 @@ where
             git_dir: git_dir.path(),
             objects_target: common_objects.path(),
             core_filemode: git_text_inputs.core_filemode,
+            isolation,
         };
         let visible = run_bounded_git_records(
             &git_context,
@@ -490,7 +558,6 @@ fn validate_bounded_index_bytes(bytes: &[u8]) -> Result<()> {
     const CHECKSUM_BYTES: usize = 20;
     const CE_EXTENDED: u16 = 0x4000;
     const CE_VALID: u16 = 0x8000;
-    const GITLINK_MODE: u32 = 0o160000;
     const SPARSE_DIRECTORY_MODE: u32 = 0o040000;
 
     if bytes.len() < HEADER_BYTES.saturating_add(CHECKSUM_BYTES) || &bytes[..4] != b"DIRC" {
@@ -525,8 +592,8 @@ fn validate_bounded_index_bytes(bytes: &[u8]) -> Result<()> {
             bail!("bounded-status index entry is truncated");
         }
         let mode = bounded_index_u32(bytes, cursor + 24)?;
-        if matches!(mode, GITLINK_MODE | SPARSE_DIRECTORY_MODE) {
-            bail!("bounded-status rejects gitlink and sparse-directory index entries");
+        if mode == SPARSE_DIRECTORY_MODE {
+            bail!("bounded-status rejects sparse-directory index entries");
         }
         let flags = bounded_index_u16(bytes, cursor + 60)?;
         if flags & CE_VALID != 0 {
@@ -719,17 +786,17 @@ fn validate_bounded_git_index_records(bytes: &[u8], max_entries: usize) -> Resul
             bail!("bounded-status index validation returned a malformed header");
         }
         let tag = header[0];
-        if tag == b'S' || tag.is_ascii_lowercase() {
-            bail!("bounded-status rejects hidden index-entry state");
-        }
         let header = std::str::from_utf8(&header[2..])
             .context("bounded-status index validation header is not ASCII")?;
         let mode = header
             .split_ascii_whitespace()
             .next()
             .context("bounded-status index validation omitted an entry mode")?;
-        if matches!(mode, "160000" | "040000") {
-            bail!("bounded-status rejects gitlink and sparse-directory index entries");
+        if mode == "040000" {
+            bail!("bounded-status rejects sparse-directory index entries");
+        }
+        if tag == b'S' || tag.is_ascii_lowercase() {
+            bail!("bounded-status rejects hidden index-entry state");
         }
     }
     Ok(())
@@ -860,7 +927,7 @@ fn validate_bounded_git_text_inputs_bound(
     {
         bail!("bounded-status rejects Git object alternates");
     }
-    let inventory = BoundedTreeWalker::walk_bound_with(
+    let inventory = BoundedTreeWalker::walk_bound_with_options(
         repository.worktree_binding(),
         BoundedTreeWalkLimits {
             max_depth: 128,
@@ -873,29 +940,30 @@ fn validate_bounded_git_text_inputs_bound(
             )?,
             same_device: true,
         },
+        crate::safe_state::BoundedTreeWalkOptions {
+            stop_at_nested_repositories: true,
+        },
         |entry| {
             if entry.relative_path == Path::new(".git") {
                 return Ok(BoundedTreeWalkAction::Skip);
             }
             // Treat managed-worktree stores and other runtime roots as walk
-            // boundaries before the nested-marker check so ignored
-            // `.worktrees/` gitfiles do not fail closed and the walker never
-            // descends those trees.
+            // boundaries so the walker never descends those trees.
             if is_bounded_status_runtime_path(&entry.relative_path) {
                 return Ok(BoundedTreeWalkAction::Skip);
-            }
-            if entry.relative_path.file_name() == Some(OsStr::new(".git")) {
-                bail!("bounded-status rejects nested Git repository markers");
-            }
-            if entry.relative_path.file_name() == Some(OsStr::new(".gitmodules")) {
-                bail!("bounded-status rejects submodule metadata");
             }
             if entry.kind == BoundedTreeEntryKind::Directory {
                 return Ok(BoundedTreeWalkAction::RecordAndDescend);
             }
-            if entry.relative_path.file_name() == Some(OsStr::new(".gitignore")) {
+            let file_name = entry.relative_path.file_name();
+            let is_gitignore = file_name == Some(OsStr::new(".gitignore"));
+            let is_gitmodules = file_name == Some(OsStr::new(".gitmodules"));
+            if is_gitignore || is_gitmodules {
                 if !entry.is_safe_regular_file() {
-                    bail!("Git ignore input is not a safe single-link regular file");
+                    if is_gitignore {
+                        bail!("Git ignore input is not a safe single-link regular file");
+                    }
+                    bail!("Git submodule metadata is not a safe single-link regular file");
                 }
                 return Ok(BoundedTreeWalkAction::Record);
             }
@@ -1118,6 +1186,15 @@ fn ensure_worktree_status_deadline(deadline: Instant, phase: &str) -> Result<()>
     remaining_worktree_status_time(deadline, phase).map(|_| ())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundedGitIsolation {
+    /// Killable systemd / Job-Object backend with verified-empty evidence.
+    Verified,
+    /// Trusted git under Unix process-group ownership. Does not require a
+    /// delegated user-systemd session and never claims verified containment.
+    Trusted,
+}
+
 struct BoundedGitContext<'a> {
     worktree: &'a Path,
     worktree_target: &'a Path,
@@ -1125,6 +1202,7 @@ struct BoundedGitContext<'a> {
     git_dir: &'a Path,
     objects_target: &'a Path,
     core_filemode: bool,
+    isolation: BoundedGitIsolation,
 }
 
 #[cfg(target_os = "linux")]
@@ -1475,12 +1553,16 @@ fn run_bounded_git_records<const N: usize>(
         max_output_bytes,
     )
     .with_environment(EnvironmentMode::ClearAndSet(environment))
-    .with_containment(ContainmentPolicy::Required)
-    .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
-        side_effects,
-    ))
     .with_stdin(StdinMode::Null)
     .with_timeout(Some(remaining));
+    let spec = match context.isolation {
+        BoundedGitIsolation::Verified => spec
+            .with_containment(ContainmentPolicy::Required)
+            .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
+                side_effects,
+            )),
+        BoundedGitIsolation::Trusted => spec.with_containment(ContainmentPolicy::TrustedBestEffort),
+    };
     let output = run_process(spec).context("bounded worktree status command failed")?;
     if output.timed_out {
         bail!(
@@ -1491,7 +1573,7 @@ fn run_bounded_git_records<const N: usize>(
     if output.stdout.is_truncated() || output.stderr.is_truncated() {
         bail!("worktree status exceeded its {max_output_bytes}-byte output budget");
     }
-    require_verified_worktree_status_process(&output)?;
+    require_bounded_git_process(&output, context.isolation)?;
     let status = output
         .status
         .context("worktree status command returned no exit status")?;
@@ -1510,12 +1592,32 @@ fn run_bounded_git_records<const N: usize>(
     Ok(bytes.to_vec())
 }
 
+#[cfg(test)]
 fn require_verified_worktree_status_process(output: &ProcessOutput) -> Result<()> {
+    require_bounded_git_process(output, BoundedGitIsolation::Verified)
+}
+
+fn require_bounded_git_process(
+    output: &ProcessOutput,
+    isolation: BoundedGitIsolation,
+) -> Result<()> {
     if output.process_error.is_some() || output.stdin_error.is_some() {
         bail!("worktree status process cleanup was not verified");
     }
-    if !output.safety_evidence_verified() {
-        bail!("worktree status process safety evidence was not verified");
+    match isolation {
+        BoundedGitIsolation::Verified => {
+            if !output.safety_evidence_verified() {
+                bail!("worktree status process safety evidence was not verified");
+            }
+        }
+        BoundedGitIsolation::Trusted => match output.process_tree {
+            crate::process_runner::ProcessTreeEvidence::TrustedBestEffort(_) => {}
+            other => {
+                bail!(
+                    "trusted worktree status did not use best-effort process ownership: {other:?}"
+                );
+            }
+        },
     }
     Ok(())
 }

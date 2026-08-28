@@ -1,7 +1,10 @@
 use super::*;
 
 mod preclaim;
-use preclaim::{parked_preclaim_outcome, preclaim_assignment, PreclaimRunEvidence};
+use preclaim::{
+    evaluate_preclaim_viability, parked_preclaim_outcome, persist_preclaim_decision,
+    preclaim_assignment, PreclaimDecision, PreclaimRunEvidence,
+};
 
 /// Admission policy for concurrently runnable supervisor children.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -65,6 +68,92 @@ type BeforeSupervisorFinalReportPersistHook = Box<dyn FnMut(&mut SupervisorFinal
 thread_local! {
     static BEFORE_SUPERVISOR_FINAL_REPORT_PERSIST_HOOK: std::cell::RefCell<Option<BeforeSupervisorFinalReportPersistHook>> =
         std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+thread_local! {
+    static SUPERVISOR_EVIDENCE_PROVIDER: std::cell::RefCell<Option<SupervisorEvidenceProvider>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct SupervisorEvidenceProvider {
+    preclaim_run_evidence: Option<PreclaimRunEvidence>,
+    primary_worktree_snapshots: std::collections::VecDeque<PrimaryWorktreeSnapshot>,
+}
+
+#[cfg(test)]
+static SUPERVISOR_EVIDENCE_PROVIDER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+struct SupervisorEvidenceProviderGuard {
+    _serialized: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for SupervisorEvidenceProviderGuard {
+    fn drop(&mut self) {
+        let remaining = SUPERVISOR_EVIDENCE_PROVIDER.with(|slot| slot.borrow_mut().take());
+        if !std::thread::panicking() {
+            let remaining = remaining.expect("supervisor evidence provider disappeared");
+            assert!(
+                remaining.preclaim_run_evidence.is_none()
+                    && remaining.primary_worktree_snapshots.is_empty(),
+                "injected supervisor evidence was not consumed: preclaim={}, primary_snapshots={}",
+                usize::from(remaining.preclaim_run_evidence.is_some()),
+                remaining.primary_worktree_snapshots.len(),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+fn set_supervisor_evidence_provider_for_test(
+    preclaim_run_evidence: PreclaimRunEvidence,
+    primary_worktree_snapshots: [PrimaryWorktreeSnapshot; 2],
+) -> SupervisorEvidenceProviderGuard {
+    assert!(
+        SUPERVISOR_EVIDENCE_PROVIDER.with(|slot| slot.borrow().is_none()),
+        "supervisor evidence provider is already active on this test thread"
+    );
+    let serialized = SUPERVISOR_EVIDENCE_PROVIDER_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    SUPERVISOR_EVIDENCE_PROVIDER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        debug_assert!(slot.is_none());
+        *slot = Some(SupervisorEvidenceProvider {
+            preclaim_run_evidence: Some(preclaim_run_evidence),
+            primary_worktree_snapshots: primary_worktree_snapshots.into_iter().collect(),
+        });
+    });
+    SupervisorEvidenceProviderGuard {
+        _serialized: serialized,
+    }
+}
+
+#[cfg(test)]
+fn take_supervisor_preclaim_run_evidence() -> Option<PreclaimRunEvidence> {
+    SUPERVISOR_EVIDENCE_PROVIDER.with(|slot| {
+        slot.borrow_mut().as_mut().map(|provider| {
+            provider
+                .preclaim_run_evidence
+                .take()
+                .expect("injected supervisor pre-claim evidence was already consumed")
+        })
+    })
+}
+
+#[cfg(test)]
+fn take_supervisor_primary_worktree_snapshot() -> Option<PrimaryWorktreeSnapshot> {
+    SUPERVISOR_EVIDENCE_PROVIDER.with(|slot| {
+        slot.borrow_mut().as_mut().map(|provider| {
+            provider
+                .primary_worktree_snapshots
+                .pop_front()
+                .expect("injected supervisor primary-worktree snapshots were exhausted")
+        })
+    })
 }
 
 #[cfg(test)]
@@ -311,6 +400,7 @@ struct AssignmentSchedulerContext<'context, 'writer> {
 
 struct SchedulerProgress {
     indexed_outcomes: Vec<Option<AssignmentExecutionOutcome>>,
+    prepared_preclaim_decisions: Option<Vec<PreclaimDecision>>,
     health_breaker: SwarmHealthCircuitBreaker,
     budget_prevented_dispatch: bool,
     budget_denied_assignment_indices: BTreeSet<usize>,
@@ -339,6 +429,7 @@ impl SchedulerProgress {
     ) -> Result<Self> {
         Ok(Self {
             indexed_outcomes: (0..assignment_count).map(|_| None).collect(),
+            prepared_preclaim_decisions: None,
             health_breaker: SwarmHealthCircuitBreaker::default(),
             budget_prevented_dispatch: false,
             budget_denied_assignment_indices: BTreeSet::new(),
@@ -350,6 +441,29 @@ impl SchedulerProgress {
                 runtime,
             )?,
         })
+    }
+
+    fn install_preclaim_decisions(&mut self, decisions: Vec<PreclaimDecision>) -> Result<()> {
+        if decisions.len() != self.indexed_outcomes.len() {
+            bail!(
+                "prepared pre-claim decision count {} does not match assignment count {}",
+                decisions.len(),
+                self.indexed_outcomes.len()
+            );
+        }
+        self.prepared_preclaim_decisions = Some(decisions);
+        Ok(())
+    }
+
+    fn prepared_preclaim_decision(&self, index: usize) -> Result<Option<PreclaimDecision>> {
+        let Some(decisions) = self.prepared_preclaim_decisions.as_ref() else {
+            return Ok(None);
+        };
+        decisions
+            .get(index)
+            .cloned()
+            .map(Some)
+            .with_context(|| format!("missing prepared pre-claim decision at index {index}"))
     }
 
     fn commit_completed_selection_prefix(&mut self, runtime: SupervisorRuntime) -> Result<()> {
@@ -1338,6 +1452,7 @@ struct CollectedAssignmentOutcomes {
     pre_action_review_metrics: Vec<ReviewMetricSnapshot>,
     gate_correction_outcomes: Vec<GateCorrectionOutcomeRecord>,
     selection_decisions: Vec<SupervisorSelectionEvent>,
+    preclaim_parked_assignment_ids: BTreeSet<String>,
     candidate_inspections: BTreeMap<String, SupervisorCandidateInspection>,
     findings: Vec<Finding>,
     assignment_execution_failed: bool,
@@ -1432,17 +1547,50 @@ where
     Ok(None)
 }
 
+fn schedule_preclaim_decision(
+    context: &AssignmentSchedulerContext<'_, '_>,
+    progress: &SchedulerProgress,
+    fallback_evidence: Option<&PreclaimRunEvidence>,
+    index: usize,
+) -> Result<PreclaimDecision> {
+    if let Some(decision) = progress.prepared_preclaim_decision(index)? {
+        return Ok(decision);
+    }
+    let evidence = fallback_evidence.context(
+        "scheduler has neither a prepared pre-claim decision nor fallback pre-claim evidence",
+    )?;
+    preclaim_assignment(
+        context.artifacts,
+        &context.plan.assignments[index],
+        &context.requested_plan.assignments,
+        evidence,
+    )
+}
+
+fn scheduler_preclaim_evidence(
+    context: &AssignmentSchedulerContext<'_, '_>,
+) -> PreclaimRunEvidence {
+    PreclaimRunEvidence::acquire(
+        context.repo,
+        context.options.runtime,
+        preclaim_assessment_runtime(
+            context.options.runtime,
+            context.execution_runtime,
+            context.worktree_creation,
+        ),
+    )
+}
+
 fn run_serial_assignment_schedule(
     context: &AssignmentSchedulerContext<'_, '_>,
     progress: &mut SchedulerProgress,
     cancellation: &ProcessCancellation,
     serial_semantic_warn_intents: &Mutex<Vec<(usize, SemanticIntent)>>,
 ) -> Result<()> {
-    let preclaim_evidence = PreclaimRunEvidence::acquire(
-        context.repo,
-        context.options.runtime,
-        context.execution_runtime,
-    );
+    let fallback_preclaim_evidence = progress
+        .prepared_preclaim_decisions
+        .is_none()
+        .then(|| scheduler_preclaim_evidence(context));
     let mut pending = (0..context.plan.assignments.len()).collect::<BTreeSet<_>>();
     while !pending.is_empty() {
         suppress_failed_descendants(
@@ -1491,6 +1639,18 @@ fn run_serial_assignment_schedule(
             bail!("supervisor scheduler could not select a hierarchy-ready pending assignment");
         };
         let assignment = &context.plan.assignments[index];
+        let preclaim = schedule_preclaim_decision(
+            context,
+            progress,
+            fallback_preclaim_evidence.as_ref(),
+            index,
+        )?;
+        if !preclaim.allows_path_claim() {
+            pending.remove(&index);
+            progress.indexed_outcomes[index] = Some(parked_preclaim_outcome(assignment, &preclaim));
+            progress.commit_completed_selection_prefix(context.options.runtime)?;
+            continue;
+        }
         let Some(budget_policy) =
             progress
                 .budget_degradation
@@ -1513,13 +1673,6 @@ fn run_serial_assignment_schedule(
                 .extend(pending.iter().copied());
             break;
         };
-        let preclaim = preclaim_assignment(context.artifacts, assignment, &preclaim_evidence)?;
-        if !preclaim.allows_path_claim() {
-            pending.remove(&index);
-            progress.indexed_outcomes[index] = Some(parked_preclaim_outcome(assignment, &preclaim));
-            progress.commit_completed_selection_prefix(context.options.runtime)?;
-            continue;
-        }
         pending.remove(&index);
         record_assignment_started_checkpoint(
             context.artifacts,
@@ -1627,11 +1780,10 @@ fn run_concurrent_assignment_schedule(
     cancellation: &ProcessCancellation,
     semantic_block_gate: &SemanticBlockGate,
 ) -> Result<()> {
-    let preclaim_evidence = PreclaimRunEvidence::acquire(
-        context.repo,
-        context.options.runtime,
-        context.execution_runtime,
-    );
+    let fallback_preclaim_evidence = progress
+        .prepared_preclaim_decisions
+        .is_none()
+        .then(|| scheduler_preclaim_evidence(context));
     thread::scope(|scope| -> Result<()> {
         let (completion_sender, completion_receiver) = mpsc::channel::<usize>();
         let mut pending = (0..context.plan.assignments.len()).collect::<BTreeSet<_>>();
@@ -1682,6 +1834,22 @@ fn run_concurrent_assignment_schedule(
                         break;
                     };
                     let assignment = &context.plan.assignments[index];
+                    if active.len() >= progress.budget_degradation.effective_fan_out {
+                        break;
+                    }
+                    let preclaim = schedule_preclaim_decision(
+                        context,
+                        progress,
+                        fallback_preclaim_evidence.as_ref(),
+                        index,
+                    )?;
+                    if !preclaim.allows_path_claim() {
+                        pending.remove(&index);
+                        progress.indexed_outcomes[index] =
+                            Some(parked_preclaim_outcome(assignment, &preclaim));
+                        progress.commit_completed_selection_prefix(context.options.runtime)?;
+                        continue;
+                    }
                     let Some(budget_policy) = progress.budget_degradation.assignment_policy(
                         AssignmentBudgetPolicyRequest {
                             assignment,
@@ -1704,18 +1872,6 @@ fn run_concurrent_assignment_schedule(
                         stop_scheduling = true;
                         break;
                     };
-                    if active.len() >= progress.budget_degradation.effective_fan_out {
-                        break;
-                    }
-                    let preclaim =
-                        preclaim_assignment(context.artifacts, assignment, &preclaim_evidence)?;
-                    if !preclaim.allows_path_claim() {
-                        pending.remove(&index);
-                        progress.indexed_outcomes[index] =
-                            Some(parked_preclaim_outcome(assignment, &preclaim));
-                        progress.commit_completed_selection_prefix(context.options.runtime)?;
-                        continue;
-                    }
                     pending.remove(&index);
                     record_assignment_started_checkpoint(
                         context.artifacts,
@@ -2297,6 +2453,44 @@ fn build_supervisor_final_report(
         &mut assignment_selection_ledger,
         &budget_degradations,
     );
+    let mut recorded_parked_assignments = BTreeSet::new();
+    assignment_selection_ledger.retain(|entry| {
+        !collected
+            .preclaim_parked_assignment_ids
+            .contains(&entry.assignment_id)
+            || recorded_parked_assignments.insert(entry.assignment_id.clone())
+    });
+    for entry in &mut assignment_selection_ledger {
+        if !collected
+            .preclaim_parked_assignment_ids
+            .contains(&entry.assignment_id)
+        {
+            continue;
+        }
+        entry.attempt = 0;
+        entry.selected_runtime = None;
+        entry.selected_model = None;
+        entry.selected_reasoning_effort = None;
+        entry.catalog_source = AssignmentCatalogSource::None;
+        entry.catalog_snapshot_digest = None;
+        entry.catalog_revisions.clear();
+        entry.rejected_candidates.clear();
+        entry.quota_evidence = None;
+        entry.evidence_gap = Some(
+            "assignment parked by the pre-claim viability gate before model or effort selection"
+                .to_string(),
+        );
+    }
+    let (serialized_admission_policy_input, policy_input_unavailable_reason) =
+        match serde_json::to_string(&admission_policy_input) {
+            Ok(serialized) => (Some(serialized), None),
+            Err(error) => (
+                None,
+                Some(format!(
+                    "scheduler could not serialize the observed admission policy input: {error}"
+                )),
+            ),
+        };
     role_economics_profile.execution = Some(SupervisorExecutionMetadata {
         assignment_count: plan.assignments.len(),
         started_assignment_count: achieved_concurrency.started_assignment_count,
@@ -2304,12 +2498,9 @@ fn build_supervisor_final_report(
         concurrency: SupervisorConcurrencyReport {
             configured_max_concurrent_children: max_concurrent_children,
             policy_input_observation: ProcessObservation::SchedulerObserved,
-            policy_input: Some(
-                serde_json::to_string(&admission_policy_input)
-                    .expect("admission policy input is JSON serializable"),
-            ),
+            policy_input: serialized_admission_policy_input,
             policy_input_details: Some(admission_policy_input),
-            policy_input_unavailable_reason: None,
+            policy_input_unavailable_reason,
             achieved_max_concurrent_children: achieved_concurrency.peak,
             achieved_mean_concurrent_children: achieved_concurrency.mean,
             achieved_mean_observation: if achieved_concurrency.mean.is_some() {
@@ -2621,6 +2812,34 @@ fn supervisor_report_paths(
     (report_plan_file, report_run_dir)
 }
 
+fn require_live_supervisor_final_profile_and_scores(report: &SupervisorFinalReport) -> Result<()> {
+    let profile = report
+        .role_economics_profile
+        .as_ref()
+        .context("newly finalized supervisor reports require role_economics_profile")?;
+    let resolved = profile
+        .resolved_objective_profile
+        .as_ref()
+        .context("newly finalized supervisor reports require resolved_objective_profile")?;
+    resolved
+        .profile
+        .validate()
+        .context("newly finalized supervisor reports require a valid resolved_objective_profile")?;
+    if let Some(execution) = profile.execution.as_ref() {
+        for event in &execution.selection_decisions {
+            event
+                .provenance
+                .resolved_objective_profile
+                .profile
+                .validate()
+                .context(
+                    "newly finalized supervisor reports require scored selector profile evidence",
+                )?;
+        }
+    }
+    Ok(())
+}
+
 fn persist_supervisor_final_report(
     mut final_report: SupervisorFinalReport,
     orchestration_journal: &mut Option<OrchestrationEventJournal>,
@@ -2669,6 +2888,7 @@ fn persist_supervisor_final_report(
     }
     #[cfg(test)]
     run_before_supervisor_final_report_persist_hook(&mut final_report);
+    require_live_supervisor_final_profile_and_scores(&final_report)?;
     crate::run_ops::append_run_heartbeat_best_effort(
         &mut artifact_writer,
         "finalizing",
@@ -2834,8 +3054,10 @@ fn initialize_scheduler_evidence(
         lifecycle_event_payload("running", None, None),
     );
 
-    let baseline =
-        primary_worktree_snapshot(initialization.repo, initialization.execution_runtime)?;
+    let baseline = supervisor_primary_worktree_snapshot(
+        initialization.repo,
+        initialization.execution_runtime,
+    )?;
     if let Some(error) = baseline.inspection_problem() {
         bail!(
             "refusing to launch supervised work without a complete primary integrity snapshot: {error}"
@@ -2845,8 +3067,153 @@ fn initialize_scheduler_evidence(
     Ok(())
 }
 
+fn evaluate_supervisor_preclaims(
+    plan: &SupervisorPlan,
+    requested_plan: &SupervisorPlan,
+    repo: &Path,
+    runtime: SupervisorRuntime,
+    execution_runtime: SupervisorExecutionRuntime,
+) -> Vec<PreclaimDecision> {
+    let evidence = supervisor_preclaim_run_evidence(repo, runtime, execution_runtime);
+    plan.assignments
+        .iter()
+        .map(|assignment| {
+            let risk = evidence.risk_for(&assignment.assigned_paths);
+            evaluate_preclaim_viability(
+                assignment,
+                &requested_plan.assignments,
+                evidence.repo_map.as_ref(),
+                risk.as_ref(),
+                evidence.runtime,
+                execution_runtime,
+            )
+        })
+        .collect()
+}
+
+fn supervisor_preclaim_run_evidence(
+    repo: &Path,
+    runtime: SupervisorRuntime,
+    execution_runtime: SupervisorExecutionRuntime,
+) -> PreclaimRunEvidence {
+    #[cfg(test)]
+    if let Some(evidence) = take_supervisor_preclaim_run_evidence() {
+        return evidence;
+    }
+    PreclaimRunEvidence::acquire(repo, runtime, execution_runtime)
+}
+
+fn supervisor_primary_worktree_snapshot(
+    repo: &Path,
+    execution_runtime: SupervisorExecutionRuntime,
+) -> Result<PrimaryWorktreeSnapshot> {
+    #[cfg(test)]
+    if let Some(snapshot) = take_supervisor_primary_worktree_snapshot() {
+        return Ok(snapshot);
+    }
+    primary_worktree_snapshot(repo, execution_runtime)
+}
+
+/// Derive viability-assessment runtime independently of effect containment.
+///
+/// Production plan-file and follow-up entry points always execute through
+/// `Verified` + `Bound`, including `--runtime fake`. Fake never supplies
+/// production map/risk verification evidence, so assessment uses the same
+/// synthetic simulation path the scheduler family already uses. Codex +
+/// `Verified` stays strict outside tests. Test `Bound`/`PrimaryWorktree`
+/// fixtures inject runners to exercise containment, not production viability
+/// evidence; `VerifiedTestOnly` remains the real pre-claim acceptance boundary.
+fn preclaim_assessment_runtime(
+    runtime: SupervisorRuntime,
+    execution_runtime: SupervisorExecutionRuntime,
+    worktree_creation: SupervisorWorktreeCreation<'_>,
+) -> SupervisorExecutionRuntime {
+    if runtime == SupervisorRuntime::Fake {
+        return SupervisorExecutionRuntime::NonpublishableSimulation;
+    }
+
+    #[cfg(test)]
+    if matches!(
+        worktree_creation,
+        SupervisorWorktreeCreation::Bound(_) | SupervisorWorktreeCreation::PrimaryWorktree
+    ) {
+        return SupervisorExecutionRuntime::NonpublishableSimulation;
+    }
+
+    #[cfg(not(test))]
+    let _ = worktree_creation;
+
+    execution_runtime
+}
+
+fn persist_prepared_preclaim_decisions(
+    repo: &Path,
+    run_id: &RunId,
+    parent_node: Option<&str>,
+    artifact_writer: &mut ArtifactRunWriter,
+    assignments: &[OrchestratorAssignment],
+    decisions: &[PreclaimDecision],
+) -> Result<()> {
+    if assignments.len() != decisions.len() {
+        bail!(
+            "cannot persist {} pre-claim decisions for {} assignments",
+            decisions.len(),
+            assignments.len()
+        );
+    }
+    let mut journal = initialize_orchestration_event_journal(repo, run_id, parent_node);
+    let mut autonomy_kpis = AutonomyKpiCollector::default();
+    let artifacts = Mutex::new(SharedSupervisorArtifacts {
+        writer: artifact_writer,
+        journal: &mut journal,
+        autonomy_kpis: &mut autonomy_kpis,
+        checkpoint: None,
+    });
+    for (assignment, decision) in assignments.iter().zip(decisions) {
+        persist_preclaim_decision(&artifacts, assignment, decision)?;
+    }
+    Ok(())
+}
+
+fn resolve_preselection_objective_profile(
+    repo: &Path,
+    plan_metadata: &mut SupervisorPlanMetadata,
+) -> Result<()> {
+    if plan_metadata.resolved_objective_profile.is_none() {
+        let requested_objective_profile = plan_metadata.objective_profile.clone();
+        plan_metadata.resolved_objective_profile = Some(
+            resolve_objective_profile(repo, requested_objective_profile.as_deref())
+                .context("failed to resolve the supervisor objective profile")?,
+        );
+    }
+    Ok(())
+}
+
+fn no_dispatch_selection_resolution(
+    plan: &SupervisorPlan,
+    runtime: SupervisorRuntime,
+    execution_runtime: SupervisorExecutionRuntime,
+) -> SupervisorSelectionResolution {
+    let mode = if execution_runtime == SupervisorExecutionRuntime::NonpublishableSimulation {
+        SupervisorSelectionMode::LegacyNonpublishableSimulation
+    } else if runtime == SupervisorRuntime::Fake {
+        SupervisorSelectionMode::LegacyFake
+    } else if plan.role_models.is_empty() {
+        SupervisorSelectionMode::Automatic
+    } else {
+        SupervisorSelectionMode::DebugOverride
+    };
+    SupervisorSelectionResolution {
+        mode,
+        decisions: Vec::new(),
+        automatic_state: None,
+        selection_preflight_failure: None,
+    }
+}
+
 struct PreparedSupervisorRun {
-    /// Selector-resolved execution plan.
+    /// Selector-resolved execution plan. Only pre-claim-viable assignments may
+    /// receive selector-bound assignment runtime state.
     plan: SupervisorPlan,
     /// Original caller plan used for artifact identity and follow-up inheritance.
     requested_plan: SupervisorPlan,
@@ -2860,6 +3227,7 @@ struct PreparedSupervisorRun {
     selection_decisions: Vec<SupervisorSelectionEvent>,
     selection_preflight_failure: Option<SupervisorSelectionPreflightFailure>,
     automatic_selection_state: Option<SupervisorAutomaticSelectionState>,
+    preclaim_decisions: Vec<PreclaimDecision>,
     budget_ledger: RunBudgetLedger,
     runtime: SupervisorRuntime,
     repo: PathBuf,
@@ -2888,14 +3256,6 @@ fn prepare_supervisor_run(
         mut plan_metadata,
     } = loaded;
     validate_max_concurrent_children(max_concurrent_children)?;
-    let mut budget_ledger = RunBudgetLedger::new_composed(
-        plan_metadata.run_budget.limits,
-        options.budget_overrides,
-        plan_metadata.run_budget_max_duration_seconds,
-        options.budget_max_duration_seconds,
-    )
-    .context("failed to initialize the supervise run budget ledger")?;
-    plan_metadata.run_budget.limits = budget_ledger.effective_limits();
     match worktree_creation {
         SupervisorWorktreeCreation::Bound(_)
             if execution_runtime != SupervisorExecutionRuntime::Verified =>
@@ -2912,6 +3272,13 @@ fn prepare_supervisor_run(
         {
             bail!("primary-worktree execution requires the verified supervisor runtime")
         }
+        SupervisorWorktreeCreation::NonpublishableSimulation
+            if execution_runtime != SupervisorExecutionRuntime::NonpublishableSimulation =>
+        {
+            bail!(
+                "nonpublishable-simulation worktree creation requires the simulation supervisor runtime"
+            )
+        }
         #[cfg(test)]
         SupervisorWorktreeCreation::TestOnly
             if execution_runtime != SupervisorExecutionRuntime::NonpublishableSimulation =>
@@ -2925,6 +3292,11 @@ fn prepare_supervisor_run(
             bail!("verified test-only worktree creation requires the verified supervisor runtime")
         }
         _ => {}
+    }
+    if execution_runtime == SupervisorExecutionRuntime::NonpublishableSimulation
+        && !worktree_creation.is_nonpublishable_simulation()
+    {
+        bail!("simulation supervisor runtime requires nonpublishable-simulation worktree creation");
     }
     match (worktree_creation, plan_metadata.execution_target.as_ref()) {
         (
@@ -2940,52 +3312,15 @@ fn prepare_supervisor_run(
         (_, None) => {}
     }
     let runtime = options.runtime;
+    if matches!(
+        worktree_creation,
+        SupervisorWorktreeCreation::NonpublishableSimulation
+    ) && runtime != SupervisorRuntime::Fake
+    {
+        bail!("nonpublishable-simulation worktree creation requires the Fake supervisor runtime");
+    }
     let repo = discover_repo_root(&options.repo)?;
-    let quota_context = live_quota_context_for_run(&repo)?;
-    if quota_context.is_some() && runtime == SupervisorRuntime::Fake {
-        bail!("operator quota config is not valid for the nonpublishable Fake supervisor runtime");
-    }
-    if let Some(quota_context) = &quota_context {
-        budget_ledger
-            .attach_quota_config(&repo, options.run_id.as_str(), &quota_context.config)
-            .context("failed to attach operator quota config to the run budget ledger")?;
-    }
-    let admission_policy_input = SupervisorAdmissionPolicyInput::resolve_with_quota(
-        &repo,
-        max_concurrent_children,
-        plan_metadata.admission,
-        options.admission_overrides,
-        quota_context.as_ref(),
-    )?;
-    let max_concurrent_children = admission_policy_input.resolved_bound;
     let requested_plan = plan.clone();
-    let selection = initialize_supervisor_selection_from_prepared_metadata(
-        &mut plan,
-        &mut plan_metadata,
-        PreparedSupervisorSelectionRequest {
-            repo: &repo,
-            runtime,
-            execution_runtime,
-            runtime_model_catalog: &runtime_model_catalog,
-            admission_policy_input: &admission_policy_input,
-            quota: SupervisorQuotaSelectionInput {
-                context: quota_context.as_ref(),
-                ledger: quota_context.as_ref().map(|_| &budget_ledger),
-            },
-        },
-    )?;
-    let evidence_only_reaudit = plan_metadata
-        .evidence_only_reaudit
-        .as_ref()
-        .map(|operation| {
-            let assignment = plan
-                .assignments
-                .first()
-                .context("evidence-only re-audit plan has no assignment")?;
-            verify_evidence_only_reaudit_source(&repo, operation, assignment)
-        })
-        .transpose()?;
-    let assignment_schedule = validated_scheduler_assignment_schedule(&plan, &plan_metadata)?;
     let collision = crate::run_ops::refuse_live_run_collision(
         &repo,
         RunArtifactFamily::Supervise,
@@ -3025,6 +3360,113 @@ fn prepare_supervisor_run(
         "ok",
         None,
     );
+    // The acceptance gate is evaluated from immutable assignment evidence before
+    // selector, quota-ledger attachment, or assignment admission policy state can
+    // affect the run. Persist every decision immediately after evaluation so any
+    // later preparation failure still leaves durable gate evidence.
+    let preclaim_runtime =
+        preclaim_assessment_runtime(runtime, execution_runtime, worktree_creation);
+    let preclaim_decisions =
+        evaluate_supervisor_preclaims(&plan, &requested_plan, &repo, runtime, preclaim_runtime);
+    persist_prepared_preclaim_decisions(
+        &repo,
+        &options.run_id,
+        options.parent_node.as_deref(),
+        &mut artifact_writer,
+        &requested_plan.assignments,
+        &preclaim_decisions,
+    )?;
+    let mut budget_ledger = RunBudgetLedger::new_composed(
+        plan_metadata.run_budget.limits,
+        options.budget_overrides,
+        plan_metadata.run_budget_max_duration_seconds,
+        options.budget_max_duration_seconds,
+    )
+    .context("failed to initialize the supervise run budget ledger")?;
+    plan_metadata.run_budget.limits = budget_ledger.effective_limits();
+    let quota_context = live_quota_context_for_run(&repo)?;
+    if quota_context.is_some() && runtime == SupervisorRuntime::Fake {
+        bail!("operator quota config is not valid for the nonpublishable Fake supervisor runtime");
+    }
+    if let Some(quota_context) = &quota_context {
+        budget_ledger
+            .attach_quota_config(&repo, options.run_id.as_str(), &quota_context.config)
+            .context("failed to attach operator quota config to the run budget ledger")?;
+    }
+    let admission_policy_input = SupervisorAdmissionPolicyInput::resolve_with_quota(
+        &repo,
+        max_concurrent_children,
+        plan_metadata.admission,
+        options.admission_overrides,
+        quota_context.as_ref(),
+    )?;
+    let max_concurrent_children = admission_policy_input.resolved_bound;
+    resolve_preselection_objective_profile(&repo, &mut plan_metadata)?;
+    let mut selector_plan = plan.clone();
+    selector_plan.assignments = selector_plan
+        .assignments
+        .into_iter()
+        .zip(&preclaim_decisions)
+        .filter_map(|(assignment, decision)| decision.allows_path_claim().then_some(assignment))
+        .collect();
+    let selection = if selector_plan.assignments.is_empty() {
+        no_dispatch_selection_resolution(&plan, runtime, execution_runtime)
+    } else {
+        initialize_supervisor_selection_from_prepared_metadata(
+            &mut selector_plan,
+            &mut plan_metadata,
+            PreparedSupervisorSelectionRequest {
+                repo: &repo,
+                runtime,
+                execution_runtime,
+                runtime_model_catalog: &runtime_model_catalog,
+                admission_policy_input: &admission_policy_input,
+                quota: SupervisorQuotaSelectionInput {
+                    context: quota_context.as_ref(),
+                    ledger: quota_context.as_ref().map(|_| &budget_ledger),
+                },
+            },
+        )?
+    };
+    if selection.selection_preflight_failure.is_none() && !selector_plan.assignments.is_empty() {
+        plan.role_models = selector_plan.role_models;
+        plan.review_lenses = selector_plan.review_lenses;
+        let mut selected_viable_assignments = selector_plan.assignments.iter();
+        for (assignment, decision) in plan.assignments.iter_mut().zip(&preclaim_decisions) {
+            if !decision.allows_path_claim() {
+                continue;
+            }
+            let selected = selected_viable_assignments.next().with_context(|| {
+                format!(
+                    "selector-resolved viable assignment list ended before assignment '{}'",
+                    assignment.id
+                )
+            })?;
+            if selected.id != assignment.id {
+                bail!(
+                    "selector-resolved viable assignment '{}' does not match original assignment '{}'",
+                    selected.id,
+                    assignment.id
+                );
+            }
+            assignment.runtime = selected.runtime;
+        }
+        if selected_viable_assignments.next().is_some() {
+            bail!("selector-resolved viable assignment list contains an unmatched assignment");
+        }
+    }
+    let evidence_only_reaudit = plan_metadata
+        .evidence_only_reaudit
+        .as_ref()
+        .map(|operation| {
+            let assignment = plan
+                .assignments
+                .first()
+                .context("evidence-only re-audit plan has no assignment")?;
+            verify_evidence_only_reaudit_source(&repo, operation, assignment)
+        })
+        .transpose()?;
+    let assignment_schedule = validated_scheduler_assignment_schedule(&plan, &plan_metadata)?;
     let primary_base = current_head_oid(&repo)?;
     let normalized_plan_sha256 = normalized_supervisor_plan_sha256(
         &requested_plan,
@@ -3060,6 +3502,7 @@ fn prepare_supervisor_run(
         selection_decisions: selection.decisions,
         selection_preflight_failure: selection.selection_preflight_failure,
         automatic_selection_state: selection.automatic_state,
+        preclaim_decisions,
         budget_ledger,
         runtime,
         repo,
@@ -3151,6 +3594,7 @@ struct PredispatchFailureFinalization<'context, 'checkpoint> {
     has_multiple_independent_assignment_scopes: bool,
     runtime_model_catalog: Option<&'context RuntimeModelCatalog>,
     selection_decisions: Vec<SupervisorSelectionEvent>,
+    preclaim_parked_assignment_ids: BTreeSet<String>,
 }
 
 enum SupervisorPredispatchFailure {
@@ -3176,12 +3620,14 @@ fn persist_supervisor_predispatch_failure(
         has_multiple_independent_assignment_scopes,
         runtime_model_catalog,
         selection_decisions,
+        preclaim_parked_assignment_ids,
     } = finalization;
     let run_budget_report = budget_ledger.report()?;
     let (report_plan_file, report_run_dir) =
         supervisor_report_paths(repo, &options.plan_file, run_dir, &options.run_id);
     let mut collected = CollectedAssignmentOutcomes {
         selection_decisions,
+        preclaim_parked_assignment_ids,
         ..CollectedAssignmentOutcomes::default()
     };
     let (finding_message, environment_failures) = match failure {
@@ -3287,6 +3733,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         mut selection_decisions,
         selection_preflight_failure,
         automatic_selection_state,
+        preclaim_decisions,
         budget_ledger,
         runtime,
         repo,
@@ -3306,6 +3753,11 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         worktree_creation,
         runtime_model_catalog,
     )?;
+    let preclaim_parked_assignment_ids = preclaim_decisions
+        .iter()
+        .filter(|decision| !decision.allows_path_claim())
+        .map(|decision| decision.assignment_id.clone())
+        .collect::<BTreeSet<_>>();
     // Runtime catalog acquisition is the first dispatch-capable environment preflight. A typed
     // failure is finalized here and deliberately short-circuits every assignment environment
     // preflight, which can begin only inside `external_runner` below.
@@ -3331,6 +3783,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                         ),
                     runtime_model_catalog: None,
                     selection_decisions,
+                    preclaim_parked_assignment_ids,
                 },
                 SupervisorPredispatchFailure::RuntimeModelCatalog(*failure),
             );
@@ -3353,6 +3806,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                     has_multiple_independent_assignment_scopes(&assignment_schedule, &plan_metadata),
                 runtime_model_catalog: Some(&runtime_model_catalog),
                 selection_decisions,
+                preclaim_parked_assignment_ids,
             },
             SupervisorPredispatchFailure::Selection(failure),
         );
@@ -3364,7 +3818,10 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
     let mut field_guide_prompt_slot = None;
     let mut orchestration_journal = None;
     let mut autonomy_kpi_collector = AutonomyKpiCollector::default();
-    let mut collected = CollectedAssignmentOutcomes::default();
+    let mut collected = CollectedAssignmentOutcomes {
+        preclaim_parked_assignment_ids,
+        ..CollectedAssignmentOutcomes::default()
+    };
     collected
         .selection_decisions
         .append(&mut selection_decisions);
@@ -3446,6 +3903,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                 automatic_selection_state,
                 options.runtime,
             )?;
+            progress.install_preclaim_decisions(preclaim_decisions)?;
             let scheduler_context = AssignmentSchedulerContext {
                 plan: &plan,
                 requested_plan: &requested_plan,
@@ -3557,7 +4015,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         semantic_release_errors,
     } = planned_scheduler_resources.clone();
     let final_primary_integrity_failed = match primary_run_baseline.as_ref() {
-        Some(baseline) => match primary_worktree_snapshot(&repo, execution_runtime) {
+        Some(baseline) => match supervisor_primary_worktree_snapshot(&repo, execution_runtime) {
             Ok(final_snapshot) => {
                 if let Some(error) = final_snapshot.inspection_problem() {
                     collected.findings.push(Finding {
@@ -3850,6 +4308,8 @@ mod selection_policy_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    const SELECTOR_TEST_TARGET: &str = "tests/selector.rs";
+
     fn test_plan() -> SupervisorPlan {
         SupervisorPlan {
             version: SUPERVISOR_SCHEMA_VERSION,
@@ -3960,10 +4420,19 @@ mod selection_policy_tests {
         let repo_path = temporary.path().join("repo");
         let repository = git2::Repository::init(&repo_path).expect("initialize repository");
         fs::write(repo_path.join("README.md"), "baseline\n").expect("write baseline");
+        fs::create_dir(repo_path.join("tests")).expect("create selector test directory");
+        fs::write(
+            repo_path.join(SELECTOR_TEST_TARGET),
+            "#[test]\nfn selector_fixture() {}\n",
+        )
+        .expect("write selector test target");
         let mut index = repository.index().expect("repository index");
         index
             .add_path(Path::new("README.md"))
             .expect("stage baseline");
+        index
+            .add_path(Path::new(SELECTOR_TEST_TARGET))
+            .expect("stage selector test target");
         index.write().expect("write index");
         let tree_id = index.write_tree().expect("write tree");
         let tree = repository.find_tree(tree_id).expect("find tree");
@@ -3992,6 +4461,64 @@ mod selection_policy_tests {
             budget_max_duration_seconds: None,
             machine_global_retention: None,
         }
+    }
+
+    #[test]
+    fn preclaim_runtime_is_derived_separately_from_effect_containment() -> Result<()> {
+        skip_without_containment!(ok);
+        let (_temporary, repo) = initialized_repository();
+        let manager = WorktreeManager::new(&repo);
+        let cleanliness = manager.acquire_repository_cleanliness()?;
+
+        assert_eq!(
+            preclaim_assessment_runtime(
+                SupervisorRuntime::Fake,
+                SupervisorExecutionRuntime::Verified,
+                SupervisorWorktreeCreation::ExistingOnly,
+            ),
+            SupervisorExecutionRuntime::NonpublishableSimulation
+        );
+        assert_eq!(
+            preclaim_assessment_runtime(
+                SupervisorRuntime::Codex,
+                SupervisorExecutionRuntime::NonpublishableSimulation,
+                SupervisorWorktreeCreation::ExistingOnly,
+            ),
+            SupervisorExecutionRuntime::NonpublishableSimulation
+        );
+        assert_eq!(
+            preclaim_assessment_runtime(
+                SupervisorRuntime::Codex,
+                SupervisorExecutionRuntime::Verified,
+                SupervisorWorktreeCreation::Bound(&cleanliness),
+            ),
+            SupervisorExecutionRuntime::NonpublishableSimulation
+        );
+        assert_eq!(
+            preclaim_assessment_runtime(
+                SupervisorRuntime::Codex,
+                SupervisorExecutionRuntime::Verified,
+                SupervisorWorktreeCreation::PrimaryWorktree,
+            ),
+            SupervisorExecutionRuntime::NonpublishableSimulation
+        );
+        assert_eq!(
+            preclaim_assessment_runtime(
+                SupervisorRuntime::Codex,
+                SupervisorExecutionRuntime::Verified,
+                SupervisorWorktreeCreation::VerifiedTestOnly,
+            ),
+            SupervisorExecutionRuntime::Verified
+        );
+        assert_eq!(
+            preclaim_assessment_runtime(
+                SupervisorRuntime::Codex,
+                SupervisorExecutionRuntime::Verified,
+                SupervisorWorktreeCreation::ExistingOnly,
+            ),
+            SupervisorExecutionRuntime::Verified
+        );
+        Ok(())
     }
 
     #[test]
@@ -4078,6 +4605,8 @@ mod selection_policy_tests {
             phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
@@ -4085,6 +4614,8 @@ mod selection_policy_tests {
             worker_assignments: vec![WorkerAssignment {
                 id: "active-effort-worker".to_string(),
                 role: AgentRole::Worker,
+                role_category: None,
+                selection_source: None,
                 assigned_paths: vec![PathBuf::from("README.md")],
                 semantic_symbols: Vec::new(),
                 semantic_modules: Vec::new(),
@@ -4595,7 +5126,9 @@ mod selection_policy_tests {
             phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
-            assigned_paths: vec![PathBuf::from("README.md")],
+            role_category: None,
+            selection_source: None,
+            assigned_paths: vec![PathBuf::from(SELECTOR_TEST_TARGET)],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
             task: None,
@@ -4643,7 +5176,9 @@ mod selection_policy_tests {
             phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
-            assigned_paths: vec![PathBuf::from("README.md")],
+            role_category: None,
+            selection_source: None,
+            assigned_paths: vec![PathBuf::from(SELECTOR_TEST_TARGET)],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
             task: None,

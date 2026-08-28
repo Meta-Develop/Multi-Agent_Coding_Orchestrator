@@ -8,7 +8,10 @@ use crate::{
     artifacts::state_auth::sha256_hex,
     autopilot::{AutopilotProfileBindingReport, AutopilotProfileBindingStatus},
     llm::provider::Usage,
-    objective_profile::{default_objective_profile, ObjectiveProfile, ObjectiveProfileBinding},
+    objective_profile::{
+        default_resolved_objective_profile, select_from_frontier, FrontierAxes,
+        ObjectiveProfileBinding, ObjectiveSelection, ResolvedObjectiveProfile,
+    },
     supervise::{
         AgentRole, Finding, FindingSeverity, ProcessObservation, RoleBindingObservation,
         RoleEconomicsProfile, RoleModelSelection, RoleUsageObservation, RoleUsageReport,
@@ -25,8 +28,9 @@ use std::{
 use thiserror::Error;
 
 pub const EVALUATION_MANIFEST_SCHEMA_VERSION: u32 = 1;
-pub const EVALUATION_RESULTS_SCHEMA_VERSION: u32 = 3;
+pub const EVALUATION_RESULTS_SCHEMA_VERSION: u32 = 4;
 pub const LEGACY_EVALUATION_RESULTS_SCHEMA_VERSION: u32 = 2;
+pub const PRE_OBJECTIVE_SELECTION_RESULTS_SCHEMA_VERSION: u32 = 3;
 pub const CONSUMED_SUPERVISOR_EXECUTION_TELEMETRY_SCHEMA_VERSION: u32 = 2;
 pub const MAX_EVALUATION_HELD_OUT_VALIDATIONS: usize = 32;
 pub const MAX_EVALUATION_PROFILES: usize = 32;
@@ -94,6 +98,11 @@ pub struct EvaluationManifest {
     pub held_out_validation: Vec<HeldOutValidation>,
     pub repetitions: u32,
     pub profiles: Vec<EvaluationProfile>,
+    /// One canonical resolved objective consumed by quality scoring and the
+    /// post-frontier selection policy. Historical manifests omit it and use
+    /// the built-in 50/25/25 profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective_profile: Option<ResolvedObjectiveProfile>,
 }
 
 impl EvaluationManifest {
@@ -164,7 +173,21 @@ impl EvaluationManifest {
         }
         validate_held_out_bindings(&self.held_out_validation)?;
         validate_profiles(&self.profiles)?;
+        self.resolved_objective_profile()?;
         Ok(())
+    }
+
+    fn resolved_objective_profile(&self) -> Result<ResolvedObjectiveProfile, EvaluationError> {
+        let profile = match &self.objective_profile {
+            Some(profile) => profile.clone(),
+            None => default_resolved_objective_profile()
+                .map_err(|error| invalid_manifest("objective_profile", error.to_string()))?,
+        };
+        profile
+            .profile
+            .validate()
+            .map_err(|error| invalid_manifest("objective_profile", error.to_string()))?;
+        Ok(profile)
     }
 
     /// Verify that supplied bytes are a labelled hand-authored plan exactly bound by this
@@ -211,13 +234,17 @@ impl EvaluationManifest {
         Ok(())
     }
 
-    fn declared_inputs_binding(&self) -> DeclaredInputsBinding {
+    fn declared_inputs_binding(
+        &self,
+        objective_profile: Option<ResolvedObjectiveProfile>,
+    ) -> DeclaredInputsBinding {
         DeclaredInputsBinding {
             target: self.target.clone(),
             repository_base_snapshot: self.repository_base_snapshot.clone(),
             limits: self.limits,
             held_out_validation: self.held_out_validation.clone(),
             profiles: self.profiles.clone(),
+            objective_profile,
         }
     }
 }
@@ -364,6 +391,8 @@ pub struct DeclaredInputsBinding {
     pub limits: EvaluationLimits,
     pub held_out_validation: Vec<HeldOutValidation>,
     pub profiles: Vec<EvaluationProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective_profile: Option<ResolvedObjectiveProfile>,
 }
 
 /// A unique identity for one synthetic repetition.
@@ -672,6 +701,10 @@ pub struct ProfileSummary {
     pub mean_wall_time_ms: PreciseMean,
     pub mean_churn_count: PreciseMean,
     pub mean_conflict_count: PreciseMean,
+    /// Typed human-review-load observation (finding count) recorded from live
+    /// evaluation runs. Historical summaries omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_review_findings: Option<PreciseMean>,
     pub mean_loc_added: PreciseMean,
     pub mean_loc_deleted: PreciseMean,
     pub mean_diff_bytes: PreciseMean,
@@ -679,16 +712,69 @@ pub struct ProfileSummary {
     pub pareto_optimal: bool,
 }
 
-/// Cost-versus-quality projection for a non-dominated profile.
+/// Durable raw quality and typed operational coordinates for a non-dominated profile.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ParetoPoint {
     pub profile_id: String,
     pub mean_cost_usd: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_quota_consumption_tokens: Option<PreciseMean>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_wall_time_ms: Option<PreciseMean>,
     pub quality_basis_points: PreciseMean,
     pub held_out_basis_points: PreciseMean,
     pub breadth_basis_points: PreciseMean,
     pub anti_shortcut_basis_points: PreciseMean,
+}
+
+/// The applied objective is the experiment's original policy. Historical
+/// rescoring requires an owned CLI/API consumer and is intentionally not
+/// represented until that end-to-end path exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectiveScoringKind {
+    Original,
+}
+
+/// Durable scoring provenance for one evaluation document.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectiveScoringProvenance {
+    pub kind: ObjectiveScoringKind,
+    pub applied_profile: ResolvedObjectiveProfile,
+}
+
+impl ObjectiveScoringProvenance {
+    fn original(applied_profile: ResolvedObjectiveProfile) -> Self {
+        Self {
+            kind: ObjectiveScoringKind::Original,
+            applied_profile,
+        }
+    }
+
+    fn validate(&self) -> Result<(), EvaluationError> {
+        self.applied_profile
+            .profile
+            .validate()
+            .map_err(|error| invalid_results("objective_scoring", error.to_string()))?;
+        Ok(())
+    }
+}
+
+/// Versioned objective evidence. Schema v4 writes `Scored`; v2/v3 fixtures
+/// remain readable through the single legacy alternative.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum EvaluationObjectiveEvidence {
+    Scored(ObjectiveScoringProvenance),
+    Legacy(Option<ObjectiveProfileBinding>),
+}
+
+impl Default for EvaluationObjectiveEvidence {
+    fn default() -> Self {
+        Self::Legacy(None)
+    }
 }
 
 /// Versioned, machine-readable result schema.
@@ -709,8 +795,10 @@ pub struct EvaluationResults {
     pub profile_summaries: Vec<ProfileSummary>,
     pub pareto_conclusion: ParetoConclusion,
     pub pareto_frontier: Vec<ParetoPoint>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub objective_profile: Option<ObjectiveProfileBinding>,
+    #[serde(default, alias = "objective_profile")]
+    pub objective_scoring: EvaluationObjectiveEvidence,
+    #[serde(default)]
+    pub objective_selection: Option<ObjectiveSelection>,
 }
 
 impl EvaluationResults {
@@ -734,7 +822,8 @@ impl EvaluationResults {
             profile_summaries: self.profile_summaries.clone(),
             pareto_conclusion: self.pareto_conclusion.clone(),
             pareto_frontier: self.pareto_frontier.clone(),
-            objective_profile: self.objective_profile.clone(),
+            objective_scoring: self.objective_scoring.clone(),
+            objective_selection: self.objective_selection.clone(),
         }
     }
 }
@@ -754,8 +843,10 @@ pub struct EvaluationSummary {
     pub profile_summaries: Vec<ProfileSummary>,
     pub pareto_conclusion: ParetoConclusion,
     pub pareto_frontier: Vec<ParetoPoint>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub objective_profile: Option<ObjectiveProfileBinding>,
+    #[serde(default, alias = "objective_profile")]
+    pub objective_scoring: EvaluationObjectiveEvidence,
+    #[serde(default)]
+    pub objective_selection: Option<ObjectiveSelection>,
 }
 
 impl EvaluationSummary {
@@ -980,7 +1071,8 @@ fn run_deterministic_fake(
     manifest: &EvaluationManifest,
     seed: u64,
 ) -> Result<EvaluationResults, EvaluationError> {
-    let declared_inputs = manifest.declared_inputs_binding();
+    let objective_profile = manifest.resolved_objective_profile()?;
+    let declared_inputs = manifest.declared_inputs_binding(Some(objective_profile.clone()));
     let declared_inputs_digest = digest_serializable(&declared_inputs)?;
     let mut runs = Vec::with_capacity(
         manifest
@@ -993,8 +1085,14 @@ fn run_deterministic_fake(
     for profile in &manifest.profiles {
         let profile_fingerprint = profile_fingerprint(profile);
         for repetition in 0..manifest.repetitions {
-            let (execution, metrics) =
-                fake_metrics(manifest, profile, &profile_fingerprint, repetition, seed)?;
+            let (execution, metrics) = fake_metrics(
+                manifest,
+                profile,
+                &objective_profile,
+                &profile_fingerprint,
+                repetition,
+                seed,
+            )?;
             runs.push(EvaluationRepetitionResult {
                 profile_id: profile.id.clone(),
                 repetition,
@@ -1020,6 +1118,8 @@ fn run_deterministic_fake(
     let pareto_allowed = pareto_conclusion.status == ParetoConclusionStatus::Available;
     let (profile_summaries, pareto_frontier) =
         summarize_profiles_with_pareto(manifest, &runs, pareto_allowed)?;
+    let objective_selection =
+        select_evaluation_frontier(&objective_profile, &profile_summaries, &pareto_frontier)?;
     let results = EvaluationResults {
         version: EVALUATION_RESULTS_SCHEMA_VERSION,
         manifest_version: manifest.version,
@@ -1034,7 +1134,10 @@ fn run_deterministic_fake(
         profile_summaries,
         pareto_conclusion,
         pareto_frontier,
-        objective_profile: Some(bound_objective_profile(&default_objective_profile())?),
+        objective_scoring: EvaluationObjectiveEvidence::Scored(
+            ObjectiveScoringProvenance::original(objective_profile),
+        ),
+        objective_selection,
     };
     validate_results_against_manifest(manifest, &results)?;
     Ok(results)
@@ -1692,6 +1795,7 @@ pub fn validate_results_against_manifest(
     manifest.validate()?;
     if ![
         LEGACY_EVALUATION_RESULTS_SCHEMA_VERSION,
+        PRE_OBJECTIVE_SELECTION_RESULTS_SCHEMA_VERSION,
         EVALUATION_RESULTS_SCHEMA_VERSION,
     ]
     .contains(&results.version)
@@ -1721,6 +1825,63 @@ pub fn validate_results_against_manifest(
     }
     results.evidence.validate()?;
     results.dispatch_comparability_claim.validate()?;
+    let manifest_objective_profile = manifest.resolved_objective_profile()?;
+    let applied_objective_profile = match (&results.objective_scoring, results.version) {
+        (
+            EvaluationObjectiveEvidence::Scored(objective_scoring),
+            EVALUATION_RESULTS_SCHEMA_VERSION,
+        ) => {
+            objective_scoring.validate()?;
+            if objective_scoring.applied_profile != manifest_objective_profile {
+                return Err(invalid_results(
+                    "objective_scoring.applied_profile",
+                    "does not match the resolved objective bound by the manifest",
+                ));
+            }
+            objective_scoring.applied_profile.clone()
+        }
+        (EvaluationObjectiveEvidence::Scored(_), _) => {
+            return Err(invalid_results(
+                "objective_scoring",
+                "scored objective evidence requires evaluation results schema v4",
+            ));
+        }
+        (
+            EvaluationObjectiveEvidence::Legacy(objective_profile),
+            LEGACY_EVALUATION_RESULTS_SCHEMA_VERSION
+            | PRE_OBJECTIVE_SELECTION_RESULTS_SCHEMA_VERSION,
+        ) => {
+            if let Some(binding) = objective_profile {
+                binding
+                    .validate()
+                    .map_err(|error| invalid_results("objective_profile", error.to_string()))?;
+                if binding != &manifest_objective_profile.profile {
+                    return Err(invalid_results(
+                        "objective_profile",
+                        "does not match the objective resolved for the manifest",
+                    ));
+                }
+            } else if manifest.objective_profile.is_some() {
+                return Err(invalid_results(
+                    "objective_profile",
+                    "legacy results may omit only the historical built-in objective",
+                ));
+            }
+            manifest_objective_profile.clone()
+        }
+        (EvaluationObjectiveEvidence::Legacy(_), EVALUATION_RESULTS_SCHEMA_VERSION) => {
+            return Err(invalid_results(
+                "objective_scoring",
+                "evaluation results schema v4 requires canonical scoring provenance",
+            ));
+        }
+        _ => {
+            return Err(invalid_results(
+                "objective_scoring",
+                "objective evidence does not match the results schema version",
+            ));
+        }
+    };
     if results.evidence.kind == EvaluationEvidenceKind::ProvisionalDeterministicFakeOnly
         && results
             .runs
@@ -1734,7 +1895,10 @@ pub fn validate_results_against_manifest(
         ));
     }
 
-    let expected_binding = manifest.declared_inputs_binding();
+    let expected_binding = manifest.declared_inputs_binding(
+        (results.version == EVALUATION_RESULTS_SCHEMA_VERSION)
+            .then(|| applied_objective_profile.clone()),
+    );
     if results.declared_inputs != expected_binding {
         return Err(invalid_results(
             "declared_inputs",
@@ -1827,7 +1991,13 @@ pub fn validate_results_against_manifest(
             run.metrics.wall_time_ms,
             run_index,
         )?;
-        validate_metrics(manifest, profile, &run.metrics, run_index)?;
+        validate_metrics(
+            manifest,
+            profile,
+            &applied_objective_profile,
+            &run.metrics,
+            run_index,
+        )?;
         if let Some(observed_dispatch) = &run.observed_dispatch {
             validate_observed_dispatch_record(observed_dispatch, run_index)?;
         }
@@ -1861,11 +2031,31 @@ pub fn validate_results_against_manifest(
             "aggregates do not match the repetition observations",
         ));
     }
-    if !pareto_frontiers_equivalent(&results.pareto_frontier, &expected_frontier) {
+    if !pareto_frontiers_equivalent(
+        &results.pareto_frontier,
+        &expected_frontier,
+        results.version != EVALUATION_RESULTS_SCHEMA_VERSION,
+    ) {
         return Err(invalid_results(
             "pareto_frontier",
-            "frontier does not match cost-versus-quality dominance over profile summaries",
+            "frontier does not match raw typed evidence dominance over profile summaries",
         ));
+    }
+    if matches!(
+        &results.objective_scoring,
+        EvaluationObjectiveEvidence::Scored(_)
+    ) {
+        let expected_selection = select_evaluation_frontier(
+            &applied_objective_profile,
+            &expected_summaries,
+            &expected_frontier,
+        )?;
+        if results.objective_selection != expected_selection {
+            return Err(invalid_results(
+                "objective_selection",
+                "does not match the explicit profile policy applied after frontier construction",
+            ));
+        }
     }
     Ok(())
 }
@@ -2297,6 +2487,7 @@ fn validate_profiles(profiles: &[EvaluationProfile]) -> Result<(), EvaluationErr
 fn fake_metrics(
     manifest: &EvaluationManifest,
     profile: &EvaluationProfile,
+    objective_profile: &ResolvedObjectiveProfile,
     profile_fingerprint: &str,
     repetition: u32,
     seed: u64,
@@ -2449,7 +2640,7 @@ fn fake_metrics(
         },
         findings,
     };
-    let quality = calculate_quality(&held_out_validation, &review)?;
+    let quality = calculate_quality(objective_profile, &held_out_validation, &review)?;
     let loc_added = 40 + (run_hash % 461);
     let loc_deleted = (run_hash >> 7) % 181;
     let changed_lines = loc_added
@@ -2482,6 +2673,7 @@ fn fake_metrics(
 fn validate_metrics(
     manifest: &EvaluationManifest,
     profile: &EvaluationProfile,
+    objective_profile: &ResolvedObjectiveProfile,
     metrics: &EvaluationMetrics,
     run_index: usize,
 ) -> Result<(), EvaluationError> {
@@ -2629,7 +2821,11 @@ fn validate_metrics(
             ));
         }
     }
-    let expected_quality = calculate_quality(&metrics.held_out_validation, &metrics.review)?;
+    let expected_quality = calculate_quality(
+        objective_profile,
+        &metrics.held_out_validation,
+        &metrics.review,
+    )?;
     if metrics.quality != expected_quality {
         return Err(invalid_results(
             field("quality"),
@@ -2662,6 +2858,7 @@ fn validate_review_dimension(
 }
 
 pub(crate) fn calculate_quality(
+    objective_profile: &ResolvedObjectiveProfile,
     held_out: &[HeldOutValidationResult],
     review: &ReviewQuality,
 ) -> Result<QualityScore, EvaluationError> {
@@ -2699,27 +2896,22 @@ pub(crate) fn calculate_quality(
         u64::from(review.anti_shortcut.checks_passed),
         u64::from(review.anti_shortcut.checks_run),
     );
-    let overall_basis_points = default_objective_profile().overall_quality_basis_points(
-        held_out_basis_points,
-        breadth_basis_points,
-        anti_shortcut_basis_points,
-    );
+    objective_profile
+        .profile
+        .validate()
+        .map_err(|error| invalid_results("objective_profile", error.to_string()))?;
+    let quality = &objective_profile.profile.quality;
+    let weighted = u64::from(held_out_basis_points) * u64::from(quality.held_out_percent)
+        + u64::from(breadth_basis_points) * u64::from(quality.breadth_percent)
+        + u64::from(anti_shortcut_basis_points) * u64::from(quality.anti_shortcut_percent);
+    let overall_basis_points = u32::try_from(weighted / 100)
+        .map_err(|_| overflow("objective-weighted quality basis points"))?;
     Ok(QualityScore {
         held_out_basis_points,
         breadth_basis_points,
         anti_shortcut_basis_points,
         overall_basis_points,
     })
-}
-
-/// Bind the objective profile that produced `overall` quality so later
-/// re-weighting cannot silently rewrite this experiment.
-pub fn bound_objective_profile(
-    profile: &ObjectiveProfile,
-) -> Result<ObjectiveProfileBinding, EvaluationError> {
-    profile
-        .binding()
-        .map_err(|error| invalid_results("objective_profile", error.to_string()))
 }
 
 #[cfg(test)]
@@ -2803,6 +2995,7 @@ fn summarize_profiles_with_pareto(
         let mut wall_time_ms = 0u64;
         let mut churn_count = 0u64;
         let mut conflict_count = 0u64;
+        let mut review_findings = 0u64;
         let mut loc_added = 0u64;
         let mut loc_deleted = 0u64;
         let mut diff_bytes = 0u64;
@@ -2825,6 +3018,12 @@ fn summarize_profiles_with_pareto(
                 conflict_count,
                 run.metrics.conflict_count,
                 "profile conflict count",
+            )?;
+            review_findings = checked_add_u64(
+                review_findings,
+                u64::try_from(run.metrics.review.findings.len())
+                    .map_err(|_| overflow("profile review findings"))?,
+                "profile review findings",
             )?;
             loc_added = checked_add_u64(loc_added, run.metrics.loc_added, "profile added lines")?;
             loc_deleted = checked_add_u64(
@@ -2866,6 +3065,7 @@ fn summarize_profiles_with_pareto(
             mean_wall_time_ms: PreciseMean::new(wall_time_ms, manifest.repetitions)?,
             mean_churn_count: PreciseMean::new(churn_count, manifest.repetitions)?,
             mean_conflict_count: PreciseMean::new(conflict_count, manifest.repetitions)?,
+            mean_review_findings: Some(PreciseMean::new(review_findings, manifest.repetitions)?),
             mean_loc_added: PreciseMean::new(loc_added, manifest.repetitions)?,
             mean_loc_deleted: PreciseMean::new(loc_deleted, manifest.repetitions)?,
             mean_diff_bytes: PreciseMean::new(diff_bytes, manifest.repetitions)?,
@@ -2893,15 +3093,23 @@ fn summarize_profiles_with_pareto(
     let mut frontier = summaries
         .iter()
         .filter(|summary| summary.pareto_optimal)
-        .map(|summary| ParetoPoint {
-            profile_id: summary.profile_id.clone(),
-            mean_cost_usd: summary.mean_cost_usd,
-            quality_basis_points: summary.mean_quality.overall_basis_points,
-            held_out_basis_points: summary.mean_quality.held_out_basis_points,
-            breadth_basis_points: summary.mean_quality.breadth_basis_points,
-            anti_shortcut_basis_points: summary.mean_quality.anti_shortcut_basis_points,
+        .map(|summary| {
+            Ok(ParetoPoint {
+                profile_id: summary.profile_id.clone(),
+                mean_cost_usd: summary.mean_cost_usd,
+                mean_quota_consumption_tokens: Some(PreciseMean::new(
+                    u64::try_from(summary.aggregate_usage.total_tokens)
+                        .map_err(|_| overflow("frontier quota consumption"))?,
+                    summary.repetitions,
+                )?),
+                mean_wall_time_ms: Some(summary.mean_wall_time_ms),
+                quality_basis_points: summary.mean_quality.overall_basis_points,
+                held_out_basis_points: summary.mean_quality.held_out_basis_points,
+                breadth_basis_points: summary.mean_quality.breadth_basis_points,
+                anti_shortcut_basis_points: summary.mean_quality.anti_shortcut_basis_points,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, EvaluationError>>()?;
     frontier.sort_by(|left, right| {
         left.mean_cost_usd
             .total_cmp(&right.mean_cost_usd)
@@ -2917,13 +3125,278 @@ fn summarize_profiles_with_pareto(
 
 fn dominates(candidate: &ProfileSummary, other: &ProfileSummary) -> bool {
     let no_more_expensive = candidate.mean_cost_usd <= other.mean_cost_usd;
-    let quality_order = candidate
+    let quota_order = compare_usage_means(
+        candidate.aggregate_usage.total_tokens,
+        candidate.repetitions,
+        other.aggregate_usage.total_tokens,
+        other.repetitions,
+    );
+    let latency_order = candidate
+        .mean_wall_time_ms
+        .cmp_value(&other.mean_wall_time_ms);
+    let held_out_order = candidate
         .mean_quality
-        .overall_basis_points
-        .cmp_value(&other.mean_quality.overall_basis_points);
-    let no_lower_quality = quality_order.is_ge();
-    let strictly_better = candidate.mean_cost_usd < other.mean_cost_usd || quality_order.is_gt();
-    no_more_expensive && no_lower_quality && strictly_better
+        .held_out_basis_points
+        .cmp_value(&other.mean_quality.held_out_basis_points);
+    let breadth_order = candidate
+        .mean_quality
+        .breadth_basis_points
+        .cmp_value(&other.mean_quality.breadth_basis_points);
+    let anti_shortcut_order = candidate
+        .mean_quality
+        .anti_shortcut_basis_points
+        .cmp_value(&other.mean_quality.anti_shortcut_basis_points);
+    let no_more_quota = quota_order.is_le();
+    let no_slower = latency_order.is_le();
+    let no_lower_raw_quality =
+        held_out_order.is_ge() && breadth_order.is_ge() && anti_shortcut_order.is_ge();
+    let strictly_better = candidate.mean_cost_usd < other.mean_cost_usd
+        || quota_order.is_lt()
+        || latency_order.is_lt()
+        || held_out_order.is_gt()
+        || breadth_order.is_gt()
+        || anti_shortcut_order.is_gt();
+    no_more_expensive && no_more_quota && no_slower && no_lower_raw_quality && strictly_better
+}
+
+fn compare_usage_means(
+    left_total: usize,
+    left_count: u32,
+    right_total: usize,
+    right_count: u32,
+) -> std::cmp::Ordering {
+    ((left_total as u128) * u128::from(right_count))
+        .cmp(&((right_total as u128) * u128::from(left_count)))
+}
+
+fn select_evaluation_frontier(
+    objective_profile: &ResolvedObjectiveProfile,
+    summaries: &[ProfileSummary],
+    frontier: &[ParetoPoint],
+) -> Result<Option<ObjectiveSelection>, EvaluationError> {
+    if frontier.is_empty() {
+        return Ok(None);
+    }
+    let frontier_ids = frontier
+        .iter()
+        .map(|point| point.profile_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let candidates = summaries
+        .iter()
+        .filter(|summary| frontier_ids.contains(summary.profile_id.as_str()))
+        .collect::<Vec<_>>();
+    if candidates.len() != frontier.len() {
+        return Err(invalid_results(
+            "objective_selection",
+            "every Pareto point must have exactly one profile summary",
+        ));
+    }
+    require_supported_evaluation_tradeoffs(
+        objective_profile,
+        true,
+        candidates
+            .iter()
+            .all(|summary| summary.mean_review_findings.is_some()),
+    )?;
+    let max_cost = candidates
+        .iter()
+        .map(|summary| summary.mean_cost_usd)
+        .fold(0.0_f64, f64::max);
+    let max_quota = candidates
+        .iter()
+        .map(|summary| summary.aggregate_usage.total_tokens as f64 / f64::from(summary.repetitions))
+        .fold(0.0_f64, f64::max);
+    let max_latency = candidates
+        .iter()
+        .map(|summary| precise_mean_as_f64(summary.mean_wall_time_ms))
+        .fold(0.0_f64, f64::max);
+    let max_retry = candidates
+        .iter()
+        .map(|summary| precise_mean_as_f64(summary.mean_churn_count))
+        .fold(0.0_f64, f64::max);
+    let max_review = candidates
+        .iter()
+        .map(|summary| {
+            summary
+                .mean_review_findings
+                .map(precise_mean_as_f64)
+                .unwrap_or(0.0)
+        })
+        .fold(0.0_f64, f64::max);
+    let points = candidates
+        .iter()
+        .map(|summary| {
+            Ok((
+                summary.profile_id.clone(),
+                FrontierAxes {
+                    held_out_quality_basis_points: precise_mean_as_u32(
+                        summary.mean_quality.held_out_basis_points,
+                    )?,
+                    breadth_quality_basis_points: precise_mean_as_u32(
+                        summary.mean_quality.breadth_basis_points,
+                    )?,
+                    anti_shortcut_quality_basis_points: precise_mean_as_u32(
+                        summary.mean_quality.anti_shortcut_basis_points,
+                    )?,
+                    monetary_cost: normalize_axis(summary.mean_cost_usd, max_cost),
+                    quota_consumption: normalize_axis(
+                        summary.aggregate_usage.total_tokens as f64
+                            / f64::from(summary.repetitions),
+                        max_quota,
+                    ),
+                    latency: normalize_axis(
+                        precise_mean_as_f64(summary.mean_wall_time_ms),
+                        max_latency,
+                    ),
+                    retry_rework: normalize_axis(
+                        precise_mean_as_f64(summary.mean_churn_count),
+                        max_retry,
+                    ),
+                    human_review: normalize_axis(
+                        summary
+                            .mean_review_findings
+                            .map(precise_mean_as_f64)
+                            .unwrap_or(0.0),
+                        max_review,
+                    ),
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>, EvaluationError>>()?;
+    select_from_frontier(objective_profile, &points)
+        .map_err(|error| invalid_results("objective_selection", error.to_string()))
+}
+
+pub(super) fn select_experiment_frontier(
+    objective_profile: &ResolvedObjectiveProfile,
+    summaries: &[ExperimentProfileSummary],
+    frontier: &[ParetoPoint],
+) -> Result<Option<ObjectiveSelection>, EvaluationError> {
+    if frontier.is_empty() {
+        return Ok(None);
+    }
+    require_supported_evaluation_tradeoffs(objective_profile, false, false)?;
+    let frontier_ids = frontier
+        .iter()
+        .map(|point| point.profile_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let candidates = summaries
+        .iter()
+        .filter(|summary| frontier_ids.contains(summary.profile_id.as_str()))
+        .collect::<Vec<_>>();
+    if candidates.len() != frontier.len() {
+        return Err(invalid_results(
+            "objective_selection",
+            "every Pareto point must have exactly one experiment profile summary",
+        ));
+    }
+    if objective_profile.profile.tradeoffs.monetary_cost_percent > 0
+        && candidates
+            .iter()
+            .any(|summary| summary.aggregate_cost_usd.is_none())
+    {
+        return Ok(None);
+    }
+    if objective_profile
+        .profile
+        .tradeoffs
+        .quota_consumption_percent
+        > 0
+        && candidates
+            .iter()
+            .any(|summary| summary.aggregate_usage.is_none())
+    {
+        return Ok(None);
+    }
+    let max_cost = candidates
+        .iter()
+        .map(|summary| summary.mean_cost_usd)
+        .fold(0.0_f64, f64::max);
+    let quota = |summary: &ExperimentProfileSummary| {
+        summary
+            .aggregate_usage
+            .map(|usage| usage.total_tokens as f64 / f64::from(summary.repetitions))
+            .unwrap_or(0.0)
+    };
+    let max_quota = candidates
+        .iter()
+        .map(|summary| quota(summary))
+        .fold(0.0_f64, f64::max);
+    let max_latency = candidates
+        .iter()
+        .map(|summary| precise_mean_as_f64(summary.mean_wall_time_ms))
+        .fold(0.0_f64, f64::max);
+    let points = candidates
+        .iter()
+        .map(|summary| {
+            Ok((
+                summary.profile_id.clone(),
+                FrontierAxes {
+                    held_out_quality_basis_points: precise_mean_as_u32(
+                        summary.mean_quality.held_out_basis_points,
+                    )?,
+                    breadth_quality_basis_points: precise_mean_as_u32(
+                        summary.mean_quality.breadth_basis_points,
+                    )?,
+                    anti_shortcut_quality_basis_points: precise_mean_as_u32(
+                        summary.mean_quality.anti_shortcut_basis_points,
+                    )?,
+                    monetary_cost: normalize_axis(summary.mean_cost_usd, max_cost),
+                    quota_consumption: normalize_axis(quota(summary), max_quota),
+                    latency: normalize_axis(
+                        precise_mean_as_f64(summary.mean_wall_time_ms),
+                        max_latency,
+                    ),
+                    retry_rework: 0.0,
+                    human_review: 0.0,
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>, EvaluationError>>()?;
+    select_from_frontier(objective_profile, &points)
+        .map_err(|error| invalid_results("objective_selection", error.to_string()))
+}
+
+fn require_supported_evaluation_tradeoffs(
+    objective_profile: &ResolvedObjectiveProfile,
+    retry_observed: bool,
+    review_observed: bool,
+) -> Result<(), EvaluationError> {
+    let tradeoffs = &objective_profile.profile.tradeoffs;
+    if tradeoffs.retry_rework_percent > 0 && !retry_observed {
+        return Err(invalid_results(
+            "objective_profile.tradeoffs.retry_rework_percent",
+            "evaluation has no typed retry/rework observation and will not substitute churn",
+        ));
+    }
+    if tradeoffs.human_review_percent > 0 && !review_observed {
+        return Err(invalid_results(
+            "objective_profile.tradeoffs.human_review_percent",
+            "evaluation has no typed human-review-load observation and will not substitute findings",
+        ));
+    }
+    Ok(())
+}
+
+fn precise_mean_as_f64(mean: PreciseMean) -> f64 {
+    mean.total as f64 / f64::from(mean.count)
+}
+
+fn precise_mean_as_u32(mean: PreciseMean) -> Result<u32, EvaluationError> {
+    let rounded = mean
+        .total
+        .checked_add(u64::from(mean.count / 2))
+        .ok_or_else(|| overflow("rounded objective quality mean"))?
+        / u64::from(mean.count);
+    u32::try_from(rounded).map_err(|_| overflow("objective quality mean"))
+}
+
+fn normalize_axis(value: f64, maximum: f64) -> f64 {
+    if maximum > 0.0 {
+        (value / maximum).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 fn profile_summaries_equivalent(left: &[ProfileSummary], right: &[ProfileSummary]) -> bool {
@@ -2960,8 +3433,9 @@ fn evaluation_summaries_equivalent(left: &EvaluationSummary, right: &EvaluationS
         && left.dispatch_comparisons == right.dispatch_comparisons
         && profile_summaries_equivalent(&left.profile_summaries, &right.profile_summaries)
         && left.pareto_conclusion == right.pareto_conclusion
-        && pareto_frontiers_equivalent(&left.pareto_frontier, &right.pareto_frontier)
-        && left.objective_profile == right.objective_profile
+        && pareto_frontiers_equivalent(&left.pareto_frontier, &right.pareto_frontier, false)
+        && left.objective_scoring == right.objective_scoring
+        && left.objective_selection == right.objective_selection
 }
 
 fn role_usage_maps_equivalent(
@@ -2984,16 +3458,38 @@ fn role_usage_maps_equivalent(
         })
 }
 
-fn pareto_frontiers_equivalent(left: &[ParetoPoint], right: &[ParetoPoint]) -> bool {
+fn pareto_frontiers_equivalent(
+    left: &[ParetoPoint],
+    right: &[ParetoPoint],
+    allow_missing_legacy_operational_axes: bool,
+) -> bool {
     left.len() == right.len()
         && left.iter().zip(right).all(|(left, right)| {
             left.profile_id == right.profile_id
                 && approximately_equal(left.mean_cost_usd, right.mean_cost_usd)
+                && optional_pareto_axis_equivalent(
+                    left.mean_quota_consumption_tokens,
+                    right.mean_quota_consumption_tokens,
+                    allow_missing_legacy_operational_axes,
+                )
+                && optional_pareto_axis_equivalent(
+                    left.mean_wall_time_ms,
+                    right.mean_wall_time_ms,
+                    allow_missing_legacy_operational_axes,
+                )
                 && left.quality_basis_points == right.quality_basis_points
                 && left.held_out_basis_points == right.held_out_basis_points
                 && left.breadth_basis_points == right.breadth_basis_points
                 && left.anti_shortcut_basis_points == right.anti_shortcut_basis_points
         })
+}
+
+fn optional_pareto_axis_equivalent(
+    observed: Option<PreciseMean>,
+    expected: Option<PreciseMean>,
+    allow_missing_legacy_axis: bool,
+) -> bool {
+    observed == expected || (allow_missing_legacy_axis && observed.is_none())
 }
 
 fn validate_usage(usage: Usage, field: &str) -> Result<(), EvaluationError> {
@@ -3225,11 +3721,13 @@ impl fmt::Display for EvaluationEvidenceKind {
 }
 
 mod experiment;
+pub mod rescore;
 pub use experiment::{
     parse_experiment_manifest, run_fake_supervise_experiment, ExperimentEvidence,
     ExperimentEvidenceKind, ExperimentManifest, ExperimentProfileSummary, ExperimentResults,
     ExperimentRun, ExperimentRunRequest, EXPERIMENT_MANIFEST_SCHEMA_VERSION,
     EXPERIMENT_RESULTS_SCHEMA_VERSION, EXPERIMENT_RESULT_SCHEMA,
+    LEGACY_EXPERIMENT_RESULTS_SCHEMA_VERSION, LEGACY_EXPERIMENT_RESULT_SCHEMA,
 };
 
 #[cfg(test)]

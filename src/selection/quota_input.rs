@@ -281,7 +281,7 @@ mod tests {
                 allow_debug_override: false,
             },
             priors,
-            objective_profile: crate::selection::ObjectiveProfileRef {
+            objective_profile: crate::selection::SelectorCalibrationRef {
                 name: profile.name,
                 version: profile.version,
                 expected_digest: None,
@@ -301,6 +301,7 @@ mod tests {
                 environment_rejections: Vec::new(),
             },
             debug_override: None,
+            operational_observations: None,
         }
     }
 

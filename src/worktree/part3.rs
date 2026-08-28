@@ -3377,6 +3377,7 @@ impl CreationCleanliness<'_> {
     fn require_clean_for_repository(&self, repository: &ManagedRepositoryBinding) -> Result<()> {
         match self {
             Self::Bound(cleanliness) => cleanliness.require_clean_for_repository(repository),
+            Self::NonpublishableSimulation => Ok(()),
             #[cfg(test)]
             Self::TestOnly => Ok(()),
         }
@@ -3385,6 +3386,7 @@ impl CreationCleanliness<'_> {
     fn require_clean_related_worktree(&self, path: &Path) -> Result<()> {
         match self {
             Self::Bound(cleanliness) => cleanliness.require_clean_related_worktree(path),
+            Self::NonpublishableSimulation => Ok(()),
             #[cfg(test)]
             Self::TestOnly => Ok(()),
         }
@@ -3419,8 +3421,12 @@ fn bounded_worktree_is_clean(
 }
 
 /// Returns a fail-closed, output-bounded Git porcelain status snapshot.  Git
-/// runs in the existing killable read-only containment boundary instead of in
-/// an in-process libgit2 call whose wall-clock work cannot be interrupted.
+/// runs as a killable trusted subprocess instead of in an in-process libgit2
+/// call whose wall-clock work cannot be interrupted. Inventory and repository
+/// map scans use process-group ownership so they function without a delegated
+/// user-systemd session. Live GC dirtiness prefers verified containment and
+/// falls back to the same trusted path when a delegated user manager is
+/// absent, so Fake completion-hook reaping can finish on GitHub runners.
 pub(crate) fn bounded_repository_status_paths(
     path: &Path,
     max_entries: usize,
@@ -3437,10 +3443,50 @@ fn bounded_repository_gc_status_paths(
     max_output_bytes: usize,
     timeout: Duration,
 ) -> Result<BoundedStatusPathRecords> {
+    bounded_repository_gc_status_paths_with_isolation(
+        path,
+        max_entries,
+        max_output_bytes,
+        timeout,
+        BoundedGitIsolation::Verified,
+    )
+}
+
+fn bounded_repository_gc_status_paths_trusted(
+    path: &Path,
+    max_entries: usize,
+    max_output_bytes: usize,
+    timeout: Duration,
+) -> Result<BoundedStatusPathRecords> {
+    bounded_repository_gc_status_paths_with_isolation(
+        path,
+        max_entries,
+        max_output_bytes,
+        timeout,
+        BoundedGitIsolation::Trusted,
+    )
+}
+
+fn bounded_repository_gc_status_paths_with_isolation(
+    path: &Path,
+    max_entries: usize,
+    max_output_bytes: usize,
+    timeout: Duration,
+    isolation: BoundedGitIsolation,
+) -> Result<BoundedStatusPathRecords> {
     let binding = RepositoryBindingGuard::bind(path)?;
     binding.verify()?;
-    let records =
-        bounded_worktree_records_with_ignored(path, max_entries, max_output_bytes, timeout)?;
+    let records = match isolation {
+        BoundedGitIsolation::Verified => {
+            bounded_worktree_records_with_ignored(path, max_entries, max_output_bytes, timeout)?
+        }
+        BoundedGitIsolation::Trusted => bounded_worktree_records_with_ignored_trusted(
+            path,
+            max_entries,
+            max_output_bytes,
+            timeout,
+        )?,
+    };
     let mut merged = parse_porcelain_v1_z(&records.status, max_entries)?
         .into_iter()
         .collect::<BTreeMap<_, _>>();
@@ -3491,6 +3537,26 @@ pub(crate) fn bounded_repository_status_paths_bound_with_process_wait(
     ))
 }
 
+pub(crate) fn bounded_repository_status_paths_bound_with_process_wait_trusted(
+    binding: &RepositoryBindingGuard,
+    max_entries: usize,
+    max_output_bytes: usize,
+    timeout: Duration,
+) -> Result<(BoundedStatusPathRecords, Duration)> {
+    binding.verify()?;
+    let records = bounded_worktree_records_trusted(
+        binding.worktree(),
+        max_entries,
+        max_output_bytes,
+        timeout,
+    )?;
+    binding.verify()?;
+    Ok((
+        parse_porcelain_v1_z(&records.status, max_entries)?,
+        records.process_queue_wait,
+    ))
+}
+
 pub(crate) fn bounded_repository_visible_paths_bound_with_process_wait(
     binding: &RepositoryBindingGuard,
     max_entries: usize,
@@ -3498,8 +3564,12 @@ pub(crate) fn bounded_repository_visible_paths_bound_with_process_wait(
     timeout: Duration,
 ) -> Result<(Vec<PathBuf>, Duration)> {
     binding.verify()?;
-    let records =
-        bounded_worktree_records(binding.worktree(), max_entries, max_output_bytes, timeout)?;
+    let records = bounded_worktree_records_trusted(
+        binding.worktree(),
+        max_entries,
+        max_output_bytes,
+        timeout,
+    )?;
     binding.verify()?;
     Ok((
         parse_nul_paths(&records.visible, max_entries)?,

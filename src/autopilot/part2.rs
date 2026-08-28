@@ -231,6 +231,7 @@ struct FinalReportInput<'a> {
     plan: AutopilotPlanSummary,
     profile_binding: AutopilotProfileBindingReport,
     safety: AutopilotSafetyReport,
+    authority_plan: Option<AutopilotAuthorityPlan>,
     validation: AutopilotValidationSummary,
     pr: Option<SanitizedPrReport>,
     review: Option<ReviewReport>,
@@ -263,6 +264,7 @@ fn final_report(input: FinalReportInput<'_>) -> AutopilotFinalReport {
         plan: input.plan,
         profile_binding: input.profile_binding,
         safety: input.safety,
+        authority_plan: input.authority_plan,
         gate_denials: input.gate_denials,
         supervisor: input.supervisor,
         primary_worktree_untouched: input.primary_worktree_untouched,
@@ -733,8 +735,42 @@ fn run_after_autopilot_safety_hook() {
     });
 }
 
-fn dirty_primary_paths(repo_path: &Path) -> Result<Vec<PathBuf>> {
-    bounded_repository_dirty_paths(repo_path)
+fn dirty_primary_paths(repo_path: &Path, runtime: SupervisorRuntime) -> Result<Vec<PathBuf>> {
+    match runtime {
+        SupervisorRuntime::Fake => {
+            let mut dirty = supervise::nonpublishable_simulation_dirty_primary_paths(repo_path)?;
+            if dirty.len() > AUTOPILOT_STATUS_MAX_ENTRIES {
+                bail!(
+                    "autopilot status reported {} paths, exceeding its limit of {}",
+                    dirty.len(),
+                    AUTOPILOT_STATUS_MAX_ENTRIES
+                );
+            }
+            let total_path_bytes = dirty.iter().try_fold(0usize, |total, path| {
+                let path_bytes = path.as_os_str().len();
+                if path_bytes > AUTOPILOT_STATUS_MAX_PATH_BYTES {
+                    bail!(
+                        "autopilot status path exceeds its {}-byte limit",
+                        AUTOPILOT_STATUS_MAX_PATH_BYTES
+                    );
+                }
+                total
+                    .checked_add(path_bytes)
+                    .context("autopilot status path byte count overflowed")
+            })?;
+            if total_path_bytes > AUTOPILOT_STATUS_MAX_TOTAL_PATH_BYTES {
+                bail!(
+                    "autopilot status paths exceed their {}-byte aggregate limit",
+                    AUTOPILOT_STATUS_MAX_TOTAL_PATH_BYTES
+                );
+            }
+            dirty.retain(|path| !is_local_runtime_path(path));
+            dirty.sort();
+            dirty.dedup();
+            Ok(dirty)
+        }
+        _ => bounded_repository_dirty_paths(repo_path),
+    }
 }
 
 fn bounded_repository_dirty_paths(repo_path: &Path) -> Result<Vec<PathBuf>> {

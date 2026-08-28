@@ -13,11 +13,10 @@ pub(super) fn reserve_dispatch_budget<'a>(
             role.as_str()
         )
     })?;
-    let pricing = command
-        .model
-        .as_ref()
-        .and_then(|model| plan.model_pricing.get(model))
-        .copied();
+    let pricing = command.model.as_ref().and_then(|model| {
+        crate::llm::provider::resolve_model_pricing(&plan.model_pricing, model)
+            .map(|resolved| resolved.pricing)
+    });
     let cost_usd = pricing
         .map(|pricing| {
             const TOKENS_PER_MILLION: f64 = 1_000_000.0;

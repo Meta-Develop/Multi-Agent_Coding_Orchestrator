@@ -1481,22 +1481,7 @@ fn validate_generated_follow_up_task(task: &GeneratedFollowUpTaskRecord) -> Resu
 fn ordinary_plan_from_generated(
     plan: &crate::supervise::GeneratedFollowUpSupervisorPlan,
 ) -> SupervisorPlan {
-    SupervisorPlan {
-        version: plan.version,
-        task: plan.task.clone(),
-        task_file: plan.task_file.clone(),
-        max_depth: plan.max_depth,
-        max_child_assignments: plan.max_child_assignments,
-        max_child_retries: plan.max_child_retries,
-        max_gate_corrections: plan.max_gate_corrections,
-        child_timeout_seconds: plan.child_timeout_seconds,
-        semantic_coordination: plan.semantic_coordination,
-        role_models: plan.role_models.clone(),
-        model_pricing: plan.model_pricing.clone(),
-        review_lenses: plan.review_lenses.clone(),
-        review_aggregation_policy: plan.review_aggregation_policy,
-        assignments: plan.assignments.clone(),
-    }
+    plan.ordinary_plan()
 }
 
 fn queue_instance_id(source: &GeneratedFollowUpQueueSource) -> Result<String> {
@@ -1867,6 +1852,8 @@ mod tests {
             phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![std::path::PathBuf::from(format!("src/{suffix}.rs"))],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
@@ -1964,6 +1951,8 @@ mod tests {
                 phase: AssignmentPhase::Execution,
                 runtime: None,
                 role: AgentRole::ChildOrchestrator,
+                role_category: None,
+                selection_source: None,
                 assigned_paths: vec![std::path::PathBuf::from("src/breaking.rs")],
                 semantic_symbols: Vec::new(),
                 semantic_modules: Vec::new(),

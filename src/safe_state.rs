@@ -887,6 +887,17 @@ pub struct BoundedTreeWalkLimits {
     pub same_device: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BoundedTreeWalkOptions {
+    pub stop_at_nested_repositories: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoundedTreeWalkResult {
+    pub entries: Vec<BoundedTreeEntry>,
+    pub nested_repository_boundaries: Vec<PathBuf>,
+}
+
 impl BoundedTreeWalkLimits {
     fn validate(self) -> Result<Self> {
         if self.max_depth == 0
@@ -1190,8 +1201,37 @@ impl BoundedTreeWalker {
     pub(crate) fn walk_bound_with<F>(
         root_binding: &DirectoryBindingGuard,
         limits: BoundedTreeWalkLimits,
-        mut action: F,
+        action: F,
     ) -> Result<Vec<BoundedTreeEntry>>
+    where
+        F: FnMut(&BoundedTreeEntry) -> Result<BoundedTreeWalkAction>,
+    {
+        Self::walk_bound_with_options(
+            root_binding,
+            limits,
+            BoundedTreeWalkOptions::default(),
+            action,
+        )
+    }
+
+    pub(crate) fn walk_bound_with_options<F>(
+        root_binding: &DirectoryBindingGuard,
+        limits: BoundedTreeWalkLimits,
+        options: BoundedTreeWalkOptions,
+        action: F,
+    ) -> Result<Vec<BoundedTreeEntry>>
+    where
+        F: FnMut(&BoundedTreeEntry) -> Result<BoundedTreeWalkAction>,
+    {
+        Ok(Self::walk_bound_with_options_detailed(root_binding, limits, options, action)?.entries)
+    }
+
+    pub(crate) fn walk_bound_with_options_detailed<F>(
+        root_binding: &DirectoryBindingGuard,
+        limits: BoundedTreeWalkLimits,
+        options: BoundedTreeWalkOptions,
+        mut action: F,
+    ) -> Result<BoundedTreeWalkResult>
     where
         F: FnMut(&BoundedTreeEntry) -> Result<BoundedTreeWalkAction>,
     {
@@ -1215,24 +1255,31 @@ impl BoundedTreeWalker {
                 deadline,
             };
             let mut entries = Vec::new();
+            let mut nested_repository_boundaries = Vec::new();
             let mut walker = InventoryWalkState {
                 root_device: root_stat.st_dev,
                 #[cfg(target_os = "linux")]
                 root_mount_id,
                 limits,
+                options,
                 budget: &mut budget,
                 action: &mut action,
                 entries: &mut entries,
+                nested_repository_boundaries: &mut nested_repository_boundaries,
             };
             walker.walk(root_binding.directory.as_raw_fd(), Path::new(""), 0)?;
             budget.ensure_before_deadline("after repository traversal")?;
             root_binding.verify()?;
-            Ok(entries)
+            nested_repository_boundaries.sort();
+            Ok(BoundedTreeWalkResult {
+                entries,
+                nested_repository_boundaries,
+            })
         }
 
         #[cfg(windows)]
         {
-            walk_bound_windows(root_binding, limits, action)
+            walk_bound_windows(root_binding, limits, options, action)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -1246,8 +1293,9 @@ impl BoundedTreeWalker {
 fn walk_bound_windows<F>(
     root_binding: &DirectoryBindingGuard,
     limits: BoundedTreeWalkLimits,
+    options: BoundedTreeWalkOptions,
     mut action: F,
-) -> Result<Vec<BoundedTreeEntry>>
+) -> Result<BoundedTreeWalkResult>
 where
     F: FnMut(&BoundedTreeEntry) -> Result<BoundedTreeWalkAction>,
 {
@@ -1261,19 +1309,26 @@ where
         deadline,
     };
     let mut entries = Vec::new();
+    let mut nested_repository_boundaries = Vec::new();
     walk_bound_windows_dir(
         root_binding,
         Path::new(""),
         0,
         root_binding.identity.device,
         limits,
+        options,
         &mut budget,
         &mut action,
         &mut entries,
+        &mut nested_repository_boundaries,
     )?;
     budget.ensure_before_deadline("after repository traversal")?;
     root_binding.verify()?;
-    Ok(entries)
+    nested_repository_boundaries.sort();
+    Ok(BoundedTreeWalkResult {
+        entries,
+        nested_repository_boundaries,
+    })
 }
 
 #[cfg(windows)]
@@ -1284,9 +1339,11 @@ fn walk_bound_windows_dir<F>(
     depth: usize,
     root_device: u64,
     limits: BoundedTreeWalkLimits,
+    options: BoundedTreeWalkOptions,
     budget: &mut InventoryBudget,
     action: &mut F,
     entries: &mut Vec<BoundedTreeEntry>,
+    nested_repository_boundaries: &mut Vec<PathBuf>,
 ) -> Result<()>
 where
     F: FnMut(&BoundedTreeEntry) -> Result<BoundedTreeWalkAction>,
@@ -1297,6 +1354,19 @@ where
     } else {
         root_binding.path.join(relative_directory)
     };
+    if nested_repository_boundary_enabled(depth, options)
+        && windows_nested_repository_marker_exists(&current_path, budget)?
+    {
+        nested_repository_boundaries.push(relative_directory.to_path_buf());
+        return Ok(());
+    }
+    if depth >= limits.max_depth {
+        bail!(
+            "repository inventory refused to descend beyond depth {} at {}",
+            limits.max_depth,
+            relative_directory.display()
+        );
+    }
     let mut names = Vec::new();
     for entry in fs::read_dir(&current_path).with_context(|| {
         format!(
@@ -1382,22 +1452,17 @@ where
                     relative.display()
                 );
             }
-            if entry_depth >= limits.max_depth {
-                bail!(
-                    "repository inventory refused to descend beyond depth {} at {}",
-                    limits.max_depth,
-                    relative.display()
-                );
-            }
             walk_bound_windows_dir(
                 root_binding,
                 &relative,
                 entry_depth,
                 root_device,
                 limits,
+                options,
                 budget,
                 action,
                 entries,
+                nested_repository_boundaries,
             )?;
         }
         let rebound =
@@ -1419,6 +1484,30 @@ where
         }
     }
     Ok(())
+}
+
+fn nested_repository_boundary_enabled(depth: usize, options: BoundedTreeWalkOptions) -> bool {
+    options.stop_at_nested_repositories && depth > 0
+}
+
+#[cfg(windows)]
+fn windows_nested_repository_marker_exists(
+    directory: &Path,
+    budget: &InventoryBudget,
+) -> Result<bool> {
+    for entry in fs::read_dir(directory).with_context(|| {
+        format!(
+            "failed to probe nested repository directory {}",
+            directory.display()
+        )
+    })? {
+        budget.ensure_before_deadline("during nested repository marker probe")?;
+        if entry?.file_name().as_os_str() == OsStr::new(".git") {
+            return Ok(true);
+        }
+    }
+    budget.ensure_before_deadline("after nested repository marker probe")?;
+    Ok(false)
 }
 
 #[cfg(windows)]

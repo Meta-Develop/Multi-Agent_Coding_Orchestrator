@@ -23,11 +23,11 @@ use super::predictor::{
     feature_bool, feature_keys, feature_text, insert_text, is_frontier_role, mean_i64,
     primary_action, PolicyOutcomeDistribution, PolicyPredictor,
 };
-use super::resources::{ObservationKind, Quantity};
+use super::resources::Quantity;
 use super::state::{OptimizerState, PosteriorSummary};
 use super::switch_cost::{
     apply_switch_cost, current_action_from_candidates, estimate_switch, oscillation_count,
-    trajectory_identities, SwitchCostEstimate, SwitchCostModel,
+    trajectory_policy_identities, SwitchCostEstimate, SwitchCostModel, DEFAULT_OSCILLATION_ALARM,
 };
 use super::taxonomy::{classify, TaxonomySpec};
 use super::trajectory::{TrajectoryEvent, TrajectoryObservation};
@@ -184,6 +184,9 @@ pub struct RouterConfig {
     /// observations still apply. Live dispatch wiring should enable this
     /// only after reviewing the priors.
     pub apply_inferred_switch_priors: bool,
+    /// Alarm once this many A→B→A reversals are visible in the retained
+    /// trajectory. A zero value is normalized to one.
+    pub oscillation_alarm_threshold: u32,
 }
 
 impl Default for RouterConfig {
@@ -192,6 +195,7 @@ impl Default for RouterConfig {
             feasibility: FeasibilityConfig::default(),
             permit_high_capability_fallback: true,
             apply_inferred_switch_priors: false,
+            oscillation_alarm_threshold: DEFAULT_OSCILLATION_ALARM,
         }
     }
 }
@@ -255,14 +259,13 @@ impl SafeContextualRouter {
         self
     }
 
-    fn should_price_switch(&self, switch: &SwitchCostEstimate) -> bool {
-        switch.observation == ObservationKind::Measured || self.config.apply_inferred_switch_priors
-    }
-
-    fn apply_priced_switch(&self, value: &mut ObjectiveValue, switch: &SwitchCostEstimate) {
-        if self.should_price_switch(switch) {
-            apply_switch_cost(value, switch, self.switch_costs.hysteresis());
-        }
+    fn apply_priced_switch(&self, value: &mut ObjectiveValue, switch: &SwitchCostEstimate) -> i64 {
+        apply_switch_cost(
+            value,
+            switch,
+            self.switch_costs.hysteresis(),
+            self.config.apply_inferred_switch_priors,
+        )
     }
 
     pub fn with_calibration(
@@ -301,12 +304,12 @@ impl SafeContextualRouter {
                 .feasibility
                 .check_predicted(state, policy, distribution)?;
             let switch = estimate_switch(&self.switch_costs, previous, policy);
-            let objective = if feasibility.feasible {
+            let (objective, applied_switch_cost_micros) = if feasibility.feasible {
                 let mut value = self.objective.evaluate(distribution)?;
-                self.apply_priced_switch(&mut value, &switch);
-                Some(value)
+                let applied = self.apply_priced_switch(&mut value, &switch);
+                (Some(value), applied)
             } else {
-                None
+                (None, 0)
             };
             classified.entries.push(ClassifiedCandidate {
                 index: *index,
@@ -314,6 +317,7 @@ impl SafeContextualRouter {
                 feasibility,
                 objective,
                 switch,
+                applied_switch_cost_micros,
             });
         }
         Ok(classified)
@@ -395,8 +399,12 @@ impl OnlineRouter for SafeContextualRouter {
         diagnostics.fill_reserves(&state.budget.snapshot(state.horizon.now));
         classify(&state.task_features, &state.repo_features, &self.taxonomy)
             .record_on(&mut diagnostics, None);
-        diagnostics.oscillation_count =
-            Some(oscillation_count(&trajectory_identities(state, candidates)));
+        let oscillation_count = oscillation_count(&trajectory_policy_identities(state));
+        let oscillation_alarm_threshold = self.config.oscillation_alarm_threshold.max(1);
+        diagnostics.oscillation_count = Some(oscillation_count);
+        diagnostics.oscillation_alarm_threshold = Some(oscillation_alarm_threshold);
+        diagnostics.oscillation_alarm = Some(oscillation_count >= oscillation_alarm_threshold);
+        diagnostics.switch_hysteresis_margin_bp = Some(self.switch_costs.hysteresis().margin_bp);
 
         let restricted;
         let candidates: &[PolicyGraph] = if let Some(response) = &self.calibration {
@@ -558,7 +566,7 @@ impl CheckpointRouter {
     ) -> Result<CheckpointDecision, OptimizerError> {
         update_posteriors(state);
         let evidence = classify_from_trajectory(state);
-        let comparison = four_way_comparison(&self.router, state, candidates)?;
+        let mut comparison = four_way_comparison(&self.router, state, candidates)?;
         let hedge = match self.hedge.as_ref() {
             Some(planner) => planner.plan(state)?,
             None => None,
@@ -571,6 +579,7 @@ impl CheckpointRouter {
                     .find(|policy| policy.policy_id == plan.delayed_policy)
                 {
                     let decision = self.router.select(state, std::slice::from_ref(policy))?;
+                    comparison.selected = decision.selected_policy().cloned();
                     return Ok(CheckpointDecision {
                         kind: ContinuationKind::Hedge,
                         router: annotate(decision, "hedge", Some(comparison.clone())),
@@ -584,6 +593,7 @@ impl CheckpointRouter {
 
         let filtered = filter_candidates_for_evidence(candidates, &evidence);
         let decision = self.router.select(state, &filtered)?;
+        comparison.selected = decision.selected_policy().cloned();
         let kind = continuation_kind(&decision, &evidence, candidates);
         let handoff = matches!(kind, ContinuationKind::CleanRestart)
             .then(|| EvidenceHandoff::from_trajectory(state));
@@ -633,6 +643,7 @@ struct ClassifiedCandidate {
     feasibility: super::feasibility::FeasibilityResult,
     objective: Option<ObjectiveValue>,
     switch: SwitchCostEstimate,
+    applied_switch_cost_micros: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -733,11 +744,14 @@ fn filter_candidates_for_evidence(
 }
 
 fn is_precision_repair(policy: &PolicyGraph) -> bool {
+    is_repair_policy(policy) && policy.topology.restart == super::action::RestartMode::Continuation
+}
+
+fn is_repair_policy(policy: &PolicyGraph) -> bool {
     policy
         .nodes
         .values()
         .any(|node| matches!(node, PolicyNode::Repair(_)))
-        && policy.topology.restart == super::action::RestartMode::Continuation
 }
 
 fn is_clean_restart(policy: &PolicyGraph) -> bool {
@@ -832,10 +846,10 @@ fn four_way_comparison(
     let previous = current_action_from_candidates(state, candidates);
 
     let mut comparison = EscalationComparison {
-        same_model_higher_effort: None,
-        different_model_same_effort: None,
-        different_model_higher_effort: None,
-        clean_restart: None,
+        continue_arm: None,
+        escalate_arm: None,
+        switch_arm: None,
+        repair_arm: None,
         selected: None,
     };
 
@@ -844,10 +858,20 @@ fn four_way_comparison(
             if is_clean_restart(policy) {
                 if let Ok(predicted) = router.predictor.predict(state, policy) {
                     if let Ok(mut objective) = router.objective.evaluate(&predicted) {
+                        let base_objective = objective.risk_adjusted_cost_micros;
                         let switch = estimate_switch(&router.switch_costs, previous, policy);
-                        router.apply_priced_switch(&mut objective, &switch);
-                        comparison.clean_restart =
-                            Some(compared(policy, &predicted, &objective, &switch));
+                        let applied = router.apply_priced_switch(&mut objective, &switch);
+                        replace_if_better(
+                            &mut comparison.switch_arm,
+                            compared(
+                                policy,
+                                &predicted,
+                                base_objective,
+                                &objective,
+                                applied,
+                                &switch,
+                            ),
+                        );
                     }
                 }
             }
@@ -859,33 +883,51 @@ fn four_way_comparison(
         let same_model =
             action.runtime_model.runtime_slug == current_action.runtime_model.runtime_slug;
         let higher = effort_rank(&action.effort) > effort_rank(&current_action.effort);
-        let same_effort = action.effort == current_action.effort;
         let Ok(predicted) = router.predictor.predict(state, policy) else {
             continue;
         };
         let Ok(mut objective) = router.objective.evaluate(&predicted) else {
             continue;
         };
+        let base_objective = objective.risk_adjusted_cost_micros;
         let switch = estimate_switch(&router.switch_costs, previous, policy);
-        router.apply_priced_switch(&mut objective, &switch);
-        let slot = compared(policy, &predicted, &objective, &switch);
-        if is_clean_restart(policy) {
-            comparison.clean_restart = Some(slot);
+        let applied = router.apply_priced_switch(&mut objective, &switch);
+        let slot = compared(
+            policy,
+            &predicted,
+            base_objective,
+            &objective,
+            applied,
+            &switch,
+        );
+        if current.is_some_and(|current| current.policy_id == policy.policy_id) {
+            replace_if_better(&mut comparison.continue_arm, slot);
+        } else if is_repair_policy(policy) {
+            replace_if_better(&mut comparison.repair_arm, slot);
+        } else if switch.class.is_switch() {
+            replace_if_better(&mut comparison.switch_arm, slot);
         } else if same_model && higher {
-            comparison.same_model_higher_effort = Some(slot);
-        } else if !same_model && same_effort {
-            comparison.different_model_same_effort = Some(slot);
-        } else if !same_model && higher {
-            comparison.different_model_higher_effort = Some(slot);
+            replace_if_better(&mut comparison.escalate_arm, slot);
         }
     }
     Ok(comparison)
 }
 
+fn replace_if_better(slot: &mut Option<ComparedPolicy>, candidate: ComparedPolicy) {
+    let replace = slot
+        .as_ref()
+        .is_none_or(|current| candidate.objective_value_micros < current.objective_value_micros);
+    if replace {
+        *slot = Some(candidate);
+    }
+}
+
 fn compared(
     policy: &PolicyGraph,
     predicted: &PolicyOutcomeDistribution,
+    base_objective_value_micros: i64,
     objective: &ObjectiveValue,
+    applied_switch_cost_micros: i64,
     switch: &SwitchCostEstimate,
 ) -> ComparedPolicy {
     let action = primary_action(policy);
@@ -897,9 +939,11 @@ fn compared(
         effort: action
             .map(|action| action.effort.as_label().to_string())
             .unwrap_or_default(),
+        base_objective_value_micros,
         objective_value_micros: objective.risk_adjusted_cost_micros,
         quality_lcb_bp: predicted.quality_lower_confidence_bp,
-        switch_cost_micros: switch.total_cost_micros,
+        applied_switch_cost_micros,
+        switch_evidence: Some(switch.clone()),
     }
 }
 
@@ -960,6 +1004,8 @@ fn select_policy(
             diagnostics.record_consumption(dimension.as_str(), Quantity::new(expected));
         }
         diagnostics.switch_cost_micros = Some(entry.switch.total_cost_micros);
+        diagnostics.switch_cost_applied_micros = Some(entry.applied_switch_cost_micros);
+        diagnostics.switch_cost_evidence = Some(entry.switch.clone());
         diagnostics.switch_class = Some(entry.switch.class.as_str().to_string());
         diagnostics.switch_observation = Some(entry.switch.observation_label().to_string());
     }
@@ -1051,6 +1097,7 @@ mod tests {
         ResourceVector,
     };
     use crate::optimizer::state::DecisionHorizon;
+    use crate::optimizer::switch_cost::SwitchHysteresis;
     use crate::optimizer::value_of_information::ExpectedInformationGain;
 
     fn topology(restart: RestartMode) -> TopologySpec {
@@ -1134,6 +1181,23 @@ mod tests {
         };
         graph.insert_node(start, node).expect("node");
         graph
+    }
+
+    fn on_backend(mut policy: PolicyGraph, backend: &str) -> PolicyGraph {
+        for node in policy.nodes.values_mut() {
+            let action = match node {
+                PolicyNode::Probe(action)
+                | PolicyNode::Plan(action)
+                | PolicyNode::Execute(action)
+                | PolicyNode::Repair(action)
+                | PolicyNode::Audit(action) => action,
+                PolicyNode::Certify(_) | PolicyNode::Stop => continue,
+            };
+            let backend = BackendId::new(backend).expect("backend");
+            action.backend_id = backend.clone();
+            action.runtime_model.backend = backend;
+        }
+        policy
     }
 
     fn capable_state() -> OptimizerState {
@@ -1222,6 +1286,7 @@ mod tests {
                 },
                 permit_high_capability_fallback: true,
                 apply_inferred_switch_priors: false,
+                oscillation_alarm_threshold: DEFAULT_OSCILLATION_ALARM,
             },
         )
     }
@@ -1552,14 +1617,21 @@ mod tests {
     }
 
     #[test]
-    fn escalation_records_four_way_comparison() {
+    fn literal_continue_escalate_switch_repair_records_applied_costs() {
         let mut predictor = ScriptedPredictor::new();
         predictor.insert(dist("current", 9_500, 4_000, 4_000, 40, 1));
         predictor.insert(dist("same-hi", 9_500, 3_500, 3_500, 35, 1));
         predictor.insert(dist("other", 9_500, 3_000, 3_000, 30, 1));
-        predictor.insert(dist("other-hi", 9_500, 2_800, 2_800, 28, 1));
-        predictor.insert(dist("restart", 9_500, 6_000, 6_000, 60, 1));
-        let checkpoint = CheckpointRouter::new(router(predictor));
+        predictor.insert(dist("repair", 9_500, 2_800, 2_800, 28, 1));
+        let mut switch_costs = SwitchCostModel::new();
+        switch_costs.observe(
+            crate::optimizer::switch_cost::TransitionClass::ModelChangeSameRuntime,
+            10,
+            10,
+            10,
+            10,
+        );
+        let checkpoint = CheckpointRouter::new(router(predictor).with_switch_costs(switch_costs));
         let mut state = capable_state();
         insert_text(
             &mut state.task_features,
@@ -1593,53 +1665,251 @@ mod tests {
                         CanonicalEffort::Low,
                         RestartMode::Continuation,
                     ),
-                    execute_policy(
-                        "other-hi",
+                    node_policy(
+                        "repair",
                         "model-b",
                         CanonicalEffort::High,
+                        AgentRole::Repairer,
+                        PolicyKind::Repair,
                         RestartMode::Continuation,
-                    ),
-                    node_policy(
-                        "restart",
-                        "model-c",
-                        CanonicalEffort::Max,
-                        AgentRole::Planner,
-                        PolicyKind::Plan,
-                        RestartMode::CleanRestart,
                     ),
                 ],
             )
             .expect("reopt");
         let comparison = decision.escalation.expect("comparison");
-        assert!(comparison.same_model_higher_effort.is_some());
-        assert!(comparison.different_model_same_effort.is_some());
-        assert!(comparison.different_model_higher_effort.is_some());
-        assert!(comparison.clean_restart.is_some());
+        assert!(comparison.continue_arm.is_some());
+        assert!(comparison.escalate_arm.is_some());
+        assert!(comparison.switch_arm.is_some());
+        assert!(comparison.repair_arm.is_some());
         assert_eq!(
             comparison
-                .same_model_higher_effort
+                .continue_arm
                 .as_ref()
-                .expect("same")
-                .switch_cost_micros,
+                .expect("continue")
+                .applied_switch_cost_micros,
+            0
+        );
+        assert_eq!(
+            comparison
+                .escalate_arm
+                .as_ref()
+                .expect("escalate")
+                .applied_switch_cost_micros,
             0
         );
         assert!(
             comparison
-                .different_model_same_effort
+                .switch_arm
                 .as_ref()
-                .expect("other")
-                .switch_cost_micros
+                .expect("switch")
+                .applied_switch_cost_micros
                 > 0
         );
         assert!(
             comparison
-                .clean_restart
+                .repair_arm
                 .as_ref()
-                .expect("restart")
-                .switch_cost_micros
+                .expect("repair")
+                .applied_switch_cost_micros
                 > 0
         );
+        let switch = comparison.switch_arm.as_ref().expect("switch");
+        assert_eq!(
+            switch.objective_value_micros,
+            switch
+                .base_objective_value_micros
+                .saturating_add(switch.applied_switch_cost_micros)
+        );
+        assert_eq!(
+            comparison.selected,
+            decision.router.selected_policy().cloned()
+        );
         assert!(decision.router.explanation().diagnostics_json().is_some());
+    }
+
+    #[test]
+    fn runtime_adapter_change_with_same_model_and_effort_is_literal_switch_arm() {
+        let mut predictor = ScriptedPredictor::new();
+        predictor.insert(dist("current", 9_500, 4_000, 4_000, 40, 1));
+        predictor.insert(dist("runtime-swap", 9_500, 3_000, 3_000, 30, 1));
+        let mut switch_costs = SwitchCostModel::new();
+        switch_costs.observe(
+            crate::optimizer::switch_cost::TransitionClass::RuntimeAdapterChange,
+            10,
+            10,
+            10,
+            10,
+        );
+        let checkpoint = CheckpointRouter::new(router(predictor).with_switch_costs(switch_costs));
+        let mut state = capable_state();
+        insert_text(
+            &mut state.task_features,
+            feature_keys::CURRENT_POLICY,
+            "current",
+        );
+        push_observation(
+            &mut state,
+            PolicyId::new("current").expect("policy"),
+            TrajectoryObservation::NoProgress,
+        );
+        let candidates = [
+            execute_policy(
+                "current",
+                "model-a",
+                CanonicalEffort::Low,
+                RestartMode::Continuation,
+            ),
+            on_backend(
+                execute_policy(
+                    "runtime-swap",
+                    "model-a",
+                    CanonicalEffort::Low,
+                    RestartMode::Continuation,
+                ),
+                "runtime-b",
+            ),
+        ];
+        let comparison = checkpoint
+            .reoptimize(&mut state, &candidates)
+            .expect("reoptimize")
+            .escalation
+            .expect("comparison");
+        let switch = comparison.switch_arm.expect("literal switch arm");
+        assert_eq!(switch.policy.as_str(), "runtime-swap");
+        assert_eq!(
+            switch
+                .switch_evidence
+                .as_ref()
+                .map(|evidence| evidence.class),
+            Some(crate::optimizer::switch_cost::TransitionClass::RuntimeAdapterChange)
+        );
+        assert!(switch.applied_switch_cost_micros > 0);
+        assert_eq!(
+            switch.objective_value_micros,
+            switch
+                .base_objective_value_micros
+                .saturating_add(switch.applied_switch_cost_micros)
+        );
+    }
+
+    #[test]
+    fn clean_restart_with_same_model_and_effort_is_literal_switch_arm() {
+        let mut predictor = ScriptedPredictor::new();
+        predictor.insert(dist("current", 9_500, 4_000, 4_000, 40, 1));
+        predictor.insert(dist("fresh", 9_500, 3_000, 3_000, 30, 1));
+        let mut switch_costs = SwitchCostModel::new();
+        switch_costs.observe(
+            crate::optimizer::switch_cost::TransitionClass::FreshSessionOrWorktree,
+            10,
+            10,
+            10,
+            10,
+        );
+        let checkpoint = CheckpointRouter::new(router(predictor).with_switch_costs(switch_costs));
+        let mut state = capable_state();
+        insert_text(
+            &mut state.task_features,
+            feature_keys::CURRENT_POLICY,
+            "current",
+        );
+        push_observation(
+            &mut state,
+            PolicyId::new("current").expect("policy"),
+            TrajectoryObservation::NoProgress,
+        );
+        let candidates = [
+            execute_policy(
+                "current",
+                "model-a",
+                CanonicalEffort::Low,
+                RestartMode::Continuation,
+            ),
+            execute_policy(
+                "fresh",
+                "model-a",
+                CanonicalEffort::Low,
+                RestartMode::CleanRestart,
+            ),
+        ];
+        let comparison = checkpoint
+            .reoptimize(&mut state, &candidates)
+            .expect("reoptimize")
+            .escalation
+            .expect("comparison");
+        let switch = comparison.switch_arm.expect("literal switch arm");
+        assert_eq!(switch.policy.as_str(), "fresh");
+        assert_eq!(
+            switch
+                .switch_evidence
+                .as_ref()
+                .map(|evidence| evidence.class),
+            Some(crate::optimizer::switch_cost::TransitionClass::FreshSessionOrWorktree)
+        );
+        assert!(switch.applied_switch_cost_micros > 0);
+        assert_eq!(
+            switch.objective_value_micros,
+            switch
+                .base_objective_value_micros
+                .saturating_add(switch.applied_switch_cost_micros)
+        );
+    }
+
+    #[test]
+    fn configurable_hysteresis_and_oscillation_alarm_are_recorded() {
+        let mut predictor = ScriptedPredictor::new();
+        predictor.insert(dist("a", 9_500, 5_000, 5_000, 50, 1));
+        predictor.insert(dist("b", 9_500, 5_100, 5_100, 50, 1));
+        let candidates = [
+            execute_policy(
+                "a",
+                "model-a",
+                CanonicalEffort::Low,
+                RestartMode::Continuation,
+            ),
+            execute_policy(
+                "b",
+                "model-b",
+                CanonicalEffort::Low,
+                RestartMode::Continuation,
+            ),
+        ];
+        let mut state = capable_state();
+        push_observation(
+            &mut state,
+            PolicyId::new("a").expect("a"),
+            TrajectoryObservation::Progress,
+        );
+        push_observation(
+            &mut state,
+            PolicyId::new("b").expect("b"),
+            TrajectoryObservation::Progress,
+        );
+        push_observation(
+            &mut state,
+            PolicyId::new("a").expect("a"),
+            TrajectoryObservation::Progress,
+        );
+        let config = RouterConfig {
+            oscillation_alarm_threshold: 1,
+            ..Default::default()
+        };
+        let switch_costs =
+            SwitchCostModel::new().with_hysteresis(SwitchHysteresis { margin_bp: 2_500 });
+        let decision = SafeContextualRouter::new(
+            Box::new(predictor),
+            Box::new(TailRiskObjective::new()),
+            config,
+        )
+        .with_switch_costs(switch_costs)
+        .select(&state, &candidates)
+        .expect("select");
+        assert_eq!(
+            decision.diagnostics().switch_hysteresis_margin_bp,
+            Some(2_500)
+        );
+        assert_eq!(decision.diagnostics().oscillation_alarm_threshold, Some(1));
+        assert_eq!(decision.diagnostics().oscillation_count, Some(1));
+        assert_eq!(decision.diagnostics().oscillation_alarm, Some(true));
     }
 
     #[test]

@@ -91,6 +91,10 @@ fn manifest() -> EvaluationManifest {
             profile("frontier-workers", "frontier-v1", "fast-v1"),
             profile("all-frontier", "frontier-v1", "frontier-v1"),
         ],
+        objective_profile: Some(
+            crate::objective_profile::default_resolved_objective_profile()
+                .expect("resolved default objective"),
+        ),
     }
 }
 
@@ -1207,11 +1211,29 @@ fn versioned_schemas_round_trip_and_reject_unknown_fields() {
 }
 
 #[test]
-fn legacy_results_without_execution_telemetry_read_as_incomparable() {
+// Exercises the full v2 document path, not only permissive field decoding.
+fn legacy_results_without_execution_telemetry_or_typed_pareto_coordinates_remain_readable() {
     let manifest = manifest();
     let results = run_fake(&manifest, 7).expect("current fake results");
     let mut legacy_json = serde_json::to_value(&results).expect("serialize results");
     legacy_json["version"] = json!(LEGACY_EVALUATION_RESULTS_SCHEMA_VERSION);
+    let legacy_binding = legacy_json["objective_scoring"]["applied_profile"]["profile"].clone();
+    let legacy_object = legacy_json.as_object_mut().expect("legacy result object");
+    legacy_object.remove("objective_scoring");
+    legacy_object.remove("objective_selection");
+    legacy_object.insert("objective_profile".to_string(), legacy_binding);
+    legacy_json["declared_inputs"]
+        .as_object_mut()
+        .expect("declared input object")
+        .remove("objective_profile");
+    let legacy_declared_inputs: DeclaredInputsBinding =
+        serde_json::from_value(legacy_json["declared_inputs"].clone())
+            .expect("legacy declared inputs");
+    let legacy_digest = digest_serializable(&legacy_declared_inputs).expect("legacy input digest");
+    legacy_json["declared_inputs_digest"] = json!(legacy_digest.clone());
+    for run in legacy_json["runs"].as_array_mut().expect("legacy runs") {
+        run["declared_inputs_digest"] = json!(legacy_digest.clone());
+    }
     for comparison in legacy_json["dispatch_comparisons"]
         .as_array_mut()
         .expect("comparison array")
@@ -1224,15 +1246,57 @@ fn legacy_results_without_execution_telemetry_read_as_incomparable() {
             "not_process_observable: one or both runs lack a complete observed dispatch record"
         );
     }
+    for point in legacy_json["pareto_frontier"]
+        .as_array_mut()
+        .expect("Pareto frontier array")
+    {
+        let point = point.as_object_mut().expect("Pareto frontier point object");
+        point.remove("mean_quota_consumption_tokens");
+        point.remove("mean_wall_time_ms");
+    }
     let legacy =
         serde_json::from_value::<EvaluationResults>(legacy_json).expect("read legacy v2 results");
     assert!(legacy.dispatch_comparisons.iter().all(|comparison| {
         comparison.execution_telemetry_comparability
             == ExecutionTelemetryComparability::Incomparable
     }));
-    legacy
-        .validate_against(&manifest)
-        .expect("legacy v2 results remain readable and explicitly incomparable");
+    legacy.validate_against(&manifest).expect(
+        "legacy v2 results remain readable despite absent execution telemetry and later typed \
+             Pareto coordinates",
+    );
+
+    // Historical result documents with a populated frontier used this exact
+    // point shape even though the provisional fixture above cannot itself
+    // license a nonempty production frontier.
+    let summary = &results.profile_summaries[0];
+    let current_point = ParetoPoint {
+        profile_id: summary.profile_id.clone(),
+        mean_cost_usd: summary.mean_cost_usd,
+        mean_quota_consumption_tokens: Some(
+            PreciseMean::new(
+                u64::try_from(summary.aggregate_usage.total_tokens)
+                    .expect("test token total fits u64"),
+                summary.repetitions,
+            )
+            .expect("valid test quota mean"),
+        ),
+        mean_wall_time_ms: Some(summary.mean_wall_time_ms),
+        quality_basis_points: summary.mean_quality.overall_basis_points,
+        held_out_basis_points: summary.mean_quality.held_out_basis_points,
+        breadth_basis_points: summary.mean_quality.breadth_basis_points,
+        anti_shortcut_basis_points: summary.mean_quality.anti_shortcut_basis_points,
+    };
+    let mut old_point_json = serde_json::to_value(&current_point).expect("serialize Pareto point");
+    let old_point = old_point_json.as_object_mut().expect("Pareto point object");
+    old_point.remove("mean_quota_consumption_tokens");
+    old_point.remove("mean_wall_time_ms");
+    let legacy_point =
+        serde_json::from_value::<ParetoPoint>(old_point_json).expect("read v2 Pareto point");
+    assert!(pareto_frontiers_equivalent(
+        &[legacy_point],
+        &[current_point],
+        true,
+    ));
 }
 
 #[test]
@@ -1494,9 +1558,12 @@ fn quality_and_pareto_retain_breadth_and_anti_shortcut_signals() {
         },
         findings: Vec::new(),
     };
-    let full_quality = calculate_quality(&held_out, &full_review).expect("full quality");
+    let objective = crate::objective_profile::default_resolved_objective_profile()
+        .expect("resolved default objective");
+    let full_quality =
+        calculate_quality(&objective, &held_out, &full_review).expect("full quality");
     let shortcut_quality =
-        calculate_quality(&held_out, &shortcut_review).expect("shortcut quality");
+        calculate_quality(&objective, &held_out, &shortcut_review).expect("shortcut quality");
     assert_eq!(full_quality.overall_basis_points, BASIS_POINTS);
     assert_eq!(shortcut_quality.overall_basis_points, 7_500);
 
@@ -1510,6 +1577,8 @@ fn quality_and_pareto_retain_breadth_and_anti_shortcut_signals() {
     high_quality.mean_quality = precise_quality(full_quality);
     let mut shortcut = results.profile_summaries[1].clone();
     shortcut.mean_cost_usd = 1.0;
+    shortcut.aggregate_usage = high_quality.aggregate_usage;
+    shortcut.mean_wall_time_ms = high_quality.mean_wall_time_ms;
     shortcut.mean_loc_added = PreciseMean { total: 1, count: 1 };
     shortcut.mean_quality = precise_quality(shortcut_quality);
 
@@ -1519,6 +1588,41 @@ fn quality_and_pareto_retain_breadth_and_anti_shortcut_signals() {
     shortcut.mean_cost_usd = 0.5;
     assert!(!dominates(&high_quality, &shortcut));
     assert!(!dominates(&shortcut, &high_quality));
+}
+
+#[test]
+fn pareto_dominance_is_preference_free_across_raw_quality_axes() {
+    let results = run_fake(&manifest(), 127).expect("fake summary shells");
+    let mut held_out_specialist = results.profile_summaries[0].clone();
+    held_out_specialist.mean_cost_usd = 1.0;
+    held_out_specialist.mean_quality = precise_quality(QualityScore {
+        held_out_basis_points: 10_000,
+        breadth_basis_points: 0,
+        anti_shortcut_basis_points: 0,
+        overall_basis_points: 5_000,
+    });
+    let mut review_specialist = results.profile_summaries[1].clone();
+    review_specialist.mean_cost_usd = 1.0;
+    review_specialist.aggregate_usage = held_out_specialist.aggregate_usage;
+    review_specialist.mean_wall_time_ms = held_out_specialist.mean_wall_time_ms;
+    review_specialist.mean_quality = precise_quality(QualityScore {
+        held_out_basis_points: 0,
+        breadth_basis_points: 10_000,
+        anti_shortcut_basis_points: 10_000,
+        overall_basis_points: 5_000,
+    });
+
+    assert!(!dominates(&held_out_specialist, &review_specialist));
+    assert!(!dominates(&review_specialist, &held_out_specialist));
+
+    review_specialist.mean_quality.overall_basis_points = PreciseMean {
+        total: 7_500,
+        count: 1,
+    };
+    assert!(
+        !dominates(&review_specialist, &held_out_specialist),
+        "a profile-weighted overall score must not change Pareto membership"
+    );
 }
 
 #[test]
@@ -1551,9 +1655,12 @@ fn loc_or_held_out_pass_inflation_alone_cannot_win_quality() {
         },
         findings: Vec::new(),
     };
+    let objective = crate::objective_profile::default_resolved_objective_profile()
+        .expect("resolved default objective");
     let shortcut_quality =
-        calculate_quality(&perfect_held_out, &shortcut_only).expect("shortcut quality");
-    let broad_quality = calculate_quality(&perfect_held_out, &broad_review).expect("broad quality");
+        calculate_quality(&objective, &perfect_held_out, &shortcut_only).expect("shortcut quality");
+    let broad_quality =
+        calculate_quality(&objective, &perfect_held_out, &broad_review).expect("broad quality");
     assert_eq!(shortcut_quality.held_out_basis_points, BASIS_POINTS);
     assert!(shortcut_quality.overall_basis_points < broad_quality.overall_basis_points);
 
@@ -1567,6 +1674,8 @@ fn loc_or_held_out_pass_inflation_alone_cannot_win_quality() {
     inflated.mean_quality = precise_quality(shortcut_quality);
     let mut broad = results.profile_summaries[1].clone();
     broad.mean_cost_usd = 1.0;
+    broad.aggregate_usage = inflated.aggregate_usage;
+    broad.mean_wall_time_ms = inflated.mean_wall_time_ms;
     broad.mean_loc_added = PreciseMean { total: 1, count: 1 };
     broad.mean_quality = precise_quality(broad_quality);
 
@@ -1593,6 +1702,10 @@ fn experiment_manifest() -> ExperimentManifest {
             profile("hybrid-mix", "planner-fast", "worker-fast"),
             profile("all-frontier", "planner-frontier", "worker-frontier"),
         ],
+        objective_profile: Some(
+            crate::objective_profile::default_resolved_objective_profile()
+                .expect("resolved default objective"),
+        ),
     }
 }
 
@@ -1641,6 +1754,50 @@ fn two_profiles_produce_comparable_machine_readable_summary() {
             || results.pareto_conclusion.status
                 == ParetoConclusionStatus::RefusedNoDispatchDifference
     );
+
+    let output = serde_json::to_value(&results).expect("serialize experiment results");
+    assert_eq!(output["objective_scoring"]["kind"], "original");
+    assert_eq!(
+        output["objective_scoring"]["applied_profile"]["profile"]["id"],
+        crate::objective_profile::DEFAULT_OBJECTIVE_PROFILE_ID
+    );
+    assert!(
+        output.get("objective_selection").is_some(),
+        "experiment output must explicitly record the post-frontier profile policy result"
+    );
+}
+
+#[test]
+fn legacy_experiment_v1_without_objective_fields_remains_valid_for_default_manifest() {
+    let mut manifest = experiment_manifest();
+    manifest.objective_profile = None;
+    let current = run_fake_supervise_experiment(&manifest, ExperimentRunRequest::default())
+        .expect("current isolated Fake experiment");
+    let mut old_wire = serde_json::to_value(current).expect("serialize current experiment");
+    old_wire["version"] = json!(LEGACY_EXPERIMENT_RESULTS_SCHEMA_VERSION);
+    old_wire["schema"] = json!(LEGACY_EXPERIMENT_RESULT_SCHEMA);
+    let old_wire = old_wire.as_object_mut().expect("experiment result object");
+    old_wire.remove("objective_scoring");
+    old_wire.remove("objective_selection");
+    for point in old_wire["pareto_frontier"]
+        .as_array_mut()
+        .expect("experiment Pareto frontier array")
+    {
+        let point = point
+            .as_object_mut()
+            .expect("experiment Pareto frontier point object");
+        point.remove("mean_quota_consumption_tokens");
+        point.remove("mean_wall_time_ms");
+    }
+    let legacy =
+        serde_json::from_value::<ExperimentResults>(serde_json::Value::Object(old_wire.clone()))
+            .expect("deserialize genuine v1 experiment shape");
+
+    assert_eq!(legacy.objective_scoring, None);
+    assert_eq!(legacy.objective_selection, None);
+    legacy
+        .validate_against(&manifest)
+        .expect("legacy v1 result remains valid only at the historical default-objective boundary");
 }
 
 #[test]

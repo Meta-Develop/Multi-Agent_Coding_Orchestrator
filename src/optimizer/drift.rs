@@ -519,7 +519,9 @@ mod tests {
     use crate::optimizer::resources::{
         ObservationKind, Quantity, ResourceDimension, ResourceObservation, ResourceSnapshot,
     };
-    use crate::optimizer::safe_set::{PromotionDecisionKind, PromotionThreshold};
+    use crate::optimizer::safe_set::{
+        PromotionDecisionKind, PromotionEvidence, PromotionRequest, PromotionThreshold,
+    };
     use crate::optimizer::telemetry::InvocationRecord;
 
     fn identity(slug: &str, version: &str) -> RuntimeModelId {
@@ -667,12 +669,14 @@ mod tests {
             safe.record_outcome(&candidate, &class, true).expect("ok");
         }
         let promoted = safe
-            .promote(
-                &candidate,
-                &class,
-                TimestampMillis::from_millis(1),
-                EvaluationFidelity::F4HiddenValidation,
-            )
+            .promote(PromotionRequest {
+                policy_id: &candidate,
+                task_class: &class,
+                decided_at: TimestampMillis::from_millis(1),
+                evidence: PromotionEvidence::DirectEvaluation {
+                    fidelity: EvaluationFidelity::F4HiddenValidation,
+                },
+            })
             .expect("promote");
         assert_eq!(promoted.kind, PromotionDecisionKind::Promoted);
 
@@ -706,12 +710,14 @@ mod tests {
             safe.record_outcome(&candidate, &class, true).expect("ok");
         }
         let again = safe
-            .promote(
-                &candidate,
-                &class,
-                TimestampMillis::from_millis(20),
-                EvaluationFidelity::F5ProductionShadow,
-            )
+            .promote(PromotionRequest {
+                policy_id: &candidate,
+                task_class: &class,
+                decided_at: TimestampMillis::from_millis(20),
+                evidence: PromotionEvidence::DirectEvaluation {
+                    fidelity: EvaluationFidelity::F5ProductionShadow,
+                },
+            })
             .expect("repromote");
         assert_eq!(again.kind, PromotionDecisionKind::Promoted);
         adaptation

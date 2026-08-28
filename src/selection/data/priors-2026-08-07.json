@@ -1,13 +1,13 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "dataset_id": "maco-runtime-model-effort-priors",
-  "revision": "2026-08-25.1",
-  "published_on": "2026-08-25",
+  "revision": "2026-08-26.1",
+  "published_on": "2026-08-26",
   "objective_profiles": [
     {
       "name": "accepted-task-total-cost",
-      "version": 2,
-      "effective_date": "2026-08-25",
+      "version": 3,
+      "effective_date": "2026-08-26",
       "minimum_quality_basis_points": 8000,
       "minimum_class_fit_samples": 1,
       "minimum_authority_samples": 1,
@@ -15,11 +15,7 @@
       "observed_consumption_unit_cost_microunits": 50,
       "entitlement_scarcity_full_cost_microunits": 50000,
       "retry_penalty_microunits": 100000,
-      "degrade_effort_rank_penalty_microunits": 30000,
-      "switch_costs": {
-        "model_change_same_runtime_microunits": 10000,
-        "runtime_change_microunits": 25000
-      }
+      "degrade_effort_rank_penalty_microunits": 30000
     }
   ],
   "models": [

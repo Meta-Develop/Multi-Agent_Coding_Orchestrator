@@ -5,11 +5,12 @@
 //! `production_eligible` stays false.
 
 use super::{
-    calculate_quality, invalid_results, DispatchComparabilityClaim, EvaluationError,
-    EvaluationExecution, EvaluationLimits, EvaluationProfile, Finding, FindingSeverity,
-    HeldOutValidation, HeldOutValidationResult, ParetoConclusion, ParetoConclusionStatus,
-    ParetoPoint, PreciseMean, PreciseQualityScore, QualityScore, ReviewDimension, ReviewQuality,
-    MAX_EVALUATION_HELD_OUT_VALIDATIONS, MAX_EVALUATION_PROFILES, MAX_EVALUATION_REPETITIONS,
+    calculate_quality, invalid_results, select_experiment_frontier, DispatchComparabilityClaim,
+    EvaluationError, EvaluationExecution, EvaluationLimits, EvaluationProfile, Finding,
+    FindingSeverity, HeldOutValidation, HeldOutValidationResult, ObjectiveScoringProvenance,
+    ParetoConclusion, ParetoConclusionStatus, ParetoPoint, PreciseMean, PreciseQualityScore,
+    QualityScore, ReviewDimension, ReviewQuality, MAX_EVALUATION_HELD_OUT_VALIDATIONS,
+    MAX_EVALUATION_PROFILES, MAX_EVALUATION_REPETITIONS,
 };
 #[cfg(not(test))]
 use crate::supervise::run_supervisor_plan_file;
@@ -17,6 +18,9 @@ use crate::{
     artifacts::state_auth::sha256_hex,
     llm::provider::Usage,
     machine_global::MachineGlobalRetentionBinding,
+    objective_profile::{
+        default_resolved_objective_profile, ObjectiveSelection, ResolvedObjectiveProfile,
+    },
     orchestrator::{RunId, SemanticCoordinationMode},
     review::ReviewAggregationPolicy,
     supervise::{
@@ -35,8 +39,10 @@ use std::{
 };
 
 pub const EXPERIMENT_MANIFEST_SCHEMA_VERSION: u32 = 1;
-pub const EXPERIMENT_RESULTS_SCHEMA_VERSION: u32 = 1;
-pub const EXPERIMENT_RESULT_SCHEMA: &str = "evaluation_experiment_result_v1";
+pub const LEGACY_EXPERIMENT_RESULTS_SCHEMA_VERSION: u32 = 1;
+pub const EXPERIMENT_RESULTS_SCHEMA_VERSION: u32 = 2;
+pub const LEGACY_EXPERIMENT_RESULT_SCHEMA: &str = "evaluation_experiment_result_v1";
+pub const EXPERIMENT_RESULT_SCHEMA: &str = "evaluation_experiment_result_v2";
 pub const ISOLATED_FAKE_SUPERVISE_NOTICE: &str =
     "isolated Fake supervise experiment; each profile \
      and repetition ran from a fresh in-process Fake supervise state with no network provider; \
@@ -55,6 +61,8 @@ pub struct ExperimentManifest {
     pub held_out_validation: Vec<HeldOutValidation>,
     pub repetitions: u32,
     pub profiles: Vec<EvaluationProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective_profile: Option<ResolvedObjectiveProfile>,
 }
 
 impl ExperimentManifest {
@@ -115,7 +123,21 @@ impl ExperimentManifest {
         }
         validate_held_out(&self.held_out_validation)?;
         validate_experiment_profiles(&self.profiles)?;
+        self.resolved_objective_profile()?;
         Ok(())
+    }
+
+    fn resolved_objective_profile(&self) -> Result<ResolvedObjectiveProfile, EvaluationError> {
+        let profile = match &self.objective_profile {
+            Some(profile) => profile.clone(),
+            None => default_resolved_objective_profile()
+                .map_err(|error| invalid_experiment("objective_profile", error.to_string()))?,
+        };
+        profile
+            .profile
+            .validate()
+            .map_err(|error| invalid_experiment("objective_profile", error.to_string()))?;
+        Ok(profile)
     }
 
     pub fn goal_digest(&self) -> String {
@@ -245,20 +267,36 @@ pub struct ExperimentResults {
     pub profile_summaries: Vec<ExperimentProfileSummary>,
     pub pareto_conclusion: ParetoConclusion,
     pub pareto_frontier: Vec<ParetoPoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective_scoring: Option<ObjectiveScoringProvenance>,
+    #[serde(default)]
+    pub objective_selection: Option<ObjectiveSelection>,
 }
 
 impl ExperimentResults {
     pub fn validate_against(&self, manifest: &ExperimentManifest) -> Result<(), EvaluationError> {
-        if self.version != EXPERIMENT_RESULTS_SCHEMA_VERSION {
-            return Err(EvaluationError::UnsupportedResultsVersion {
-                found: self.version,
-                supported: EXPERIMENT_RESULTS_SCHEMA_VERSION,
-            });
-        }
-        if self.schema != EXPERIMENT_RESULT_SCHEMA {
+        let legacy_v1 = match self.version {
+            EXPERIMENT_RESULTS_SCHEMA_VERSION => false,
+            LEGACY_EXPERIMENT_RESULTS_SCHEMA_VERSION => true,
+            _ => {
+                return Err(EvaluationError::UnsupportedResultsVersion {
+                    found: self.version,
+                    supported: EXPERIMENT_RESULTS_SCHEMA_VERSION,
+                });
+            }
+        };
+        let expected_schema = if legacy_v1 {
+            LEGACY_EXPERIMENT_RESULT_SCHEMA
+        } else {
+            EXPERIMENT_RESULT_SCHEMA
+        };
+        if self.schema != expected_schema {
             return Err(invalid_results(
                 "schema",
-                format!("expected {EXPERIMENT_RESULT_SCHEMA}"),
+                format!(
+                    "expected {expected_schema} for results version {}",
+                    self.version
+                ),
             ));
         }
         if self.experiment_id != manifest.experiment_id {
@@ -313,6 +351,55 @@ impl ExperimentResults {
                 "Fake supervise experiment results must keep production_eligible=false",
             ));
         }
+        let resolved_objective = manifest.resolved_objective_profile()?;
+        match (&self.objective_scoring, legacy_v1) {
+            (Some(scoring), false) => {
+                scoring.validate()?;
+                if scoring.applied_profile != resolved_objective {
+                    return Err(invalid_results(
+                        "objective_scoring.applied_profile",
+                        "does not match the resolved objective bound by the experiment manifest",
+                    ));
+                }
+            }
+            (None, false) => {
+                return Err(invalid_results(
+                    "objective_scoring",
+                    "experiment results schema v2 must bind canonical scoring provenance",
+                ));
+            }
+            (None, true) if manifest.objective_profile.is_none() => {}
+            (None, true) => {
+                return Err(invalid_results(
+                    "objective_scoring",
+                    "legacy v1 may omit scoring provenance only when the manifest omitted the \
+                     objective and therefore used the historical built-in default",
+                ));
+            }
+            (Some(_), true) => {
+                return Err(invalid_results(
+                    "objective_scoring",
+                    "legacy experiment results schema v1 must not claim v2 scoring provenance",
+                ));
+            }
+        }
+        let expected_selection = select_experiment_frontier(
+            &resolved_objective,
+            &self.profile_summaries,
+            &self.pareto_frontier,
+        )?;
+        if legacy_v1 && self.objective_selection.is_some() {
+            return Err(invalid_results(
+                "objective_selection",
+                "legacy experiment results schema v1 must not claim v2 selection evidence",
+            ));
+        }
+        if !legacy_v1 && self.objective_selection != expected_selection {
+            return Err(invalid_results(
+                "objective_selection",
+                "does not match the explicit profile policy applied after frontier construction",
+            ));
+        }
         Ok(())
     }
 }
@@ -353,6 +440,7 @@ fn run_isolated_fake_supervise(
         }
     })?;
 
+    let objective_profile = manifest.resolved_objective_profile()?;
     let mut runs = Vec::with_capacity(
         manifest
             .profiles
@@ -365,7 +453,12 @@ fn run_isolated_fake_supervise(
 
     for profile in &manifest.profiles {
         for repetition in 0..manifest.repetitions {
-            runs.push(run_isolated_profile(manifest, profile, repetition)?);
+            runs.push(run_isolated_profile(
+                manifest,
+                profile,
+                &objective_profile,
+                repetition,
+            )?);
         }
     }
 
@@ -377,6 +470,8 @@ fn run_isolated_fake_supervise(
         }
         pareto_frontier.clear();
     }
+    let objective_selection =
+        select_experiment_frontier(&objective_profile, &profile_summaries, &pareto_frontier)?;
 
     let results = ExperimentResults {
         version: EXPERIMENT_RESULTS_SCHEMA_VERSION,
@@ -394,6 +489,8 @@ fn run_isolated_fake_supervise(
         profile_summaries,
         pareto_conclusion,
         pareto_frontier,
+        objective_scoring: Some(ObjectiveScoringProvenance::original(objective_profile)),
+        objective_selection,
     };
     results.validate_against(manifest)?;
     Ok(results)
@@ -402,6 +499,7 @@ fn run_isolated_fake_supervise(
 fn run_isolated_profile(
     manifest: &ExperimentManifest,
     profile: &EvaluationProfile,
+    objective_profile: &ResolvedObjectiveProfile,
     repetition: u32,
 ) -> Result<ExperimentRun, EvaluationError> {
     let isolated = IsolatedSuperviseState::create(manifest, profile, repetition)?;
@@ -421,6 +519,7 @@ fn run_isolated_profile(
     capture_experiment_run(
         manifest,
         profile,
+        objective_profile,
         repetition,
         isolated.run_id.as_str(),
         wall_time_ms,
@@ -431,6 +530,7 @@ fn run_isolated_profile(
 fn capture_experiment_run(
     manifest: &ExperimentManifest,
     profile: &EvaluationProfile,
+    objective_profile: &ResolvedObjectiveProfile,
     repetition: u32,
     run_id: &str,
     wall_time_ms: u64,
@@ -477,7 +577,7 @@ fn capture_experiment_run(
 
     let held_out_validation = held_out_from_fake_report(manifest, report);
     let review = review_from_fake_report(report);
-    let quality = calculate_quality(&held_out_validation, &review)?;
+    let quality = calculate_quality(objective_profile, &held_out_validation, &review)?;
 
     Ok(ExperimentRun {
         profile_id: profile.id.clone(),
@@ -670,15 +770,29 @@ fn summarize_experiment(
     let mut frontier = summaries
         .iter()
         .filter(|summary| summary.pareto_optimal)
-        .map(|summary| ParetoPoint {
-            profile_id: summary.profile_id.clone(),
-            mean_cost_usd: summary.mean_cost_usd,
-            quality_basis_points: summary.mean_quality.overall_basis_points,
-            held_out_basis_points: summary.mean_quality.held_out_basis_points,
-            breadth_basis_points: summary.mean_quality.breadth_basis_points,
-            anti_shortcut_basis_points: summary.mean_quality.anti_shortcut_basis_points,
+        .map(|summary| {
+            Ok(ParetoPoint {
+                profile_id: summary.profile_id.clone(),
+                mean_cost_usd: summary.mean_cost_usd,
+                mean_quota_consumption_tokens: summary
+                    .aggregate_usage
+                    .map(|usage| {
+                        let total = u64::try_from(usage.total_tokens).map_err(|_| {
+                            EvaluationError::ArithmeticOverflow {
+                                context: "experiment frontier quota consumption".to_string(),
+                            }
+                        })?;
+                        PreciseMean::new(total, summary.repetitions)
+                    })
+                    .transpose()?,
+                mean_wall_time_ms: Some(summary.mean_wall_time_ms),
+                quality_basis_points: summary.mean_quality.overall_basis_points,
+                held_out_basis_points: summary.mean_quality.held_out_basis_points,
+                breadth_basis_points: summary.mean_quality.breadth_basis_points,
+                anti_shortcut_basis_points: summary.mean_quality.anti_shortcut_basis_points,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, EvaluationError>>()?;
     frontier.sort_by(|left, right| {
         left.mean_cost_usd
             .total_cmp(&right.mean_cost_usd)
@@ -691,16 +805,49 @@ fn experiment_dominates(
     candidate: &ExperimentProfileSummary,
     other: &ExperimentProfileSummary,
 ) -> bool {
+    let (Some(candidate_usage), Some(other_usage)) =
+        (candidate.aggregate_usage, other.aggregate_usage)
+    else {
+        return false;
+    };
+    if candidate.aggregate_cost_usd.is_none() || other.aggregate_cost_usd.is_none() {
+        return false;
+    }
     let no_more_expensive = candidate.mean_cost_usd <= other.mean_cost_usd;
-    let quality_order = (u128::from(candidate.mean_quality.overall_basis_points.total)
-        * u128::from(other.mean_quality.overall_basis_points.count))
-    .cmp(
-        &(u128::from(other.mean_quality.overall_basis_points.total)
-            * u128::from(candidate.mean_quality.overall_basis_points.count)),
+    let quota_order = super::compare_usage_means(
+        candidate_usage.total_tokens,
+        candidate.repetitions,
+        other_usage.total_tokens,
+        other.repetitions,
     );
-    let no_lower_quality = quality_order.is_ge();
-    let strictly_better = candidate.mean_cost_usd < other.mean_cost_usd || quality_order.is_gt();
-    no_more_expensive && no_lower_quality && strictly_better
+    let latency_order = candidate
+        .mean_wall_time_ms
+        .cmp_value(&other.mean_wall_time_ms);
+    let held_out_order = candidate
+        .mean_quality
+        .held_out_basis_points
+        .cmp_value(&other.mean_quality.held_out_basis_points);
+    let breadth_order = candidate
+        .mean_quality
+        .breadth_basis_points
+        .cmp_value(&other.mean_quality.breadth_basis_points);
+    let anti_shortcut_order = candidate
+        .mean_quality
+        .anti_shortcut_basis_points
+        .cmp_value(&other.mean_quality.anti_shortcut_basis_points);
+    let no_lower_raw_quality =
+        held_out_order.is_ge() && breadth_order.is_ge() && anti_shortcut_order.is_ge();
+    let strictly_better = candidate.mean_cost_usd < other.mean_cost_usd
+        || quota_order.is_lt()
+        || latency_order.is_lt()
+        || held_out_order.is_gt()
+        || breadth_order.is_gt()
+        || anti_shortcut_order.is_gt();
+    no_more_expensive
+        && quota_order.is_le()
+        && latency_order.is_le()
+        && no_lower_raw_quality
+        && strictly_better
 }
 
 fn experiment_pareto_conclusion(summaries: &[ExperimentProfileSummary]) -> ParetoConclusion {
@@ -708,7 +855,11 @@ fn experiment_pareto_conclusion(summaries: &[ExperimentProfileSummary]) -> Paret
         .windows(2)
         .any(|pair| (pair[0].mean_cost_usd - pair[1].mean_cost_usd).abs() > f64::EPSILON);
     let quality_differs = summaries.windows(2).any(|pair| {
-        pair[0].mean_quality.overall_basis_points != pair[1].mean_quality.overall_basis_points
+        pair[0].mean_quality.held_out_basis_points != pair[1].mean_quality.held_out_basis_points
+            || pair[0].mean_quality.breadth_basis_points
+                != pair[1].mean_quality.breadth_basis_points
+            || pair[0].mean_quality.anti_shortcut_basis_points
+                != pair[1].mean_quality.anti_shortcut_basis_points
     });
     let status = if summaries.len() < 2 {
         ParetoConclusionStatus::RefusedIncomparableDispatchEvidence
@@ -832,6 +983,8 @@ fn experiment_plan(manifest: &ExperimentManifest, profile: &EvaluationProfile) -
             phase: AssignmentPhase::Execution,
             runtime: None,
             role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
@@ -839,6 +992,8 @@ fn experiment_plan(manifest: &ExperimentManifest, profile: &EvaluationProfile) -
             worker_assignments: vec![WorkerAssignment {
                 id: "worker-a".to_string(),
                 role: AgentRole::Worker,
+                role_category: None,
+                selection_source: None,
                 assigned_paths: vec![PathBuf::from("README.md")],
                 semantic_symbols: Vec::new(),
                 semantic_modules: Vec::new(),
