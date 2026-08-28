@@ -632,6 +632,8 @@ fn configure_stdin(command: &mut Command, stdin: &StdinMode) {
 #[cfg(target_os = "windows")]
 const WINDOWS_PROCESS_CREATION_FLAGS: u32 = 0x0000_0200 | 0x0000_0004;
 
+include!("containment_platform.rs");
+
 struct PreparedProcessTree {
     backend: PreparedContainmentBackend,
     side_effects: SideEffectConfinementEvidence,
@@ -686,68 +688,54 @@ impl PreparedProcessTree {
         ensure_not_cancelled(cancellation, label, command, "containment slot acquisition")?;
         match policy {
             ContainmentPolicy::Required => {
-                #[cfg(target_os = "linux")]
-                {
-                    match SystemdUnit::prepare(operation_deadline, cancellation) {
-                        Ok(unit) => Ok(Self {
-                            backend: PreparedContainmentBackend::Systemd(Box::new(unit)),
-                            side_effects,
-                        }),
-                        Err(_source) if cancellation.is_cancelled() => {
-                            Err(ProcessRunError::Cancelled {
-                                label: label.to_string(),
-                                command: command.to_string(),
-                                phase: "containment slot acquisition",
-                                evidence: None,
-                            })
-                        }
-                        Err(source)
-                            if operation_deadline
-                                .is_some_and(|deadline| Instant::now() >= deadline) =>
+                let backend = select_required_containment_backend(
+                    RequiredContainmentPlatform::current(),
+                    label,
+                    command,
+                )?;
+                match backend {
+                    ReviewedRequiredContainmentBackend::LinuxSystemdCgroupV2 => {
+                        #[cfg(target_os = "linux")]
                         {
-                            Err(setup_timeout_error(
-                                label,
-                                command,
-                                "strict containment slot acquisition",
-                                source.to_string(),
+                            match SystemdUnit::prepare(operation_deadline, cancellation) {
+                                Ok(unit) => Ok(Self {
+                                    backend: PreparedContainmentBackend::Systemd(Box::new(unit)),
+                                    side_effects,
+                                }),
+                                Err(_source) if cancellation.is_cancelled() => {
+                                    Err(ProcessRunError::Cancelled {
+                                        label: label.to_string(),
+                                        command: command.to_string(),
+                                        phase: "containment slot acquisition",
+                                        evidence: None,
+                                    })
+                                }
+                                Err(source)
+                                    if operation_deadline
+                                        .is_some_and(|deadline| Instant::now() >= deadline) =>
+                                {
+                                    Err(setup_timeout_error(
+                                        label,
+                                        command,
+                                        "strict containment slot acquisition",
+                                        source.to_string(),
+                                    ))
+                                }
+                                Err(source) => Err(containment_setup_error(
+                                    label.to_string(),
+                                    command.to_string(),
+                                    source,
+                                )),
+                            }
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        {
+                            Err(unavailable(
+                                RequiredContainmentRefusal::ReviewedBackendPlatformMismatch
+                                    .into_io_error(),
                             ))
                         }
-                        Err(source) => Err(containment_setup_error(
-                            label.to_string(),
-                            command.to_string(),
-                            source,
-                        )),
                     }
-                }
-                #[cfg(target_os = "windows")]
-                {
-                    if !matches!(
-                        side_effect_profile,
-                        SideEffectConfinementProfile::TrustedCompatibility
-                    ) {
-                        return Err(unavailable(std::io::Error::new(
-                            std::io::ErrorKind::Unsupported,
-                            "verified side-effect confinement is not implemented for Windows; use explicit trusted compatibility only for trusted commands",
-                        )));
-                    }
-                    return Ok(Self {
-                        backend: PreparedContainmentBackend::WindowsJob,
-                        side_effects,
-                    });
-                }
-                #[cfg(all(unix, not(target_os = "linux")))]
-                {
-                    return Err(unavailable(std::io::Error::new(
-                        std::io::ErrorKind::Unsupported,
-                        "no verified subtree-containment backend is implemented on this Unix platform; use TrustedBestEffort only for trusted commands",
-                    )));
-                }
-                #[cfg(not(any(unix, target_os = "windows")))]
-                {
-                    return Err(unavailable(std::io::Error::new(
-                        std::io::ErrorKind::Unsupported,
-                        "no verified subtree-containment backend is implemented on this platform",
-                    )));
                 }
             }
             ContainmentPolicy::TrustedBestEffort => {
