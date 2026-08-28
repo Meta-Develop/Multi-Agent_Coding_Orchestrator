@@ -72,8 +72,11 @@ The current implementation covers a local-first command-line slice:
 - `maco supervise run <task-or-plan-file>` and
   `maco supervise run --from-goal <file>` accept the same mutually exclusive
   positional-plan or high-level-goal inputs as `supervise plan`, then execute
-  the resulting validated plan through the live supervisor gates. The command
-  selects the Codex runtime by default. Normalized planning-phase Codex
+  the resulting validated plan through the live supervisor gates. Optional
+  `--role-category` stamps every assignment (and nested worker assignment) as
+  `selection_source=operator_override`; omitting it keeps automatic selection
+  derived from the plan role. Resume of an existing run refuses a new
+  `--role-category`. The command selects the Codex runtime by default. Normalized planning-phase Codex
   children receive a read-only workspace and read-only access to their own Git
   worktree metadata in both the outer systemd containment and inner Codex
   permission profile. Only their exact private final-message staging root is
@@ -152,8 +155,13 @@ The current implementation covers a local-first command-line slice:
   report by default, with `ci_reaction_supported=false`.
 - `maco inbox scan/run/status/collect/watch` provides a fake-first reaction
   loop for issue intake, pull request review feedback, and failing CI checks,
-  converting safe inbox items into autopilot repair plans without network access
-  or automatic merge by default.
+  converting safe inbox items into Autopilot repair plans without network access
+  or automatic merge by default. `inbox run` accepts optional rolling-quota
+  ceilings `--max-rolling-tokens`, `--max-rolling-cost-usd`, and
+  `--rolling-window-seconds`.
+- `maco inbox workspace scan/run/watch` supervises the same inbox loop across
+  a workspace JSON of repositories. `run` and `watch` execute; they do not
+  return `Unsupported`.
 - `maco inbox artifacts list/latest/prune` inspects or prunes durable inbox run
   artifacts.
 
@@ -3390,8 +3398,10 @@ The load-bearing CLI contract changed explicitly: previously every
 integration test required zero run artifacts. It now requires a complete
 machine-global binding, performs typed preflight and pre-dispatch checks, and
 delegates exactly once to live supervise; the missing-binding test retains the
-old before-effects refusal boundary. Effectful Inbox run/watch callers remain
-disabled and do not inherit this narrower capability.
+old before-effects refusal boundary. Effectful `maco inbox run` and
+`maco inbox watch` callers are live again: they dispatch selected item work
+through that same Autopilot spine, so they inherit its machine-global binding
+requirement whenever item work launches Autopilot.
 
 Run the fake-first inbox reaction loop:
 
@@ -3412,9 +3422,10 @@ Run the fake-first inbox reaction loop:
 
 ```bash
 cargo run -- inbox scan --repo . --json
-# The following run/watch commands currently return Unsupported:
 cargo run -- inbox run --repo . --run-id inbox-demo --json
 cargo run -- inbox run --repo . --run-id inbox-codex --permission github_local --codex-bin codex --json
+cargo run -- inbox run --repo . --run-id inbox-quota \
+  --max-rolling-tokens 42000 --max-rolling-cost-usd 12.5 --json
 cargo run -- inbox status inbox-demo --repo . --json
 cargo run -- inbox collect inbox-demo --repo . --json
 cargo run -- inbox watch --repo . --poll-seconds 60 --once --json
@@ -3451,13 +3462,27 @@ item is used. Duplicate detection remains stable by repository, kind, and number
 while the snapshot digest separately identifies the observed source revision.
 Fake fixtures use fixed timestamps and canonical fake OIDs for reproducibility.
 
-`maco inbox run` and `maco inbox watch` execute effectfully again: item work
-dispatches through autopilot, whose supervisor cascade derives the
+`maco inbox run` and `maco inbox watch` execute effectfully: item work
+dispatches through Autopilot, whose supervisor cascade derives the
 capability-bound repository cleanliness input before creating managed
 worktrees. `scan`, `status`, `collect`, and read-only artifact inspection
 remain available. The fake-first reaction flow described below is the
 executable behavior; the unbound Fake reviewer still stops as nonpublishable
 before real publication effects.
+
+`maco inbox run` accepts optional workspace rolling-quota ceilings
+`--max-rolling-tokens`, `--max-rolling-cost-usd`, and
+`--rolling-window-seconds`. A quota is bound only when at least one of
+`--max-rolling-tokens` or `--max-rolling-cost-usd` is set; `--rolling-window-seconds`
+alone is ignored. Values must be finite and positive. When a ceiling is set
+and the window is omitted, the window defaults to 86400 seconds (24 hours).
+These flags are inbox-run ceilings across Autopilot dispatches in the
+workspace rolling ledger; they are not the supervise/autopilot per-run
+`--max-tokens` / `--max-cost-usd` / `--max-duration-seconds` flags, which
+`inbox run` rejects. `inbox watch` and `inbox workspace run|watch` do not
+expose the rolling-quota flags. When a rolling quota refuses further work,
+the run records `status=refused` and the next action asks the operator to
+increase or wait for the quota.
 
 Inbox runs write public-safe artifacts under `.maco/inbox/runs/<run-id>/`,
 including `scan-report.json`, `selected-items.json`, `item-<n>-plan.json`,
@@ -3537,21 +3562,26 @@ Run the cross-repository inbox workspace supervisor:
 
 ```bash
 cargo run -- inbox workspace scan --config workspace-inbox.json --json
-# The following workspace run/watch commands currently return Unsupported:
 cargo run -- inbox workspace run --config workspace-inbox.json --run-id workspace-demo --json
 cargo run -- inbox workspace run --config workspace-inbox.json --run-id workspace-dry --dry-run --json
 cargo run -- inbox workspace watch --config workspace-inbox.json --poll-seconds 60 --once --json
 ```
 
-Workspace inbox `run` and `watch` currently return `Unsupported` before reading
-the workspace config or creating artifacts. Workspace `scan` remains available.
+`maco inbox workspace scan`, `run`, and `watch` are implemented. `scan` reads
+the workspace config and reports per-repository intake without launching
+Autopilot. `run` writes aggregate artifacts under
+`.maco/inbox-workspace/runs/<run-id>/` and then executes each enabled
+repository through the same inbox run path used by `maco inbox run`. `watch`
+polls that run path; `--once` performs a single iteration and returns. `--dry-run`
+plans item work and writes reports without launching Autopilot. Workspace
+run/watch do not accept the inbox rolling-quota flags; those apply only to
+`maco inbox run`.
 The retained aggregate design reports `version`, a public-safe `config_path`,
 `strict`, repo counts, and one entry per repository with `id`, `enabled`,
 `permission_mode`, `status`, `success`, `refused`, optional `message`, and an
-embedded `scan_report` or `run_report`. Workspace run artifacts are written
-under `.maco/inbox-workspace/runs/<run-id>/`, while per-repo repair artifacts
-remain under each repository's `.maco/inbox/runs/<run-id>/` tree. Public reports
-must not expose local temp paths, credentials, raw secrets, or private bodies.
+embedded `scan_report` or `run_report`. Per-repo repair artifacts remain under
+each repository's `.maco/inbox/runs/<run-id>/` tree. Public reports must not
+expose local temp paths, credentials, raw secrets, or private bodies.
 Workspace configs use the same 256 KiB bounded, no-follow UTF-8 loading and
 strict unknown-field/version rules. They support at most 64 uniquely identified
 repositories; repository IDs, paths, labels, per-repository item counts, and
