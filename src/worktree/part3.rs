@@ -3424,7 +3424,9 @@ fn bounded_worktree_is_clean(
 /// runs as a killable trusted subprocess instead of in an in-process libgit2
 /// call whose wall-clock work cannot be interrupted. Inventory and repository
 /// map scans use process-group ownership so they function without a delegated
-/// user-systemd session; live GC dirtiness still uses verified containment.
+/// user-systemd session. Live GC dirtiness prefers verified containment and
+/// falls back to the same trusted path when a delegated user manager is
+/// absent, so Fake completion-hook reaping can finish on GitHub runners.
 pub(crate) fn bounded_repository_status_paths(
     path: &Path,
     max_entries: usize,
@@ -3441,10 +3443,50 @@ fn bounded_repository_gc_status_paths(
     max_output_bytes: usize,
     timeout: Duration,
 ) -> Result<BoundedStatusPathRecords> {
+    bounded_repository_gc_status_paths_with_isolation(
+        path,
+        max_entries,
+        max_output_bytes,
+        timeout,
+        BoundedGitIsolation::Verified,
+    )
+}
+
+fn bounded_repository_gc_status_paths_trusted(
+    path: &Path,
+    max_entries: usize,
+    max_output_bytes: usize,
+    timeout: Duration,
+) -> Result<BoundedStatusPathRecords> {
+    bounded_repository_gc_status_paths_with_isolation(
+        path,
+        max_entries,
+        max_output_bytes,
+        timeout,
+        BoundedGitIsolation::Trusted,
+    )
+}
+
+fn bounded_repository_gc_status_paths_with_isolation(
+    path: &Path,
+    max_entries: usize,
+    max_output_bytes: usize,
+    timeout: Duration,
+    isolation: BoundedGitIsolation,
+) -> Result<BoundedStatusPathRecords> {
     let binding = RepositoryBindingGuard::bind(path)?;
     binding.verify()?;
-    let records =
-        bounded_worktree_records_with_ignored(path, max_entries, max_output_bytes, timeout)?;
+    let records = match isolation {
+        BoundedGitIsolation::Verified => {
+            bounded_worktree_records_with_ignored(path, max_entries, max_output_bytes, timeout)?
+        }
+        BoundedGitIsolation::Trusted => bounded_worktree_records_with_ignored_trusted(
+            path,
+            max_entries,
+            max_output_bytes,
+            timeout,
+        )?,
+    };
     let mut merged = parse_porcelain_v1_z(&records.status, max_entries)?
         .into_iter()
         .collect::<BTreeMap<_, _>>();
