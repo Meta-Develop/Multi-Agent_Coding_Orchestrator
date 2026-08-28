@@ -174,7 +174,7 @@ fn capture_repository_map_snapshot(
     deadline: &mut Instant,
 ) -> Result<RepositoryMapSnapshot> {
     let (statuses, process_queue_wait) =
-        crate::worktree::bounded_repository_status_paths_bound_with_process_wait(
+        crate::worktree::bounded_repository_status_paths_bound_with_process_wait_trusted(
             binding,
             REPOSITORY_MAP_MAX_ENTRIES,
             REPOSITORY_MAP_MAX_TOTAL_PATH_BYTES,

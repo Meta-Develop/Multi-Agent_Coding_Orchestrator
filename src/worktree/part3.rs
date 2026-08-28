@@ -3421,8 +3421,10 @@ fn bounded_worktree_is_clean(
 }
 
 /// Returns a fail-closed, output-bounded Git porcelain status snapshot.  Git
-/// runs in the existing killable read-only containment boundary instead of in
-/// an in-process libgit2 call whose wall-clock work cannot be interrupted.
+/// runs as a killable trusted subprocess instead of in an in-process libgit2
+/// call whose wall-clock work cannot be interrupted. Inventory and repository
+/// map scans use process-group ownership so they function without a delegated
+/// user-systemd session; live GC dirtiness still uses verified containment.
 pub(crate) fn bounded_repository_status_paths(
     path: &Path,
     max_entries: usize,
@@ -3493,6 +3495,26 @@ pub(crate) fn bounded_repository_status_paths_bound_with_process_wait(
     ))
 }
 
+pub(crate) fn bounded_repository_status_paths_bound_with_process_wait_trusted(
+    binding: &RepositoryBindingGuard,
+    max_entries: usize,
+    max_output_bytes: usize,
+    timeout: Duration,
+) -> Result<(BoundedStatusPathRecords, Duration)> {
+    binding.verify()?;
+    let records = bounded_worktree_records_trusted(
+        binding.worktree(),
+        max_entries,
+        max_output_bytes,
+        timeout,
+    )?;
+    binding.verify()?;
+    Ok((
+        parse_porcelain_v1_z(&records.status, max_entries)?,
+        records.process_queue_wait,
+    ))
+}
+
 pub(crate) fn bounded_repository_visible_paths_bound_with_process_wait(
     binding: &RepositoryBindingGuard,
     max_entries: usize,
@@ -3500,8 +3522,12 @@ pub(crate) fn bounded_repository_visible_paths_bound_with_process_wait(
     timeout: Duration,
 ) -> Result<(Vec<PathBuf>, Duration)> {
     binding.verify()?;
-    let records =
-        bounded_worktree_records(binding.worktree(), max_entries, max_output_bytes, timeout)?;
+    let records = bounded_worktree_records_trusted(
+        binding.worktree(),
+        max_entries,
+        max_output_bytes,
+        timeout,
+    )?;
     binding.verify()?;
     Ok((
         parse_nul_paths(&records.visible, max_entries)?,
