@@ -1322,8 +1322,14 @@ fn bounded_status_tolerates_nested_repository_gitfiles() {
         .branch("linked", &nested_commit, false)
         .expect("create nested linked branch")
         .into_reference();
-    let linked_path = repo_path.join("vendor/linked-sdk");
+    let linked_path = repo_path.join("vendor/linked-[sdk]");
     fs::create_dir_all(linked_path.parent().expect("linked parent")).expect("create linked parent");
+    fs::create_dir_all(repo_path.join("vendor/linked-s")).expect("create boundary-like sibling");
+    fs::write(
+        repo_path.join("vendor/linked-s/outer-sibling.txt"),
+        "outer sibling\n",
+    )
+    .expect("write boundary-like sibling");
     let mut options = WorktreeAddOptions::new();
     options.reference(Some(&nested_branch));
     nested
@@ -1343,7 +1349,8 @@ fn bounded_status_tolerates_nested_repository_gitfiles() {
 
     assert!(visible.contains(&PathBuf::from("README.md")));
     assert!(visible.contains(&PathBuf::from("outer-visible.txt")));
-    assert!(!visible.contains(&PathBuf::from("vendor/linked-sdk/README.md")));
+    assert!(visible.contains(&PathBuf::from("vendor/linked-s/outer-sibling.txt")));
+    assert!(!visible.contains(&PathBuf::from("vendor/linked-[sdk]/README.md")));
 }
 
 #[cfg(target_os = "linux")]

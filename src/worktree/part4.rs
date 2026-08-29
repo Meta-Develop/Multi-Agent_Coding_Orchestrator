@@ -898,6 +898,46 @@ fn is_bounded_status_runtime_path(path: &Path) -> bool {
         || crate::repo_map::is_ignored_worktree_store_path(path)
 }
 
+fn append_nested_repository_excludes(excludes: &mut Vec<u8>, boundaries: &[PathBuf]) -> Result<()> {
+    for boundary in boundaries {
+        excludes.push(b'/');
+        let mut first = true;
+        for component in boundary.components() {
+            let std::path::Component::Normal(component) = component else {
+                bail!("nested repository boundary is not a safe relative path");
+            };
+            if !first {
+                excludes.push(b'/');
+            }
+            first = false;
+            #[cfg(unix)]
+            let bytes = component.as_bytes();
+            #[cfg(not(unix))]
+            let bytes = component
+                .to_str()
+                .context("nested repository boundary is not valid UTF-8")?
+                .as_bytes();
+            for byte in bytes {
+                match byte {
+                    b'\n' | b'\r' => {
+                        bail!("nested repository boundary contains a line-breaking path byte")
+                    }
+                    b'\\' | b'!' | b'#' | b'*' | b'?' | b'[' | b']' => {
+                        excludes.push(b'\\');
+                        excludes.push(*byte);
+                    }
+                    _ => excludes.push(*byte),
+                }
+            }
+        }
+        if first {
+            bail!("nested repository boundary is empty");
+        }
+        excludes.extend_from_slice(b"/\n");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn validate_bounded_git_text_inputs(
     worktree: &Path,
@@ -927,7 +967,7 @@ fn validate_bounded_git_text_inputs_bound(
     {
         bail!("bounded-status rejects Git object alternates");
     }
-    let inventory = BoundedTreeWalker::walk_bound_with_options(
+    let inventory = BoundedTreeWalker::walk_bound_with_options_detailed(
         repository.worktree_binding(),
         BoundedTreeWalkLimits {
             max_depth: 128,
@@ -971,6 +1011,7 @@ fn validate_bounded_git_text_inputs_bound(
         },
     )?;
     if inventory
+        .entries
         .iter()
         .filter(|entry| entry.kind == BoundedTreeEntryKind::RegularFile)
         .count()
@@ -980,6 +1021,7 @@ fn validate_bounded_git_text_inputs_bound(
     }
     let mut total = 0_u64;
     for entry in inventory
+        .entries
         .iter()
         .filter(|entry| entry.kind == BoundedTreeEntryKind::RegularFile)
     {
@@ -1042,6 +1084,20 @@ fn validate_bounded_git_text_inputs_bound(
     ensure_worktree_status_deadline(deadline, "after Git metadata prevalidation")?;
     let mut effective_exclude = info_exclude.unwrap_or_default();
     effective_exclude.extend_from_slice(MACO_STATUS_EXCLUDES);
+    let generated_exclude_start = effective_exclude.len();
+    append_nested_repository_excludes(
+        &mut effective_exclude,
+        &inventory.nested_repository_boundaries,
+    )?;
+    total = total
+        .checked_add(
+            u64::try_from(effective_exclude.len().saturating_sub(generated_exclude_start))
+                .unwrap_or(u64::MAX),
+        )
+        .context("Git metadata aggregate byte count overflowed")?;
+    if total > MAX_WORKTREE_GIT_TEXT_TOTAL_BYTES {
+        bail!("repository exceeds its Git metadata aggregate byte limit");
+    }
     Ok(BoundedGitTextInputs {
         info_exclude: Some(effective_exclude),
         core_filemode: local_config.core_filemode,
