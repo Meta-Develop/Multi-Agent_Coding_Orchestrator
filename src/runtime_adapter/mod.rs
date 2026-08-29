@@ -312,6 +312,8 @@ pub enum OutputCaptureMode {
     StdoutAndStderr,
 }
 
+const GROK_NO_SUBAGENTS_ARG: &str = "--no-subagents";
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeAdapterConfig {
@@ -350,6 +352,7 @@ impl RuntimeAdapterConfig {
                     "{cwd}".into(),
                     "--output-format".into(),
                     "plain".into(),
+                    GROK_NO_SUBAGENTS_ARG.into(),
                 ],
                 // grok prints the headless response to stdout; there is no --output file flag.
                 OutputCaptureMode::Stdout,
@@ -412,6 +415,7 @@ impl RuntimeAdapterConfig {
 
     /// Load operator overrides from environment without requiring a code change.
     /// `MACO_<RUNTIME>_ARGS` is whitespace-separated and supports the same placeholders.
+    /// Grok's non-delegation flag is restored after this mutable operator template.
     pub fn from_environment(runtime: RuntimeId) -> Self {
         Self::from_adapter_environment(AdapterId::from_runtime(runtime))
     }
@@ -425,7 +429,7 @@ impl RuntimeAdapterConfig {
             config.binary = Some(PathBuf::from(binary));
         }
         if let Ok(args) = env::var(format!("{prefix}_ARGS")) {
-            config.argument_template = args.split_whitespace().map(str::to_string).collect();
+            config.replace_operator_argument_template(adapter, &args);
         }
         if let Ok(names) = env::var(format!("{prefix}_ENV")) {
             // Drop denied names here so the live insert in external_agent.rs
@@ -447,6 +451,15 @@ impl RuntimeAdapterConfig {
             config.feed_prompt_on_stdin = matches!(stdin.as_str(), "1" | "true" | "stdin");
         }
         config
+    }
+
+    fn replace_operator_argument_template(&mut self, adapter: AdapterId, args: &str) {
+        self.argument_template = args.split_whitespace().map(str::to_string).collect();
+        if adapter == AdapterId::Grok {
+            self.argument_template
+                .retain(|argument| argument != GROK_NO_SUBAGENTS_ARG);
+            self.argument_template.push(GROK_NO_SUBAGENTS_ARG.into());
+        }
     }
 
     pub fn binary_path(&self) -> &Path {
@@ -809,6 +822,7 @@ mod tests {
                 "{cwd}",
                 "--output-format",
                 "plain",
+                "--no-subagents",
             ]
         );
 
@@ -832,6 +846,7 @@ mod tests {
                 "/tmp/work",
                 "--output-format",
                 "plain",
+                "--no-subagents",
             ]
         );
         assert_eq!(spec.output_capture, OutputCaptureMode::Stdout);
@@ -859,6 +874,7 @@ mod tests {
                 "/tmp/work",
                 "--output-format",
                 "plain",
+                "--no-subagents",
             ]
         );
         Ok(())
@@ -962,11 +978,9 @@ mod tests {
     }
 
     #[test]
-    fn grok_argument_template_override_replaces_the_whole_default() -> Result<()> {
-        let config = RuntimeAdapterConfig {
-            argument_template: vec!["--prompt-file".into(), "{prompt}".into()],
-            ..RuntimeAdapterConfig::defaults(RuntimeId::Grok)
-        };
+    fn grok_operator_argument_override_preserves_immutable_no_subagents() -> Result<()> {
+        let mut config = RuntimeAdapterConfig::defaults(RuntimeId::Grok);
+        config.replace_operator_argument_template(AdapterId::Grok, "--prompt-file {prompt}");
         let spec = config.render(&launch_context(
             Path::new("prompt.txt"),
             Some("grok-4.6"),
@@ -974,8 +988,36 @@ mod tests {
             Path::new("/tmp/work"),
             Path::new("out.txt"),
         ))?;
-        assert_eq!(spec.argv, ["--prompt-file", "prompt.txt"]);
+        assert_eq!(spec.argv, ["--prompt-file", "prompt.txt", "--no-subagents"]);
         assert_eq!(spec.output_capture, OutputCaptureMode::Stdout);
+
+        config.replace_operator_argument_template(
+            AdapterId::Grok,
+            "--no-subagents --prompt-file {prompt} --no-subagents",
+        );
+        assert_eq!(
+            config
+                .argument_template
+                .iter()
+                .filter(|argument| argument.as_str() == GROK_NO_SUBAGENTS_ARG)
+                .count(),
+            1
+        );
+        assert_eq!(
+            config.argument_template.last().map(String::as_str),
+            Some(GROK_NO_SUBAGENTS_ARG)
+        );
+
+        let mut cursor = RuntimeAdapterConfig::defaults(RuntimeId::Cursor);
+        cursor.replace_operator_argument_template(AdapterId::Cursor, "--prompt-file {prompt}");
+        let cursor_spec = cursor.render(&launch_context(
+            Path::new("prompt.txt"),
+            Some("sonnet-4"),
+            Some("high"),
+            Path::new("/tmp/work"),
+            Path::new("out.txt"),
+        ))?;
+        assert_eq!(cursor_spec.argv, ["--prompt-file", "prompt.txt"]);
         Ok(())
     }
 
@@ -1383,6 +1425,7 @@ mod tests {
                 OsString::from("/tmp/work"),
                 OsString::from("--output-format"),
                 OsString::from("plain"),
+                OsString::from("--no-subagents"),
             ]
         );
         Ok(())
@@ -1579,7 +1622,13 @@ mod tests {
     fn assert_grok_help_contract(help: &str, label: &str) {
         assert_help_contains(
             help,
-            &["--prompt-file", "--model", "--cwd", "--output-format"],
+            &[
+                "--prompt-file",
+                "--model",
+                "--cwd",
+                "--output-format",
+                "--no-subagents",
+            ],
             label,
         );
         assert!(

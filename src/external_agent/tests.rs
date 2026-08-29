@@ -3720,6 +3720,51 @@ fn runtime_adapter_argv_propagates_render_failure() {
 }
 
 #[test]
+fn grok_runtime_adapter_argv_immutably_disables_subagents() {
+    let grok = ExternalAgentCommand::codex(
+        "grok",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(1),
+    )
+    .with_runtime_adapter(
+        RuntimeId::Grok,
+        RuntimeAdapterConfig::defaults(RuntimeId::Grok),
+    );
+    let grok_argv = runtime_adapter_argv(&grok)
+        .expect("Grok argv")
+        .into_iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        grok_argv
+            .iter()
+            .filter(|argument| argument.as_str() == "--no-subagents")
+            .count(),
+        1
+    );
+
+    let cursor = ExternalAgentCommand::codex(
+        "cursor-agent",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(1),
+    )
+    .with_runtime_adapter(
+        RuntimeId::Cursor,
+        RuntimeAdapterConfig::defaults(RuntimeId::Cursor),
+    );
+    let cursor_argv = runtime_adapter_argv(&cursor).expect("Cursor argv");
+    assert!(!cursor_argv
+        .iter()
+        .any(|argument| argument == "--no-subagents"));
+}
+
+#[test]
 fn codex_app_server_argv_preserves_the_external_codex_ceiling() {
     let command = ExternalAgentCommand::codex(
         "codex",
