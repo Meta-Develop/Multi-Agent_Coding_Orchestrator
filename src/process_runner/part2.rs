@@ -1254,6 +1254,10 @@ struct SandboxMountRegion {
 
 #[cfg(target_os = "linux")]
 impl ResolvedSystemdSandbox {
+    fn exact_writable_file_parents(&self) -> BTreeSet<PathBuf> {
+        external_codex_writable_file_parents(&self.external_codex_writable_file_capabilities)
+    }
+
     fn explicitly_binds_program(&self, program: &Path) -> bool {
         std::iter::once(&self.workspace_root)
             .chain(self.visible_read_only_roots.iter())
@@ -1529,14 +1533,20 @@ impl ResolvedSystemdSandbox {
     fn effective_path_access(&self, path: &Path) -> std::io::Result<Option<SandboxMountAccess>> {
         let mut selected: Option<(usize, SandboxMountAccess)> = None;
         let mut consider =
-            |boundary: &Path, exact: bool, access: SandboxMountAccess| -> std::io::Result<()> {
+            |boundary: &Path,
+             exact: bool,
+             access: SandboxMountAccess,
+             override_equal: bool|
+             -> std::io::Result<()> {
                 if (exact && path != boundary) || (!exact && !path.starts_with(boundary)) {
                     return Ok(());
                 }
                 let specificity = boundary.components().count();
                 match selected {
                     Some((existing_specificity, existing_access))
-                        if existing_specificity == specificity && existing_access != access =>
+                        if existing_specificity == specificity
+                            && existing_access != access
+                            && !override_equal =>
                     {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::PermissionDenied,
@@ -1559,22 +1569,29 @@ impl ResolvedSystemdSandbox {
                 WorkspaceAccess::ReadOnly => SandboxMountAccess::ReadOnly,
                 WorkspaceAccess::ReadWrite => SandboxMountAccess::ReadWrite,
             },
+            false,
         )?;
         for root in &self.visible_read_only_roots {
-            consider(root, false, SandboxMountAccess::ReadOnly)?;
+            consider(root, false, SandboxMountAccess::ReadOnly, false)?;
         }
         for file in &self.visible_read_only_files {
-            consider(file, true, SandboxMountAccess::ReadOnly)?;
+            consider(file, true, SandboxMountAccess::ReadOnly, false)?;
         }
         for root in self
             .visible_read_write_roots
             .iter()
             .chain(&self.writable_artifact_roots)
         {
-            consider(root, false, SandboxMountAccess::ReadWrite)?;
+            consider(root, false, SandboxMountAccess::ReadWrite, false)?;
+        }
+        // A held exact-file capability is narrower than any writable ancestor. Its parent is a
+        // deliberate read-only carve-out, including when it is the writable workspace or
+        // artifact root itself, and the exact file below restores write access.
+        for parent in self.exact_writable_file_parents() {
+            consider(&parent, false, SandboxMountAccess::ReadOnly, true)?;
         }
         for file in &self.visible_read_write_files {
-            consider(file, true, SandboxMountAccess::ReadWrite)?;
+            consider(file, true, SandboxMountAccess::ReadWrite, false)?;
         }
         Ok(selected.map(|(_, access)| access))
     }
@@ -1583,6 +1600,7 @@ impl ResolvedSystemdSandbox {
         use std::os::unix::fs::MetadataExt;
 
         let mut protected_roots = self.visible_read_only_roots.clone();
+        protected_roots.extend(self.exact_writable_file_parents());
         if self.workspace_access == WorkspaceAccess::ReadOnly {
             protected_roots.push(self.workspace_root.clone());
         }
@@ -2088,48 +2106,43 @@ fn verify_sandbox_mount_alias_conflicts(
     sandbox: &ResolvedSystemdSandbox,
     mountinfo: &[SandboxMountInfo],
 ) -> std::io::Result<()> {
-    let mut boundaries = vec![(
-        sandbox.workspace_root.clone(),
-        match sandbox.workspace_access {
-            WorkspaceAccess::ReadOnly => SandboxMountAccess::ReadOnly,
-            WorkspaceAccess::ReadWrite => SandboxMountAccess::ReadWrite,
-        },
-    )];
-    boundaries.extend(
+    let mut boundary_paths = BTreeSet::from([sandbox.workspace_root.clone()]);
+    boundary_paths.extend(
         sandbox
             .visible_read_only_roots
             .iter()
             .chain(&sandbox.visible_read_only_files)
-            .cloned()
-            .map(|path| (path, SandboxMountAccess::ReadOnly)),
+            .cloned(),
     );
-    boundaries.extend(
+    boundary_paths.extend(
         sandbox
             .visible_read_write_roots
             .iter()
             .chain(&sandbox.visible_read_write_files)
             .chain(&sandbox.writable_artifact_roots)
-            .cloned()
-            .map(|path| (path, SandboxMountAccess::ReadWrite)),
+            .cloned(),
     );
+    boundary_paths.extend(sandbox.exact_writable_file_parents());
     for entry in mountinfo {
         if sandbox.effective_path_access(&entry.mount_point)?.is_some() {
-            boundaries.push((
-                entry.mount_point.clone(),
-                sandbox
-                    .effective_path_access(&entry.mount_point)?
-                    .ok_or_else(|| std::io::Error::other("sandbox mount access disappeared"))?,
-            ));
+            boundary_paths.insert(entry.mount_point.clone());
         }
     }
-    boundaries.sort();
-    boundaries.dedup();
-    if boundaries.len() > MAX_SANDBOX_MOUNT_CHECKS {
+    if boundary_paths.len() > MAX_SANDBOX_MOUNT_CHECKS {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "sandbox mount-region vector exceeds its safety bound",
         ));
     }
+    let boundaries = boundary_paths
+        .into_iter()
+        .map(|path| {
+            let access = sandbox
+                .effective_path_access(&path)?
+                .ok_or_else(|| std::io::Error::other("sandbox mount access disappeared"))?;
+            Ok((path, access))
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
 
     let mut regions = boundaries
         .into_iter()
@@ -2354,6 +2367,8 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
         resolved_capability.verify_path()?;
         external_codex_writable_file_capabilities.push(resolved_capability);
     }
+    let exact_writable_file_parents =
+        external_codex_writable_file_parents(&external_codex_writable_file_capabilities);
 
     let mut hidden_roots = config
         .hidden_roots
@@ -2410,6 +2425,7 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
     identity_paths.extend(visible_read_only_files.iter().cloned());
     identity_paths.extend(visible_read_write_roots.iter().cloned());
     identity_paths.extend(visible_read_write_files.iter().cloned());
+    identity_paths.extend(exact_writable_file_parents.iter().cloned());
     identity_paths.extend(writable_artifact_roots.iter().cloned());
     identity_paths.extend(hidden_roots.iter().cloned());
     identity_paths.sort();
@@ -2425,6 +2441,7 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
         visible_read_only_files: &visible_read_only_files,
         visible_read_write_roots: &visible_read_write_roots,
         visible_read_write_files: &visible_read_write_files,
+        exact_writable_file_parents: &exact_writable_file_parents,
         writable_artifact_roots: &writable_artifact_roots,
         hidden_roots: &hidden_roots,
         isolated_host_view: config.isolated_host_view,
@@ -2458,6 +2475,16 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
     }
     sandbox.verify_no_special_entries()?;
     Ok(Some(sandbox))
+}
+
+#[cfg(target_os = "linux")]
+fn external_codex_writable_file_parents(
+    capabilities: &[ExternalCodexWritableFileCapability],
+) -> BTreeSet<PathBuf> {
+    capabilities
+        .iter()
+        .filter_map(|capability| capability.path.parent().map(Path::to_path_buf))
+        .collect()
 }
 
 #[cfg(target_os = "linux")]
@@ -2589,6 +2616,7 @@ struct SandboxMountPaths<'a> {
     visible_read_only_files: &'a [PathBuf],
     visible_read_write_roots: &'a [PathBuf],
     visible_read_write_files: &'a [PathBuf],
+    exact_writable_file_parents: &'a BTreeSet<PathBuf>,
     writable_artifact_roots: &'a [PathBuf],
     hidden_roots: &'a [PathBuf],
     isolated_host_view: bool,
@@ -2653,6 +2681,11 @@ fn build_sandbox_mount_checks(
                 ),
             ));
         }
+    }
+    for parent in paths.exact_writable_file_parents {
+        // The exact-file parent intentionally overrides a writable ancestor at the same path.
+        // The exact file remains the more-specific writable mount.
+        requested.insert(parent.clone(), SandboxMountAccess::ReadOnly);
     }
     let mut checks = requested
         .into_iter()
@@ -2797,6 +2830,9 @@ fn apply_systemd_sandbox_properties(command: &mut Command, sandbox: &ResolvedSys
         command
             .arg(systemd_path_property("BindPaths=", file, false))
             .arg(systemd_path_property("ReadWritePaths=", file, false));
+    }
+    for parent in sandbox.exact_writable_file_parents() {
+        command.arg(systemd_path_property("ReadOnlyPaths=", &parent, false));
     }
 
     match sandbox.workspace_access {
@@ -2999,6 +3035,13 @@ fn verify_systemd_sandbox_properties(
             file,
         )?;
     }
+    for parent in sandbox.exact_writable_file_parents() {
+        require_property_path(
+            "ReadOnlyPaths",
+            property_value(properties, "ReadOnlyPaths")?,
+            &parent,
+        )?;
+    }
     for root in &sandbox.writable_artifact_roots {
         require_property_path("BindPaths", property_value(properties, "BindPaths")?, root)?;
         require_property_path(
@@ -3043,6 +3086,7 @@ fn verify_exact_systemd_path_properties(
         .chain(&sandbox.visible_read_only_files)
         .cloned()
         .collect::<BTreeSet<_>>();
+    read_only.extend(sandbox.exact_writable_file_parents());
     let mut read_only_bindings = sandbox
         .visible_read_only_roots
         .iter()

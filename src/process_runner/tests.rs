@@ -1195,6 +1195,88 @@ fn external_codex_held_file_capability_rejects_replacement_before_resolution() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn exact_writable_file_capability_carves_read_only_parent_from_writable_artifact_root() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("worktree");
+    let incoming = temp.path().join("incoming");
+    let carrier = incoming.join("worker-journals");
+    let journal = carrier.join("worker-a.jsonl");
+    let sibling = carrier.join("sibling");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::create_dir_all(&carrier).expect("journal carrier");
+    fs::write(&journal, []).expect("journal");
+    fs::write(&sibling, []).expect("sibling");
+    let held_journal = Arc::new(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&journal)
+            .expect("held journal capability"),
+    );
+
+    let profile = ExternalCodexProfile::read_write(&workspace)
+        .with_visible_read_write_file_capability(&journal, held_journal)
+        .expect("exact writable journal")
+        .with_writable_artifact_root(&incoming);
+    let spec = ProcessSpec::direct(
+        "exact writable file parent boundary",
+        PathBuf::from("/bin/true"),
+        Vec::<OsString>::new(),
+        &workspace,
+        128,
+    )
+    .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(profile));
+    let sandbox = resolve_systemd_sandbox(&spec)
+        .expect("resolve exact writable file sandbox")
+        .expect("resolved sandbox");
+
+    for (path, expected) in [
+        (&incoming, SandboxMountAccess::ReadWrite),
+        (&carrier, SandboxMountAccess::ReadOnly),
+        (&sibling, SandboxMountAccess::ReadOnly),
+        (&journal, SandboxMountAccess::ReadWrite),
+    ] {
+        assert_eq!(
+            sandbox
+                .effective_path_access(path)
+                .expect("effective path access"),
+            Some(expected),
+            "unexpected access for {}",
+            path.display()
+        );
+    }
+    for (path, access) in [
+        (&incoming, SandboxMountAccess::ReadWrite),
+        (&carrier, SandboxMountAccess::ReadOnly),
+        (&journal, SandboxMountAccess::ReadWrite),
+    ] {
+        assert!(
+            sandbox
+                .mount_checks
+                .iter()
+                .any(|check| check.path == *path && check.access == access),
+            "missing {access:?} mount check for {}",
+            path.display()
+        );
+    }
+
+    let mut command = Command::new("systemd-run");
+    apply_systemd_sandbox_properties(&mut command, &sandbox);
+    let arguments = command
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<BTreeSet<_>>();
+    assert!(arguments.contains(&format!("--property=ReadOnlyPaths={}", carrier.display())));
+    assert!(!arguments.contains(&format!(
+        "--property=BindReadOnlyPaths={}",
+        carrier.display()
+    )));
+    assert!(arguments.contains(&format!("--property=BindPaths={}", journal.display())));
+    assert!(arguments.contains(&format!("--property=ReadWritePaths={}", journal.display())));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn nested_codex_profile_appends_exact_journal_while_outer_keeps_parent_nonwritable() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1231,7 +1313,8 @@ fn nested_codex_profile_appends_exact_journal_while_outer_keeps_parent_nonwritab
 
     let temp = tempfile::tempdir().expect("journal containment tempdir");
     let workspace = temp.path().join("worktree");
-    let journal_parent = temp.path().join("incoming/worker-journals");
+    let incoming = temp.path().join("incoming");
+    let journal_parent = incoming.join("worker-journals");
     fs::create_dir(&workspace).expect("workspace");
     fs::create_dir_all(&journal_parent).expect("journal carrier");
     fs::set_permissions(&journal_parent, fs::Permissions::from_mode(0o700))
@@ -1297,7 +1380,8 @@ fn nested_codex_profile_appends_exact_journal_while_outer_keeps_parent_nonwritab
     ]);
     let profile = ExternalCodexProfile::read_write(&workspace)
         .with_visible_read_write_file_capability(&journal, held_journal)
-        .expect("outer exact-file capability");
+        .expect("outer exact-file capability")
+        .with_writable_artifact_root(&incoming);
     let output = run_process(
         ProcessSpec::direct(
             "nested Codex exact worker-journal probe",
