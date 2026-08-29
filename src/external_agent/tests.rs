@@ -3732,12 +3732,29 @@ fn grok_runtime_adapter_argv_immutably_disables_subagents() {
     .with_runtime_adapter(
         RuntimeId::Grok,
         RuntimeAdapterConfig::defaults(RuntimeId::Grok),
-    );
+    )
+    .with_model_selection(Some("grok-4.6".to_string()), Some("xhigh".to_string()));
     let grok_argv = runtime_adapter_argv(&grok)
         .expect("Grok argv")
         .into_iter()
         .map(|argument| argument.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
+    assert_eq!(
+        grok_argv,
+        [
+            "--prompt-file",
+            "/run/prompt.md",
+            "--model",
+            "grok-4.6",
+            "--effort",
+            "xhigh",
+            "--cwd",
+            "/workspace",
+            "--output-format",
+            "plain",
+            "--no-subagents",
+        ]
+    );
     assert_eq!(
         grok_argv
             .iter()

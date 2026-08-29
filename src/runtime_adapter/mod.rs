@@ -898,6 +898,7 @@ mod tests {
                 "/tmp/work",
                 "--output-format",
                 "plain",
+                "--no-subagents",
             ]
         );
         Ok(())
@@ -1622,13 +1623,7 @@ mod tests {
     fn assert_grok_help_contract(help: &str, label: &str) {
         assert_help_contains(
             help,
-            &[
-                "--prompt-file",
-                "--model",
-                "--cwd",
-                "--output-format",
-                "--no-subagents",
-            ],
+            &["--prompt-file", "--model", "--cwd", "--output-format"],
             label,
         );
         assert!(
@@ -1719,7 +1714,9 @@ mod tests {
         if !installed_cli_verification_enabled() {
             return;
         }
-        assert_grok_help_contract(&require_installed_cli_help("grok"), "installed grok help");
+        let help = require_installed_cli_help("grok");
+        assert_grok_help_contract(&help, "installed grok help");
+        assert_help_contains(&help, &["--no-subagents"], "installed grok help");
     }
 
     #[test]
