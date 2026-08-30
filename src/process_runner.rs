@@ -1374,6 +1374,22 @@ impl ExternalGrokProfile {
         }
     }
 
+    pub(crate) fn read_write(workspace_root: impl Into<PathBuf>) -> Self {
+        Self {
+            config: WorkspaceSandboxConfig::new(workspace_root, WorkspaceAccess::ReadWrite),
+        }
+    }
+
+    pub(crate) fn with_visible_read_only_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_only_root(root);
+        self
+    }
+
+    pub(crate) fn with_visible_read_only_file(mut self, file: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_only_file(file);
+        self
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn with_visible_read_only_file_capability(
         mut self,
@@ -1387,37 +1403,22 @@ impl ExternalGrokProfile {
     }
 
     #[cfg(test)]
-    pub(crate) fn read_write(workspace_root: impl Into<PathBuf>) -> Self {
-        Self {
-            config: WorkspaceSandboxConfig::new(workspace_root, WorkspaceAccess::ReadWrite),
-        }
-    }
-
-    #[cfg(test)]
     pub(crate) fn with_writable_artifact_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_writable_artifact_root(root);
         self
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_visible_read_only_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.config = self.config.with_visible_read_only_root(root);
-        self
-    }
-
-    #[cfg(test)]
     pub(crate) fn with_visible_read_write_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_visible_read_write_root(root);
         self
     }
 
-    #[cfg(test)]
     pub(crate) fn with_visible_read_write_file(mut self, file: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_visible_read_write_file(file);
         self
     }
 
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     pub(crate) fn with_visible_read_write_file_capability(
         mut self,
         file: impl Into<PathBuf>,
@@ -1429,7 +1430,6 @@ impl ExternalGrokProfile {
         Ok(self)
     }
 
-    #[cfg(test)]
     pub(crate) fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_hidden_root(root);
         self
@@ -3924,6 +3924,31 @@ pub(crate) fn external_codex_systemd_properties_for_test(
     .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(profile));
     let sandbox = resolve_systemd_sandbox(&spec)?.ok_or_else(|| {
         io::Error::other("external Codex test profile did not resolve a systemd sandbox")
+    })?;
+    let mut command = Command::new("systemd-run");
+    apply_systemd_sandbox_properties(&mut command, &sandbox);
+    Ok(command
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn external_grok_systemd_properties_for_test(
+    profile: ExternalGrokProfile,
+    program: &Path,
+    current_dir: &Path,
+) -> io::Result<Vec<String>> {
+    let spec = ProcessSpec::direct(
+        "external Grok systemd profile projection",
+        program,
+        std::iter::empty::<OsString>(),
+        current_dir,
+        8 * 1024,
+    )
+    .with_side_effect_confinement(SideEffectConfinementProfile::ExternalGrok(profile));
+    let sandbox = resolve_systemd_sandbox(&spec)?.ok_or_else(|| {
+        io::Error::other("external Grok test profile did not resolve a systemd sandbox")
     })?;
     let mut command = Command::new("systemd-run");
     apply_systemd_sandbox_properties(&mut command, &sandbox);

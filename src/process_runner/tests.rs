@@ -790,6 +790,176 @@ fn external_grok_network_properties_require_unix_without_netlink() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn external_grok_profile_projects_exact_systemd_properties() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("worktree");
+    let read_only_root = workspace.join(".maco");
+    let prompt = temp.path().join("prompt.md");
+    let auth = temp.path().join("auth.json");
+    let read_write_root = workspace.join(".agents/docs");
+    let read_write_file = workspace.join("AGENTS.md");
+    let exact_write_root = temp.path().join("exact");
+    let exact_write = exact_write_root.join("worker-journal.json");
+    let hidden_root = temp.path().join("primary-worktree");
+    for directory in [
+        &workspace,
+        &read_only_root,
+        &read_write_root,
+        &exact_write_root,
+        &hidden_root,
+    ] {
+        fs::create_dir_all(directory).expect("sandbox fixture directory");
+    }
+    for file in [&prompt, &auth, &read_write_file, &exact_write] {
+        fs::write(file, "fixture\n").expect("sandbox fixture file");
+    }
+    let held_auth = Arc::new(
+        OpenOptions::new()
+            .read(true)
+            .open(&auth)
+            .expect("held read-only Grok authentication"),
+    );
+    let held_exact_write = Arc::new(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&exact_write)
+            .expect("held exact writable journal"),
+    );
+    let profile = ExternalGrokProfile::read_write(&workspace)
+        .with_visible_read_only_root(&read_only_root)
+        .with_visible_read_only_file(&prompt)
+        .with_visible_read_only_file_capability(&auth, held_auth)
+        .expect("held read-only Grok capability")
+        .with_visible_read_write_root(&read_write_root)
+        .with_visible_read_write_file(&read_write_file)
+        .with_visible_read_write_file_capability(&exact_write, held_exact_write)
+        .expect("held exact writable capability")
+        .with_hidden_root(&hidden_root);
+
+    let arguments =
+        external_grok_systemd_properties_for_test(profile, Path::new("/bin/true"), &workspace)
+            .expect("ExternalGrok systemd projection")
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+
+    for expected in [
+        "--property=ProtectSystem=strict".to_string(),
+        "--property=ProtectHome=tmpfs".to_string(),
+        "--property=NoNewPrivileges=yes".to_string(),
+        "--property=RestrictNamespaces=yes".to_string(),
+        "--property=PrivateNetwork=no".to_string(),
+        "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6".to_string(),
+        format!(
+            "--property=MemoryMax={}",
+            ProcessResourceLimits::default().memory_max_bytes
+        ),
+        format!(
+            "--property=TasksMax={}",
+            ProcessResourceLimits::default().tasks_max
+        ),
+        format!(
+            "--property=CPUQuota={}%",
+            ProcessResourceLimits::default().cpu_quota_percent
+        ),
+        format!(
+            "--property=LimitNOFILE={}",
+            ProcessResourceLimits::default().open_files_max
+        ),
+        format!(
+            "--property=LimitFSIZE={}",
+            ProcessResourceLimits::default().file_size_max_bytes
+        ),
+    ] {
+        assert!(arguments.contains(&expected), "missing {expected}");
+    }
+    assert!(!arguments.contains("--property=RestrictNamespaces=no"));
+    assert!(arguments
+        .iter()
+        .all(|argument| !argument.contains("AF_NETLINK")));
+    let system_call_filter = arguments
+        .iter()
+        .find_map(|argument| argument.strip_prefix("--property=SystemCallFilter="))
+        .expect("ExternalGrok system call filter");
+    assert!(system_call_filter
+        .split_whitespace()
+        .any(|token| token.trim_start_matches('~') == "@mount"));
+
+    let actual_path_properties = arguments
+        .iter()
+        .filter(|argument| {
+            [
+                "--property=InaccessiblePaths=",
+                "--property=BindReadOnlyPaths=",
+                "--property=ReadOnlyPaths=",
+                "--property=BindPaths=",
+                "--property=ReadWritePaths=",
+            ]
+            .iter()
+            .any(|prefix| argument.starts_with(prefix))
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut expected_path_properties = BTreeSet::from([
+        systemd_path_property("InaccessiblePaths=", &hidden_root, false)
+            .to_string_lossy()
+            .into_owned(),
+        systemd_path_property("BindReadOnlyPaths=", &read_only_root, false)
+            .to_string_lossy()
+            .into_owned(),
+        systemd_path_property("ReadOnlyPaths=", &read_only_root, false)
+            .to_string_lossy()
+            .into_owned(),
+        systemd_path_property("BindReadOnlyPaths=", &prompt, false)
+            .to_string_lossy()
+            .into_owned(),
+        systemd_path_property("ReadOnlyPaths=", &prompt, false)
+            .to_string_lossy()
+            .into_owned(),
+        systemd_path_property("BindReadOnlyPaths=", &auth, false)
+            .to_string_lossy()
+            .into_owned(),
+        systemd_path_property("ReadOnlyPaths=", &auth, false)
+            .to_string_lossy()
+            .into_owned(),
+        systemd_path_property("BindPaths=", &read_write_root, false)
+            .to_string_lossy()
+            .into_owned(),
+        systemd_path_property("ReadWritePaths=", &read_write_root, false)
+            .to_string_lossy()
+            .into_owned(),
+        systemd_path_property("BindPaths=", &read_write_file, false)
+            .to_string_lossy()
+            .into_owned(),
+        systemd_path_property("ReadWritePaths=", &read_write_file, false)
+            .to_string_lossy()
+            .into_owned(),
+        systemd_path_property("BindPaths=", &exact_write, false)
+            .to_string_lossy()
+            .into_owned(),
+        systemd_path_property("ReadWritePaths=", &exact_write, false)
+            .to_string_lossy()
+            .into_owned(),
+        systemd_path_property("ReadOnlyPaths=", &exact_write_root, false)
+            .to_string_lossy()
+            .into_owned(),
+        systemd_path_property("BindPaths=", &workspace, false)
+            .to_string_lossy()
+            .into_owned(),
+        systemd_path_property("ReadWritePaths=", &workspace, false)
+            .to_string_lossy()
+            .into_owned(),
+    ]);
+    expected_path_properties.extend(known_sensitive_socket_paths().into_iter().map(|path| {
+        systemd_path_property("InaccessiblePaths=", &path, true)
+            .to_string_lossy()
+            .into_owned()
+    }));
+    assert_eq!(actual_path_properties, expected_path_properties);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn external_grok_profile_resolves_only_declared_managed_paths() {
     let temp = tempfile::tempdir().expect("tempdir");
     let workspace = temp.path().join("worktree");
@@ -799,14 +969,12 @@ fn external_grok_profile_resolves_only_declared_managed_paths() {
     let read_write_file = workspace.join("AGENTS.md");
     let capability_root = temp.path().join("exact");
     let capability_file = capability_root.join("worker-report.json");
-    let artifact_root = temp.path().join("incoming");
     let hidden_root = temp.path().join("primary");
     for directory in [
         &workspace,
         &read_only_root,
         &read_write_root,
         &capability_root,
-        &artifact_root,
         &hidden_root,
     ] {
         fs::create_dir_all(directory).expect("sandbox fixture directory");
@@ -837,7 +1005,6 @@ fn external_grok_profile_resolves_only_declared_managed_paths() {
         .expect("ExternalGrok exact read-only capability")
         .with_visible_read_write_root(&read_write_root)
         .with_visible_read_write_file(&read_write_file)
-        .with_writable_artifact_root(&artifact_root)
         .with_hidden_root(&hidden_root)
         .with_visible_read_write_file_capability(&capability_file, held_capability)
         .expect("ExternalGrok exact writable capability");
@@ -852,7 +1019,7 @@ fn external_grok_profile_resolves_only_declared_managed_paths() {
         profile.visible_read_write_files(),
         &[read_write_file.clone(), capability_file.clone()]
     );
-    assert_eq!(profile.writable_artifact_roots(), &[artifact_root.clone()]);
+    assert!(profile.writable_artifact_roots().is_empty());
 
     let spec = ProcessSpec::direct(
         "external Grok managed path projection",
@@ -875,7 +1042,7 @@ fn external_grok_profile_resolves_only_declared_managed_paths() {
         sandbox.visible_read_write_files,
         vec![capability_file, read_write_file]
     );
-    assert_eq!(sandbox.writable_artifact_roots, vec![artifact_root]);
+    assert!(sandbox.writable_artifact_roots.is_empty());
     assert_eq!(sandbox.hidden_roots, vec![hidden_root]);
 }
 
@@ -914,6 +1081,62 @@ fn external_grok_read_only_file_capability_rejects_replacement_before_resolution
         Err(error) => error,
         Ok(_) => panic!("replacement must not inherit the held read-only capability"),
     };
+    assert!(
+        error
+            .to_string()
+            .contains("read-only file capability identity changed"),
+        "{error}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn external_grok_held_read_only_file_drives_mount_identity_and_gate_refusal() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("worktree");
+    let state_root = temp.path().join("grok-home");
+    let auth = state_root.join("auth.json");
+    let replaced_auth = state_root.join("held-auth.json");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::create_dir(&state_root).expect("Grok state root");
+    fs::write(&auth, "reviewed identity\n").expect("reviewed identity fixture");
+    let held_auth = Arc::new(
+        OpenOptions::new()
+            .read(true)
+            .open(&auth)
+            .expect("held reviewed identity capability"),
+    );
+    let held_metadata = held_auth.metadata().expect("held identity metadata");
+    let profile = ExternalGrokProfile::read_only(&workspace)
+        .with_visible_read_only_file_capability(&auth, held_auth)
+        .expect("ExternalGrok exact read-only capability");
+    let spec = ProcessSpec::direct(
+        "held ExternalGrok identity",
+        PathBuf::from("/bin/true"),
+        Vec::<OsString>::new(),
+        &workspace,
+        128,
+    )
+    .with_side_effect_confinement(SideEffectConfinementProfile::ExternalGrok(profile));
+    let sandbox = resolve_systemd_sandbox(&spec)
+        .expect("resolve held ExternalGrok identity")
+        .expect("workspace sandbox");
+    let mount_check = sandbox
+        .mount_checks
+        .iter()
+        .find(|check| check.path == auth)
+        .expect("held read-only file mount check");
+    assert_eq!(mount_check.access, SandboxMountAccess::ReadOnly);
+    assert_eq!(mount_check.device, held_metadata.dev());
+    assert_eq!(mount_check.inode, held_metadata.ino());
+
+    fs::rename(&auth, &replaced_auth).expect("retain held inode at a different path");
+    fs::write(&auth, "replacement identity\n").expect("replacement identity fixture");
+    let error = sandbox
+        .verify_path_identities()
+        .expect_err("replacement after resolution must fail the release gate");
     assert!(
         error
             .to_string()
@@ -1824,11 +2047,11 @@ fn external_grok_unix_stream_initialization_preserves_codex_and_write_boundaries
                 assert_eq!(error.raw_os_error(), Some(libc::EPERM));
                 fs::write(marker, "eperm\n").expect("write Codex EPERM evidence");
             }
-            "grok" => {
+            "grok" | "offline" => {
                 let (left, right) =
-                    UnixStream::pair().expect("ExternalGrok must admit local Unix streams");
+                    UnixStream::pair().expect("profile must admit local Unix streams");
                 drop((left, right));
-                fs::write(marker, "initialized\n").expect("write Grok worktree evidence");
+                fs::write(marker, "initialized\n").expect("write worktree evidence");
             }
             other => panic!("unexpected runtime mode {other}"),
         }
@@ -1909,6 +2132,27 @@ fn external_grok_unix_stream_initialization_preserves_codex_and_write_boundaries
     );
     assert_eq!(
         fs::read_to_string(grok_worktree.join(MARKER_FILE)).expect("Grok initialization evidence"),
+        "initialized\n"
+    );
+
+    let offline_worktree = temp.path().join("offline-worktree");
+    fs::create_dir(&offline_worktree).expect("offline worktree");
+    let offline_output = run_case(
+        "offline",
+        &offline_worktree,
+        SideEffectConfinementProfile::StrictOfflineWorkspace(
+            StrictOfflineWorkspaceProfile::read_write(&offline_worktree),
+        ),
+    );
+    assert_eq!(
+        offline_output.side_effects,
+        SideEffectConfinementEvidence::Verified(
+            SideEffectConfinementProfileKind::StrictOfflineWorkspace
+        )
+    );
+    assert_eq!(
+        fs::read_to_string(offline_worktree.join("initialized.txt"))
+            .expect("offline initialization evidence"),
         "initialized\n"
     );
     assert_eq!(
