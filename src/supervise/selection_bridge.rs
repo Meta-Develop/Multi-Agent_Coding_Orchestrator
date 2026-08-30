@@ -522,11 +522,12 @@ pub(super) fn initialize_supervisor_selection_with_quota(
     } = quota;
 
     let automatic = plan.role_models.is_empty();
-    let roles = if automatic {
-        all_selector_roles().to_vec()
-    } else {
-        plan.role_models.keys().copied().collect()
-    };
+    // A resolved profile is an input to selection, not permission to leave
+    // unspecified roles on the provisional catalog-order path. Resolve every
+    // executable role and apply authored entries only as exact debug
+    // overrides so launch and persisted evidence share one complete decision
+    // set.
+    let roles = all_selector_roles().to_vec();
     if runtime == SupervisorRuntime::Cursor && advertised.cursor.is_none() {
         let role = roles.first().copied().unwrap_or(AgentRole::Worker);
         let detail = advertised
@@ -585,10 +586,10 @@ pub(super) fn initialize_supervisor_selection_with_quota(
                 role.as_str()
             )
         })?;
-        let primary_cause = if automatic {
-            SupervisorSelectionEventCause::Initial
-        } else {
+        let primary_cause = if configured.is_some() {
             SupervisorSelectionEventCause::DebugOverride
+        } else {
+            SupervisorSelectionEventCause::Initial
         };
         let event = SupervisorSelectionEvent {
             assignment_id: None,
@@ -2747,7 +2748,7 @@ fn selector_effort_from_str(value: &str) -> Option<SelectorEffort> {
     }
 }
 
-fn selector_effort_as_str(effort: SelectorEffort) -> &'static str {
+pub(super) fn selector_effort_as_str(effort: SelectorEffort) -> &'static str {
     match effort {
         SelectorEffort::Low => "low",
         SelectorEffort::Medium => "medium",
@@ -3904,6 +3905,62 @@ mod tests {
     }
 
     #[test]
+    fn partial_profile_retains_typed_authority_refusal_instead_of_catalog_fallback() -> Result<()> {
+        let worker_prior = codex_prior_for(|prior| {
+            prior
+                .prohibited_authority_roles
+                .contains(&AuthorityRole::AcceptanceGate)
+                && prior
+                    .class_fit
+                    .iter()
+                    .any(|class_fit| class_fit.task_class == AUTOMATIC_SELECTION_TASK_CLASS)
+        })?;
+        let worker_effort = worker_prior
+            .class_fit
+            .iter()
+            .find(|class_fit| class_fit.task_class == AUTOMATIC_SELECTION_TASK_CLASS)
+            .map(|class_fit| selector_effort_as_str(class_fit.effort))
+            .context("worker-only prior effort")?;
+        let catalog =
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs([worker_prior
+                .model
+                .clone()])?);
+        let mut plan = test_plan();
+        plan.role_models.insert(
+            AgentRole::Worker,
+            role_selection(worker_prior.model, Some(worker_effort)),
+        );
+
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+        )?;
+
+        assert_eq!(resolution.mode, SupervisorSelectionMode::DebugOverride);
+        let failure = resolution
+            .selection_preflight_failure
+            .as_ref()
+            .context("authority selection must fail closed")?;
+        assert_eq!(failure.role, AgentRole::Supervisor);
+        assert_eq!(
+            failure.kind,
+            SupervisorSelectionPreflightFailureKind::FailClosed
+        );
+        assert!(failure.message.contains("selector failed closed"));
+        let decision = resolution
+            .decisions
+            .first()
+            .context("typed authority refusal decision")?;
+        assert_eq!(decision.role, AgentRole::Supervisor);
+        assert_eq!(decision.provenance.status, DecisionStatus::FailClosed);
+        assert!(decision.provenance.choice.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn debug_mode_applies_exact_selector_triple_to_plan() -> Result<()> {
         let catalog = codex_catalog()?;
         let prior = codex_prior_for(|prior| {
@@ -3930,16 +3987,20 @@ mod tests {
         )?;
 
         assert_eq!(resolution.mode, SupervisorSelectionMode::DebugOverride);
-        assert_eq!(resolution.decisions.len(), 1);
-        assert_eq!(resolution.decisions[0].role, AgentRole::Worker);
-        assert_eq!(resolution.decisions[0].attempt, 0);
-        assert!(resolution.decisions[0].assignment_id.is_none());
+        assert_eq!(resolution.decisions.len(), all_selector_roles().len());
+        let worker = resolution
+            .decisions
+            .iter()
+            .find(|decision| decision.role == AgentRole::Worker)
+            .context("Worker debug decision")?;
+        assert_eq!(worker.attempt, 0);
+        assert!(worker.assignment_id.is_none());
         assert_eq!(
-            resolution.decisions[0].primary_cause,
+            worker.primary_cause,
             SupervisorSelectionEventCause::DebugOverride
         );
         assert_eq!(
-            resolution.decisions[0]
+            worker
                 .provenance
                 .choice
                 .as_ref()
@@ -3947,6 +4008,15 @@ mod tests {
                 .candidate,
             requested
         );
+        assert!(resolution.decisions.iter().all(|decision| {
+            decision.role == AgentRole::Worker
+                || decision.primary_cause == SupervisorSelectionEventCause::Initial
+        }));
+        assert_eq!(plan.role_models.len(), all_selector_roles().len());
+        assert!(plan.role_models.values().all(|selection| matches!(
+            selection.unavailable_model_fallback,
+            UnavailableModelFallback::FailClosed
+        )));
         assert_eq!(
             plan.role_models
                 .get(&AgentRole::Worker)

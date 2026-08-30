@@ -1,4 +1,5 @@
 use super::*;
+use crate::supervise::selection_bridge::selector_effort_as_str;
 
 fn default_resolved_objective_profile() -> ResolvedObjectiveProfile {
     ResolvedObjectiveProfile {
@@ -2360,6 +2361,128 @@ fn role_selection_produces_distinct_launched_role_argv() {
         .iter()
         .any(|argument| argument.contains("worker-model")));
     assert_ne!(child_argv, auditor_argv);
+}
+
+#[test]
+fn verified_supervise_dispatch_consumes_and_persists_the_selector_triple() {
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    let plan = injected_plan(assignment.clone(), 0);
+    let options = injected_options(&repo_path, temp.path(), "verified-selector-triple-dispatch");
+    let run_id = options.run_id.clone();
+    let catalog = test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
+        .expect("construct selector-backed Codex catalog");
+    let mut child_commands = Vec::new();
+    let mut runner = |command: &ExternalAgentCommand| {
+        let name = command
+            .output_last_message
+            .file_name()
+            .and_then(OsStr::to_str)
+            .expect("UTF-8 output name");
+        if name.contains("review-auditor") {
+            write_injected_json(
+                &command.output_last_message,
+                &injected_auditor_report(&assignment, &injected_child_report(&assignment)),
+            );
+        } else {
+            child_commands.push(command.clone());
+            write_injected_assignment_report(command, &assignment);
+        }
+        write_injected_usage(command, 8, 3);
+        injected_verified_run(command)
+    };
+
+    let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        SupervisorExecutionRuntime::Verified,
+        Ok(catalog),
+        &mut runner,
+    )
+    .expect("run verified selector-backed supervise dispatch");
+
+    assert!(report.success, "unexpected failed report: {report:#?}");
+    assert_eq!(child_commands.len(), 1);
+    let execution = report
+        .role_economics_profile
+        .as_ref()
+        .and_then(|profile| profile.execution.as_ref())
+        .expect("selector execution evidence");
+    let decision = execution
+        .selection_decisions
+        .iter()
+        .find(|decision| decision.role == AgentRole::ChildOrchestrator)
+        .expect("ChildOrchestrator selector decision");
+    let choice = decision
+        .provenance
+        .choice
+        .as_ref()
+        .expect("selected ChildOrchestrator choice");
+    let command = &child_commands[0];
+    assert_eq!(choice.candidate.runtime, "codex");
+    assert!(command.runtime_adapter.is_none());
+    assert_eq!(
+        command.model.as_deref(),
+        Some(choice.candidate.model.as_str())
+    );
+    assert_eq!(
+        command.reasoning_effort.as_deref(),
+        Some(selector_effort_as_str(choice.candidate.effort))
+    );
+
+    assert_eq!(execution.selection_decisions.len(), 5);
+    let ledger = execution
+        .assignment_selection_ledger
+        .iter()
+        .find(|entry| {
+            entry.assignment_id == assignment.id && entry.role == AgentRole::ChildOrchestrator
+        })
+        .expect("ChildOrchestrator selection ledger entry");
+    assert_eq!(ledger.selected_runtime.as_deref(), Some("codex"));
+    assert_eq!(
+        ledger.selected_model.as_deref(),
+        Some(choice.candidate.model.as_str())
+    );
+    assert_eq!(
+        ledger.selected_reasoning_effort.as_deref(),
+        Some(selector_effort_as_str(choice.candidate.effort))
+    );
+    assert!(ledger.catalog_snapshot_digest.is_some());
+    assert!(!ledger.catalog_revisions.is_empty());
+    assert!(!ledger.rejected_candidates.is_empty());
+
+    let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+        .expect("open persisted selector-backed supervise artifacts");
+    let persisted = read_supervisor_final_report(&reader)
+        .expect("read persisted selector-backed supervisor report");
+    let persisted_execution = persisted
+        .role_economics_profile
+        .as_ref()
+        .and_then(|profile| profile.execution.as_ref())
+        .expect("persisted selector execution evidence");
+    assert_eq!(
+        persisted_execution.selection_decisions,
+        execution.selection_decisions
+    );
+    assert_eq!(
+        persisted_execution.assignment_selection_ledger,
+        execution.assignment_selection_ledger
+    );
+    let persisted_ledger: AssignmentSelectionLedger = serde_json::from_slice(
+        &reader
+            .read(Path::new(SELECTION_LEDGER_RELATIVE))
+            .expect("read persisted assignment selection ledger"),
+    )
+    .expect("decode persisted assignment selection ledger");
+    assert_eq!(
+        persisted_ledger.schema_version,
+        ASSIGNMENT_SELECTION_LEDGER_SCHEMA_VERSION
+    );
+    assert_eq!(
+        persisted_ledger.entries,
+        execution.assignment_selection_ledger
+    );
 }
 
 #[test]

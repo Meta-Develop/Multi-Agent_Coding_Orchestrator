@@ -18,7 +18,8 @@ use crate::{
     live_claim::{self, LiveClock},
     llm::{FakeProvider, PromptContext, ProviderCapabilities, Redactor, RepoExcerpt, WorkProposal},
     machine_global::{
-        DestructiveTargetInput, GateOutcome, MachineGlobalClaimSummary, MachineGlobalClaimToken,
+        machine_global_config_content_binding, DestructiveTargetInput, GateOutcome,
+        MachineGlobalClaimSummary, MachineGlobalClaimToken, MachineGlobalConfig,
         MachineGlobalRetentionBinding, MachineGlobalStore, RetentionOperationId,
         RetentionOperationToken,
     },
@@ -73,11 +74,12 @@ use crate::{
     },
 };
 use anyhow::{bail, Context, Result};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::BTreeSet,
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -103,6 +105,7 @@ const MAX_PROMPT_EXCERPT_BYTES: u64 = 32 * 1024;
 const MAX_PROMPT_EXCERPT_TOTAL_BYTES: usize = 48 * 1024;
 const MAX_PROMPT_PATHS: usize = 64;
 const MAX_SUPERVISE_GOAL_FILE_BYTES: u64 = 256 * 1024;
+const MAX_DEFAULT_MACHINE_GLOBAL_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_EVALUATION_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_EVALUATION_PLAN_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_EXTERNAL_EVENT_PAYLOAD_CLI_BYTES: usize = 4 * 1024;
@@ -114,6 +117,160 @@ const MAX_EXTERNAL_EVENT_PAYLOAD_CLI_BYTES: usize = 4 * 1024;
 pub struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+/// Routes a bare instruction into the existing supervised goal/spec entrypoint.
+///
+/// Explicit subcommand names and option-shaped first arguments retain Clap's
+/// normal behavior. `--` can be used as the first argument to force an
+/// instruction whose first word is an explicit subcommand name or looks like
+/// an option. Every routed argument is joined with one ASCII space and passed
+/// as one literal goal/spec, so option-shaped words after the first instruction
+/// word remain instruction text rather than becoming MACO options.
+pub fn route_literal_instruction_args<I, T>(args: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let Some(first) = args.get(1) else {
+        return args;
+    };
+
+    let instruction_start = if first == OsStr::new("--") {
+        if args.len() == 2 {
+            return args;
+        }
+        2
+    } else {
+        if is_option_shaped(first) || is_explicit_cli_subcommand(first) {
+            return args;
+        }
+        1
+    };
+
+    let mut instruction = OsString::new();
+    for (index, argument) in args[instruction_start..].iter().enumerate() {
+        if index != 0 {
+            instruction.push(" ");
+        }
+        instruction.push(argument);
+    }
+
+    vec![
+        args[0].clone(),
+        OsString::from("supervise"),
+        OsString::from("run"),
+        OsString::from("--literal-goal"),
+        instruction,
+    ]
+}
+
+fn is_option_shaped(argument: &OsStr) -> bool {
+    argument.as_encoded_bytes().starts_with(b"-")
+}
+
+fn is_explicit_cli_subcommand(argument: &OsStr) -> bool {
+    let Some(argument) = argument.to_str() else {
+        return false;
+    };
+    argument == "help"
+        || Cli::command().get_subcommands().any(|subcommand| {
+            subcommand.get_name() == argument
+                || subcommand.get_all_aliases().any(|alias| alias == argument)
+        })
+}
+
+fn resolve_supervise_machine_global_binding(
+    routed_literal: bool,
+    config: Option<PathBuf>,
+    runtime_root_id: Option<String>,
+) -> Result<(PathBuf, String)> {
+    match (config, runtime_root_id) {
+        (Some(config), Some(runtime_root_id)) => Ok((config, runtime_root_id)),
+        (None, None) if routed_literal => resolve_literal_machine_global_defaults().context(
+            "failed to resolve default machine-global binding for routed literal instruction",
+        ),
+        (None, None) => bail!(
+            "explicit supervise run requires --machine-global-config and \
+             --machine-global-runtime-root-id"
+        ),
+        _ => bail!(
+            "--machine-global-config and --machine-global-runtime-root-id must be supplied together"
+        ),
+    }
+}
+
+fn physical_xdg_machine_global_config_path() -> Result<PathBuf> {
+    let config_home = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(value) if !value.is_empty() => {
+            let path = PathBuf::from(value);
+            if !path.is_absolute() {
+                bail!("XDG_CONFIG_HOME must be an absolute physical path");
+            }
+            path
+        }
+        _ => {
+            let home = std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .context("HOME must be set when XDG_CONFIG_HOME is absent")?;
+            let home = PathBuf::from(home);
+            if !home.is_absolute() {
+                bail!("HOME must be an absolute physical path");
+            }
+            home.join(".config")
+        }
+    };
+    Ok(config_home.join("maco").join("machine-global.json"))
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_literal_machine_global_defaults() -> Result<(PathBuf, String)> {
+    let config_path = physical_xdg_machine_global_config_path()?;
+    let binding_before = machine_global_config_content_binding(&config_path)
+        .context("default machine-global config is not a safe physical file")?;
+    let bytes = BoundedRegularReader::read_tree_no_follow(
+        &config_path,
+        MAX_DEFAULT_MACHINE_GLOBAL_CONFIG_BYTES,
+    )
+    .context("failed to read the default machine-global config without following links")?;
+    let store = MachineGlobalStore::open_config(&config_path)
+        .context("failed to authenticate the default machine-global config")?;
+    let binding_after = machine_global_config_content_binding(&config_path)
+        .context("default machine-global config changed after authentication")?;
+    if binding_before != binding_after
+        || binding_before.0 != crate::artifacts::state_auth::sha256_hex(&bytes)
+    {
+        bail!("default machine-global config changed while resolving runtime defaults");
+    }
+    let config: MachineGlobalConfig = serde_json::from_slice(&bytes)
+        .context("authenticated default machine-global config is invalid JSON")?;
+    let runtime_root = crate::process_runner::trusted_linux_runtime_root()
+        .context("current user's runtime staging root is unavailable or unsafe")?;
+    let candidates: Vec<_> = config
+        .roots
+        .iter()
+        .filter(|root| runtime_root.starts_with(&root.path))
+        .collect();
+    let [selected] = candidates.as_slice() else {
+        bail!(
+            "default machine-global config must declare exactly one reviewed root containing the current user's runtime staging path"
+        );
+    };
+    store
+        .revalidate_root(&selected.id)
+        .context("selected default machine-global runtime root is no longer safe")?;
+    let binding_final = machine_global_config_content_binding(&config_path)
+        .context("default machine-global config changed after runtime-root selection")?;
+    if binding_after != binding_final {
+        bail!("default machine-global config changed while selecting the runtime root");
+    }
+    Ok((config_path, selected.id.clone()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resolve_literal_machine_global_defaults() -> Result<(PathBuf, String)> {
+    bail!("routed literal machine-global defaults require the strict Linux runtime")
 }
 
 impl Cli {
@@ -860,18 +1017,29 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
             print_query_report(&plan, json)
         }
         SuperviseSubcommand::Run(args) => {
+            let routed_literal = args.literal_goal.is_some();
+            let (machine_global_config, machine_global_runtime_root_id) =
+                resolve_supervise_machine_global_binding(
+                    routed_literal,
+                    args.machine_global_config.clone(),
+                    args.machine_global_runtime_root_id.clone(),
+                )?;
             let quota_config = args.quota_config.clone();
             let rolling_quota = args.budget.rolling_quota();
             let budget_overrides = args.budget.limits();
             let budget_max_duration_seconds = args.budget.max_duration_seconds();
-            let (plan_file, goal_spec) = match (args.supervisor_plan, args.from_goal) {
-                (Some(plan_file), None) => (plan_file, None),
-                (None, Some(goal_file)) => {
+            let (plan_file, goal_spec) =
+                match (args.supervisor_plan, args.from_goal, args.literal_goal) {
+                (Some(plan_file), None, None) => (plan_file, None),
+                (None, Some(goal_file), None) => {
                     let goal_spec = read_supervise_goal_file(&goal_file)?;
                     (goal_file, Some(goal_spec))
                 }
+                (None, None, Some(goal_spec)) => {
+                    (PathBuf::from("<literal-instruction>"), Some(goal_spec))
+                }
                 _ => bail!(
-                    "supervise run requires exactly one positional SUPERVISOR_PLAN or --from-goal <FILE>"
+                    "supervise run requires exactly one positional SUPERVISOR_PLAN, --from-goal <FILE>, or routed literal instruction"
                 ),
             };
             let existing = if let Some(explicit) = args.run_id.as_deref() {
@@ -974,8 +1142,8 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                 budget_overrides,
                 budget_max_duration_seconds,
                 machine_global_retention: Some(MachineGlobalRetentionBinding {
-                    config: args.machine_global_config,
-                    root_id: args.machine_global_runtime_root_id,
+                    config: machine_global_config,
+                    root_id: machine_global_runtime_root_id,
                     owner: "maco-supervise".to_string(),
                     correction_correlation_id: resolved_run_id.as_str().to_string(),
                 }),
@@ -1388,13 +1556,26 @@ struct RunSuperviseArgs {
     /// JSON supervisor plan file to run.
     #[arg(
         value_name = "SUPERVISOR_PLAN",
-        required_unless_present = "from_goal",
-        conflicts_with = "from_goal"
+        required_unless_present_any = ["from_goal", "literal_goal"],
+        conflicts_with_all = ["from_goal", "literal_goal"]
     )]
     supervisor_plan: Option<PathBuf>,
     /// High-level goal/spec file to decompose and run through the supervisor gates.
-    #[arg(long, value_name = "FILE", conflicts_with = "supervisor_plan")]
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = ["supervisor_plan", "literal_goal"]
+    )]
     from_goal: Option<PathBuf>,
+    /// Internal argv-routing source for a bare literal instruction.
+    #[arg(
+        long,
+        value_name = "TEXT",
+        hide = true,
+        allow_hyphen_values = true,
+        conflicts_with_all = ["supervisor_plan", "from_goal"]
+    )]
+    literal_goal: Option<String>,
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
@@ -1461,11 +1642,21 @@ struct RunSuperviseArgs {
     #[command(flatten)]
     role_category_override: OperatorRoleCategoryArgs,
     /// Exact reviewed config used to gate private runtime output-staging cleanup.
-    #[arg(long, required = true)]
-    machine_global_config: PathBuf,
+    #[arg(
+        long,
+        env = "MACO_MACHINE_GLOBAL_CONFIG",
+        required_unless_present = "literal_goal",
+        requires = "machine_global_runtime_root_id"
+    )]
+    machine_global_config: Option<PathBuf>,
     /// Reviewed root id whose canonical root must contain `/run/user/<uid>`.
-    #[arg(long, required = true)]
-    machine_global_runtime_root_id: String,
+    #[arg(
+        long,
+        env = "MACO_MACHINE_GLOBAL_RUNTIME_ROOT_ID",
+        required_unless_present = "literal_goal",
+        requires = "machine_global_config"
+    )]
+    machine_global_runtime_root_id: Option<String>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,

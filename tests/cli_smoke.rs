@@ -5,17 +5,517 @@ use git2::{Oid, Repository, Signature};
 use multi_agent_coding_orchestrator::{orchestrator::RunId, sync_store::SyncStore};
 use serde_json::Value;
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 #[cfg(unix)]
 use std::{collections::BTreeMap, path::PathBuf};
 use std::{
     fs::{self, File},
     path::Path,
-    process::Command,
+    process::{Command, Output, Stdio},
 };
 use tempfile::TempDir;
 
-const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
+const BIN: &str = env!("CARGO_BIN_EXE_maco");
+const MACHINE_GLOBAL_CONFIG_ENV: &str = "MACO_MACHINE_GLOBAL_CONFIG";
+const MACHINE_GLOBAL_RUNTIME_ROOT_ID_ENV: &str = "MACO_MACHINE_GLOBAL_RUNTIME_ROOT_ID";
+
+fn cli_without_machine_global_bindings() -> Command {
+    let mut command = Command::new(BIN);
+    command
+        .env_remove(MACHINE_GLOBAL_CONFIG_ENV)
+        .env_remove(MACHINE_GLOBAL_RUNTIME_ROOT_ID_ENV)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("HOME");
+    command
+}
+
+fn assert_literal_route_attempts_safe_defaults(output: &Output) {
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed to resolve default machine-global binding"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("unrecognized subcommand"), "{stderr}");
+    assert!(!stderr.contains("unexpected argument"), "{stderr}");
+}
+
+#[test]
+fn cli_literal_entrypoint_routes_quoted_literal_and_option_shaped_content() -> Result<()> {
+    let literal = cli_without_machine_global_bindings()
+        .args([
+            r#"preserve "double quoted" and 'single quoted' text"#,
+            "--without-treating-this-as-an-option",
+        ])
+        .output()
+        .context("route quoted bare literal instruction")?;
+    assert_literal_route_attempts_safe_defaults(&literal);
+    Ok(())
+}
+
+#[test]
+fn cli_literal_entrypoint_preserves_explicit_subcommands_and_top_level_help_and_version(
+) -> Result<()> {
+    for subcommand in [
+        "init",
+        "repo",
+        "state",
+        "worktree",
+        "merge",
+        "live",
+        "pr",
+        "issue",
+        "sync",
+        "machine-global",
+        "coord",
+        "orchestrate",
+        "supervise",
+        "consult",
+        "inbox",
+        "scope",
+        "autopilot",
+        "artifacts",
+        "review",
+        "agent",
+        "agents",
+        "llm",
+        "evaluation",
+        "eval-harness",
+        "optimizer",
+    ] {
+        let explicit = cli_without_machine_global_bindings()
+            .args([subcommand, "--help"])
+            .output()
+            .with_context(|| format!("run explicit {subcommand} help"))?;
+        assert!(explicit.status.success());
+        let explicit_stdout =
+            String::from_utf8(explicit.stdout).context("decode explicit subcommand help")?;
+        assert!(
+            explicit_stdout.contains(&format!("Usage: maco {subcommand}")),
+            "{explicit_stdout}"
+        );
+    }
+
+    let help = cli_without_machine_global_bindings()
+        .arg("--help")
+        .output()
+        .context("run top-level help")?;
+    assert!(help.status.success());
+    let help_stdout = String::from_utf8(help.stdout).context("decode top-level help")?;
+    assert!(
+        help_stdout.contains("Usage: maco <COMMAND>"),
+        "{help_stdout}"
+    );
+
+    let version = cli_without_machine_global_bindings()
+        .arg("--version")
+        .output()
+        .context("run top-level version")?;
+    assert!(version.status.success());
+    let version_stdout = String::from_utf8(version.stdout).context("decode top-level version")?;
+    assert_eq!(
+        version_stdout.trim(),
+        format!("maco {}", env!("CARGO_PKG_VERSION"))
+    );
+    Ok(())
+}
+
+#[test]
+fn cli_literal_entrypoint_double_dash_forces_subcommand_shaped_literal_but_not_top_level_option(
+) -> Result<()> {
+    let escaped = cli_without_machine_global_bindings()
+        .args([
+            "--",
+            "repo",
+            r#"is "quoted" instruction text"#,
+            "--option-shaped-content",
+        ])
+        .output()
+        .context("force subcommand-shaped literal instruction")?;
+    assert_literal_route_attempts_safe_defaults(&escaped);
+
+    let option = cli_without_machine_global_bindings()
+        .arg("--not-a-maco-option")
+        .output()
+        .context("preserve option-shaped top-level argument")?;
+    assert!(!option.status.success());
+    let option_stderr = String::from_utf8_lossy(&option.stderr);
+    assert!(option_stderr.contains("unexpected argument '--not-a-maco-option'"));
+    assert!(!option_stderr.contains("default machine-global binding"));
+    Ok(())
+}
+
+#[test]
+fn cli_explicit_supervise_run_still_requires_machine_global_operands() -> Result<()> {
+    let output = cli_without_machine_global_bindings()
+        .args(["supervise", "run", "plan.json"])
+        .output()
+        .context("run explicit supervise without required machine-global operands")?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--machine-global-config"), "{stderr}");
+    assert!(
+        stderr.contains("--machine-global-runtime-root-id"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("default machine-global binding"), "{stderr}");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn current_private_runtime_root() -> Option<PathBuf> {
+    // SAFETY: geteuid has no preconditions and does not access Rust memory.
+    let uid = unsafe { libc::geteuid() };
+    let runtime = PathBuf::from(format!("/run/user/{uid}"));
+    let metadata = fs::symlink_metadata(&runtime).ok()?;
+    (metadata.is_dir()
+        && !metadata.file_type().is_symlink()
+        && metadata.uid() == uid
+        && metadata.permissions().mode() & 0o077 == 0)
+        .then_some(runtime)
+}
+
+#[cfg(target_os = "linux")]
+fn write_literal_default_config(
+    config: &Path,
+    state_root: &Path,
+    roots: &[(&str, &Path)],
+) -> Result<()> {
+    let parent = config.parent().context("default config parent")?;
+    fs::create_dir_all(parent).context("create default config parent")?;
+    fs::write(
+        config,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "state_root": state_root,
+            "roots": roots
+                .iter()
+                .map(|(id, path)| serde_json::json!({
+                    "id": id,
+                    "path": path,
+                    "protected_paths": [],
+                    "quarantine_grace_seconds": 60
+                }))
+                .collect::<Vec<_>>()
+        }))?,
+    )
+    .context("write default machine-global config")?;
+    fs::set_permissions(config, fs::Permissions::from_mode(0o600))
+        .context("secure default machine-global config")
+}
+
+#[cfg(target_os = "linux")]
+fn create_private_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("secure {}", path.display()))
+}
+
+#[cfg(target_os = "linux")]
+fn run_literal_with_xdg_config(cwd: &Path, config_home: &Path) -> Result<Output> {
+    cli_without_machine_global_bindings()
+        .arg("resolve reviewed literal defaults")
+        .current_dir(cwd)
+        .env("XDG_CONFIG_HOME", config_home)
+        .output()
+        .context("run routed literal with XDG defaults")
+}
+
+#[cfg(target_os = "linux")]
+fn assert_default_refusal(output: &Output, expected: &str) {
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed to resolve default machine-global binding"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(expected), "{stderr}");
+    assert!(!stderr.contains("unrecognized subcommand"), "{stderr}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_literal_defaults_resolve_from_physical_xdg_and_home_outside_any_repository() -> Result<()> {
+    let Some(runtime_root) = current_private_runtime_root() else {
+        return Ok(());
+    };
+    let temp = TempDir::new().context("tempdir")?;
+
+    let xdg = temp.path().join("xdg");
+    let xdg_state = temp.path().join("xdg-state");
+    create_private_dir(&xdg_state)?;
+    write_literal_default_config(
+        &xdg.join("maco/machine-global.json"),
+        &xdg_state,
+        &[("runtime", &runtime_root)],
+    )?;
+    let xdg_output = run_literal_with_xdg_config(temp.path(), &xdg)?;
+    assert!(!xdg_output.status.success());
+    let xdg_stderr = String::from_utf8_lossy(&xdg_output.stderr);
+    assert!(xdg_stderr.contains("repository"), "{xdg_stderr}");
+    assert!(
+        !xdg_stderr.contains("default machine-global binding"),
+        "{xdg_stderr}"
+    );
+
+    let home = temp.path().join("home");
+    let home_state = temp.path().join("home-state");
+    create_private_dir(&home_state)?;
+    write_literal_default_config(
+        &home.join(".config/maco/machine-global.json"),
+        &home_state,
+        &[("runtime", &runtime_root)],
+    )?;
+    let home_output = cli_without_machine_global_bindings()
+        .arg("resolve reviewed HOME fallback")
+        .current_dir(temp.path())
+        .env("HOME", &home)
+        .output()
+        .context("run routed literal with HOME defaults")?;
+    assert!(!home_output.status.success());
+    let home_stderr = String::from_utf8_lossy(&home_output.stderr);
+    assert!(home_stderr.contains("repository"), "{home_stderr}");
+    assert!(
+        !home_stderr.contains("default machine-global binding"),
+        "{home_stderr}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_concurrent_bare_invocations_reserve_distinct_generated_run_ids() -> Result<()> {
+    let Some(runtime_root) = current_private_runtime_root() else {
+        return Ok(());
+    };
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_paths = (0..2)
+        .map(|index| {
+            let root = temp.path().join(format!("repo-{index}"));
+            fs::create_dir(&root)
+                .with_context(|| format!("create concurrent repo root {index}"))?;
+            create_committed_repo(&root)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let xdg = temp.path().join("xdg");
+    let state_root = temp.path().join("state");
+    create_private_dir(&state_root)?;
+    write_literal_default_config(
+        &xdg.join("maco/machine-global.json"),
+        &state_root,
+        &[("runtime", &runtime_root)],
+    )?;
+
+    let children = repo_paths
+        .iter()
+        .enumerate()
+        .map(|(index, repo_path)| {
+            let mut command = cli_without_machine_global_bindings();
+            command
+                .arg(format!(
+                    "Update README.md for concurrent literal invocation {index}"
+                ))
+                .current_dir(repo_path)
+                .env("XDG_CONFIG_HOME", &xdg)
+                .env("PATH", "")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            command
+                .spawn()
+                .with_context(|| format!("spawn concurrent bare invocation {index}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let outputs = children
+        .into_iter()
+        .enumerate()
+        .map(|(index, child)| {
+            child
+                .wait_with_output()
+                .with_context(|| format!("wait for concurrent bare invocation {index}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for output in &outputs {
+        assert!(!output.status.success());
+    }
+
+    let mut run_ids = repo_paths
+        .iter()
+        .map(|repo_path| {
+            let run_root = repo_path.join(".maco/o2/runs");
+            let mut entries = fs::read_dir(&run_root)
+                .with_context(|| format!("read generated run root {}", run_root.display()))?
+                .filter_map(|entry| {
+                    let entry = entry.ok()?;
+                    entry.file_type().ok()?.is_dir().then(|| entry.file_name())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(entries.len(), 1, "generated entries in {run_root:?}");
+            Ok(entries.pop().expect("one generated run directory"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    run_ids.sort();
+    run_ids.dedup();
+    let stderr = outputs
+        .iter()
+        .map(|output| String::from_utf8_lossy(&output.stderr))
+        .collect::<Vec<_>>();
+    assert_eq!(run_ids.len(), 2, "run ids: {run_ids:?}; stderr: {stderr:?}");
+    assert!(run_ids.iter().all(|run_id| run_id
+        .to_string_lossy()
+        .starts_with("o2-")));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_literal_defaults_refuse_missing_multiple_mismatched_symlinked_and_unsafe_roots(
+) -> Result<()> {
+    let Some(runtime_root) = current_private_runtime_root() else {
+        return Ok(());
+    };
+    let temp = TempDir::new().context("tempdir")?;
+
+    let missing_xdg = temp.path().join("missing-xdg");
+    fs::create_dir(&missing_xdg).context("create missing-config XDG root")?;
+    let missing = run_literal_with_xdg_config(temp.path(), &missing_xdg)?;
+    assert_default_refusal(&missing, "not a safe physical file");
+
+    let mismatch_xdg = temp.path().join("mismatch-xdg");
+    let mismatch_state = temp.path().join("mismatch-state");
+    let mismatch_root = temp.path().join("mismatch-root");
+    create_private_dir(&mismatch_state)?;
+    create_private_dir(&mismatch_root)?;
+    write_literal_default_config(
+        &mismatch_xdg.join("maco/machine-global.json"),
+        &mismatch_state,
+        &[("not-runtime", &mismatch_root)],
+    )?;
+    let mismatch = run_literal_with_xdg_config(temp.path(), &mismatch_xdg)?;
+    assert_default_refusal(&mismatch, "exactly one reviewed root");
+
+    let multiple_xdg = temp.path().join("multiple-xdg");
+    let multiple_state = temp.path().join("multiple-state");
+    create_private_dir(&multiple_state)?;
+    write_literal_default_config(
+        &multiple_xdg.join("maco/machine-global.json"),
+        &multiple_state,
+        &[("runtime-a", &runtime_root), ("runtime-b", &runtime_root)],
+    )?;
+    let multiple = run_literal_with_xdg_config(temp.path(), &multiple_xdg)?;
+    assert_default_refusal(&multiple, "overlap by canonical path components");
+
+    let symlink_config_xdg = temp.path().join("symlink-config-xdg");
+    let symlink_config_state = temp.path().join("symlink-config-state");
+    let actual_config = temp.path().join("actual-machine-global.json");
+    create_private_dir(&symlink_config_state)?;
+    write_literal_default_config(
+        &actual_config,
+        &symlink_config_state,
+        &[("runtime", &runtime_root)],
+    )?;
+    fs::create_dir_all(symlink_config_xdg.join("maco"))
+        .context("create symlink-config XDG parent")?;
+    symlink(
+        &actual_config,
+        symlink_config_xdg.join("maco/machine-global.json"),
+    )
+    .context("substitute default config with symlink")?;
+    let symlink_config = run_literal_with_xdg_config(temp.path(), &symlink_config_xdg)?;
+    assert_default_refusal(&symlink_config, "not a safe physical file");
+
+    let symlink_root_xdg = temp.path().join("symlink-root-xdg");
+    let symlink_root_state = temp.path().join("symlink-root-state");
+    let runtime_alias = temp.path().join("runtime-alias");
+    create_private_dir(&symlink_root_state)?;
+    symlink(&runtime_root, &runtime_alias).context("create runtime-root symlink substitute")?;
+    write_literal_default_config(
+        &symlink_root_xdg.join("maco/machine-global.json"),
+        &symlink_root_state,
+        &[("runtime", &runtime_alias)],
+    )?;
+    let symlink_root = run_literal_with_xdg_config(temp.path(), &symlink_root_xdg)?;
+    assert_default_refusal(&symlink_root, "failed to authenticate");
+
+    let unsafe_xdg = temp.path().join("unsafe-xdg");
+    let unsafe_state = temp.path().join("unsafe-state");
+    let unsafe_root = temp.path().join("unsafe-root");
+    create_private_dir(&unsafe_state)?;
+    create_private_dir(&unsafe_root)?;
+    fs::set_permissions(&unsafe_root, fs::Permissions::from_mode(0o777))
+        .context("make reviewed root unsafe")?;
+    write_literal_default_config(
+        &unsafe_xdg.join("maco/machine-global.json"),
+        &unsafe_state,
+        &[("runtime", &unsafe_root)],
+    )?;
+    let unsafe_output = run_literal_with_xdg_config(temp.path(), &unsafe_xdg)?;
+    assert_default_refusal(&unsafe_output, "group/world-writable");
+    Ok(())
+}
+
+#[test]
+fn cli_literal_entrypoint_accepts_machine_global_environment_bindings() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let config = temp.path().join("machine-global.json");
+
+    let config_only = cli_without_machine_global_bindings()
+        .arg("environment binding probe")
+        .current_dir(temp.path())
+        .env(MACHINE_GLOBAL_CONFIG_ENV, &config)
+        .output()
+        .context("route literal with only the machine-global config environment binding")?;
+    assert!(!config_only.status.success());
+    let config_only_stderr = String::from_utf8_lossy(&config_only.stderr);
+    let config_only_error = config_only_stderr
+        .split("\n\nUsage:")
+        .next()
+        .context("read config-only missing-argument diagnostic")?;
+    assert!(
+        config_only_error.contains("--machine-global-runtime-root-id"),
+        "{config_only_stderr}"
+    );
+    assert!(
+        !config_only_error.contains("--machine-global-config"),
+        "{config_only_stderr}"
+    );
+
+    let runtime_root_only = cli_without_machine_global_bindings()
+        .arg("environment binding probe")
+        .current_dir(temp.path())
+        .env(MACHINE_GLOBAL_RUNTIME_ROOT_ID_ENV, "runtime")
+        .output()
+        .context("route literal with only the machine-global runtime-root environment binding")?;
+    assert!(!runtime_root_only.status.success());
+    let runtime_root_only_stderr = String::from_utf8_lossy(&runtime_root_only.stderr);
+    let runtime_root_only_error = runtime_root_only_stderr
+        .split("\n\nUsage:")
+        .next()
+        .context("read runtime-root-only missing-argument diagnostic")?;
+    assert!(
+        runtime_root_only_error.contains("--machine-global-config"),
+        "{runtime_root_only_stderr}"
+    );
+    assert!(
+        !runtime_root_only_error.contains("--machine-global-runtime-root-id"),
+        "{runtime_root_only_stderr}"
+    );
+
+    let both = cli_without_machine_global_bindings()
+        .arg("environment binding probe")
+        .current_dir(temp.path())
+        .env(MACHINE_GLOBAL_CONFIG_ENV, &config)
+        .env(MACHINE_GLOBAL_RUNTIME_ROOT_ID_ENV, "runtime")
+        .output()
+        .context("route literal with both machine-global environment bindings")?;
+    assert!(!both.status.success());
+    let both_stderr = String::from_utf8_lossy(&both.stderr);
+    assert!(both_stderr.contains("repository"), "{both_stderr}");
+    assert!(
+        !both_stderr.contains("the following required arguments were not provided"),
+        "{both_stderr}"
+    );
+    Ok(())
+}
 
 #[cfg(unix)]
 const ISSUE33_PINNED_WRAPPER_ENV: &str = "MACO_ISSUE33_PINNED_WRAPPER";
