@@ -97,6 +97,36 @@ fn bind_runtime_output_schema(
     Ok(command)
 }
 
+fn direct_assignment_report_schema_path<'a>(
+    role: AgentRole,
+    orchestrator_schema_path: &'a Path,
+    worker_schema_path: &'a Path,
+) -> Result<&'a Path> {
+    match role {
+        AgentRole::ChildOrchestrator => Ok(orchestrator_schema_path),
+        AgentRole::Worker => Ok(worker_schema_path),
+        unsupported => bail!(
+            "assignment role '{}' has no direct report schema contract",
+            unsupported.as_str()
+        ),
+    }
+}
+
+fn direct_assignment_report_is_valid(
+    role: AgentRole,
+    contents: Option<&[u8]>,
+    display_path: &Path,
+) -> Result<bool> {
+    match role {
+        AgentRole::ChildOrchestrator => Ok(read_child_report(contents, display_path).is_ok()),
+        AgentRole::Worker => Ok(read_worker_report(contents, display_path).is_ok()),
+        unsupported => bail!(
+            "assignment role '{}' has no direct report parser contract",
+            unsupported.as_str()
+        ),
+    }
+}
+
 fn codex_output_schema_path(authoritative: &Path) -> Result<PathBuf> {
     let parent = authoritative
         .parent()
@@ -1243,7 +1273,9 @@ fn prepare_child_attempt<'a>(
         &launch_catalog,
     )?;
     command = bound_launch.command;
-    command = bind_runtime_output_schema(command, launch_runtime, schema_path)?;
+    let direct_report_schema_path =
+        direct_assignment_report_schema_path(assignment.role, schema_path, worker_schema_path)?;
+    command = bind_runtime_output_schema(command, launch_runtime, direct_report_schema_path)?;
     command = bind_runtime_read_only_schema_files(
         command,
         launch_runtime,
@@ -1781,11 +1813,11 @@ fn dispatch_and_collect_child_attempt<'a>(
     outcome
         .command_records
         .push(command_record_from_external(&external_run, &command));
-    let raw_report_validated = read_child_report(
+    let raw_report_validated = direct_assignment_report_is_valid(
+        assignment.role,
         external_run.output_last_message(),
         &attempt_artifacts.raw_report_relative,
-    )
-    .is_ok();
+    )?;
     let worker_journal_result = with_supervisor_artifacts(artifacts, |writer, journal| {
         let evidence =
             import_worker_execution_journals(writer, assignment, &incoming_scratch, &external_run)?;
@@ -5783,6 +5815,67 @@ done
         );
         assert_eq!(fake.output_schema.as_deref(), Some(schema));
         assert!(fake.read_only_input_files.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn direct_worker_dispatch_binds_the_exact_worker_report_schema() -> Result<()> {
+        let orchestrator_schema =
+            Path::new("/hidden-primary/schemas/orchestrator-review-report.schema.json");
+        let worker_schema = Path::new("/hidden-primary/schemas/worker-report.schema.json");
+
+        assert_eq!(
+            direct_assignment_report_schema_path(
+                AgentRole::ChildOrchestrator,
+                orchestrator_schema,
+                worker_schema,
+            )?,
+            orchestrator_schema
+        );
+        let direct_worker_schema = direct_assignment_report_schema_path(
+            AgentRole::Worker,
+            orchestrator_schema,
+            worker_schema,
+        )?;
+        assert_eq!(direct_worker_schema, worker_schema);
+
+        let codex = bind_runtime_output_schema(
+            launch_fixture_command(),
+            SupervisorRuntime::Codex,
+            direct_worker_schema,
+        )?;
+        assert_eq!(
+            codex.output_schema.as_deref(),
+            Some(Path::new(
+                "/hidden-primary/schemas/worker-report.codex-output.schema.json"
+            ))
+        );
+
+        let fake = bind_runtime_output_schema(
+            launch_fixture_command(),
+            SupervisorRuntime::Fake,
+            direct_worker_schema,
+        )?;
+        assert_eq!(fake.output_schema.as_deref(), Some(worker_schema));
+
+        for unsupported in [
+            AgentRole::Supervisor,
+            AgentRole::GateClassifier,
+            AgentRole::Auditor,
+        ] {
+            let error = direct_assignment_report_schema_path(
+                unsupported,
+                orchestrator_schema,
+                worker_schema,
+            )
+            .expect_err("unsupported direct role must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("has no direct report schema contract"),
+                "{error:#}"
+            );
+        }
         Ok(())
     }
 
