@@ -506,9 +506,12 @@ fn supervise_run_requires_complete_machine_global_binding() {
     };
     assert_eq!(
         complete.machine_global_config,
-        PathBuf::from("/tmp/maco-machine-global.json")
+        Some(PathBuf::from("/tmp/maco-machine-global.json"))
     );
-    assert_eq!(complete.machine_global_runtime_root_id, "runtime");
+    assert_eq!(
+        complete.machine_global_runtime_root_id.as_deref(),
+        Some("runtime")
+    );
 
     for incomplete in [
         vec!["maco", "supervise", "run", "plan.json"],

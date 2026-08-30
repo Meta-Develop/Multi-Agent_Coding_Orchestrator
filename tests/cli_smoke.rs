@@ -158,7 +158,10 @@ fn cli_explicit_supervise_run_still_requires_machine_global_operands() -> Result
         stderr.contains("--machine-global-runtime-root-id"),
         "{stderr}"
     );
-    assert!(!stderr.contains("default machine-global binding"), "{stderr}");
+    assert!(
+        !stderr.contains("default machine-global binding"),
+        "{stderr}"
+    );
     Ok(())
 }
 
@@ -360,16 +363,16 @@ fn cli_concurrent_bare_invocations_reserve_distinct_generated_run_ids() -> Resul
         .map(|output| String::from_utf8_lossy(&output.stderr))
         .collect::<Vec<_>>();
     assert_eq!(run_ids.len(), 2, "run ids: {run_ids:?}; stderr: {stderr:?}");
-    assert!(run_ids.iter().all(|run_id| run_id
-        .to_string_lossy()
-        .starts_with("o2-")));
+    assert!(run_ids
+        .iter()
+        .all(|run_id| run_id.to_string_lossy().starts_with("o2-")));
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn cli_literal_defaults_refuse_missing_multiple_mismatched_symlinked_and_unsafe_roots(
-) -> Result<()> {
+fn cli_literal_defaults_refuse_missing_multiple_mismatched_symlinked_and_unsafe_roots() -> Result<()>
+{
     let Some(runtime_root) = current_private_runtime_root() else {
         return Ok(());
     };
