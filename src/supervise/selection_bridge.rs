@@ -116,6 +116,8 @@ const TEST_CURSOR_CATALOG_FIXTURE_ENV: &str = "MACO_TEST_CURSOR_CATALOG_FIXTURE"
 const TEST_CURSOR_CATALOG_OBSERVED_AT_ENV: &str = "MACO_TEST_CURSOR_CATALOG_OBSERVED_AT";
 #[cfg(test)]
 const TEST_SELECTOR_TRIPLE_RUNNER_UP_MODEL: &str = "gpt-5.6-sol-selector-triple-runner-up";
+#[cfg(test)]
+const TEST_BELOW_FLOOR_REVIEW_AUDITOR_MODEL: &str = "gpt-5.6-sol-review-auditor-below-floor";
 
 #[cfg(test)]
 thread_local! {
@@ -123,6 +125,7 @@ thread_local! {
         RefCell::new(None)
     };
     static TEST_SELECTOR_TRIPLE_RUNNER_UP_ENABLED: Cell<bool> = const { Cell::new(false) };
+    static TEST_BELOW_FLOOR_REVIEW_AUDITOR_ENABLED: Cell<bool> = const { Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -186,6 +189,39 @@ pub(super) fn bind_test_selector_triple_catalog(
     Ok((
         TestSelectorTripleCatalogBindGuard {
             previous_runner_up_enabled,
+            _model_capability: model_capability,
+        },
+        catalog,
+    ))
+}
+
+#[cfg(test)]
+struct TestBelowFloorReviewAuditorBindGuard {
+    _model_capability: InstalledModelCapabilityPolicy,
+}
+
+#[cfg(test)]
+impl Drop for TestBelowFloorReviewAuditorBindGuard {
+    fn drop(&mut self) {
+        TEST_BELOW_FLOOR_REVIEW_AUDITOR_ENABLED.with(|enabled| enabled.set(false));
+    }
+}
+
+#[cfg(test)]
+fn bind_test_below_floor_review_auditor() -> Result<(
+    TestBelowFloorReviewAuditorBindGuard,
+    CodexRuntimeModelCatalog,
+)> {
+    let model_capability = install_test_fixture_models(&[(
+        TEST_BELOW_FLOOR_REVIEW_AUDITOR_MODEL,
+        ModelCapabilityClass::GeneralJudgment,
+    )])?;
+    let catalog = CodexRuntimeModelCatalog::from_slugs([TEST_BELOW_FLOOR_REVIEW_AUDITOR_MODEL])?;
+    TEST_BELOW_FLOOR_REVIEW_AUDITOR_ENABLED.with(|enabled| {
+        assert!(!enabled.replace(true), "test fixture cannot be nested");
+    });
+    Ok((
+        TestBelowFloorReviewAuditorBindGuard {
             _model_capability: model_capability,
         },
         catalog,
@@ -567,6 +603,171 @@ pub(super) struct SupervisorReselection {
 pub(super) struct SupervisorExecutableSelectionBindings {
     pub(super) model_overrides: BTreeMap<AgentRole, RoleModelSelection>,
     pub(super) runtime_overrides: BTreeMap<AgentRole, SupervisorRuntime>,
+}
+
+/// Executable, authority-checked selection for one non-delegating review auditor.
+///
+/// The full selector provenance remains attached so inbox callers can retain the
+/// same catalog, objective-profile, candidate-set, and scoring evidence that
+/// authorized the exact runtime/model/effort triple.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct ExecutableReviewAuditorSelection {
+    pub(crate) candidate: CandidateKey,
+    pub(crate) authority: PhaseModelPolicyDecision,
+    pub(crate) provenance: SelectionProvenance,
+}
+
+impl CodexRuntimeModelCatalog {
+    /// Invoke the shared bridge without importing its private module path.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn select_executable_review_auditor(
+        &self,
+    ) -> Result<ExecutableReviewAuditorSelection> {
+        select_executable_review_auditor(self)
+    }
+}
+
+/// Select one executable `ReviewAuditor` directly from a live Codex catalog.
+///
+/// This is deliberately independent of supervisor-plan authority: it admits a
+/// single read-only auditor, requests only `ReviewAuditor` authority, and never
+/// constructs a supervisor or delegating role binding. Unknown, unavailable,
+/// measured-ineligible, below-`CriticalJudgment`, and below-xhigh candidates
+/// all fail closed before an executable selection is returned.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn select_executable_review_auditor(
+    catalog: &CodexRuntimeModelCatalog,
+) -> Result<ExecutableReviewAuditorSelection> {
+    let task = task_profile_for_role(AgentRole::Auditor);
+    let priors = selector_priors_with_terminal_worker_economics()?;
+    let runtime_catalog = runtime_catalog_from_priors(
+        runtime_name(SupervisorRuntime::Codex),
+        &RuntimeModelCatalog::Codex(catalog.clone()),
+        &task,
+        &priors,
+    )?;
+    let catalog_revision = runtime_catalog.revision.clone();
+    let (calibration_name, calibration_version) = priors
+        .objective_profiles
+        .first()
+        .map(|calibration| (calibration.name.clone(), calibration.version))
+        .context("built-in selector data has no objective profile")?;
+    let mut input = SelectionInput {
+        task,
+        catalogs: vec![runtime_catalog],
+        pools: vec![RuntimePoolState {
+            runtime: runtime_name(SupervisorRuntime::Codex).to_string(),
+            admission_open: true,
+            pool_reference: None,
+            pool_kind: None,
+            entitlement_bounded: true,
+            entitlement_capacity_units: 1,
+            entitlement_remaining_units: 1,
+            pool_pressure_basis_points: 0,
+            observed_consumption_units: 0,
+            marginal_cost_microunits: 0,
+            exhausted: false,
+            exhaustion_behavior: None,
+            authorized_alternatives: Vec::new(),
+            observation_revision: catalog_revision,
+            observation_source: None,
+            admission_provenance:
+                "crate-internal launch adapter admits one non-delegating read-only review auditor"
+                    .to_string(),
+            failover_provenance: None,
+        }],
+        quota_source: None,
+        constraints: OperatorConstraints {
+            allowed_runtimes: [runtime_name(SupervisorRuntime::Codex).to_string()]
+                .into_iter()
+                .collect(),
+            allowed_models: BTreeSet::new(),
+            forbidden_runtimes: BTreeSet::new(),
+            forbidden_models: BTreeSet::new(),
+            forbidden_candidates: BTreeSet::new(),
+            allow_debug_override: false,
+        },
+        priors,
+        objective_profile: ObjectiveProfileRef {
+            name: calibration_name,
+            version: calibration_version,
+            expected_digest: None,
+        },
+        resolved_objective_profile: crate::objective_profile::default_resolved_objective_profile()
+            .context("resolve review-auditor objective profile")?,
+        outcomes: Vec::new(),
+        signals: DynamicSignals {
+            retry_count: 0,
+            budget_signal: BudgetSignal::Continue,
+            previous_choice: None,
+            previous_catalog_digest: None,
+            environment_rejections: Vec::new(),
+        },
+        debug_override: None,
+        operational_observations: None,
+    };
+    input.operational_observations = Some(live_operational_observations(&input));
+
+    let provenance = select_with_live_switch_cost(&input)
+        .map_err(|error| anyhow!("critical ReviewAuditor selector rejected its input: {error}"))?;
+    if provenance.status != DecisionStatus::Selected {
+        bail!(
+            "critical ReviewAuditor selector failed closed against the supplied live catalog: {}",
+            provenance.decision_reason
+        );
+    }
+    if provenance.normalized_task.authority_role != AuthorityRole::ReviewAuditor {
+        bail!("critical ReviewAuditor selector returned mismatched authority provenance");
+    }
+    let choice = provenance
+        .choice
+        .as_ref()
+        .context("critical ReviewAuditor selector reported selected status without a choice")?;
+    if choice.candidate.runtime != runtime_name(SupervisorRuntime::Codex)
+        || !catalog.contains(&choice.candidate.model)
+    {
+        bail!(
+            "critical ReviewAuditor selector returned a runtime/model pair absent from the supplied live catalog"
+        );
+    }
+    if choice.candidate.effort < SelectorEffort::Xhigh {
+        bail!(
+            "critical ReviewAuditor selector returned effort '{}' below the xhigh execution floor",
+            selector_effort_as_str(choice.candidate.effort)
+        );
+    }
+    validate_known_judgment_role_model(AgentRole::Auditor, Some(&choice.candidate.model))
+        .with_context(|| {
+            format!(
+                "selected model '{}' cannot receive ReviewAuditor authority",
+                choice.candidate.model
+            )
+        })?;
+    let capability = trusted_model_capability(&choice.candidate.model).with_context(|| {
+        format!(
+            "selected ReviewAuditor model '{}' lost its trusted capability evidence",
+            choice.candidate.model
+        )
+    })?;
+    let authority = validate_phase_model_binding(
+        AgentRole::Auditor,
+        OrchestrationPhase::Audit,
+        None,
+        capability,
+    )
+    .with_context(|| {
+        format!(
+            "selected model '{}' is below the CriticalJudgment ReviewAuditor floor",
+            choice.candidate.model
+        )
+    })?;
+    let candidate = choice.candidate.clone();
+    Ok(ExecutableReviewAuditorSelection {
+        candidate,
+        authority,
+        provenance,
+    })
 }
 
 #[cfg(test)]
@@ -1252,6 +1453,28 @@ fn selector_priors_with_terminal_worker_economics() -> Result<selection::PriorDa
         runner_up.one_shot_environment_fallbacks.clear();
         priors.revision = format!("{}+selector-triple-runner-up-fixture", priors.revision);
         priors.models.push(runner_up);
+    }
+    #[cfg(test)]
+    if TEST_BELOW_FLOOR_REVIEW_AUDITOR_ENABLED.with(Cell::get) {
+        let mut below_floor = priors
+            .models
+            .iter()
+            .find(|prior| {
+                prior.runtime == runtime_name(SupervisorRuntime::Codex)
+                    && prior.model == FRONTIER_PROFILE_MODEL
+            })
+            .cloned()
+            .context("below-floor ReviewAuditor fixture requires the frontier Codex prior")?;
+        below_floor.model = TEST_BELOW_FLOOR_REVIEW_AUDITOR_MODEL.to_string();
+        below_floor.source_id = "test-below-floor-review-auditor-fixture".to_string();
+        below_floor.prior_scope =
+            "test-only ReviewAuditor candidate whose static capability is below the role floor"
+                .to_string();
+        below_floor.limitations = vec![
+            "test fixture only; exercises the post-selection CriticalJudgment floor".to_string(),
+        ];
+        priors.revision = format!("{}+below-floor-review-auditor-fixture", priors.revision);
+        priors.models.push(below_floor);
     }
     let economics = crate::optimizer::objective::terminal_worker_routing_economics()?;
     if priors
@@ -3012,6 +3235,120 @@ mod tests {
                     .map(|prior| prior.model.clone()),
             )?,
         ))
+    }
+
+    #[test]
+    fn executable_review_auditor_selects_strongest_eligible_live_model() -> Result<()> {
+        let catalog = CodexRuntimeModelCatalog::from_slugs([
+            FRONTIER_PROFILE_MODEL,
+            ECONOMY_PROFILE_MODEL,
+            BALANCED_PROFILE_MODEL,
+        ])?;
+
+        let selected = catalog.select_executable_review_auditor()?;
+
+        assert_eq!(selected.candidate.runtime, "codex");
+        assert_eq!(selected.candidate.model, FRONTIER_PROFILE_MODEL);
+        assert_eq!(selected.candidate.effort, SelectorEffort::Xhigh);
+        assert_eq!(
+            selected
+                .provenance
+                .choice
+                .as_ref()
+                .context("ReviewAuditor choice")?
+                .reason,
+            selection::ChoiceReason::StrongestNoEvidenceJudgmentFallback
+        );
+        assert!(selected.provenance.candidate_set.iter().all(|candidate| {
+            candidate.candidate.model == FRONTIER_PROFILE_MODEL || !candidate.eligible
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn executable_review_auditor_refuses_selected_model_below_capability_floor() -> Result<()> {
+        let (_guard, catalog) = bind_test_below_floor_review_auditor()?;
+
+        let error = catalog
+            .select_executable_review_auditor()
+            .expect_err("GeneralJudgment model must not receive ReviewAuditor authority");
+        let detail = format!("{error:#}");
+
+        assert!(detail.contains(TEST_BELOW_FLOOR_REVIEW_AUDITOR_MODEL));
+        assert!(detail.contains("ReviewAuditor authority"));
+        assert!(detail.contains("critical_judgment"));
+        assert!(detail.contains("general_judgment"));
+        Ok(())
+    }
+
+    #[test]
+    fn executable_review_auditor_fails_closed_for_ineligible_unavailable_and_unknown_models(
+    ) -> Result<()> {
+        for (case, models) in [
+            ("ineligible", vec![BALANCED_PROFILE_MODEL]),
+            ("unavailable", vec![ECONOMY_PROFILE_MODEL]),
+            ("unknown", vec!["provider-unknown-review-model"]),
+        ] {
+            let catalog = CodexRuntimeModelCatalog::from_slugs(models)?;
+            let error = catalog
+                .select_executable_review_auditor()
+                .expect_err("non-executable ReviewAuditor catalog must fail closed");
+            assert!(
+                error.to_string().contains("failed closed"),
+                "{case}: {error:#}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn executable_review_auditor_returns_authority_and_selector_provenance() -> Result<()> {
+        let catalog = CodexRuntimeModelCatalog::from_slugs([FRONTIER_PROFILE_MODEL])?;
+
+        let selected = catalog.select_executable_review_auditor()?;
+        let provenance = &selected.provenance;
+
+        assert_eq!(selected.authority.role, AgentRole::Auditor);
+        assert_eq!(selected.authority.phase, OrchestrationPhase::Audit);
+        assert_eq!(
+            selected.authority.required_capability,
+            ModelCapabilityClass::CriticalJudgment
+        );
+        assert_eq!(
+            selected.authority.selected_capability,
+            ModelCapabilityClass::CriticalJudgment
+        );
+        assert_eq!(provenance.status, DecisionStatus::Selected);
+        assert_eq!(
+            provenance.normalized_task.authority_role,
+            AuthorityRole::ReviewAuditor
+        );
+        assert_eq!(
+            provenance.normalized_task.task_class,
+            JUDGMENT_SELECTION_TASK_CLASS
+        );
+        assert_eq!(
+            provenance
+                .choice
+                .as_ref()
+                .context("ReviewAuditor choice")?
+                .candidate,
+            selected.candidate
+        );
+        assert!(!provenance.input_digests.normalized_input.value.is_empty());
+        assert!(!provenance.resolved_objective_profile.profile.id.is_empty());
+        assert!(provenance.normalized_input.catalogs.iter().any(|runtime| {
+            runtime.runtime == "codex"
+                && runtime.models.iter().any(|model| {
+                    model.model == FRONTIER_PROFILE_MODEL
+                        && model.available
+                        && model
+                            .capabilities
+                            .authority_roles
+                            .contains(&AuthorityRole::ReviewAuditor)
+                })
+        }));
+        Ok(())
     }
 
     fn test_plan() -> SupervisorPlan {
