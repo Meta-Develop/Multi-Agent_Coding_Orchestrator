@@ -1096,7 +1096,7 @@ fn scheduler_materializes_and_binds_worker_codex_schema_for_direct_worker() {
     assignment.role = AgentRole::Worker;
     assignment.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
     assignment.selection_source = Some(AssignmentSelectionSource::Automatic);
-    assignment.assigned_paths = vec![target];
+    assignment.assigned_paths = vec![target.clone()];
     assignment.task = Some("exercise direct Worker Codex schema binding".to_string());
     let worker = WorkerReport {
         id: assignment.id.clone(),
