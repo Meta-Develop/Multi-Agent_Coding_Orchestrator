@@ -3911,6 +3911,253 @@ fn grok_runtime_adapter_argv_immutably_disables_subagents() {
         .any(|argument| argument == "--no-subagents"));
 }
 
+fn selected_writable_grok_command(
+    program: impl Into<PathBuf>,
+    workspace: impl Into<PathBuf>,
+    prompt: impl Into<PathBuf>,
+    incoming: impl Into<PathBuf>,
+) -> Result<ExternalAgentCommand> {
+    let workspace = workspace.into();
+    let incoming = incoming.into();
+    ExternalAgentCommand::codex(
+        program,
+        &workspace,
+        prompt,
+        incoming.join("events.jsonl"),
+        incoming.join("report.json"),
+        Duration::from_secs(7),
+    )
+    .with_runtime_adapter(
+        RuntimeId::Grok,
+        RuntimeAdapterConfig::defaults(RuntimeId::Grok),
+    )
+    .with_model_selection(Some("grok-4.6".to_string()), Some("xhigh".to_string()))
+    .with_workspace_access(WorkspaceAccess::ReadWrite)
+    .with_writable_launch_target(WritableLaunchTarget::ManagedChildWorktree)
+    .with_writable_runtime_selection("grok-worker", RuntimeId::Grok, true)
+}
+
+fn writable_grok_confinement(
+    side_effect_confinement: SideEffectConfinement,
+) -> WorktreeWritableAdmission {
+    WorktreeWritableAdmission {
+        version: WORKTREE_WRITABLE_ADMISSION_SCHEMA_VERSION,
+        assignment_id: "grok-worker".to_string(),
+        attempt: 1,
+        target: WritableLaunchTarget::ManagedChildWorktree,
+        worktree: ManagedWorktreeAdmission {
+            kind: ManagedWorktreeAdmissionKind::ManagedDisposable,
+            worktree_id: "grok-worker".to_string(),
+        },
+        claims: HeldPathClaimsAdmission {
+            state: HeldPathClaimsAdmissionState::Held,
+            token: 9,
+            paths: vec![PathBuf::from("bounded-result.txt")],
+        },
+        native_sandbox: NativeSandboxAdmission {
+            runtime: RuntimeId::Grok,
+            workspace_access: WorkspaceAccess::ReadWrite,
+            side_effect_confinement,
+        },
+    }
+}
+
+#[test]
+fn writable_grok_external_boundary_names_every_selection_and_confinement_refusal() -> Result<()> {
+    let generic = ExternalAgentCommand::codex(
+        "grok",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(1),
+    )
+    .with_runtime_adapter(
+        RuntimeId::Grok,
+        RuntimeAdapterConfig::defaults(RuntimeId::Grok),
+    )
+    .with_model_selection(Some("grok".to_string()), Some("xhigh".to_string()));
+    let generic_report = run_external_agent(&generic);
+    assert!(!generic_report.stdout.target_launch_attempted);
+    assert!(generic_report
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains(WRITABLE_GROK_EXACT_MODEL_REQUIRED)));
+
+    let non_xhigh = generic
+        .clone()
+        .with_model_selection(Some("grok-4.6".to_string()), Some("high".to_string()));
+    let effort_report = run_external_agent(&non_xhigh);
+    assert!(!effort_report.stdout.target_launch_attempted);
+    assert!(effort_report
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains(WRITABLE_GROK_XHIGH_EFFORT_REQUIRED)));
+
+    let exact_without_selection = non_xhigh
+        .clone()
+        .with_model_selection(Some("grok-4.6".to_string()), Some("xhigh".to_string()));
+    let missing_selection = run_external_agent(&exact_without_selection);
+    assert!(!missing_selection.stdout.target_launch_attempted);
+    assert!(missing_selection
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains(WRITABLE_GROK_SELECTION_EVIDENCE_MISSING)));
+
+    let selected = selected_writable_grok_command("grok", "/workspace", "/run/prompt.md", "/run")?;
+    let missing_confinement = run_external_agent(&selected);
+    assert!(!missing_confinement.stdout.target_launch_attempted);
+    assert!(missing_confinement
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains(WRITABLE_GROK_CONFINEMENT_PROOF_MISSING)));
+
+    let mut stale = selected
+        .clone()
+        .with_worktree_writable_confinement(writable_grok_confinement(
+            SideEffectConfinement::Verified,
+        ));
+    stale
+        .runtime_adapter
+        .as_mut()
+        .expect("selected Grok adapter")
+        .output_capture = crate::runtime_adapter::OutputCaptureMode::StdoutAndStderr;
+    let stale_report = run_external_agent(&stale);
+    assert!(!stale_report.stdout.target_launch_attempted);
+    assert!(stale_report
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains(WRITABLE_GROK_SELECTION_EVIDENCE_STALE)));
+
+    let confinement_stale = selected
+        .clone()
+        .with_worktree_writable_confinement(writable_grok_confinement(
+            SideEffectConfinement::Verified,
+        ))
+        .with_worktree_control_exception("late-write.txt");
+    let confinement_stale_report = run_external_agent(&confinement_stale);
+    assert!(!confinement_stale_report.stdout.target_launch_attempted);
+    assert!(confinement_stale_report
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains(WRITABLE_GROK_CONFINEMENT_PROOF_STALE)));
+
+    let unverified =
+        selected
+            .clone()
+            .with_worktree_writable_confinement(writable_grok_confinement(
+                SideEffectConfinement::Unverified,
+            ));
+    let unverified_report = run_external_agent(&unverified);
+    assert!(!unverified_report.stdout.target_launch_attempted);
+    assert!(unverified_report
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains(WRITABLE_GROK_CONFINEMENT_UNVERIFIED)));
+
+    let primary = selected
+        .with_worktree_writable_confinement(writable_grok_confinement(
+            SideEffectConfinement::Verified,
+        ))
+        .with_writable_launch_target(WritableLaunchTarget::PrimaryWorktree);
+    let primary_report = run_external_agent(&primary);
+    assert!(!primary_report.stdout.target_launch_attempted);
+    assert!(primary_report.error.as_deref().is_some_and(|error| {
+        error.contains("writable grok failed closed before launch")
+            && error.contains("blocking_pre_action_callback != All")
+    }));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn writable_grok_selected_request_has_only_the_bounded_worktree_effect_and_result() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("grok-worker");
+    let incoming = temp.path().join("incoming");
+    let bin = temp.path().join("bin");
+    fs::create_dir(&workspace)?;
+    create_mandatory_control_roots(&workspace)?;
+    fs::create_dir(&incoming)?;
+    fs::create_dir(&bin)?;
+    let prompt = temp.path().join("prompt.md");
+    fs::write(&prompt, "make the bounded result\n")?;
+    let program = bin.join("grok-fixture");
+    fs::write(
+        &program,
+        r#"#!/bin/sh
+printf '%s\n' "$@" > selected-request.txt
+printf 'bounded worktree effect\n' > bounded-result.txt
+printf '%s\n' '{"type":"text","data":"bounded result"}'
+printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-session","requestId":"fixture-request"}'
+"#,
+    )?;
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755))?;
+    let outside = temp.path().join("outside-untouched.txt");
+    fs::write(&outside, "outside\n")?;
+
+    let command = selected_writable_grok_command(&program, &workspace, &prompt, &incoming)?
+        .with_worktree_writable_confinement(writable_grok_confinement(
+            SideEffectConfinement::Verified,
+        ));
+    let capabilities = command.verified_writable_capabilities(RuntimeId::Grok)?;
+    assert!(capabilities.admits_worktree_writable());
+    assert!(
+        !capabilities.admits_writable_release(),
+        "the typed Grok leaf proof must not grant publication authority"
+    );
+
+    let expected_request = runtime_adapter_argv(&command)?
+        .into_iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let controls = protected_worktree_controls(&command)?;
+    let profile = external_side_effect_profile(
+        &command,
+        &program,
+        ExternalProgramTrust::ExplicitCustom,
+        &controls,
+    )?;
+    let SideEffectConfinementProfile::ExternalCodex(profile) = profile else {
+        bail!("expected MACO ExternalCodex confinement profile");
+    };
+    assert_eq!(profile.workspace_access(), WorkspaceAccess::ReadWrite);
+    let canonical_incoming = fs::canonicalize(&incoming)?;
+    assert!(
+        profile.writable_artifact_roots().is_empty(),
+        "Grok stdout is parent-published, so the child must not receive a publication root"
+    );
+    assert!(!profile
+        .visible_read_write_roots()
+        .contains(&canonical_incoming));
+
+    let config = command.runtime_adapter.as_ref().context("Grok adapter")?;
+    let run = config.execute(&LaunchContext {
+        prompt: &command.prompt,
+        model: command.model.as_deref(),
+        effort: command.reasoning_effort.as_deref(),
+        cwd: &command.cwd,
+        output: &command.output_last_message,
+    })?;
+    assert_eq!(run.status, Some(0));
+    let parsed = command
+        .current_grok_writable_contract()?
+        .parse_output(&run.captured)?;
+    assert_eq!(parsed.response_text(), "bounded result");
+    assert_eq!(
+        fs::read_to_string(workspace.join("selected-request.txt"))?,
+        format!("{}\n", expected_request.join("\n"))
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("bounded-result.txt"))?,
+        "bounded worktree effect\n"
+    );
+    assert_eq!(fs::read_to_string(outside)?, "outside\n");
+    Ok(())
+}
+
 #[test]
 fn grok_runtime_boundary_uses_prompt_file_and_validates_terminal_stream_output() -> Result<()> {
     let grok = ExternalAgentCommand::codex(

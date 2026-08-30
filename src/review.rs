@@ -69,6 +69,10 @@ const REVIEW_LENS_EVIDENCE_CONTENT_DOMAIN: &[u8] = b"MACO\0review-lens-evidence-
 const REVIEW_LENS_REQUEST_DOMAIN: &[u8] = b"MACO\0review-lens-request\0v1\0";
 const SANITIZED_REVIEW_VIEW_DOMAIN: &[u8] = b"MACO\0sanitized-review-view\0v1\0";
 const REVIEW_SHA256_IDENTITY_PREFIX: &str = "sha256:";
+const REVIEW_TRANSCRIPT_COMPLETE_MARKER: &str =
+    "complete: authoritative transcript is reproduced in head_excerpt";
+const REVIEW_TRANSCRIPT_TRUNCATED_MARKER: &str =
+    "truncated: middle omitted; authoritative full transcript retained in authenticated parent artifact";
 
 pub const DEFAULT_DIFF_REVIEW_LENS_ID: &str = "default-diff-review";
 pub const DEFAULT_OUTPUT_REVIEW_LENS_ID: &str = "default-output-report-review";
@@ -469,6 +473,47 @@ pub struct ReviewLensRequestSources<'a> {
     pub output_report: &'a str,
 }
 
+/// Exact supervisor bindings that must accompany a bounded full-transcript
+/// review. `serde_json::Value` keeps this review-layer type independent of the
+/// supervisor's report and candidate types while retaining their complete,
+/// canonical serialized representations.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewLensBindingMaterial {
+    pub candidate_binding: serde_json::Value,
+    pub path_bindings: serde_json::Value,
+    pub validation_bindings: serde_json::Value,
+}
+
+/// Parent-authenticated transcript input used to construct a bounded request.
+///
+/// The caller remains responsible for authenticating `child_transcript`
+/// against the retained artifact before calling this constructor. The artifact
+/// path is carried into the request so the digest and length remain tied to the
+/// separately retained authority rather than being mistaken for a complete
+/// inline transcript.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BoundedReviewLensRequestSources<'a> {
+    pub child_transcript: &'a str,
+    pub authoritative_transcript_path: &'a Path,
+    pub diff: &'a str,
+    pub output_report: &'a str,
+    pub bindings: &'a ReviewLensBindingMaterial,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundedReviewTranscript {
+    pub authoritative_artifact: PathBuf,
+    pub original_bytes: u64,
+    pub sha256: String,
+    pub truncated: bool,
+    pub omitted_bytes: u64,
+    pub truncation_marker: String,
+    pub head_excerpt: String,
+    pub tail_excerpt: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewLensRequest {
@@ -494,6 +539,12 @@ pub enum ReviewLensScopedInformation {
         diff: String,
         output_report: String,
     },
+    BoundedFullChildTranscript {
+        child_transcript: BoundedReviewTranscript,
+        bindings: ReviewLensBindingMaterial,
+        diff: String,
+        output_report: String,
+    },
     DiffOnly {
         diff: String,
     },
@@ -505,7 +556,9 @@ pub enum ReviewLensScopedInformation {
 impl ReviewLensScopedInformation {
     pub fn scope(&self) -> ReviewInformationScope {
         match self {
-            Self::FullChildTranscript { .. } => ReviewInformationScope::FullChildTranscript,
+            Self::FullChildTranscript { .. } | Self::BoundedFullChildTranscript { .. } => {
+                ReviewInformationScope::FullChildTranscript
+            }
             Self::DiffOnly { .. } => ReviewInformationScope::DiffOnly,
             Self::OutputReportOnly { .. } => ReviewInformationScope::OutputReportOnly,
         }
@@ -544,6 +597,175 @@ pub fn build_review_lens_request(
             output_report: sources.output_report.to_string(),
         },
     };
+    build_review_lens_request_from_information(lens, information)
+}
+
+/// Constructs the bounded full-transcript representation used at the parent
+/// review boundary. Required report, diff, candidate, path, and validation
+/// material is never shortened. If that material plus transcript
+/// authentication metadata cannot fit, construction fails closed. Otherwise
+/// the largest deterministic, balanced UTF-8 head/tail excerpt that fits is
+/// selected by serialized request size.
+pub(crate) fn build_bounded_review_lens_request(
+    lens: &ReviewLensConfig,
+    sources: BoundedReviewLensRequestSources<'_>,
+) -> Result<ReviewLensRequest> {
+    validate_review_lens_config(lens)?;
+    if matches!(lens.backend, ReviewLensBackendConfig::Precomputed { .. }) {
+        bail!("precomputed review lenses do not receive model request material");
+    }
+    if lens.information_scope != ReviewInformationScope::FullChildTranscript {
+        return build_review_lens_request(
+            lens,
+            ReviewLensRequestSources {
+                child_transcript: sources.child_transcript,
+                diff: sources.diff,
+                output_report: sources.output_report,
+            },
+        );
+    }
+    validate_repo_relative_path(
+        sources.authoritative_transcript_path,
+        "authoritative review transcript artifact",
+    )?;
+    validate_review_lens_binding_material(sources.bindings)?;
+    let sha256 = sha256_hex(sources.child_transcript.as_bytes());
+
+    let complete = bounded_review_transcript(
+        sources.child_transcript,
+        sources.authoritative_transcript_path,
+        &sha256,
+        sources.child_transcript.len(),
+        false,
+    )?;
+    if let Ok(request) = build_bounded_review_lens_request_with_transcript(lens, sources, complete)
+    {
+        return Ok(request);
+    }
+
+    let minimal = bounded_review_transcript(
+        sources.child_transcript,
+        sources.authoritative_transcript_path,
+        &sha256,
+        0,
+        true,
+    )?;
+    let mut best = build_bounded_review_lens_request_with_transcript(lens, sources, minimal)
+        .with_context(|| {
+            format!(
+                "required review report and candidate/path/validation bindings cannot fit or authenticate within the {} byte review-lens request limit",
+                REVIEW_INPUT_LIMIT_BYTES
+            )
+        })?;
+
+    let mut low = 0usize;
+    let mut high = sources.child_transcript.len().saturating_sub(1);
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        let transcript = bounded_review_transcript(
+            sources.child_transcript,
+            sources.authoritative_transcript_path,
+            &sha256,
+            middle,
+            true,
+        )?;
+        match build_bounded_review_lens_request_with_transcript(lens, sources, transcript) {
+            Ok(request) => {
+                low = middle;
+                best = request;
+            }
+            Err(_) => high = middle.saturating_sub(1),
+        }
+    }
+    Ok(best)
+}
+
+fn build_bounded_review_lens_request_with_transcript(
+    lens: &ReviewLensConfig,
+    sources: BoundedReviewLensRequestSources<'_>,
+    child_transcript: BoundedReviewTranscript,
+) -> Result<ReviewLensRequest> {
+    build_review_lens_request_from_information(
+        lens,
+        ReviewLensScopedInformation::BoundedFullChildTranscript {
+            child_transcript,
+            bindings: sources.bindings.clone(),
+            diff: sources.diff.to_string(),
+            output_report: sources.output_report.to_string(),
+        },
+    )
+}
+
+fn bounded_review_transcript(
+    transcript: &str,
+    authoritative_artifact: &Path,
+    sha256: &str,
+    excerpt_byte_budget: usize,
+    truncated: bool,
+) -> Result<BoundedReviewTranscript> {
+    let (head_excerpt, tail_excerpt) = if truncated {
+        bounded_head_tail_excerpt(transcript, excerpt_byte_budget)
+    } else {
+        (transcript, "")
+    };
+    let excerpt_bytes = head_excerpt
+        .len()
+        .checked_add(tail_excerpt.len())
+        .context("bounded review transcript excerpt byte length overflow")?;
+    let omitted_bytes = transcript
+        .len()
+        .checked_sub(excerpt_bytes)
+        .context("bounded review transcript excerpts overlap")?;
+    Ok(BoundedReviewTranscript {
+        authoritative_artifact: authoritative_artifact.to_path_buf(),
+        original_bytes: u64::try_from(transcript.len())
+            .context("authoritative review transcript byte length overflow")?,
+        sha256: sha256.to_string(),
+        truncated,
+        omitted_bytes: u64::try_from(omitted_bytes)
+            .context("omitted review transcript byte length overflow")?,
+        truncation_marker: if truncated {
+            REVIEW_TRANSCRIPT_TRUNCATED_MARKER
+        } else {
+            REVIEW_TRANSCRIPT_COMPLETE_MARKER
+        }
+        .to_string(),
+        head_excerpt: head_excerpt.to_string(),
+        tail_excerpt: tail_excerpt.to_string(),
+    })
+}
+
+fn bounded_head_tail_excerpt(transcript: &str, byte_budget: usize) -> (&str, &str) {
+    let byte_budget = byte_budget.min(transcript.len());
+    let mut head_end = byte_budget.div_ceil(2);
+    while !transcript.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = transcript.len().saturating_sub(byte_budget / 2);
+    while !transcript.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    debug_assert!(head_end <= tail_start);
+    (&transcript[..head_end], &transcript[tail_start..])
+}
+
+fn validate_review_lens_binding_material(bindings: &ReviewLensBindingMaterial) -> Result<()> {
+    for (label, value) in [
+        ("candidate binding", &bindings.candidate_binding),
+        ("path bindings", &bindings.path_bindings),
+        ("validation bindings", &bindings.validation_bindings),
+    ] {
+        if !value.is_object() {
+            bail!("review lens {label} must be a complete JSON object");
+        }
+    }
+    Ok(())
+}
+
+fn build_review_lens_request_from_information(
+    lens: &ReviewLensConfig,
+    information: ReviewLensScopedInformation,
+) -> Result<ReviewLensRequest> {
     let descriptor = ReviewLensDescriptor::from(lens);
     let backend_configuration_id = review_lens_backend_configuration_id(&lens.backend)?;
     let binding_payload = serde_json::to_vec(&ReviewLensRequestBindingPayload {
@@ -577,6 +799,24 @@ pub fn build_review_lens_request(
         );
     }
     Ok(request)
+}
+
+#[cfg(test)]
+pub(crate) fn review_lens_request_binding_payload_len_for_test(
+    lens: &ReviewLensConfig,
+    information: &ReviewLensScopedInformation,
+) -> Result<usize> {
+    validate_review_lens_config(lens)?;
+    let descriptor = ReviewLensDescriptor::from(lens);
+    let backend_configuration_id = review_lens_backend_configuration_id(&lens.backend)?;
+    Ok(serde_json::to_vec(&ReviewLensRequestBindingPayload {
+        version: REVIEW_SCHEMA_VERSION,
+        lens: &descriptor,
+        backend_configuration_id: &backend_configuration_id,
+        information,
+    })
+    .context("failed to serialize review lens request identity for boundary test")?
+    .len())
 }
 
 fn validate_review_lens_selected_input(

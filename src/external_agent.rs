@@ -21,8 +21,8 @@ use crate::process_runner::{
 };
 use crate::protected_path::{DeclaredPathCoordinate, ProtectedPathSpec};
 use crate::runtime_adapter::{
-    AdapterId, LaunchContext, RuntimeAdapterConfig, RuntimeId, SideEffectConfinement,
-    WritableLaunchTarget,
+    AdapterId, LaunchContext, RuntimeAdapterConfig, RuntimeId, SideEffectConfinement, TypedRuntime,
+    TypedRuntimeContract, WritableLaunchTarget,
 };
 use crate::safe_state::{unsigned_to_u32, ReservedDirectory};
 use crate::secure_output::{ReservedOutputFile, SecureOutputRoot};
@@ -230,6 +230,113 @@ pub struct ExternalAgentCommand {
     /// Isolated child worktree vs primary checkout. Default constructors use a
     /// managed child worktree; primary-target launch stays fail-closed.
     pub writable_launch_target: WritableLaunchTarget,
+    /// Opaque supervisor-selected launch identity. Only the MACO assignment binder can create
+    /// this evidence; writable Grok admission rechecks it against the live command so a later
+    /// model, effort, executable, cwd, invocation, or adapter-config change fails closed.
+    writable_runtime_selection: Option<WritableRuntimeSelectionEvidence>,
+    /// Opaque MACO-owned proof that the selected command, held claims, disposable worktree, and
+    /// verified native confinement were authenticated together immediately before launch.
+    worktree_writable_confinement: Option<WorktreeWritableConfinementProof>,
+}
+
+pub(crate) const WRITABLE_GROK_TERMINAL_WORKER_REQUIRED: &str =
+    "writable_grok_terminal_worker_required";
+pub(crate) const WRITABLE_GROK_SELECTION_EVIDENCE_MISSING: &str =
+    "writable_grok_selection_evidence_missing";
+pub(crate) const WRITABLE_GROK_SELECTION_EVIDENCE_STALE: &str =
+    "writable_grok_selection_evidence_stale";
+pub(crate) const WRITABLE_GROK_EXACT_MODEL_REQUIRED: &str = "writable_grok_exact_model_required";
+pub(crate) const WRITABLE_GROK_XHIGH_EFFORT_REQUIRED: &str = "writable_grok_xhigh_effort_required";
+pub(crate) const WRITABLE_GROK_ADAPTER_CONFIGURATION_UNVERIFIED: &str =
+    "writable_grok_adapter_configuration_unverified";
+pub(crate) const WRITABLE_GROK_CONFINEMENT_PROOF_MISSING: &str =
+    "writable_grok_confinement_proof_missing";
+pub(crate) const WRITABLE_GROK_CONFINEMENT_PROOF_STALE: &str =
+    "writable_grok_confinement_proof_stale";
+pub(crate) const WRITABLE_GROK_CONFINEMENT_UNVERIFIED: &str =
+    "writable_grok_confinement_unverified";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WritableRuntimeSelectionEvidence {
+    assignment_id: String,
+    runtime: RuntimeId,
+    invocation: ExternalAgentInvocation,
+    program: PathBuf,
+    cwd: PathBuf,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    adapter_config: Option<RuntimeAdapterConfig>,
+}
+
+impl WritableRuntimeSelectionEvidence {
+    fn from_command(
+        assignment_id: impl Into<String>,
+        runtime: RuntimeId,
+        command: &ExternalAgentCommand,
+    ) -> Self {
+        Self {
+            assignment_id: assignment_id.into(),
+            runtime,
+            invocation: command.invocation,
+            program: command.program.clone(),
+            cwd: command.cwd.clone(),
+            model: command.model.clone(),
+            reasoning_effort: command.reasoning_effort.clone(),
+            adapter_config: command.runtime_adapter.clone(),
+        }
+    }
+
+    fn matches_command(&self, command: &ExternalAgentCommand, runtime: RuntimeId) -> bool {
+        self.runtime == runtime
+            && self.invocation == command.invocation
+            && self.program == command.program
+            && self.cwd == command.cwd
+            && self.model == command.model
+            && self.reasoning_effort == command.reasoning_effort
+            && self.adapter_config == command.runtime_adapter
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorktreeWritableConfinementProof {
+    admission: WorktreeWritableAdmission,
+    selected_launch: Option<WritableRuntimeSelectionEvidence>,
+    command: WorktreeConfinementSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorktreeConfinementSnapshot {
+    prompt: PathBuf,
+    json_log: PathBuf,
+    output_last_message: PathBuf,
+    output_schema: Option<PathBuf>,
+    read_only_input_files: Vec<PathBuf>,
+    worker_journal_artifacts: Vec<WorkerJournalArtifactSpec>,
+    workspace_access: WorkspaceAccess,
+    hidden_roots: Vec<PathBuf>,
+    worktree_control_exceptions: Vec<PathBuf>,
+    writable_launch_target: WritableLaunchTarget,
+}
+
+impl WorktreeConfinementSnapshot {
+    fn from_command(command: &ExternalAgentCommand) -> Self {
+        Self {
+            prompt: command.prompt.clone(),
+            json_log: command.json_log.clone(),
+            output_last_message: command.output_last_message.clone(),
+            output_schema: command.output_schema.clone(),
+            read_only_input_files: command.read_only_input_files.clone(),
+            worker_journal_artifacts: command.worker_journal_artifacts.clone(),
+            workspace_access: command.workspace_access,
+            hidden_roots: command.hidden_roots.clone(),
+            worktree_control_exceptions: command.worktree_control_exceptions.clone(),
+            writable_launch_target: command.writable_launch_target,
+        }
+    }
+
+    fn matches_command(&self, command: &ExternalAgentCommand) -> bool {
+        self == &Self::from_command(command)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -877,6 +984,8 @@ impl ExternalAgentCommand {
             machine_global_retention: None,
             runtime_adapter: None,
             writable_launch_target: WritableLaunchTarget::ManagedChildWorktree,
+            writable_runtime_selection: None,
+            worktree_writable_confinement: None,
         }
     }
 
@@ -910,6 +1019,8 @@ impl ExternalAgentCommand {
             machine_global_retention: None,
             runtime_adapter: None,
             writable_launch_target: WritableLaunchTarget::ManagedChildWorktree,
+            writable_runtime_selection: None,
+            worktree_writable_confinement: None,
         }
     }
 
@@ -943,6 +1054,8 @@ impl ExternalAgentCommand {
             machine_global_retention: None,
             runtime_adapter: None,
             writable_launch_target: WritableLaunchTarget::ManagedChildWorktree,
+            writable_runtime_selection: None,
+            worktree_writable_confinement: None,
         }
     }
 
@@ -1005,6 +1118,176 @@ impl ExternalAgentCommand {
         self.model = model;
         self.reasoning_effort = reasoning_effort;
         self
+    }
+
+    /// Bind the supervisor-resolved identity used for writable Grok admission.
+    ///
+    /// This is deliberately crate-private and snapshots the already rendered command rather than
+    /// accepting provider-controlled evidence. Both writable consumers compare the snapshot with
+    /// the live command and independently re-prove the immutable adapter contract.
+    pub(crate) fn with_writable_runtime_selection(
+        mut self,
+        assignment_id: impl Into<String>,
+        runtime: RuntimeId,
+        non_delegating_terminal_worker: bool,
+    ) -> Result<Self> {
+        if runtime != RuntimeId::Grok || !non_delegating_terminal_worker {
+            bail!(
+                "{WRITABLE_GROK_TERMINAL_WORKER_REQUIRED}: writable Grok requires an explicitly bound non-delegating terminal Worker"
+            );
+        }
+        if self.invocation != ExternalAgentInvocation::Grok {
+            bail!(
+                "{WRITABLE_GROK_SELECTION_EVIDENCE_STALE}: selected Grok runtime does not match the executable invocation"
+            );
+        }
+        self.writable_runtime_selection = Some(WritableRuntimeSelectionEvidence::from_command(
+            assignment_id,
+            runtime,
+            &self,
+        ));
+        self.worktree_writable_confinement = None;
+        Ok(self)
+    }
+
+    /// Attach the parent-authenticated managed-worktree proof to the exact selected launch.
+    /// A later command mutation cannot reuse it because verification compares both snapshots.
+    pub(crate) fn with_worktree_writable_confinement(
+        mut self,
+        admission: WorktreeWritableAdmission,
+    ) -> Self {
+        self.worktree_writable_confinement = Some(WorktreeWritableConfinementProof {
+            admission,
+            selected_launch: self.writable_runtime_selection.clone(),
+            command: WorktreeConfinementSnapshot::from_command(&self),
+        });
+        self
+    }
+
+    fn current_grok_writable_contract(&self) -> Result<TypedRuntimeContract> {
+        if self.writable_launch_target != WritableLaunchTarget::ManagedChildWorktree {
+            bail!(
+                "writable_grok_managed_worktree_required: writable Grok is restricted to a managed child worktree"
+            );
+        }
+        if self.model.as_deref() != Some(TypedRuntime::Grok46Xhigh.model()) {
+            bail!(
+                "{WRITABLE_GROK_EXACT_MODEL_REQUIRED}: writable Grok requires exact model '{}'",
+                TypedRuntime::Grok46Xhigh.model()
+            );
+        }
+        if self.reasoning_effort.as_deref() != Some(TypedRuntime::Grok46Xhigh.reasoning_effort()) {
+            bail!(
+                "{WRITABLE_GROK_XHIGH_EFFORT_REQUIRED}: writable Grok requires exact reasoning effort '{}'",
+                TypedRuntime::Grok46Xhigh.reasoning_effort()
+            );
+        }
+        let selected = self.writable_runtime_selection.as_ref().with_context(|| {
+            format!(
+                "{WRITABLE_GROK_SELECTION_EVIDENCE_MISSING}: writable Grok has no supervisor-selected launch evidence"
+            )
+        })?;
+        if !selected.matches_command(self, RuntimeId::Grok) {
+            bail!(
+                "{WRITABLE_GROK_SELECTION_EVIDENCE_STALE}: writable Grok launch no longer matches its supervisor-selected evidence"
+            );
+        }
+        let config = self.runtime_adapter.as_ref().with_context(|| {
+            format!(
+                "{WRITABLE_GROK_ADAPTER_CONFIGURATION_UNVERIFIED}: writable Grok has no adapter configuration"
+            )
+        })?;
+        if self.invocation != ExternalAgentInvocation::Grok
+            || config.binary_path() != self.program.as_path()
+        {
+            bail!(
+                "{WRITABLE_GROK_ADAPTER_CONFIGURATION_UNVERIFIED}: writable Grok adapter executable is not bound to the selected program"
+            );
+        }
+        config
+            .typed_runtime_contract(
+                AdapterId::Grok,
+                &LaunchContext {
+                    prompt: &self.prompt,
+                    model: self.model.as_deref(),
+                    effort: self.reasoning_effort.as_deref(),
+                    cwd: &self.cwd,
+                    output: &self.output_last_message,
+                },
+            )
+            .with_context(|| {
+                format!(
+                    "{WRITABLE_GROK_ADAPTER_CONFIGURATION_UNVERIFIED}: writable Grok adapter contract is not the immutable bounded 4.6/xhigh contract"
+                )
+            })
+    }
+
+    /// Concrete capabilities used by the supervisor while creating MACO-owned confinement
+    /// evidence. Static capabilities remain authoritative for every non-Grok runtime.
+    pub(crate) fn selected_writable_capabilities(
+        &self,
+        runtime: RuntimeId,
+        expected_assignment_id: Option<&str>,
+    ) -> Result<crate::runtime_adapter::RuntimeCapabilities> {
+        if runtime != RuntimeId::Grok {
+            return Ok(runtime.capabilities());
+        }
+        let contract = self.current_grok_writable_contract()?;
+        if expected_assignment_id.is_some_and(|expected| {
+            self.writable_runtime_selection
+                .as_ref()
+                .is_none_or(|selected| selected.assignment_id != expected)
+        }) {
+            bail!(
+                "{WRITABLE_GROK_SELECTION_EVIDENCE_STALE}: writable Grok selection evidence belongs to a different assignment"
+            );
+        }
+        Ok(contract.capabilities())
+    }
+
+    /// Concrete capabilities used at the external process boundary. Writable Grok must carry the
+    /// exact MACO-owned proof produced after worktree and claim reauthentication.
+    fn verified_writable_capabilities(
+        &self,
+        runtime: RuntimeId,
+    ) -> Result<crate::runtime_adapter::RuntimeCapabilities> {
+        let capabilities = self.selected_writable_capabilities(runtime, None)?;
+        if runtime != RuntimeId::Grok {
+            return Ok(capabilities);
+        }
+        let selected = self.writable_runtime_selection.as_ref().with_context(|| {
+            format!(
+                "{WRITABLE_GROK_SELECTION_EVIDENCE_MISSING}: writable Grok selection evidence disappeared before confinement verification"
+            )
+        })?;
+        let proof = self.worktree_writable_confinement.as_ref().with_context(|| {
+            format!(
+                "{WRITABLE_GROK_CONFINEMENT_PROOF_MISSING}: writable Grok has no MACO-owned managed-worktree confinement proof"
+            )
+        })?;
+        if proof.selected_launch.as_ref() != Some(selected) || !proof.command.matches_command(self)
+        {
+            bail!(
+                "{WRITABLE_GROK_CONFINEMENT_PROOF_STALE}: writable Grok confinement proof does not bind the current selected launch"
+            );
+        }
+        let admission = &proof.admission;
+        if admission.version != WORKTREE_WRITABLE_ADMISSION_SCHEMA_VERSION
+            || admission.assignment_id != selected.assignment_id
+            || admission.target != WritableLaunchTarget::ManagedChildWorktree
+            || admission.worktree.kind != ManagedWorktreeAdmissionKind::ManagedDisposable
+            || admission.worktree.worktree_id != selected.assignment_id
+            || admission.claims.state != HeldPathClaimsAdmissionState::Held
+            || admission.native_sandbox.runtime != RuntimeId::Grok
+            || admission.native_sandbox.workspace_access != WorkspaceAccess::ReadWrite
+            || admission.native_sandbox.side_effect_confinement != SideEffectConfinement::Verified
+            || self.workspace_access != WorkspaceAccess::ReadWrite
+        {
+            bail!(
+                "{WRITABLE_GROK_CONFINEMENT_UNVERIFIED}: writable Grok confinement proof does not authenticate the current bounded managed-worktree launch"
+            );
+        }
+        Ok(capabilities)
     }
 
     pub fn with_model_provider(mut self, model_provider: Option<String>) -> Self {
@@ -1631,7 +1914,31 @@ fn run_external_agent_runtime(
     }
     if spec.workspace_access == WorkspaceAccess::ReadWrite {
         if let Some(adapter) = spec.invocation.adapter_id() {
-            if let Some(capability) = adapter.writable_launch_refusal(spec.writable_launch_target) {
+            let capabilities = if adapter == AdapterId::Grok
+                && spec.writable_launch_target == WritableLaunchTarget::ManagedChildWorktree
+            {
+                match spec.verified_writable_capabilities(RuntimeId::Grok) {
+                    Ok(capabilities) => capabilities,
+                    Err(error) => {
+                        return failed_external_environment_run(
+                            spec,
+                            started,
+                            command_display(&spec.program, &[]),
+                            false,
+                            EnvironmentFailureCategory::SandboxUnavailable,
+                            Some(EnvironmentRequirement::sandbox(
+                                EnvironmentSandboxCapability::VerifiedExternalCodex,
+                            )),
+                            format!("writable grok failed closed before launch: {error:#}"),
+                        );
+                    }
+                }
+            } else {
+                adapter.capabilities()
+            };
+            if let Some(capability) =
+                capabilities.writable_launch_refusal(spec.writable_launch_target)
+            {
                 return failed_external_environment_run(
                     spec,
                     started,

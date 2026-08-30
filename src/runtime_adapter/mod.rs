@@ -560,7 +560,7 @@ impl RuntimeAdapterConfig {
 
     /// Prove a typed runtime from the fully rendered adapter contract.
     ///
-    /// Grok capability elevation requires an absolute cwd, the canonical
+    /// Grok capability elevation requires an absolute cwd, the selected
     /// executable, the exact immutable argv (including strict sandboxing,
     /// streaming JSON, and no subagents), stdout capture for the bounded
     /// parser, and no operator environment or stdin alteration. A model/effort
@@ -582,7 +582,14 @@ impl RuntimeAdapterConfig {
                     return None;
                 }
                 let actual = self.render(context).ok()?;
-                let expected = Self::defaults_for(AdapterId::Grok).render(context).ok()?;
+                // The operator may select an alternate executable pathname, but that is the
+                // only mutable part of the Grok process contract. Compare against a canonical
+                // descriptor carrying that same selected binary so argv, cwd, capture, stdin,
+                // and environment checks remain exact without requiring Grok to be installed at
+                // the default PATH location.
+                let mut expected_config = Self::defaults_for(AdapterId::Grok);
+                expected_config.binary = self.binary.clone();
+                let expected = expected_config.render(context).ok()?;
                 if actual != expected {
                     return None;
                 }

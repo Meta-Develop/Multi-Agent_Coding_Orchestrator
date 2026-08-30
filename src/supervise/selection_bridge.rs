@@ -76,6 +76,17 @@ impl AdvertisedCatalogSet {
             cursor_evidence_gap: None,
         }
     }
+
+    #[cfg(test)]
+    pub(super) fn with_grok(
+        observation: crate::runtime_adapter::grok::GrokAdvertisedCatalogObservation,
+    ) -> Self {
+        Self {
+            cursor: None,
+            grok: Some(observation),
+            cursor_evidence_gap: None,
+        }
+    }
 }
 
 fn bounded_cursor_catalog_gap_detail(detail: &str) -> &str {
@@ -1427,6 +1438,19 @@ fn constructed_selection_catalogs(
         } else {
             runtime_catalog_from_priors(runtime_name(runtime), catalog, task, priors)?
         }
+    } else if runtime == SupervisorRuntime::Grok {
+        if let Some(observation) = &advertised.grok {
+            runtime_catalog_from_advertised_slugs(
+                "grok",
+                observation.catalog().slugs(),
+                format!("grok-advertised-sha256:{}", observation.source_sha256()),
+                observation.observed_at_unix_millis().to_string(),
+                task,
+                priors,
+            )?
+        } else {
+            runtime_catalog_from_priors(runtime_name(runtime), catalog, task, priors)?
+        }
     } else {
         runtime_catalog_from_priors(runtime_name(runtime), catalog, task, priors)?
     };
@@ -1447,15 +1471,17 @@ fn constructed_selection_catalogs(
             ));
         }
     }
-    if let Some(observation) = &advertised.grok {
-        catalogs.push(runtime_catalog_from_advertised_slugs(
-            "grok",
-            observation.catalog().slugs(),
-            format!("grok-advertised-sha256:{}", observation.source_sha256()),
-            observation.observed_at_unix_millis().to_string(),
-            task,
-            priors,
-        )?);
+    if runtime != SupervisorRuntime::Grok {
+        if let Some(observation) = &advertised.grok {
+            catalogs.push(runtime_catalog_from_advertised_slugs(
+                "grok",
+                observation.catalog().slugs(),
+                format!("grok-advertised-sha256:{}", observation.source_sha256()),
+                observation.observed_at_unix_millis().to_string(),
+                task,
+                priors,
+            )?);
+        }
     }
     Ok(catalogs)
 }
@@ -5264,6 +5290,60 @@ mod tests {
             .models
             .iter()
             .any(|model| model.model == "composer-2.5"));
+        Ok(())
+    }
+
+    #[test]
+    fn selected_grok_uses_one_authenticated_advertised_primary_catalog() -> Result<()> {
+        let advertised = advertised_with_grok(discover_grok_observation(CAPTURED_GROK_CATALOG)?);
+        let priors = selector_priors_with_terminal_worker_economics()?;
+        let catalogs = constructed_selection_catalogs(
+            SupervisorRuntime::Grok,
+            &RuntimeModelCatalog::OperatorDeclared,
+            &advertised,
+            &task_profile_for_role(AgentRole::Worker),
+            &priors,
+        )?;
+
+        assert_eq!(catalogs.len(), 1);
+        assert_eq!(catalogs[0].runtime, "grok");
+        assert!(catalogs[0].revision.starts_with("grok-advertised-sha256:"));
+        assert!(catalogs[0]
+            .models
+            .iter()
+            .any(|model| model.model == "grok-4.6"));
+        Ok(())
+    }
+
+    #[test]
+    fn genuinely_duplicated_grok_catalog_input_still_fails_closed() -> Result<()> {
+        let advertised = advertised_with_grok(discover_grok_observation(CAPTURED_GROK_CATALOG)?);
+        let resolved = default_resolved_profile();
+        let mut input = selection_input_for_role(SelectionInputForRoleArgs {
+            role: AgentRole::Worker,
+            runtime: SupervisorRuntime::Grok,
+            catalog: &RuntimeModelCatalog::OperatorDeclared,
+            advertised: &advertised,
+            admission: &test_admission(),
+            resolved_objective_profile: &resolved,
+            quota_context: None,
+            quota_ledger: None,
+            signals: DynamicSignals {
+                retry_count: 0,
+                budget_signal: BudgetSignal::Continue,
+                previous_choice: None,
+                previous_catalog_digest: None,
+                environment_rejections: Vec::new(),
+            },
+            debug_override: None,
+        })?;
+        input.catalogs.push(input.catalogs[0].clone());
+
+        let error = selection::select(&input).expect_err("duplicate runtime must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "invalid selection input: runtime catalogs contain a duplicate runtime"
+        );
         Ok(())
     }
 

@@ -202,6 +202,74 @@ pub(super) fn write_worker_report(
     })
 }
 
+pub(super) fn finalized_direct_worker_report(
+    assignment: &OrchestratorAssignment,
+    envelope: &OrchestratorReviewReport,
+    report_path: &Path,
+) -> WorkerReport {
+    let matching_worker = match envelope.worker_reports.as_slice() {
+        [worker] if worker.id == assignment.id => Some(worker.clone()),
+        _ => None,
+    };
+    let matched = matching_worker.is_some();
+    let mut report = matching_worker.unwrap_or_else(|| WorkerReport {
+        id: assignment.id.clone(),
+        role: AgentRole::Worker,
+        assignment_kind: AssignmentKind::Ordinary,
+        target_path: None,
+        assigned_paths: assignment.assigned_paths.clone(),
+        semantic_symbols: assignment.semantic_symbols.clone(),
+        semantic_modules: assignment.semantic_modules.clone(),
+        claim_token: envelope.claim_token,
+        semantic_intent_token: envelope.semantic_intent_token,
+        commands_run: envelope.commands_run.clone(),
+        environment_failures: envelope.environment_failures.clone(),
+        files_changed: envelope.files_changed.clone(),
+        validation_results: envelope.validation_results.clone(),
+        findings: vec![Finding {
+            severity: FindingSeverity::Error,
+            message: format!(
+                "direct worker finalization envelope contained {} WorkerReport entries instead of exactly one report bound to assignment '{}'",
+                envelope.worker_reports.len(),
+                assignment.id
+            ),
+            paths: vec![report_path.to_path_buf()],
+        }],
+        field_guide_entries: Vec::new(),
+        bloated_file_flags: Vec::new(),
+        decomposition_completion: None,
+        no_further_delegation: None,
+        accepted: false,
+        rejected: true,
+        status: if envelope.status == ReviewStatus::Succeeded {
+            ReviewStatus::Failed
+        } else {
+            envelope.status
+        },
+        remaining_risk: envelope.remaining_risk.clone(),
+        next_safe_action: envelope.next_safe_action.clone(),
+    });
+    for finding in &envelope.findings {
+        if !report.findings.contains(finding) {
+            report.findings.push(finding.clone());
+        }
+    }
+    if matched {
+        report.accepted = envelope.accepted;
+        report.rejected = envelope.rejected;
+        report.status = envelope.status;
+    }
+    report
+        .environment_failures
+        .clone_from(&envelope.environment_failures);
+    report.remaining_risk.clone_from(&envelope.remaining_risk);
+    report
+        .next_safe_action
+        .clone_from(&envelope.next_safe_action);
+    enforce_worker_environment_failure_outcome(&mut report);
+    report
+}
+
 pub(super) fn read_auditor_report(
     contents: Option<&[u8]>,
     display_path: &Path,

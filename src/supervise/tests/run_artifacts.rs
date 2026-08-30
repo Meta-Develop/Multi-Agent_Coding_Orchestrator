@@ -134,6 +134,84 @@ fn worker_codex_schema_artifact_is_authenticated_across_resume_and_refuses_mutat
 }
 
 #[test]
+fn multiple_assignments_share_one_authenticated_grok_runtime_snapshot() {
+    let (_temp, repo_path) = injected_repository();
+    let mut first = injected_named_assignment("grok-first", "README.md");
+    first.role = AgentRole::Worker;
+    let mut second = injected_named_assignment("grok-second", "SECOND.md");
+    second.role = AgentRole::Worker;
+    let mut plan = injected_multi_plan(vec![first, second], 0);
+    let catalog = injected_codex_runtime_catalog(&["gpt-5.6-sol"]);
+    let grok_source = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/runtime_adapter/grok/captured-minimal-20260821.txt"
+    ));
+    let grok_catalog = crate::runtime_adapter::grok::parse_grok_model_catalog(grok_source)
+        .expect("parse hermetic Grok catalog");
+    let grok_observation = crate::runtime_adapter::grok::inject_grok_advertised_catalog(
+        grok_catalog,
+        Some(1_787_240_463_000),
+        grok_source,
+    )
+    .expect("authenticate hermetic Grok catalog");
+    let advertised = AdvertisedCatalogSet::with_grok(grok_observation);
+    let admission = SupervisorAdmissionPolicyInput::resolve(
+        &repo_path,
+        2,
+        SupervisorAdmissionConfig::default(),
+        SupervisorAdmissionConfig::default(),
+    )
+    .expect("resolve selector admission fixture");
+    let resolved_objective_profile = ResolvedObjectiveProfile {
+        profile: crate::objective_profile::default_objective_profile()
+            .binding()
+            .expect("default objective binding"),
+        source: crate::objective_profile::ObjectiveProfileSource::BuiltIn,
+    };
+
+    let resolution = initialize_supervisor_selection(
+        &mut plan,
+        SupervisorRuntime::Codex,
+        &catalog,
+        &admission,
+        &advertised,
+        Some(&resolved_objective_profile),
+    )
+    .expect("select roles for repeated Grok assignments");
+    bind_selected_assignment_runtimes(&mut plan, &resolution.decisions)
+        .expect("bind repeated selected runtime");
+
+    assert!(plan
+        .assignments
+        .iter()
+        .all(|assignment| assignment.runtime == Some(SupervisorRuntime::Grok)));
+    let ledger =
+        build_assignment_selection_ledger(&plan, &resolution.decisions, SupervisorRuntime::Codex);
+    let grok_entries = ledger
+        .iter()
+        .filter(|entry| entry.role == AgentRole::Worker)
+        .collect::<Vec<_>>();
+    assert_eq!(grok_entries.len(), 2);
+    assert_eq!(
+        grok_entries[0].catalog_snapshot_digest,
+        grok_entries[1].catalog_snapshot_digest
+    );
+    assert!(grok_entries.iter().all(|entry| {
+        entry.selected_runtime.as_deref() == Some("grok")
+            && entry
+                .catalog_revisions
+                .iter()
+                .filter(|revision| revision.runtime == "grok")
+                .count()
+                == 1
+            && entry.catalog_revisions.iter().any(|revision| {
+                revision.runtime == "grok"
+                    && revision.revision.starts_with("grok-advertised-sha256:")
+            })
+    }));
+}
+
+#[test]
 fn finalized_artifacts_round_trip_typed_context_switch_selection_evidence() {
     let (_temp, repo_path) = injected_repository();
     let run_id = RunId::new("artifact-context-switch-evidence").expect("valid run id");
@@ -681,6 +759,48 @@ fn prepare_worker_journal_binding_uses_authenticated_subjects_and_exact_paths() 
         .expect("discard child invocation scratches");
 }
 
+fn direct_worker_artifact_assignment() -> OrchestratorAssignment {
+    let mut assignment = injected_assignment(false);
+    assignment.id = "direct-worker".to_string();
+    assignment.role = AgentRole::Worker;
+    assignment.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+    assignment.selection_source = Some(AssignmentSelectionSource::Automatic);
+    assignment
+}
+
+fn direct_worker_artifact_report(assignment: &OrchestratorAssignment) -> WorkerReport {
+    WorkerReport {
+        id: assignment.id.clone(),
+        role: AgentRole::Worker,
+        assignment_kind: AssignmentKind::Ordinary,
+        target_path: None,
+        assigned_paths: assignment.assigned_paths.clone(),
+        semantic_symbols: assignment.semantic_symbols.clone(),
+        semantic_modules: assignment.semantic_modules.clone(),
+        claim_token: Some(41),
+        semantic_intent_token: Some(73),
+        commands_run: Vec::new(),
+        environment_failures: Vec::new(),
+        files_changed: Vec::new(),
+        validation_results: vec![ValidationResult {
+            name: "direct worker artifact validation".to_string(),
+            status: ReviewStatus::Succeeded,
+            command: Vec::new(),
+            message: None,
+        }],
+        findings: Vec::new(),
+        field_guide_entries: Vec::new(),
+        bloated_file_flags: Vec::new(),
+        decomposition_completion: None,
+        no_further_delegation: Some(true),
+        accepted: true,
+        rejected: false,
+        status: ReviewStatus::Succeeded,
+        remaining_risk: "none".to_string(),
+        next_safe_action: "review the bounded direct-worker result".to_string(),
+    }
+}
+
 #[test]
 #[cfg(unix)]
 fn direct_worker_fake_output_and_journal_are_first_class_and_non_delegating() {
@@ -696,11 +816,7 @@ fn direct_worker_fake_output_and_journal_are_first_class_and_non_delegating() {
     let dirs = RunDirs::for_writer(&writer);
     let (incoming, capture) =
         create_invocation_scratches(&mut writer).expect("reserve invocation scratches");
-    let mut assignment = injected_assignment(false);
-    assignment.id = "direct-worker".to_string();
-    assignment.role = AgentRole::Worker;
-    assignment.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
-    assignment.selection_source = Some(AssignmentSelectionSource::Automatic);
+    let assignment = direct_worker_artifact_assignment();
 
     assert_eq!(
         assignment_worker_journal_subject_ids(&assignment)
@@ -917,7 +1033,7 @@ fn scheduler_materializes_and_binds_worker_codex_schema_for_direct_worker() {
 }
 
 #[test]
-fn direct_worker_decision_preserves_authenticated_artifact_order_and_replay_parentage() {
+fn direct_worker_finalization_persists_one_report_before_acceptance_and_replays() {
     let (_temp, repo_path) = injected_repository();
     let run_id = RunId::new("artifact-direct-worker-decision").expect("valid run id");
     let mut writer = ArtifactRunWriter::reserve(
@@ -931,14 +1047,15 @@ fn direct_worker_decision_preserves_authenticated_artifact_order_and_replay_pare
         initialize_orchestration_event_journal(&repo_path, &run_id, None)
             .expect("initialize authenticated orchestration journal"),
     );
-    let worker_id = "direct-worker";
+    let assignment = direct_worker_artifact_assignment();
+    let worker_id = assignment.id.as_str();
     let spawn = record_supervision_spawn_payload_with_category(
         worker_id,
         run_id.as_str(),
         OrchestrationRole::Worker,
         AgentRole::Worker,
-        None,
-        vec!["README.md".to_string()],
+        assignment.category_override(),
+        write_boundary_refs(&assignment.assigned_paths),
         &assignment_scope_ref(worker_id),
         json!({"attempt": 1}),
     )
@@ -953,11 +1070,20 @@ fn direct_worker_decision_preserves_authenticated_artifact_order_and_replay_pare
         spawn,
     );
 
-    let mut worker = injected_child_report(&injected_assignment(true))
-        .worker_reports
-        .remove(0);
-    worker.id = worker_id.to_string();
-    record_final_worker_report_decision(&mut journal, &mut writer, run_id.as_str(), &worker);
+    let worker = direct_worker_artifact_report(&assignment);
+    let envelope = direct_worker_report_envelope(worker.clone());
+    let report_relative = Path::new("reports/direct-worker.json");
+    let report_path = writer.run_dir().join(report_relative);
+    persist_final_assignment_report(
+        &mut writer,
+        &mut journal,
+        &assignment,
+        run_id.as_str(),
+        report_relative,
+        &report_path,
+        &envelope,
+    )
+    .expect("persist canonical direct worker finalization");
     let final_report = artifact_test_final_report(&run_id);
     write_final_report(&mut writer, &final_report).expect("write final report");
     writer
@@ -969,6 +1095,13 @@ fn direct_worker_decision_preserves_authenticated_artifact_order_and_replay_pare
 
     let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
         .expect("authenticate finalized direct worker artifact run");
+    let persisted: WorkerReport = serde_json::from_slice(
+        &reader
+            .read(report_relative)
+            .expect("read authenticated direct worker report"),
+    )
+    .expect("decode authenticated direct worker report");
+    assert_eq!(persisted, worker);
     let events = read_finalized_orchestration_events(&reader);
     let direct_events = events
         .iter()
@@ -988,6 +1121,131 @@ fn direct_worker_decision_preserves_authenticated_artifact_order_and_replay_pare
             .map(|edge| edge.parent_agent_id.as_str()),
         Some(run_id.as_str())
     );
+}
+
+#[test]
+fn invalid_direct_worker_finalization_persists_one_rejection_report_and_decision() {
+    let (temp, repo_path) = injected_repository();
+    let run_id = RunId::new("artifact-invalid-direct-worker").expect("valid run id");
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        run_id.clone(),
+        "supervise-test",
+    )
+    .expect("reserve supervise artifact run");
+    let mut journal = Some(
+        initialize_orchestration_event_journal(&repo_path, &run_id, None)
+            .expect("initialize authenticated orchestration journal"),
+    );
+    let assignment = direct_worker_artifact_assignment();
+    let spawn = record_supervision_spawn_payload_with_category(
+        &assignment.id,
+        run_id.as_str(),
+        OrchestrationRole::Worker,
+        AgentRole::Worker,
+        assignment.category_override(),
+        write_boundary_refs(&assignment.assigned_paths),
+        &assignment_scope_ref(&assignment.id),
+        json!({"attempt": 1}),
+    )
+    .expect("bind invalid direct worker spawn payload");
+    record_orchestration_event(
+        &mut journal,
+        &mut writer,
+        &assignment.id,
+        Some(run_id.as_str()),
+        OrchestrationRole::Worker,
+        OrchestrationEventKind::Spawn,
+        spawn,
+    );
+    let invalid_output = temp.path().join("invalid-direct-worker.json");
+    fs::write(&invalid_output, b"{not a WorkerReport\n")
+        .expect("write invalid descriptor-held direct worker output");
+    let command = ExternalAgentCommand::codex(
+        "injected-codex",
+        &repo_path,
+        temp.path().join("invalid-direct-worker.prompt.md"),
+        temp.path().join("invalid-direct-worker.jsonl"),
+        &invalid_output,
+        Duration::from_secs(1),
+    );
+    let external_run = injected_verified_run_without_journals(&command);
+    let child_base_head = current_head_oid(&repo_path).expect("read invalid fixture base");
+    let worker_journals = WorkerExecutionJournalEvidenceSet::new();
+    let observed_changed_paths = Vec::new();
+    let raw_report_relative = Path::new("evidence/incoming/direct-worker.json");
+    let (invalid, shape_problems) = collect_child_report(ChildReportCollectionContext {
+        assignment: &assignment,
+        assignment_metadata: &AssignmentMetadata::new(),
+        report_path: raw_report_relative,
+        external_run: &external_run,
+        external_command: &command,
+        worktree_path: &repo_path,
+        child_base_head: &child_base_head,
+        worker_journals: &worker_journals,
+        evidence_only_source: None,
+        observed_changed_paths: Some(&observed_changed_paths),
+    });
+    assert!(!shape_problems.is_empty());
+    assert_eq!(invalid.role, AgentRole::Worker);
+    assert!(invalid.worker_reports.is_empty());
+    assert_eq!(invalid.status, ReviewStatus::Missing);
+    assert!(invalid.rejected);
+    let report_relative = Path::new("reports/direct-worker.json");
+    let report_path = writer.run_dir().join(report_relative);
+    persist_final_assignment_report(
+        &mut writer,
+        &mut journal,
+        &assignment,
+        run_id.as_str(),
+        report_relative,
+        &report_path,
+        &invalid,
+    )
+    .expect("persist invalid direct worker finalization");
+    write_final_report(&mut writer, &artifact_test_final_report(&run_id))
+        .expect("write final report");
+    writer
+        .finalize(
+            RunArtifactFamily::Supervise.final_report_relative_path(),
+            false,
+        )
+        .expect("finalize invalid direct worker artifact run");
+
+    let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+        .expect("authenticate invalid direct worker artifact run");
+    let persisted: WorkerReport = serde_json::from_slice(
+        &reader
+            .read(report_relative)
+            .expect("read invalid direct worker report"),
+    )
+    .expect("decode invalid direct worker report");
+    assert_eq!(persisted.id, assignment.id);
+    assert!(!persisted.accepted);
+    assert!(persisted.rejected);
+    assert_eq!(persisted.status, ReviewStatus::Missing);
+    assert_eq!(persisted.no_further_delegation, None);
+    assert!(persisted.findings.iter().any(|finding| finding
+        .message
+        .contains("instead of exactly one report bound to assignment")));
+    assert!(persisted.findings.iter().any(|finding| finding
+        .message
+        .contains("required child report is missing or invalid")));
+    let decisions = read_finalized_orchestration_events(&reader)
+        .into_iter()
+        .filter(|event| {
+            event.node == assignment.id
+                && matches!(
+                    event.kind,
+                    OrchestrationEventKind::Accept | OrchestrationEventKind::Reject
+                )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].kind, OrchestrationEventKind::Reject);
+    assert_eq!(decisions[0].role, OrchestrationRole::Worker);
+    assert_eq!(decisions[0].parent.as_deref(), Some(run_id.as_str()));
 }
 
 #[test]
@@ -1669,6 +1927,78 @@ fn scheduler_crash_after_authenticated_report_plan_resumes_without_redispatch() 
         .is_empty());
     ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)
         .expect("scheduler resume finalizes the exact planned report");
+}
+
+#[test]
+fn direct_worker_report_and_decision_survive_resume_without_republication() {
+    skip_without_containment!();
+    let (temp, repo) = injected_repository();
+    let assignment = direct_worker_artifact_assignment();
+    let plan = injected_plan(assignment.clone(), 0);
+    let run_id = RunId::new("direct-worker-final-report-resume").expect("valid resume run id");
+    let mut options = injected_options(&repo, temp.path(), run_id.as_str());
+    options.runtime = SupervisorRuntime::Fake;
+    let mut runner = |_command: &ExternalAgentCommand| -> ExternalAgentRun {
+        panic!("fake direct worker resume fixture must not invoke the external runner")
+    };
+    install_checkpoint_failure(run_id.as_str(), "after:final_report_planned");
+
+    let error = run_supervisor_plan_with_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        &mut runner,
+    )
+    .expect_err("authenticated report-plan interruption must stop finalization");
+    assert!(format!("{error:#}").contains("after phase 'final_report_planned'"));
+
+    let run_root = repo
+        .join(RunArtifactFamily::Supervise.run_root())
+        .join(run_id.as_str());
+    let worker_report_path = run_root.join("reports/direct-worker.json");
+    let journal_path = run_root.join(ORCHESTRATION_EVENT_PATH);
+    let worker_report_before =
+        fs::read(&worker_report_path).expect("read direct worker report before resume");
+    assert!(journal_path.is_file());
+    let staged: WorkerReport =
+        serde_json::from_slice(&worker_report_before).expect("decode staged direct worker report");
+    assert_eq!(staged.id, assignment.id);
+    assert!(staged.accepted);
+
+    let resumed = resume_supervisor_run(&repo, run_id.clone()).expect("resume finalization");
+    assert!(resumed.success);
+    assert!(resumed.resumed);
+    assert_eq!(resumed.completed_assignments, vec![assignment.id.clone()]);
+    assert_eq!(
+        fs::read(&worker_report_path).expect("read direct worker report after resume"),
+        worker_report_before,
+        "resume must not rewrite the already persisted direct WorkerReport"
+    );
+    let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)
+        .expect("authenticate resumed direct worker artifact run");
+    let events = read_finalized_orchestration_events(&reader);
+    let decisions = events
+        .iter()
+        .filter(|event| {
+            event.node == assignment.id
+                && matches!(
+                    event.kind,
+                    OrchestrationEventKind::Accept | OrchestrationEventKind::Reject
+                )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].kind, OrchestrationEventKind::Accept);
+    assert_eq!(decisions[0].role, OrchestrationRole::Worker);
+    let replay = reconstruct_hierarchy_ledger(&events).expect("replay resumed direct worker run");
+    assert_eq!(
+        replay
+            .edges
+            .get(&assignment.id)
+            .map(|edge| edge.role_category),
+        Some(crate::hierarchy_ledger::RoleCategory::NonDelegatingTerminalWorker)
+    );
 }
 
 #[test]
@@ -3805,4 +4135,236 @@ fn is_named_writable_capability_refusal(message: &str) -> bool {
     message.contains("failed closed before launch")
         && (message.contains("blocking_pre_action_callback != All")
             || message.contains("writable_workspace != supported"))
+}
+
+fn bounded_transcript_review_lens() -> ReviewLensConfig {
+    ReviewLensConfig {
+        id: "bounded-transcript-review".to_string(),
+        backend: ReviewLensBackendConfig::Model {
+            backend_id: "bounded-transcript-backend".to_string(),
+            model: "bounded-transcript-model".to_string(),
+            reasoning_effort: None,
+        },
+        information_scope: ReviewInformationScope::FullChildTranscript,
+    }
+}
+
+fn bounded_transcript_binding_fixture() -> crate::review::ReviewLensBindingMaterial {
+    crate::review::ReviewLensBindingMaterial {
+        candidate_binding: json!({
+            "version": 1,
+            "agent_id": "child-a",
+            "diff_oid": "0123456789abcdef0123456789abcdef01234567",
+        }),
+        path_bindings: json!({
+            "assigned_paths": ["src/review.rs"],
+            "child_reported_paths": ["src/review.rs"],
+            "supervisor_observed_paths": ["src/review.rs"],
+        }),
+        validation_bindings: json!({
+            "orchestrator_validation_results": [{
+                "name": "focused",
+                "status": "succeeded",
+                "command": ["cargo", "test"],
+            }],
+            "worker_validation_results": [],
+            "child_auditor_validation_results": [],
+        }),
+    }
+}
+
+fn bounded_transcript_request(
+    transcript: &str,
+    output_report: &str,
+) -> crate::review::ReviewLensRequest {
+    let lens = bounded_transcript_review_lens();
+    let bindings = bounded_transcript_binding_fixture();
+    crate::review::build_bounded_review_lens_request(
+        &lens,
+        crate::review::BoundedReviewLensRequestSources {
+            child_transcript: transcript,
+            authoritative_transcript_path: Path::new("logs/child-a.jsonl"),
+            diff: "diff --git a/src/review.rs b/src/review.rs\n",
+            output_report,
+            bindings: &bindings,
+        },
+    )
+    .expect("build bounded transcript review request")
+}
+
+#[test]
+fn bounded_review_transcript_preserves_complete_small_input_and_required_bindings() {
+    let report =
+        r#"{"id":"child-a","validation_results":[{"name":"focused","status":"succeeded"}]}"#;
+    let request = bounded_transcript_request("abc", report);
+    let crate::review::ReviewLensScopedInformation::BoundedFullChildTranscript {
+        child_transcript,
+        bindings,
+        diff,
+        output_report,
+    } = &request.information
+    else {
+        panic!("full review lens did not receive bounded transcript information");
+    };
+    assert_eq!(
+        child_transcript.authoritative_artifact,
+        Path::new("logs/child-a.jsonl")
+    );
+    assert_eq!(child_transcript.original_bytes, 3);
+    assert_eq!(
+        child_transcript.sha256,
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert!(!child_transcript.truncated);
+    assert_eq!(child_transcript.omitted_bytes, 0);
+    assert!(child_transcript.truncation_marker.contains("complete"));
+    assert_eq!(child_transcript.head_excerpt, "abc");
+    assert!(child_transcript.tail_excerpt.is_empty());
+    assert_eq!(bindings, &bounded_transcript_binding_fixture());
+    assert_eq!(
+        diff.as_str(),
+        "diff --git a/src/review.rs b/src/review.rs\n"
+    );
+    assert_eq!(output_report.as_str(), report);
+    assert!(
+        serde_json::to_vec(&request)
+            .expect("serialize bounded request")
+            .len()
+            <= REVIEW_LENS_REQUEST_LIMIT_BYTES
+    );
+}
+
+#[test]
+fn bounded_review_transcript_handles_both_sides_of_original_threshold_deterministically() {
+    for original_bytes in [
+        REVIEW_LENS_REQUEST_LIMIT_BYTES - 1,
+        REVIEW_LENS_REQUEST_LIMIT_BYTES,
+        REVIEW_LENS_REQUEST_LIMIT_BYTES + 1,
+    ] {
+        let mut transcript = "HEAD".to_string();
+        transcript.push_str(&"x".repeat(original_bytes - 8));
+        transcript.push_str("TAIL");
+        let first = bounded_transcript_request(&transcript, "{\"accepted\":true}");
+        let second = bounded_transcript_request(&transcript, "{\"accepted\":true}");
+        assert_eq!(
+            first, second,
+            "bounded representation must be deterministic"
+        );
+        assert!(
+            serde_json::to_vec(&first)
+                .expect("serialize bounded request")
+                .len()
+                <= REVIEW_LENS_REQUEST_LIMIT_BYTES
+        );
+        assert!(
+            crate::review::review_lens_request_binding_payload_len_for_test(
+                &bounded_transcript_review_lens(),
+                &first.information,
+            )
+            .expect("measure bounded request binding payload")
+                <= REVIEW_LENS_REQUEST_LIMIT_BYTES
+        );
+        let mut one_more_excerpt_byte = first.clone();
+        let crate::review::ReviewLensScopedInformation::BoundedFullChildTranscript {
+            child_transcript: expanded_transcript,
+            ..
+        } = &mut one_more_excerpt_byte.information
+        else {
+            panic!("full review lens did not receive bounded transcript information");
+        };
+        expanded_transcript.head_excerpt.push('x');
+        let expanded_payload = crate::review::review_lens_request_binding_payload_len_for_test(
+            &bounded_transcript_review_lens(),
+            &one_more_excerpt_byte.information,
+        )
+        .expect("measure expanded request binding payload");
+        let expanded_request = serde_json::to_vec(&one_more_excerpt_byte)
+            .expect("serialize expanded bounded request")
+            .len();
+        assert!(
+            expanded_payload > REVIEW_LENS_REQUEST_LIMIT_BYTES
+                || expanded_request > REVIEW_LENS_REQUEST_LIMIT_BYTES,
+            "one additional ASCII excerpt byte must cross an exact request boundary"
+        );
+        let crate::review::ReviewLensScopedInformation::BoundedFullChildTranscript {
+            child_transcript,
+            ..
+        } = first.information
+        else {
+            panic!("full review lens did not receive bounded transcript information");
+        };
+        assert_eq!(child_transcript.original_bytes, original_bytes as u64);
+        assert!(child_transcript.truncated);
+        assert!(child_transcript.omitted_bytes > 0);
+        assert!(child_transcript
+            .truncation_marker
+            .contains("middle omitted"));
+        assert!(child_transcript.head_excerpt.starts_with("HEAD"));
+        assert!(child_transcript.tail_excerpt.ends_with("TAIL"));
+        assert_eq!(
+            child_transcript.head_excerpt.len()
+                + child_transcript.tail_excerpt.len()
+                + usize::try_from(child_transcript.omitted_bytes).expect("omitted bytes fit usize"),
+            original_bytes
+        );
+    }
+}
+
+#[test]
+fn bounded_review_transcript_fails_closed_when_required_material_cannot_fit() {
+    let lens = bounded_transcript_review_lens();
+    let bindings = bounded_transcript_binding_fixture();
+    let oversized_report = "r".repeat(REVIEW_LENS_REQUEST_LIMIT_BYTES);
+    let error = crate::review::build_bounded_review_lens_request(
+        &lens,
+        crate::review::BoundedReviewLensRequestSources {
+            child_transcript: "transcript",
+            authoritative_transcript_path: Path::new("logs/child-a.jsonl"),
+            diff: "diff",
+            output_report: &oversized_report,
+            bindings: &bindings,
+        },
+    )
+    .expect_err("required oversized report must fail closed");
+    assert!(error
+        .to_string()
+        .contains("required review report and candidate/path/validation bindings cannot fit"));
+}
+
+#[test]
+fn retained_review_transcript_manifest_authentication_refuses_tampering() {
+    let (_temp, repo_path) = injected_repository();
+    let run_id = RunId::new("review-transcript-tamper").expect("valid run id");
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        run_id,
+        "supervise-test",
+    )
+    .expect("reserve transcript artifact run");
+    let transcript_relative = Path::new("logs/child-a.jsonl");
+    let transcript = "t".repeat(REVIEW_LENS_REQUEST_LIMIT_BYTES + 1);
+    writer
+        .write_bytes(
+            transcript_relative,
+            transcript.as_bytes(),
+            ArtifactFileDisposition::PrivateEvidence,
+        )
+        .expect("write manifested transcript");
+    assert_eq!(
+        read_authenticated_review_transcript(&mut writer, transcript_relative)
+            .expect("read authenticated transcript"),
+        transcript
+    );
+
+    fs::write(
+        writer.run_dir().join(transcript_relative),
+        b"tampered transcript",
+    )
+    .expect("tamper transcript fixture");
+    let error = read_authenticated_review_transcript(&mut writer, transcript_relative)
+        .expect_err("tampered transcript must be refused");
+    assert!(error
+        .to_string()
+        .contains("failed to authenticate retained transcript artifact manifest before read"));
 }

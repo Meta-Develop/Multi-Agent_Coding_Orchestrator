@@ -2582,6 +2582,109 @@
 
     #[cfg(unix)]
     #[test]
+    fn concurrent_managed_worktree_creations_wait_for_registry_and_serialize() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
+        let blocker = store.lock().expect("initial registry lock");
+
+        assert!(MANAGED_WORKTREE_REGISTRY_LOCK_TIMEOUT > Duration::from_secs(5));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let records = std::thread::scope(|scope| {
+            let handles = ["concurrent-a", "concurrent-b"].map(|agent_id| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                let repo_path = repo_path.clone();
+                let worktree_root = worktree_root.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    WorktreeManager::new(repo_path).create_for_test(WorktreeCreateOptions {
+                        agent_id: agent_id.to_string(),
+                        branch: None,
+                        base: None,
+                        worktree_root: Some(worktree_root),
+                    })
+                })
+            });
+
+            barrier.wait();
+            // Keep both creators queued beyond the generic five-second state
+            // lock budget that caused the NTFS parallel-launch regression.
+            std::thread::sleep(Duration::from_millis(5_250));
+            drop(blocker);
+            handles.map(|handle| {
+                handle
+                    .join()
+                    .expect("managed creation thread panicked")
+                    .expect("contending managed creation")
+            })
+        });
+
+        let mut names = records.map(|record| record.name);
+        names.sort();
+        assert_eq!(names, ["concurrent-a", "concurrent-b"]);
+        let listed = WorktreeManager::new(&repo_path)
+            .list()
+            .expect("serialized registry remains readable");
+        assert_eq!(listed.len(), 2);
+        let lock = store.lock().expect("registry lock after serialized creates");
+        let registry = store.load(&lock).expect("authenticated registry");
+        assert!(registry.operations.is_empty());
+        assert_eq!(
+            registry.records.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["concurrent-a", "concurrent-b"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_lock_contention_and_corruption_fail_closed_within_bounds() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
+        let active = store.lock().expect("active registry lock");
+
+        let active_started = Instant::now();
+        let active_error = store
+            .lock_with_timeout(Duration::from_millis(100))
+            .expect_err("active registry lock must time out");
+        assert!(
+            active_started.elapsed() < Duration::from_secs(2),
+            "active registry lock exceeded its bounded test wait"
+        );
+        assert!(
+            active_error.to_string().contains("timed out"),
+            "unexpected active-lock error: {active_error:#}"
+        );
+
+        let lock_path = active.lock.path().to_path_buf();
+        drop(active);
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o640))
+            .expect("corrupt stable lock mode");
+        let corrupt_started = Instant::now();
+        let corrupt_error = store
+            .lock_with_timeout(Duration::from_millis(100))
+            .expect_err("corrupt registry lock must fail closed");
+        assert!(
+            corrupt_started.elapsed() < Duration::from_secs(2),
+            "corrupt registry lock exceeded its bounded test wait"
+        );
+        assert!(
+            corrupt_error.to_string().contains("unsafe mode")
+                || corrupt_error.to_string().contains("owner-private"),
+            "unexpected corrupt-lock error: {corrupt_error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn registry_lock_rebind_after_precheck_preserves_newer_record_and_live_temp() {
         use std::os::unix::fs::PermissionsExt;
 

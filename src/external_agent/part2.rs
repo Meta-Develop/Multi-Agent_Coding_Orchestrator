@@ -3860,8 +3860,8 @@ fn external_side_effect_profile(
         .parent()
         .with_context(|| format!("executable has no parent: {}", program.display()))?;
     // The parent tee owns and holds `json_log`; the child never needs that directory writable.
-    // Only the validated, disjoint incoming final-message directory is exposed as a child
-    // artifact root.
+    // Only the validated, disjoint incoming final-message directory can become a child artifact
+    // root. Grok is excluded below because MACO captures its stdout and owns publication.
     let artifact_root = protected_controls
         .writable_artifact_root
         .as_ref()
@@ -3972,7 +3972,12 @@ fn external_side_effect_profile(
                     profile = profile.with_visible_read_write_file(&artifact.path);
                 }
             }
-            profile = profile.with_writable_artifact_root(artifact_root);
+            // Grok's bounded streaming-json response is captured and published by the MACO
+            // parent. The child needs only its exact precreated journal file capabilities; it
+            // must never receive the incoming publication directory as a writable root.
+            if spec.invocation != ExternalAgentInvocation::Grok {
+                profile = profile.with_writable_artifact_root(artifact_root);
+            }
             for root in &spec.hidden_roots {
                 profile = profile.with_hidden_root(root);
             }

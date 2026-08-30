@@ -127,6 +127,17 @@ fn direct_assignment_report_is_valid(
     }
 }
 
+fn direct_assignment_orchestration_role(role: AgentRole) -> Result<OrchestrationRole> {
+    match role {
+        AgentRole::ChildOrchestrator => Ok(OrchestrationRole::Orchestrator),
+        AgentRole::Worker => Ok(OrchestrationRole::Worker),
+        unsupported => bail!(
+            "assignment role '{}' has no direct orchestration role contract",
+            unsupported.as_str()
+        ),
+    }
+}
+
 fn codex_output_schema_path(authoritative: &Path) -> Result<PathBuf> {
     let parent = authoritative
         .parent()
@@ -152,6 +163,83 @@ fn bind_runtime_read_only_schema_files(
         }
     }
     command
+}
+
+pub(super) fn read_authenticated_review_transcript(
+    writer: &mut ArtifactRunWriter,
+    transcript_relative: &Path,
+) -> Result<String> {
+    if transcript_relative.is_absolute()
+        || transcript_relative.as_os_str().is_empty()
+        || transcript_relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("review transcript artifact path is not canonical relative form");
+    }
+    let before = writer
+        .resume_binding()
+        .context("failed to authenticate retained transcript artifact manifest before read")?;
+    let transcript_path = writer.run_dir().join(transcript_relative);
+    let bytes = read_bounded_regular_file_nofollow(&transcript_path, MAX_SUPERVISOR_REPORT_BYTES)
+        .with_context(|| {
+        format!(
+            "failed to read retained child transcript {}",
+            transcript_path.display()
+        )
+    })?;
+    let after = writer
+        .resume_binding()
+        .context("failed to authenticate retained transcript artifact manifest after read")?;
+    if before != after {
+        bail!("retained transcript artifact manifest changed while it was read");
+    }
+    String::from_utf8(bytes).context("child transcript evidence is not valid UTF-8")
+}
+
+fn supervisor_review_lens_binding_material(
+    assignment: &OrchestratorAssignment,
+    child_report: &OrchestratorReviewReport,
+    candidate: Option<&SupervisorCandidateInspection>,
+) -> Result<crate::review::ReviewLensBindingMaterial> {
+    if !report_failed(child_report) && candidate.is_none() {
+        bail!("accepted child report has no authenticated supervisor candidate binding");
+    }
+    let worker_validations = child_report
+        .worker_reports
+        .iter()
+        .map(|worker| {
+            json!({
+                "worker_id": worker.id,
+                "validation_results": worker.validation_results,
+            })
+        })
+        .collect::<Vec<_>>();
+    let auditor_validations = child_report
+        .audit_reports
+        .iter()
+        .map(|auditor| {
+            json!({
+                "auditor_id": auditor.id,
+                "validation_results": auditor.validation_results,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(crate::review::ReviewLensBindingMaterial {
+        candidate_binding: json!({
+            "supervisor_inspected": candidate.map(|inspection| &inspection.binding),
+        }),
+        path_bindings: json!({
+            "assigned_paths": assignment.assigned_paths,
+            "child_reported_paths": child_report.files_changed,
+            "supervisor_observed_paths": candidate.map(|inspection| &inspection.changed_paths),
+        }),
+        validation_bindings: json!({
+            "orchestrator_validation_results": child_report.validation_results,
+            "worker_validation_results": worker_validations,
+            "child_auditor_validation_results": auditor_validations,
+        }),
+    })
 }
 
 fn requires_hosted_pre_action_review(command: &ExternalAgentCommand) -> bool {
@@ -247,7 +335,14 @@ fn worktree_writable_admission_record(
             assignment_id
         );
     }
-    let capabilities = runtime.capabilities();
+    let capabilities = command
+        .selected_writable_capabilities(runtime, Some(assignment_id))
+        .with_context(|| {
+            format!(
+                "writable child launch for assignment '{}' did not prove its selected runtime contract",
+                assignment_id
+            )
+        })?;
     if let Some(reason) = capabilities.writable_launch_refusal(command.writable_launch_target) {
         bail!(
             "writable child launch for assignment '{}' lacks verified native sandbox admission: {}",
@@ -384,6 +479,20 @@ fn bind_selected_runtime_launch(
             )
         })?;
     }
+    let is_writable_grok_terminal_worker = assignment.phase == AssignmentPhase::Execution
+        && assignment.role == AgentRole::Worker
+        && assignment.effective_role_category() == RoleCategory::NonDelegatingTerminalWorker
+        && assignment.worker_assignments.is_empty();
+    if launch_runtime == SupervisorRuntime::Grok
+        && assignment.phase == AssignmentPhase::Execution
+        && !is_writable_grok_terminal_worker
+    {
+        bail!(
+            "{}: assignment '{}' must be an explicitly bound non-delegating terminal Worker with no nested assignments",
+            crate::external_agent::WRITABLE_GROK_TERMINAL_WORKER_REQUIRED,
+            assignment.id
+        );
+    }
     admit_assignment_role_category(assignment, launch_runtime, &resolution)?;
     if launch_runtime.is_adapter_subprocess() {
         command.program = selected_runtime_program(launch_runtime, options);
@@ -407,6 +516,23 @@ fn bind_selected_runtime_launch(
         command = command
             .with_model_selection(Some(model), resolution.selection.reasoning_effort.clone());
         prerender_selected_runtime_adapter_command(&command, launch_runtime)?;
+        if launch_runtime == SupervisorRuntime::Grok
+            && assignment.phase == AssignmentPhase::Execution
+        {
+            command = command.with_writable_runtime_selection(
+                &assignment.id,
+                launch_runtime,
+                is_writable_grok_terminal_worker,
+            )?;
+            command
+                .selected_writable_capabilities(launch_runtime, Some(&assignment.id))
+                .with_context(|| {
+                    format!(
+                        "writable Grok assignment '{}' did not prove its exact selected launch contract",
+                        assignment.id
+                    )
+                })?;
+        }
         return Ok(BoundSelectedRuntimeLaunch {
             command,
             model_provenance,
@@ -1238,12 +1364,26 @@ fn prepare_child_attempt<'a>(
         )?
     };
     if evidence_only_reaudit.is_none() {
+        let (assignment_journal_role, assignment_prompt_role) = match assignment.role {
+            AgentRole::ChildOrchestrator => (
+                OrchestrationRole::Orchestrator,
+                SupervisePromptRole::O1ChildOrchestrator,
+            ),
+            AgentRole::Worker => (
+                OrchestrationRole::Worker,
+                SupervisePromptRole::TerminalWorker,
+            ),
+            unsupported => bail!(
+                "assignment role '{}' has no direct prompt journal contract",
+                unsupported.as_str()
+            ),
+        };
         record_field_guide_prompt_injection_strict(
             artifacts,
             &assignment.id,
             Some(journal_parent_id),
-            OrchestrationRole::Orchestrator,
-            SupervisePromptRole::O1ChildOrchestrator,
+            assignment_journal_role,
+            assignment_prompt_role,
             field_guide,
             attempt,
         )?;
@@ -1488,6 +1628,7 @@ fn prepare_child_attempt<'a>(
             launch_runtime,
             assignment_phase,
         )? {
+            command = command.with_worktree_writable_confinement(admission.clone());
             let relative = PathBuf::from("assignments").join(format!(
                 "{}.attempt-{attempt}.worktree-writable-admission.json",
                 assignment.id
@@ -1637,17 +1778,18 @@ fn dispatch_and_collect_child_attempt<'a>(
     let launch_runtime = prepared.launch_runtime;
     let mut budget_reservation = prepared.budget_reservation;
     let pre_action_review_context = prepared.pre_action_review_context;
+    let assignment_journal_role = direct_assignment_orchestration_role(assignment.role)?;
 
     record_shared_orchestration_event(
         artifacts,
         &assignment.id,
         Some(journal_parent_id),
-        OrchestrationRole::Orchestrator,
+        assignment_journal_role,
         OrchestrationEventKind::Spawn,
         record_supervision_spawn_payload_with_category(
             &assignment.id,
             journal_parent_id,
-            OrchestrationRole::Orchestrator,
+            assignment_journal_role,
             assignment.role,
             assignment.category_override(),
             write_boundary_refs(&assignment.assigned_paths),
@@ -1788,7 +1930,7 @@ fn dispatch_and_collect_child_attempt<'a>(
     match usage_settlement.reliable_usage() {
         Some(usage) => {
             outcome.usage_samples.push(RoleUsageSample {
-                role: AgentRole::ChildOrchestrator,
+                role: assignment.role,
                 lens_id: None,
                 model: command.model.clone(),
                 usage,
@@ -1822,7 +1964,7 @@ fn dispatch_and_collect_child_attempt<'a>(
         artifacts,
         &assignment.id,
         Some(journal_parent_id),
-        OrchestrationRole::Orchestrator,
+        assignment_journal_role,
         OrchestrationEventKind::Status,
         lifecycle_event_payload(
             if external_process_completed(&external_run) {
@@ -2101,6 +2243,7 @@ fn decide_child_attempt(
         plan, artifacts, ..
     } = context;
     let assignment = &preflight.assignment;
+    let assignment_journal_role = direct_assignment_orchestration_role(assignment.role)?;
     let CollectedChildAttempt {
         mut attempt_report,
         report_shape_problems,
@@ -2366,7 +2509,7 @@ fn decide_child_attempt(
             artifacts,
             &assignment.id,
             Some(journal_parent_id),
-            OrchestrationRole::Orchestrator,
+            assignment_journal_role,
             OrchestrationEventKind::Reject,
             json!({
                 "scope": "attempt",
@@ -2379,7 +2522,7 @@ fn decide_child_attempt(
             artifacts,
             &assignment.id,
             Some(journal_parent_id),
-            OrchestrationRole::Orchestrator,
+            assignment_journal_role,
             OrchestrationEventKind::Status,
             lifecycle_event_payload("retrying", Some(attempt), None),
         )?;
@@ -3558,8 +3701,15 @@ fn publish_assignment_report(
         auditor_capability,
     )?;
     with_supervisor_artifacts(context.artifacts, |writer, journal| {
-        write_child_report(writer, final_report_relative, &child_report)?;
-        record_final_report_decisions(journal, writer, journal_parent_id, &child_report);
+        persist_final_assignment_report(
+            writer,
+            journal,
+            assignment,
+            journal_parent_id,
+            final_report_relative,
+            final_report_path,
+            &child_report,
+        )?;
         if let Some(executed) = &role_transition {
             record_orchestration_event(
                 journal,
@@ -3612,6 +3762,33 @@ fn publish_assignment_report(
     outcome.report = Some(child_report);
     if !completed_assignment_containment {
         outcome.external_containment_failed = true;
+    }
+    Ok(())
+}
+
+fn persist_final_assignment_report(
+    writer: &mut ArtifactRunWriter,
+    journal: &mut Option<OrchestrationEventJournal>,
+    assignment: &OrchestratorAssignment,
+    journal_parent_id: &str,
+    final_report_relative: &Path,
+    final_report_path: &Path,
+    report: &OrchestratorReviewReport,
+) -> Result<()> {
+    match assignment.role {
+        AgentRole::ChildOrchestrator => {
+            write_child_report(writer, final_report_relative, report)?;
+            record_final_report_decisions(journal, writer, journal_parent_id, report);
+        }
+        AgentRole::Worker => {
+            let worker = finalized_direct_worker_report(assignment, report, final_report_path);
+            write_worker_report(writer, final_report_relative, &worker)?;
+            record_final_worker_report_decision(journal, writer, journal_parent_id, &worker);
+        }
+        unsupported => bail!(
+            "assignment role '{}' has no final report persistence contract",
+            unsupported.as_str()
+        ),
     }
     Ok(())
 }
@@ -3829,9 +4006,11 @@ fn execute_supervisor_assignment_inner(
                 child_gate_terminal = true;
             }
         }
-        with_supervisor_artifacts(artifacts, |writer, _| {
-            write_child_report(writer, &final_report_relative, &child_report)
-        })?;
+        if assignment.role == AgentRole::ChildOrchestrator {
+            with_supervisor_artifacts(artifacts, |writer, _| {
+                write_child_report(writer, &final_report_relative, &child_report)
+            })?;
+        }
 
         let mut assignment_containment_verified = child_containment_verified;
         let mut auditor_primary_integrity_failed = false;
@@ -3841,29 +4020,13 @@ fn execute_supervisor_assignment_inner(
             && !child_gate_terminal
             && parent_auditor_required(assignment, &child_report)
         {
-            let transcript_path = attempt_history
+            let transcript_relative = attempt_history
                 .last()
-                .map(|history| run_dir.join(&history.raw_stdout_path))
+                .map(|history| history.raw_stdout_path.as_path())
                 .context("successful child attempt has no retained transcript evidence")?;
-            let transcript_probe_limit = REVIEW_LENS_REQUEST_LIMIT_BYTES
-                .checked_add(1)
-                .context("review-lens transcript probe limit overflowed")?;
-            let child_transcript_bytes =
-                read_bounded_regular_file_nofollow(&transcript_path, transcript_probe_limit)
-                    .with_context(|| {
-                        format!(
-                            "failed to read bounded child transcript {}",
-                            transcript_path.display()
-                        )
-                    })?;
-            if child_transcript_bytes.len() > REVIEW_LENS_REQUEST_LIMIT_BYTES {
-                bail!(
-                    "child transcript exceeds its {} byte review-lens input limit",
-                    REVIEW_LENS_REQUEST_LIMIT_BYTES
-                );
-            }
-            let child_transcript = String::from_utf8(child_transcript_bytes)
-                .context("child transcript evidence is not valid UTF-8")?;
+            let child_transcript = with_supervisor_artifacts(artifacts, |writer, _| {
+                read_authenticated_review_transcript(writer, transcript_relative)
+            })?;
             let review_base = context
                 .evidence_only_reaudit
                 .and_then(|source| {
@@ -3894,10 +4057,17 @@ fn execute_supervisor_assignment_inner(
             };
             let output_report = serde_json::to_string(&child_report)
                 .context("failed to serialize child output report for review lenses")?;
-            let sources = ReviewLensRequestSources {
+            let review_bindings = supervisor_review_lens_binding_material(
+                assignment,
+                &child_report,
+                pre_auditor_candidate.as_ref(),
+            )?;
+            let sources = crate::review::BoundedReviewLensRequestSources {
                 child_transcript: &child_transcript,
+                authoritative_transcript_path: transcript_relative,
                 diff: &diff,
                 output_report: &output_report,
+                bindings: &review_bindings,
             };
             let required_coverage =
                 supervisor_review_coverage_requirement(assignment, &child_report);
@@ -3908,7 +4078,8 @@ fn execute_supervisor_assignment_inner(
             let mut expected_requests = Vec::with_capacity(active_plan.review_lenses.len());
             let mut verdicts = Vec::with_capacity(active_plan.review_lenses.len());
             for (lens_index, lens) in active_plan.review_lenses.iter().enumerate() {
-                let expected_request = build_review_lens_request(lens, sources)?;
+                let expected_request =
+                    crate::review::build_bounded_review_lens_request(lens, sources)?;
                 let runtime_validation = validate_review_lens_runtime_selection(
                     lens,
                     auditor_launch_runtime,
@@ -3956,7 +4127,10 @@ fn execute_supervisor_assignment_inner(
                         for remaining_lens in active_plan.review_lenses.iter().skip(lens_index + 1)
                         {
                             let remaining_request =
-                                build_review_lens_request(remaining_lens, sources)?;
+                                crate::review::build_bounded_review_lens_request(
+                                    remaining_lens,
+                                    sources,
+                                )?;
                             verdicts.push(ReviewLensVerdict::for_lens(
                                 remaining_lens,
                                 remaining_request.request_binding.clone(),
@@ -6122,6 +6296,163 @@ done
                 "--no-subagents",
             ]
         );
+        let worktree = WorktreeRecord {
+            name: assignment.id.clone(),
+            path: command.cwd.clone(),
+            branch: "maco/grok-worker".to_string(),
+        };
+        let claim = PathClaim {
+            token: crate::sync::ClaimToken::from_u64(11),
+            agent_id: assignment.id.clone(),
+            paths: assignment.assigned_paths.clone(),
+        };
+        let admission = worktree_writable_admission_record(
+            &assignment.id,
+            &assignment.assigned_paths,
+            1,
+            &worktree,
+            &claim,
+            std::slice::from_ref(&claim),
+            &command,
+            runtime,
+            assignment.phase,
+        )?
+        .context("writable Grok admission")?;
+        assert_eq!(
+            admission.native_sandbox.side_effect_confinement,
+            crate::runtime_adapter::SideEffectConfinement::Verified
+        );
+        assert_eq!(admission.native_sandbox.runtime, SupervisorRuntime::Grok);
+        Ok(())
+    }
+
+    #[test]
+    fn writable_grok_supervisor_admission_names_missing_stale_and_inexact_selection() -> Result<()>
+    {
+        fn admission_error(command: &ExternalAgentCommand) -> String {
+            let assigned_paths = vec![PathBuf::from("README.md")];
+            let worktree = WorktreeRecord {
+                name: "grok-worker".to_string(),
+                path: command.cwd.clone(),
+                branch: "maco/grok-worker".to_string(),
+            };
+            let claim = PathClaim {
+                token: crate::sync::ClaimToken::from_u64(12),
+                agent_id: "grok-worker".to_string(),
+                paths: assigned_paths.clone(),
+            };
+            format!(
+                "{:#}",
+                worktree_writable_admission_record(
+                    "grok-worker",
+                    &assigned_paths,
+                    1,
+                    &worktree,
+                    &claim,
+                    std::slice::from_ref(&claim),
+                    command,
+                    SupervisorRuntime::Grok,
+                    AssignmentPhase::Execution,
+                )
+                .expect_err("invalid writable Grok selection must fail closed")
+            )
+        }
+
+        let exact = launch_fixture_command()
+            .with_runtime_adapter(
+                SupervisorRuntime::Grok,
+                crate::runtime_adapter::RuntimeAdapterConfig::defaults(SupervisorRuntime::Grok),
+            )
+            .with_model_selection(Some("grok-4.6".to_string()), Some("xhigh".to_string()));
+        assert!(admission_error(&exact)
+            .contains(crate::external_agent::WRITABLE_GROK_SELECTION_EVIDENCE_MISSING));
+
+        let generic = exact
+            .clone()
+            .with_model_selection(Some("grok".to_string()), Some("xhigh".to_string()))
+            .with_writable_runtime_selection("grok-worker", SupervisorRuntime::Grok, true)?;
+        assert!(admission_error(&generic)
+            .contains(crate::external_agent::WRITABLE_GROK_EXACT_MODEL_REQUIRED));
+
+        let non_xhigh = exact
+            .clone()
+            .with_model_selection(Some("grok-4.6".to_string()), Some("high".to_string()))
+            .with_writable_runtime_selection("grok-worker", SupervisorRuntime::Grok, true)?;
+        assert!(admission_error(&non_xhigh)
+            .contains(crate::external_agent::WRITABLE_GROK_XHIGH_EFFORT_REQUIRED));
+
+        let mut stale = exact.clone().with_writable_runtime_selection(
+            "grok-worker",
+            SupervisorRuntime::Grok,
+            true,
+        )?;
+        stale
+            .runtime_adapter
+            .as_mut()
+            .context("Grok adapter")?
+            .output_capture = crate::runtime_adapter::OutputCaptureMode::StdoutAndStderr;
+        assert!(admission_error(&stale)
+            .contains(crate::external_agent::WRITABLE_GROK_SELECTION_EVIDENCE_STALE));
+
+        let mut malformed = exact;
+        malformed
+            .runtime_adapter
+            .as_mut()
+            .context("Grok adapter")?
+            .env_passthrough
+            .push("PATH".to_string());
+        let malformed = malformed.with_writable_runtime_selection(
+            "grok-worker",
+            SupervisorRuntime::Grok,
+            true,
+        )?;
+        assert!(admission_error(&malformed)
+            .contains(crate::external_agent::WRITABLE_GROK_ADAPTER_CONFIGURATION_UNVERIFIED));
+        Ok(())
+    }
+
+    #[test]
+    fn writable_grok_binding_requires_the_explicit_terminal_worker_category() -> Result<()> {
+        let assignment = OrchestratorAssignment {
+            id: "grok-worker".to_string(),
+            phase: AssignmentPhase::Execution,
+            runtime: None,
+            role: AgentRole::Worker,
+            role_category: Some(RoleCategory::DelegatingCoordinator),
+            selection_source: Some(AssignmentSelectionSource::OperatorOverride),
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        };
+        let mut policy = AssignmentBudgetPolicy::default();
+        policy.set_selector_binding_for_test(
+            AgentRole::Worker,
+            SupervisorRuntime::Grok,
+            RoleModelSelection {
+                model: Some("grok-4.6".to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        let plan = policy.apply(&worker_plan("gpt-5.6-codex"));
+        let catalog =
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-codex"])?);
+        let error = bind_selected_assignment_launch_for_test(
+            launch_fixture_command(),
+            &assignment,
+            &policy,
+            &plan,
+            &launch_fixture_options(SupervisorRuntime::Codex),
+            &catalog,
+        )
+        .expect_err("writable Grok must remain a terminal Worker");
+        assert!(format!("{error:#}")
+            .contains(crate::external_agent::WRITABLE_GROK_TERMINAL_WORKER_REQUIRED));
         Ok(())
     }
 

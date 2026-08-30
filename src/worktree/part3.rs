@@ -353,7 +353,15 @@ impl ManagedWorktreeRegistryStore {
     }
 
     fn lock(&self) -> Result<ManagedWorktreeRegistryLock> {
-        let lock = KernelStateLock::acquire_direct(&self.state_root, "managed_worktrees.lock")?;
+        self.lock_with_timeout(MANAGED_WORKTREE_REGISTRY_LOCK_TIMEOUT)
+    }
+
+    fn lock_with_timeout(&self, timeout: Duration) -> Result<ManagedWorktreeRegistryLock> {
+        let lock = KernelStateLock::acquire_direct_with_timeout(
+            &self.state_root,
+            "managed_worktrees.lock",
+            timeout,
+        )?;
         let bound = ManagedWorktreeRegistryLock {
             root_identity: self.state_root.identity().clone(),
             lock_identity: lock.identity().clone(),
