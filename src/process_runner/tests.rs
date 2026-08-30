@@ -1817,7 +1817,7 @@ fn external_grok_unix_stream_initialization_preserves_codex_and_write_boundaries
             fs::write(&protected, "forbidden\n").is_err(),
             "{mode} profile wrote outside its managed worktree"
         );
-        match mode.as_str() {
+        match mode {
             "codex" => {
                 let error =
                     UnixStream::pair().expect_err("ExternalCodex must continue to reject AF_UNIX");
