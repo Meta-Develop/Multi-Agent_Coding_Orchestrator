@@ -4328,6 +4328,428 @@ fn authenticated_merge_repository() -> tempfile::TempDir {
     repository
 }
 
+#[derive(Default)]
+struct ScriptedAuthenticatedMergeState {
+    lookup_override: Option<Vec<PullRequestMergeReceipt>>,
+    lose_execute_response: bool,
+    lookup_calls: usize,
+    execute_calls: usize,
+    verify_calls: usize,
+}
+
+struct ScriptedAuthenticatedMergeTransport {
+    inner: FakeForgeTransport,
+    state: Mutex<ScriptedAuthenticatedMergeState>,
+}
+
+impl ScriptedAuthenticatedMergeTransport {
+    fn new(snapshot: &PullRequestReviewSnapshot) -> Self {
+        let mut inner = FakeForgeTransport::new();
+        inner
+            .register_pull_request_merge_observation(snapshot.item(), snapshot.clone())
+            .expect("register scripted merge ground truth");
+        Self {
+            inner,
+            state: Mutex::new(ScriptedAuthenticatedMergeState::default()),
+        }
+    }
+
+    fn override_lookup(&self, receipts: Option<Vec<PullRequestMergeReceipt>>) {
+        self.state
+            .lock()
+            .expect("scripted merge state")
+            .lookup_override = receipts;
+    }
+
+    fn lose_execute_response(&self) {
+        self.state
+            .lock()
+            .expect("scripted merge state")
+            .lose_execute_response = true;
+    }
+
+    fn call_counts(&self) -> (usize, usize, usize) {
+        let state = self.state.lock().expect("scripted merge state");
+        (state.lookup_calls, state.execute_calls, state.verify_calls)
+    }
+}
+
+impl PullRequestMergeTransport for ScriptedAuthenticatedMergeTransport {
+    fn observe_pull_request_for_merge(
+        &self,
+        candidate: &ForgeItem,
+    ) -> Result<PullRequestReviewSnapshot> {
+        self.inner.observe_pull_request_for_merge(candidate)
+    }
+
+    fn lookup_pull_request_merge(
+        &self,
+        effect: &PullRequestMergeEffect,
+    ) -> Result<Vec<PullRequestMergeReceipt>> {
+        let lookup_override = {
+            let mut state = self.state.lock().expect("scripted merge state");
+            state.lookup_calls += 1;
+            state.lookup_override.clone()
+        };
+        match lookup_override {
+            Some(receipts) => Ok(receipts),
+            None => self.inner.lookup_pull_request_merge(effect),
+        }
+    }
+
+    fn execute_pull_request_merge(
+        &self,
+        effect: &PullRequestMergeEffect,
+    ) -> Result<PullRequestMergeReceipt> {
+        let lose_response = {
+            let mut state = self.state.lock().expect("scripted merge state");
+            state.execute_calls += 1;
+            state.lose_execute_response
+        };
+        let receipt = self.inner.execute_pull_request_merge(effect)?;
+        if lose_response {
+            bail!("injected authenticated merge response loss");
+        }
+        Ok(receipt)
+    }
+
+    fn verify_pull_request_merge(
+        &self,
+        effect: &PullRequestMergeEffect,
+        receipt: &PullRequestMergeReceipt,
+    ) -> Result<PullRequestMergeReceipt> {
+        self.state
+            .lock()
+            .expect("scripted merge state")
+            .verify_calls += 1;
+        receipt.validate_for_effect(effect)?;
+        if self.lookup_pull_request_merge(effect)?.as_slice() != [receipt.clone()] {
+            bail!("scripted merge receipt was missing, duplicated, or changed");
+        }
+        Ok(receipt.clone())
+    }
+}
+
+fn seed_authenticated_merge_phase(
+    repo: &Path,
+    candidate: &ForgeItem,
+    evidence: &AuthenticatedPullRequestMergeEvidence,
+    transport: &ScriptedAuthenticatedMergeTransport,
+    phase: EffectPhase,
+    seed_provider_effect: bool,
+) -> Option<PullRequestMergeReceipt> {
+    let plan_digest = stable_json_digest(&(
+        "maco_authenticated_pull_request_merge_plan_v1",
+        candidate,
+        evidence,
+    ))
+    .expect("authenticated merge plan digest");
+    let effect_id = format!("merge:{plan_digest}");
+    let logical_id = format!("pr-merge-{plan_digest}");
+    let planned = AuthenticatedPullRequestMergeRecord {
+        version: AUTHENTICATED_PR_MERGE_VERSION,
+        plan_digest: plan_digest.clone(),
+        candidate: candidate.clone(),
+        effect: None,
+        authority: None,
+        receipt: None,
+    };
+    let auth = repository_auth_writer(repo)
+        .expect("seed authenticated merge auth writer")
+        .into_authenticator()
+        .expect("seed authenticated merge authenticator");
+    let mut wal = EffectWal::create_planned(auth, &logical_id, &effect_id, &planned)
+        .expect("seed planned authenticated merge");
+    if phase == EffectPhase::Planned {
+        return None;
+    }
+
+    let authorized = match authorize_current_pull_request_merge(candidate, evidence, transport)
+        .expect("authorize seeded authenticated merge")
+    {
+        PullRequestMergePreflight::Allowed(authorized) => authorized,
+        PullRequestMergePreflight::Blocked(outcome) => {
+            panic!("seeded authenticated merge was blocked: {outcome:?}")
+        }
+    };
+    let effect = pull_request_merge_effect(&effect_id, &plan_digest, evidence, &authorized)
+        .expect("seed authenticated merge effect");
+    let started = AuthenticatedPullRequestMergeRecord {
+        version: AUTHENTICATED_PR_MERGE_VERSION,
+        plan_digest: plan_digest.clone(),
+        candidate: candidate.clone(),
+        effect: Some(effect.clone()),
+        authority: Some(authorized.authority.clone()),
+        receipt: None,
+    };
+    wal.started(&effect_id, &started)
+        .expect("seed started authenticated merge");
+
+    let receipt = seed_provider_effect.then(|| {
+        transport
+            .execute_pull_request_merge(&effect)
+            .expect("seed provider merge receipt")
+    });
+    if matches!(phase, EffectPhase::Observed | EffectPhase::Completed) {
+        let observed = AuthenticatedPullRequestMergeRecord {
+            receipt: Some(
+                receipt
+                    .clone()
+                    .expect("observed seeded merge requires a provider receipt"),
+            ),
+            ..started
+        };
+        wal.observed(&effect_id, &observed)
+            .expect("seed observed authenticated merge");
+        if phase == EffectPhase::Completed {
+            wal.completed(&effect_id, &observed)
+                .expect("seed completed authenticated merge");
+        }
+    }
+    receipt
+}
+
+fn mismatched_effect_merge_receipt(receipt: &PullRequestMergeReceipt) -> PullRequestMergeReceipt {
+    PullRequestMergeReceipt::new(
+        "merge:mismatched-effect",
+        receipt.item().clone(),
+        receipt.approved_actor().clone(),
+        receipt.evidence_digest(),
+        receipt.ground_truth_digest(),
+        receipt.completion_mode(),
+        receipt.provider_merge_id().clone(),
+        receipt.merged_oid(),
+        receipt.url(),
+        receipt.merged_at().clone(),
+    )
+    .expect("valid receipt for a different merge effect")
+}
+
+fn changed_provider_merge_receipt(receipt: &PullRequestMergeReceipt) -> PullRequestMergeReceipt {
+    let changed_oid = if receipt.merged_oid().bytes().all(|byte| byte == b'f') {
+        "e".repeat(40)
+    } else {
+        "f".repeat(40)
+    };
+    let plan_digest = receipt
+        .evidence_digest()
+        .strip_prefix("sha256:")
+        .expect("merge evidence digest prefix");
+    PullRequestMergeReceipt::new(
+        format!("merge:{plan_digest}"),
+        receipt.item().clone(),
+        receipt.approved_actor().clone(),
+        receipt.evidence_digest(),
+        receipt.ground_truth_digest(),
+        receipt.completion_mode(),
+        receipt.provider_merge_id().clone(),
+        changed_oid,
+        receipt.url(),
+        receipt.merged_at().clone(),
+    )
+    .expect("valid changed provider merge receipt")
+}
+
+#[test]
+fn authenticated_pull_request_merge_recovers_every_wal_phase_without_a_second_merge() {
+    for phase in [
+        EffectPhase::Planned,
+        EffectPhase::Started,
+        EffectPhase::Observed,
+        EffectPhase::Completed,
+    ] {
+        let (snapshot, input) = merge_authority_fixture(
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+        );
+        let evidence = authenticated_merge_evidence(&snapshot, &input);
+        let repository = authenticated_merge_repository();
+        let transport = ScriptedAuthenticatedMergeTransport::new(&snapshot);
+        let seeded_receipt = seed_authenticated_merge_phase(
+            repository.path(),
+            snapshot.item(),
+            &evidence,
+            &transport,
+            phase,
+            phase != EffectPhase::Planned,
+        );
+
+        let recovered = execute_authenticated_pull_request_merge(
+            repository.path(),
+            snapshot.item(),
+            Some(&evidence),
+            &transport,
+        )
+        .unwrap_or_else(|error| panic!("recover {phase:?} authenticated merge: {error:#}"));
+        let retry = execute_authenticated_pull_request_merge(
+            repository.path(),
+            snapshot.item(),
+            Some(&evidence),
+            &transport,
+        )
+        .unwrap_or_else(|error| panic!("retry recovered {phase:?} authenticated merge: {error:#}"));
+
+        assert!(recovered.is_merged(), "{phase:?} recovery was blocked");
+        assert_eq!(recovered.receipt(), retry.receipt());
+        if let Some(seeded_receipt) = seeded_receipt.as_ref() {
+            assert_eq!(recovered.receipt(), Some(seeded_receipt));
+        }
+        assert_eq!(
+            transport.call_counts().1,
+            1,
+            "{phase:?} recovery issued a second provider merge"
+        );
+    }
+}
+
+#[test]
+fn authenticated_pull_request_merge_reconciles_a_lost_response_without_resending() {
+    let (snapshot, input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    let evidence = authenticated_merge_evidence(&snapshot, &input);
+    let repository = authenticated_merge_repository();
+    let transport = ScriptedAuthenticatedMergeTransport::new(&snapshot);
+    transport.lose_execute_response();
+
+    let recovered = execute_authenticated_pull_request_merge(
+        repository.path(),
+        snapshot.item(),
+        Some(&evidence),
+        &transport,
+    )
+    .expect("lost merge response reconciles by exact lookup");
+    let retry = execute_authenticated_pull_request_merge(
+        repository.path(),
+        snapshot.item(),
+        Some(&evidence),
+        &transport,
+    )
+    .expect("completed lost-response recovery is reusable");
+
+    assert_eq!(recovered.receipt(), retry.receipt());
+    let (lookup_calls, execute_calls, verify_calls) = transport.call_counts();
+    assert!(
+        lookup_calls > 0,
+        "lost response was not reconciled by lookup"
+    );
+    assert!(verify_calls > 0, "reconciled receipt was not verified");
+    assert_eq!(execute_calls, 1, "lost response caused a blind resend");
+}
+
+#[test]
+fn authenticated_pull_request_merge_started_lookup_ambiguity_fails_closed() {
+    for case in ["zero", "multiple", "mismatched"] {
+        let (snapshot, input) = merge_authority_fixture(
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+        );
+        let evidence = authenticated_merge_evidence(&snapshot, &input);
+        let repository = authenticated_merge_repository();
+        let transport = ScriptedAuthenticatedMergeTransport::new(&snapshot);
+        let seeded_receipt = seed_authenticated_merge_phase(
+            repository.path(),
+            snapshot.item(),
+            &evidence,
+            &transport,
+            EffectPhase::Started,
+            case != "zero",
+        );
+        match case {
+            "zero" => transport.override_lookup(Some(Vec::new())),
+            "multiple" => {
+                let receipt = seeded_receipt.expect("multiple case provider receipt");
+                transport.override_lookup(Some(vec![receipt.clone(), receipt]));
+            }
+            "mismatched" => {
+                let receipt = seeded_receipt.expect("mismatched case provider receipt");
+                transport.override_lookup(Some(vec![mismatched_effect_merge_receipt(&receipt)]));
+            }
+            _ => unreachable!(),
+        }
+        let execute_calls_before = transport.call_counts().1;
+
+        let error = execute_authenticated_pull_request_merge(
+            repository.path(),
+            snapshot.item(),
+            Some(&evidence),
+            &transport,
+        )
+        .unwrap_err();
+
+        let error_text = format!("{error:#}");
+        assert!(
+            if case == "mismatched" {
+                error_text.contains("does not bind the exact authorized effect")
+            } else {
+                error_text.contains("started pull-request merge")
+            },
+            "unexpected {case} lookup error: {error_text}"
+        );
+        assert_eq!(
+            transport.call_counts().1,
+            execute_calls_before,
+            "{case} lookup ambiguity caused a blind provider merge"
+        );
+    }
+}
+
+#[test]
+fn authenticated_pull_request_merge_completed_receipt_is_revalidated_and_stale_state_fails() {
+    let (snapshot, input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    let evidence = authenticated_merge_evidence(&snapshot, &input);
+    let repository = authenticated_merge_repository();
+    let transport = ScriptedAuthenticatedMergeTransport::new(&snapshot);
+    let receipt = seed_authenticated_merge_phase(
+        repository.path(),
+        snapshot.item(),
+        &evidence,
+        &transport,
+        EffectPhase::Completed,
+        true,
+    )
+    .expect("completed provider receipt");
+
+    let exact = execute_authenticated_pull_request_merge(
+        repository.path(),
+        snapshot.item(),
+        Some(&evidence),
+        &transport,
+    )
+    .expect("completed receipt revalidates against exact provider state");
+    assert_eq!(exact.receipt(), Some(&receipt));
+
+    for stale in [Vec::new(), vec![changed_provider_merge_receipt(&receipt)]] {
+        transport.override_lookup(Some(stale));
+        let error = execute_authenticated_pull_request_merge(
+            repository.path(),
+            snapshot.item(),
+            Some(&evidence),
+            &transport,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("completed pull-request merge receipt changed or disappeared"),
+            "unexpected completed-receipt revalidation error: {error:#}"
+        );
+        assert_eq!(
+            transport.call_counts().1,
+            1,
+            "stale completed receipt caused a second provider merge"
+        );
+    }
+    assert!(
+        transport.call_counts().2 >= 3,
+        "completed receipt was not reverified on every retry"
+    );
+}
+
 #[test]
 fn authenticated_github_merge_operation_is_finite_and_head_bound() {
     let repository = GithubRepositoryIdentity {
