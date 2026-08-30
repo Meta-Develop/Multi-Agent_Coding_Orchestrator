@@ -747,6 +747,89 @@ fn authored_profile_reaches_verified_scheduler_selection_and_exact_score_evidenc
 }
 
 #[test]
+fn cost_weighted_and_quality_weighted_profiles_select_distinct_acceptable_outcomes() {
+    use crate::objective_profile::{
+        select_from_frontier, FrontierAxes, ObjectiveProfileSource, QualityOperationsBalance,
+    };
+
+    let outcome = |quality_basis_points: u32, monetary_cost: f64| FrontierAxes {
+        held_out_quality_basis_points: quality_basis_points,
+        breadth_quality_basis_points: quality_basis_points,
+        anti_shortcut_quality_basis_points: quality_basis_points,
+        monetary_cost,
+        quota_consumption: 0.0,
+        latency: 0.0,
+        retry_rework: 0.0,
+        human_review: 0.0,
+    };
+    let frontier = [
+        ("quality-first".to_string(), outcome(9_700, 0.8)),
+        ("cost-first".to_string(), outcome(9_000, 0.2)),
+    ];
+    assert!(frontier.iter().all(|(_, outcome)| {
+        outcome.held_out_quality_basis_points >= 9_000
+            && outcome.breadth_quality_basis_points >= 9_000
+            && outcome.anti_shortcut_quality_basis_points >= 9_000
+    }));
+
+    let profile = |id: &str, quality_percent: u32| {
+        let mut profile = crate::objective_profile::default_objective_profile();
+        profile.id = id.to_string();
+        profile.quality_operations_balance = QualityOperationsBalance {
+            quality_percent,
+            operations_percent: 100 - quality_percent,
+        };
+        ResolvedObjectiveProfile {
+            profile: profile.binding().expect("acceptance profile binding"),
+            source: ObjectiveProfileSource::RepositoryOverride,
+        }
+    };
+    let cost_profile = profile("acceptance-cost-weighted-v1", 0);
+    let quality_profile = profile("acceptance-quality-weighted-v1", 100);
+
+    let cost_selection = select_from_frontier(&cost_profile, &frontier)
+        .expect("cost-weighted selection")
+        .expect("non-empty cost frontier");
+    let quality_selection = select_from_frontier(&quality_profile, &frontier)
+        .expect("quality-weighted selection")
+        .expect("non-empty quality frontier");
+
+    assert_eq!(cost_selection.selected_profile_id, "cost-first");
+    assert_eq!(quality_selection.selected_profile_id, "quality-first");
+    assert_eq!(
+        cost_selection.runner_up_profile_id.as_deref(),
+        Some("quality-first")
+    );
+    assert_eq!(
+        quality_selection.runner_up_profile_id.as_deref(),
+        Some("cost-first")
+    );
+    assert_eq!(
+        cost_selection.profile_hash,
+        cost_profile.profile.content_hash
+    );
+    assert_eq!(
+        quality_selection.profile_hash,
+        quality_profile.profile.content_hash
+    );
+    assert_ne!(cost_selection.profile_hash, quality_selection.profile_hash);
+    assert!(cost_selection.selected_score < cost_selection.runner_up_score.unwrap());
+    assert!(quality_selection.selected_score < quality_selection.runner_up_score.unwrap());
+    let selected_cost = |selection: &crate::objective_profile::ObjectiveSelection| {
+        frontier
+            .iter()
+            .find(|(id, _)| id == &selection.selected_profile_id)
+            .map(|(_, outcome)| outcome.monetary_cost)
+            .expect("selected frontier cost")
+    };
+    assert_eq!(selected_cost(&cost_selection), 0.2);
+    assert_eq!(selected_cost(&quality_selection), 0.8);
+    let measurable_cost_difference =
+        selected_cost(&quality_selection) - selected_cost(&cost_selection);
+    assert!((measurable_cost_difference - 0.6).abs() < 1e-12);
+}
+
+#[test]
 fn authored_serial_plan_reports_independent_scope_width_warning() {
     let mut assignment = injected_assignment(false);
     assignment.assigned_paths = vec![PathBuf::from("README.md"), PathBuf::from("src/planning.rs")];
@@ -2404,10 +2487,29 @@ fn verified_supervise_dispatch_consumes_and_persists_the_selector_triple() {
 
     assert!(report.success, "unexpected failed report: {report:#?}");
     assert_eq!(child_commands.len(), 1);
-    let execution = report
+    let economics = report
         .role_economics_profile
         .as_ref()
-        .and_then(|profile| profile.execution.as_ref())
+        .expect("selector role economics evidence");
+    let resolved_profile = economics
+        .resolved_objective_profile
+        .as_ref()
+        .expect("omitted profile resolves to a frozen built-in default");
+    assert_eq!(
+        resolved_profile.source,
+        crate::objective_profile::ObjectiveProfileSource::BuiltIn
+    );
+    assert_eq!(
+        resolved_profile.profile.id,
+        crate::objective_profile::DEFAULT_OBJECTIVE_PROFILE_ID
+    );
+    resolved_profile
+        .profile
+        .validate()
+        .expect("built-in objective profile hash binding");
+    let execution = economics
+        .execution
+        .as_ref()
         .expect("selector execution evidence");
     let decision = execution
         .selection_decisions
@@ -2419,6 +2521,51 @@ fn verified_supervise_dispatch_consumes_and_persists_the_selector_triple() {
         .choice
         .as_ref()
         .expect("selected ChildOrchestrator choice");
+    assert_eq!(
+        decision.primary_cause,
+        SupervisorSelectionEventCause::Initial
+    );
+    assert_eq!(
+        decision.provenance.resolved_objective_profile,
+        *resolved_profile
+    );
+    assert_eq!(
+        decision
+            .provenance
+            .input_digests
+            .resolved_objective_profile
+            .algorithm,
+        "sha256"
+    );
+    assert_eq!(
+        decision
+            .provenance
+            .input_digests
+            .resolved_objective_profile
+            .value,
+        crate::artifacts::state_auth::sha256_hex(
+            &serde_json::to_vec(resolved_profile).expect("serialize frozen objective profile")
+        )
+    );
+    let selected_score = decision
+        .provenance
+        .candidate_set
+        .iter()
+        .find(|evaluation| evaluation.candidate == choice.candidate)
+        .and_then(|evaluation| evaluation.score.as_ref())
+        .expect("selected score evidence");
+    assert_eq!(
+        selected_score.total_score_microunits,
+        choice.total_score_microunits
+    );
+    let runner_up = decision
+        .provenance
+        .runner_up_scores
+        .first()
+        .expect("runner-up decision evidence");
+    assert_eq!(runner_up.rank, 2);
+    assert_ne!(runner_up.candidate, choice.candidate);
+    assert!(runner_up.total_score_microunits >= choice.total_score_microunits);
     let command = &child_commands[0];
     assert_eq!(choice.candidate.runtime, "codex");
     assert!(command.runtime_adapter.is_none());
@@ -2439,6 +2586,10 @@ fn verified_supervise_dispatch_consumes_and_persists_the_selector_triple() {
             entry.assignment_id == assignment.id && entry.role == AgentRole::ChildOrchestrator
         })
         .expect("ChildOrchestrator selection ledger entry");
+    assert_eq!(
+        ledger.selection_source,
+        AssignmentSelectionSource::Automatic
+    );
     assert_eq!(ledger.selected_runtime.as_deref(), Some("codex"));
     assert_eq!(
         ledger.selected_model.as_deref(),

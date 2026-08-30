@@ -5558,6 +5558,20 @@ mod tests {
             .iter()
             .find(|decision| decision.role == AgentRole::Worker)
             .context("worker decision")?;
+        assert_eq!(worker.primary_cause, SupervisorSelectionEventCause::Initial);
+        assert_eq!(
+            worker.provenance.resolved_objective_profile.source,
+            crate::objective_profile::ObjectiveProfileSource::BuiltIn
+        );
+        assert_eq!(
+            worker.provenance.resolved_objective_profile.profile.id,
+            crate::objective_profile::DEFAULT_OBJECTIVE_PROFILE_ID
+        );
+        worker
+            .provenance
+            .resolved_objective_profile
+            .profile
+            .validate()?;
         let choice = worker.provenance.choice.as_ref().context("worker choice")?;
         assert_eq!(
             choice.candidate.runtime,
@@ -5589,6 +5603,18 @@ mod tests {
             selected_score.expected_total_cost_per_accepted_task_microunits,
             87_552
         );
+        assert_eq!(
+            choice.total_score_microunits,
+            selected_score.total_score_microunits
+        );
+        let runner_up = worker
+            .provenance
+            .runner_up_scores
+            .first()
+            .context("worker runner-up score")?;
+        assert_eq!(runner_up.rank, 2);
+        assert_ne!(runner_up.candidate, choice.candidate);
+        assert!(runner_up.total_score_microunits > choice.total_score_microunits);
         assert!(worker.provenance.candidate_set.iter().all(|candidate| {
             !candidate.eligible
                 || candidate.candidate == choice.candidate
@@ -5667,6 +5693,21 @@ mod tests {
 
     #[test]
     fn grok_worker_economics_never_grant_delegating_or_judgment_authority() -> Result<()> {
+        let priors = selector_priors_with_terminal_worker_economics()?;
+        for authority in [
+            AuthorityRole::Delegating,
+            AuthorityRole::ReviewAuditor,
+            AuthorityRole::GitPublication,
+        ] {
+            assert!(matches!(
+                priors.measured_authority_eligibility(
+                    crate::optimizer::objective::DEFAULT_TERMINAL_MODEL,
+                    authority,
+                ),
+                selection::MeasuredAuthorityEligibility::Ineligible { .. }
+            ));
+        }
+
         let catalog = codex_catalog()?;
         let observation = discover_grok_observation(CAPTURED_GROK_CATALOG)?;
         let mut plan = test_plan();
