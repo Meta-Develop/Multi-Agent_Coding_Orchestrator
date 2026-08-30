@@ -7,7 +7,7 @@ use crate::{
     artifacts::{
         self, ArtifactRetentionFamily, ArtifactRetentionPolicy, ResolvedRunId, RunArtifactFamily,
     },
-    autopilot::{self, AutopilotRunOptions},
+    autopilot,
     consult::{self, ConsultAskOptions, ConsultantRuntime, DEFAULT_CONSULT_TIMEOUT_SECONDS},
     hierarchy_ledger::{is_coordinator_role_label, observe_hierarchy, ObservedHierarchyNode},
     inbox::{
@@ -109,6 +109,8 @@ const MAX_DEFAULT_MACHINE_GLOBAL_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_EVALUATION_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_EVALUATION_PLAN_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_EXTERNAL_EVENT_PAYLOAD_CLI_BYTES: usize = 4 * 1024;
+const RETIRED_AUTOPILOT_EXECUTION_MESSAGE: &str =
+    "autopilot plan/run is retired; use literal instruction routing: maco <instruction>";
 
 #[derive(Debug, Parser)]
 #[command(name = "maco")]
@@ -345,7 +347,7 @@ enum Command {
     Inbox(InboxCommand),
     /// Serve read-only real-time orchestration observability APIs.
     Scope(ScopeCommand),
-    /// Run local-first autopilot workflow phases.
+    /// Inspect artifacts from retired autopilot runs.
     Autopilot(AutopilotCommand),
     /// Apply retention to one repository-local bulk artifact family.
     Artifacts(RepositoryArtifactsCommand),
@@ -2377,106 +2379,8 @@ struct AutopilotCommand {
 impl AutopilotCommand {
     fn run(self) -> Result<()> {
         match self.command {
-            AutopilotSubcommand::Plan(args) => {
-                let plan = autopilot::autopilot_plan_from_task_file(args.repo, args.task_file)?;
-                print_query_report(&plan, args.json)
-            }
-            AutopilotSubcommand::Run(args) => {
-                let json = args.json;
-                let quota_config = args.quota_config.clone();
-                let rolling_quota = args.budget.rolling_quota();
-                let budget_overrides = args.budget.limits();
-                let budget_max_duration_seconds = args.budget.max_duration_seconds();
-                let (plan_file, goal_spec) = match (args.task_file, args.from_goal) {
-                    (Some(plan_file), None) => (plan_file, None),
-                    (None, Some(goal_file)) => {
-                        let goal_spec = read_supervise_goal_file(&goal_file)?;
-                        (goal_file, Some(goal_spec))
-                    }
-                    _ => bail!(
-                        "autopilot run requires exactly one positional TASK_FILE or --from-goal <FILE>"
-                    ),
-                };
-                let profile = args
-                    .profile
-                    .as_ref()
-                    .map(autopilot::autopilot_profile_from_file)
-                    .transpose()?;
-                let resolved = resolve_run_id_for_run(
-                    &args.repo,
-                    RunArtifactFamily::Autopilot,
-                    args.run_id.as_deref(),
-                    args.json,
-                )?;
-                let parent_node = args.parent_node.map(Into::into);
-                let (plan_file, goal_spec) = materialize_launch_plan_for_operator_role_category(
-                    plan_file,
-                    goal_spec,
-                    &resolved.repo,
-                    resolved.run_id.as_str(),
-                    args.role_category_override.role_category,
-                )?;
-                let reap_repo = resolved.repo.clone();
-                let _rolling_guard = rolling_quota
-                    .map(|quota| {
-                        crate::budget_ledger::bind_rolling_budget(
-                            &resolved.repo,
-                            quota,
-                            resolved.run_id.as_str(),
-                        )
-                    })
-                    .transpose()?;
-                let _quota_config_guard = quota_config
-                    .as_deref()
-                    .map(|path| supervise::bind_operator_quota_config(&resolved.repo, path))
-                    .transpose()?;
-                let options = AutopilotRunOptions {
-                    repo: resolved.repo,
-                    plan_file,
-                    run_id: resolved.run_id.clone(),
-                    codex_bin: args.codex_bin,
-                    reviewer_command: args.reviewer_command,
-                    allow_dirty_primary: args.allow_dirty_primary,
-                    allow_live_run_collision: args.force_live_run,
-                    max_child_dispatches: args.max_child_dispatches,
-                    budget_overrides,
-                    budget_max_duration_seconds,
-                    cancellation: None,
-                };
-                let retention = Some(MachineGlobalRetentionBinding {
-                    config: args.machine_global_config,
-                    root_id: args.machine_global_runtime_root_id,
-                    owner: "maco-autopilot".to_string(),
-                    correction_correlation_id: resolved.run_id.as_str().to_string(),
-                });
-                let outcome = (|| {
-                    let report = match goal_spec {
-                        Some(goal_spec) => {
-                            autopilot::run_autopilot_goal_spec_with_profile_retention_and_parent(
-                                options,
-                                "",
-                                &goal_spec,
-                                profile,
-                                retention,
-                                parent_node,
-                            )?
-                        }
-                        None => {
-                            autopilot::run_autopilot_plan_file_with_profile_retention_and_parent(
-                                options,
-                                profile,
-                                retention,
-                                parent_node,
-                            )?
-                        }
-                    };
-                    print_query_report(&report, json)?;
-                    if !report.success {
-                        bail!("autopilot run failed");
-                    }
-                    Ok(())
-                })();
-                finish_with_merged_worktree_reap(&reap_repo, json, outcome)
+            AutopilotSubcommand::Plan(_) | AutopilotSubcommand::Run(_) => {
+                bail!(RETIRED_AUTOPILOT_EXECUTION_MESSAGE)
             }
             AutopilotSubcommand::Status(args) => {
                 let report = autopilot::autopilot_status(args.repo, RunId::new(&args.run_id)?)?;
@@ -2502,10 +2406,12 @@ impl AutopilotCommand {
 
 #[derive(Debug, Subcommand)]
 enum AutopilotSubcommand {
-    /// Normalize a task file or JSON autopilot plan without running it.
-    Plan(PlanAutopilotArgs),
-    /// Run one depth-2 plan through the live supervise gates without applying to primary.
-    Run(Box<RunAutopilotArgs>),
+    /// Retired. Use `maco <instruction>`.
+    #[command(hide = true)]
+    Plan(RetiredAutopilotArgs),
+    /// Retired. Use `maco <instruction>`.
+    #[command(hide = true)]
+    Run(RetiredAutopilotArgs),
     /// Report durable autopilot run artifact state.
     Status(StatusAutopilotArgs),
     /// Collect the durable autopilot final report.
@@ -2515,73 +2421,10 @@ enum AutopilotSubcommand {
 }
 
 #[derive(Debug, Args)]
-struct PlanAutopilotArgs {
-    /// Task file or JSON autopilot plan file.
-    task_file: PathBuf,
-    /// Repository path.
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
-    /// Emit machine-readable JSON.
-    #[arg(long)]
-    json: bool,
-}
-
-#[derive(Debug, Args)]
-struct RunAutopilotArgs {
-    /// Task file or JSON autopilot plan file.
-    #[arg(
-        value_name = "TASK_FILE",
-        required_unless_present = "from_goal",
-        conflicts_with = "from_goal"
-    )]
-    task_file: Option<PathBuf>,
-    /// High-level goal/spec file to decompose and run through the autopilot gates.
-    #[arg(long, value_name = "FILE", conflicts_with = "task_file")]
-    from_goal: Option<PathBuf>,
-    /// Repository path.
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
-    /// Stable run id for durable `.maco/autopilot/runs/<run-id>` artifacts. Omit to generate one.
-    #[arg(long)]
-    run_id: Option<String>,
-    /// External orchestration node that directly spawned this autopilot run.
-    #[arg(long, value_parser = parse_boxed_orchestration_node_id)]
-    parent_node: Option<Box<str>>,
-    /// Codex-compatible executable to invoke. Omit for deterministic local fake mode.
-    #[arg(long)]
-    codex_bin: Option<PathBuf>,
-    /// Versioned role/model, pricing, and review-lens profile manifest.
-    #[arg(long)]
-    profile: Option<PathBuf>,
-    /// Disabled legacy reviewer shell string; supplying it fails closed.
-    #[arg(long)]
-    reviewer_command: Option<String>,
-    /// Allow autopilot to run when the primary worktree is dirty.
-    #[arg(long)]
-    allow_dirty_primary: bool,
-    /// Launch even when another live supervise or autopilot run still targets this repository.
-    /// Launch-only: grants no authority to kill, interrupt, revert, or discard another run.
-    #[arg(long)]
-    force_live_run: bool,
-    /// Maximum source plus generated follow-up supervisor-plan dispatches admitted by this run.
-    #[arg(long, value_name = "COUNT")]
-    max_child_dispatches: Option<usize>,
-    /// Repository-relative strict versioned quota entitlement config propagated to supervise.
-    #[arg(long, value_name = "REPO_RELATIVE_FILE")]
-    quota_config: Option<PathBuf>,
-    #[command(flatten)]
-    budget: RunBudgetArgs,
-    #[command(flatten)]
-    role_category_override: OperatorRoleCategoryArgs,
-    /// Exact reviewed config used to gate private runtime output-staging cleanup.
-    #[arg(long, required = true)]
-    machine_global_config: PathBuf,
-    /// Reviewed root id whose canonical root must contain `/run/user/<uid>`.
-    #[arg(long, required = true)]
-    machine_global_runtime_root_id: String,
-    /// Emit machine-readable JSON.
-    #[arg(long)]
-    json: bool,
+struct RetiredAutopilotArgs {
+    /// Ignored legacy arguments. The command always returns the retirement message.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    _legacy_args: Vec<OsString>,
 }
 
 #[derive(Debug, Args)]
