@@ -1076,6 +1076,43 @@ struct PreparedChildAttempt<'a> {
     pre_action_review_context: Option<ReviewContext>,
 }
 
+pub(super) fn bind_worker_journal_artifacts(
+    mut command: ExternalAgentCommand,
+    assignment: &OrchestratorAssignment,
+    incoming_root: &Path,
+    journal_paths: Vec<PathBuf>,
+) -> Result<ExternalAgentCommand> {
+    let worker_journal_subject_ids = assignment_worker_journal_subject_ids(assignment)?;
+    if !command.worker_journal_artifacts.is_empty() {
+        bail!("worker journal artifacts were already bound before assignment preparation");
+    }
+    if journal_paths.len() != worker_journal_subject_ids.len() {
+        bail!("worker journal reservation count did not match the assignment contract");
+    }
+    for (worker_id, journal_path) in worker_journal_subject_ids
+        .iter()
+        .copied()
+        .zip(journal_paths)
+    {
+        let expected_path =
+            incoming_root.join(worker_execution_journal_incoming_relative_for_id(worker_id));
+        if journal_path != expected_path {
+            bail!(
+                "worker journal reservation path {} for '{}' did not match the assignment contract path {}",
+                journal_path.display(),
+                worker_id,
+                expected_path.display()
+            );
+        }
+        command = command.with_worker_journal_artifact(
+            worker_id.to_string(),
+            incoming_root,
+            journal_path,
+        );
+    }
+    Ok(command)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_child_attempt<'a>(
     context: &AssignmentExecutionContext<'a, '_>,
@@ -1373,21 +1410,22 @@ fn prepare_child_attempt<'a>(
                 return Err(error).context("failed to reserve exact worker journal artifacts");
             }
         };
-        if journal_paths.len() != assignment.worker_assignments.len() {
-            drop(incoming_output_root);
-            drop(capture_output_root);
-            with_supervisor_artifacts(artifacts, |writer, _| {
-                discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
-            })?;
-            bail!("worker journal reservation count did not match the assignment contract");
-        }
-        for (worker, journal_path) in assignment.worker_assignments.iter().zip(journal_paths) {
-            command = command.with_worker_journal_artifact(
-                worker.id.clone(),
-                incoming_scratch.path(),
-                journal_path,
-            );
-        }
+        command = match bind_worker_journal_artifacts(
+            command,
+            assignment,
+            incoming_scratch.path(),
+            journal_paths,
+        ) {
+            Ok(command) => command,
+            Err(error) => {
+                drop(incoming_output_root);
+                drop(capture_output_root);
+                with_supervisor_artifacts(artifacts, |writer, _| {
+                    discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
+                })?;
+                return Err(error).context("failed to bind exact worker journal artifacts");
+            }
+        };
     }
     let budget_reservation = match reserve_dispatch_budget(
         &budget_plan,

@@ -441,6 +441,115 @@ fn worker_journals_are_precreated_as_private_exact_files() {
 
 #[test]
 #[cfg(unix)]
+fn prepare_worker_journal_binding_uses_authenticated_subjects_and_exact_paths() {
+    let (_temp, repo_path) = injected_repository();
+    let run_id = RunId::new("artifact-prepare-worker-journal-binding").expect("valid run id");
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        run_id,
+        "supervise-test",
+    )
+    .expect("reserve supervise artifact run");
+
+    let mut direct = injected_assignment(false);
+    direct.id = "direct-worker".to_string();
+    direct.role = AgentRole::Worker;
+    direct.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+    let (direct_incoming, direct_capture) = create_named_invocation_scratches(
+        &mut writer,
+        Path::new("incoming-direct"),
+        Path::new("capture-direct"),
+    )
+    .expect("reserve direct-worker invocation scratches");
+    let direct_paths = precreate_worker_execution_journals(&direct, &direct_incoming)
+        .expect("reserve direct journal");
+    let direct_command = ExternalAgentCommand::codex(
+        "unused-codex",
+        &repo_path,
+        direct_incoming.path().join("prompt.md"),
+        direct_capture.path().join("events.jsonl"),
+        direct_incoming.path().join("report.json"),
+        Duration::from_secs(1),
+    );
+    let bound_direct_command = bind_worker_journal_artifacts(
+        direct_command.clone(),
+        &direct,
+        direct_incoming.path(),
+        direct_paths.clone(),
+    )
+    .expect("bind direct-worker journal");
+    assert_eq!(
+        bound_direct_command.worker_journal_artifacts,
+        vec![crate::external_agent::WorkerJournalArtifactSpec {
+            worker_id: direct.id.clone(),
+            incoming_root: direct_incoming.path().to_path_buf(),
+            path: direct_paths[0].clone(),
+        }]
+    );
+
+    let error = bind_worker_journal_artifacts(
+        direct_command,
+        &direct,
+        direct_incoming.path(),
+        vec![direct_capture.path().join("direct-worker.jsonl")],
+    )
+    .expect_err("capture path must not replace the reserved incoming journal path");
+    assert!(error
+        .to_string()
+        .contains("did not match the assignment contract path"));
+
+    let mut child = injected_assignment(true);
+    let mut second = child.worker_assignments[0].clone();
+    second.id = "worker-b".to_string();
+    child.worker_assignments.push(second);
+    let (child_incoming, child_capture) = create_named_invocation_scratches(
+        &mut writer,
+        Path::new("incoming-child"),
+        Path::new("capture-child"),
+    )
+    .expect("reserve child-orchestrator invocation scratches");
+    let child_paths = precreate_worker_execution_journals(&child, &child_incoming)
+        .expect("reserve nested journals");
+    let child_command = bind_worker_journal_artifacts(
+        ExternalAgentCommand::codex(
+            "unused-codex",
+            &repo_path,
+            child_incoming.path().join("prompt.md"),
+            child_capture.path().join("events.jsonl"),
+            child_incoming.path().join("report.json"),
+            Duration::from_secs(1),
+        ),
+        &child,
+        child_incoming.path(),
+        child_paths.clone(),
+    )
+    .expect("bind nested worker journals");
+    assert_eq!(
+        child_command
+            .worker_journal_artifacts
+            .iter()
+            .map(|artifact| artifact.worker_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["worker-a", "worker-b"]
+    );
+    assert_eq!(
+        child_command
+            .worker_journal_artifacts
+            .iter()
+            .map(|artifact| artifact.path.clone())
+            .collect::<Vec<_>>(),
+        child_paths
+    );
+
+    discard_invocation_scratches(&mut writer, &direct_incoming, &direct_capture)
+        .expect("discard direct invocation scratches");
+    discard_invocation_scratches(&mut writer, &child_incoming, &child_capture)
+        .expect("discard child invocation scratches");
+}
+
+#[test]
+#[cfg(unix)]
 fn direct_worker_fake_output_and_journal_are_first_class_and_non_delegating() {
     let (_temp, repo_path) = injected_repository();
     let run_id = RunId::new("artifact-direct-worker-journal").expect("valid run id");
