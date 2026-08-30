@@ -3710,8 +3710,9 @@ use crate::optimizer::{
     },
 };
 use crate::publication::forge_transport::{
-    decide_pull_request_merge, ForgeActor, ForgeCheck, ForgeCheckConclusion, ForgeCheckStatus,
-    ForgeItem, ForgeItemKind, ForgeRepository, ForgeTimestamp, ProviderObjectId,
+    decide_pull_request_merge, AuthenticatedPullRequestMergeEvidence, FakeForgeTransport,
+    ForgeActor, ForgeCheck, ForgeCheckConclusion, ForgeCheckStatus, ForgeItem, ForgeItemKind,
+    ForgeRepository, ForgeReview, ForgeReviewState, ForgeTimestamp, ProviderObjectId,
     ProviderObjectKind, PullRequestAuditorEvidence, PullRequestChangedPathsEvidence,
     PullRequestFreshnessEvidence, PullRequestFreshnessStatus, PullRequestMergeAuthorityBlocker,
     PullRequestMergeAuthorityDecision, PullRequestMergeAuthorityInput,
@@ -3752,6 +3753,7 @@ fn merge_authority_check(
     name: &str,
     status: ForgeCheckStatus,
     conclusion: Option<ForgeCheckConclusion>,
+    head_oid: &str,
 ) -> ForgeCheck {
     ForgeCheck::new(
         merge_authority_object(ProviderObjectKind::Check, stable_id),
@@ -3765,20 +3767,49 @@ fn merge_authority_check(
         name,
         status,
         conclusion,
-        "1".repeat(40),
+        head_oid,
         ForgeTimestamp::new(MERGE_AUTHORITY_OBSERVED_AT).expect("valid check timestamp"),
     )
     .expect("valid check")
 }
 
-fn merge_authority_fixture(
+fn merge_authority_auditor_review(
+    head_oid: &str,
+    actor_id: &str,
+    state: ForgeReviewState,
+) -> ForgeReview {
+    ForgeReview::new(
+        merge_authority_object(ProviderObjectKind::Review, "R_auditor"),
+        ForgeActor::new(
+            "github",
+            merge_authority_object(ProviderObjectKind::Actor, actor_id),
+            actor_id,
+            ReportedActorKind::Human,
+        )
+        .expect("valid auditor actor"),
+        state,
+        "authenticated auditor approval",
+        ForgeTimestamp::new(MERGE_AUTHORITY_OBSERVED_AT).expect("valid review timestamp"),
+        head_oid,
+    )
+    .expect("valid auditor review")
+}
+
+fn merge_execution_snapshot(
+    head_oid: &str,
     lint_status: ForgeCheckStatus,
     lint_conclusion: Option<ForgeCheckConclusion>,
-) -> (PullRequestReviewSnapshot, PullRequestMergeAuthorityInput) {
-    let snapshot = PullRequestReviewSnapshot::new(
-        merge_authority_item(&"1".repeat(40)),
+    auditor_actor_id: &str,
+    review_state: ForgeReviewState,
+) -> PullRequestReviewSnapshot {
+    PullRequestReviewSnapshot::new(
+        merge_authority_item(head_oid),
         ForgeTimestamp::new(MERGE_AUTHORITY_OBSERVED_AT).expect("valid observation timestamp"),
-        Vec::new(),
+        vec![merge_authority_auditor_review(
+            head_oid,
+            auditor_actor_id,
+            review_state,
+        )],
         Vec::new(),
         vec![
             merge_authority_check(
@@ -3786,11 +3817,25 @@ fn merge_authority_fixture(
                 "ci/unit",
                 ForgeCheckStatus::Completed,
                 Some(ForgeCheckConclusion::Success),
+                head_oid,
             ),
-            merge_authority_check("C_lint", "ci/lint", lint_status, lint_conclusion),
+            merge_authority_check("C_lint", "ci/lint", lint_status, lint_conclusion, head_oid),
         ],
     )
-    .expect("valid review snapshot");
+    .expect("valid review snapshot")
+}
+
+fn merge_authority_fixture(
+    lint_status: ForgeCheckStatus,
+    lint_conclusion: Option<ForgeCheckConclusion>,
+) -> (PullRequestReviewSnapshot, PullRequestMergeAuthorityInput) {
+    let snapshot = merge_execution_snapshot(
+        &"1".repeat(40),
+        lint_status,
+        lint_conclusion,
+        "auditor",
+        ForgeReviewState::Approved,
+    );
     let producer_actor = MergeActor {
         agent: AgentIdentity {
             stable_id: "producer".to_string(),
@@ -4203,4 +4248,254 @@ fn pull_request_merge_evidence_adapter_requires_clean_non_flattening_simulation(
             )
         )
     });
+}
+
+fn authenticated_merge_evidence(
+    snapshot: &PullRequestReviewSnapshot,
+    input: &PullRequestMergeAuthorityInput,
+) -> AuthenticatedPullRequestMergeEvidence {
+    AuthenticatedPullRequestMergeEvidence::from_authenticated_acceptance(
+        snapshot.item().clone(),
+        merge_authority_object(ProviderObjectKind::Review, "R_auditor"),
+        input
+            .required_checks
+            .clone()
+            .expect("fixture required checks"),
+        input.producer.clone().expect("fixture producer"),
+        input.auditor.clone().expect("fixture auditor"),
+        input
+            .merge_simulation
+            .clone()
+            .expect("fixture merge simulation"),
+        input.completion_mode.expect("fixture completion mode"),
+        input.changed_paths.clone().expect("fixture changed paths"),
+    )
+    .expect("authenticated merge evidence")
+}
+
+fn authenticated_merge_repository() -> tempfile::TempDir {
+    let repository = tempfile::tempdir().expect("merge repository tempdir");
+    Repository::init(repository.path()).expect("initialize merge repository");
+    repository
+}
+
+fn assert_authenticated_no_merge(
+    outcome: &AuthenticatedPullRequestMergeOutcome,
+    expected: impl Fn(&AuthenticatedPullRequestMergeBlocker) -> bool,
+) {
+    assert!(
+        !outcome.is_merged(),
+        "unexpected merge outcome: {outcome:?}"
+    );
+    assert!(
+        outcome.blockers().iter().any(expected),
+        "expected no-merge blocker was absent: {outcome:?}"
+    );
+}
+
+#[test]
+fn authenticated_pull_request_merge_types_missing_evidence_without_effect() {
+    let (snapshot, _) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    let repository = authenticated_merge_repository();
+    let fake = FakeForgeTransport::new();
+
+    let outcome =
+        execute_authenticated_pull_request_merge(repository.path(), snapshot.item(), None, &fake)
+            .expect("typed missing evidence");
+
+    assert_authenticated_no_merge(&outcome, |blocker| {
+        matches!(
+            blocker,
+            AuthenticatedPullRequestMergeBlocker::MissingAuthenticatedAuditorEvidence
+        )
+    });
+    assert_eq!(fake.pull_request_merge_count().expect("merge count"), 0);
+}
+
+#[test]
+fn authenticated_pull_request_merge_refuses_stale_head_without_effect() {
+    let (candidate_snapshot, input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    let evidence = authenticated_merge_evidence(&candidate_snapshot, &input);
+    let current_snapshot = merge_execution_snapshot(
+        &"3".repeat(40),
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+        "auditor",
+        ForgeReviewState::Approved,
+    );
+    let mut fake = FakeForgeTransport::new();
+    fake.register_pull_request_merge_observation(candidate_snapshot.item(), current_snapshot)
+        .expect("register stale current head");
+    let repository = authenticated_merge_repository();
+
+    let outcome = execute_authenticated_pull_request_merge(
+        repository.path(),
+        candidate_snapshot.item(),
+        Some(&evidence),
+        &fake,
+    )
+    .expect("typed stale head");
+
+    assert_authenticated_no_merge(&outcome, |blocker| {
+        matches!(
+            blocker,
+            AuthenticatedPullRequestMergeBlocker::StaleCandidateHead { .. }
+        )
+    });
+    assert_eq!(fake.pull_request_merge_count().expect("merge count"), 0);
+}
+
+#[test]
+fn authenticated_pull_request_merge_refuses_red_ci_without_effect() {
+    let (snapshot, input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Failure),
+    );
+    let evidence = authenticated_merge_evidence(&snapshot, &input);
+    let mut fake = FakeForgeTransport::new();
+    fake.register_pull_request_merge_observation(snapshot.item(), snapshot.clone())
+        .expect("register red CI ground truth");
+    let repository = authenticated_merge_repository();
+
+    let outcome = execute_authenticated_pull_request_merge(
+        repository.path(),
+        snapshot.item(),
+        Some(&evidence),
+        &fake,
+    )
+    .expect("typed red CI");
+
+    assert_authenticated_no_merge(&outcome, |blocker| {
+        matches!(
+            blocker,
+            AuthenticatedPullRequestMergeBlocker::Authority(
+                PullRequestMergeAuthorityBlocker::FailedRequiredCheck { .. }
+            )
+        )
+    });
+    assert_eq!(fake.pull_request_merge_count().expect("merge count"), 0);
+}
+
+#[test]
+fn authenticated_pull_request_merge_refuses_self_audit_without_effect() {
+    let (candidate_snapshot, mut input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    input.auditor.as_mut().expect("fixture auditor").auditor = input
+        .producer
+        .as_ref()
+        .expect("fixture producer")
+        .producer
+        .actor
+        .clone();
+    let evidence = authenticated_merge_evidence(&candidate_snapshot, &input);
+    let current_snapshot = merge_execution_snapshot(
+        &"1".repeat(40),
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+        "producer",
+        ForgeReviewState::Approved,
+    );
+    let mut fake = FakeForgeTransport::new();
+    fake.register_pull_request_merge_observation(candidate_snapshot.item(), current_snapshot)
+        .expect("register self-audit ground truth");
+    let repository = authenticated_merge_repository();
+
+    let outcome = execute_authenticated_pull_request_merge(
+        repository.path(),
+        candidate_snapshot.item(),
+        Some(&evidence),
+        &fake,
+    )
+    .expect("typed self-audit");
+
+    assert_authenticated_no_merge(&outcome, |blocker| {
+        matches!(
+            blocker,
+            AuthenticatedPullRequestMergeBlocker::Authority(
+                PullRequestMergeAuthorityBlocker::OptimizerBlocked(
+                    MergeBlocker::ReviewerNotIndependent
+                )
+            )
+        )
+    });
+    assert_eq!(fake.pull_request_merge_count().expect("merge count"), 0);
+}
+
+#[test]
+fn authenticated_pull_request_merge_records_exact_success_receipt() {
+    let (snapshot, input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    let evidence = authenticated_merge_evidence(&snapshot, &input);
+    let mut fake = FakeForgeTransport::new();
+    fake.register_pull_request_merge_observation(snapshot.item(), snapshot.clone())
+        .expect("register green merge ground truth");
+    let repository = authenticated_merge_repository();
+
+    let outcome = execute_authenticated_pull_request_merge(
+        repository.path(),
+        snapshot.item(),
+        Some(&evidence),
+        &fake,
+    )
+    .expect("successful authenticated merge");
+
+    assert!(outcome.is_merged(), "green merge was blocked: {outcome:?}");
+    let receipt = outcome.receipt().expect("authenticated merge receipt");
+    assert_eq!(receipt.item(), snapshot.item());
+    assert_eq!(
+        receipt.approved_actor().provider_actor_id().stable_id(),
+        "auditor"
+    );
+    assert_eq!(receipt.completion_mode(), CompletionMode::MergeCommit);
+    assert!(receipt.evidence_digest().starts_with("sha256:"));
+    assert!(receipt.ground_truth_digest().starts_with("sha256:"));
+    assert_eq!(receipt.merged_oid().len(), 40);
+    assert_eq!(
+        receipt.provider_merge_id().kind(),
+        ProviderObjectKind::Merge
+    );
+    assert!(receipt.url().contains("/pull/327/merge/"));
+    assert_eq!(receipt.merged_at().as_str(), "2000-01-01T00:00:00Z");
+    assert_eq!(fake.pull_request_merge_count().expect("merge count"), 1);
+}
+
+#[test]
+fn authenticated_pull_request_merge_duplicate_retry_reconciles_one_effect() {
+    let (snapshot, input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    let evidence = authenticated_merge_evidence(&snapshot, &input);
+    let mut fake = FakeForgeTransport::new();
+    fake.register_pull_request_merge_observation(snapshot.item(), snapshot.clone())
+        .expect("register retry merge ground truth");
+    let repository = authenticated_merge_repository();
+
+    let first = execute_authenticated_pull_request_merge(
+        repository.path(),
+        snapshot.item(),
+        Some(&evidence),
+        &fake,
+    )
+    .expect("first authenticated merge");
+    let retry = execute_authenticated_pull_request_merge(
+        repository.path(),
+        snapshot.item(),
+        Some(&evidence),
+        &fake,
+    )
+    .expect("reconciled authenticated merge retry");
+
+    assert_eq!(first.receipt(), retry.receipt());
+    assert_eq!(fake.pull_request_merge_count().expect("merge count"), 1);
 }
