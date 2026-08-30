@@ -1310,7 +1310,12 @@ pub struct PullRequestChangedPathsEvidence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct AuthenticatedPullRequestMergeEvidence {
     pub(crate) candidate: ForgeItem,
+    /// Exact provider review selected from fresh GitHub ground truth.
     pub(crate) approved_review_id: ProviderObjectId,
+    /// Provider-authenticated author of `approved_review_id`. This is distinct
+    /// from the terminal critical auditor recorded in `auditor`; both are
+    /// independently bound and neither is inferred from requester text.
+    pub(crate) approved_reviewer: ForgeActor,
     pub(crate) required_checks: Vec<String>,
     pub(crate) producer: PullRequestProducerEvidence,
     pub(crate) auditor: PullRequestAuditorEvidence,
@@ -1324,6 +1329,7 @@ impl AuthenticatedPullRequestMergeEvidence {
     pub(crate) fn from_authenticated_acceptance(
         candidate: ForgeItem,
         approved_review_id: ProviderObjectId,
+        approved_reviewer: ForgeActor,
         required_checks: Vec<String>,
         producer: PullRequestProducerEvidence,
         auditor: PullRequestAuditorEvidence,
@@ -1341,9 +1347,14 @@ impl AuthenticatedPullRequestMergeEvidence {
             ProviderObjectKind::Review,
             "authenticated auditor approval review id",
         )?;
+        approved_reviewer.validate()?;
+        if approved_reviewer.provider_id() != candidate.repository().provider_id() {
+            bail!("authenticated approval reviewer is not bound to the target provider");
+        }
         let evidence = Self {
             candidate,
             approved_review_id,
+            approved_reviewer,
             required_checks,
             producer,
             auditor,
@@ -2402,26 +2413,27 @@ impl PullRequestMergeReceipt {
         Ok(receipt)
     }
 
-    pub(crate) fn effect_id(&self) -> &str {
-        &self.effect_id
-    }
-
+    #[cfg(test)]
     pub(crate) fn item(&self) -> &ForgeItem {
         &self.item
     }
 
+    #[cfg(test)]
     pub(crate) fn approved_actor(&self) -> &ForgeActor {
         &self.approved_actor
     }
 
+    #[cfg(test)]
     pub(crate) fn evidence_digest(&self) -> &str {
         &self.evidence_digest
     }
 
+    #[cfg(test)]
     pub(crate) fn ground_truth_digest(&self) -> &str {
         &self.ground_truth_digest
     }
 
+    #[cfg(test)]
     pub(crate) fn completion_mode(&self) -> CompletionMode {
         self.completion_mode
     }
@@ -2547,6 +2559,7 @@ struct FakeEffectRecord {
     receipt: ForgeMutationReceipt,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct FakeMergeRecord {
     effect_digest: String,
@@ -2557,7 +2570,9 @@ struct FakeMergeRecord {
 pub struct FakeForgeTransport {
     observations: BTreeMap<String, ForgeObservation>,
     effects: Mutex<BTreeMap<String, FakeEffectRecord>>,
+    #[cfg(test)]
     merge_observations: BTreeMap<String, PullRequestReviewSnapshot>,
+    #[cfg(test)]
     merges: Mutex<BTreeMap<String, FakeMergeRecord>>,
 }
 
@@ -2588,6 +2603,7 @@ impl FakeForgeTransport {
     /// Register the current provider state for one stable pull request. The
     /// candidate may carry an older head so stale-head behavior can be tested
     /// without weakening exact observation validation elsewhere.
+    #[cfg(test)]
     pub(crate) fn register_pull_request_merge_observation(
         &mut self,
         candidate: &ForgeItem,
@@ -2689,6 +2705,7 @@ impl ForgeTransport for FakeForgeTransport {
     }
 }
 
+#[cfg(test)]
 impl PullRequestMergeTransport for FakeForgeTransport {
     fn observe_pull_request_for_merge(
         &self,
@@ -2885,6 +2902,7 @@ fn effect_request_digest(request: &ForgeEffectRequest) -> Result<String> {
     ))
 }
 
+#[cfg(test)]
 fn same_pull_request_identity(left: &ForgeItem, right: &ForgeItem) -> bool {
     left.kind() == ForgeItemKind::PullRequest
         && right.kind() == ForgeItemKind::PullRequest
@@ -2893,6 +2911,7 @@ fn same_pull_request_identity(left: &ForgeItem, right: &ForgeItem) -> bool {
         && left.provider_item_id() == right.provider_item_id()
 }
 
+#[cfg(test)]
 fn pull_request_identity_digest(item: &ForgeItem) -> Result<String> {
     item.validate()?;
     if item.kind() != ForgeItemKind::PullRequest {
@@ -2908,6 +2927,7 @@ fn pull_request_identity_digest(item: &ForgeItem) -> Result<String> {
     Ok(sha256_identity(&encoded))
 }
 
+#[cfg(test)]
 fn pull_request_merge_effect_digest(effect: &PullRequestMergeEffect) -> Result<String> {
     effect.validate()?;
     let encoded = serde_json::to_vec(effect).context("failed to bind forge merge effect")?;

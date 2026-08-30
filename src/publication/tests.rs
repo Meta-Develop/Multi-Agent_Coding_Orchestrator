@@ -609,6 +609,8 @@ fn external_source_guard_separates_full_freshness_from_action_revision_and_accep
         "headRefOid": "1".repeat(40),
         "baseRefOid": "2".repeat(40),
         "isDraft": false,
+        "headRepository": {"nameWithOwner": "acme/repo"},
+        "isCrossRepository": false,
         "files": [{"path": "src/lib.rs"}],
         "reviewDecision": "",
         "latestReviews": [],
@@ -639,6 +641,22 @@ fn external_source_guard_separates_full_freshness_from_action_revision_and_accep
         volatile_guard.action_revision_digest
     );
     assert!(revalidate_external_source_value(&expected, &volatile).is_err());
+
+    let mut forked = original.clone();
+    forked["headRepository"] = serde_json::json!({"nameWithOwner": "contributor/repo"});
+    forked["isCrossRepository"] = serde_json::json!(true);
+    let forked_guard = github_source_guard_from_value(
+        "github.example",
+        "github.example/acme/repo",
+        &stable_external_digest(b"source-repo"),
+        ExternalSourceObjectKind::PullRequest,
+        &forked,
+    )
+    .expect("forked guard");
+    assert_ne!(
+        expected.action_revision_digest,
+        forked_guard.action_revision_digest
+    );
 
     let mut changed = volatile;
     changed["title"] = serde_json::json!("changed title");
@@ -672,6 +690,8 @@ fn github_source_guard_requires_exact_typed_fields_and_only_documented_nulls() {
         "headRefOid": "1".repeat(40),
         "baseRefOid": "2".repeat(40),
         "isDraft": false,
+        "headRepository": {"nameWithOwner": "acme/repo"},
+        "isCrossRepository": false,
         "files": [],
         "reviewDecision": null,
         "latestReviews": [],
@@ -702,6 +722,8 @@ fn github_source_guard_requires_exact_typed_fields_and_only_documented_nulls() {
         "headRefOid",
         "baseRefOid",
         "isDraft",
+        "headRepository",
+        "isCrossRepository",
         "files",
         "reviewDecision",
         "latestReviews",
@@ -717,6 +739,8 @@ fn github_source_guard_requires_exact_typed_fields_and_only_documented_nulls() {
         ("labels", serde_json::json!(null)),
         ("labels", serde_json::json!([null])),
         ("isDraft", serde_json::json!(null)),
+        ("headRepository", serde_json::json!("acme/repo")),
+        ("isCrossRepository", serde_json::json!(null)),
         ("files", serde_json::json!({})),
         ("files", serde_json::json!([null])),
         ("reviewDecision", serde_json::json!(false)),
@@ -4257,6 +4281,29 @@ fn authenticated_merge_evidence(
     AuthenticatedPullRequestMergeEvidence::from_authenticated_acceptance(
         snapshot.item().clone(),
         merge_authority_object(ProviderObjectKind::Review, "R_auditor"),
+        ForgeActor::new(
+            "github",
+            merge_authority_object(
+                ProviderObjectKind::Actor,
+                &input
+                    .auditor
+                    .as_ref()
+                    .expect("fixture auditor")
+                    .auditor
+                    .agent
+                    .stable_id,
+            ),
+            input
+                .auditor
+                .as_ref()
+                .expect("fixture auditor")
+                .auditor
+                .agent
+                .stable_id
+                .clone(),
+            ReportedActorKind::Human,
+        )
+        .expect("fixture approved reviewer"),
         input
             .required_checks
             .clone()
@@ -4277,6 +4324,66 @@ fn authenticated_merge_repository() -> tempfile::TempDir {
     let repository = tempfile::tempdir().expect("merge repository tempdir");
     Repository::init(repository.path()).expect("initialize merge repository");
     repository
+}
+
+#[test]
+fn authenticated_github_merge_operation_is_finite_and_head_bound() {
+    let repository = GithubRepositoryIdentity {
+        host: "github.example".to_string(),
+        owner: "acme".to_string(),
+        name: "repo".to_string(),
+    };
+    let digest = "a".repeat(64);
+    let operation = AuthenticatedGithubOperation::Merge {
+        number: 327,
+        expected_head_oid: "1".repeat(40),
+        effect_id: format!("merge:{digest}"),
+        evidence_digest: format!("sha256:{digest}"),
+        ground_truth_digest: format!("sha256:{}", "b".repeat(64)),
+    };
+    let (args, stdin) = operation
+        .command(&repository)
+        .expect("finite merge operation");
+    let args = args
+        .iter()
+        .map(|argument| argument.to_str().expect("UTF-8 argument"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        args,
+        [
+            "api",
+            "--method",
+            "PUT",
+            "repos/acme/repo/pulls/327/merge",
+            "--input",
+            "-"
+        ]
+    );
+    let StdinMode::Bytes(body) = stdin else {
+        panic!("merge operation must send one bounded JSON body");
+    };
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("merge JSON");
+    assert_eq!(body["sha"], "1".repeat(40));
+    assert_eq!(body["merge_method"], "merge");
+    assert!(body["commit_message"]
+        .as_str()
+        .expect("effect marker")
+        .contains(&format!("merge:{digest}")));
+
+    let invalid = AuthenticatedGithubOperation::Merge {
+        number: 327,
+        expected_head_oid: "not-a-head".to_string(),
+        effect_id: format!("merge:{digest}"),
+        evidence_digest: format!("sha256:{digest}"),
+        ground_truth_digest: format!("sha256:{}", "b".repeat(64)),
+    };
+    assert!(invalid.command(&repository).is_err());
+
+    let node = github_node_object_id(ProviderObjectKind::Actor, "MDQ6VXNlcjE=")
+        .expect("real GitHub base64 node id");
+    assert_eq!(node.provider_id(), "github");
+    assert_eq!(node.kind(), ProviderObjectKind::Actor);
+    assert!(node.stable_id().starts_with("node:sha256:"));
 }
 
 fn assert_authenticated_no_merge(
@@ -4377,6 +4484,53 @@ fn authenticated_pull_request_merge_refuses_red_ci_without_effect() {
             AuthenticatedPullRequestMergeBlocker::Authority(
                 PullRequestMergeAuthorityBlocker::FailedRequiredCheck { .. }
             )
+        )
+    });
+    assert_eq!(fake.pull_request_merge_count().expect("merge count"), 0);
+}
+
+#[test]
+fn authenticated_pull_request_merge_refuses_a_changed_check_union_without_effect() {
+    let (candidate_snapshot, input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    let evidence = authenticated_merge_evidence(&candidate_snapshot, &input);
+    let current_snapshot = PullRequestReviewSnapshot::new(
+        candidate_snapshot.item().clone(),
+        candidate_snapshot.observed_at().clone(),
+        candidate_snapshot.reviews().to_vec(),
+        Vec::new(),
+        [
+            candidate_snapshot.checks().to_vec(),
+            vec![merge_authority_check(
+                "C_late",
+                "ci/late",
+                ForgeCheckStatus::Completed,
+                Some(ForgeCheckConclusion::Success),
+                candidate_snapshot.item().head_oid().expect("head OID"),
+            )],
+        ]
+        .concat(),
+    )
+    .expect("changed provider check union");
+    let mut fake = FakeForgeTransport::new();
+    fake.register_pull_request_merge_observation(candidate_snapshot.item(), current_snapshot)
+        .expect("register changed check union");
+    let repository = authenticated_merge_repository();
+
+    let outcome = execute_authenticated_pull_request_merge(
+        repository.path(),
+        candidate_snapshot.item(),
+        Some(&evidence),
+        &fake,
+    )
+    .expect("typed changed-check refusal");
+
+    assert_authenticated_no_merge(&outcome, |blocker| {
+        matches!(
+            blocker,
+            AuthenticatedPullRequestMergeBlocker::CurrentCheckSetMismatch
         )
     });
     assert_eq!(fake.pull_request_merge_count().expect("merge count"), 0);
@@ -4498,4 +4652,131 @@ fn authenticated_pull_request_merge_duplicate_retry_reconciles_one_effect() {
 
     assert_eq!(first.receipt(), retry.receipt());
     assert_eq!(fake.pull_request_merge_count().expect("merge count"), 1);
+}
+
+fn sequenced_provider_review(
+    sequence: u64,
+    submitted_at: &str,
+    state: ForgeReviewState,
+) -> SequencedGithubReview {
+    SequencedGithubReview {
+        sequence,
+        review: ForgeReview::new(
+            merge_authority_object(ProviderObjectKind::Review, &format!("R_review_{sequence}")),
+            ForgeActor::new(
+                "github",
+                merge_authority_object(ProviderObjectKind::Actor, "A_reviewer"),
+                "reviewer",
+                ReportedActorKind::Human,
+            )
+            .expect("review actor"),
+            state,
+            "review",
+            ForgeTimestamp::new(submitted_at).expect("review timestamp"),
+            "1".repeat(40),
+        )
+        .expect("provider review"),
+    }
+}
+
+#[test]
+fn github_merge_ground_truth_uses_latest_decisive_review_state() {
+    let reviews = latest_effective_github_reviews(vec![
+        sequenced_provider_review(1, "2026-08-30T00:00:01Z", ForgeReviewState::Approved),
+        sequenced_provider_review(2, "2026-08-30T00:00:02Z", ForgeReviewState::Commented),
+        sequenced_provider_review(
+            3,
+            "2026-08-30T00:00:03Z",
+            ForgeReviewState::ChangesRequested,
+        ),
+    ]);
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].state(), ForgeReviewState::ChangesRequested);
+
+    let dismissed = latest_effective_github_reviews(vec![
+        sequenced_provider_review(4, "2026-08-30T00:00:04Z", ForgeReviewState::Approved),
+        sequenced_provider_review(5, "2026-08-30T00:00:05Z", ForgeReviewState::Dismissed),
+    ]);
+    assert_eq!(dismissed.len(), 1);
+    assert_eq!(dismissed[0].state(), ForgeReviewState::Dismissed);
+}
+
+#[test]
+fn authenticated_github_pagination_rejects_incomplete_shapes() {
+    validate_authenticated_github_page_shape([0], "empty collection")
+        .expect("one empty page is a complete empty collection");
+    validate_authenticated_github_page_shape([100, 1], "complete collection")
+        .expect("full non-final page and nonempty final page");
+    assert!(validate_authenticated_github_page_shape([99, 1], "short page").is_err());
+    assert!(validate_authenticated_github_page_shape([100, 0], "empty tail").is_err());
+    assert!(validate_authenticated_github_page_shape(
+        std::iter::repeat_n(100, AUTHENTICATED_GITHUB_MAX_PAGES + 1),
+        "excessive pages",
+    )
+    .is_err());
+}
+
+#[test]
+fn github_same_repository_head_requires_the_provider_node_identity() {
+    let base = GithubApiRepository {
+        node_id: "R_base".to_string(),
+        full_name: "acme/repo".to_string(),
+    };
+    let exact = GithubApiRepository {
+        node_id: "R_base".to_string(),
+        full_name: "ACME/REPO".to_string(),
+    };
+    let lookalike = GithubApiRepository {
+        node_id: "R_other".to_string(),
+        full_name: "acme/repo".to_string(),
+    };
+    assert!(github_same_repository_head(
+        Some(&exact),
+        &base,
+        "acme/repo"
+    ));
+    assert!(!github_same_repository_head(
+        Some(&lookalike),
+        &base,
+        "acme/repo"
+    ));
+    assert!(!github_same_repository_head(None, &base, "acme/repo"));
+}
+
+fn github_status(id: &str, state: &str, updated_at: &str) -> GithubApiStatus {
+    GithubApiStatus {
+        node_id: id.to_string(),
+        context: "ci/status".to_string(),
+        state: state.to_string(),
+        updated_at: updated_at.to_string(),
+        creator: Some(GithubApiActor {
+            node_id: "A_status".to_string(),
+            login: "status-bot".to_string(),
+            kind: "Bot".to_string(),
+        }),
+    }
+}
+
+#[test]
+fn github_commit_status_union_rejects_equal_timestamp_ambiguity() {
+    let latest = latest_github_statuses(vec![
+        github_status("S_old", "pending", "2026-08-30T00:00:01Z"),
+        github_status("S_new", "success", "2026-08-30T00:00:02Z"),
+    ])
+    .expect("strict latest status");
+    assert_eq!(latest.len(), 1);
+    assert_eq!(latest[0].state, "success");
+
+    assert!(latest_github_statuses(vec![
+        github_status("S_red", "failure", "2026-08-30T00:00:03Z"),
+        github_status("S_green", "success", "2026-08-30T00:00:03Z"),
+    ])
+    .is_err());
+}
+
+#[test]
+fn github_pr_source_fields_include_fail_closed_source_provenance() {
+    let fields = GITHUB_PR_SOURCE_FIELDS.split(',').collect::<BTreeSet<_>>();
+    assert!(fields.contains("headRepository"));
+    assert!(fields.contains("isCrossRepository"));
 }

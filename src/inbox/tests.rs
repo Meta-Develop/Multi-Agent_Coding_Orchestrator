@@ -1084,6 +1084,7 @@ fn raw_pr_candidate_parsing_deduplicates_labels_files_and_failed_checks() {
         "headRefOid": "1111111111111111111111111111111111111111",
         "baseRefOid": "2222222222222222222222222222222222222222",
         "isDraft": false,
+        "isCrossRepository": false,
         "labels": [{"name": "z"}, {"name": "a"}, {"name": "a"}],
         "files": [{"path": "src/../src/inbox.rs"}, {"path": "src/inbox.rs"}],
         "statusCheckRollup": [

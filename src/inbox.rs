@@ -26,7 +26,7 @@ use crate::{
 use anyhow::{bail, Context, Result};
 #[cfg(test)]
 use git2::Repository;
-use git2::StatusOptions;
+use git2::{Delta, DiffFindOptions, DiffOptions, Oid, StatusOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -37,6 +37,22 @@ use std::{
     process, thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+use crate::optimizer::merge_authority::{assess_independence, CompletionMode, ProducerFingerprint};
+#[cfg(test)]
+use crate::optimizer::merge_authority::{AgentIdentity, MergeActor, SessionId};
+use crate::publication::forge_transport::{
+    AuthenticatedPullRequestMergeEvidence, ForgeCheckConclusion, ForgeCheckStatus, ForgeItem,
+    ForgeReviewState, PullRequestAuditorEvidence, PullRequestChangedPathsEvidence,
+    PullRequestMergeReceipt, PullRequestMergeSimulationEvidence, PullRequestProducerEvidence,
+    PullRequestReviewSnapshot,
+};
+#[cfg(test)]
+use crate::publication::forge_transport::{
+    FakeForgeTransport, ForgeActor, ForgeReview, ProviderObjectId, ProviderObjectKind,
+    ReportedActorKind,
+};
+use crate::publication::AuthenticatedPullRequestMergeOutcome;
 
 const INBOX_SCHEMA_VERSION: u32 = 1;
 const CONFIG_FILE: &str = "maco-inbox.json";
@@ -1752,6 +1768,11 @@ fn run_inbox_with_overrides(
     } else {
         InboxRunStatus::Failed
     };
+    let auto_merge_performed = item_reports.iter().any(|item| {
+        item.independent_audit_lane
+            .as_ref()
+            .is_some_and(|lane| lane.auto_merge_performed && lane.merge_receipt.is_some())
+    });
     let report = InboxRunReport {
         version: INBOX_SCHEMA_VERSION,
         run_id: options.run_id,
@@ -1765,9 +1786,11 @@ fn run_inbox_with_overrides(
         artifacts,
         selected_item_count: selected_items.len(),
         item_reports,
-        auto_merge_performed: false,
+        auto_merge_performed,
         next_action: if status == InboxRunStatus::Refused {
             "increase or wait for the rolling inbox quota before starting another run".to_string()
+        } else if success && auto_merge_performed {
+            "review the verified authenticated pull-request merge receipt".to_string()
         } else if success {
             "review inbox item reports; no automatic merge was performed".to_string()
         } else {
@@ -1997,6 +2020,12 @@ pub fn run_workspace_inbox(options: InboxWorkspaceRunOptions) -> Result<InboxWor
         scan_report: public_run_dir.join("scan-report.json"),
         final_report: public_run_dir.join("final-report.json"),
     };
+    let auto_merge_performed = repositories.iter().any(|repository| {
+        repository
+            .run_report
+            .as_ref()
+            .is_some_and(|report| report.auto_merge_performed)
+    });
     let report = InboxWorkspaceRunReport {
         version: INBOX_SCHEMA_VERSION,
         run_id: options.run_id,
@@ -2012,7 +2041,7 @@ pub fn run_workspace_inbox(options: InboxWorkspaceRunOptions) -> Result<InboxWor
         refused_repo_count: repo_counts.refused,
         repo_counts,
         artifacts,
-        auto_merge_performed: false,
+        auto_merge_performed,
         auto_approval_performed: false,
         repositories,
         next_action: workspace_next_action(success, loaded.config.strict, "workspace run"),
@@ -2046,6 +2075,7 @@ pub fn watch_workspace_inbox(
         thread::sleep(Duration::from_secs(options.poll_seconds));
     }
     let success = runs.iter().all(|run| run.success);
+    let auto_merge_performed = runs.iter().any(|run| run.auto_merge_performed);
     Ok(InboxWorkspaceWatchReport {
         version: INBOX_SCHEMA_VERSION,
         config_path: public_config_path,
@@ -2053,7 +2083,7 @@ pub fn watch_workspace_inbox(
         once: options.once,
         success,
         iteration_count: runs.len(),
-        auto_merge_performed: false,
+        auto_merge_performed,
         auto_approval_performed: false,
         runs,
     })
@@ -2981,32 +3011,44 @@ where
         return finish_independent_audit_lane_item(writer, input, review_loop, pr_intake, lane);
     }
     let task = task.expect("checked source-bound independent-audit task");
+    if item.source_snapshot.provider() == InboxSourceProvider::Github
+        && verify_local_independent_audit_candidate(context.repo, task).is_err()
+    {
+        let lane = review_loop_entry::blocked_independent_audit_lane_result(
+            item,
+            &task.head_oid,
+            vec![
+                review_loop_entry::InboxIndependentAuditLaneBlocker::MissingEvidence {
+                    evidence: vec!["local_exact_pull_request_diff".to_string()],
+                },
+            ],
+            None,
+            None,
+        );
+        return finish_independent_audit_lane_item(writer, input, review_loop, pr_intake, lane);
+    }
     let timeout = Duration::from_secs(context.config.timeout_seconds.unwrap_or(600));
     let program = context
         .codex_bin
         .clone()
         .unwrap_or_else(|| PathBuf::from("codex"));
-    let available_models = match available_models_override.cloned().map(Ok).unwrap_or_else(|| {
-        independent_auditor_available_models(&program, context.repo, timeout)
-    }) {
-            Ok(models) => models,
-            Err(blocker) => {
-                let lane = review_loop_entry::blocked_independent_audit_lane_result(
-                    item,
-                    &task.head_oid,
-                    vec![blocker],
-                    None,
-                    None,
-                );
-                return finish_independent_audit_lane_item(
-                    writer,
-                    input,
-                    review_loop,
-                    pr_intake,
-                    lane,
-                );
-            }
-        };
+    let available_models = match available_models_override
+        .cloned()
+        .map(Ok)
+        .unwrap_or_else(|| independent_auditor_available_models(&program, context.repo, timeout))
+    {
+        Ok(models) => models,
+        Err(blocker) => {
+            let lane = review_loop_entry::blocked_independent_audit_lane_result(
+                item,
+                &task.head_oid,
+                vec![blocker],
+                None,
+                None,
+            );
+            return finish_independent_audit_lane_item(writer, input, review_loop, pr_intake, lane);
+        }
+    };
     let decision = match review_loop_entry::select_critical_independent_auditor(&available_models) {
         Ok(decision) => decision,
         Err(error) => {
@@ -3167,46 +3209,533 @@ where
                 Some(launch),
             ),
             Some(raw_output) => {
-                match serde_json::from_slice::<review_loop_entry::InboxIndependentAuditorOutput>(
-                    &raw_output,
-                ) {
-                    Err(_) => review_loop_entry::blocked_independent_audit_lane_result(
+                let report_sha256 = crate::artifacts::state_auth::sha256_hex(&raw_output);
+                if launch.report_sha256.as_deref() != Some(report_sha256.as_str()) {
+                    review_loop_entry::blocked_independent_audit_lane_result(
                         item,
                         &task.head_oid,
                         vec![
                             review_loop_entry::InboxIndependentAuditLaneBlocker::MissingAuditEvidence {
-                                evidence: vec!["strict_auditor_output_json".to_string()],
+                                evidence: vec!["auditor_output_digest".to_string()],
                             },
                         ],
                         Some(selection),
                         Some(launch),
-                    ),
-                    Ok(output) => match review_loop_entry::validate_independent_auditor_output(
-                        output, item, task, auditor,
-                    ) {
-                        Ok(auditor_evidence) => {
-                            review_loop_entry::accepted_independent_audit_lane_result(
+                    )
+                } else {
+                    let parsed = serde_json::from_slice::<
+                        review_loop_entry::InboxIndependentAuditorOutput,
+                    >(&raw_output);
+                    match parsed {
+                        Err(_) => review_loop_entry::blocked_independent_audit_lane_result(
+                            item,
+                            &task.head_oid,
+                            vec![
+                                review_loop_entry::InboxIndependentAuditLaneBlocker::MissingAuditEvidence {
+                                    evidence: vec!["strict_auditor_output_json".to_string()],
+                                },
+                            ],
+                            Some(selection),
+                            Some(launch),
+                        ),
+                        Ok(output) => match review_loop_entry::validate_independent_auditor_output(
+                            output, item, task, auditor,
+                        ) {
+                            Ok(auditor_evidence) => complete_authenticated_independent_audit_merge(
+                                context,
                                 item,
+                                task,
                                 selection,
                                 launch,
                                 auditor_evidence,
-                            )
-                        }
-                        Err(blocker) => {
-                            review_loop_entry::blocked_independent_audit_lane_result(
-                                item,
-                                &task.head_oid,
-                                vec![blocker],
-                                Some(selection),
-                                Some(launch),
-                            )
-                        }
-                    },
+                            ),
+                            Err(blocker) => {
+                                review_loop_entry::blocked_independent_audit_lane_result(
+                                    item,
+                                    &task.head_oid,
+                                    vec![blocker],
+                                    Some(selection),
+                                    Some(launch),
+                                )
+                            }
+                        },
+                    }
                 }
             }
         }
     };
     finish_independent_audit_lane_item(writer, input, review_loop, pr_intake, lane)
+}
+
+fn verify_local_independent_audit_candidate(
+    repo_path: &Path,
+    task: &InboxIndependentAuditMergeLaneTask,
+) -> Result<()> {
+    let repository = crate::git_repository::open(repo_path)
+        .context("open repository for exact local pull-request audit")?;
+    let head_oid = Oid::from_str(&task.head_oid).context("parse local pull-request head OID")?;
+    let base_oid = Oid::from_str(&task.base_oid).context("parse local pull-request base OID")?;
+    if head_oid.to_string() != task.head_oid || base_oid.to_string() != task.base_oid {
+        bail!("local pull-request OIDs were not canonical SHA-1 object identities");
+    }
+    let head = repository
+        .find_commit(head_oid)
+        .context("local repository omitted the exact pull-request head commit")?;
+    let base = repository
+        .find_commit(base_oid)
+        .context("local repository omitted the exact pull-request base commit")?;
+    let merge_base_oid = repository
+        .merge_base(base.id(), head.id())
+        .context("local pull-request commits had no unique merge base")?;
+    let merge_base = repository
+        .find_commit(merge_base_oid)
+        .context("local repository omitted the pull-request merge-base commit")?;
+    let merge_base_tree = merge_base
+        .tree()
+        .context("load pull-request merge-base tree")?;
+    let head_tree = head.tree().context("load pull-request head tree")?;
+    let mut options = DiffOptions::new();
+    options
+        .include_typechange(true)
+        .recurse_untracked_dirs(false);
+    let mut diff = repository
+        .diff_tree_to_tree(Some(&merge_base_tree), Some(&head_tree), Some(&mut options))
+        .context("compute exact local pull-request diff")?;
+    let mut find = DiffFindOptions::new();
+    find.renames(true);
+    diff.find_similar(Some(&mut find))
+        .context("resolve exact local pull-request renames")?;
+    let mut observed = BTreeSet::new();
+    for delta in diff.deltas() {
+        let path = if delta.status() == Delta::Deleted {
+            delta.old_file().path()
+        } else {
+            delta.new_file().path().or_else(|| delta.old_file().path())
+        }
+        .context("local pull-request diff omitted a changed path")?;
+        observed.insert(
+            normalize_repo_relative_path(path)
+                .context("local pull-request diff contained an invalid changed path")?,
+        );
+    }
+    let expected = task.changed_files.iter().cloned().collect::<BTreeSet<_>>();
+    if expected.is_empty() || expected.len() != task.changed_files.len() || observed != expected {
+        bail!("local pull-request diff paths did not match provider-bound audit paths");
+    }
+    Ok(())
+}
+
+struct TrustedInboxPullRequestMergeGroundTruth {
+    snapshot: PullRequestReviewSnapshot,
+    producer: ProducerFingerprint,
+    producer_login: String,
+    changed_paths: Vec<PathBuf>,
+    merges_cleanly: bool,
+    is_draft: bool,
+    is_open: bool,
+    same_repository_head: bool,
+}
+
+fn complete_authenticated_independent_audit_merge(
+    context: &InboxItemRunContext<'_>,
+    item: &InboxItem,
+    task: &InboxIndependentAuditMergeLaneTask,
+    selection: review_loop_entry::InboxIndependentAuditorSelectionEvidence,
+    launch: review_loop_entry::InboxIndependentAuditLaunchEvidence,
+    auditor_evidence: PullRequestAuditorEvidence,
+) -> review_loop_entry::InboxIndependentAuditLaneResult {
+    if context.action_policy == InboxActionPolicy::DryRun
+        || (context.action_policy == InboxActionPolicy::Github
+            && context.permission_mode != InboxPermissionMode::GithubFull)
+    {
+        return review_loop_entry::blocked_authenticated_merge_lane_result(
+            item,
+            selection,
+            launch,
+            auditor_evidence,
+            review_loop_entry::InboxIndependentAuditLaneBlocker::MergeModeNotAuthorized {
+                action_policy: format!("{:?}", context.action_policy).to_ascii_lowercase(),
+                permission_mode: format!("{:?}", context.permission_mode).to_ascii_lowercase(),
+            },
+        );
+    }
+    #[cfg(not(test))]
+    if context.action_policy == InboxActionPolicy::Fake {
+        return review_loop_entry::blocked_authenticated_merge_lane_result(
+            item,
+            selection,
+            launch,
+            auditor_evidence,
+            review_loop_entry::InboxIndependentAuditLaneBlocker::MergeModeNotAuthorized {
+                action_policy: "fake".to_string(),
+                permission_mode: format!("{:?}", context.permission_mode).to_ascii_lowercase(),
+            },
+        );
+    }
+
+    let ground_truth = match context.action_policy {
+        InboxActionPolicy::DryRun => unreachable!("dry run returned before ground-truth access"),
+        InboxActionPolicy::Fake => {
+            #[cfg(test)]
+            {
+                fake_pull_request_merge_ground_truth(item, task, &auditor_evidence)
+            }
+            #[cfg(not(test))]
+            {
+                unreachable!("production fake merge mode returned before ground-truth access")
+            }
+        }
+        InboxActionPolicy::Github => publication::observe_github_pull_request_merge_ground_truth(
+            context.repo,
+            item.source_snapshot.repository_selector(),
+            item.source_snapshot.number(),
+        )
+        .map(|truth| TrustedInboxPullRequestMergeGroundTruth {
+            snapshot: truth.snapshot,
+            producer: truth.producer,
+            producer_login: truth.producer_login,
+            changed_paths: truth.changed_paths,
+            merges_cleanly: truth.merges_cleanly,
+            is_draft: truth.is_draft,
+            is_open: truth.is_open,
+            same_repository_head: truth.same_repository_head,
+        }),
+    };
+    let ground_truth = match ground_truth {
+        Ok(ground_truth) => ground_truth,
+        Err(error) => {
+            return review_loop_entry::blocked_authenticated_merge_lane_result(
+                item,
+                selection,
+                launch,
+                auditor_evidence,
+                review_loop_entry::InboxIndependentAuditLaneBlocker::MergeGroundTruthUnavailable {
+                    detail: sanitize_public_text(
+                        context.repo,
+                        &format!("{error:#}"),
+                        GH_DIAGNOSTIC_LIMIT,
+                    )
+                    .text,
+                },
+            );
+        }
+    };
+    let (candidate, evidence) = match authenticated_merge_evidence_from_ground_truth(
+        task,
+        &auditor_evidence,
+        &ground_truth,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return review_loop_entry::blocked_authenticated_merge_lane_result(
+                item,
+                selection,
+                launch,
+                auditor_evidence,
+                review_loop_entry::InboxIndependentAuditLaneBlocker::MergeGroundTruthMismatch {
+                    field: sanitize_public_text(
+                        context.repo,
+                        &error.to_string(),
+                        GH_DIAGNOSTIC_LIMIT,
+                    )
+                    .text,
+                },
+            );
+        }
+    };
+
+    let merge = match context.action_policy {
+        InboxActionPolicy::DryRun => unreachable!("dry run returned before merge execution"),
+        InboxActionPolicy::Fake => {
+            #[cfg(test)]
+            {
+                let mut transport = FakeForgeTransport::new();
+                transport
+                    .register_pull_request_merge_observation(
+                        &candidate,
+                        ground_truth.snapshot.clone(),
+                    )
+                    .and_then(|()| {
+                        publication::execute_authenticated_pull_request_merge(
+                            context.repo,
+                            &candidate,
+                            Some(&evidence),
+                            &transport,
+                        )
+                    })
+            }
+            #[cfg(not(test))]
+            {
+                unreachable!("production fake merge mode returned before merge execution")
+            }
+        }
+        InboxActionPolicy::Github => publication::execute_authenticated_github_pull_request_merge(
+            context.repo,
+            item.source_snapshot.repository_selector(),
+            &candidate,
+            Some(&evidence),
+        ),
+    };
+    match merge {
+        Ok(AuthenticatedPullRequestMergeOutcome::Merged { receipt, .. }) => {
+            review_loop_entry::accepted_independent_audit_lane_result(
+                item,
+                selection,
+                launch,
+                auditor_evidence,
+                inbox_merge_receipt(&receipt),
+            )
+        }
+        Ok(AuthenticatedPullRequestMergeOutcome::NotMerged { blockers, .. }) => {
+            review_loop_entry::blocked_authenticated_merge_lane_result(
+                item,
+                selection,
+                launch,
+                auditor_evidence,
+                review_loop_entry::InboxIndependentAuditLaneBlocker::AuthenticatedMergeBlocked {
+                    blockers,
+                },
+            )
+        }
+        Err(error) => review_loop_entry::blocked_authenticated_merge_lane_result(
+            item,
+            selection,
+            launch,
+            auditor_evidence,
+            review_loop_entry::InboxIndependentAuditLaneBlocker::AuthenticatedMergeFailed {
+                detail: sanitize_public_text(
+                    context.repo,
+                    &format!("{error:#}"),
+                    GH_DIAGNOSTIC_LIMIT,
+                )
+                .text,
+            },
+        ),
+    }
+}
+
+#[cfg(test)]
+fn fake_pull_request_merge_ground_truth(
+    item: &InboxItem,
+    task: &InboxIndependentAuditMergeLaneTask,
+    auditor_evidence: &PullRequestAuditorEvidence,
+) -> Result<TrustedInboxPullRequestMergeGroundTruth> {
+    let synthesized = review_loop_entry::synthesize_inbox_review_observation(item)?;
+    let provider = synthesized.item.repository().provider_id();
+    let auditor_actor = ForgeActor::new(
+        provider,
+        ProviderObjectId::new(
+            provider,
+            ProviderObjectKind::Actor,
+            auditor_evidence.auditor.agent.stable_id.clone(),
+        )?,
+        auditor_evidence
+            .auditor
+            .agent
+            .stable_id
+            .to_ascii_lowercase(),
+        ReportedActorKind::Human,
+    )?;
+    let approval = ForgeReview::new(
+        ProviderObjectId::new(
+            provider,
+            ProviderObjectKind::Review,
+            format!(
+                "review:{}:independent-auditor",
+                item.source_snapshot.number()
+            ),
+        )?,
+        auditor_actor,
+        ForgeReviewState::Approved,
+        "authenticated independent audit acceptance",
+        synthesized.observed_at.clone(),
+        &task.head_oid,
+    )?;
+    let snapshot = PullRequestReviewSnapshot::new(
+        synthesized.item.clone(),
+        synthesized.observed_at,
+        vec![approval],
+        Vec::new(),
+        synthesized.snapshot.checks().to_vec(),
+    )?;
+    let producer_id = format!("actor:{}", task.producer_login.to_ascii_lowercase());
+    Ok(TrustedInboxPullRequestMergeGroundTruth {
+        snapshot,
+        producer: ProducerFingerprint {
+            actor: MergeActor {
+                agent: AgentIdentity {
+                    stable_id: producer_id.clone(),
+                },
+                session: SessionId {
+                    id: format!("fake-pr-head:{}", task.head_oid),
+                },
+                model_label: "fake-pr-producer".to_string(),
+            },
+            commit_authors: vec![producer_id.clone()],
+            commit_committers: vec![producer_id],
+        },
+        producer_login: task.producer_login.clone(),
+        changed_paths: task.changed_files.clone(),
+        merges_cleanly: true,
+        is_draft: task.is_draft,
+        is_open: true,
+        same_repository_head: task.source_trust == GithubPrSourceTrust::TrustedTargetRepository,
+    })
+}
+
+fn authenticated_merge_evidence_from_ground_truth(
+    task: &InboxIndependentAuditMergeLaneTask,
+    local_auditor: &PullRequestAuditorEvidence,
+    truth: &TrustedInboxPullRequestMergeGroundTruth,
+) -> Result<(ForgeItem, AuthenticatedPullRequestMergeEvidence)> {
+    let candidate = truth.snapshot.item();
+    if candidate.head_oid() != Some(task.head_oid.as_str()) {
+        bail!("head_oid");
+    }
+    if candidate.base_oid() != Some(task.base_oid.as_str()) {
+        bail!("base_oid");
+    }
+    if local_auditor.head_oid != task.head_oid {
+        bail!("auditor_head_oid");
+    }
+    if truth.is_draft {
+        bail!("draft_pull_request");
+    }
+    if !truth.is_open {
+        bail!("open_pull_request");
+    }
+    if !truth.same_repository_head {
+        bail!("trusted_same_repository_head");
+    }
+    if !truth
+        .producer_login
+        .eq_ignore_ascii_case(&task.producer_login)
+    {
+        bail!("producer_identity");
+    }
+    let mut task_paths = task.changed_files.clone();
+    task_paths.sort();
+    if task_paths != truth.changed_paths {
+        bail!("changed_paths");
+    }
+    if !truth.merges_cleanly {
+        bail!("merge_simulation");
+    }
+
+    let mut required_checks = task
+        .checks
+        .iter()
+        .map(|check| check.name.trim().to_string())
+        .collect::<Vec<_>>();
+    required_checks.sort();
+    if required_checks.is_empty()
+        || required_checks.iter().any(|check| check.is_empty())
+        || required_checks.windows(2).any(|pair| pair[0] == pair[1])
+    {
+        bail!("required_checks");
+    }
+    let mut observed_check_names = truth
+        .snapshot
+        .checks()
+        .iter()
+        .map(|check| check.name().to_string())
+        .collect::<Vec<_>>();
+    observed_check_names.sort();
+    if observed_check_names != required_checks {
+        bail!("required_check_set");
+    }
+    if truth.snapshot.checks().iter().any(|check| {
+        check.status() != ForgeCheckStatus::Completed
+            || check.conclusion() != Some(ForgeCheckConclusion::Success)
+    }) {
+        bail!("incomplete_or_unsuccessful_check");
+    }
+    for required in &required_checks {
+        let matches = truth
+            .snapshot
+            .checks()
+            .iter()
+            .filter(|check| check.name() == required)
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            bail!("required_check:{required}");
+        }
+        let check = matches[0];
+        if check.status() != ForgeCheckStatus::Completed
+            || check.conclusion() != Some(ForgeCheckConclusion::Success)
+        {
+            bail!("required_check_not_successful:{required}");
+        }
+    }
+
+    let mut approvals = truth
+        .snapshot
+        .reviews()
+        .iter()
+        .filter(|review| review.state() == ForgeReviewState::Approved)
+        .filter(|review| {
+            let actor = review.author().provider_actor_id().stable_id();
+            actor != truth.producer.actor.agent.stable_id
+                && !truth.producer.commit_authors.iter().any(|id| id == actor)
+                && !truth
+                    .producer
+                    .commit_committers
+                    .iter()
+                    .any(|id| id == actor)
+        })
+        .collect::<Vec<_>>();
+    approvals.sort_by(|left, right| {
+        left.submitted_at().cmp(right.submitted_at()).then_with(|| {
+            left.provider_review_id()
+                .stable_id()
+                .cmp(right.provider_review_id().stable_id())
+        })
+    });
+    let approval = approvals.pop().context("independent_approved_review")?;
+    let auditor = local_auditor.auditor.clone();
+    if !assess_independence(&truth.producer, &auditor).independent {
+        bail!("producer_auditor_separation");
+    }
+    let provider_auditor = PullRequestAuditorEvidence {
+        head_oid: task.head_oid.clone(),
+        snapshot_observed_at: truth.snapshot.observed_at().clone(),
+        auditor,
+        lenses: local_auditor.lenses.clone(),
+    };
+    let evidence = AuthenticatedPullRequestMergeEvidence::from_authenticated_acceptance(
+        candidate.clone(),
+        approval.provider_review_id().clone(),
+        approval.author().clone(),
+        required_checks,
+        PullRequestProducerEvidence {
+            head_oid: task.head_oid.clone(),
+            producer: truth.producer.clone(),
+        },
+        provider_auditor,
+        PullRequestMergeSimulationEvidence {
+            head_oid: task.head_oid.clone(),
+            base_oid: task.base_oid.clone(),
+            snapshot_observed_at: truth.snapshot.observed_at().clone(),
+            merges_cleanly: true,
+        },
+        CompletionMode::MergeCommit,
+        PullRequestChangedPathsEvidence {
+            head_oid: task.head_oid.clone(),
+            paths: truth.changed_paths.clone(),
+        },
+    )?;
+    Ok((candidate.clone(), evidence))
+}
+
+fn inbox_merge_receipt(
+    receipt: &PullRequestMergeReceipt,
+) -> review_loop_entry::InboxAuthenticatedPullRequestMergeReceipt {
+    review_loop_entry::InboxAuthenticatedPullRequestMergeReceipt {
+        provider_merge_id: receipt.provider_merge_id().stable_id().to_string(),
+        merged_oid: receipt.merged_oid().to_string(),
+        url: receipt.url().to_string(),
+        merged_at: receipt.merged_at().as_str().to_string(),
+    }
 }
 
 fn pr_intake_lane_blocker(
@@ -3286,15 +3815,22 @@ fn finish_independent_audit_lane_item(
     let github_report = InboxGithubActionReport {
         mode: context.action_policy,
         permission_mode: context.permission_mode,
-        status: "skipped".to_string(),
+        status: if lane.auto_merge_performed {
+            "merged".to_string()
+        } else {
+            "blocked".to_string()
+        },
         success: lane.success,
         target: item_target(item),
-        comment_url: None,
-        message: Some(if lane.success {
-            "independent audit evidence was accepted; no GitHub action or merge was performed"
+        comment_url: lane
+            .merge_receipt
+            .as_ref()
+            .map(|receipt| receipt.url.clone()),
+        message: Some(if lane.auto_merge_performed {
+            "independent audit evidence was accepted and one authenticated merge receipt was verified"
                 .to_string()
         } else {
-            "independent audit lane was blocked; no GitHub action or merge was performed"
+            "independent audit or authenticated merge lane was blocked; no verified merge was reported"
                 .to_string()
         }),
     };
@@ -3307,8 +3843,10 @@ fn finish_independent_audit_lane_item(
             kind: item.kind,
             title: item.title.clone(),
             success: lane.success,
-            status: if lane.success {
-                "audit_accepted".to_string()
+            status: if lane.auto_merge_performed {
+                "merged".to_string()
+            } else if lane.auditor_evidence.is_some() {
+                "merge_blocked".to_string()
             } else {
                 "launch_blocked".to_string()
             },
@@ -4458,11 +4996,23 @@ fn github_pr_source_trust(
             let repository = value
                 .as_object()
                 .context("GitHub PR headRepository must be an object")?;
-            Some(required_input_string(
+            let name_with_owner = required_input_string(
                 repository.get("nameWithOwner"),
                 "GitHub PR headRepository.nameWithOwner",
                 MAX_GITHUB_REF_BYTES,
-            )?)
+            )?;
+            let components = name_with_owner.split('/').collect::<Vec<_>>();
+            if components.len() != 2
+                || components.iter().any(|component| {
+                    component.is_empty()
+                        || !component.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                        })
+                })
+            {
+                bail!("GitHub PR headRepository.nameWithOwner must be canonical owner/name");
+            }
+            Some(name_with_owner.to_ascii_lowercase())
         }
     };
     if is_cross_repository == Some(true) {
@@ -4851,7 +5401,7 @@ mod pr_intake_always_on_audit_tests {
     }
 
     #[test]
-    fn independent_audit_adapter_accepts_strict_fake_command_evidence_without_merging() {
+    fn independent_audit_adapter_accepts_strict_fake_command_evidence_and_merges_once() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let repo = temp.path().join("repo");
         crate::worktree::WorktreeManager::init_repository(&repo, "main")
@@ -4870,14 +5420,14 @@ mod pr_intake_always_on_audit_tests {
             lenses: vec![
                 crate::optimizer::merge_authority::LensVerdict {
                     lens_id: "diff".to_string(),
-                    model_label: "gpt-5.6-sol/diff".to_string(),
+                    model_label: "gpt-5.6-sol".to_string(),
                     framing: "adversarial-diff".to_string(),
                     information_scope: "diff-only".to_string(),
                     decision: crate::optimizer::merge_authority::LensDecision::Accept,
                 },
                 crate::optimizer::merge_authority::LensVerdict {
                     lens_id: "tests".to_string(),
-                    model_label: "gpt-5.6-sol/tests".to_string(),
+                    model_label: "gpt-5.6-sol".to_string(),
                     framing: "tests-as-contract".to_string(),
                     information_scope: "tests-only".to_string(),
                     decision: crate::optimizer::merge_authority::LensDecision::Accept,
@@ -4952,8 +5502,123 @@ mod pr_intake_always_on_audit_tests {
         );
         assert!(lane.success);
         assert!(!lane.grants_merge_permission);
-        assert!(!lane.auto_merge_performed);
-        assert_eq!(outcome.report.status, "audit_accepted");
+        assert!(lane.auto_merge_performed);
+        assert!(lane.merge_receipt.is_some());
+        assert_eq!(outcome.report.status, "merged");
+    }
+
+    #[test]
+    fn independent_audit_dry_run_neither_launches_nor_merges() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        crate::worktree::WorktreeManager::init_repository(&repo, "main")
+            .expect("initialize repository");
+        let config = InboxConfig::default();
+        let item = pr_item(fake_pr(907), &config, &fake_source(), &BTreeMap::new())
+            .expect("clean PR item");
+        let pr_intake = pr_intake_report_for_item(&item).expect("audit intake");
+        let run_id = RunId::new("independent-audit-dry-run").expect("run id");
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Inbox,
+            run_id.clone(),
+            "inbox-test",
+        )
+        .expect("reserve Inbox artifacts");
+        let run_dir = writer.run_dir().to_path_buf();
+        let context = InboxItemRunContext {
+            repo: &repo,
+            run_dir: &run_dir,
+            run_id: &run_id,
+            config: &config,
+            action_policy: InboxActionPolicy::DryRun,
+            permission_mode: InboxPermissionMode::Fake,
+            codex_bin: Some(PathBuf::from("/must-not-run/codex")),
+            machine_global: None,
+            rolling_budget_quota: None,
+        };
+        let outcome = run_independent_audit_intake_item_with_runner(
+            &mut writer,
+            InboxItemRunInput {
+                context: &context,
+                item_index: 1,
+                item: &item,
+            },
+            review_loop_entry::evaluate_inbox_item_review_loop(&item),
+            pr_intake,
+            true,
+            None,
+            |_| panic!("dry run must not launch the independent auditor"),
+        )
+        .expect("dry-run audit plan");
+
+        assert_eq!(outcome.report.status, "dry_run");
+        assert!(outcome.report.independent_audit_lane.is_none());
+        assert!(outcome.report.github_success);
+    }
+
+    #[test]
+    fn independent_auditor_requires_the_exact_local_head_diff() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        crate::worktree::WorktreeManager::init_repository(&repo_path, "main")
+            .expect("initialize repository");
+        let repository = Repository::open(&repo_path).expect("open repository");
+        let signature =
+            git2::Signature::now("Audit Test", "audit@example.invalid").expect("test signature");
+        fs::write(repo_path.join("base.txt"), "base\n").expect("write base file");
+        let mut index = repository.index().expect("repository index");
+        index
+            .add_path(Path::new("base.txt"))
+            .expect("add base file");
+        index.write().expect("write base index");
+        let base_tree_oid = index.write_tree().expect("write base tree");
+        let base_tree = repository.find_tree(base_tree_oid).expect("find base tree");
+        let base = repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "base",
+                &base_tree,
+                &[],
+            )
+            .expect("commit base");
+        fs::write(repo_path.join("audit.txt"), "audited\n").expect("write audited file");
+        let mut index = repository.index().expect("updated repository index");
+        index
+            .add_path(Path::new("audit.txt"))
+            .expect("add audited file");
+        index.write().expect("write index");
+        let tree_oid = index.write_tree().expect("write tree");
+        let tree = repository.find_tree(tree_oid).expect("find tree");
+        let parent = repository.find_commit(base).expect("find parent");
+        let head = repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "audited head",
+                &tree,
+                &[&parent],
+            )
+            .expect("commit audited head");
+
+        let config = InboxConfig::default();
+        let mut raw = fake_pr(908);
+        raw.base_oid = base.to_string();
+        raw.head_oid = head.to_string();
+        raw.changed_files = vec![PathBuf::from("audit.txt")];
+        let item =
+            pr_item(raw, &config, &fake_source(), &BTreeMap::new()).expect("local audit item");
+        let intake = pr_intake_report_for_item(&item).expect("local audit intake");
+        let task = intake.task.expect("local audit task");
+        verify_local_independent_audit_candidate(&repo_path, &task)
+            .expect("exact local audit candidate");
+
+        let mut mismatched = task;
+        mismatched.changed_files = vec![PathBuf::from("different.txt")];
+        assert!(verify_local_independent_audit_candidate(&repo_path, &mismatched).is_err());
     }
 
     #[test]
@@ -5022,7 +5687,7 @@ mod pr_intake_always_on_audit_tests {
             is_draft: false,
             source_trust: GithubPrSourceTrust::TrustedTargetRepository,
             head_repository: Some("fake/maco/inbox".to_string()),
-            changed_files: vec![PathBuf::from("src/inbox.rs")],
+            changed_files: vec![PathBuf::from("src/feature.rs")],
             checks: vec![GithubCheckSummary {
                 name: "ci".to_string(),
                 status: Some("completed".to_string()),
