@@ -910,8 +910,10 @@ fn external_grok_read_only_file_capability_rejects_replacement_before_resolution
         128,
     )
     .with_side_effect_confinement(SideEffectConfinementProfile::ExternalGrok(profile));
-    let error = resolve_systemd_sandbox(&spec)
-        .expect_err("replacement must not inherit the held read-only capability");
+    let error = match resolve_systemd_sandbox(&spec) {
+        Err(error) => error,
+        Ok(_) => panic!("replacement must not inherit the held read-only capability"),
+    };
     assert!(
         error
             .to_string()
