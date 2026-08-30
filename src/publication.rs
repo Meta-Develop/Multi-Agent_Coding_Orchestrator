@@ -2810,9 +2810,10 @@ pub(crate) fn github_source_guard_from_value(
 fn canonical_external_source_head_repository(
     value: Option<&serde_json::Value>,
 ) -> Result<Option<String>> {
-    let Some(value) = value.filter(|value| !value.is_null()) else {
+    let value = value.context("GitHub source observation omitted headRepository")?;
+    if value.is_null() {
         return Ok(None);
-    };
+    }
     let name_with_owner = value
         .as_object()
         .and_then(|repository| repository.get("nameWithOwner"))
