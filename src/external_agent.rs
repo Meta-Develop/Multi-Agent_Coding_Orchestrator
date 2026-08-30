@@ -13,13 +13,15 @@ use crate::pre_action_review::{
 };
 use crate::process_runner::{
     read_bounded_regular_file_nofollow, run_process_cancellable, run_process_interactive,
-    CapturedBytes, ContainmentBackend, EnvironmentMode, ExternalCodexProfile,
+    CapturedBytes, ContainmentBackend, EnvironmentMode, ExternalCodexProfile, ExternalGrokProfile,
     InteractiveProcessOutput, ProcessCancellation, ProcessOutput, ProcessRunError, ProcessSpec,
     ProcessTreeEvidence, SideEffectConfinementEvidence, SideEffectConfinementProfile,
     SideEffectConfinementProfileKind, StdinMode, StreamCapture, StrictOfflineWorkspaceProfile,
     WorkspaceAccess,
 };
 use crate::protected_path::{DeclaredPathCoordinate, ProtectedPathSpec};
+#[cfg(target_os = "linux")]
+use crate::runtime_adapter::grok::GrokCredentialSource;
 use crate::runtime_adapter::{
     AdapterId, LaunchContext, RuntimeAdapterConfig, RuntimeId, SideEffectConfinement, TypedRuntime,
     TypedRuntimeContract, WritableLaunchTarget,
@@ -603,6 +605,7 @@ pub enum EnvironmentCredential {
 #[serde(rename_all = "snake_case")]
 pub enum EnvironmentConfiguration {
     CodexAuthFile,
+    GrokAuthFile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -616,6 +619,7 @@ pub enum EnvironmentNetworkAccess {
 #[serde(rename_all = "snake_case")]
 pub enum EnvironmentSandboxCapability {
     VerifiedExternalCodex,
+    VerifiedExternalGrok,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -1820,6 +1824,59 @@ fn default_environment_preflight_process_started() -> bool {
     true
 }
 
+struct AdmittedGrokCredentials {
+    #[cfg(target_os = "linux")]
+    source: GrokCredentialSource,
+}
+
+impl AdmittedGrokCredentials {
+    fn from_ambient_environment() -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            return Ok(Self {
+                source: GrokCredentialSource::from_ambient_environment()?,
+            });
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            bail!("Grok credential capability confinement requires Linux");
+        }
+    }
+
+    fn grok_home_environment(&self) -> Result<&str> {
+        #[cfg(target_os = "linux")]
+        {
+            return Ok(self.source.grok_home_environment());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            bail!("Grok credential capability confinement requires Linux");
+        }
+    }
+
+    fn bind_to_profile(&self, profile: ExternalGrokProfile) -> Result<ExternalGrokProfile> {
+        #[cfg(target_os = "linux")]
+        {
+            return self.source.bind_to_profile(profile);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = profile;
+            bail!("Grok credential capability confinement requires Linux");
+        }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn from_environment(
+        ambient_home: Option<&OsStr>,
+        ambient_grok_home: Option<&OsStr>,
+    ) -> Result<Self> {
+        Ok(Self {
+            source: GrokCredentialSource::from_environment(ambient_home, ambient_grok_home)?,
+        })
+    }
+}
+
 pub fn run_external_agent(spec: &ExternalAgentCommand) -> ExternalAgentRun {
     run_external_agent_cancellable(spec, &ProcessCancellation::new())
 }
@@ -1926,9 +1983,7 @@ fn run_external_agent_runtime(
                             command_display(&spec.program, &[]),
                             false,
                             EnvironmentFailureCategory::SandboxUnavailable,
-                            Some(EnvironmentRequirement::sandbox(
-                                EnvironmentSandboxCapability::VerifiedExternalCodex,
-                            )),
+                            Some(external_sandbox_requirement(spec.invocation)),
                             format!("writable grok failed closed before launch: {error:#}"),
                         );
                     }
@@ -1945,9 +2000,7 @@ fn run_external_agent_runtime(
                     command_display(&spec.program, &[]),
                     false,
                     EnvironmentFailureCategory::SandboxUnavailable,
-                    Some(EnvironmentRequirement::sandbox(
-                        EnvironmentSandboxCapability::VerifiedExternalCodex,
-                    )),
+                    Some(external_sandbox_requirement(spec.invocation)),
                     format!(
                         "writable {} failed closed before launch: {capability}",
                         adapter.as_str()
@@ -1970,9 +2023,7 @@ fn run_external_agent_runtime(
                 command_display(&spec.program, &[]),
                 false,
                 EnvironmentFailureCategory::SandboxUnavailable,
-                Some(EnvironmentRequirement::sandbox(
-                    EnvironmentSandboxCapability::VerifiedExternalCodex,
-                )),
+                Some(external_sandbox_requirement(spec.invocation)),
                 error.to_string(),
             );
         }
@@ -2065,9 +2116,7 @@ fn run_external_agent_runtime(
                 command_display(&resolved_program, &[]),
                 false,
                 EnvironmentFailureCategory::SandboxUnavailable,
-                Some(EnvironmentRequirement::sandbox(
-                    EnvironmentSandboxCapability::VerifiedExternalCodex,
-                )),
+                Some(external_sandbox_requirement(spec.invocation)),
                 format!("failed to validate protected worktree controls: {error}"),
             );
         }
@@ -2398,6 +2447,21 @@ fn run_external_agent_runtime(
         None
     };
 
+    let grok_credentials = if runtime == ExternalExecutionRuntime::Verified
+        && spec.invocation == ExternalAgentInvocation::Grok
+    {
+        match AdmittedGrokCredentials::from_ambient_environment() {
+            Ok(credentials) => Some(credentials),
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_grok_credential_environment_failure(&mut report, &error);
+                return report;
+            }
+        }
+    } else {
+        None
+    };
+
     let side_effect_profile = if runtime == ExternalExecutionRuntime::Verified
         && (program_trust == ExternalProgramTrust::TrustedSystemCodex
             || spec.invocation.is_adapter_subprocess())
@@ -2412,9 +2476,7 @@ fn run_external_agent_runtime(
             Err(error) => {
                 report.duration_ms = duration_millis(started.elapsed());
                 report.error = Some(format!("failed to prepare external-agent sandbox: {error}"));
-                let requirement = EnvironmentRequirement::sandbox(
-                    EnvironmentSandboxCapability::VerifiedExternalCodex,
-                );
+                let requirement = external_sandbox_requirement(spec.invocation);
                 report
                     .stdout
                     .run_metadata
@@ -2431,7 +2493,11 @@ fn run_external_agent_runtime(
                     .push(environment_failure(
                         EnvironmentFailureCategory::SandboxUnavailable,
                         Some(requirement),
-                        format!("failed to prepare the fixed ExternalCodex sandbox: {error}"),
+                        if spec.invocation == ExternalAgentInvocation::Grok {
+                            format!("failed to prepare the fixed ExternalGrok sandbox: {error}")
+                        } else {
+                            format!("failed to prepare the fixed ExternalCodex sandbox: {error}")
+                        },
                     ));
                 return report;
             }
@@ -2439,12 +2505,61 @@ fn run_external_agent_runtime(
     } else {
         None
     };
+    let side_effect_profile = match (grok_credentials.as_ref(), side_effect_profile) {
+        (Some(credentials), Some(SideEffectConfinementProfile::ExternalGrok(profile))) => {
+            match credentials.bind_to_profile(profile) {
+                Ok(profile) => Some(SideEffectConfinementProfile::ExternalGrok(profile)),
+                Err(error) => {
+                    report.duration_ms = duration_millis(started.elapsed());
+                    record_grok_credential_environment_failure(&mut report, &error);
+                    return report;
+                }
+            }
+        }
+        (Some(_), Some(_)) => {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_environment_failure(
+                &mut report,
+                EnvironmentFailureCategory::SandboxUnavailable,
+                Some(external_sandbox_requirement(spec.invocation)),
+                "Grok credential capability was not paired with an ExternalGrok profile"
+                    .to_string(),
+            );
+            return report;
+        }
+        (Some(_), None) => {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_environment_failure(
+                &mut report,
+                EnvironmentFailureCategory::SandboxUnavailable,
+                Some(EnvironmentRequirement::sandbox(
+                    EnvironmentSandboxCapability::VerifiedExternalGrok,
+                )),
+                "Grok credential capability was not paired with an ExternalGrok profile"
+                    .to_string(),
+            );
+            return report;
+        }
+        (None, profile) => profile,
+    };
     let mut external_environment = allowed_env(spec.invocation, program_trust);
     if let Some(config) = &target_spec.runtime_adapter {
         for key in &config.env_passthrough {
+            if !runtime_environment_passthrough_allowed(spec.invocation, key) {
+                continue;
+            }
             if let Ok(value) = env::var(key) {
                 external_environment.insert(key.clone(), value);
             }
+        }
+    }
+    if let Some(credentials) = grok_credentials.as_ref() {
+        if let Err(error) =
+            insert_admitted_grok_home_environment(&mut external_environment, credentials)
+        {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_grok_credential_environment_failure(&mut report, &error);
+            return report;
         }
     }
     if let Some(metadata) = &agent_lifecycle {
@@ -2643,9 +2758,7 @@ fn run_external_agent_runtime(
                 record_environment_failure(
                     &mut report,
                     EnvironmentFailureCategory::SandboxUnavailable,
-                    Some(EnvironmentRequirement::sandbox(
-                        EnvironmentSandboxCapability::VerifiedExternalCodex,
-                    )),
+                    Some(external_sandbox_requirement(target_spec.invocation)),
                     "verified external-agent runtime did not prepare a side-effect profile"
                         .to_string(),
                 );
@@ -2804,7 +2917,8 @@ fn run_external_agent_runtime(
         Ok(()) => {}
         Err(error) => {
             report.timed_out = matches!(&error, ProcessRunError::SetupTimeout { .. });
-            let preparation_failure = target_process_environment_failure(&error);
+            let preparation_failure =
+                target_process_environment_failure(&error, target_spec.invocation);
             if let Some((category, requirement)) = preparation_failure {
                 if process_run_error_definitely_before_process_start(&error) {
                     report.stdout.target_launch_attempted = false;
@@ -4060,20 +4174,18 @@ fn process_run_error_definitely_before_process_start(error: &ProcessRunError) ->
 
 fn target_process_environment_failure(
     error: &ProcessRunError,
+    invocation: ExternalAgentInvocation,
 ) -> Option<(EnvironmentFailureCategory, Option<EnvironmentRequirement>)> {
     match error {
         ProcessRunError::ContainmentUnavailable { .. }
         | ProcessRunError::ProcessOwnership { .. } => Some((
             EnvironmentFailureCategory::SandboxUnavailable,
-            Some(EnvironmentRequirement::sandbox(
-                EnvironmentSandboxCapability::VerifiedExternalCodex,
-            )),
+            Some(external_sandbox_requirement(invocation)),
         )),
         ProcessRunError::EnvironmentFailure { failure, .. } => Some((
             failure.category,
-            (failure.category == EnvironmentFailureCategory::SandboxUnavailable).then(|| {
-                EnvironmentRequirement::sandbox(EnvironmentSandboxCapability::VerifiedExternalCodex)
-            }),
+            (failure.category == EnvironmentFailureCategory::SandboxUnavailable)
+                .then(|| external_sandbox_requirement(invocation)),
         )),
         ProcessRunError::Cancelled { .. }
         | ProcessRunError::OpenTee { .. }
@@ -4508,15 +4620,22 @@ fn evaluate_environment_requirement(
             }
         }
         EnvironmentRequirement::Sandbox { capability } => {
-            let verified = *capability == EnvironmentSandboxCapability::VerifiedExternalCodex
-                && verified_confinement == Some(SideEffectConfinementProfileKind::ExternalCodex);
+            let required_profile = match capability {
+                EnvironmentSandboxCapability::VerifiedExternalCodex => {
+                    SideEffectConfinementProfileKind::ExternalCodex
+                }
+                EnvironmentSandboxCapability::VerifiedExternalGrok => {
+                    SideEffectConfinementProfileKind::ExternalGrok
+                }
+            };
+            let verified = verified_confinement == Some(required_profile);
             if verified {
                 (
                     EnvironmentPreflightResult {
                         requirement: requirement.clone(),
                         status: EnvironmentPreflightStatus::Satisfied,
                         observation: Some(EnvironmentPreflightObservation::Sandbox {
-                            profile: SideEffectConfinementProfileKind::ExternalCodex,
+                            profile: required_profile,
                         }),
                     },
                     None,
@@ -4533,8 +4652,9 @@ fn evaluate_environment_requirement(
                     Some(environment_failure(
                         EnvironmentFailureCategory::SandboxUnavailable,
                         Some(requirement.clone()),
-                        "the fixed ExternalCodex confinement profile was not safely verified"
-                            .to_string(),
+                        format!(
+                            "the fixed {required_profile:?} confinement profile was not safely verified"
+                        ),
                     )),
                     false,
                 )
