@@ -130,8 +130,16 @@ pub(super) fn read_child_report(
             display_path.display()
         )
     })?;
-    parse_report_json(contents)
-        .with_context(|| format!("failed to parse child report {}", display_path.display()))
+    let parsed: ParsedReport<OrchestratorReviewReport> = parse_report_json(contents)
+        .with_context(|| format!("failed to parse child report {}", display_path.display()))?;
+    if parsed.report.role != AgentRole::ChildOrchestrator {
+        bail!(
+            "child report {} declared non-child role {:?}",
+            display_path.display(),
+            parsed.report.role
+        );
+    }
+    Ok(parsed)
 }
 
 pub(super) fn read_worker_report(

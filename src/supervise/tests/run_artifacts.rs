@@ -130,7 +130,8 @@ fn worker_codex_schema_artifact_is_authenticated_across_resume_and_refuses_mutat
     let replaced_error = ArtifactRunWriter::reopen_unfinalized(&repo_path, &replaced_binding)
         .err()
         .expect("replaced worker schema must refuse authenticated resume");
-    assert!(format!("{replaced_error:#}").contains("symbolic link"));
+    let replaced_error = format!("{replaced_error:#}");
+    assert!(replaced_error.contains(CODEX_OUTPUT), "{replaced_error}");
 }
 
 #[test]
@@ -669,8 +670,8 @@ fn prepare_worker_journal_binding_uses_authenticated_subjects_and_exact_paths() 
     direct.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
     let (direct_incoming, direct_capture) = create_named_invocation_scratches(
         &mut writer,
-        Path::new("incoming-direct"),
-        Path::new("capture-direct"),
+        Path::new("incoming-assignment-0001-attempt-01"),
+        Path::new("capture-assignment-0001-attempt-01"),
     )
     .expect("reserve direct-worker invocation scratches");
     let direct_paths = precreate_worker_execution_journals(&direct, &direct_incoming)
@@ -716,8 +717,8 @@ fn prepare_worker_journal_binding_uses_authenticated_subjects_and_exact_paths() 
     child.worker_assignments.push(second);
     let (child_incoming, child_capture) = create_named_invocation_scratches(
         &mut writer,
-        Path::new("incoming-child"),
-        Path::new("capture-child"),
+        Path::new("incoming-assignment-0002-attempt-01"),
+        Path::new("capture-assignment-0002-attempt-01"),
     )
     .expect("reserve child-orchestrator invocation scratches");
     let child_paths = precreate_worker_execution_journals(&child, &child_incoming)
@@ -1082,11 +1083,20 @@ fn direct_worker_fake_output_and_journal_are_first_class_and_non_delegating() {
 fn scheduler_materializes_and_binds_worker_codex_schema_for_direct_worker() {
     skip_without_containment!();
     let (temp, repo_path) = injected_repository();
+    let target = PathBuf::from("tests/direct_worker.rs");
+    fs::create_dir_all(repo_path.join("tests")).expect("create direct Worker test directory");
+    fs::write(
+        repo_path.join(&target),
+        "#[test]\nfn direct_worker_target() {}\n",
+    )
+    .expect("write direct Worker test target");
+    commit_injected_repository(&repo_path, "add direct Worker test target");
     let mut assignment = injected_assignment(false);
     assignment.id = "direct-worker-schema".to_string();
     assignment.role = AgentRole::Worker;
     assignment.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
     assignment.selection_source = Some(AssignmentSelectionSource::Automatic);
+    assignment.assigned_paths = vec![target];
     assignment.task = Some("exercise direct Worker Codex schema binding".to_string());
     let worker = WorkerReport {
         id: assignment.id.clone(),
@@ -1214,6 +1224,9 @@ fn scheduler_materializes_and_binds_worker_codex_schema_for_direct_worker() {
 #[test]
 fn direct_worker_finalization_persists_one_report_before_acceptance_and_replays() {
     let (_temp, repo_path) = injected_repository();
+    let auth_writer = crate::artifacts::repository_auth_writer(&repo_path)
+        .expect("bootstrap repository authentication");
+    drop(auth_writer);
     let run_id = RunId::new("artifact-direct-worker-decision").expect("valid run id");
     let mut writer = ArtifactRunWriter::reserve(
         &repo_path,
@@ -1305,6 +1318,9 @@ fn direct_worker_finalization_persists_one_report_before_acceptance_and_replays(
 #[test]
 fn invalid_direct_worker_finalization_persists_one_rejection_report_and_decision() {
     let (temp, repo_path) = injected_repository();
+    let auth_writer = crate::artifacts::repository_auth_writer(&repo_path)
+        .expect("bootstrap repository authentication");
+    drop(auth_writer);
     let run_id = RunId::new("artifact-invalid-direct-worker").expect("valid run id");
     let mut writer = ArtifactRunWriter::reserve(
         &repo_path,
