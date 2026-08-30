@@ -440,6 +440,181 @@ fn worker_journals_are_precreated_as_private_exact_files() {
 }
 
 #[test]
+#[cfg(unix)]
+fn direct_worker_fake_output_and_journal_are_first_class_and_non_delegating() {
+    let (_temp, repo_path) = injected_repository();
+    let run_id = RunId::new("artifact-direct-worker-journal").expect("valid run id");
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        run_id,
+        "supervise-test",
+    )
+    .expect("reserve supervise artifact run");
+    let dirs = RunDirs::for_writer(&writer);
+    let (incoming, capture) =
+        create_invocation_scratches(&mut writer).expect("reserve invocation scratches");
+    let mut assignment = injected_assignment(false);
+    assignment.id = "direct-worker".to_string();
+    assignment.role = AgentRole::Worker;
+    assignment.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+    assignment.selection_source = Some(AssignmentSelectionSource::Automatic);
+
+    assert_eq!(
+        assignment_worker_journal_subject_ids(&assignment)
+            .expect("resolve direct worker journal subject"),
+        vec!["direct-worker"]
+    );
+    let journal_paths = precreate_worker_execution_journals(&assignment, &incoming)
+        .expect("precreate direct worker journal");
+    assert_eq!(journal_paths.len(), 1);
+    assert_eq!(
+        journal_paths[0].file_name().and_then(OsStr::to_str),
+        Some("direct-worker.jsonl")
+    );
+
+    let artifacts = child_attempt_artifacts(
+        &dirs,
+        incoming.path(),
+        capture.path(),
+        &assignment.id,
+        1,
+        false,
+    );
+    let command = ExternalAgentCommand::codex(
+        "unused-codex",
+        &repo_path,
+        &artifacts.prompt_path,
+        &artifacts.log_path,
+        &artifacts.report_path,
+        Duration::from_secs(1),
+    )
+    .with_worker_journal_artifact(
+        assignment.id.clone(),
+        incoming.path(),
+        journal_paths[0].clone(),
+    );
+    let fake = deterministic_fake_child_run(
+        &command,
+        &assignment,
+        &AssignmentMetadata::new(),
+        41,
+        Some(73),
+    )
+    .expect("produce deterministic direct worker output");
+    let parsed = read_worker_report(fake.output_last_message(), Path::new("direct-worker.json"))
+        .expect("parse direct worker output");
+    assert!(!parsed.recovered);
+    assert_eq!(parsed.report.id, assignment.id);
+    assert_eq!(parsed.report.role, AgentRole::Worker);
+    assert_eq!(parsed.report.claim_token, Some(41));
+    assert_eq!(parsed.report.semantic_intent_token, Some(73));
+    assert_eq!(parsed.report.no_further_delegation, Some(true));
+    assert!(
+        read_child_report(fake.output_last_message(), Path::new("direct-worker.json")).is_err()
+    );
+    let normalized_relative = Path::new("reports/direct-worker.json");
+    write_worker_report(&mut writer, normalized_relative, &parsed.report)
+        .expect("persist normalized direct worker report");
+    let normalized: WorkerReport = serde_json::from_slice(
+        &fs::read(dirs.run_dir.join(normalized_relative)).expect("read normalized worker report"),
+    )
+    .expect("decode normalized worker report");
+    assert_eq!(normalized, parsed.report);
+
+    let journals = import_worker_execution_journals(&mut writer, &assignment, &incoming, &fake)
+        .expect("import direct worker journal");
+    assert!(matches!(
+        journals.get("direct-worker").map(|evidence| &evidence.status),
+        Some(WorkerExecutionJournalStatus::Loaded(entries)) if entries.is_empty()
+    ));
+    discard_invocation_scratches(&mut writer, &incoming, &capture)
+        .expect("discard direct worker scratch fixture");
+
+    let mut nested = assignment;
+    nested.worker_assignments = injected_assignment(true).worker_assignments;
+    let error = assignment_worker_journal_subject_ids(&nested)
+        .expect_err("direct worker must not acquire nested journal subjects");
+    assert!(error
+        .to_string()
+        .contains("attempted nested worker delegation"));
+}
+
+#[test]
+fn direct_worker_decision_preserves_authenticated_artifact_order_and_replay_parentage() {
+    let (_temp, repo_path) = injected_repository();
+    let run_id = RunId::new("artifact-direct-worker-decision").expect("valid run id");
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        run_id.clone(),
+        "supervise-test",
+    )
+    .expect("reserve supervise artifact run");
+    let mut journal = Some(
+        initialize_orchestration_event_journal(&repo_path, &run_id, None)
+            .expect("initialize authenticated orchestration journal"),
+    );
+    let worker_id = "direct-worker";
+    let spawn = record_supervision_spawn_payload_with_category(
+        worker_id,
+        run_id.as_str(),
+        OrchestrationRole::Worker,
+        AgentRole::Worker,
+        None,
+        vec!["README.md".to_string()],
+        &assignment_scope_ref(worker_id),
+        json!({"attempt": 1}),
+    )
+    .expect("bind direct worker spawn payload");
+    record_orchestration_event(
+        &mut journal,
+        &mut writer,
+        worker_id,
+        Some(run_id.as_str()),
+        OrchestrationRole::Worker,
+        OrchestrationEventKind::Spawn,
+        spawn,
+    );
+
+    let mut worker = injected_child_report(&injected_assignment(true))
+        .worker_reports
+        .remove(0);
+    worker.id = worker_id.to_string();
+    record_final_worker_report_decision(&mut journal, &mut writer, run_id.as_str(), &worker);
+    let final_report = artifact_test_final_report(&run_id);
+    write_final_report(&mut writer, &final_report).expect("write final report");
+    writer
+        .finalize(
+            RunArtifactFamily::Supervise.final_report_relative_path(),
+            false,
+        )
+        .expect("finalize authenticated direct worker artifact run");
+
+    let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+        .expect("authenticate finalized direct worker artifact run");
+    let events = read_finalized_orchestration_events(&reader);
+    let direct_events = events
+        .iter()
+        .filter(|event| event.node == worker_id)
+        .collect::<Vec<_>>();
+    assert_eq!(direct_events.len(), 2);
+    assert_eq!(direct_events[0].kind, OrchestrationEventKind::Spawn);
+    assert_eq!(direct_events[1].kind, OrchestrationEventKind::Accept);
+    assert!(direct_events.iter().all(|event| {
+        event.parent.as_deref() == Some(run_id.as_str()) && event.role == OrchestrationRole::Worker
+    }));
+    let replay = reconstruct_hierarchy_ledger(&events).expect("replay direct worker hierarchy");
+    assert_eq!(
+        replay
+            .edges
+            .get(worker_id)
+            .map(|edge| edge.parent_agent_id.as_str()),
+        Some(run_id.as_str())
+    );
+}
+
+#[test]
 fn worker_journal_append_writes_a_complete_apply_patch_record() {
     let record = WorkerExecutionJournalEntry {
         command: vec![

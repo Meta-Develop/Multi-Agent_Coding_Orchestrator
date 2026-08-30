@@ -134,6 +134,26 @@ pub(super) fn read_child_report(
         .with_context(|| format!("failed to parse child report {}", display_path.display()))
 }
 
+pub(super) fn read_worker_report(
+    contents: Option<&[u8]>,
+    display_path: &Path,
+) -> Result<ParsedReport<WorkerReport>> {
+    let contents =
+        contents.context("external run did not capture a descriptor-held direct worker report")?;
+    let contents = std::str::from_utf8(contents).with_context(|| {
+        format!(
+            "descriptor-held direct worker report is not UTF-8: {}",
+            display_path.display()
+        )
+    })?;
+    parse_report_json(contents).with_context(|| {
+        format!(
+            "failed to parse direct worker report {}",
+            display_path.display()
+        )
+    })
+}
+
 pub(super) fn write_child_report(
     writer: &mut ArtifactRunWriter,
     relative: &Path,
@@ -160,6 +180,28 @@ pub(super) fn write_child_report(
     })
 }
 
+pub(super) fn write_worker_report(
+    writer: &mut ArtifactRunWriter,
+    relative: &Path,
+    report: &WorkerReport,
+) -> Result<()> {
+    let mut normalized_report = report.clone();
+    enforce_worker_environment_failure_outcome(&mut normalized_report);
+    write_artifact_json(
+        writer,
+        relative,
+        &normalized_report,
+        MAX_SUPERVISOR_REPORT_BYTES,
+        ArtifactFileDisposition::PrivateEvidence,
+    )
+    .with_context(|| {
+        format!(
+            "failed to update normalized direct worker report {}",
+            relative.display()
+        )
+    })
+}
+
 pub(super) fn read_auditor_report(
     contents: Option<&[u8]>,
     display_path: &Path,
@@ -176,6 +218,25 @@ pub(super) fn read_auditor_report(
         .with_context(|| format!("failed to parse auditor report {}", display_path.display()))
 }
 
+pub(super) fn assignment_worker_journal_subject_ids(
+    assignment: &OrchestratorAssignment,
+) -> Result<Vec<&str>> {
+    if assignment.role == AgentRole::Worker {
+        if !assignment.worker_assignments.is_empty() {
+            bail!(
+                "direct terminal-worker assignment '{}' attempted nested worker delegation",
+                assignment.id
+            );
+        }
+        return Ok(vec![assignment.id.as_str()]);
+    }
+    Ok(assignment
+        .worker_assignments
+        .iter()
+        .map(|worker| worker.id.as_str())
+        .collect())
+}
+
 pub(super) fn import_worker_execution_journals(
     writer: &mut ArtifactRunWriter,
     assignment: &OrchestratorAssignment,
@@ -183,18 +244,19 @@ pub(super) fn import_worker_execution_journals(
     external_run: &ExternalAgentRun,
 ) -> Result<WorkerExecutionJournalEvidenceSet> {
     let mut journals = WorkerExecutionJournalEvidenceSet::new();
+    let worker_ids = assignment_worker_journal_subject_ids(assignment)?;
     let process_quiescent = external_run.scratch_quiescence_verified();
     let mut capture_contract_error = None;
     let mut seen_capture_ids = BTreeSet::new();
     for capture in external_run.worker_journal_artifacts() {
-        let expected_path = assignment
-            .worker_assignments
+        let expected_path = worker_ids
             .iter()
-            .find(|worker| worker.id == capture.worker_id)
-            .map(|worker| {
+            .copied()
+            .find(|worker_id| capture.worker_id.as_str() == *worker_id)
+            .map(|worker_id| {
                 incoming_scratch
                     .path()
-                    .join(worker_execution_journal_incoming_relative(worker))
+                    .join(worker_execution_journal_incoming_relative_for_id(worker_id))
             });
         if !seen_capture_ids.insert(capture.worker_id.clone()) {
             capture_contract_error = Some(format!(
@@ -227,15 +289,15 @@ pub(super) fn import_worker_execution_journals(
     if let Some(error) = capture_contract_error {
         bail!("trusted worker journal capture set violates the assignment contract: {error}");
     }
-    for worker in &assignment.worker_assignments {
-        let incoming_relative_path = worker_execution_journal_incoming_relative(worker);
+    for worker_id in worker_ids {
+        let incoming_relative_path = worker_execution_journal_incoming_relative_for_id(worker_id);
         let scratch_path = incoming_scratch.path().join(&incoming_relative_path);
         let evidence_relative_path =
-            worker_execution_journal_evidence_relative(&assignment.id, &worker.id);
+            worker_execution_journal_evidence_relative(&assignment.id, worker_id);
         let matching_capture = external_run
             .worker_journal_artifacts()
             .iter()
-            .find(|capture| capture.worker_id == worker.id);
+            .find(|capture| capture.worker_id.as_str() == worker_id);
         let status = if !process_quiescent {
             WorkerExecutionJournalStatus::Invalid(
                 "worker journal evidence was not imported because external process quiescence was not verified"
@@ -245,7 +307,7 @@ pub(super) fn import_worker_execution_journals(
             if capture.path != scratch_path {
                 WorkerExecutionJournalStatus::Invalid(format!(
                     "trusted worker journal capture for '{}' had unexpected contract path {}; expected {}",
-                    worker.id,
+                    worker_id,
                     capture.path.display(),
                     scratch_path.display()
                 ))
@@ -271,7 +333,7 @@ pub(super) fn import_worker_execution_journals(
             WorkerExecutionJournalStatus::Missing
         };
         journals.insert(
-            worker.id.clone(),
+            worker_id.to_string(),
             WorkerExecutionJournalEvidence {
                 incoming_relative_path,
                 evidence_relative_path,
@@ -533,7 +595,8 @@ pub(super) fn precreate_worker_execution_journals(
     assignment: &OrchestratorAssignment,
     incoming_scratch: &ArtifactScratchDirectory,
 ) -> Result<Vec<PathBuf>> {
-    if assignment.worker_assignments.is_empty() {
+    let worker_ids = assignment_worker_journal_subject_ids(assignment)?;
+    if worker_ids.is_empty() {
         return Ok(Vec::new());
     }
     let journal_root = incoming_scratch.path().join("worker-journals");
@@ -576,9 +639,9 @@ pub(super) fn precreate_worker_execution_journals(
             })?;
         }
     }
-    let mut paths = Vec::with_capacity(assignment.worker_assignments.len());
-    for worker in &assignment.worker_assignments {
-        let file_name = worker_execution_journal_file_name(&worker.id);
+    let mut paths = Vec::with_capacity(worker_ids.len());
+    for worker_id in worker_ids {
+        let file_name = worker_execution_journal_file_name(worker_id);
         let path = journal_root.join(&file_name);
         let mut options = fs::OpenOptions::new();
         options.read(true).write(true).create_new(true);
@@ -1482,47 +1545,38 @@ pub(super) fn deterministic_fake_child_run(
         bail!("deterministic fake child command retained a provider model slug");
     }
     let worker_journal_artifacts = write_deterministic_fake_worker_journals(command, assignment)?;
+    if assignment.role == AgentRole::Worker {
+        let report = deterministic_fake_worker_report(
+            &assignment.id,
+            &assignment.assigned_paths,
+            &assignment.semantic_symbols,
+            &assignment.semantic_modules,
+            AssignmentKind::Ordinary,
+            None,
+            Some(claim_token),
+            semantic_intent_token,
+        );
+        let mut output = serde_json::to_vec_pretty(&report)?;
+        output.push(b'\n');
+        let mut run = deterministic_fake_run(command, output);
+        run.replace_worker_journal_artifacts(worker_journal_artifacts);
+        return Ok(run);
+    }
     let worker_reports = assignment
         .worker_assignments
         .iter()
         .map(|worker| {
             let metadata = worker_assignment_metadata(assignment_metadata, assignment, worker);
-            WorkerReport {
-                id: worker.id.clone(),
-                role: AgentRole::Worker,
-                assignment_kind: metadata.kind,
-                target_path: metadata.target_path.clone(),
-                assigned_paths: worker.assigned_paths.clone(),
-                semantic_symbols: worker.semantic_symbols.clone(),
-                semantic_modules: worker.semantic_modules.clone(),
-                claim_token: None,
-                semantic_intent_token: None,
-                commands_run: Vec::new(),
-                environment_failures: Vec::new(),
-                files_changed: Vec::new(),
-                validation_results: vec![ValidationResult {
-                    name: "deterministic fake worker validation".to_string(),
-                    status: ReviewStatus::Succeeded,
-                    command: Vec::new(),
-                    message: None,
-                }],
-                findings: Vec::new(),
-                field_guide_entries: Vec::new(),
-                bloated_file_flags: Vec::new(),
-                decomposition_completion: metadata.target_path.map(|target_path| {
-                    DecompositionCompletion {
-                        target_path,
-                        replacement_paths: Vec::new(),
-                        supervisor_candidate_binding: None,
-                    }
-                }),
-                no_further_delegation: Some(true),
-                accepted: true,
-                rejected: false,
-                status: ReviewStatus::Succeeded,
-                remaining_risk: "simulation-only evidence".to_string(),
-                next_safe_action: "rerun with the verified Codex runtime".to_string(),
-            }
+            deterministic_fake_worker_report(
+                &worker.id,
+                &worker.assigned_paths,
+                &worker.semantic_symbols,
+                &worker.semantic_modules,
+                metadata.kind,
+                metadata.target_path,
+                None,
+                None,
+            )
         })
         .collect::<Vec<_>>();
     let decomposition_completions = worker_reports
@@ -1569,10 +1623,58 @@ pub(super) fn deterministic_fake_child_run(
     Ok(run)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn deterministic_fake_worker_report(
+    id: &str,
+    assigned_paths: &[PathBuf],
+    semantic_symbols: &[String],
+    semantic_modules: &[String],
+    assignment_kind: AssignmentKind,
+    target_path: Option<PathBuf>,
+    claim_token: Option<u64>,
+    semantic_intent_token: Option<u64>,
+) -> WorkerReport {
+    WorkerReport {
+        id: id.to_string(),
+        role: AgentRole::Worker,
+        assignment_kind,
+        target_path: target_path.clone(),
+        assigned_paths: assigned_paths.to_vec(),
+        semantic_symbols: semantic_symbols.to_vec(),
+        semantic_modules: semantic_modules.to_vec(),
+        claim_token,
+        semantic_intent_token,
+        commands_run: Vec::new(),
+        environment_failures: Vec::new(),
+        files_changed: Vec::new(),
+        validation_results: vec![ValidationResult {
+            name: "deterministic fake worker validation".to_string(),
+            status: ReviewStatus::Succeeded,
+            command: Vec::new(),
+            message: None,
+        }],
+        findings: Vec::new(),
+        field_guide_entries: Vec::new(),
+        bloated_file_flags: Vec::new(),
+        decomposition_completion: target_path.map(|target_path| DecompositionCompletion {
+            target_path,
+            replacement_paths: Vec::new(),
+            supervisor_candidate_binding: None,
+        }),
+        no_further_delegation: Some(true),
+        accepted: true,
+        rejected: false,
+        status: ReviewStatus::Succeeded,
+        remaining_risk: "simulation-only evidence".to_string(),
+        next_safe_action: "rerun with the verified Codex runtime".to_string(),
+    }
+}
+
 fn write_deterministic_fake_worker_journals(
     command: &ExternalAgentCommand,
     assignment: &OrchestratorAssignment,
 ) -> Result<Vec<WorkerJournalArtifactCapture>> {
+    let worker_ids = assignment_worker_journal_subject_ids(assignment)?;
     let incoming_path = command
         .output_last_message
         .parent()
@@ -1584,13 +1686,13 @@ fn write_deterministic_fake_worker_journals(
             journal_root.display()
         )
     })?;
-    let mut captures = Vec::with_capacity(assignment.worker_assignments.len());
-    for worker in &assignment.worker_assignments {
-        let journal_path = journal_root.join(worker_execution_journal_file_name(&worker.id));
+    let mut captures = Vec::with_capacity(worker_ids.len());
+    for worker_id in worker_ids {
+        let journal_path = journal_root.join(worker_execution_journal_file_name(worker_id));
         let matching_specs = command
             .worker_journal_artifacts
             .iter()
-            .filter(|artifact| artifact.worker_id == worker.id)
+            .filter(|artifact| artifact.worker_id.as_str() == worker_id)
             .collect::<Vec<_>>();
         if matching_specs.len() != 1
             || matching_specs[0].incoming_root != incoming_path
@@ -1598,7 +1700,7 @@ fn write_deterministic_fake_worker_journals(
         {
             bail!(
                 "deterministic fake worker journal capability does not exactly match worker '{}'",
-                worker.id
+                worker_id
             );
         }
         fs::write(&journal_path, b"").with_context(|| {
@@ -1608,7 +1710,7 @@ fn write_deterministic_fake_worker_journals(
             )
         })?;
         captures.push(WorkerJournalArtifactCapture {
-            worker_id: worker.id.clone(),
+            worker_id: worker_id.to_string(),
             path: journal_path,
             status: WorkerJournalArtifactCaptureStatus::Loaded(Vec::new()),
         });

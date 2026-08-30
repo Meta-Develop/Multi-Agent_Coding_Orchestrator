@@ -250,6 +250,63 @@ fn deterministic_fake_cli_emits_stable_shape_artifacts_and_cleans_claims() -> Re
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn deterministic_fake_cli_persists_a_direct_worker_report_without_an_orchestrator_envelope(
+) -> Result<()> {
+    support::require_containment!(
+        "deterministic_fake_cli_persists_a_direct_worker_report_without_an_orchestrator_envelope"
+    );
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let plan_path = temp.path().join("direct-worker.json");
+    fs::write(
+        &plan_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "task": "direct terminal worker",
+            "max_child_retries": 0,
+            "max_gate_corrections": 0,
+            "assignments": [{
+                "id": "direct-worker",
+                "phase": "execution",
+                "role": "worker",
+                "role_category": "non_delegating_terminal_worker",
+                "assigned_paths": ["README.md"],
+                "worker_assignments": []
+            }]
+        }))?,
+    )?;
+
+    let report = run_success_json(&[
+        "supervise",
+        "run",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "direct-worker-fake",
+        "--runtime",
+        "fake",
+        "--json",
+    ])?;
+    assert_eq!(report["success"], true);
+    assert_eq!(report["publishable"], false);
+
+    let run_root = repo_path.join(".maco/o2/runs/direct-worker-fake");
+    let raw_report: Value = serde_json::from_slice(&fs::read(
+        run_root.join("evidence/incoming/direct-worker.json"),
+    )?)?;
+    assert_eq!(raw_report["id"], "direct-worker");
+    assert_eq!(raw_report["role"], "worker");
+    assert_eq!(raw_report["no_further_delegation"], true);
+    assert!(raw_report.get("worker_reports").is_none());
+    assert!(run_root
+        .join("logs/workers/direct-worker/direct-worker.jsonl")
+        .exists());
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn codex_runtime_custom_bin_fails_closed_and_cannot_mutate_primary() -> Result<()> {
