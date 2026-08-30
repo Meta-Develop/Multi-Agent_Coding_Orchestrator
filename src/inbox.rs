@@ -9,6 +9,7 @@ use crate::{
         self, AutopilotForgeMode, AutopilotPlan, AutopilotPublishMode, AutopilotRunOptions,
         AutopilotRunStatus, AutopilotTask, AutopilotValidationCommand,
     },
+    external_agent::{load_codex_runtime_model_catalog, run_external_agent, ExternalAgentCommand},
     gate_denial::GateDenialReason,
     live_claim::{self, LiveClock},
     llm::{RedactionSummary, Redactor},
@@ -577,6 +578,12 @@ pub struct InboxIndependentAuditMergeLaneTask {
     pub head_oid: String,
     pub base_oid: String,
     pub producer_login: String,
+    #[serde(default)]
+    pub is_draft: bool,
+    #[serde(default)]
+    pub source_trust: GithubPrSourceTrust,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_repository: Option<String>,
     pub changed_files: Vec<PathBuf>,
     pub checks: Vec<GithubCheckSummary>,
     pub requires_trusted_actor_binding: bool,
@@ -648,6 +655,15 @@ pub struct InboxItem {
 pub enum InboxItemKind {
     Issue,
     PullRequest,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GithubPrSourceTrust {
+    TrustedTargetRepository,
+    Fork,
+    #[default]
+    Untrusted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -1067,6 +1083,12 @@ pub struct GithubPrCandidate {
     pub head_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_ref: Option<String>,
+    #[serde(default)]
+    pub is_draft: bool,
+    #[serde(default)]
+    pub source_trust: GithubPrSourceTrust,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_repository: Option<String>,
     pub changed_files: Vec<PathBuf>,
     pub checks: Vec<GithubCheckSummary>,
     pub review_feedback: GithubReviewFeedbackSummary,
@@ -1173,6 +1195,8 @@ pub struct InboxItemRunReport {
     pub review_loop: Option<review_loop_entry::InboxReviewLoopReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_intake: Option<InboxPrIntakeReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub independent_audit_lane: Option<review_loop_entry::InboxIndependentAuditLaneResult>,
     pub next_action: String,
 }
 
@@ -1379,6 +1403,8 @@ struct RawPrCandidate {
     head_oid: String,
     base_oid: String,
     is_draft: bool,
+    source_trust: GithubPrSourceTrust,
+    head_repository: Option<String>,
     changed_files: Vec<PathBuf>,
     checks: Vec<GithubCheckSummary>,
     review_feedback: GithubReviewFeedbackSummary,
@@ -2546,8 +2572,12 @@ fn run_inbox_item(
     let action_policy = context.action_policy;
     let permission_mode = context.permission_mode;
     let config = context.config;
-    revalidate_inbox_item_source(repo, item)
-        .context("inbox source changed before item processing started")?;
+    let pr_intake = pr_intake_report_for_item(item);
+    let source_fresh = revalidate_inbox_item_source(repo, item).is_ok();
+    if pr_intake.is_none() && !source_fresh {
+        revalidate_inbox_item_source(repo, item)
+            .context("inbox source changed before item processing started")?;
+    }
     let review_loop = review_loop_entry::evaluate_inbox_item_review_loop(item);
     if let Some(report) = &review_loop {
         write_private_artifact_json(
@@ -2556,8 +2586,14 @@ fn run_inbox_item(
             report,
         )?;
     }
-    if let Some(pr_intake) = pr_intake_report_for_item(item) {
-        return run_independent_audit_intake_item(writer, input, review_loop, pr_intake);
+    if let Some(pr_intake) = pr_intake {
+        return run_independent_audit_intake_item(
+            writer,
+            input,
+            review_loop,
+            pr_intake,
+            source_fresh,
+        );
     }
     let plan = autopilot_plan_for_item(item, config, permission_mode)?;
     let plan_relative = PathBuf::from(format!("item-{item_index}-plan.json"));
@@ -2623,6 +2659,7 @@ fn run_inbox_item(
                 github_success: true,
                 review_loop,
                 pr_intake: pr_intake_report_for_item(item),
+                independent_audit_lane: None,
                 next_action: if planned_only {
                     "review the plan; this permission mode does not launch work".to_string()
                 } else {
@@ -2743,6 +2780,7 @@ fn run_inbox_item(
             github_success: github_report.success,
             review_loop,
             pr_intake: pr_intake_report_for_item(item),
+            independent_audit_lane: None,
             next_action: if refusal.is_some() {
                 "wait for or increase the rolling inbox quota before retrying".to_string()
             } else if success {
@@ -2760,7 +2798,65 @@ fn run_independent_audit_intake_item(
     input: InboxItemRunInput<'_>,
     review_loop: Option<review_loop_entry::InboxReviewLoopReport>,
     pr_intake: InboxPrIntakeReport,
+    source_fresh: bool,
 ) -> Result<InboxItemRunOutcome> {
+    run_independent_audit_intake_item_with_runner(
+        writer,
+        input,
+        review_loop,
+        pr_intake,
+        source_fresh,
+        None,
+        verified_independent_audit_runner,
+    )
+}
+
+struct IndependentAuditRunnerResult {
+    raw_output: Option<Vec<u8>>,
+    report_sha256: Option<String>,
+    exit_code: Option<i32>,
+    duration_ms: u64,
+    timed_out: bool,
+    safely_executed: bool,
+    publishable: bool,
+    succeeded: bool,
+    scratch_quiescence_verified: bool,
+    error: Option<String>,
+}
+
+fn verified_independent_audit_runner(
+    command: &ExternalAgentCommand,
+) -> IndependentAuditRunnerResult {
+    let external_run = run_external_agent(command);
+    let raw_output = external_run.output_last_message().map(ToOwned::to_owned);
+    IndependentAuditRunnerResult {
+        report_sha256: raw_output
+            .as_deref()
+            .map(crate::artifacts::state_auth::sha256_hex),
+        raw_output,
+        exit_code: external_run.exit_code,
+        duration_ms: external_run.duration_ms,
+        timed_out: external_run.timed_out,
+        safely_executed: external_run.safely_executed(),
+        publishable: external_run.publishable,
+        succeeded: external_run.succeeded(),
+        scratch_quiescence_verified: external_run.scratch_quiescence_verified(),
+        error: external_run.error,
+    }
+}
+
+fn run_independent_audit_intake_item_with_runner<F>(
+    writer: &mut ArtifactRunWriter,
+    input: InboxItemRunInput<'_>,
+    review_loop: Option<review_loop_entry::InboxReviewLoopReport>,
+    pr_intake: InboxPrIntakeReport,
+    source_fresh: bool,
+    available_models_override: Option<&BTreeSet<String>>,
+    mut external_runner: F,
+) -> Result<InboxItemRunOutcome>
+where
+    F: FnMut(&ExternalAgentCommand) -> IndependentAuditRunnerResult,
+{
     let context = input.context;
     let item_index = input.item_index;
     let item = input.item;
@@ -2779,28 +2875,7 @@ fn run_independent_audit_intake_item(
 
     let planning_only =
         action_policy == InboxActionPolicy::DryRun || !permission_mode.launches_autopilot();
-    let evidence_block = pr_intake.status == InboxPrIntakeStatus::LaunchBlocked;
-    let launch_blocked = evidence_block || !planning_only;
-    let launch_block = if evidence_block {
-        pr_intake
-            .launch_block
-            .clone()
-            .context("blocked PR intake omitted its launch-block report")?
-    } else {
-        InboxPrLaunchBlockReport {
-            version: INBOX_SCHEMA_VERSION,
-            status: InboxPrIntakeStatus::LaunchBlocked,
-            success: false,
-            reason: "independent_audit_executor_unavailable".to_string(),
-            missing_evidence: Vec::new(),
-            grants_merge_permission: false,
-            auto_merge_performed: false,
-            next_action: "route this typed task through a source-bound independent-audit executor; do not use the repair producer and do not merge".to_string(),
-        }
-    };
-    if launch_blocked {
-        write_private_artifact_json(writer, &autopilot_report_relative, &launch_block)?;
-    } else {
+    if planning_only && pr_intake.status == InboxPrIntakeStatus::Ready && source_fresh {
         write_private_artifact_json(
             writer,
             &autopilot_report_relative,
@@ -2814,38 +2889,428 @@ fn run_independent_audit_intake_item(
                 }
             }),
         )?;
+        let github_report = InboxGithubActionReport {
+            mode: action_policy,
+            permission_mode,
+            status: "skipped".to_string(),
+            success: true,
+            target: item_target(item),
+            comment_url: None,
+            message: Some(
+                "independent audit task was recorded without launch; no GitHub action or merge was performed"
+                    .to_string(),
+            ),
+        };
+        write_private_artifact_json(writer, &github_report_relative, &github_report)?;
+        return Ok(InboxItemRunOutcome {
+            report: InboxItemRunReport {
+                item_index,
+                item_id: item.item_id.clone(),
+                kind: item.kind,
+                title: item.title.clone(),
+                success: true,
+                status: if action_policy == InboxActionPolicy::DryRun {
+                    "dry_run".to_string()
+                } else {
+                    "planned".to_string()
+                },
+                plan_path: public_item_path(run_id, &format!("item-{item_index}-plan.json")),
+                autopilot_run_id: autopilot_run_id.as_str().to_string(),
+                autopilot_report_path: public_item_path(
+                    run_id,
+                    &format!("item-{item_index}-autopilot-report.json"),
+                ),
+                github_report_path: public_item_path(
+                    run_id,
+                    &format!("item-{item_index}-github-report.json"),
+                ),
+                autopilot_success: None,
+                github_success: true,
+                review_loop,
+                pr_intake: Some(pr_intake),
+                independent_audit_lane: None,
+                next_action:
+                    "launch the recorded task through the independent-audit adapter; no merge was performed"
+                        .to_string(),
+            },
+            refusal: None,
+        });
     }
 
+    let head_oid = item
+        .source_snapshot
+        .head_oid()
+        .unwrap_or_default()
+        .to_string();
+    let mut initial_blockers = Vec::new();
+    if !source_fresh {
+        initial_blockers.push(
+            review_loop_entry::InboxIndependentAuditLaneBlocker::StaleHead {
+                expected_head_oid: head_oid.clone(),
+            },
+        );
+    }
+    if pr_intake.status == InboxPrIntakeStatus::LaunchBlocked {
+        let block = pr_intake
+            .launch_block
+            .as_ref()
+            .context("blocked PR intake omitted its launch-block report")?;
+        initial_blockers.push(pr_intake_lane_blocker(block));
+    }
+    let task = pr_intake.task.as_ref();
+    if task.is_none() && initial_blockers.is_empty() {
+        initial_blockers.push(
+            review_loop_entry::InboxIndependentAuditLaneBlocker::MissingEvidence {
+                evidence: vec!["source_bound_audit_task".to_string()],
+            },
+        );
+    }
+    if let Some(task) = task {
+        initial_blockers.extend(review_loop_entry::independent_audit_task_blockers(
+            item, task,
+        ));
+    }
+    if !initial_blockers.is_empty() {
+        let lane = review_loop_entry::blocked_independent_audit_lane_result(
+            item,
+            head_oid,
+            initial_blockers,
+            None,
+            None,
+        );
+        return finish_independent_audit_lane_item(writer, input, review_loop, pr_intake, lane);
+    }
+    let task = task.expect("checked source-bound independent-audit task");
+    let timeout = Duration::from_secs(context.config.timeout_seconds.unwrap_or(600));
+    let program = context
+        .codex_bin
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("codex"));
+    let available_models = match available_models_override.cloned().map(Ok).unwrap_or_else(|| {
+        independent_auditor_available_models(&program, context.repo, timeout)
+    }) {
+            Ok(models) => models,
+            Err(blocker) => {
+                let lane = review_loop_entry::blocked_independent_audit_lane_result(
+                    item,
+                    &task.head_oid,
+                    vec![blocker],
+                    None,
+                    None,
+                );
+                return finish_independent_audit_lane_item(
+                    writer,
+                    input,
+                    review_loop,
+                    pr_intake,
+                    lane,
+                );
+            }
+        };
+    let decision = match review_loop_entry::select_critical_independent_auditor(&available_models) {
+        Ok(decision) => decision,
+        Err(error) => {
+            let lane = review_loop_entry::blocked_independent_audit_lane_result(
+                item,
+                &task.head_oid,
+                vec![
+                    review_loop_entry::InboxIndependentAuditLaneBlocker::SelectorRejected {
+                        detail: sanitize_public_text(
+                            context.repo,
+                            &error.to_string(),
+                            GH_DIAGNOSTIC_LIMIT,
+                        )
+                        .text,
+                    },
+                ],
+                None,
+                None,
+            );
+            return finish_independent_audit_lane_item(writer, input, review_loop, pr_intake, lane);
+        }
+    };
+    let selection = match review_loop_entry::compact_independent_auditor_selection(&decision) {
+        Ok(selection) => selection,
+        Err(_) => {
+            let lane = review_loop_entry::blocked_independent_audit_lane_result(
+                item,
+                &task.head_oid,
+                vec![
+                    review_loop_entry::InboxIndependentAuditLaneBlocker::UnavailableEligibleAuditor {
+                        detail: decision.decision_reason,
+                    },
+                ],
+                None,
+                None,
+            );
+            return finish_independent_audit_lane_item(writer, input, review_loop, pr_intake, lane);
+        }
+    };
+    let auditor_session_id = format!("{}-item-{item_index}-auditor", run_id.as_str());
+    let auditor =
+        review_loop_entry::independent_auditor_actor(&auditor_session_id, &selection.model);
+    if let Some(blocker) = review_loop_entry::producer_auditor_separation_blocker(
+        &task.producer_login,
+        &auditor,
+        &task.head_oid,
+    ) {
+        let lane = review_loop_entry::blocked_independent_audit_lane_result(
+            item,
+            &task.head_oid,
+            vec![blocker],
+            Some(selection),
+            None,
+        );
+        return finish_independent_audit_lane_item(writer, input, review_loop, pr_intake, lane);
+    }
+
+    let prompt = review_loop_entry::independent_auditor_prompt(item, task, &selection)?;
+    let prompt_sha256 = crate::artifacts::state_auth::sha256_hex(prompt.as_bytes());
+    let prompt_relative = PathBuf::from(format!("item-{item_index}-independent-audit-prompt.txt"));
+    writer.write_bytes(
+        &prompt_relative,
+        prompt.as_bytes(),
+        ArtifactFileDisposition::PrivateEvidence,
+    )?;
+    let incoming =
+        writer.create_scratch_dir(format!("item-{item_index}-independent-audit-incoming"))?;
+    let output_path = incoming.path().join("auditor-output.json");
+    let json_log_path = incoming.path().join("auditor-events.jsonl");
+    let mut command = ExternalAgentCommand::codex_read_only_consultant(
+        &program,
+        context.repo,
+        writer.run_dir().join(&prompt_relative),
+        &json_log_path,
+        &output_path,
+        timeout,
+    )
+    .with_model_selection(
+        Some(selection.model.clone()),
+        Some(selector_effort_label(selection.effort).to_string()),
+    );
+    if let Some(machine_global) = &context.machine_global {
+        command = command.with_machine_global_retention(
+            machine_global.retention_binding_for_run(&autopilot_run_id),
+        );
+    }
+    let runner_result = external_runner(&command);
+    let raw_output = runner_result.raw_output.clone();
+    let launch = review_loop_entry::InboxIndependentAuditLaunchEvidence {
+        adapter: "codex_read_only_consultant".to_string(),
+        permission_profile: review_loop_entry::independent_auditor_permission_profile().to_string(),
+        auditor_identity: review_loop_entry::independent_auditor_stable_id().to_string(),
+        auditor_session_id,
+        prompt_sha256,
+        report_sha256: runner_result.report_sha256.clone(),
+        exit_code: runner_result.exit_code,
+        duration_ms: runner_result.duration_ms,
+        timed_out: runner_result.timed_out,
+        safely_executed: runner_result.safely_executed,
+        publishable: runner_result.publishable,
+    };
+    drop(command);
+    if !runner_result.scratch_quiescence_verified {
+        bail!(
+            "independent-auditor scratch quiescence was not verified; leaving the Inbox run unfinalized"
+        );
+    }
+    writer
+        .discard_scratch(&incoming)
+        .context("discard independent-auditor invocation scratch")?;
+
+    let lane = if !runner_result.succeeded {
+        let detail = runner_result
+            .error
+            .as_deref()
+            .filter(|message| !message.is_empty())
+            .unwrap_or_else(|| {
+                if runner_result.timed_out {
+                    "independent auditor timed out"
+                } else {
+                    "independent auditor did not complete in the verified read-only boundary"
+                }
+            });
+        review_loop_entry::blocked_independent_audit_lane_result(
+            item,
+            &task.head_oid,
+            vec![
+                review_loop_entry::InboxIndependentAuditLaneBlocker::LaunchFailed {
+                    detail: sanitize_public_text(context.repo, detail, GH_DIAGNOSTIC_LIMIT).text,
+                },
+            ],
+            Some(selection),
+            Some(launch),
+        )
+    } else if revalidate_inbox_item_source(context.repo, item).is_err() {
+        review_loop_entry::blocked_independent_audit_lane_result(
+            item,
+            &task.head_oid,
+            vec![
+                review_loop_entry::InboxIndependentAuditLaneBlocker::StaleHead {
+                    expected_head_oid: task.head_oid.clone(),
+                },
+            ],
+            Some(selection),
+            Some(launch),
+        )
+    } else {
+        match raw_output {
+            None => review_loop_entry::blocked_independent_audit_lane_result(
+                item,
+                &task.head_oid,
+                vec![
+                    review_loop_entry::InboxIndependentAuditLaneBlocker::MissingAuditEvidence {
+                        evidence: vec!["auditor_output".to_string()],
+                    },
+                ],
+                Some(selection),
+                Some(launch),
+            ),
+            Some(raw_output) => {
+                match serde_json::from_slice::<review_loop_entry::InboxIndependentAuditorOutput>(
+                    &raw_output,
+                ) {
+                    Err(_) => review_loop_entry::blocked_independent_audit_lane_result(
+                        item,
+                        &task.head_oid,
+                        vec![
+                            review_loop_entry::InboxIndependentAuditLaneBlocker::MissingAuditEvidence {
+                                evidence: vec!["strict_auditor_output_json".to_string()],
+                            },
+                        ],
+                        Some(selection),
+                        Some(launch),
+                    ),
+                    Ok(output) => match review_loop_entry::validate_independent_auditor_output(
+                        output, item, task, auditor,
+                    ) {
+                        Ok(auditor_evidence) => {
+                            review_loop_entry::accepted_independent_audit_lane_result(
+                                item,
+                                selection,
+                                launch,
+                                auditor_evidence,
+                            )
+                        }
+                        Err(blocker) => {
+                            review_loop_entry::blocked_independent_audit_lane_result(
+                                item,
+                                &task.head_oid,
+                                vec![blocker],
+                                Some(selection),
+                                Some(launch),
+                            )
+                        }
+                    },
+                }
+            }
+        }
+    };
+    finish_independent_audit_lane_item(writer, input, review_loop, pr_intake, lane)
+}
+
+fn pr_intake_lane_blocker(
+    block: &InboxPrLaunchBlockReport,
+) -> review_loop_entry::InboxIndependentAuditLaneBlocker {
+    match block.reason.as_str() {
+        "draft_pull_request" => {
+            review_loop_entry::InboxIndependentAuditLaneBlocker::DraftPullRequest
+        }
+        "fork_source" => review_loop_entry::InboxIndependentAuditLaneBlocker::ForkSource,
+        "untrusted_source" => review_loop_entry::InboxIndependentAuditLaneBlocker::UntrustedSource,
+        "missing_eligibility" => {
+            review_loop_entry::InboxIndependentAuditLaneBlocker::MissingEligibility {
+                evidence: block.missing_evidence.clone(),
+            }
+        }
+        _ => review_loop_entry::InboxIndependentAuditLaneBlocker::MissingEvidence {
+            evidence: block.missing_evidence.clone(),
+        },
+    }
+}
+
+fn independent_auditor_available_models(
+    program: &Path,
+    repo: &Path,
+    timeout: Duration,
+) -> std::result::Result<BTreeSet<String>, review_loop_entry::InboxIndependentAuditLaneBlocker> {
+    let priors = crate::selection::built_in_prior_dataset().map_err(|error| {
+        review_loop_entry::InboxIndependentAuditLaneBlocker::SelectorRejected {
+            detail: error.to_string(),
+        }
+    })?;
+    let known = priors
+        .models
+        .iter()
+        .filter(|prior| prior.runtime == "codex")
+        .map(|prior| prior.model.clone())
+        .collect::<BTreeSet<_>>();
+    let catalog = load_codex_runtime_model_catalog(program, repo, timeout).map_err(|failure| {
+        review_loop_entry::InboxIndependentAuditLaneBlocker::UnavailableEligibleAuditor {
+            detail: failure.summary,
+        }
+    })?;
+    Ok(known
+        .into_iter()
+        .filter(|model| catalog.contains(model))
+        .collect())
+}
+
+fn selector_effort_label(effort: crate::selection::ReasoningEffort) -> &'static str {
+    match effort {
+        crate::selection::ReasoningEffort::Low => "low",
+        crate::selection::ReasoningEffort::Medium => "medium",
+        crate::selection::ReasoningEffort::High => "high",
+        crate::selection::ReasoningEffort::Xhigh => "xhigh",
+        crate::selection::ReasoningEffort::Max => "max",
+        crate::selection::ReasoningEffort::Ultra => "ultra",
+    }
+}
+
+fn finish_independent_audit_lane_item(
+    writer: &mut ArtifactRunWriter,
+    input: InboxItemRunInput<'_>,
+    review_loop: Option<review_loop_entry::InboxReviewLoopReport>,
+    pr_intake: InboxPrIntakeReport,
+    lane: review_loop_entry::InboxIndependentAuditLaneResult,
+) -> Result<InboxItemRunOutcome> {
+    let context = input.context;
+    let item_index = input.item_index;
+    let item = input.item;
+    let run_id = context.run_id;
+    let autopilot_run_id = RunId::new(format!("{}-item-{item_index}", run_id.as_str()))?;
+    let autopilot_report_relative =
+        PathBuf::from(format!("item-{item_index}-autopilot-report.json"));
+    let github_report_relative = PathBuf::from(format!("item-{item_index}-github-report.json"));
+    write_private_artifact_json(writer, &autopilot_report_relative, &lane)?;
     let github_report = InboxGithubActionReport {
-        mode: action_policy,
-        permission_mode,
+        mode: context.action_policy,
+        permission_mode: context.permission_mode,
         status: "skipped".to_string(),
-        success: !launch_blocked,
+        success: lane.success,
         target: item_target(item),
         comment_url: None,
-        message: Some(if launch_blocked {
-            "independent audit launch was blocked; no GitHub action or merge was performed"
+        message: Some(if lane.success {
+            "independent audit evidence was accepted; no GitHub action or merge was performed"
                 .to_string()
         } else {
-            "independent audit task was recorded for later launch; no GitHub action or merge was performed"
+            "independent audit lane was blocked; no GitHub action or merge was performed"
                 .to_string()
         }),
     };
     write_private_artifact_json(writer, &github_report_relative, &github_report)?;
-
+    let next_action = lane.next_action.clone();
     Ok(InboxItemRunOutcome {
         report: InboxItemRunReport {
             item_index,
             item_id: item.item_id.clone(),
             kind: item.kind,
             title: item.title.clone(),
-            success: !launch_blocked,
-            status: if launch_blocked {
-                "launch_blocked".to_string()
-            } else if action_policy == InboxActionPolicy::DryRun {
-                "dry_run".to_string()
+            success: lane.success,
+            status: if lane.success {
+                "audit_accepted".to_string()
             } else {
-                "planned".to_string()
+                "launch_blocked".to_string()
             },
             plan_path: public_item_path(run_id, &format!("item-{item_index}-plan.json")),
             autopilot_run_id: autopilot_run_id.as_str().to_string(),
@@ -2861,12 +3326,8 @@ fn run_independent_audit_intake_item(
             github_success: github_report.success,
             review_loop,
             pr_intake: Some(pr_intake),
-            next_action: if launch_blocked {
-                launch_block.next_action
-            } else {
-                "launch the recorded task through an independent-audit executor; no merge was performed"
-                    .to_string()
-            },
+            independent_audit_lane: Some(lane),
+            next_action,
         },
         refusal: None,
     })
@@ -3361,6 +3822,9 @@ fn pr_item(
             base_ref: raw
                 .base_ref
                 .map(|value| sanitize_public_field(&value, MAX_GITHUB_REF_BYTES)),
+            is_draft: raw.is_draft,
+            source_trust: raw.source_trust,
+            head_repository: raw.head_repository,
             // Preserve an explicitly empty GitHub file observation. Repair
             // planning may still use configured fallback paths, but the
             // independent-audit lane must not mistake a fallback for source
@@ -3398,6 +3862,7 @@ fn pr_intake_report_for_item(item: &InboxItem) -> Option<InboxPrIntakeReport> {
 
     let task_kind = InboxPrIntakeTaskKind::IndependentAuditMergeLane;
     let mut missing_evidence = Vec::new();
+    let mut missing_eligibility = Vec::new();
     let producer_login = pull_request
         .author
         .as_deref()
@@ -3410,12 +3875,30 @@ fn pr_intake_report_for_item(item: &InboxItem) -> Option<InboxPrIntakeReport> {
     }
     if pull_request.checks.is_empty() {
         missing_evidence.push("ci_checks".to_string());
-    } else if pull_request
-        .checks
-        .iter()
-        .any(|check| check.status.as_deref().is_none_or(str::is_empty))
+    } else {
+        for check in &pull_request.checks {
+            if check.status.as_deref().is_none_or(str::is_empty) {
+                missing_evidence.push("ci_check_status".to_string());
+            }
+            if check
+                .conclusion
+                .as_deref()
+                .is_none_or(|conclusion| !conclusion.eq_ignore_ascii_case("success"))
+                || check
+                    .status
+                    .as_deref()
+                    .is_none_or(|status| !status.eq_ignore_ascii_case("completed"))
+            {
+                missing_eligibility.push("passing_completed_ci".to_string());
+            }
+        }
+    }
+    if pull_request
+        .review_feedback
+        .unresolved_thread_count
+        .is_some_and(|count| count > 0)
     {
-        missing_evidence.push("ci_check_status".to_string());
+        missing_eligibility.push("resolved_review_threads".to_string());
     }
 
     let head_oid = item.source_snapshot.head_oid();
@@ -3428,8 +3911,26 @@ fn pr_intake_report_for_item(item: &InboxItem) -> Option<InboxPrIntakeReport> {
     }
     missing_evidence.sort();
     missing_evidence.dedup();
+    missing_eligibility.sort();
+    missing_eligibility.dedup();
 
-    let (status, task, launch_block) = if missing_evidence.is_empty() {
+    let block_reason = if pull_request.is_draft {
+        Some(("draft_pull_request", Vec::new()))
+    } else {
+        match pull_request.source_trust {
+            GithubPrSourceTrust::Fork => Some(("fork_source", Vec::new())),
+            GithubPrSourceTrust::Untrusted => Some(("untrusted_source", Vec::new())),
+            GithubPrSourceTrust::TrustedTargetRepository if !missing_eligibility.is_empty() => {
+                Some(("missing_eligibility", missing_eligibility))
+            }
+            GithubPrSourceTrust::TrustedTargetRepository if !missing_evidence.is_empty() => {
+                Some(("missing_required_evidence", missing_evidence))
+            }
+            GithubPrSourceTrust::TrustedTargetRepository => None,
+        }
+    };
+
+    let (status, task, launch_block) = if block_reason.is_none() {
         (
             InboxPrIntakeStatus::Ready,
             Some(InboxIndependentAuditMergeLaneTask {
@@ -3440,6 +3941,9 @@ fn pr_intake_report_for_item(item: &InboxItem) -> Option<InboxPrIntakeReport> {
                 head_oid: head_oid.expect("checked PR head OID").to_string(),
                 base_oid: base_oid.expect("checked PR base OID").to_string(),
                 producer_login: producer_login.expect("checked producer identity").to_string(),
+                is_draft: pull_request.is_draft,
+                source_trust: pull_request.source_trust,
+                head_repository: pull_request.head_repository.clone(),
                 changed_files: pull_request.changed_files.clone(),
                 checks: pull_request.checks.clone(),
                 requires_trusted_actor_binding: true,
@@ -3455,6 +3959,7 @@ fn pr_intake_report_for_item(item: &InboxItem) -> Option<InboxPrIntakeReport> {
             None,
         )
     } else {
+        let (reason, evidence) = block_reason.expect("checked blocked PR intake reason");
         (
             InboxPrIntakeStatus::LaunchBlocked,
             None,
@@ -3462,8 +3967,8 @@ fn pr_intake_report_for_item(item: &InboxItem) -> Option<InboxPrIntakeReport> {
                 version: INBOX_SCHEMA_VERSION,
                 status: InboxPrIntakeStatus::LaunchBlocked,
                 success: false,
-                reason: "missing_required_evidence".to_string(),
-                missing_evidence,
+                reason: reason.to_string(),
+                missing_evidence: evidence,
                 grants_merge_permission: false,
                 auto_merge_performed: false,
                 next_action:
@@ -3685,6 +4190,8 @@ fn fake_pr_candidates(config: &InboxConfig) -> Vec<RawPrCandidate> {
         head_oid: "1111111111111111111111111111111111111111".to_string(),
         base_oid: "2222222222222222222222222222222222222222".to_string(),
         is_draft: false,
+        source_trust: GithubPrSourceTrust::TrustedTargetRepository,
+        head_repository: Some("fake/maco/inbox".to_string()),
         changed_files: config.default_assigned_paths.clone(),
         checks: vec![GithubCheckSummary {
             name: "fake-ci".to_string(),
@@ -3889,6 +4396,8 @@ fn raw_pr_from_value(
             .as_bool()
             .context("GitHub PR isDraft must be a boolean")?,
     };
+    let (source_trust, head_repository) =
+        github_pr_source_trust(object, &source_repository.selector)?;
     Ok(RawPrCandidate {
         provider: InboxSourceProvider::Github,
         number,
@@ -3923,10 +4432,63 @@ fn raw_pr_from_value(
         head_oid,
         base_oid,
         is_draft,
+        source_trust,
+        head_repository,
         changed_files: files_from_value(object.get("files"))?,
         checks: checks_from_value(object.get("statusCheckRollup"))?,
         review_feedback: review_feedback_from_value(value)?,
     })
+}
+
+fn github_pr_source_trust(
+    object: &serde_json::Map<String, Value>,
+    target_repository_selector: &str,
+) -> Result<(GithubPrSourceTrust, Option<String>)> {
+    let is_cross_repository = match object.get("isCrossRepository") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_bool()
+                .context("GitHub PR isCrossRepository must be a boolean")?,
+        ),
+    };
+    let head_repository = match object.get("headRepository") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let repository = value
+                .as_object()
+                .context("GitHub PR headRepository must be an object")?;
+            Some(required_input_string(
+                repository.get("nameWithOwner"),
+                "GitHub PR headRepository.nameWithOwner",
+                MAX_GITHUB_REF_BYTES,
+            )?)
+        }
+    };
+    if is_cross_repository == Some(true) {
+        return Ok((GithubPrSourceTrust::Fork, head_repository));
+    }
+    let target_owner_name = target_repository_selector
+        .split('/')
+        .rev()
+        .take(2)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("/");
+    let trusted = is_cross_repository == Some(false)
+        && head_repository
+            .as_deref()
+            .is_some_and(|repository| repository.eq_ignore_ascii_case(&target_owner_name));
+    Ok((
+        if trusted {
+            GithubPrSourceTrust::TrustedTargetRepository
+        } else {
+            GithubPrSourceTrust::Untrusted
+        },
+        head_repository,
+    ))
 }
 
 fn labels_from_value(value: Option<&Value>) -> Result<Vec<String>> {
@@ -4252,6 +4814,149 @@ mod pr_intake_always_on_audit_tests {
     }
 
     #[test]
+    fn github_pr_source_trust_requires_explicit_same_repository_evidence() {
+        let absent = serde_json::Map::new();
+        assert_eq!(
+            github_pr_source_trust(&absent, "github.com/acme/repo").expect("absent provenance"),
+            (GithubPrSourceTrust::Untrusted, None)
+        );
+
+        let fork = json!({
+            "isCrossRepository": true,
+            "headRepository": {"nameWithOwner": "contributor/fork"}
+        });
+        assert_eq!(
+            github_pr_source_trust(
+                fork.as_object().expect("fork object"),
+                "github.com/acme/repo"
+            )
+            .expect("fork provenance")
+            .0,
+            GithubPrSourceTrust::Fork
+        );
+
+        let trusted = json!({
+            "isCrossRepository": false,
+            "headRepository": {"nameWithOwner": "acme/repo"}
+        });
+        assert_eq!(
+            github_pr_source_trust(
+                trusted.as_object().expect("trusted object"),
+                "github.com/acme/repo"
+            )
+            .expect("trusted provenance")
+            .0,
+            GithubPrSourceTrust::TrustedTargetRepository
+        );
+    }
+
+    #[test]
+    fn independent_audit_adapter_accepts_strict_fake_command_evidence_without_merging() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        crate::worktree::WorktreeManager::init_repository(&repo, "main")
+            .expect("initialize repository");
+        let config = InboxConfig::default();
+        let item = pr_item(fake_pr(906), &config, &fake_source(), &BTreeMap::new())
+            .expect("clean PR item");
+        let pr_intake = pr_intake_report_for_item(&item).expect("audit intake");
+        let task = pr_intake.task.as_ref().expect("audit task").clone();
+        let output = review_loop_entry::InboxIndependentAuditorOutput {
+            version: 1,
+            item_id: item.item_id.clone(),
+            source_snapshot_digest: task.source_snapshot_digest.clone(),
+            head_oid: task.head_oid.clone(),
+            accepted: true,
+            lenses: vec![
+                crate::optimizer::merge_authority::LensVerdict {
+                    lens_id: "diff".to_string(),
+                    model_label: "gpt-5.6-sol/diff".to_string(),
+                    framing: "adversarial-diff".to_string(),
+                    information_scope: "diff-only".to_string(),
+                    decision: crate::optimizer::merge_authority::LensDecision::Accept,
+                },
+                crate::optimizer::merge_authority::LensVerdict {
+                    lens_id: "tests".to_string(),
+                    model_label: "gpt-5.6-sol/tests".to_string(),
+                    framing: "tests-as-contract".to_string(),
+                    information_scope: "tests-only".to_string(),
+                    decision: crate::optimizer::merge_authority::LensDecision::Accept,
+                },
+            ],
+            summary: "accepted exact candidate".to_string(),
+            no_further_delegation: true,
+            read_only: true,
+        };
+        let raw_output = serde_json::to_vec(&output).expect("serialize fake auditor output");
+        let report_sha256 = crate::artifacts::state_auth::sha256_hex(&raw_output);
+        let run_id = RunId::new("independent-audit-fake-command").expect("run id");
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Inbox,
+            run_id.clone(),
+            "inbox-test",
+        )
+        .expect("reserve Inbox artifacts");
+        let run_dir = writer.run_dir().to_path_buf();
+        let context = InboxItemRunContext {
+            repo: &repo,
+            run_dir: &run_dir,
+            run_id: &run_id,
+            config: &config,
+            action_policy: InboxActionPolicy::Fake,
+            permission_mode: InboxPermissionMode::Fake,
+            codex_bin: Some(PathBuf::from("/fake/codex")),
+            machine_global: None,
+            rolling_budget_quota: None,
+        };
+        let review_loop = review_loop_entry::evaluate_inbox_item_review_loop(&item);
+        let available_models = ["gpt-5.6-sol".to_string()].into_iter().collect();
+        let outcome = run_independent_audit_intake_item_with_runner(
+            &mut writer,
+            InboxItemRunInput {
+                context: &context,
+                item_index: 1,
+                item: &item,
+            },
+            review_loop,
+            pr_intake,
+            true,
+            Some(&available_models),
+            |command| {
+                assert_eq!(
+                    command.workspace_access,
+                    crate::process_runner::WorkspaceAccess::ReadOnly
+                );
+                assert_eq!(command.model.as_deref(), Some("gpt-5.6-sol"));
+                assert_eq!(command.reasoning_effort.as_deref(), Some("xhigh"));
+                IndependentAuditRunnerResult {
+                    raw_output: Some(raw_output.clone()),
+                    report_sha256: Some(report_sha256.clone()),
+                    exit_code: Some(0),
+                    duration_ms: 7,
+                    timed_out: false,
+                    safely_executed: true,
+                    publishable: true,
+                    succeeded: true,
+                    scratch_quiescence_verified: true,
+                    error: None,
+                }
+            },
+        )
+        .expect("run fake independent-audit adapter");
+
+        let lane = outcome.report.independent_audit_lane.expect("lane result");
+        assert_eq!(
+            lane.status,
+            review_loop_entry::InboxIndependentAuditLaneStatus::Accepted
+        );
+        assert!(lane.success);
+        assert!(!lane.grants_merge_permission);
+        assert!(!lane.auto_merge_performed);
+        assert_eq!(outcome.report.status, "audit_accepted");
+    }
+
+    #[test]
     fn updated_pr_snapshot_is_not_suppressed_as_the_old_observation() {
         let config = InboxConfig::default();
         let raw = fake_pr(905);
@@ -4315,6 +5020,8 @@ mod pr_intake_always_on_audit_tests {
             head_oid: format!("{number:040x}"),
             base_oid: "2222222222222222222222222222222222222222".to_string(),
             is_draft: false,
+            source_trust: GithubPrSourceTrust::TrustedTargetRepository,
+            head_repository: Some("fake/maco/inbox".to_string()),
             changed_files: vec![PathBuf::from("src/inbox.rs")],
             checks: vec![GithubCheckSummary {
                 name: "ci".to_string(),

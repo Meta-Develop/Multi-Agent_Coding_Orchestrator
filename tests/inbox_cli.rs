@@ -125,6 +125,10 @@ fn scan_emits_public_safe_fake_schema() -> Result<()> {
         .context("fake pull request")?;
     assert_eq!(pull_request["selected"], true);
     assert!(pull_request["skip_reason"].is_null());
+    assert_eq!(
+        pull_request["pull_request"]["source_trust"],
+        "trusted_target_repository"
+    );
     assert_ne!(
         pull_request["skip_reason"],
         "no_requested_changes_or_failing_checks"
@@ -208,6 +212,7 @@ fn run_processes_default_fake_items_and_writes_expected_artifacts() -> Result<()
     assert_eq!(item_reports[0]["autopilot_success"], true);
     assert_eq!(item_reports[0]["github_success"], true);
     assert!(item_reports[0]["pr_intake"].is_null());
+    assert!(item_reports[0]["independent_audit_lane"].is_null());
     assert_eq!(
         item_reports[0]["plan_path"],
         ".maco/inbox/runs/default-flow/item-1-plan.json"
@@ -259,6 +264,7 @@ fn run_processes_default_fake_items_and_writes_expected_artifacts() -> Result<()
 
     let pr_plan = read_json_file(&run_dir.join("item-2-plan.json"))?;
     assert!(item_reports[1]["pr_intake"].is_null());
+    assert!(item_reports[1]["independent_audit_lane"].is_null());
     assert_eq!(pr_plan["assigned_paths"], json!(["README.md"]));
     let pr_body = pr_plan["task"]["body"].as_str().context("pr plan body")?;
     assert!(pr_body.contains("Target paths and reasons:"));
