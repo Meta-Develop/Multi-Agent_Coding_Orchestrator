@@ -277,6 +277,10 @@ pub use scheduler::*;
 mod selection_bridge;
 use selection_bridge::*;
 
+// Issue #333 introduces the session factory before wiring it into launch paths.
+#[allow(dead_code)]
+mod messaging_bridge;
+
 mod assignment_execution;
 #[cfg(test)]
 pub(crate) use assignment_execution::configure_assignment_phase_command_for_test;
