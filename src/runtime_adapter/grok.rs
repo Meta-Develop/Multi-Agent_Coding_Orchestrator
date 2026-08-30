@@ -1610,10 +1610,17 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn configured_default_grok_resolves_to_one_canonical_absolute_identity() -> Result<()> {
-        let resolved = resolve_configured_grok_executable(None)?;
+    fn trusted_grok_entry_resolves_to_one_canonical_absolute_identity() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let executable = temp.path().join("grok-real");
+        fs::write(&executable, "fixture")?;
+        let trusted_entry = temp.path().join("grok");
+        symlink(&executable, &trusted_entry)?;
+        let resolved = resolve_grok_executable_candidate(&trusted_entry, true)?;
         assert!(resolved.is_absolute());
-        assert_eq!(resolved, std::fs::canonicalize(default_grok_executable())?);
+        assert_eq!(resolved, std::fs::canonicalize(executable)?);
         assert!(!std::fs::symlink_metadata(&resolved)?
             .file_type()
             .is_symlink());

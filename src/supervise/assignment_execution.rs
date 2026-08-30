@@ -4252,6 +4252,40 @@ mod decomposition_tests {
     use std::os::unix::fs::PermissionsExt;
     #[cfg(target_os = "linux")]
     use std::time::Instant;
+    use std::{ffi::OsString, sync::MutexGuard};
+
+    static GROK_BINARY_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+
+    struct GrokBinaryEnvironmentGuard {
+        previous: Option<OsString>,
+    }
+
+    impl GrokBinaryEnvironmentGuard {
+        fn install(program: &Path) -> (MutexGuard<'static, ()>, Self) {
+            let lock = GROK_BINARY_ENVIRONMENT_LOCK
+                .lock()
+                .expect("lock Grok binary environment");
+            let previous = std::env::var_os("MACO_GROK_BIN");
+            // SAFETY: this test serializes its MACO_GROK_BIN mutation and the
+            // guard restores the exact prior process value before releasing
+            // that lock.
+            unsafe { std::env::set_var("MACO_GROK_BIN", program) };
+            (lock, Self { previous })
+        }
+    }
+
+    impl Drop for GrokBinaryEnvironmentGuard {
+        fn drop(&mut self) {
+            // SAFETY: the corresponding lock remains held until after this
+            // guard drops because the tuple binding declares it first.
+            unsafe {
+                match &self.previous {
+                    Some(previous) => std::env::set_var("MACO_GROK_BIN", previous),
+                    None => std::env::remove_var("MACO_GROK_BIN"),
+                }
+            }
+        }
+    }
 
     fn commit_fixture_repository(path: &Path) {
         let repo = crate::git_repository::open(path).expect("open fixture repository");
@@ -6233,6 +6267,10 @@ done
 
     #[test]
     fn selector_bound_grok_worker_dispatches_exact_leaf_command() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let grok = temp.path().join("grok");
+        fs::write(&grok, "fixture")?;
+        let (_environment_lock, _environment_guard) = GrokBinaryEnvironmentGuard::install(&grok);
         let assignment = OrchestratorAssignment {
             id: "grok-worker".to_string(),
             phase: AssignmentPhase::Execution,
@@ -6273,10 +6311,7 @@ done
 
         assert_eq!(runtime, SupervisorRuntime::Grok);
         assert!(command.program.is_absolute());
-        assert_eq!(
-            command.program,
-            crate::runtime_adapter::grok::resolve_configured_grok_executable(None)?
-        );
+        assert_eq!(command.program, std::fs::canonicalize(grok)?);
         assert_eq!(
             command
                 .runtime_adapter
