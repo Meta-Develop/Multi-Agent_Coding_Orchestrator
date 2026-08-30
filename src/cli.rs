@@ -226,6 +226,27 @@ fn physical_xdg_machine_global_config_path() -> Result<PathBuf> {
     Ok(config_home.join("maco").join("machine-global.json"))
 }
 
+fn select_literal_machine_global_runtime_root<'a>(
+    config: &'a MachineGlobalConfig,
+    trusted_runtime_root: &Path,
+) -> Result<&'a str> {
+    let mut candidates = config
+        .roots
+        .iter()
+        .filter(|root| root.path.starts_with(trusted_runtime_root));
+    let Some(selected) = candidates.next() else {
+        bail!(
+            "default machine-global config must declare exactly one reviewed root canonically inside the current user's runtime root"
+        );
+    };
+    if candidates.next().is_some() {
+        bail!(
+            "default machine-global config must declare exactly one reviewed root canonically inside the current user's runtime root"
+        );
+    }
+    Ok(selected.id.as_str())
+}
+
 #[cfg(target_os = "linux")]
 fn resolve_literal_machine_global_defaults() -> Result<(PathBuf, String)> {
     let config_path = physical_xdg_machine_global_config_path()?;
@@ -248,26 +269,17 @@ fn resolve_literal_machine_global_defaults() -> Result<(PathBuf, String)> {
     let config: MachineGlobalConfig = serde_json::from_slice(&bytes)
         .context("authenticated default machine-global config is invalid JSON")?;
     let runtime_root = crate::process_runner::trusted_linux_runtime_root()
-        .context("current user's runtime staging root is unavailable or unsafe")?;
-    let candidates: Vec<_> = config
-        .roots
-        .iter()
-        .filter(|root| runtime_root.starts_with(&root.path))
-        .collect();
-    let [selected] = candidates.as_slice() else {
-        bail!(
-            "default machine-global config must declare exactly one reviewed root containing the current user's runtime staging path"
-        );
-    };
+        .context("current user's runtime root is unavailable or unsafe")?;
+    let selected = select_literal_machine_global_runtime_root(&config, &runtime_root)?;
     store
-        .revalidate_root(&selected.id)
+        .revalidate_root(selected)
         .context("selected default machine-global runtime root is no longer safe")?;
     let binding_final = machine_global_config_content_binding(&config_path)
         .context("default machine-global config changed after runtime-root selection")?;
     if binding_after != binding_final {
         bail!("default machine-global config changed while selecting the runtime root");
     }
-    Ok((config_path, selected.id.clone()))
+    Ok((config_path, selected.to_string()))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1651,7 +1663,7 @@ struct RunSuperviseArgs {
         requires = "machine_global_runtime_root_id"
     )]
     machine_global_config: Option<PathBuf>,
-    /// Reviewed root id whose canonical root must contain `/run/user/<uid>`.
+    /// Reviewed root id whose canonical root must be inside `/run/user/<uid>`.
     #[arg(
         long,
         env = "MACO_MACHINE_GLOBAL_RUNTIME_ROOT_ID",
@@ -4308,6 +4320,74 @@ include!("cli/part2.rs");
 #[cfg(test)]
 mod cli_integration_tests {
     use super::*;
+
+    fn literal_default_config_with_roots(roots: &[(&str, &str)]) -> MachineGlobalConfig {
+        MachineGlobalConfig {
+            version: 1,
+            state_root: PathBuf::from("/state"),
+            roots: roots
+                .iter()
+                .map(
+                    |(id, path)| crate::machine_global::DeclaredGlobalRootConfig {
+                        id: (*id).to_string(),
+                        path: PathBuf::from(path),
+                        protected_paths: Vec::new(),
+                        quarantine_grace_seconds: 60,
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn literal_default_runtime_root_selector_accepts_one_descendant() {
+        let config = literal_default_config_with_roots(&[
+            ("elsewhere", "/srv/maco/runtime"),
+            ("runtime", "/run/user/1000/maco/runtime"),
+        ]);
+        assert_eq!(
+            select_literal_machine_global_runtime_root(&config, Path::new("/run/user/1000"))
+                .expect("select the one reviewed descendant"),
+            "runtime"
+        );
+    }
+
+    #[test]
+    fn literal_default_runtime_root_selector_refuses_outside_sibling_and_broad_ancestor() {
+        for root in [
+            "/srv/maco/runtime",
+            "/run/user/1001/maco/runtime",
+            "/run/user",
+        ] {
+            let config = literal_default_config_with_roots(&[("runtime", root)]);
+            assert!(
+                select_literal_machine_global_runtime_root(&config, Path::new("/run/user/1000"))
+                    .is_err(),
+                "must refuse {root}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_default_runtime_root_selector_refuses_duplicate_and_overlapping_candidates() {
+        for roots in [
+            vec![
+                ("runtime-a", "/run/user/1000/maco/runtime"),
+                ("runtime-b", "/run/user/1000/maco/runtime"),
+            ],
+            vec![
+                ("runtime-parent", "/run/user/1000/maco"),
+                ("runtime-child", "/run/user/1000/maco/runtime"),
+            ],
+        ] {
+            let config = literal_default_config_with_roots(&roots);
+            assert!(
+                select_literal_machine_global_runtime_root(&config, Path::new("/run/user/1000"))
+                    .is_err(),
+                "must refuse ambiguous roots {roots:?}"
+            );
+        }
+    }
 
     fn inbox_run_args(argv: &[&str]) -> RunInboxArgs {
         let parsed = Cli::try_parse_from(argv).expect("inbox run arguments should parse");

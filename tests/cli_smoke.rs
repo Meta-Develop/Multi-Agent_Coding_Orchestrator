@@ -41,6 +41,21 @@ fn assert_literal_route_attempts_safe_defaults(output: &Output) {
 }
 
 #[test]
+fn cli_literal_defaults_fail_closed_without_xdg_or_home() -> Result<()> {
+    let output = cli_without_machine_global_bindings()
+        .arg("resolve defaults without a config home")
+        .output()
+        .context("route literal without XDG_CONFIG_HOME or HOME")?;
+    assert_literal_route_attempts_safe_defaults(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("HOME must be set when XDG_CONFIG_HOME is absent"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
 fn cli_literal_entrypoint_routes_quoted_literal_and_option_shaped_content() -> Result<()> {
     let literal = cli_without_machine_global_bindings()
         .args([
@@ -179,6 +194,19 @@ fn current_private_runtime_root() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
+fn current_private_runtime_staging_root() -> Option<PathBuf> {
+    let runtime = current_private_runtime_root()?;
+    let runtime_uid = fs::symlink_metadata(&runtime).ok()?.uid();
+    let staging = runtime.join("maco/runtime");
+    let metadata = fs::symlink_metadata(&staging).ok()?;
+    (metadata.is_dir()
+        && !metadata.file_type().is_symlink()
+        && metadata.uid() == runtime_uid
+        && metadata.permissions().mode() & 0o077 == 0)
+        .then_some(staging)
+}
+
+#[cfg(target_os = "linux")]
 fn write_literal_default_config(
     config: &Path,
     state_root: &Path,
@@ -239,7 +267,7 @@ fn assert_default_refusal(output: &Output, expected: &str) {
 #[cfg(target_os = "linux")]
 #[test]
 fn cli_literal_defaults_resolve_from_physical_xdg_and_home_outside_any_repository() -> Result<()> {
-    let Some(runtime_root) = current_private_runtime_root() else {
+    let Some(runtime_root) = current_private_runtime_staging_root() else {
         return Ok(());
     };
     let temp = TempDir::new().context("tempdir")?;
@@ -288,7 +316,7 @@ fn cli_literal_defaults_resolve_from_physical_xdg_and_home_outside_any_repositor
 #[cfg(target_os = "linux")]
 #[test]
 fn cli_concurrent_bare_invocations_reserve_distinct_generated_run_ids() -> Result<()> {
-    let Some(runtime_root) = current_private_runtime_root() else {
+    let Some(runtime_root) = current_private_runtime_staging_root() else {
         return Ok(());
     };
     let temp = TempDir::new().context("tempdir")?;
@@ -373,7 +401,7 @@ fn cli_concurrent_bare_invocations_reserve_distinct_generated_run_ids() -> Resul
 #[test]
 fn cli_literal_defaults_refuse_missing_multiple_mismatched_symlinked_and_unsafe_roots() -> Result<()>
 {
-    let Some(runtime_root) = current_private_runtime_root() else {
+    let Some(runtime_root) = current_private_runtime_staging_root() else {
         return Ok(());
     };
     let temp = TempDir::new().context("tempdir")?;
