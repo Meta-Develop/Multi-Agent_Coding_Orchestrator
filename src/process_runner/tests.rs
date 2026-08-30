@@ -1797,16 +1797,22 @@ fn external_codex_outer_sandbox_enforces_control_and_report_write_boundaries() {
 fn external_grok_unix_stream_initialization_preserves_codex_and_write_boundaries() {
     use std::os::unix::net::UnixStream;
 
-    const CHILD_ENV: &str = "MACO_TEST_EXTERNAL_GROK_UNIX_STREAM_CHILD";
-    const MODE_ENV: &str = "MACO_TEST_EXTERNAL_GROK_UNIX_STREAM_MODE";
-    const MARKER_ENV: &str = "MACO_TEST_EXTERNAL_GROK_UNIX_STREAM_MARKER";
-    const PROTECTED_ENV: &str = "MACO_TEST_EXTERNAL_GROK_UNIX_STREAM_PROTECTED";
+    const MODE_FILE: &str = ".maco-external-grok-unix-stream-mode";
+    const MARKER_FILE: &str = "initialized.txt";
+    const PROTECTED_FILE: &str = "outside-worktree.txt";
 
-    skip_without_containment!();
-    if env::var_os(CHILD_ENV).is_some() {
-        let mode = env::var(MODE_ENV).expect("runtime mode");
-        let marker = PathBuf::from(env::var_os(MARKER_ENV).expect("marker path"));
-        let protected = PathBuf::from(env::var_os(PROTECTED_ENV).expect("protected path"));
+    // The strict guardian starts from `env -i`; keep this nested test independent of screened
+    // `MACO_TEST_*` propagation by carrying its mode in the already-confined managed worktree.
+    let current_dir = env::current_dir().expect("current test directory");
+    let mode_file = current_dir.join(MODE_FILE);
+    if mode_file.is_file() {
+        let mode = fs::read_to_string(&mode_file).expect("runtime mode fixture");
+        let mode = mode.trim();
+        let marker = current_dir.join(MARKER_FILE);
+        let protected = current_dir
+            .parent()
+            .expect("managed worktree parent")
+            .join(PROTECTED_FILE);
         assert!(
             fs::write(&protected, "forbidden\n").is_err(),
             "{mode} profile wrote outside its managed worktree"
@@ -1828,6 +1834,7 @@ fn external_grok_unix_stream_initialization_preserves_codex_and_write_boundaries
         }
         return;
     }
+    skip_without_containment!();
 
     let test_binary = env::current_exe().expect("current test executable");
     let test_output_root = test_binary
@@ -1839,20 +1846,14 @@ fn external_grok_unix_stream_initialization_preserves_codex_and_write_boundaries
     let grok_worktree = temp.path().join("grok-worktree");
     fs::create_dir(&codex_worktree).expect("Codex worktree");
     fs::create_dir(&grok_worktree).expect("Grok worktree");
-    let protected = temp.path().join("outside-worktree.txt");
+    let protected = temp.path().join(PROTECTED_FILE);
     fs::write(&protected, "protected\n").expect("protected fixture");
 
     let run_case = |mode: &str,
                     worktree: &Path,
                     side_effects: SideEffectConfinementProfile|
      -> ProcessOutput {
-        let marker = worktree.join("initialized.txt");
-        let environment = BTreeMap::from([
-            (CHILD_ENV.to_string(), "1".to_string()),
-            (MODE_ENV.to_string(), mode.to_string()),
-            (MARKER_ENV.to_string(), marker.display().to_string()),
-            (PROTECTED_ENV.to_string(), protected.display().to_string()),
-        ]);
+        fs::write(worktree.join(MODE_FILE), mode).expect("runtime mode fixture");
         let output = run_process(
             ProcessSpec::direct(
                 format!("External{mode} UnixStream initialization probe"),
@@ -1866,7 +1867,7 @@ fn external_grok_unix_stream_initialization_preserves_codex_and_write_boundaries
                 worktree,
                 4 * 1024,
             )
-            .with_environment(EnvironmentMode::InheritAndSet(environment))
+            .with_environment(EnvironmentMode::ClearAndSet(BTreeMap::new()))
             .with_stdin(StdinMode::Null)
             .with_timeout(Some(CONTENTION_RESILIENT_PROCESS_TEST_TIMEOUT))
             .with_side_effect_confinement(side_effects),
@@ -1880,6 +1881,7 @@ fn external_grok_unix_stream_initialization_preserves_codex_and_write_boundaries
         output
     };
 
+    let unit_capture = TestSystemdUnitNameCapture::start();
     let codex_output = run_case(
         "codex",
         &codex_worktree,
@@ -1892,7 +1894,7 @@ fn external_grok_unix_stream_initialization_preserves_codex_and_write_boundaries
         SideEffectConfinementEvidence::Verified(SideEffectConfinementProfileKind::ExternalCodex)
     );
     assert_eq!(
-        fs::read_to_string(codex_worktree.join("initialized.txt")).expect("Codex EPERM evidence"),
+        fs::read_to_string(codex_worktree.join(MARKER_FILE)).expect("Codex EPERM evidence"),
         "eperm\n"
     );
 
@@ -1906,14 +1908,20 @@ fn external_grok_unix_stream_initialization_preserves_codex_and_write_boundaries
         SideEffectConfinementEvidence::Verified(SideEffectConfinementProfileKind::ExternalGrok)
     );
     assert_eq!(
-        fs::read_to_string(grok_worktree.join("initialized.txt"))
-            .expect("Grok initialization evidence"),
+        fs::read_to_string(grok_worktree.join(MARKER_FILE)).expect("Grok initialization evidence"),
         "initialized\n"
     );
     assert_eq!(
         fs::read_to_string(&protected).expect("protected evidence"),
         "protected\n"
     );
+    let unit_names = unit_capture.finish();
+    assert_eq!(
+        unit_names.len(),
+        2,
+        "Codex and Grok strict runs must each allocate one systemd unit"
+    );
+    assert_systemd_units_have_no_residue(&unit_names);
 }
 
 #[cfg(target_os = "linux")]
