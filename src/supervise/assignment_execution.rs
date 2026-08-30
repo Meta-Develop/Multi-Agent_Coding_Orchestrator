@@ -61,22 +61,27 @@ fn runtime_model_catalog_for_launch(
 fn selected_runtime_program(
     launch_runtime: SupervisorRuntime,
     options: &SupervisorRunOptions,
-) -> PathBuf {
+) -> Result<PathBuf> {
     match launch_runtime {
         SupervisorRuntime::Codex if options.runtime == SupervisorRuntime::Codex => {
-            options.codex_bin.clone()
+            Ok(options.codex_bin.clone())
         }
-        SupervisorRuntime::Grok
-        | SupervisorRuntime::Cursor
+        SupervisorRuntime::Grok => {
+            let program_override = std::env::var_os("MACO_GROK_BIN");
+            crate::runtime_adapter::grok::resolve_configured_grok_executable(
+                program_override.as_deref(),
+            )
+        }
+        SupervisorRuntime::Cursor
         | SupervisorRuntime::ClaudeCode
-        | SupervisorRuntime::GeminiCli => {
+        | SupervisorRuntime::GeminiCli => Ok(
             crate::runtime_adapter::RuntimeAdapterConfig::from_environment(launch_runtime)
                 .binary
                 .filter(|path| !path.as_os_str().is_empty())
-                .unwrap_or_else(|| PathBuf::from(launch_runtime.default_binary()))
-        }
+                .unwrap_or_else(|| PathBuf::from(launch_runtime.default_binary())),
+        ),
         SupervisorRuntime::Codex | SupervisorRuntime::Fake => {
-            PathBuf::from(launch_runtime.default_binary())
+            Ok(PathBuf::from(launch_runtime.default_binary()))
         }
     }
 }
@@ -495,7 +500,7 @@ fn bind_selected_runtime_launch(
     }
     admit_assignment_role_category(assignment, launch_runtime, &resolution)?;
     if launch_runtime.is_adapter_subprocess() {
-        command.program = selected_runtime_program(launch_runtime, options);
+        command.program = selected_runtime_program(launch_runtime, options)?;
         command = command.with_runtime_adapter(
             launch_runtime,
             crate::runtime_adapter::RuntimeAdapterConfig::from_environment(launch_runtime),
@@ -2866,7 +2871,7 @@ fn prepare_parent_auditor<'a>(
         Duration::from_secs(plan.child_timeout_seconds),
     );
     if launch_runtime.is_adapter_subprocess() {
-        auditor_command.program = selected_runtime_program(launch_runtime, options);
+        auditor_command.program = selected_runtime_program(launch_runtime, options)?;
         auditor_command = auditor_command.with_runtime_adapter(
             launch_runtime,
             crate::runtime_adapter::RuntimeAdapterConfig::from_environment(launch_runtime),
@@ -3766,7 +3771,7 @@ fn publish_assignment_report(
     Ok(())
 }
 
-fn persist_final_assignment_report(
+pub(super) fn persist_final_assignment_report(
     writer: &mut ArtifactRunWriter,
     journal: &mut Option<OrchestrationEventJournal>,
     assignment: &OrchestratorAssignment,
@@ -6266,6 +6271,19 @@ done
         )?;
 
         assert_eq!(runtime, SupervisorRuntime::Grok);
+        assert!(command.program.is_absolute());
+        assert_eq!(
+            command.program,
+            crate::runtime_adapter::grok::resolve_configured_grok_executable(None)?
+        );
+        assert_eq!(
+            command
+                .runtime_adapter
+                .as_ref()
+                .context("selected Grok runtime adapter")?
+                .binary_path(),
+            command.program
+        );
         assert_eq!(
             command.invocation,
             crate::external_agent::ExternalAgentInvocation::Grok

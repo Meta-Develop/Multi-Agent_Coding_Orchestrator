@@ -262,7 +262,9 @@ fn observe_grok_catalog(
 ) -> Result<crate::runtime_adapter::grok::GrokAdvertisedCatalogObservation> {
     let mut spec = crate::runtime_adapter::grok::GrokCatalogCommandSpec::new(repo);
     if let Some(program) = program_override {
-        spec = spec.with_program(program);
+        spec = spec.with_program(crate::runtime_adapter::grok::explicit_grok_executable(
+            program,
+        )?);
     }
     crate::runtime_adapter::grok::discover_grok_model_catalog(
         runner,
@@ -5464,7 +5466,11 @@ mod tests {
         );
         let specs = runner.observed_specs.borrow();
         assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].program(), Path::new("grok"));
+        assert_eq!(
+            specs[0].program(),
+            Path::new(crate::runtime_adapter::grok::default_grok_executable())
+        );
+        assert!(specs[0].program().is_absolute());
         assert_eq!(specs[0].args(), &[std::ffi::OsString::from("models")]);
         assert_eq!(specs[0].current_dir(), Path::new("/workspace"));
         Ok(())
@@ -5487,6 +5493,26 @@ mod tests {
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].program(), Path::new(program));
         Ok(())
+    }
+
+    #[test]
+    fn live_grok_catalog_bridge_refuses_a_relative_explicit_program_without_running_it() {
+        let runner = FakeGrokRunner::successful(CAPTURED_GROK_CATALOG);
+        let error = observe_optional_live_grok_catalog(
+            &runner,
+            Path::new("/workspace"),
+            CAPTURED_CURSOR_AT_UNIX_MILLIS,
+            Some(std::ffi::OsStr::new("relative/grok")),
+        )
+        .expect_err("a relative MACO_GROK_BIN must fail closed");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("MACO_GROK_BIN must be an absolute path"),
+            "{message}"
+        );
+        assert!(message.contains("ambient PATH"), "{message}");
+        assert!(runner.observed_specs.borrow().is_empty());
     }
 
     #[test]

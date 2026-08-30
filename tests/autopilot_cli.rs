@@ -100,8 +100,12 @@ fn retired_autopilot_verbs_are_hidden_while_read_only_commands_remain() -> Resul
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).context("decode autopilot help")?;
 
-    assert!(!stdout.lines().any(|line| line.trim_start().starts_with("plan ")));
-    assert!(!stdout.lines().any(|line| line.trim_start().starts_with("run ")));
+    assert!(!stdout
+        .lines()
+        .any(|line| line.trim_start().starts_with("plan ")));
+    assert!(!stdout
+        .lines()
+        .any(|line| line.trim_start().starts_with("run ")));
     for command in ["status", "collect", "artifacts"] {
         assert!(
             stdout
@@ -132,7 +136,9 @@ fn literal_instruction_routing_remains_available() -> Result<()> {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("failed to resolve default machine-global binding for routed literal instruction"),
+        stderr.contains(
+            "failed to resolve default machine-global binding for routed literal instruction"
+        ),
         "{stderr}"
     );
     assert!(!stderr.contains("unrecognized subcommand"), "{stderr}");
@@ -146,9 +152,7 @@ fn literal_instruction_routing_remains_available() -> Result<()> {
 fn status_and_collect_remain_read_only_for_legacy_artifacts() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     Repository::init(temp.path()).context("initialize repository")?;
-    let run_dir = temp
-        .path()
-        .join(".maco/autopilot/runs/legacy-active");
+    let run_dir = temp.path().join(".maco/autopilot/runs/legacy-active");
     fs::create_dir_all(&run_dir).context("create legacy run artifacts")?;
     #[cfg(unix)]
     {
@@ -207,9 +211,7 @@ fn assert_retired(output: Output) {
 fn direct_child_names(path: &Path) -> Result<Vec<String>> {
     let mut names = fs::read_dir(path)
         .with_context(|| format!("read {}", path.display()))?
-        .map(|entry| {
-            entry.map(|entry| entry.file_name().to_string_lossy().into_owned())
-        })
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
         .collect::<std::io::Result<Vec<_>>>()?;
     names.sort();
     Ok(names)

@@ -22,14 +22,13 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     str,
     time::Duration,
 };
 #[cfg(target_os = "linux")]
 use std::{
-    ffi::OsStr,
     fs::{File, OpenOptions},
     sync::Arc,
 };
@@ -49,6 +48,76 @@ const GROK_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
 const GROK_DIGEST_FRAMING_VERSION: &[u8] = b"maco.grok.advertised-catalog.v1\n";
 const GROK_CATALOG_AUTH_FILE: &str = "auth.json";
 const GROK_CATALOG_CONFIG_FILE: &str = "config.toml";
+
+/// Fixed host entry point used when the operator does not set `MACO_GROK_BIN`.
+///
+/// The Nix system profile entry is expected to be a symlink. Resolution binds
+/// its canonical store identity before either catalog observation or launch;
+/// arbitrary explicit symlinks remain refused.
+pub const TRUSTED_SYSTEM_GROK_EXECUTABLE: &str = "/run/current-system/sw/bin/grok";
+
+pub const fn default_grok_executable() -> &'static str {
+    TRUSTED_SYSTEM_GROK_EXECUTABLE
+}
+
+/// Validate the operator-controlled `MACO_GROK_BIN` value without consulting
+/// ambient `PATH`. The screened catalog runner and launch preflight perform
+/// the remaining filesystem identity checks before starting Grok.
+pub fn explicit_grok_executable(program: &OsStr) -> Result<PathBuf> {
+    let program = PathBuf::from(program);
+    if !program.is_absolute() {
+        bail!(
+            "MACO_GROK_BIN must be an absolute path; ambient PATH and relative resolution are refused (requested {})",
+            program.display()
+        );
+    }
+    Ok(program)
+}
+
+/// Resolve the configured Grok executable to one canonical absolute identity.
+///
+/// The fixed Nix profile entry is trusted as a discovery location and may be
+/// a symlink. An explicit override must already be absolute and may not itself
+/// be a symlink, matching the external-agent executable preflight.
+pub fn resolve_configured_grok_executable(program_override: Option<&OsStr>) -> Result<PathBuf> {
+    let (candidate, trusted_system_entry) = match program_override {
+        Some(program) => (explicit_grok_executable(program)?, false),
+        None => (PathBuf::from(TRUSTED_SYSTEM_GROK_EXECUTABLE), true),
+    };
+    resolve_grok_executable_candidate(&candidate, trusted_system_entry)
+}
+
+fn resolve_grok_executable_candidate(
+    candidate: &Path,
+    trusted_system_entry: bool,
+) -> Result<PathBuf> {
+    if !candidate.is_absolute() {
+        bail!(
+            "Grok executable must be an absolute path; ambient PATH and relative resolution are refused (requested {})",
+            candidate.display()
+        );
+    }
+    if !trusted_system_entry
+        && std::fs::symlink_metadata(candidate)
+            .with_context(|| format!("Grok executable '{}' is missing", candidate.display()))?
+            .file_type()
+            .is_symlink()
+    {
+        bail!(
+            "explicit Grok executable may not be a symlink: {}",
+            candidate.display()
+        );
+    }
+    let canonical = std::fs::canonicalize(candidate)
+        .with_context(|| format!("Grok executable '{}' is missing", candidate.display()))?;
+    if !canonical.is_file() {
+        bail!(
+            "Grok executable '{}' is not a regular file",
+            canonical.display()
+        );
+    }
+    Ok(canonical)
+}
 
 /// Immutable Grok headless protocol supported by this adapter.
 ///
@@ -398,7 +467,7 @@ impl GrokCatalogCommandSpec {
     /// Construct the stable catalog request `grok models`.
     pub fn new(current_dir: impl Into<PathBuf>) -> Self {
         Self {
-            program: PathBuf::from("grok"),
+            program: PathBuf::from(TRUSTED_SYSTEM_GROK_EXECUTABLE),
             args: vec![OsString::from("models")],
             current_dir: current_dir.into(),
             environment: BTreeMap::from([
@@ -983,19 +1052,14 @@ fn open_reviewed_grok_catalog_source(path: &Path, required: bool) -> Result<Opti
 }
 
 fn resolve_catalog_program(program: &Path) -> Result<PathBuf> {
-    if program.components().count() > 1 {
-        if program.is_file() {
-            return Ok(program.to_path_buf());
-        }
-        bail!("Grok catalog executable '{}' is missing", program.display());
-    }
-    env::var_os("PATH")
-        .as_deref()
-        .into_iter()
-        .flat_map(env::split_paths)
-        .map(|dir| dir.join(program))
-        .find(|candidate| candidate.is_file())
-        .with_context(|| format!("Grok catalog executable '{}' is missing", program.display()))
+    let program_override =
+        (program != Path::new(TRUSTED_SYSTEM_GROK_EXECUTABLE)).then_some(program.as_os_str());
+    resolve_configured_grok_executable(program_override).with_context(|| {
+        format!(
+            "Grok catalog executable '{}' is unavailable",
+            program.display()
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1293,7 +1357,8 @@ mod tests {
     #[test]
     fn command_spec_is_exact_and_discovery_uses_only_the_injected_runner() -> Result<()> {
         let spec = GrokCatalogCommandSpec::new("/workspace");
-        assert_eq!(spec.program(), Path::new("grok"));
+        assert_eq!(spec.program(), Path::new(default_grok_executable()));
+        assert!(spec.program().is_absolute());
         assert_eq!(spec.args(), [OsString::from("models")]);
         assert_eq!(
             spec.environment(),
@@ -1328,6 +1393,30 @@ mod tests {
         );
         assert_ne!(observation.source_sha256(), sha256_hex(CAPTURED_CATALOG));
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configured_default_grok_resolves_to_one_canonical_absolute_identity() -> Result<()> {
+        let resolved = resolve_configured_grok_executable(None)?;
+        assert!(resolved.is_absolute());
+        assert_eq!(resolved, std::fs::canonicalize(default_grok_executable())?);
+        assert!(!std::fs::symlink_metadata(&resolved)?
+            .file_type()
+            .is_symlink());
+        Ok(())
+    }
+
+    #[test]
+    fn relative_explicit_grok_override_fails_closed_without_path_search() {
+        let error = resolve_configured_grok_executable(Some(OsStr::new("relative/grok")))
+            .expect_err("relative MACO_GROK_BIN must fail closed")
+            .to_string();
+        assert!(
+            error.contains("MACO_GROK_BIN must be an absolute path"),
+            "{error}"
+        );
+        assert!(error.contains("ambient PATH"), "{error}");
     }
 
     #[test]
