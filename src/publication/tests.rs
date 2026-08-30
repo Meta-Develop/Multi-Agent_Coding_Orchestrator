@@ -3313,7 +3313,10 @@ fn publication_network_capability_callsites_are_exactly_audited() {
             "supervise.rs",
         ]
     );
-    assert_eq!(runners, ["publication.rs", "publication.rs"]);
+    assert_eq!(
+        runners,
+        ["publication.rs", "publication.rs", "publication.rs"]
+    );
 }
 
 fn rust_sources_under(root: &Path) -> Vec<PathBuf> {
