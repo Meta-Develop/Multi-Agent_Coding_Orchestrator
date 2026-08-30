@@ -186,6 +186,8 @@ pub(super) fn read_authenticated_review_transcript(
         .resume_binding()
         .context("failed to authenticate retained transcript artifact manifest before read")?;
     let transcript_path = writer.run_dir().join(transcript_relative);
+    // Authenticate and decode the complete retained evidence under the supervisor-report cap.
+    // Only the later review-lens request is excerpted to its smaller, independent request limit.
     let bytes = read_bounded_regular_file_nofollow(&transcript_path, MAX_SUPERVISOR_REPORT_BYTES)
         .with_context(|| {
         format!(

@@ -4332,6 +4332,99 @@ fn bounded_review_transcript_fails_closed_when_required_material_cannot_fit() {
 }
 
 #[test]
+fn retained_large_multibyte_transcript_is_authenticated_before_request_bounding() {
+    const LARGE_TRANSCRIPT_FLOOR_BYTES: usize = 550 * 1024;
+
+    let (_temp, repo_path) = injected_repository();
+    let run_id = RunId::new("review-transcript-large-multibyte").expect("valid run id");
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        run_id,
+        "supervise-test",
+    )
+    .expect("reserve large transcript artifact run");
+    let transcript_relative = Path::new("logs/child-a.jsonl");
+    let transcript = format!(
+        "HEAD-雪🦀\n{}TAIL-終🦀\n",
+        "界🙂".repeat(LARGE_TRANSCRIPT_FLOOR_BYTES / "界🙂".len() + 1)
+    );
+    assert!(transcript.len() > LARGE_TRANSCRIPT_FLOOR_BYTES);
+    assert!(transcript.len() < MAX_SUPERVISOR_REPORT_BYTES);
+    writer
+        .write_bytes(
+            transcript_relative,
+            transcript.as_bytes(),
+            ArtifactFileDisposition::PrivateEvidence,
+        )
+        .expect("write manifested large transcript");
+
+    let authenticated = read_authenticated_review_transcript(&mut writer, transcript_relative)
+        .expect("authenticate complete large transcript");
+    assert_eq!(authenticated, transcript);
+    let request = bounded_transcript_request(&authenticated, "{\"accepted\":true}");
+    assert!(
+        serde_json::to_vec(&request)
+            .expect("serialize bounded large-transcript request")
+            .len()
+            <= REVIEW_LENS_REQUEST_LIMIT_BYTES
+    );
+    let crate::review::ReviewLensScopedInformation::BoundedFullChildTranscript {
+        child_transcript,
+        ..
+    } = request.information
+    else {
+        panic!("full review lens did not receive bounded transcript information");
+    };
+    assert_eq!(child_transcript.authoritative_artifact, transcript_relative);
+    assert_eq!(child_transcript.original_bytes, transcript.len() as u64);
+    assert_eq!(
+        child_transcript.sha256,
+        crate::artifacts::state_auth::sha256_hex(transcript.as_bytes())
+    );
+    assert!(child_transcript.truncated);
+    assert!(child_transcript.head_excerpt.starts_with("HEAD-雪🦀\n"));
+    assert!(child_transcript.tail_excerpt.ends_with("TAIL-終🦀\n"));
+    assert_eq!(
+        child_transcript.omitted_bytes,
+        (transcript.len()
+            - child_transcript.head_excerpt.len()
+            - child_transcript.tail_excerpt.len()) as u64
+    );
+    assert!(child_transcript
+        .truncation_marker
+        .contains("truncated: middle omitted"));
+}
+
+#[test]
+fn retained_review_transcript_refuses_input_above_supervisor_report_limit() {
+    let (_temp, repo_path) = injected_repository();
+    let run_id = RunId::new("review-transcript-over-supervisor-limit").expect("valid run id");
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        run_id,
+        "supervise-test",
+    )
+    .expect("reserve oversized transcript artifact run");
+    let transcript_relative = Path::new("logs/child-a.jsonl");
+    let transcript = "t".repeat(MAX_SUPERVISOR_REPORT_BYTES + 1);
+    writer
+        .write_bytes(
+            transcript_relative,
+            transcript.as_bytes(),
+            ArtifactFileDisposition::PrivateEvidence,
+        )
+        .expect("write manifested oversized transcript");
+
+    let error = read_authenticated_review_transcript(&mut writer, transcript_relative)
+        .expect_err("transcript above the supervisor report limit must be refused");
+    assert!(format!("{error:#}").contains(&format!(
+        "configured {MAX_SUPERVISOR_REPORT_BYTES} byte limit"
+    )));
+}
+
+#[test]
 fn retained_review_transcript_manifest_authentication_refuses_tampering() {
     let (_temp, repo_path) = injected_repository();
     let run_id = RunId::new("review-transcript-tamper").expect("valid run id");
