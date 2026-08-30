@@ -2785,6 +2785,15 @@ fn apply_systemd_sandbox_properties(command: &mut Command, sandbox: &ResolvedSys
             // networked deny list intact and relax @mount only for ExternalCodex.
             "--property=SystemCallFilter=~@clock @debug @module @obsolete @raw-io @reboot @swap bpf fanotify_init fanotify_mark ipc mq_getsetattr mq_notify mq_open mq_timedreceive mq_timedreceive_time64 mq_timedsend mq_timedsend_time64 mq_unlink msgctl msgget msgrcv msgsnd open_by_handle_at process_madvise process_vm_readv process_vm_writev quotactl quotactl_fd semctl semget semop semtimedop semtimedop_time64 shmat shmctl shmdt shmget link linkat mknod mknodat",
         ]);
+    } else if sandbox.kind == SideEffectConfinementProfileKind::ExternalGrok {
+        command.args([
+            "--property=PrivateNetwork=no",
+            // Grok's admitted parent runtime uses local Unix streams during initialization. It
+            // does not need Codex's namespace or mount exceptions, and known same-user sockets
+            // remain masked by the exact path policy below.
+            "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+            "--property=SystemCallFilter=~@clock @debug @module @mount @obsolete @raw-io @reboot @swap bpf fanotify_init fanotify_mark ipc mq_getsetattr mq_notify mq_open mq_timedreceive mq_timedreceive_time64 mq_timedsend mq_timedsend_time64 mq_unlink msgctl msgget msgrcv msgsnd open_by_handle_at process_madvise process_vm_readv process_vm_writev quotactl quotactl_fd semctl semget semop semtimedop semtimedop_time64 shmat shmctl shmdt shmget link linkat mknod mknodat",
+        ]);
     } else {
         command.args([
             "--property=PrivateNetwork=no",
@@ -3063,6 +3072,7 @@ fn verify_exact_systemd_path_properties(
         sandbox.kind,
         SideEffectConfinementProfileKind::TrustedFixedNetwork
             | SideEffectConfinementProfileKind::ExternalCodex
+            | SideEffectConfinementProfileKind::ExternalGrok
     ) && !sandbox.isolated_host_view
     {
         return Ok(());
@@ -3190,6 +3200,9 @@ fn verify_systemd_network_properties(
         SideEffectConfinementProfileKind::StrictOfflineWorkspace => BTreeSet::from(["AF_UNIX"]),
         SideEffectConfinementProfileKind::ExternalCodex => {
             BTreeSet::from(["AF_INET", "AF_INET6", "AF_NETLINK"])
+        }
+        SideEffectConfinementProfileKind::ExternalGrok => {
+            BTreeSet::from(["AF_UNIX", "AF_INET", "AF_INET6"])
         }
         SideEffectConfinementProfileKind::TrustedFixedNetwork
         | SideEffectConfinementProfileKind::TrustedCompatibility => {

@@ -58,6 +58,17 @@ pub trait AgentRuntimeAdapter {
         self.adapter_id().capabilities()
     }
 
+    fn typed_runtime_contract(&self, context: &LaunchContext<'_>) -> Option<TypedRuntimeContract> {
+        self.config()
+            .typed_runtime_contract(self.adapter_id(), context)
+    }
+
+    fn capabilities_for_launch(&self, context: &LaunchContext<'_>) -> RuntimeCapabilities {
+        self.typed_runtime_contract(context)
+            .map(TypedRuntimeContract::capabilities)
+            .unwrap_or_else(|| self.capabilities())
+    }
+
     fn launch(&self, context: &LaunchContext<'_>) -> Result<LaunchSpec> {
         self.config().render(context)
     }
@@ -312,7 +323,95 @@ pub enum OutputCaptureMode {
     StdoutAndStderr,
 }
 
+#[cfg(test)]
 const GROK_NO_SUBAGENTS_ARG: &str = "--no-subagents";
+
+/// A model/effort runtime identity whose launch contract is known precisely.
+///
+/// This identity is not capability evidence by itself. Call
+/// [`RuntimeAdapterConfig::typed_runtime_contract`] to obtain the opaque proof
+/// that the rendered adapter contract still matches it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TypedRuntime {
+    #[serde(rename = "grok-4.6-xhigh")]
+    Grok46Xhigh,
+}
+
+impl TypedRuntime {
+    pub const fn adapter_id(self) -> AdapterId {
+        match self {
+            Self::Grok46Xhigh => AdapterId::Grok,
+        }
+    }
+
+    pub const fn model(self) -> &'static str {
+        match self {
+            Self::Grok46Xhigh => "grok-4.6",
+        }
+    }
+
+    pub const fn reasoning_effort(self) -> &'static str {
+        match self {
+            Self::Grok46Xhigh => "xhigh",
+        }
+    }
+
+    pub fn from_launch(
+        adapter: AdapterId,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+    ) -> Option<Self> {
+        if adapter == AdapterId::Grok
+            && model == Some(Self::Grok46Xhigh.model())
+            && reasoning_effort == Some(Self::Grok46Xhigh.reasoning_effort())
+        {
+            Some(Self::Grok46Xhigh)
+        } else {
+            None
+        }
+    }
+}
+
+/// Opaque evidence that a rendered typed runtime retains MACO's bounded leaf
+/// contract. It can only be constructed by checking the real adapter config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TypedRuntimeContract {
+    runtime: TypedRuntime,
+}
+
+impl TypedRuntimeContract {
+    pub const fn runtime(self) -> TypedRuntime {
+        self.runtime
+    }
+
+    pub const fn has_bounded_cwd(self) -> bool {
+        true
+    }
+
+    pub const fn has_bounded_output(self) -> bool {
+        true
+    }
+
+    pub const fn subagents_disabled(self) -> bool {
+        true
+    }
+
+    /// Capability elevation is available only after the adapter proof exists.
+    pub const fn capabilities(self) -> RuntimeCapabilities {
+        match self.runtime {
+            TypedRuntime::Grok46Xhigh => RuntimeCapabilities::GROK_4_6_XHIGH,
+        }
+    }
+
+    /// Parse the output protocol selected by this proof. The Grok parser
+    /// enforces byte, line, event-count, and terminal-event bounds.
+    pub fn parse_output(self, bytes: &[u8]) -> Result<grok::GrokParsedEventStream> {
+        match self.runtime {
+            TypedRuntime::Grok46Xhigh => grok::parse_grok_event_stream(bytes),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -341,20 +440,8 @@ impl RuntimeAdapterConfig {
     pub fn defaults_for(adapter: AdapterId) -> Self {
         let (template, output_capture, feed_prompt_on_stdin) = match adapter {
             AdapterId::Grok => (
-                vec![
-                    "--prompt-file".into(),
-                    "{prompt}".into(),
-                    "--model".into(),
-                    "{model}".into(),
-                    "--effort".into(),
-                    "{effort}".into(),
-                    "--cwd".into(),
-                    "{cwd}".into(),
-                    "--output-format".into(),
-                    "plain".into(),
-                    GROK_NO_SUBAGENTS_ARG.into(),
-                ],
-                // grok prints the headless response to stdout; there is no --output file flag.
+                grok::GROK_RUNTIME_DESCRIPTOR.immutable_argument_template(),
+                // Grok emits bounded NDJSON on stdout; there is no --output file flag.
                 OutputCaptureMode::Stdout,
                 false,
             ),
@@ -415,7 +502,8 @@ impl RuntimeAdapterConfig {
 
     /// Load operator overrides from environment without requiring a code change.
     /// `MACO_<RUNTIME>_ARGS` is whitespace-separated and supports the same placeholders.
-    /// Grok's non-delegation flag is restored after this mutable operator template.
+    /// Grok's protocol and safety argv are immutable; Grok operator overrides
+    /// may select only the binary and screened environment passthrough.
     pub fn from_environment(runtime: RuntimeId) -> Self {
         Self::from_adapter_environment(AdapterId::from_runtime(runtime))
     }
@@ -450,16 +538,69 @@ impl RuntimeAdapterConfig {
         if let Ok(stdin) = env::var(format!("{prefix}_STDIN_PROMPT")) {
             config.feed_prompt_on_stdin = matches!(stdin.as_str(), "1" | "true" | "stdin");
         }
+        if adapter == AdapterId::Grok {
+            config.restore_immutable_grok_descriptor();
+        }
         config
     }
 
     fn replace_operator_argument_template(&mut self, adapter: AdapterId, args: &str) {
-        self.argument_template = args.split_whitespace().map(str::to_string).collect();
         if adapter == AdapterId::Grok {
-            self.argument_template
-                .retain(|argument| argument != GROK_NO_SUBAGENTS_ARG);
-            self.argument_template.push(GROK_NO_SUBAGENTS_ARG.into());
+            return;
         }
+        self.argument_template = args.split_whitespace().map(str::to_string).collect();
+    }
+
+    fn restore_immutable_grok_descriptor(&mut self) {
+        self.argument_template = grok::GROK_RUNTIME_DESCRIPTOR.immutable_argument_template();
+        self.working_dir_flag = None;
+        self.output_capture = OutputCaptureMode::Stdout;
+        self.feed_prompt_on_stdin = false;
+    }
+
+    /// Prove a typed runtime from the fully rendered adapter contract.
+    ///
+    /// Grok capability elevation requires an absolute cwd, the canonical
+    /// executable, the exact immutable argv (including strict sandboxing,
+    /// streaming JSON, and no subagents), stdout capture for the bounded
+    /// parser, and no operator environment or stdin alteration. A model/effort
+    /// string without these checks remains on the fail-closed adapter-level
+    /// capability row.
+    pub fn typed_runtime_contract(
+        &self,
+        adapter: AdapterId,
+        context: &LaunchContext<'_>,
+    ) -> Option<TypedRuntimeContract> {
+        let runtime = TypedRuntime::from_launch(adapter, context.model, context.effort)?;
+        match runtime {
+            TypedRuntime::Grok46Xhigh => {
+                if !context.cwd.is_absolute()
+                    || !self.env_passthrough.is_empty()
+                    || self.feed_prompt_on_stdin
+                    || self.working_dir_flag.is_some()
+                {
+                    return None;
+                }
+                let actual = self.render(context).ok()?;
+                let expected = Self::defaults_for(AdapterId::Grok).render(context).ok()?;
+                if actual != expected {
+                    return None;
+                }
+                Some(TypedRuntimeContract { runtime })
+            }
+        }
+    }
+
+    /// Capabilities for one concrete launch. Static adapter capabilities remain
+    /// the fallback so every non-proved runtime is unchanged and fail-closed.
+    pub fn capabilities_for_launch(
+        &self,
+        adapter: AdapterId,
+        context: &LaunchContext<'_>,
+    ) -> RuntimeCapabilities {
+        self.typed_runtime_contract(adapter, context)
+            .map(TypedRuntimeContract::capabilities)
+            .unwrap_or_else(|| adapter.capabilities())
     }
 
     pub fn binary_path(&self) -> &Path {
@@ -816,12 +957,16 @@ mod tests {
                 "{prompt}",
                 "--model",
                 "{model}",
-                "--effort",
+                "--reasoning-effort",
                 "{effort}",
                 "--cwd",
                 "{cwd}",
                 "--output-format",
-                "plain",
+                "streaming-json",
+                "--sandbox",
+                "strict",
+                "--disable-web-search",
+                "--no-memory",
                 "--no-subagents",
             ]
         );
@@ -829,7 +974,7 @@ mod tests {
         let spec = config.render(&launch_context(
             Path::new("prompt.txt"),
             Some("grok-4.6"),
-            Some("high"),
+            Some("xhigh"),
             Path::new("/tmp/work"),
             Path::new("out.txt"),
         ))?;
@@ -840,12 +985,16 @@ mod tests {
                 "prompt.txt",
                 "--model",
                 "grok-4.6",
-                "--effort",
-                "high",
+                "--reasoning-effort",
+                "xhigh",
                 "--cwd",
                 "/tmp/work",
                 "--output-format",
-                "plain",
+                "streaming-json",
+                "--sandbox",
+                "strict",
+                "--disable-web-search",
+                "--no-memory",
                 "--no-subagents",
             ]
         );
@@ -868,12 +1017,16 @@ mod tests {
             [
                 "--prompt-file",
                 "prompt.txt",
-                "--effort",
+                "--reasoning-effort",
                 "high",
                 "--cwd",
                 "/tmp/work",
                 "--output-format",
-                "plain",
+                "streaming-json",
+                "--sandbox",
+                "strict",
+                "--disable-web-search",
+                "--no-memory",
                 "--no-subagents",
             ]
         );
@@ -897,7 +1050,11 @@ mod tests {
                 "--cwd",
                 "/tmp/work",
                 "--output-format",
-                "plain",
+                "streaming-json",
+                "--sandbox",
+                "strict",
+                "--disable-web-search",
+                "--no-memory",
                 "--no-subagents",
             ]
         );
@@ -979,23 +1136,45 @@ mod tests {
     }
 
     #[test]
-    fn grok_operator_argument_override_preserves_immutable_no_subagents() -> Result<()> {
+    fn grok_operator_argument_override_cannot_replace_the_immutable_descriptor() -> Result<()> {
         let mut config = RuntimeAdapterConfig::defaults(RuntimeId::Grok);
+        let immutable = config.argument_template.clone();
         config.replace_operator_argument_template(AdapterId::Grok, "--prompt-file {prompt}");
         let spec = config.render(&launch_context(
             Path::new("prompt.txt"),
             Some("grok-4.6"),
-            Some("high"),
+            Some("xhigh"),
             Path::new("/tmp/work"),
             Path::new("out.txt"),
         ))?;
-        assert_eq!(spec.argv, ["--prompt-file", "prompt.txt", "--no-subagents"]);
+        assert_eq!(config.argument_template, immutable);
+        assert_eq!(
+            spec.argv,
+            [
+                "--prompt-file",
+                "prompt.txt",
+                "--model",
+                "grok-4.6",
+                "--reasoning-effort",
+                "xhigh",
+                "--cwd",
+                "/tmp/work",
+                "--output-format",
+                "streaming-json",
+                "--sandbox",
+                "strict",
+                "--disable-web-search",
+                "--no-memory",
+                "--no-subagents",
+            ]
+        );
         assert_eq!(spec.output_capture, OutputCaptureMode::Stdout);
 
         config.replace_operator_argument_template(
             AdapterId::Grok,
             "--no-subagents --prompt-file {prompt} --no-subagents",
         );
+        assert_eq!(config.argument_template, immutable);
         assert_eq!(
             config
                 .argument_template
@@ -1420,12 +1599,16 @@ mod tests {
                 OsString::from("prompt.txt"),
                 OsString::from("--model"),
                 OsString::from("grok-4.6"),
-                OsString::from("--effort"),
+                OsString::from("--reasoning-effort"),
                 OsString::from("high"),
                 OsString::from("--cwd"),
                 OsString::from("/tmp/work"),
                 OsString::from("--output-format"),
-                OsString::from("plain"),
+                OsString::from("streaming-json"),
+                OsString::from("--sandbox"),
+                OsString::from("strict"),
+                OsString::from("--disable-web-search"),
+                OsString::from("--no-memory"),
                 OsString::from("--no-subagents"),
             ]
         );
@@ -1623,7 +1806,17 @@ mod tests {
     fn assert_grok_help_contract(help: &str, label: &str) {
         assert_help_contains(
             help,
-            &["--prompt-file", "--model", "--cwd", "--output-format"],
+            &[
+                "--prompt-file",
+                "--model",
+                "--cwd",
+                "--output-format",
+                "streaming-json",
+                "--sandbox",
+                "--disable-web-search",
+                "--no-memory",
+                "--no-subagents",
+            ],
             label,
         );
         assert!(
@@ -1716,7 +1909,6 @@ mod tests {
         }
         let help = require_installed_cli_help("grok");
         assert_grok_help_contract(&help, "installed grok help");
-        assert_help_contains(&help, &["--no-subagents"], "installed grok help");
     }
 
     #[test]

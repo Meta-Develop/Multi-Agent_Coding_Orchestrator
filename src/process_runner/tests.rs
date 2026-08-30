@@ -755,6 +755,124 @@ fn external_codex_network_properties_require_exact_netlink_family() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn external_grok_network_properties_require_unix_without_netlink() {
+    let mut properties = BTreeMap::from([
+        (
+            "RestrictAddressFamilies".to_string(),
+            "AF_INET6 AF_UNIX AF_INET".to_string(),
+        ),
+        ("PrivateNetwork".to_string(), "no".to_string()),
+    ]);
+    verify_systemd_network_properties(SideEffectConfinementProfileKind::ExternalGrok, &properties)
+        .expect("exact ExternalGrok network properties");
+
+    properties.insert(
+        "RestrictAddressFamilies".to_string(),
+        "AF_INET AF_INET6".to_string(),
+    );
+    assert!(verify_systemd_network_properties(
+        SideEffectConfinementProfileKind::ExternalGrok,
+        &properties,
+    )
+    .is_err());
+
+    properties.insert(
+        "RestrictAddressFamilies".to_string(),
+        "AF_UNIX AF_INET AF_INET6 AF_NETLINK".to_string(),
+    );
+    assert!(verify_systemd_network_properties(
+        SideEffectConfinementProfileKind::ExternalGrok,
+        &properties,
+    )
+    .is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn external_grok_profile_resolves_only_declared_managed_paths() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("worktree");
+    let read_only_root = workspace.join(".maco");
+    let read_only_file = workspace.join(".git");
+    let read_write_root = workspace.join(".agents/docs");
+    let read_write_file = workspace.join("AGENTS.md");
+    let capability_root = temp.path().join("exact");
+    let capability_file = capability_root.join("worker-report.json");
+    let artifact_root = temp.path().join("incoming");
+    let hidden_root = temp.path().join("primary");
+    for directory in [
+        &workspace,
+        &read_only_root,
+        &read_write_root,
+        &capability_root,
+        &artifact_root,
+        &hidden_root,
+    ] {
+        fs::create_dir_all(directory).expect("sandbox fixture directory");
+    }
+    for file in [&read_only_file, &read_write_file, &capability_file] {
+        fs::write(file, "fixture\n").expect("sandbox fixture file");
+    }
+    let held_capability = Arc::new(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&capability_file)
+            .expect("held writable capability"),
+    );
+
+    let read_only = ExternalGrokProfile::read_only(&workspace);
+    assert_eq!(read_only.workspace_access(), WorkspaceAccess::ReadOnly);
+
+    let profile = ExternalGrokProfile::read_write(&workspace)
+        .with_visible_read_only_root(&read_only_root)
+        .with_visible_read_only_file(&read_only_file)
+        .with_visible_read_write_root(&read_write_root)
+        .with_visible_read_write_file(&read_write_file)
+        .with_writable_artifact_root(&artifact_root)
+        .with_hidden_root(&hidden_root)
+        .with_visible_read_write_file_capability(&capability_file, held_capability)
+        .expect("ExternalGrok exact writable capability");
+    assert_eq!(profile.workspace_access(), WorkspaceAccess::ReadWrite);
+    assert_eq!(profile.visible_read_only_roots(), &[read_only_root.clone()]);
+    assert_eq!(profile.visible_read_only_files(), &[read_only_file.clone()]);
+    assert_eq!(
+        profile.visible_read_write_roots(),
+        &[read_write_root.clone()]
+    );
+    assert_eq!(
+        profile.visible_read_write_files(),
+        &[read_write_file.clone(), capability_file.clone()]
+    );
+    assert_eq!(profile.writable_artifact_roots(), &[artifact_root.clone()]);
+
+    let spec = ProcessSpec::direct(
+        "external Grok managed path projection",
+        PathBuf::from("/bin/true"),
+        Vec::<OsString>::new(),
+        &workspace,
+        128,
+    )
+    .with_side_effect_confinement(SideEffectConfinementProfile::ExternalGrok(profile));
+    let sandbox = resolve_systemd_sandbox(&spec)
+        .expect("resolve ExternalGrok sandbox")
+        .expect("workspace sandbox");
+    assert_eq!(sandbox.kind, SideEffectConfinementProfileKind::ExternalGrok);
+    assert_eq!(sandbox.workspace_root, workspace);
+    assert_eq!(sandbox.workspace_access, WorkspaceAccess::ReadWrite);
+    assert_eq!(sandbox.visible_read_only_roots, vec![read_only_root]);
+    assert_eq!(sandbox.visible_read_only_files, vec![read_only_file]);
+    assert_eq!(sandbox.visible_read_write_roots, vec![read_write_root]);
+    assert_eq!(
+        sandbox.visible_read_write_files,
+        vec![capability_file, read_write_file]
+    );
+    assert_eq!(sandbox.writable_artifact_roots, vec![artifact_root]);
+    assert_eq!(sandbox.hidden_roots, vec![hidden_root]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn external_codex_writable_workspace_resolves_nested_read_only_controls() {
     let temp = tempfile::tempdir().expect("tempdir");
     let workspace = temp.path().join("worktree");
@@ -1597,6 +1715,130 @@ fn external_codex_outer_sandbox_enforces_control_and_report_write_boundaries() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn external_grok_unix_stream_initialization_preserves_codex_and_write_boundaries() {
+    use std::os::unix::net::UnixStream;
+
+    const CHILD_ENV: &str = "MACO_TEST_EXTERNAL_GROK_UNIX_STREAM_CHILD";
+    const MODE_ENV: &str = "MACO_TEST_EXTERNAL_GROK_UNIX_STREAM_MODE";
+    const MARKER_ENV: &str = "MACO_TEST_EXTERNAL_GROK_UNIX_STREAM_MARKER";
+    const PROTECTED_ENV: &str = "MACO_TEST_EXTERNAL_GROK_UNIX_STREAM_PROTECTED";
+
+    skip_without_containment!();
+    if env::var_os(CHILD_ENV).is_some() {
+        let mode = env::var(MODE_ENV).expect("runtime mode");
+        let marker = PathBuf::from(env::var_os(MARKER_ENV).expect("marker path"));
+        let protected = PathBuf::from(env::var_os(PROTECTED_ENV).expect("protected path"));
+        assert!(
+            fs::write(&protected, "forbidden\n").is_err(),
+            "{mode} profile wrote outside its managed worktree"
+        );
+        match mode.as_str() {
+            "codex" => {
+                let error =
+                    UnixStream::pair().expect_err("ExternalCodex must continue to reject AF_UNIX");
+                assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+                fs::write(marker, "eperm\n").expect("write Codex EPERM evidence");
+            }
+            "grok" => {
+                let (left, right) =
+                    UnixStream::pair().expect("ExternalGrok must admit local Unix streams");
+                drop((left, right));
+                fs::write(marker, "initialized\n").expect("write Grok worktree evidence");
+            }
+            other => panic!("unexpected runtime mode {other}"),
+        }
+        return;
+    }
+
+    let test_binary = env::current_exe().expect("current test executable");
+    let test_output_root = test_binary
+        .parent()
+        .and_then(Path::parent)
+        .expect("test output root");
+    let temp = tempfile::tempdir_in(test_output_root).expect("test output tempdir");
+    let codex_worktree = temp.path().join("codex-worktree");
+    let grok_worktree = temp.path().join("grok-worktree");
+    fs::create_dir(&codex_worktree).expect("Codex worktree");
+    fs::create_dir(&grok_worktree).expect("Grok worktree");
+    let protected = temp.path().join("outside-worktree.txt");
+    fs::write(&protected, "protected\n").expect("protected fixture");
+
+    let run_case = |mode: &str,
+                    worktree: &Path,
+                    side_effects: SideEffectConfinementProfile|
+     -> ProcessOutput {
+        let marker = worktree.join("initialized.txt");
+        let environment = BTreeMap::from([
+            (CHILD_ENV.to_string(), "1".to_string()),
+            (MODE_ENV.to_string(), mode.to_string()),
+            (MARKER_ENV.to_string(), marker.display().to_string()),
+            (PROTECTED_ENV.to_string(), protected.display().to_string()),
+        ]);
+        let output = run_process(
+            ProcessSpec::direct(
+                format!("External{mode} UnixStream initialization probe"),
+                &test_binary,
+                [
+                    OsString::from("--exact"),
+                    OsString::from(
+                        "process_runner::tests::external_grok_unix_stream_initialization_preserves_codex_and_write_boundaries",
+                    ),
+                ],
+                worktree,
+                4 * 1024,
+            )
+            .with_environment(EnvironmentMode::InheritAndSet(environment))
+            .with_stdin(StdinMode::Null)
+            .with_timeout(Some(CONTENTION_RESILIENT_PROCESS_TEST_TIMEOUT))
+            .with_side_effect_confinement(side_effects),
+        )
+        .unwrap_or_else(|error| panic!("run External{mode} UnixStream probe: {error}"));
+        assert!(
+            output.status.is_some_and(|status| status.success()),
+            "External{mode} UnixStream child failed: {output:#?}"
+        );
+        assert!(output.safety_evidence_verified());
+        output
+    };
+
+    let codex_output = run_case(
+        "codex",
+        &codex_worktree,
+        SideEffectConfinementProfile::ExternalCodex(ExternalCodexProfile::read_write(
+            &codex_worktree,
+        )),
+    );
+    assert_eq!(
+        codex_output.side_effects,
+        SideEffectConfinementEvidence::Verified(SideEffectConfinementProfileKind::ExternalCodex)
+    );
+    assert_eq!(
+        fs::read_to_string(codex_worktree.join("initialized.txt")).expect("Codex EPERM evidence"),
+        "eperm\n"
+    );
+
+    let grok_output = run_case(
+        "grok",
+        &grok_worktree,
+        SideEffectConfinementProfile::ExternalGrok(ExternalGrokProfile::read_write(&grok_worktree)),
+    );
+    assert_eq!(
+        grok_output.side_effects,
+        SideEffectConfinementEvidence::Verified(SideEffectConfinementProfileKind::ExternalGrok)
+    );
+    assert_eq!(
+        fs::read_to_string(grok_worktree.join("initialized.txt"))
+            .expect("Grok initialization evidence"),
+        "initialized\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&protected).expect("protected evidence"),
+        "protected\n"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn mountinfo_parser_decodes_paths_and_rejects_malformed_or_oversized_input() {
     let parsed = parse_sandbox_mountinfo(
         b"10 1 8:1 / / rw,relatime - ext4 /dev/root rw\n\
@@ -2280,6 +2522,7 @@ fn external_codex_alone_admits_inner_bubblewrap_namespaces_and_mounts() {
     for kind in [
         SideEffectConfinementProfileKind::StrictOfflineWorkspace,
         SideEffectConfinementProfileKind::TrustedFixedNetwork,
+        SideEffectConfinementProfileKind::ExternalGrok,
         SideEffectConfinementProfileKind::TrustedCompatibility,
     ] {
         let mut ordinary = program_visibility_sandbox(Path::new("/worktree"));
@@ -2303,6 +2546,9 @@ fn external_codex_alone_admits_inner_bubblewrap_namespaces_and_mounts() {
             SideEffectConfinementProfileKind::TrustedFixedNetwork
             | SideEffectConfinementProfileKind::TrustedCompatibility => {
                 "--property=RestrictAddressFamilies=AF_INET AF_INET6"
+            }
+            SideEffectConfinementProfileKind::ExternalGrok => {
+                "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"
             }
             SideEffectConfinementProfileKind::ExternalCodex => {
                 unreachable!("ExternalCodex is checked separately")

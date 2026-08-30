@@ -3468,11 +3468,12 @@ fn environment_preflight_uses_the_target_runtime_context() {
         ),
         environment.clone(),
         profile.clone(),
+        ExternalAgentInvocation::CodexSupervisor,
         None,
         Some(&lifecycle),
     );
 
-    let mut expected_environment = environment;
+    let mut expected_environment = environment.clone();
     expected_environment.insert(MACO_RUN_ID_ENV.to_string(), "run-31".to_string());
     expected_environment.insert(MACO_TASK_ID_ENV.to_string(), "task-31".to_string());
     assert_eq!(
@@ -3483,6 +3484,23 @@ fn environment_preflight_uses_the_target_runtime_context() {
     assert_eq!(prepared.side_effects, profile);
     assert!(prepared.private_runtime_home);
     assert!(prepared.private_runtime_codex_home);
+
+    let grok = with_external_runtime_context(
+        ProcessSpec::direct(
+            "grok target",
+            "/run/current-system/sw/bin/grok",
+            std::iter::empty::<&str>(),
+            "/workspace",
+            128,
+        ),
+        environment,
+        SideEffectConfinementProfile::ExternalCodex(ExternalCodexProfile::read_only("/workspace")),
+        ExternalAgentInvocation::Grok,
+        None,
+        None,
+    );
+    assert!(grok.private_runtime_home);
+    assert!(!grok.private_runtime_codex_home);
 }
 
 #[test]
@@ -3746,12 +3764,16 @@ fn grok_runtime_adapter_argv_immutably_disables_subagents() {
             "/run/prompt.md",
             "--model",
             "grok-4.6",
-            "--effort",
+            "--reasoning-effort",
             "xhigh",
             "--cwd",
             "/workspace",
             "--output-format",
-            "plain",
+            "streaming-json",
+            "--sandbox",
+            "strict",
+            "--disable-web-search",
+            "--no-memory",
             "--no-subagents",
         ]
     );
@@ -3779,6 +3801,95 @@ fn grok_runtime_adapter_argv_immutably_disables_subagents() {
     assert!(!cursor_argv
         .iter()
         .any(|argument| argument == "--no-subagents"));
+}
+
+#[test]
+fn grok_runtime_boundary_uses_prompt_file_and_validates_terminal_stream_output() -> Result<()> {
+    let grok = ExternalAgentCommand::codex(
+        "grok",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(7),
+    )
+    .with_runtime_adapter(
+        RuntimeId::Grok,
+        RuntimeAdapterConfig::defaults(RuntimeId::Grok),
+    )
+    .with_model_selection(Some("grok-4.6".to_string()), Some("xhigh".to_string()));
+
+    assert!(matches!(
+        external_agent_stdin_mode(&grok, false, b"prompt must stay in its file".to_vec()),
+        StdinMode::Null
+    ));
+    assert!(matches!(
+        external_agent_stdin_mode(&grok, true, Vec::new()),
+        StdinMode::Interactive
+    ));
+
+    let completed = br#"{"type":"thought","data":"private reasoning"}
+{"type":"text","data":"hello "}
+{"type":"text","data":"world"}
+{"type":"end","stopReason":"end_turn","sessionId":"session-1","requestId":"request-1"}
+"#;
+    assert_eq!(
+        runtime_adapter_captured_output(&grok, completed, b"", true)?,
+        RuntimeAdapterCapturedOutput::Captured(b"hello world".to_vec())
+    );
+    assert_eq!(
+        runtime_adapter_captured_output(&grok, completed, b"", false)?,
+        RuntimeAdapterCapturedOutput::Unavailable,
+        "timed-out or nonzero Grok targets must not publish partial final output"
+    );
+
+    let sensitive = "credential-fixture-must-not-escape";
+    let terminal_error = format!("{{\"type\":\"error\",\"message\":\"{sensitive}\"}}\n");
+    let error = runtime_adapter_captured_output(&grok, terminal_error.as_bytes(), b"", true)
+        .expect_err("a terminal Grok error event must fail the external run")
+        .to_string();
+    assert!(error.contains("terminal streaming-json error event"));
+    assert!(!error.contains(sensitive));
+    Ok(())
+}
+
+#[test]
+fn grok_prompt_file_is_an_exact_read_only_sandbox_input() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    create_mandatory_control_roots(&workspace)?;
+    let prompt_root = temp.path().join("prompt-root");
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&prompt_root)?;
+    fs::create_dir(&incoming)?;
+    let prompt = prompt_root.join("prompt.md");
+    fs::write(&prompt, "bounded Grok prompt\n")?;
+    let grok = ExternalAgentCommand::codex(
+        workspace.join("grok"),
+        &workspace,
+        &prompt,
+        incoming.join("events.jsonl"),
+        incoming.join("report.txt"),
+        Duration::from_secs(7),
+    )
+    .with_runtime_adapter(
+        RuntimeId::Grok,
+        RuntimeAdapterConfig::defaults(RuntimeId::Grok),
+    )
+    .with_model_selection(Some("grok-4.6".to_string()), Some("xhigh".to_string()));
+    let controls = protected_worktree_controls(&grok)?;
+    let profile = external_side_effect_profile(
+        &grok,
+        &workspace.join("grok"),
+        ExternalProgramTrust::ExplicitCustom,
+        &controls,
+    )?;
+    let SideEffectConfinementProfile::ExternalCodex(profile) = profile else {
+        bail!("expected ExternalCodex profile");
+    };
+    assert!(profile.visible_read_only_files().contains(&prompt));
+    assert!(!profile.visible_read_only_roots().contains(&prompt_root));
+    Ok(())
 }
 
 #[test]

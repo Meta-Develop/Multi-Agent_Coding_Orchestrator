@@ -1,8 +1,10 @@
-//! Runtime-advertised Grok model catalog discovery.
+//! Pinned Grok launch/event protocol and runtime-advertised model discovery.
 //!
-//! Catalog membership comes only from one bounded `grok models` observation
-//! or from the typed constructed-entry injection seam. Policy code may
-//! classify the returned slugs, but this adapter does not embed a live model
+//! The launch descriptor fixes the headless output and inner-sandbox posture;
+//! the NDJSON parser accepts only bounded, terminally complete event streams.
+//! Catalog membership still comes only from one bounded `grok models`
+//! observation or from the typed constructed-entry injection seam. Policy code
+//! may classify returned slugs, but this adapter does not embed a live model
 //! list or infer authority from a model name.
 
 use super::AdapterId;
@@ -15,6 +17,8 @@ use crate::{
     },
 };
 use anyhow::{bail, Context, Result};
+use serde::Deserialize;
+use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
@@ -24,6 +28,12 @@ use std::{
     time::Duration,
 };
 
+const GROK_EVENT_STREAM_MAX_BYTES: usize = 8 * 1024 * 1024;
+const GROK_EVENT_LINE_MAX_BYTES: usize = 1024 * 1024;
+const GROK_EVENT_STREAM_MAX_EVENTS: usize = 16 * 1024;
+const GROK_EVENT_TYPE_MAX_BYTES: usize = 64;
+const GROK_EVENT_METADATA_MAX_BYTES: usize = 512;
+const GROK_EVENT_ERROR_MAX_BYTES: usize = 64 * 1024;
 const GROK_CATALOG_MAX_BYTES: usize = 256 * 1024;
 const GROK_CATALOG_MAX_MODELS: usize = 512;
 const GROK_MODEL_SLUG_MAX_BYTES: usize = 256;
@@ -31,6 +41,339 @@ const GROK_MODEL_DISPLAY_NAME_MAX_BYTES: usize = 768;
 const GROK_LOGIN_PROVIDER_MAX_BYTES: usize = 253;
 const GROK_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
 const GROK_DIGEST_FRAMING_VERSION: &[u8] = b"maco.grok.advertised-catalog.v1\n";
+
+/// Immutable Grok headless protocol supported by this adapter.
+///
+/// Model and reasoning effort remain selector inputs. Every protocol and
+/// confinement argument below is fixed by MACO and is not an operator template.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrokRuntimeDescriptor {
+    executable: &'static str,
+    output_format: &'static str,
+    sandbox_profile: &'static str,
+}
+
+impl GrokRuntimeDescriptor {
+    pub const fn executable(self) -> &'static str {
+        self.executable
+    }
+
+    pub const fn output_format(self) -> &'static str {
+        self.output_format
+    }
+
+    pub const fn sandbox_profile(self) -> &'static str {
+        self.sandbox_profile
+    }
+
+    pub const fn subagents_disabled(self) -> bool {
+        true
+    }
+
+    pub const fn memory_disabled(self) -> bool {
+        true
+    }
+
+    pub const fn web_search_disabled(self) -> bool {
+        true
+    }
+
+    /// Canonical argv template. Dynamic values occupy whole argv elements.
+    pub fn immutable_argument_template(self) -> Vec<String> {
+        [
+            "--prompt-file",
+            "{prompt}",
+            "--model",
+            "{model}",
+            "--reasoning-effort",
+            "{effort}",
+            "--cwd",
+            "{cwd}",
+            "--output-format",
+            self.output_format,
+            "--sandbox",
+            self.sandbox_profile,
+            "--disable-web-search",
+            "--no-memory",
+            "--no-subagents",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+}
+
+pub const GROK_RUNTIME_DESCRIPTOR: GrokRuntimeDescriptor = GrokRuntimeDescriptor {
+    executable: "grok",
+    output_format: "streaming-json",
+    sandbox_profile: "strict",
+};
+
+/// One validated event from Grok's `streaming-json` output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrokStreamEvent {
+    Text(String),
+    Thought(String),
+    End(GrokEndEvent),
+    Error(String),
+    /// Forward-compatible non-terminal event advertised by Grok.
+    Other {
+        event_type: String,
+    },
+}
+
+/// Successful terminal metadata from a Grok stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrokEndEvent {
+    stop_reason: String,
+    session_id: String,
+    request_id: String,
+}
+
+impl GrokEndEvent {
+    pub fn stop_reason(&self) -> &str {
+        &self.stop_reason
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+}
+
+/// Typed terminal outcome; an error event is evidence of failure, not success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrokStreamOutcome {
+    Completed(GrokEndEvent),
+    Failed { message: String },
+}
+
+/// Bounded, terminally complete Grok event stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrokParsedEventStream {
+    events: Vec<GrokStreamEvent>,
+    response_text: String,
+    outcome: GrokStreamOutcome,
+}
+
+impl GrokParsedEventStream {
+    pub fn events(&self) -> &[GrokStreamEvent] {
+        &self.events
+    }
+
+    pub fn response_text(&self) -> &str {
+        &self.response_text
+    }
+
+    pub fn outcome(&self) -> &GrokStreamOutcome {
+        &self.outcome
+    }
+
+    pub const fn completed(&self) -> bool {
+        matches!(self.outcome, GrokStreamOutcome::Completed(_))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawGrokStreamEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    #[serde(default)]
+    data: Option<String>,
+    #[serde(default, rename = "stopReason")]
+    stop_reason: Option<String>,
+    #[serde(default, rename = "sessionId")]
+    session_id: Option<String>,
+    #[serde(default, rename = "requestId")]
+    request_id: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(flatten)]
+    _other: BTreeMap<String, Value>,
+}
+
+/// Parse Grok's bounded newline-delimited `streaming-json` protocol.
+///
+/// Unknown event types are preserved as non-terminal events because Grok's
+/// documented event list is non-exhaustive. Exactly one final `end` or `error`
+/// event is still required, and no data may follow it.
+pub fn parse_grok_event_stream(bytes: &[u8]) -> Result<GrokParsedEventStream> {
+    if bytes.is_empty() {
+        bail!("Grok streaming-json output was empty");
+    }
+    if bytes.len() > GROK_EVENT_STREAM_MAX_BYTES {
+        bail!(
+            "Grok streaming-json output exceeds the {} byte limit",
+            GROK_EVENT_STREAM_MAX_BYTES
+        );
+    }
+    if !bytes.ends_with(b"\n") {
+        bail!("Grok streaming-json output lacks its terminal newline and may be truncated");
+    }
+    if bytes.contains(&b'\r') {
+        bail!("Grok streaming-json output contains a carriage return");
+    }
+
+    let mut events = Vec::new();
+    let mut response_text = String::new();
+    let mut outcome = None;
+    for (index, line) in bytes[..bytes.len() - 1]
+        .split(|byte| *byte == b'\n')
+        .enumerate()
+    {
+        if line.is_empty() {
+            bail!("Grok streaming-json event {index} is empty");
+        }
+        if line.len() > GROK_EVENT_LINE_MAX_BYTES {
+            bail!(
+                "Grok streaming-json event {index} exceeds the {} byte line limit",
+                GROK_EVENT_LINE_MAX_BYTES
+            );
+        }
+        if events.len() >= GROK_EVENT_STREAM_MAX_EVENTS {
+            bail!(
+                "Grok streaming-json output exceeds the {} event limit",
+                GROK_EVENT_STREAM_MAX_EVENTS
+            );
+        }
+        if outcome.is_some() {
+            bail!("Grok streaming-json output contains data after its terminal event");
+        }
+
+        let raw: RawGrokStreamEvent = serde_json::from_slice(line)
+            .with_context(|| format!("Grok streaming-json event {index} is malformed"))?;
+        validate_grok_event_type(&raw.event_type)
+            .with_context(|| format!("Grok streaming-json event {index}"))?;
+        let event = match raw.event_type.as_str() {
+            "text" => {
+                require_absent_grok_event_fields(
+                    index,
+                    &raw,
+                    &[
+                        raw.stop_reason.as_ref(),
+                        raw.session_id.as_ref(),
+                        raw.request_id.as_ref(),
+                        raw.message.as_ref(),
+                    ],
+                )?;
+                let data = raw
+                    .data
+                    .context("Grok streaming-json text event is missing data")?;
+                let next_len = response_text
+                    .len()
+                    .checked_add(data.len())
+                    .context("Grok streaming-json response length overflow")?;
+                if next_len > GROK_EVENT_STREAM_MAX_BYTES {
+                    bail!("Grok streaming-json response exceeds its bounded stream size");
+                }
+                response_text.push_str(&data);
+                GrokStreamEvent::Text(data)
+            }
+            "thought" => {
+                require_absent_grok_event_fields(
+                    index,
+                    &raw,
+                    &[
+                        raw.stop_reason.as_ref(),
+                        raw.session_id.as_ref(),
+                        raw.request_id.as_ref(),
+                        raw.message.as_ref(),
+                    ],
+                )?;
+                GrokStreamEvent::Thought(
+                    raw.data
+                        .context("Grok streaming-json thought event is missing data")?,
+                )
+            }
+            "end" => {
+                require_absent_grok_event_fields(
+                    index,
+                    &raw,
+                    &[raw.data.as_ref(), raw.message.as_ref()],
+                )?;
+                let terminal = GrokEndEvent {
+                    stop_reason: validate_grok_event_metadata("stopReason", raw.stop_reason)?,
+                    session_id: validate_grok_event_metadata("sessionId", raw.session_id)?,
+                    request_id: validate_grok_event_metadata("requestId", raw.request_id)?,
+                };
+                outcome = Some(GrokStreamOutcome::Completed(terminal.clone()));
+                GrokStreamEvent::End(terminal)
+            }
+            "error" => {
+                require_absent_grok_event_fields(
+                    index,
+                    &raw,
+                    &[
+                        raw.data.as_ref(),
+                        raw.stop_reason.as_ref(),
+                        raw.session_id.as_ref(),
+                        raw.request_id.as_ref(),
+                    ],
+                )?;
+                let message = raw
+                    .message
+                    .filter(|message| {
+                        !message.is_empty() && message.len() <= GROK_EVENT_ERROR_MAX_BYTES
+                    })
+                    .context(
+                        "Grok streaming-json error event has a missing or oversized message",
+                    )?;
+                outcome = Some(GrokStreamOutcome::Failed {
+                    message: message.clone(),
+                });
+                GrokStreamEvent::Error(message)
+            }
+            _ => GrokStreamEvent::Other {
+                event_type: raw.event_type,
+            },
+        };
+        events.push(event);
+    }
+
+    let outcome =
+        outcome.context("Grok streaming-json output has no terminal end or error event")?;
+    Ok(GrokParsedEventStream {
+        events,
+        response_text,
+        outcome,
+    })
+}
+
+fn require_absent_grok_event_fields(
+    index: usize,
+    _raw: &RawGrokStreamEvent,
+    fields: &[Option<&String>],
+) -> Result<()> {
+    if fields.iter().any(Option::is_some) {
+        bail!("Grok streaming-json event {index} mixes fields from incompatible event types");
+    }
+    Ok(())
+}
+
+fn validate_grok_event_type(event_type: &str) -> Result<()> {
+    if event_type.is_empty()
+        || event_type.len() > GROK_EVENT_TYPE_MAX_BYTES
+        || !event_type.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+    {
+        bail!("has an invalid event type");
+    }
+    Ok(())
+}
+
+fn validate_grok_event_metadata(label: &str, value: Option<String>) -> Result<String> {
+    value
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= GROK_EVENT_METADATA_MAX_BYTES
+                && !value.chars().any(char::is_control)
+        })
+        .with_context(|| format!("Grok streaming-json end event has invalid {label}"))
+}
 
 /// Exact bounded command request for Grok's account-visible catalog.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -634,6 +977,136 @@ mod tests {
             text.push('\n');
         }
         text.into_bytes()
+    }
+
+    #[test]
+    fn grok_headless_command_template_contract_is_exact() {
+        assert_eq!(GROK_RUNTIME_DESCRIPTOR.executable(), "grok");
+        assert_eq!(GROK_RUNTIME_DESCRIPTOR.output_format(), "streaming-json");
+        assert_eq!(GROK_RUNTIME_DESCRIPTOR.sandbox_profile(), "strict");
+        assert!(GROK_RUNTIME_DESCRIPTOR.subagents_disabled());
+        assert!(GROK_RUNTIME_DESCRIPTOR.memory_disabled());
+        assert!(GROK_RUNTIME_DESCRIPTOR.web_search_disabled());
+        assert_eq!(
+            GROK_RUNTIME_DESCRIPTOR.immutable_argument_template(),
+            [
+                "--prompt-file",
+                "{prompt}",
+                "--model",
+                "{model}",
+                "--reasoning-effort",
+                "{effort}",
+                "--cwd",
+                "{cwd}",
+                "--output-format",
+                "streaming-json",
+                "--sandbox",
+                "strict",
+                "--disable-web-search",
+                "--no-memory",
+                "--no-subagents",
+            ]
+        );
+    }
+
+    #[test]
+    fn documented_streaming_json_contract_parses_to_one_completed_response() -> Result<()> {
+        let bytes = concat!(
+            "{\"type\":\"text\",\"data\":\"Here's\"}\n",
+            "{\"type\":\"text\",\"data\":\" a summary\"}\n",
+            "{\"type\":\"thought\",\"data\":\"Analyzing the directory structure...\"}\n",
+            "{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"abc123\",\"requestId\":\"xyz789\"}\n",
+        )
+        .as_bytes();
+
+        let parsed = parse_grok_event_stream(bytes)?;
+        assert!(parsed.completed());
+        assert_eq!(parsed.response_text(), "Here's a summary");
+        assert_eq!(parsed.events().len(), 4);
+        assert!(matches!(
+            &parsed.events()[0],
+            GrokStreamEvent::Text(data) if data == "Here's"
+        ));
+        assert!(matches!(
+            &parsed.events()[2],
+            GrokStreamEvent::Thought(data) if data == "Analyzing the directory structure..."
+        ));
+        let GrokStreamOutcome::Completed(end) = parsed.outcome() else {
+            panic!("documented stream did not produce a completed outcome");
+        };
+        assert_eq!(end.stop_reason(), "EndTurn");
+        assert_eq!(end.session_id(), "abc123");
+        assert_eq!(end.request_id(), "xyz789");
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_json_error_is_a_terminal_failed_outcome() -> Result<()> {
+        let parsed = parse_grok_event_stream(
+            b"{\"type\":\"error\",\"message\":\"Couldn't start session\"}\n",
+        )?;
+        assert!(!parsed.completed());
+        assert!(parsed.response_text().is_empty());
+        assert!(matches!(
+            parsed.outcome(),
+            GrokStreamOutcome::Failed { message } if message == "Couldn't start session"
+        ));
+        assert!(matches!(
+            parsed.events(),
+            [GrokStreamEvent::Error(message)] if message == "Couldn't start session"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_json_parser_fails_closed_on_incomplete_or_mixed_streams() {
+        let cases = [
+            ("empty", b"".as_slice(), "output was empty"),
+            (
+                "missing terminal newline",
+                b"{\"type\":\"error\",\"message\":\"failed\"}".as_slice(),
+                "lacks its terminal newline",
+            ),
+            (
+                "missing terminal event",
+                b"{\"type\":\"text\",\"data\":\"partial\"}\n".as_slice(),
+                "has no terminal",
+            ),
+            (
+                "data after terminal event",
+                concat!(
+                    "{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"abc123\",\"requestId\":\"xyz789\"}\n",
+                    "{\"type\":\"text\",\"data\":\"late\"}\n",
+                )
+                .as_bytes(),
+                "contains data after",
+            ),
+            (
+                "fields from incompatible event types",
+                concat!(
+                    "{\"type\":\"text\",\"data\":\"mixed\",\"message\":\"wrong\"}\n",
+                    "{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"abc123\",\"requestId\":\"xyz789\"}\n",
+                )
+                .as_bytes(),
+                "mixes fields",
+            ),
+            (
+                "malformed JSON",
+                b"{\"type\":\"end\"\n".as_slice(),
+                "is malformed",
+            ),
+        ];
+
+        for (label, bytes, expected) in cases {
+            let error = parse_grok_event_stream(bytes).expect_err(label).to_string();
+            assert!(error.contains(expected), "{label}: {error}");
+        }
+
+        let oversized = vec![b'x'; GROK_EVENT_STREAM_MAX_BYTES.saturating_add(1)];
+        let error = parse_grok_event_stream(&oversized)
+            .expect_err("oversized stream")
+            .to_string();
+        assert!(error.contains("exceeds the 8388608 byte limit"), "{error}");
     }
 
     #[test]

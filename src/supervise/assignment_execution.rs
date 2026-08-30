@@ -345,7 +345,6 @@ fn bind_selected_runtime_launch(
     let resolution = catalog.resolve_role_model_selection(&configured, launch_runtime)?;
     let model_provenance =
         CompletedLaunchModelProvenance::from_resolution(launch_runtime, &configured, &resolution);
-    admit_assignment_role_category(assignment, launch_runtime, &resolution)?;
     if launch_runtime.is_adapter_subprocess() {
         authorize_bounded_leaf_runtime_role(assignment.role).with_context(|| {
             format!(
@@ -354,6 +353,9 @@ fn bind_selected_runtime_launch(
                 assignment.role.as_str()
             )
         })?;
+    }
+    admit_assignment_role_category(assignment, launch_runtime, &resolution)?;
+    if launch_runtime.is_adapter_subprocess() {
         command.program = selected_runtime_program(launch_runtime, options);
         command = command.with_runtime_adapter(
             launch_runtime,
@@ -5884,6 +5886,116 @@ done
         let worker_selection = effective_role_model_selection(&retry_plan, AgentRole::Worker);
         assert_eq!(worker_selection.model.as_deref(), Some("composer-2.5"));
         assert_eq!(worker_selection.reasoning_effort.as_deref(), Some("high"));
+        Ok(())
+    }
+
+    #[test]
+    fn selector_bound_grok_worker_dispatches_exact_leaf_command() -> Result<()> {
+        let assignment = OrchestratorAssignment {
+            id: "grok-worker".to_string(),
+            phase: AssignmentPhase::Execution,
+            runtime: None,
+            role: AgentRole::Worker,
+            role_category: Some(RoleCategory::NonDelegatingTerminalWorker),
+            selection_source: Some(AssignmentSelectionSource::Automatic),
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        };
+        let mut policy = AssignmentBudgetPolicy::default();
+        policy.set_selector_binding_for_test(
+            AgentRole::Worker,
+            SupervisorRuntime::Grok,
+            RoleModelSelection {
+                model: Some("grok-4.6".to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        let plan = policy.apply(&worker_plan("gpt-5.6-codex"));
+        let catalog =
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-codex"])?);
+        let (runtime, command) = bind_selected_assignment_launch_for_test(
+            launch_fixture_command(),
+            &assignment,
+            &policy,
+            &plan,
+            &launch_fixture_options(SupervisorRuntime::Codex),
+            &catalog,
+        )?;
+
+        assert_eq!(runtime, SupervisorRuntime::Grok);
+        assert_eq!(
+            command.invocation,
+            crate::external_agent::ExternalAgentInvocation::Grok
+        );
+        assert_eq!(command.model.as_deref(), Some("grok-4.6"));
+        assert_eq!(command.reasoning_effort.as_deref(), Some("xhigh"));
+        let argv = crate::external_agent::command_argv(&command)
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            argv,
+            [
+                "--prompt-file",
+                "prompt.txt",
+                "--model",
+                "grok-4.6",
+                "--reasoning-effort",
+                "xhigh",
+                "--cwd",
+                "/tmp/work",
+                "--output-format",
+                "streaming-json",
+                "--sandbox",
+                "strict",
+                "--disable-web-search",
+                "--no-memory",
+                "--no-subagents",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selector_bound_grok_refuses_child_orchestrator_before_model_admission() -> Result<()> {
+        let plan = valid_child_plan_with_nested_worker()?;
+        let assignment = &plan.assignments[0];
+        let mut policy = AssignmentBudgetPolicy::default();
+        policy.set_selector_binding_for_test(
+            AgentRole::ChildOrchestrator,
+            SupervisorRuntime::Grok,
+            RoleModelSelection {
+                model: Some("grok-4.6".to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        let selected_plan = policy.apply(&plan);
+        let catalog =
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-codex"])?);
+        let error = bind_selected_assignment_launch_for_test(
+            launch_fixture_command(),
+            assignment,
+            &policy,
+            &selected_plan,
+            &launch_fixture_options(SupervisorRuntime::Codex),
+            &catalog,
+        )
+        .expect_err("Grok must remain a non-delegating terminal runtime");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("selected runtime 'grok'"), "{message}");
+        assert!(
+            message.contains("cannot launch judgment or delegating role 'child_orchestrator'"),
+            "{message}"
+        );
         Ok(())
     }
 

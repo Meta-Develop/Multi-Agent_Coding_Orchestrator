@@ -150,6 +150,7 @@ fn run_fixed_version_probe(
         process_spec,
         environment.clone(),
         side_effect_profile.clone(),
+        ExternalAgentInvocation::CodexSupervisor,
         codex_auth,
         agent_lifecycle,
     );
@@ -251,13 +252,17 @@ fn with_external_runtime_context(
     process_spec: ProcessSpec,
     environment: BTreeMap<String, String>,
     side_effect_profile: SideEffectConfinementProfile,
+    invocation: ExternalAgentInvocation,
     codex_auth: Option<&ValidatedCodexAuth>,
     agent_lifecycle: Option<&AgentLaunchMetadata>,
 ) -> ProcessSpec {
     let prepared = process_spec
         .with_environment(EnvironmentMode::ClearAndSet(environment))
         .with_private_runtime_home(true)
-        .with_private_runtime_codex_home(true)
+        .with_private_runtime_codex_home(matches!(
+            invocation,
+            ExternalAgentInvocation::CodexSupervisor | ExternalAgentInvocation::CodexConsultant
+        ))
         .with_side_effect_confinement(side_effect_profile);
     let prepared = match agent_lifecycle {
         Some(metadata) => prepared.with_agent_lifecycle(metadata.clone()),
@@ -3938,6 +3943,12 @@ fn external_side_effect_profile(
             if let Some(schema) = &spec.output_schema {
                 profile = profile.with_visible_read_only_file(schema);
             }
+            if spec.invocation == ExternalAgentInvocation::Grok {
+                // Grok's pinned headless protocol reads the prompt by pathname. The shared
+                // runner still owns prompt validation; expose only that exact held input to the
+                // contained child instead of its parent directory.
+                profile = profile.with_visible_read_only_file(&spec.prompt);
+            }
             for input in &protected_controls.exact_read_only_input_files {
                 profile = profile.with_visible_read_only_file(input);
             }
@@ -4632,6 +4643,24 @@ fn command_argv_with_controls(
         | ExternalAgentInvocation::Cursor
         | ExternalAgentInvocation::ClaudeCode
         | ExternalAgentInvocation::GeminiCli => runtime_adapter_argv(spec),
+    }
+}
+
+fn external_agent_stdin_mode(
+    spec: &ExternalAgentCommand,
+    duplex_review_required: bool,
+    prompt: Vec<u8>,
+) -> StdinMode {
+    if duplex_review_required {
+        StdinMode::Interactive
+    } else if spec
+        .runtime_adapter
+        .as_ref()
+        .is_some_and(|config| !config.feed_prompt_on_stdin)
+    {
+        StdinMode::Null
+    } else {
+        StdinMode::Bytes(prompt)
     }
 }
 

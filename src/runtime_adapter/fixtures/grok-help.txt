@@ -3,14 +3,22 @@ Usage: grok [OPTIONS] [PROMPT] [COMMAND]
 Options:
       --cwd <CWD>
           Working directory
+      --disable-web-search
+          Disable web search and web fetch tools
       --model <MODEL>
           Model ID to use
+      --no-memory
+          Disable cross-session memory for this session
+      --no-subagents
+          Disable subagent spawning
       --output-format <OUTPUT_FORMAT>
-          Output format for headless mode [default: plain]
+          Output format for headless mode [default: plain] [possible values: plain, json, streaming-json]
       --prompt-file <PATH>
           Single-turn prompt from a file
       --reasoning-effort <EFFORT>
           Reasoning effort for reasoning models [aliases: --effort]
+      --sandbox <PROFILE>
+          Sandbox profile for filesystem and network access [env: GROK_SANDBOX=]
 
 Commands:
   models       List available models and exit

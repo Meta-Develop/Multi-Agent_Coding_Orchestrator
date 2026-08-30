@@ -750,6 +750,7 @@ pub enum SideEffectConfinementProfileKind {
     StrictOfflineWorkspace,
     TrustedFixedNetwork,
     ExternalCodex,
+    ExternalGrok,
     TrustedCompatibility,
 }
 
@@ -1214,11 +1215,115 @@ impl ExternalCodexProfile {
     }
 }
 
+/// Outer Linux profile for an admitted Grok runtime. Grok may use local Unix streams while the
+/// parent CLI reaches its provider, but it retains namespace and mount restrictions and the exact
+/// workspace path boundary enforced for external-agent launches.
+///
+/// This is an opaque capability. External callers cannot construct one directly; the crate's
+/// validated Grok launch path is the only authority that may create it.
+///
+/// ```compile_fail
+/// use multi_agent_coding_orchestrator::process_runner::ExternalGrokProfile;
+/// let _profile = ExternalGrokProfile::read_write(".");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalGrokProfile {
+    config: WorkspaceSandboxConfig,
+}
+
+#[cfg(test)]
+impl ExternalGrokProfile {
+    pub(crate) fn read_write(workspace_root: impl Into<PathBuf>) -> Self {
+        Self {
+            config: WorkspaceSandboxConfig::new(workspace_root, WorkspaceAccess::ReadWrite),
+        }
+    }
+
+    pub(crate) fn read_only(workspace_root: impl Into<PathBuf>) -> Self {
+        Self {
+            config: WorkspaceSandboxConfig::new(workspace_root, WorkspaceAccess::ReadOnly),
+        }
+    }
+
+    pub(crate) fn with_writable_artifact_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_writable_artifact_root(root);
+        self
+    }
+
+    pub(crate) fn with_visible_read_only_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_only_root(root);
+        self
+    }
+
+    pub(crate) fn with_visible_read_only_file(mut self, file: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_only_file(file);
+        self
+    }
+
+    pub(crate) fn with_visible_read_write_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_write_root(root);
+        self
+    }
+
+    pub(crate) fn with_visible_read_write_file(mut self, file: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_write_file(file);
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_visible_read_write_file_capability(
+        mut self,
+        file: impl Into<PathBuf>,
+        held_file: Arc<File>,
+    ) -> std::io::Result<Self> {
+        self.config = self
+            .config
+            .with_external_codex_writable_file_capability(file, held_file)?;
+        Ok(self)
+    }
+
+    pub(crate) fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_hidden_root(root);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn writable_artifact_roots(&self) -> &[PathBuf] {
+        &self.config.writable_artifact_roots
+    }
+
+    #[cfg(test)]
+    pub(crate) fn workspace_access(&self) -> WorkspaceAccess {
+        self.config.workspace_access
+    }
+
+    #[cfg(test)]
+    pub(crate) fn visible_read_only_roots(&self) -> &[PathBuf] {
+        &self.config.visible_read_only_roots
+    }
+
+    #[cfg(test)]
+    pub(crate) fn visible_read_only_files(&self) -> &[PathBuf] {
+        &self.config.visible_read_only_files
+    }
+
+    #[cfg(test)]
+    pub(crate) fn visible_read_write_roots(&self) -> &[PathBuf] {
+        &self.config.visible_read_write_roots
+    }
+
+    #[cfg(test)]
+    pub(crate) fn visible_read_write_files(&self) -> &[PathBuf] {
+        &self.config.visible_read_write_files
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SideEffectConfinementProfile {
     StrictOfflineWorkspace(StrictOfflineWorkspaceProfile),
     TrustedFixedNetwork(TrustedFixedNetworkProfile),
     ExternalCodex(ExternalCodexProfile),
+    ExternalGrok(ExternalGrokProfile),
     /// Explicit legacy compatibility. Results are never publishable.
     TrustedCompatibility,
 }
@@ -1231,6 +1336,7 @@ impl SideEffectConfinementProfile {
             }
             Self::TrustedFixedNetwork(_) => SideEffectConfinementProfileKind::TrustedFixedNetwork,
             Self::ExternalCodex(_) => SideEffectConfinementProfileKind::ExternalCodex,
+            Self::ExternalGrok(_) => SideEffectConfinementProfileKind::ExternalGrok,
             Self::TrustedCompatibility => SideEffectConfinementProfileKind::TrustedCompatibility,
         }
     }
@@ -1240,6 +1346,7 @@ impl SideEffectConfinementProfile {
             Self::StrictOfflineWorkspace(profile) => Some(&profile.config),
             Self::TrustedFixedNetwork(profile) => Some(&profile.config),
             Self::ExternalCodex(profile) => Some(&profile.config),
+            Self::ExternalGrok(profile) => Some(&profile.config),
             Self::TrustedCompatibility => None,
         }
     }

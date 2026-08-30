@@ -2321,11 +2321,11 @@ fn run_external_agent_runtime(
         &target_spec.cwd,
         OUTPUT_TEE_LIMIT_BYTES,
     )
-    .with_stdin(if duplex_review_required {
-        StdinMode::Interactive
-    } else {
-        StdinMode::Bytes(prompt)
-    })
+    .with_stdin(external_agent_stdin_mode(
+        &target_spec,
+        duplex_review_required,
+        prompt,
+    ))
     .with_stdin_limit(MAX_PROMPT_BYTES)
     .with_timeout(Some(timeout))
     .with_stdout(StreamCapture::bounded(OUTPUT_TEE_LIMIT_BYTES));
@@ -2348,6 +2348,7 @@ fn run_external_agent_runtime(
                 process_spec,
                 external_environment,
                 side_effect_profile,
+                target_spec.invocation,
                 codex_auth.as_ref(),
                 agent_lifecycle.as_ref(),
             )
@@ -3092,6 +3093,52 @@ struct CompletedTargetContext<'a> {
     program_identity: &'a ExternalProgramIdentity,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeAdapterCapturedOutput {
+    ExistingStagedOutput,
+    Captured(Vec<u8>),
+    Unavailable,
+}
+
+fn runtime_adapter_captured_output(
+    spec: &ExternalAgentCommand,
+    stdout: &[u8],
+    stderr: &[u8],
+    target_completed_successfully: bool,
+) -> Result<RuntimeAdapterCapturedOutput> {
+    if spec.invocation == ExternalAgentInvocation::Grok {
+        if !target_completed_successfully {
+            return Ok(RuntimeAdapterCapturedOutput::Unavailable);
+        }
+        let stream = crate::runtime_adapter::grok::parse_grok_event_stream(stdout)
+            .context("Grok runtime output failed bounded streaming-json validation")?;
+        if !stream.completed() {
+            // Grok error text can contain provider-owned diagnostics. The raw stream is retained
+            // only through the existing redacted JSON-log path; public failure evidence names the
+            // typed terminal condition without reflecting child-controlled text.
+            bail!("Grok runtime returned a terminal streaming-json error event");
+        }
+        return Ok(RuntimeAdapterCapturedOutput::Captured(
+            stream.response_text().as_bytes().to_vec(),
+        ));
+    }
+
+    let Some(config) = &spec.runtime_adapter else {
+        return Ok(RuntimeAdapterCapturedOutput::ExistingStagedOutput);
+    };
+    Ok(match config.output_capture {
+        crate::runtime_adapter::OutputCaptureMode::OutputFile => {
+            RuntimeAdapterCapturedOutput::ExistingStagedOutput
+        }
+        crate::runtime_adapter::OutputCaptureMode::Stdout => {
+            RuntimeAdapterCapturedOutput::Captured(stdout.to_vec())
+        }
+        crate::runtime_adapter::OutputCaptureMode::StdoutAndStderr => {
+            RuntimeAdapterCapturedOutput::Captured(stdout.iter().chain(stderr).copied().collect())
+        }
+    })
+}
+
 fn record_completed_target(
     report: &mut ExternalAgentRun,
     output: ProcessOutput,
@@ -3102,6 +3149,10 @@ fn record_completed_target(
     context: CompletedTargetContext<'_>,
 ) {
     let safety_verified = output.safety_evidence_verified();
+    let target_completed_successfully = !output.timed_out
+        && output.status.is_some_and(|status| status.success())
+        && output.process_error.is_none()
+        && output.stdin_error.is_none();
     let mut sandbox_denials =
         sandbox_denials_from_codex_jsonl(context.protected_controls, output.stdout.as_bytes());
     deduplicate_sandbox_denials(&mut sandbox_denials);
@@ -3161,41 +3212,48 @@ fn record_completed_target(
         };
         report.error = append_external_error(report.error.take(), Some(status_error));
     }
-    if let Some(config) = &context.spec.runtime_adapter {
-        let captured = match config.output_capture {
-            crate::runtime_adapter::OutputCaptureMode::OutputFile => None,
-            crate::runtime_adapter::OutputCaptureMode::Stdout => {
-                Some(output.stdout.as_bytes().to_vec())
-            }
-            crate::runtime_adapter::OutputCaptureMode::StdoutAndStderr => Some(
-                output
-                    .stdout
-                    .as_bytes()
-                    .iter()
-                    .chain(output.stderr.as_bytes().iter())
-                    .copied()
-                    .collect(),
-            ),
-        };
-        if let Some(captured) = captured {
-            if let Err(error) = staged_output.write_bytes_atomic(&captured, OUTPUT_TEE_LIMIT_BYTES)
-            {
-                report.error = append_external_error(
-                    report.error.take(),
-                    Some(format!("failed to stage runtime adapter output: {error:#}")),
-                );
+    let staged_output_available = match runtime_adapter_captured_output(
+        context.spec,
+        output.stdout.as_bytes(),
+        output.stderr.as_bytes(),
+        target_completed_successfully,
+    ) {
+        Ok(RuntimeAdapterCapturedOutput::ExistingStagedOutput) => true,
+        Ok(RuntimeAdapterCapturedOutput::Captured(captured)) => {
+            match staged_output.write_bytes_atomic(&captured, OUTPUT_TEE_LIMIT_BYTES) {
+                Ok(()) => true,
+                Err(error) => {
+                    report.error = append_external_error(
+                        report.error.take(),
+                        Some(format!("failed to stage runtime adapter output: {error:#}")),
+                    );
+                    false
+                }
             }
         }
-    }
-    match capture_redacted_staged_output(staged_output, output_reservation, credential_redactor) {
-        Ok(bytes) => report.output_last_message = Some(bytes),
+        Ok(RuntimeAdapterCapturedOutput::Unavailable) => false,
         Err(error) => {
             report.error = append_external_error(
                 report.error.take(),
-                Some(format!(
-                    "external-agent output reservation changed: {error}"
-                )),
+                Some(credential_redactor.redact_string(&format!(
+                    "runtime adapter output validation failed: {error:#}"
+                ))),
             );
+            false
+        }
+    };
+    if staged_output_available {
+        match capture_redacted_staged_output(staged_output, output_reservation, credential_redactor)
+        {
+            Ok(bytes) => report.output_last_message = Some(bytes),
+            Err(error) => {
+                report.error = append_external_error(
+                    report.error.take(),
+                    Some(format!(
+                        "external-agent output reservation changed: {error}"
+                    )),
+                );
+            }
         }
     }
     if let Some(git) = &context.protected_controls.managed_git {
