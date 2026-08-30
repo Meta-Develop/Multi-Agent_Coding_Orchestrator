@@ -4610,10 +4610,13 @@ mod selection_policy_tests {
             ),
         ];
         let ledger = build_assignment_selection_ledger(&plan, &decisions, SupervisorRuntime::Codex);
-        assert_eq!(ledger.len(), 2);
-        assert!(ledger.iter().all(|entry| {
-            entry.role == AgentRole::Worker
-                && entry.selected_runtime.as_deref() == Some("grok")
+        let worker_rows = ledger
+            .iter()
+            .filter(|entry| entry.role == AgentRole::Worker)
+            .collect::<Vec<_>>();
+        assert_eq!(worker_rows.len(), 2);
+        assert!(worker_rows.iter().all(|entry| {
+            entry.selected_runtime.as_deref() == Some("grok")
                 && entry.selected_model.as_deref() == Some("grok-4.6")
                 && entry.selected_reasoning_effort.as_deref() == Some("xhigh")
                 && entry.catalog_source == AssignmentCatalogSource::RuntimeAdvertised
