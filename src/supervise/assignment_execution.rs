@@ -3806,7 +3806,6 @@ fn execute_supervisor_assignment_inner(
         plan,
         options,
         repo,
-        run_dir,
         dirs,
         artifacts,
         runtime_model_catalog,

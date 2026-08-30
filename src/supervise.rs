@@ -2,6 +2,8 @@
 use crate::external_agent::CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS;
 #[cfg(test)]
 use crate::follow_up_queue::GeneratedFollowUpQueueEntrypoint;
+#[cfg(test)]
+use crate::review::{build_review_lens_request, ReviewLensRequestSources};
 pub use crate::supervise_budget::{
     BudgetAction, BudgetAmount, BudgetReason, BudgetRemaining, RoleBudgetReport, RunBudgetLimits,
     RunBudgetReport, RunBudgetSource, RunBudgetSources,
@@ -56,12 +58,12 @@ use crate::{
         SideEffectConfinementProfile, StdinMode, StrictOfflineWorkspaceProfile, WorkspaceAccess,
     },
     review::{
-        aggregate_review_lenses_against_requests, build_review_lens_request,
-        validate_review_lens_set, ReviewAggregationDecision, ReviewAggregationPolicy,
-        ReviewCoverageRequirement, ReviewInformationScope, ReviewLensAggregate,
-        ReviewLensAggregateAuthority, ReviewLensBackendConfig, ReviewLensConfig,
-        ReviewLensCoverage, ReviewLensEvidenceKind, ReviewLensRequest, ReviewLensRequestSources,
-        ReviewLensVerdict, ReviewLensVerdictStatus, REVIEW_LENS_REQUEST_LIMIT_BYTES,
+        aggregate_review_lenses_against_requests, validate_review_lens_set,
+        ReviewAggregationDecision, ReviewAggregationPolicy, ReviewCoverageRequirement,
+        ReviewInformationScope, ReviewLensAggregate, ReviewLensAggregateAuthority,
+        ReviewLensBackendConfig, ReviewLensConfig, ReviewLensCoverage, ReviewLensEvidenceKind,
+        ReviewLensRequest, ReviewLensVerdict, ReviewLensVerdictStatus,
+        REVIEW_LENS_REQUEST_LIMIT_BYTES,
     },
     runtime_adapter::RuntimeId,
     safe_state::BoundedRegularReader,
