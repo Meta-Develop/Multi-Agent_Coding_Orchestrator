@@ -1,5 +1,138 @@
 use super::*;
 
+#[cfg(unix)]
+#[test]
+fn worker_codex_schema_artifact_is_authenticated_across_resume_and_refuses_mutation() {
+    const AUTHORITATIVE: &str = "schemas/worker-report.schema.json";
+    const CODEX_OUTPUT: &str = "schemas/worker-report.codex-output.schema.json";
+
+    let (_temp, repo_path) = injected_repository();
+    let run_id = RunId::new("artifact-worker-codex-schema-resume").expect("valid run id");
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        run_id.clone(),
+        "supervise-test",
+    )
+    .expect("reserve worker schema artifact run");
+    write_worker_schema(&mut writer, Path::new(AUTHORITATIVE))
+        .expect("write authoritative worker report schema");
+    write_codex_worker_schema(&mut writer, Path::new(CODEX_OUTPUT))
+        .expect("write Codex worker output schema");
+    let expected_codex =
+        codex_response_format_schema(worker_report_schema_value()).expect("derive worker schema");
+    let before_resume = fs::read(writer.run_dir().join(CODEX_OUTPUT))
+        .expect("read worker Codex schema before resume");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&before_resume)
+            .expect("parse worker Codex schema"),
+        expected_codex
+    );
+    let binding = writer
+        .resume_binding()
+        .expect("authenticate worker schema manifest");
+    drop(writer);
+
+    let mut resumed = ArtifactRunWriter::reopen_unfinalized(&repo_path, &binding)
+        .expect("resume exact authenticated worker schema manifest");
+    assert_eq!(
+        fs::read(resumed.run_dir().join(CODEX_OUTPUT))
+            .expect("read worker Codex schema after resume"),
+        before_resume
+    );
+    let final_report = artifact_test_final_report(&run_id);
+    write_final_report(&mut resumed, &final_report).expect("write resumed final report");
+    resumed
+        .finalize(
+            RunArtifactFamily::Supervise.final_report_relative_path(),
+            false,
+        )
+        .expect("finalize resumed worker schema artifact run");
+    let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+        .expect("authenticate finalized worker schema artifact run");
+    assert_eq!(
+        reader
+            .read(CODEX_OUTPUT)
+            .expect("read authenticated worker Codex schema"),
+        before_resume
+    );
+    assert!(reader.finalization().files.iter().any(|record| {
+        record.path == Path::new(CODEX_OUTPUT)
+            && record.disposition == ArtifactFileDisposition::PrivateEvidence
+    }));
+
+    let missing_id =
+        RunId::new("artifact-worker-codex-schema-missing").expect("valid missing run id");
+    let mut missing_writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        missing_id,
+        "supervise-test",
+    )
+    .expect("reserve missing worker schema artifact run");
+    write_codex_worker_schema(&mut missing_writer, Path::new(CODEX_OUTPUT))
+        .expect("write worker schema before removal");
+    let missing_path = missing_writer.run_dir().join(CODEX_OUTPUT);
+    let missing_binding = missing_writer
+        .resume_binding()
+        .expect("bind worker schema before removal");
+    drop(missing_writer);
+    fs::remove_file(&missing_path).expect("remove worker schema artifact");
+    let missing_error = ArtifactRunWriter::reopen_unfinalized(&repo_path, &missing_binding)
+        .err()
+        .expect("missing worker schema must refuse authenticated resume");
+    assert!(format!("{missing_error:#}").contains(CODEX_OUTPUT));
+
+    let tampered_id =
+        RunId::new("artifact-worker-codex-schema-tampered").expect("valid tamper run id");
+    let mut tampered_writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        tampered_id,
+        "supervise-test",
+    )
+    .expect("reserve tampered worker schema artifact run");
+    write_codex_worker_schema(&mut tampered_writer, Path::new(CODEX_OUTPUT))
+        .expect("write worker schema before tampering");
+    let tampered_path = tampered_writer.run_dir().join(CODEX_OUTPUT);
+    let tampered_binding = tampered_writer
+        .resume_binding()
+        .expect("bind worker schema before tampering");
+    drop(tampered_writer);
+    fs::write(&tampered_path, b"{}\n").expect("tamper worker schema artifact");
+    let tampered_error = ArtifactRunWriter::reopen_unfinalized(&repo_path, &tampered_binding)
+        .err()
+        .expect("tampered worker schema must refuse authenticated resume");
+    assert!(format!("{tampered_error:#}").contains("digest/length"));
+
+    let replaced_id =
+        RunId::new("artifact-worker-codex-schema-replaced").expect("valid replacement run id");
+    let mut replaced_writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        replaced_id,
+        "supervise-test",
+    )
+    .expect("reserve replaced worker schema artifact run");
+    write_worker_schema(&mut replaced_writer, Path::new(AUTHORITATIVE))
+        .expect("write replacement target schema");
+    write_codex_worker_schema(&mut replaced_writer, Path::new(CODEX_OUTPUT))
+        .expect("write worker schema before replacement");
+    let replaced_path = replaced_writer.run_dir().join(CODEX_OUTPUT);
+    let replacement_target = replaced_writer.run_dir().join(AUTHORITATIVE);
+    let replaced_binding = replaced_writer
+        .resume_binding()
+        .expect("bind worker schema before replacement");
+    drop(replaced_writer);
+    fs::remove_file(&replaced_path).expect("remove worker schema before link replacement");
+    std::os::unix::fs::symlink(&replacement_target, &replaced_path)
+        .expect("replace worker schema with symlink");
+    let replaced_error = ArtifactRunWriter::reopen_unfinalized(&repo_path, &replaced_binding)
+        .err()
+        .expect("replaced worker schema must refuse authenticated resume");
+    assert!(format!("{replaced_error:#}").contains("symbolic link"));
+}
+
 #[test]
 fn finalized_artifacts_round_trip_typed_context_switch_selection_evidence() {
     let (_temp, repo_path) = injected_repository();
@@ -647,6 +780,140 @@ fn direct_worker_fake_output_and_journal_are_first_class_and_non_delegating() {
     assert!(error
         .to_string()
         .contains("attempted nested worker delegation"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn scheduler_materializes_and_binds_worker_codex_schema_for_direct_worker() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    let mut assignment = injected_assignment(false);
+    assignment.id = "direct-worker-schema".to_string();
+    assignment.role = AgentRole::Worker;
+    assignment.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+    assignment.selection_source = Some(AssignmentSelectionSource::Automatic);
+    assignment.task = Some("exercise direct Worker Codex schema binding".to_string());
+    let worker = WorkerReport {
+        id: assignment.id.clone(),
+        role: AgentRole::Worker,
+        assignment_kind: AssignmentKind::Ordinary,
+        target_path: None,
+        assigned_paths: assignment.assigned_paths.clone(),
+        semantic_symbols: assignment.semantic_symbols.clone(),
+        semantic_modules: assignment.semantic_modules.clone(),
+        claim_token: None,
+        semantic_intent_token: None,
+        commands_run: Vec::new(),
+        environment_failures: Vec::new(),
+        files_changed: Vec::new(),
+        validation_results: vec![ValidationResult {
+            name: "direct Worker schema dispatch".to_string(),
+            status: ReviewStatus::Succeeded,
+            command: Vec::new(),
+            message: None,
+        }],
+        findings: Vec::new(),
+        field_guide_entries: Vec::new(),
+        bloated_file_flags: Vec::new(),
+        decomposition_completion: None,
+        no_further_delegation: Some(true),
+        accepted: true,
+        rejected: false,
+        status: ReviewStatus::Succeeded,
+        remaining_risk: "none".to_string(),
+        next_safe_action: "review".to_string(),
+    };
+    let plan = injected_plan(assignment.clone(), 0);
+    let options = injected_options(
+        &repo_path,
+        temp.path(),
+        "direct-worker-codex-schema-dispatch",
+    );
+    let run_id = options.run_id.clone();
+    let expected_codex =
+        codex_response_format_schema(worker_report_schema_value()).expect("derive worker schema");
+    let mut worker_invocations = 0usize;
+    let mut auditor_invocations = 0usize;
+    let mut runner = |command: &ExternalAgentCommand| {
+        let output_name = command
+            .output_last_message
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default();
+        let output_schema = command
+            .output_schema
+            .as_ref()
+            .expect("Codex launch must bind an output schema");
+        if output_name.contains("review-auditor") {
+            auditor_invocations = auditor_invocations.saturating_add(1);
+            assert_eq!(
+                output_schema.file_name().and_then(OsStr::to_str),
+                Some("auditor-report.codex-output.schema.json")
+            );
+            let worker_envelope = direct_worker_report_envelope(worker.clone());
+            write_injected_json(
+                &command.output_last_message,
+                &injected_auditor_report(&assignment, &worker_envelope),
+            );
+        } else {
+            worker_invocations = worker_invocations.saturating_add(1);
+            assert_eq!(
+                command
+                    .agent_lifecycle
+                    .as_ref()
+                    .map(|identity| identity.role.as_str()),
+                Some("worker")
+            );
+            assert_eq!(
+                output_schema.file_name().and_then(OsStr::to_str),
+                Some("worker-report.codex-output.schema.json")
+            );
+            assert!(output_schema.is_file());
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(
+                    &fs::read(output_schema).expect("read bound worker Codex schema")
+                )
+                .expect("parse bound worker Codex schema"),
+                expected_codex
+            );
+            assert!(command.read_only_input_files.iter().any(|path| {
+                path.file_name().and_then(OsStr::to_str) == Some("worker-report.schema.json")
+            }));
+            write_injected_json(&command.output_last_message, &worker);
+        }
+        injected_verified_run(command)
+    };
+
+    let report = run_supervisor_plan_with_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        &mut runner,
+    )
+    .expect("run direct Worker Codex schema dispatch");
+    assert!(report.success, "unexpected failed report: {report:#?}");
+    assert_eq!(worker_invocations, 1);
+    assert_eq!(auditor_invocations, 1);
+
+    let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+        .expect("open authenticated direct Worker artifact run");
+    let authoritative = reader
+        .read("schemas/worker-report.schema.json")
+        .expect("read authoritative worker schema");
+    let codex = reader
+        .read("schemas/worker-report.codex-output.schema.json")
+        .expect("read worker Codex schema");
+    assert_ne!(authoritative, codex);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&codex)
+            .expect("parse finalized worker Codex schema"),
+        expected_codex
+    );
+    assert!(reader.finalization().files.iter().any(|record| {
+        record.path == Path::new("schemas/worker-report.codex-output.schema.json")
+            && record.disposition == ArtifactFileDisposition::PrivateEvidence
+    }));
 }
 
 #[test]

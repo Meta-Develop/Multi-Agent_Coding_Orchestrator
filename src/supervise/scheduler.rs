@@ -2994,6 +2994,10 @@ fn initialize_scheduler_evidence(
         initialization.artifact_writer,
         Path::new("schemas/worker-report.schema.json"),
     )?;
+    write_codex_worker_schema(
+        initialization.artifact_writer,
+        Path::new("schemas/worker-report.codex-output.schema.json"),
+    )?;
     write_auditor_schema(
         initialization.artifact_writer,
         Path::new("schemas/auditor-report.schema.json"),

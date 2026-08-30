@@ -5877,6 +5877,22 @@ done
         )?;
         assert_eq!(direct_worker_schema, worker_schema);
 
+        let child_codex = bind_runtime_output_schema(
+            launch_fixture_command(),
+            SupervisorRuntime::Codex,
+            direct_assignment_report_schema_path(
+                AgentRole::ChildOrchestrator,
+                orchestrator_schema,
+                worker_schema,
+            )?,
+        )?;
+        assert_eq!(
+            child_codex.output_schema.as_deref(),
+            Some(Path::new(
+                "/hidden-primary/schemas/orchestrator-review-report.codex-output.schema.json"
+            ))
+        );
+
         let codex = bind_runtime_output_schema(
             launch_fixture_command(),
             SupervisorRuntime::Codex,
@@ -5895,6 +5911,21 @@ done
             direct_worker_schema,
         )?;
         assert_eq!(fake.output_schema.as_deref(), Some(worker_schema));
+
+        for runtime in [
+            SupervisorRuntime::Grok,
+            SupervisorRuntime::Cursor,
+            SupervisorRuntime::ClaudeCode,
+            SupervisorRuntime::GeminiCli,
+        ] {
+            assert!(bind_runtime_output_schema(
+                launch_fixture_command(),
+                runtime,
+                direct_worker_schema,
+            )?
+            .output_schema
+            .is_none());
+        }
 
         for unsupported in [
             AgentRole::Supervisor,
