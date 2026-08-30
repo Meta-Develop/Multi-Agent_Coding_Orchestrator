@@ -1961,7 +1961,10 @@ pub(super) fn role_usage_report(
     for (sample_sequence, sample) in samples.into_iter().enumerate() {
         if !matches!(
             sample.role,
-            AgentRole::ChildOrchestrator | AgentRole::GateClassifier | AgentRole::Auditor
+            AgentRole::ChildOrchestrator
+                | AgentRole::Worker
+                | AgentRole::GateClassifier
+                | AgentRole::Auditor
         ) {
             bail!(
                 "{} usage is not directly process-observable",
@@ -2051,9 +2054,9 @@ pub(super) fn role_usage_report(
         })
         .collect::<BTreeMap<_, _>>();
     let mut reports = reports;
-    reports.insert(
-        AgentRole::Worker,
-        RoleUsageReport {
+    reports
+        .entry(AgentRole::Worker)
+        .or_insert_with(|| RoleUsageReport {
             models: Vec::new(),
             usage: None,
             cost_usd: None,
@@ -2062,8 +2065,7 @@ pub(super) fn role_usage_report(
                 "nested-worker delegation is requested through the child-orchestrator contract, but MACO does not separately observe a worker process or runtime identity; runtime-side role-tagged usage reporting is required before worker usage or cost can be reported"
                     .to_string(),
             ),
-        },
-    );
+        });
     reports
         .entry(AgentRole::GateClassifier)
         .or_insert_with(|| RoleUsageReport {
@@ -2162,7 +2164,7 @@ pub(super) fn role_usage_report(
             cost_usd: total_cost_usd,
             observation: RoleUsageObservation::SupervisorAggregate,
             unavailable_reason: total_usage.is_none().then(|| {
-                "no MACO-launched child-orchestrator or auditor process usage was observed"
+                "no MACO-launched worker, child-orchestrator, or auditor process usage was observed"
                     .to_string()
             }),
         },

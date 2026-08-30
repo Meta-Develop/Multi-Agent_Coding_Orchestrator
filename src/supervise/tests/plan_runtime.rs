@@ -3764,6 +3764,82 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
 }
 
 #[test]
+fn process_role_usage_aggregation_prices_direct_workers() {
+    let mut plan = parse_supervisor_plan_with_consultant(
+        std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),
+    )
+    .expect("base plan")
+    .plan;
+    plan.model_pricing = BTreeMap::from([
+        (
+            "worker-primary".to_string(),
+            ModelPricing {
+                input_usd_per_million_tokens: 2.0,
+                output_usd_per_million_tokens: 8.0,
+            },
+        ),
+        (
+            "worker-fallback".to_string(),
+            ModelPricing {
+                input_usd_per_million_tokens: 1.0,
+                output_usd_per_million_tokens: 4.0,
+            },
+        ),
+    ]);
+    let first_usage = Usage {
+        input_tokens: 1_000,
+        output_tokens: 200,
+        total_tokens: 1_200,
+    };
+    let second_usage = Usage {
+        input_tokens: 500,
+        output_tokens: 100,
+        total_tokens: 600,
+    };
+
+    let aggregation = role_usage_report(
+        &plan,
+        vec![
+            RoleUsageSample {
+                role: AgentRole::Worker,
+                lens_id: None,
+                model: Some("worker-primary".to_string()),
+                usage: first_usage,
+            },
+            RoleUsageSample {
+                role: AgentRole::Worker,
+                lens_id: None,
+                model: Some("worker-fallback".to_string()),
+                usage: second_usage,
+            },
+        ],
+    )
+    .expect("aggregate direct Worker process usage");
+
+    let worker = &aggregation.reports[&AgentRole::Worker];
+    let expected_usage = first_usage.saturating_add(second_usage);
+    let expected_cost = 0.0036 + 0.0009;
+    assert_eq!(
+        worker.models,
+        vec!["worker-fallback".to_string(), "worker-primary".to_string()]
+    );
+    assert_eq!(worker.usage, Some(expected_usage));
+    assert!(worker
+        .cost_usd
+        .is_some_and(|cost| (cost - expected_cost).abs() < 1e-12));
+    assert_eq!(worker.observation, RoleUsageObservation::ProcessObserved);
+    assert!(worker.unavailable_reason.is_none());
+    assert_eq!(aggregation.total_usage, Some(expected_usage));
+    assert!(aggregation
+        .total_cost_usd
+        .is_some_and(|cost| (cost - expected_cost).abs() < 1e-12));
+    assert_eq!(
+        aggregation.reports[&AgentRole::Supervisor].usage,
+        Some(expected_usage)
+    );
+}
+
+#[test]
 fn final_usage_evidence_preserves_rejected_and_active_auditor_models() {
     let assignment = injected_assignment(true);
     assert_eq!(assignment.role, AgentRole::ChildOrchestrator);
@@ -3919,6 +3995,46 @@ fn empty_process_usage_has_no_synthetic_supervisor_or_worker_totals() {
         .unavailable_reason
         .as_deref()
         .is_some_and(|reason| reason.contains("not heuristically allocated")));
+}
+
+#[test]
+fn nested_process_usage_has_no_synthetic_worker_totals() {
+    let assignment = injected_assignment(true);
+    assert_eq!(assignment.role, AgentRole::ChildOrchestrator);
+    assert_eq!(assignment.worker_assignments.len(), 1);
+    let nested_plan = injected_plan(assignment, 1);
+    let child_usage = Usage {
+        input_tokens: 400,
+        output_tokens: 100,
+        total_tokens: 500,
+    };
+    let nested = role_usage_report(
+        &nested_plan,
+        vec![RoleUsageSample {
+            role: AgentRole::ChildOrchestrator,
+            lens_id: None,
+            model: Some("planner-model".to_string()),
+            usage: child_usage,
+        }],
+    )
+    .expect("aggregate child-orchestrator usage without synthesizing nested Worker usage");
+    let nested_worker = &nested.reports[&AgentRole::Worker];
+    assert!(nested_worker.models.is_empty());
+    assert!(nested_worker.usage.is_none());
+    assert!(nested_worker.cost_usd.is_none());
+    assert_eq!(
+        nested_worker.observation,
+        RoleUsageObservation::NotProcessObservable
+    );
+    assert!(nested_worker
+        .unavailable_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("nested-worker delegation")));
+    assert_eq!(nested.total_usage, Some(child_usage));
+    assert_eq!(
+        nested.reports[&AgentRole::Supervisor].usage,
+        Some(child_usage)
+    );
 }
 
 #[test]
