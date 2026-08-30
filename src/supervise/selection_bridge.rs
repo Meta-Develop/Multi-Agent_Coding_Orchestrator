@@ -140,9 +140,9 @@ pub(super) fn bind_test_cursor_catalog_fixture(
 /// Observe advertised runtime catalogs for supervisor launch.
 ///
 /// Under `cargo test` this stays hermetic: it never resolves or starts a
-/// third-party CLI. Production binaries screen a live `cursor-agent models`
-/// observation and retain a private evidence gap when that optional catalog
-/// cannot be observed.
+/// third-party CLI. Production binaries screen live `cursor-agent models` and
+/// `grok models` observations and retain a private evidence gap when the
+/// optional Cursor catalog cannot be observed.
 pub(super) fn advertised_catalogs_for_launch(repo: &Path) -> Result<AdvertisedCatalogSet> {
     #[cfg(test)]
     {
@@ -214,11 +214,55 @@ fn advertised_catalogs_from_live_runtimes(repo: &Path) -> Result<AdvertisedCatal
                 return Err(error).context("live Cursor catalog observation failed closed");
             }
         };
+    let grok_program = std::env::var_os("MACO_GROK_BIN");
+    let grok = observe_optional_live_grok_catalog(
+        &crate::runtime_adapter::grok::ScreenedGrokCatalogCommandRunner,
+        repo,
+        observed_at_unix_millis,
+        grok_program.as_deref(),
+    )?;
     Ok(AdvertisedCatalogSet {
         cursor,
-        grok: None,
+        grok,
         cursor_evidence_gap,
     })
+}
+
+fn observe_optional_live_grok_catalog(
+    runner: &dyn crate::runtime_adapter::grok::GrokCatalogCommandRunner,
+    repo: &Path,
+    observed_at_unix_millis: u64,
+    program_override: Option<&std::ffi::OsStr>,
+) -> Result<Option<crate::runtime_adapter::grok::GrokAdvertisedCatalogObservation>> {
+    match observe_grok_catalog(runner, repo, observed_at_unix_millis, program_override) {
+        Ok(observation) => Ok(Some(observation)),
+        Err(error) if program_override.is_none() && grok_catalog_executable_is_missing(&error) => {
+            Ok(None)
+        }
+        Err(error) => Err(error).context("live Grok catalog observation failed closed"),
+    }
+}
+
+fn observe_grok_catalog(
+    runner: &dyn crate::runtime_adapter::grok::GrokCatalogCommandRunner,
+    repo: &Path,
+    observed_at_unix_millis: u64,
+    program_override: Option<&std::ffi::OsStr>,
+) -> Result<crate::runtime_adapter::grok::GrokAdvertisedCatalogObservation> {
+    let mut spec = crate::runtime_adapter::grok::GrokCatalogCommandSpec::new(repo);
+    if let Some(program) = program_override {
+        spec = spec.with_program(program);
+    }
+    crate::runtime_adapter::grok::discover_grok_model_catalog(
+        runner,
+        &spec,
+        Some(observed_at_unix_millis),
+    )
+}
+
+fn grok_catalog_executable_is_missing(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    text.contains("grok catalog executable") && text.contains("is missing")
 }
 
 #[cfg(not(test))]
@@ -4584,6 +4628,10 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/runtime_adapter/cursor/hand-authored-withdrawn.txt"
     ));
+    const CAPTURED_GROK_CATALOG: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/runtime_adapter/grok/captured-minimal-20260821.txt"
+    ));
     const CAPTURED_CURSOR_AT_UNIX_MILLIS: u64 = 1_787_240_463_000;
 
     struct FakeCursorRunner {
@@ -4661,6 +4709,7 @@ mod tests {
 
     struct FakeGrokRunner {
         output: crate::runtime_adapter::grok::GrokCatalogCommandOutput,
+        observed_specs: RefCell<Vec<crate::runtime_adapter::grok::GrokCatalogCommandSpec>>,
     }
 
     impl FakeGrokRunner {
@@ -4680,6 +4729,7 @@ mod tests {
                         crate::process_runner::SideEffectConfinementProfileKind::TrustedFixedNetwork,
                     ),
                 },
+                observed_specs: RefCell::new(Vec::new()),
             }
         }
     }
@@ -4687,9 +4737,21 @@ mod tests {
     impl crate::runtime_adapter::grok::GrokCatalogCommandRunner for FakeGrokRunner {
         fn run(
             &self,
+            spec: &crate::runtime_adapter::grok::GrokCatalogCommandSpec,
+        ) -> Result<crate::runtime_adapter::grok::GrokCatalogCommandOutput> {
+            self.observed_specs.borrow_mut().push(spec.clone());
+            Ok(self.output.clone())
+        }
+    }
+
+    struct MissingGrokRunner;
+
+    impl crate::runtime_adapter::grok::GrokCatalogCommandRunner for MissingGrokRunner {
+        fn run(
+            &self,
             _spec: &crate::runtime_adapter::grok::GrokCatalogCommandSpec,
         ) -> Result<crate::runtime_adapter::grok::GrokCatalogCommandOutput> {
-            Ok(self.output.clone())
+            bail!("Grok catalog executable 'grok' is missing")
         }
     }
 
@@ -5239,6 +5301,75 @@ mod tests {
         assert!(
             format!("{missing:#}").contains("failed to read hermetic Cursor catalog fixture"),
             "{missing:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn live_grok_catalog_bridge_observes_the_default_catalog_hermetically() -> Result<()> {
+        let runner = FakeGrokRunner::successful(CAPTURED_GROK_CATALOG);
+        let observation = observe_optional_live_grok_catalog(
+            &runner,
+            Path::new("/workspace"),
+            CAPTURED_CURSOR_AT_UNIX_MILLIS,
+            None,
+        )?
+        .context("installed Grok catalog observation")?;
+
+        assert!(observation.catalog().contains("grok-4.6"));
+        assert_eq!(
+            observation.observed_at_unix_millis(),
+            CAPTURED_CURSOR_AT_UNIX_MILLIS
+        );
+        let specs = runner.observed_specs.borrow();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].program(), Path::new("grok"));
+        assert_eq!(specs[0].args(), &[std::ffi::OsString::from("models")]);
+        assert_eq!(specs[0].current_dir(), Path::new("/workspace"));
+        Ok(())
+    }
+
+    #[test]
+    fn live_grok_catalog_bridge_applies_the_explicit_program_override() -> Result<()> {
+        let runner = FakeGrokRunner::successful(CAPTURED_GROK_CATALOG);
+        let program = std::ffi::OsStr::new("/opt/maco/bin/grok-pinned");
+        let observation = observe_optional_live_grok_catalog(
+            &runner,
+            Path::new("/workspace"),
+            CAPTURED_CURSOR_AT_UNIX_MILLIS,
+            Some(program),
+        )?
+        .context("overridden Grok catalog observation")?;
+
+        assert!(observation.catalog().contains("grok-4.6"));
+        let specs = runner.observed_specs.borrow();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].program(), Path::new(program));
+        Ok(())
+    }
+
+    #[test]
+    fn live_grok_catalog_bridge_only_omits_an_unconfigured_missing_binary() -> Result<()> {
+        assert_eq!(
+            observe_optional_live_grok_catalog(
+                &MissingGrokRunner,
+                Path::new("/workspace"),
+                CAPTURED_CURSOR_AT_UNIX_MILLIS,
+                None,
+            )?,
+            None
+        );
+
+        let error = observe_optional_live_grok_catalog(
+            &MissingGrokRunner,
+            Path::new("/workspace"),
+            CAPTURED_CURSOR_AT_UNIX_MILLIS,
+            Some(std::ffi::OsStr::new("/configured/grok")),
+        )
+        .expect_err("an explicit missing Grok binary must fail closed");
+        assert!(
+            format!("{error:#}").contains("live Grok catalog observation failed closed"),
+            "{error:#}"
         );
         Ok(())
     }
