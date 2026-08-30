@@ -11,9 +11,9 @@ use super::AdapterId;
 use crate::{
     artifacts::state_auth::sha256_hex,
     process_runner::{
-        run_process, EnvironmentMode, ProcessSpec, ProcessTreeEvidence,
+        run_process, EnvironmentMode, ExternalGrokProfile, ProcessSpec, ProcessTreeEvidence,
         SideEffectConfinementEvidence, SideEffectConfinementProfile,
-        SideEffectConfinementProfileKind, StdinMode, TrustedFixedNetworkProfile,
+        SideEffectConfinementProfileKind, StdinMode,
     },
 };
 use anyhow::{bail, Context, Result};
@@ -26,6 +26,12 @@ use std::{
     path::{Path, PathBuf},
     str,
     time::Duration,
+};
+#[cfg(target_os = "linux")]
+use std::{
+    ffi::OsStr,
+    fs::{File, OpenOptions},
+    sync::Arc,
 };
 
 const GROK_EVENT_STREAM_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -41,6 +47,8 @@ const GROK_MODEL_DISPLAY_NAME_MAX_BYTES: usize = 768;
 const GROK_LOGIN_PROVIDER_MAX_BYTES: usize = 253;
 const GROK_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
 const GROK_DIGEST_FRAMING_VERSION: &[u8] = b"maco.grok.advertised-catalog.v1\n";
+const GROK_CATALOG_AUTH_FILE: &str = "auth.json";
+const GROK_CATALOG_CONFIG_FILE: &str = "config.toml";
 
 /// Immutable Grok headless protocol supported by this adapter.
 ///
@@ -643,6 +651,7 @@ pub fn discover_grok_model_catalog(
         SideEffectConfinementEvidence::Verified(
             SideEffectConfinementProfileKind::StrictOfflineWorkspace
                 | SideEffectConfinementProfileKind::TrustedFixedNetwork
+                | SideEffectConfinementProfileKind::ExternalGrok
         )
     ) {
         bail!(
@@ -855,12 +864,49 @@ fn run_screened_grok_catalog_command(
 
 fn screened_grok_catalog_process_spec(spec: &GrokCatalogCommandSpec) -> Result<ProcessSpec> {
     let program = resolve_catalog_program(spec.program())?;
-    let mut environment = spec.environment().clone();
-    if let Ok(home) = env::var("HOME") {
-        environment.insert("HOME".to_string(), home);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = program;
+        bail!("Grok catalog authentication confinement requires Linux");
     }
-    if let Ok(grok_home) = env::var("GROK_HOME") {
-        environment.insert("GROK_HOME".to_string(), grok_home);
+    #[cfg(target_os = "linux")]
+    {
+        let ambient_home = env::var_os("HOME");
+        let ambient_grok_home = env::var_os("GROK_HOME");
+        screened_grok_catalog_process_spec_with_sources(
+            spec,
+            program,
+            ambient_home.as_deref(),
+            ambient_grok_home.as_deref(),
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ReviewedGrokCatalogSources {
+    grok_home_environment: String,
+    auth_path: PathBuf,
+    auth_file: Arc<File>,
+    config: Option<(PathBuf, Arc<File>)>,
+}
+
+#[cfg(target_os = "linux")]
+fn screened_grok_catalog_process_spec_with_sources(
+    spec: &GrokCatalogCommandSpec,
+    program: PathBuf,
+    ambient_home: Option<&OsStr>,
+    ambient_grok_home: Option<&OsStr>,
+) -> Result<ProcessSpec> {
+    let sources = reviewed_grok_catalog_sources(ambient_home, ambient_grok_home)?;
+    let mut environment = spec.environment().clone();
+    environment.insert("GROK_HOME".to_string(), sources.grok_home_environment);
+    let mut profile = ExternalGrokProfile::read_only(spec.current_dir())
+        .with_visible_read_only_file_capability(sources.auth_path, sources.auth_file)
+        .context("failed to bind the reviewed Grok catalog authentication source")?;
+    if let Some((config_path, config_file)) = sources.config {
+        profile = profile
+            .with_visible_read_only_file_capability(config_path, config_file)
+            .context("failed to bind the reviewed Grok catalog configuration source")?;
     }
     Ok(ProcessSpec::direct(
         "Grok runtime model catalog",
@@ -872,9 +918,68 @@ fn screened_grok_catalog_process_spec(spec: &GrokCatalogCommandSpec) -> Result<P
     .with_environment(EnvironmentMode::ClearAndSet(environment))
     .with_stdin(StdinMode::Null)
     .with_timeout(Some(spec.timeout()))
-    .with_side_effect_confinement(SideEffectConfinementProfile::TrustedFixedNetwork(
-        TrustedFixedNetworkProfile::read_write(spec.current_dir()),
-    )))
+    .with_private_runtime_home(true)
+    .with_side_effect_confinement(SideEffectConfinementProfile::ExternalGrok(profile)))
+}
+
+#[cfg(target_os = "linux")]
+fn reviewed_grok_catalog_sources(
+    ambient_home: Option<&OsStr>,
+    ambient_grok_home: Option<&OsStr>,
+) -> Result<ReviewedGrokCatalogSources> {
+    let grok_home = match ambient_grok_home {
+        Some(grok_home) => PathBuf::from(grok_home),
+        None => PathBuf::from(
+            ambient_home.context("Grok catalog authentication requires HOME or GROK_HOME")?,
+        )
+        .join(".grok"),
+    };
+    if !grok_home.is_absolute()
+        || grok_home.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        bail!("Grok catalog state home must be an absolute normalized path");
+    }
+    let grok_home_environment = grok_home
+        .to_str()
+        .context("Grok catalog state home is not valid UTF-8")?
+        .to_string();
+    let auth_path = grok_home.join(GROK_CATALOG_AUTH_FILE);
+    let auth_file = open_reviewed_grok_catalog_source(&auth_path, true)?
+        .context("Grok catalog authentication source is missing")?;
+    let config_path = grok_home.join(GROK_CATALOG_CONFIG_FILE);
+    let config =
+        open_reviewed_grok_catalog_source(&config_path, false)?.map(|file| (config_path, file));
+    Ok(ReviewedGrokCatalogSources {
+        grok_home_environment,
+        auth_path,
+        auth_file,
+        config,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn open_reviewed_grok_catalog_source(path: &Path, required: bool) -> Result<Option<Arc<File>>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let result = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path);
+    match result {
+        Ok(file) => Ok(Some(Arc::new(file))),
+        Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to open reviewed Grok catalog source {}",
+                path.display()
+            )
+        }),
+    }
 }
 
 fn resolve_catalog_program(program: &Path) -> Result<PathBuf> {
@@ -953,7 +1058,7 @@ mod tests {
                         ContainmentBackend::DirectChild,
                     ),
                     side_effects: SideEffectConfinementEvidence::Verified(
-                        SideEffectConfinementProfileKind::TrustedFixedNetwork,
+                        SideEffectConfinementProfileKind::ExternalGrok,
                     ),
                 },
                 observed_specs: RefCell::new(Vec::new()),
@@ -1531,13 +1636,25 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn screened_process_spec_is_bounded_cleared_and_confined() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let program = dir.path().join("catalog-standin");
         fs::write(&program, "")?;
+        let grok_home = dir.path().join("reviewed-grok-home");
+        fs::create_dir(&grok_home)?;
+        let auth = grok_home.join(GROK_CATALOG_AUTH_FILE);
+        let config = grok_home.join(GROK_CATALOG_CONFIG_FILE);
+        fs::write(&auth, "hermetic-auth-fixture")?;
+        fs::write(&config, "hermetic-config-fixture")?;
         let spec = GrokCatalogCommandSpec::new(dir.path()).with_program(&program);
-        let process = screened_grok_catalog_process_spec(&spec)?;
+        let process = screened_grok_catalog_process_spec_with_sources(
+            &spec,
+            program.clone(),
+            None,
+            Some(grok_home.as_os_str()),
+        )?;
         match &process.command {
             ProcessCommand::Direct {
                 program: observed_program,
@@ -1554,14 +1671,129 @@ mod tests {
         assert_eq!(environment.get("NO_COLOR").map(String::as_str), Some("1"));
         assert_eq!(environment.get("TERM").map(String::as_str), Some("dumb"));
         assert!(!environment.contains_key("PATH"));
+        assert!(!environment.contains_key("HOME"));
+        assert!(!environment.contains_key("TMPDIR"));
+        assert_eq!(
+            environment.get("GROK_HOME").map(String::as_str),
+            grok_home.to_str()
+        );
+        assert!(process.private_runtime_home);
         assert_eq!(process.stdin, StdinMode::Null);
         assert_eq!(process.timeout, Some(GROK_CATALOG_TIMEOUT));
         assert_eq!(process.stdout.max_bytes, GROK_CATALOG_MAX_BYTES);
         assert_eq!(process.stderr.max_bytes, GROK_CATALOG_MAX_BYTES);
         assert_eq!(
             process.side_effects.kind(),
-            SideEffectConfinementProfileKind::TrustedFixedNetwork
+            SideEffectConfinementProfileKind::ExternalGrok
         );
+        let SideEffectConfinementProfile::ExternalGrok(profile) = &process.side_effects else {
+            panic!("screened catalog must use ExternalGrok confinement");
+        };
+        assert_eq!(
+            profile.workspace_access(),
+            crate::process_runner::WorkspaceAccess::ReadOnly
+        );
+        assert!(profile.visible_read_only_roots().is_empty());
+        assert_eq!(
+            profile.visible_read_only_files(),
+            &[auth, config],
+            "only the exact reviewed identity/config leaves may escape ProtectHome=tmpfs"
+        );
+        assert!(profile.visible_read_write_roots().is_empty());
+        assert!(profile.visible_read_write_files().is_empty());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn screened_catalog_state_sources_fail_closed_when_missing_or_malformed() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let program = dir.path().join("catalog-standin");
+        fs::write(&program, "")?;
+        let spec = GrokCatalogCommandSpec::new(dir.path()).with_program(&program);
+
+        let missing_home = match reviewed_grok_catalog_sources(None, None) {
+            Ok(_) => panic!("ambient home omission must fail closed"),
+            Err(error) => error.to_string(),
+        };
+        assert!(missing_home.contains("HOME or GROK_HOME"), "{missing_home}");
+
+        let relative = match reviewed_grok_catalog_sources(None, Some(OsStr::new("relative/.grok")))
+        {
+            Ok(_) => panic!("relative state home must fail closed"),
+            Err(error) => error.to_string(),
+        };
+        assert!(relative.contains("absolute normalized"), "{relative}");
+
+        let missing_auth_home = dir.path().join("missing-auth");
+        fs::create_dir(&missing_auth_home)?;
+        let missing_auth = screened_grok_catalog_process_spec_with_sources(
+            &spec,
+            program.clone(),
+            None,
+            Some(missing_auth_home.as_os_str()),
+        )
+        .expect_err("missing authentication source must fail closed")
+        .to_string();
+        assert!(
+            missing_auth.contains(GROK_CATALOG_AUTH_FILE),
+            "{missing_auth}"
+        );
+
+        let malformed_config_home = dir.path().join("malformed-config");
+        fs::create_dir(&malformed_config_home)?;
+        fs::write(
+            malformed_config_home.join(GROK_CATALOG_AUTH_FILE),
+            "hermetic-auth-fixture",
+        )?;
+        fs::create_dir(malformed_config_home.join(GROK_CATALOG_CONFIG_FILE))?;
+        let malformed_config = screened_grok_catalog_process_spec_with_sources(
+            &spec,
+            program,
+            None,
+            Some(malformed_config_home.as_os_str()),
+        )
+        .expect_err("non-file configuration source must fail closed")
+        .to_string();
+        assert!(
+            malformed_config.contains("not a regular file"),
+            "{malformed_config}"
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn absent_optional_config_keeps_only_reviewed_auth_visible_and_home_private() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let program = dir.path().join("catalog-standin");
+        fs::write(&program, "")?;
+        let default_grok_home = dir.path().join(".grok");
+        fs::create_dir(&default_grok_home)?;
+        let auth = default_grok_home.join(GROK_CATALOG_AUTH_FILE);
+        fs::write(&auth, "hermetic-auth-fixture")?;
+        let spec = GrokCatalogCommandSpec::new(dir.path()).with_program(&program);
+
+        let process = screened_grok_catalog_process_spec_with_sources(
+            &spec,
+            program,
+            Some(dir.path().as_os_str()),
+            None,
+        )?;
+        let EnvironmentMode::ClearAndSet(environment) = &process.environment else {
+            panic!("screened catalog environment must be ClearAndSet");
+        };
+        assert_eq!(
+            environment.get("GROK_HOME").map(String::as_str),
+            default_grok_home.to_str()
+        );
+        assert!(!environment.contains_key("HOME"));
+        assert!(process.private_runtime_home);
+        let SideEffectConfinementProfile::ExternalGrok(profile) = &process.side_effects else {
+            panic!("screened catalog must use ExternalGrok confinement");
+        };
+        assert_eq!(profile.visible_read_only_files(), &[auth]);
+        assert!(profile.visible_read_only_roots().is_empty());
         Ok(())
     }
 

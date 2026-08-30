@@ -868,6 +868,124 @@ impl PartialEq for ExternalCodexWritableFileCapability {
 impl Eq for ExternalCodexWritableFileCapability {}
 
 #[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct ExternalGrokReadOnlyFileCapability {
+    path: PathBuf,
+    held_file: Arc<File>,
+    identity: ExternalGrokReadOnlyFileIdentity,
+}
+
+#[cfg(target_os = "linux")]
+impl ExternalGrokReadOnlyFileCapability {
+    fn new(path: PathBuf, held_file: Arc<File>) -> std::io::Result<Self> {
+        verify_external_grok_file_descriptor_is_read_only(&held_file)?;
+        let identity = external_grok_read_only_file_identity(&held_file.metadata()?)?;
+        let capability = Self {
+            path,
+            held_file,
+            identity,
+        };
+        capability.verify_path()?;
+        Ok(capability)
+    }
+
+    fn with_resolved_path(&self, path: PathBuf) -> Self {
+        Self {
+            path,
+            held_file: Arc::clone(&self.held_file),
+            identity: self.identity,
+        }
+    }
+
+    fn verify_path(&self) -> std::io::Result<()> {
+        verify_external_grok_file_descriptor_is_read_only(&self.held_file)?;
+        let held_identity = external_grok_read_only_file_identity(&self.held_file.metadata()?)?;
+        let observed_identity =
+            external_grok_read_only_file_identity(&fs::symlink_metadata(&self.path)?)?;
+        if held_identity != self.identity || observed_identity != self.identity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "ExternalGrok read-only file capability identity changed: {}",
+                    self.path.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for ExternalGrokReadOnlyFileCapability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExternalGrokReadOnlyFileCapability")
+            .field("path", &self.path)
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PartialEq for ExternalGrokReadOnlyFileCapability {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path && self.identity == other.identity
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Eq for ExternalGrokReadOnlyFileCapability {}
+
+#[cfg(target_os = "linux")]
+fn verify_external_grok_file_descriptor_is_read_only(file: &File) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    // SAFETY: F_GETFL only reads status flags from this live descriptor.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if flags & libc::O_ACCMODE != libc::O_RDONLY {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "ExternalGrok read-only file capability requires a read-only held descriptor",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExternalGrokReadOnlyFileIdentity {
+    device: u64,
+    inode: u64,
+    owner: u32,
+    mode: u32,
+    links: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn external_grok_read_only_file_identity(
+    metadata: &fs::Metadata,
+) -> std::io::Result<ExternalGrokReadOnlyFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "ExternalGrok read-only file capability is not a regular file",
+        ));
+    }
+    Ok(ExternalGrokReadOnlyFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        owner: metadata.uid(),
+        mode: metadata.mode(),
+        links: metadata.nlink(),
+    })
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ExternalCodexWritableFileIdentity {
     device: u64,
@@ -908,6 +1026,8 @@ struct WorkspaceSandboxConfig {
     visible_read_write_files: Vec<PathBuf>,
     #[cfg(target_os = "linux")]
     external_codex_writable_file_capabilities: Vec<ExternalCodexWritableFileCapability>,
+    #[cfg(target_os = "linux")]
+    external_grok_read_only_file_capabilities: Vec<ExternalGrokReadOnlyFileCapability>,
     writable_artifact_roots: Vec<PathBuf>,
     hidden_roots: Vec<PathBuf>,
     isolated_host_view: bool,
@@ -925,6 +1045,8 @@ impl WorkspaceSandboxConfig {
             visible_read_write_files: Vec::new(),
             #[cfg(target_os = "linux")]
             external_codex_writable_file_capabilities: Vec::new(),
+            #[cfg(target_os = "linux")]
+            external_grok_read_only_file_capabilities: Vec::new(),
             writable_artifact_roots: Vec::new(),
             hidden_roots: Vec::new(),
             isolated_host_view: false,
@@ -967,6 +1089,20 @@ impl WorkspaceSandboxConfig {
         let capability = ExternalCodexWritableFileCapability::new(path.clone(), held_file)?;
         self.visible_read_write_files.push(path);
         self.external_codex_writable_file_capabilities
+            .push(capability);
+        Ok(self)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn with_external_grok_read_only_file_capability(
+        mut self,
+        file: impl Into<PathBuf>,
+        held_file: Arc<File>,
+    ) -> std::io::Result<Self> {
+        let path = file.into();
+        let capability = ExternalGrokReadOnlyFileCapability::new(path.clone(), held_file)?;
+        self.visible_read_only_files.push(path);
+        self.external_grok_read_only_file_capabilities
             .push(capability);
         Ok(self)
     }
@@ -1231,46 +1367,63 @@ pub struct ExternalGrokProfile {
     config: WorkspaceSandboxConfig,
 }
 
-#[cfg(test)]
 impl ExternalGrokProfile {
-    pub(crate) fn read_write(workspace_root: impl Into<PathBuf>) -> Self {
-        Self {
-            config: WorkspaceSandboxConfig::new(workspace_root, WorkspaceAccess::ReadWrite),
-        }
-    }
-
     pub(crate) fn read_only(workspace_root: impl Into<PathBuf>) -> Self {
         Self {
             config: WorkspaceSandboxConfig::new(workspace_root, WorkspaceAccess::ReadOnly),
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_visible_read_only_file_capability(
+        mut self,
+        file: impl Into<PathBuf>,
+        held_file: Arc<File>,
+    ) -> std::io::Result<Self> {
+        self.config = self
+            .config
+            .with_external_grok_read_only_file_capability(file, held_file)?;
+        Ok(self)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_write(workspace_root: impl Into<PathBuf>) -> Self {
+        Self {
+            config: WorkspaceSandboxConfig::new(workspace_root, WorkspaceAccess::ReadWrite),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_writable_artifact_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_writable_artifact_root(root);
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_visible_read_only_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_visible_read_only_root(root);
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_visible_read_only_file(mut self, file: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_visible_read_only_file(file);
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_visible_read_write_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_visible_read_write_root(root);
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_visible_read_write_file(mut self, file: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_visible_read_write_file(file);
         self
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn with_visible_read_write_file_capability(
         mut self,
         file: impl Into<PathBuf>,
@@ -1282,6 +1435,7 @@ impl ExternalGrokProfile {
         Ok(self)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_hidden_root(root);
         self
@@ -2770,6 +2924,24 @@ fn validate_workspace_config_bounds(config: &WorkspaceSandboxConfig) -> std::io:
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "ExternalCodex writable file capability is duplicate or lacks an exact writable file",
+                ));
+            }
+        }
+        if config.external_grok_read_only_file_capabilities.len() > MAX_SANDBOX_PATHS_PER_CLASS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ExternalGrok read-only file capabilities exceed their vector limit",
+            ));
+        }
+        let mut grok_capability_paths = BTreeSet::new();
+        for capability in &config.external_grok_read_only_file_capabilities {
+            validate_bounded_path(&capability.path, "ExternalGrok read-only file capability")?;
+            if !config.visible_read_only_files.contains(&capability.path)
+                || !grok_capability_paths.insert(&capability.path)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "ExternalGrok read-only file capability is duplicate or lacks an exact read-only file",
                 ));
             }
         }

@@ -1170,6 +1170,7 @@ struct ResolvedSystemdSandbox {
     visible_read_write_roots: Vec<PathBuf>,
     visible_read_write_files: Vec<PathBuf>,
     external_codex_writable_file_capabilities: Vec<ExternalCodexWritableFileCapability>,
+    external_grok_read_only_file_capabilities: Vec<ExternalGrokReadOnlyFileCapability>,
     writable_artifact_roots: Vec<PathBuf>,
     hidden_roots: Vec<PathBuf>,
     isolated_host_view: bool,
@@ -1403,6 +1404,9 @@ impl ResolvedSystemdSandbox {
         use std::os::unix::fs::MetadataExt;
 
         for capability in &self.external_codex_writable_file_capabilities {
+            capability.verify_path()?;
+        }
+        for capability in &self.external_grok_read_only_file_capabilities {
             capability.verify_path()?;
         }
         for identity in &self.path_identities {
@@ -2311,6 +2315,23 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
         .collect::<std::io::Result<Vec<_>>>()?;
     visible_read_only_files.sort();
     visible_read_only_files.dedup();
+    let mut external_grok_read_only_file_capabilities = Vec::new();
+    let mut grok_capability_paths = BTreeSet::new();
+    for capability in &config.external_grok_read_only_file_capabilities {
+        let canonical_path =
+            canonical_sandbox_file(&capability.path, "ExternalGrok read-only file capability")?;
+        if !visible_read_only_files.contains(&canonical_path)
+            || !grok_capability_paths.insert(canonical_path.clone())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ExternalGrok read-only file capability is duplicate or lacks an exact read-only file",
+            ));
+        }
+        let resolved_capability = capability.with_resolved_path(canonical_path);
+        resolved_capability.verify_path()?;
+        external_grok_read_only_file_capabilities.push(resolved_capability);
+    }
     let mut writable_artifact_roots = config
         .writable_artifact_roots
         .iter()
@@ -2463,6 +2484,7 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
         visible_read_write_roots,
         visible_read_write_files,
         external_codex_writable_file_capabilities,
+        external_grok_read_only_file_capabilities,
         writable_artifact_roots,
         hidden_roots,
         isolated_host_view: config.isolated_host_view,

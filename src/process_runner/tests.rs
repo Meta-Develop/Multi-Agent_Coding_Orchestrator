@@ -12,6 +12,7 @@ fn program_visibility_sandbox(workspace_root: &Path) -> ResolvedSystemdSandbox {
         visible_read_write_roots: Vec::new(),
         visible_read_write_files: Vec::new(),
         external_codex_writable_file_capabilities: Vec::new(),
+        external_grok_read_only_file_capabilities: Vec::new(),
         writable_artifact_roots: Vec::new(),
         hidden_roots: Vec::new(),
         isolated_host_view: false,
@@ -820,13 +821,20 @@ fn external_grok_profile_resolves_only_declared_managed_paths() {
             .open(&capability_file)
             .expect("held writable capability"),
     );
+    let held_read_only = Arc::new(
+        OpenOptions::new()
+            .read(true)
+            .open(&read_only_file)
+            .expect("held read-only capability"),
+    );
 
     let read_only = ExternalGrokProfile::read_only(&workspace);
     assert_eq!(read_only.workspace_access(), WorkspaceAccess::ReadOnly);
 
     let profile = ExternalGrokProfile::read_write(&workspace)
         .with_visible_read_only_root(&read_only_root)
-        .with_visible_read_only_file(&read_only_file)
+        .with_visible_read_only_file_capability(&read_only_file, held_read_only)
+        .expect("ExternalGrok exact read-only capability")
         .with_visible_read_write_root(&read_write_root)
         .with_visible_read_write_file(&read_write_file)
         .with_writable_artifact_root(&artifact_root)
@@ -869,6 +877,72 @@ fn external_grok_profile_resolves_only_declared_managed_paths() {
     );
     assert_eq!(sandbox.writable_artifact_roots, vec![artifact_root]);
     assert_eq!(sandbox.hidden_roots, vec![hidden_root]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn external_grok_read_only_file_capability_rejects_replacement_before_resolution() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("worktree");
+    let state_root = temp.path().join("grok-home");
+    let auth = state_root.join("auth.json");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::create_dir(&state_root).expect("Grok state root");
+    fs::write(&auth, "reviewed identity\n").expect("reviewed identity fixture");
+    let held_auth = Arc::new(
+        OpenOptions::new()
+            .read(true)
+            .open(&auth)
+            .expect("held reviewed identity capability"),
+    );
+    let profile = ExternalGrokProfile::read_only(&workspace)
+        .with_visible_read_only_file_capability(&auth, held_auth)
+        .expect("ExternalGrok exact read-only capability");
+
+    fs::remove_file(&auth).expect("remove reviewed identity fixture");
+    fs::write(&auth, "replacement identity\n").expect("replacement identity fixture");
+
+    let spec = ProcessSpec::direct(
+        "replaced ExternalGrok identity",
+        PathBuf::from("/bin/true"),
+        Vec::<OsString>::new(),
+        &workspace,
+        128,
+    )
+    .with_side_effect_confinement(SideEffectConfinementProfile::ExternalGrok(profile));
+    let error = resolve_systemd_sandbox(&spec)
+        .expect_err("replacement must not inherit the held read-only capability");
+    assert!(
+        error
+            .to_string()
+            .contains("read-only file capability identity changed"),
+        "{error}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn external_grok_read_only_file_capability_rejects_writable_descriptor() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("worktree");
+    let auth = temp.path().join("auth.json");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::write(&auth, "reviewed identity\n").expect("reviewed identity fixture");
+    let writable_auth = Arc::new(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&auth)
+            .expect("writable identity descriptor"),
+    );
+
+    let error = ExternalGrokProfile::read_only(&workspace)
+        .with_visible_read_only_file_capability(&auth, writable_auth)
+        .expect_err("a writable descriptor must not confer a read-only capability");
+    assert!(
+        error.to_string().contains("read-only held descriptor"),
+        "{error}"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -1108,6 +1182,7 @@ fn protected_alias_scan_skips_read_only_roots_without_a_writable_surface() {
         visible_read_write_roots: Vec::new(),
         visible_read_write_files: Vec::new(),
         external_codex_writable_file_capabilities: Vec::new(),
+        external_grok_read_only_file_capabilities: Vec::new(),
         writable_artifact_roots: Vec::new(),
         hidden_roots: Vec::new(),
         isolated_host_view: false,
@@ -1141,6 +1216,7 @@ fn protected_alias_scan_skips_disjoint_read_only_roots_when_writable_files_are_s
         visible_read_write_roots: Vec::new(),
         visible_read_write_files: Vec::new(),
         external_codex_writable_file_capabilities: Vec::new(),
+        external_grok_read_only_file_capabilities: Vec::new(),
         writable_artifact_roots: Vec::new(),
         hidden_roots: Vec::new(),
         isolated_host_view: false,
@@ -1186,6 +1262,7 @@ fn protected_alias_scan_ignores_special_entries_but_preserves_writable_checks() 
         visible_read_write_roots: Vec::new(),
         visible_read_write_files: Vec::new(),
         external_codex_writable_file_capabilities: Vec::new(),
+        external_grok_read_only_file_capabilities: Vec::new(),
         writable_artifact_roots: Vec::new(),
         hidden_roots: Vec::new(),
         isolated_host_view: false,
@@ -1877,6 +1954,7 @@ fn same_filesystem_mount_identity_rejects_rw_aliases_and_nested_conflicts() {
         visible_read_write_roots: Vec::new(),
         visible_read_write_files: vec![exception.clone()],
         external_codex_writable_file_capabilities: Vec::new(),
+        external_grok_read_only_file_capabilities: Vec::new(),
         writable_artifact_roots: vec![incoming.clone()],
         hidden_roots: Vec::new(),
         isolated_host_view: false,
@@ -1934,6 +2012,7 @@ fn ordinary_external_codex_exact_path_properties_reject_drift() {
         visible_read_write_roots: vec![PathBuf::from("/worktree/.agents/docs")],
         visible_read_write_files: vec![PathBuf::from("/worktree/AGENTS.md")],
         external_codex_writable_file_capabilities: Vec::new(),
+        external_grok_read_only_file_capabilities: Vec::new(),
         writable_artifact_roots: Vec::new(),
         hidden_roots: vec![PathBuf::from("/primary")],
         isolated_host_view: false,
@@ -2154,6 +2233,7 @@ fn isolated_root_property_and_required_inaccessible_report_fail_closed() {
         visible_read_write_roots: Vec::new(),
         visible_read_write_files: Vec::new(),
         external_codex_writable_file_capabilities: Vec::new(),
+        external_grok_read_only_file_capabilities: Vec::new(),
         writable_artifact_roots: Vec::new(),
         hidden_roots: vec![PathBuf::from("/source")],
         isolated_host_view: true,
@@ -2392,6 +2472,7 @@ fn sandbox_scan_rejects_fifo_and_external_hardlink_alias() {
         visible_read_write_roots: Vec::new(),
         visible_read_write_files: Vec::new(),
         external_codex_writable_file_capabilities: Vec::new(),
+        external_grok_read_only_file_capabilities: Vec::new(),
         writable_artifact_roots: Vec::new(),
         hidden_roots: Vec::new(),
         isolated_host_view: false,
