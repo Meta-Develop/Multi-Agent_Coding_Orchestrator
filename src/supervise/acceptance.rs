@@ -27,8 +27,20 @@ pub(super) fn collect_child_report(
             Vec::new(),
         );
     }
+    let direct_worker = assignment.role == AgentRole::Worker
+        && assignment.role_category == Some(RoleCategory::NonDelegatingTerminalWorker);
     let mut report_shape_problems = Vec::new();
-    let mut report = match read_child_report(external_run.output_last_message(), report_path) {
+    let parsed_report = if direct_worker {
+        read_direct_worker_report(external_run.output_last_message(), report_path).map(|parsed| {
+            ParsedReport {
+                report: direct_worker_report_envelope(parsed.report),
+                recovered: parsed.recovered,
+            }
+        })
+    } else {
+        read_child_report(external_run.output_last_message(), report_path)
+    };
+    let mut report = match parsed_report {
         Ok(parsed) => {
             let mut report = parsed.report;
             if parsed.recovered {
@@ -53,8 +65,11 @@ pub(super) fn collect_child_report(
                     paths: vec![report_path.to_path_buf()],
                 });
             }
-            if report.role != AgentRole::ChildOrchestrator {
-                let message = "orchestrator report role must be child_orchestrator".to_string();
+            if report.role != assignment.role {
+                let message = format!(
+                    "assignment report role must be '{}'",
+                    assignment.role.as_str()
+                );
                 report_shape_problems.push(message.clone());
                 report.status = ReviewStatus::Failed;
                 report.accepted = false;
@@ -80,15 +95,17 @@ pub(super) fn collect_child_report(
         }
         Err(error) => {
             let error = format!("{error:#}");
-            let message = format!("required child report is missing or invalid: {error}");
+            let message = format!("required assignment report is missing or invalid: {error}");
             report_shape_problems.push(message);
-            missing_child_report(
+            let mut report = missing_child_report(
                 assignment,
                 report_path,
                 external_run,
                 external_command,
                 error,
-            )
+            );
+            report.role = assignment.role;
+            report
         }
     };
     if !report.gate_denials.is_empty() || !report.gate_correction_outcomes.is_empty() {
@@ -156,6 +173,61 @@ pub(super) fn collect_child_report(
     }
     enforce_orchestrator_environment_failure_outcome(&mut report);
     (report, report_shape_problems)
+}
+
+fn read_direct_worker_report(
+    contents: Option<&[u8]>,
+    display_path: &Path,
+) -> Result<ParsedReport<WorkerReport>> {
+    let contents =
+        contents.context("external run did not capture a descriptor-held direct worker report")?;
+    let contents = std::str::from_utf8(contents).with_context(|| {
+        format!(
+            "descriptor-held direct worker report is not UTF-8: {}",
+            display_path.display()
+        )
+    })?;
+    parse_report_json(contents).with_context(|| {
+        format!(
+            "failed to parse direct worker report {}",
+            display_path.display()
+        )
+    })
+}
+
+fn direct_worker_report_envelope(worker: WorkerReport) -> OrchestratorReviewReport {
+    OrchestratorReviewReport {
+        id: worker.id.clone(),
+        role: worker.role,
+        assigned_paths: worker.assigned_paths.clone(),
+        semantic_symbols: worker.semantic_symbols.clone(),
+        semantic_modules: worker.semantic_modules.clone(),
+        claim_token: worker.claim_token,
+        semantic_intent_token: worker.semantic_intent_token,
+        commands_run: worker.commands_run.clone(),
+        environment_failures: worker.environment_failures.clone(),
+        files_changed: worker.files_changed.clone(),
+        validation_results: worker.validation_results.clone(),
+        findings: worker.findings.clone(),
+        field_guide_entries: Vec::new(),
+        worker_reports: vec![worker.clone()],
+        audit_reports: Vec::new(),
+        review_lens_aggregate: None,
+        decomposition_completions: worker
+            .decomposition_completion
+            .clone()
+            .into_iter()
+            .collect(),
+        licensed_breakage_review: None,
+        generated_follow_up_tasks: Vec::new(),
+        gate_denials: Vec::new(),
+        gate_correction_outcomes: Vec::new(),
+        accepted: worker.accepted,
+        rejected: worker.rejected,
+        status: worker.status,
+        remaining_risk: worker.remaining_risk.clone(),
+        next_safe_action: worker.next_safe_action.clone(),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1511,6 +1583,35 @@ fn normalize_worker_report_plumbing(
     workers_by_id: &BTreeMap<&str, &WorkerAssignment>,
     report: &mut WorkerReport,
 ) -> Result<()> {
+    if report.role != AgentRole::Worker {
+        bail!("worker report role must be worker");
+    }
+    if assignment.role == AgentRole::Worker
+        && assignment.role_category == Some(RoleCategory::NonDelegatingTerminalWorker)
+        && report.id == assignment.id
+    {
+        if report.assigned_paths != assignment.assigned_paths {
+            bail!("assigned_paths do not exactly match the declared direct worker assignment");
+        }
+        if report.semantic_symbols != assignment.semantic_symbols {
+            bail!("semantic_symbols do not exactly match the declared direct worker assignment");
+        }
+        if report.semantic_modules != assignment.semantic_modules {
+            bail!("semantic_modules do not exactly match the declared direct worker assignment");
+        }
+        if report.assignment_kind != AssignmentKind::Ordinary {
+            bail!("direct worker assignment_kind must be ordinary");
+        }
+        report.target_path =
+            normalize_report_target_path(report.target_path.take(), "target_path")?;
+        if report.target_path.is_some() {
+            bail!("direct worker target_path must be null");
+        }
+        if report.decomposition_completion.is_some() {
+            bail!("direct worker must not report decomposition_completion");
+        }
+        return Ok(());
+    }
     let worker = workers_by_id
         .get(report.id.as_str())
         .context("worker is not declared in the assignment")?;
@@ -1606,6 +1707,7 @@ fn normalize_worker_report_plumbing(
 
 fn normalize_bloated_file_flags(
     report: &mut WorkerReport,
+    assignment: &OrchestratorAssignment,
     workers_by_id: &BTreeMap<&str, &WorkerAssignment>,
 ) -> Result<()> {
     if report.bloated_file_flags.len() > MAX_BLOATED_FILE_FLAGS_PER_WORKER {
@@ -1615,9 +1717,16 @@ fn normalize_bloated_file_flags(
             MAX_BLOATED_FILE_FLAGS_PER_WORKER
         );
     }
-    let worker = workers_by_id
-        .get(report.id.as_str())
-        .context("worker is not declared in the assignment")?;
+    let allowed_paths = if let Some(worker) = workers_by_id.get(report.id.as_str()) {
+        worker.assigned_paths.as_slice()
+    } else if assignment.role == AgentRole::Worker
+        && assignment.role_category == Some(RoleCategory::NonDelegatingTerminalWorker)
+        && report.id == assignment.id
+    {
+        assignment.assigned_paths.as_slice()
+    } else {
+        bail!("worker is not declared in the assignment");
+    };
     let mut normalized = BTreeSet::new();
     for flag in std::mem::take(&mut report.bloated_file_flags) {
         let path = normalize_repo_relative_path(&flag.path)
@@ -1625,8 +1734,7 @@ fn normalize_bloated_file_flags(
         if path.as_os_str().is_empty() {
             bail!("flag path must name a repository file");
         }
-        if !worker
-            .assigned_paths
+        if !allowed_paths
             .iter()
             .any(|assigned| path_is_covered_by_claim(&path, assigned))
         {
@@ -1839,7 +1947,8 @@ pub(super) fn validate_worker_report_evidence(
             );
             blocking_messages.push((message, vec![report_path.to_path_buf()]));
         }
-        if let Err(error) = normalize_bloated_file_flags(worker_report, &workers_by_id) {
+        if let Err(error) = normalize_bloated_file_flags(worker_report, assignment, &workers_by_id)
+        {
             let message = format!(
                 "worker '{}' has invalid bloated_file_flags: {error}",
                 worker_report.id
@@ -1875,6 +1984,11 @@ pub(super) fn validate_worker_report_evidence(
 
         let allowed_paths = if let Some(worker) = workers_by_id.get(worker_report.id.as_str()) {
             worker.assigned_paths.clone()
+        } else if assignment.role == AgentRole::Worker
+            && assignment.role_category == Some(RoleCategory::NonDelegatingTerminalWorker)
+            && worker_report.id == assignment.id
+        {
+            assignment.assigned_paths.clone()
         } else {
             let message = format!(
                 "worker '{}' is not declared in assignment '{}' worker_assignments",

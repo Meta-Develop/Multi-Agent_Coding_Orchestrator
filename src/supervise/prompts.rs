@@ -310,6 +310,43 @@ fn worker_cacheable_prefix_for_target(
     }
 }
 
+fn direct_terminal_worker_cacheable_prefix(
+    execution_target: Option<&SupervisorExecutionTarget>,
+) -> String {
+    let scope_rule = if execution_target.is_some() {
+        "- The assigned worktree is the existing primary checkout. Edit only the exact declared primary-worktree claim paths; do not stage, commit, or change Git metadata."
+    } else {
+        "- Edit only inside the assigned worktree and only inside the exact declared assigned paths.\n- Do not mutate the primary worktree."
+    };
+    format!(
+        r#"You are an admitted direct terminal worker in an opt-in local Codex CLI supervised run.
+Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> admitted direct terminal worker.
+You are not a supervisor, child orchestrator, reviewer, acceptance gate, merger, or publisher. Your authority is execution-only.
+Do not launch workers, create delegated subtasks, delegate to another agent, or spawn/impersonate O1 or O2 roles.
+
+{tool_call_batching_guidance}
+
+Rules:
+{scope_rule}
+- Do not broaden the assignment, add claim paths, or change files outside the exact assigned path set.
+- Do not request, access, read, write, disclose, or transmit credentials, secrets, tokens, or keys.
+- Do not stage, commit, push, merge, or otherwise publish changes.
+- Validate the bounded change, or report exactly why validation could not run.
+- Return exactly one WorkerReport JSON object matching the declared worker schema. Do not return an OrchestratorReviewReport, prose, Markdown, or a code fence.
+- Set assignment_kind to ordinary, target_path to null, and decomposition_completion to null.
+- Copy assigned_paths, semantic_symbols, and semantic_modules byte-for-byte from the assignment JSON; do not widen or reinterpret scope.
+- Include no_further_delegation=true to attest that this direct terminal worker did not delegate.
+- Include environment_failures=[] when no typed environment failure occurred. When it is nonempty, do not report an accepted or succeeded outcome, and never include credential or secret values.
+- field_guide_entries is optional: each item has exactly finding and context, no date, source_run, role text, policy, or provenance. Only the trusted supervisor may append accepted audited suggestions.
+- bloated_file_flags contains at most {max_bloated_file_flags} unique {{"path":"repo/relative/file"}} objects, all within assigned_paths.
+- Do not write a report file with tools. Return the WorkerReport only through the configured output-last-message channel.
+"#,
+        tool_call_batching_guidance = TOOL_CALL_BATCHING_GUIDANCE,
+        scope_rule = scope_rule,
+        max_bloated_file_flags = MAX_BLOATED_FILE_FLAGS_PER_WORKER,
+    )
+}
+
 pub(super) fn review_auditor_cacheable_prefix() -> String {
     format!(
         r#"You are a terminal read-only review auditor in an opt-in local Codex CLI supervised run.
@@ -568,6 +605,16 @@ pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guid
     child_launch_runtime: SupervisorRuntime,
     worker_launch_runtime: SupervisorRuntime,
 ) -> Result<RenderedPromptWithMeasurements> {
+    if context.assignment.role == AgentRole::Worker {
+        return render_direct_terminal_worker_prompt(context, field_guide, child_launch_runtime);
+    }
+    if context.assignment.role != AgentRole::ChildOrchestrator {
+        bail!(
+            "assignment '{}' cannot render an executable supervision prompt for role '{}'",
+            context.assignment.id,
+            context.assignment.role.as_str()
+        );
+    }
     let ChildOrchestratorPromptContext {
         plan,
         execution_target,
@@ -773,6 +820,123 @@ Review auditor prompt template:
             prompt_measurements,
             Some(WorkerPromptEmbeddingMultiplier::for_plan(plan)?),
         ),
+    })
+}
+
+fn render_direct_terminal_worker_prompt(
+    context: ChildOrchestratorPromptContext<'_>,
+    field_guide: &SupervisorFieldGuidePrompt,
+    launch_runtime: SupervisorRuntime,
+) -> Result<RenderedPromptWithMeasurements> {
+    let ChildOrchestratorPromptContext {
+        plan,
+        execution_target,
+        assignment,
+        run_dir,
+        worktree,
+        report_path,
+        worker_schema_path,
+        claim_context,
+        ..
+    } = context;
+    if assignment.role != AgentRole::Worker
+        || assignment.role_category != Some(RoleCategory::NonDelegatingTerminalWorker)
+    {
+        bail!(
+            "assignment '{}' is not an explicitly declared non-delegating direct worker",
+            assignment.id
+        );
+    }
+    if !assignment.worker_assignments.is_empty() {
+        bail!(
+            "direct worker assignment '{}' may not contain nested worker assignments",
+            assignment.id
+        );
+    }
+
+    let cacheable_prefix = direct_terminal_worker_cacheable_prefix(execution_target);
+    let role_prefix =
+        supervise_role_prefix(SupervisePromptRole::TerminalWorker, &assignment.id, None);
+    let assignment_json = serde_json::to_string_pretty(assignment)
+        .context("failed to serialize direct worker assignment")?;
+    let task = assignment_task(plan, assignment);
+    let (worker_model, worker_reasoning_effort) = role_model_selection(plan, AgentRole::Worker);
+    let instruction_profile_section = phase_aware_instruction_profile_section(
+        AgentRole::Worker,
+        OrchestrationPhase::MechanicalTerminal,
+        worker_model.as_deref(),
+    );
+    let execution_target_context = execution_target
+        .map(|target| {
+            format!(
+                "- Execution target: {} (declared scope: {})\n",
+                target.kind_name(),
+                display_paths(target.claim_paths())
+            )
+        })
+        .unwrap_or_default();
+    let prompt = format!(
+        r#"{cacheable_prefix}{role_prefix}{field_guide_section}{instruction_profile_section}
+
+Direct-worker assignment context:
+- Assigned worktree: {worktree_path}
+{execution_target_context}- Direct worker id: {worker_id}
+- Assigned paths: {assigned_paths}
+- Semantic symbols: {semantic_symbols}
+- Semantic modules: {semantic_modules}
+- Path claim token: {claim_token}
+- Semantic intent token: {semantic_intent_token}
+- Run artifact root: {run_dir}
+- Exact WorkerReport output-last-message path: {report_path}
+- WorkerReport schema path: {worker_schema_path}
+
+Declared role selection:
+- Direct worker runtime: {launch_runtime}
+- Direct worker model: {worker_model}
+- Direct worker reasoning effort: {worker_reasoning_effort}
+
+Supervisor task:
+{task}
+
+Direct worker assignment JSON:
+{assignment_json}
+"#,
+        cacheable_prefix = cacheable_prefix,
+        role_prefix = role_prefix,
+        field_guide_section = field_guide.section,
+        instruction_profile_section = instruction_profile_section,
+        worktree_path = worktree.path.display(),
+        execution_target_context = execution_target_context,
+        worker_id = assignment.id,
+        assigned_paths = display_paths(&assignment.assigned_paths),
+        semantic_symbols = assignment.semantic_symbols.join(", "),
+        semantic_modules = assignment.semantic_modules.join(", "),
+        claim_token = claim_context.claim.token.get(),
+        semantic_intent_token = claim_context
+            .semantic_intent_token
+            .map(|token| token.to_string())
+            .unwrap_or_else(|| "<none>".to_string()),
+        run_dir = run_dir.display(),
+        report_path = report_path.display(),
+        worker_schema_path = worker_schema_path.display(),
+        launch_runtime = launch_runtime.as_str(),
+        worker_model = worker_model.as_deref().unwrap_or("<runtime default>"),
+        worker_reasoning_effort = worker_reasoning_effort
+            .as_deref()
+            .unwrap_or("<runtime default>"),
+        task = task,
+        assignment_json = assignment_json,
+    );
+    let measurement = PromptByteMeasurement::new(
+        PromptMeasurementRole::TerminalWorker,
+        &assignment.id,
+        &prompt,
+        &cacheable_prefix,
+        WORKER_PROMPT_FIXTURE_CEILING_BYTES,
+    )?;
+    Ok(RenderedPromptWithMeasurements {
+        prompt,
+        measurements: PromptMeasurementsArtifact::new(vec![measurement], None),
     })
 }
 
