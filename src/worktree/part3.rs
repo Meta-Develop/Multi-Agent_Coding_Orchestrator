@@ -3112,7 +3112,7 @@ fn ensure_clean_worktree(path: &Path) -> Result<()> {
 #[derive(Debug)]
 enum GitAssociationMarker {
     Directory(DirectoryBindingGuard),
-    File(RegularFileBindingGuard),
+    File(Box<RegularFileBindingGuard>),
 }
 
 impl GitAssociationMarker {
@@ -3134,7 +3134,7 @@ impl GitAssociationMarker {
         }
         if metadata.is_file() {
             return RegularFileBindingGuard::bind(path, MAX_WORKTREE_GIT_TEXT_FILE_BYTES)
-                .map(Self::File);
+                .map(|binding| Self::File(Box::new(binding)));
         }
         bail!(
             "Git association marker has an unsupported file type: {}",

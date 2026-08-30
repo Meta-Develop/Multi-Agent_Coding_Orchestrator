@@ -540,7 +540,7 @@ pub enum ReviewLensScopedInformation {
         output_report: String,
     },
     BoundedFullChildTranscript {
-        child_transcript: BoundedReviewTranscript,
+        child_transcript: Box<BoundedReviewTranscript>,
         bindings: ReviewLensBindingMaterial,
         diff: String,
         output_report: String,
@@ -688,7 +688,7 @@ fn build_bounded_review_lens_request_with_transcript(
     build_review_lens_request_from_information(
         lens,
         ReviewLensScopedInformation::BoundedFullChildTranscript {
-            child_transcript,
+            child_transcript: Box::new(child_transcript),
             bindings: sources.bindings.clone(),
             diff: sources.diff.to_string(),
             output_report: sources.output_report.to_string(),

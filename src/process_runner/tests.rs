@@ -1009,11 +1009,17 @@ fn external_grok_profile_resolves_only_declared_managed_paths() {
         .with_visible_read_write_file_capability(&capability_file, held_capability)
         .expect("ExternalGrok exact writable capability");
     assert_eq!(profile.workspace_access(), WorkspaceAccess::ReadWrite);
-    assert_eq!(profile.visible_read_only_roots(), &[read_only_root.clone()]);
-    assert_eq!(profile.visible_read_only_files(), &[read_only_file.clone()]);
+    assert_eq!(
+        profile.visible_read_only_roots(),
+        std::slice::from_ref(&read_only_root)
+    );
+    assert_eq!(
+        profile.visible_read_only_files(),
+        std::slice::from_ref(&read_only_file)
+    );
     assert_eq!(
         profile.visible_read_write_roots(),
-        &[read_write_root.clone()]
+        std::slice::from_ref(&read_write_root)
     );
     assert_eq!(
         profile.visible_read_write_files(),

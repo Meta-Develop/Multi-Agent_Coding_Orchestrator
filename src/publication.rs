@@ -807,7 +807,7 @@ pub(crate) enum AuthenticatedPullRequestMergeOutcome {
     },
     Merged {
         authority: PullRequestMergeAuthorityDecision,
-        receipt: PullRequestMergeReceipt,
+        receipt: Box<PullRequestMergeReceipt>,
     },
 }
 
@@ -827,7 +827,7 @@ impl AuthenticatedPullRequestMergeOutcome {
     pub(crate) fn receipt(&self) -> Option<&PullRequestMergeReceipt> {
         match self {
             Self::NotMerged { .. } => None,
-            Self::Merged { receipt, .. } => Some(receipt),
+            Self::Merged { receipt, .. } => Some(receipt.as_ref()),
         }
     }
 }
@@ -945,7 +945,7 @@ fn execute_authenticated_pull_request_merge_with_wal(
                 .context("completed pull-request merge receipt changed or disappeared")?;
             Ok(AuthenticatedPullRequestMergeOutcome::Merged {
                 authority,
-                receipt: verified,
+                receipt: Box::new(verified),
             })
         }
         EffectPhase::Observed => {
@@ -1260,7 +1260,7 @@ fn complete_authenticated_pull_request_merge(
     wal.completed(effect_id, &completed)?;
     Ok(AuthenticatedPullRequestMergeOutcome::Merged {
         authority,
-        receipt: completed_receipt,
+        receipt: Box::new(completed_receipt),
     })
 }
 

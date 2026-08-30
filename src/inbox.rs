@@ -3165,12 +3165,10 @@ where
             .error
             .as_deref()
             .filter(|message| !message.is_empty())
-            .unwrap_or_else(|| {
-                if runner_result.timed_out {
-                    "independent auditor timed out"
-                } else {
-                    "independent auditor did not complete in the verified read-only boundary"
-                }
+            .unwrap_or(if runner_result.timed_out {
+                "independent auditor timed out"
+            } else {
+                "independent auditor did not complete in the verified read-only boundary"
             });
         review_loop_entry::blocked_independent_audit_lane_result(
             item,
@@ -3483,7 +3481,7 @@ fn complete_authenticated_independent_audit_merge(
                 selection,
                 launch,
                 auditor_evidence,
-                inbox_merge_receipt(&receipt),
+                inbox_merge_receipt(receipt.as_ref()),
             )
         }
         Ok(AuthenticatedPullRequestMergeOutcome::NotMerged { blockers, .. }) => {
@@ -4468,8 +4466,8 @@ fn pr_intake_report_for_item(item: &InboxItem) -> Option<InboxPrIntakeReport> {
         }
     };
 
-    let (status, task, launch_block) = if block_reason.is_none() {
-        (
+    let (status, task, launch_block) = match block_reason {
+        None => (
             InboxPrIntakeStatus::Ready,
             Some(InboxIndependentAuditMergeLaneTask {
                 version: INBOX_SCHEMA_VERSION,
@@ -4495,10 +4493,8 @@ fn pr_intake_report_for_item(item: &InboxItem) -> Option<InboxPrIntakeReport> {
                         .to_string(),
             }),
             None,
-        )
-    } else {
-        let (reason, evidence) = block_reason.expect("checked blocked PR intake reason");
-        (
+        ),
+        Some((reason, evidence)) => (
             InboxPrIntakeStatus::LaunchBlocked,
             None,
             Some(InboxPrLaunchBlockReport {
@@ -4513,7 +4509,7 @@ fn pr_intake_report_for_item(item: &InboxItem) -> Option<InboxPrIntakeReport> {
                     "refresh the PR observation and supply the missing evidence before launching an independent auditor"
                         .to_string(),
             }),
-        )
+        ),
     };
 
     Some(InboxPrIntakeReport {
