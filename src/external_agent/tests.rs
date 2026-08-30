@@ -3667,16 +3667,22 @@ fn absent_model_selection_preserves_the_exact_hardened_codex_argv() {
             "computer_use",
             "--disable",
             "image_generation",
+            "--disable",
+            "multi_agent",
             "--enable",
             "goals",
-            "--enable",
-            "multi_agent",
             "--json",
             "--output-last-message",
             "/run/report.json",
             "-",
         ];
     assert_eq!(actual, expected);
+    assert!(actual
+        .windows(2)
+        .any(|arguments| arguments == ["--disable", "multi_agent"]));
+    assert!(!actual
+        .windows(2)
+        .any(|arguments| arguments == ["--enable", "multi_agent"]));
 }
 
 #[test]
@@ -3940,6 +3946,12 @@ fn codex_app_server_argv_preserves_the_external_codex_ceiling() {
             || argument.contains("danger-full-access")
             || argument == "--add-dir"
     }));
+    assert!(actual
+        .windows(2)
+        .any(|arguments| arguments == ["--disable", "multi_agent"]));
+    assert!(!actual
+        .windows(2)
+        .any(|arguments| arguments == ["--enable", "multi_agent"]));
 }
 
 #[test]

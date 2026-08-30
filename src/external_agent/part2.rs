@@ -4691,8 +4691,6 @@ fn codex_supervisor_argv(
     argv.extend([
         OsString::from("--enable"),
         OsString::from("goals"),
-        OsString::from("--enable"),
-        OsString::from("multi_agent"),
         OsString::from("--json"),
         OsString::from("--output-last-message"),
         spec.output_last_message.as_os_str().to_os_string(),
@@ -4759,6 +4757,7 @@ fn codex_hardened_argv(
         "browser_use_external",
         "computer_use",
         "image_generation",
+        "multi_agent",
     ] {
         argv.push(OsString::from("--disable"));
         argv.push(OsString::from(feature));
@@ -4828,6 +4827,7 @@ fn codex_app_server_argv(
         "browser_use_external",
         "computer_use",
         "image_generation",
+        "multi_agent",
     ] {
         argv.push(OsString::from("--disable"));
         argv.push(OsString::from(feature));

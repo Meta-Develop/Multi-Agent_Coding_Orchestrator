@@ -23,6 +23,57 @@
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn first_managed_worktree_from_fresh_clone_preserves_repository_binding() {
+        skip_without_containment!();
+        let temp = TempDir::new().expect("tempdir");
+        let origin_path = temp.path().join("origin");
+        WorktreeManager::init_repository(&origin_path, "main").expect("init origin");
+        let origin = crate::git_repository::open(&origin_path).expect("open origin");
+        commit_readme(&origin).expect("initial commit");
+        drop(origin);
+
+        let clone_path = temp.path().join("fresh-clone");
+        let cloned = git2::Repository::clone(
+            origin_path.to_str().expect("UTF-8 origin path"),
+            &clone_path,
+        )
+        .expect("clone repository");
+        assert!(
+            !cloned.commondir().join("worktrees").exists(),
+            "fresh clone must exercise creation of the worktrees metadata directory"
+        );
+        drop(cloned);
+
+        let manager = WorktreeManager::new(&clone_path);
+        let cleanliness = manager
+            .acquire_repository_cleanliness()
+            .expect("bind clean fresh clone");
+        assert!(
+            !clone_path.join(".git/worktrees").exists(),
+            "cleanliness capture must not pre-create worktree metadata"
+        );
+        let record = manager
+            .create_with_repository_cleanliness(
+                WorktreeCreateOptions {
+                    agent_id: "first-bound".to_string(),
+                    branch: None,
+                    base: None,
+                    worktree_root: Some(temp.path().join("worktrees")),
+                },
+                &cleanliness,
+            )
+            .expect("create first capability-bound managed worktree");
+
+        assert!(record.path.is_dir());
+        assert!(clone_path.join(".git/worktrees/first-bound").is_dir());
+        assert_eq!(
+            manager.list_managed_verified().expect("list managed lanes"),
+            vec![record]
+        );
+    }
+
     #[test]
     fn target_only_mode_rejects_conflicting_gc_policies() {
         let retention = WorktreeRetentionPolicy {
