@@ -236,8 +236,8 @@ impl RecipientDeliveryState {
 
     pub fn validate(&self, limits: &MessagingLimits) -> Result<(), EnvelopeValidationError> {
         limits.validate()?;
-        if usize::try_from(self.delivery_attempts)
-            .map_or(true, |attempts| attempts > limits.max_delivery_attempts)
+        if !usize::try_from(self.delivery_attempts)
+            .is_ok_and(|attempts| attempts <= limits.max_delivery_attempts)
         {
             return Err(EnvelopeValidationError::TooManyDeliveryAttempts {
                 actual: self.delivery_attempts,
@@ -264,7 +264,7 @@ impl RecipientDeliveryState {
             .delivery_attempts
             .checked_add(1)
             .ok_or(EnvelopeValidationError::DeliveryAttemptOverflow)?;
-        if usize::try_from(next).map_or(true, |attempts| attempts > limits.max_delivery_attempts) {
+        if !usize::try_from(next).is_ok_and(|attempts| attempts <= limits.max_delivery_attempts) {
             return Err(EnvelopeValidationError::TooManyDeliveryAttempts {
                 actual: next,
                 max: limits.max_delivery_attempts,
