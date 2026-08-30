@@ -235,6 +235,7 @@ impl SupervisorMessagingSessionFactory {
     /// Returns one launched agent's own process-local presentation capability.
     ///
     /// The returned value is neither serializable nor secret-revealing under `Debug`.
+    #[cfg(test)]
     pub(super) fn capability_for(&self, agent_id: &str) -> Result<PresentedCredential> {
         self.capabilities
             .get(agent_id)

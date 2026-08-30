@@ -1227,7 +1227,7 @@ impl fmt::Display for GrokCredentialSourceFailure {
 #[cfg(target_os = "linux")]
 impl std::error::Error for GrokCredentialSourceFailure {}
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 fn screened_grok_catalog_process_spec_with_sources(
     spec: &GrokCatalogCommandSpec,
     program: PathBuf,

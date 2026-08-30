@@ -1402,12 +1402,6 @@ impl ExternalGrokProfile {
         Ok(self)
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_writable_artifact_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.config = self.config.with_writable_artifact_root(root);
-        self
-    }
-
     pub(crate) fn with_visible_read_write_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_visible_read_write_root(root);
         self

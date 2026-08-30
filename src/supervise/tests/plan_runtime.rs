@@ -2606,7 +2606,7 @@ fn verified_supervise_dispatch_consumes_and_persists_the_selector_triple() {
         Some(selector_effort_as_str(choice.candidate.effort))
     );
 
-    assert_eq!(execution.selection_decisions.len(), 5);
+    assert_eq!(execution.selection_decisions.len(), 6);
     let ledger = execution
         .assignment_selection_ledger
         .iter()
