@@ -841,7 +841,7 @@ fn unix_child_stat(parent_fd: i32, name: &OsStr) -> Result<Option<libc::stat>, S
 impl DataFileIdentity {
     fn from_stat(stat: &libc::stat) -> Self {
         Self {
-            device: stat.st_dev,
+            device: crate::safe_state::device_id_to_u64(stat.st_dev),
             inode: stat.st_ino,
         }
     }
@@ -1001,7 +1001,7 @@ fn validate_unix_regular_single_link(stat: &libc::stat, path: &Path) -> Result<(
     if stat.st_nlink != 1 {
         return Err(StoreError::MultipleDataLinks {
             path: path.to_path_buf(),
-            links: stat.st_nlink,
+            links: crate::safe_state::unsigned_to_u64(stat.st_nlink),
         });
     }
     Ok(())
