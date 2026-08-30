@@ -4616,7 +4616,7 @@ pub(crate) fn command_argv(spec: &ExternalAgentCommand) -> Vec<OsString> {
                 .map(PathBuf::from),
             ..ProtectedWorktreeControls::default()
         });
-    command_argv_with_controls(spec, &controls).expect("command argv")
+    command_argv_with_controls_and_service_tier_input(spec, &controls, None).expect("command argv")
 }
 
 #[cfg(test)]
@@ -4635,8 +4635,38 @@ fn command_argv_with_controls(
     spec: &ExternalAgentCommand,
     controls: &ProtectedWorktreeControls,
 ) -> Result<Vec<OsString>> {
+    let service_tier = env::var_os("MACO_CODEX_SERVICE_TIER");
+    command_argv_with_controls_and_service_tier_input(spec, controls, service_tier.as_deref())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexServiceTierOverride {
+    Priority,
+}
+
+fn parse_codex_service_tier_override(
+    value: Option<&OsStr>,
+) -> Result<Option<CodexServiceTierOverride>> {
+    match value {
+        None => Ok(None),
+        Some(value) if value == OsStr::new("priority") => {
+            Ok(Some(CodexServiceTierOverride::Priority))
+        }
+        Some(_) => bail!("MACO_CODEX_SERVICE_TIER must be unset or exactly 'priority'"),
+    }
+}
+
+fn command_argv_with_controls_and_service_tier_input(
+    spec: &ExternalAgentCommand,
+    controls: &ProtectedWorktreeControls,
+    service_tier_input: Option<&OsStr>,
+) -> Result<Vec<OsString>> {
     match spec.invocation {
-        ExternalAgentInvocation::CodexSupervisor => Ok(codex_supervisor_argv(spec, controls)),
+        ExternalAgentInvocation::CodexSupervisor => Ok(codex_supervisor_argv(
+            spec,
+            controls,
+            parse_codex_service_tier_override(service_tier_input)?,
+        )),
         ExternalAgentInvocation::CodexConsultant => Ok(codex_consultant_argv(spec, controls)),
         ExternalAgentInvocation::ClaudeConsultant => Ok(claude_consultant_argv()),
         ExternalAgentInvocation::Grok
@@ -4686,8 +4716,9 @@ fn runtime_adapter_argv(spec: &ExternalAgentCommand) -> Result<Vec<OsString>> {
 fn codex_supervisor_argv(
     spec: &ExternalAgentCommand,
     controls: &ProtectedWorktreeControls,
+    service_tier: Option<CodexServiceTierOverride>,
 ) -> Vec<OsString> {
-    let mut argv = codex_hardened_argv(spec, controls);
+    let mut argv = codex_hardened_argv_with_service_tier(spec, controls, service_tier);
     argv.extend([
         OsString::from("--enable"),
         OsString::from("goals"),
@@ -4719,6 +4750,14 @@ fn codex_consultant_argv(
 fn codex_hardened_argv(
     spec: &ExternalAgentCommand,
     controls: &ProtectedWorktreeControls,
+) -> Vec<OsString> {
+    codex_hardened_argv_with_service_tier(spec, controls, None)
+}
+
+fn codex_hardened_argv_with_service_tier(
+    spec: &ExternalAgentCommand,
+    controls: &ProtectedWorktreeControls,
+    service_tier: Option<CodexServiceTierOverride>,
 ) -> Vec<OsString> {
     let filesystem_permissions = codex_filesystem_permissions(spec, controls);
     let shell_environment_include_only = codex_shell_environment_include_only(controls);
@@ -4779,6 +4818,10 @@ fn codex_hardened_argv(
             "model_reasoning_effort={}",
             toml_basic_string(reasoning_effort)
         )));
+    }
+    if service_tier == Some(CodexServiceTierOverride::Priority) {
+        argv.push(OsString::from("-c"));
+        argv.push(OsString::from("service_tier=\"priority\""));
     }
     argv
 }

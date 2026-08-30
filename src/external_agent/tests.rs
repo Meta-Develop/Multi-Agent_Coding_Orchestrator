@@ -3683,6 +3683,108 @@ fn absent_model_selection_preserves_the_exact_hardened_codex_argv() {
     assert!(!actual
         .windows(2)
         .any(|arguments| arguments == ["--enable", "multi_agent"]));
+    assert!(!actual
+        .iter()
+        .any(|argument| argument.starts_with("service_tier=")));
+}
+
+#[test]
+fn priority_service_tier_is_an_exact_opt_in_argv_delta() {
+    let mut command = ExternalAgentCommand::codex(
+        "codex",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(1),
+    )
+    .with_model_selection(Some("gpt-5.6-sol".to_string()), Some("xhigh".to_string()));
+    command.output_schema = Some(PathBuf::from("/run/orchestrator-review-report.schema.json"));
+    let controls =
+        protected_worktree_controls(&command).unwrap_or_else(|_| ProtectedWorktreeControls {
+            writable_artifact_root: Some(PathBuf::from("/run")),
+            ..ProtectedWorktreeControls::default()
+        });
+
+    let default = command_argv_with_controls_and_service_tier_input(&command, &controls, None)
+        .expect("default service tier argv");
+    let mut priority = command_argv_with_controls_and_service_tier_input(
+        &command,
+        &controls,
+        Some(OsStr::new("priority")),
+    )
+    .expect("priority service tier argv");
+
+    let service_tier_index = priority
+        .windows(2)
+        .position(|arguments| {
+            arguments
+                == [
+                    OsString::from("-c"),
+                    OsString::from("service_tier=\"priority\""),
+                ]
+        })
+        .expect("exact priority service tier config");
+    priority.drain(service_tier_index..service_tier_index + 2);
+    assert_eq!(priority, default, "priority must be the only argv delta");
+    assert!(default.windows(2).any(|arguments| {
+        arguments
+            == [
+                OsString::from("-c"),
+                OsString::from("model_reasoning_effort=\"xhigh\""),
+            ]
+    }));
+    assert!(default
+        .windows(2)
+        .any(|arguments| arguments == ["--disable", "multi_agent"]));
+    assert!(default.windows(2).any(|arguments| {
+        arguments
+            == [
+                OsString::from("--output-schema"),
+                OsString::from("/run/orchestrator-review-report.schema.json"),
+            ]
+    }));
+}
+
+#[test]
+fn malformed_service_tier_input_fails_closed_without_reflection() {
+    let command = ExternalAgentCommand::codex(
+        "codex",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(1),
+    );
+    let controls =
+        protected_worktree_controls(&command).unwrap_or_else(|_| ProtectedWorktreeControls {
+            writable_artifact_root: Some(PathBuf::from("/run")),
+            ..ProtectedWorktreeControls::default()
+        });
+
+    for malformed in [
+        "",
+        "default",
+        "flex",
+        "Priority",
+        "priority ",
+        "priority\nweb_search=\"live\"",
+    ] {
+        let error = command_argv_with_controls_and_service_tier_input(
+            &command,
+            &controls,
+            Some(OsStr::new(malformed)),
+        )
+        .expect_err("malformed service tier must fail closed")
+        .to_string();
+        assert_eq!(
+            error,
+            "MACO_CODEX_SERVICE_TIER must be unset or exactly 'priority'"
+        );
+        if !malformed.is_empty() {
+            assert!(!error.contains(malformed));
+        }
+    }
 }
 
 #[test]
