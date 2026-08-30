@@ -4517,17 +4517,6 @@ mod cli_integration_tests {
         args
     }
 
-    fn autopilot_run_args(argv: &[&str]) -> Box<RunAutopilotArgs> {
-        let parsed = Cli::try_parse_from(argv).expect("autopilot run arguments should parse");
-        let Command::Autopilot(AutopilotCommand {
-            command: AutopilotSubcommand::Run(args),
-        }) = parsed.command
-        else {
-            panic!("expected autopilot run command");
-        };
-        args
-    }
-
     const LAUNCH_RETENTION: [&str; 4] = [
         "--machine-global-config",
         "/tmp/maco-machine-global.json",
@@ -4536,7 +4525,7 @@ mod cli_integration_tests {
     ];
 
     #[test]
-    fn supervise_and_autopilot_role_category_override_defaults_to_automatic() {
+    fn supervise_role_category_override_defaults_to_automatic() {
         let supervise = supervise_run_args(&[
             "maco",
             "supervise",
@@ -4548,22 +4537,10 @@ mod cli_integration_tests {
             LAUNCH_RETENTION[3],
         ]);
         assert_eq!(supervise.role_category_override.role_category, None);
-
-        let autopilot = autopilot_run_args(&[
-            "maco",
-            "autopilot",
-            "run",
-            "plan.json",
-            LAUNCH_RETENTION[0],
-            LAUNCH_RETENTION[1],
-            LAUNCH_RETENTION[2],
-            LAUNCH_RETENTION[3],
-        ]);
-        assert_eq!(autopilot.role_category_override.role_category, None);
     }
 
     #[test]
-    fn supervise_and_autopilot_role_category_override_parses_operator_values() {
+    fn supervise_role_category_override_parses_operator_values() {
         let supervise = supervise_run_args(&[
             "maco",
             "supervise",
@@ -4580,45 +4557,26 @@ mod cli_integration_tests {
             supervise.role_category_override.role_category,
             Some(OperatorRoleCategory::ReadOnlyResearcher)
         );
+    }
 
-        let autopilot = autopilot_run_args(&[
+    #[test]
+    fn supervise_rejects_unknown_role_category() {
+        let argv = [
             "maco",
-            "autopilot",
+            "supervise",
             "run",
             "plan.json",
             "--role-category",
-            "non-delegating-terminal-worker",
+            "weak_model",
             LAUNCH_RETENTION[0],
             LAUNCH_RETENTION[1],
             LAUNCH_RETENTION[2],
             LAUNCH_RETENTION[3],
-        ]);
-        assert_eq!(
-            autopilot.role_category_override.role_category,
-            Some(OperatorRoleCategory::NonDelegatingTerminalWorker)
+        ];
+        assert!(
+            Cli::try_parse_from(argv).is_err(),
+            "supervise must reject an unknown role category"
         );
-    }
-
-    #[test]
-    fn supervise_and_autopilot_reject_unknown_role_category() {
-        for command in ["supervise", "autopilot"] {
-            let argv = [
-                "maco",
-                command,
-                "run",
-                "plan.json",
-                "--role-category",
-                "weak_model",
-                LAUNCH_RETENTION[0],
-                LAUNCH_RETENTION[1],
-                LAUNCH_RETENTION[2],
-                LAUNCH_RETENTION[3],
-            ];
-            assert!(
-                Cli::try_parse_from(argv).is_err(),
-                "{command} must reject an unknown role category"
-            );
-        }
     }
 
     #[test]
