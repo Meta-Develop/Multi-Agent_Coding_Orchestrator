@@ -394,6 +394,140 @@ pub const DEFAULT_TERMINAL_RUNTIME: &str = "grok";
 pub const DEFAULT_TERMINAL_MODEL: &str = "grok-4.6";
 pub const DEFAULT_TERMINAL_EFFORT: &str = "xhigh";
 pub const DEFAULT_TERMINAL_PROVIDER: &str = "xai";
+pub const DEFAULT_TERMINAL_EVIDENCE_OBSERVED_ON: &str = "2026-08-22";
+pub const DEFAULT_TERMINAL_EVIDENCE_SOURCE_ID: &str =
+    "optimizer-seed-grok-4-6-cost-quality-2026-08";
+
+// Selector class-fit costs use the same 100,000-microunit-per-USD scale as
+// the shipped dated priors. Keeping the scale explicit prevents a measured
+// dollar value from silently becoming a model preference table.
+const SELECTOR_COST_MICROUNITS_PER_USD: f64 = 100_000.0;
+
+/// Objective evidence used to admit, score, and explain the default terminal
+/// worker candidate. Runtime membership remains a separate live hard gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalWorkerRoutingEconomics {
+    pub runtime: String,
+    pub model: String,
+    pub effort: String,
+    pub observed_on: String,
+    pub source_id: String,
+    pub prior_scope: String,
+    pub limitations: Vec<String>,
+    pub quality_basis_points: u16,
+    pub sample_size: u32,
+    pub execution_cost_microunits: u64,
+}
+
+/// Evaluate the tracked Grok observations into selector-compatible economics.
+///
+/// This function does not select a role or bypass catalog membership. It
+/// converts the exact shipped cost and software-engineering quality axes into
+/// a bounded class-fit prior; the selector still applies availability,
+/// authority, operator, quality, and pool gates before ranking it.
+pub fn terminal_worker_routing_economics() -> Result<TerminalWorkerRoutingEconomics, OptimizerError>
+{
+    let document = super::seed_evidence::load_shipped_seed_evidence()?;
+    let measured_cost = exact_seed_observation(
+        &document,
+        DEFAULT_TERMINAL_MODEL,
+        "measured_cost_per_task_usd",
+    )?;
+    let software_quality = exact_seed_observation(&document, DEFAULT_TERMINAL_MODEL, "swe_bench")?;
+    let execution_cost_microunits = scaled_observation_value(
+        measured_cost,
+        SELECTOR_COST_MICROUNITS_PER_USD,
+        "measured_cost_per_task_usd",
+    )?;
+    let quality_basis_points = u16::try_from(scaled_observation_value(
+        software_quality,
+        10_000.0,
+        "swe_bench",
+    )?)
+    .map_err(|_| {
+        OptimizerError::invalid("grok-4.6 SWE-bench seed observation exceeds basis-point range")
+    })?;
+    if quality_basis_points > 10_000 {
+        return Err(OptimizerError::invalid(
+            "grok-4.6 SWE-bench seed observation exceeds 10000 basis points",
+        ));
+    }
+    Ok(TerminalWorkerRoutingEconomics {
+        runtime: DEFAULT_TERMINAL_RUNTIME.to_string(),
+        model: DEFAULT_TERMINAL_MODEL.to_string(),
+        effort: DEFAULT_TERMINAL_EFFORT.to_string(),
+        observed_on: DEFAULT_TERMINAL_EVIDENCE_OBSERVED_ON.to_string(),
+        source_id: DEFAULT_TERMINAL_EVIDENCE_SOURCE_ID.to_string(),
+        prior_scope: "tracked cost and software-engineering quality observations evaluated for bounded terminal implementation work"
+            .to_string(),
+        limitations: vec![
+            format!(
+                "quality is the shipped aggregate SWE-bench observation from {}; local accepted-task outcomes remain authoritative",
+                software_quality.source
+            ),
+            format!(
+                "execution cost is the shipped measured cost-per-task observation from {} on the explicit selector scale",
+                measured_cost.source
+            ),
+            "bounded terminal implementation work only; no delegation, review, audit, gate, or publication authority"
+                .to_string(),
+        ],
+        quality_basis_points,
+        sample_size: 1,
+        execution_cost_microunits,
+    })
+}
+
+fn exact_seed_observation<'a>(
+    document: &'a super::seed_evidence::SeedEvidenceDocument,
+    model: &str,
+    axis: &str,
+) -> Result<&'a super::seed_evidence::SeedObservation, OptimizerError> {
+    let mut matches = document
+        .observations
+        .iter()
+        .filter(|observation| observation.model == model && observation.axis == axis);
+    let observation = matches.next().ok_or_else(|| {
+        OptimizerError::invalid(format!(
+            "shipped seed evidence has no exact '{model}' observation for axis '{axis}'"
+        ))
+    })?;
+    if matches.next().is_some() {
+        return Err(OptimizerError::invalid(format!(
+            "shipped seed evidence has duplicate '{model}' observations for axis '{axis}'"
+        )));
+    }
+    Ok(observation)
+}
+
+fn scaled_observation_value(
+    observation: &super::seed_evidence::SeedObservation,
+    scale: f64,
+    axis: &str,
+) -> Result<u64, OptimizerError> {
+    let value = observation
+        .value
+        .as_ref()
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| {
+            OptimizerError::invalid(format!(
+                "'{axis}' seed observation must contain a numeric value"
+            ))
+        })?;
+    let scaled = value * scale;
+    let rounded = scaled.round();
+    if !scaled.is_finite()
+        || scaled < 0.0
+        || (scaled - rounded).abs() > f64::EPSILON * scale
+        || rounded > u64::MAX as f64
+    {
+        return Err(OptimizerError::invalid(format!(
+            "'{axis}' seed observation cannot be represented on its objective scale"
+        )));
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Ok(rounded as u64)
+}
 
 /// Stable identity used in decision evidence and deterministic tie-breaking.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1083,6 +1217,21 @@ mod tests {
         assert!(profile.exploration.is_empty());
         assert!(profile.task_class_overrides.is_empty());
         assert_eq!(profile.hedge, HedgeAggressiveness::default());
+    }
+
+    #[test]
+    fn terminal_worker_economics_are_derived_from_exact_shipped_observations() {
+        let evidence = terminal_worker_routing_economics().expect("terminal worker economics");
+        assert_eq!(evidence.runtime, DEFAULT_TERMINAL_RUNTIME);
+        assert_eq!(evidence.model, DEFAULT_TERMINAL_MODEL);
+        assert_eq!(evidence.effort, DEFAULT_TERMINAL_EFFORT);
+        assert_eq!(evidence.quality_basis_points, 9_560);
+        assert_eq!(evidence.execution_cost_microunits, 83_700);
+        assert_eq!(evidence.sample_size, 1);
+        assert!(evidence
+            .limitations
+            .iter()
+            .any(|limitation| limitation.contains("no delegation")));
     }
 
     #[test]

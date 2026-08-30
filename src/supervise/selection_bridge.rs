@@ -1160,6 +1160,67 @@ fn select_with_live_switch_cost(
     Ok(provenance)
 }
 
+fn selector_priors_with_terminal_worker_economics() -> Result<selection::PriorDataset> {
+    let mut priors = selection::built_in_prior_dataset()?;
+    let economics = crate::optimizer::objective::terminal_worker_routing_economics()?;
+    if priors
+        .models
+        .iter()
+        .any(|prior| prior.runtime == economics.runtime && prior.model == economics.model)
+    {
+        bail!(
+            "built-in selector data already defines terminal routing evidence for '{}:{}'; refusing an ambiguous duplicate",
+            economics.runtime,
+            economics.model
+        );
+    }
+    let effort = selector_effort_from_str(&economics.effort).with_context(|| {
+        format!(
+            "terminal routing economics names unsupported reasoning effort '{}'",
+            economics.effort
+        )
+    })?;
+    priors.revision = format!("{}+{}", priors.revision, economics.source_id);
+    priors.models.push(selection::ModelPrior {
+        runtime: economics.runtime,
+        model: economics.model,
+        observed_on: economics.observed_on,
+        source_id: economics.source_id,
+        prior_scope: economics.prior_scope,
+        limitations: economics.limitations,
+        prohibited: false,
+        prohibition_reason: None,
+        prohibited_authority_roles: [
+            AuthorityRole::Delegating,
+            AuthorityRole::AcceptanceGate,
+            AuthorityRole::ReviewAuditor,
+            AuthorityRole::Audit,
+            AuthorityRole::ConflictResolution,
+            AuthorityRole::FailureClassification,
+            AuthorityRole::GitPublication,
+            AuthorityRole::UnknownJudgment,
+        ]
+        .into_iter()
+        .collect(),
+        long_context_eligible: false,
+        strong_gate_fallback_efforts: BTreeSet::new(),
+        strength_rank: 40,
+        class_fit: vec![selection::ClassFitPrior {
+            task_class: AUTOMATIC_SELECTION_TASK_CLASS.to_string(),
+            effort,
+            quality_basis_points: economics.quality_basis_points,
+            sample_size: economics.sample_size,
+            execution_cost_microunits: economics.execution_cost_microunits,
+            review_cost_microunits: 0,
+            rework_cost_microunits: 0,
+            rereview_cost_microunits: 0,
+        }],
+        authority_evidence: Vec::new(),
+        one_shot_environment_fallbacks: Vec::new(),
+    });
+    Ok(priors)
+}
+
 fn selection_input_for_role(args: SelectionInputForRoleArgs<'_>) -> Result<SelectionInput> {
     let SelectionInputForRoleArgs {
         role,
@@ -1173,7 +1234,7 @@ fn selection_input_for_role(args: SelectionInputForRoleArgs<'_>) -> Result<Selec
         signals,
         debug_override,
     } = args;
-    let priors = selection::built_in_prior_dataset()?;
+    let priors = selector_priors_with_terminal_worker_economics()?;
     let task = task_profile_for_role(role);
     let runtime_name = runtime_name(runtime);
     let catalogs = constructed_selection_catalogs(runtime, catalog, advertised, &task, &priors)?;
@@ -5371,6 +5432,221 @@ mod tests {
             format!("{error:#}").contains("live Grok catalog observation failed closed"),
             "{error:#}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn live_grok_46_xhigh_is_selected_by_recorded_worker_economics() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let observation = discover_grok_observation(CAPTURED_GROK_CATALOG)?;
+        let mut plan = test_plan();
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &advertised_with_grok(observation),
+        )?;
+        let worker = resolution
+            .decisions
+            .iter()
+            .find(|decision| decision.role == AgentRole::Worker)
+            .context("worker decision")?;
+        let choice = worker.provenance.choice.as_ref().context("worker choice")?;
+        assert_eq!(
+            choice.candidate.runtime,
+            crate::optimizer::objective::DEFAULT_TERMINAL_RUNTIME
+        );
+        assert_eq!(
+            choice.candidate.model,
+            crate::optimizer::objective::DEFAULT_TERMINAL_MODEL
+        );
+        assert_eq!(choice.candidate.effort, SelectorEffort::Xhigh);
+        assert_eq!(
+            choice.reason,
+            selection::ChoiceReason::LowestExpectedTotalCostPerAcceptedTask
+        );
+        let evaluation = worker
+            .provenance
+            .candidate_set
+            .iter()
+            .find(|evaluation| evaluation.candidate == choice.candidate)
+            .context("selected worker evaluation")?;
+        assert!(evaluation.eligible);
+        assert_eq!(
+            evaluation.prior_source_id.as_deref(),
+            Some(crate::optimizer::objective::DEFAULT_TERMINAL_EVIDENCE_SOURCE_ID)
+        );
+        let selected_score = evaluation.score.as_ref().context("selected worker score")?;
+        assert_eq!(selected_score.posterior_quality_basis_points, 9_560);
+        assert_eq!(
+            selected_score.expected_total_cost_per_accepted_task_microunits,
+            87_552
+        );
+        assert!(worker.provenance.candidate_set.iter().all(|candidate| {
+            !candidate.eligible
+                || candidate.candidate == choice.candidate
+                || candidate.score.as_ref().is_some_and(|score| {
+                    score.total_score_microunits > selected_score.total_score_microunits
+                })
+        }));
+        assert!(worker
+            .provenance
+            .normalized_input
+            .catalogs
+            .iter()
+            .any(|runtime_catalog| {
+                runtime_catalog.runtime == crate::optimizer::objective::DEFAULT_TERMINAL_RUNTIME
+                    && runtime_catalog
+                        .revision
+                        .starts_with("grok-advertised-sha256:")
+                    && runtime_catalog.models.iter().any(|model| {
+                        model.model == crate::optimizer::objective::DEFAULT_TERMINAL_MODEL
+                            && model.supported_efforts == [SelectorEffort::Xhigh]
+                    })
+            }));
+        assert_eq!(
+            plan.role_models
+                .get(&AgentRole::Worker)
+                .and_then(|selection| selection.reasoning_effort.as_deref()),
+            Some("xhigh")
+        );
+        assert!(matches!(
+            plan.role_models[&AgentRole::Worker].unavailable_model_fallback,
+            UnavailableModelFallback::FailClosed
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_grok_46_falls_back_to_scored_codex_with_honest_membership() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let withdrawn =
+            discover_grok_observation(&grok_listing("grok-4.5", &["  * grok-4.5 (default)"]))?;
+        let mut plan = test_plan();
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &advertised_with_grok(withdrawn),
+        )?;
+        let worker = resolution
+            .decisions
+            .iter()
+            .find(|decision| decision.role == AgentRole::Worker)
+            .context("worker decision")?;
+        assert!(worker.provenance.candidate_set.iter().all(|evaluation| {
+            evaluation.candidate.model != crate::optimizer::objective::DEFAULT_TERMINAL_MODEL
+        }));
+        let choice = worker
+            .provenance
+            .choice
+            .as_ref()
+            .context("fallback worker choice")?;
+        assert_eq!(choice.candidate.runtime, "codex");
+        assert_eq!(
+            choice.reason,
+            selection::ChoiceReason::LowestExpectedTotalCostPerAcceptedTask
+        );
+        assert!(worker
+            .provenance
+            .normalized_input
+            .catalogs
+            .iter()
+            .find(|runtime_catalog| runtime_catalog.runtime == "grok")
+            .is_some_and(|runtime_catalog| runtime_catalog.models.is_empty()));
+        Ok(())
+    }
+
+    #[test]
+    fn grok_worker_economics_never_grant_delegating_or_judgment_authority() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let observation = discover_grok_observation(CAPTURED_GROK_CATALOG)?;
+        let mut plan = test_plan();
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &advertised_with_grok(observation),
+        )?;
+        for role in [
+            AgentRole::Supervisor,
+            AgentRole::ChildOrchestrator,
+            AgentRole::Auditor,
+            AgentRole::GateClassifier,
+        ] {
+            let decision = resolution
+                .decisions
+                .iter()
+                .find(|decision| decision.role == role)
+                .with_context(|| format!("{} decision", role.as_str()))?;
+            assert_eq!(
+                decision
+                    .provenance
+                    .choice
+                    .as_ref()
+                    .with_context(|| format!("{} choice", role.as_str()))?
+                    .candidate
+                    .runtime,
+                "codex",
+                "{}",
+                role.as_str()
+            );
+            assert!(decision.provenance.candidate_set.iter().all(|evaluation| {
+                evaluation.candidate.model != crate::optimizer::objective::DEFAULT_TERMINAL_MODEL
+                    || !evaluation.eligible
+            }));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_worker_override_wins_over_live_grok_worker_economics() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let observation = discover_grok_observation(CAPTURED_GROK_CATALOG)?;
+        let requested = codex_prior_for(|prior| {
+            prior.class_fit.iter().any(|class_fit| {
+                class_fit.task_class == AUTOMATIC_SELECTION_TASK_CLASS
+                    && class_fit.effort == SelectorEffort::High
+            })
+        })?;
+        let mut plan = test_plan();
+        plan.role_models.insert(
+            AgentRole::Worker,
+            role_selection(requested.model.clone(), Some("high")),
+        );
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &advertised_with_grok(observation),
+        )?;
+        let worker = resolution
+            .decisions
+            .iter()
+            .find(|decision| decision.role == AgentRole::Worker)
+            .context("worker decision")?;
+        let choice = worker
+            .provenance
+            .choice
+            .as_ref()
+            .context("worker override choice")?;
+        assert_eq!(choice.candidate.runtime, "codex");
+        assert_eq!(choice.candidate.model, requested.model);
+        assert_eq!(choice.candidate.effort, SelectorEffort::High);
+        assert_eq!(choice.reason, selection::ChoiceReason::DebugOverride);
+        assert!(matches!(
+            worker
+                .provenance
+                .debug_override
+                .as_ref()
+                .context("worker debug override provenance")?
+                .disposition,
+            selection::DebugOverrideDisposition::Applied
+        ));
         Ok(())
     }
 
