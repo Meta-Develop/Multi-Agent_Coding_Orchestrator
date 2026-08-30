@@ -275,10 +275,13 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
             "Read-only planning gate for workstream '{}'. Review the proposed scope and implementation task without editing files or delegating implementation. Confirm whether the execution child can proceed safely.\n\nExecution task:\n{}",
             assignment.id, assignment.task
         );
-        let explicit_new_file_notes = (explicit_new_file_workstream.as_deref()
-            == Some(assignment.id.as_str()))
-        .then(|| explicit_new_file_preclaim_directive(&assignment, &planning_id, &planning_task))
-        .transpose()?;
+        let is_explicit_new_file_workstream =
+            explicit_new_file_workstream.as_deref() == Some(assignment.id.as_str());
+        let explicit_new_file_notes = is_explicit_new_file_workstream
+            .then(|| {
+                explicit_new_file_preclaim_directive(&assignment, &planning_id, &planning_task)
+            })
+            .transpose()?;
         let planning_index = assignments.len();
         assignments.push(OrchestratorAssignment {
             id: planning_id.clone(),
@@ -310,35 +313,49 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
 
         spec_fragment_ids_by_assignment
             .insert(assignment.id.clone(), assignment.fragment_ids.clone());
-        let worker = WorkerAssignment {
-            id: format!("{}-worker", assignment.id),
-            role: AgentRole::Worker,
-            role_category: Some(AgentRole::Worker.authority_category()),
-            selection_source: None,
-            assigned_paths: assignment.assigned_paths.clone(),
-            semantic_symbols: assignment.semantic_symbols.clone(),
-            semantic_modules: assignment.semantic_modules.clone(),
-            task: Some(assignment.task.clone()),
-            environment_requirements: Vec::new(),
-            report_path: None,
-        };
-        assignment_metadata.insert(
-            (assignment.id.clone(), worker.id.clone()),
-            WorkerAssignmentMetadata::default(),
-        );
+        let (execution_role, execution_role_category, worker_assignments) =
+            if is_explicit_new_file_workstream {
+                (
+                    AgentRole::Worker,
+                    AgentRole::Worker.authority_category(),
+                    Vec::new(),
+                )
+            } else {
+                let worker = WorkerAssignment {
+                    id: format!("{}-worker", assignment.id),
+                    role: AgentRole::Worker,
+                    role_category: Some(AgentRole::Worker.authority_category()),
+                    selection_source: None,
+                    assigned_paths: assignment.assigned_paths.clone(),
+                    semantic_symbols: assignment.semantic_symbols.clone(),
+                    semantic_modules: assignment.semantic_modules.clone(),
+                    task: Some(assignment.task.clone()),
+                    environment_requirements: Vec::new(),
+                    report_path: None,
+                };
+                assignment_metadata.insert(
+                    (assignment.id.clone(), worker.id.clone()),
+                    WorkerAssignmentMetadata::default(),
+                );
+                (
+                    AgentRole::ChildOrchestrator,
+                    AgentRole::ChildOrchestrator.authority_category(),
+                    vec![worker],
+                )
+            };
         let execution_index = assignments.len();
         assignments.push(OrchestratorAssignment {
             id: assignment.id.clone(),
             phase: AssignmentPhase::Execution,
             runtime: None,
-            role: AgentRole::ChildOrchestrator,
-            role_category: Some(AgentRole::ChildOrchestrator.authority_category()),
+            role: execution_role,
+            role_category: Some(execution_role_category),
             selection_source: None,
             assigned_paths: assignment.assigned_paths,
             semantic_symbols: assignment.semantic_symbols,
             semantic_modules: assignment.semantic_modules,
             task: Some(assignment.task),
-            worker_assignments: vec![worker],
+            worker_assignments,
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: explicit_new_file_notes.or_else(|| {
@@ -447,10 +464,16 @@ fn explicit_new_file_preclaim_directive(
             "assigned_path": assigned_path,
             "planning_assignment": {
                 "id": planning_id,
+                "phase": AssignmentPhase::Planning,
+                "role": AgentRole::ChildOrchestrator,
+                "role_category": AgentRole::ChildOrchestrator.authority_category(),
                 "task_sha256": crate::artifacts::state_auth::sha256_hex(planning_task.as_bytes()),
             },
             "execution_assignment": {
                 "id": assignment.id,
+                "phase": AssignmentPhase::Execution,
+                "role": AgentRole::Worker,
+                "role_category": AgentRole::Worker.authority_category(),
                 "task_sha256": crate::artifacts::state_auth::sha256_hex(assignment.task.as_bytes()),
             }
         }

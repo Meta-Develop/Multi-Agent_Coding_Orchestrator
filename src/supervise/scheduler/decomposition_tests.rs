@@ -2396,24 +2396,55 @@ fn verified_acquire_without_evidence_still_fails_closed() {
 }
 
 #[test]
-fn literal_new_file_lowering_preclaims_planning_root_and_execution_child() {
+fn literal_new_file_lowering_preclaims_planning_root_and_direct_execution_worker() {
     let (_temp, repo) = test_repository();
     let task = "Create a new file named LITERAL_E2E.md containing exactly one line: MACO literal routing reached the terminal worker.";
-    let plan = supervisor_plan_from_goal_spec(&repo, "", task)
+    let (plan, document) = supervisor_plan_and_document_from_goal_spec(&repo, "", task)
         .expect("lower authoritative literal new-file directive");
     assert_eq!(plan.assignments.len(), 2);
-    assert!(plan
-        .assignments
-        .iter()
-        .all(|assignment| assignment.assigned_paths == [PathBuf::from("LITERAL_E2E.md")]));
-    assert!(plan
-        .assignments
-        .iter()
-        .any(|assignment| assignment.phase == AssignmentPhase::Planning));
-    assert!(plan
-        .assignments
-        .iter()
-        .any(|assignment| assignment.phase == AssignmentPhase::Execution));
+    let [planning, execution] = plan.assignments.as_slice() else {
+        panic!("literal lowering must emit exactly two assignments");
+    };
+    assert_eq!(planning.id, "assignment-001-planning");
+    assert_eq!(planning.phase, AssignmentPhase::Planning);
+    assert_eq!(planning.role, AgentRole::ChildOrchestrator);
+    assert_eq!(
+        planning.role_category,
+        Some(RoleCategory::DelegatingCoordinator)
+    );
+    assert!(planning.worker_assignments.is_empty());
+    assert_eq!(execution.id, "assignment-001");
+    assert_eq!(execution.phase, AssignmentPhase::Execution);
+    assert_eq!(execution.role, AgentRole::Worker);
+    assert_eq!(
+        execution.role_category,
+        Some(RoleCategory::NonDelegatingTerminalWorker)
+    );
+    assert!(execution.worker_assignments.is_empty());
+    for assignment in [planning, execution] {
+        assert_eq!(assignment.assigned_paths, [PathBuf::from("LITERAL_E2E.md")]);
+        assert!(assignment.semantic_symbols.is_empty());
+        assert!(assignment.semantic_modules.is_empty());
+        assert!(assignment.environment_requirements.is_empty());
+        assert!(assignment.licensed_breakage.is_none());
+    }
+    assert_eq!(planning.notes, execution.notes);
+    assert_eq!(
+        document["assignment_schedule"],
+        serde_json::json!([
+            {
+                "assignment_id": "assignment-001-planning",
+                "depth": 2,
+                "flattened_index": 0
+            },
+            {
+                "assignment_id": "assignment-001",
+                "parent_assignment_id": "assignment-001-planning",
+                "depth": 3,
+                "flattened_index": 1
+            }
+        ])
+    );
 
     let evidence = PreclaimRunEvidence::acquire(
         &repo,

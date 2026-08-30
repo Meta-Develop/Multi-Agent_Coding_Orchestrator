@@ -582,9 +582,9 @@ fn primary_worktree_cli_requires_plan_and_flag_and_rejects_invalid_scope() -> Re
 }
 
 #[test]
-fn supervise_plan_literal_new_file_carries_bound_preclaim_contract_for_both_nodes() -> Result<()> {
+fn supervise_plan_literal_new_file_emits_parent_gated_direct_worker_contract() -> Result<()> {
     support::require_containment!(
-        "supervise_plan_literal_new_file_carries_bound_preclaim_contract_for_both_nodes"
+        "supervise_plan_literal_new_file_emits_parent_gated_direct_worker_contract"
     );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -607,11 +607,44 @@ fn supervise_plan_literal_new_file_carries_bound_preclaim_contract_for_both_node
     assert_eq!(assignments.len(), 2);
     assert_eq!(assignments[0]["id"], "assignment-001-planning");
     assert_eq!(assignments[0]["phase"], "planning");
+    assert_eq!(assignments[0]["role"], "child_orchestrator");
+    assert_eq!(assignments[0]["role_category"], "delegating_coordinator");
     assert_eq!(assignments[1]["id"], "assignment-001");
     assert_eq!(assignments[1]["phase"], "execution");
+    assert_eq!(assignments[1]["role"], "worker");
+    assert_eq!(
+        assignments[1]["role_category"],
+        "non_delegating_terminal_worker"
+    );
     assert!(assignments
         .iter()
         .all(|assignment| assignment["assigned_paths"] == serde_json::json!(["LITERAL_E2E.md"])));
+    for assignment in assignments {
+        assert_eq!(assignment["semantic_symbols"], serde_json::json!([]));
+        assert_eq!(assignment["semantic_modules"], serde_json::json!([]));
+        assert_eq!(assignment["worker_assignments"], serde_json::json!([]));
+        assert_eq!(
+            assignment["environment_requirements"],
+            serde_json::json!([])
+        );
+        assert!(assignment.get("licensed_breakage").is_none());
+    }
+    assert_eq!(
+        plan["assignment_schedule"],
+        serde_json::json!([
+            {
+                "assignment_id": "assignment-001-planning",
+                "depth": 2,
+                "flattened_index": 0
+            },
+            {
+                "assignment_id": "assignment-001",
+                "parent_assignment_id": "assignment-001-planning",
+                "depth": 3,
+                "flattened_index": 1
+            }
+        ])
+    );
 
     let contracts = assignments
         .iter()
@@ -633,16 +666,30 @@ fn supervise_plan_literal_new_file_carries_bound_preclaim_contract_for_both_node
         contract["planning_assignment"]["id"],
         "assignment-001-planning"
     );
+    assert_eq!(contract["planning_assignment"]["phase"], "planning");
+    assert_eq!(
+        contract["planning_assignment"]["role"],
+        "child_orchestrator"
+    );
+    assert_eq!(
+        contract["planning_assignment"]["role_category"],
+        "delegating_coordinator"
+    );
     assert_eq!(contract["execution_assignment"]["id"], "assignment-001");
-    for binding in ["planning_assignment", "execution_assignment"] {
-        assert_eq!(
-            contract[binding]["task_sha256"]
-                .as_str()
-                .context("task_sha256")?
-                .len(),
-            64
-        );
-    }
+    assert_eq!(contract["execution_assignment"]["phase"], "execution");
+    assert_eq!(contract["execution_assignment"]["role"], "worker");
+    assert_eq!(
+        contract["execution_assignment"]["role_category"],
+        "non_delegating_terminal_worker"
+    );
+    assert_eq!(
+        contract["planning_assignment"]["task_sha256"],
+        "dd5eb07b5e6698eb47b432b7d53053f7b097a77a5e9a71db09531040f58a4b72"
+    );
+    assert_eq!(
+        contract["execution_assignment"]["task_sha256"],
+        "4ac87ed5a17996cca85967f242041325e8078cce281b1d9ca0c6719ef7d30541"
+    );
     assert!(!repo_path.join("LITERAL_E2E.md").exists());
     Ok(())
 }

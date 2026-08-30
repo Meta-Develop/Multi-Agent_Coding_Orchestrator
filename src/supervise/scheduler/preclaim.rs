@@ -126,6 +126,9 @@ enum RequestedPreclaimVerificationContract {
 #[serde(deny_unknown_fields)]
 struct RequestedPreclaimAssignmentBinding {
     id: String,
+    phase: AssignmentPhase,
+    role: AgentRole,
+    role_category: RoleCategory,
     task_sha256: String,
 }
 
@@ -507,7 +510,14 @@ fn requested_explicit_new_file_contract(
         planning_assignment,
         execution_assignment,
     } = &contract;
-    if planning_assignment.id == execution_assignment.id {
+    if planning_assignment.id == execution_assignment.id
+        || planning_assignment.phase != AssignmentPhase::Planning
+        || planning_assignment.role != AgentRole::ChildOrchestrator
+        || planning_assignment.role_category != RoleCategory::DelegatingCoordinator
+        || execution_assignment.phase != AssignmentPhase::Execution
+        || execution_assignment.role != AgentRole::Worker
+        || execution_assignment.role_category != RoleCategory::NonDelegatingTerminalWorker
+    {
         return false;
     }
     let Some(planning) =
@@ -561,8 +571,9 @@ fn requested_explicit_new_file_contract(
     }
 
     if planning.id != planning_assignment.id
-        || planning.phase != AssignmentPhase::Planning
-        || planning.role != AgentRole::ChildOrchestrator
+        || planning.phase != planning_assignment.phase
+        || planning.role != planning_assignment.role
+        || planning.role_category != Some(planning_assignment.role_category)
         || planning.assigned_paths.as_slice() != [target.as_path()]
         || !planning.semantic_symbols.is_empty()
         || !planning.semantic_modules.is_empty()
@@ -575,25 +586,18 @@ fn requested_explicit_new_file_contract(
     {
         return false;
     }
-    let [worker] = execution.worker_assignments.as_slice() else {
-        return false;
-    };
     execution.id == execution_assignment.id
-        && execution.phase == AssignmentPhase::Execution
-        && execution.role == AgentRole::ChildOrchestrator
+        && execution.phase == execution_assignment.phase
+        && execution.role == execution_assignment.role
+        && execution.role_category == Some(execution_assignment.role_category)
         && execution.assigned_paths.as_slice() == [target.as_path()]
         && execution.semantic_symbols.is_empty()
         && execution.semantic_modules.is_empty()
+        && execution.worker_assignments.is_empty()
         && execution.environment_requirements.is_empty()
         && execution.licensed_breakage.is_none()
         && crate::artifacts::state_auth::sha256_hex(execution_task.as_bytes())
             == execution_assignment.task_sha256
-        && worker.task.as_deref() == Some(execution_task)
-        && worker.role == AgentRole::Worker
-        && worker.assigned_paths.as_slice() == [target.as_path()]
-        && worker.semantic_symbols.is_empty()
-        && worker.semantic_modules.is_empty()
-        && worker.environment_requirements.is_empty()
 }
 
 fn unique_requested_assignment<'a>(
@@ -1626,6 +1630,7 @@ mod tests {
         let mut planning = assignment();
         planning.id = "assignment-001-planning".to_string();
         planning.phase = AssignmentPhase::Planning;
+        planning.role_category = Some(RoleCategory::DelegatingCoordinator);
         planning.assigned_paths = vec![PathBuf::from(assigned_path)];
         planning.task = Some(format!(
             "Read-only planning gate for workstream 'assignment-001'. Review the proposed scope and implementation task without editing files or delegating implementation. Confirm whether the execution child can proceed safely.\n\nExecution task:\n{execution_task}"
@@ -1633,31 +1638,31 @@ mod tests {
 
         let mut execution = assignment();
         execution.id = "assignment-001".to_string();
+        execution.role = AgentRole::Worker;
+        execution.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
         execution.assigned_paths = vec![PathBuf::from(assigned_path)];
         execution.task = Some(execution_task.to_string());
-        execution.worker_assignments = vec![WorkerAssignment {
-            id: "assignment-001-worker".to_string(),
-            role: AgentRole::Worker,
-            role_category: None,
-            selection_source: None,
-            assigned_paths: execution.assigned_paths.clone(),
-            semantic_symbols: Vec::new(),
-            semantic_modules: Vec::new(),
-            task: execution.task.clone(),
-            environment_requirements: Vec::new(),
-            report_path: None,
-        }];
 
         let contract = RequestedPreclaimVerificationContract::ExplicitNewFileCreation {
             assigned_path: assigned_path.to_string(),
             planning_assignment: RequestedPreclaimAssignmentBinding {
                 id: planning.id.clone(),
+                phase: planning.phase,
+                role: planning.role,
+                role_category: planning
+                    .role_category
+                    .expect("explicit planning role category"),
                 task_sha256: crate::artifacts::state_auth::sha256_hex(
                     planning.task.as_deref().expect("planning task").as_bytes(),
                 ),
             },
             execution_assignment: RequestedPreclaimAssignmentBinding {
                 id: execution.id.clone(),
+                phase: execution.phase,
+                role: execution.role,
+                role_category: execution
+                    .role_category
+                    .expect("explicit execution role category"),
                 task_sha256: crate::artifacts::state_auth::sha256_hex(
                     execution
                         .task
@@ -2361,7 +2366,6 @@ mod tests {
         let bound_pair = explicit_new_file_assignments("LITERAL_E2E.md", literal_task);
         let mut changed_current = bound_pair[1].clone();
         changed_current.task = Some("unbound caller task text".to_string());
-        changed_current.worker_assignments[0].task = changed_current.task.clone();
         let changed = evaluate_preclaim_viability(
             &changed_current,
             &bound_pair,
@@ -2373,6 +2377,50 @@ mod tests {
         assert_eq!(changed.disposition, PreclaimDisposition::Park);
         assert_eq!(
             changed.dimensions.clear_verification_path,
+            ViabilityFinding::Unknown
+        );
+
+        let mut nested_pair = explicit_new_file_assignments("LITERAL_E2E.md", literal_task);
+        nested_pair[1].worker_assignments.push(WorkerAssignment {
+            id: "forbidden-nested-worker".to_string(),
+            role: AgentRole::Worker,
+            role_category: Some(RoleCategory::NonDelegatingTerminalWorker),
+            selection_source: None,
+            assigned_paths: vec![PathBuf::from("LITERAL_E2E.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: Some(literal_task.to_string()),
+            environment_requirements: Vec::new(),
+            report_path: None,
+        });
+        let nested = evaluate_preclaim_viability(
+            &nested_pair[1],
+            &nested_pair,
+            Some(&present_map()),
+            Some(&risk_for_path("LITERAL_E2E.md")),
+            Some(SupervisorRuntime::Codex),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(nested.disposition, PreclaimDisposition::Park);
+        assert_eq!(
+            nested.dimensions.clear_verification_path,
+            ViabilityFinding::Unknown
+        );
+
+        let mut wrong_role_pair = explicit_new_file_assignments("LITERAL_E2E.md", literal_task);
+        wrong_role_pair[1].role = AgentRole::ChildOrchestrator;
+        wrong_role_pair[1].role_category = Some(RoleCategory::DelegatingCoordinator);
+        let wrong_role = evaluate_preclaim_viability(
+            &wrong_role_pair[1],
+            &wrong_role_pair,
+            Some(&present_map()),
+            Some(&risk_for_path("LITERAL_E2E.md")),
+            Some(SupervisorRuntime::Codex),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(wrong_role.disposition, PreclaimDisposition::Park);
+        assert_eq!(
+            wrong_role.dimensions.clear_verification_path,
             ViabilityFinding::Unknown
         );
     }
