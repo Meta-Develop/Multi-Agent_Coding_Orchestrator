@@ -79,6 +79,16 @@ fn verify_effective_system_call_filter(
             }
         }
     }
+    if kind == SideEffectConfinementProfileKind::ExternalCodex
+        && !tokens
+            .iter()
+            .any(|token| token.trim_start_matches('~') == "socketpair")
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "effective SystemCallFilter omitted denied syscall socketpair",
+        ));
+    }
     Ok(())
 }
 

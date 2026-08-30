@@ -5308,18 +5308,21 @@ mod selection_policy_tests {
             .as_ref()
             .context("selection failure execution metadata")?
             .selection_decisions;
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].role, AgentRole::Auditor);
+        assert_eq!(events.len(), provisional_default_role_models().len());
+        let auditor_event = events
+            .iter()
+            .find(|event| event.role == AgentRole::Auditor)
+            .context("persisted fail-closed auditor selection event")?;
         assert_eq!(
-            events[0].primary_cause,
+            auditor_event.primary_cause,
             SupervisorSelectionEventCause::DebugOverride
         );
         assert_eq!(
-            events[0].provenance.status,
+            auditor_event.provenance.status,
             crate::selection::DecisionStatus::FailClosed
         );
-        assert!(events[0].provenance.choice.is_none());
-        assert!(!events[0].provenance.candidate_set.is_empty());
+        assert!(auditor_event.provenance.choice.is_none());
+        assert!(!auditor_event.provenance.candidate_set.is_empty());
         let ledger = &profile
             .execution
             .as_ref()

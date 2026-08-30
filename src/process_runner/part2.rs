@@ -2805,7 +2805,7 @@ fn apply_systemd_sandbox_properties(command: &mut Command, sandbox: &ResolvedSys
             "--property=RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK",
             // Bubblewrap must construct the inner mount tree. Keep the rest of the ordinary
             // networked deny list intact and relax @mount only for ExternalCodex.
-            "--property=SystemCallFilter=~@clock @debug @module @obsolete @raw-io @reboot @swap bpf fanotify_init fanotify_mark ipc mq_getsetattr mq_notify mq_open mq_timedreceive mq_timedreceive_time64 mq_timedsend mq_timedsend_time64 mq_unlink msgctl msgget msgrcv msgsnd open_by_handle_at process_madvise process_vm_readv process_vm_writev quotactl quotactl_fd semctl semget semop semtimedop semtimedop_time64 shmat shmctl shmdt shmget link linkat mknod mknodat",
+            "--property=SystemCallFilter=~@clock @debug @module @obsolete @raw-io @reboot @swap bpf fanotify_init fanotify_mark ipc mq_getsetattr mq_notify mq_open mq_timedreceive mq_timedreceive_time64 mq_timedsend mq_timedsend_time64 mq_unlink msgctl msgget msgrcv msgsnd open_by_handle_at process_madvise process_vm_readv process_vm_writev quotactl quotactl_fd semctl semget semop semtimedop semtimedop_time64 shmat shmctl shmdt shmget link linkat mknod mknodat socketpair",
         ]);
     } else if sandbox.kind == SideEffectConfinementProfileKind::ExternalGrok {
         command.args([

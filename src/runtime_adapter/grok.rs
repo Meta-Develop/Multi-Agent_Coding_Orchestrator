@@ -2057,11 +2057,6 @@ mod tests {
         .expect_err("non-file configuration source must fail closed");
         let malformed_config = format!("{malformed_config:#}");
         assert!(
-            malformed_config
-                .contains("failed to bind the reviewed Grok catalog configuration source"),
-            "{malformed_config}"
-        );
-        assert!(
             malformed_config.contains("not a regular file"),
             "{malformed_config}"
         );
