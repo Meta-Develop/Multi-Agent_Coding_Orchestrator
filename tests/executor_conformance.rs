@@ -2922,9 +2922,6 @@ fn grok_capability_elevation_fails_closed_and_other_runtimes_do_not_change() {
         .expect("canonical cwd placeholder");
     *cwd_value = "/tmp/unbounded".to_string();
     mutations.push(altered_cwd);
-    let mut altered_binary = canonical.clone();
-    altered_binary.binary = Some("/tmp/operator-grok".into());
-    mutations.push(altered_binary);
     let mut altered_environment = canonical.clone();
     altered_environment.env_passthrough.push("PATH".into());
     mutations.push(altered_environment);
@@ -2943,6 +2940,15 @@ fn grok_capability_elevation_fails_closed_and_other_runtimes_do_not_change() {
             .capabilities_for_launch(AdapterId::Grok, &exact)
             .admits_worktree_writable());
     }
+
+    let mut alternate_binary = canonical.clone();
+    alternate_binary.binary = Some("/tmp/operator-grok".into());
+    assert!(alternate_binary
+        .typed_runtime_contract(AdapterId::Grok, &exact)
+        .is_some());
+    assert!(alternate_binary
+        .capabilities_for_launch(AdapterId::Grok, &exact)
+        .admits_worktree_writable());
 
     for adapter in [
         AdapterId::Codex,
