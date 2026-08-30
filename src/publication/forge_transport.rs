@@ -4,10 +4,18 @@
 //! idempotent mutation. Provider command construction remains outside the
 //! transport trait.
 
+use crate::optimizer::{
+    ids::TimestampMillis,
+    merge_authority::{
+        decide_merge, CheckStatus, CompletionMode, LensDecision, LensVerdict, MergeActor,
+        MergeBlocker, MergeDecision, MergeRequest, ProducerFingerprint, VerificationCheck,
+    },
+};
 use anyhow::{bail, Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use std::{
     collections::{btree_map::Entry, BTreeMap, BTreeSet},
+    path::PathBuf,
     sync::Mutex,
 };
 
@@ -1224,6 +1232,520 @@ impl<'de> Deserialize<'de> for PullRequestReviewSnapshot {
         )
         .map_err(serde::de::Error::custom)
     }
+}
+
+/// Provider-observed current PR state used to prove that a review snapshot is
+/// still the exact state being authorized.
+///
+/// This is an evidence input, not a clock heuristic. The adapter requires the
+/// complete item and observation timestamp to equal the authenticated
+/// snapshot and never guesses freshness from local time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PullRequestFreshnessStatus {
+    Fresh,
+    Stale,
+    Uncertain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PullRequestFreshnessEvidence {
+    pub current_item: ForgeItem,
+    pub snapshot_observed_at: ForgeTimestamp,
+    pub status: PullRequestFreshnessStatus,
+    pub decided_at: TimestampMillis,
+}
+
+/// Ground-truth producer identity bound to the exact PR head.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PullRequestProducerEvidence {
+    pub head_oid: String,
+    pub producer: ProducerFingerprint,
+}
+
+/// Ground-truth independent-auditor evidence bound to the reviewed head and
+/// snapshot observation. Lens text is never inferred from a PR body, comment,
+/// or requesting-agent message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PullRequestAuditorEvidence {
+    pub head_oid: String,
+    pub snapshot_observed_at: ForgeTimestamp,
+    pub auditor: MergeActor,
+    pub lenses: Vec<LensVerdict>,
+}
+
+/// Result of an actual merge simulation, bound to both sides of the simulated
+/// merge and to the snapshot for which it was run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PullRequestMergeSimulationEvidence {
+    pub head_oid: String,
+    pub base_oid: String,
+    pub snapshot_observed_at: ForgeTimestamp,
+    pub merges_cleanly: bool,
+}
+
+/// Actual changed paths for the candidate head. Binding the path set prevents
+/// callers from omitting never-auto-merge paths while supplying evidence for a
+/// different revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PullRequestChangedPathsEvidence {
+    pub head_oid: String,
+    pub paths: Vec<PathBuf>,
+}
+
+/// Complete, explicit inputs to the pure PR merge-authority adapter.
+///
+/// Optional fields model unavailable ground truth. Absence is returned as a
+/// typed blocked decision; it is never filled from requesting-agent text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PullRequestMergeAuthorityInput {
+    pub freshness: Option<PullRequestFreshnessEvidence>,
+    pub required_checks: Option<Vec<String>>,
+    pub producer: Option<PullRequestProducerEvidence>,
+    pub auditor: Option<PullRequestAuditorEvidence>,
+    pub merge_simulation: Option<PullRequestMergeSimulationEvidence>,
+    pub completion_mode: Option<CompletionMode>,
+    pub changed_paths: Option<PullRequestChangedPathsEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "blocker", content = "details", rename_all = "snake_case")]
+pub enum PullRequestMergeAuthorityBlocker {
+    MissingFreshnessEvidence,
+    StaleSnapshotHead {
+        snapshot_head_oid: String,
+        current_head_oid: String,
+    },
+    StaleSnapshotObservation,
+    UncertainSnapshotFreshness,
+    SnapshotItemMismatch,
+    MissingRequiredChecks,
+    InvalidRequiredCheckName,
+    DuplicateRequiredCheck {
+        name: String,
+    },
+    MissingRequiredCheck {
+        name: String,
+    },
+    AmbiguousRequiredCheck {
+        name: String,
+    },
+    StaleRequiredCheck {
+        name: String,
+    },
+    SkippedRequiredCheck {
+        name: String,
+    },
+    FailedRequiredCheck {
+        name: String,
+        conclusion: ForgeCheckConclusion,
+    },
+    UncertainRequiredCheck {
+        name: String,
+    },
+    MissingProducerEvidence,
+    IncompleteProducerEvidence,
+    StaleProducerEvidence,
+    MissingAuditorEvidence,
+    IncompleteAuditorEvidence,
+    StaleAuditorEvidence,
+    UncertainAuditorEvidence,
+    MissingMergeSimulationEvidence,
+    StaleMergeSimulationEvidence,
+    MissingCompletionMode,
+    MissingChangedPathsEvidence,
+    EmptyChangedPathsEvidence,
+    StaleChangedPathsEvidence,
+    OptimizerBlocked(MergeBlocker),
+    OptimizerDecisionFailed,
+}
+
+/// Pure authority result. `Allowed` means the optimizer received only exact,
+/// complete evidence and returned an unblocked decision. `Blocked` never
+/// authorizes a provider mutation, even when a nested diagnostic decision is
+/// present.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum PullRequestMergeAuthorityDecision {
+    Allowed {
+        merge_decision: MergeDecision,
+    },
+    Blocked {
+        blockers: Vec<PullRequestMergeAuthorityBlocker>,
+        merge_decision: Option<MergeDecision>,
+    },
+}
+
+impl PullRequestMergeAuthorityDecision {
+    pub fn is_allowed(&self) -> bool {
+        matches!(self, Self::Allowed { .. })
+    }
+
+    pub fn blockers(&self) -> &[PullRequestMergeAuthorityBlocker] {
+        match self {
+            Self::Allowed { .. } => &[],
+            Self::Blocked { blockers, .. } => blockers,
+        }
+    }
+
+    pub fn merge_decision(&self) -> Option<&MergeDecision> {
+        match self {
+            Self::Allowed { merge_decision } => Some(merge_decision),
+            Self::Blocked { merge_decision, .. } => merge_decision.as_ref(),
+        }
+    }
+}
+
+/// Adapt an authenticated, constructor-validated PR snapshot and explicit
+/// ground-truth evidence to optimizer merge authority.
+///
+/// The function is side-effect free: it does not call GitHub, merge a branch,
+/// or interpret request/comment text as evidence.
+pub fn decide_pull_request_merge(
+    snapshot: &PullRequestReviewSnapshot,
+    input: &PullRequestMergeAuthorityInput,
+) -> PullRequestMergeAuthorityDecision {
+    let head_oid = snapshot
+        .item()
+        .head_oid()
+        .expect("validated PR snapshots always contain a head OID");
+    let base_oid = snapshot
+        .item()
+        .base_oid()
+        .expect("validated PR snapshots always contain a base OID");
+    let mut blockers = Vec::new();
+    let mut structurally_trusted = true;
+
+    let decided_at = match &input.freshness {
+        Some(freshness) => {
+            match freshness.status {
+                PullRequestFreshnessStatus::Fresh => {}
+                PullRequestFreshnessStatus::Stale => {
+                    blockers.push(PullRequestMergeAuthorityBlocker::StaleSnapshotObservation);
+                    structurally_trusted = false;
+                }
+                PullRequestFreshnessStatus::Uncertain => {
+                    blockers.push(PullRequestMergeAuthorityBlocker::UncertainSnapshotFreshness);
+                    structurally_trusted = false;
+                }
+            }
+            if freshness.current_item.head_oid() != Some(head_oid) {
+                blockers.push(PullRequestMergeAuthorityBlocker::StaleSnapshotHead {
+                    snapshot_head_oid: head_oid.to_string(),
+                    current_head_oid: freshness
+                        .current_item
+                        .head_oid()
+                        .unwrap_or_default()
+                        .to_string(),
+                });
+                structurally_trusted = false;
+            }
+            if freshness.snapshot_observed_at != *snapshot.observed_at() {
+                blockers.push(PullRequestMergeAuthorityBlocker::StaleSnapshotObservation);
+                structurally_trusted = false;
+            }
+            if freshness.current_item != *snapshot.item() {
+                blockers.push(PullRequestMergeAuthorityBlocker::SnapshotItemMismatch);
+                structurally_trusted = false;
+            }
+            Some(freshness.decided_at)
+        }
+        None => {
+            blockers.push(PullRequestMergeAuthorityBlocker::MissingFreshnessEvidence);
+            structurally_trusted = false;
+            None
+        }
+    };
+
+    let verification_checks = map_required_checks(snapshot, &input.required_checks, &mut blockers);
+
+    let producer = match &input.producer {
+        Some(evidence) => {
+            if !producer_is_complete(&evidence.producer) {
+                blockers.push(PullRequestMergeAuthorityBlocker::IncompleteProducerEvidence);
+                structurally_trusted = false;
+            }
+            if evidence.head_oid != head_oid {
+                blockers.push(PullRequestMergeAuthorityBlocker::StaleProducerEvidence);
+                structurally_trusted = false;
+            }
+            Some(evidence.producer.clone())
+        }
+        None => {
+            blockers.push(PullRequestMergeAuthorityBlocker::MissingProducerEvidence);
+            structurally_trusted = false;
+            None
+        }
+    };
+
+    let (auditor, lenses) = match &input.auditor {
+        Some(evidence) => {
+            if !actor_is_complete(&evidence.auditor) {
+                blockers.push(PullRequestMergeAuthorityBlocker::IncompleteAuditorEvidence);
+                structurally_trusted = false;
+            }
+            if evidence.head_oid != head_oid
+                || evidence.snapshot_observed_at != *snapshot.observed_at()
+            {
+                blockers.push(PullRequestMergeAuthorityBlocker::StaleAuditorEvidence);
+                structurally_trusted = false;
+            }
+            let mut lenses = evidence.lenses.clone();
+            if lenses_are_uncertain(&lenses) {
+                blockers.push(PullRequestMergeAuthorityBlocker::UncertainAuditorEvidence);
+                for lens in &mut lenses {
+                    if lens.lens_id.trim().is_empty()
+                        || lens.model_label.trim().is_empty()
+                        || lens.framing.trim().is_empty()
+                        || lens.information_scope.trim().is_empty()
+                    {
+                        lens.decision = LensDecision::CannotVerify;
+                    }
+                }
+            }
+            (Some(evidence.auditor.clone()), Some(lenses))
+        }
+        None => {
+            blockers.push(PullRequestMergeAuthorityBlocker::MissingAuditorEvidence);
+            structurally_trusted = false;
+            (None, None)
+        }
+    };
+
+    let branch_merges_cleanly = match &input.merge_simulation {
+        Some(evidence) => {
+            if evidence.head_oid != head_oid
+                || evidence.base_oid != base_oid
+                || evidence.snapshot_observed_at != *snapshot.observed_at()
+            {
+                blockers.push(PullRequestMergeAuthorityBlocker::StaleMergeSimulationEvidence);
+                structurally_trusted = false;
+            }
+            Some(evidence.merges_cleanly)
+        }
+        None => {
+            blockers.push(PullRequestMergeAuthorityBlocker::MissingMergeSimulationEvidence);
+            structurally_trusted = false;
+            None
+        }
+    };
+
+    let completion_mode = match input.completion_mode {
+        Some(mode) => Some(mode),
+        None => {
+            blockers.push(PullRequestMergeAuthorityBlocker::MissingCompletionMode);
+            structurally_trusted = false;
+            None
+        }
+    };
+
+    let changed_paths = match &input.changed_paths {
+        Some(evidence) => {
+            if evidence.paths.is_empty() {
+                blockers.push(PullRequestMergeAuthorityBlocker::EmptyChangedPathsEvidence);
+                structurally_trusted = false;
+            }
+            if evidence.head_oid != head_oid {
+                blockers.push(PullRequestMergeAuthorityBlocker::StaleChangedPathsEvidence);
+                structurally_trusted = false;
+            }
+            Some(evidence.paths.clone())
+        }
+        None => {
+            blockers.push(PullRequestMergeAuthorityBlocker::MissingChangedPathsEvidence);
+            structurally_trusted = false;
+            None
+        }
+    };
+
+    if !structurally_trusted {
+        return PullRequestMergeAuthorityDecision::Blocked {
+            blockers,
+            merge_decision: None,
+        };
+    }
+
+    let request = MergeRequest {
+        requested: true,
+        producer: producer.expect("trusted producer evidence is present"),
+        reviewer: auditor.expect("trusted auditor evidence is present"),
+        lenses: lenses.expect("trusted auditor lenses are present"),
+        certified: !verification_checks.is_empty()
+            && verification_checks
+                .iter()
+                .all(|check| check.status == CheckStatus::Passed),
+        checks: verification_checks,
+        branch_merges_cleanly: branch_merges_cleanly
+            .expect("trusted merge-simulation evidence is present"),
+        completion_mode: completion_mode.expect("trusted completion mode is present"),
+        changed_paths: changed_paths.expect("trusted changed-path evidence is present"),
+        decided_at: decided_at.expect("trusted freshness evidence is present"),
+    };
+
+    let merge_decision = match decide_merge(&request) {
+        Ok(decision) => decision,
+        Err(_) => {
+            blockers.push(PullRequestMergeAuthorityBlocker::OptimizerDecisionFailed);
+            return PullRequestMergeAuthorityDecision::Blocked {
+                blockers,
+                merge_decision: None,
+            };
+        }
+    };
+    blockers.extend(
+        merge_decision
+            .blockers
+            .iter()
+            .cloned()
+            .map(PullRequestMergeAuthorityBlocker::OptimizerBlocked),
+    );
+
+    if blockers.is_empty() && merge_decision.auto_merge_performed {
+        PullRequestMergeAuthorityDecision::Allowed { merge_decision }
+    } else {
+        PullRequestMergeAuthorityDecision::Blocked {
+            blockers,
+            merge_decision: Some(merge_decision),
+        }
+    }
+}
+
+fn map_required_checks(
+    snapshot: &PullRequestReviewSnapshot,
+    required_checks: &Option<Vec<String>>,
+    blockers: &mut Vec<PullRequestMergeAuthorityBlocker>,
+) -> Vec<VerificationCheck> {
+    let Some(required_checks) = required_checks else {
+        blockers.push(PullRequestMergeAuthorityBlocker::MissingRequiredChecks);
+        return Vec::new();
+    };
+    if required_checks.is_empty() {
+        blockers.push(PullRequestMergeAuthorityBlocker::MissingRequiredChecks);
+        return Vec::new();
+    }
+
+    let mut seen = BTreeSet::new();
+    required_checks
+        .iter()
+        .map(|required| {
+            if required.trim().is_empty() || required != required.trim() {
+                blockers.push(PullRequestMergeAuthorityBlocker::InvalidRequiredCheckName);
+                return VerificationCheck {
+                    name: required.clone(),
+                    status: CheckStatus::Uncertain,
+                };
+            }
+            if !seen.insert(required.as_str()) {
+                blockers.push(PullRequestMergeAuthorityBlocker::DuplicateRequiredCheck {
+                    name: required.clone(),
+                });
+                return VerificationCheck {
+                    name: required.clone(),
+                    status: CheckStatus::Uncertain,
+                };
+            }
+
+            let matching: Vec<&ForgeCheck> = snapshot
+                .checks()
+                .iter()
+                .filter(|check| check.name() == required)
+                .collect();
+            let status = match matching.as_slice() {
+                [] => {
+                    blockers.push(PullRequestMergeAuthorityBlocker::MissingRequiredCheck {
+                        name: required.clone(),
+                    });
+                    CheckStatus::Missing
+                }
+                [check] => map_required_check_status(check, blockers),
+                _ => {
+                    blockers.push(PullRequestMergeAuthorityBlocker::AmbiguousRequiredCheck {
+                        name: required.clone(),
+                    });
+                    CheckStatus::Uncertain
+                }
+            };
+            VerificationCheck {
+                name: required.clone(),
+                status,
+            }
+        })
+        .collect()
+}
+
+fn map_required_check_status(
+    check: &ForgeCheck,
+    blockers: &mut Vec<PullRequestMergeAuthorityBlocker>,
+) -> CheckStatus {
+    if check.status() != ForgeCheckStatus::Completed {
+        blockers.push(PullRequestMergeAuthorityBlocker::UncertainRequiredCheck {
+            name: check.name().to_string(),
+        });
+        return CheckStatus::Uncertain;
+    }
+    match check
+        .conclusion()
+        .expect("completed forge checks always contain a conclusion")
+    {
+        ForgeCheckConclusion::Success => CheckStatus::Passed,
+        ForgeCheckConclusion::Skipped => {
+            blockers.push(PullRequestMergeAuthorityBlocker::SkippedRequiredCheck {
+                name: check.name().to_string(),
+            });
+            CheckStatus::Skipped
+        }
+        ForgeCheckConclusion::Stale => {
+            blockers.push(PullRequestMergeAuthorityBlocker::StaleRequiredCheck {
+                name: check.name().to_string(),
+            });
+            CheckStatus::Stale
+        }
+        conclusion => {
+            blockers.push(PullRequestMergeAuthorityBlocker::FailedRequiredCheck {
+                name: check.name().to_string(),
+                conclusion,
+            });
+            CheckStatus::Failed
+        }
+    }
+}
+
+fn actor_is_complete(actor: &MergeActor) -> bool {
+    [
+        actor.agent.stable_id.as_str(),
+        actor.session.id.as_str(),
+        actor.model_label.as_str(),
+    ]
+    .into_iter()
+    .all(|value| !value.trim().is_empty() && value == value.trim())
+}
+
+fn producer_is_complete(producer: &ProducerFingerprint) -> bool {
+    actor_is_complete(&producer.actor)
+        && !producer.commit_authors.is_empty()
+        && !producer.commit_committers.is_empty()
+        && producer
+            .commit_authors
+            .iter()
+            .chain(&producer.commit_committers)
+            .all(|value| !value.trim().is_empty() && value == value.trim())
+}
+
+fn lenses_are_uncertain(lenses: &[LensVerdict]) -> bool {
+    let mut ids = BTreeSet::new();
+    lenses.iter().any(|lens| {
+        lens.lens_id.trim().is_empty()
+            || lens.model_label.trim().is_empty()
+            || lens.framing.trim().is_empty()
+            || lens.information_scope.trim().is_empty()
+            || !ids.insert(lens.lens_id.as_str())
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
