@@ -2800,12 +2800,13 @@ fn apply_systemd_sandbox_properties(command: &mut Command, sandbox: &ResolvedSys
     } else if sandbox.kind == SideEffectConfinementProfileKind::ExternalCodex {
         command.args([
             "--property=PrivateNetwork=no",
-            // Codex's inner bubblewrap sandbox needs AF_NETLINK while constructing its network
-            // namespace and configuring loopback. Keep this exception exclusive to ExternalCodex.
-            "--property=RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK",
+            // Codex initializes local Unix streams before its inner bubblewrap sandbox uses
+            // AF_NETLINK to construct the network namespace and configure loopback. Known
+            // same-user sockets remain masked by the exact path policy below.
+            "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
             // Bubblewrap must construct the inner mount tree. Keep the rest of the ordinary
-            // networked deny list intact and relax @mount only for ExternalCodex.
-            "--property=SystemCallFilter=~@clock @debug @module @obsolete @raw-io @reboot @swap bpf fanotify_init fanotify_mark ipc mq_getsetattr mq_notify mq_open mq_timedreceive mq_timedreceive_time64 mq_timedsend mq_timedsend_time64 mq_unlink msgctl msgget msgrcv msgsnd open_by_handle_at process_madvise process_vm_readv process_vm_writev quotactl quotactl_fd semctl semget semop semtimedop semtimedop_time64 shmat shmctl shmdt shmget link linkat mknod mknodat socketpair",
+            // networked deny list intact and relax @mount and socketpair only for ExternalCodex.
+            "--property=SystemCallFilter=~@clock @debug @module @obsolete @raw-io @reboot @swap bpf fanotify_init fanotify_mark ipc mq_getsetattr mq_notify mq_open mq_timedreceive mq_timedreceive_time64 mq_timedsend mq_timedsend_time64 mq_unlink msgctl msgget msgrcv msgsnd open_by_handle_at process_madvise process_vm_readv process_vm_writev quotactl quotactl_fd semctl semget semop semtimedop semtimedop_time64 shmat shmctl shmdt shmget link linkat mknod mknodat",
         ]);
     } else if sandbox.kind == SideEffectConfinementProfileKind::ExternalGrok {
         command.args([
@@ -3221,7 +3222,7 @@ fn verify_systemd_network_properties(
     let expected_families = match kind {
         SideEffectConfinementProfileKind::StrictOfflineWorkspace => BTreeSet::from(["AF_UNIX"]),
         SideEffectConfinementProfileKind::ExternalCodex => {
-            BTreeSet::from(["AF_INET", "AF_INET6", "AF_NETLINK"])
+            BTreeSet::from(["AF_UNIX", "AF_INET", "AF_INET6", "AF_NETLINK"])
         }
         SideEffectConfinementProfileKind::ExternalGrok => {
             BTreeSet::from(["AF_UNIX", "AF_INET", "AF_INET6"])
