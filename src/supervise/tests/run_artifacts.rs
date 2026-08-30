@@ -1185,7 +1185,7 @@ fn scheduler_materializes_and_binds_worker_codex_schema_for_direct_worker() {
                 path.file_name().and_then(OsStr::to_str) == Some("worker-report.schema.json")
             }));
             fs::write(
-                command.current_dir.join(&target),
+                command.cwd.join(&target),
                 "#[test]\nfn direct_worker_target_changed() {}\n",
             )
             .expect("mutate the direct Worker target inside its managed worktree");
