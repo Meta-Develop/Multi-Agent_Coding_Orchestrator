@@ -923,6 +923,7 @@ impl ExternalGrokReadOnlyFileCapability {
 
     fn private_grok_home_target(&self, runtime_dir: &Path) -> Option<PathBuf> {
         match &self.projection {
+            #[cfg(test)]
             ExternalGrokReadOnlyFileProjection::Direct => None,
             ExternalGrokReadOnlyFileProjection::PrivateGrokHome { file_name } => {
                 Some(runtime_dir.join(file_name))
@@ -965,8 +966,11 @@ impl Eq for ExternalGrokReadOnlyFileCapability {}
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ExternalGrokReadOnlyFileProjection {
+    #[cfg(test)]
     Direct,
-    PrivateGrokHome { file_name: String },
+    PrivateGrokHome {
+        file_name: String,
+    },
 }
 
 #[cfg(target_os = "linux")]
@@ -1126,7 +1130,7 @@ impl WorkspaceSandboxConfig {
         Ok(self)
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", test))]
     fn with_external_grok_read_only_file_capability(
         mut self,
         file: impl Into<PathBuf>,
@@ -1448,7 +1452,7 @@ impl ExternalGrokProfile {
         self
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", test))]
     pub(crate) fn with_visible_read_only_file_capability(
         mut self,
         file: impl Into<PathBuf>,
@@ -3041,15 +3045,17 @@ fn validate_workspace_config_bounds(config: &WorkspaceSandboxConfig) -> std::io:
                     "ExternalGrok read-only file capability is duplicate or lacks an exact read-only file",
                 ));
             }
-            if let ExternalGrokReadOnlyFileProjection::PrivateGrokHome { file_name } =
-                &capability.projection
-            {
-                validate_private_runtime_file_name(file_name)?;
-                if !grok_projection_names.insert(file_name) {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "ExternalGrok private home file projection is duplicate",
-                    ));
+            match &capability.projection {
+                #[cfg(test)]
+                ExternalGrokReadOnlyFileProjection::Direct => {}
+                ExternalGrokReadOnlyFileProjection::PrivateGrokHome { file_name } => {
+                    validate_private_runtime_file_name(file_name)?;
+                    if !grok_projection_names.insert(file_name) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "ExternalGrok private home file projection is duplicate",
+                        ));
+                    }
                 }
             }
         }

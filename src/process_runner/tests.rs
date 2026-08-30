@@ -1264,7 +1264,7 @@ fn external_codex_writable_workspace_resolves_nested_read_only_controls() {
     }
 
     let mut command = Command::new("systemd-run");
-    apply_systemd_sandbox_properties(&mut command, &sandbox);
+    apply_systemd_sandbox_properties(&mut command, &sandbox, &runtime);
     command
         .arg(systemd_path_property("BindPaths=", &runtime, false))
         .arg(systemd_path_property("ReadWritePaths=", &runtime, false));
@@ -1687,7 +1687,11 @@ fn exact_writable_file_capability_carves_read_only_parent_from_writable_artifact
     }
 
     let mut command = Command::new("systemd-run");
-    apply_systemd_sandbox_properties(&mut command, &sandbox);
+    apply_systemd_sandbox_properties(
+        &mut command,
+        &sandbox,
+        Path::new("/run/user/1000/maco-test-runtime"),
+    );
     let arguments = command
         .get_args()
         .map(|argument| argument.to_string_lossy().into_owned())
@@ -2445,7 +2449,7 @@ fn isolated_host_view_resolves_disjoint_required_mounts_and_root_tmpfs() {
     }));
 
     let mut command = Command::new("systemd-run");
-    apply_systemd_sandbox_properties(&mut command, &sandbox);
+    apply_systemd_sandbox_properties(&mut command, &sandbox, &runtime);
     assert!(command
         .get_args()
         .any(|arg| arg == OsStr::new("--property=TemporaryFileSystem=/:ro")));
@@ -2833,7 +2837,11 @@ fn external_codex_alone_admits_inner_bubblewrap_namespaces_and_mounts() {
     let mut external = program_visibility_sandbox(Path::new("/worktree"));
     external.kind = SideEffectConfinementProfileKind::ExternalCodex;
     let mut command = Command::new("systemd-run");
-    apply_systemd_sandbox_properties(&mut command, &external);
+    apply_systemd_sandbox_properties(
+        &mut command,
+        &external,
+        Path::new("/run/user/1000/maco-test-runtime"),
+    );
     let arguments = command
         .get_args()
         .map(|argument| argument.to_string_lossy().into_owned())
@@ -2870,7 +2878,11 @@ fn external_codex_alone_admits_inner_bubblewrap_namespaces_and_mounts() {
         let mut ordinary = program_visibility_sandbox(Path::new("/worktree"));
         ordinary.kind = kind;
         let mut command = Command::new("systemd-run");
-        apply_systemd_sandbox_properties(&mut command, &ordinary);
+        apply_systemd_sandbox_properties(
+            &mut command,
+            &ordinary,
+            Path::new("/run/user/1000/maco-test-runtime"),
+        );
         let arguments = command
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
