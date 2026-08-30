@@ -29,6 +29,7 @@ use std::{
 };
 #[cfg(target_os = "linux")]
 use std::{
+    fmt,
     fs::{File, OpenOptions},
     sync::Arc,
 };
@@ -46,8 +47,8 @@ const GROK_MODEL_DISPLAY_NAME_MAX_BYTES: usize = 768;
 const GROK_LOGIN_PROVIDER_MAX_BYTES: usize = 253;
 const GROK_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
 const GROK_DIGEST_FRAMING_VERSION: &[u8] = b"maco.grok.advertised-catalog.v1\n";
-const GROK_CATALOG_AUTH_FILE: &str = "auth.json";
-const GROK_CATALOG_CONFIG_FILE: &str = "config.toml";
+const GROK_AUTH_FILE: &str = "auth.json";
+const GROK_CONFIG_FILE: &str = "config.toml";
 
 /// Fixed host entry point used when the operator does not set `MACO_GROK_BIN`.
 ///
@@ -940,24 +941,291 @@ fn screened_grok_catalog_process_spec(spec: &GrokCatalogCommandSpec) -> Result<P
     }
     #[cfg(target_os = "linux")]
     {
+        let sources = GrokCredentialSource::from_ambient_environment()?;
+        screened_grok_catalog_process_spec_with_credential_source(spec, program, &sources)
+    }
+}
+
+/// Admitted host credential/configuration sources for one confined Grok process.
+///
+/// This capability owns read-only descriptors for the exact files selected by
+/// `GROK_HOME`. It deliberately has no byte-reading or serialization API. A
+/// caller may copy the normalized environment value and bind the held files to
+/// an [`ExternalGrokProfile`]; the profile performs another pathname identity
+/// check before the process is released.
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+pub(crate) struct GrokCredentialSource {
+    grok_home_environment: String,
+    auth: GrokCredentialFile,
+    config: Option<GrokCredentialFile>,
+}
+
+#[cfg(target_os = "linux")]
+impl GrokCredentialSource {
+    /// Admit the current process's Grok credential source without reading it.
+    pub(crate) fn from_ambient_environment() -> Result<Self> {
         let ambient_home = env::var_os("HOME");
         let ambient_grok_home = env::var_os("GROK_HOME");
-        screened_grok_catalog_process_spec_with_sources(
-            spec,
-            program,
-            ambient_home.as_deref(),
-            ambient_grok_home.as_deref(),
-        )
+        Self::from_environment(ambient_home.as_deref(), ambient_grok_home.as_deref())
+    }
+
+    /// Derive and admit an absolute, lexically normalized `GROK_HOME`.
+    ///
+    /// `auth.json` is mandatory. `config.toml` is admitted only when present.
+    /// Neither file is read; successful admission retains its descriptor and
+    /// the device/inode identity observed through both descriptor and path.
+    pub(crate) fn from_environment(
+        ambient_home: Option<&OsStr>,
+        ambient_grok_home: Option<&OsStr>,
+    ) -> Result<Self> {
+        let grok_home = match ambient_grok_home {
+            Some(grok_home) => PathBuf::from(grok_home),
+            None => PathBuf::from(ambient_home.ok_or(GrokCredentialSourceFailure::HomeMissing)?)
+                .join(".grok"),
+        };
+        if !grok_home.is_absolute()
+            || grok_home.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::CurDir | std::path::Component::ParentDir
+                )
+            })
+        {
+            return Err(GrokCredentialSourceFailure::HomeNotAbsoluteNormalized.into());
+        }
+        let grok_home = grok_home.components().collect::<PathBuf>();
+        let grok_home_environment = grok_home
+            .to_str()
+            .ok_or(GrokCredentialSourceFailure::HomeNotUtf8)?
+            .to_string();
+        let auth = GrokCredentialFile::open(
+            grok_home.join(GROK_AUTH_FILE),
+            GrokCredentialFileKind::Authentication,
+        )?
+        .ok_or(GrokCredentialSourceFailure::AuthenticationMissing)?;
+        let config = GrokCredentialFile::open(
+            grok_home.join(GROK_CONFIG_FILE),
+            GrokCredentialFileKind::Configuration,
+        )?;
+        Ok(Self {
+            grok_home_environment,
+            auth,
+            config,
+        })
+    }
+
+    /// The only environment value derived from this capability.
+    pub(crate) fn grok_home_environment(&self) -> &str {
+        &self.grok_home_environment
+    }
+
+    /// Bind the exact held sources into a Grok confinement profile.
+    pub(crate) fn bind_to_profile(
+        &self,
+        profile: ExternalGrokProfile,
+    ) -> Result<ExternalGrokProfile> {
+        let profile = self.auth.bind_to_profile(profile)?;
+        match &self.config {
+            Some(config) => config.bind_to_profile(profile),
+            None => Ok(profile),
+        }
     }
 }
 
 #[cfg(target_os = "linux")]
-struct ReviewedGrokCatalogSources {
-    grok_home_environment: String,
-    auth_path: PathBuf,
-    auth_file: Arc<File>,
-    config: Option<(PathBuf, Arc<File>)>,
+impl fmt::Debug for GrokCredentialSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GrokCredentialSource")
+            .field("authentication", &"held read-only source")
+            .field("configuration_present", &self.config.is_some())
+            .finish_non_exhaustive()
+    }
 }
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct GrokCredentialFile {
+    kind: GrokCredentialFileKind,
+    path: PathBuf,
+    held_file: Arc<File>,
+    identity: GrokCredentialFileIdentity,
+}
+
+#[cfg(target_os = "linux")]
+impl GrokCredentialFile {
+    fn open(path: PathBuf, kind: GrokCredentialFileKind) -> Result<Option<Self>> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error)
+                if kind == GrokCredentialFileKind::Configuration
+                    && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            }
+            Err(error)
+                if kind == GrokCredentialFileKind::Authentication
+                    && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Err(GrokCredentialSourceFailure::AuthenticationMissing.into());
+            }
+            Err(_) => return Err(kind.unavailable_failure().into()),
+        };
+        let identity = file
+            .metadata()
+            .ok()
+            .and_then(|metadata| GrokCredentialFileIdentity::from_metadata(&metadata))
+            .ok_or_else(|| anyhow::Error::from(kind.not_regular_failure()))?;
+        let observed_identity = std::fs::symlink_metadata(&path)
+            .ok()
+            .and_then(|metadata| GrokCredentialFileIdentity::from_metadata(&metadata))
+            .ok_or_else(|| anyhow::Error::from(kind.identity_changed_failure()))?;
+        if observed_identity != identity {
+            return Err(kind.identity_changed_failure().into());
+        }
+        Ok(Some(Self {
+            kind,
+            path,
+            held_file: Arc::new(file),
+            identity,
+        }))
+    }
+
+    fn bind_to_profile(&self, profile: ExternalGrokProfile) -> Result<ExternalGrokProfile> {
+        self.revalidate()?;
+        profile
+            .with_visible_read_only_file_capability(&self.path, Arc::clone(&self.held_file))
+            .map_err(|_| anyhow::Error::from(self.kind.identity_changed_failure()))
+    }
+
+    fn revalidate(&self) -> Result<()> {
+        let held_identity = self
+            .held_file
+            .metadata()
+            .ok()
+            .and_then(|metadata| GrokCredentialFileIdentity::from_metadata(&metadata));
+        let observed_identity = std::fs::symlink_metadata(&self.path)
+            .ok()
+            .and_then(|metadata| GrokCredentialFileIdentity::from_metadata(&metadata));
+        if held_identity != Some(self.identity) || observed_identity != Some(self.identity) {
+            return Err(self.kind.identity_changed_failure().into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GrokCredentialFileIdentity {
+    device: u64,
+    inode: u64,
+    owner: u32,
+    mode: u32,
+    links: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl GrokCredentialFileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        metadata.is_file().then(|| Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            owner: metadata.uid(),
+            mode: metadata.mode(),
+            links: metadata.nlink(),
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GrokCredentialFileKind {
+    Authentication,
+    Configuration,
+}
+
+#[cfg(target_os = "linux")]
+impl GrokCredentialFileKind {
+    const fn unavailable_failure(self) -> GrokCredentialSourceFailure {
+        match self {
+            Self::Authentication => GrokCredentialSourceFailure::AuthenticationUnavailable,
+            Self::Configuration => GrokCredentialSourceFailure::ConfigurationUnavailable,
+        }
+    }
+
+    const fn not_regular_failure(self) -> GrokCredentialSourceFailure {
+        match self {
+            Self::Authentication => GrokCredentialSourceFailure::AuthenticationNotRegular,
+            Self::Configuration => GrokCredentialSourceFailure::ConfigurationNotRegular,
+        }
+    }
+
+    const fn identity_changed_failure(self) -> GrokCredentialSourceFailure {
+        match self {
+            Self::Authentication => GrokCredentialSourceFailure::AuthenticationIdentityChanged,
+            Self::Configuration => GrokCredentialSourceFailure::ConfigurationIdentityChanged,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrokCredentialSourceFailure {
+    HomeMissing,
+    HomeNotAbsoluteNormalized,
+    HomeNotUtf8,
+    AuthenticationMissing,
+    AuthenticationUnavailable,
+    AuthenticationNotRegular,
+    AuthenticationIdentityChanged,
+    ConfigurationUnavailable,
+    ConfigurationNotRegular,
+    ConfigurationIdentityChanged,
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Display for GrokCredentialSourceFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::HomeMissing => "Grok credential source requires HOME or GROK_HOME",
+            Self::HomeNotAbsoluteNormalized => {
+                "Grok credential state home must be an absolute normalized path"
+            }
+            Self::HomeNotUtf8 => "Grok credential state home is not valid UTF-8",
+            Self::AuthenticationMissing => "Grok authentication source auth.json is missing",
+            Self::AuthenticationUnavailable => {
+                "Grok authentication source auth.json is unavailable"
+            }
+            Self::AuthenticationNotRegular => {
+                "Grok authentication source auth.json is not a regular file"
+            }
+            Self::AuthenticationIdentityChanged => {
+                "Grok authentication source auth.json identity changed"
+            }
+            Self::ConfigurationUnavailable => {
+                "Grok configuration source config.toml is unavailable"
+            }
+            Self::ConfigurationNotRegular => {
+                "Grok configuration source config.toml is not a regular file"
+            }
+            Self::ConfigurationIdentityChanged => {
+                "Grok configuration source config.toml identity changed"
+            }
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::error::Error for GrokCredentialSourceFailure {}
 
 #[cfg(target_os = "linux")]
 fn screened_grok_catalog_process_spec_with_sources(
@@ -966,17 +1234,22 @@ fn screened_grok_catalog_process_spec_with_sources(
     ambient_home: Option<&OsStr>,
     ambient_grok_home: Option<&OsStr>,
 ) -> Result<ProcessSpec> {
-    let sources = reviewed_grok_catalog_sources(ambient_home, ambient_grok_home)?;
+    let sources = GrokCredentialSource::from_environment(ambient_home, ambient_grok_home)?;
+    screened_grok_catalog_process_spec_with_credential_source(spec, program, &sources)
+}
+
+#[cfg(target_os = "linux")]
+fn screened_grok_catalog_process_spec_with_credential_source(
+    spec: &GrokCatalogCommandSpec,
+    program: PathBuf,
+    sources: &GrokCredentialSource,
+) -> Result<ProcessSpec> {
     let mut environment = spec.environment().clone();
-    environment.insert("GROK_HOME".to_string(), sources.grok_home_environment);
-    let mut profile = ExternalGrokProfile::read_only(spec.current_dir())
-        .with_visible_read_only_file_capability(sources.auth_path, sources.auth_file)
-        .context("failed to bind the reviewed Grok catalog authentication source")?;
-    if let Some((config_path, config_file)) = sources.config {
-        profile = profile
-            .with_visible_read_only_file_capability(config_path, config_file)
-            .context("failed to bind the reviewed Grok catalog configuration source")?;
-    }
+    environment.insert(
+        "GROK_HOME".to_string(),
+        sources.grok_home_environment().to_string(),
+    );
+    let profile = sources.bind_to_profile(ExternalGrokProfile::read_only(spec.current_dir()))?;
     Ok(ProcessSpec::direct(
         "Grok runtime model catalog",
         program,
@@ -989,66 +1262,6 @@ fn screened_grok_catalog_process_spec_with_sources(
     .with_timeout(Some(spec.timeout()))
     .with_private_runtime_home(true)
     .with_side_effect_confinement(SideEffectConfinementProfile::ExternalGrok(profile)))
-}
-
-#[cfg(target_os = "linux")]
-fn reviewed_grok_catalog_sources(
-    ambient_home: Option<&OsStr>,
-    ambient_grok_home: Option<&OsStr>,
-) -> Result<ReviewedGrokCatalogSources> {
-    let grok_home = match ambient_grok_home {
-        Some(grok_home) => PathBuf::from(grok_home),
-        None => PathBuf::from(
-            ambient_home.context("Grok catalog authentication requires HOME or GROK_HOME")?,
-        )
-        .join(".grok"),
-    };
-    if !grok_home.is_absolute()
-        || grok_home.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::CurDir | std::path::Component::ParentDir
-            )
-        })
-    {
-        bail!("Grok catalog state home must be an absolute normalized path");
-    }
-    let grok_home_environment = grok_home
-        .to_str()
-        .context("Grok catalog state home is not valid UTF-8")?
-        .to_string();
-    let auth_path = grok_home.join(GROK_CATALOG_AUTH_FILE);
-    let auth_file = open_reviewed_grok_catalog_source(&auth_path, true)?
-        .context("Grok catalog authentication source is missing")?;
-    let config_path = grok_home.join(GROK_CATALOG_CONFIG_FILE);
-    let config =
-        open_reviewed_grok_catalog_source(&config_path, false)?.map(|file| (config_path, file));
-    Ok(ReviewedGrokCatalogSources {
-        grok_home_environment,
-        auth_path,
-        auth_file,
-        config,
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn open_reviewed_grok_catalog_source(path: &Path, required: bool) -> Result<Option<Arc<File>>> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let result = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path);
-    match result {
-        Ok(file) => Ok(Some(Arc::new(file))),
-        Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| {
-            format!(
-                "failed to open reviewed Grok catalog source {}",
-                path.display()
-            )
-        }),
-    }
 }
 
 fn resolve_catalog_program(program: &Path) -> Result<PathBuf> {
@@ -1733,8 +1946,8 @@ mod tests {
         fs::write(&program, "")?;
         let grok_home = dir.path().join("reviewed-grok-home");
         fs::create_dir(&grok_home)?;
-        let auth = grok_home.join(GROK_CATALOG_AUTH_FILE);
-        let config = grok_home.join(GROK_CATALOG_CONFIG_FILE);
+        let auth = grok_home.join(GROK_AUTH_FILE);
+        let config = grok_home.join(GROK_CONFIG_FILE);
         fs::write(&auth, "hermetic-auth-fixture")?;
         fs::write(&config, "hermetic-config-fixture")?;
         let spec = GrokCatalogCommandSpec::new(dir.path()).with_program(&program);
@@ -1801,14 +2014,16 @@ mod tests {
         fs::write(&program, "")?;
         let spec = GrokCatalogCommandSpec::new(dir.path()).with_program(&program);
 
-        let missing_home = match reviewed_grok_catalog_sources(None, None) {
+        let missing_home = match GrokCredentialSource::from_environment(None, None) {
             Ok(_) => panic!("ambient home omission must fail closed"),
             Err(error) => error.to_string(),
         };
         assert!(missing_home.contains("HOME or GROK_HOME"), "{missing_home}");
 
-        let relative = match reviewed_grok_catalog_sources(None, Some(OsStr::new("relative/.grok")))
-        {
+        let relative = match GrokCredentialSource::from_environment(
+            None,
+            Some(OsStr::new("relative/.grok")),
+        ) {
             Ok(_) => panic!("relative state home must fail closed"),
             Err(error) => error.to_string(),
         };
@@ -1824,18 +2039,15 @@ mod tests {
         )
         .expect_err("missing authentication source must fail closed")
         .to_string();
-        assert!(
-            missing_auth.contains(GROK_CATALOG_AUTH_FILE),
-            "{missing_auth}"
-        );
+        assert!(missing_auth.contains(GROK_AUTH_FILE), "{missing_auth}");
 
         let malformed_config_home = dir.path().join("malformed-config");
         fs::create_dir(&malformed_config_home)?;
         fs::write(
-            malformed_config_home.join(GROK_CATALOG_AUTH_FILE),
+            malformed_config_home.join(GROK_AUTH_FILE),
             "hermetic-auth-fixture",
         )?;
-        fs::create_dir(malformed_config_home.join(GROK_CATALOG_CONFIG_FILE))?;
+        fs::create_dir(malformed_config_home.join(GROK_CONFIG_FILE))?;
         let malformed_config = screened_grok_catalog_process_spec_with_sources(
             &spec,
             program,
@@ -1858,13 +2070,141 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn grok_credential_source_rejects_symlink_and_replaced_files() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir()?;
+        let grok_home = dir.path().join("grok-home");
+        fs::create_dir(&grok_home)?;
+        let external = dir.path().join("external-secret-source");
+        fs::write(&external, "synthetic-secret-fixture")?;
+        let auth = grok_home.join(GROK_AUTH_FILE);
+        let config = grok_home.join(GROK_CONFIG_FILE);
+
+        symlink(&external, &auth)?;
+        let auth_symlink =
+            GrokCredentialSource::from_environment(None, Some(grok_home.as_os_str()))
+                .expect_err("a symlink authentication source must be refused")
+                .to_string();
+        assert!(auth_symlink.contains("auth.json is unavailable"));
+
+        fs::remove_file(&auth)?;
+        fs::write(&auth, "admitted-auth-fixture")?;
+        symlink(&external, &config)?;
+        let config_symlink =
+            GrokCredentialSource::from_environment(None, Some(grok_home.as_os_str()))
+                .expect_err("a symlink configuration source must be refused")
+                .to_string();
+        assert!(config_symlink.contains("config.toml is unavailable"));
+
+        fs::remove_file(&config)?;
+        fs::write(&config, "admitted-config-fixture")?;
+        let auth_source =
+            GrokCredentialSource::from_environment(None, Some(grok_home.as_os_str()))?;
+        let replacement_auth = grok_home.join("replacement-auth");
+        fs::write(&replacement_auth, "replacement-auth-fixture")?;
+        fs::rename(&replacement_auth, &auth)?;
+        let replaced_auth = auth_source
+            .bind_to_profile(ExternalGrokProfile::read_only(dir.path()))
+            .expect_err("a replaced authentication source must be refused")
+            .to_string();
+        assert!(replaced_auth.contains("auth.json identity changed"));
+
+        let config_source =
+            GrokCredentialSource::from_environment(None, Some(grok_home.as_os_str()))?;
+        let replacement_config = grok_home.join("replacement-config");
+        fs::write(&replacement_config, "replacement-config-fixture")?;
+        fs::rename(&replacement_config, &config)?;
+        let replaced_config = config_source
+            .bind_to_profile(ExternalGrokProfile::read_only(dir.path()))
+            .expect_err("a replaced configuration source must be refused")
+            .to_string();
+        assert!(replaced_config.contains("config.toml identity changed"));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grok_credential_source_holds_read_only_cloexec_descriptors() -> Result<()> {
+        use std::os::fd::AsRawFd;
+
+        let dir = tempfile::tempdir()?;
+        let grok_home = dir.path().join("grok-home");
+        fs::create_dir(&grok_home)?;
+        let auth = grok_home.join(GROK_AUTH_FILE);
+        let config = grok_home.join(GROK_CONFIG_FILE);
+        fs::write(&auth, "synthetic-auth-fixture")?;
+        fs::write(&config, "synthetic-config-fixture")?;
+        let source = GrokCredentialSource::from_environment(None, Some(grok_home.as_os_str()))?;
+
+        assert_eq!(source.grok_home_environment(), grok_home.to_str().unwrap());
+        for admitted in [&source.auth, source.config.as_ref().unwrap()] {
+            let descriptor = admitted.held_file.as_raw_fd();
+            // SAFETY: both fcntl commands only inspect flags on a live held descriptor.
+            let (descriptor_flags, status_flags) = unsafe {
+                (
+                    libc::fcntl(descriptor, libc::F_GETFD),
+                    libc::fcntl(descriptor, libc::F_GETFL),
+                )
+            };
+            assert!(descriptor_flags >= 0);
+            assert_ne!(descriptor_flags & libc::FD_CLOEXEC, 0);
+            assert!(status_flags >= 0);
+            assert_eq!(status_flags & libc::O_ACCMODE, libc::O_RDONLY);
+            assert!(
+                GrokCredentialFileIdentity::from_metadata(&admitted.held_file.metadata()?)
+                    == Some(admitted.identity)
+            );
+        }
+
+        let profile = source.bind_to_profile(ExternalGrokProfile::read_only(dir.path()))?;
+        assert_eq!(profile.visible_read_only_files(), &[auth, config]);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grok_credential_source_debug_and_errors_are_secret_free() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let secret = "credential-fixture-secret-value";
+        let grok_home = dir.path().join(secret);
+        fs::create_dir(&grok_home)?;
+        let auth = grok_home.join(GROK_AUTH_FILE);
+        fs::write(&auth, secret)?;
+        let source = GrokCredentialSource::from_environment(None, Some(grok_home.as_os_str()))?;
+
+        let debug = format!("{source:?}");
+        assert!(!debug.contains(secret), "{debug}");
+        assert!(!debug.contains(&grok_home.display().to_string()), "{debug}");
+
+        let replacement = grok_home.join("replacement-auth");
+        fs::write(&replacement, secret)?;
+        fs::rename(&replacement, &auth)?;
+        let error = source
+            .bind_to_profile(ExternalGrokProfile::read_only(dir.path()))
+            .expect_err("a replaced secret source must fail closed");
+        let rendered = format!("{error:#?}");
+        assert_eq!(
+            error.to_string(),
+            "Grok authentication source auth.json identity changed"
+        );
+        assert!(!rendered.contains(secret), "{rendered}");
+        assert!(
+            !rendered.contains(&grok_home.display().to_string()),
+            "{rendered}"
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn absent_optional_config_keeps_only_reviewed_auth_visible_and_home_private() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let program = dir.path().join("catalog-standin");
         fs::write(&program, "")?;
         let default_grok_home = dir.path().join(".grok");
         fs::create_dir(&default_grok_home)?;
-        let auth = default_grok_home.join(GROK_CATALOG_AUTH_FILE);
+        let auth = default_grok_home.join(GROK_AUTH_FILE);
         fs::write(&auth, "hermetic-auth-fixture")?;
         let spec = GrokCatalogCommandSpec::new(dir.path()).with_program(&program);
 
