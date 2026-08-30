@@ -41,7 +41,10 @@ const MAX_TAIL_ANCHOR_BYTES: usize = 4_096;
 const STORE_INTEGRITY_KEY_BYTES: usize = 32;
 const SHA256_BYTES: usize = 32;
 const HMAC_BLOCK_BYTES: usize = 64;
-const MAX_BROKER_INSTANCE_ID_BYTES: usize = 128;
+// `{messaging-v1}-{sha256}-{32-byte hex generation}` is 142 bytes. Keep the
+// ceiling aligned with envelope message-id bounds so a live broker instance
+// identity can also appear in durable message identifiers.
+const MAX_BROKER_INSTANCE_ID_BYTES: usize = 256;
 const MAX_AUTHORITY_IDENTITIES: usize = 65_536;
 const HARD_MAX_JOURNAL_RECORDS: usize = 1_000_000;
 const HARD_MAX_JOURNAL_BYTES: usize = 512 * 1024 * 1024;
