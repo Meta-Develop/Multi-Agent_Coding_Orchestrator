@@ -490,12 +490,9 @@ fn bind_selected_runtime_launch(
         && assignment.role == AgentRole::Worker
         && assignment.effective_role_category() == RoleCategory::NonDelegatingTerminalWorker
         && assignment.worker_assignments.is_empty();
-    if launch_runtime == SupervisorRuntime::Grok
-        && assignment.phase == AssignmentPhase::Execution
-        && !is_writable_grok_terminal_worker
-    {
+    if launch_runtime == SupervisorRuntime::Grok && !is_writable_grok_terminal_worker {
         bail!(
-            "{}: assignment '{}' must be an explicitly bound non-delegating terminal Worker with no nested assignments",
+            "{}: assignment '{}' must be an execution-phase, explicitly bound non-delegating terminal Worker with no nested assignments",
             crate::external_agent::WRITABLE_GROK_TERMINAL_WORKER_REQUIRED,
             assignment.id
         );
@@ -523,23 +520,6 @@ fn bind_selected_runtime_launch(
         command = command
             .with_model_selection(Some(model), resolution.selection.reasoning_effort.clone());
         prerender_selected_runtime_adapter_command(&command, launch_runtime)?;
-        if launch_runtime == SupervisorRuntime::Grok
-            && assignment.phase == AssignmentPhase::Execution
-        {
-            command = command.with_writable_runtime_selection(
-                &assignment.id,
-                launch_runtime,
-                is_writable_grok_terminal_worker,
-            )?;
-            command
-                .selected_writable_capabilities(launch_runtime, Some(&assignment.id))
-                .with_context(|| {
-                    format!(
-                        "writable Grok assignment '{}' did not prove its exact selected launch contract",
-                        assignment.id
-                    )
-                })?;
-        }
         return Ok(BoundSelectedRuntimeLaunch {
             command,
             model_provenance,
@@ -562,6 +542,49 @@ fn bind_selected_runtime_launch(
     })
 }
 
+fn bind_selected_grok_execution_workspace(
+    mut command: ExternalAgentCommand,
+    assignment: &OrchestratorAssignment,
+    launch_runtime: SupervisorRuntime,
+    managed_worktree: &Path,
+    writable_execution: bool,
+) -> Result<ExternalAgentCommand> {
+    if launch_runtime != SupervisorRuntime::Grok {
+        return Ok(command);
+    }
+    let is_writable_grok_terminal_worker = writable_execution
+        && assignment.phase == AssignmentPhase::Execution
+        && assignment.role == AgentRole::Worker
+        && assignment.effective_role_category() == RoleCategory::NonDelegatingTerminalWorker
+        && assignment.worker_assignments.is_empty();
+    if !is_writable_grok_terminal_worker
+        || command.writable_launch_target
+            != crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree
+    {
+        bail!(
+            "{}: assignment '{}' selected Grok launch is not exactly bound to its writable managed child worktree",
+            crate::external_agent::WRITABLE_GROK_TERMINAL_WORKER_REQUIRED,
+            assignment.id
+        );
+    }
+    command.cwd = managed_worktree.to_path_buf();
+    command.workspace_access = WorkspaceAccess::ReadWrite;
+    let command = command.with_writable_runtime_selection(
+        &assignment.id,
+        launch_runtime,
+        is_writable_grok_terminal_worker,
+    )?;
+    command
+        .selected_writable_capabilities(launch_runtime, Some(&assignment.id))
+        .with_context(|| {
+            format!(
+                "writable Grok assignment '{}' did not prove its exact selected launch contract",
+                assignment.id
+            )
+        })?;
+    Ok(command)
+}
+
 #[cfg(test)]
 pub(super) fn bind_selected_assignment_launch_for_test(
     command: ExternalAgentCommand,
@@ -571,6 +594,7 @@ pub(super) fn bind_selected_assignment_launch_for_test(
     options: &SupervisorRunOptions,
     catalog: &RuntimeModelCatalog,
 ) -> Result<(SupervisorRuntime, ExternalAgentCommand)> {
+    let managed_worktree = command.cwd.clone();
     let launch_runtime = assignment_launch_runtime(assignment, options, budget_policy);
     let launch_catalog =
         runtime_model_catalog_for_launch(catalog, options.runtime, launch_runtime)?;
@@ -582,7 +606,14 @@ pub(super) fn bind_selected_assignment_launch_for_test(
         launch_runtime,
         &launch_catalog,
     )?;
-    Ok((launch_runtime, bound_launch.command))
+    let command = bind_selected_grok_execution_workspace(
+        bound_launch.command,
+        assignment,
+        launch_runtime,
+        &managed_worktree,
+        true,
+    )?;
+    Ok((launch_runtime, command))
 }
 
 pub(super) fn prerender_selected_runtime_adapter_command(
@@ -1489,6 +1520,13 @@ fn prepare_child_attempt<'a>(
         }
         None => crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree,
     });
+    command = bind_selected_grok_execution_workspace(
+        command,
+        assignment,
+        launch_runtime,
+        &worktree.path,
+        evidence_only_reaudit.is_none(),
+    )?;
 
     let primary_before = primary_worktree_snapshot(repo, *execution_runtime)?;
     if let Some(error) = primary_before.inspection_problem() {
@@ -6268,7 +6306,16 @@ done
     #[test]
     fn selector_bound_grok_worker_dispatches_exact_leaf_command() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let grok = temp.path().join("grok");
+        let primary = temp.path().join("primary");
+        let managed_child = temp.path().join("managed-child");
+        let incoming = temp.path().join("incoming");
+        let bin = temp.path().join("bin");
+        for directory in [&primary, &managed_child, &incoming, &bin] {
+            fs::create_dir(directory)?;
+        }
+        let prompt = temp.path().join("prompt.txt");
+        fs::write(&prompt, "bounded selected Grok task\n")?;
+        let grok = bin.join("grok");
         fs::write(&grok, "fixture")?;
         let (_environment_lock, _environment_guard) = GrokBinaryEnvironmentGuard::install(&grok);
         let assignment = OrchestratorAssignment {
@@ -6300,13 +6347,31 @@ done
         let plan = policy.apply(&worker_plan("gpt-5.6-codex"));
         let catalog =
             RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-codex"])?);
-        let (runtime, command) = bind_selected_assignment_launch_for_test(
-            launch_fixture_command(),
+        let initial_command = ExternalAgentCommand::codex(
+            "unused-codex",
+            &managed_child,
+            &prompt,
+            incoming.join("events.jsonl"),
+            incoming.join("report.json"),
+            Duration::from_secs(1),
+        )
+        .with_hidden_root(&primary);
+        let (runtime, mut command) = bind_selected_assignment_launch_for_test(
+            initial_command,
             &assignment,
             &policy,
             &plan,
             &launch_fixture_options(SupervisorRuntime::Codex),
             &catalog,
+        )?;
+        command.cwd = primary.clone();
+        command.workspace_access = WorkspaceAccess::ReadOnly;
+        let command = bind_selected_grok_execution_workspace(
+            command,
+            &assignment,
+            runtime,
+            &managed_child,
+            true,
         )?;
 
         assert_eq!(runtime, SupervisorRuntime::Grok);
@@ -6326,6 +6391,12 @@ done
         );
         assert_eq!(command.model.as_deref(), Some("grok-4.6"));
         assert_eq!(command.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(command.cwd, managed_child);
+        assert_eq!(command.workspace_access, WorkspaceAccess::ReadWrite);
+        assert_eq!(
+            command.writable_launch_target,
+            crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree
+        );
         let argv = crate::external_agent::command_argv(&command)
             .into_iter()
             .map(|argument| argument.to_string_lossy().into_owned())
@@ -6333,23 +6404,47 @@ done
         assert_eq!(
             argv,
             [
-                "--prompt-file",
-                "prompt.txt",
-                "--model",
-                "grok-4.6",
-                "--reasoning-effort",
-                "xhigh",
-                "--cwd",
-                "/tmp/work",
-                "--output-format",
-                "streaming-json",
-                "--sandbox",
-                "strict",
-                "--disable-web-search",
-                "--no-memory",
-                "--no-subagents",
+                "--prompt-file".to_string(),
+                prompt.display().to_string(),
+                "--model".to_string(),
+                "grok-4.6".to_string(),
+                "--reasoning-effort".to_string(),
+                "xhigh".to_string(),
+                "--cwd".to_string(),
+                managed_child.display().to_string(),
+                "--output-format".to_string(),
+                "streaming-json".to_string(),
+                "--sandbox".to_string(),
+                "strict".to_string(),
+                "--disable-web-search".to_string(),
+                "--no-memory".to_string(),
+                "--no-subagents".to_string(),
             ]
         );
+        #[cfg(target_os = "linux")]
+        {
+            let projection =
+                crate::external_agent::selected_grok_profile_projection_for_test(&command)?;
+            assert_eq!(projection.workspace_access, WorkspaceAccess::ReadWrite);
+            let writable_child = format!("--property=BindPaths={}", managed_child.display());
+            let read_write_child = format!("--property=ReadWritePaths={}", managed_child.display());
+            let read_only_child =
+                format!("--property=BindReadOnlyPaths={}", managed_child.display());
+            let hidden_primary = format!("--property=InaccessiblePaths={}", primary.display());
+            assert!(projection.systemd_properties.contains(&writable_child));
+            assert!(projection.systemd_properties.contains(&read_write_child));
+            assert!(!projection.systemd_properties.contains(&read_only_child));
+            assert!(projection.systemd_properties.contains(&hidden_primary));
+
+            let mut replaced = command.clone();
+            replaced.cwd = primary.clone();
+            replaced.workspace_access = WorkspaceAccess::ReadOnly;
+            let error = crate::external_agent::selected_grok_profile_projection_for_test(&replaced)
+                .err()
+                .context("selected Grok profile must reject a replaced read-only workspace")?;
+            assert!(format!("{error:#}")
+                .contains(crate::external_agent::WRITABLE_GROK_SELECTION_EVIDENCE_STALE));
+        }
         let worktree = WorktreeRecord {
             name: assignment.id.clone(),
             path: command.cwd.clone(),
@@ -6507,6 +6602,59 @@ done
         .expect_err("writable Grok must remain a terminal Worker");
         assert!(format!("{error:#}")
             .contains(crate::external_agent::WRITABLE_GROK_TERMINAL_WORKER_REQUIRED));
+        Ok(())
+    }
+
+    #[test]
+    fn selected_grok_refuses_nonexecution_terminal_worker() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let grok = temp.path().join("grok");
+        fs::write(&grok, "fixture")?;
+        let (_environment_lock, _environment_guard) = GrokBinaryEnvironmentGuard::install(&grok);
+        let assignment = OrchestratorAssignment {
+            id: "grok-planner".to_string(),
+            phase: AssignmentPhase::Planning,
+            runtime: None,
+            role: AgentRole::Worker,
+            role_category: Some(RoleCategory::NonDelegatingTerminalWorker),
+            selection_source: Some(AssignmentSelectionSource::Automatic),
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        };
+        let mut policy = AssignmentBudgetPolicy::default();
+        policy.set_selector_binding_for_test(
+            AgentRole::Worker,
+            SupervisorRuntime::Grok,
+            RoleModelSelection {
+                model: Some("grok-4.6".to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        let plan = policy.apply(&worker_plan("gpt-5.6-codex"));
+        let catalog =
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-codex"])?);
+        let error = bind_selected_assignment_launch_for_test(
+            launch_fixture_command(),
+            &assignment,
+            &policy,
+            &plan,
+            &launch_fixture_options(SupervisorRuntime::Codex),
+            &catalog,
+        )
+        .expect_err("Grok planning must remain fail closed");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(crate::external_agent::WRITABLE_GROK_TERMINAL_WORKER_REQUIRED),
+            "{message}"
+        );
+        assert!(message.contains("execution-phase"), "{message}");
         Ok(())
     }
 

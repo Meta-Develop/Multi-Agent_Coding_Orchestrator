@@ -265,6 +265,8 @@ struct WritableRuntimeSelectionEvidence {
     invocation: ExternalAgentInvocation,
     program: PathBuf,
     cwd: PathBuf,
+    workspace_access: WorkspaceAccess,
+    writable_launch_target: WritableLaunchTarget,
     model: Option<String>,
     reasoning_effort: Option<String>,
     adapter_config: Option<RuntimeAdapterConfig>,
@@ -282,6 +284,8 @@ impl WritableRuntimeSelectionEvidence {
             invocation: command.invocation,
             program: command.program.clone(),
             cwd: command.cwd.clone(),
+            workspace_access: command.workspace_access,
+            writable_launch_target: command.writable_launch_target,
             model: command.model.clone(),
             reasoning_effort: command.reasoning_effort.clone(),
             adapter_config: command.runtime_adapter.clone(),
@@ -293,6 +297,8 @@ impl WritableRuntimeSelectionEvidence {
             && self.invocation == command.invocation
             && self.program == command.program
             && self.cwd == command.cwd
+            && self.workspace_access == command.workspace_access
+            && self.writable_launch_target == command.writable_launch_target
             && self.model == command.model
             && self.reasoning_effort == command.reasoning_effort
             && self.adapter_config == command.runtime_adapter
@@ -1224,6 +1230,21 @@ impl ExternalAgentCommand {
                     "{WRITABLE_GROK_ADAPTER_CONFIGURATION_UNVERIFIED}: writable Grok adapter contract is not the immutable bounded 4.6/xhigh contract"
                 )
             })
+    }
+
+    fn selected_grok_writable_workspace(&self) -> Result<&Path> {
+        if self.workspace_access != WorkspaceAccess::ReadWrite {
+            bail!(
+                "{WRITABLE_GROK_SELECTION_EVIDENCE_STALE}: writable Grok workspace no longer matches its supervisor-selected evidence"
+            );
+        }
+        self.current_grok_writable_contract()?;
+        let selected = self.writable_runtime_selection.as_ref().with_context(|| {
+            format!(
+                "{WRITABLE_GROK_SELECTION_EVIDENCE_MISSING}: writable Grok has no supervisor-selected launch evidence"
+            )
+        })?;
+        Ok(&selected.cwd)
     }
 
     /// Concrete capabilities used by the supervisor while creating MACO-owned confinement

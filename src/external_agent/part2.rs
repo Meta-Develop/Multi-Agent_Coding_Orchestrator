@@ -3922,21 +3922,31 @@ enum ExternalProviderProfile {
 }
 
 impl ExternalProviderProfile {
-    fn for_command(spec: &ExternalAgentCommand) -> Self {
-        match (spec.invocation, spec.workspace_access) {
-            (ExternalAgentInvocation::Grok, WorkspaceAccess::ReadOnly) => {
+    fn for_command(spec: &ExternalAgentCommand) -> Result<Self> {
+        Ok(match (
+            spec.invocation,
+            spec.workspace_access,
+            spec.writable_runtime_selection.as_ref(),
+        ) {
+            (ExternalAgentInvocation::Grok, _, Some(_)) => Self::Grok(
+                ExternalGrokProfile::read_write(spec.selected_grok_writable_workspace()?),
+            ),
+            (ExternalAgentInvocation::Grok, WorkspaceAccess::ReadOnly, None) => {
                 Self::Grok(ExternalGrokProfile::read_only(&spec.cwd))
             }
-            (ExternalAgentInvocation::Grok, WorkspaceAccess::ReadWrite) => {
+            // Direct profile unit tests exercise lower-level Grok inputs. Production writable
+            // Grok reaches this point only after the external boundary has required supervisor
+            // selection and confinement evidence.
+            (ExternalAgentInvocation::Grok, WorkspaceAccess::ReadWrite, None) => {
                 Self::Grok(ExternalGrokProfile::read_write(&spec.cwd))
             }
-            (_, WorkspaceAccess::ReadOnly) => {
+            (_, WorkspaceAccess::ReadOnly, _) => {
                 Self::Codex(ExternalCodexProfile::read_only(&spec.cwd))
             }
-            (_, WorkspaceAccess::ReadWrite) => {
+            (_, WorkspaceAccess::ReadWrite, _) => {
                 Self::Codex(ExternalCodexProfile::read_write(&spec.cwd))
             }
-        }
+        })
     }
 
     fn with_visible_read_only_root(self, root: impl Into<PathBuf>) -> Self {
@@ -4033,7 +4043,7 @@ fn external_side_effect_profile(
         | ExternalAgentInvocation::Cursor
         | ExternalAgentInvocation::ClaudeCode
         | ExternalAgentInvocation::GeminiCli => {
-            let mut profile = ExternalProviderProfile::for_command(spec);
+            let mut profile = ExternalProviderProfile::for_command(spec)?;
             for control in &protected_controls.read_only_roots {
                 profile = profile.with_visible_read_only_root(&control.absolute);
             }
@@ -4148,6 +4158,42 @@ fn external_side_effect_profile(
             bail!("Claude consultant has no enforceable fixed-network capability ({capability})")
         }
     }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct ExternalGrokProfileProjection {
+    pub(crate) workspace_access: WorkspaceAccess,
+    pub(crate) systemd_properties: Vec<String>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn selected_grok_profile_projection_for_test(
+    spec: &ExternalAgentCommand,
+) -> Result<ExternalGrokProfileProjection> {
+    let output_parent = required_parent(&spec.output_last_message)?;
+    let controls = ProtectedWorktreeControls {
+        writable_artifact_root: Some(fs::canonicalize(output_parent)?),
+        ..ProtectedWorktreeControls::default()
+    };
+    let profile = external_side_effect_profile(
+        spec,
+        &spec.program,
+        ExternalProgramTrust::ExplicitCustom,
+        &controls,
+    )?;
+    let SideEffectConfinementProfile::ExternalGrok(profile) = profile else {
+        bail!("selected Grok command did not produce an ExternalGrok profile");
+    };
+    let workspace_access = profile.workspace_access();
+    let systemd_properties = crate::process_runner::external_grok_systemd_properties_for_test(
+        profile,
+        &spec.program,
+        &spec.cwd,
+    )?;
+    Ok(ExternalGrokProfileProjection {
+        workspace_access,
+        systemd_properties,
+    })
 }
 
 fn sandbox_denials_from_codex_jsonl(
