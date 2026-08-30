@@ -854,7 +854,7 @@ struct AuthorizedPullRequestMerge {
 
 enum PullRequestMergePreflight {
     Allowed(Box<AuthorizedPullRequestMerge>),
-    Blocked(AuthenticatedPullRequestMergeOutcome),
+    Blocked(Box<AuthenticatedPullRequestMergeOutcome>),
 }
 
 /// Execute one authenticated, head-bound pull-request merge exactly once.
@@ -997,7 +997,7 @@ fn execute_authenticated_pull_request_merge_with_wal(
             let first = match authorize_current_pull_request_merge(candidate, evidence, transport)?
             {
                 PullRequestMergePreflight::Allowed(authorized) => authorized,
-                PullRequestMergePreflight::Blocked(outcome) => return Ok(outcome),
+                PullRequestMergePreflight::Blocked(outcome) => return Ok(*outcome),
             };
             let probe = pull_request_merge_effect(effect_id, plan_digest, evidence, &first)?;
             match transport.lookup_pull_request_merge(&probe) {
@@ -1013,7 +1013,7 @@ fn execute_authenticated_pull_request_merge_with_wal(
             let authorized =
                 match authorize_current_pull_request_merge(candidate, evidence, transport)? {
                     PullRequestMergePreflight::Allowed(authorized) => authorized,
-                    PullRequestMergePreflight::Blocked(outcome) => return Ok(outcome),
+                    PullRequestMergePreflight::Blocked(outcome) => return Ok(*outcome),
                 };
             let effect = pull_request_merge_effect(effect_id, plan_digest, evidence, &authorized)?;
             let started = AuthenticatedPullRequestMergeRecord {
@@ -1063,7 +1063,7 @@ fn authorize_current_pull_request_merge(
     let snapshot = match transport.observe_pull_request_for_merge(candidate) {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            return Ok(PullRequestMergePreflight::Blocked(
+            return Ok(PullRequestMergePreflight::Blocked(Box::new(
                 AuthenticatedPullRequestMergeOutcome::NotMerged {
                     blockers: vec![
                         AuthenticatedPullRequestMergeBlocker::CurrentGroundTruthUnavailable {
@@ -1072,7 +1072,7 @@ fn authorize_current_pull_request_merge(
                     ],
                     authority: None,
                 },
-            ));
+            )));
         }
     };
     let current = snapshot.item();
@@ -1145,12 +1145,12 @@ fn authorize_current_pull_request_merge(
     };
 
     if !blockers.is_empty() {
-        return Ok(PullRequestMergePreflight::Blocked(
+        return Ok(PullRequestMergePreflight::Blocked(Box::new(
             AuthenticatedPullRequestMergeOutcome::NotMerged {
                 blockers,
                 authority: None,
             },
-        ));
+        )));
     }
 
     let decided_at = current_timestamp_millis()?;
@@ -1186,12 +1186,12 @@ fn authorize_current_pull_request_merge(
             .cloned()
             .map(AuthenticatedPullRequestMergeBlocker::Authority)
             .collect();
-        return Ok(PullRequestMergePreflight::Blocked(
+        return Ok(PullRequestMergePreflight::Blocked(Box::new(
             AuthenticatedPullRequestMergeOutcome::NotMerged {
                 blockers,
                 authority: Some(authority),
             },
-        ));
+        )));
     }
 
     Ok(PullRequestMergePreflight::Allowed(Box::new(
