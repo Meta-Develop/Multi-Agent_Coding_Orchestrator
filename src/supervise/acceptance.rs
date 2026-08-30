@@ -195,7 +195,7 @@ fn read_direct_worker_report(
     })
 }
 
-fn direct_worker_report_envelope(worker: WorkerReport) -> OrchestratorReviewReport {
+pub(super) fn direct_worker_report_envelope(worker: WorkerReport) -> OrchestratorReviewReport {
     OrchestratorReviewReport {
         id: worker.id.clone(),
         role: worker.role,
