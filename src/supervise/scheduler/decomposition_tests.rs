@@ -156,7 +156,7 @@ fn role_binding_telemetry_retains_catalog_fallback_resolution() {
         CodexRuntimeModelCatalog::from_slugs([FRONTIER_PROFILE_MODEL]).expect("fallback catalog"),
     );
     let bindings =
-        resolved_role_execution_bindings(&plan, SupervisorRuntime::Codex, Some(&catalog));
+        resolved_role_execution_bindings(&plan, SupervisorRuntime::Codex, Some(&catalog), &[], &[]);
     let binding = &bindings[&AgentRole::ChildOrchestrator];
     assert_eq!(
         binding.configured_model.as_deref(),
