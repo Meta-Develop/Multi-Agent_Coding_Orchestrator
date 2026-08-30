@@ -801,6 +801,185 @@ fn direct_worker_artifact_report(assignment: &OrchestratorAssignment) -> WorkerR
     }
 }
 
+fn messaging_plan_metadata(plan: &SupervisorPlan) -> SupervisorPlanMetadata {
+    SupervisorPlanMetadata {
+        assignment_schedule: plan
+            .assignments
+            .iter()
+            .enumerate()
+            .map(|(flattened_index, assignment)| AssignmentScheduleEntry {
+                assignment_id: assignment.id.clone(),
+                parent_assignment_id: None,
+                depth: MIN_SUPERVISOR_DEPTH,
+                flattened_index,
+            })
+            .collect(),
+        ..SupervisorPlanMetadata::default()
+    }
+}
+
+#[test]
+fn run_messaging_session_uses_exact_direct_and_broadcast_assignment_identities() {
+    let (_temp, repo_path) = injected_repository();
+    let run_id = RunId::new("artifact-messaging-direct-broadcast").expect("valid run id");
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        run_id,
+        "supervise-test",
+    )
+    .expect("reserve messaging artifact run");
+    let run_directory = writer.run_dir().to_path_buf();
+    let plan = injected_plan(injected_assignment(true), 0);
+    // The scheduler validates this legacy flat-plan fallback before evidence initialization.
+    let metadata = SupervisorPlanMetadata::default();
+    messaging_bridge::initialize_supervisor_messaging_session(&mut writer, &plan, &metadata)
+        .expect("initialize run messaging session");
+
+    let (direct, broadcast) =
+        messaging_bridge::with_supervisor_messaging_session(&run_directory, |factory| {
+            let coordinator = factory.capability_for("child-a")?;
+            let mut broker = factory.open_or_create()?;
+            let direct = broker.send_direct(&coordinator, "worker-a", json!({"turn": 1}))?;
+            broker.create_channel(
+                &coordinator,
+                "assignment-all",
+                ["child-a", "worker-a"],
+                ["child-a"],
+            )?;
+            let broadcast =
+                broker.publish_channel(&coordinator, "assignment-all", json!({"turn": 2}))?;
+            Ok((direct, broadcast))
+        })
+        .expect("exercise run messaging identities");
+
+    assert_eq!(direct.sender_id, "child-a");
+    assert_eq!(direct.address.identifier(), "worker-a");
+    assert_eq!(
+        direct.sender_role.as_str(),
+        "delegating_coordinator",
+        "sender role must come from normalized assignment authority"
+    );
+    assert_eq!(broadcast.address.identifier(), "assignment-all");
+    assert_eq!(
+        broadcast
+            .recipients
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["child-a", "worker-a"]
+    );
+}
+
+#[test]
+fn run_messaging_session_recovers_without_regrant_and_refuses_role_mismatch() {
+    let (_temp, repo_path) = injected_repository();
+    let run_id = RunId::new("artifact-messaging-resume-role").expect("valid run id");
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        run_id,
+        "supervise-test",
+    )
+    .expect("reserve resumable messaging artifact run");
+    let run_directory = writer.run_dir().to_path_buf();
+    let plan = injected_plan(injected_assignment(true), 0);
+    let metadata = messaging_plan_metadata(&plan);
+    messaging_bridge::initialize_supervisor_messaging_session(&mut writer, &plan, &metadata)
+        .expect("initialize resumable messaging session");
+
+    let (broker_instance_id, message_id, original_capability) =
+        messaging_bridge::with_supervisor_messaging_session(&run_directory, |factory| {
+            let coordinator = factory.capability_for("child-a")?;
+            let mut broker = factory.open_or_create()?;
+            let broker_instance_id = broker.broker_instance_id().to_string();
+            let message = broker.send_direct(&coordinator, "worker-a", "resume-me")?;
+            Ok((broker_instance_id, message.id, coordinator))
+        })
+        .expect("send resumable run message");
+
+    messaging_bridge::recover_supervisor_messaging_session(&run_directory)
+        .expect("reopen and replay run messaging journal");
+    messaging_bridge::with_supervisor_messaging_session(&run_directory, |factory| {
+        assert_eq!(factory.capability_for("child-a")?, original_capability);
+        let worker = factory.capability_for("worker-a")?;
+        let mut broker = factory.open_or_create()?;
+        assert_eq!(broker.broker_instance_id(), broker_instance_id);
+        assert_eq!(
+            broker
+                .receive_next(&worker)?
+                .context("recovered run message is missing")?
+                .id,
+            message_id
+        );
+        Ok(())
+    })
+    .expect("receive recovered run message with original capability set");
+
+    let mut mismatched = plan;
+    mismatched.assignments[0].role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+    let error = messaging_bridge::initialize_supervisor_messaging_session(
+        &mut writer,
+        &mismatched,
+        &metadata,
+    )
+    .expect_err("role-changing resume must be refused");
+    assert!(format!("{error:#}").contains("differs from the originally admitted identity set"));
+    messaging_bridge::with_supervisor_messaging_session(&run_directory, |factory| {
+        assert_eq!(factory.capability_for("child-a")?, original_capability);
+        Ok(())
+    })
+    .expect("role refusal must preserve the original capability");
+}
+
+#[test]
+fn fake_supervise_run_manifests_creation_only_messaging_artifacts() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    let plan = injected_plan(injected_assignment(true), 0);
+    let run_id = RunId::new("artifact-messaging-created-only").expect("valid run id");
+    let mut options = injected_options(&repo_path, temp.path(), run_id.as_str());
+    options.runtime = SupervisorRuntime::Fake;
+    let mut runner = |_command: &ExternalAgentCommand| -> ExternalAgentRun {
+        panic!("fake messaging lifecycle fixture must not invoke the external runner")
+    };
+
+    let report = run_supervisor_plan_with_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        &mut runner,
+    )
+    .expect("run fake messaging lifecycle fixture");
+    assert!(report.success, "unexpected failed report: {report:#?}");
+
+    let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+        .expect("open finalized messaging artifact run");
+    let journal = reader
+        .read("messaging.jsonl")
+        .expect("read authenticated messaging journal");
+    reader
+        .read("messaging.jsonl.tail-anchor")
+        .expect("read authenticated messaging tail anchor");
+    let journal_text = std::str::from_utf8(&journal).expect("messaging journal is UTF-8");
+    assert_eq!(journal_text.lines().count(), 1);
+    let created: serde_json::Value =
+        serde_json::from_slice(&journal).expect("decode messaging creation record");
+    assert_eq!(created["event"]["event"], "created");
+    assert_eq!(
+        created["event"]["authority_binding"]["child-a"],
+        "delegating_coordinator"
+    );
+    assert_eq!(
+        created["event"]["authority_binding"]["worker-a"],
+        "non_delegating_terminal_worker"
+    );
+    assert!(!journal_text.contains("message_sent"));
+    assert!(!journal_text.contains("README.md"));
+    assert!(!journal_text.contains("generated_follow_up"));
+}
+
 #[test]
 #[cfg(unix)]
 fn direct_worker_fake_output_and_journal_are_first_class_and_non_delegating() {
@@ -1900,6 +2079,13 @@ fn scheduler_crash_after_authenticated_report_plan_resumes_without_redispatch() 
         .join(run_id.as_str())
         .join(ARTIFACT_FINALIZATION_MARKER)
         .exists());
+    let run_root = repo
+        .join(RunArtifactFamily::Supervise.run_root())
+        .join(run_id.as_str());
+    let messaging_before = fs::read(run_root.join("messaging.jsonl"))
+        .expect("read messaging journal before scheduler resume");
+    let messaging_anchor_before = fs::read(run_root.join("messaging.jsonl.tail-anchor"))
+        .expect("read messaging anchor before scheduler resume");
     let active_claims = SyncStore::open(&repo)
         .expect("open terminal-plan claim store")
         .snapshot()
@@ -1925,6 +2111,16 @@ fn scheduler_crash_after_authenticated_report_plan_resumes_without_redispatch() 
         .snapshot()
         .expect("snapshot claims after resumed release")
         .is_empty());
+    assert_eq!(
+        fs::read(run_root.join("messaging.jsonl"))
+            .expect("read messaging journal after scheduler resume"),
+        messaging_before
+    );
+    assert_eq!(
+        fs::read(run_root.join("messaging.jsonl.tail-anchor"))
+            .expect("read messaging anchor after scheduler resume"),
+        messaging_anchor_before
+    );
     ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)
         .expect("scheduler resume finalizes the exact planned report");
 }

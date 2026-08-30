@@ -1,11 +1,13 @@
 //! Private supervisor bridge for one run's authenticated messaging session.
 //!
-//! This first issue #333 slice deliberately stops before launch or IPC wiring. The factory keeps
-//! every presented capability in memory, binds the durable broker to ledger authority, and can
-//! reopen the same store while the per-run factory remains alive.
+//! The supervisor opens this session before assignment dispatch and keeps every presented
+//! capability process-local. Child IPC/CLI transport deliberately remains outside this bridge;
+//! later transport wiring can borrow the already-admitted capability instead of creating a new
+//! identity.
 
 use super::{
-    role_authority::RoleCategory as AssignmentRoleCategory, OrchestratorAssignment,
+    role_authority::RoleCategory as AssignmentRoleCategory, ArtifactFileDisposition,
+    ArtifactRunWriter, OrchestratorAssignment, SupervisorPlan, SupervisorPlanMetadata,
     WorkerAssignment,
 };
 use crate::{
@@ -17,11 +19,13 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fmt,
+    fmt, fs,
     path::{Component, Path, PathBuf},
+    sync::{Mutex, OnceLock},
 };
 
 const SUPERVISOR_MESSAGING_STORE_NAME: &str = "messaging.jsonl";
+const SUPERVISOR_MESSAGING_ANCHOR_NAME: &str = "messaging.jsonl.tail-anchor";
 
 /// One assignment identity that the supervisor has already admitted for launch.
 ///
@@ -167,6 +171,67 @@ impl SupervisorMessagingSessionFactory {
         Ok(broker)
     }
 
+    /// Creates the initial broker header and adopts its exact bytes into the authenticated run
+    /// manifest before reopening it. Child transport is not wired in this slice, so no message
+    /// append can bypass the artifact writer during a supervisor run.
+    fn create_manifested_store(&self, writer: &mut ArtifactRunWriter) -> Result<()> {
+        if self
+            .artifact_root
+            .direct_child_exists(SUPERVISOR_MESSAGING_STORE_NAME)?
+            || self
+                .artifact_root
+                .direct_child_exists(SUPERVISOR_MESSAGING_ANCHOR_NAME)?
+        {
+            bail!(
+                "supervisor messaging store or tail anchor already exists before initial session admission"
+            );
+        }
+
+        drop(self.open_or_create()?);
+        self.artifact_root
+            .verify()
+            .context("supervisor messaging artifact directory changed after broker creation")?;
+        let anchor_path = self
+            .artifact_root
+            .direct_child(SUPERVISOR_MESSAGING_ANCHOR_NAME)
+            .context("failed to bind supervisor messaging tail anchor")?;
+        for (label, path) in [("store", &self.store_path), ("tail anchor", &anchor_path)] {
+            let metadata = fs::symlink_metadata(path)
+                .with_context(|| format!("failed to inspect newly created messaging {label}"))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!("newly created supervisor messaging {label} is not a regular file");
+            }
+        }
+        let contents = fs::read(&self.store_path)
+            .context("failed to read newly created supervisor messaging store")?;
+        let anchor_contents = fs::read(&anchor_path)
+            .context("failed to read newly created supervisor messaging tail anchor")?;
+        fs::remove_file(&self.store_path)
+            .context("failed to transfer supervisor messaging store into artifact authority")?;
+        fs::remove_file(&anchor_path).context(
+            "failed to transfer supervisor messaging tail anchor into artifact authority",
+        )?;
+        writer
+            .write_bytes(
+                Path::new(SUPERVISOR_MESSAGING_STORE_NAME),
+                &contents,
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .context("failed to manifest supervisor messaging store")?;
+        writer
+            .write_bytes(
+                Path::new(SUPERVISOR_MESSAGING_ANCHOR_NAME),
+                &anchor_contents,
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .context("failed to manifest supervisor messaging tail anchor")?;
+        drop(
+            self.open_or_create()
+                .context("failed to verify manifested supervisor messaging store")?,
+        );
+        Ok(())
+    }
+
     /// Returns one launched agent's own process-local presentation capability.
     ///
     /// The returned value is neither serializable nor secret-revealing under `Debug`.
@@ -175,6 +240,198 @@ impl SupervisorMessagingSessionFactory {
             .get(agent_id)
             .cloned()
             .with_context(|| format!("supervisor messaging identity {agent_id:?} was not launched"))
+    }
+}
+
+fn run_sessions() -> &'static Mutex<BTreeMap<PathBuf, SupervisorMessagingSessionFactory>> {
+    static RUN_SESSIONS: OnceLock<Mutex<BTreeMap<PathBuf, SupervisorMessagingSessionFactory>>> =
+        OnceLock::new();
+    RUN_SESSIONS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Establishes exactly one process-local identity set for an authenticated supervisor run.
+///
+/// This is called from scheduler evidence initialization after plan normalization and before the
+/// first dispatch-capable scheduler action. An existing durable journal without the original
+/// memory-resident factory is refused instead of receiving replacement credentials.
+pub(super) fn initialize_supervisor_messaging_session(
+    writer: &mut ArtifactRunWriter,
+    plan: &SupervisorPlan,
+    metadata: &SupervisorPlanMetadata,
+) -> Result<()> {
+    if plan.assignments.is_empty() {
+        return Ok(());
+    }
+    let run_directory = writer.run_dir().to_path_buf();
+    let (hierarchy, identities) = admitted_messaging_authority(plan, metadata)?;
+    let mut sessions = run_sessions()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervisor messaging session registry is poisoned"))?;
+
+    sessions.retain(|directory, _| {
+        directory.is_dir()
+            && !directory
+                .join(super::ARTIFACT_FINALIZATION_MARKER)
+                .is_file()
+    });
+    if let Some(existing) = sessions.get(&run_directory) {
+        existing.validate_session_authority(&hierarchy, &identities)?;
+        drop(existing.open_or_create()?);
+        return Ok(());
+    }
+    let existing_store = run_directory.join(SUPERVISOR_MESSAGING_STORE_NAME);
+    let existing_anchor = run_directory.join(SUPERVISOR_MESSAGING_ANCHOR_NAME);
+    if existing_store
+        .try_exists()
+        .context("failed to inspect existing supervisor messaging store")?
+        || existing_anchor
+            .try_exists()
+            .context("failed to inspect existing supervisor messaging tail anchor")?
+    {
+        bail!(
+            "supervisor messaging journal exists but its memory-resident credentials are unavailable; refusing to grant replacement identities"
+        );
+    }
+
+    let factory = SupervisorMessagingSessionFactory::new(&run_directory, &hierarchy, &identities)
+        .context("supervisor messaging pre-launch admission failed")?;
+    factory
+        .create_manifested_store(writer)
+        .context("supervisor messaging pre-launch journal creation failed")?;
+    sessions.insert(run_directory, factory);
+    Ok(())
+}
+
+/// Reopens and fully replays the existing run journal with its original process-local registry.
+pub(super) fn recover_supervisor_messaging_session(run_directory: &Path) -> Result<()> {
+    let store = run_directory.join(SUPERVISOR_MESSAGING_STORE_NAME);
+    let anchor = run_directory.join(SUPERVISOR_MESSAGING_ANCHOR_NAME);
+    if !store
+        .try_exists()
+        .context("failed to inspect resumable supervisor messaging journal")?
+        && !anchor
+            .try_exists()
+            .context("failed to inspect resumable supervisor messaging tail anchor")?
+    {
+        return Ok(());
+    }
+    let sessions = run_sessions()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervisor messaging session registry is poisoned"))?;
+    let factory = sessions.get(run_directory).with_context(|| {
+        format!(
+            "supervisor messaging journal {} cannot be resumed because its memory-resident credentials are unavailable; refusing to grant replacement identities",
+            store.display()
+        )
+    })?;
+    drop(
+        factory
+            .open_or_create()
+            .context("failed to recover supervisor messaging journal")?,
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn with_supervisor_messaging_session<T>(
+    run_directory: &Path,
+    operation: impl FnOnce(&SupervisorMessagingSessionFactory) -> Result<T>,
+) -> Result<T> {
+    let sessions = run_sessions()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervisor messaging session registry is poisoned"))?;
+    let factory = sessions
+        .get(run_directory)
+        .context("supervisor messaging test session is not initialized")?;
+    operation(factory)
+}
+
+fn admitted_messaging_authority(
+    plan: &SupervisorPlan,
+    metadata: &SupervisorPlanMetadata,
+) -> Result<(HierarchyLedgerSnapshot, Vec<LaunchedMessagingIdentity>)> {
+    // The scheduler treats an absent supplied schedule as the validated flat-plan schedule. Keep
+    // messaging admission on that same authority path: an explicit schedule must match exactly,
+    // while absence never invents identities beyond the already-normalized plan.
+    let schedule = (!metadata.assignment_schedule.is_empty())
+        .then_some(metadata.assignment_schedule.as_slice());
+    if schedule.is_some_and(|schedule| schedule.len() != plan.assignments.len()) {
+        bail!("validated assignment schedule does not cover every messaging identity owner");
+    }
+
+    let mut hierarchy = HierarchyLedgerSnapshot::default();
+    let mut identities = Vec::new();
+    for (index, assignment) in plan.assignments.iter().enumerate() {
+        if let Some(entry) = schedule.and_then(|schedule| schedule.get(index)) {
+            if entry.flattened_index != index {
+                bail!(
+                    "validated assignment schedule entry {:?} has unexpected flattened index {}",
+                    entry.assignment_id,
+                    entry.flattened_index
+                );
+            }
+            if entry.assignment_id != assignment.id {
+                bail!(
+                    "validated assignment schedule identity {:?} does not match plan identity {:?}",
+                    entry.assignment_id,
+                    assignment.id
+                );
+            }
+        }
+        insert_admitted_identity(
+            &mut hierarchy,
+            &mut identities,
+            LaunchedMessagingIdentity::from_orchestrator(assignment),
+        )?;
+        for worker in &assignment.worker_assignments {
+            insert_admitted_identity(
+                &mut hierarchy,
+                &mut identities,
+                LaunchedMessagingIdentity::from_worker(worker),
+            )?;
+        }
+    }
+    validate_launched_identities(&hierarchy, &identities)?;
+    Ok((hierarchy, identities))
+}
+
+fn insert_admitted_identity(
+    hierarchy: &mut HierarchyLedgerSnapshot,
+    identities: &mut Vec<LaunchedMessagingIdentity>,
+    identity: LaunchedMessagingIdentity,
+) -> Result<()> {
+    if hierarchy
+        .effective_categories
+        .insert(identity.agent_id.clone(), identity.role_category)
+        .is_some()
+    {
+        bail!(
+            "validated supervisor plan contains duplicate messaging identity {:?}",
+            identity.agent_id
+        );
+    }
+    identities.push(identity);
+    Ok(())
+}
+
+impl SupervisorMessagingSessionFactory {
+    fn validate_session_authority(
+        &self,
+        hierarchy: &HierarchyLedgerSnapshot,
+        identities: &[LaunchedMessagingIdentity],
+    ) -> Result<()> {
+        validate_launched_identities(hierarchy, identities)?;
+        if self.hierarchy.effective_categories != hierarchy.effective_categories
+            || self.capabilities.len() != identities.len()
+            || identities
+                .iter()
+                .any(|identity| !self.capabilities.contains_key(&identity.agent_id))
+        {
+            bail!(
+                "supervisor messaging resume authority differs from the originally admitted identity set"
+            );
+        }
+        Ok(())
     }
 }
 
