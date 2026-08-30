@@ -3,15 +3,18 @@ use git2::{IndexAddOption, Repository, Signature};
 use multi_agent_coding_orchestrator::agent_lifecycle::{
     AgentLaunchMetadata, AgentListFilter, AgentRegistry,
 };
+use multi_agent_coding_orchestrator::supervise::{admit_role_category, RoleCategory};
 use serde_json::Value;
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Child, Command, Output},
+    process::{Child, Command},
 };
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
+const RETIRED_AUTOPILOT_MESSAGE: &str =
+    "autopilot plan/run is retired; use literal instruction routing: maco <instruction>";
 
 struct SleepChild(Child);
 
@@ -150,99 +153,105 @@ fn fake_goal_launch_returns_automatic_authority_and_derived_shape() -> Result<()
         &goal,
         "Coordinate repository work.\n- Update README.md.\n- Update src/lib.rs.\n",
     )?;
-    let output = run_autopilot_cli(
-        &repo,
-        &[
-            "autopilot",
-            "run",
+    let output = Command::new(BIN)
+        .args([
+            "supervise",
+            "plan",
             "--from-goal",
             path_text(&goal)?,
             "--repo",
             path_text(&repo)?,
-            "--run-id",
-            "authority-goal-run",
             "--json",
-        ],
-    )?;
+        ])
+        .output()
+        .context("plan goal through active supervise entrypoint")?;
     assert!(
         output.status.success(),
-        "goal launch failed: {}",
+        "goal planning failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let report: Value = serde_json::from_slice(&output.stdout).context("parse goal report")?;
-    let authority = &report["authority_plan"];
-    assert_eq!(authority["selection_source"], "effective_planner_output");
-    assert_eq!(authority["caller_selected_category"], false);
-    assert_eq!(authority["caller_selected_coordination_depth"], false);
-    assert!(authority["planned_max_depth"]
+    let plan: Value =
+        serde_json::from_slice(&output.stdout).context("parse supervise goal plan")?;
+    let topology = &plan["coordination_topology"];
+    assert_eq!(topology["caller_selected_coordination_depth"], false);
+    assert_eq!(topology["planned_max_depth"], plan["max_depth"]);
+    assert!(topology["planned_max_depth"]
         .as_u64()
         .is_some_and(|depth| depth >= 2));
-    assert!(authority["derived_coordination_depth"]
+    assert!(topology["derived_coordination_depth"]
         .as_u64()
         .is_some_and(|depth| depth >= 1));
-    let assignments = authority["assignments"]
+    let assignments = plan["assignments"]
         .as_array()
-        .context("authority assignments")?;
+        .context("supervise assignments")?;
     assert!(!assignments.is_empty());
     assert!(assignments
         .iter()
-        .all(|entry| entry["category"].is_string()));
+        .all(|entry| entry["role_category"] == "delegating_coordinator"));
     assert!(assignments
         .iter()
-        .all(|entry| entry["may_mutate_git_history"] == false));
-    assert!(assignments.iter().any(|entry| {
-        entry["category"] == "read_only_review_auditor"
-            && entry["may_judge_acceptance"] == true
-            && entry["may_write"] == false
-    }));
+        .all(|entry| entry.get("selection_source").is_none()));
+    assert!(assignments.iter().any(|entry| entry["phase"] == "planning"));
+    assert!(assignments
+        .iter()
+        .any(|entry| entry["phase"] == "execution"));
+    let workers = assignments
+        .iter()
+        .filter_map(|entry| entry["worker_assignments"].as_array())
+        .flatten()
+        .collect::<Vec<_>>();
+    assert!(!workers.is_empty());
+    assert!(workers
+        .iter()
+        .all(|worker| worker["role_category"] == "non_delegating_terminal_worker"));
+    assert!(workers
+        .iter()
+        .all(|worker| worker.get("selection_source").is_none()));
+    assert!(plan["review_lenses"]
+        .as_array()
+        .is_some_and(|lenses| !lenses.is_empty()));
+    assert!(RoleCategory::ReadOnlyReviewAuditor.is_read_only());
+    assert!(!RoleCategory::ReadOnlyReviewAuditor.may_delegate());
+    assert!(!RoleCategory::ReadOnlyReviewAuditor.may_write());
+    assert!(RoleCategory::ReadOnlyReviewAuditor.may_judge_acceptance());
     Ok(())
 }
 
 #[test]
-fn fake_autopilot_refuses_luna_delegation_before_supervisor_dispatch() -> Result<()> {
-    assert_fake_authority_refusal(
-        "luna-delegation-refusal",
-        None,
-        Some(
-            r#"{
-              "version": 1,
-              "role_models": {
-                "child_orchestrator": {"model": "gpt-5.6-luna"}
-              }
-            }"#,
-        ),
-        "model_ineligible_for_delegating_coordinator",
-    )
+fn fake_autopilot_refuses_luna_delegation_before_supervisor_dispatch() {
+    let error = admit_role_category(RoleCategory::DelegatingCoordinator, Some("gpt-5.6-luna"))
+        .expect_err("luna must not receive delegating coordinator authority");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("delegating_coordinator")
+            && (message.contains("ineligible by measured catalog/evidence")
+                || message.contains("cannot hold")),
+        "{message}"
+    );
 }
 
 #[test]
-fn fake_autopilot_refuses_luna_auditor_before_supervisor_dispatch() -> Result<()> {
-    assert_fake_authority_refusal(
-        "luna-auditor-refusal",
-        None,
-        Some(
-            r#"{
-              "version": 1,
-              "review_lenses": [{
-                "id": "weak-auditor",
-                "backend": {
-                  "kind": "model",
-                  "backend_id": "openai",
-                  "model": "gpt-5.6-luna",
-                  "reasoning_effort": "xhigh"
-                },
-                "information_scope": "diff_only"
-              }]
-            }"#,
-        ),
-        "model_ineligible_for_review_auditor",
-    )
+fn fake_autopilot_refuses_luna_auditor_before_supervisor_dispatch() {
+    let error = admit_role_category(RoleCategory::ReadOnlyReviewAuditor, Some("gpt-5.6-luna"))
+        .expect_err("luna must not receive review auditor authority");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("read_only_review_auditor")
+            && (message.contains("ineligible by measured catalog/evidence")
+                || message.contains("cannot hold")
+                || message.contains("below floor")),
+        "{message}"
+    );
 }
 
 #[test]
 fn fake_autopilot_git_forge_does_not_grant_history_authority() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo = create_committed_autopilot_repo(temp.path())?;
+    let repository = Repository::open(&repo)?;
+    let head_before = repository.head()?.target().context("HEAD target")?;
+    let index_before = fs::read(repository.path().join("index"))?;
+    drop(repository);
     let plan = temp.path().join("authority-plan.json");
     fs::write(
         &plan,
@@ -253,9 +262,8 @@ fn fake_autopilot_git_forge_does_not_grant_history_authority() -> Result<()> {
           "assigned_paths": ["README.md"]
         }"#,
     )?;
-    let output = run_autopilot_cli(
-        &repo,
-        &[
+    let output = Command::new(BIN)
+        .args([
             "autopilot",
             "run",
             path_text(&plan)?,
@@ -264,83 +272,23 @@ fn fake_autopilot_git_forge_does_not_grant_history_authority() -> Result<()> {
             "--run-id",
             "git-authority-binding",
             "--json",
-        ],
-    )?;
-    let report: Value = serde_json::from_slice(&output.stdout).with_context(|| {
-        format!(
-            "parse git-authority report; stderr={}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-    })?;
-    let authority = &report["authority_plan"];
-    assert_eq!(authority["forge_mode"], "git");
-    assert_eq!(authority["git_history_mutation_granted"], false);
-    assert_ne!(authority["refusal_reason"], "git_authority_unbound");
-    let assignments = authority["assignments"]
-        .as_array()
-        .context("git-authority assignments")?;
-    assert!(!assignments.is_empty());
-    assert!(assignments
-        .iter()
-        .all(|entry| entry["may_mutate_git_history"] == false));
-    Ok(())
-}
-
-fn assert_fake_authority_refusal(
-    run_id: &str,
-    extra_plan_field: Option<&str>,
-    profile: Option<&str>,
-    expected_reason: &str,
-) -> Result<()> {
-    let temp = TempDir::new().context("tempdir")?;
-    let repo = create_committed_autopilot_repo(temp.path())?;
-    let plan = temp.path().join("authority-plan.json");
-    fs::write(
-        &plan,
-        format!(
-            r#"{{
-              "version": 1,
-              "task": {{"title": "Authority refusal", "body": "Refuse before dispatch."}},
-              {} 
-              "assigned_paths": ["README.md"]
-            }}"#,
-            extra_plan_field.unwrap_or("")
-        ),
-    )?;
-    let profile_path = profile
-        .map(|contents| {
-            let path = temp.path().join("authority-profile.json");
-            fs::write(&path, contents).map(|()| path)
-        })
-        .transpose()?;
-    let mut args = vec![
-        "autopilot",
-        "run",
-        path_text(&plan)?,
-        "--repo",
-        path_text(&repo)?,
-    ];
-    if let Some(profile_path) = &profile_path {
-        args.extend(["--profile", path_text(profile_path)?]);
-    }
-    args.extend(["--run-id", run_id, "--json"]);
-    let output = run_autopilot_cli(&repo, &args)?;
+        ])
+        .output()
+        .context("run retired autopilot git forge")?;
+    assert!(!output.status.success());
     assert!(
-        !output.status.success(),
-        "authority-unsafe Fake run unexpectedly succeeded"
+        output.stdout.is_empty(),
+        "retirement must not emit a run report"
     );
-    let report: Value = serde_json::from_slice(&output.stdout).with_context(|| {
-        format!(
-            "parse authority refusal; stderr={}",
-            String::from_utf8_lossy(&output.stderr)
-        )
-    })?;
-    assert_eq!(report["status"], "refused");
-    assert_eq!(report["attempt_count"], 0);
-    assert_eq!(report["authority_plan"]["refusal_reason"], expected_reason);
-    assert!(!repo
-        .join(format!(".maco/o2/runs/{run_id}-supervise"))
-        .exists());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(RETIRED_AUTOPILOT_MESSAGE), "{stderr}");
+    assert!(!stderr.contains("Usage:"), "{stderr}");
+
+    let repository = Repository::open(&repo)?;
+    assert_eq!(repository.head()?.target(), Some(head_before));
+    assert_eq!(fs::read(repository.path().join("index"))?, index_before);
+    assert!(repository.statuses(None)?.is_empty());
+    assert!(!repo.join(".maco").exists());
     Ok(())
 }
 
@@ -374,62 +322,6 @@ fn create_committed_autopilot_repo(root: &Path) -> Result<PathBuf> {
     drop(tree);
     drop(repository);
     Ok(repo)
-}
-
-fn run_autopilot_cli(repo: &Path, args: &[&str]) -> Result<Output> {
-    let fixture_root = repo.parent().context("fixture root")?;
-    let child_tmp = fixture_root.join("autopilot-child-tmp");
-    fs::create_dir_all(&child_tmp)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&child_tmp, fs::Permissions::from_mode(0o700))?;
-    }
-    let config = write_machine_global_fixture(repo)?;
-    Command::new(BIN)
-        .args(args)
-        .args([
-            "--machine-global-config",
-            path_text(&config)?,
-            "--machine-global-runtime-root-id",
-            "runtime",
-        ])
-        .env("TMPDIR", child_tmp)
-        .env_remove("MACO_BOUNDED_STATUS_RUNTIME_ROOT")
-        .output()
-        .context("run autopilot CLI")
-}
-
-#[cfg(target_os = "linux")]
-fn write_machine_global_fixture(repo: &Path) -> Result<PathBuf> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    let fixture_root = repo.parent().context("fixture root")?;
-    let state_root = fixture_root.join("machine-global-state");
-    fs::create_dir_all(&state_root)?;
-    fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700))?;
-    let uid = fs::metadata("/proc/self")?.uid();
-    let config = fixture_root.join("machine-global.json");
-    fs::write(
-        &config,
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "version": 1,
-            "state_root": state_root,
-            "roots": [{
-                "id": "runtime",
-                "path": format!("/run/user/{uid}"),
-                "protected_paths": [],
-                "quarantine_grace_seconds": 60
-            }]
-        }))?,
-    )?;
-    fs::set_permissions(&config, fs::Permissions::from_mode(0o600))?;
-    Ok(config)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn write_machine_global_fixture(repo: &Path) -> Result<PathBuf> {
-    Ok(repo.join("unsupported-machine-global.json"))
 }
 
 fn path_text(path: &Path) -> Result<&str> {
