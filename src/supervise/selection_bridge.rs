@@ -114,12 +114,15 @@ fn cursor_catalog_optional_unavailability(error: &anyhow::Error) -> bool {
 const TEST_CURSOR_CATALOG_FIXTURE_ENV: &str = "MACO_TEST_CURSOR_CATALOG_FIXTURE";
 #[cfg(test)]
 const TEST_CURSOR_CATALOG_OBSERVED_AT_ENV: &str = "MACO_TEST_CURSOR_CATALOG_OBSERVED_AT";
+#[cfg(test)]
+const TEST_SELECTOR_TRIPLE_RUNNER_UP_MODEL: &str = "gpt-5.6-sol-selector-triple-runner-up";
 
 #[cfg(test)]
 thread_local! {
     static TEST_ADVERTISED_CATALOGS: RefCell<Option<AdvertisedCatalogSet>> = const {
         RefCell::new(None)
     };
+    static TEST_SELECTOR_TRIPLE_RUNNER_UP_ENABLED: Cell<bool> = const { Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -146,6 +149,47 @@ pub(super) fn bind_test_cursor_catalog_fixture(
             previous: slot.borrow_mut().replace(advertised),
         }),
     )
+}
+
+#[cfg(test)]
+pub(super) struct TestSelectorTripleCatalogBindGuard {
+    previous_runner_up_enabled: bool,
+    _model_capability: InstalledModelCapabilityPolicy,
+}
+
+#[cfg(test)]
+impl Drop for TestSelectorTripleCatalogBindGuard {
+    fn drop(&mut self) {
+        TEST_SELECTOR_TRIPLE_RUNNER_UP_ENABLED.with(|enabled| {
+            enabled.set(self.previous_runner_up_enabled);
+        });
+    }
+}
+
+#[cfg(test)]
+pub(super) fn bind_test_selector_triple_catalog(
+) -> Result<(TestSelectorTripleCatalogBindGuard, RuntimeModelCatalog)> {
+    let mut slugs = selection::built_in_prior_dataset()?
+        .models
+        .into_iter()
+        .filter(|prior| prior.runtime == runtime_name(SupervisorRuntime::Codex))
+        .map(|prior| prior.model)
+        .collect::<BTreeSet<_>>();
+    slugs.insert(TEST_SELECTOR_TRIPLE_RUNNER_UP_MODEL.to_string());
+    let catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(slugs)?);
+    let model_capability = install_test_fixture_models(&[(
+        TEST_SELECTOR_TRIPLE_RUNNER_UP_MODEL,
+        ModelCapabilityClass::CriticalJudgment,
+    )])?;
+    let previous_runner_up_enabled =
+        TEST_SELECTOR_TRIPLE_RUNNER_UP_ENABLED.with(|enabled| enabled.replace(true));
+    Ok((
+        TestSelectorTripleCatalogBindGuard {
+            previous_runner_up_enabled,
+            _model_capability: model_capability,
+        },
+        catalog,
+    ))
 }
 
 /// Observe advertised runtime catalogs for supervisor launch.
@@ -1175,6 +1219,40 @@ fn select_with_live_switch_cost(
 
 fn selector_priors_with_terminal_worker_economics() -> Result<selection::PriorDataset> {
     let mut priors = selection::built_in_prior_dataset()?;
+    #[cfg(test)]
+    if TEST_SELECTOR_TRIPLE_RUNNER_UP_ENABLED.with(Cell::get) {
+        let mut runner_up = priors
+            .models
+            .iter()
+            .find(|prior| {
+                prior.runtime == runtime_name(SupervisorRuntime::Codex)
+                    && prior.model == FRONTIER_PROFILE_MODEL
+            })
+            .cloned()
+            .context("selector-triple fixture requires the frontier Codex prior")?;
+        runner_up.model = TEST_SELECTOR_TRIPLE_RUNNER_UP_MODEL.to_string();
+        runner_up.source_id = "test-selector-triple-runner-up-fixture".to_string();
+        runner_up.prior_scope =
+            "test-only deterministic second delegating candidate for selector-triple coverage"
+                .to_string();
+        runner_up.limitations =
+            vec!["test fixture only; not production model or authority evidence".to_string()];
+        runner_up.prohibited_authority_roles = [
+            AuthorityRole::TerminalLeaf,
+            AuthorityRole::AcceptanceGate,
+            AuthorityRole::ReviewAuditor,
+            AuthorityRole::Audit,
+            AuthorityRole::ConflictResolution,
+            AuthorityRole::FailureClassification,
+            AuthorityRole::GitPublication,
+            AuthorityRole::UnknownJudgment,
+        ]
+        .into_iter()
+        .collect();
+        runner_up.one_shot_environment_fallbacks.clear();
+        priors.revision = format!("{}+selector-triple-runner-up-fixture", priors.revision);
+        priors.models.push(runner_up);
+    }
     let economics = crate::optimizer::objective::terminal_worker_routing_economics()?;
     if priors
         .models

@@ -1,5 +1,7 @@
 use super::*;
-use crate::supervise::selection_bridge::selector_effort_as_str;
+use crate::supervise::selection_bridge::{
+    bind_test_selector_triple_catalog, selector_effort_as_str,
+};
 
 fn default_resolved_objective_profile() -> ResolvedObjectiveProfile {
     ResolvedObjectiveProfile {
@@ -2449,12 +2451,23 @@ fn role_selection_produces_distinct_launched_role_argv() {
 #[test]
 fn verified_supervise_dispatch_consumes_and_persists_the_selector_triple() {
     let (temp, repo_path) = injected_repository();
-    let assignment = injected_assignment(true);
+    let verification_target = PathBuf::from("tests/selector_triple.rs");
+    fs::create_dir(repo_path.join("tests")).expect("create injected tests directory");
+    fs::write(
+        repo_path.join(&verification_target),
+        "#[test]\nfn selector_triple_fixture() {}\n",
+    )
+    .expect("write injected selector test target");
+    commit_injected_repository(&repo_path, "selector test target");
+
+    let mut assignment = injected_assignment(true);
+    assignment.assigned_paths = vec![verification_target.clone()];
+    assignment.worker_assignments[0].assigned_paths = vec![verification_target];
     let plan = injected_plan(assignment.clone(), 0);
     let options = injected_options(&repo_path, temp.path(), "verified-selector-triple-dispatch");
     let run_id = options.run_id.clone();
-    let catalog = test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
-        .expect("construct selector-backed Codex catalog");
+    let (_selector_fixture, catalog) = bind_test_selector_triple_catalog()
+        .expect("construct selector-backed Codex catalog with a deterministic runner-up");
     let mut child_commands = Vec::new();
     let mut runner = |command: &ExternalAgentCommand| {
         let name = command
@@ -2566,6 +2579,21 @@ fn verified_supervise_dispatch_consumes_and_persists_the_selector_triple() {
     assert_eq!(runner_up.rank, 2);
     assert_ne!(runner_up.candidate, choice.candidate);
     assert!(runner_up.total_score_microunits >= choice.total_score_microunits);
+    let runner_up_evaluation = decision
+        .provenance
+        .candidate_set
+        .iter()
+        .find(|evaluation| evaluation.candidate == runner_up.candidate)
+        .expect("runner-up candidate evaluation");
+    assert!(runner_up_evaluation.eligible);
+    assert_eq!(
+        runner_up_evaluation
+            .score
+            .as_ref()
+            .expect("eligible runner-up score")
+            .total_score_microunits,
+        runner_up.total_score_microunits
+    );
     let command = &child_commands[0];
     assert_eq!(choice.candidate.runtime, "codex");
     assert!(command.runtime_adapter.is_none());
