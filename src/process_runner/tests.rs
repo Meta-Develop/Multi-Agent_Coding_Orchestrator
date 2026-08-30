@@ -726,7 +726,7 @@ fn external_codex_network_properties_require_exact_netlink_family() {
     let mut properties = BTreeMap::from([
         (
             "RestrictAddressFamilies".to_string(),
-            "AF_NETLINK AF_INET6 AF_INET".to_string(),
+            "AF_UNIX AF_NETLINK AF_INET6 AF_INET".to_string(),
         ),
         ("PrivateNetwork".to_string(), "no".to_string()),
     ]);
@@ -745,7 +745,7 @@ fn external_codex_network_properties_require_exact_netlink_family() {
 
     properties.insert(
         "RestrictAddressFamilies".to_string(),
-        "AF_UNIX AF_INET AF_INET6 AF_NETLINK".to_string(),
+        "AF_UNIX AF_INET AF_INET6".to_string(),
     );
     assert!(verify_systemd_network_properties(
         SideEffectConfinementProfileKind::ExternalCodex,
@@ -2047,15 +2047,15 @@ fn external_grok_unix_stream_initialization_preserves_codex_and_write_boundaries
             "{mode} profile wrote outside its managed worktree"
         );
         match mode {
-            "codex" | "offline" => {
+            "offline" => {
                 let error = UnixStream::pair()
-                    .expect_err("non-Grok profile must continue to reject AF_UNIX socket pairs");
+                    .expect_err("offline profile must continue to reject AF_UNIX socket pairs");
                 assert_eq!(error.raw_os_error(), Some(libc::EPERM));
                 fs::write(marker, "eperm\n").expect("write AF_UNIX denial evidence");
             }
-            "grok" => {
+            "codex" | "grok" => {
                 let (left, right) =
-                    UnixStream::pair().expect("profile must admit local Unix streams");
+                    UnixStream::pair().expect("external runtime must admit local Unix streams");
                 drop((left, right));
                 fs::write(marker, "initialized\n").expect("write worktree evidence");
             }
@@ -2123,8 +2123,9 @@ fn external_grok_unix_stream_initialization_preserves_codex_and_write_boundaries
         SideEffectConfinementEvidence::Verified(SideEffectConfinementProfileKind::ExternalCodex)
     );
     assert_eq!(
-        fs::read_to_string(codex_worktree.join(MARKER_FILE)).expect("Codex EPERM evidence"),
-        "eperm\n"
+        fs::read_to_string(codex_worktree.join(MARKER_FILE))
+            .expect("Codex initialization evidence"),
+        "initialized\n"
     );
 
     let grok_output = run_case(
@@ -2841,7 +2842,7 @@ fn external_codex_alone_admits_inner_bubblewrap_namespaces_and_mounts() {
         .iter()
         .any(|argument| argument == "--property=RestrictNamespaces=no"));
     assert!(arguments.iter().any(|argument| {
-        argument == "--property=RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK"
+        argument == "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"
     }));
     let external_filter = arguments
         .iter()
