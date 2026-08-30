@@ -288,6 +288,7 @@ fn budget_integration_serial_scheduler_accounts_exact_hard_boundary_by_process_r
 
 #[test]
 fn budget_integration_auditor_admission_refusal_reaches_typed_child_and_final_reports() {
+    skip_without_containment!();
     let _capability = install_budget_fixture_models();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
@@ -764,6 +765,7 @@ fn budget_lifecycle_child_pre_runner_failure_releases_reservation_and_stops_pend
 
 #[test]
 fn budget_lifecycle_auditor_pre_runner_failure_releases_reservation_and_stops_pending() {
+    skip_without_containment!();
     let _capability = install_budget_fixture_models();
     let (temp, repo_path) = injected_repository();
     let child_a = injected_assignment(true);
@@ -887,6 +889,7 @@ fn budget_lifecycle_child_runner_panic_reconciles_missing_and_stops_pending() {
 
 #[test]
 fn budget_lifecycle_auditor_runner_panic_reconciles_missing_and_stops_pending() {
+    skip_without_containment!();
     let _capability = install_budget_fixture_models();
     let (temp, repo_path) = injected_repository();
     let child_a = injected_assignment(true);

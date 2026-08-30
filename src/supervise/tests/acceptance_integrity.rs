@@ -70,6 +70,7 @@ fn parent_report_slots_reject_child_time_symlink_rebinding_without_clobbering_se
 
 #[test]
 fn injected_parent_auditor_primary_mutation_is_rejected() {
+    skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let plan = injected_plan(assignment.clone(), 0);
@@ -111,6 +112,7 @@ fn injected_parent_auditor_primary_mutation_is_rejected() {
 
 #[test]
 fn injected_missing_child_or_auditor_and_failed_child_propagate_final_failure() {
+    skip_without_containment!();
     for scenario in [
         "missing-child",
         "failed-child",

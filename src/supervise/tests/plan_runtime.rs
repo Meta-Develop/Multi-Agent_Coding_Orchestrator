@@ -2450,6 +2450,7 @@ fn role_selection_produces_distinct_launched_role_argv() {
 
 #[test]
 fn verified_supervise_dispatch_consumes_and_persists_the_selector_triple() {
+    skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     let verification_target = PathBuf::from("tests/selector_triple.rs");
     fs::create_dir(repo_path.join("tests")).expect("create injected tests directory");
@@ -4256,6 +4257,7 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
 
 #[test]
 fn unavailable_lens_runtime_selection_is_reported_and_journaled_procedurally() {
+    skip_without_containment!();
     let _capability = install_named_test_models(&["child-model"]);
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);

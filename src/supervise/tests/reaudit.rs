@@ -277,6 +277,7 @@ fn evidence_rejection_reaudits_preserved_diff_without_worker_rerun_and_can_accep
 
 #[test]
 fn evidence_only_reaudit_refuses_typed_implementation_defect_without_new_run() {
+    skip_without_containment!();
     let (temp, repo) = injected_repository();
     let source_id = RunId::new("reaudit-source-defect").expect("valid source run id");
     let (source, assignment, _worktree) = run_evidence_rejected_source(
