@@ -72,8 +72,11 @@ The current implementation covers a local-first command-line slice:
 - `maco supervise run <task-or-plan-file>` and
   `maco supervise run --from-goal <file>` accept the same mutually exclusive
   positional-plan or high-level-goal inputs as `supervise plan`, then execute
-  the resulting validated plan through the live supervisor gates. The command
-  selects the Codex runtime by default. Normalized planning-phase Codex
+  the resulting validated plan through the live supervisor gates. Optional
+  `--role-category` stamps every assignment (and nested worker assignment) as
+  `selection_source=operator_override`; omitting it keeps automatic selection
+  derived from the plan role. Resume of an existing run refuses a new
+  `--role-category`. The command selects the Codex runtime by default. Normalized planning-phase Codex
   children receive a read-only workspace and read-only access to their own Git
   worktree metadata in both the outer systemd containment and inner Codex
   permission profile. Only their exact private final-message staging root is
@@ -136,12 +139,13 @@ The current implementation covers a local-first command-line slice:
 - `maco autopilot plan/run/status/collect` provides the local-first autopilot
   workflow: normalize a positional task/plan or decompose `--from-goal <file>`,
   then pass the validated plan through the live depth-2 supervisor path in
-  fake/local mode by default. Accepted, publishable licensed-breakage
-  follow-ups enter the authenticated durable bounded command-level queue and
-  execute through ordinary supervise gates. Fake or otherwise non-publishable
-  follow-ups remain deferred. Autopilot writes public-safe reports under
-  `.maco/autopilot/runs/<run-id>/` but never publishes, merges, or applies a
-  result to the primary worktree.
+  fake/local mode by default. `autopilot run` accepts the same
+  `--role-category` operator override as `supervise run`. Accepted, publishable
+  licensed-breakage follow-ups enter the authenticated durable bounded
+  command-level queue and execute through ordinary supervise gates. Fake or
+  otherwise non-publishable follow-ups remain deferred. Autopilot writes
+  public-safe reports under `.maco/autopilot/runs/<run-id>/` but never
+  publishes, merges, or applies a result to the primary worktree.
 - `maco autopilot artifacts list/latest/prune` inspects or prunes durable
   autopilot run artifacts.
 - `maco artifacts prune --family <family>` applies one retention policy to any
@@ -152,10 +156,35 @@ The current implementation covers a local-first command-line slice:
   report by default, with `ci_reaction_supported=false`.
 - `maco inbox scan/run/status/collect/watch` provides a fake-first reaction
   loop for issue intake, pull request review feedback, and failing CI checks,
-  converting safe inbox items into autopilot repair plans without network access
-  or automatic merge by default.
+  converting safe inbox items into Autopilot repair plans without network access
+  or automatic merge by default. `inbox run` accepts optional rolling-quota
+  ceilings `--max-rolling-tokens`, `--max-rolling-cost-usd`, and
+  `--rolling-window-seconds`.
+- `maco inbox workspace scan/run/watch` supervises the same inbox loop across
+  a workspace JSON of repositories. `scan` reports per-repository intake
+  without launching Autopilot; `run` and `watch` execute the same per-repository
+  inbox path used by `maco inbox run`.
 - `maco inbox artifacts list/latest/prune` inspects or prunes durable inbox run
   artifacts.
+- `maco evaluation run` generates deterministic fake model-mix fixture results
+  from a versioned manifest and digest-bound plan. `maco evaluation experiment`
+  runs the same goal/spec under multiple profiles through isolated Fake
+  supervise. `maco evaluation rescore` re-scores a stored results document
+  under a named objective profile without overwriting the stored file. Real
+  providers remain refused.
+- `maco eval-harness run` completes a declared role mix through the local fake
+  provider. Version 2 manifests are routed to the Issue #26 v2 operator path;
+  `maco eval-harness run-v2` always parses that v2 schema. Real network
+  providers are refused; v2 output is not production-eligible.
+- `maco optimizer library|preference|replay` inspects the starter policy
+  library, operator preference profiles, and stored decision replay snapshots.
+  It does not launch supervise or change production model defaults.
+- `maco scope serve` is a localhost-only observability backend. `maco scope
+  event` appends one disclosure-safe external orchestration event. Neither
+  command launches supervise or mutates source trees.
+- `maco agents list` inspects live MACO-launched agent process records.
+  `maco agents stop` stops one unambiguous process or every process in one
+  explicitly selected run.
 
 ## Roadmap
 
@@ -168,8 +197,9 @@ Implemented local foundations:
    per-agent validation, repo-level validation, run ids, checkpoint writes,
    safe checkpoint resume, and guarded `reuse=reset`.
 4. Provider-neutral LLM adapter boundaries with deterministic fake-provider
-   tests; public fake-provider-backed `maco agent run` execution is temporarily
-   disabled at the assignment-creation boundary.
+   tests; public `maco agent run` executes the local `fake` provider in an
+   isolated managed worktree. Real network providers remain planned and are
+   refused until configured.
 
 Known limitations and roadmap for 0.3.0:
 
@@ -1199,7 +1229,9 @@ generated by `src/evaluation.rs`; no provider, supervisor, held-out command, or
 hand-authored plan was executed to produce them. Cost-shaped values are
 synthetic fixture data rather than prices.
 
-The version-1 experiment fixture set contains (the results/summary wire schema is version 3):
+The version-1 experiment fixture set contains (the current results/summary wire
+schema is version 4; version 3 remains the pre-objective-selection readable
+legacy):
 
 - `hand-authored-plan-v1.json` explicitly identifies itself as a provisional
   hand-authored plan used only to generate deterministic fake evidence. It is
@@ -1240,8 +1272,10 @@ The version-1 experiment fixture set contains (the results/summary wire schema i
   `supervisor-final-execution-v1-legacy.json` fixture proves that configured
   values from an older report are not substituted for missing observations.
 
-Results schema v3 extends each same-repetition dispatch comparison with a
-separate `execution_telemetry_comparability` value. Resolved model/effort
+Results schema v3 added a separate `execution_telemetry_comparability` value
+on each same-repetition dispatch comparison. Schema v4 is the current scored
+wire: it requires canonical `objective_scoring` provenance and is the family
+`maco evaluation rescore --family evaluation` accepts. Resolved model/effort
 differences remain dispatch-selection evidence; assignment, fan-out, and usage
 differences remain execution-telemetry evidence and do not masquerade as a
 model-selection difference. A report without economics schema v2, complete
@@ -1284,6 +1318,39 @@ The ignored regeneration test is an explicit maintainer action:
 ```bash
 cargo test evaluation::tests::regenerate_committed_evaluation_fixtures \
   -- --ignored --exact
+```
+
+The same fixture generator is also the `maco evaluation run` CLI. It still
+generates deterministic fake evidence from a versioned manifest and a
+digest-bound hand-authored plan; it does not inspect the repository or execute
+a provider, supervisor, or held-out command. `--execution` defaults to
+`deterministic-fake`. `--allow-real-provider` acknowledges a future real
+provider path and is still refused by the current runner.
+`maco evaluation experiment` runs the same goal/spec under multiple profiles
+through isolated Fake supervise and likewise refuses real-provider execution.
+
+```bash
+cargo run -- evaluation run tests/fixtures/model_mix_evaluation/manifest-v1.json \
+  --plan-file tests/fixtures/model_mix_evaluation/hand-authored-plan-v1.json --json
+```
+
+### Local fake eval-harness
+
+`maco eval-harness run <manifest.json>` completes each declared role mix
+through the local fake provider and records mix plus per-role outcomes. Version
+1 manifests use the v1 local-fake path. Version 2 manifests are routed to the
+Issue #26 v2 operator path. `maco eval-harness run-v2 <manifest.json>` always
+parses the v2 manifest schema and refuses a v1 document. Both commands accept
+`--json`. Real network providers are refused. A v2 `provider_request` of
+`real_provider` fails closed: omitting the explicit opt-in is
+`RealProviderOptInRequired`, and `allow_real_provider=true` is still
+`RealProviderUnavailable`. The v2 local fake path emits machine-readable
+comparable results (`schema` such as `eval_harness_comparable_fake_results_v2`)
+with `production_eligible=false` and does not write cwd artifacts.
+
+```bash
+cargo run -- eval-harness run tests/fixtures/eval_harness/manifest-v2.json --json
+cargo run -- eval-harness run-v2 tests/fixtures/eval_harness/manifest-v2.json --json
 ```
 
 Real-provider experiments are a strict future opt-in boundary. A future runner
@@ -1347,9 +1414,39 @@ scored as numeric zero.
 
 The 50/25/25 quality decomposition is frozen for evaluation-side consumers;
 supervisor selector hard quality and authority gates remain unchanged and
-non-weightable. This milestone adds operator profile selection and immutable
-review evidence only; it does not implement the GUI tracked by #152 or
-historical run rescoring.
+non-weightable. Operator profile selection and immutable review evidence are
+live. Historical rescoring of stored evaluation documents is available as
+`maco evaluation rescore` and does not overwrite the stored results file. The
+GUI tracked by #152 remains planned.
+
+### Historical evaluation rescoring
+
+`maco evaluation rescore` re-scores a validated stored results document under a
+different named objective profile. The stored file is never overwritten. The
+command requires:
+
+- a positional manifest path matching the selected family
+- `--results <file>` for the stored document
+- `--family evaluation|experiment`
+- `--objective-profile <name>` resolved from the repository override file or
+  the built-in profiles
+- optional `--repo` (default `.`) used only to resolve that named profile
+- optional `--json`
+
+`--family evaluation` expects stored `EvaluationResults` schema v4 plus an
+`EvaluationManifest`. `--family experiment` expects stored `ExperimentResults`
+schema v2 plus an `ExperimentManifest`. Missing `--results`, `--family`, or
+`--objective-profile`, and an unknown family name, fail at argument parsing.
+Unknown profile names fail before scoring. The JSON envelope records
+`kind=historical_rescore`, the original and applied profile bindings, the
+complete original stored document, and only the preference-bearing selection
+recomputed from the stored preference-free Pareto evidence.
+
+```bash
+cargo run -- evaluation rescore tests/fixtures/model_mix_evaluation/manifest-v1.json \
+  --results tests/fixtures/model_mix_evaluation/runs-v1.json \
+  --family evaluation --objective-profile maco-default-objective-v1 --json
+```
 
 ### Provisional named effort default
 
@@ -1461,7 +1558,23 @@ is supplied, the run budget ledger also retains the original plan and CLI
 values under `run_budget.sources` so the override is visible independently of
 the composed `limits`.
 
-Autopilot propagates these limits to its source and generated follow-up
+The same two commands also accept optional workspace rolling-quota ceilings:
+
+- `--max-rolling-tokens`
+- `--max-rolling-cost-usd`
+- `--rolling-window-seconds`
+
+A rolling quota is bound only when at least one of `--max-rolling-tokens` or
+`--max-rolling-cost-usd` is set; `--rolling-window-seconds` alone does not
+create a quota. Values must be finite and positive. When a ceiling is set and
+the window is omitted, the window defaults to 86400 seconds (24 hours). These
+ceilings apply across supervise/autopilot runs in the workspace rolling
+ledger; they are distinct from the per-run `--max-tokens` / `--max-cost-usd` /
+`--max-duration-seconds` flags. `maco inbox run` exposes the same three rolling
+flags for inbox Autopilot dispatches and rejects the per-run supervise
+ceilings.
+
+Autopilot propagates the per-run limits to its source and generated follow-up
 supervise dispatches. Completed run-budget results also update MACO's
 authenticated rolling workspace ledger; in-flight reservations remain local to
 the run.
@@ -1653,7 +1766,10 @@ bounded to 16,384 logical records and authenticated
 snapshot storage is also bounded; older logical events are evicted, so this is
 operational recent history rather than an indefinite audit archive.
 
-Managed worktree creation currently returns `Unsupported` before repository access:
+Managed worktree creation derives a capability-bound repository cleanliness
+input at command start and creates a linked worktree when the primary is
+observed clean. A dirty primary fails with the required remedy before the
+worktree is created:
 
 ```bash
 cargo run -- worktree create agent-a --repo . --json
@@ -2005,7 +2121,6 @@ Run a local orchestration plan:
 
 ```bash
 cargo run -- orchestrate validate plan.json --json
-# Temporarily returns Unsupported before assignment creation:
 cargo run -- orchestrate run plan.json --repo . --jobs 2 --patch-dir .maco/patches --reuse clean --run-id demo --checkpoint-dir .maco/checkpoints --json
 cargo run -- orchestrate resume .maco/checkpoints/demo.json --repo . --plan-file plan.json --jobs 2 --patch-dir .maco/patches --json
 ```
@@ -2671,9 +2786,9 @@ Run a deterministic local fake-provider proposal in an isolated worktree:
 cargo run -- agent run task.md --agent-id agent-a --path README.md --fake-proposal proposal.json --validation "cargo test" --repo . --json
 ```
 
-The command above currently returns `Unsupported` before repository, claim, or
-worktree mutation. The retained agent runner accepts only the local `fake`
-provider. It renders
+The retained agent runner accepts only the local `fake` provider and executes
+in an isolated managed worktree after deriving the capability-bound
+repository-cleanliness input. Other provider names are refused. It renders
 the same provider-neutral prompt boundary used by `llm prompt-preview`.
 Provider-proposed shell commands are disabled by default: the command above
 reports a refusal for the proposed `printf` command and tells you to rerun with
@@ -2747,6 +2862,11 @@ cargo run -- supervise run supervisor-plan.json --repo . --run-id supervise-demo
   --quota-config config/operator-quota.json \
   --machine-global-config /exact/path/to/machine-global.json \
   --machine-global-runtime-root-id runtime --json
+# Operator role-category override recorded as selection_source=operator_override:
+cargo run -- supervise run supervisor-plan.json --repo . --run-id supervise-role \
+  --runtime fake --role-category non_delegating_terminal_worker \
+  --machine-global-config /exact/path/to/machine-global.json \
+  --machine-global-runtime-root-id runtime --json
 # Decompose the goal and execute that same validated plan through the live gates:
 cargo run -- supervise run --from-goal goal.md --repo . \
   --run-id supervise-goal-demo --codex-bin codex \
@@ -2769,6 +2889,18 @@ specification.
 `--from-goal <FILE>` is mutually exclusive with the positional input and always
 treats the bounded UTF-8 file as a high-level goal/spec, even if its contents
 happen to be valid JSON.
+
+`supervise run` and `autopilot run` accept optional `--role-category`. Omitted
+keeps automatic selection derived from the plan role. When set, the CLI stamps
+every assignment and nested `worker_assignments` entry with that category and
+`selection_source=operator_override` before launch. Accepted values are
+`delegating_coordinator`, `non_delegating_terminal_worker`,
+`read_only_researcher`, and `read_only_review_auditor` (hyphen aliases are
+accepted). Unknown names fail at argument parsing, before repository access.
+Resume of an existing supervise run refuses `--role-category`; the frozen
+categories from the original launch remain in force. The override does not
+bypass role-authority admission: a weak-model coordinator remains a typed
+refusal.
 
 `supervise run` and `autopilot run` persist launch preflight evidence under
 `preflight/` (git status, repository map, sync status, and in-process runtime
@@ -2923,8 +3055,9 @@ plan requests it, and writes structured logs and reports under the run
 directory. Managed-worktree Codex uses native workspace-write execution under
 the outer confinement boundary; the Issue 28 universal-review coverage gate
 remains mandatory for a writable primary-checkout target. The in-process Fake
-file-entry simulation path instead returns `Unsupported` before repository
-access or artifact reservation.
+runtime executes the same depth, claim, journal, review-lens, economics, KPI,
+and final primary-integrity gates without launching an external executable;
+its successful output is always non-publishable.
 Child/model final-message bytes are confined to `incoming/`; normalized child
 reports and `supervisor-final.json` are parent-owned under `reports/`. A live
 external child requires two distinct writable artifact capabilities in both the
@@ -3390,8 +3523,10 @@ The load-bearing CLI contract changed explicitly: previously every
 integration test required zero run artifacts. It now requires a complete
 machine-global binding, performs typed preflight and pre-dispatch checks, and
 delegates exactly once to live supervise; the missing-binding test retains the
-old before-effects refusal boundary. Effectful Inbox run/watch callers remain
-disabled and do not inherit this narrower capability.
+old before-effects refusal boundary. Effectful `maco inbox run` and
+`maco inbox watch` callers are live again: they dispatch selected item work
+through that same Autopilot spine, so they inherit its machine-global binding
+requirement whenever item work launches Autopilot.
 
 Run the fake-first inbox reaction loop:
 
@@ -3412,9 +3547,10 @@ Run the fake-first inbox reaction loop:
 
 ```bash
 cargo run -- inbox scan --repo . --json
-# The following run/watch commands currently return Unsupported:
 cargo run -- inbox run --repo . --run-id inbox-demo --json
 cargo run -- inbox run --repo . --run-id inbox-codex --permission github_local --codex-bin codex --json
+cargo run -- inbox run --repo . --run-id inbox-quota \
+  --max-rolling-tokens 42000 --max-rolling-cost-usd 12.5 --json
 cargo run -- inbox status inbox-demo --repo . --json
 cargo run -- inbox collect inbox-demo --repo . --json
 cargo run -- inbox watch --repo . --poll-seconds 60 --once --json
@@ -3451,13 +3587,27 @@ item is used. Duplicate detection remains stable by repository, kind, and number
 while the snapshot digest separately identifies the observed source revision.
 Fake fixtures use fixed timestamps and canonical fake OIDs for reproducibility.
 
-`maco inbox run` and `maco inbox watch` execute effectfully again: item work
-dispatches through autopilot, whose supervisor cascade derives the
+`maco inbox run` and `maco inbox watch` execute effectfully: item work
+dispatches through Autopilot, whose supervisor cascade derives the
 capability-bound repository cleanliness input before creating managed
 worktrees. `scan`, `status`, `collect`, and read-only artifact inspection
 remain available. The fake-first reaction flow described below is the
 executable behavior; the unbound Fake reviewer still stops as nonpublishable
 before real publication effects.
+
+`maco inbox run` accepts optional workspace rolling-quota ceilings
+`--max-rolling-tokens`, `--max-rolling-cost-usd`, and
+`--rolling-window-seconds`. A quota is bound only when at least one of
+`--max-rolling-tokens` or `--max-rolling-cost-usd` is set; `--rolling-window-seconds`
+alone is ignored. Values must be finite and positive. When a ceiling is set
+and the window is omitted, the window defaults to 86400 seconds (24 hours).
+These flags are inbox-run ceilings across Autopilot dispatches in the
+workspace rolling ledger; they are not the supervise/autopilot per-run
+`--max-tokens` / `--max-cost-usd` / `--max-duration-seconds` flags, which
+`inbox run` rejects. `inbox watch` and `inbox workspace run|watch` do not
+expose the rolling-quota flags. When a rolling quota refuses further work,
+the run records `status=refused` and the next action asks the operator to
+increase or wait for the quota.
 
 Inbox runs write public-safe artifacts under `.maco/inbox/runs/<run-id>/`,
 including `scan-report.json`, `selected-items.json`, `item-<n>-plan.json`,
@@ -3537,21 +3687,26 @@ Run the cross-repository inbox workspace supervisor:
 
 ```bash
 cargo run -- inbox workspace scan --config workspace-inbox.json --json
-# The following workspace run/watch commands currently return Unsupported:
 cargo run -- inbox workspace run --config workspace-inbox.json --run-id workspace-demo --json
 cargo run -- inbox workspace run --config workspace-inbox.json --run-id workspace-dry --dry-run --json
 cargo run -- inbox workspace watch --config workspace-inbox.json --poll-seconds 60 --once --json
 ```
 
-Workspace inbox `run` and `watch` currently return `Unsupported` before reading
-the workspace config or creating artifacts. Workspace `scan` remains available.
+`maco inbox workspace scan`, `run`, and `watch` are implemented. `scan` reads
+the workspace config and reports per-repository intake without launching
+Autopilot. `run` writes aggregate artifacts under
+`.maco/inbox-workspace/runs/<run-id>/` and then executes each enabled
+repository through the same inbox run path used by `maco inbox run`. `watch`
+polls that run path; `--once` performs a single iteration and returns. `--dry-run`
+plans item work and writes reports without launching Autopilot. Workspace
+run/watch do not accept the inbox rolling-quota flags; those apply only to
+`maco inbox run`.
 The retained aggregate design reports `version`, a public-safe `config_path`,
 `strict`, repo counts, and one entry per repository with `id`, `enabled`,
 `permission_mode`, `status`, `success`, `refused`, optional `message`, and an
-embedded `scan_report` or `run_report`. Workspace run artifacts are written
-under `.maco/inbox-workspace/runs/<run-id>/`, while per-repo repair artifacts
-remain under each repository's `.maco/inbox/runs/<run-id>/` tree. Public reports
-must not expose local temp paths, credentials, raw secrets, or private bodies.
+embedded `scan_report` or `run_report`. Per-repo repair artifacts remain under
+each repository's `.maco/inbox/runs/<run-id>/` tree. Public reports must not
+expose local temp paths, credentials, raw secrets, or private bodies.
 Workspace configs use the same 256 KiB bounded, no-follow UTF-8 loading and
 strict unknown-field/version rules. They support at most 64 uniquely identified
 repositories; repository IDs, paths, labels, per-repository item counts, and
