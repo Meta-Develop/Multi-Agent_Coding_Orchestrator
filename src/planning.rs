@@ -628,6 +628,30 @@ fn propose_task_decomposition_from_fragments(
             },
         });
     }
+    if let Some(assignment) = authoritative_new_file_creation_assignment(
+        repo,
+        title,
+        body,
+        &fragments,
+        &file_set,
+        &inventory.nested_repository_boundaries,
+    ) {
+        diagnostics.notes.push(
+            "an explicit safe new-file creation directive bounded the task before semantic inference"
+                .to_string(),
+        );
+        return Ok(TaskDecompositionProposal {
+            fragments,
+            assignments: vec![assignment],
+            coverage_gaps: Vec::new(),
+            diagnostics,
+            disjointness: TaskDisjointnessReport {
+                disjoint: true,
+                conflicts: Vec::new(),
+                conflicts_truncated: false,
+            },
+        });
+    }
     let semantic_map = match repo_semantic::scan_repository_with_exclusions(
         repo,
         Some(&file_set),
@@ -786,6 +810,221 @@ fn is_single_file_only_directive(line: &str) -> bool {
     ]
     .iter()
     .any(|phrase| contains_phrase(&normalized, phrase))
+}
+
+fn authoritative_new_file_creation_assignment(
+    repo: &Path,
+    title: &str,
+    body: &str,
+    fragments: &[TaskSpecFragment],
+    file_set: &BTreeSet<PathBuf>,
+    nested_repository_boundaries: &[PathBuf],
+) -> Option<TaskAssignmentProposal> {
+    let full_text = format!("{title}\n{body}");
+    let target = explicit_new_file_creation_target(&full_text)?;
+    let only_path =
+        safe_missing_new_file_target(repo, &target, file_set, nested_repository_boundaries)?;
+
+    Some(TaskAssignmentProposal {
+        id: "assignment-001".to_string(),
+        task: fragments
+            .iter()
+            .map(|fragment| fragment.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        fragment_ids: fragments
+            .iter()
+            .map(|fragment| fragment.id.clone())
+            .collect(),
+        assigned_paths: vec![only_path],
+        semantic_symbols: Vec::new(),
+        semantic_modules: Vec::new(),
+    })
+}
+
+fn explicit_new_file_creation_target(text: &str) -> Option<String> {
+    const DIRECTIVES: [&str; 6] = [
+        "create a new file",
+        "create new file",
+        "create a file",
+        "create file",
+        "add a new file",
+        "add new file",
+    ];
+
+    let mut parsed_target = None;
+    let mut directive_count = 0_usize;
+    for line in text.lines() {
+        let lowered = line.to_ascii_lowercase();
+        for directive in DIRECTIVES {
+            let mut search_start = 0_usize;
+            while let Some(relative_index) = lowered.get(search_start..)?.find(directive) {
+                let index = search_start.checked_add(relative_index)?;
+                let directive_end = index.checked_add(directive.len())?;
+                search_start = directive_end;
+                if !has_phrase_boundaries(&lowered, index, directive_end) {
+                    continue;
+                }
+                directive_count = directive_count.checked_add(1)?;
+                if directive_count != 1 {
+                    return None;
+                }
+                let remainder = line.get(directive_end..)?;
+                parsed_target = parse_new_file_target(remainder);
+            }
+        }
+    }
+    if directive_count != 1 {
+        return None;
+    }
+    let target = parsed_target?;
+
+    let mentioned_paths = extract_path_like_tokens(text);
+    if mentioned_paths.len() > 1
+        || mentioned_paths
+            .first()
+            .is_some_and(|mentioned| mentioned != &target)
+    {
+        return None;
+    }
+    Some(target)
+}
+
+fn has_phrase_boundaries(text: &str, start: usize, end: usize) -> bool {
+    let bytes = text.as_bytes();
+    let is_word_byte = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let starts_at_boundary = start == 0
+        || bytes
+            .get(start.saturating_sub(1))
+            .is_some_and(|byte| !is_word_byte(*byte));
+    let ends_at_boundary = bytes.get(end).is_none_or(|byte| !is_word_byte(*byte));
+    starts_at_boundary && ends_at_boundary
+}
+
+fn parse_new_file_target(remainder: &str) -> Option<String> {
+    let mut remainder = remainder.trim_start();
+    let mut explicitly_named = false;
+    for label in ["named", "called", "at"] {
+        if let Some(stripped) = strip_ascii_word_prefix(remainder, label) {
+            remainder = stripped.trim_start();
+            explicitly_named = true;
+            break;
+        }
+    }
+
+    let (raw_target, trailing) = match remainder.chars().next()? {
+        quote @ ('`' | '\'' | '"') => {
+            let quoted = remainder.get(quote.len_utf8()..)?;
+            let closing = quoted.find(quote)?;
+            (
+                quoted.get(..closing)?,
+                quoted.get(closing + quote.len_utf8()..)?,
+            )
+        }
+        _ => match remainder.find(char::is_whitespace) {
+            Some(end) => (remainder.get(..end)?, remainder.get(end..)?),
+            None => (remainder, ""),
+        },
+    };
+    let target = normalize_creation_target_token(raw_target)?;
+    if !explicitly_named && !looks_like_repo_relative_path(&target) {
+        return None;
+    }
+    let trailing = trailing.trim_start();
+    if trailing.starts_with(',')
+        || trailing.starts_with(';')
+        || (!trailing.is_empty()
+            && !["containing", "with", "whose", "that", "which", "to"]
+                .iter()
+                .any(|prefix| strip_ascii_word_prefix(trailing, prefix).is_some()))
+    {
+        return None;
+    }
+    Some(target)
+}
+
+fn strip_ascii_word_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let candidate = value.get(..prefix.len())?;
+    if !candidate.eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+    let remainder = value.get(prefix.len()..)?;
+    if remainder
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        return None;
+    }
+    Some(remainder)
+}
+
+fn normalize_creation_target_token(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches(|ch: char| {
+        matches!(
+            ch,
+            ',' | ';' | ':' | ')' | '(' | '[' | ']' | '{' | '}' | '!'
+        )
+    });
+    if trimmed.is_empty() {
+        return None;
+    }
+    let trimmed = match trimmed.strip_suffix('.') {
+        Some(stripped) if looks_like_repo_relative_path(stripped) => stripped,
+        _ => trimmed,
+    };
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn safe_missing_new_file_target(
+    repo: &Path,
+    target: &str,
+    file_set: &BTreeSet<PathBuf>,
+    nested_repository_boundaries: &[PathBuf],
+) -> Option<PathBuf> {
+    if target.ends_with('/')
+        || target.ends_with('\\')
+        || target.contains('\\')
+        || target
+            .split('/')
+            .any(|component| matches!(component, "." | ".." | ".git"))
+    {
+        return None;
+    }
+    let target_path = Path::new(target);
+    if target_path.is_absolute() || target.as_bytes().get(1).is_some_and(|byte| *byte == b':') {
+        return None;
+    }
+    let normalized = normalize_repo_relative_path(target_path).ok()?;
+    if normalized.as_os_str().is_empty()
+        || is_excluded_planning_path(&normalized)
+        || file_set.contains(&normalized)
+        || nested_repository_boundaries
+            .iter()
+            .any(|boundary| normalized.starts_with(boundary))
+    {
+        return None;
+    }
+
+    match fs::symlink_metadata(repo.join(&normalized)) {
+        Ok(_) => return None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return None,
+    }
+    let mut parent = normalized.parent();
+    while let Some(relative) = parent {
+        if relative.as_os_str().is_empty() {
+            break;
+        }
+        match fs::symlink_metadata(repo.join(relative)) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => return None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+        parent = relative.parent();
+    }
+    Some(normalized)
 }
 
 pub fn propose_task_decomposition_with_optional_provider(
@@ -3812,6 +4051,118 @@ Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other 
                 .notes
                 .iter()
                 .any(|note| { note.contains("explicit single-file-only directive") }));
+        });
+    }
+
+    #[test]
+    fn explicit_new_root_file_creation_is_bound_before_semantic_inference() {
+        skip_without_containment!();
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            for index in 0..24 {
+                write_file(
+                    repo,
+                    &format!("src/unrelated_{index:02}.rs"),
+                    "pub fn create() {}\npub fn file() {}\n",
+                );
+            }
+
+            let task = "Create a new file named LITERAL_E2E.md containing exactly one line: MACO literal routing reached the terminal worker.";
+            let proposal = propose_task_decomposition(repo, task, "")
+                .expect("explicit new-file creation proposal");
+
+            assert_eq!(proposal.assignments.len(), 1);
+            assert_eq!(proposal.assignments[0].id, "assignment-001");
+            assert_eq!(
+                proposal.assignments[0].assigned_paths,
+                vec![PathBuf::from("LITERAL_E2E.md")]
+            );
+            assert!(proposal.assignments[0].semantic_symbols.is_empty());
+            assert!(proposal.assignments[0].semantic_modules.is_empty());
+            assert!(proposal.coverage_gaps.is_empty());
+            assert!(proposal.disjointness.disjoint);
+            assert!(!repo.join("LITERAL_E2E.md").exists());
+            assert!(proposal
+                .diagnostics
+                .notes
+                .iter()
+                .any(|note| { note.contains("explicit safe new-file creation directive") }));
+        });
+    }
+
+    #[test]
+    fn explicit_new_file_creation_rejects_unsafe_or_ambiguous_targets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        git2::Repository::init(repo).expect("init repo");
+        fs::create_dir_all(repo.join("docs")).expect("create existing directory");
+        let nested_path = repo.join("vendor/nested");
+        git2::Repository::init(&nested_path).expect("init nested repo");
+
+        let files = BTreeSet::new();
+        let nested = vec![PathBuf::from("vendor/nested")];
+        for task in [
+            "Create a new file named /tmp/ABSOLUTE.md.",
+            "Create a new file named ../TRAVERSAL.md.",
+            "Create a new file named nested/../TRAVERSAL.md.",
+            "Create a new file named ./DOT.md.",
+            "Create a new file named . containing one line.",
+            "Create a new file named .git/config.",
+            "Create a new file named docs/.",
+            "Create a new file named vendor/nested/NEW.md.",
+            "Create a new file named FIRST.md and SECOND.md.",
+            "Create a new file named NOTICE and LICENSE.",
+            "Create a new file named NOTICE LICENSE.",
+            "Create a new file named FIRST, SECOND.",
+            "Create a new file named FIRST.md, then create a new file named SECOND.md.",
+            "Update MISSING_REFERENCE.md without creating it.",
+        ] {
+            assert_eq!(
+                authoritative_new_file_creation_assignment(
+                    repo,
+                    task,
+                    "",
+                    &[TaskSpecFragment {
+                        id: "fragment-001".to_string(),
+                        text: task.to_string(),
+                    }],
+                    &files,
+                    &nested,
+                ),
+                None,
+                "unexpectedly admitted {task}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_creation_of_an_existing_path_uses_normal_existing_path_planning() {
+        skip_without_containment!();
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, "EXISTING.md", "already here\n");
+
+            let proposal = propose_task_decomposition(
+                repo,
+                "Create a new file named EXISTING.md containing replacement text.",
+                "",
+            )
+            .expect("existing path follows ordinary planning");
+
+            assert_eq!(proposal.assignments.len(), 1);
+            assert_eq!(
+                proposal.assignments[0].assigned_paths,
+                vec![PathBuf::from("EXISTING.md")]
+            );
+            assert!(!proposal
+                .diagnostics
+                .notes
+                .iter()
+                .any(|note| { note.contains("explicit safe new-file creation directive") }));
         });
     }
 
