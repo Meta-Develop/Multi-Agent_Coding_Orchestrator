@@ -254,6 +254,8 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
     planning::validate_task_assignment_disjointness(&proposal.assignments)
         .context("goal/spec workstreams are not independently assignable")?;
 
+    let explicit_new_file_workstream = authoritative_new_file_workstream_id(&proposal);
+
     let spec_fragment_ids = proposal
         .fragments
         .iter()
@@ -269,6 +271,14 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
     let mut assignment_schedule = Vec::with_capacity(assignment_capacity);
     for assignment in proposal.assignments {
         let planning_id = format!("{}-planning", assignment.id);
+        let planning_task = format!(
+            "Read-only planning gate for workstream '{}'. Review the proposed scope and implementation task without editing files or delegating implementation. Confirm whether the execution child can proceed safely.\n\nExecution task:\n{}",
+            assignment.id, assignment.task
+        );
+        let explicit_new_file_notes = (explicit_new_file_workstream.as_deref()
+            == Some(assignment.id.as_str()))
+        .then(|| explicit_new_file_preclaim_directive(&assignment, &planning_id, &planning_task))
+        .transpose()?;
         let planning_index = assignments.len();
         assignments.push(OrchestratorAssignment {
             id: planning_id.clone(),
@@ -280,17 +290,16 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
             assigned_paths: assignment.assigned_paths.clone(),
             semantic_symbols: assignment.semantic_symbols.clone(),
             semantic_modules: assignment.semantic_modules.clone(),
-            task: Some(format!(
-                "Read-only planning gate for workstream '{}'. Review the proposed scope and implementation task without editing files or delegating implementation. Confirm whether the execution child can proceed safely.\n\nExecution task:\n{}",
-                assignment.id, assignment.task
-            )),
+            task: Some(planning_task),
             worker_assignments: Vec::new(),
             environment_requirements: Vec::new(),
             licensed_breakage: None,
-            notes: Some(
-                "MACO-visible read-only planning root; its execution child is parent-gated"
-                    .to_string(),
-            ),
+            notes: explicit_new_file_notes.clone().or_else(|| {
+                Some(
+                    "MACO-visible read-only planning root; its execution child is parent-gated"
+                        .to_string(),
+                )
+            }),
         });
         assignment_schedule.push(AssignmentScheduleEntry {
             assignment_id: planning_id.clone(),
@@ -332,9 +341,11 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
             worker_assignments: vec![worker],
             environment_requirements: Vec::new(),
             licensed_breakage: None,
-            notes: Some(format!(
-                "Execution child admitted only after read-only planning root '{planning_id}' succeeds"
-            )),
+            notes: explicit_new_file_notes.or_else(|| {
+                Some(format!(
+                    "Execution child admitted only after read-only planning root '{planning_id}' succeeds"
+                ))
+            }),
         });
         assignment_schedule.push(AssignmentScheduleEntry {
             assignment_id: assignment.id,
@@ -383,6 +394,72 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         assignment_metadata,
         plan_metadata,
     })
+}
+
+const AUTHORITATIVE_NEW_FILE_DIAGNOSTIC: &str =
+    "an explicit safe new-file creation directive bounded the task before semantic inference";
+const GENERATED_PRECLAIM_DIRECTIVE_PREFIX: &str = "maco-preclaim-v1:";
+
+fn authoritative_new_file_workstream_id(
+    proposal: &planning::TaskDecompositionProposal,
+) -> Option<String> {
+    let [assignment] = proposal.assignments.as_slice() else {
+        return None;
+    };
+    let [_assigned_path] = assignment.assigned_paths.as_slice() else {
+        return None;
+    };
+    let authoritative_diagnostic_count = proposal
+        .diagnostics
+        .notes
+        .iter()
+        .filter(|note| note.as_str() == AUTHORITATIVE_NEW_FILE_DIAGNOSTIC)
+        .count();
+    (authoritative_diagnostic_count == 1
+        && proposal.coverage_gaps.is_empty()
+        && proposal.disjointness.disjoint
+        && proposal.disjointness.conflicts.is_empty()
+        && assignment.semantic_symbols.is_empty()
+        && assignment.semantic_modules.is_empty())
+    .then(|| assignment.id.clone())
+}
+
+fn explicit_new_file_preclaim_directive(
+    assignment: &planning::TaskAssignmentProposal,
+    planning_id: &str,
+    planning_task: &str,
+) -> Result<String> {
+    let [assigned_path] = assignment.assigned_paths.as_slice() else {
+        bail!(
+            "explicit new-file workstream '{}' lost its single-path binding",
+            assignment.id
+        );
+    };
+    let assigned_path = assigned_path.to_str().with_context(|| {
+        format!(
+            "explicit new-file workstream '{}' path is not UTF-8",
+            assignment.id
+        )
+    })?;
+    let payload = serde_json::json!({
+        "verification_contract": {
+            "kind": "explicit_new_file_creation",
+            "assigned_path": assigned_path,
+            "planning_assignment": {
+                "id": planning_id,
+                "task_sha256": crate::artifacts::state_auth::sha256_hex(planning_task.as_bytes()),
+            },
+            "execution_assignment": {
+                "id": assignment.id,
+                "task_sha256": crate::artifacts::state_auth::sha256_hex(assignment.task.as_bytes()),
+            }
+        }
+    });
+    Ok(format!(
+        "{GENERATED_PRECLAIM_DIRECTIVE_PREFIX}{}",
+        serde_json::to_string(&payload)
+            .context("failed to serialize explicit new-file pre-claim contract")?
+    ))
 }
 
 const CONSERVATIVE_GENERATED_ROLE_RESERVATION_TOKENS: usize = 1_024;

@@ -582,6 +582,72 @@ fn primary_worktree_cli_requires_plan_and_flag_and_rejects_invalid_scope() -> Re
 }
 
 #[test]
+fn supervise_plan_literal_new_file_carries_bound_preclaim_contract_for_both_nodes() -> Result<()> {
+    support::require_containment!(
+        "supervise_plan_literal_new_file_carries_bound_preclaim_contract_for_both_nodes"
+    );
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let goal_path = temp.path().join("literal-new-file.md");
+    fs::write(
+        &goal_path,
+        "Create a new file named LITERAL_E2E.md containing exactly one line: MACO literal routing reached the terminal worker.\n",
+    )?;
+
+    let plan = run_success_json(&[
+        "supervise",
+        "plan",
+        "--from-goal",
+        path_str(&goal_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    let assignments = plan["assignments"].as_array().context("assignments")?;
+    assert_eq!(assignments.len(), 2);
+    assert_eq!(assignments[0]["id"], "assignment-001-planning");
+    assert_eq!(assignments[0]["phase"], "planning");
+    assert_eq!(assignments[1]["id"], "assignment-001");
+    assert_eq!(assignments[1]["phase"], "execution");
+    assert!(assignments
+        .iter()
+        .all(|assignment| assignment["assigned_paths"] == serde_json::json!(["LITERAL_E2E.md"])));
+
+    let contracts = assignments
+        .iter()
+        .map(|assignment| {
+            let notes = assignment["notes"]
+                .as_str()
+                .context("literal assignment notes")?;
+            let payload = notes
+                .strip_prefix("maco-preclaim-v1:")
+                .context("typed preclaim directive prefix")?;
+            serde_json::from_str::<Value>(payload).context("typed preclaim directive JSON")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(contracts[0], contracts[1]);
+    let contract = &contracts[0]["verification_contract"];
+    assert_eq!(contract["kind"], "explicit_new_file_creation");
+    assert_eq!(contract["assigned_path"], "LITERAL_E2E.md");
+    assert_eq!(
+        contract["planning_assignment"]["id"],
+        "assignment-001-planning"
+    );
+    assert_eq!(contract["execution_assignment"]["id"], "assignment-001");
+    for binding in ["planning_assignment", "execution_assignment"] {
+        assert_eq!(
+            contract[binding]["task_sha256"]
+                .as_str()
+                .context("task_sha256")?
+                .len(),
+            64
+        );
+    }
+    assert!(!repo_path.join("LITERAL_E2E.md").exists());
+    Ok(())
+}
+
+#[test]
 fn supervise_plan_from_goal_emits_nested_traceable_disjoint_workstreams() -> Result<()> {
     support::require_containment!(
         "supervise_plan_from_goal_emits_nested_traceable_disjoint_workstreams"

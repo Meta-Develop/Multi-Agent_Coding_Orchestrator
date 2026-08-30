@@ -2396,6 +2396,67 @@ fn verified_acquire_without_evidence_still_fails_closed() {
 }
 
 #[test]
+fn literal_new_file_lowering_preclaims_planning_root_and_execution_child() {
+    let (_temp, repo) = test_repository();
+    let task = "Create a new file named LITERAL_E2E.md containing exactly one line: MACO literal routing reached the terminal worker.";
+    let plan = supervisor_plan_from_goal_spec(&repo, "", task)
+        .expect("lower authoritative literal new-file directive");
+    assert_eq!(plan.assignments.len(), 2);
+    assert!(plan
+        .assignments
+        .iter()
+        .all(|assignment| assignment.assigned_paths == [PathBuf::from("LITERAL_E2E.md")]));
+    assert!(plan
+        .assignments
+        .iter()
+        .any(|assignment| assignment.phase == AssignmentPhase::Planning));
+    assert!(plan
+        .assignments
+        .iter()
+        .any(|assignment| assignment.phase == AssignmentPhase::Execution));
+
+    let evidence = PreclaimRunEvidence::acquire(
+        &repo,
+        SupervisorRuntime::Codex,
+        SupervisorExecutionRuntime::Verified,
+    );
+    assert!(evidence.repo_map.is_some());
+    assert!(evidence.runtime.is_some());
+    for assignment in &plan.assignments {
+        let risk = evidence
+            .risk_for(&assignment.assigned_paths)
+            .expect("literal assignment risk evidence");
+        let decision = evaluate_preclaim_viability(
+            assignment,
+            &plan.assignments,
+            evidence.repo_map.as_ref(),
+            Some(&risk),
+            evidence.runtime,
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(
+            decision.dimensions,
+            preclaim::PreclaimViabilityDimensions {
+                limited_scope: preclaim::ViabilityFinding::Yes,
+                clear_verification_path: preclaim::ViabilityFinding::Yes,
+                autonomously_completable: preclaim::ViabilityFinding::Yes,
+            },
+            "{}: {}",
+            assignment.id,
+            decision.reason
+        );
+        assert_eq!(
+            decision.disposition,
+            preclaim::PreclaimDisposition::Claim,
+            "{}: {}",
+            assignment.id,
+            decision.reason
+        );
+    }
+    assert!(!repo.join("LITERAL_E2E.md").exists());
+}
+
+#[test]
 fn concurrency_tracker_measures_live_guards_and_closes_on_unwind() {
     let tracker = SchedulerConcurrencyTracker::new();
     {
