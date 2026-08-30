@@ -873,17 +873,23 @@ struct ExternalGrokReadOnlyFileCapability {
     path: PathBuf,
     held_file: Arc<File>,
     identity: ExternalGrokReadOnlyFileIdentity,
+    projection: ExternalGrokReadOnlyFileProjection,
 }
 
 #[cfg(target_os = "linux")]
 impl ExternalGrokReadOnlyFileCapability {
-    fn new(path: PathBuf, held_file: Arc<File>) -> std::io::Result<Self> {
+    fn new(
+        path: PathBuf,
+        held_file: Arc<File>,
+        projection: ExternalGrokReadOnlyFileProjection,
+    ) -> std::io::Result<Self> {
         verify_external_grok_file_descriptor_is_read_only(&held_file)?;
         let identity = external_grok_read_only_file_identity(&held_file.metadata()?)?;
         let capability = Self {
             path,
             held_file,
             identity,
+            projection,
         };
         capability.verify_path()?;
         Ok(capability)
@@ -894,6 +900,7 @@ impl ExternalGrokReadOnlyFileCapability {
             path,
             held_file: Arc::clone(&self.held_file),
             identity: self.identity,
+            projection: self.projection.clone(),
         }
     }
 
@@ -913,6 +920,22 @@ impl ExternalGrokReadOnlyFileCapability {
         }
         Ok(())
     }
+
+    fn private_grok_home_target(&self, runtime_dir: &Path) -> Option<PathBuf> {
+        match &self.projection {
+            ExternalGrokReadOnlyFileProjection::Direct => None,
+            ExternalGrokReadOnlyFileProjection::PrivateGrokHome { file_name } => {
+                Some(runtime_dir.join(file_name))
+            }
+        }
+    }
+
+    fn is_private_grok_home_projection(&self) -> bool {
+        matches!(
+            &self.projection,
+            ExternalGrokReadOnlyFileProjection::PrivateGrokHome { .. }
+        )
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -922,6 +945,7 @@ impl fmt::Debug for ExternalGrokReadOnlyFileCapability {
             .debug_struct("ExternalGrokReadOnlyFileCapability")
             .field("path", &self.path)
             .field("identity", &self.identity)
+            .field("projection", &self.projection)
             .finish_non_exhaustive()
     }
 }
@@ -929,12 +953,21 @@ impl fmt::Debug for ExternalGrokReadOnlyFileCapability {
 #[cfg(target_os = "linux")]
 impl PartialEq for ExternalGrokReadOnlyFileCapability {
     fn eq(&self, other: &Self) -> bool {
-        self.path == other.path && self.identity == other.identity
+        self.path == other.path
+            && self.identity == other.identity
+            && self.projection == other.projection
     }
 }
 
 #[cfg(target_os = "linux")]
 impl Eq for ExternalGrokReadOnlyFileCapability {}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExternalGrokReadOnlyFileProjection {
+    Direct,
+    PrivateGrokHome { file_name: String },
+}
 
 #[cfg(target_os = "linux")]
 fn verify_external_grok_file_descriptor_is_read_only(file: &File) -> std::io::Result<()> {
@@ -1100,7 +1133,32 @@ impl WorkspaceSandboxConfig {
         held_file: Arc<File>,
     ) -> std::io::Result<Self> {
         let path = file.into();
-        let capability = ExternalGrokReadOnlyFileCapability::new(path.clone(), held_file)?;
+        let capability = ExternalGrokReadOnlyFileCapability::new(
+            path.clone(),
+            held_file,
+            ExternalGrokReadOnlyFileProjection::Direct,
+        )?;
+        self.visible_read_only_files.push(path);
+        self.external_grok_read_only_file_capabilities
+            .push(capability);
+        Ok(self)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn with_external_grok_private_home_file_capability(
+        mut self,
+        file: impl Into<PathBuf>,
+        file_name: impl Into<String>,
+        held_file: Arc<File>,
+    ) -> std::io::Result<Self> {
+        let path = file.into();
+        let file_name = file_name.into();
+        validate_private_runtime_file_name(&file_name)?;
+        let capability = ExternalGrokReadOnlyFileCapability::new(
+            path.clone(),
+            held_file,
+            ExternalGrokReadOnlyFileProjection::PrivateGrokHome { file_name },
+        )?;
         self.visible_read_only_files.push(path);
         self.external_grok_read_only_file_capabilities
             .push(capability);
@@ -1402,6 +1460,19 @@ impl ExternalGrokProfile {
         Ok(self)
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_private_grok_home_file_capability(
+        mut self,
+        file: impl Into<PathBuf>,
+        file_name: impl Into<String>,
+        held_file: Arc<File>,
+    ) -> std::io::Result<Self> {
+        self.config = self
+            .config
+            .with_external_grok_private_home_file_capability(file, file_name, held_file)?;
+        Ok(self)
+    }
+
     pub(crate) fn with_visible_read_write_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_visible_read_write_root(root);
         self
@@ -1564,6 +1635,9 @@ pub struct ProcessSpec {
     pub private_runtime_home: bool,
     /// Point CODEX_HOME at the same owner-private RuntimeDirectory.
     pub private_runtime_codex_home: bool,
+    /// Point GROK_HOME at the same owner-private RuntimeDirectory. Admitted host auth/config
+    /// capabilities may be projected as read-only leaves below this otherwise writable home.
+    pub private_runtime_grok_home: bool,
     #[cfg(target_os = "linux")]
     private_runtime_files: Vec<PrivateRuntimeFile>,
     pinned_direct: Option<PinnedDirectCommand>,
@@ -1648,6 +1722,7 @@ impl ProcessSpec {
             max_stdin_bytes: DEFAULT_MAX_STDIN_BYTES,
             private_runtime_home: false,
             private_runtime_codex_home: false,
+            private_runtime_grok_home: false,
             #[cfg(target_os = "linux")]
             private_runtime_files: Vec::new(),
             pinned_direct: None,
@@ -1683,6 +1758,7 @@ impl ProcessSpec {
             max_stdin_bytes: DEFAULT_MAX_STDIN_BYTES,
             private_runtime_home: false,
             private_runtime_codex_home: false,
+            private_runtime_grok_home: false,
             #[cfg(target_os = "linux")]
             private_runtime_files: Vec::new(),
             pinned_direct: None,
@@ -1778,6 +1854,11 @@ impl ProcessSpec {
 
     pub const fn with_private_runtime_codex_home(mut self, enabled: bool) -> Self {
         self.private_runtime_codex_home = enabled;
+        self
+    }
+
+    pub const fn with_private_runtime_grok_home(mut self, enabled: bool) -> Self {
+        self.private_runtime_grok_home = enabled;
         self
     }
 
@@ -2715,6 +2796,16 @@ fn validate_process_spec_bounds(spec: &ProcessSpec) -> std::io::Result<()> {
             .validate()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
     }
+    if spec.private_runtime_grok_home
+        && (!spec.private_runtime_home
+            || spec.side_effects.kind() != SideEffectConfinementProfileKind::ExternalGrok
+            || spec.containment != ContainmentPolicy::Required)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "private runtime GROK_HOME requires private HOME and strict ExternalGrok confinement",
+        ));
+    }
     if let Some(request) = &spec.nested_usage {
         if request.parent_span_id.is_empty()
             || request.parent_span_id.len() > MAX_PROCESS_LABEL_BYTES
@@ -2827,6 +2918,23 @@ fn validate_process_spec_bounds(spec: &ProcessSpec) -> std::io::Result<()> {
     validate_bounded_path(&spec.current_dir, "process working directory")?;
     if let Some(config) = spec.side_effects.workspace_config() {
         validate_workspace_config_bounds(config)?;
+        #[cfg(target_os = "linux")]
+        if config
+            .external_grok_read_only_file_capabilities
+            .iter()
+            .any(|capability| {
+                matches!(
+                    &capability.projection,
+                    ExternalGrokReadOnlyFileProjection::PrivateGrokHome { .. }
+                )
+            })
+            && !spec.private_runtime_grok_home
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ExternalGrok private home projections require a private runtime GROK_HOME",
+            ));
+        }
     }
     Ok(())
 }
@@ -2922,6 +3030,7 @@ fn validate_workspace_config_bounds(config: &WorkspaceSandboxConfig) -> std::io:
             ));
         }
         let mut grok_capability_paths = BTreeSet::new();
+        let mut grok_projection_names = BTreeSet::new();
         for capability in &config.external_grok_read_only_file_capabilities {
             validate_bounded_path(&capability.path, "ExternalGrok read-only file capability")?;
             if !config.visible_read_only_files.contains(&capability.path)
@@ -2931,6 +3040,17 @@ fn validate_workspace_config_bounds(config: &WorkspaceSandboxConfig) -> std::io:
                     std::io::ErrorKind::InvalidInput,
                     "ExternalGrok read-only file capability is duplicate or lacks an exact read-only file",
                 ));
+            }
+            if let ExternalGrokReadOnlyFileProjection::PrivateGrokHome { file_name } =
+                &capability.projection
+            {
+                validate_private_runtime_file_name(file_name)?;
+                if !grok_projection_names.insert(file_name) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "ExternalGrok private home file projection is duplicate",
+                    ));
+                }
             }
         }
     }
@@ -3920,7 +4040,11 @@ pub(crate) fn external_codex_systemd_properties_for_test(
         io::Error::other("external Codex test profile did not resolve a systemd sandbox")
     })?;
     let mut command = Command::new("systemd-run");
-    apply_systemd_sandbox_properties(&mut command, &sandbox);
+    apply_systemd_sandbox_properties(
+        &mut command,
+        &sandbox,
+        Path::new("/run/user/1000/maco-test-runtime"),
+    );
     Ok(command
         .get_args()
         .map(|argument| argument.to_string_lossy().into_owned())
@@ -3945,11 +4069,29 @@ pub(crate) fn external_grok_systemd_properties_for_test(
         io::Error::other("external Grok test profile did not resolve a systemd sandbox")
     })?;
     let mut command = Command::new("systemd-run");
-    apply_systemd_sandbox_properties(&mut command, &sandbox);
+    apply_systemd_sandbox_properties(
+        &mut command,
+        &sandbox,
+        Path::new("/run/user/1000/maco-test-runtime"),
+    );
     Ok(command
         .get_args()
         .map(|argument| argument.to_string_lossy().into_owned())
         .collect())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn private_runtime_environment_for_test(
+    spec: &ProcessSpec,
+    runtime_dir: &Path,
+) -> io::Result<EnvironmentMode> {
+    environment_with_private_runtime_home(
+        &spec.environment,
+        runtime_dir,
+        spec.private_runtime_home,
+        spec.private_runtime_codex_home,
+        spec.private_runtime_grok_home,
+    )
 }
 
 #[cfg(test)]

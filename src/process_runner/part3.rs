@@ -114,6 +114,18 @@ fn systemd_path_property(name: &str, path: &Path, optional: bool) -> OsString {
 }
 
 #[cfg(target_os = "linux")]
+fn systemd_path_binding_property(
+    name: &str,
+    source: &Path,
+    destination: &Path,
+) -> OsString {
+    let mut property = systemd_path_property(name, source, false);
+    property.push(":");
+    property.push(destination.as_os_str());
+    property
+}
+
+#[cfg(target_os = "linux")]
 fn known_sensitive_socket_paths() -> Vec<PathBuf> {
     // SAFETY: geteuid has no preconditions and does not access Rust memory.
     let uid = unsafe { libc::geteuid() };
@@ -476,12 +488,16 @@ impl SystemdUnit {
     }
 
     fn build_command(&mut self, spec: &ProcessSpec) -> std::io::Result<Command> {
-        let target_environment = if spec.private_runtime_home || spec.private_runtime_codex_home {
+        let target_environment = if spec.private_runtime_home
+            || spec.private_runtime_codex_home
+            || spec.private_runtime_grok_home
+        {
             environment_with_private_runtime_home(
                 &spec.environment,
                 &self.runtime_dir,
                 spec.private_runtime_home,
                 spec.private_runtime_codex_home,
+                spec.private_runtime_grok_home,
             )?
         } else {
             spec.environment.clone()
@@ -596,7 +612,7 @@ impl SystemdUnit {
                 runtime_max.as_millis()
             ));
         if let Some(sandbox) = &sandbox {
-            apply_systemd_sandbox_properties(&mut command, sandbox);
+            apply_systemd_sandbox_properties(&mut command, sandbox, &self.runtime_dir);
             command
                 .arg(systemd_path_property(
                     "BindPaths=",
@@ -1487,6 +1503,7 @@ fn environment_with_private_runtime_home(
     runtime_dir: &Path,
     set_home: bool,
     set_codex_home: bool,
+    set_grok_home: bool,
 ) -> std::io::Result<EnvironmentMode> {
     let runtime_dir = runtime_dir.to_str().ok_or_else(|| {
         std::io::Error::new(
@@ -1508,6 +1525,9 @@ fn environment_with_private_runtime_home(
     }
     if set_codex_home {
         values.insert("CODEX_HOME".to_string(), runtime_dir.to_string());
+    }
+    if set_grok_home {
+        values.insert("GROK_HOME".to_string(), runtime_dir.to_string());
     }
     Ok(if clear {
         EnvironmentMode::ClearAndSet(values)
@@ -1729,22 +1749,7 @@ fn validate_private_runtime_files(files: &[PrivateRuntimeFile]) -> std::io::Resu
     }
     let mut names = std::collections::BTreeSet::new();
     for file in files {
-        let path = Path::new(&file.name);
-        if file.name.is_empty()
-            || path.components().count() != 1
-            || !matches!(
-                path.components().next(),
-                Some(std::path::Component::Normal(_))
-            )
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "private runtime filename must be one safe component: {:?}",
-                    file.name
-                ),
-            ));
-        }
+        validate_private_runtime_file_name(&file.name)?;
         if file.bytes.len() > MAX_PRIVATE_RUNTIME_FILE_BYTES {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::FileTooLarge,
@@ -1760,23 +1765,41 @@ fn validate_private_runtime_files(files: &[PrivateRuntimeFile]) -> std::io::Resu
                 format!("duplicate private runtime filename {:?}", file.name),
             ));
         }
-        if matches!(
-            file.name.as_str(),
-            "environment"
-                | "environment-ready"
-                | "guardian-waiting"
-                | "environment-gate"
-                | "start-gate"
-                | "target-pid"
-                | "owner-liveness"
-                | "fifo-waiting"
-                | "sandbox-mount-report"
-        ) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("private runtime filename is reserved: {:?}", file.name),
-            ));
-        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_private_runtime_file_name(name: &str) -> std::io::Result<()> {
+    let path = Path::new(name);
+    if name.is_empty()
+        || path.components().count() != 1
+        || !matches!(
+            path.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("private runtime filename must be one safe component: {name:?}"),
+        ));
+    }
+    if matches!(
+        name,
+        "environment"
+            | "environment-ready"
+            | "guardian-waiting"
+            | "environment-gate"
+            | "start-gate"
+            | "target-pid"
+            | "owner-liveness"
+            | "fifo-waiting"
+            | "sandbox-mount-report"
+    ) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("private runtime filename is reserved: {name:?}"),
+        ));
     }
     Ok(())
 }

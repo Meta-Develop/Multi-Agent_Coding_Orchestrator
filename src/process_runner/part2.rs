@@ -770,7 +770,10 @@ impl PreparedProcessTree {
             PreparedContainmentBackend::Systemd(unit) => unit.build_command(spec),
             #[cfg(target_os = "windows")]
             PreparedContainmentBackend::WindowsJob => {
-                if spec.private_runtime_home || spec.private_runtime_codex_home {
+                if spec.private_runtime_home
+                    || spec.private_runtime_codex_home
+                    || spec.private_runtime_grok_home
+                {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Unsupported,
                         "private runtime HOME requires the strict Linux systemd backend",
@@ -785,7 +788,10 @@ impl PreparedProcessTree {
             }
             #[cfg(unix)]
             PreparedContainmentBackend::UnixProcessGroup => {
-                if spec.private_runtime_home || spec.private_runtime_codex_home {
+                if spec.private_runtime_home
+                    || spec.private_runtime_codex_home
+                    || spec.private_runtime_grok_home
+                {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Unsupported,
                         "private runtime HOME requires the strict Linux systemd backend",
@@ -800,7 +806,10 @@ impl PreparedProcessTree {
             }
             #[cfg(not(any(unix, target_os = "windows")))]
             PreparedContainmentBackend::DirectChild => {
-                if spec.private_runtime_home || spec.private_runtime_codex_home {
+                if spec.private_runtime_home
+                    || spec.private_runtime_codex_home
+                    || spec.private_runtime_grok_home
+                {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Unsupported,
                         "private runtime HOME requires the strict Linux systemd backend",
@@ -1272,6 +1281,17 @@ impl ResolvedSystemdSandbox {
                 .any(|file| program == file)
     }
 
+    fn projected_external_grok_file_target(
+        &self,
+        source: &Path,
+        runtime_dir: &Path,
+    ) -> Option<PathBuf> {
+        self.external_grok_read_only_file_capabilities
+            .iter()
+            .find(|capability| capability.path == source)
+            .and_then(|capability| capability.private_grok_home_target(runtime_dir))
+    }
+
     fn validate_program_visibility(&self, program: &Path) -> std::io::Result<()> {
         if let Some(hidden_root) = self
             .hidden_roots
@@ -1383,6 +1403,25 @@ impl ResolvedSystemdSandbox {
                 std::io::ErrorKind::PermissionDenied,
                 "private unit runtime root overlaps an inaccessible sandbox root",
             ));
+        }
+        for capability in &self.external_grok_read_only_file_capabilities {
+            let Some(target) = capability.private_grok_home_target(root) else {
+                continue;
+            };
+            validate_systemd_path_syntax(&target, "private Grok home credential target")?;
+            let mount_check = self
+                .mount_checks
+                .iter_mut()
+                .find(|check| {
+                    check.path == capability.path && check.access == SandboxMountAccess::ReadOnly
+                })
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "private Grok home capability lacks its identity-bound mount check",
+                    )
+                })?;
+            mount_check.path = target;
         }
         self.mount_checks.push(SandboxMountCheck {
             path: root.to_path_buf(),
@@ -2415,6 +2454,18 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
             "strict workspace confinement refuses '/' as a hidden root",
         ));
     }
+    for capability in &external_grok_read_only_file_capabilities {
+        if capability.is_private_grok_home_projection()
+            && !hidden_roots
+                .iter()
+                .any(|hidden| capability.path.starts_with(hidden))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "ExternalGrok private home projection requires its ambient source directory to be inaccessible",
+            ));
+        }
+    }
     if config.isolated_host_view {
         let nix_store = canonical_sandbox_directory(Path::new("/nix/store"), "Nix store root")?;
         if !visible_read_only_roots.contains(&nix_store) {
@@ -2753,7 +2804,11 @@ fn build_sandbox_mount_checks(
 }
 
 #[cfg(target_os = "linux")]
-fn apply_systemd_sandbox_properties(command: &mut Command, sandbox: &ResolvedSystemdSandbox) {
+fn apply_systemd_sandbox_properties(
+    command: &mut Command,
+    sandbox: &ResolvedSystemdSandbox,
+    runtime_dir: &Path,
+) {
     command.args([
         "--property=ProtectSystem=strict",
         "--property=ProtectHome=tmpfs",
@@ -2849,6 +2904,16 @@ fn apply_systemd_sandbox_properties(command: &mut Command, sandbox: &ResolvedSys
             .arg(systemd_path_property("ReadOnlyPaths=", root, false));
     }
     for file in &sandbox.visible_read_only_files {
+        if let Some(target) = sandbox.projected_external_grok_file_target(file, runtime_dir) {
+            command
+                .arg(systemd_path_binding_property(
+                    "BindReadOnlyPaths=",
+                    file,
+                    &target,
+                ))
+                .arg(systemd_path_property("ReadOnlyPaths=", &target, false));
+            continue;
+        }
         command
             .arg(systemd_path_property("BindReadOnlyPaths=", file, false))
             .arg(systemd_path_property("ReadOnlyPaths=", file, false));
@@ -3040,6 +3105,9 @@ fn verify_systemd_sandbox_properties(
         )?;
     }
     for file in &sandbox.visible_read_only_files {
+        let target = sandbox
+            .projected_external_grok_file_target(file, runtime_dir)
+            .unwrap_or_else(|| file.clone());
         require_property_path(
             "BindReadOnlyPaths",
             property_value(properties, "BindReadOnlyPaths")?,
@@ -3048,7 +3116,7 @@ fn verify_systemd_sandbox_properties(
         require_property_path(
             "ReadOnlyPaths",
             property_value(properties, "ReadOnlyPaths")?,
-            file,
+            &target,
         )?;
     }
     for root in &sandbox.visible_read_write_roots {
@@ -3116,16 +3184,27 @@ fn verify_exact_systemd_path_properties(
     let mut read_only = sandbox
         .visible_read_only_roots
         .iter()
-        .chain(&sandbox.visible_read_only_files)
         .cloned()
         .collect::<BTreeSet<_>>();
+    read_only.extend(sandbox.visible_read_only_files.iter().map(|file| {
+        sandbox
+            .projected_external_grok_file_target(file, runtime_dir)
+            .unwrap_or_else(|| file.clone())
+    }));
     read_only.extend(sandbox.exact_writable_file_parents());
     let mut read_only_bindings = sandbox
         .visible_read_only_roots
         .iter()
-        .chain(&sandbox.visible_read_only_files)
         .map(|path| (path.clone(), path.clone()))
         .collect::<BTreeSet<_>>();
+    read_only_bindings.extend(sandbox.visible_read_only_files.iter().map(|file| {
+        (
+            file.clone(),
+            sandbox
+                .projected_external_grok_file_target(file, runtime_dir)
+                .unwrap_or_else(|| file.clone()),
+        )
+    }));
     let mut read_write = sandbox
         .visible_read_write_roots
         .iter()
