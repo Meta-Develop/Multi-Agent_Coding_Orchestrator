@@ -1349,7 +1349,15 @@ fn prepare_child_attempt<'a>(
     let nested_worker_runtime = nested_worker_launch_runtime(launch_runtime, budget_policy);
     let resolved_prompt_plan = evidence_only_reaudit
         .is_none()
-        .then(|| runtime_resolved_prompt_plan(&budget_plan, launch_runtime, &launch_catalog))
+        .then(|| {
+            runtime_resolved_prompt_plan(
+                &budget_plan,
+                assignment,
+                launch_runtime,
+                nested_worker_runtime,
+                &launch_catalog,
+            )
+        })
         .transpose()?;
     let RenderedPromptWithMeasurements {
         prompt,

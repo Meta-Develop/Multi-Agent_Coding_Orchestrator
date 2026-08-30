@@ -1515,11 +1515,23 @@ pub(super) fn apply_role_model_selection(
 
 pub(super) fn runtime_resolved_prompt_plan(
     plan: &SupervisorPlan,
+    assignment: &OrchestratorAssignment,
     runtime: SupervisorRuntime,
+    nested_worker_runtime: SupervisorRuntime,
     catalog: &RuntimeModelCatalog,
 ) -> Result<SupervisorPlan> {
     let mut resolved = plan.clone();
-    for role in [AgentRole::ChildOrchestrator, AgentRole::Worker] {
+    let mut roles = vec![assignment.role];
+    // Nested workers execute through the enclosing runtime-native child bridge. The
+    // renderer refuses cross-runtime bridges below, so only a same-runtime nested
+    // worker can use this launch catalog.
+    if assignment.role == AgentRole::ChildOrchestrator
+        && !assignment.worker_assignments.is_empty()
+        && nested_worker_runtime == runtime
+    {
+        roles.push(AgentRole::Worker);
+    }
+    for role in roles {
         let configured = effective_role_model_selection(plan, role);
         let resolution = catalog.resolve_role_model_selection(&configured, runtime)?;
         if role != AgentRole::Worker {

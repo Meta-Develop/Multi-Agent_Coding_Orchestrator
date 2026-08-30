@@ -2934,15 +2934,35 @@ fn ordered_catalog_chain_selects_first_available_model_with_typed_observation() 
             ECONOMY_PROFILE_MODEL.to_string()
         ]
     );
+}
 
-    let plan = parse_supervisor_plan_with_consultant(
+#[test]
+fn assignment_scoped_prompt_resolution_skips_irrelevant_cross_runtime_worker() {
+    let mut plan = parse_supervisor_plan_with_consultant(
         std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),
     )
     .expect("base plan")
     .plan;
-    let resolved_prompt_plan =
-        runtime_resolved_prompt_plan(&plan, SupervisorRuntime::Codex, &catalog)
-            .expect("resolve prompt selections");
+    plan.assignments[0].phase = AssignmentPhase::Planning;
+    plan.role_models.insert(
+        AgentRole::Worker,
+        RoleModelSelection {
+            model: Some("grok-4.6".to_string()),
+            reasoning_effort: Some("xhigh".to_string()),
+            unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+        },
+    );
+    let assignment = plan.assignments[0].clone();
+    let catalog = injected_codex_runtime_catalog(&[FRONTIER_PROFILE_MODEL]);
+
+    let resolved_prompt_plan = runtime_resolved_prompt_plan(
+        &plan,
+        &assignment,
+        SupervisorRuntime::Codex,
+        SupervisorRuntime::Grok,
+        &catalog,
+    )
+    .expect("resolve only the directly launched planning role");
     assert_eq!(
         effective_role_model_selection(&resolved_prompt_plan, AgentRole::ChildOrchestrator)
             .model
@@ -2953,7 +2973,116 @@ fn ordered_catalog_chain_selects_first_available_model_with_typed_observation() 
         effective_role_model_selection(&resolved_prompt_plan, AgentRole::Worker)
             .model
             .as_deref(),
+        Some("grok-4.6")
+    );
+}
+
+#[test]
+fn assignment_scoped_prompt_resolution_uses_direct_grok_worker_catalog() {
+    let mut plan = parse_supervisor_plan_with_consultant(
+        std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),
+    )
+    .expect("base plan")
+    .plan;
+    let mut child_selection = configured_role_model_selection(&plan, AgentRole::ChildOrchestrator);
+    child_selection.unavailable_model_fallback = UnavailableModelFallback::RuntimeDefault;
+    plan.role_models
+        .insert(AgentRole::ChildOrchestrator, child_selection);
+    plan.role_models.insert(
+        AgentRole::Worker,
+        RoleModelSelection {
+            model: Some("grok-4.6".to_string()),
+            reasoning_effort: Some("xhigh".to_string()),
+            unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
+        },
+    );
+    let mut assignment = plan.assignments[0].clone();
+    assignment.runtime = Some(SupervisorRuntime::Grok);
+    assignment.role = AgentRole::Worker;
+    assignment.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+
+    let resolved_prompt_plan = runtime_resolved_prompt_plan(
+        &plan,
+        &assignment,
+        SupervisorRuntime::Grok,
+        SupervisorRuntime::Grok,
+        &RuntimeModelCatalog::OperatorDeclared,
+    )
+    .expect("resolve the directly launched Grok Worker");
+
+    assert_eq!(
+        effective_role_model_selection(&resolved_prompt_plan, AgentRole::Worker)
+            .model
+            .as_deref(),
+        Some("grok-4.6")
+    );
+    assert_eq!(
+        effective_role_model_selection(&resolved_prompt_plan, AgentRole::Worker)
+            .unavailable_model_fallback,
+        UnavailableModelFallback::FailClosed
+    );
+    assert_eq!(
+        effective_role_model_selection(&resolved_prompt_plan, AgentRole::ChildOrchestrator)
+            .unavailable_model_fallback,
+        UnavailableModelFallback::RuntimeDefault
+    );
+}
+
+#[test]
+fn assignment_scoped_prompt_resolution_resolves_same_runtime_nested_worker() {
+    let mut plan = parse_supervisor_plan_with_consultant(
+        std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),
+    )
+    .expect("base plan")
+    .plan;
+    plan.role_models.insert(
+        AgentRole::Worker,
+        RoleModelSelection {
+            model: Some(ECONOMY_PROFILE_MODEL.to_string()),
+            reasoning_effort: Some("xhigh".to_string()),
+            unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
+        },
+    );
+    let mut assignment = plan.assignments[0].clone();
+    assignment.worker_assignments.push(WorkerAssignment {
+        id: "nested-worker".to_string(),
+        role: AgentRole::Worker,
+        role_category: Some(RoleCategory::NonDelegatingTerminalWorker),
+        selection_source: Some(AssignmentSelectionSource::Automatic),
+        assigned_paths: assignment.assigned_paths.clone(),
+        semantic_symbols: Vec::new(),
+        semantic_modules: Vec::new(),
+        task: Some("complete the nested worker task".to_string()),
+        environment_requirements: Vec::new(),
+        report_path: None,
+    });
+    let catalog = injected_codex_runtime_catalog(&[FRONTIER_PROFILE_MODEL, ECONOMY_PROFILE_MODEL]);
+
+    let resolved_prompt_plan = runtime_resolved_prompt_plan(
+        &plan,
+        &assignment,
+        SupervisorRuntime::Codex,
+        SupervisorRuntime::Codex,
+        &catalog,
+    )
+    .expect("resolve the child and its same-runtime nested Worker");
+
+    assert_eq!(
+        effective_role_model_selection(&resolved_prompt_plan, AgentRole::ChildOrchestrator)
+            .model
+            .as_deref(),
         Some(FRONTIER_PROFILE_MODEL)
+    );
+    assert_eq!(
+        effective_role_model_selection(&resolved_prompt_plan, AgentRole::Worker)
+            .model
+            .as_deref(),
+        Some(ECONOMY_PROFILE_MODEL)
+    );
+    assert_eq!(
+        effective_role_model_selection(&resolved_prompt_plan, AgentRole::Worker)
+            .unavailable_model_fallback,
+        UnavailableModelFallback::FailClosed
     );
 }
 
