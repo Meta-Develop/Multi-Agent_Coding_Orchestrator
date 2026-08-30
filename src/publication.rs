@@ -853,7 +853,7 @@ struct AuthorizedPullRequestMerge {
 }
 
 enum PullRequestMergePreflight {
-    Allowed(AuthorizedPullRequestMerge),
+    Allowed(Box<AuthorizedPullRequestMerge>),
     Blocked(AuthenticatedPullRequestMergeOutcome),
 }
 
@@ -1194,13 +1194,13 @@ fn authorize_current_pull_request_merge(
         ));
     }
 
-    Ok(PullRequestMergePreflight::Allowed(
+    Ok(PullRequestMergePreflight::Allowed(Box::new(
         AuthorizedPullRequestMerge {
             snapshot,
             approved_actor: approved_actor.expect("unblocked approval contains an actor"),
             authority,
         },
-    ))
+    )))
 }
 
 fn pull_request_merge_effect(

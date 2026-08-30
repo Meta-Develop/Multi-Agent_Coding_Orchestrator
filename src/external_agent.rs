@@ -1833,9 +1833,9 @@ impl AdmittedGrokCredentials {
     fn from_ambient_environment() -> Result<Self> {
         #[cfg(target_os = "linux")]
         {
-            return Ok(Self {
+            Ok(Self {
                 source: GrokCredentialSource::from_ambient_environment()?,
-            });
+            })
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -1846,7 +1846,7 @@ impl AdmittedGrokCredentials {
     fn grok_home_environment(&self) -> Result<&str> {
         #[cfg(target_os = "linux")]
         {
-            return Ok(self.source.grok_home_environment());
+            Ok(self.source.grok_home_environment())
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -1857,7 +1857,7 @@ impl AdmittedGrokCredentials {
     fn bind_to_profile(&self, profile: ExternalGrokProfile) -> Result<ExternalGrokProfile> {
         #[cfg(target_os = "linux")]
         {
-            return self.source.bind_to_profile(profile);
+            self.source.bind_to_profile(profile)
         }
         #[cfg(not(target_os = "linux"))]
         {
