@@ -950,9 +950,10 @@ fn screened_grok_catalog_process_spec(spec: &GrokCatalogCommandSpec) -> Result<P
 ///
 /// This capability owns read-only descriptors for the exact files selected by
 /// `GROK_HOME`. It deliberately has no byte-reading or serialization API. A
-/// caller may copy the normalized environment value and bind the held files to
-/// an [`ExternalGrokProfile`]; the profile performs another pathname identity
-/// check before the process is released.
+/// caller may retain the normalized source value for preflight/redaction and
+/// bind the held files to an [`ExternalGrokProfile`]. The process runner replaces
+/// the target's `GROK_HOME` with its private runtime directory and performs
+/// another pathname identity check before release.
 #[cfg(target_os = "linux")]
 #[derive(Clone)]
 pub(crate) struct GrokCredentialSource {
@@ -1025,6 +1026,10 @@ impl GrokCredentialSource {
         &self,
         profile: ExternalGrokProfile,
     ) -> Result<ExternalGrokProfile> {
+        // Hide the ambient directory at its host pathname even when a caller selected a
+        // GROK_HOME outside the roots replaced by ProtectHome/PrivateTmp. Only the held leaves
+        // are projected into the run-private GROK_HOME below.
+        let profile = profile.with_hidden_root(PathBuf::from(self.grok_home_environment.as_str()));
         let profile = self.auth.bind_to_profile(profile)?;
         match &self.config {
             Some(config) => config.bind_to_profile(profile),
@@ -1101,7 +1106,11 @@ impl GrokCredentialFile {
     fn bind_to_profile(&self, profile: ExternalGrokProfile) -> Result<ExternalGrokProfile> {
         self.revalidate()?;
         profile
-            .with_visible_read_only_file_capability(&self.path, Arc::clone(&self.held_file))
+            .with_private_grok_home_file_capability(
+                &self.path,
+                self.kind.file_name(),
+                Arc::clone(&self.held_file),
+            )
             .map_err(|_| anyhow::Error::from(self.kind.identity_changed_failure()))
     }
 
@@ -1155,6 +1164,13 @@ enum GrokCredentialFileKind {
 
 #[cfg(target_os = "linux")]
 impl GrokCredentialFileKind {
+    const fn file_name(self) -> &'static str {
+        match self {
+            Self::Authentication => GROK_AUTH_FILE,
+            Self::Configuration => GROK_CONFIG_FILE,
+        }
+    }
+
     const fn unavailable_failure(self) -> GrokCredentialSourceFailure {
         match self {
             Self::Authentication => GrokCredentialSourceFailure::AuthenticationUnavailable,
@@ -1261,6 +1277,7 @@ fn screened_grok_catalog_process_spec_with_credential_source(
     .with_stdin(StdinMode::Null)
     .with_timeout(Some(spec.timeout()))
     .with_private_runtime_home(true)
+    .with_private_runtime_grok_home(true)
     .with_side_effect_confinement(SideEffectConfinementProfile::ExternalGrok(profile)))
 }
 
@@ -1987,6 +2004,20 @@ mod tests {
             grok_home.to_str()
         );
         assert!(process.private_runtime_home);
+        assert!(process.private_runtime_grok_home);
+        let private_home = Path::new("/run/user/1000/maco-test-runtime");
+        let EnvironmentMode::ClearAndSet(private_environment) =
+            crate::process_runner::private_runtime_environment_for_test(&process, private_home)?
+        else {
+            panic!("screened catalog private environment must remain ClearAndSet");
+        };
+        for key in ["HOME", "TMPDIR", "GROK_HOME"] {
+            assert_eq!(
+                private_environment.get(key).map(String::as_str),
+                private_home.to_str(),
+                "{key} must use the per-launch writable runtime home"
+            );
+        }
         assert_eq!(process.stdin, StdinMode::Null);
         assert_eq!(process.timeout, Some(GROK_CATALOG_TIMEOUT));
         assert_eq!(process.stdout.max_bytes, GROK_CATALOG_MAX_BYTES);
@@ -2005,11 +2036,40 @@ mod tests {
         assert!(profile.visible_read_only_roots().is_empty());
         assert_eq!(
             profile.visible_read_only_files(),
-            &[auth, config],
+            &[auth.clone(), config.clone()],
             "only the exact reviewed identity/config leaves may escape ProtectHome=tmpfs"
         );
         assert!(profile.visible_read_write_roots().is_empty());
         assert!(profile.visible_read_write_files().is_empty());
+        let properties = crate::process_runner::external_grok_systemd_properties_for_test(
+            profile.clone(),
+            &program,
+            dir.path(),
+        )?;
+        assert!(properties.contains(&format!(
+            "--property=InaccessiblePaths={}",
+            grok_home.display()
+        )));
+        for (source, name) in [(&auth, GROK_AUTH_FILE), (&config, GROK_CONFIG_FILE)] {
+            let target = private_home.join(name);
+            assert!(properties.contains(&format!(
+                "--property=BindReadOnlyPaths={}:{}",
+                source.display(),
+                target.display()
+            )));
+            assert!(properties.contains(&format!("--property=ReadOnlyPaths={}", target.display())));
+            assert!(
+                !properties.contains(&format!(
+                    "--property=BindReadOnlyPaths={}",
+                    source.display()
+                )),
+                "the ambient credential path must not be mounted at its host location"
+            );
+            assert!(
+                !properties.contains(&format!("--property=ReadWritePaths={}", target.display())),
+                "projected credential/config leaves must never become writable"
+            );
+        }
         Ok(())
     }
 
@@ -2225,6 +2285,7 @@ mod tests {
         );
         assert!(!environment.contains_key("HOME"));
         assert!(process.private_runtime_home);
+        assert!(process.private_runtime_grok_home);
         let SideEffectConfinementProfile::ExternalGrok(profile) = &process.side_effects else {
             panic!("screened catalog must use ExternalGrok confinement");
         };

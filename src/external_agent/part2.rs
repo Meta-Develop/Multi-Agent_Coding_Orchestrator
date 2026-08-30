@@ -263,6 +263,7 @@ fn with_external_runtime_context(
             invocation,
             ExternalAgentInvocation::CodexSupervisor | ExternalAgentInvocation::CodexConsultant
         ))
+        .with_private_runtime_grok_home(invocation == ExternalAgentInvocation::Grok)
         .with_side_effect_confinement(side_effect_profile);
     let prepared = match agent_lifecycle {
         Some(metadata) => prepared.with_agent_lifecycle(metadata.clone()),
@@ -376,6 +377,8 @@ fn insert_admitted_grok_home_environment(
     environment: &mut BTreeMap<String, String>,
     credentials: &AdmittedGrokCredentials,
 ) -> Result<()> {
+    // Retain the normalized ambient source for preflight redaction. The shared runner replaces
+    // this value with the per-launch RuntimeDirectory before publishing the target environment.
     environment.insert(
         "GROK_HOME".to_string(),
         credentials.grok_home_environment()?.to_string(),
