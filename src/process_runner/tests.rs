@@ -2047,13 +2047,13 @@ fn external_grok_unix_stream_initialization_preserves_codex_and_write_boundaries
             "{mode} profile wrote outside its managed worktree"
         );
         match mode {
-            "codex" => {
-                let error =
-                    UnixStream::pair().expect_err("ExternalCodex must continue to reject AF_UNIX");
+            "codex" | "offline" => {
+                let error = UnixStream::pair()
+                    .expect_err("non-Grok profile must continue to reject AF_UNIX socket pairs");
                 assert_eq!(error.raw_os_error(), Some(libc::EPERM));
-                fs::write(marker, "eperm\n").expect("write Codex EPERM evidence");
+                fs::write(marker, "eperm\n").expect("write AF_UNIX denial evidence");
             }
-            "grok" | "offline" => {
+            "grok" => {
                 let (left, right) =
                     UnixStream::pair().expect("profile must admit local Unix streams");
                 drop((left, right));
@@ -2158,8 +2158,8 @@ fn external_grok_unix_stream_initialization_preserves_codex_and_write_boundaries
     );
     assert_eq!(
         fs::read_to_string(offline_worktree.join("initialized.txt"))
-            .expect("offline initialization evidence"),
-        "initialized\n"
+            .expect("offline AF_UNIX denial evidence"),
+        "eperm\n"
     );
     assert_eq!(
         fs::read_to_string(&protected).expect("protected evidence"),
@@ -2168,8 +2168,8 @@ fn external_grok_unix_stream_initialization_preserves_codex_and_write_boundaries
     let unit_names = unit_capture.finish();
     assert_eq!(
         unit_names.len(),
-        2,
-        "Codex and Grok strict runs must each allocate one systemd unit"
+        3,
+        "Codex, Grok, and offline strict runs must each allocate one systemd unit"
     );
     assert_systemd_units_have_no_residue(&unit_names);
 }
