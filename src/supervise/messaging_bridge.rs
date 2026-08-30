@@ -4,7 +4,10 @@
 //! every presented capability in memory, binds the durable broker to ledger authority, and can
 //! reopen the same store while the per-run factory remains alive.
 
-use super::{OrchestratorAssignment, WorkerAssignment};
+use super::{
+    role_authority::RoleCategory as AssignmentRoleCategory, OrchestratorAssignment,
+    WorkerAssignment,
+};
 use crate::{
     artifacts::state_auth::random_identifier,
     hierarchy_ledger::{HierarchyLedgerSnapshot, RoleCategory},
@@ -39,11 +42,28 @@ impl LaunchedMessagingIdentity {
     }
 
     pub(super) fn from_orchestrator(assignment: &OrchestratorAssignment) -> Self {
-        Self::new(assignment.id.clone(), assignment.effective_role_category())
+        Self::new(
+            assignment.id.clone(),
+            hierarchy_role_category(assignment.effective_role_category()),
+        )
     }
 
     pub(super) fn from_worker(assignment: &WorkerAssignment) -> Self {
-        Self::new(assignment.id.clone(), assignment.effective_role_category())
+        Self::new(
+            assignment.id.clone(),
+            hierarchy_role_category(assignment.effective_role_category()),
+        )
+    }
+}
+
+const fn hierarchy_role_category(category: AssignmentRoleCategory) -> RoleCategory {
+    match category {
+        AssignmentRoleCategory::DelegatingCoordinator => RoleCategory::DelegatingCoordinator,
+        AssignmentRoleCategory::NonDelegatingTerminalWorker => {
+            RoleCategory::NonDelegatingTerminalWorker
+        }
+        AssignmentRoleCategory::ReadOnlyResearcher => RoleCategory::ReadOnlyResearcher,
+        AssignmentRoleCategory::ReadOnlyReviewAuditor => RoleCategory::ReadOnlyReviewAuditor,
     }
 }
 
