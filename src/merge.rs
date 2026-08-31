@@ -1069,7 +1069,7 @@ impl ArbitrationEnvironment for ProductionArbitrationEnvironment {
             bail!("neutral arbitration worktree changed before candidate materialization");
         }
         if !patch.is_empty() {
-            let output = run_git_with_input(
+            let output = run_git_with_input_with_writable_worktree(
                 &prepared.input.neutral_worktree.path,
                 &["apply", "--binary"],
                 patch.as_bytes(),
@@ -3032,8 +3032,12 @@ fn apply_prechecked_merge_with_candidate_validation_locked(
         });
     }
 
-    let output = run_git_with_input(&preview.candidate.metadata.primary_repo_root, &args, &patch)
-        .context("failed to run git apply")?;
+    let output = run_git_with_input_with_writable_worktree(
+        &preview.candidate.metadata.primary_repo_root,
+        &args,
+        &patch,
+    )
+    .context("failed to run git apply")?;
     if !output.success {
         bail!(
             "git apply failed: {}",
