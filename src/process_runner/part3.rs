@@ -2652,7 +2652,11 @@ impl OwnedIoThread {
     }
 
     fn finish(self, completion_observed: bool, label: &str) -> Vec<IoThreadCleanupError> {
-        self.finish_with_clock(completion_observed, label, &RealIoThreadClock)
+        #[cfg(test)]
+        let clock = TestIoFinalizationClock::default();
+        #[cfg(not(test))]
+        let clock = RealIoThreadClock;
+        self.finish_with_clock(completion_observed, label, &clock)
     }
 
     fn finish_with_clock<C: IoThreadClock>(
