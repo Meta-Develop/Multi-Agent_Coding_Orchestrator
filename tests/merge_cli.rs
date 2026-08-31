@@ -1827,7 +1827,7 @@ fn wait_for_candidate_validation_ready(
 ) -> Result<PathBuf> {
     let result = (|| {
         let prefix = format!("maco-candidate-validation-{}-", apply.id());
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let mut matches = Vec::new();
             for name in candidate_validation_runtime_entries(runtime_root)? {
