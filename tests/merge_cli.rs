@@ -1767,7 +1767,7 @@ fn candidate_validation_runtime_root() -> Result<PathBuf> {
                 user_runtime.display()
             );
         }
-        return Ok(user_runtime.join(format!("maco-runtime-{uid}")));
+        Ok(user_runtime.join(format!("maco-runtime-{uid}")))
     }
 
     #[cfg(not(target_os = "linux"))]
