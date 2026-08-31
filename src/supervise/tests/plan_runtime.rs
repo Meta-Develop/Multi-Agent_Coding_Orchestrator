@@ -1415,6 +1415,65 @@ Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other 
 }
 
 #[test]
+fn literal_existing_file_edit_lowers_to_direct_grok_eligible_worker() {
+    skip_without_containment!();
+    let (_temp, repo) = injected_repository();
+    let task = "In README.md, replace baseline with exactly: MACO literal routing reached the terminal worker. Verify the result with git diff --check and confirm README.md contains exactly that line.";
+    let mut plan =
+        supervisor_plan_from_goal_spec(&repo, "", task).expect("plan literal existing-file edit");
+    let [planning, execution] = plan.assignments.as_slice() else {
+        panic!("literal existing-file plan must contain one planning/execution pair");
+    };
+    assert_eq!(planning.phase, AssignmentPhase::Planning);
+    assert_eq!(planning.role, AgentRole::ChildOrchestrator);
+    assert_eq!(execution.phase, AssignmentPhase::Execution);
+    assert_eq!(execution.role, AgentRole::Worker);
+    assert_eq!(
+        execution.role_category,
+        Some(RoleCategory::NonDelegatingTerminalWorker)
+    );
+    assert!(execution.worker_assignments.is_empty());
+    assert!(execution
+        .notes
+        .as_deref()
+        .is_some_and(|notes| notes.contains("existing_git_visible_regular_file_edit")));
+
+    plan.role_models.insert(
+        AgentRole::Worker,
+        RoleModelSelection {
+            model: Some("grok-4.6".to_string()),
+            reasoning_effort: Some("xhigh".to_string()),
+            unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
+        },
+    );
+    let execution = plan.assignments[1].clone();
+    let resolved = runtime_resolved_prompt_plan(
+        &plan,
+        &execution,
+        SupervisorRuntime::Grok,
+        SupervisorRuntime::Grok,
+        &RuntimeModelCatalog::OperatorDeclared,
+    )
+    .expect("resolve direct Grok terminal worker");
+    let worker = effective_role_model_selection(&resolved, AgentRole::Worker);
+    assert_eq!(worker.model.as_deref(), Some("grok-4.6"));
+    assert_eq!(worker.reasoning_effort.as_deref(), Some("xhigh"));
+    assert_eq!(
+        worker.unavailable_model_fallback,
+        UnavailableModelFallback::FailClosed
+    );
+
+    let ordinary = supervisor_plan_from_goal_spec(&repo, "", "Update README.md.")
+        .expect("plan ordinary README task");
+    assert_eq!(ordinary.assignments[1].role, AgentRole::ChildOrchestrator);
+    assert_eq!(ordinary.assignments[1].worker_assignments.len(), 1);
+    assert!(!ordinary.assignments[1]
+        .notes
+        .as_deref()
+        .is_some_and(|notes| notes.contains("existing_git_visible_regular_file_edit")));
+}
+
+#[test]
 fn plain_text_task_without_actionable_scope_returns_guidance() {
     skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
