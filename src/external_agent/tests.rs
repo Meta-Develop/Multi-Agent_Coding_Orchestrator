@@ -1595,7 +1595,43 @@ fn selected_writable_grok_prepares_private_git_and_retains_it_through_collection
 
 #[cfg(unix)]
 #[test]
-fn managed_git_authority_requires_supported_writable_managed_child_launch() -> Result<()> {
+fn read_only_codex_planning_prepares_private_git_boundary() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (_primary, child, _common, child_git_dir) =
+        create_linked_git_metadata_fixture(temp.path())?;
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    let command = crate::supervise::configure_assignment_phase_command_for_test(
+        managed_git_command(&child, &incoming),
+        crate::supervise::AssignmentPhase::Planning,
+        &[PathBuf::from("RELEASE_NOTES.md")],
+    )?;
+
+    assert_eq!(command.invocation, ExternalAgentInvocation::CodexSupervisor);
+    assert_eq!(command.workspace_access, WorkspaceAccess::ReadOnly);
+    assert_eq!(
+        command.writable_launch_target,
+        WritableLaunchTarget::ManagedChildWorktree
+    );
+    assert!(command.agent_lifecycle.is_some());
+
+    let controls = protected_worktree_controls(&command)?;
+    let git = controls
+        .managed_git
+        .as_ref()
+        .context("read-only Codex planning did not prepare managed Git")?;
+    assert_eq!(
+        git.private_git_dir,
+        child_git_dir.join(MANAGED_CHILD_PRIVATE_GIT_DIR)
+    );
+    assert!(git.private_git_dir.is_dir());
+    verify_managed_git_boundary_after_launch(git)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_git_authority_requires_supported_adapter_managed_child_and_lifecycle() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let (primary, child, _common, child_git_dir) = create_linked_git_metadata_fixture(temp.path())?;
     let incoming = temp.path().join("incoming");
@@ -1625,8 +1661,14 @@ fn managed_git_authority_requires_supported_writable_managed_child_launch() -> R
         .managed_git
         .is_none());
 
-    let read_only = base.with_workspace_access(WorkspaceAccess::ReadOnly);
-    assert!(protected_worktree_controls(&read_only)?
+    let missing_lifecycle = selected_writable_grok_command(
+        child.join("grok"),
+        &child,
+        child.join("prompt.md"),
+        &incoming,
+    )?
+    .with_worktree_writable_confinement(writable_grok_confinement(SideEffectConfinement::Verified));
+    assert!(protected_worktree_controls(&missing_lifecycle)?
         .managed_git
         .is_none());
     assert!(!child_git_dir.join(MANAGED_CHILD_PRIVATE_GIT_DIR).exists());

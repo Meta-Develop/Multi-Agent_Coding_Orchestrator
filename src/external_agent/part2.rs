@@ -1838,17 +1838,20 @@ fn protected_worktree_controls(spec: &ExternalAgentCommand) -> Result<ProtectedW
         .invocation
         .adapter_id()
         .and_then(AdapterId::to_runtime_id);
-    let prepare_managed_git = spec.workspace_access == WorkspaceAccess::ReadWrite
+    let prepare_managed_git = (spec.invocation == ExternalAgentInvocation::CodexSupervisor
         && spec.writable_launch_target == WritableLaunchTarget::ManagedChildWorktree
-        && spec.agent_lifecycle.is_some()
-        && managed_git_runtime.is_some_and(|runtime| {
-            spec.verified_writable_capabilities(runtime)
-                .is_ok_and(|capabilities| {
-                    capabilities
-                        .writable_launch_refusal(spec.writable_launch_target)
-                        .is_none()
-                })
-        });
+        && spec.agent_lifecycle.is_some())
+        || (spec.workspace_access == WorkspaceAccess::ReadWrite
+            && spec.writable_launch_target == WritableLaunchTarget::ManagedChildWorktree
+            && spec.agent_lifecycle.is_some()
+            && managed_git_runtime.is_some_and(|runtime| {
+                spec.verified_writable_capabilities(runtime)
+                    .is_ok_and(|capabilities| {
+                        capabilities
+                            .writable_launch_refusal(spec.writable_launch_target)
+                            .is_none()
+                    })
+            }));
     if prepare_managed_git {
         controls.managed_git = managed_worktree_git_metadata(&spec.cwd)?;
     }
