@@ -3478,13 +3478,7 @@ fn snapshot_worktree_candidate_from_base(
     base_commit: Option<Oid>,
 ) -> Result<CapturedWorktreeTree> {
     let index = TemporaryIndex::create(repo.commondir())?;
-    snapshot_worktree_candidate_from_base_with_index(
-        repo,
-        worktree_path,
-        head,
-        base_commit,
-        &index,
-    )
+    snapshot_worktree_candidate_from_base_with_index(repo, worktree_path, head, base_commit, &index)
 }
 
 fn snapshot_worktree_candidate_from_base_with_index(

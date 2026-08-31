@@ -387,11 +387,8 @@ fn merge_apply_revalidates_clean_committed_primary_after_candidate_validation() 
         .stderr(Stdio::piped())
         .spawn()
         .context("start merge apply")?;
-    let validation_sandbox = wait_for_candidate_validation_ready(
-        &mut apply,
-        &runtime_root,
-        &existing_runtime_entries,
-    )?;
+    let validation_sandbox =
+        wait_for_candidate_validation_ready(&mut apply, &runtime_root, &existing_runtime_entries)?;
 
     fs::write(
         repo_path.join("src/lib.rs"),
@@ -542,11 +539,8 @@ fn pr_publish_cannot_run_while_merge_apply_validates_candidate() -> Result<()> {
         .stderr(Stdio::piped())
         .spawn()
         .context("start merge apply")?;
-    let validation_sandbox = wait_for_candidate_validation_ready(
-        &mut apply,
-        &runtime_root,
-        &existing_runtime_entries,
-    )?;
+    let validation_sandbox =
+        wait_for_candidate_validation_ready(&mut apply, &runtime_root, &existing_runtime_entries)?;
 
     let publish = Command::new(BIN)
         .args([
@@ -1818,7 +1812,11 @@ fn candidate_validation_runtime_entries(runtime_root: &Path) -> Result<BTreeSet<
         )
     })?;
     entries
-        .map(|entry| Ok(entry.context("read candidate validation runtime entry")?.file_name()))
+        .map(|entry| {
+            Ok(entry
+                .context("read candidate validation runtime entry")?
+                .file_name())
+        })
         .collect()
 }
 
@@ -1834,9 +1832,7 @@ fn wait_for_candidate_validation_ready(
             let mut matches = Vec::new();
             for name in candidate_validation_runtime_entries(runtime_root)? {
                 if existing_runtime_entries.contains(&name)
-                    || !name
-                        .to_str()
-                        .is_some_and(|name| name.starts_with(&prefix))
+                    || !name.to_str().is_some_and(|name| name.starts_with(&prefix))
                 {
                     continue;
                 }
