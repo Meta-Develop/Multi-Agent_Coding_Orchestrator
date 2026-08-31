@@ -960,18 +960,47 @@ fn external_grok_profile_projects_exact_systemd_properties() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn hidden_roots_are_optional_only_when_absent_and_remain_masked_if_created() {
+fn existing_hidden_root_under_home_is_optional_because_protect_home_masks_it_first() {
+    let hidden_root = PathBuf::from("/home/konn/.grok");
+    // Model the real post-OAuth host state without requiring this unit test to mutate /home.
+    assert!(hidden_root_mask_is_optional(&hidden_root, true));
+
+    let mut sandbox = program_visibility_sandbox(Path::new("/opt/maco/workspace"));
+    sandbox.kind = SideEffectConfinementProfileKind::ExternalGrok;
+    sandbox.hidden_roots.push(hidden_root.clone());
+    sandbox.mount_checks.push(SandboxMountCheck {
+        path: hidden_root.clone(),
+        device: 0,
+        inode: 0,
+        access: SandboxMountAccess::Inaccessible,
+        optional: hidden_root_mask_is_optional(&hidden_root, true),
+    });
+
+    let hidden_check = sandbox
+        .mount_checks
+        .iter()
+        .find(|check| check.path == hidden_root && check.access == SandboxMountAccess::Inaccessible)
+        .expect("ProtectHome-covered hidden-root guardian check");
+    assert!(hidden_check.optional);
+
+    let mut command = Command::new("systemd-run");
+    apply_systemd_sandbox_properties(&mut command, &sandbox, Path::new("/run/maco-test-runtime"));
+    assert!(command.get_args().any(|argument| {
+        argument == systemd_path_property("InaccessiblePaths=", &hidden_root, true)
+    }));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn existing_hidden_root_outside_home_remains_required() {
     let temp = tempfile::tempdir().expect("tempdir");
     let workspace = temp.path().join("worktree");
     let present = temp.path().join("present-hidden");
-    let absent = temp.path().join("absent-hidden");
     fs::create_dir(&workspace).expect("workspace");
     fs::create_dir(&present).expect("present hidden root");
-    let profile = ExternalGrokProfile::read_only(&workspace)
-        .with_hidden_root(&present)
-        .with_hidden_root(&absent);
+    let profile = ExternalGrokProfile::read_only(&workspace).with_hidden_root(&present);
     let spec = ProcessSpec::direct(
-        "hidden root optionality",
+        "required non-home hidden root",
         PathBuf::from("/bin/true"),
         Vec::<OsString>::new(),
         &workspace,
@@ -979,7 +1008,7 @@ fn hidden_roots_are_optional_only_when_absent_and_remain_masked_if_created() {
     )
     .with_side_effect_confinement(SideEffectConfinementProfile::ExternalGrok(profile));
     let sandbox = resolve_systemd_sandbox(&spec)
-        .expect("resolve sandbox with an absent hidden root")
+        .expect("resolve sandbox with an existing non-home hidden root")
         .expect("workspace sandbox");
 
     let present_check = sandbox
@@ -992,6 +1021,33 @@ fn hidden_roots_are_optional_only_when_absent_and_remain_masked_if_created() {
         .path_identities
         .iter()
         .any(|identity| identity.path == present));
+    let mut command = Command::new("systemd-run");
+    apply_systemd_sandbox_properties(&mut command, &sandbox, Path::new("/run/maco-test-runtime"));
+    assert!(command.get_args().any(|argument| {
+        argument == systemd_path_property("InaccessiblePaths=", &present, false)
+    }));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn absent_hidden_roots_are_optional_and_remain_masked_if_created() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("worktree");
+    let absent = temp.path().join("absent-hidden");
+    fs::create_dir(&workspace).expect("workspace");
+    let profile = ExternalGrokProfile::read_only(&workspace).with_hidden_root(&absent);
+    let spec = ProcessSpec::direct(
+        "absent hidden root optionality",
+        PathBuf::from("/bin/true"),
+        Vec::<OsString>::new(),
+        &workspace,
+        128,
+    )
+    .with_side_effect_confinement(SideEffectConfinementProfile::ExternalGrok(profile));
+    let sandbox = resolve_systemd_sandbox(&spec)
+        .expect("resolve sandbox with an absent hidden root")
+        .expect("workspace sandbox");
+
     let absent_check = sandbox
         .mount_checks
         .iter()
@@ -1014,11 +1070,6 @@ fn hidden_roots_are_optional_only_when_absent_and_remain_masked_if_created() {
         .get_args()
         .map(OsStr::to_os_string)
         .collect::<BTreeSet<_>>();
-    assert!(arguments.contains(&systemd_path_property(
-        "InaccessiblePaths=",
-        &present,
-        false
-    )));
     assert!(arguments.contains(&systemd_path_property("InaccessiblePaths=", &absent, true)));
 }
 

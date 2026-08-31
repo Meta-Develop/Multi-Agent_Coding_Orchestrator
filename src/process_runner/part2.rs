@@ -1294,9 +1294,7 @@ impl ResolvedSystemdSandbox {
 
     fn hidden_root_is_optional(&self, root: &Path) -> bool {
         self.mount_checks.iter().any(|check| {
-            check.path == root
-                && check.access == SandboxMountAccess::Inaccessible
-                && check.optional
+            check.path == root && check.access == SandboxMountAccess::Inaccessible && check.optional
         })
     }
 
@@ -1583,35 +1581,34 @@ impl ResolvedSystemdSandbox {
 
     fn effective_path_access(&self, path: &Path) -> std::io::Result<Option<SandboxMountAccess>> {
         let mut selected: Option<(usize, SandboxMountAccess)> = None;
-        let mut consider =
-            |boundary: &Path,
-             exact: bool,
-             access: SandboxMountAccess,
-             override_equal: bool|
-             -> std::io::Result<()> {
-                if (exact && path != boundary) || (!exact && !path.starts_with(boundary)) {
-                    return Ok(());
+        let mut consider = |boundary: &Path,
+                            exact: bool,
+                            access: SandboxMountAccess,
+                            override_equal: bool|
+         -> std::io::Result<()> {
+            if (exact && path != boundary) || (!exact && !path.starts_with(boundary)) {
+                return Ok(());
+            }
+            let specificity = boundary.components().count();
+            match selected {
+                Some((existing_specificity, existing_access))
+                    if existing_specificity == specificity
+                        && existing_access != access
+                        && !override_equal =>
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "sandbox path has conflicting effective access: {}",
+                            path.display()
+                        ),
+                    ));
                 }
-                let specificity = boundary.components().count();
-                match selected {
-                    Some((existing_specificity, existing_access))
-                        if existing_specificity == specificity
-                            && existing_access != access
-                            && !override_equal =>
-                    {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            format!(
-                                "sandbox path has conflicting effective access: {}",
-                                path.display()
-                            ),
-                        ));
-                    }
-                    Some((existing_specificity, _)) if existing_specificity > specificity => {}
-                    _ => selected = Some((specificity, access)),
-                }
-                Ok(())
-            };
+                Some((existing_specificity, _)) if existing_specificity > specificity => {}
+                _ => selected = Some((specificity, access)),
+            }
+            Ok(())
+        };
 
         consider(
             &self.workspace_root,
@@ -1698,21 +1695,22 @@ impl ResolvedSystemdSandbox {
             return Ok(());
         }
 
-        let reject_protected_alias = |path: &Path, metadata: &fs::Metadata| -> std::io::Result<()> {
-            if self.effective_path_access(path)? != Some(SandboxMountAccess::ReadOnly) {
-                return Ok(());
-            }
-            if writable_multilink_inodes.contains_key(&(metadata.dev(), metadata.ino())) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!(
-                        "protected read-only sandbox file has a writable hard-link alias: {}",
-                        path.display()
-                    ),
-                ));
-            }
-            Ok(())
-        };
+        let reject_protected_alias =
+            |path: &Path, metadata: &fs::Metadata| -> std::io::Result<()> {
+                if self.effective_path_access(path)? != Some(SandboxMountAccess::ReadOnly) {
+                    return Ok(());
+                }
+                if writable_multilink_inodes.contains_key(&(metadata.dev(), metadata.ino())) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "protected read-only sandbox file has a writable hard-link alias: {}",
+                            path.display()
+                        ),
+                    ));
+                }
+                Ok(())
+            };
         for root in protected_roots {
             scan_sandbox_regular_files(&root, false, &mut remaining, |path, metadata| {
                 reject_protected_alias(path, metadata)
@@ -2610,15 +2608,21 @@ fn canonical_sandbox_directory(path: &Path, label: &str) -> std::io::Result<Path
 #[cfg(target_os = "linux")]
 fn resolve_hidden_root(path: &Path, label: &str) -> std::io::Result<(PathBuf, bool)> {
     match canonical_sandbox_directory(path, label) {
-        Ok(canonical) => Ok((canonical, false)),
+        Ok(canonical) => {
+            let optional = hidden_root_mask_is_optional(&canonical, true);
+            Ok((canonical, optional))
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let normalized = normalized_absolute_sandbox_path(path, label)?;
             reject_symlink_ancestors_until_missing(&normalized, label)?;
             match fs::symlink_metadata(&normalized) {
-                Ok(_) => canonical_sandbox_directory(&normalized, label)
-                    .map(|canonical| (canonical, false)),
+                Ok(_) => canonical_sandbox_directory(&normalized, label).map(|canonical| {
+                    let optional = hidden_root_mask_is_optional(&canonical, true);
+                    (canonical, optional)
+                }),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    Ok((normalized, true))
+                    let optional = hidden_root_mask_is_optional(&normalized, false);
+                    Ok((normalized, optional))
                 }
                 Err(error) => Err(std::io::Error::new(
                     error.kind(),
@@ -2631,6 +2635,21 @@ fn resolve_hidden_root(path: &Path, label: &str) -> std::io::Result<(PathBuf, bo
         }
         Err(error) => Err(error),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn hidden_root_mask_is_optional(root: &Path, host_path_exists: bool) -> bool {
+    // systemd mounts ProtectHome=tmpfs before applying InaccessiblePaths=. A required child
+    // path would therefore fail namespace setup because its ProtectHome-covered host path has
+    // already disappeared, even though the enclosing tmpfs already provides the intended mask.
+    !host_path_exists
+        || [
+            Path::new("/home"),
+            Path::new("/root"),
+            Path::new("/run/user"),
+        ]
+        .into_iter()
+        .any(|protected_home| root.starts_with(protected_home))
 }
 
 #[cfg(target_os = "linux")]
