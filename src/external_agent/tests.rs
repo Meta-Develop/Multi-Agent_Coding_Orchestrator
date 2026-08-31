@@ -3938,10 +3938,18 @@ fn grok_runtime_adapter_argv_immutably_disables_subagents() {
             "streaming-json",
             "--sandbox",
             "strict",
+            "--always-approve",
             "--disable-web-search",
             "--no-memory",
             "--no-subagents",
         ]
+    );
+    assert_eq!(
+        grok_argv
+            .iter()
+            .filter(|argument| argument.as_str() == "--always-approve")
+            .count(),
+        1
     );
     assert_eq!(
         grok_argv

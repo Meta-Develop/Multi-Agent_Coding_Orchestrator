@@ -1,6 +1,8 @@
 Usage: grok [OPTIONS] [PROMPT] [COMMAND]
 
 Options:
+      --always-approve
+          Auto-approve all tool executions
       --cwd <CWD>
           Working directory
       --disable-web-search
