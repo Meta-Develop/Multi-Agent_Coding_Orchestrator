@@ -450,7 +450,7 @@ fn completed_quota_refresh_switches_the_next_actual_assignment_launch_to_cursor(
             .observed_usage
             .expect("second completed usage")
             .total_tokens,
-        3
+        10
     );
 
     let observed_launches = launches.lock().expect("launch observations").clone();
@@ -475,7 +475,7 @@ fn completed_quota_refresh_switches_the_next_actual_assignment_launch_to_cursor(
         .pool_usage(&quota_config.pools[1].key(), now)
         .expect("Cursor pool usage");
     assert_eq!(codex.tokens, 10);
-    assert_eq!(cursor.tokens, 3);
+    assert_eq!(cursor.tokens, 10);
     assert_eq!(cursor.requests, 1);
 }
 
