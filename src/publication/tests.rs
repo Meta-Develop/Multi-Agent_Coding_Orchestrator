@@ -4458,7 +4458,7 @@ fn seed_authenticated_merge_phase(
         .expect("seed authenticated merge auth writer")
         .into_authenticator()
         .expect("seed authenticated merge authenticator");
-    let mut wal = EffectWal::create_planned(auth, &logical_id, &effect_id, &planned)
+    let mut wal: EffectWal = EffectWal::create_planned(auth, &logical_id, &effect_id, &planned)
         .expect("seed planned authenticated merge");
     if phase == EffectPhase::Planned {
         return None;
