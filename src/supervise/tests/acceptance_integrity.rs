@@ -1652,6 +1652,7 @@ fn missing_child_report_preserves_original_and_adds_actionable_contract_finding(
         report_path,
         &external_run,
         &command,
+        SupervisorRuntime::Codex,
         parse_error.to_string(),
     );
     assert_eq!(report.findings.len(), 2);

@@ -621,7 +621,8 @@ pub(super) fn import_external_attempt_evidence(
             stdout_bytes,
             ArtifactFileDisposition::PrivateEvidence,
         )?;
-        let command_record = command_record_from_external(external_run, external_command);
+        let command_record =
+            command_record_from_external_for_runtime(external_run, external_command, runtime);
         write_artifact_json(
             writer,
             &artifacts.command_record_relative,
@@ -1196,6 +1197,7 @@ pub(super) fn environment_blocked_child_report(
     report_path: &Path,
     external_run: &ExternalAgentRun,
     external_command: &ExternalAgentCommand,
+    runtime: SupervisorRuntime,
 ) -> OrchestratorReviewReport {
     let failures = sanitized_environment_failures(external_run.environment_failures().to_vec());
     let categories = environment_failure_categories(&failures);
@@ -1247,7 +1249,11 @@ pub(super) fn environment_blocked_child_report(
         semantic_modules: assignment.semantic_modules.clone(),
         claim_token: None,
         semantic_intent_token: None,
-        commands_run: vec![command_record_from_external(external_run, external_command)],
+        commands_run: vec![command_record_from_external_for_runtime(
+            external_run,
+            external_command,
+            runtime,
+        )],
         environment_failures: failures,
         files_changed: Vec::new(),
         validation_results: Vec::new(),
@@ -1282,6 +1288,7 @@ pub(super) fn missing_child_report(
     report_path: &Path,
     external_run: &ExternalAgentRun,
     external_command: &ExternalAgentCommand,
+    runtime: SupervisorRuntime,
     error: String,
 ) -> OrchestratorReviewReport {
     OrchestratorReviewReport {
@@ -1292,7 +1299,11 @@ pub(super) fn missing_child_report(
         semantic_modules: assignment.semantic_modules.clone(),
         claim_token: None,
         semantic_intent_token: None,
-        commands_run: vec![command_record_from_external(external_run, external_command)],
+        commands_run: vec![command_record_from_external_for_runtime(
+            external_run,
+            external_command,
+            runtime,
+        )],
         environment_failures: sanitized_environment_failures(
             external_run.environment_failures().to_vec(),
         ),
@@ -1906,9 +1917,19 @@ pub(super) fn external_containment_verified(
     }
 }
 
-pub(super) fn external_process_completed(run: &ExternalAgentRun) -> bool {
-    run.succeeded()
-        || (run.simulation_succeeded() && run.program_trust == ExternalProgramTrust::ExplicitCustom)
+pub(super) fn external_process_completed(
+    run: &ExternalAgentRun,
+    runtime: SupervisorRuntime,
+) -> bool {
+    if runtime == SupervisorRuntime::Fake {
+        return run.simulation_succeeded()
+            && run.program_trust == ExternalProgramTrust::ExplicitCustom;
+    }
+    run.publishable
+        && run.exit_code == Some(0)
+        && !run.timed_out
+        && run.error.is_none()
+        && external_safety_verified(run, runtime)
 }
 
 pub(super) fn complete_external_codex_usage(
@@ -2205,15 +2226,16 @@ pub(super) fn finalize_supervisor_cost(
     None
 }
 
-pub(super) fn command_record_from_external(
+pub(super) fn command_record_from_external_for_runtime(
     run: &ExternalAgentRun,
     command: &ExternalAgentCommand,
+    runtime: SupervisorRuntime,
 ) -> CommandRunRecord {
     CommandRunRecord {
         command: serializable_external_command(&run.command, command),
         cwd: PathBuf::from("<child-worktree>"),
         exit_code: run.exit_code,
-        status: if external_process_completed(run) {
+        status: if external_process_completed(run, runtime) {
             ReviewStatus::Succeeded
         } else {
             ReviewStatus::Failed
@@ -2228,6 +2250,25 @@ pub(super) fn command_record_from_external(
         environment_failures: sanitized_environment_failures(run.environment_failures().to_vec()),
         error: run.error.clone(),
     }
+}
+
+#[cfg(test)]
+pub(super) fn command_record_from_external(
+    run: &ExternalAgentRun,
+    command: &ExternalAgentCommand,
+) -> CommandRunRecord {
+    let runtime = if run.simulation_succeeded()
+        && run.program_trust == ExternalProgramTrust::ExplicitCustom
+    {
+        SupervisorRuntime::Fake
+    } else {
+        command
+            .invocation
+            .adapter_id()
+            .and_then(crate::runtime_adapter::AdapterId::to_runtime_id)
+            .unwrap_or(SupervisorRuntime::Codex)
+    };
+    command_record_from_external_for_runtime(run, command, runtime)
 }
 
 pub(super) fn sandbox_denials_for_report(

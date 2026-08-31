@@ -2022,7 +2022,7 @@ fn dispatch_and_collect_child_attempt<'a>(
         assignment_journal_role,
         OrchestrationEventKind::Status,
         lifecycle_event_payload(
-            if external_process_completed(&external_run) {
+            if external_process_completed(&external_run, launch_runtime) {
                 "completed"
             } else {
                 "failed"
@@ -2047,7 +2047,11 @@ fn dispatch_and_collect_child_attempt<'a>(
     }
     outcome
         .command_records
-        .push(command_record_from_external(&external_run, &command));
+        .push(command_record_from_external_for_runtime(
+            &external_run,
+            &command,
+            launch_runtime,
+        ));
     let raw_report_validated = direct_assignment_report_is_valid(
         assignment.role,
         external_run.output_last_message(),
@@ -2087,7 +2091,7 @@ fn dispatch_and_collect_child_attempt<'a>(
     };
     let managed_child_git_import = if options.runtime == SupervisorRuntime::Codex
         && *execution_runtime == SupervisorExecutionRuntime::Verified
-        && external_process_completed(&external_run)
+        && external_process_completed(&external_run, launch_runtime)
         && attempt_containment_verified
         && external_run.publishable
         && raw_report_validated
@@ -2145,8 +2149,8 @@ fn dispatch_and_collect_child_attempt<'a>(
         outcome.pre_action_review_metrics.push(metrics.clone());
     }
     let external_side_effect_state = external_run.external_side_effect_state();
-    let (mut attempt_report, report_shape_problems) =
-        collect_child_report(ChildReportCollectionContext {
+    let (mut attempt_report, report_shape_problems) = collect_child_report_for_runtime(
+        ChildReportCollectionContext {
             assignment,
             assignment_metadata,
             report_path: &attempt_artifacts.raw_report_relative,
@@ -2157,7 +2161,9 @@ fn dispatch_and_collect_child_attempt<'a>(
             worker_journals: &worker_journal_evidence,
             evidence_only_source: context.evidence_only_reaudit.map(|source| &source.report),
             observed_changed_paths: observed_primary_scope_changes.as_deref(),
-        });
+        },
+        launch_runtime,
+    );
     if let Some(import) = managed_child_git_import {
         match import {
             Ok(imported) => attempt_report.findings.push(Finding {
@@ -3165,7 +3171,7 @@ fn dispatch_and_collect_parent_auditor(
         SupervisorRuntime::Codex => {
             // All fallible pre-dispatch preparation is complete. Mark
             // invocation only at the external-runner call boundary.
-            if let Err(error) = auditor_budget_reservation.mark_invoked_for_runtime(options.runtime)
+            if let Err(error) = auditor_budget_reservation.mark_invoked_for_runtime(launch_runtime)
             {
                 drop(auditor_incoming_root);
                 drop(auditor_capture_root);
@@ -3201,7 +3207,7 @@ fn dispatch_and_collect_parent_auditor(
         | SupervisorRuntime::Cursor
         | SupervisorRuntime::ClaudeCode
         | SupervisorRuntime::GeminiCli => {
-            if let Err(error) = auditor_budget_reservation.mark_invoked_for_runtime(options.runtime)
+            if let Err(error) = auditor_budget_reservation.mark_invoked_for_runtime(launch_runtime)
             {
                 drop(auditor_incoming_root);
                 drop(auditor_capture_root);
@@ -3218,7 +3224,7 @@ fn dispatch_and_collect_parent_auditor(
             Ok(external_runner(&auditor_command, cancellation, None))
         }
         SupervisorRuntime::Fake => {
-            if let Err(error) = auditor_budget_reservation.mark_invoked_for_runtime(options.runtime)
+            if let Err(error) = auditor_budget_reservation.mark_invoked_for_runtime(launch_runtime)
             {
                 drop(auditor_incoming_root);
                 drop(auditor_capture_root);
@@ -3273,7 +3279,7 @@ fn dispatch_and_collect_parent_auditor(
                     assignment_id: &assignment.id,
                     attempt: auditor_attempt,
                     role: AgentRole::Auditor,
-                    runtime: options.runtime,
+                    runtime: launch_runtime,
                     model: auditor_command.model.as_deref(),
                     effort: auditor_command.reasoning_effort.as_deref(),
                     worktree_id: &assignment.id,
@@ -3296,7 +3302,7 @@ fn dispatch_and_collect_parent_auditor(
         OrchestrationRole::Auditor,
         OrchestrationEventKind::Status,
         lifecycle_event_payload(
-            if external_process_completed(&auditor_run) {
+            if external_process_completed(&auditor_run, launch_runtime) {
                 "completed"
             } else {
                 "failed"
@@ -3356,7 +3362,8 @@ fn dispatch_and_collect_parent_auditor(
             tracker.escalate(denial, artifacts, &assignment.id, journal_parent_id)?;
         }
     }
-    let auditor_command_record = command_record_from_external(&auditor_run, &auditor_command);
+    let auditor_command_record =
+        command_record_from_external_for_runtime(&auditor_run, &auditor_command, launch_runtime);
     outcome.command_records.push(auditor_command_record.clone());
     child_report.commands_run.push(auditor_command_record);
     let raw_auditor_validated = read_auditor_report(
@@ -3386,6 +3393,7 @@ fn dispatch_and_collect_parent_auditor(
         &auditor_artifacts.raw_report_relative,
         &auditor_run,
         &auditor_command,
+        launch_runtime,
     );
     let auditor_primary_integrity_failed = !primary_auditor_changes.is_empty();
     if auditor_primary_integrity_failed {
