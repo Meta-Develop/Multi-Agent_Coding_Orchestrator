@@ -1,7 +1,27 @@
 use super::*;
 
+#[cfg(test)]
 pub(super) fn collect_child_report(
     context: ChildReportCollectionContext<'_>,
+) -> (OrchestratorReviewReport, Vec<String>) {
+    let runtime = if context.external_run.simulation_succeeded()
+        && context.external_run.program_trust == ExternalProgramTrust::ExplicitCustom
+    {
+        SupervisorRuntime::Fake
+    } else {
+        context
+            .external_command
+            .invocation
+            .adapter_id()
+            .and_then(crate::runtime_adapter::AdapterId::to_runtime_id)
+            .unwrap_or(SupervisorRuntime::Codex)
+    };
+    collect_child_report_for_runtime(context, runtime)
+}
+
+pub(super) fn collect_child_report_for_runtime(
+    context: ChildReportCollectionContext<'_>,
+    runtime: SupervisorRuntime,
 ) -> (OrchestratorReviewReport, Vec<String>) {
     let ChildReportCollectionContext {
         assignment,
@@ -23,6 +43,7 @@ pub(super) fn collect_child_report(
                 report_path,
                 external_run,
                 external_command,
+                runtime,
             ),
             Vec::new(),
         );
@@ -80,7 +101,8 @@ pub(super) fn collect_child_report(
                     paths: vec![report_path.to_path_buf()],
                 });
             }
-            if !external_process_completed(external_run) && report.status == ReviewStatus::Succeeded
+            if !external_process_completed(external_run, runtime)
+                && report.status == ReviewStatus::Succeeded
             {
                 report.status = ReviewStatus::Failed;
                 report.accepted = false;
@@ -102,6 +124,7 @@ pub(super) fn collect_child_report(
                 report_path,
                 external_run,
                 external_command,
+                runtime,
                 error,
             );
             report.role = assignment.role;
@@ -656,6 +679,7 @@ pub(super) fn collect_parent_auditor_report(
     report_path: &Path,
     external_run: &ExternalAgentRun,
     external_command: &ExternalAgentCommand,
+    runtime: SupervisorRuntime,
 ) -> AuditorReport {
     if external_run.environment_blocked() {
         let mut report = missing_parent_auditor_report(
@@ -666,7 +690,11 @@ pub(super) fn collect_parent_auditor_report(
         );
         report
             .commands_run
-            .push(command_record_from_external(external_run, external_command));
+            .push(command_record_from_external_for_runtime(
+                external_run,
+                external_command,
+                runtime,
+            ));
         return report;
     }
     let mut report = match read_auditor_report(external_run.output_last_message(), report_path) {
@@ -692,7 +720,8 @@ pub(super) fn collect_parent_auditor_report(
                     paths: vec![report_path.to_path_buf()],
                 });
             }
-            if !external_process_completed(external_run) && report.status == ReviewStatus::Succeeded
+            if !external_process_completed(external_run, runtime)
+                && report.status == ReviewStatus::Succeeded
             {
                 report.status = ReviewStatus::Failed;
                 report.accepted = false;
@@ -710,7 +739,11 @@ pub(super) fn collect_parent_auditor_report(
     };
     report
         .commands_run
-        .push(command_record_from_external(external_run, external_command));
+        .push(command_record_from_external_for_runtime(
+            external_run,
+            external_command,
+            runtime,
+        ));
     enforce_auditor_environment_failure_outcome(&mut report);
     report
 }
