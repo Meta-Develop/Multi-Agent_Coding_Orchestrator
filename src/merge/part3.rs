@@ -421,11 +421,19 @@ fn isolated_git_workspace_profile(
             repository_root.display()
         )
     })?;
-    let profile = StrictOfflineWorkspaceProfile::read_write(worktree_path)
+    let worktree_root = fs::canonicalize(worktree_path).with_context(|| {
+        format!(
+            "failed to resolve Git worktree {}",
+            worktree_path.display()
+        )
+    })?;
+    let mut profile = StrictOfflineWorkspaceProfile::read_write(worktree_path)
         .with_writable_artifact_root(&context.directory)
         .with_visible_read_only_root(&context.alternate_object_directory)
-        .with_visible_read_only_root(&common_dir)
-        .with_visible_read_only_root(&repository_root);
+        .with_visible_read_only_root(&common_dir);
+    if repository_root != worktree_root {
+        profile = profile.with_visible_read_only_root(&repository_root);
+    }
     hide_sensitive_state_if_present(profile, &common_dir)
 }
 
