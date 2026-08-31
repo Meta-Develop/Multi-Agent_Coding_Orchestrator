@@ -325,6 +325,8 @@ pub enum OutputCaptureMode {
 
 #[cfg(test)]
 const GROK_NO_SUBAGENTS_ARG: &str = "--no-subagents";
+#[cfg(test)]
+const GROK_ALWAYS_APPROVE_ARG: &str = "--always-approve";
 
 /// A model/effort runtime identity whose launch contract is known precisely.
 ///
@@ -562,10 +564,10 @@ impl RuntimeAdapterConfig {
     ///
     /// Grok capability elevation requires an absolute cwd, the selected
     /// executable, the exact immutable argv (including strict sandboxing,
-    /// streaming JSON, and no subagents), stdout capture for the bounded
-    /// parser, and no operator environment or stdin alteration. A model/effort
-    /// string without these checks remains on the fail-closed adapter-level
-    /// capability row.
+    /// headless tool approval, streaming JSON, and no subagents), stdout
+    /// capture for the bounded parser, and no operator environment or stdin
+    /// alteration. A model/effort string without these checks remains on the
+    /// fail-closed adapter-level capability row.
     pub fn typed_runtime_contract(
         &self,
         adapter: AdapterId,
@@ -972,6 +974,7 @@ mod tests {
                 "streaming-json",
                 "--sandbox",
                 "strict",
+                "--always-approve",
                 "--disable-web-search",
                 "--no-memory",
                 "--no-subagents",
@@ -1000,6 +1003,7 @@ mod tests {
                 "streaming-json",
                 "--sandbox",
                 "strict",
+                "--always-approve",
                 "--disable-web-search",
                 "--no-memory",
                 "--no-subagents",
@@ -1032,6 +1036,7 @@ mod tests {
                 "streaming-json",
                 "--sandbox",
                 "strict",
+                "--always-approve",
                 "--disable-web-search",
                 "--no-memory",
                 "--no-subagents",
@@ -1060,6 +1065,7 @@ mod tests {
                 "streaming-json",
                 "--sandbox",
                 "strict",
+                "--always-approve",
                 "--disable-web-search",
                 "--no-memory",
                 "--no-subagents",
@@ -1170,6 +1176,7 @@ mod tests {
                 "streaming-json",
                 "--sandbox",
                 "strict",
+                "--always-approve",
                 "--disable-web-search",
                 "--no-memory",
                 "--no-subagents",
@@ -1205,6 +1212,70 @@ mod tests {
             Path::new("out.txt"),
         ))?;
         assert_eq!(cursor_spec.argv, ["--prompt-file", "prompt.txt"]);
+        Ok(())
+    }
+
+    #[test]
+    fn grok_headless_approval_is_immutable_across_restoration_and_overrides() -> Result<()> {
+        let immutable = grok::GROK_RUNTIME_DESCRIPTOR.immutable_argument_template();
+        assert_eq!(
+            immutable
+                .iter()
+                .filter(|argument| argument.as_str() == GROK_ALWAYS_APPROVE_ARG)
+                .count(),
+            1
+        );
+
+        let mut restored = RuntimeAdapterConfig::defaults(RuntimeId::Grok);
+        restored
+            .argument_template
+            .retain(|argument| argument != GROK_ALWAYS_APPROVE_ARG);
+        restored
+            .argument_template
+            .extend(["--permission-mode".to_string(), "dontAsk".to_string()]);
+        restored.restore_immutable_grok_descriptor();
+        assert_eq!(restored.argument_template, immutable);
+
+        restored.replace_operator_argument_template(
+            AdapterId::Grok,
+            "--prompt-file {prompt} --permission-mode dontAsk",
+        );
+        assert_eq!(restored.argument_template, immutable);
+        let context = launch_context(
+            Path::new("prompt.txt"),
+            Some("grok-4.6"),
+            Some("xhigh"),
+            Path::new("/tmp/work"),
+            Path::new("out.txt"),
+        );
+        let rendered = restored.render(&context)?;
+        assert_eq!(
+            rendered
+                .argv
+                .iter()
+                .filter(|argument| argument.as_str() == GROK_ALWAYS_APPROVE_ARG)
+                .count(),
+            1
+        );
+        assert!(restored
+            .typed_runtime_contract(AdapterId::Grok, &context)
+            .is_some());
+
+        let mut removed = restored.clone();
+        removed
+            .argument_template
+            .retain(|argument| argument != GROK_ALWAYS_APPROVE_ARG);
+        assert!(removed
+            .typed_runtime_contract(AdapterId::Grok, &context)
+            .is_none());
+
+        let mut duplicated = restored;
+        duplicated
+            .argument_template
+            .push(GROK_ALWAYS_APPROVE_ARG.to_string());
+        assert!(duplicated
+            .typed_runtime_contract(AdapterId::Grok, &context)
+            .is_none());
         Ok(())
     }
 
@@ -1614,6 +1685,7 @@ mod tests {
                 OsString::from("streaming-json"),
                 OsString::from("--sandbox"),
                 OsString::from("strict"),
+                OsString::from("--always-approve"),
                 OsString::from("--disable-web-search"),
                 OsString::from("--no-memory"),
                 OsString::from("--no-subagents"),
@@ -1916,6 +1988,15 @@ mod tests {
         }
         let help = require_installed_cli_help("grok");
         assert_grok_help_contract(&help, "installed grok help");
+        assert_help_contains(
+            &help,
+            &[grok::GROK_RUNTIME_DESCRIPTOR.headless_approval_flag()],
+            "installed grok help",
+        );
+        assert!(
+            help.contains("Auto-approve all tool executions"),
+            "installed grok help no longer documents the immutable headless approval behavior"
+        );
     }
 
     #[test]
