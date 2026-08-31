@@ -199,17 +199,17 @@ Runtime boundary:
 - MACO launched this Codex CLI with strict/ephemeral configuration, approval policy never, goals and multi-agent enabled, and the named maco_external_codex permission profile.
 - The inner permission profile grants only minimal reads plus writes in this assigned workspace root; model-generated network access, user config/rules, web search, plugins, apps, hooks, browser/computer use, and inherited shell environment are disabled.
 - An outer MACO systemd boundary separately verifies the exact workspace/artifact mounts, blocked host IPC sockets, resource limits, and empty owned cgroup before the result can be published.
-- Never launch a raw Codex subprocess or request danger-full-access. Any nested role must go through a MACO-approved runner and a least-privilege profile whose process-tree and side-effect evidence is verified.
-- If an approved nested runner/profile is unavailable, stop and report the blocked delegation instead of weakening this boundary.
+- Never launch a raw Codex subprocess or request danger-full-access. Any nested role authorized by an execution assignment must go through a MACO-approved runner and a least-privilege profile whose process-tree and side-effect evidence is verified.
+- If an execution assignment requires a nested role but an approved runner/profile is unavailable, stop and report the blocked delegation instead of weakening this boundary.
 
 Required behavior:
 - First, read and follow AGENTS.md and project-local .agents instructions in this worktree. When present, specifically read .agents/skills/agent-orchestration/SKILL.md and .agents/docs/AGENT_ORCHESTRATION.md before worker delegation or mutation.
-- Use Codex native SubAgent/delegated-worker mechanisms only for lightweight terminal worker or researcher assignments when available, following AGENTS.md and .agents instructions.
-- When launching a worker, use the generated worker prompt template verbatim and preserve its trusted shared prefix followed by its six-line TERMINAL_WORKER role metadata block.
-- You may collect advisory child-side review-auditor evidence with the generated REVIEW_AUDITOR prompt template, but it is not an acceptance gate unless MACO/O2 collects it through the parent-enforced gate.
-- When collecting advisory child-side review-auditor evidence, preserve its trusted shared prefix followed by its six-line REVIEW_AUDITOR role metadata block.
+- For an execution assignment with worker_assignments, use Codex native SubAgent/delegated-worker mechanisms only for the declared lightweight terminal worker or researcher assignments when available, following AGENTS.md and .agents instructions.
+- When an execution assignment authorizes launching a worker, use the generated worker prompt template verbatim and preserve its trusted shared prefix followed by its six-line TERMINAL_WORKER role metadata block.
+- An execution child orchestrator with worker_assignments must collect the required advisory child-side review-auditor evidence with the generated REVIEW_AUDITOR prompt template, but it is not an acceptance gate unless MACO/O2 collects it through the parent-enforced gate.
+- When an execution assignment authorizes advisory child-side review-auditor evidence, preserve its trusted shared prefix followed by its six-line REVIEW_AUDITOR role metadata block.
 - Do not force raw Codex CLI subprocess workers as the primary worker path.
-- If no delegated-worker mechanism is available, stop before mutation and report the exact blocked worker task in your OrchestratorReviewReport findings and remaining_risk.
+- If an execution assignment declares worker_assignments but no delegated-worker mechanism is available, stop before mutation and report the exact blocked worker task in your OrchestratorReviewReport findings and remaining_risk.
 - Workers must return WorkerReport JSON matching the worker report contract and include "no_further_delegation": true.
 - WorkerReport, AuditorReport, and OrchestratorReviewReport must include environment_failures. Use [] when no typed failure occurred. A nonempty environment_failures list requires accepted=false, rejected=true, and status=failed; never include credential or secret values.
 - Workers may propose bounded field_guide_entries containing finding and context only. They must never add date, source_run, or other provenance; the trusted parent stamps provenance only after acceptance and audit.
@@ -217,18 +217,18 @@ Required behavior:
 - Review auditors must return AuditorReport JSON matching the auditor report contract and include "no_further_delegation": true.
 - Review auditors must include "read_only": true in AuditorReport JSON to attest they did not mutate files or repository state.
 - Acceptance-gate review auditors are parent-launched MACO/Codex CLI subprocess roles; a child-launched review auditor is advisory child-side evidence unless MACO/O2 collects it through the parent-enforced acceptance gate.
-- Embed each accepted terminal WorkerReport in OrchestratorReviewReport.worker_reports without losing or changing any reported evidence, using [] for genuinely empty arrays; represent absent optional evidence as null. Reject the child report if worker evidence is missing or rejected.
+- For an execution assignment with worker_assignments, embed each accepted terminal WorkerReport in OrchestratorReviewReport.worker_reports without losing or changing any reported evidence, using [] for genuinely empty arrays; represent absent optional evidence as null. Reject the child report if worker evidence is missing or rejected.
 - OrchestratorReviewReport may also propose bounded field_guide_entries containing finding and context only. Do not copy unreviewed or rejected worker suggestions into this field.
 - Preserve each worker assignment_kind and target_path in WorkerReport. A successful megafile_decomposition worker must report the exact canonical target_path in files_changed and include decomposition_completion with that target plus at least one concrete canonical replacement_path also present in files_changed. OrchestratorReviewReport must aggregate the exact accepted worker evidence in decomposition_completions; this evidence does not bypass claims, journals, validation, audit, or later merge gates.
-- Include at least one accepted read-only AuditorReport in audit_reports whose reviewed_worker_ids covers every embedded worker id; MACO rejects child reports with worker assignments that omit terminal audit evidence.
+- For an execution assignment with worker_assignments, include at least one accepted read-only AuditorReport in audit_reports whose reviewed_worker_ids covers every embedded worker id; MACO rejects child reports with worker assignments that omit terminal audit evidence.
 - A licensed_breakage declaration in the assignment is immutable plan authority, not permission you may create or widen. For each dependent validation failure, use the exact declared dependent_id as ValidationResult.name, preserve the exact bounded compiler/build signature in message (including the declared interface name), and add an Error finding with the identical message and exact affected dependent paths. Unmatched failures remain ordinary assignment failures.
 - Never emit licensed_breakage_review or generated_follow_up_tasks. They are supervisor-owned gate and journal records; attempting to self-assert them fails the assignment.
 
 Safety requirements:
-- Do not edit outside the assigned paths, symbols, or modules.
+- Planning assignments are read-only. For execution assignments, do not edit outside the assigned paths, symbols, or modules.
 - Do not mutate the primary worktree.
 - Run validation commands when feasible. If validation cannot run, explain why in validation_results and remaining_risk.
-- Return exactly one OrchestratorReviewReport JSON object with all accepted WorkerReports and required read-only AuditorReport coverage; use no prose wrapper or Markdown fence.
+- Return exactly one OrchestratorReviewReport JSON object with the evidence applicable to this assignment; use no prose wrapper or Markdown fence. An execution assignment with worker_assignments requires its accepted WorkerReports and read-only AuditorReport coverage. A workerless planning gate instead returns worker_reports=[] and audit_reports=[] and relies on the parent-enforced MACO review lens for acceptance.
 "#,
         tool_call_batching_guidance = TOOL_CALL_BATCHING_GUIDANCE
     )
@@ -615,6 +615,8 @@ pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guid
             context.assignment.role.as_str()
         );
     }
+    let workerless_planning_gate = context.assignment.phase == AssignmentPhase::Planning
+        && context.assignment.worker_assignments.is_empty();
     let ChildOrchestratorPromptContext {
         plan,
         execution_target,
@@ -676,23 +678,28 @@ pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guid
         .map(|(rendered, _)| rendered.as_str())
         .collect::<Vec<_>>()
         .join("\n\n--- worker prompt contract ---\n\n");
-    let auditor_prompt = review_auditor_prompt_with_metadata_and_field_guide(
-        plan,
-        assignment,
-        assignment_metadata,
-        run_dir,
-        auditor_schema_path,
-        field_guide,
-    )?;
-    let auditor_prefix = review_auditor_cacheable_prefix();
-    let auditor_id = format!("{}-review-auditor", assignment.id);
-    let auditor_measurement = PromptByteMeasurement::new(
-        PromptMeasurementRole::ChildSideReviewAuditor,
-        auditor_id,
-        &auditor_prompt,
-        &auditor_prefix,
-        REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES,
-    )?;
+    let (auditor_prompt, auditor_measurement) = if workerless_planning_gate {
+        (None, None)
+    } else {
+        let prompt = review_auditor_prompt_with_metadata_and_field_guide(
+            plan,
+            assignment,
+            assignment_metadata,
+            run_dir,
+            auditor_schema_path,
+            field_guide,
+        )?;
+        let auditor_prefix = review_auditor_cacheable_prefix();
+        let auditor_id = format!("{}-review-auditor", assignment.id);
+        let measurement = PromptByteMeasurement::new(
+            PromptMeasurementRole::ChildSideReviewAuditor,
+            auditor_id,
+            &prompt,
+            &auditor_prefix,
+            REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES,
+        )?;
+        (Some(prompt), Some(measurement))
+    };
     let task = assignment_task(plan, assignment);
     let role_prefix = supervise_role_prefix(
         SupervisePromptRole::O1ChildOrchestrator,
@@ -704,10 +711,75 @@ pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guid
     let (worker_model, worker_reasoning_effort) = role_model_selection(plan, AgentRole::Worker);
     let instruction_profile_section = phase_aware_instruction_profile_section(
         AgentRole::ChildOrchestrator,
-        OrchestrationPhase::Implementation,
+        if assignment.phase == AssignmentPhase::Planning {
+            OrchestrationPhase::Planning
+        } else {
+            OrchestrationPhase::Implementation
+        },
         child_model.as_deref(),
     );
-    let consultation_section = consultation_prompt_section(consultant);
+    let consultation_section = if workerless_planning_gate {
+        String::new()
+    } else {
+        consultation_prompt_section(consultant)
+    };
+    let phase_contract_section = if workerless_planning_gate {
+        r#"
+Workerless planning gate:
+- This assignment is phase=planning with worker_assignments=[]. It is a read-only planning gate, not an implementation assignment.
+- Stay read-only: do not edit files, apply patches, mutate repository state, or delegate implementation.
+- Do not launch terminal workers or child-side review auditors. No child-side WorkerReport or AuditorReport evidence is required or permitted for this gate.
+- Return worker_reports=[] and audit_reports=[] in the OrchestratorReviewReport.
+- MACO/O2 applies the parent-enforced review lens after this report; rely on that parent review for acceptance instead of attempting a child-side audit.
+"#
+    } else if assignment.worker_assignments.is_empty() {
+        r#"
+Worker assignment context:
+- This assignment has worker_assignments=[]; do not attempt terminal-worker delegation.
+"#
+    } else {
+        r#"
+Execution delegation contract:
+- This execution child orchestrator has declared worker_assignments. Launch every supplied terminal worker and preserve the required WorkerReport plus child-side audit evidence.
+"#
+    };
+    let worker_delegation_selection = if assignment.worker_assignments.is_empty() {
+        "- Nested worker delegation: <not applicable: worker_assignments=[]>"
+    } else {
+        "- Launch each supplied terminal worker prompt through runtime-native SubAgent/delegated-worker support on this enclosing bridge and preserve its declared runtime, model, and effort. Prompt rendering fails closed when that bridge cannot honor the selected worker runtime. MACO's parent scheduler does not launch those terminal sessions for you; runtime-side role-tagged usage reporting is required before worker execution, usage, or cost can be reported."
+    };
+    let nested_prompt_templates_section = auditor_prompt
+        .as_ref()
+        .map(|auditor_prompt| {
+            format!(
+                r#"
+Worker prompt templates:
+{worker_prompts}
+
+Review auditor prompt template:
+{auditor_prompt}
+"#
+            )
+        })
+        .unwrap_or_default();
+    let source_collection_rule = if workerless_planning_gate {
+        "- The assigned child worktree is read-only for this planning gate; do not write source files or worker journals."
+    } else {
+        "- Source writes only in assigned worktree paths; each worker journal is a separate exact precreated append-only file and the sole non-source write under a nonwritable parent (never create, replace, rename, link, or swap)."
+    };
+    let schema_collection = if workerless_planning_gate {
+        format!(
+            "OrchestratorReviewReport={}; WorkerReport=<not applicable: worker_reports=[]>; AuditorReport=<not applicable: audit_reports=[]; parent-enforced review lens>",
+            schema_path.display()
+        )
+    } else {
+        format!(
+            "OrchestratorReviewReport={}; WorkerReport={}; AuditorReport={}",
+            schema_path.display(),
+            worker_schema_path.display(),
+            auditor_schema_path.display()
+        )
+    };
     let cacheable_prefix = child_cacheable_prefix_for_target(execution_target);
     let execution_target_context = execution_target
         .map(|target| {
@@ -719,11 +791,12 @@ pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guid
         })
         .unwrap_or_default();
     let prompt = format!(
-        r#"{cacheable_prefix}{role_prefix}{field_guide_section}{instruction_profile_section}
+        r#"{cacheable_prefix}{role_prefix}{field_guide_section}{instruction_profile_section}{phase_contract_section}
 
 Assignment-specific context:
 - Assigned child worktree: {worktree_path}
 {execution_target_context}- Child orchestrator id: {child_id}
+- Assignment phase: {assignment_phase}
 - Megafile decomposition worker targets: {decomposition_targets}
 - Assigned paths: {assigned_paths}
 - Semantic symbols: {semantic_symbols}
@@ -738,26 +811,21 @@ Declared role selections:
 - Nested worker runtime: {worker_launch_runtime}
 - Nested worker model: {worker_model}
 - Nested worker reasoning effort: {worker_reasoning_effort}
-- Launch each supplied terminal worker prompt through runtime-native SubAgent/delegated-worker support on this enclosing bridge and preserve its declared runtime, model, and effort. Prompt rendering fails closed when that bridge cannot honor the selected worker runtime. MACO's parent scheduler does not launch those terminal sessions for you; runtime-side role-tagged usage reporting is required before worker execution, usage, or cost can be reported.
+{worker_delegation_selection}
 {consultation_section}
 
 Collection:
 - Artifact-only incoming root: {incoming_root}
 - Exact report path for Codex CLI --output-last-message only (never tools): {report_path}
-- Source writes only in assigned worktree paths; each worker journal is a separate exact precreated append-only file and the sole non-source write under a nonwritable parent (never create, replace, rename, link, or swap).
-- Schemas: OrchestratorReviewReport={schema_path}; WorkerReport={worker_schema_path}; AuditorReport={auditor_schema_path}
+{source_collection_rule}
+- Schemas: {schema_collection}
 
 Supervisor task:
 {task}
 
 Orchestrator assignment JSON:
 {assignment_json}
-
-Worker prompt templates:
-{worker_prompts}
-
-Review auditor prompt template:
-{auditor_prompt}
+{nested_prompt_templates_section}
 "#,
         cacheable_prefix = cacheable_prefix,
         role_prefix = role_prefix,
@@ -765,6 +833,10 @@ Review auditor prompt template:
         instruction_profile_section = instruction_profile_section,
         worktree_path = worktree.path.display(),
         child_id = assignment.id,
+        assignment_phase = match assignment.phase {
+            AssignmentPhase::Planning => "planning",
+            AssignmentPhase::Execution => "execution",
+        },
         execution_target_context = execution_target_context,
         incoming_root = incoming_root.display(),
         decomposition_targets = display_decomposition_targets(assignment, assignment_metadata),
@@ -786,19 +858,27 @@ Review auditor prompt template:
         } else {
             worker_launch_runtime.as_str()
         },
-        worker_model = worker_model.as_deref().unwrap_or("<runtime default>"),
-        worker_reasoning_effort = worker_reasoning_effort
-            .as_deref()
-            .unwrap_or("<runtime default>"),
+        worker_model = if assignment.worker_assignments.is_empty() {
+            "<not applicable: no nested workers>"
+        } else {
+            worker_model.as_deref().unwrap_or("<runtime default>")
+        },
+        worker_reasoning_effort = if assignment.worker_assignments.is_empty() {
+            "<not applicable: no nested workers>"
+        } else {
+            worker_reasoning_effort
+                .as_deref()
+                .unwrap_or("<runtime default>")
+        },
         report_path = report_path.display(),
-        schema_path = schema_path.display(),
-        worker_schema_path = worker_schema_path.display(),
-        auditor_schema_path = auditor_schema_path.display(),
         task = task,
         assignment_json = assignment_json,
-        worker_prompts = worker_prompts,
-        auditor_prompt = auditor_prompt,
         consultation_section = consultation_section,
+        phase_contract_section = phase_contract_section,
+        worker_delegation_selection = worker_delegation_selection,
+        nested_prompt_templates_section = nested_prompt_templates_section,
+        source_collection_rule = source_collection_rule,
+        schema_collection = schema_collection,
     );
     let mut prompt_measurements = Vec::with_capacity(worker_prompt_renders.len() + 2);
     prompt_measurements.push(PromptByteMeasurement::new(
@@ -813,7 +893,9 @@ Review auditor prompt template:
             .into_iter()
             .map(|(_, measurement)| measurement),
     );
-    prompt_measurements.push(auditor_measurement);
+    if let Some(auditor_measurement) = auditor_measurement {
+        prompt_measurements.push(auditor_measurement);
+    }
     Ok(RenderedPromptWithMeasurements {
         prompt,
         measurements: PromptMeasurementsArtifact::new(
@@ -1804,6 +1886,7 @@ mod regression_tests {
     }
 
     fn render_valid_nested_runtime_fixture(
+        phase: AssignmentPhase,
         child_runtime: SupervisorRuntime,
         worker_runtime: SupervisorRuntime,
         include_worker: bool,
@@ -1825,7 +1908,7 @@ mod regression_tests {
             .collect();
         let assignment = OrchestratorAssignment {
             id: "child-runtime".to_string(),
-            phase: AssignmentPhase::Execution,
+            phase,
             runtime: Some(child_runtime),
             role: AgentRole::ChildOrchestrator,
             role_category: None,
@@ -1833,7 +1916,12 @@ mod regression_tests {
             assigned_paths: vec![PathBuf::from("src/supervise/prompts.rs")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
-            task: Some("complete the valid nested-worker runtime handoff".to_string()),
+            task: Some(if phase == AssignmentPhase::Planning {
+                "Read-only planning gate: review scope without editing files or delegating implementation."
+                    .to_string()
+            } else {
+                "complete the valid nested-worker runtime handoff".to_string()
+            }),
             worker_assignments,
             environment_requirements: Vec::new(),
             licensed_breakage: None,
@@ -2003,6 +2091,7 @@ mod regression_tests {
     #[test]
     fn valid_child_orchestrator_carries_matching_nested_worker_runtime_contract() -> Result<()> {
         let prompt = render_valid_nested_runtime_fixture(
+            AssignmentPhase::Execution,
             SupervisorRuntime::Codex,
             SupervisorRuntime::Codex,
             true,
@@ -2013,6 +2102,10 @@ mod regression_tests {
         assert!(prompt.contains("- Nested worker runtime: codex"));
         assert!(prompt.contains("Worker prompt templates:"));
         assert!(prompt.contains("ROLE: TERMINAL_WORKER"));
+        assert!(prompt.contains("Review auditor prompt template:"));
+        assert!(prompt.contains("ROLE: REVIEW_AUDITOR"));
+        assert!(prompt
+            .contains("Include at least one accepted read-only AuditorReport in audit_reports"));
         assert!(prompt.contains("- Worker runtime: codex"));
         assert!(prompt.contains("runtime-side role-tagged usage reporting is required before worker execution, usage, or cost can be reported"));
         Ok(())
@@ -2021,6 +2114,7 @@ mod regression_tests {
     #[test]
     fn nested_worker_runtime_mismatch_fails_closed_during_prompt_rendering() {
         let error = render_valid_nested_runtime_fixture(
+            AssignmentPhase::Execution,
             SupervisorRuntime::Codex,
             SupervisorRuntime::Cursor,
             true,
@@ -2037,6 +2131,7 @@ mod regression_tests {
     #[test]
     fn workerless_child_does_not_refuse_an_unused_runtime_mismatch() -> Result<()> {
         let prompt = render_valid_nested_runtime_fixture(
+            AssignmentPhase::Execution,
             SupervisorRuntime::Codex,
             SupervisorRuntime::Cursor,
             false,
@@ -2045,6 +2140,30 @@ mod regression_tests {
         assert!(prompt.contains("- Enclosing child launch runtime: codex"));
         assert!(prompt.contains("- Nested worker runtime: <not applicable: no nested workers>"));
         assert!(!prompt.contains("ROLE: TERMINAL_WORKER"));
+        Ok(())
+    }
+
+    #[test]
+    fn workerless_planning_prompt_stays_read_only_and_defers_to_parent_review() -> Result<()> {
+        let prompt = render_valid_nested_runtime_fixture(
+            AssignmentPhase::Planning,
+            SupervisorRuntime::Codex,
+            SupervisorRuntime::Cursor,
+            false,
+        )?;
+
+        assert!(prompt.contains("Workerless planning gate:"));
+        assert!(prompt.contains("Stay read-only: do not edit files, apply patches"));
+        assert!(prompt.contains("Do not launch terminal workers or child-side review auditors"));
+        assert!(prompt.contains("Return worker_reports=[] and audit_reports=[]"));
+        assert!(prompt.contains("parent-enforced review lens"));
+        assert!(prompt.contains("- Assignment phase: planning"));
+        assert!(prompt.contains("- Nested worker delegation: <not applicable"));
+        assert!(!prompt.contains("Review auditor prompt template:"));
+        assert!(!prompt.contains("ROLE: TERMINAL_WORKER"));
+        assert!(!prompt.contains("ROLE: REVIEW_AUDITOR"));
+        assert!(!prompt.contains("- Launch each supplied terminal worker prompt"));
+        assert!(!prompt.contains("- Source writes only in assigned worktree paths"));
         Ok(())
     }
 

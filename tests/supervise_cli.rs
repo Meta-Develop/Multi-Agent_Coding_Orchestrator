@@ -1924,6 +1924,62 @@ fn fake_prompt_keeps_role_assignment_and_consultant_contract_as_data() -> Result
 }
 
 #[test]
+fn workerless_planning_cli_prompt_forbids_child_delegation_and_defers_review() -> Result<()> {
+    support::require_containment!(
+        "workerless_planning_cli_prompt_forbids_child_delegation_and_defers_review"
+    );
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let plan_path = temp.path().join("workerless-planning-plan.json");
+    fs::write(
+        &plan_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "task": "parent task",
+            "assignments": [{
+                "id": "workerless-planning",
+                "phase": "planning",
+                "role": "child_orchestrator",
+                "role_category": "delegating_coordinator",
+                "assigned_paths": ["README.md"],
+                "task": "Read-only planning gate. Review scope without editing files or delegating implementation.",
+                "worker_assignments": []
+            }]
+        }))?,
+    )?;
+
+    let report = run_success_json(&[
+        "supervise",
+        "run",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "workerless-planning-prompt",
+        "--runtime",
+        "fake",
+        "--json",
+    ])?;
+    assert_eq!(report["success"], true);
+
+    let prompt = fs::read_to_string(repo_path.join(
+        ".maco/o2/runs/workerless-planning-prompt/assignments/workerless-planning.prompt.md",
+    ))?;
+    assert!(prompt.contains("Workerless planning gate:"));
+    assert!(prompt.contains("Stay read-only: do not edit files, apply patches"));
+    assert!(prompt.contains("Do not launch terminal workers or child-side review auditors"));
+    assert!(prompt.contains("Return worker_reports=[] and audit_reports=[]"));
+    assert!(prompt.contains("parent-enforced review lens"));
+    assert!(prompt.contains("WorkerReport=<not applicable: worker_reports=[]>"));
+    assert!(!prompt.contains("Review auditor prompt template:"));
+    assert!(!prompt.contains("ROLE: TERMINAL_WORKER"));
+    assert!(!prompt.contains("ROLE: REVIEW_AUDITOR"));
+    assert!(!prompt.contains("- Launch each supplied terminal worker prompt"));
+    assert!(!prompt.contains("- Source writes only in assigned worktree paths"));
+    Ok(())
+}
+
+#[test]
 fn supervise_generates_run_ids_refuses_reuse_and_lists_artifacts() -> Result<()> {
     support::require_containment!("supervise_generates_run_ids_refuses_reuse_and_lists_artifacts");
     let temp = TempDir::new().context("tempdir")?;
