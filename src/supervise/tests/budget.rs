@@ -288,6 +288,7 @@ fn budget_integration_serial_scheduler_accounts_exact_hard_boundary_by_process_r
 
 #[test]
 fn budget_integration_auditor_admission_refusal_reaches_typed_child_and_final_reports() {
+    skip_without_containment!();
     let _capability = install_budget_fixture_models();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
@@ -764,6 +765,7 @@ fn budget_lifecycle_child_pre_runner_failure_releases_reservation_and_stops_pend
 
 #[test]
 fn budget_lifecycle_auditor_pre_runner_failure_releases_reservation_and_stops_pending() {
+    skip_without_containment!();
     let _capability = install_budget_fixture_models();
     let (temp, repo_path) = injected_repository();
     let child_a = injected_assignment(true);
@@ -887,6 +889,7 @@ fn budget_lifecycle_child_runner_panic_reconciles_missing_and_stops_pending() {
 
 #[test]
 fn budget_lifecycle_auditor_runner_panic_reconciles_missing_and_stops_pending() {
+    skip_without_containment!();
     let _capability = install_budget_fixture_models();
     let (temp, repo_path) = injected_repository();
     let child_a = injected_assignment(true);
@@ -1159,7 +1162,7 @@ fn budget_integration_parseable_usage_from_truncated_capture_is_estimated() {
     write_injected_usage(&command, 7, 3);
     let mut run = injected_verified_run_without_journals(&command);
     run.stdout.truncated = true;
-    assert!(external_process_completed(&run));
+    assert!(external_process_completed(&run, SupervisorRuntime::Codex));
     assert!(external_safety_verified(&run, SupervisorRuntime::Codex));
     assert_eq!(
         complete_external_codex_usage(&run, &command).map(|usage| usage.total_tokens),
@@ -1196,6 +1199,162 @@ fn budget_integration_parseable_usage_from_truncated_capture_is_estimated() {
         .expect("later admission result"),
         DispatchBudgetAdmission::Refused(BudgetAdmissionRefusal::NewDispatchStopped)
     ));
+}
+
+#[test]
+fn runtime_aware_external_completion_accepts_only_verified_publishable_adapter_runs() {
+    let temp = tempfile::tempdir().expect("runtime completion command root");
+    let command = ExternalAgentCommand::codex(
+        "injected-codex",
+        temp.path(),
+        temp.path().join("prompt.md"),
+        temp.path().join("capture.jsonl"),
+        temp.path().join("report.json"),
+        Duration::from_secs(1),
+    );
+    let mut grok_run = injected_verified_run_without_journals(&command);
+    grok_run.program_trust = ExternalProgramTrust::ExplicitCustom;
+    grok_run.codex_permissions = None;
+
+    assert!(external_process_completed(
+        &grok_run,
+        SupervisorRuntime::Grok
+    ));
+    assert!(external_safety_verified(&grok_run, SupervisorRuntime::Grok));
+    assert_eq!(
+        command_record_from_external_for_runtime(&grok_run, &command, SupervisorRuntime::Grok)
+            .status,
+        ReviewStatus::Succeeded
+    );
+    assert!(!grok_run.succeeded());
+    let mut codex_without_permissions = grok_run.clone();
+    codex_without_permissions.program_trust = ExternalProgramTrust::TrustedSystemCodex;
+    assert!(!codex_without_permissions.safely_executed());
+    assert!(!external_process_completed(
+        &codex_without_permissions,
+        SupervisorRuntime::Codex
+    ));
+
+    let mut missing_containment = grok_run.clone();
+    missing_containment.process_tree = None;
+    assert!(!external_process_completed(
+        &missing_containment,
+        SupervisorRuntime::Grok
+    ));
+
+    let mut nonzero = grok_run.clone();
+    nonzero.exit_code = Some(23);
+    assert!(!external_process_completed(
+        &nonzero,
+        SupervisorRuntime::Grok
+    ));
+
+    let mut errored = grok_run.clone();
+    errored.error = Some("adapter process error".to_string());
+    assert!(!external_process_completed(
+        &errored,
+        SupervisorRuntime::Grok
+    ));
+
+    let mut timed_out = grok_run.clone();
+    timed_out.timed_out = true;
+    assert!(!external_process_completed(
+        &timed_out,
+        SupervisorRuntime::Grok
+    ));
+
+    let mut unpublishable = grok_run;
+    unpublishable.publishable = false;
+    assert!(!external_process_completed(
+        &unpublishable,
+        SupervisorRuntime::Grok
+    ));
+}
+
+#[test]
+fn runtime_aware_external_completion_preserves_fake_simulation_contract() {
+    let temp = tempfile::tempdir().expect("fake completion command root");
+    let command = ExternalAgentCommand::codex(
+        "unused-codex",
+        temp.path(),
+        temp.path().join("prompt.md"),
+        temp.path().join("capture.jsonl"),
+        temp.path().join("report.json"),
+        Duration::from_secs(1),
+    );
+    let fake_run = deterministic_fake_run(&command, Vec::new());
+    assert!(external_process_completed(
+        &fake_run,
+        SupervisorRuntime::Fake
+    ));
+
+    let mut wrong_trust = fake_run.clone();
+    wrong_trust.program_trust = ExternalProgramTrust::TrustedSystemCodex;
+    assert!(!external_process_completed(
+        &wrong_trust,
+        SupervisorRuntime::Fake
+    ));
+
+    let mut publishable = fake_run;
+    publishable.publishable = true;
+    assert!(!external_process_completed(
+        &publishable,
+        SupervisorRuntime::Fake
+    ));
+}
+
+#[test]
+fn budget_reliability_uses_bound_adapter_runtime_completion() {
+    let _capability = install_budget_fixture_models();
+    let assignment = injected_assignment(false);
+    let mut plan = injected_plan(assignment, 0);
+    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    let budget = injected_run_budget(None, Some(100), None, Some(1.0), 50, 50);
+    let ledger = RunBudgetLedger::new(budget.limits).expect("budget ledger");
+    let temp = tempfile::tempdir().expect("adapter budget command root");
+    let mut command = ExternalAgentCommand::codex(
+        "grok",
+        temp.path(),
+        temp.path().join("prompt.md"),
+        temp.path().join("capture.jsonl"),
+        temp.path().join("report.json"),
+        Duration::from_secs(1),
+    )
+    .with_runtime_adapter(
+        SupervisorRuntime::Grok,
+        crate::runtime_adapter::RuntimeAdapterConfig::defaults(SupervisorRuntime::Grok),
+    );
+    command.model = Some("priced-model".to_string());
+    let mut reservation = match reserve_dispatch_budget(
+        &plan,
+        &budget,
+        &ledger,
+        AgentRole::ChildOrchestrator,
+        &command,
+    )
+    .expect("reserve adapter dispatch")
+    {
+        DispatchBudgetAdmission::Admitted(reservation) => reservation,
+        DispatchBudgetAdmission::Refused(refusal) => {
+            panic!("unexpected budget refusal: {refusal:?}")
+        }
+    };
+    reservation
+        .mark_invoked_for_runtime(SupervisorRuntime::Grok)
+        .expect("retain adapter launch runtime");
+    write_injected_usage(&command, 7, 3);
+    let mut run = injected_verified_run_without_journals(&command);
+    run.program_trust = ExternalProgramTrust::ExplicitCustom;
+    run.codex_permissions = None;
+
+    let settlement = reservation
+        .settle(&run, SupervisorRuntime::Grok, &command)
+        .expect("settle verified adapter usage");
+    assert_eq!(
+        settlement.observed_usage.map(|usage| usage.total_tokens),
+        Some(10)
+    );
+    assert_eq!(settlement.reliability, DispatchUsageReliability::Reliable);
 }
 
 #[test]

@@ -304,6 +304,27 @@ impl OptimizerPreferenceCommand {
                 }
                 print_query_report(&preview, args.json)
             }
+            OptimizerPreferenceSubcommand::Select(args) => {
+                let store = crate::optimizer::objective::PreferenceStore::open(&args.store);
+                let profile = store
+                    .load(&args.id)?
+                    .resolved_for_task_class(args.task_class.as_deref());
+                let bytes = BoundedRegularReader::read_tree_no_follow(
+                    &args.decision,
+                    MAX_OPTIMIZER_JSON_BYTES,
+                )
+                .with_context(|| {
+                    format!("failed to read decision file {}", args.decision.display())
+                })?;
+                let candidates: Vec<crate::optimizer::objective::PreferenceCandidate> =
+                    serde_json::from_slice(&bytes).context("parse preference candidates")?;
+                let decision = crate::optimizer::objective::decide_with_profile(
+                    &candidates,
+                    &profile,
+                    args.quality_threshold_bp,
+                )?;
+                print_query_report(&decision, args.json)
+            }
         }
     }
 }
@@ -322,6 +343,9 @@ enum OptimizerPreferenceSubcommand {
     Diff(OptimizerPreferenceDiffArgs),
     /// Preview selected policies under two profiles.
     Preview(OptimizerPreferencePreviewArgs),
+    /// Select once and emit complete deterministic scoring evidence.
+    #[command(alias = "decide")]
+    Select(OptimizerPreferenceSelectArgs),
 }
 
 #[derive(Debug, Args)]
@@ -391,6 +415,25 @@ struct OptimizerPreferencePreviewArgs {
     quality_threshold_bp: u16,
     #[arg(long)]
     html: Option<PathBuf>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct OptimizerPreferenceSelectArgs {
+    #[arg(long, default_value = ".maco/optimizer/preferences")]
+    store: PathBuf,
+    /// Exact stored profile id. Selection never substitutes catalog order.
+    #[arg(long)]
+    id: String,
+    /// Recorded candidates with evaluation evidence and admission state.
+    #[arg(long)]
+    decision: PathBuf,
+    /// Resolve an optional task-class override before hashing and scoring.
+    #[arg(long)]
+    task_class: Option<String>,
+    #[arg(long, default_value_t = 8000)]
+    quality_threshold_bp: u16,
     #[arg(long)]
     json: bool,
 }

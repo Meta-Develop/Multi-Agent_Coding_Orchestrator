@@ -4,10 +4,18 @@
 //! idempotent mutation. Provider command construction remains outside the
 //! transport trait.
 
+use crate::optimizer::{
+    ids::TimestampMillis,
+    merge_authority::{
+        decide_merge, CheckStatus, CompletionMode, LensDecision, LensVerdict, MergeActor,
+        MergeBlocker, MergeDecision, MergeRequest, ProducerFingerprint, VerificationCheck,
+    },
+};
 use anyhow::{bail, Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use std::{
     collections::{btree_map::Entry, BTreeMap, BTreeSet},
+    path::PathBuf,
     sync::Mutex,
 };
 
@@ -38,6 +46,7 @@ pub enum ProviderObjectKind {
     Review,
     ReviewThread,
     Check,
+    Merge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -1226,6 +1235,592 @@ impl<'de> Deserialize<'de> for PullRequestReviewSnapshot {
     }
 }
 
+/// Provider-observed current PR state used to prove that a review snapshot is
+/// still the exact state being authorized.
+///
+/// This is an evidence input, not a clock heuristic. The adapter requires the
+/// complete item and observation timestamp to equal the authenticated
+/// snapshot and never guesses freshness from local time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PullRequestFreshnessStatus {
+    Fresh,
+    Stale,
+    Uncertain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PullRequestFreshnessEvidence {
+    pub current_item: ForgeItem,
+    pub snapshot_observed_at: ForgeTimestamp,
+    pub status: PullRequestFreshnessStatus,
+    pub decided_at: TimestampMillis,
+}
+
+/// Ground-truth producer identity bound to the exact PR head.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PullRequestProducerEvidence {
+    pub head_oid: String,
+    pub producer: ProducerFingerprint,
+}
+
+/// Ground-truth independent-auditor evidence bound to the reviewed head and
+/// snapshot observation. Lens text is never inferred from a PR body, comment,
+/// or requesting-agent message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PullRequestAuditorEvidence {
+    pub head_oid: String,
+    pub snapshot_observed_at: ForgeTimestamp,
+    pub auditor: MergeActor,
+    pub lenses: Vec<LensVerdict>,
+}
+
+/// Result of an actual merge simulation, bound to both sides of the simulated
+/// merge and to the snapshot for which it was run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PullRequestMergeSimulationEvidence {
+    pub head_oid: String,
+    pub base_oid: String,
+    pub snapshot_observed_at: ForgeTimestamp,
+    pub merges_cleanly: bool,
+}
+
+/// Actual changed paths for the candidate head. Binding the path set prevents
+/// callers from omitting never-auto-merge paths while supplying evidence for a
+/// different revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PullRequestChangedPathsEvidence {
+    pub head_oid: String,
+    pub paths: Vec<PathBuf>,
+}
+
+/// Accepted auditor evidence that may cross the authenticated merge boundary.
+///
+/// This capability deliberately has no public constructor and does not
+/// implement `Deserialize`. Request bodies, comments, and other
+/// requester-authored JSON therefore cannot mint merge authority. Trusted
+/// crate code may construct it only after authenticating the accepted auditor
+/// record; the effectful executor still rechecks every candidate binding and
+/// the provider-observed approval immediately before the merge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct AuthenticatedPullRequestMergeEvidence {
+    pub(crate) candidate: ForgeItem,
+    /// Exact provider review selected from fresh GitHub ground truth.
+    pub(crate) approved_review_id: ProviderObjectId,
+    /// Provider-authenticated author of `approved_review_id`. This is distinct
+    /// from the terminal critical auditor recorded in `auditor`; both are
+    /// independently bound and neither is inferred from requester text.
+    pub(crate) approved_reviewer: ForgeActor,
+    pub(crate) required_checks: Vec<String>,
+    pub(crate) producer: PullRequestProducerEvidence,
+    pub(crate) auditor: PullRequestAuditorEvidence,
+    pub(crate) merge_simulation: PullRequestMergeSimulationEvidence,
+    pub(crate) completion_mode: CompletionMode,
+    pub(crate) changed_paths: PullRequestChangedPathsEvidence,
+}
+
+impl AuthenticatedPullRequestMergeEvidence {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_authenticated_acceptance(
+        candidate: ForgeItem,
+        approved_review_id: ProviderObjectId,
+        approved_reviewer: ForgeActor,
+        required_checks: Vec<String>,
+        producer: PullRequestProducerEvidence,
+        auditor: PullRequestAuditorEvidence,
+        merge_simulation: PullRequestMergeSimulationEvidence,
+        completion_mode: CompletionMode,
+        changed_paths: PullRequestChangedPathsEvidence,
+    ) -> Result<Self> {
+        candidate.validate()?;
+        if candidate.kind() != ForgeItemKind::PullRequest {
+            bail!("authenticated merge evidence requires a pull-request candidate");
+        }
+        require_object_id(
+            &approved_review_id,
+            candidate.repository().provider_id(),
+            ProviderObjectKind::Review,
+            "authenticated auditor approval review id",
+        )?;
+        approved_reviewer.validate()?;
+        if approved_reviewer.provider_id() != candidate.repository().provider_id() {
+            bail!("authenticated approval reviewer is not bound to the target provider");
+        }
+        let evidence = Self {
+            candidate,
+            approved_review_id,
+            approved_reviewer,
+            required_checks,
+            producer,
+            auditor,
+            merge_simulation,
+            completion_mode,
+            changed_paths,
+        };
+        validate_serialized(
+            &evidence,
+            MAX_RESPONSE_BYTES,
+            "authenticated pull-request merge evidence",
+        )?;
+        Ok(evidence)
+    }
+}
+
+/// Complete, explicit inputs to the pure PR merge-authority adapter.
+///
+/// Optional fields model unavailable ground truth. Absence is returned as a
+/// typed blocked decision; it is never filled from requesting-agent text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PullRequestMergeAuthorityInput {
+    pub freshness: Option<PullRequestFreshnessEvidence>,
+    pub required_checks: Option<Vec<String>>,
+    pub producer: Option<PullRequestProducerEvidence>,
+    pub auditor: Option<PullRequestAuditorEvidence>,
+    pub merge_simulation: Option<PullRequestMergeSimulationEvidence>,
+    pub completion_mode: Option<CompletionMode>,
+    pub changed_paths: Option<PullRequestChangedPathsEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "blocker", content = "details", rename_all = "snake_case")]
+pub enum PullRequestMergeAuthorityBlocker {
+    MissingFreshnessEvidence,
+    StaleSnapshotHead {
+        snapshot_head_oid: String,
+        current_head_oid: String,
+    },
+    StaleSnapshotObservation,
+    UncertainSnapshotFreshness,
+    SnapshotItemMismatch,
+    MissingRequiredChecks,
+    InvalidRequiredCheckName,
+    DuplicateRequiredCheck {
+        name: String,
+    },
+    MissingRequiredCheck {
+        name: String,
+    },
+    AmbiguousRequiredCheck {
+        name: String,
+    },
+    StaleRequiredCheck {
+        name: String,
+    },
+    SkippedRequiredCheck {
+        name: String,
+    },
+    FailedRequiredCheck {
+        name: String,
+        conclusion: ForgeCheckConclusion,
+    },
+    UncertainRequiredCheck {
+        name: String,
+    },
+    MissingProducerEvidence,
+    IncompleteProducerEvidence,
+    StaleProducerEvidence,
+    MissingAuditorEvidence,
+    IncompleteAuditorEvidence,
+    StaleAuditorEvidence,
+    UncertainAuditorEvidence,
+    MissingMergeSimulationEvidence,
+    StaleMergeSimulationEvidence,
+    MissingCompletionMode,
+    MissingChangedPathsEvidence,
+    EmptyChangedPathsEvidence,
+    StaleChangedPathsEvidence,
+    OptimizerBlocked(MergeBlocker),
+    OptimizerDecisionFailed,
+}
+
+/// Pure authority result. `Allowed` means the optimizer received only exact,
+/// complete evidence and returned an unblocked decision. `Blocked` never
+/// authorizes a provider mutation, even when a nested diagnostic decision is
+/// present.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum PullRequestMergeAuthorityDecision {
+    Allowed {
+        merge_decision: MergeDecision,
+    },
+    Blocked {
+        blockers: Vec<PullRequestMergeAuthorityBlocker>,
+        merge_decision: Option<MergeDecision>,
+    },
+}
+
+impl PullRequestMergeAuthorityDecision {
+    pub fn is_allowed(&self) -> bool {
+        matches!(self, Self::Allowed { .. })
+    }
+
+    pub fn blockers(&self) -> &[PullRequestMergeAuthorityBlocker] {
+        match self {
+            Self::Allowed { .. } => &[],
+            Self::Blocked { blockers, .. } => blockers,
+        }
+    }
+
+    pub fn merge_decision(&self) -> Option<&MergeDecision> {
+        match self {
+            Self::Allowed { merge_decision } => Some(merge_decision),
+            Self::Blocked { merge_decision, .. } => merge_decision.as_ref(),
+        }
+    }
+}
+
+/// Adapt an authenticated, constructor-validated PR snapshot and explicit
+/// ground-truth evidence to optimizer merge authority.
+///
+/// The function is side-effect free: it does not call GitHub, merge a branch,
+/// or interpret request/comment text as evidence.
+pub fn decide_pull_request_merge(
+    snapshot: &PullRequestReviewSnapshot,
+    input: &PullRequestMergeAuthorityInput,
+) -> PullRequestMergeAuthorityDecision {
+    let head_oid = snapshot
+        .item()
+        .head_oid()
+        .expect("validated PR snapshots always contain a head OID");
+    let base_oid = snapshot
+        .item()
+        .base_oid()
+        .expect("validated PR snapshots always contain a base OID");
+    let mut blockers = Vec::new();
+    let mut structurally_trusted = true;
+
+    let decided_at = match &input.freshness {
+        Some(freshness) => {
+            match freshness.status {
+                PullRequestFreshnessStatus::Fresh => {}
+                PullRequestFreshnessStatus::Stale => {
+                    blockers.push(PullRequestMergeAuthorityBlocker::StaleSnapshotObservation);
+                    structurally_trusted = false;
+                }
+                PullRequestFreshnessStatus::Uncertain => {
+                    blockers.push(PullRequestMergeAuthorityBlocker::UncertainSnapshotFreshness);
+                    structurally_trusted = false;
+                }
+            }
+            if freshness.current_item.head_oid() != Some(head_oid) {
+                blockers.push(PullRequestMergeAuthorityBlocker::StaleSnapshotHead {
+                    snapshot_head_oid: head_oid.to_string(),
+                    current_head_oid: freshness
+                        .current_item
+                        .head_oid()
+                        .unwrap_or_default()
+                        .to_string(),
+                });
+                structurally_trusted = false;
+            }
+            if freshness.snapshot_observed_at != *snapshot.observed_at() {
+                blockers.push(PullRequestMergeAuthorityBlocker::StaleSnapshotObservation);
+                structurally_trusted = false;
+            }
+            if freshness.current_item != *snapshot.item() {
+                blockers.push(PullRequestMergeAuthorityBlocker::SnapshotItemMismatch);
+                structurally_trusted = false;
+            }
+            Some(freshness.decided_at)
+        }
+        None => {
+            blockers.push(PullRequestMergeAuthorityBlocker::MissingFreshnessEvidence);
+            structurally_trusted = false;
+            None
+        }
+    };
+
+    let verification_checks = map_required_checks(snapshot, &input.required_checks, &mut blockers);
+
+    let producer = match &input.producer {
+        Some(evidence) => {
+            if !producer_is_complete(&evidence.producer) {
+                blockers.push(PullRequestMergeAuthorityBlocker::IncompleteProducerEvidence);
+                structurally_trusted = false;
+            }
+            if evidence.head_oid != head_oid {
+                blockers.push(PullRequestMergeAuthorityBlocker::StaleProducerEvidence);
+                structurally_trusted = false;
+            }
+            Some(evidence.producer.clone())
+        }
+        None => {
+            blockers.push(PullRequestMergeAuthorityBlocker::MissingProducerEvidence);
+            structurally_trusted = false;
+            None
+        }
+    };
+
+    let (auditor, lenses) = match &input.auditor {
+        Some(evidence) => {
+            if !actor_is_complete(&evidence.auditor) {
+                blockers.push(PullRequestMergeAuthorityBlocker::IncompleteAuditorEvidence);
+                structurally_trusted = false;
+            }
+            if evidence.head_oid != head_oid
+                || evidence.snapshot_observed_at != *snapshot.observed_at()
+            {
+                blockers.push(PullRequestMergeAuthorityBlocker::StaleAuditorEvidence);
+                structurally_trusted = false;
+            }
+            let mut lenses = evidence.lenses.clone();
+            if lenses_are_uncertain(&lenses) {
+                blockers.push(PullRequestMergeAuthorityBlocker::UncertainAuditorEvidence);
+                for lens in &mut lenses {
+                    if lens.lens_id.trim().is_empty()
+                        || lens.model_label.trim().is_empty()
+                        || lens.framing.trim().is_empty()
+                        || lens.information_scope.trim().is_empty()
+                    {
+                        lens.decision = LensDecision::CannotVerify;
+                    }
+                }
+            }
+            (Some(evidence.auditor.clone()), Some(lenses))
+        }
+        None => {
+            blockers.push(PullRequestMergeAuthorityBlocker::MissingAuditorEvidence);
+            structurally_trusted = false;
+            (None, None)
+        }
+    };
+
+    let branch_merges_cleanly = match &input.merge_simulation {
+        Some(evidence) => {
+            if evidence.head_oid != head_oid
+                || evidence.base_oid != base_oid
+                || evidence.snapshot_observed_at != *snapshot.observed_at()
+            {
+                blockers.push(PullRequestMergeAuthorityBlocker::StaleMergeSimulationEvidence);
+                structurally_trusted = false;
+            }
+            Some(evidence.merges_cleanly)
+        }
+        None => {
+            blockers.push(PullRequestMergeAuthorityBlocker::MissingMergeSimulationEvidence);
+            structurally_trusted = false;
+            None
+        }
+    };
+
+    let completion_mode = match input.completion_mode {
+        Some(mode) => Some(mode),
+        None => {
+            blockers.push(PullRequestMergeAuthorityBlocker::MissingCompletionMode);
+            structurally_trusted = false;
+            None
+        }
+    };
+
+    let changed_paths = match &input.changed_paths {
+        Some(evidence) => {
+            if evidence.paths.is_empty() {
+                blockers.push(PullRequestMergeAuthorityBlocker::EmptyChangedPathsEvidence);
+                structurally_trusted = false;
+            }
+            if evidence.head_oid != head_oid {
+                blockers.push(PullRequestMergeAuthorityBlocker::StaleChangedPathsEvidence);
+                structurally_trusted = false;
+            }
+            Some(evidence.paths.clone())
+        }
+        None => {
+            blockers.push(PullRequestMergeAuthorityBlocker::MissingChangedPathsEvidence);
+            structurally_trusted = false;
+            None
+        }
+    };
+
+    if !structurally_trusted {
+        return PullRequestMergeAuthorityDecision::Blocked {
+            blockers,
+            merge_decision: None,
+        };
+    }
+
+    let request = MergeRequest {
+        requested: true,
+        producer: producer.expect("trusted producer evidence is present"),
+        reviewer: auditor.expect("trusted auditor evidence is present"),
+        lenses: lenses.expect("trusted auditor lenses are present"),
+        certified: !verification_checks.is_empty()
+            && verification_checks
+                .iter()
+                .all(|check| check.status == CheckStatus::Passed),
+        checks: verification_checks,
+        branch_merges_cleanly: branch_merges_cleanly
+            .expect("trusted merge-simulation evidence is present"),
+        completion_mode: completion_mode.expect("trusted completion mode is present"),
+        changed_paths: changed_paths.expect("trusted changed-path evidence is present"),
+        decided_at: decided_at.expect("trusted freshness evidence is present"),
+    };
+
+    let merge_decision = match decide_merge(&request) {
+        Ok(decision) => decision,
+        Err(_) => {
+            blockers.push(PullRequestMergeAuthorityBlocker::OptimizerDecisionFailed);
+            return PullRequestMergeAuthorityDecision::Blocked {
+                blockers,
+                merge_decision: None,
+            };
+        }
+    };
+    blockers.extend(
+        merge_decision
+            .blockers
+            .iter()
+            .cloned()
+            .map(PullRequestMergeAuthorityBlocker::OptimizerBlocked),
+    );
+
+    if blockers.is_empty() && merge_decision.auto_merge_performed {
+        PullRequestMergeAuthorityDecision::Allowed { merge_decision }
+    } else {
+        PullRequestMergeAuthorityDecision::Blocked {
+            blockers,
+            merge_decision: Some(merge_decision),
+        }
+    }
+}
+
+fn map_required_checks(
+    snapshot: &PullRequestReviewSnapshot,
+    required_checks: &Option<Vec<String>>,
+    blockers: &mut Vec<PullRequestMergeAuthorityBlocker>,
+) -> Vec<VerificationCheck> {
+    let Some(required_checks) = required_checks else {
+        blockers.push(PullRequestMergeAuthorityBlocker::MissingRequiredChecks);
+        return Vec::new();
+    };
+    if required_checks.is_empty() {
+        blockers.push(PullRequestMergeAuthorityBlocker::MissingRequiredChecks);
+        return Vec::new();
+    }
+
+    let mut seen = BTreeSet::new();
+    required_checks
+        .iter()
+        .map(|required| {
+            if required.trim().is_empty() || required != required.trim() {
+                blockers.push(PullRequestMergeAuthorityBlocker::InvalidRequiredCheckName);
+                return VerificationCheck {
+                    name: required.clone(),
+                    status: CheckStatus::Uncertain,
+                };
+            }
+            if !seen.insert(required.as_str()) {
+                blockers.push(PullRequestMergeAuthorityBlocker::DuplicateRequiredCheck {
+                    name: required.clone(),
+                });
+                return VerificationCheck {
+                    name: required.clone(),
+                    status: CheckStatus::Uncertain,
+                };
+            }
+
+            let matching: Vec<&ForgeCheck> = snapshot
+                .checks()
+                .iter()
+                .filter(|check| check.name() == required)
+                .collect();
+            let status = match matching.as_slice() {
+                [] => {
+                    blockers.push(PullRequestMergeAuthorityBlocker::MissingRequiredCheck {
+                        name: required.clone(),
+                    });
+                    CheckStatus::Missing
+                }
+                [check] => map_required_check_status(check, blockers),
+                _ => {
+                    blockers.push(PullRequestMergeAuthorityBlocker::AmbiguousRequiredCheck {
+                        name: required.clone(),
+                    });
+                    CheckStatus::Uncertain
+                }
+            };
+            VerificationCheck {
+                name: required.clone(),
+                status,
+            }
+        })
+        .collect()
+}
+
+fn map_required_check_status(
+    check: &ForgeCheck,
+    blockers: &mut Vec<PullRequestMergeAuthorityBlocker>,
+) -> CheckStatus {
+    if check.status() != ForgeCheckStatus::Completed {
+        blockers.push(PullRequestMergeAuthorityBlocker::UncertainRequiredCheck {
+            name: check.name().to_string(),
+        });
+        return CheckStatus::Uncertain;
+    }
+    match check
+        .conclusion()
+        .expect("completed forge checks always contain a conclusion")
+    {
+        ForgeCheckConclusion::Success => CheckStatus::Passed,
+        ForgeCheckConclusion::Skipped => {
+            blockers.push(PullRequestMergeAuthorityBlocker::SkippedRequiredCheck {
+                name: check.name().to_string(),
+            });
+            CheckStatus::Skipped
+        }
+        ForgeCheckConclusion::Stale => {
+            blockers.push(PullRequestMergeAuthorityBlocker::StaleRequiredCheck {
+                name: check.name().to_string(),
+            });
+            CheckStatus::Stale
+        }
+        conclusion => {
+            blockers.push(PullRequestMergeAuthorityBlocker::FailedRequiredCheck {
+                name: check.name().to_string(),
+                conclusion,
+            });
+            CheckStatus::Failed
+        }
+    }
+}
+
+fn actor_is_complete(actor: &MergeActor) -> bool {
+    [
+        actor.agent.stable_id.as_str(),
+        actor.session.id.as_str(),
+        actor.model_label.as_str(),
+    ]
+    .into_iter()
+    .all(|value| !value.trim().is_empty() && value == value.trim())
+}
+
+fn producer_is_complete(producer: &ProducerFingerprint) -> bool {
+    actor_is_complete(&producer.actor)
+        && !producer.commit_authors.is_empty()
+        && !producer.commit_committers.is_empty()
+        && producer
+            .commit_authors
+            .iter()
+            .chain(&producer.commit_committers)
+            .all(|value| !value.trim().is_empty() && value == value.trim())
+}
+
+fn lenses_are_uncertain(lenses: &[LensVerdict]) -> bool {
+    let mut ids = BTreeSet::new();
+    lenses.iter().any(|lens| {
+        lens.lens_id.trim().is_empty()
+            || lens.model_label.trim().is_empty()
+            || lens.framing.trim().is_empty()
+            || lens.information_scope.trim().is_empty()
+            || !ids.insert(lens.lens_id.as_str())
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "observation", content = "request", rename_all = "snake_case")]
 pub enum ForgeObservationRequest {
@@ -1651,6 +2246,307 @@ impl<'de> Deserialize<'de> for ForgeMutationReceipt {
     }
 }
 
+/// Exact compare-and-swap merge request created only after merge authority has
+/// been recomputed from a current forge observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct PullRequestMergeEffect {
+    effect_id: String,
+    item: ForgeItem,
+    approved_actor: ForgeActor,
+    evidence_digest: String,
+    ground_truth_digest: String,
+    completion_mode: CompletionMode,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PullRequestMergeEffectWire {
+    effect_id: String,
+    item: ForgeItem,
+    approved_actor: ForgeActor,
+    evidence_digest: String,
+    ground_truth_digest: String,
+    completion_mode: CompletionMode,
+}
+
+impl PullRequestMergeEffect {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        effect_id: impl Into<String>,
+        item: ForgeItem,
+        approved_actor: ForgeActor,
+        evidence_digest: impl Into<String>,
+        ground_truth_digest: impl Into<String>,
+        completion_mode: CompletionMode,
+    ) -> Result<Self> {
+        let effect = Self {
+            effect_id: effect_id.into(),
+            item,
+            approved_actor,
+            evidence_digest: evidence_digest.into(),
+            ground_truth_digest: ground_truth_digest.into(),
+            completion_mode,
+        };
+        effect.validate()?;
+        Ok(effect)
+    }
+
+    pub(crate) fn effect_id(&self) -> &str {
+        &self.effect_id
+    }
+
+    pub(crate) fn item(&self) -> &ForgeItem {
+        &self.item
+    }
+
+    pub(crate) fn approved_actor(&self) -> &ForgeActor {
+        &self.approved_actor
+    }
+
+    pub(crate) fn evidence_digest(&self) -> &str {
+        &self.evidence_digest
+    }
+
+    pub(crate) fn ground_truth_digest(&self) -> &str {
+        &self.ground_truth_digest
+    }
+
+    pub(crate) fn completion_mode(&self) -> CompletionMode {
+        self.completion_mode
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        validate_stable_id(&self.effect_id, "forge merge effect id")?;
+        self.item.validate()?;
+        if self.item.kind() != ForgeItemKind::PullRequest {
+            bail!("forge merge effect requires a pull-request item");
+        }
+        self.approved_actor.validate()?;
+        if self.approved_actor.provider_id() != self.item.repository().provider_id() {
+            bail!("forge merge approval actor is not bound to the target provider");
+        }
+        validate_sha256_identity(&self.evidence_digest, "merge evidence digest")?;
+        validate_sha256_identity(&self.ground_truth_digest, "merge ground-truth digest")?;
+        if self.completion_mode.history_flattening() {
+            bail!("forge merge effect refuses a history-flattening completion mode");
+        }
+        validate_serialized(self, MAX_REQUEST_BYTES, "forge pull-request merge effect")
+    }
+}
+
+impl<'de> Deserialize<'de> for PullRequestMergeEffect {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PullRequestMergeEffectWire::deserialize(deserializer)?;
+        Self::new(
+            wire.effect_id,
+            wire.item,
+            wire.approved_actor,
+            wire.evidence_digest,
+            wire.ground_truth_digest,
+            wire.completion_mode,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Provider-authenticated merge receipt. The authenticated effect WAL stores
+/// this exact value before declaring the operation complete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct PullRequestMergeReceipt {
+    effect_id: String,
+    item: ForgeItem,
+    approved_actor: ForgeActor,
+    evidence_digest: String,
+    ground_truth_digest: String,
+    completion_mode: CompletionMode,
+    provider_merge_id: ProviderObjectId,
+    merged_oid: String,
+    url: String,
+    merged_at: ForgeTimestamp,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PullRequestMergeReceiptWire {
+    effect_id: String,
+    item: ForgeItem,
+    approved_actor: ForgeActor,
+    evidence_digest: String,
+    ground_truth_digest: String,
+    completion_mode: CompletionMode,
+    provider_merge_id: ProviderObjectId,
+    merged_oid: String,
+    url: String,
+    merged_at: ForgeTimestamp,
+}
+
+impl PullRequestMergeReceipt {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        effect_id: impl Into<String>,
+        item: ForgeItem,
+        approved_actor: ForgeActor,
+        evidence_digest: impl Into<String>,
+        ground_truth_digest: impl Into<String>,
+        completion_mode: CompletionMode,
+        provider_merge_id: ProviderObjectId,
+        merged_oid: impl Into<String>,
+        url: impl Into<String>,
+        merged_at: ForgeTimestamp,
+    ) -> Result<Self> {
+        let receipt = Self {
+            effect_id: effect_id.into(),
+            item,
+            approved_actor,
+            evidence_digest: evidence_digest.into(),
+            ground_truth_digest: ground_truth_digest.into(),
+            completion_mode,
+            provider_merge_id,
+            merged_oid: merged_oid.into(),
+            url: url.into(),
+            merged_at,
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn item(&self) -> &ForgeItem {
+        &self.item
+    }
+
+    #[cfg(test)]
+    pub(crate) fn approved_actor(&self) -> &ForgeActor {
+        &self.approved_actor
+    }
+
+    #[cfg(test)]
+    pub(crate) fn evidence_digest(&self) -> &str {
+        &self.evidence_digest
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ground_truth_digest(&self) -> &str {
+        &self.ground_truth_digest
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completion_mode(&self) -> CompletionMode {
+        self.completion_mode
+    }
+
+    pub(crate) fn provider_merge_id(&self) -> &ProviderObjectId {
+        &self.provider_merge_id
+    }
+
+    pub(crate) fn merged_oid(&self) -> &str {
+        &self.merged_oid
+    }
+
+    pub(crate) fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub(crate) fn merged_at(&self) -> &ForgeTimestamp {
+        &self.merged_at
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_stable_id(&self.effect_id, "forge merge receipt effect id")?;
+        self.item.validate()?;
+        if self.item.kind() != ForgeItemKind::PullRequest {
+            bail!("forge merge receipt requires a pull-request item");
+        }
+        self.approved_actor.validate()?;
+        if self.approved_actor.provider_id() != self.item.repository().provider_id() {
+            bail!("forge merge receipt approval actor is not bound to the target provider");
+        }
+        validate_sha256_identity(&self.evidence_digest, "merge receipt evidence digest")?;
+        validate_sha256_identity(
+            &self.ground_truth_digest,
+            "merge receipt ground-truth digest",
+        )?;
+        if self.completion_mode.history_flattening() {
+            bail!("forge merge receipt records a prohibited completion mode");
+        }
+        require_object_id(
+            &self.provider_merge_id,
+            self.item.repository().provider_id(),
+            ProviderObjectKind::Merge,
+            "merge receipt provider id",
+        )?;
+        validate_git_oid(&self.merged_oid, "merged commit OID")?;
+        validate_https_url(&self.url)?;
+        validate_serialized(self, MAX_REQUEST_BYTES, "forge pull-request merge receipt")
+    }
+
+    pub(crate) fn validate_for_effect(&self, effect: &PullRequestMergeEffect) -> Result<()> {
+        self.validate()?;
+        effect.validate()?;
+        if self.effect_id != effect.effect_id
+            || self.item != effect.item
+            || self.approved_actor != effect.approved_actor
+            || self.evidence_digest != effect.evidence_digest
+            || self.ground_truth_digest != effect.ground_truth_digest
+            || self.completion_mode != effect.completion_mode
+        {
+            bail!("forge merge receipt does not bind the exact authorized effect");
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for PullRequestMergeReceipt {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PullRequestMergeReceiptWire::deserialize(deserializer)?;
+        Self::new(
+            wire.effect_id,
+            wire.item,
+            wire.approved_actor,
+            wire.evidence_digest,
+            wire.ground_truth_digest,
+            wire.completion_mode,
+            wire.provider_merge_id,
+            wire.merged_oid,
+            wire.url,
+            wire.merged_at,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Separate, crate-private mutation boundary for authenticated pull-request
+/// merges. Keeping this out of the public comment transport prevents ordinary
+/// requester-controlled forge calls from acquiring merge authority.
+pub(crate) trait PullRequestMergeTransport {
+    fn observe_pull_request_for_merge(
+        &self,
+        candidate: &ForgeItem,
+    ) -> Result<PullRequestReviewSnapshot>;
+
+    fn lookup_pull_request_merge(
+        &self,
+        effect: &PullRequestMergeEffect,
+    ) -> Result<Vec<PullRequestMergeReceipt>>;
+
+    fn execute_pull_request_merge(
+        &self,
+        effect: &PullRequestMergeEffect,
+    ) -> Result<PullRequestMergeReceipt>;
+
+    fn verify_pull_request_merge(
+        &self,
+        effect: &PullRequestMergeEffect,
+        receipt: &PullRequestMergeReceipt,
+    ) -> Result<PullRequestMergeReceipt>;
+}
+
 /// Object-safe provider-neutral boundary. It contains no trust or reducer policy.
 pub trait ForgeTransport {
     fn observe(&self, request: &ForgeObservationRequest) -> Result<ForgeObservation>;
@@ -1663,10 +2559,21 @@ struct FakeEffectRecord {
     receipt: ForgeMutationReceipt,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct FakeMergeRecord {
+    effect_digest: String,
+    receipt: PullRequestMergeReceipt,
+}
+
 #[derive(Debug, Default)]
 pub struct FakeForgeTransport {
     observations: BTreeMap<String, ForgeObservation>,
     effects: Mutex<BTreeMap<String, FakeEffectRecord>>,
+    #[cfg(test)]
+    merge_observations: BTreeMap<String, PullRequestReviewSnapshot>,
+    #[cfg(test)]
+    merges: Mutex<BTreeMap<String, FakeMergeRecord>>,
 }
 
 impl FakeForgeTransport {
@@ -1691,6 +2598,43 @@ impl FakeForgeTransport {
                 bail!("fake forge observation request was registered more than once")
             }
         }
+    }
+
+    /// Register the current provider state for one stable pull request. The
+    /// candidate may carry an older head so stale-head behavior can be tested
+    /// without weakening exact observation validation elsewhere.
+    #[cfg(test)]
+    pub(crate) fn register_pull_request_merge_observation(
+        &mut self,
+        candidate: &ForgeItem,
+        snapshot: PullRequestReviewSnapshot,
+    ) -> Result<()> {
+        candidate.validate()?;
+        snapshot.validate()?;
+        if candidate.kind() != ForgeItemKind::PullRequest
+            || !same_pull_request_identity(candidate, snapshot.item())
+        {
+            bail!("fake merge observation does not match the stable pull-request identity");
+        }
+        let key = pull_request_identity_digest(candidate)?;
+        match self.merge_observations.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(snapshot);
+                Ok(())
+            }
+            Entry::Occupied(_) => {
+                bail!("fake forge merge observation was registered more than once")
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pull_request_merge_count(&self) -> Result<usize> {
+        Ok(self
+            .merges
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fake forge merge ledger lock was poisoned"))?
+            .len())
     }
 }
 
@@ -1761,6 +2705,132 @@ impl ForgeTransport for FakeForgeTransport {
     }
 }
 
+#[cfg(test)]
+impl PullRequestMergeTransport for FakeForgeTransport {
+    fn observe_pull_request_for_merge(
+        &self,
+        candidate: &ForgeItem,
+    ) -> Result<PullRequestReviewSnapshot> {
+        candidate.validate()?;
+        if candidate.kind() != ForgeItemKind::PullRequest {
+            bail!("fake forge merge observation requires a pull-request candidate");
+        }
+        let snapshot = self
+            .merge_observations
+            .get(&pull_request_identity_digest(candidate)?)
+            .context("fake forge has no current merge observation for the pull request")?
+            .clone();
+        snapshot.validate()?;
+        if !same_pull_request_identity(candidate, snapshot.item()) {
+            bail!("fake forge returned a different pull-request identity");
+        }
+        Ok(snapshot)
+    }
+
+    fn lookup_pull_request_merge(
+        &self,
+        effect: &PullRequestMergeEffect,
+    ) -> Result<Vec<PullRequestMergeReceipt>> {
+        effect.validate()?;
+        let digest = pull_request_merge_effect_digest(effect)?;
+        let merges = self
+            .merges
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fake forge merge ledger lock was poisoned"))?;
+        let Some(record) = merges.get(effect.effect_id()) else {
+            return Ok(Vec::new());
+        };
+        if record.effect_digest != digest {
+            bail!("fake forge merge effect id was reused with different authority");
+        }
+        record.receipt.validate_for_effect(effect)?;
+        Ok(vec![record.receipt.clone()])
+    }
+
+    fn execute_pull_request_merge(
+        &self,
+        effect: &PullRequestMergeEffect,
+    ) -> Result<PullRequestMergeReceipt> {
+        effect.validate()?;
+        let current = self
+            .merge_observations
+            .get(&pull_request_identity_digest(effect.item())?)
+            .context("fake forge lost the current pull-request state before merge")?;
+        if current.item() != effect.item() {
+            bail!("fake forge pull-request head changed before the compare-and-swap merge");
+        }
+
+        let effect_digest = pull_request_merge_effect_digest(effect)?;
+        let mut merges = self
+            .merges
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fake forge merge ledger lock was poisoned"))?;
+        if let Some(record) = merges.get(effect.effect_id()) {
+            if record.effect_digest != effect_digest {
+                bail!("fake forge merge effect id was reused with different authority");
+            }
+            record.receipt.validate_for_effect(effect)?;
+            return Ok(record.receipt.clone());
+        }
+
+        let raw_digest = crate::artifacts::state_auth::sha256_hex(
+            format!("forge-fake-merge-v1\0{effect_digest}").as_bytes(),
+        );
+        let head_width = effect
+            .item()
+            .head_oid()
+            .expect("validated merge effects contain a head OID")
+            .len();
+        let merged_oid = raw_digest[..head_width].to_string();
+        let provider_merge_id = ProviderObjectId::new(
+            effect.item().repository().provider_id(),
+            ProviderObjectKind::Merge,
+            format!("merge:{raw_digest}"),
+        )?;
+        let url = format!(
+            "https://{}/pull/{}/merge/{}",
+            effect.item().repository().canonical_locator(),
+            effect.item().number(),
+            provider_merge_id.stable_id()
+        );
+        let receipt = PullRequestMergeReceipt::new(
+            effect.effect_id().to_string(),
+            effect.item().clone(),
+            effect.approved_actor().clone(),
+            effect.evidence_digest().to_string(),
+            effect.ground_truth_digest().to_string(),
+            effect.completion_mode(),
+            provider_merge_id,
+            merged_oid,
+            url,
+            ForgeTimestamp::new("2000-01-01T00:00:00Z")?,
+        )?;
+        receipt.validate_for_effect(effect)?;
+        merges.insert(
+            effect.effect_id().to_string(),
+            FakeMergeRecord {
+                effect_digest,
+                receipt: receipt.clone(),
+            },
+        );
+        Ok(receipt)
+    }
+
+    fn verify_pull_request_merge(
+        &self,
+        effect: &PullRequestMergeEffect,
+        receipt: &PullRequestMergeReceipt,
+    ) -> Result<PullRequestMergeReceipt> {
+        effect.validate()?;
+        receipt.validate_for_effect(effect)?;
+        let matches = self.lookup_pull_request_merge(effect)?;
+        if matches.as_slice() != [receipt.clone()] {
+            bail!("fake forge merge receipt was missing, duplicated, or changed");
+        }
+        Ok(receipt.clone())
+    }
+}
+
 fn validate_actor_identity<'a>(actors: impl Iterator<Item = &'a ForgeActor>) -> Result<()> {
     let mut by_id = BTreeMap::<ProviderObjectId, ForgeActor>::new();
     let mut by_handle = BTreeMap::<(String, String), ProviderObjectId>::new();
@@ -1827,6 +2897,42 @@ fn effect_request_digest(request: &ForgeEffectRequest) -> Result<String> {
     let encoded = serde_json::to_vec(request).context("failed to bind forge effect request")?;
     Ok(sha256_identity(
         [b"forge-effect-request-v1\0".as_slice(), &encoded]
+            .concat()
+            .as_slice(),
+    ))
+}
+
+#[cfg(test)]
+fn same_pull_request_identity(left: &ForgeItem, right: &ForgeItem) -> bool {
+    left.kind() == ForgeItemKind::PullRequest
+        && right.kind() == ForgeItemKind::PullRequest
+        && left.repository() == right.repository()
+        && left.number() == right.number()
+        && left.provider_item_id() == right.provider_item_id()
+}
+
+#[cfg(test)]
+fn pull_request_identity_digest(item: &ForgeItem) -> Result<String> {
+    item.validate()?;
+    if item.kind() != ForgeItemKind::PullRequest {
+        bail!("pull-request identity digest requires a pull-request item");
+    }
+    let encoded = serde_json::to_vec(&(
+        "forge-pull-request-identity-v1",
+        item.repository(),
+        item.number(),
+        item.provider_item_id(),
+    ))
+    .context("failed to bind stable pull-request identity")?;
+    Ok(sha256_identity(&encoded))
+}
+
+#[cfg(test)]
+fn pull_request_merge_effect_digest(effect: &PullRequestMergeEffect) -> Result<String> {
+    effect.validate()?;
+    let encoded = serde_json::to_vec(effect).context("failed to bind forge merge effect")?;
+    Ok(sha256_identity(
+        [b"forge-pull-request-merge-effect-v1\0".as_slice(), &encoded]
             .concat()
             .as_slice(),
     ))
@@ -2444,6 +3550,7 @@ fn github_comment_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::optimizer::merge_authority::{AgentIdentity, SessionId};
     use serde_json::{json, Value};
     use std::{collections::VecDeque, sync::Mutex};
 
@@ -2723,6 +3830,456 @@ mod tests {
             "pageInfo": complete_page(),
             "truncated": false,
         })
+    }
+
+    fn authority_actor(agent: &str, session: &str, model_label: &str) -> MergeActor {
+        MergeActor {
+            agent: AgentIdentity {
+                stable_id: agent.to_string(),
+            },
+            session: SessionId {
+                id: session.to_string(),
+            },
+            model_label: model_label.to_string(),
+        }
+    }
+
+    fn authority_review(head_oid: &str) -> ForgeReview {
+        ForgeReview::new(
+            object(ProviderObjectKind::Review, "PRR_authority"),
+            actor("U_auditor", "auditor", ReportedActorKind::Human),
+            ForgeReviewState::Approved,
+            "authenticated approval",
+            ForgeTimestamp::new(CREATED_AT).expect("review timestamp"),
+            head_oid,
+        )
+        .expect("authority review")
+    }
+
+    fn authority_check(
+        stable_id: &str,
+        name: &str,
+        status: ForgeCheckStatus,
+        conclusion: Option<ForgeCheckConclusion>,
+        head_oid: &str,
+    ) -> ForgeCheck {
+        ForgeCheck::new(
+            object(ProviderObjectKind::Check, stable_id),
+            actor("B_ci", "ci-bot", ReportedActorKind::Bot),
+            name,
+            status,
+            conclusion,
+            head_oid,
+            ForgeTimestamp::new(CREATED_AT).expect("check timestamp"),
+        )
+        .expect("authority check")
+    }
+
+    fn authority_snapshot(
+        lint_status: ForgeCheckStatus,
+        lint_conclusion: Option<ForgeCheckConclusion>,
+    ) -> PullRequestReviewSnapshot {
+        let item = pr();
+        let head_oid = item.head_oid().expect("PR head");
+        PullRequestReviewSnapshot::new(
+            item.clone(),
+            ForgeTimestamp::new(OBSERVED_AT).expect("snapshot timestamp"),
+            vec![authority_review(head_oid)],
+            Vec::new(),
+            vec![
+                authority_check(
+                    "C_unit",
+                    "ci/unit",
+                    ForgeCheckStatus::Completed,
+                    Some(ForgeCheckConclusion::Success),
+                    head_oid,
+                ),
+                authority_check("C_lint", "ci/lint", lint_status, lint_conclusion, head_oid),
+            ],
+        )
+        .expect("authority snapshot")
+    }
+
+    fn authenticated_authority_evidence(
+        snapshot: &PullRequestReviewSnapshot,
+    ) -> AuthenticatedPullRequestMergeEvidence {
+        let head_oid = snapshot.item().head_oid().expect("PR head").to_string();
+        let base_oid = snapshot.item().base_oid().expect("PR base").to_string();
+        let approved_review = snapshot.reviews().first().expect("approved review");
+        AuthenticatedPullRequestMergeEvidence::from_authenticated_acceptance(
+            snapshot.item().clone(),
+            approved_review.provider_review_id().clone(),
+            approved_review.author().clone(),
+            vec!["ci/unit".to_string(), "ci/lint".to_string()],
+            PullRequestProducerEvidence {
+                head_oid: head_oid.clone(),
+                producer: ProducerFingerprint {
+                    actor: authority_actor("producer", "producer-session", "producer-model"),
+                    commit_authors: vec!["producer".to_string()],
+                    commit_committers: vec!["producer".to_string()],
+                },
+            },
+            PullRequestAuditorEvidence {
+                head_oid: head_oid.clone(),
+                snapshot_observed_at: snapshot.observed_at().clone(),
+                auditor: authority_actor("auditor", "auditor-session", "auditor-model"),
+                lenses: vec![
+                    LensVerdict {
+                        lens_id: "diff".to_string(),
+                        model_label: "review-model-a".to_string(),
+                        framing: "adversarial-diff".to_string(),
+                        information_scope: "diff-only".to_string(),
+                        decision: LensDecision::Accept,
+                    },
+                    LensVerdict {
+                        lens_id: "tests".to_string(),
+                        model_label: "review-model-b".to_string(),
+                        framing: "tests-as-contract".to_string(),
+                        information_scope: "tests-only".to_string(),
+                        decision: LensDecision::Accept,
+                    },
+                ],
+            },
+            PullRequestMergeSimulationEvidence {
+                head_oid: head_oid.clone(),
+                base_oid,
+                snapshot_observed_at: snapshot.observed_at().clone(),
+                merges_cleanly: true,
+            },
+            CompletionMode::MergeCommit,
+            PullRequestChangedPathsEvidence {
+                head_oid,
+                paths: vec![PathBuf::from("src/publication/forge_transport.rs")],
+            },
+        )
+        .expect("authenticated authority evidence")
+    }
+
+    fn authority_input_from_authenticated(
+        snapshot: &PullRequestReviewSnapshot,
+        evidence: &AuthenticatedPullRequestMergeEvidence,
+    ) -> PullRequestMergeAuthorityInput {
+        PullRequestMergeAuthorityInput {
+            freshness: Some(PullRequestFreshnessEvidence {
+                current_item: snapshot.item().clone(),
+                snapshot_observed_at: snapshot.observed_at().clone(),
+                status: PullRequestFreshnessStatus::Fresh,
+                decided_at: TimestampMillis::from_millis(1_777_777_777_000),
+            }),
+            required_checks: Some(evidence.required_checks.clone()),
+            producer: Some(evidence.producer.clone()),
+            auditor: Some(evidence.auditor.clone()),
+            merge_simulation: Some(evidence.merge_simulation.clone()),
+            completion_mode: Some(evidence.completion_mode),
+            changed_paths: Some(evidence.changed_paths.clone()),
+        }
+    }
+
+    fn assert_authority_denied(
+        decision: &PullRequestMergeAuthorityDecision,
+        expected: impl Fn(&PullRequestMergeAuthorityBlocker) -> bool,
+    ) {
+        assert!(
+            !decision.is_allowed(),
+            "adversarial evidence was allowed: {decision:?}"
+        );
+        assert!(
+            !decision
+                .merge_decision()
+                .is_some_and(|nested| nested.auto_merge_performed),
+            "nested optimizer decision allowed a merge: {decision:?}"
+        );
+        assert!(
+            decision.blockers().iter().any(expected),
+            "expected blocker was absent: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn authenticated_authority_rejects_actor_mismatch_and_actor_failure() {
+        let snapshot = authority_snapshot(
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+        );
+        let evidence = authenticated_authority_evidence(&snapshot);
+        assert!(ForgeActor::new(
+            "github",
+            object(ProviderObjectKind::Actor, "U_invalid"),
+            " invalid",
+            ReportedActorKind::Human,
+        )
+        .is_err());
+
+        let foreign_actor = ForgeActor::new(
+            "gitlab",
+            ProviderObjectId::new("gitlab", ProviderObjectKind::Actor, "U_foreign")
+                .expect("foreign actor id"),
+            "foreign",
+            ReportedActorKind::Human,
+        )
+        .expect("foreign actor");
+        let error = AuthenticatedPullRequestMergeEvidence::from_authenticated_acceptance(
+            evidence.candidate.clone(),
+            evidence.approved_review_id.clone(),
+            foreign_actor.clone(),
+            evidence.required_checks.clone(),
+            evidence.producer.clone(),
+            evidence.auditor.clone(),
+            evidence.merge_simulation.clone(),
+            evidence.completion_mode,
+            evidence.changed_paths.clone(),
+        )
+        .expect_err("provider-mismatched approved actor must fail");
+        assert!(error
+            .to_string()
+            .contains("not bound to the target provider"));
+
+        let foreign_review = ForgeReview::new(
+            ProviderObjectId::new("gitlab", ProviderObjectKind::Review, "R_foreign")
+                .expect("foreign review id"),
+            foreign_actor,
+            ForgeReviewState::Approved,
+            "foreign approval",
+            ForgeTimestamp::new(CREATED_AT).expect("review timestamp"),
+            snapshot.item().head_oid().expect("PR head"),
+        )
+        .expect("internally valid foreign review");
+        assert!(PullRequestReviewSnapshot::new(
+            snapshot.item().clone(),
+            snapshot.observed_at().clone(),
+            vec![foreign_review],
+            Vec::new(),
+            snapshot.checks().to_vec(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn provider_ground_truth_rejects_stale_approval_and_check_bindings() {
+        let snapshot = authority_snapshot(
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+        );
+        let stale_head = "3".repeat(40);
+        let stale_review = authority_review(&stale_head);
+        let error = PullRequestReviewSnapshot::new(
+            snapshot.item().clone(),
+            snapshot.observed_at().clone(),
+            vec![stale_review],
+            Vec::new(),
+            snapshot.checks().to_vec(),
+        )
+        .expect_err("stale approval must not become ground truth");
+        assert!(error.to_string().contains("stale"));
+
+        let stale_check = authority_check(
+            "C_stale",
+            "ci/unit",
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+            &stale_head,
+        );
+        let error = PullRequestReviewSnapshot::new(
+            snapshot.item().clone(),
+            snapshot.observed_at().clone(),
+            snapshot.reviews().to_vec(),
+            Vec::new(),
+            vec![stale_check],
+        )
+        .expect_err("stale check must not become ground truth");
+        assert!(error.to_string().contains("stale"));
+    }
+
+    #[test]
+    fn stale_authenticated_evidence_cannot_reach_an_allowed_merge_decision() {
+        let snapshot = authority_snapshot(
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+        );
+        let baseline = authenticated_authority_evidence(&snapshot);
+
+        let mut evidence = baseline.clone();
+        evidence.auditor.head_oid = "3".repeat(40);
+        let decision = decide_pull_request_merge(
+            &snapshot,
+            &authority_input_from_authenticated(&snapshot, &evidence),
+        );
+        assert_authority_denied(&decision, |blocker| {
+            matches!(
+                blocker,
+                PullRequestMergeAuthorityBlocker::StaleAuditorEvidence
+            )
+        });
+
+        let mut evidence = baseline.clone();
+        evidence.changed_paths.head_oid = "3".repeat(40);
+        let decision = decide_pull_request_merge(
+            &snapshot,
+            &authority_input_from_authenticated(&snapshot, &evidence),
+        );
+        assert_authority_denied(&decision, |blocker| {
+            matches!(
+                blocker,
+                PullRequestMergeAuthorityBlocker::StaleChangedPathsEvidence
+            )
+        });
+
+        let mut evidence = baseline;
+        evidence.merge_simulation.snapshot_observed_at =
+            ForgeTimestamp::new(CREATED_AT).expect("stale simulation timestamp");
+        let decision = decide_pull_request_merge(
+            &snapshot,
+            &authority_input_from_authenticated(&snapshot, &evidence),
+        );
+        assert_authority_denied(&decision, |blocker| {
+            matches!(
+                blocker,
+                PullRequestMergeAuthorityBlocker::StaleMergeSimulationEvidence
+            )
+        });
+    }
+
+    #[test]
+    fn missing_and_non_independent_evidence_cannot_authorize_merge() {
+        let snapshot = authority_snapshot(
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+        );
+        let evidence = authenticated_authority_evidence(&snapshot);
+        let missing = PullRequestMergeAuthorityInput {
+            freshness: None,
+            required_checks: None,
+            producer: None,
+            auditor: None,
+            merge_simulation: None,
+            completion_mode: None,
+            changed_paths: None,
+        };
+        let decision = decide_pull_request_merge(&snapshot, &missing);
+        for expected in [
+            PullRequestMergeAuthorityBlocker::MissingFreshnessEvidence,
+            PullRequestMergeAuthorityBlocker::MissingRequiredChecks,
+            PullRequestMergeAuthorityBlocker::MissingProducerEvidence,
+            PullRequestMergeAuthorityBlocker::MissingAuditorEvidence,
+            PullRequestMergeAuthorityBlocker::MissingMergeSimulationEvidence,
+            PullRequestMergeAuthorityBlocker::MissingCompletionMode,
+            PullRequestMergeAuthorityBlocker::MissingChangedPathsEvidence,
+        ] {
+            assert!(
+                decision.blockers().contains(&expected),
+                "missing evidence blocker {expected:?} was absent: {decision:?}"
+            );
+        }
+        assert!(decision.merge_decision().is_none());
+
+        let mut only_checks_missing = authority_input_from_authenticated(&snapshot, &evidence);
+        only_checks_missing.required_checks = None;
+        let decision = decide_pull_request_merge(&snapshot, &only_checks_missing);
+        assert_authority_denied(&decision, |blocker| {
+            matches!(
+                blocker,
+                PullRequestMergeAuthorityBlocker::MissingRequiredChecks
+            )
+        });
+
+        let mut evidence = evidence;
+        evidence.auditor.auditor = evidence.producer.producer.actor.clone();
+        let decision = decide_pull_request_merge(
+            &snapshot,
+            &authority_input_from_authenticated(&snapshot, &evidence),
+        );
+        assert_authority_denied(&decision, |blocker| {
+            matches!(
+                blocker,
+                PullRequestMergeAuthorityBlocker::OptimizerBlocked(
+                    MergeBlocker::ReviewerNotIndependent
+                )
+            )
+        });
+    }
+
+    #[test]
+    fn non_green_provider_ci_never_reaches_an_allowed_merge_decision() {
+        for conclusion in [
+            ForgeCheckConclusion::Failure,
+            ForgeCheckConclusion::Neutral,
+            ForgeCheckConclusion::Cancelled,
+            ForgeCheckConclusion::Skipped,
+            ForgeCheckConclusion::TimedOut,
+            ForgeCheckConclusion::ActionRequired,
+            ForgeCheckConclusion::StartupFailure,
+            ForgeCheckConclusion::Stale,
+        ] {
+            let snapshot = authority_snapshot(ForgeCheckStatus::Completed, Some(conclusion));
+            let evidence = authenticated_authority_evidence(&snapshot);
+            let decision = decide_pull_request_merge(
+                &snapshot,
+                &authority_input_from_authenticated(&snapshot, &evidence),
+            );
+            assert_authority_denied(&decision, |blocker| {
+                matches!(
+                    blocker,
+                    PullRequestMergeAuthorityBlocker::FailedRequiredCheck { .. }
+                        | PullRequestMergeAuthorityBlocker::SkippedRequiredCheck { .. }
+                        | PullRequestMergeAuthorityBlocker::StaleRequiredCheck { .. }
+                )
+            });
+        }
+
+        let snapshot = authority_snapshot(ForgeCheckStatus::InProgress, None);
+        let evidence = authenticated_authority_evidence(&snapshot);
+        let decision = decide_pull_request_merge(
+            &snapshot,
+            &authority_input_from_authenticated(&snapshot, &evidence),
+        );
+        assert_authority_denied(&decision, |blocker| {
+            matches!(
+                blocker,
+                PullRequestMergeAuthorityBlocker::UncertainRequiredCheck { .. }
+            )
+        });
+    }
+
+    #[test]
+    fn valid_provider_ground_truth_maps_to_exact_request_and_allowed_decision() {
+        let snapshot = authority_snapshot(
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+        );
+        let evidence = authenticated_authority_evidence(&snapshot);
+        let input = authority_input_from_authenticated(&snapshot, &evidence);
+        let expected_request = MergeRequest {
+            requested: true,
+            producer: evidence.producer.producer.clone(),
+            reviewer: evidence.auditor.auditor.clone(),
+            lenses: evidence.auditor.lenses.clone(),
+            certified: true,
+            checks: vec![
+                VerificationCheck {
+                    name: "ci/unit".to_string(),
+                    status: CheckStatus::Passed,
+                },
+                VerificationCheck {
+                    name: "ci/lint".to_string(),
+                    status: CheckStatus::Passed,
+                },
+            ],
+            branch_merges_cleanly: true,
+            completion_mode: CompletionMode::MergeCommit,
+            changed_paths: evidence.changed_paths.paths.clone(),
+            decided_at: TimestampMillis::from_millis(1_777_777_777_000),
+        };
+        let expected_decision =
+            decide_merge(&expected_request).expect("expected optimizer decision");
+        assert!(expected_decision.auto_merge_performed);
+
+        let decision = decide_pull_request_merge(&snapshot, &input);
+        assert_eq!(
+            decision,
+            PullRequestMergeAuthorityDecision::Allowed {
+                merge_decision: expected_decision,
+            }
+        );
     }
 
     #[test]

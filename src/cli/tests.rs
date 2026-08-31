@@ -506,9 +506,12 @@ fn supervise_run_requires_complete_machine_global_binding() {
     };
     assert_eq!(
         complete.machine_global_config,
-        PathBuf::from("/tmp/maco-machine-global.json")
+        Some(PathBuf::from("/tmp/maco-machine-global.json"))
     );
-    assert_eq!(complete.machine_global_runtime_root_id, "runtime");
+    assert_eq!(
+        complete.machine_global_runtime_root_id.as_deref(),
+        Some("runtime")
+    );
 
     for incomplete in [
         vec!["maco", "supervise", "run", "plan.json"],
@@ -1269,68 +1272,50 @@ fn supervise_plan_requires_exactly_one_positional_or_goal_source() {
 }
 
 #[test]
-fn live_goal_entrypoints_require_exactly_one_plan_or_goal_source() {
+fn supervise_run_requires_exactly_one_plan_or_goal_source() {
     let retention = [
         "--machine-global-config",
         "/tmp/maco-machine-global.json",
         "--machine-global-runtime-root-id",
         "runtime",
     ];
-    for command in ["supervise", "autopilot"] {
-        let mut positional = vec!["maco", command, "run", "plan.json"];
-        positional.extend(retention);
-        let positional = Cli::try_parse_from(positional)
-            .unwrap_or_else(|error| panic!("{command} positional source must parse: {error}"));
-        match positional.command {
-            Command::Supervise(SuperviseCommand {
-                command: SuperviseSubcommand::Run(args),
-            }) => {
-                assert_eq!(args.supervisor_plan, Some(PathBuf::from("plan.json")));
-                assert_eq!(args.from_goal, None);
-            }
-            Command::Autopilot(AutopilotCommand {
-                command: AutopilotSubcommand::Run(args),
-            }) => {
-                assert_eq!(args.task_file, Some(PathBuf::from("plan.json")));
-                assert_eq!(args.from_goal, None);
-            }
-            _ => panic!("expected a live run command"),
-        }
+    let mut positional = vec!["maco", "supervise", "run", "plan.json"];
+    positional.extend(retention);
+    let positional = Cli::try_parse_from(positional).expect("positional source must parse");
+    let Command::Supervise(SuperviseCommand {
+        command: SuperviseSubcommand::Run(args),
+    }) = positional.command
+    else {
+        panic!("expected supervise run command");
+    };
+    assert_eq!(args.supervisor_plan, Some(PathBuf::from("plan.json")));
+    assert_eq!(args.from_goal, None);
 
-        let mut from_goal = vec!["maco", command, "run", "--from-goal", "goal.md"];
-        from_goal.extend(retention);
-        let from_goal = Cli::try_parse_from(from_goal)
-            .unwrap_or_else(|error| panic!("{command} goal source must parse: {error}"));
-        match from_goal.command {
-            Command::Supervise(SuperviseCommand {
-                command: SuperviseSubcommand::Run(args),
-            }) => {
-                assert_eq!(args.supervisor_plan, None);
-                assert_eq!(args.from_goal, Some(PathBuf::from("goal.md")));
-            }
-            Command::Autopilot(AutopilotCommand {
-                command: AutopilotSubcommand::Run(args),
-            }) => {
-                assert_eq!(args.task_file, None);
-                assert_eq!(args.from_goal, Some(PathBuf::from("goal.md")));
-            }
-            _ => panic!("expected a live run command"),
-        }
+    let mut from_goal = vec!["maco", "supervise", "run", "--from-goal", "goal.md"];
+    from_goal.extend(retention);
+    let from_goal = Cli::try_parse_from(from_goal).expect("goal source must parse");
+    let Command::Supervise(SuperviseCommand {
+        command: SuperviseSubcommand::Run(args),
+    }) = from_goal.command
+    else {
+        panic!("expected supervise run command");
+    };
+    assert_eq!(args.supervisor_plan, None);
+    assert_eq!(args.from_goal, Some(PathBuf::from("goal.md")));
 
-        let mut missing = vec!["maco", command, "run"];
-        missing.extend(retention);
-        assert!(Cli::try_parse_from(missing).is_err());
-        let mut conflicting = vec![
-            "maco",
-            command,
-            "run",
-            "plan.json",
-            "--from-goal",
-            "goal.md",
-        ];
-        conflicting.extend(retention);
-        assert!(Cli::try_parse_from(conflicting).is_err());
-    }
+    let mut missing = vec!["maco", "supervise", "run"];
+    missing.extend(retention);
+    assert!(Cli::try_parse_from(missing).is_err());
+    let mut conflicting = vec![
+        "maco",
+        "supervise",
+        "run",
+        "plan.json",
+        "--from-goal",
+        "goal.md",
+    ];
+    conflicting.extend(retention);
+    assert!(Cli::try_parse_from(conflicting).is_err());
 }
 
 #[test]
@@ -1403,136 +1388,128 @@ fn supervise_admission_flags_parse_and_reject_zero() {
 }
 
 #[test]
-fn supervise_and_autopilot_parse_repository_local_quota_config() {
-    let retention = [
+fn supervise_parses_repository_local_quota_config() {
+    let mut argv = vec![
+        "maco",
+        "supervise",
+        "run",
+        "plan.json",
+        "--quota-config",
+        "config/operator-quota.json",
+    ];
+    argv.extend([
         "--machine-global-config",
         "/tmp/maco-machine-global.json",
         "--machine-global-runtime-root-id",
         "runtime",
-    ];
-    for command in ["supervise", "autopilot"] {
-        let mut argv = vec![
-            "maco",
-            command,
-            "run",
-            "plan.json",
-            "--quota-config",
-            "config/operator-quota.json",
+    ]);
+    let parsed = Cli::try_parse_from(argv).expect("quota config must parse");
+    let Command::Supervise(SuperviseCommand {
+        command: SuperviseSubcommand::Run(args),
+    }) = parsed.command
+    else {
+        panic!("expected supervise run command");
+    };
+    assert_eq!(
+        args.quota_config,
+        Some(PathBuf::from("config/operator-quota.json"))
+    );
+}
+
+#[test]
+fn retired_autopilot_plan_and_run_capture_legacy_argv_and_fail_before_side_effects() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let missing_input = temp.path().join("missing-input.json");
+    let untouched_repo = temp.path().join("untouched-repo");
+    let missing_runtime = temp.path().join("missing-codex");
+
+    for subcommand in ["plan", "run"] {
+        let legacy_args = vec![
+            missing_input.as_os_str().to_owned(),
+            OsString::from("--from-goal"),
+            OsString::from("missing-goal.md"),
+            OsString::from("--run-id"),
+            OsString::from("../invalid-run-id"),
+            OsString::from("--codex-bin"),
+            missing_runtime.as_os_str().to_owned(),
+            OsString::from("--repo"),
+            untouched_repo.as_os_str().to_owned(),
         ];
-        argv.extend(retention);
-        let parsed = Cli::try_parse_from(argv)
-            .unwrap_or_else(|error| panic!("{command} quota config must parse: {error}"));
-        let quota_config = match parsed.command {
-            Command::Supervise(SuperviseCommand {
-                command: SuperviseSubcommand::Run(args),
-            }) => args.quota_config,
-            Command::Autopilot(AutopilotCommand {
-                command: AutopilotSubcommand::Run(args),
-            }) => args.quota_config,
-            _ => panic!("expected a live run command"),
+        let mut argv = vec![
+            OsString::from("maco"),
+            OsString::from("autopilot"),
+            OsString::from(subcommand),
+        ];
+        argv.extend(legacy_args.clone());
+
+        let parsed = Cli::try_parse_from(argv).expect("legacy autopilot argv must parse opaquely");
+        let Command::Autopilot(command) = parsed.command else {
+            panic!("expected retired autopilot command");
         };
-        assert_eq!(
-            quota_config,
-            Some(PathBuf::from("config/operator-quota.json"))
+        let captured = match &command.command {
+            AutopilotSubcommand::Plan(args) | AutopilotSubcommand::Run(args) => &args._legacy_args,
+            _ => panic!("expected retired autopilot plan/run command"),
+        };
+        assert_eq!(captured, &legacy_args);
+
+        let error = command
+            .run()
+            .expect_err("retired autopilot execution must fail");
+        assert_eq!(error.to_string(), RETIRED_AUTOPILOT_EXECUTION_MESSAGE);
+        assert!(
+            !untouched_repo.exists(),
+            "retired autopilot must fail before writing artifacts"
         );
     }
 }
 
 #[test]
-fn autopilot_parses_real_runtime_quota_and_rolling_budget_as_one_run_contract() {
-    let parsed = Cli::try_parse_from([
-        "maco",
-        "autopilot",
-        "run",
-        "plan.json",
-        "--run-id",
-        "autopilot-live-quota",
-        "--codex-bin",
-        "codex",
-        "--quota-config",
-        "config/operator-quota.json",
-        "--max-rolling-tokens",
-        "50000",
-        "--rolling-window-seconds",
-        "3600",
-        "--machine-global-config",
-        "/tmp/maco-machine-global.json",
-        "--machine-global-runtime-root-id",
-        "runtime",
-    ])
-    .expect("combined Autopilot quota and rolling budget flags must parse");
-    let Command::Autopilot(AutopilotCommand {
-        command: AutopilotSubcommand::Run(args),
-    }) = parsed.command
-    else {
-        panic!("expected Autopilot run command");
-    };
-    assert_eq!(args.run_id.as_deref(), Some("autopilot-live-quota"));
-    assert_eq!(args.codex_bin, Some(PathBuf::from("codex")));
-    assert_eq!(
-        args.quota_config,
-        Some(PathBuf::from("config/operator-quota.json"))
-    );
-    let rolling = args
-        .budget
-        .rolling_quota()
-        .expect("combined Autopilot rolling budget");
-    assert_eq!(rolling.max_tokens, Some(50_000));
-    assert_eq!(rolling.window_seconds, 3_600);
-}
-
-#[test]
-fn supervise_and_autopilot_budget_flags_parse_validate_and_bind_hard_limits() {
+fn supervise_budget_flags_parse_validate_and_bind_hard_limits() {
     let retention = [
         "--machine-global-config",
         "/tmp/maco-machine-global.json",
         "--machine-global-runtime-root-id",
         "runtime",
     ];
-    for command in ["supervise", "autopilot"] {
-        let mut argv = vec![
-            "maco",
-            command,
-            "run",
-            "plan.json",
-            "--max-tokens",
-            "12000",
-            "--max-cost-usd",
-            "1.25",
-            "--max-duration-seconds",
-            "900",
-        ];
-        argv.extend(retention);
-        let parsed = Cli::try_parse_from(argv)
-            .unwrap_or_else(|error| panic!("{command} budget flags must parse: {error}"));
-        let budget = match parsed.command {
-            Command::Supervise(SuperviseCommand {
-                command: SuperviseSubcommand::Run(args),
-            }) => args.budget,
-            Command::Autopilot(AutopilotCommand {
-                command: AutopilotSubcommand::Run(args),
-            }) => args.budget,
-            _ => panic!("expected {command} run command"),
-        };
-        assert_eq!(budget.limits().hard_tokens, Some(12_000));
-        assert_eq!(budget.limits().hard_cost_usd, Some(1.25));
-        assert_eq!(budget.max_duration_seconds(), Some(900));
-        assert!(budget.rolling_quota().is_none());
+    let mut argv = vec![
+        "maco",
+        "supervise",
+        "run",
+        "plan.json",
+        "--max-tokens",
+        "12000",
+        "--max-cost-usd",
+        "1.25",
+        "--max-duration-seconds",
+        "900",
+    ];
+    argv.extend(retention);
+    let parsed = Cli::try_parse_from(argv).expect("budget flags must parse");
+    let Command::Supervise(SuperviseCommand {
+        command: SuperviseSubcommand::Run(args),
+    }) = parsed.command
+    else {
+        panic!("expected supervise run command");
+    };
+    let budget = args.budget;
+    assert_eq!(budget.limits().hard_tokens, Some(12_000));
+    assert_eq!(budget.limits().hard_cost_usd, Some(1.25));
+    assert_eq!(budget.max_duration_seconds(), Some(900));
+    assert!(budget.rolling_quota().is_none());
 
-        for (flag, value) in [
-            ("--max-tokens", "0"),
-            ("--max-cost-usd", "0"),
-            ("--max-cost-usd", "NaN"),
-            ("--max-cost-usd", "inf"),
-            ("--max-duration-seconds", "0"),
-        ] {
-            let mut invalid = vec!["maco", command, "run", "plan.json", flag, value];
-            invalid.extend(retention);
-            assert!(
-                Cli::try_parse_from(invalid).is_err(),
-                "{command} accepted nonsense {flag}={value}"
-            );
-        }
+    for (flag, value) in [
+        ("--max-tokens", "0"),
+        ("--max-cost-usd", "0"),
+        ("--max-cost-usd", "NaN"),
+        ("--max-cost-usd", "inf"),
+        ("--max-duration-seconds", "0"),
+    ] {
+        let mut invalid = vec!["maco", "supervise", "run", "plan.json", flag, value];
+        invalid.extend(retention);
+        assert!(
+            Cli::try_parse_from(invalid).is_err(),
+            "supervise accepted nonsense {flag}={value}"
+        );
     }
 
     let mut aliases = vec![
@@ -1550,96 +1527,85 @@ fn supervise_and_autopilot_budget_flags_parse_validate_and_bind_hard_limits() {
     aliases.extend(retention);
     assert!(Cli::try_parse_from(aliases).is_ok());
 
-    for command in ["supervise", "autopilot"] {
-        let mut argv = vec![
-            "maco",
-            command,
-            "run",
-            "plan.json",
-            "--max-rolling-tokens",
-            "50000",
-            "--max-rolling-cost-usd",
-            "12.5",
-            "--rolling-window-seconds",
-            "3600",
-        ];
-        argv.extend(retention);
-        let parsed = Cli::try_parse_from(argv)
-            .unwrap_or_else(|error| panic!("{command} rolling budget flags must parse: {error}"));
-        let budget = match parsed.command {
-            Command::Supervise(SuperviseCommand {
-                command: SuperviseSubcommand::Run(args),
-            }) => args.budget,
-            Command::Autopilot(AutopilotCommand {
-                command: AutopilotSubcommand::Run(args),
-            }) => args.budget,
-            _ => panic!("expected {command} run command"),
-        };
-        let rolling = budget
-            .rolling_quota()
-            .expect("rolling quota must bind from CLI flags");
-        assert_eq!(rolling.max_tokens, Some(50_000));
-        assert_eq!(rolling.max_cost_usd, Some(12.5));
-        assert_eq!(rolling.window_seconds, 3_600);
+    let mut argv = vec![
+        "maco",
+        "supervise",
+        "run",
+        "plan.json",
+        "--max-rolling-tokens",
+        "50000",
+        "--max-rolling-cost-usd",
+        "12.5",
+        "--rolling-window-seconds",
+        "3600",
+    ];
+    argv.extend(retention);
+    let parsed = Cli::try_parse_from(argv).expect("rolling budget flags must parse");
+    let Command::Supervise(SuperviseCommand {
+        command: SuperviseSubcommand::Run(args),
+    }) = parsed.command
+    else {
+        panic!("expected supervise run command");
+    };
+    let rolling = args
+        .budget
+        .rolling_quota()
+        .expect("rolling quota must bind from CLI flags");
+    assert_eq!(rolling.max_tokens, Some(50_000));
+    assert_eq!(rolling.max_cost_usd, Some(12.5));
+    assert_eq!(rolling.window_seconds, 3_600);
 
-        for (flag, value) in [
-            ("--max-rolling-tokens", "0"),
-            ("--max-rolling-cost-usd", "0"),
-            ("--max-rolling-cost-usd", "NaN"),
-            ("--rolling-window-seconds", "0"),
-        ] {
-            let mut invalid = vec!["maco", command, "run", "plan.json", flag, value];
-            invalid.extend(retention);
-            assert!(
-                Cli::try_parse_from(invalid).is_err(),
-                "{command} accepted nonsense {flag}={value}"
-            );
-        }
+    for (flag, value) in [
+        ("--max-rolling-tokens", "0"),
+        ("--max-rolling-cost-usd", "0"),
+        ("--max-rolling-cost-usd", "NaN"),
+        ("--rolling-window-seconds", "0"),
+    ] {
+        let mut invalid = vec!["maco", "supervise", "run", "plan.json", flag, value];
+        invalid.extend(retention);
+        assert!(
+            Cli::try_parse_from(invalid).is_err(),
+            "supervise accepted nonsense {flag}={value}"
+        );
     }
 }
 
 #[test]
-fn live_run_entrypoints_accept_only_canonical_parent_nodes() {
+fn supervise_run_accepts_only_canonical_parent_nodes() {
     let retention = [
         "--machine-global-config",
         "/tmp/maco-machine-global.json",
         "--machine-global-runtime-root-id",
         "runtime",
     ];
-    for command in ["supervise", "autopilot"] {
-        let mut valid = vec![
-            "maco",
-            command,
-            "run",
-            "plan.json",
-            "--parent-node",
-            "driver-root",
-        ];
-        valid.extend(retention);
-        let parsed = Cli::try_parse_from(valid)
-            .unwrap_or_else(|error| panic!("{command} parent node must parse: {error}"));
-        let parent_node = match parsed.command {
-            Command::Supervise(SuperviseCommand {
-                command: SuperviseSubcommand::Run(args),
-            }) => args.parent_node,
-            Command::Autopilot(AutopilotCommand {
-                command: AutopilotSubcommand::Run(args),
-            }) => args.parent_node,
-            _ => panic!("expected a live run command"),
-        };
-        assert_eq!(parent_node.as_deref(), Some("driver-root"));
+    let mut valid = vec![
+        "maco",
+        "supervise",
+        "run",
+        "plan.json",
+        "--parent-node",
+        "driver-root",
+    ];
+    valid.extend(retention);
+    let parsed = Cli::try_parse_from(valid).expect("parent node must parse");
+    let Command::Supervise(SuperviseCommand {
+        command: SuperviseSubcommand::Run(args),
+    }) = parsed.command
+    else {
+        panic!("expected supervise run command");
+    };
+    assert_eq!(args.parent_node.as_deref(), Some("driver-root"));
 
-        let mut invalid = vec![
-            "maco",
-            command,
-            "run",
-            "plan.json",
-            "--parent-node",
-            "invalid/parent",
-        ];
-        invalid.extend(retention);
-        assert!(Cli::try_parse_from(invalid).is_err());
-    }
+    let mut invalid = vec![
+        "maco",
+        "supervise",
+        "run",
+        "plan.json",
+        "--parent-node",
+        "invalid/parent",
+    ];
+    invalid.extend(retention);
+    assert!(Cli::try_parse_from(invalid).is_err());
 }
 
 #[test]

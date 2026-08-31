@@ -2248,7 +2248,7 @@ impl CandidateValidationSandbox {
         if let Some(base_oid) = base_oid {
             sandbox.git_context.set_detached_head(base_oid)?;
         }
-        let checkout = run_isolated_git_process(
+        let checkout = run_isolated_git_process_with_writable_worktree(
             &sandbox.git_context,
             sandbox.path(),
             &["checkout-index", "--all", "--force"],
@@ -2264,7 +2264,7 @@ impl CandidateValidationSandbox {
             ApplyMode::None => Vec::new(),
         };
         if !args.is_empty() {
-            let apply_output = run_isolated_git_process(
+            let apply_output = run_isolated_git_process_with_writable_worktree(
                 &sandbox.git_context,
                 sandbox.path(),
                 &args,
@@ -2335,7 +2335,13 @@ impl CandidateValidationSandbox {
         let base = collection_base_oid(&preview.candidate.metadata)?;
         capture_two_matching(|| {
             let head = head_oid(&repo).context("failed to read validation sandbox HEAD")?;
-            let captured = snapshot_worktree_candidate_from_base(&repo, self.path(), head, base)?;
+            let captured = snapshot_worktree_candidate_from_base_with_index(
+                &repo,
+                self.path(),
+                head,
+                base,
+                &self.git_context,
+            )?;
             let binding =
                 candidate_validation_binding(&preview.candidate.metadata, &captured.raw_diff)?;
             let repository =

@@ -1084,6 +1084,8 @@ fn raw_pr_candidate_parsing_deduplicates_labels_files_and_failed_checks() {
         "headRefOid": "1111111111111111111111111111111111111111",
         "baseRefOid": "2222222222222222222222222222222222222222",
         "isDraft": false,
+        "headRepository": {"nameWithOwner": "acme/repo"},
+        "isCrossRepository": false,
         "labels": [{"name": "z"}, {"name": "a"}, {"name": "a"}],
         "files": [{"path": "src/../src/inbox.rs"}, {"path": "src/inbox.rs"}],
         "statusCheckRollup": [
@@ -1174,6 +1176,9 @@ fn make_pr_item(number: u64, title: &str, changed_files: Vec<PathBuf>) -> InboxI
             updated_at: Some("2026-07-08T00:00:00Z".to_string()),
             head_ref: Some("feature/inbox".to_string()),
             base_ref: Some("main".to_string()),
+            is_draft: false,
+            source_trust: GithubPrSourceTrust::TrustedTargetRepository,
+            head_repository: Some("acme/repo".to_string()),
             changed_files,
             checks: vec![GithubCheckSummary {
                 name: "ci".to_string(),

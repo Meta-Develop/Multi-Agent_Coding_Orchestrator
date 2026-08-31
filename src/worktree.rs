@@ -149,6 +149,11 @@ const WORKTREE_STATUS_SCAVENGE_LIMITS: PrivateDirectoryScavengeLimits =
         max_duration: Duration::from_secs(10),
     };
 const WORKTREE_STATUS_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
+// Managed worktree creation intentionally keeps the authenticated registry
+// lock across its WAL-backed Git/worktree transaction. That transaction can
+// exceed the generic state-lock budget on local NTFS, so registry contenders
+// get a larger bounded serialization window without weakening other locks.
+const MANAGED_WORKTREE_REGISTRY_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(not(test))]
 const WORKTREE_STATUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 // Full library suites share the finite systemd containment slots with other

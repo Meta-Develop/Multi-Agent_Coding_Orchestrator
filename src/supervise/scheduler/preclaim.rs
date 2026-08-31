@@ -9,8 +9,9 @@
 //! rejection is classification evidence, never mutation authority.
 
 use super::*;
-use crate::repo_map::{RepoEntryKind, RepoMap};
+use crate::repo_map::{RepoEntryKind, RepoGitStatus, RepoMap};
 use crate::repo_semantic::{risk_report_for_paths, SemanticRepoMap, SemanticRiskReport};
+use crate::safe_state::BoundedRegularReader;
 use serde::{Deserialize, Serialize};
 
 pub(super) const PRECLAIM_DECISIONS_RELATIVE: &str = "preclaim/decisions.jsonl";
@@ -108,6 +109,33 @@ struct RequestedPreclaimDirective {
     ambiguity_bias: Option<PreclaimAmbiguityBias>,
     #[serde(default)]
     operator_override: Option<RecordedPreclaimOverride>,
+    #[serde(default)]
+    verification_contract: Option<RequestedPreclaimVerificationContract>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum RequestedPreclaimVerificationContract {
+    ExplicitNewFileCreation {
+        assigned_path: String,
+        planning_assignment: RequestedPreclaimAssignmentBinding,
+        execution_assignment: RequestedPreclaimAssignmentBinding,
+    },
+    ExistingGitVisibleRegularFileEdit {
+        assigned_path: String,
+        planning_assignment: RequestedPreclaimAssignmentBinding,
+        execution_assignment: RequestedPreclaimAssignmentBinding,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RequestedPreclaimAssignmentBinding {
+    id: String,
+    phase: AssignmentPhase,
+    role: AgentRole,
+    role_category: RoleCategory,
+    task_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,6 +426,32 @@ fn deterministic_verification_path(
     if requested_licensed_breakage_contract(assignment, requested_assignments) {
         return ViabilityFinding::Yes;
     }
+    if repo_map
+        .zip(risk_report)
+        .is_some_and(|(repo_map, risk_report)| {
+            requested_explicit_new_file_contract(
+                assignment,
+                requested_assignments,
+                repo_map,
+                risk_report,
+            )
+        })
+    {
+        return ViabilityFinding::Yes;
+    }
+    if repo_map
+        .zip(risk_report)
+        .is_some_and(|(repo_map, risk_report)| {
+            requested_existing_regular_file_edit_contract(
+                assignment,
+                requested_assignments,
+                repo_map,
+                risk_report,
+            )
+        })
+    {
+        return ViabilityFinding::Yes;
+    }
     let assignment_names_exact_test_target = assignment
         .assigned_paths
         .iter()
@@ -453,6 +507,426 @@ fn requested_licensed_breakage_contract(
         && requested.assigned_paths == assignment.assigned_paths
         && assignment.licensed_breakage.is_some()
         && requested.licensed_breakage == assignment.licensed_breakage
+}
+
+fn requested_explicit_new_file_contract(
+    assignment: &OrchestratorAssignment,
+    requested_assignments: &[OrchestratorAssignment],
+    repo_map: &RepoMap,
+    risk_report: &SemanticRiskReport,
+) -> bool {
+    let Some(requested) = unique_requested_assignment(requested_assignments, &assignment.id) else {
+        return false;
+    };
+    if requested != assignment {
+        return false;
+    }
+    let Some(contract) = requested_verification_contract(requested.notes.as_deref()) else {
+        return false;
+    };
+    let RequestedPreclaimVerificationContract::ExplicitNewFileCreation {
+        assigned_path,
+        planning_assignment,
+        execution_assignment,
+    } = &contract
+    else {
+        return false;
+    };
+    if planning_assignment.id == execution_assignment.id
+        || planning_assignment.phase != AssignmentPhase::Planning
+        || planning_assignment.role != AgentRole::ChildOrchestrator
+        || planning_assignment.role_category != RoleCategory::DelegatingCoordinator
+        || execution_assignment.phase != AssignmentPhase::Execution
+        || execution_assignment.role != AgentRole::Worker
+        || execution_assignment.role_category != RoleCategory::NonDelegatingTerminalWorker
+    {
+        return false;
+    }
+    let Some(planning) =
+        unique_requested_assignment(requested_assignments, &planning_assignment.id)
+    else {
+        return false;
+    };
+    let Some(execution) =
+        unique_requested_assignment(requested_assignments, &execution_assignment.id)
+    else {
+        return false;
+    };
+    if requested_verification_contract(planning.notes.as_deref()).as_ref() != Some(&contract)
+        || requested_verification_contract(execution.notes.as_deref()).as_ref() != Some(&contract)
+    {
+        return false;
+    }
+    let Some(target) = safe_requested_contract_path(assigned_path) else {
+        return false;
+    };
+    let Some(execution_task) = execution.task.as_deref() else {
+        return false;
+    };
+    if explicit_new_file_task_target(execution_task).as_ref() != Some(&target) {
+        return false;
+    }
+    if !risk_is_bound_to_assignment(risk_report, std::slice::from_ref(&target)) {
+        return false;
+    }
+    let expected_planning_task = format!(
+        "Read-only planning gate for workstream '{}'. Review the proposed scope and implementation task without editing files or delegating implementation. Confirm whether the execution child can proceed safely.\n\nExecution task:\n{}",
+        execution.id, execution_task
+    );
+    if repo_map.entries.iter().any(|entry| entry.path == target) {
+        return false;
+    }
+    let mut parent = target.parent();
+    while let Some(relative) = parent {
+        if relative.as_os_str().is_empty() {
+            break;
+        }
+        if repo_map
+            .entries
+            .iter()
+            .find(|entry| entry.path == relative)
+            .is_some_and(|entry| entry.kind != RepoEntryKind::Directory)
+        {
+            return false;
+        }
+        parent = relative.parent();
+    }
+
+    if planning.id != planning_assignment.id
+        || planning.phase != planning_assignment.phase
+        || planning.role != planning_assignment.role
+        || planning.role_category != Some(planning_assignment.role_category)
+        || planning.assigned_paths.as_slice() != [target.as_path()]
+        || !planning.semantic_symbols.is_empty()
+        || !planning.semantic_modules.is_empty()
+        || !planning.worker_assignments.is_empty()
+        || !planning.environment_requirements.is_empty()
+        || planning.licensed_breakage.is_some()
+        || planning.task.as_deref() != Some(expected_planning_task.as_str())
+        || crate::artifacts::state_auth::sha256_hex(expected_planning_task.as_bytes())
+            != planning_assignment.task_sha256
+    {
+        return false;
+    }
+    execution.id == execution_assignment.id
+        && execution.phase == execution_assignment.phase
+        && execution.role == execution_assignment.role
+        && execution.role_category == Some(execution_assignment.role_category)
+        && execution.assigned_paths.as_slice() == [target.as_path()]
+        && execution.semantic_symbols.is_empty()
+        && execution.semantic_modules.is_empty()
+        && execution.worker_assignments.is_empty()
+        && execution.environment_requirements.is_empty()
+        && execution.licensed_breakage.is_none()
+        && crate::artifacts::state_auth::sha256_hex(execution_task.as_bytes())
+            == execution_assignment.task_sha256
+}
+
+fn requested_existing_regular_file_edit_contract(
+    assignment: &OrchestratorAssignment,
+    requested_assignments: &[OrchestratorAssignment],
+    repo_map: &RepoMap,
+    risk_report: &SemanticRiskReport,
+) -> bool {
+    if requested_assignments.len() != 2 {
+        return false;
+    }
+    let Some(requested) = unique_requested_assignment(requested_assignments, &assignment.id) else {
+        return false;
+    };
+    if requested != assignment {
+        return false;
+    }
+    let Some(contract) = requested_verification_contract(requested.notes.as_deref()) else {
+        return false;
+    };
+    let RequestedPreclaimVerificationContract::ExistingGitVisibleRegularFileEdit {
+        assigned_path,
+        planning_assignment,
+        execution_assignment,
+    } = &contract
+    else {
+        return false;
+    };
+    if planning_assignment.id == execution_assignment.id
+        || planning_assignment.phase != AssignmentPhase::Planning
+        || planning_assignment.role != AgentRole::ChildOrchestrator
+        || planning_assignment.role_category != RoleCategory::DelegatingCoordinator
+        || execution_assignment.phase != AssignmentPhase::Execution
+        || execution_assignment.role != AgentRole::Worker
+        || execution_assignment.role_category != RoleCategory::NonDelegatingTerminalWorker
+    {
+        return false;
+    }
+    let Some(planning) =
+        unique_requested_assignment(requested_assignments, &planning_assignment.id)
+    else {
+        return false;
+    };
+    let Some(execution) =
+        unique_requested_assignment(requested_assignments, &execution_assignment.id)
+    else {
+        return false;
+    };
+    if requested_verification_contract(planning.notes.as_deref()).as_ref() != Some(&contract)
+        || requested_verification_contract(execution.notes.as_deref()).as_ref() != Some(&contract)
+    {
+        return false;
+    }
+    let Some(target) = safe_requested_contract_path(assigned_path) else {
+        return false;
+    };
+    let Some(execution_task) = execution.task.as_deref() else {
+        return false;
+    };
+    if !super::super::plan_api::explicit_existing_file_edit_verification_task(
+        execution_task,
+        &target,
+    ) || !risk_report.errors.is_empty()
+        || !risk_is_bound_to_assignment(risk_report, std::slice::from_ref(&target))
+        || !mapped_git_visible_readable_regular_file(repo_map, &target)
+    {
+        return false;
+    }
+    let expected_planning_task = format!(
+        "Read-only planning gate for workstream '{}'. Review the proposed scope and implementation task without editing files or delegating implementation. Confirm whether the execution child can proceed safely.\n\nExecution task:\n{}",
+        execution.id, execution_task
+    );
+    if planning.id != planning_assignment.id
+        || planning.phase != planning_assignment.phase
+        || planning.role != planning_assignment.role
+        || planning.role_category != Some(planning_assignment.role_category)
+        || planning.assigned_paths.as_slice() != [target.as_path()]
+        || !planning.semantic_symbols.is_empty()
+        || !planning.semantic_modules.is_empty()
+        || !planning.worker_assignments.is_empty()
+        || !planning.environment_requirements.is_empty()
+        || planning.licensed_breakage.is_some()
+        || planning.task.as_deref() != Some(expected_planning_task.as_str())
+        || crate::artifacts::state_auth::sha256_hex(expected_planning_task.as_bytes())
+            != planning_assignment.task_sha256
+    {
+        return false;
+    }
+    execution.id == execution_assignment.id
+        && execution.phase == execution_assignment.phase
+        && execution.role == execution_assignment.role
+        && execution.role_category == Some(execution_assignment.role_category)
+        && execution.assigned_paths.as_slice() == [target.as_path()]
+        && execution.semantic_symbols.is_empty()
+        && execution.semantic_modules.is_empty()
+        && execution.worker_assignments.is_empty()
+        && execution.environment_requirements.is_empty()
+        && execution.licensed_breakage.is_none()
+        && crate::artifacts::state_auth::sha256_hex(execution_task.as_bytes())
+            == execution_assignment.task_sha256
+}
+
+fn mapped_git_visible_readable_regular_file(repo_map: &RepoMap, target: &Path) -> bool {
+    let mut matching_entries = repo_map.entries.iter().filter(|entry| entry.path == target);
+    let Some(entry) = matching_entries.next() else {
+        return false;
+    };
+    if matching_entries.next().is_some()
+        || entry.kind != RepoEntryKind::File
+        || entry.git_status != RepoGitStatus::Clean
+    {
+        return false;
+    }
+    let Some(expected_bytes) = entry.size_bytes else {
+        return false;
+    };
+    let Ok(repository) = git2::Repository::open(&repo_map.root) else {
+        return false;
+    };
+    let Ok(index) = repository.index() else {
+        return false;
+    };
+    let Some(index_entry) = index.get_path(target, 0) else {
+        return false;
+    };
+    if index_entry.mode & 0o170_000 != 0o100_000 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(metadata) = std::fs::symlink_metadata(repo_map.root.join(target)) else {
+            return false;
+        };
+        if !metadata.is_file() || metadata.permissions().mode() & 0o444 == 0 {
+            return false;
+        }
+    }
+    BoundedRegularReader::read_relative(&repo_map.root, target, expected_bytes)
+        .is_ok_and(|contents| u64::try_from(contents.len()) == Ok(expected_bytes))
+}
+
+fn unique_requested_assignment<'a>(
+    requested_assignments: &'a [OrchestratorAssignment],
+    id: &str,
+) -> Option<&'a OrchestratorAssignment> {
+    let mut matching = requested_assignments
+        .iter()
+        .filter(|requested| requested.id == id);
+    let requested = matching.next()?;
+    matching.next().is_none().then_some(requested)
+}
+
+fn requested_verification_contract(
+    notes: Option<&str>,
+) -> Option<RequestedPreclaimVerificationContract> {
+    let trimmed = notes?.trim();
+    if !trimmed.starts_with(PRECLAIM_DIRECTIVE_PREFIX)
+        || trimmed.matches(PRECLAIM_DIRECTIVE_PREFIX).count() != 1
+    {
+        return None;
+    }
+    let payload = trimmed.strip_prefix(PRECLAIM_DIRECTIVE_PREFIX)?;
+    let directive = serde_json::from_str::<RequestedPreclaimDirective>(payload).ok()?;
+    if directive.ambiguity_bias.is_some() || directive.operator_override.is_some() {
+        return None;
+    }
+    directive.verification_contract
+}
+
+fn safe_requested_contract_path(value: &str) -> Option<PathBuf> {
+    if value.is_empty()
+        || value.ends_with('/')
+        || value.contains('\\')
+        || value.as_bytes().get(1).is_some_and(|byte| *byte == b':')
+    {
+        return None;
+    }
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return None;
+    }
+    let components = path.components().collect::<Vec<_>>();
+    if components.is_empty()
+        || components.iter().any(|component| {
+            !matches!(component, std::path::Component::Normal(_))
+                || component.as_os_str() == ".git"
+                || component.as_os_str() == ".maco"
+        })
+    {
+        return None;
+    }
+    Some(path.to_path_buf())
+}
+
+fn explicit_new_file_task_target(task: &str) -> Option<PathBuf> {
+    const DIRECTIVES: [&str; 6] = [
+        "create a new file",
+        "create new file",
+        "create a file",
+        "create file",
+        "add a new file",
+        "add new file",
+    ];
+
+    let mut parsed_target = None;
+    let mut directive_count = 0_usize;
+    for line in task.lines() {
+        let lowered = line.to_ascii_lowercase();
+        for directive in DIRECTIVES {
+            let mut search_start = 0_usize;
+            while let Some(relative_index) = lowered.get(search_start..)?.find(directive) {
+                let index = search_start.checked_add(relative_index)?;
+                let directive_end = index.checked_add(directive.len())?;
+                search_start = directive_end;
+                if !explicit_new_file_phrase_boundaries(&lowered, index, directive_end) {
+                    continue;
+                }
+                directive_count = directive_count.checked_add(1)?;
+                if directive_count != 1 {
+                    return None;
+                }
+                parsed_target = parse_explicit_new_file_target(line.get(directive_end..)?);
+            }
+        }
+    }
+    if directive_count != 1 {
+        return None;
+    }
+    safe_requested_contract_path(&parsed_target?)
+}
+
+fn explicit_new_file_phrase_boundaries(text: &str, start: usize, end: usize) -> bool {
+    let bytes = text.as_bytes();
+    let is_word_byte = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let starts_at_boundary = start == 0
+        || bytes
+            .get(start.saturating_sub(1))
+            .is_some_and(|byte| !is_word_byte(*byte));
+    let ends_at_boundary = bytes.get(end).is_none_or(|byte| !is_word_byte(*byte));
+    starts_at_boundary && ends_at_boundary
+}
+
+fn parse_explicit_new_file_target(remainder: &str) -> Option<String> {
+    let mut remainder = remainder.trim_start();
+    let mut explicitly_named = false;
+    for label in ["named", "called", "at"] {
+        if let Some(stripped) = strip_explicit_new_file_word_prefix(remainder, label) {
+            remainder = stripped.trim_start();
+            explicitly_named = true;
+            break;
+        }
+    }
+    let (raw_target, trailing) = match remainder.chars().next()? {
+        quote @ ('`' | '\'' | '"') => {
+            let quoted = remainder.get(quote.len_utf8()..)?;
+            let closing = quoted.find(quote)?;
+            (
+                quoted.get(..closing)?,
+                quoted.get(closing + quote.len_utf8()..)?,
+            )
+        }
+        _ => match remainder.find(char::is_whitespace) {
+            Some(end) => (remainder.get(..end)?, remainder.get(end..)?),
+            None => (remainder, ""),
+        },
+    };
+    let target = raw_target.trim().trim_matches(|ch: char| {
+        matches!(
+            ch,
+            ',' | ';' | ':' | ')' | '(' | '[' | ']' | '{' | '}' | '!'
+        )
+    });
+    let target = match target.strip_suffix('.') {
+        Some(stripped) if stripped.contains('.') || stripped.contains('/') => stripped,
+        _ => target,
+    };
+    if target.is_empty() || (!explicitly_named && !target.contains('.') && !target.contains('/')) {
+        return None;
+    }
+    let trailing = trailing.trim_start();
+    if trailing.starts_with(',')
+        || trailing.starts_with(';')
+        || (!trailing.is_empty()
+            && !["containing", "with", "whose", "that", "which", "to"]
+                .iter()
+                .any(|prefix| strip_explicit_new_file_word_prefix(trailing, prefix).is_some()))
+    {
+        return None;
+    }
+    Some(target.to_string())
+}
+
+fn strip_explicit_new_file_word_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let candidate = value.get(..prefix.len())?;
+    if !candidate.eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+    let remainder = value.get(prefix.len()..)?;
+    if remainder
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        return None;
+    }
+    Some(remainder)
 }
 
 fn mapped_regular_file(repo_map: &RepoMap, path: &Path) -> bool {
@@ -727,7 +1201,10 @@ fn parse_requested_preclaim_directive(
     let Ok(mut directive) = serde_json::from_str::<RequestedPreclaimDirective>(payload) else {
         return invalid_requested_directive(assignment);
     };
-    if directive.ambiguity_bias.is_none() && directive.operator_override.is_none() {
+    if directive.ambiguity_bias.is_none()
+        && directive.operator_override.is_none()
+        && directive.verification_contract.is_none()
+    {
         return invalid_requested_directive(assignment);
     }
     if let Some(operator_override) = directive.operator_override.as_mut() {
@@ -1308,6 +1785,155 @@ mod tests {
         }
     }
 
+    fn explicit_new_file_assignments(
+        assigned_path: &str,
+        execution_task: &str,
+    ) -> [OrchestratorAssignment; 2] {
+        let mut planning = assignment();
+        planning.id = "assignment-001-planning".to_string();
+        planning.phase = AssignmentPhase::Planning;
+        planning.role_category = Some(RoleCategory::DelegatingCoordinator);
+        planning.assigned_paths = vec![PathBuf::from(assigned_path)];
+        planning.task = Some(format!(
+            "Read-only planning gate for workstream 'assignment-001'. Review the proposed scope and implementation task without editing files or delegating implementation. Confirm whether the execution child can proceed safely.\n\nExecution task:\n{execution_task}"
+        ));
+
+        let mut execution = assignment();
+        execution.id = "assignment-001".to_string();
+        execution.role = AgentRole::Worker;
+        execution.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+        execution.assigned_paths = vec![PathBuf::from(assigned_path)];
+        execution.task = Some(execution_task.to_string());
+
+        let contract = RequestedPreclaimVerificationContract::ExplicitNewFileCreation {
+            assigned_path: assigned_path.to_string(),
+            planning_assignment: RequestedPreclaimAssignmentBinding {
+                id: planning.id.clone(),
+                phase: planning.phase,
+                role: planning.role,
+                role_category: planning
+                    .role_category
+                    .expect("explicit planning role category"),
+                task_sha256: crate::artifacts::state_auth::sha256_hex(
+                    planning.task.as_deref().expect("planning task").as_bytes(),
+                ),
+            },
+            execution_assignment: RequestedPreclaimAssignmentBinding {
+                id: execution.id.clone(),
+                phase: execution.phase,
+                role: execution.role,
+                role_category: execution
+                    .role_category
+                    .expect("explicit execution role category"),
+                task_sha256: crate::artifacts::state_auth::sha256_hex(
+                    execution
+                        .task
+                        .as_deref()
+                        .expect("execution task")
+                        .as_bytes(),
+                ),
+            },
+        };
+        let notes = format!(
+            "{PRECLAIM_DIRECTIVE_PREFIX}{}",
+            serde_json::to_string(&serde_json::json!({
+                "verification_contract": contract,
+            }))
+            .expect("serialize explicit new-file contract")
+        );
+        planning.notes = Some(notes.clone());
+        execution.notes = Some(notes);
+        [planning, execution]
+    }
+
+    fn existing_file_edit_assignments(
+        assigned_path: &str,
+        execution_task: &str,
+    ) -> [OrchestratorAssignment; 2] {
+        let mut planning = assignment();
+        planning.id = "assignment-001-planning".to_string();
+        planning.phase = AssignmentPhase::Planning;
+        planning.role_category = Some(RoleCategory::DelegatingCoordinator);
+        planning.assigned_paths = vec![PathBuf::from(assigned_path)];
+        planning.task = Some(format!(
+            "Read-only planning gate for workstream 'assignment-001'. Review the proposed scope and implementation task without editing files or delegating implementation. Confirm whether the execution child can proceed safely.\n\nExecution task:\n{execution_task}"
+        ));
+
+        let mut execution = assignment();
+        execution.id = "assignment-001".to_string();
+        execution.role = AgentRole::Worker;
+        execution.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+        execution.assigned_paths = vec![PathBuf::from(assigned_path)];
+        execution.task = Some(execution_task.to_string());
+
+        let contract = RequestedPreclaimVerificationContract::ExistingGitVisibleRegularFileEdit {
+            assigned_path: assigned_path.to_string(),
+            planning_assignment: RequestedPreclaimAssignmentBinding {
+                id: planning.id.clone(),
+                phase: planning.phase,
+                role: planning.role,
+                role_category: planning
+                    .role_category
+                    .expect("existing-file planning role category"),
+                task_sha256: crate::artifacts::state_auth::sha256_hex(
+                    planning.task.as_deref().expect("planning task").as_bytes(),
+                ),
+            },
+            execution_assignment: RequestedPreclaimAssignmentBinding {
+                id: execution.id.clone(),
+                phase: execution.phase,
+                role: execution.role,
+                role_category: execution
+                    .role_category
+                    .expect("existing-file execution role category"),
+                task_sha256: crate::artifacts::state_auth::sha256_hex(
+                    execution
+                        .task
+                        .as_deref()
+                        .expect("execution task")
+                        .as_bytes(),
+                ),
+            },
+        };
+        let notes = format!(
+            "{PRECLAIM_DIRECTIVE_PREFIX}{}",
+            serde_json::to_string(&serde_json::json!({
+                "verification_contract": contract,
+            }))
+            .expect("serialize existing-file contract")
+        );
+        planning.notes = Some(notes.clone());
+        execution.notes = Some(notes);
+        [planning, execution]
+    }
+
+    fn repository_map_for_file(
+        relative: &str,
+        contents: &str,
+        tracked: bool,
+    ) -> (tempfile::TempDir, RepoMap) {
+        let temp = tempfile::tempdir().expect("temporary preclaim repository");
+        let repo_path = temp.path().join("repo");
+        let repository = git2::Repository::init(&repo_path).expect("initialize repository");
+        std::fs::write(repo_path.join(relative), contents).expect("write repository file");
+        if tracked {
+            let mut index = repository.index().expect("open repository index");
+            index
+                .add_path(Path::new(relative))
+                .expect("stage repository file");
+            index.write().expect("write repository index");
+            let tree_id = index.write_tree().expect("write repository tree");
+            let tree = repository.find_tree(tree_id).expect("find repository tree");
+            let signature = git2::Signature::now("maco test", "maco-test@example.invalid")
+                .expect("repository signature");
+            repository
+                .commit(Some("HEAD"), &signature, &signature, "baseline", &tree, &[])
+                .expect("commit repository file");
+        }
+        let map = crate::repo_map::scan_repository(&repo_path).expect("scan repository map");
+        (temp, map)
+    }
+
     fn evaluate(assignment: &OrchestratorAssignment) -> PreclaimDecision {
         evaluate_with_requested(assignment, std::slice::from_ref(assignment))
     }
@@ -1842,6 +2468,391 @@ mod tests {
             ViabilityFinding::Yes
         );
         assert_eq!(decision.disposition, PreclaimDisposition::Claim);
+    }
+
+    #[test]
+    fn requested_plan_bound_explicit_new_file_contract_verifies_both_lowered_assignments() {
+        let task = "Create a new file named LITERAL_E2E.md containing exactly one line: MACO literal routing reached the terminal worker.";
+        let assignments = explicit_new_file_assignments("LITERAL_E2E.md", task);
+        for assignment in &assignments {
+            let decision = evaluate_preclaim_viability(
+                assignment,
+                &assignments,
+                Some(&present_map()),
+                Some(&risk_for_path("LITERAL_E2E.md")),
+                Some(SupervisorRuntime::Codex),
+                SupervisorExecutionRuntime::Verified,
+            );
+            assert_eq!(
+                decision.dimensions.clear_verification_path,
+                ViabilityFinding::Yes,
+                "{}: {}",
+                assignment.id,
+                decision.reason
+            );
+            assert_eq!(
+                decision.disposition,
+                PreclaimDisposition::Claim,
+                "{}: {}",
+                assignment.id,
+                decision.reason
+            );
+        }
+    }
+
+    #[test]
+    fn requested_plan_bound_existing_file_contract_verifies_both_lowered_assignments() {
+        let task = "In README.md, replace scheduler fixture with exactly: verified replacement. Verify the result with git diff --check and confirm README.md contains exactly that line.";
+        let assignments = existing_file_edit_assignments("README.md", task);
+        let (_temp, repo_map) = repository_map_for_file("README.md", "scheduler fixture\n", true);
+        for assignment in &assignments {
+            let decision = evaluate_preclaim_viability(
+                assignment,
+                &assignments,
+                Some(&repo_map),
+                Some(&risk_for_path("README.md")),
+                Some(SupervisorRuntime::Codex),
+                SupervisorExecutionRuntime::Verified,
+            );
+            assert_eq!(
+                decision.dimensions.clear_verification_path,
+                ViabilityFinding::Yes,
+                "{}: {}",
+                assignment.id,
+                decision.reason
+            );
+            assert_eq!(
+                decision.disposition,
+                PreclaimDisposition::Claim,
+                "{}: {}",
+                assignment.id,
+                decision.reason
+            );
+        }
+    }
+
+    #[test]
+    fn existing_file_contract_rejects_forged_mismatched_missing_and_ambiguous_evidence() {
+        let task = "In README.md, replace scheduler fixture with exactly: verified replacement. Verify the result with git diff --check and confirm README.md contains exactly that line.";
+        let assignments = existing_file_edit_assignments("README.md", task);
+        let (_temp, repo_map) = repository_map_for_file("README.md", "scheduler fixture\n", true);
+        let risk = risk_for_path("README.md");
+
+        let mut task_only = assignment();
+        task_only.assigned_paths = vec![PathBuf::from("README.md")];
+        task_only.task = Some(task.to_string());
+        let task_only_requested = [task_only.clone()];
+        let task_only_decision = evaluate_preclaim_viability(
+            &task_only,
+            &task_only_requested,
+            Some(&repo_map),
+            Some(&risk),
+            Some(SupervisorRuntime::Codex),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(task_only_decision.disposition, PreclaimDisposition::Park);
+
+        let forged_task = existing_file_edit_assignments(
+            "README.md",
+            "Arbitrary prose asks to update README.md without the exact verification contract.",
+        );
+        let forged_decision = evaluate_preclaim_viability(
+            &forged_task[1],
+            &forged_task,
+            Some(&repo_map),
+            Some(&risk),
+            Some(SupervisorRuntime::Codex),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(forged_decision.disposition, PreclaimDisposition::Park);
+
+        let mut mismatched_task = assignments.clone();
+        mismatched_task[1].task = Some("caller replaced the bound task".to_string());
+        let mismatched_decision = evaluate_preclaim_viability(
+            &mismatched_task[1],
+            &mismatched_task,
+            Some(&repo_map),
+            Some(&risk),
+            Some(SupervisorRuntime::Codex),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(mismatched_decision.disposition, PreclaimDisposition::Park);
+
+        let mut missing_map = repo_map.clone();
+        missing_map
+            .entries
+            .retain(|entry| entry.path != Path::new("README.md"));
+        let missing_decision = evaluate_preclaim_viability(
+            &assignments[1],
+            &assignments,
+            Some(&missing_map),
+            Some(&risk),
+            Some(SupervisorRuntime::Codex),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(missing_decision.disposition, PreclaimDisposition::Park);
+
+        for kind in [RepoEntryKind::Directory, RepoEntryKind::Symlink] {
+            let mut wrong_kind_map = repo_map.clone();
+            wrong_kind_map
+                .entries
+                .iter_mut()
+                .find(|entry| entry.path == Path::new("README.md"))
+                .expect("README map entry")
+                .kind = kind;
+            let decision = evaluate_preclaim_viability(
+                &assignments[1],
+                &assignments,
+                Some(&wrong_kind_map),
+                Some(&risk),
+                Some(SupervisorRuntime::Codex),
+                SupervisorExecutionRuntime::Verified,
+            );
+            assert_eq!(decision.disposition, PreclaimDisposition::Park, "{kind:?}");
+        }
+
+        let (_untracked_temp, untracked_map) =
+            repository_map_for_file("README.md", "scheduler fixture\n", false);
+        let untracked_decision = evaluate_preclaim_viability(
+            &assignments[1],
+            &assignments,
+            Some(&untracked_map),
+            Some(&risk),
+            Some(SupervisorRuntime::Codex),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(untracked_decision.disposition, PreclaimDisposition::Park);
+
+        let mut extra_requested = assignments.to_vec();
+        let mut extra = assignment();
+        extra.id = "unexpected-third-assignment".to_string();
+        extra.assigned_paths = vec![PathBuf::from("README.md")];
+        extra_requested.push(extra);
+        let extra_decision = evaluate_preclaim_viability(
+            &extra_requested[1],
+            &extra_requested,
+            Some(&repo_map),
+            Some(&risk),
+            Some(SupervisorRuntime::Codex),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(extra_decision.disposition, PreclaimDisposition::Park);
+
+        let mismatched_risk_decision = evaluate_preclaim_viability(
+            &assignments[1],
+            &assignments,
+            Some(&repo_map),
+            Some(&risk_for_path("Cargo.toml")),
+            Some(SupervisorRuntime::Codex),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(
+            mismatched_risk_decision.disposition,
+            PreclaimDisposition::Park
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_file_contract_rejects_an_unreadable_tracked_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let task = "In README.md, replace scheduler fixture with exactly: verified replacement. Verify the result with git diff --check and confirm README.md contains exactly that line.";
+        let assignments = existing_file_edit_assignments("README.md", task);
+        let (_temp, repo_map) = repository_map_for_file("README.md", "scheduler fixture\n", true);
+        let readme = repo_map.root.join("README.md");
+        std::fs::set_permissions(&readme, std::fs::Permissions::from_mode(0o000))
+            .expect("make README unreadable");
+        let decision = evaluate_preclaim_viability(
+            &assignments[1],
+            &assignments,
+            Some(&repo_map),
+            Some(&risk_for_path("README.md")),
+            Some(SupervisorRuntime::Codex),
+            SupervisorExecutionRuntime::Verified,
+        );
+        std::fs::set_permissions(&readme, std::fs::Permissions::from_mode(0o600))
+            .expect("restore README permissions");
+        assert_eq!(decision.disposition, PreclaimDisposition::Park);
+        assert_eq!(
+            decision.dimensions.clear_verification_path,
+            ViabilityFinding::Unknown
+        );
+    }
+
+    #[test]
+    fn missing_paths_and_unbound_or_unsafe_creation_evidence_remain_fail_closed() {
+        let literal_task = "Create a new file named LITERAL_E2E.md containing exactly one line: MACO literal routing reached the terminal worker.";
+        for task in [
+            literal_task,
+            "Update LITERAL_E2E.md with the corrected text.",
+            "Create one or perhaps two new documentation files.",
+        ] {
+            let mut ordinary = assignment();
+            ordinary.assigned_paths = vec![PathBuf::from("LITERAL_E2E.md")];
+            ordinary.task = Some(task.to_string());
+            let requested = [ordinary.clone()];
+            let decision = evaluate_preclaim_viability(
+                &ordinary,
+                &requested,
+                Some(&present_map()),
+                Some(&risk_for_path("LITERAL_E2E.md")),
+                Some(SupervisorRuntime::Codex),
+                SupervisorExecutionRuntime::Verified,
+            );
+            assert_eq!(
+                decision.dimensions.clear_verification_path,
+                ViabilityFinding::Unknown,
+                "{task}"
+            );
+            assert_eq!(decision.disposition, PreclaimDisposition::Park, "{task}");
+        }
+
+        let injected_pair = explicit_new_file_assignments("LITERAL_E2E.md", literal_task);
+        let injected_singleton = [injected_pair[1].clone()];
+        let injected = evaluate_preclaim_viability(
+            &injected_singleton[0],
+            &injected_singleton,
+            Some(&present_map()),
+            Some(&risk_for_path("LITERAL_E2E.md")),
+            Some(SupervisorRuntime::Codex),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(injected.disposition, PreclaimDisposition::Park);
+        assert_eq!(
+            injected.dimensions.clear_verification_path,
+            ViabilityFinding::Unknown
+        );
+
+        let forged_pair = explicit_new_file_assignments(
+            "LITERAL_E2E.md",
+            "reserved policy note injection without an explicit creation directive",
+        );
+        let forged = evaluate_preclaim_viability(
+            &forged_pair[1],
+            &forged_pair,
+            Some(&present_map()),
+            Some(&risk_for_path("LITERAL_E2E.md")),
+            Some(SupervisorRuntime::Codex),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(forged.disposition, PreclaimDisposition::Park);
+        assert_eq!(
+            forged.dimensions.clear_verification_path,
+            ViabilityFinding::Unknown
+        );
+
+        let ambiguous_pair = explicit_new_file_assignments(
+            "FIRST.md",
+            "Create a new file named FIRST.md and SECOND.md.",
+        );
+        let ambiguous = evaluate_preclaim_viability(
+            &ambiguous_pair[1],
+            &ambiguous_pair,
+            Some(&present_map()),
+            Some(&risk_for_path("FIRST.md")),
+            Some(SupervisorRuntime::Codex),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(ambiguous.disposition, PreclaimDisposition::Park);
+        assert_eq!(
+            ambiguous.dimensions.clear_verification_path,
+            ViabilityFinding::Unknown
+        );
+
+        let unsafe_pair = explicit_new_file_assignments("../ESCAPE.md", literal_task);
+        let unsafe_decision = evaluate_preclaim_viability(
+            &unsafe_pair[1],
+            &unsafe_pair,
+            Some(&present_map()),
+            Some(&risk_for_path("../ESCAPE.md")),
+            Some(SupervisorRuntime::Codex),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(unsafe_decision.disposition, PreclaimDisposition::Park);
+        assert_eq!(
+            unsafe_decision.dimensions.clear_verification_path,
+            ViabilityFinding::Unknown
+        );
+
+        let existing_pair = explicit_new_file_assignments(
+            "README.md",
+            "Create a new file named README.md containing replacement text.",
+        );
+        let existing = evaluate_preclaim_viability(
+            &existing_pair[1],
+            &existing_pair,
+            Some(&present_map()),
+            Some(&risk_for_path("README.md")),
+            Some(SupervisorRuntime::Codex),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(existing.disposition, PreclaimDisposition::Park);
+        assert_eq!(
+            existing.dimensions.clear_verification_path,
+            ViabilityFinding::Unknown
+        );
+
+        let bound_pair = explicit_new_file_assignments("LITERAL_E2E.md", literal_task);
+        let mut changed_current = bound_pair[1].clone();
+        changed_current.task = Some("unbound caller task text".to_string());
+        let changed = evaluate_preclaim_viability(
+            &changed_current,
+            &bound_pair,
+            Some(&present_map()),
+            Some(&risk_for_path("LITERAL_E2E.md")),
+            Some(SupervisorRuntime::Codex),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(changed.disposition, PreclaimDisposition::Park);
+        assert_eq!(
+            changed.dimensions.clear_verification_path,
+            ViabilityFinding::Unknown
+        );
+
+        let mut nested_pair = explicit_new_file_assignments("LITERAL_E2E.md", literal_task);
+        nested_pair[1].worker_assignments.push(WorkerAssignment {
+            id: "forbidden-nested-worker".to_string(),
+            role: AgentRole::Worker,
+            role_category: Some(RoleCategory::NonDelegatingTerminalWorker),
+            selection_source: None,
+            assigned_paths: vec![PathBuf::from("LITERAL_E2E.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: Some(literal_task.to_string()),
+            environment_requirements: Vec::new(),
+            report_path: None,
+        });
+        let nested = evaluate_preclaim_viability(
+            &nested_pair[1],
+            &nested_pair,
+            Some(&present_map()),
+            Some(&risk_for_path("LITERAL_E2E.md")),
+            Some(SupervisorRuntime::Codex),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(nested.disposition, PreclaimDisposition::Park);
+        assert_eq!(
+            nested.dimensions.clear_verification_path,
+            ViabilityFinding::Unknown
+        );
+
+        let mut wrong_role_pair = explicit_new_file_assignments("LITERAL_E2E.md", literal_task);
+        wrong_role_pair[1].role = AgentRole::ChildOrchestrator;
+        wrong_role_pair[1].role_category = Some(RoleCategory::DelegatingCoordinator);
+        let wrong_role = evaluate_preclaim_viability(
+            &wrong_role_pair[1],
+            &wrong_role_pair,
+            Some(&present_map()),
+            Some(&risk_for_path("LITERAL_E2E.md")),
+            Some(SupervisorRuntime::Codex),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(wrong_role.disposition, PreclaimDisposition::Park);
+        assert_eq!(
+            wrong_role.dimensions.clear_verification_path,
+            ViabilityFinding::Unknown
+        );
     }
 
     #[test]

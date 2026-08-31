@@ -190,7 +190,7 @@ impl DispatchBudgetReservation<'_> {
         let settlement = if external_dispatch_may_have_started(run, launch_runtime) {
             let (measurement, reliability) = match usage {
                 Some(usage)
-                    if external_process_completed(run)
+                    if external_process_completed(run, launch_runtime)
                         && external_safety_verified(run, launch_runtime)
                         && !run.stdout.truncated =>
                 {

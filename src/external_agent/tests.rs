@@ -1173,8 +1173,10 @@ fn create_linked_git_metadata_fixture(root: &Path) -> Result<(PathBuf, PathBuf, 
     let peer = root.join("peer");
     let repository = git2::Repository::init(&primary)?;
     fs::write(primary.join("RELEASE_NOTES.md"), "initial\n")?;
+    fs::write(primary.join("DELETE.md"), "delete this candidate\n")?;
     let mut index = repository.index()?;
     index.add_path(Path::new("RELEASE_NOTES.md"))?;
+    index.add_path(Path::new("DELETE.md"))?;
     let tree_id = index.write_tree()?;
     index.write()?;
     let tree = repository.find_tree(tree_id)?;
@@ -1273,6 +1275,49 @@ fn create_private_root_commit(
         format!("{oid}\n"),
     )?;
     Ok(oid)
+}
+
+#[cfg(unix)]
+fn expected_managed_candidate_tree(
+    git: &ManagedWorktreeGitMetadata,
+    base: Oid,
+    entries: &[(&str, Option<&[u8]>, u32)],
+) -> Result<Oid> {
+    let repository = git2::Repository::open_bare(&git.private_git_dir)?;
+    repository.odb()?.add_disk_alternate(
+        git.shared_object_dir
+            .to_str()
+            .context("UTF-8 shared objects")?,
+    )?;
+    let base_tree = repository.find_commit(base)?.tree()?;
+    let mut index = git2::Index::new()?;
+    index.read_tree(&base_tree)?;
+    for (path, contents, mode) in entries {
+        match contents {
+            Some(contents) => {
+                let path_bytes = path.as_bytes().to_vec();
+                let blob = repository.blob(contents)?;
+                index.add(&git2::IndexEntry {
+                    ctime: git2::IndexTime::new(0, 0),
+                    mtime: git2::IndexTime::new(0, 0),
+                    dev: 0,
+                    ino: 0,
+                    mode: *mode,
+                    uid: 0,
+                    gid: 0,
+                    file_size: u32::try_from(contents.len()).unwrap_or(u32::MAX),
+                    id: blob,
+                    flags: u16::try_from(path_bytes.len().min(0x0fff)).unwrap_or(0x0fff),
+                    flags_extended: 0,
+                    path: path_bytes,
+                })?;
+            }
+            None => index.remove_path(Path::new(path))?,
+        }
+    }
+    index
+        .write_tree_to(&repository)
+        .map_err(anyhow::Error::from)
 }
 
 #[cfg(unix)]
@@ -1514,6 +1559,314 @@ fn managed_git_metadata_is_private_gitdir_write_and_shared_components_read_in_bo
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn selected_writable_grok_prepares_private_git_and_retains_it_through_collection() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (primary, child, _common, child_git_dir) = create_linked_git_metadata_fixture(temp.path())?;
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    let command = selected_writable_grok_command(
+        child.join("grok"),
+        &child,
+        child.join("prompt.md"),
+        &incoming,
+    )?
+    .with_agent_lifecycle(&primary, "worker", "run-grok", "grok-worker")
+    .with_worktree_writable_confinement(writable_grok_confinement(SideEffectConfinement::Verified));
+
+    let controls = protected_worktree_controls(&command)?;
+    let git = controls
+        .managed_git
+        .as_ref()
+        .context("verified writable Grok launch did not prepare managed Git")?;
+    assert_eq!(
+        git.private_git_dir,
+        child_git_dir.join(MANAGED_CHILD_PRIVATE_GIT_DIR)
+    );
+    let managed_environment = managed_git_environment(git)?;
+    assert_eq!(
+        managed_environment.get("GIT_DIR").map(String::as_str),
+        git.private_git_dir.to_str()
+    );
+    let profile = external_side_effect_profile(
+        &command,
+        &child.join("grok"),
+        ExternalProgramTrust::ExplicitCustom,
+        &controls,
+    )?;
+    let SideEffectConfinementProfile::ExternalGrok(profile) = profile else {
+        bail!("expected ExternalGrok profile");
+    };
+    assert!(profile
+        .visible_read_write_roots()
+        .contains(&git.private_git_dir));
+    assert!(profile
+        .visible_read_only_roots()
+        .contains(&git.worktree_git_dir));
+
+    let linked = crate::git_repository::open(&child)?;
+    let base = linked.head()?.target().context("linked base")?;
+    fs::write(
+        child.join("RELEASE_NOTES.md"),
+        "initial\nGrok managed change\n",
+    )?;
+    let private_head = create_private_root_commit(
+        git,
+        base,
+        &[base],
+        "RELEASE_NOTES.md",
+        b"initial\nGrok managed change\n",
+        "Grok managed change",
+    )?;
+    verify_managed_git_boundary_after_launch(git)?;
+
+    let imported = collect_and_import_managed_child_git_commit(
+        &primary,
+        &child,
+        base,
+        &[PathBuf::from("RELEASE_NOTES.md")],
+    )?;
+    assert_eq!(imported.head_oid, private_head);
+    assert_eq!(
+        imported.final_changed_paths,
+        vec![PathBuf::from("RELEASE_NOTES.md")]
+    );
+    assert!(crate::git_repository::open(&primary)?
+        .find_commit(private_head)
+        .is_ok());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn grok_style_uncommitted_candidate_materializes_exact_tree_and_imports() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    skip_without_containment!(ok);
+    let temp = tempfile::tempdir()?;
+    let (primary, child, common, _child_git_dir) = create_linked_git_metadata_fixture(temp.path())?;
+    let linked = crate::git_repository::open(&child)?;
+    let mut config = linked.config()?;
+    config.set_str("user.name", "Fixture Owner")?;
+    config.set_str("user.email", "fixture@example.invalid")?;
+    drop(config);
+    fs::remove_file(child.join("fixture-codex"))?;
+    let git = managed_worktree_git_metadata(&child)?.context("managed Git metadata")?;
+    let base = linked.head()?.target().context("linked base")?;
+    let shared_refs_before = snapshot_managed_git_tree(&common.join("refs"))?;
+
+    fs::write(
+        child.join("RELEASE_NOTES.md"),
+        "initial\nGrok-style uncommitted edit\n",
+    )?;
+    fs::remove_file(child.join("DELETE.md"))?;
+    fs::create_dir(child.join("nested"))?;
+    fs::write(child.join("nested/addition.txt"), "nested candidate\n")?;
+    fs::write(child.join("run-candidate"), "#!/bin/sh\nexit 0\n")?;
+    fs::set_permissions(
+        child.join("run-candidate"),
+        fs::Permissions::from_mode(0o755),
+    )?;
+    let candidate_paths = vec![
+        PathBuf::from("DELETE.md"),
+        PathBuf::from("RELEASE_NOTES.md"),
+        PathBuf::from("nested/addition.txt"),
+        PathBuf::from("run-candidate"),
+    ];
+    let candidate_tree = expected_managed_candidate_tree(
+        &git,
+        base,
+        &[
+            ("DELETE.md", None, 0o100644),
+            (
+                "RELEASE_NOTES.md",
+                Some(b"initial\nGrok-style uncommitted edit\n"),
+                0o100644,
+            ),
+            ("nested/addition.txt", Some(b"nested candidate\n"), 0o100644),
+            ("run-candidate", Some(b"#!/bin/sh\nexit 0\n"), 0o100755),
+        ],
+    )?;
+
+    let materialized = materialize_managed_child_git_commit(
+        &primary,
+        &child,
+        base,
+        &candidate_paths,
+        &candidate_paths,
+        candidate_tree,
+    )?
+    .context("uncommitted candidate did not materialize")?;
+    let imported =
+        collect_and_import_managed_child_git_commit(&primary, &child, base, &candidate_paths)?;
+
+    assert_eq!(imported.head_oid, materialized);
+    assert_eq!(imported.head_tree_oid, candidate_tree);
+    assert_eq!(imported.final_changed_paths, candidate_paths);
+    let primary_repository = crate::git_repository::open(&primary)?;
+    let commit = primary_repository.find_commit(materialized)?;
+    assert_eq!(commit.parent_id(0)?, base);
+    assert_eq!(commit.author().name()?, "Fixture Owner");
+    assert_eq!(commit.author().email()?, "fixture@example.invalid");
+    assert_eq!(commit.committer().name()?, "Fixture Owner");
+    assert_eq!(commit.committer().email()?, "fixture@example.invalid");
+    assert_eq!(linked.head()?.target(), Some(base));
+    assert_eq!(
+        snapshot_managed_git_tree(&common.join("refs"))?,
+        shared_refs_before
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_child_materialization_refuses_unclaimed_and_symlink_candidates_before_ref_advance(
+) -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    for symlink_candidate in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let (primary, child, _common, _child_git_dir) =
+            create_linked_git_metadata_fixture(temp.path())?;
+        let linked = crate::git_repository::open(&child)?;
+        let git = managed_worktree_git_metadata(&child)?.context("managed Git metadata")?;
+        let base = linked.head()?.target().context("linked base")?;
+        let candidate_path = if symlink_candidate {
+            symlink("RELEASE_NOTES.md", child.join("linked-candidate"))?;
+            PathBuf::from("linked-candidate")
+        } else {
+            fs::write(child.join("UNCLAIMED.md"), "unclaimed candidate\n")?;
+            PathBuf::from("UNCLAIMED.md")
+        };
+        let candidate_tree = expected_managed_candidate_tree(
+            &git,
+            base,
+            &[if symlink_candidate {
+                (
+                    "linked-candidate",
+                    Some(b"RELEASE_NOTES.md".as_slice()),
+                    0o120000,
+                )
+            } else {
+                (
+                    "UNCLAIMED.md",
+                    Some(b"unclaimed candidate\n".as_slice()),
+                    0o100644,
+                )
+            }],
+        )?;
+        let claims = if symlink_candidate {
+            vec![candidate_path.clone()]
+        } else {
+            vec![PathBuf::from("RELEASE_NOTES.md")]
+        };
+
+        let error = materialize_managed_child_git_commit(
+            &primary,
+            &child,
+            base,
+            &claims,
+            std::slice::from_ref(&candidate_path),
+            candidate_tree,
+        )
+        .expect_err("unsafe candidate must fail before private ref advance");
+        let message = format!("{error:#}");
+        if symlink_candidate {
+            assert!(message.contains("contains a symlink"), "{message}");
+        } else {
+            assert!(message.contains("unclaimed path"), "{message}");
+        }
+        assert_eq!(
+            read_managed_child_private_ref_oid(&git.private_git_dir)?,
+            base
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn read_only_codex_planning_prepares_private_git_boundary() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (_primary, child, _common, child_git_dir) =
+        create_linked_git_metadata_fixture(temp.path())?;
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    let command = crate::supervise::configure_assignment_phase_command_for_test(
+        managed_git_command(&child, &incoming),
+        crate::supervise::AssignmentPhase::Planning,
+        &[PathBuf::from("RELEASE_NOTES.md")],
+    )?;
+
+    assert_eq!(command.invocation, ExternalAgentInvocation::CodexSupervisor);
+    assert_eq!(command.workspace_access, WorkspaceAccess::ReadOnly);
+    assert_eq!(
+        command.writable_launch_target,
+        WritableLaunchTarget::ManagedChildWorktree
+    );
+    assert!(command.agent_lifecycle.is_some());
+
+    let controls = protected_worktree_controls(&command)?;
+    let git = controls
+        .managed_git
+        .as_ref()
+        .context("read-only Codex planning did not prepare managed Git")?;
+    assert_eq!(
+        git.private_git_dir,
+        child_git_dir.join(MANAGED_CHILD_PRIVATE_GIT_DIR)
+    );
+    assert!(git.private_git_dir.is_dir());
+    verify_managed_git_boundary_after_launch(git)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_git_authority_requires_supported_adapter_managed_child_and_lifecycle() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (primary, child, _common, child_git_dir) = create_linked_git_metadata_fixture(temp.path())?;
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    let base = ExternalAgentCommand::codex(
+        child.join("agent"),
+        &child,
+        child.join("prompt.md"),
+        child.join("events.jsonl"),
+        incoming.join("report.json"),
+        Duration::from_secs(1),
+    )
+    .with_agent_lifecycle(&primary, "worker", "run-negative", "worker-negative");
+
+    let unsupported = base.clone().with_runtime_adapter(
+        RuntimeId::Cursor,
+        RuntimeAdapterConfig::defaults(RuntimeId::Cursor),
+    );
+    assert!(protected_worktree_controls(&unsupported)?
+        .managed_git
+        .is_none());
+
+    let primary_target = base
+        .clone()
+        .with_writable_launch_target(WritableLaunchTarget::PrimaryWorktree);
+    assert!(protected_worktree_controls(&primary_target)?
+        .managed_git
+        .is_none());
+
+    let missing_lifecycle = selected_writable_grok_command(
+        child.join("grok"),
+        &child,
+        child.join("prompt.md"),
+        &incoming,
+    )?
+    .with_worktree_writable_confinement(writable_grok_confinement(SideEffectConfinement::Verified));
+    assert!(protected_worktree_controls(&missing_lifecycle)?
+        .managed_git
+        .is_none());
+    assert!(!child_git_dir.join(MANAGED_CHILD_PRIVATE_GIT_DIR).exists());
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn planning_and_execution_profiles_reach_actual_inner_argv_and_outer_systemd_properties(
@@ -1589,10 +1942,51 @@ fn planning_and_execution_profiles_reach_actual_inner_argv_and_outer_systemd_pro
             .iter()
             .find(|argument| argument.starts_with("permissions.maco_external_codex.filesystem="))
             .context("actual Codex argv filesystem profile")?;
+        let (workspace_permission, forbidden_workspace_permission) = match access {
+            WorkspaceAccess::ReadOnly => (
+                "\":workspace_roots\"={\".\"=\"read\"}",
+                "\":workspace_roots\"={\".\"=\"write\"}",
+            ),
+            WorkspaceAccess::ReadWrite => (
+                "\":workspace_roots\"={\".\"=\"write\"}",
+                "\":workspace_roots\"={\".\"=\"read\"}",
+            ),
+        };
+        assert!(filesystem.contains(workspace_permission));
+        assert!(!filesystem.contains(forbidden_workspace_permission));
         assert_eq!(
-            filesystem.contains("\":workspace_roots\"={\".\"=\"write\"}"),
-            access == WorkspaceAccess::ReadWrite
+            filesystem.matches("\":workspace_roots\"").count(),
+            1,
+            "workspace root permission must be projected exactly once: {filesystem}"
         );
+        for control in controls
+            .read_only_roots
+            .iter()
+            .chain(&controls.read_only_files)
+        {
+            let path = toml_basic_string(
+                control
+                    .absolute
+                    .to_str()
+                    .context("UTF-8 protected read-only control")?,
+            );
+            assert!(filesystem.contains(&format!("{path}=\"read\"")));
+            assert!(!filesystem.contains(&format!("{path}=\"write\"")));
+        }
+        for control in controls
+            .read_write_roots
+            .iter()
+            .chain(&controls.read_write_files)
+        {
+            let path = toml_basic_string(
+                control
+                    .absolute
+                    .to_str()
+                    .context("UTF-8 protected read-write control")?,
+            );
+            assert!(filesystem.contains(&format!("{path}=\"write\"")));
+            assert!(!filesystem.contains(&format!("{path}=\"read\"")));
+        }
         let child_git_read = format!(
             "{}=\"read\"",
             toml_basic_string(child_git_dir.to_str().context("UTF-8 child gitdir")?)
@@ -2797,10 +3191,19 @@ fn target_process_classification_types_only_environment_capability_failures() {
         target_process_started: false,
     };
 
-    assert_eq!(target_process_environment_failure(&setup_timeout), None);
-    assert_eq!(target_process_environment_failure(&cancellation), None);
     assert_eq!(
-        target_process_environment_failure(&containment),
+        target_process_environment_failure(
+            &setup_timeout,
+            ExternalAgentInvocation::CodexSupervisor,
+        ),
+        None
+    );
+    assert_eq!(
+        target_process_environment_failure(&cancellation, ExternalAgentInvocation::CodexSupervisor,),
+        None
+    );
+    assert_eq!(
+        target_process_environment_failure(&containment, ExternalAgentInvocation::CodexSupervisor,),
         Some((
             EnvironmentFailureCategory::SandboxUnavailable,
             Some(EnvironmentRequirement::sandbox(
@@ -2809,7 +3212,7 @@ fn target_process_classification_types_only_environment_capability_failures() {
         ))
     );
     assert_eq!(
-        target_process_environment_failure(&environment),
+        target_process_environment_failure(&environment, ExternalAgentInvocation::CodexSupervisor,),
         Some((
             EnvironmentFailureCategory::SandboxUnavailable,
             Some(EnvironmentRequirement::sandbox(
@@ -2838,6 +3241,14 @@ fn environment_preflight_wire_is_presence_only_and_backward_compatible() -> Resu
         r#"{"kind":"configuration","configuration":"codex_auth_file"}"#
     );
     assert!(!config_wire.contains(secret));
+    assert_eq!(
+        serde_json::to_string(&grok_auth_environment_requirement())?,
+        r#"{"kind":"configuration","configuration":"grok_auth_file"}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&external_sandbox_requirement(ExternalAgentInvocation::Grok))?,
+        r#"{"kind":"sandbox","capability":"verified_external_grok"}"#
+    );
 
     let command = ExternalAgentCommand::codex(
         "codex",
@@ -3468,11 +3879,12 @@ fn environment_preflight_uses_the_target_runtime_context() {
         ),
         environment.clone(),
         profile.clone(),
+        ExternalAgentInvocation::CodexSupervisor,
         None,
         Some(&lifecycle),
     );
 
-    let mut expected_environment = environment;
+    let mut expected_environment = environment.clone();
     expected_environment.insert(MACO_RUN_ID_ENV.to_string(), "run-31".to_string());
     expected_environment.insert(MACO_TASK_ID_ENV.to_string(), "task-31".to_string());
     assert_eq!(
@@ -3483,6 +3895,23 @@ fn environment_preflight_uses_the_target_runtime_context() {
     assert_eq!(prepared.side_effects, profile);
     assert!(prepared.private_runtime_home);
     assert!(prepared.private_runtime_codex_home);
+
+    let grok = with_external_runtime_context(
+        ProcessSpec::direct(
+            "grok target",
+            "/run/current-system/sw/bin/grok",
+            std::iter::empty::<&str>(),
+            "/workspace",
+            128,
+        ),
+        environment,
+        SideEffectConfinementProfile::ExternalGrok(ExternalGrokProfile::read_only("/workspace")),
+        ExternalAgentInvocation::Grok,
+        None,
+        None,
+    );
+    assert!(grok.private_runtime_home);
+    assert!(!grok.private_runtime_codex_home);
 }
 
 #[test]
@@ -3649,16 +4078,124 @@ fn absent_model_selection_preserves_the_exact_hardened_codex_argv() {
             "computer_use",
             "--disable",
             "image_generation",
+            "--disable",
+            "multi_agent",
             "--enable",
             "goals",
-            "--enable",
-            "multi_agent",
             "--json",
             "--output-last-message",
             "/run/report.json",
             "-",
         ];
     assert_eq!(actual, expected);
+    assert!(actual
+        .windows(2)
+        .any(|arguments| arguments == ["--disable", "multi_agent"]));
+    assert!(!actual
+        .windows(2)
+        .any(|arguments| arguments == ["--enable", "multi_agent"]));
+    assert!(!actual
+        .iter()
+        .any(|argument| argument.starts_with("service_tier=")));
+}
+
+#[test]
+fn priority_service_tier_is_an_exact_opt_in_argv_delta() {
+    let mut command = ExternalAgentCommand::codex(
+        "codex",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(1),
+    )
+    .with_model_selection(Some("gpt-5.6-sol".to_string()), Some("xhigh".to_string()));
+    command.output_schema = Some(PathBuf::from("/run/orchestrator-review-report.schema.json"));
+    let controls =
+        protected_worktree_controls(&command).unwrap_or_else(|_| ProtectedWorktreeControls {
+            writable_artifact_root: Some(PathBuf::from("/run")),
+            ..ProtectedWorktreeControls::default()
+        });
+
+    let default = command_argv_with_controls_and_service_tier_input(&command, &controls, None)
+        .expect("default service tier argv");
+    let mut priority = command_argv_with_controls_and_service_tier_input(
+        &command,
+        &controls,
+        Some(OsStr::new("priority")),
+    )
+    .expect("priority service tier argv");
+
+    let service_tier_index = priority
+        .windows(2)
+        .position(|arguments| {
+            arguments
+                == [
+                    OsString::from("-c"),
+                    OsString::from("service_tier=\"priority\""),
+                ]
+        })
+        .expect("exact priority service tier config");
+    priority.drain(service_tier_index..service_tier_index + 2);
+    assert_eq!(priority, default, "priority must be the only argv delta");
+    assert!(default.windows(2).any(|arguments| {
+        arguments
+            == [
+                OsString::from("-c"),
+                OsString::from("model_reasoning_effort=\"xhigh\""),
+            ]
+    }));
+    assert!(default
+        .windows(2)
+        .any(|arguments| arguments == ["--disable", "multi_agent"]));
+    assert!(default.windows(2).any(|arguments| {
+        arguments
+            == [
+                OsString::from("--output-schema"),
+                OsString::from("/run/orchestrator-review-report.schema.json"),
+            ]
+    }));
+}
+
+#[test]
+fn malformed_service_tier_input_fails_closed_without_reflection() {
+    let command = ExternalAgentCommand::codex(
+        "codex",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(1),
+    );
+    let controls =
+        protected_worktree_controls(&command).unwrap_or_else(|_| ProtectedWorktreeControls {
+            writable_artifact_root: Some(PathBuf::from("/run")),
+            ..ProtectedWorktreeControls::default()
+        });
+
+    for malformed in [
+        "",
+        "default",
+        "flex",
+        "Priority",
+        "priority ",
+        "priority\nweb_search=\"live\"",
+    ] {
+        let error = command_argv_with_controls_and_service_tier_input(
+            &command,
+            &controls,
+            Some(OsStr::new(malformed)),
+        )
+        .expect_err("malformed service tier must fail closed")
+        .to_string();
+        assert_eq!(
+            error,
+            "MACO_CODEX_SERVICE_TIER must be unset or exactly 'priority'"
+        );
+        if !malformed.is_empty() {
+            assert!(!error.contains(malformed));
+        }
+    }
 }
 
 #[test]
@@ -3746,14 +4283,26 @@ fn grok_runtime_adapter_argv_immutably_disables_subagents() {
             "/run/prompt.md",
             "--model",
             "grok-4.6",
-            "--effort",
+            "--reasoning-effort",
             "xhigh",
             "--cwd",
             "/workspace",
             "--output-format",
-            "plain",
+            "streaming-json",
+            "--sandbox",
+            "strict",
+            "--always-approve",
+            "--disable-web-search",
+            "--no-memory",
             "--no-subagents",
         ]
+    );
+    assert_eq!(
+        grok_argv
+            .iter()
+            .filter(|argument| argument.as_str() == "--always-approve")
+            .count(),
+        1
     );
     assert_eq!(
         grok_argv
@@ -3779,6 +4328,712 @@ fn grok_runtime_adapter_argv_immutably_disables_subagents() {
     assert!(!cursor_argv
         .iter()
         .any(|argument| argument == "--no-subagents"));
+}
+
+#[test]
+fn grok_runtime_adapter_argv_binds_schema_json_without_weakening_operators() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = temp.path().join("worker-report.schema.json");
+    fs::write(
+        &schema,
+        "{\n  \"type\": \"object\", \"required\": [\"accepted\"]\n}\n",
+    )?;
+    let mut grok = ExternalAgentCommand::codex(
+        "grok",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(1),
+    )
+    .with_runtime_adapter(
+        RuntimeId::Grok,
+        RuntimeAdapterConfig::defaults(RuntimeId::Grok),
+    )
+    .with_model_selection(Some("grok-4.6".to_string()), Some("xhigh".to_string()));
+    grok.output_schema = Some(schema);
+    let argv = runtime_adapter_argv(&grok)?
+        .into_iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        argv,
+        [
+            "--prompt-file",
+            "/run/prompt.md",
+            "--model",
+            "grok-4.6",
+            "--reasoning-effort",
+            "xhigh",
+            "--cwd",
+            "/workspace",
+            "--json-schema",
+            r#"{"required":["accepted"],"type":"object"}"#,
+            "--output-format",
+            "streaming-json",
+            "--sandbox",
+            "strict",
+            "--always-approve",
+            "--disable-web-search",
+            "--no-memory",
+            "--no-subagents",
+        ]
+    );
+    for fixed in [
+        "--output-format",
+        "streaming-json",
+        "--sandbox",
+        "strict",
+        "--always-approve",
+        "--disable-web-search",
+        "--no-memory",
+        "--no-subagents",
+    ] {
+        assert_eq!(argv.iter().filter(|argument| *argument == fixed).count(), 1);
+    }
+    Ok(())
+}
+
+fn selected_writable_grok_command(
+    program: impl Into<PathBuf>,
+    workspace: impl Into<PathBuf>,
+    prompt: impl Into<PathBuf>,
+    incoming: impl Into<PathBuf>,
+) -> Result<ExternalAgentCommand> {
+    let workspace = workspace.into();
+    let incoming = incoming.into();
+    ExternalAgentCommand::codex(
+        program,
+        &workspace,
+        prompt,
+        incoming.join("events.jsonl"),
+        incoming.join("report.json"),
+        Duration::from_secs(7),
+    )
+    .with_runtime_adapter(
+        RuntimeId::Grok,
+        RuntimeAdapterConfig::defaults(RuntimeId::Grok),
+    )
+    .with_model_selection(Some("grok-4.6".to_string()), Some("xhigh".to_string()))
+    .with_workspace_access(WorkspaceAccess::ReadWrite)
+    .with_writable_launch_target(WritableLaunchTarget::ManagedChildWorktree)
+    .with_writable_runtime_selection("grok-worker", RuntimeId::Grok, true)
+}
+
+fn writable_grok_confinement(
+    side_effect_confinement: SideEffectConfinement,
+) -> WorktreeWritableAdmission {
+    WorktreeWritableAdmission {
+        version: WORKTREE_WRITABLE_ADMISSION_SCHEMA_VERSION,
+        assignment_id: "grok-worker".to_string(),
+        attempt: 1,
+        target: WritableLaunchTarget::ManagedChildWorktree,
+        worktree: ManagedWorktreeAdmission {
+            kind: ManagedWorktreeAdmissionKind::ManagedDisposable,
+            worktree_id: "grok-worker".to_string(),
+        },
+        claims: HeldPathClaimsAdmission {
+            state: HeldPathClaimsAdmissionState::Held,
+            token: 9,
+            paths: vec![PathBuf::from("bounded-result.txt")],
+        },
+        native_sandbox: NativeSandboxAdmission {
+            runtime: RuntimeId::Grok,
+            workspace_access: WorkspaceAccess::ReadWrite,
+            side_effect_confinement,
+        },
+    }
+}
+
+#[test]
+fn writable_grok_external_boundary_names_every_selection_and_confinement_refusal() -> Result<()> {
+    let generic = ExternalAgentCommand::codex(
+        "grok",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(1),
+    )
+    .with_runtime_adapter(
+        RuntimeId::Grok,
+        RuntimeAdapterConfig::defaults(RuntimeId::Grok),
+    )
+    .with_model_selection(Some("grok".to_string()), Some("xhigh".to_string()));
+    let generic_report = run_external_agent(&generic);
+    assert!(!generic_report.stdout.target_launch_attempted);
+    assert!(generic_report
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains(WRITABLE_GROK_EXACT_MODEL_REQUIRED)));
+
+    let non_xhigh = generic
+        .clone()
+        .with_model_selection(Some("grok-4.6".to_string()), Some("high".to_string()));
+    let effort_report = run_external_agent(&non_xhigh);
+    assert!(!effort_report.stdout.target_launch_attempted);
+    assert!(effort_report
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains(WRITABLE_GROK_XHIGH_EFFORT_REQUIRED)));
+
+    let exact_without_selection = non_xhigh
+        .clone()
+        .with_model_selection(Some("grok-4.6".to_string()), Some("xhigh".to_string()));
+    let missing_selection = run_external_agent(&exact_without_selection);
+    assert!(!missing_selection.stdout.target_launch_attempted);
+    assert!(missing_selection
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains(WRITABLE_GROK_SELECTION_EVIDENCE_MISSING)));
+
+    let selected = selected_writable_grok_command("grok", "/workspace", "/run/prompt.md", "/run")?;
+    let missing_confinement = run_external_agent(&selected);
+    assert!(!missing_confinement.stdout.target_launch_attempted);
+    assert!(missing_confinement
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains(WRITABLE_GROK_CONFINEMENT_PROOF_MISSING)));
+
+    let mut stale = selected
+        .clone()
+        .with_worktree_writable_confinement(writable_grok_confinement(
+            SideEffectConfinement::Verified,
+        ));
+    stale
+        .runtime_adapter
+        .as_mut()
+        .expect("selected Grok adapter")
+        .output_capture = crate::runtime_adapter::OutputCaptureMode::StdoutAndStderr;
+    let stale_report = run_external_agent(&stale);
+    assert!(!stale_report.stdout.target_launch_attempted);
+    assert!(stale_report
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains(WRITABLE_GROK_SELECTION_EVIDENCE_STALE)));
+
+    let confinement_stale = selected
+        .clone()
+        .with_worktree_writable_confinement(writable_grok_confinement(
+            SideEffectConfinement::Verified,
+        ))
+        .with_worktree_control_exception("late-write.txt");
+    let confinement_stale_report = run_external_agent(&confinement_stale);
+    assert!(!confinement_stale_report.stdout.target_launch_attempted);
+    assert!(confinement_stale_report
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains(WRITABLE_GROK_CONFINEMENT_PROOF_STALE)));
+
+    let unverified =
+        selected
+            .clone()
+            .with_worktree_writable_confinement(writable_grok_confinement(
+                SideEffectConfinement::Unverified,
+            ));
+    let unverified_report = run_external_agent(&unverified);
+    assert!(!unverified_report.stdout.target_launch_attempted);
+    assert!(unverified_report
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains(WRITABLE_GROK_CONFINEMENT_UNVERIFIED)));
+
+    let primary = selected
+        .with_worktree_writable_confinement(writable_grok_confinement(
+            SideEffectConfinement::Verified,
+        ))
+        .with_writable_launch_target(WritableLaunchTarget::PrimaryWorktree);
+    let primary_report = run_external_agent(&primary);
+    assert!(!primary_report.stdout.target_launch_attempted);
+    assert!(primary_report.error.as_deref().is_some_and(|error| {
+        error.contains("writable grok failed closed before launch")
+            && error.contains("blocking_pre_action_callback != All")
+    }));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn writable_grok_selected_request_has_only_the_bounded_worktree_effect_and_result() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("grok-worker");
+    let incoming = temp.path().join("incoming");
+    let bin = temp.path().join("bin");
+    fs::create_dir(&workspace)?;
+    create_mandatory_control_roots(&workspace)?;
+    fs::create_dir(&incoming)?;
+    fs::create_dir(&bin)?;
+    let prompt = temp.path().join("prompt.md");
+    fs::write(&prompt, "make the bounded result\n")?;
+    let program = bin.join("grok-fixture");
+    fs::write(
+        &program,
+        r#"#!/bin/sh
+printf '%s\n' "$@" > selected-request.txt
+printf 'bounded worktree effect\n' > bounded-result.txt
+printf '%s\n' '{"type":"text","data":"bounded result"}'
+printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-session","requestId":"fixture-request"}'
+"#,
+    )?;
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755))?;
+    let outside = temp.path().join("outside-untouched.txt");
+    fs::write(&outside, "outside\n")?;
+
+    let command = selected_writable_grok_command(&program, &workspace, &prompt, &incoming)?
+        .with_worktree_writable_confinement(writable_grok_confinement(
+            SideEffectConfinement::Verified,
+        ));
+    let capabilities = command.verified_writable_capabilities(RuntimeId::Grok)?;
+    assert!(capabilities.admits_worktree_writable());
+    assert!(
+        !capabilities.admits_writable_release(),
+        "the typed Grok leaf proof must not grant publication authority"
+    );
+
+    let expected_request = runtime_adapter_argv(&command)?
+        .into_iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let controls = protected_worktree_controls(&command)?;
+    let profile = external_side_effect_profile(
+        &command,
+        &program,
+        ExternalProgramTrust::ExplicitCustom,
+        &controls,
+    )?;
+    let SideEffectConfinementProfile::ExternalGrok(profile) = profile else {
+        bail!("expected MACO ExternalGrok confinement profile");
+    };
+    assert_eq!(profile.workspace_access(), WorkspaceAccess::ReadWrite);
+    let canonical_incoming = fs::canonicalize(&incoming)?;
+    assert!(
+        profile.writable_artifact_roots().is_empty(),
+        "Grok stdout is parent-published, so the child must not receive a publication root"
+    );
+    assert!(!profile
+        .visible_read_write_roots()
+        .contains(&canonical_incoming));
+
+    let config = command.runtime_adapter.as_ref().context("Grok adapter")?;
+    let run = config.execute(&LaunchContext {
+        prompt: &command.prompt,
+        model: command.model.as_deref(),
+        effort: command.reasoning_effort.as_deref(),
+        cwd: &command.cwd,
+        output: &command.output_last_message,
+    })?;
+    assert_eq!(run.status, Some(0));
+    let parsed = command
+        .current_grok_writable_contract()?
+        .parse_output(&run.captured)?;
+    assert_eq!(parsed.response_text(), "bounded result");
+    assert_eq!(
+        fs::read_to_string(workspace.join("selected-request.txt"))?,
+        format!("{}\n", expected_request.join("\n"))
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("bounded-result.txt"))?,
+        "bounded worktree effect\n"
+    );
+    assert_eq!(fs::read_to_string(outside)?, "outside\n");
+    Ok(())
+}
+
+#[test]
+fn grok_runtime_boundary_uses_prompt_file_and_validates_terminal_stream_output() -> Result<()> {
+    let grok = ExternalAgentCommand::codex(
+        "grok",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(7),
+    )
+    .with_runtime_adapter(
+        RuntimeId::Grok,
+        RuntimeAdapterConfig::defaults(RuntimeId::Grok),
+    )
+    .with_model_selection(Some("grok-4.6".to_string()), Some("xhigh".to_string()));
+
+    assert!(matches!(
+        external_agent_stdin_mode(&grok, false, b"prompt must stay in its file".to_vec()),
+        StdinMode::Null
+    ));
+    assert!(matches!(
+        external_agent_stdin_mode(&grok, true, Vec::new()),
+        StdinMode::Interactive
+    ));
+
+    let completed = br#"{"type":"thought","data":"private reasoning"}
+{"type":"text","data":"hello "}
+{"type":"text","data":"world"}
+{"type":"end","stopReason":"end_turn","sessionId":"session-1","requestId":"request-1"}
+"#;
+    assert_eq!(
+        runtime_adapter_captured_output(&grok, completed, b"", true)?,
+        RuntimeAdapterCapturedOutput::Captured(b"hello world".to_vec())
+    );
+    assert_eq!(
+        runtime_adapter_captured_output(&grok, completed, b"", false)?,
+        RuntimeAdapterCapturedOutput::Unavailable,
+        "timed-out or nonzero Grok targets must not publish partial final output"
+    );
+
+    let mut structured_grok = grok.clone();
+    structured_grok.output_schema = Some(PathBuf::from("/run/worker-report.schema.json"));
+    let structured = br#"{"type":"text","data":"ordinary progress before the report"}
+{"type":"end","stopReason":"EndTurn","sessionId":"session-1","requestId":"request-1","structuredOutput":{"status":"succeeded","accepted":true}}
+"#;
+    assert_eq!(
+        runtime_adapter_captured_output(&grok, structured, b"", true)?,
+        RuntimeAdapterCapturedOutput::Captured(b"ordinary progress before the report".to_vec()),
+        "Grok commands without a schema must retain their text response behavior"
+    );
+    assert_eq!(
+        runtime_adapter_captured_output(&structured_grok, structured, b"", true)?,
+        RuntimeAdapterCapturedOutput::Captured(
+            br#"{"accepted":true,"status":"succeeded"}"#.to_vec()
+        ),
+        "schema-bound publication must use only terminal structuredOutput"
+    );
+
+    let missing = br#"{"type":"text","data":"{\"accepted\":true}"}
+{"type":"end","stopReason":"EndTurn","sessionId":"session-1","requestId":"request-1"}
+"#;
+    let error = runtime_adapter_captured_output(&structured_grok, missing, b"", true)
+        .expect_err("leading report text must not substitute for structuredOutput")
+        .to_string();
+    assert!(error.contains("missing structuredOutput"), "{error}");
+
+    let sensitive = "credential-fixture-must-not-escape";
+    let structured_error = format!(
+        "{{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"session-1\",\"requestId\":\"request-1\",\"structuredOutputError\":\"{sensitive}\"}}\n"
+    );
+    let error =
+        runtime_adapter_captured_output(&structured_grok, structured_error.as_bytes(), b"", true)
+            .expect_err("structuredOutputError must fail closed")
+            .to_string();
+    assert!(error.contains("terminal structuredOutputError"), "{error}");
+    assert!(!error.contains(sensitive));
+
+    let non_object = br#"{"type":"end","stopReason":"EndTurn","sessionId":"session-1","requestId":"request-1","structuredOutput":["report"]}
+"#;
+    let error = runtime_adapter_captured_output(&structured_grok, non_object, b"", true)
+        .expect_err("non-object structured output must fail closed")
+        .to_string();
+    assert!(error.contains("not a JSON object"), "{error}");
+
+    let terminal_error = format!("{{\"type\":\"error\",\"message\":\"{sensitive}\"}}\n");
+    let error = runtime_adapter_captured_output(&grok, terminal_error.as_bytes(), b"", true)
+        .expect_err("a terminal Grok error event must fail the external run")
+        .to_string();
+    assert!(error.contains("terminal streaming-json error event"));
+    assert!(!error.contains(sensitive));
+    Ok(())
+}
+
+#[test]
+fn grok_prompt_file_is_an_exact_read_only_sandbox_input() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    create_mandatory_control_roots(&workspace)?;
+    let prompt_root = temp.path().join("prompt-root");
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&prompt_root)?;
+    fs::create_dir(&incoming)?;
+    let prompt = prompt_root.join("prompt.md");
+    let schema_root = temp.path().join("schema-root");
+    fs::create_dir(&schema_root)?;
+    let schema = schema_root.join("worker-report.schema.json");
+    fs::write(&prompt, "bounded Grok prompt\n")?;
+    fs::write(&schema, "{\"type\":\"object\"}\n")?;
+    let mut grok = ExternalAgentCommand::codex(
+        workspace.join("grok"),
+        &workspace,
+        &prompt,
+        incoming.join("events.jsonl"),
+        incoming.join("report.txt"),
+        Duration::from_secs(7),
+    )
+    .with_runtime_adapter(
+        RuntimeId::Grok,
+        RuntimeAdapterConfig::defaults(RuntimeId::Grok),
+    )
+    .with_model_selection(Some("grok-4.6".to_string()), Some("xhigh".to_string()));
+    grok.output_schema = Some(schema.clone());
+    let controls = protected_worktree_controls(&grok)?;
+    let profile = external_side_effect_profile(
+        &grok,
+        &workspace.join("grok"),
+        ExternalProgramTrust::ExplicitCustom,
+        &controls,
+    )?;
+    let SideEffectConfinementProfile::ExternalGrok(profile) = profile else {
+        bail!("expected ExternalGrok profile");
+    };
+    assert!(profile.visible_read_only_files().contains(&prompt));
+    assert!(profile.visible_read_only_files().contains(&schema));
+    assert!(!profile.visible_read_only_roots().contains(&prompt_root));
+    assert!(!profile.visible_read_only_roots().contains(&schema_root));
+    assert!(!profile.visible_read_write_files().contains(&schema));
+    assert!(!profile.visible_read_write_roots().contains(&schema_root));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn grok_live_launch_profile_binds_exact_credentials_and_normalized_home() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    create_mandatory_control_roots(&workspace)?;
+    let prompt_root = temp.path().join("prompt-root");
+    let incoming = temp.path().join("incoming");
+    let grok_home = temp.path().join("grok-home");
+    fs::create_dir(&prompt_root)?;
+    fs::create_dir(&incoming)?;
+    fs::create_dir(&grok_home)?;
+    let prompt = prompt_root.join("prompt.md");
+    let auth = grok_home.join("auth.json");
+    let config = grok_home.join("config.toml");
+    fs::write(&prompt, "bounded Grok prompt\n")?;
+    fs::write(&auth, "held authentication fixture\n")?;
+    fs::write(&config, "held configuration fixture\n")?;
+    let command = ExternalAgentCommand::codex(
+        workspace.join("grok"),
+        &workspace,
+        &prompt,
+        incoming.join("events.jsonl"),
+        incoming.join("report.txt"),
+        Duration::from_secs(7),
+    )
+    .with_runtime_adapter(
+        RuntimeId::Grok,
+        RuntimeAdapterConfig::defaults(RuntimeId::Grok),
+    )
+    .with_model_selection(Some("grok-4.6".to_string()), Some("xhigh".to_string()));
+    let controls = protected_worktree_controls(&command)?;
+    let profile = external_side_effect_profile(
+        &command,
+        &workspace.join("grok"),
+        ExternalProgramTrust::ExplicitCustom,
+        &controls,
+    )?;
+    assert_eq!(
+        profile.kind(),
+        SideEffectConfinementProfileKind::ExternalGrok
+    );
+    let SideEffectConfinementProfile::ExternalGrok(profile) = profile else {
+        bail!("expected the live Grok profile");
+    };
+
+    let credentials = AdmittedGrokCredentials::from_environment(None, Some(grok_home.as_os_str()))?;
+    let profile = credentials.bind_to_profile(profile)?;
+    for exact_file in [&prompt, &auth, &config] {
+        assert!(profile.visible_read_only_files().contains(exact_file));
+    }
+    assert!(!profile.visible_read_only_roots().contains(&grok_home));
+    assert!(!profile.visible_read_write_roots().contains(&grok_home));
+    assert!(!profile.visible_read_write_files().contains(&auth));
+    assert!(!profile.visible_read_write_files().contains(&config));
+
+    let mut environment = allowed_env(
+        ExternalAgentInvocation::Grok,
+        ExternalProgramTrust::ExplicitCustom,
+    );
+    insert_admitted_grok_home_environment(&mut environment, &credentials)?;
+    assert_eq!(
+        environment.get("GROK_HOME").map(String::as_str),
+        grok_home.to_str()
+    );
+    assert!(!environment.contains_key("HOME"));
+    assert!(!runtime_environment_passthrough_allowed(
+        ExternalAgentInvocation::Grok,
+        "HOME"
+    ));
+    assert!(!runtime_environment_passthrough_allowed(
+        ExternalAgentInvocation::Grok,
+        "GROK_HOME"
+    ));
+    assert!(runtime_environment_passthrough_allowed(
+        ExternalAgentInvocation::Grok,
+        "LANG"
+    ));
+    assert!(runtime_environment_passthrough_allowed(
+        ExternalAgentInvocation::CodexSupervisor,
+        "HOME"
+    ));
+    let prepared = with_external_runtime_context(
+        ProcessSpec::direct(
+            "grok target",
+            workspace.join("grok"),
+            std::iter::empty::<&str>(),
+            &workspace,
+            128,
+        ),
+        environment.clone(),
+        SideEffectConfinementProfile::ExternalGrok(profile),
+        ExternalAgentInvocation::Grok,
+        None,
+        None,
+    );
+    assert_eq!(
+        prepared.environment,
+        EnvironmentMode::ClearAndSet(environment)
+    );
+    assert_eq!(
+        prepared.side_effects.kind(),
+        SideEffectConfinementProfileKind::ExternalGrok
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn grok_missing_symlinked_and_replaced_auth_fail_typed_without_disclosure() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir()?;
+    let secret = "grok-auth-fixture-secret-must-not-escape";
+    let sensitive_home = temp.path().join(secret);
+    fs::create_dir(&sensitive_home)?;
+    let command = ExternalAgentCommand::codex(
+        "grok",
+        temp.path(),
+        temp.path().join("prompt.md"),
+        temp.path().join("events.jsonl"),
+        temp.path().join("report.json"),
+        Duration::from_secs(1),
+    )
+    .with_runtime_adapter(
+        RuntimeId::Grok,
+        RuntimeAdapterConfig::defaults(RuntimeId::Grok),
+    );
+
+    let missing =
+        match AdmittedGrokCredentials::from_environment(None, Some(sensitive_home.as_os_str())) {
+            Ok(_) => bail!("missing auth.json must refuse the Grok launch"),
+            Err(error) => error,
+        };
+    let mut missing_report = failed_external_run(
+        &command,
+        Instant::now(),
+        vec!["grok".to_string()],
+        false,
+        "pending credential admission".to_string(),
+    );
+    record_grok_credential_environment_failure(&mut missing_report, &missing);
+    assert!(!missing_report.stdout.target_launch_attempted);
+    assert_eq!(missing_report.environment_failures().len(), 1);
+    assert_eq!(
+        missing_report.environment_failures()[0].category,
+        EnvironmentFailureCategory::MissingCredential
+    );
+    assert_eq!(
+        missing_report.environment_failures()[0].requirement,
+        Some(grok_auth_environment_requirement())
+    );
+    assert_eq!(
+        missing_report.environment_preflight_results()[0].status,
+        EnvironmentPreflightStatus::Blocked
+    );
+    assert!(missing_report.environment_failures()[0]
+        .remediation
+        .iter()
+        .all(
+            |remediation| remediation.scope == EnvironmentRemediationScope::CredentialConfiguration
+        ));
+
+    let real_auth = temp.path().join("real-auth.json");
+    fs::write(&real_auth, secret)?;
+    symlink(&real_auth, sensitive_home.join("auth.json"))?;
+    let symlink_error =
+        match AdmittedGrokCredentials::from_environment(None, Some(sensitive_home.as_os_str())) {
+            Ok(_) => bail!("symlinked auth.json must refuse the Grok launch"),
+            Err(error) => error,
+        };
+    assert!(symlink_error
+        .to_string()
+        .contains("auth.json is unavailable"));
+    fs::remove_file(sensitive_home.join("auth.json"))?;
+
+    let auth = sensitive_home.join("auth.json");
+    fs::write(&auth, secret)?;
+    let credentials =
+        AdmittedGrokCredentials::from_environment(None, Some(sensitive_home.as_os_str()))?;
+    let debug = format!("{:?}", credentials.source);
+    assert!(!debug.contains(secret), "{debug}");
+    assert!(
+        !debug.contains(&sensitive_home.display().to_string()),
+        "{debug}"
+    );
+    let held_profile = credentials.bind_to_profile(ExternalGrokProfile::read_only(temp.path()))?;
+    let replacement = sensitive_home.join("replacement-auth.json");
+    fs::write(&replacement, secret)?;
+    fs::rename(&replacement, &auth)?;
+    let replaced = credentials
+        .bind_to_profile(ExternalGrokProfile::read_only(temp.path()))
+        .expect_err("replaced auth.json must lose the held capability");
+    assert_eq!(
+        replaced.to_string(),
+        "Grok authentication source auth.json identity changed"
+    );
+    let release_gate_error = crate::process_runner::external_grok_systemd_properties_for_test(
+        held_profile,
+        Path::new("/bin/true"),
+        temp.path(),
+    )
+    .expect_err("the held capability gate must revalidate before release");
+
+    let mut replacement_report = failed_external_run(
+        &command,
+        Instant::now(),
+        vec!["grok".to_string()],
+        false,
+        "pending credential admission".to_string(),
+    );
+    record_grok_credential_environment_failure(&mut replacement_report, &replaced);
+    assert!(!replacement_report.stdout.target_launch_attempted);
+    let redactor = CredentialRedactor::from_runtime(
+        &BTreeMap::from([(
+            "GROK_HOME".to_string(),
+            sensitive_home.display().to_string(),
+        )]),
+        None,
+    )?;
+    let redacted_release_error = redactor.redact_string(&format!("{release_gate_error}"));
+    assert!(redacted_release_error.contains("identity changed"));
+    assert!(!redacted_release_error.contains(&sensitive_home.display().to_string()));
+    let rendered = format!(
+        "{missing:#?}\n{symlink_error:#?}\n{replaced:#?}\n{}\n{}",
+        serde_json::to_string(&missing_report)?,
+        serde_json::to_string(&replacement_report)?
+    );
+    assert!(!rendered.contains(secret), "{rendered}");
+    assert!(
+        !rendered.contains(&sensitive_home.display().to_string()),
+        "{rendered}"
+    );
+    Ok(())
+}
+
+#[test]
+fn grok_sandbox_requirement_tracks_external_grok_evidence() {
+    let containment = ProcessRunError::ContainmentUnavailable {
+        label: "external Grok".to_string(),
+        command: "grok".to_string(),
+        source: std::io::Error::other("injected containment refusal"),
+    };
+    assert_eq!(
+        target_process_environment_failure(&containment, ExternalAgentInvocation::Grok),
+        Some((
+            EnvironmentFailureCategory::SandboxUnavailable,
+            Some(EnvironmentRequirement::sandbox(
+                EnvironmentSandboxCapability::VerifiedExternalGrok,
+            )),
+        ))
+    );
 }
 
 #[test]
@@ -3829,6 +5084,12 @@ fn codex_app_server_argv_preserves_the_external_codex_ceiling() {
             || argument.contains("danger-full-access")
             || argument == "--add-dir"
     }));
+    assert!(actual
+        .windows(2)
+        .any(|arguments| arguments == ["--disable", "multi_agent"]));
+    assert!(!actual
+        .windows(2)
+        .any(|arguments| arguments == ["--enable", "multi_agent"]));
 }
 
 #[test]
@@ -5065,6 +6326,33 @@ fn structured_failed_command_denials_are_typed_deduplicated_and_redacted() -> Re
             assert!(sandbox_denials_from_codex_jsonl(&controls, noise).is_empty());
         }
     Ok(())
+}
+
+#[test]
+fn codex_inner_permissions_project_workspace_root_access_exactly() {
+    let command = ExternalAgentCommand::codex(
+        "codex",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(1),
+    );
+    let controls = ProtectedWorktreeControls::default();
+
+    for (access, permission) in [
+        (WorkspaceAccess::ReadOnly, "read"),
+        (WorkspaceAccess::ReadWrite, "write"),
+    ] {
+        let permissions =
+            codex_filesystem_permissions(&command.clone().with_workspace_access(access), &controls);
+        assert_eq!(
+            permissions,
+            format!(
+                "permissions.maco_external_codex.filesystem={{\":minimal\"=\"read\",\":workspace_roots\"={{\".\"=\"{permission}\"}}}}"
+            )
+        );
+    }
 }
 
 #[test]

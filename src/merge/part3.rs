@@ -360,6 +360,24 @@ fn run_git_with_input(repo_root: &Path, args: &[&str], input: &[u8]) -> Result<G
     )
 }
 
+fn run_git_with_input_with_writable_worktree(
+    repo_root: &Path,
+    args: &[&str],
+    input: &[u8],
+) -> Result<GitCommandOutput> {
+    let repo = crate::git_repository::open(repo_root)
+        .with_context(|| format!("failed to open Git worktree {}", repo_root.display()))?;
+    let context = TemporaryIndex::create(repo.commondir())?;
+    initialize_isolated_index(&context, repo_root, head_oid(&repo)?)?;
+    run_isolated_git_process_with_writable_worktree(
+        &context,
+        repo_root,
+        args,
+        StdinMode::Bytes(input.to_vec()),
+        "git patch command",
+    )
+}
+
 fn run_isolated_git_process(
     context: &TemporaryIndex,
     worktree_path: &Path,
@@ -376,6 +394,24 @@ fn run_isolated_git_process(
     )
 }
 
+fn run_isolated_git_process_with_writable_worktree(
+    context: &TemporaryIndex,
+    worktree_path: &Path,
+    operation: &[&str],
+    stdin: StdinMode,
+    label: &str,
+) -> Result<GitCommandOutput> {
+    let profile =
+        isolated_git_workspace_profile_with_writable_worktree(context, worktree_path)?;
+    run_isolated_git_process_os_with_profile(
+        worktree_path,
+        context.command_args(worktree_path, operation),
+        stdin,
+        label,
+        profile,
+    )
+}
+
 fn run_isolated_git_process_os(
     context: &TemporaryIndex,
     worktree_path: &Path,
@@ -384,6 +420,22 @@ fn run_isolated_git_process_os(
     label: &str,
 ) -> Result<GitCommandOutput> {
     let profile = isolated_git_workspace_profile(context, worktree_path)?;
+    run_isolated_git_process_os_with_profile(
+        worktree_path,
+        command_args,
+        stdin,
+        label,
+        profile,
+    )
+}
+
+fn run_isolated_git_process_os_with_profile(
+    worktree_path: &Path,
+    command_args: Vec<OsString>,
+    stdin: StdinMode,
+    label: &str,
+    profile: StrictOfflineWorkspaceProfile,
+) -> Result<GitCommandOutput> {
     run_required_direct(
         label,
         resolve_trusted_executable("git")?,
@@ -402,6 +454,29 @@ fn isolated_git_workspace_profile(
     context: &TemporaryIndex,
     worktree_path: &Path,
 ) -> Result<StrictOfflineWorkspaceProfile> {
+    configure_isolated_git_workspace_profile(
+        context,
+        worktree_path,
+        StrictOfflineWorkspaceProfile::read_only(worktree_path),
+    )
+}
+
+fn isolated_git_workspace_profile_with_writable_worktree(
+    context: &TemporaryIndex,
+    worktree_path: &Path,
+) -> Result<StrictOfflineWorkspaceProfile> {
+    configure_isolated_git_workspace_profile(
+        context,
+        worktree_path,
+        StrictOfflineWorkspaceProfile::read_write(worktree_path),
+    )
+}
+
+fn configure_isolated_git_workspace_profile(
+    context: &TemporaryIndex,
+    worktree_path: &Path,
+    profile: StrictOfflineWorkspaceProfile,
+) -> Result<StrictOfflineWorkspaceProfile> {
     let common_dir = context
         .alternate_object_directory
         .parent()
@@ -412,10 +487,28 @@ fn isolated_git_workspace_profile(
             common_dir.display()
         )
     })?;
-    let profile = StrictOfflineWorkspaceProfile::read_write(worktree_path)
+    let repository_root = common_dir
+        .parent()
+        .context("Git common directory omitted its parent repository root")?;
+    let repository_root = fs::canonicalize(repository_root).with_context(|| {
+        format!(
+            "failed to resolve Git repository root {}",
+            repository_root.display()
+        )
+    })?;
+    let worktree_root = fs::canonicalize(worktree_path).with_context(|| {
+        format!(
+            "failed to resolve Git worktree {}",
+            worktree_path.display()
+        )
+    })?;
+    let mut profile = profile
         .with_writable_artifact_root(&context.directory)
         .with_visible_read_only_root(&context.alternate_object_directory)
         .with_visible_read_only_root(&common_dir);
+    if repository_root != worktree_root {
+        profile = profile.with_visible_read_only_root(&repository_root);
+    }
     hide_sensitive_state_if_present(profile, &common_dir)
 }
 

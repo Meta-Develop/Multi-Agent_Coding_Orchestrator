@@ -770,7 +770,10 @@ impl PreparedProcessTree {
             PreparedContainmentBackend::Systemd(unit) => unit.build_command(spec),
             #[cfg(target_os = "windows")]
             PreparedContainmentBackend::WindowsJob => {
-                if spec.private_runtime_home || spec.private_runtime_codex_home {
+                if spec.private_runtime_home
+                    || spec.private_runtime_codex_home
+                    || spec.private_runtime_grok_home
+                {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Unsupported,
                         "private runtime HOME requires the strict Linux systemd backend",
@@ -785,7 +788,10 @@ impl PreparedProcessTree {
             }
             #[cfg(unix)]
             PreparedContainmentBackend::UnixProcessGroup => {
-                if spec.private_runtime_home || spec.private_runtime_codex_home {
+                if spec.private_runtime_home
+                    || spec.private_runtime_codex_home
+                    || spec.private_runtime_grok_home
+                {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Unsupported,
                         "private runtime HOME requires the strict Linux systemd backend",
@@ -800,7 +806,10 @@ impl PreparedProcessTree {
             }
             #[cfg(not(any(unix, target_os = "windows")))]
             PreparedContainmentBackend::DirectChild => {
-                if spec.private_runtime_home || spec.private_runtime_codex_home {
+                if spec.private_runtime_home
+                    || spec.private_runtime_codex_home
+                    || spec.private_runtime_grok_home
+                {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Unsupported,
                         "private runtime HOME requires the strict Linux systemd backend",
@@ -1170,6 +1179,7 @@ struct ResolvedSystemdSandbox {
     visible_read_write_roots: Vec<PathBuf>,
     visible_read_write_files: Vec<PathBuf>,
     external_codex_writable_file_capabilities: Vec<ExternalCodexWritableFileCapability>,
+    external_grok_read_only_file_capabilities: Vec<ExternalGrokReadOnlyFileCapability>,
     writable_artifact_roots: Vec<PathBuf>,
     hidden_roots: Vec<PathBuf>,
     isolated_host_view: bool,
@@ -1269,6 +1279,23 @@ impl ResolvedSystemdSandbox {
                 .iter()
                 .chain(self.visible_read_write_files.iter())
                 .any(|file| program == file)
+    }
+
+    fn projected_external_grok_file_target(
+        &self,
+        source: &Path,
+        runtime_dir: &Path,
+    ) -> Option<PathBuf> {
+        self.external_grok_read_only_file_capabilities
+            .iter()
+            .find(|capability| capability.path == source)
+            .and_then(|capability| capability.private_grok_home_target(runtime_dir))
+    }
+
+    fn hidden_root_is_optional(&self, root: &Path) -> bool {
+        self.mount_checks.iter().any(|check| {
+            check.path == root && check.access == SandboxMountAccess::Inaccessible && check.optional
+        })
     }
 
     fn validate_program_visibility(&self, program: &Path) -> std::io::Result<()> {
@@ -1383,6 +1410,25 @@ impl ResolvedSystemdSandbox {
                 "private unit runtime root overlaps an inaccessible sandbox root",
             ));
         }
+        for capability in &self.external_grok_read_only_file_capabilities {
+            let Some(target) = capability.private_grok_home_target(root) else {
+                continue;
+            };
+            validate_systemd_path_syntax(&target, "private Grok home credential target")?;
+            let mount_check = self
+                .mount_checks
+                .iter_mut()
+                .find(|check| {
+                    check.path == capability.path && check.access == SandboxMountAccess::ReadOnly
+                })
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "private Grok home capability lacks its identity-bound mount check",
+                    )
+                })?;
+            mount_check.path = target;
+        }
         self.mount_checks.push(SandboxMountCheck {
             path: root.to_path_buf(),
             device: 0,
@@ -1403,6 +1449,9 @@ impl ResolvedSystemdSandbox {
         use std::os::unix::fs::MetadataExt;
 
         for capability in &self.external_codex_writable_file_capabilities {
+            capability.verify_path()?;
+        }
+        for capability in &self.external_grok_read_only_file_capabilities {
             capability.verify_path()?;
         }
         for identity in &self.path_identities {
@@ -1532,35 +1581,34 @@ impl ResolvedSystemdSandbox {
 
     fn effective_path_access(&self, path: &Path) -> std::io::Result<Option<SandboxMountAccess>> {
         let mut selected: Option<(usize, SandboxMountAccess)> = None;
-        let mut consider =
-            |boundary: &Path,
-             exact: bool,
-             access: SandboxMountAccess,
-             override_equal: bool|
-             -> std::io::Result<()> {
-                if (exact && path != boundary) || (!exact && !path.starts_with(boundary)) {
-                    return Ok(());
+        let mut consider = |boundary: &Path,
+                            exact: bool,
+                            access: SandboxMountAccess,
+                            override_equal: bool|
+         -> std::io::Result<()> {
+            if (exact && path != boundary) || (!exact && !path.starts_with(boundary)) {
+                return Ok(());
+            }
+            let specificity = boundary.components().count();
+            match selected {
+                Some((existing_specificity, existing_access))
+                    if existing_specificity == specificity
+                        && existing_access != access
+                        && !override_equal =>
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "sandbox path has conflicting effective access: {}",
+                            path.display()
+                        ),
+                    ));
                 }
-                let specificity = boundary.components().count();
-                match selected {
-                    Some((existing_specificity, existing_access))
-                        if existing_specificity == specificity
-                            && existing_access != access
-                            && !override_equal =>
-                    {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            format!(
-                                "sandbox path has conflicting effective access: {}",
-                                path.display()
-                            ),
-                        ));
-                    }
-                    Some((existing_specificity, _)) if existing_specificity > specificity => {}
-                    _ => selected = Some((specificity, access)),
-                }
-                Ok(())
-            };
+                Some((existing_specificity, _)) if existing_specificity > specificity => {}
+                _ => selected = Some((specificity, access)),
+            }
+            Ok(())
+        };
 
         consider(
             &self.workspace_root,
@@ -1647,21 +1695,22 @@ impl ResolvedSystemdSandbox {
             return Ok(());
         }
 
-        let reject_protected_alias = |path: &Path, metadata: &fs::Metadata| -> std::io::Result<()> {
-            if self.effective_path_access(path)? != Some(SandboxMountAccess::ReadOnly) {
-                return Ok(());
-            }
-            if writable_multilink_inodes.contains_key(&(metadata.dev(), metadata.ino())) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!(
-                        "protected read-only sandbox file has a writable hard-link alias: {}",
-                        path.display()
-                    ),
-                ));
-            }
-            Ok(())
-        };
+        let reject_protected_alias =
+            |path: &Path, metadata: &fs::Metadata| -> std::io::Result<()> {
+                if self.effective_path_access(path)? != Some(SandboxMountAccess::ReadOnly) {
+                    return Ok(());
+                }
+                if writable_multilink_inodes.contains_key(&(metadata.dev(), metadata.ino())) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "protected read-only sandbox file has a writable hard-link alias: {}",
+                            path.display()
+                        ),
+                    ));
+                }
+                Ok(())
+            };
         for root in protected_roots {
             scan_sandbox_regular_files(&root, false, &mut remaining, |path, metadata| {
                 reject_protected_alias(path, metadata)
@@ -2311,6 +2360,23 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
         .collect::<std::io::Result<Vec<_>>>()?;
     visible_read_only_files.sort();
     visible_read_only_files.dedup();
+    let mut external_grok_read_only_file_capabilities = Vec::new();
+    let mut grok_capability_paths = BTreeSet::new();
+    for capability in &config.external_grok_read_only_file_capabilities {
+        let canonical_path =
+            canonical_sandbox_file(&capability.path, "ExternalGrok read-only file capability")?;
+        if !visible_read_only_files.contains(&canonical_path)
+            || !grok_capability_paths.insert(canonical_path.clone())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ExternalGrok read-only file capability is duplicate or lacks an exact read-only file",
+            ));
+        }
+        let resolved_capability = capability.with_resolved_path(canonical_path);
+        resolved_capability.verify_path()?;
+        external_grok_read_only_file_capabilities.push(resolved_capability);
+    }
     let mut writable_artifact_roots = config
         .writable_artifact_roots
         .iter()
@@ -2370,29 +2436,54 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
     let exact_writable_file_parents =
         external_codex_writable_file_parents(&external_codex_writable_file_capabilities);
 
-    let mut hidden_roots = config
+    let hidden_roots = config
         .hidden_roots
         .iter()
-        .map(|root| canonical_sandbox_directory(root, "hidden root"))
+        .map(|root| resolve_hidden_root(root, "hidden root"))
         .collect::<std::io::Result<Vec<_>>>()?;
-    hidden_roots.sort();
-    hidden_roots.dedup();
-    let mut minimal_hidden_roots: Vec<PathBuf> = Vec::new();
-    for root in hidden_roots {
+    let mut unique_hidden_roots = BTreeMap::<PathBuf, bool>::new();
+    for (root, optional) in hidden_roots {
+        unique_hidden_roots
+            .entry(root)
+            .and_modify(|existing| *existing &= optional)
+            .or_insert(optional);
+    }
+    let mut minimal_hidden_roots: Vec<(PathBuf, bool)> = Vec::new();
+    for (root, optional) in unique_hidden_roots {
         if minimal_hidden_roots
             .iter()
-            .any(|ancestor| root.starts_with(ancestor))
+            .any(|(ancestor, _)| root.starts_with(ancestor))
         {
             continue;
         }
-        minimal_hidden_roots.push(root);
+        minimal_hidden_roots.push((root, optional));
     }
-    let hidden_roots = minimal_hidden_roots;
+    let optional_hidden_roots = minimal_hidden_roots
+        .iter()
+        .filter(|(_, optional)| *optional)
+        .map(|(root, _)| root.clone())
+        .collect::<BTreeSet<_>>();
+    let hidden_roots = minimal_hidden_roots
+        .into_iter()
+        .map(|(root, _)| root)
+        .collect::<Vec<_>>();
     if hidden_roots.iter().any(|root| root == Path::new("/")) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "strict workspace confinement refuses '/' as a hidden root",
         ));
+    }
+    for capability in &external_grok_read_only_file_capabilities {
+        if capability.is_private_grok_home_projection()
+            && !hidden_roots
+                .iter()
+                .any(|hidden| capability.path.starts_with(hidden))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "ExternalGrok private home projection requires its ambient source directory to be inaccessible",
+            ));
+        }
     }
     if config.isolated_host_view {
         let nix_store = canonical_sandbox_directory(Path::new("/nix/store"), "Nix store root")?;
@@ -2427,7 +2518,12 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
     identity_paths.extend(visible_read_write_files.iter().cloned());
     identity_paths.extend(exact_writable_file_parents.iter().cloned());
     identity_paths.extend(writable_artifact_roots.iter().cloned());
-    identity_paths.extend(hidden_roots.iter().cloned());
+    identity_paths.extend(
+        hidden_roots
+            .iter()
+            .filter(|root| !optional_hidden_roots.contains(*root))
+            .cloned(),
+    );
     identity_paths.sort();
     identity_paths.dedup();
     let path_identities = identity_paths
@@ -2444,6 +2540,7 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
         exact_writable_file_parents: &exact_writable_file_parents,
         writable_artifact_roots: &writable_artifact_roots,
         hidden_roots: &hidden_roots,
+        optional_hidden_roots: &optional_hidden_roots,
         isolated_host_view: config.isolated_host_view,
     })?;
     if mount_checks.len() > MAX_SANDBOX_MOUNT_CHECKS {
@@ -2463,6 +2560,7 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
         visible_read_write_roots,
         visible_read_write_files,
         external_codex_writable_file_capabilities,
+        external_grok_read_only_file_capabilities,
         writable_artifact_roots,
         hidden_roots,
         isolated_host_view: config.isolated_host_view,
@@ -2505,6 +2603,118 @@ fn canonical_sandbox_directory(path: &Path, label: &str) -> std::io::Result<Path
     }
     validate_systemd_path_syntax(&canonical, label)?;
     Ok(canonical)
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_hidden_root(path: &Path, label: &str) -> std::io::Result<(PathBuf, bool)> {
+    match canonical_sandbox_directory(path, label) {
+        Ok(canonical) => {
+            let optional = hidden_root_mask_is_optional(&canonical, true);
+            Ok((canonical, optional))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let normalized = normalized_absolute_sandbox_path(path, label)?;
+            reject_symlink_ancestors_until_missing(&normalized, label)?;
+            match fs::symlink_metadata(&normalized) {
+                Ok(_) => canonical_sandbox_directory(&normalized, label).map(|canonical| {
+                    let optional = hidden_root_mask_is_optional(&canonical, true);
+                    (canonical, optional)
+                }),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let optional = hidden_root_mask_is_optional(&normalized, false);
+                    Ok((normalized, optional))
+                }
+                Err(error) => Err(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to inspect {label} {}: {error}",
+                        normalized.display()
+                    ),
+                )),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn hidden_root_mask_is_optional(root: &Path, host_path_exists: bool) -> bool {
+    // systemd mounts ProtectHome=tmpfs before applying InaccessiblePaths=. A required child
+    // path would therefore fail namespace setup because its ProtectHome-covered host path has
+    // already disappeared, even though the enclosing tmpfs already provides the intended mask.
+    !host_path_exists
+        || [
+            Path::new("/home"),
+            Path::new("/root"),
+            Path::new("/run/user"),
+        ]
+        .into_iter()
+        .any(|protected_home| root.starts_with(protected_home))
+}
+
+#[cfg(target_os = "linux")]
+fn normalized_absolute_sandbox_path(path: &Path, label: &str) -> std::io::Result<PathBuf> {
+    validate_systemd_path_syntax(path, label)?;
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                normalized.push(component.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{label} may not contain '..': {}", path.display()),
+                ));
+            }
+            std::path::Component::Normal(component) => normalized.push(component),
+        }
+    }
+    validate_systemd_path_syntax(&normalized, label)?;
+    Ok(normalized)
+}
+
+#[cfg(target_os = "linux")]
+fn reject_symlink_ancestors_until_missing(path: &Path, label: &str) -> std::io::Result<()> {
+    let mut current = PathBuf::new();
+    let mut ancestor_missing = false;
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if ancestor_missing || !matches!(component, std::path::Component::Normal(_)) {
+            continue;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "{label} may not traverse a symlink ancestor: {}",
+                        current.display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor_missing = true;
+            }
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to inspect {label} ancestor {}: {error}",
+                        current.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -2619,6 +2829,7 @@ struct SandboxMountPaths<'a> {
     exact_writable_file_parents: &'a BTreeSet<PathBuf>,
     writable_artifact_roots: &'a [PathBuf],
     hidden_roots: &'a [PathBuf],
+    optional_hidden_roots: &'a BTreeSet<PathBuf>,
     isolated_host_view: bool,
 }
 
@@ -2716,7 +2927,7 @@ fn build_sandbox_mount_checks(
         .map(|path| (path, true))
         .collect::<BTreeMap<_, _>>();
     for path in paths.hidden_roots {
-        inaccessible.insert(path.clone(), false);
+        inaccessible.insert(path.clone(), paths.optional_hidden_roots.contains(path));
     }
     for (path, optional) in inaccessible {
         checks.push(SandboxMountCheck {
@@ -2731,7 +2942,11 @@ fn build_sandbox_mount_checks(
 }
 
 #[cfg(target_os = "linux")]
-fn apply_systemd_sandbox_properties(command: &mut Command, sandbox: &ResolvedSystemdSandbox) {
+fn apply_systemd_sandbox_properties(
+    command: &mut Command,
+    sandbox: &ResolvedSystemdSandbox,
+    runtime_dir: &Path,
+) {
     command.args([
         "--property=ProtectSystem=strict",
         "--property=ProtectHome=tmpfs",
@@ -2778,12 +2993,22 @@ fn apply_systemd_sandbox_properties(command: &mut Command, sandbox: &ResolvedSys
     } else if sandbox.kind == SideEffectConfinementProfileKind::ExternalCodex {
         command.args([
             "--property=PrivateNetwork=no",
-            // Codex's inner bubblewrap sandbox needs AF_NETLINK while constructing its network
-            // namespace and configuring loopback. Keep this exception exclusive to ExternalCodex.
-            "--property=RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK",
+            // Codex initializes local Unix streams before its inner bubblewrap sandbox uses
+            // AF_NETLINK to construct the network namespace and configure loopback. Known
+            // same-user sockets remain masked by the exact path policy below.
+            "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
             // Bubblewrap must construct the inner mount tree. Keep the rest of the ordinary
-            // networked deny list intact and relax @mount only for ExternalCodex.
+            // networked deny list intact and relax @mount and socketpair only for ExternalCodex.
             "--property=SystemCallFilter=~@clock @debug @module @obsolete @raw-io @reboot @swap bpf fanotify_init fanotify_mark ipc mq_getsetattr mq_notify mq_open mq_timedreceive mq_timedreceive_time64 mq_timedsend mq_timedsend_time64 mq_unlink msgctl msgget msgrcv msgsnd open_by_handle_at process_madvise process_vm_readv process_vm_writev quotactl quotactl_fd semctl semget semop semtimedop semtimedop_time64 shmat shmctl shmdt shmget link linkat mknod mknodat",
+        ]);
+    } else if sandbox.kind == SideEffectConfinementProfileKind::ExternalGrok {
+        command.args([
+            "--property=PrivateNetwork=no",
+            // Grok's admitted parent runtime uses local Unix streams during initialization. It
+            // does not need Codex's namespace or mount exceptions, and known same-user sockets
+            // remain masked by the exact path policy below.
+            "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+            "--property=SystemCallFilter=~@clock @debug @module @mount @obsolete @raw-io @reboot @swap bpf fanotify_init fanotify_mark ipc mq_getsetattr mq_notify mq_open mq_timedreceive mq_timedreceive_time64 mq_timedsend mq_timedsend_time64 mq_unlink msgctl msgget msgrcv msgsnd open_by_handle_at process_madvise process_vm_readv process_vm_writev quotactl quotactl_fd semctl semget semop semtimedop semtimedop_time64 shmat shmctl shmdt shmget link linkat mknod mknodat",
         ]);
     } else {
         command.args([
@@ -2805,7 +3030,11 @@ fn apply_systemd_sandbox_properties(command: &mut Command, sandbox: &ResolvedSys
         ));
 
     for root in &sandbox.hidden_roots {
-        command.arg(systemd_path_property("InaccessiblePaths=", root, false));
+        command.arg(systemd_path_property(
+            "InaccessiblePaths=",
+            root,
+            sandbox.hidden_root_is_optional(root),
+        ));
     }
     for path in known_sensitive_socket_paths() {
         command.arg(systemd_path_property("InaccessiblePaths=", &path, true));
@@ -2817,6 +3046,16 @@ fn apply_systemd_sandbox_properties(command: &mut Command, sandbox: &ResolvedSys
             .arg(systemd_path_property("ReadOnlyPaths=", root, false));
     }
     for file in &sandbox.visible_read_only_files {
+        if let Some(target) = sandbox.projected_external_grok_file_target(file, runtime_dir) {
+            command
+                .arg(systemd_path_binding_property(
+                    "BindReadOnlyPaths=",
+                    file,
+                    &target,
+                ))
+                .arg(systemd_path_property("ReadOnlyPaths=", &target, false));
+            continue;
+        }
         command
             .arg(systemd_path_property("BindReadOnlyPaths=", file, false))
             .arg(systemd_path_property("ReadOnlyPaths=", file, false));
@@ -3008,6 +3247,9 @@ fn verify_systemd_sandbox_properties(
         )?;
     }
     for file in &sandbox.visible_read_only_files {
+        let target = sandbox
+            .projected_external_grok_file_target(file, runtime_dir)
+            .unwrap_or_else(|| file.clone());
         require_property_path(
             "BindReadOnlyPaths",
             property_value(properties, "BindReadOnlyPaths")?,
@@ -3016,7 +3258,7 @@ fn verify_systemd_sandbox_properties(
         require_property_path(
             "ReadOnlyPaths",
             property_value(properties, "ReadOnlyPaths")?,
-            file,
+            &target,
         )?;
     }
     for root in &sandbox.visible_read_write_roots {
@@ -3063,6 +3305,7 @@ fn verify_exact_systemd_path_properties(
         sandbox.kind,
         SideEffectConfinementProfileKind::TrustedFixedNetwork
             | SideEffectConfinementProfileKind::ExternalCodex
+            | SideEffectConfinementProfileKind::ExternalGrok
     ) && !sandbox.isolated_host_view
     {
         return Ok(());
@@ -3083,16 +3326,27 @@ fn verify_exact_systemd_path_properties(
     let mut read_only = sandbox
         .visible_read_only_roots
         .iter()
-        .chain(&sandbox.visible_read_only_files)
         .cloned()
         .collect::<BTreeSet<_>>();
+    read_only.extend(sandbox.visible_read_only_files.iter().map(|file| {
+        sandbox
+            .projected_external_grok_file_target(file, runtime_dir)
+            .unwrap_or_else(|| file.clone())
+    }));
     read_only.extend(sandbox.exact_writable_file_parents());
     let mut read_only_bindings = sandbox
         .visible_read_only_roots
         .iter()
-        .chain(&sandbox.visible_read_only_files)
         .map(|path| (path.clone(), path.clone()))
         .collect::<BTreeSet<_>>();
+    read_only_bindings.extend(sandbox.visible_read_only_files.iter().map(|file| {
+        (
+            file.clone(),
+            sandbox
+                .projected_external_grok_file_target(file, runtime_dir)
+                .unwrap_or_else(|| file.clone()),
+        )
+    }));
     let mut read_write = sandbox
         .visible_read_write_roots
         .iter()
@@ -3189,7 +3443,10 @@ fn verify_systemd_network_properties(
     let expected_families = match kind {
         SideEffectConfinementProfileKind::StrictOfflineWorkspace => BTreeSet::from(["AF_UNIX"]),
         SideEffectConfinementProfileKind::ExternalCodex => {
-            BTreeSet::from(["AF_INET", "AF_INET6", "AF_NETLINK"])
+            BTreeSet::from(["AF_UNIX", "AF_INET", "AF_INET6", "AF_NETLINK"])
+        }
+        SideEffectConfinementProfileKind::ExternalGrok => {
+            BTreeSet::from(["AF_UNIX", "AF_INET", "AF_INET6"])
         }
         SideEffectConfinementProfileKind::TrustedFixedNetwork
         | SideEffectConfinementProfileKind::TrustedCompatibility => {

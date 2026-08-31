@@ -353,7 +353,15 @@ impl ManagedWorktreeRegistryStore {
     }
 
     fn lock(&self) -> Result<ManagedWorktreeRegistryLock> {
-        let lock = KernelStateLock::acquire_direct(&self.state_root, "managed_worktrees.lock")?;
+        self.lock_with_timeout(MANAGED_WORKTREE_REGISTRY_LOCK_TIMEOUT)
+    }
+
+    fn lock_with_timeout(&self, timeout: Duration) -> Result<ManagedWorktreeRegistryLock> {
+        let lock = KernelStateLock::acquire_direct_with_timeout(
+            &self.state_root,
+            "managed_worktrees.lock",
+            timeout,
+        )?;
         let bound = ManagedWorktreeRegistryLock {
             root_identity: self.state_root.identity().clone(),
             lock_identity: lock.identity().clone(),
@@ -3104,7 +3112,7 @@ fn ensure_clean_worktree(path: &Path) -> Result<()> {
 #[derive(Debug)]
 enum GitAssociationMarker {
     Directory(DirectoryBindingGuard),
-    File(RegularFileBindingGuard),
+    File(Box<RegularFileBindingGuard>),
 }
 
 impl GitAssociationMarker {
@@ -3126,7 +3134,7 @@ impl GitAssociationMarker {
         }
         if metadata.is_file() {
             return RegularFileBindingGuard::bind(path, MAX_WORKTREE_GIT_TEXT_FILE_BYTES)
-                .map(Self::File);
+                .map(|binding| Self::File(Box::new(binding)));
         }
         bail!(
             "Git association marker has an unsupported file type: {}",

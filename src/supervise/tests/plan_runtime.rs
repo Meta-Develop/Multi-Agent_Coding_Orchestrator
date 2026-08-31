@@ -1,4 +1,7 @@
 use super::*;
+use crate::supervise::selection_bridge::{
+    bind_test_selector_triple_catalog, selector_effort_as_str,
+};
 
 fn default_resolved_objective_profile() -> ResolvedObjectiveProfile {
     ResolvedObjectiveProfile {
@@ -440,7 +443,7 @@ fn completed_quota_refresh_switches_the_next_actual_assignment_launch_to_cursor(
         .expect("settle completed second Cursor assignment");
     assert_eq!(
         second_settlement.reliability,
-        DispatchUsageReliability::Reliable
+        DispatchUsageReliability::Estimated
     );
     assert_eq!(
         second_settlement
@@ -472,7 +475,7 @@ fn completed_quota_refresh_switches_the_next_actual_assignment_launch_to_cursor(
         .pool_usage(&quota_config.pools[1].key(), now)
         .expect("Cursor pool usage");
     assert_eq!(codex.tokens, 10);
-    assert_eq!(cursor.tokens, 3);
+    assert_eq!(cursor.tokens, 10);
     assert_eq!(cursor.requests, 1);
 }
 
@@ -743,6 +746,89 @@ fn authored_profile_reaches_verified_scheduler_selection_and_exact_score_evidenc
         Some(resolved.clone())
     );
     drop(temp);
+}
+
+#[test]
+fn cost_weighted_and_quality_weighted_profiles_select_distinct_acceptable_outcomes() {
+    use crate::objective_profile::{
+        select_from_frontier, FrontierAxes, ObjectiveProfileSource, QualityOperationsBalance,
+    };
+
+    let outcome = |quality_basis_points: u32, monetary_cost: f64| FrontierAxes {
+        held_out_quality_basis_points: quality_basis_points,
+        breadth_quality_basis_points: quality_basis_points,
+        anti_shortcut_quality_basis_points: quality_basis_points,
+        monetary_cost,
+        quota_consumption: 0.0,
+        latency: 0.0,
+        retry_rework: 0.0,
+        human_review: 0.0,
+    };
+    let frontier = [
+        ("quality-first".to_string(), outcome(9_700, 0.8)),
+        ("cost-first".to_string(), outcome(9_000, 0.2)),
+    ];
+    assert!(frontier.iter().all(|(_, outcome)| {
+        outcome.held_out_quality_basis_points >= 9_000
+            && outcome.breadth_quality_basis_points >= 9_000
+            && outcome.anti_shortcut_quality_basis_points >= 9_000
+    }));
+
+    let profile = |id: &str, quality_percent: u32| {
+        let mut profile = crate::objective_profile::default_objective_profile();
+        profile.id = id.to_string();
+        profile.quality_operations_balance = QualityOperationsBalance {
+            quality_percent,
+            operations_percent: 100 - quality_percent,
+        };
+        ResolvedObjectiveProfile {
+            profile: profile.binding().expect("acceptance profile binding"),
+            source: ObjectiveProfileSource::RepositoryOverride,
+        }
+    };
+    let cost_profile = profile("acceptance-cost-weighted-v1", 0);
+    let quality_profile = profile("acceptance-quality-weighted-v1", 100);
+
+    let cost_selection = select_from_frontier(&cost_profile, &frontier)
+        .expect("cost-weighted selection")
+        .expect("non-empty cost frontier");
+    let quality_selection = select_from_frontier(&quality_profile, &frontier)
+        .expect("quality-weighted selection")
+        .expect("non-empty quality frontier");
+
+    assert_eq!(cost_selection.selected_profile_id, "cost-first");
+    assert_eq!(quality_selection.selected_profile_id, "quality-first");
+    assert_eq!(
+        cost_selection.runner_up_profile_id.as_deref(),
+        Some("quality-first")
+    );
+    assert_eq!(
+        quality_selection.runner_up_profile_id.as_deref(),
+        Some("cost-first")
+    );
+    assert_eq!(
+        cost_selection.profile_hash,
+        cost_profile.profile.content_hash
+    );
+    assert_eq!(
+        quality_selection.profile_hash,
+        quality_profile.profile.content_hash
+    );
+    assert_ne!(cost_selection.profile_hash, quality_selection.profile_hash);
+    assert!(cost_selection.selected_score < cost_selection.runner_up_score.unwrap());
+    assert!(quality_selection.selected_score < quality_selection.runner_up_score.unwrap());
+    let selected_cost = |selection: &crate::objective_profile::ObjectiveSelection| {
+        frontier
+            .iter()
+            .find(|(id, _)| id == &selection.selected_profile_id)
+            .map(|(_, outcome)| outcome.monetary_cost)
+            .expect("selected frontier cost")
+    };
+    assert_eq!(selected_cost(&cost_selection), 0.2);
+    assert_eq!(selected_cost(&quality_selection), 0.8);
+    let measurable_cost_difference =
+        selected_cost(&quality_selection) - selected_cost(&cost_selection);
+    assert!((measurable_cost_difference - 0.6).abs() < 1e-12);
 }
 
 #[test]
@@ -1326,6 +1412,65 @@ Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other 
         2
     );
     assert!(document.get("coverage_gaps").is_none());
+}
+
+#[test]
+fn literal_existing_file_edit_lowers_to_direct_grok_eligible_worker() {
+    skip_without_containment!();
+    let (_temp, repo) = injected_repository();
+    let task = "In README.md, replace baseline with exactly: MACO literal routing reached the terminal worker. Verify the result with git diff --check and confirm README.md contains exactly that line.";
+    let mut plan =
+        supervisor_plan_from_goal_spec(&repo, "", task).expect("plan literal existing-file edit");
+    let [planning, execution] = plan.assignments.as_slice() else {
+        panic!("literal existing-file plan must contain one planning/execution pair");
+    };
+    assert_eq!(planning.phase, AssignmentPhase::Planning);
+    assert_eq!(planning.role, AgentRole::ChildOrchestrator);
+    assert_eq!(execution.phase, AssignmentPhase::Execution);
+    assert_eq!(execution.role, AgentRole::Worker);
+    assert_eq!(
+        execution.role_category,
+        Some(RoleCategory::NonDelegatingTerminalWorker)
+    );
+    assert!(execution.worker_assignments.is_empty());
+    assert!(execution
+        .notes
+        .as_deref()
+        .is_some_and(|notes| notes.contains("existing_git_visible_regular_file_edit")));
+
+    plan.role_models.insert(
+        AgentRole::Worker,
+        RoleModelSelection {
+            model: Some("grok-4.6".to_string()),
+            reasoning_effort: Some("xhigh".to_string()),
+            unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
+        },
+    );
+    let execution = plan.assignments[1].clone();
+    let resolved = runtime_resolved_prompt_plan(
+        &plan,
+        &execution,
+        SupervisorRuntime::Grok,
+        SupervisorRuntime::Grok,
+        &RuntimeModelCatalog::OperatorDeclared,
+    )
+    .expect("resolve direct Grok terminal worker");
+    let worker = effective_role_model_selection(&resolved, AgentRole::Worker);
+    assert_eq!(worker.model.as_deref(), Some("grok-4.6"));
+    assert_eq!(worker.reasoning_effort.as_deref(), Some("xhigh"));
+    assert_eq!(
+        worker.unavailable_model_fallback,
+        UnavailableModelFallback::FailClosed
+    );
+
+    let ordinary = supervisor_plan_from_goal_spec(&repo, "", "Update README.md.")
+        .expect("plan ordinary README task");
+    assert_eq!(ordinary.assignments[1].role, AgentRole::ChildOrchestrator);
+    assert_eq!(ordinary.assignments[1].worker_assignments.len(), 1);
+    assert!(!ordinary.assignments[1]
+        .notes
+        .as_deref()
+        .is_some_and(|notes| notes.contains("existing_git_visible_regular_file_edit")));
 }
 
 #[test]
@@ -2363,6 +2508,223 @@ fn role_selection_produces_distinct_launched_role_argv() {
 }
 
 #[test]
+fn verified_supervise_dispatch_consumes_and_persists_the_selector_triple() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    let verification_target = PathBuf::from("tests/selector_triple.rs");
+    fs::create_dir(repo_path.join("tests")).expect("create injected tests directory");
+    fs::write(
+        repo_path.join(&verification_target),
+        "#[test]\nfn selector_triple_fixture() {}\n",
+    )
+    .expect("write injected selector test target");
+    commit_injected_repository(&repo_path, "selector test target");
+
+    let mut assignment = injected_assignment(true);
+    assignment.assigned_paths = vec![verification_target.clone()];
+    assignment.worker_assignments[0].assigned_paths = vec![verification_target];
+    let plan = injected_plan(assignment.clone(), 0);
+    let options = injected_options(&repo_path, temp.path(), "verified-selector-triple-dispatch");
+    let run_id = options.run_id.clone();
+    let (_selector_fixture, catalog) = bind_test_selector_triple_catalog()
+        .expect("construct selector-backed Codex catalog with a deterministic runner-up");
+    let mut child_commands = Vec::new();
+    let mut runner = |command: &ExternalAgentCommand| {
+        let name = command
+            .output_last_message
+            .file_name()
+            .and_then(OsStr::to_str)
+            .expect("UTF-8 output name");
+        if name.contains("review-auditor") {
+            write_injected_json(
+                &command.output_last_message,
+                &injected_auditor_report(&assignment, &injected_child_report(&assignment)),
+            );
+        } else {
+            child_commands.push(command.clone());
+            write_injected_assignment_report(command, &assignment);
+        }
+        write_injected_usage(command, 8, 3);
+        injected_verified_run(command)
+    };
+
+    let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        SupervisorExecutionRuntime::Verified,
+        Ok(catalog),
+        &mut runner,
+    )
+    .expect("run verified selector-backed supervise dispatch");
+
+    assert!(report.success, "unexpected failed report: {report:#?}");
+    assert_eq!(child_commands.len(), 1);
+    let economics = report
+        .role_economics_profile
+        .as_ref()
+        .expect("selector role economics evidence");
+    let resolved_profile = economics
+        .resolved_objective_profile
+        .as_ref()
+        .expect("omitted profile resolves to a frozen built-in default");
+    assert_eq!(
+        resolved_profile.source,
+        crate::objective_profile::ObjectiveProfileSource::BuiltIn
+    );
+    assert_eq!(
+        resolved_profile.profile.id,
+        crate::objective_profile::DEFAULT_OBJECTIVE_PROFILE_ID
+    );
+    resolved_profile
+        .profile
+        .validate()
+        .expect("built-in objective profile hash binding");
+    let execution = economics
+        .execution
+        .as_ref()
+        .expect("selector execution evidence");
+    let decision = execution
+        .selection_decisions
+        .iter()
+        .find(|decision| decision.role == AgentRole::ChildOrchestrator)
+        .expect("ChildOrchestrator selector decision");
+    let choice = decision
+        .provenance
+        .choice
+        .as_ref()
+        .expect("selected ChildOrchestrator choice");
+    assert_eq!(
+        decision.primary_cause,
+        SupervisorSelectionEventCause::Initial
+    );
+    assert_eq!(
+        decision.provenance.resolved_objective_profile,
+        *resolved_profile
+    );
+    assert_eq!(
+        decision
+            .provenance
+            .input_digests
+            .resolved_objective_profile
+            .algorithm,
+        "sha256"
+    );
+    assert_eq!(
+        decision
+            .provenance
+            .input_digests
+            .resolved_objective_profile
+            .value,
+        crate::artifacts::state_auth::sha256_hex(
+            &serde_json::to_vec(resolved_profile).expect("serialize frozen objective profile")
+        )
+    );
+    let selected_score = decision
+        .provenance
+        .candidate_set
+        .iter()
+        .find(|evaluation| evaluation.candidate == choice.candidate)
+        .and_then(|evaluation| evaluation.score.as_ref())
+        .expect("selected score evidence");
+    assert_eq!(
+        selected_score.total_score_microunits,
+        choice.total_score_microunits
+    );
+    let runner_up = decision
+        .provenance
+        .runner_up_scores
+        .first()
+        .expect("runner-up decision evidence");
+    assert_eq!(runner_up.rank, 2);
+    assert_ne!(runner_up.candidate, choice.candidate);
+    assert!(runner_up.total_score_microunits >= choice.total_score_microunits);
+    let runner_up_evaluation = decision
+        .provenance
+        .candidate_set
+        .iter()
+        .find(|evaluation| evaluation.candidate == runner_up.candidate)
+        .expect("runner-up candidate evaluation");
+    assert!(runner_up_evaluation.eligible);
+    assert_eq!(
+        runner_up_evaluation
+            .score
+            .as_ref()
+            .expect("eligible runner-up score")
+            .total_score_microunits,
+        runner_up.total_score_microunits
+    );
+    let command = &child_commands[0];
+    assert_eq!(choice.candidate.runtime, "codex");
+    assert!(command.runtime_adapter.is_none());
+    assert_eq!(
+        command.model.as_deref(),
+        Some(choice.candidate.model.as_str())
+    );
+    assert_eq!(
+        command.reasoning_effort.as_deref(),
+        Some(selector_effort_as_str(choice.candidate.effort))
+    );
+
+    assert_eq!(execution.selection_decisions.len(), 6);
+    let ledger = execution
+        .assignment_selection_ledger
+        .iter()
+        .find(|entry| {
+            entry.assignment_id == assignment.id && entry.role == AgentRole::ChildOrchestrator
+        })
+        .expect("ChildOrchestrator selection ledger entry");
+    assert_eq!(
+        ledger.selection_source,
+        AssignmentSelectionSource::Automatic
+    );
+    assert_eq!(ledger.selected_runtime.as_deref(), Some("codex"));
+    assert_eq!(
+        ledger.selected_model.as_deref(),
+        Some(choice.candidate.model.as_str())
+    );
+    assert_eq!(
+        ledger.selected_reasoning_effort.as_deref(),
+        Some(selector_effort_as_str(choice.candidate.effort))
+    );
+    assert!(ledger.catalog_snapshot_digest.is_some());
+    assert!(!ledger.catalog_revisions.is_empty());
+    assert!(!ledger.rejected_candidates.is_empty());
+
+    let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+        .expect("open persisted selector-backed supervise artifacts");
+    let persisted = read_supervisor_final_report(&reader)
+        .expect("read persisted selector-backed supervisor report");
+    let persisted_execution = persisted
+        .role_economics_profile
+        .as_ref()
+        .and_then(|profile| profile.execution.as_ref())
+        .expect("persisted selector execution evidence");
+    assert_eq!(
+        persisted_execution.selection_decisions,
+        execution.selection_decisions
+    );
+    assert_eq!(
+        persisted_execution.assignment_selection_ledger,
+        execution.assignment_selection_ledger
+    );
+    let persisted_ledger: AssignmentSelectionLedger = serde_json::from_slice(
+        &reader
+            .read(Path::new(SELECTION_LEDGER_RELATIVE))
+            .expect("read persisted assignment selection ledger"),
+    )
+    .expect("decode persisted assignment selection ledger");
+    assert_eq!(
+        persisted_ledger.schema_version,
+        ASSIGNMENT_SELECTION_LEDGER_SCHEMA_VERSION
+    );
+    assert_eq!(
+        persisted_ledger.entries,
+        execution.assignment_selection_ledger
+    );
+}
+
+#[test]
 fn no_override_selects_single_slug_effort_profile_for_every_role() {
     let plan = parse_supervisor_plan_with_consultant(
         std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),
@@ -2631,15 +2993,35 @@ fn ordered_catalog_chain_selects_first_available_model_with_typed_observation() 
             ECONOMY_PROFILE_MODEL.to_string()
         ]
     );
+}
 
-    let plan = parse_supervisor_plan_with_consultant(
+#[test]
+fn assignment_scoped_prompt_resolution_skips_irrelevant_cross_runtime_worker() {
+    let mut plan = parse_supervisor_plan_with_consultant(
         std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),
     )
     .expect("base plan")
     .plan;
-    let resolved_prompt_plan =
-        runtime_resolved_prompt_plan(&plan, SupervisorRuntime::Codex, &catalog)
-            .expect("resolve prompt selections");
+    plan.assignments[0].phase = AssignmentPhase::Planning;
+    plan.role_models.insert(
+        AgentRole::Worker,
+        RoleModelSelection {
+            model: Some("grok-4.6".to_string()),
+            reasoning_effort: Some("xhigh".to_string()),
+            unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+        },
+    );
+    let assignment = plan.assignments[0].clone();
+    let catalog = injected_codex_runtime_catalog(&[FRONTIER_PROFILE_MODEL]);
+
+    let resolved_prompt_plan = runtime_resolved_prompt_plan(
+        &plan,
+        &assignment,
+        SupervisorRuntime::Codex,
+        SupervisorRuntime::Grok,
+        &catalog,
+    )
+    .expect("resolve only the directly launched planning role");
     assert_eq!(
         effective_role_model_selection(&resolved_prompt_plan, AgentRole::ChildOrchestrator)
             .model
@@ -2650,7 +3032,116 @@ fn ordered_catalog_chain_selects_first_available_model_with_typed_observation() 
         effective_role_model_selection(&resolved_prompt_plan, AgentRole::Worker)
             .model
             .as_deref(),
+        Some("grok-4.6")
+    );
+}
+
+#[test]
+fn assignment_scoped_prompt_resolution_uses_direct_grok_worker_catalog() {
+    let mut plan = parse_supervisor_plan_with_consultant(
+        std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),
+    )
+    .expect("base plan")
+    .plan;
+    let mut child_selection = configured_role_model_selection(&plan, AgentRole::ChildOrchestrator);
+    child_selection.unavailable_model_fallback = UnavailableModelFallback::RuntimeDefault;
+    plan.role_models
+        .insert(AgentRole::ChildOrchestrator, child_selection);
+    plan.role_models.insert(
+        AgentRole::Worker,
+        RoleModelSelection {
+            model: Some("grok-4.6".to_string()),
+            reasoning_effort: Some("xhigh".to_string()),
+            unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
+        },
+    );
+    let mut assignment = plan.assignments[0].clone();
+    assignment.runtime = Some(SupervisorRuntime::Grok);
+    assignment.role = AgentRole::Worker;
+    assignment.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+
+    let resolved_prompt_plan = runtime_resolved_prompt_plan(
+        &plan,
+        &assignment,
+        SupervisorRuntime::Grok,
+        SupervisorRuntime::Grok,
+        &RuntimeModelCatalog::OperatorDeclared,
+    )
+    .expect("resolve the directly launched Grok Worker");
+
+    assert_eq!(
+        effective_role_model_selection(&resolved_prompt_plan, AgentRole::Worker)
+            .model
+            .as_deref(),
+        Some("grok-4.6")
+    );
+    assert_eq!(
+        effective_role_model_selection(&resolved_prompt_plan, AgentRole::Worker)
+            .unavailable_model_fallback,
+        UnavailableModelFallback::FailClosed
+    );
+    assert_eq!(
+        effective_role_model_selection(&resolved_prompt_plan, AgentRole::ChildOrchestrator)
+            .unavailable_model_fallback,
+        UnavailableModelFallback::RuntimeDefault
+    );
+}
+
+#[test]
+fn assignment_scoped_prompt_resolution_resolves_same_runtime_nested_worker() {
+    let mut plan = parse_supervisor_plan_with_consultant(
+        std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),
+    )
+    .expect("base plan")
+    .plan;
+    plan.role_models.insert(
+        AgentRole::Worker,
+        RoleModelSelection {
+            model: Some(ECONOMY_PROFILE_MODEL.to_string()),
+            reasoning_effort: Some("xhigh".to_string()),
+            unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
+        },
+    );
+    let mut assignment = plan.assignments[0].clone();
+    assignment.worker_assignments.push(WorkerAssignment {
+        id: "nested-worker".to_string(),
+        role: AgentRole::Worker,
+        role_category: Some(RoleCategory::NonDelegatingTerminalWorker),
+        selection_source: Some(AssignmentSelectionSource::Automatic),
+        assigned_paths: assignment.assigned_paths.clone(),
+        semantic_symbols: Vec::new(),
+        semantic_modules: Vec::new(),
+        task: Some("complete the nested worker task".to_string()),
+        environment_requirements: Vec::new(),
+        report_path: None,
+    });
+    let catalog = injected_codex_runtime_catalog(&[FRONTIER_PROFILE_MODEL, ECONOMY_PROFILE_MODEL]);
+
+    let resolved_prompt_plan = runtime_resolved_prompt_plan(
+        &plan,
+        &assignment,
+        SupervisorRuntime::Codex,
+        SupervisorRuntime::Codex,
+        &catalog,
+    )
+    .expect("resolve the child and its same-runtime nested Worker");
+
+    assert_eq!(
+        effective_role_model_selection(&resolved_prompt_plan, AgentRole::ChildOrchestrator)
+            .model
+            .as_deref(),
         Some(FRONTIER_PROFILE_MODEL)
+    );
+    assert_eq!(
+        effective_role_model_selection(&resolved_prompt_plan, AgentRole::Worker)
+            .model
+            .as_deref(),
+        Some(ECONOMY_PROFILE_MODEL)
+    );
+    assert_eq!(
+        effective_role_model_selection(&resolved_prompt_plan, AgentRole::Worker)
+            .unavailable_model_fallback,
+        UnavailableModelFallback::FailClosed
     );
 }
 
@@ -3490,6 +3981,82 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
 }
 
 #[test]
+fn process_role_usage_aggregation_prices_direct_workers() {
+    let mut plan = parse_supervisor_plan_with_consultant(
+        std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),
+    )
+    .expect("base plan")
+    .plan;
+    plan.model_pricing = BTreeMap::from([
+        (
+            "worker-primary".to_string(),
+            ModelPricing {
+                input_usd_per_million_tokens: 2.0,
+                output_usd_per_million_tokens: 8.0,
+            },
+        ),
+        (
+            "worker-fallback".to_string(),
+            ModelPricing {
+                input_usd_per_million_tokens: 1.0,
+                output_usd_per_million_tokens: 4.0,
+            },
+        ),
+    ]);
+    let first_usage = Usage {
+        input_tokens: 1_000,
+        output_tokens: 200,
+        total_tokens: 1_200,
+    };
+    let second_usage = Usage {
+        input_tokens: 500,
+        output_tokens: 100,
+        total_tokens: 600,
+    };
+
+    let aggregation = role_usage_report(
+        &plan,
+        vec![
+            RoleUsageSample {
+                role: AgentRole::Worker,
+                lens_id: None,
+                model: Some("worker-primary".to_string()),
+                usage: first_usage,
+            },
+            RoleUsageSample {
+                role: AgentRole::Worker,
+                lens_id: None,
+                model: Some("worker-fallback".to_string()),
+                usage: second_usage,
+            },
+        ],
+    )
+    .expect("aggregate direct Worker process usage");
+
+    let worker = &aggregation.reports[&AgentRole::Worker];
+    let expected_usage = first_usage.saturating_add(second_usage);
+    let expected_cost = 0.0036 + 0.0009;
+    assert_eq!(
+        worker.models,
+        vec!["worker-fallback".to_string(), "worker-primary".to_string()]
+    );
+    assert_eq!(worker.usage, Some(expected_usage));
+    assert!(worker
+        .cost_usd
+        .is_some_and(|cost| (cost - expected_cost).abs() < 1e-12));
+    assert_eq!(worker.observation, RoleUsageObservation::ProcessObserved);
+    assert!(worker.unavailable_reason.is_none());
+    assert_eq!(aggregation.total_usage, Some(expected_usage));
+    assert!(aggregation
+        .total_cost_usd
+        .is_some_and(|cost| (cost - expected_cost).abs() < 1e-12));
+    assert_eq!(
+        aggregation.reports[&AgentRole::Supervisor].usage,
+        Some(expected_usage)
+    );
+}
+
+#[test]
 fn final_usage_evidence_preserves_rejected_and_active_auditor_models() {
     let assignment = injected_assignment(true);
     assert_eq!(assignment.role, AgentRole::ChildOrchestrator);
@@ -3645,6 +4212,46 @@ fn empty_process_usage_has_no_synthetic_supervisor_or_worker_totals() {
         .unavailable_reason
         .as_deref()
         .is_some_and(|reason| reason.contains("not heuristically allocated")));
+}
+
+#[test]
+fn nested_process_usage_has_no_synthetic_worker_totals() {
+    let assignment = injected_assignment(true);
+    assert_eq!(assignment.role, AgentRole::ChildOrchestrator);
+    assert_eq!(assignment.worker_assignments.len(), 1);
+    let nested_plan = injected_plan(assignment, 1);
+    let child_usage = Usage {
+        input_tokens: 400,
+        output_tokens: 100,
+        total_tokens: 500,
+    };
+    let nested = role_usage_report(
+        &nested_plan,
+        vec![RoleUsageSample {
+            role: AgentRole::ChildOrchestrator,
+            lens_id: None,
+            model: Some("planner-model".to_string()),
+            usage: child_usage,
+        }],
+    )
+    .expect("aggregate child-orchestrator usage without synthesizing nested Worker usage");
+    let nested_worker = &nested.reports[&AgentRole::Worker];
+    assert!(nested_worker.models.is_empty());
+    assert!(nested_worker.usage.is_none());
+    assert!(nested_worker.cost_usd.is_none());
+    assert_eq!(
+        nested_worker.observation,
+        RoleUsageObservation::NotProcessObservable
+    );
+    assert!(nested_worker
+        .unavailable_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("nested-worker delegation")));
+    assert_eq!(nested.total_usage, Some(child_usage));
+    assert_eq!(
+        nested.reports[&AgentRole::Supervisor].usage,
+        Some(child_usage)
+    );
 }
 
 #[test]
@@ -3838,6 +4445,7 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
 
 #[test]
 fn unavailable_lens_runtime_selection_is_reported_and_journaled_procedurally() {
+    skip_without_containment!();
     let _capability = install_named_test_models(&["child-model"]);
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);

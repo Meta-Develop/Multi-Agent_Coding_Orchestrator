@@ -364,6 +364,176 @@ fn worker_prompt_includes_execution_journal_contract() {
     assert!(prompt.contains("runtime-side role-tagged usage reporting"));
 }
 
+fn injected_direct_worker_assignment() -> OrchestratorAssignment {
+    OrchestratorAssignment {
+        id: "direct-worker-a".to_string(),
+        phase: AssignmentPhase::Execution,
+        runtime: None,
+        role: AgentRole::Worker,
+        role_category: Some(RoleCategory::NonDelegatingTerminalWorker),
+        selection_source: Some(AssignmentSelectionSource::Automatic),
+        assigned_paths: vec![PathBuf::from("README.md")],
+        semantic_symbols: vec!["direct_scope".to_string()],
+        semantic_modules: vec!["docs".to_string()],
+        task: Some("make the exact bounded direct-worker edit".to_string()),
+        worker_assignments: Vec::new(),
+        environment_requirements: Vec::new(),
+        licensed_breakage: None,
+        notes: None,
+    }
+}
+
+fn injected_direct_worker_report(assignment: &OrchestratorAssignment) -> WorkerReport {
+    WorkerReport {
+        id: assignment.id.clone(),
+        role: AgentRole::Worker,
+        assignment_kind: AssignmentKind::Ordinary,
+        target_path: None,
+        assigned_paths: assignment.assigned_paths.clone(),
+        semantic_symbols: assignment.semantic_symbols.clone(),
+        semantic_modules: assignment.semantic_modules.clone(),
+        claim_token: None,
+        semantic_intent_token: None,
+        commands_run: Vec::new(),
+        environment_failures: Vec::new(),
+        files_changed: Vec::new(),
+        validation_results: vec![ValidationResult {
+            name: "direct worker validation".to_string(),
+            status: ReviewStatus::Succeeded,
+            command: Vec::new(),
+            message: None,
+        }],
+        findings: Vec::new(),
+        field_guide_entries: Vec::new(),
+        bloated_file_flags: Vec::new(),
+        decomposition_completion: None,
+        no_further_delegation: Some(true),
+        accepted: true,
+        rejected: false,
+        status: ReviewStatus::Succeeded,
+        remaining_risk: "none".to_string(),
+        next_safe_action: "review the bounded result".to_string(),
+    }
+}
+
+#[test]
+fn admitted_direct_worker_prompt_has_leaf_authority_and_exact_scope() {
+    let assignment = injected_direct_worker_assignment();
+    let mut plan = injected_plan(assignment.clone(), 0);
+    plan.role_models.insert(
+        AgentRole::Worker,
+        RoleModelSelection {
+            model: Some("worker-model".to_string()),
+            reasoning_effort: Some("low".to_string()),
+            unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+        },
+    );
+    let worktree = WorktreeRecord {
+        name: assignment.id.clone(),
+        path: PathBuf::from("/tmp/maco-direct-worker"),
+        branch: "maco/direct-worker".to_string(),
+    };
+    let claim = PathClaim {
+        token: ClaimToken::from_u64(7),
+        agent_id: assignment.id.clone(),
+        paths: assignment.assigned_paths.clone(),
+    };
+    let prompt = child_orchestrator_prompt(ChildOrchestratorPromptContext {
+        plan: &plan,
+        execution_target: None,
+        assignment: &assignment,
+        run_dir: Path::new("/tmp/maco-run"),
+        worktree: &worktree,
+        report_path: Path::new("/tmp/maco-run/reports/direct-worker-a.json"),
+        schema_path: Path::new("/tmp/maco-run/schemas/orchestrator-review-report.schema.json"),
+        worker_schema_path: Path::new("/tmp/maco-run/schemas/worker-report.schema.json"),
+        auditor_schema_path: Path::new("/tmp/maco-run/schemas/auditor-report.schema.json"),
+        consultant: &SupervisorConsultantPlan::default(),
+        claim_context: ChildPromptClaimContext {
+            claim: &claim,
+            semantic_intent_token: None,
+        },
+    })
+    .expect("render admitted direct worker prompt");
+
+    assert!(prompt.contains("admitted direct terminal worker"));
+    assert!(prompt.contains("Do not launch workers, create delegated subtasks"));
+    assert!(prompt.contains("only inside the exact declared assigned paths"));
+    assert!(prompt.contains("no_further_delegation=true"));
+    assert!(prompt.contains("Return exactly one WorkerReport JSON object"));
+    assert!(prompt.contains("Exact WorkerReport output-last-message path"));
+    assert!(prompt.contains("ROLE: TERMINAL_WORKER"));
+    assert!(!prompt.contains("The O1 must launch"));
+    assert!(!prompt.contains("Parent child orchestrator"));
+    assert!(!prompt.contains("Worker prompt templates"));
+    assert!(!prompt.contains("OrchestratorReviewReport={"));
+}
+
+#[test]
+fn direct_worker_plan_validation_rejects_delegation_and_category_widening() {
+    let direct = injected_direct_worker_assignment();
+    validate_legacy_supervisor_plan(injected_plan(direct.clone(), 0))
+        .expect("explicitly typed direct worker remains admissible");
+
+    let mut nested = direct.clone();
+    nested
+        .worker_assignments
+        .push(injected_assignment(true).worker_assignments.remove(0));
+    let error = validate_legacy_supervisor_plan(injected_plan(nested, 0))
+        .expect_err("a direct worker cannot declare a nested worker");
+    assert!(error
+        .to_string()
+        .contains("may not declare nested worker assignments"));
+
+    let mut widened = direct;
+    widened.role_category = Some(RoleCategory::DelegatingCoordinator);
+    widened.selection_source = Some(AssignmentSelectionSource::OperatorOverride);
+    let error = validate_legacy_supervisor_plan(injected_plan(widened, 0))
+        .expect_err("a coordinator category cannot masquerade as a direct worker");
+    assert!(error
+        .to_string()
+        .contains("must explicitly declare role_category non_delegating_terminal_worker"));
+}
+
+#[test]
+fn acceptance_distinguishes_declared_direct_worker_from_undeclared_nested_worker() {
+    let direct = injected_direct_worker_assignment();
+    let mut direct_report = direct_worker_report_envelope(injected_direct_worker_report(&direct));
+    validate_worker_report_delegation_attestations(
+        &direct,
+        Path::new("reports/direct-worker-a.json"),
+        &mut direct_report,
+    );
+    validate_worker_report_evidence(
+        &direct,
+        &AssignmentMetadata::new(),
+        Path::new("reports/direct-worker-a.json"),
+        &mut direct_report,
+    );
+    assert!(direct_report.accepted);
+    assert_eq!(direct_report.status, ReviewStatus::Succeeded);
+    assert_eq!(direct_report.worker_reports.len(), 1);
+
+    let child = injected_assignment(false);
+    let mut undeclared = injected_direct_worker_report(&direct);
+    undeclared.id = "undeclared-nested-worker".to_string();
+    undeclared.assigned_paths = child.assigned_paths.clone();
+    undeclared.semantic_symbols = child.semantic_symbols.clone();
+    undeclared.semantic_modules = child.semantic_modules.clone();
+    let mut child_report = injected_child_report(&child);
+    child_report.worker_reports.push(undeclared);
+    validate_worker_report_evidence(
+        &child,
+        &AssignmentMetadata::new(),
+        Path::new("reports/child-a.json"),
+        &mut child_report,
+    );
+    assert!(child_report.rejected);
+    assert!(child_report.findings.iter().any(|finding| finding
+        .message
+        .contains("worker is not declared in the assignment")));
+}
+
 #[test]
 fn auditor_prompts_explain_repo_relative_coverage_and_absolute_evidence() {
     let assignment = injected_assignment(true);

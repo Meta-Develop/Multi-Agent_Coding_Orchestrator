@@ -675,6 +675,7 @@ fn failure_outside_declared_path_scope_is_not_licensed() {
 
 #[test]
 fn auditor_must_accept_exact_declaration_digest_before_tasks_exist() {
+    skip_without_containment!();
     let assignment = licensed_assignment();
     let child = dependent_failure_child(&assignment, "src/client.rs");
     let scenario = run_licensed_scenario(assignment, child, false, "licensed-auditor-refusal");

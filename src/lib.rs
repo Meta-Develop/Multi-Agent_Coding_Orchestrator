@@ -33,6 +33,7 @@ pub mod loop_guard;
 pub mod machine_global;
 pub mod megafile;
 pub mod merge;
+pub mod messaging;
 pub mod mutation_taxonomy;
 pub mod objective_profile;
 pub mod optimizer;

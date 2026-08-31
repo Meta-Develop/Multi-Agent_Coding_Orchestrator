@@ -29,8 +29,12 @@ pub(super) fn worker_execution_journal_file_name(worker_id: &str) -> String {
     format!("{worker_id}.jsonl")
 }
 
+pub(super) fn worker_execution_journal_incoming_relative_for_id(worker_id: &str) -> PathBuf {
+    PathBuf::from("worker-journals").join(worker_execution_journal_file_name(worker_id))
+}
+
 pub(super) fn worker_execution_journal_incoming_relative(worker: &WorkerAssignment) -> PathBuf {
-    PathBuf::from("worker-journals").join(worker_execution_journal_file_name(&worker.id))
+    worker_execution_journal_incoming_relative_for_id(&worker.id)
 }
 
 pub(super) fn worker_execution_journal_evidence_relative(
@@ -609,6 +613,31 @@ pub(super) fn record_final_report_decisions(
         &report.id,
         Some(orchestrator_parent_id),
         OrchestrationRole::Orchestrator,
+        if report_failed(report) {
+            OrchestrationEventKind::Reject
+        } else {
+            OrchestrationEventKind::Accept
+        },
+        json!({
+            "status": report.status,
+            "accepted": report.accepted,
+            "rejected": report.rejected,
+        }),
+    );
+}
+
+pub(super) fn record_final_worker_report_decision(
+    journal: &mut Option<OrchestrationEventJournal>,
+    writer: &mut ArtifactRunWriter,
+    parent_id: &str,
+    report: &WorkerReport,
+) {
+    record_orchestration_event(
+        journal,
+        writer,
+        &report.id,
+        Some(parent_id),
+        OrchestrationRole::Worker,
         if report_failed(report) {
             OrchestrationEventKind::Reject
         } else {

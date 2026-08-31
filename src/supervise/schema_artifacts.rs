@@ -1500,6 +1500,17 @@ pub(super) fn write_worker_schema(writer: &mut ArtifactRunWriter, relative: &Pat
     write_schema(writer, relative, worker_report_schema_value())
 }
 
+pub(super) fn write_codex_worker_schema(
+    writer: &mut ArtifactRunWriter,
+    relative: &Path,
+) -> Result<()> {
+    write_schema(
+        writer,
+        relative,
+        codex_response_format_schema(worker_report_schema_value())?,
+    )
+}
+
 pub(super) fn write_auditor_schema(writer: &mut ArtifactRunWriter, relative: &Path) -> Result<()> {
     write_schema(writer, relative, auditor_report_schema_value())
 }

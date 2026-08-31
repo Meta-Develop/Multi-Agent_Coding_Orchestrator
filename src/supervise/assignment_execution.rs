@@ -61,22 +61,27 @@ fn runtime_model_catalog_for_launch(
 fn selected_runtime_program(
     launch_runtime: SupervisorRuntime,
     options: &SupervisorRunOptions,
-) -> PathBuf {
+) -> Result<PathBuf> {
     match launch_runtime {
         SupervisorRuntime::Codex if options.runtime == SupervisorRuntime::Codex => {
-            options.codex_bin.clone()
+            Ok(options.codex_bin.clone())
         }
-        SupervisorRuntime::Grok
-        | SupervisorRuntime::Cursor
+        SupervisorRuntime::Grok => {
+            let program_override = std::env::var_os("MACO_GROK_BIN");
+            crate::runtime_adapter::grok::resolve_configured_grok_executable(
+                program_override.as_deref(),
+            )
+        }
+        SupervisorRuntime::Cursor
         | SupervisorRuntime::ClaudeCode
-        | SupervisorRuntime::GeminiCli => {
+        | SupervisorRuntime::GeminiCli => Ok(
             crate::runtime_adapter::RuntimeAdapterConfig::from_environment(launch_runtime)
                 .binary
                 .filter(|path| !path.as_os_str().is_empty())
-                .unwrap_or_else(|| PathBuf::from(launch_runtime.default_binary()))
-        }
+                .unwrap_or_else(|| PathBuf::from(launch_runtime.default_binary())),
+        ),
         SupervisorRuntime::Codex | SupervisorRuntime::Fake => {
-            PathBuf::from(launch_runtime.default_binary())
+            Ok(PathBuf::from(launch_runtime.default_binary()))
         }
     }
 }
@@ -89,12 +94,55 @@ fn bind_runtime_output_schema(
     command.output_schema = match runtime {
         SupervisorRuntime::Codex => Some(codex_output_schema_path(schema_path)?),
         SupervisorRuntime::Fake => Some(schema_path.to_path_buf()),
-        SupervisorRuntime::Grok
-        | SupervisorRuntime::Cursor
+        // Grok Build consumes the authoritative report schema value directly and returns its
+        // validated structuredOutput on the terminal streaming-json end event.
+        SupervisorRuntime::Grok => Some(schema_path.to_path_buf()),
+        SupervisorRuntime::Cursor
         | SupervisorRuntime::ClaudeCode
         | SupervisorRuntime::GeminiCli => None,
     };
     Ok(command)
+}
+
+fn direct_assignment_report_schema_path<'a>(
+    role: AgentRole,
+    orchestrator_schema_path: &'a Path,
+    worker_schema_path: &'a Path,
+) -> Result<&'a Path> {
+    match role {
+        AgentRole::ChildOrchestrator => Ok(orchestrator_schema_path),
+        AgentRole::Worker => Ok(worker_schema_path),
+        unsupported => bail!(
+            "assignment role '{}' has no direct report schema contract",
+            unsupported.as_str()
+        ),
+    }
+}
+
+fn direct_assignment_report_is_valid(
+    role: AgentRole,
+    contents: Option<&[u8]>,
+    display_path: &Path,
+) -> Result<bool> {
+    match role {
+        AgentRole::ChildOrchestrator => Ok(read_child_report(contents, display_path).is_ok()),
+        AgentRole::Worker => Ok(read_worker_report(contents, display_path).is_ok()),
+        unsupported => bail!(
+            "assignment role '{}' has no direct report parser contract",
+            unsupported.as_str()
+        ),
+    }
+}
+
+fn direct_assignment_orchestration_role(role: AgentRole) -> Result<OrchestrationRole> {
+    match role {
+        AgentRole::ChildOrchestrator => Ok(OrchestrationRole::Orchestrator),
+        AgentRole::Worker => Ok(OrchestrationRole::Worker),
+        unsupported => bail!(
+            "assignment role '{}' has no direct orchestration role contract",
+            unsupported.as_str()
+        ),
+    }
 }
 
 fn codex_output_schema_path(authoritative: &Path) -> Result<PathBuf> {
@@ -122,6 +170,85 @@ fn bind_runtime_read_only_schema_files(
         }
     }
     command
+}
+
+pub(super) fn read_authenticated_review_transcript(
+    writer: &mut ArtifactRunWriter,
+    transcript_relative: &Path,
+) -> Result<String> {
+    if transcript_relative.is_absolute()
+        || transcript_relative.as_os_str().is_empty()
+        || transcript_relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("review transcript artifact path is not canonical relative form");
+    }
+    let before = writer
+        .resume_binding()
+        .context("failed to authenticate retained transcript artifact manifest before read")?;
+    let transcript_path = writer.run_dir().join(transcript_relative);
+    // Authenticate and decode the complete retained evidence under the supervisor-report cap.
+    // Only the later review-lens request is excerpted to its smaller, independent request limit.
+    let bytes = read_bounded_regular_file_nofollow(&transcript_path, MAX_SUPERVISOR_REPORT_BYTES)
+        .with_context(|| {
+        format!(
+            "failed to read retained child transcript {}",
+            transcript_path.display()
+        )
+    })?;
+    let after = writer
+        .resume_binding()
+        .context("failed to authenticate retained transcript artifact manifest after read")?;
+    if before != after {
+        bail!("retained transcript artifact manifest changed while it was read");
+    }
+    String::from_utf8(bytes).context("child transcript evidence is not valid UTF-8")
+}
+
+fn supervisor_review_lens_binding_material(
+    assignment: &OrchestratorAssignment,
+    child_report: &OrchestratorReviewReport,
+    candidate: Option<&SupervisorCandidateInspection>,
+) -> Result<crate::review::ReviewLensBindingMaterial> {
+    if !report_failed(child_report) && candidate.is_none() {
+        bail!("accepted child report has no authenticated supervisor candidate binding");
+    }
+    let worker_validations = child_report
+        .worker_reports
+        .iter()
+        .map(|worker| {
+            json!({
+                "worker_id": worker.id,
+                "validation_results": worker.validation_results,
+            })
+        })
+        .collect::<Vec<_>>();
+    let auditor_validations = child_report
+        .audit_reports
+        .iter()
+        .map(|auditor| {
+            json!({
+                "auditor_id": auditor.id,
+                "validation_results": auditor.validation_results,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(crate::review::ReviewLensBindingMaterial {
+        candidate_binding: json!({
+            "supervisor_inspected": candidate.map(|inspection| &inspection.binding),
+        }),
+        path_bindings: json!({
+            "assigned_paths": assignment.assigned_paths,
+            "child_reported_paths": child_report.files_changed,
+            "supervisor_observed_paths": candidate.map(|inspection| &inspection.changed_paths),
+        }),
+        validation_bindings: json!({
+            "orchestrator_validation_results": child_report.validation_results,
+            "worker_validation_results": worker_validations,
+            "child_auditor_validation_results": auditor_validations,
+        }),
+    })
 }
 
 fn requires_hosted_pre_action_review(command: &ExternalAgentCommand) -> bool {
@@ -217,7 +344,14 @@ fn worktree_writable_admission_record(
             assignment_id
         );
     }
-    let capabilities = runtime.capabilities();
+    let capabilities = command
+        .selected_writable_capabilities(runtime, Some(assignment_id))
+        .with_context(|| {
+            format!(
+                "writable child launch for assignment '{}' did not prove its selected runtime contract",
+                assignment_id
+            )
+        })?;
     if let Some(reason) = capabilities.writable_launch_refusal(command.writable_launch_target) {
         bail!(
             "writable child launch for assignment '{}' lacks verified native sandbox admission: {}",
@@ -345,7 +479,6 @@ fn bind_selected_runtime_launch(
     let resolution = catalog.resolve_role_model_selection(&configured, launch_runtime)?;
     let model_provenance =
         CompletedLaunchModelProvenance::from_resolution(launch_runtime, &configured, &resolution);
-    admit_assignment_role_category(assignment, launch_runtime, &resolution)?;
     if launch_runtime.is_adapter_subprocess() {
         authorize_bounded_leaf_runtime_role(assignment.role).with_context(|| {
             format!(
@@ -354,7 +487,21 @@ fn bind_selected_runtime_launch(
                 assignment.role.as_str()
             )
         })?;
-        command.program = selected_runtime_program(launch_runtime, options);
+    }
+    let is_writable_grok_terminal_worker = assignment.phase == AssignmentPhase::Execution
+        && assignment.role == AgentRole::Worker
+        && assignment.effective_role_category() == RoleCategory::NonDelegatingTerminalWorker
+        && assignment.worker_assignments.is_empty();
+    if launch_runtime == SupervisorRuntime::Grok && !is_writable_grok_terminal_worker {
+        bail!(
+            "{}: assignment '{}' must be an execution-phase, explicitly bound non-delegating terminal Worker with no nested assignments",
+            crate::external_agent::WRITABLE_GROK_TERMINAL_WORKER_REQUIRED,
+            assignment.id
+        );
+    }
+    admit_assignment_role_category(assignment, launch_runtime, &resolution)?;
+    if launch_runtime.is_adapter_subprocess() {
+        command.program = selected_runtime_program(launch_runtime, options)?;
         command = command.with_runtime_adapter(
             launch_runtime,
             crate::runtime_adapter::RuntimeAdapterConfig::from_environment(launch_runtime),
@@ -397,6 +544,49 @@ fn bind_selected_runtime_launch(
     })
 }
 
+fn bind_selected_grok_execution_workspace(
+    mut command: ExternalAgentCommand,
+    assignment: &OrchestratorAssignment,
+    launch_runtime: SupervisorRuntime,
+    managed_worktree: &Path,
+    writable_execution: bool,
+) -> Result<ExternalAgentCommand> {
+    if launch_runtime != SupervisorRuntime::Grok {
+        return Ok(command);
+    }
+    let is_writable_grok_terminal_worker = writable_execution
+        && assignment.phase == AssignmentPhase::Execution
+        && assignment.role == AgentRole::Worker
+        && assignment.effective_role_category() == RoleCategory::NonDelegatingTerminalWorker
+        && assignment.worker_assignments.is_empty();
+    if !is_writable_grok_terminal_worker
+        || command.writable_launch_target
+            != crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree
+    {
+        bail!(
+            "{}: assignment '{}' selected Grok launch is not exactly bound to its writable managed child worktree",
+            crate::external_agent::WRITABLE_GROK_TERMINAL_WORKER_REQUIRED,
+            assignment.id
+        );
+    }
+    command.cwd = managed_worktree.to_path_buf();
+    command.workspace_access = WorkspaceAccess::ReadWrite;
+    let command = command.with_writable_runtime_selection(
+        &assignment.id,
+        launch_runtime,
+        is_writable_grok_terminal_worker,
+    )?;
+    command
+        .selected_writable_capabilities(launch_runtime, Some(&assignment.id))
+        .with_context(|| {
+            format!(
+                "writable Grok assignment '{}' did not prove its exact selected launch contract",
+                assignment.id
+            )
+        })?;
+    Ok(command)
+}
+
 #[cfg(test)]
 pub(super) fn bind_selected_assignment_launch_for_test(
     command: ExternalAgentCommand,
@@ -406,6 +596,7 @@ pub(super) fn bind_selected_assignment_launch_for_test(
     options: &SupervisorRunOptions,
     catalog: &RuntimeModelCatalog,
 ) -> Result<(SupervisorRuntime, ExternalAgentCommand)> {
+    let managed_worktree = command.cwd.clone();
     let launch_runtime = assignment_launch_runtime(assignment, options, budget_policy);
     let launch_catalog =
         runtime_model_catalog_for_launch(catalog, options.runtime, launch_runtime)?;
@@ -417,7 +608,14 @@ pub(super) fn bind_selected_assignment_launch_for_test(
         launch_runtime,
         &launch_catalog,
     )?;
-    Ok((launch_runtime, bound_launch.command))
+    let command = bind_selected_grok_execution_workspace(
+        bound_launch.command,
+        assignment,
+        launch_runtime,
+        &managed_worktree,
+        true,
+    )?;
+    Ok((launch_runtime, command))
 }
 
 pub(super) fn prerender_selected_runtime_adapter_command(
@@ -1044,6 +1242,43 @@ struct PreparedChildAttempt<'a> {
     pre_action_review_context: Option<ReviewContext>,
 }
 
+pub(super) fn bind_worker_journal_artifacts(
+    mut command: ExternalAgentCommand,
+    assignment: &OrchestratorAssignment,
+    incoming_root: &Path,
+    journal_paths: Vec<PathBuf>,
+) -> Result<ExternalAgentCommand> {
+    let worker_journal_subject_ids = assignment_worker_journal_subject_ids(assignment)?;
+    if !command.worker_journal_artifacts.is_empty() {
+        bail!("worker journal artifacts were already bound before assignment preparation");
+    }
+    if journal_paths.len() != worker_journal_subject_ids.len() {
+        bail!("worker journal reservation count did not match the assignment contract");
+    }
+    for (worker_id, journal_path) in worker_journal_subject_ids
+        .iter()
+        .copied()
+        .zip(journal_paths)
+    {
+        let expected_path =
+            incoming_root.join(worker_execution_journal_incoming_relative_for_id(worker_id));
+        if journal_path != expected_path {
+            bail!(
+                "worker journal reservation path {} for '{}' did not match the assignment contract path {}",
+                journal_path.display(),
+                worker_id,
+                expected_path.display()
+            );
+        }
+        command = command.with_worker_journal_artifact(
+            worker_id.to_string(),
+            incoming_root,
+            journal_path,
+        );
+    }
+    Ok(command)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_child_attempt<'a>(
     context: &AssignmentExecutionContext<'a, '_>,
@@ -1116,7 +1351,15 @@ fn prepare_child_attempt<'a>(
     let nested_worker_runtime = nested_worker_launch_runtime(launch_runtime, budget_policy);
     let resolved_prompt_plan = evidence_only_reaudit
         .is_none()
-        .then(|| runtime_resolved_prompt_plan(&budget_plan, launch_runtime, &launch_catalog))
+        .then(|| {
+            runtime_resolved_prompt_plan(
+                &budget_plan,
+                assignment,
+                launch_runtime,
+                nested_worker_runtime,
+                &launch_catalog,
+            )
+        })
         .transpose()?;
     let RenderedPromptWithMeasurements {
         prompt,
@@ -1169,12 +1412,26 @@ fn prepare_child_attempt<'a>(
         )?
     };
     if evidence_only_reaudit.is_none() {
+        let (assignment_journal_role, assignment_prompt_role) = match assignment.role {
+            AgentRole::ChildOrchestrator => (
+                OrchestrationRole::Orchestrator,
+                SupervisePromptRole::O1ChildOrchestrator,
+            ),
+            AgentRole::Worker => (
+                OrchestrationRole::Worker,
+                SupervisePromptRole::TerminalWorker,
+            ),
+            unsupported => bail!(
+                "assignment role '{}' has no direct prompt journal contract",
+                unsupported.as_str()
+            ),
+        };
         record_field_guide_prompt_injection_strict(
             artifacts,
             &assignment.id,
             Some(journal_parent_id),
-            OrchestrationRole::Orchestrator,
-            SupervisePromptRole::O1ChildOrchestrator,
+            assignment_journal_role,
+            assignment_prompt_role,
             field_guide,
             attempt,
         )?;
@@ -1241,7 +1498,9 @@ fn prepare_child_attempt<'a>(
         &launch_catalog,
     )?;
     command = bound_launch.command;
-    command = bind_runtime_output_schema(command, launch_runtime, schema_path)?;
+    let direct_report_schema_path =
+        direct_assignment_report_schema_path(assignment.role, schema_path, worker_schema_path)?;
+    command = bind_runtime_output_schema(command, launch_runtime, direct_report_schema_path)?;
     command = bind_runtime_read_only_schema_files(
         command,
         launch_runtime,
@@ -1271,6 +1530,13 @@ fn prepare_child_attempt<'a>(
         }
         None => crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree,
     });
+    command = bind_selected_grok_execution_workspace(
+        command,
+        assignment,
+        launch_runtime,
+        &worktree.path,
+        evidence_only_reaudit.is_none(),
+    )?;
 
     let primary_before = primary_worktree_snapshot(repo, *execution_runtime)?;
     if let Some(error) = primary_before.inspection_problem() {
@@ -1339,21 +1605,22 @@ fn prepare_child_attempt<'a>(
                 return Err(error).context("failed to reserve exact worker journal artifacts");
             }
         };
-        if journal_paths.len() != assignment.worker_assignments.len() {
-            drop(incoming_output_root);
-            drop(capture_output_root);
-            with_supervisor_artifacts(artifacts, |writer, _| {
-                discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
-            })?;
-            bail!("worker journal reservation count did not match the assignment contract");
-        }
-        for (worker, journal_path) in assignment.worker_assignments.iter().zip(journal_paths) {
-            command = command.with_worker_journal_artifact(
-                worker.id.clone(),
-                incoming_scratch.path(),
-                journal_path,
-            );
-        }
+        command = match bind_worker_journal_artifacts(
+            command,
+            assignment,
+            incoming_scratch.path(),
+            journal_paths,
+        ) {
+            Ok(command) => command,
+            Err(error) => {
+                drop(incoming_output_root);
+                drop(capture_output_root);
+                with_supervisor_artifacts(artifacts, |writer, _| {
+                    discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
+                })?;
+                return Err(error).context("failed to bind exact worker journal artifacts");
+            }
+        };
     }
     let budget_reservation = match reserve_dispatch_budget(
         &budget_plan,
@@ -1416,6 +1683,7 @@ fn prepare_child_attempt<'a>(
             launch_runtime,
             assignment_phase,
         )? {
+            command = command.with_worktree_writable_confinement(admission.clone());
             let relative = PathBuf::from("assignments").join(format!(
                 "{}.attempt-{attempt}.worktree-writable-admission.json",
                 assignment.id
@@ -1488,12 +1756,12 @@ struct CollectedChildAttempt<'a> {
     _command: ExternalAgentCommand,
 }
 
-fn verify_imported_managed_child_candidate(
+fn capture_managed_child_candidate(
     repo: &Path,
     assignment: &OrchestratorAssignment,
     write_lease: &ManagedWorktreeWriteLease,
-    imported: &ManagedChildGitImport,
-) -> Result<()> {
+    context: &str,
+) -> Result<(Vec<PathBuf>, Oid)> {
     let candidate = collect_agent_result_with_evidence_and_write_lease(
         MergeCollectOptions {
             repo: repo.to_path_buf(),
@@ -1506,15 +1774,30 @@ fn verify_imported_managed_child_candidate(
         ValidationEvidenceBundle::default(),
         write_lease,
     )
-    .context("failed to capture the imported managed child candidate")?;
+    .with_context(|| format!("failed to capture {context}"))?;
     if !candidate.unclaimed_changed_paths.is_empty() {
         bail!(
-            "imported managed child candidate contains unclaimed paths: {}",
+            "{context} contains unclaimed paths: {}",
             display_paths(&candidate.unclaimed_changed_paths)
         );
     }
     let candidate_paths = normalize_paths(candidate.changed_paths)
-        .context("imported managed child candidate paths are invalid")?;
+        .with_context(|| format!("{context} paths are invalid"))?;
+    Ok((candidate_paths, candidate.snapshot_tree))
+}
+
+fn verify_imported_managed_child_candidate(
+    repo: &Path,
+    assignment: &OrchestratorAssignment,
+    write_lease: &ManagedWorktreeWriteLease,
+    imported: &ManagedChildGitImport,
+) -> Result<()> {
+    let (candidate_paths, candidate_tree) = capture_managed_child_candidate(
+        repo,
+        assignment,
+        write_lease,
+        "the imported managed child candidate",
+    )?;
     if candidate_paths != imported.final_changed_paths {
         bail!(
             "imported managed child commit paths differ from the collected worktree candidate: commit [{}], worktree [{}]",
@@ -1522,14 +1805,49 @@ fn verify_imported_managed_child_candidate(
             display_paths(&candidate_paths)
         );
     }
-    if candidate.snapshot_tree != imported.head_tree_oid {
+    if candidate_tree != imported.head_tree_oid {
         bail!(
             "imported managed child commit tree {} differs from collected worktree tree {}",
             imported.head_tree_oid,
-            candidate.snapshot_tree
+            candidate_tree
         );
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ManagedChildMaterializationGate {
+    codex_supervisor: bool,
+    verified_execution: bool,
+    process_completed: bool,
+    containment_verified: bool,
+    publishable: bool,
+    structured_report_valid: bool,
+    report_succeeded: bool,
+    writable_workspace: bool,
+    isolated_managed_child: bool,
+    primary_integrity_verified: bool,
+    sandbox_denials_absent: bool,
+    pre_action_refusals_absent: bool,
+    external_side_effect_absent: bool,
+}
+
+impl ManagedChildMaterializationGate {
+    fn eligible(self) -> bool {
+        self.codex_supervisor
+            && self.verified_execution
+            && self.process_completed
+            && self.containment_verified
+            && self.publishable
+            && self.structured_report_valid
+            && self.report_succeeded
+            && self.writable_workspace
+            && self.isolated_managed_child
+            && self.primary_integrity_verified
+            && self.sandbox_denials_absent
+            && self.pre_action_refusals_absent
+            && self.external_side_effect_absent
+    }
 }
 
 fn dispatch_and_collect_child_attempt<'a>(
@@ -1565,17 +1883,18 @@ fn dispatch_and_collect_child_attempt<'a>(
     let launch_runtime = prepared.launch_runtime;
     let mut budget_reservation = prepared.budget_reservation;
     let pre_action_review_context = prepared.pre_action_review_context;
+    let assignment_journal_role = direct_assignment_orchestration_role(assignment.role)?;
 
     record_shared_orchestration_event(
         artifacts,
         &assignment.id,
         Some(journal_parent_id),
-        OrchestrationRole::Orchestrator,
+        assignment_journal_role,
         OrchestrationEventKind::Spawn,
         record_supervision_spawn_payload_with_category(
             &assignment.id,
             journal_parent_id,
-            OrchestrationRole::Orchestrator,
+            assignment_journal_role,
             assignment.role,
             assignment.category_override(),
             write_boundary_refs(&assignment.assigned_paths),
@@ -1716,7 +2035,7 @@ fn dispatch_and_collect_child_attempt<'a>(
     match usage_settlement.reliable_usage() {
         Some(usage) => {
             outcome.usage_samples.push(RoleUsageSample {
-                role: AgentRole::ChildOrchestrator,
+                role: assignment.role,
                 lens_id: None,
                 model: command.model.clone(),
                 usage,
@@ -1750,10 +2069,10 @@ fn dispatch_and_collect_child_attempt<'a>(
         artifacts,
         &assignment.id,
         Some(journal_parent_id),
-        OrchestrationRole::Orchestrator,
+        assignment_journal_role,
         OrchestrationEventKind::Status,
         lifecycle_event_payload(
-            if external_process_completed(&external_run) {
+            if external_process_completed(&external_run, launch_runtime) {
                 "completed"
             } else {
                 "failed"
@@ -1778,12 +2097,16 @@ fn dispatch_and_collect_child_attempt<'a>(
     }
     outcome
         .command_records
-        .push(command_record_from_external(&external_run, &command));
-    let raw_report_validated = read_child_report(
+        .push(command_record_from_external_for_runtime(
+            &external_run,
+            &command,
+            launch_runtime,
+        ));
+    let raw_report_validated = direct_assignment_report_is_valid(
+        assignment.role,
         external_run.output_last_message(),
         &attempt_artifacts.raw_report_relative,
-    )
-    .is_ok();
+    )?;
     let worker_journal_result = with_supervisor_artifacts(artifacts, |writer, journal| {
         let evidence =
             import_worker_execution_journals(writer, assignment, &incoming_scratch, &external_run)?;
@@ -1815,33 +2138,6 @@ fn dispatch_and_collect_child_attempt<'a>(
                 "external attempt evidence import and scratch cleanup also failed: {import_error:#}"
             ))
         }
-    };
-    let managed_child_git_import = if options.runtime == SupervisorRuntime::Codex
-        && *execution_runtime == SupervisorExecutionRuntime::Verified
-        && external_process_completed(&external_run)
-        && attempt_containment_verified
-        && external_run.publishable
-        && raw_report_validated
-        && preflight.primary_scope_baseline.is_none()
-    {
-        let write_lease = preflight
-            .worktree_write_lease
-            .as_ref()
-            .context("verified managed child Git collection has no write lease")?;
-        Some(
-            collect_and_import_managed_child_git_commit(
-                repo,
-                &worktree.path,
-                preflight.child_base_head,
-                &assignment.assigned_paths,
-            )
-            .and_then(|imported| {
-                verify_imported_managed_child_candidate(repo, assignment, write_lease, &imported)?;
-                Ok(imported)
-            }),
-        )
-    } else {
-        None
     };
     let primary_after = primary_worktree_snapshot(repo, *execution_runtime)?;
     let primary_changes = primary_integrity_changes(&primary_before, &primary_after);
@@ -1876,8 +2172,8 @@ fn dispatch_and_collect_child_attempt<'a>(
         outcome.pre_action_review_metrics.push(metrics.clone());
     }
     let external_side_effect_state = external_run.external_side_effect_state();
-    let (mut attempt_report, report_shape_problems) =
-        collect_child_report(ChildReportCollectionContext {
+    let (mut attempt_report, report_shape_problems) = collect_child_report_for_runtime(
+        ChildReportCollectionContext {
             assignment,
             assignment_metadata,
             report_path: &attempt_artifacts.raw_report_relative,
@@ -1888,7 +2184,56 @@ fn dispatch_and_collect_child_attempt<'a>(
             worker_journals: &worker_journal_evidence,
             evidence_only_source: context.evidence_only_reaudit.map(|source| &source.report),
             observed_changed_paths: observed_primary_scope_changes.as_deref(),
-        });
+        },
+        launch_runtime,
+    );
+    let materialization_gate = ManagedChildMaterializationGate {
+        codex_supervisor: options.runtime == SupervisorRuntime::Codex,
+        verified_execution: *execution_runtime == SupervisorExecutionRuntime::Verified,
+        process_completed: external_process_completed(&external_run, launch_runtime),
+        containment_verified: attempt_containment_verified,
+        publishable: external_run.publishable,
+        structured_report_valid: raw_report_validated,
+        report_succeeded: !report_failed(&attempt_report),
+        writable_workspace: command.workspace_access == WorkspaceAccess::ReadWrite,
+        isolated_managed_child: preflight.primary_scope_baseline.is_none(),
+        primary_integrity_verified: primary_changes.is_empty(),
+        sandbox_denials_absent: sandbox_denials.is_empty(),
+        pre_action_refusals_absent: pre_action_refusals.is_empty(),
+        external_side_effect_absent: external_side_effect_state.is_none(),
+    };
+    let managed_child_git_import = if materialization_gate.eligible() {
+        let write_lease = preflight
+            .worktree_write_lease
+            .as_ref()
+            .context("verified managed child Git materialization has no write lease")?;
+        Some((|| {
+            let (candidate_paths, candidate_tree) = capture_managed_child_candidate(
+                repo,
+                assignment,
+                write_lease,
+                "the pre-materialization managed child candidate",
+            )?;
+            crate::external_agent::materialize_managed_child_git_commit(
+                repo,
+                &worktree.path,
+                preflight.child_base_head,
+                &assignment.assigned_paths,
+                &candidate_paths,
+                candidate_tree,
+            )?;
+            let imported = collect_and_import_managed_child_git_commit(
+                repo,
+                &worktree.path,
+                preflight.child_base_head,
+                &assignment.assigned_paths,
+            )?;
+            verify_imported_managed_child_candidate(repo, assignment, write_lease, &imported)?;
+            Ok::<_, anyhow::Error>(imported)
+        })())
+    } else {
+        None
+    };
     if let Some(import) = managed_child_git_import {
         match import {
             Ok(imported) => attempt_report.findings.push(Finding {
@@ -2029,6 +2374,7 @@ fn decide_child_attempt(
         plan, artifacts, ..
     } = context;
     let assignment = &preflight.assignment;
+    let assignment_journal_role = direct_assignment_orchestration_role(assignment.role)?;
     let CollectedChildAttempt {
         mut attempt_report,
         report_shape_problems,
@@ -2294,7 +2640,7 @@ fn decide_child_attempt(
             artifacts,
             &assignment.id,
             Some(journal_parent_id),
-            OrchestrationRole::Orchestrator,
+            assignment_journal_role,
             OrchestrationEventKind::Reject,
             json!({
                 "scope": "attempt",
@@ -2307,7 +2653,7 @@ fn decide_child_attempt(
             artifacts,
             &assignment.id,
             Some(journal_parent_id),
-            OrchestrationRole::Orchestrator,
+            assignment_journal_role,
             OrchestrationEventKind::Status,
             lifecycle_event_payload("retrying", Some(attempt), None),
         )?;
@@ -2651,7 +2997,7 @@ fn prepare_parent_auditor<'a>(
         Duration::from_secs(plan.child_timeout_seconds),
     );
     if launch_runtime.is_adapter_subprocess() {
-        auditor_command.program = selected_runtime_program(launch_runtime, options);
+        auditor_command.program = selected_runtime_program(launch_runtime, options)?;
         auditor_command = auditor_command.with_runtime_adapter(
             launch_runtime,
             crate::runtime_adapter::RuntimeAdapterConfig::from_environment(launch_runtime),
@@ -2895,7 +3241,7 @@ fn dispatch_and_collect_parent_auditor(
         SupervisorRuntime::Codex => {
             // All fallible pre-dispatch preparation is complete. Mark
             // invocation only at the external-runner call boundary.
-            if let Err(error) = auditor_budget_reservation.mark_invoked_for_runtime(options.runtime)
+            if let Err(error) = auditor_budget_reservation.mark_invoked_for_runtime(launch_runtime)
             {
                 drop(auditor_incoming_root);
                 drop(auditor_capture_root);
@@ -2931,7 +3277,7 @@ fn dispatch_and_collect_parent_auditor(
         | SupervisorRuntime::Cursor
         | SupervisorRuntime::ClaudeCode
         | SupervisorRuntime::GeminiCli => {
-            if let Err(error) = auditor_budget_reservation.mark_invoked_for_runtime(options.runtime)
+            if let Err(error) = auditor_budget_reservation.mark_invoked_for_runtime(launch_runtime)
             {
                 drop(auditor_incoming_root);
                 drop(auditor_capture_root);
@@ -2948,7 +3294,7 @@ fn dispatch_and_collect_parent_auditor(
             Ok(external_runner(&auditor_command, cancellation, None))
         }
         SupervisorRuntime::Fake => {
-            if let Err(error) = auditor_budget_reservation.mark_invoked_for_runtime(options.runtime)
+            if let Err(error) = auditor_budget_reservation.mark_invoked_for_runtime(launch_runtime)
             {
                 drop(auditor_incoming_root);
                 drop(auditor_capture_root);
@@ -3003,7 +3349,7 @@ fn dispatch_and_collect_parent_auditor(
                     assignment_id: &assignment.id,
                     attempt: auditor_attempt,
                     role: AgentRole::Auditor,
-                    runtime: options.runtime,
+                    runtime: launch_runtime,
                     model: auditor_command.model.as_deref(),
                     effort: auditor_command.reasoning_effort.as_deref(),
                     worktree_id: &assignment.id,
@@ -3026,7 +3372,7 @@ fn dispatch_and_collect_parent_auditor(
         OrchestrationRole::Auditor,
         OrchestrationEventKind::Status,
         lifecycle_event_payload(
-            if external_process_completed(&auditor_run) {
+            if external_process_completed(&auditor_run, launch_runtime) {
                 "completed"
             } else {
                 "failed"
@@ -3086,7 +3432,8 @@ fn dispatch_and_collect_parent_auditor(
             tracker.escalate(denial, artifacts, &assignment.id, journal_parent_id)?;
         }
     }
-    let auditor_command_record = command_record_from_external(&auditor_run, &auditor_command);
+    let auditor_command_record =
+        command_record_from_external_for_runtime(&auditor_run, &auditor_command, launch_runtime);
     outcome.command_records.push(auditor_command_record.clone());
     child_report.commands_run.push(auditor_command_record);
     let raw_auditor_validated = read_auditor_report(
@@ -3116,6 +3463,7 @@ fn dispatch_and_collect_parent_auditor(
         &auditor_artifacts.raw_report_relative,
         &auditor_run,
         &auditor_command,
+        launch_runtime,
     );
     let auditor_primary_integrity_failed = !primary_auditor_changes.is_empty();
     if auditor_primary_integrity_failed {
@@ -3486,8 +3834,15 @@ fn publish_assignment_report(
         auditor_capability,
     )?;
     with_supervisor_artifacts(context.artifacts, |writer, journal| {
-        write_child_report(writer, final_report_relative, &child_report)?;
-        record_final_report_decisions(journal, writer, journal_parent_id, &child_report);
+        persist_final_assignment_report(
+            writer,
+            journal,
+            assignment,
+            journal_parent_id,
+            final_report_relative,
+            final_report_path,
+            &child_report,
+        )?;
         if let Some(executed) = &role_transition {
             record_orchestration_event(
                 journal,
@@ -3544,6 +3899,33 @@ fn publish_assignment_report(
     Ok(())
 }
 
+pub(super) fn persist_final_assignment_report(
+    writer: &mut ArtifactRunWriter,
+    journal: &mut Option<OrchestrationEventJournal>,
+    assignment: &OrchestratorAssignment,
+    journal_parent_id: &str,
+    final_report_relative: &Path,
+    final_report_path: &Path,
+    report: &OrchestratorReviewReport,
+) -> Result<()> {
+    match assignment.role {
+        AgentRole::ChildOrchestrator => {
+            write_child_report(writer, final_report_relative, report)?;
+            record_final_report_decisions(journal, writer, journal_parent_id, report);
+        }
+        AgentRole::Worker => {
+            let worker = finalized_direct_worker_report(assignment, report, final_report_path);
+            write_worker_report(writer, final_report_relative, &worker)?;
+            record_final_worker_report_decision(journal, writer, journal_parent_id, &worker);
+        }
+        unsupported => bail!(
+            "assignment role '{}' has no final report persistence contract",
+            unsupported.as_str()
+        ),
+    }
+    Ok(())
+}
+
 fn execute_supervisor_assignment_inner(
     context: &AssignmentExecutionContext<'_, '_>,
     outcome: &mut AssignmentExecutionOutcome,
@@ -3552,7 +3934,6 @@ fn execute_supervisor_assignment_inner(
         plan,
         options,
         repo,
-        run_dir,
         dirs,
         artifacts,
         runtime_model_catalog,
@@ -3757,9 +4138,11 @@ fn execute_supervisor_assignment_inner(
                 child_gate_terminal = true;
             }
         }
-        with_supervisor_artifacts(artifacts, |writer, _| {
-            write_child_report(writer, &final_report_relative, &child_report)
-        })?;
+        if assignment.role == AgentRole::ChildOrchestrator {
+            with_supervisor_artifacts(artifacts, |writer, _| {
+                write_child_report(writer, &final_report_relative, &child_report)
+            })?;
+        }
 
         let mut assignment_containment_verified = child_containment_verified;
         let mut auditor_primary_integrity_failed = false;
@@ -3769,29 +4152,13 @@ fn execute_supervisor_assignment_inner(
             && !child_gate_terminal
             && parent_auditor_required(assignment, &child_report)
         {
-            let transcript_path = attempt_history
+            let transcript_relative = attempt_history
                 .last()
-                .map(|history| run_dir.join(&history.raw_stdout_path))
+                .map(|history| history.raw_stdout_path.as_path())
                 .context("successful child attempt has no retained transcript evidence")?;
-            let transcript_probe_limit = REVIEW_LENS_REQUEST_LIMIT_BYTES
-                .checked_add(1)
-                .context("review-lens transcript probe limit overflowed")?;
-            let child_transcript_bytes =
-                read_bounded_regular_file_nofollow(&transcript_path, transcript_probe_limit)
-                    .with_context(|| {
-                        format!(
-                            "failed to read bounded child transcript {}",
-                            transcript_path.display()
-                        )
-                    })?;
-            if child_transcript_bytes.len() > REVIEW_LENS_REQUEST_LIMIT_BYTES {
-                bail!(
-                    "child transcript exceeds its {} byte review-lens input limit",
-                    REVIEW_LENS_REQUEST_LIMIT_BYTES
-                );
-            }
-            let child_transcript = String::from_utf8(child_transcript_bytes)
-                .context("child transcript evidence is not valid UTF-8")?;
+            let child_transcript = with_supervisor_artifacts(artifacts, |writer, _| {
+                read_authenticated_review_transcript(writer, transcript_relative)
+            })?;
             let review_base = context
                 .evidence_only_reaudit
                 .and_then(|source| {
@@ -3822,10 +4189,17 @@ fn execute_supervisor_assignment_inner(
             };
             let output_report = serde_json::to_string(&child_report)
                 .context("failed to serialize child output report for review lenses")?;
-            let sources = ReviewLensRequestSources {
+            let review_bindings = supervisor_review_lens_binding_material(
+                assignment,
+                &child_report,
+                pre_auditor_candidate.as_ref(),
+            )?;
+            let sources = crate::review::BoundedReviewLensRequestSources {
                 child_transcript: &child_transcript,
+                authoritative_transcript_path: transcript_relative,
                 diff: &diff,
                 output_report: &output_report,
+                bindings: &review_bindings,
             };
             let required_coverage =
                 supervisor_review_coverage_requirement(assignment, &child_report);
@@ -3836,7 +4210,8 @@ fn execute_supervisor_assignment_inner(
             let mut expected_requests = Vec::with_capacity(active_plan.review_lenses.len());
             let mut verdicts = Vec::with_capacity(active_plan.review_lenses.len());
             for (lens_index, lens) in active_plan.review_lenses.iter().enumerate() {
-                let expected_request = build_review_lens_request(lens, sources)?;
+                let expected_request =
+                    crate::review::build_bounded_review_lens_request(lens, sources)?;
                 let runtime_validation = validate_review_lens_runtime_selection(
                     lens,
                     auditor_launch_runtime,
@@ -3884,7 +4259,10 @@ fn execute_supervisor_assignment_inner(
                         for remaining_lens in active_plan.review_lenses.iter().skip(lens_index + 1)
                         {
                             let remaining_request =
-                                build_review_lens_request(remaining_lens, sources)?;
+                                crate::review::build_bounded_review_lens_request(
+                                    remaining_lens,
+                                    sources,
+                                )?;
                             verdicts.push(ReviewLensVerdict::for_lens(
                                 remaining_lens,
                                 remaining_request.request_binding.clone(),
@@ -4000,6 +4378,40 @@ mod decomposition_tests {
     use std::os::unix::fs::PermissionsExt;
     #[cfg(target_os = "linux")]
     use std::time::Instant;
+    use std::{ffi::OsString, sync::MutexGuard};
+
+    static GROK_BINARY_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+
+    struct GrokBinaryEnvironmentGuard {
+        previous: Option<OsString>,
+    }
+
+    impl GrokBinaryEnvironmentGuard {
+        fn install(program: &Path) -> (MutexGuard<'static, ()>, Self) {
+            let lock = GROK_BINARY_ENVIRONMENT_LOCK
+                .lock()
+                .expect("lock Grok binary environment");
+            let previous = std::env::var_os("MACO_GROK_BIN");
+            // SAFETY: this test serializes its MACO_GROK_BIN mutation and the
+            // guard restores the exact prior process value before releasing
+            // that lock.
+            unsafe { std::env::set_var("MACO_GROK_BIN", program) };
+            (lock, Self { previous })
+        }
+    }
+
+    impl Drop for GrokBinaryEnvironmentGuard {
+        fn drop(&mut self) {
+            // SAFETY: the corresponding lock remains held until after this
+            // guard drops because the tuple binding declares it first.
+            unsafe {
+                match &self.previous {
+                    Some(previous) => std::env::set_var("MACO_GROK_BIN", previous),
+                    None => std::env::remove_var("MACO_GROK_BIN"),
+                }
+            }
+        }
+    }
 
     fn commit_fixture_repository(path: &Path) {
         let repo = crate::git_repository::open(path).expect("open fixture repository");
@@ -5392,6 +5804,89 @@ done
         assert!(execution_command.worktree_control_exceptions.is_empty());
     }
 
+    fn eligible_managed_child_materialization_gate() -> ManagedChildMaterializationGate {
+        ManagedChildMaterializationGate {
+            codex_supervisor: true,
+            verified_execution: true,
+            process_completed: true,
+            containment_verified: true,
+            publishable: true,
+            structured_report_valid: true,
+            report_succeeded: true,
+            writable_workspace: true,
+            isolated_managed_child: true,
+            primary_integrity_verified: true,
+            sandbox_denials_absent: true,
+            pre_action_refusals_absent: true,
+            external_side_effect_absent: true,
+        }
+    }
+
+    #[test]
+    fn successful_writable_adapter_report_is_eligible_for_private_materialization() {
+        assert!(eligible_managed_child_materialization_gate().eligible());
+    }
+
+    #[test]
+    fn private_materialization_gate_refuses_failed_unverified_and_read_only_attempts() {
+        let baseline = eligible_managed_child_materialization_gate();
+        for refused in [
+            ManagedChildMaterializationGate {
+                process_completed: false,
+                ..baseline
+            },
+            ManagedChildMaterializationGate {
+                containment_verified: false,
+                ..baseline
+            },
+            ManagedChildMaterializationGate {
+                publishable: false,
+                ..baseline
+            },
+            ManagedChildMaterializationGate {
+                structured_report_valid: false,
+                ..baseline
+            },
+            ManagedChildMaterializationGate {
+                report_succeeded: false,
+                ..baseline
+            },
+            ManagedChildMaterializationGate {
+                verified_execution: false,
+                ..baseline
+            },
+            ManagedChildMaterializationGate {
+                writable_workspace: false,
+                ..baseline
+            },
+            ManagedChildMaterializationGate {
+                isolated_managed_child: false,
+                ..baseline
+            },
+            ManagedChildMaterializationGate {
+                primary_integrity_verified: false,
+                ..baseline
+            },
+            ManagedChildMaterializationGate {
+                sandbox_denials_absent: false,
+                ..baseline
+            },
+            ManagedChildMaterializationGate {
+                pre_action_refusals_absent: false,
+                ..baseline
+            },
+            ManagedChildMaterializationGate {
+                external_side_effect_absent: false,
+                ..baseline
+            },
+        ] {
+            assert!(
+                !refused.eligible(),
+                "refused gate became eligible: {refused:?}"
+            );
+        }
+    }
+
     #[test]
     fn assignment_phase_launch_rejects_schedule_id_mismatch() {
         let assignment = phase_fixture_assignment("child-a", AssignmentPhase::Planning);
@@ -5726,7 +6221,7 @@ done
     }
 
     #[test]
-    fn codex_binds_compatible_output_schema_without_weakening_local_schema() -> Result<()> {
+    fn codex_and_grok_bind_output_schemas_without_weakening_local_schema() -> Result<()> {
         let schema = Path::new("/hidden-primary/schemas/orchestrator-review-report.schema.json");
         let worker_schema = Path::new("/hidden-primary/schemas/worker.json");
         let auditor_schema = Path::new("/hidden-primary/schemas/auditor.json");
@@ -5750,8 +6245,21 @@ done
                 .collect::<Vec<_>>()
         );
 
-        for runtime in [
+        let grok = bind_runtime_read_only_schema_files(
+            bind_runtime_output_schema(launch_fixture_command(), SupervisorRuntime::Grok, schema)?,
             SupervisorRuntime::Grok,
+            &schemas,
+        );
+        assert_eq!(grok.output_schema.as_deref(), Some(schema));
+        assert_eq!(
+            grok.read_only_input_files,
+            schemas
+                .iter()
+                .map(|path| path.to_path_buf())
+                .collect::<Vec<_>>()
+        );
+
+        for runtime in [
             SupervisorRuntime::Cursor,
             SupervisorRuntime::ClaudeCode,
             SupervisorRuntime::GeminiCli,
@@ -5763,7 +6271,7 @@ done
             );
             assert!(
                 adapter.output_schema.is_none(),
-                "{runtime:?} must not inherit Codex-only output schema staging"
+                "{runtime:?} must not inherit a native output schema contract"
             );
             assert_eq!(
                 adapter.read_only_input_files,
@@ -5781,6 +6289,104 @@ done
         );
         assert_eq!(fake.output_schema.as_deref(), Some(schema));
         assert!(fake.read_only_input_files.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn direct_worker_dispatch_binds_the_exact_worker_report_schema() -> Result<()> {
+        let orchestrator_schema =
+            Path::new("/hidden-primary/schemas/orchestrator-review-report.schema.json");
+        let worker_schema = Path::new("/hidden-primary/schemas/worker-report.schema.json");
+
+        assert_eq!(
+            direct_assignment_report_schema_path(
+                AgentRole::ChildOrchestrator,
+                orchestrator_schema,
+                worker_schema,
+            )?,
+            orchestrator_schema
+        );
+        let direct_worker_schema = direct_assignment_report_schema_path(
+            AgentRole::Worker,
+            orchestrator_schema,
+            worker_schema,
+        )?;
+        assert_eq!(direct_worker_schema, worker_schema);
+
+        let child_codex = bind_runtime_output_schema(
+            launch_fixture_command(),
+            SupervisorRuntime::Codex,
+            direct_assignment_report_schema_path(
+                AgentRole::ChildOrchestrator,
+                orchestrator_schema,
+                worker_schema,
+            )?,
+        )?;
+        assert_eq!(
+            child_codex.output_schema.as_deref(),
+            Some(Path::new(
+                "/hidden-primary/schemas/orchestrator-review-report.codex-output.schema.json"
+            ))
+        );
+
+        let codex = bind_runtime_output_schema(
+            launch_fixture_command(),
+            SupervisorRuntime::Codex,
+            direct_worker_schema,
+        )?;
+        assert_eq!(
+            codex.output_schema.as_deref(),
+            Some(Path::new(
+                "/hidden-primary/schemas/worker-report.codex-output.schema.json"
+            ))
+        );
+
+        let fake = bind_runtime_output_schema(
+            launch_fixture_command(),
+            SupervisorRuntime::Fake,
+            direct_worker_schema,
+        )?;
+        assert_eq!(fake.output_schema.as_deref(), Some(worker_schema));
+
+        let grok = bind_runtime_output_schema(
+            launch_fixture_command(),
+            SupervisorRuntime::Grok,
+            direct_worker_schema,
+        )?;
+        assert_eq!(grok.output_schema.as_deref(), Some(worker_schema));
+
+        for runtime in [
+            SupervisorRuntime::Cursor,
+            SupervisorRuntime::ClaudeCode,
+            SupervisorRuntime::GeminiCli,
+        ] {
+            assert!(bind_runtime_output_schema(
+                launch_fixture_command(),
+                runtime,
+                direct_worker_schema,
+            )?
+            .output_schema
+            .is_none());
+        }
+
+        for unsupported in [
+            AgentRole::Supervisor,
+            AgentRole::GateClassifier,
+            AgentRole::Auditor,
+        ] {
+            let error = direct_assignment_report_schema_path(
+                unsupported,
+                orchestrator_schema,
+                worker_schema,
+            )
+            .expect_err("unsupported direct role must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("has no direct report schema contract"),
+                "{error:#}"
+            );
+        }
         Ok(())
     }
 
@@ -5884,6 +6490,413 @@ done
         let worker_selection = effective_role_model_selection(&retry_plan, AgentRole::Worker);
         assert_eq!(worker_selection.model.as_deref(), Some("composer-2.5"));
         assert_eq!(worker_selection.reasoning_effort.as_deref(), Some("high"));
+        Ok(())
+    }
+
+    #[test]
+    fn selector_bound_grok_worker_dispatches_exact_leaf_command() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let primary = temp.path().join("primary");
+        let managed_child = temp.path().join("managed-child");
+        let incoming = temp.path().join("incoming");
+        let bin = temp.path().join("bin");
+        for directory in [&primary, &managed_child, &incoming, &bin] {
+            fs::create_dir(directory)?;
+        }
+        let prompt = temp.path().join("prompt.txt");
+        fs::write(&prompt, "bounded selected Grok task\n")?;
+        let grok = bin.join("grok");
+        fs::write(&grok, "fixture")?;
+        let (_environment_lock, _environment_guard) = GrokBinaryEnvironmentGuard::install(&grok);
+        let assignment = OrchestratorAssignment {
+            id: "grok-worker".to_string(),
+            phase: AssignmentPhase::Execution,
+            runtime: None,
+            role: AgentRole::Worker,
+            role_category: Some(RoleCategory::NonDelegatingTerminalWorker),
+            selection_source: Some(AssignmentSelectionSource::Automatic),
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        };
+        let mut policy = AssignmentBudgetPolicy::default();
+        policy.set_selector_binding_for_test(
+            AgentRole::Worker,
+            SupervisorRuntime::Grok,
+            RoleModelSelection {
+                model: Some("grok-4.6".to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        let plan = policy.apply(&worker_plan("gpt-5.6-codex"));
+        let catalog =
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-codex"])?);
+        let initial_command = ExternalAgentCommand::codex(
+            "unused-codex",
+            &managed_child,
+            &prompt,
+            incoming.join("events.jsonl"),
+            incoming.join("report.json"),
+            Duration::from_secs(1),
+        )
+        .with_hidden_root(&primary);
+        let (runtime, mut command) = bind_selected_assignment_launch_for_test(
+            initial_command,
+            &assignment,
+            &policy,
+            &plan,
+            &launch_fixture_options(SupervisorRuntime::Codex),
+            &catalog,
+        )?;
+        command.cwd = primary.clone();
+        command.workspace_access = WorkspaceAccess::ReadOnly;
+        let command = bind_selected_grok_execution_workspace(
+            command,
+            &assignment,
+            runtime,
+            &managed_child,
+            true,
+        )?;
+
+        assert_eq!(runtime, SupervisorRuntime::Grok);
+        assert!(command.program.is_absolute());
+        assert_eq!(command.program, std::fs::canonicalize(grok)?);
+        assert_eq!(
+            command
+                .runtime_adapter
+                .as_ref()
+                .context("selected Grok runtime adapter")?
+                .binary_path(),
+            command.program
+        );
+        assert_eq!(
+            command.invocation,
+            crate::external_agent::ExternalAgentInvocation::Grok
+        );
+        assert_eq!(command.model.as_deref(), Some("grok-4.6"));
+        assert_eq!(command.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(command.cwd, managed_child);
+        assert_eq!(command.workspace_access, WorkspaceAccess::ReadWrite);
+        assert_eq!(
+            command.writable_launch_target,
+            crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree
+        );
+        let argv = crate::external_agent::command_argv(&command)
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            argv,
+            [
+                "--prompt-file".to_string(),
+                prompt.display().to_string(),
+                "--model".to_string(),
+                "grok-4.6".to_string(),
+                "--reasoning-effort".to_string(),
+                "xhigh".to_string(),
+                "--cwd".to_string(),
+                managed_child.display().to_string(),
+                "--output-format".to_string(),
+                "streaming-json".to_string(),
+                "--sandbox".to_string(),
+                "strict".to_string(),
+                "--always-approve".to_string(),
+                "--disable-web-search".to_string(),
+                "--no-memory".to_string(),
+                "--no-subagents".to_string(),
+            ]
+        );
+        assert_eq!(
+            argv.iter()
+                .filter(|argument| argument.as_str() == "--always-approve")
+                .count(),
+            1
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let projection =
+                crate::external_agent::selected_grok_profile_projection_for_test(&command)?;
+            assert_eq!(projection.workspace_access, WorkspaceAccess::ReadWrite);
+            let writable_child = format!("--property=BindPaths={}", managed_child.display());
+            let read_write_child = format!("--property=ReadWritePaths={}", managed_child.display());
+            let read_only_child =
+                format!("--property=BindReadOnlyPaths={}", managed_child.display());
+            let hidden_primary = format!("--property=InaccessiblePaths={}", primary.display());
+            assert!(projection.systemd_properties.contains(&writable_child));
+            assert!(projection.systemd_properties.contains(&read_write_child));
+            assert!(!projection.systemd_properties.contains(&read_only_child));
+            assert!(projection.systemd_properties.contains(&hidden_primary));
+
+            let mut replaced = command.clone();
+            replaced.cwd = primary.clone();
+            replaced.workspace_access = WorkspaceAccess::ReadOnly;
+            let error = crate::external_agent::selected_grok_profile_projection_for_test(&replaced)
+                .err()
+                .context("selected Grok profile must reject a replaced read-only workspace")?;
+            assert!(format!("{error:#}")
+                .contains(crate::external_agent::WRITABLE_GROK_SELECTION_EVIDENCE_STALE));
+        }
+        let worktree = WorktreeRecord {
+            name: assignment.id.clone(),
+            path: command.cwd.clone(),
+            branch: "maco/grok-worker".to_string(),
+        };
+        let claim = PathClaim {
+            token: crate::sync::ClaimToken::from_u64(11),
+            agent_id: assignment.id.clone(),
+            paths: assignment.assigned_paths.clone(),
+        };
+        let admission = worktree_writable_admission_record(
+            &assignment.id,
+            &assignment.assigned_paths,
+            1,
+            &worktree,
+            &claim,
+            std::slice::from_ref(&claim),
+            &command,
+            runtime,
+            assignment.phase,
+        )?
+        .context("writable Grok admission")?;
+        assert_eq!(
+            admission.native_sandbox.side_effect_confinement,
+            crate::runtime_adapter::SideEffectConfinement::Verified
+        );
+        assert_eq!(admission.native_sandbox.runtime, SupervisorRuntime::Grok);
+        Ok(())
+    }
+
+    #[test]
+    fn writable_grok_supervisor_admission_names_missing_stale_and_inexact_selection() -> Result<()>
+    {
+        fn admission_error(command: &ExternalAgentCommand) -> String {
+            let assigned_paths = vec![PathBuf::from("README.md")];
+            let worktree = WorktreeRecord {
+                name: "grok-worker".to_string(),
+                path: command.cwd.clone(),
+                branch: "maco/grok-worker".to_string(),
+            };
+            let claim = PathClaim {
+                token: crate::sync::ClaimToken::from_u64(12),
+                agent_id: "grok-worker".to_string(),
+                paths: assigned_paths.clone(),
+            };
+            format!(
+                "{:#}",
+                worktree_writable_admission_record(
+                    "grok-worker",
+                    &assigned_paths,
+                    1,
+                    &worktree,
+                    &claim,
+                    std::slice::from_ref(&claim),
+                    command,
+                    SupervisorRuntime::Grok,
+                    AssignmentPhase::Execution,
+                )
+                .expect_err("invalid writable Grok selection must fail closed")
+            )
+        }
+
+        let exact = launch_fixture_command()
+            .with_runtime_adapter(
+                SupervisorRuntime::Grok,
+                crate::runtime_adapter::RuntimeAdapterConfig::defaults(SupervisorRuntime::Grok),
+            )
+            .with_model_selection(Some("grok-4.6".to_string()), Some("xhigh".to_string()));
+        assert!(admission_error(&exact)
+            .contains(crate::external_agent::WRITABLE_GROK_SELECTION_EVIDENCE_MISSING));
+
+        let generic = exact
+            .clone()
+            .with_model_selection(Some("grok".to_string()), Some("xhigh".to_string()))
+            .with_writable_runtime_selection("grok-worker", SupervisorRuntime::Grok, true)?;
+        assert!(admission_error(&generic)
+            .contains(crate::external_agent::WRITABLE_GROK_EXACT_MODEL_REQUIRED));
+
+        let non_xhigh = exact
+            .clone()
+            .with_model_selection(Some("grok-4.6".to_string()), Some("high".to_string()))
+            .with_writable_runtime_selection("grok-worker", SupervisorRuntime::Grok, true)?;
+        assert!(admission_error(&non_xhigh)
+            .contains(crate::external_agent::WRITABLE_GROK_XHIGH_EFFORT_REQUIRED));
+
+        let mut stale = exact.clone().with_writable_runtime_selection(
+            "grok-worker",
+            SupervisorRuntime::Grok,
+            true,
+        )?;
+        stale
+            .runtime_adapter
+            .as_mut()
+            .context("Grok adapter")?
+            .output_capture = crate::runtime_adapter::OutputCaptureMode::StdoutAndStderr;
+        assert!(admission_error(&stale)
+            .contains(crate::external_agent::WRITABLE_GROK_SELECTION_EVIDENCE_STALE));
+
+        let mut schema_stale = exact.clone().with_writable_runtime_selection(
+            "grok-worker",
+            SupervisorRuntime::Grok,
+            true,
+        )?;
+        schema_stale.output_schema = Some(PathBuf::from("/replaced/worker-report.schema.json"));
+        assert!(admission_error(&schema_stale)
+            .contains(crate::external_agent::WRITABLE_GROK_SELECTION_EVIDENCE_STALE));
+
+        let mut malformed = exact;
+        malformed
+            .runtime_adapter
+            .as_mut()
+            .context("Grok adapter")?
+            .env_passthrough
+            .push("PATH".to_string());
+        let malformed = malformed.with_writable_runtime_selection(
+            "grok-worker",
+            SupervisorRuntime::Grok,
+            true,
+        )?;
+        assert!(admission_error(&malformed)
+            .contains(crate::external_agent::WRITABLE_GROK_ADAPTER_CONFIGURATION_UNVERIFIED));
+        Ok(())
+    }
+
+    #[test]
+    fn writable_grok_binding_requires_the_explicit_terminal_worker_category() -> Result<()> {
+        let assignment = OrchestratorAssignment {
+            id: "grok-worker".to_string(),
+            phase: AssignmentPhase::Execution,
+            runtime: None,
+            role: AgentRole::Worker,
+            role_category: Some(RoleCategory::DelegatingCoordinator),
+            selection_source: Some(AssignmentSelectionSource::OperatorOverride),
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        };
+        let mut policy = AssignmentBudgetPolicy::default();
+        policy.set_selector_binding_for_test(
+            AgentRole::Worker,
+            SupervisorRuntime::Grok,
+            RoleModelSelection {
+                model: Some("grok-4.6".to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        let plan = policy.apply(&worker_plan("gpt-5.6-codex"));
+        let catalog =
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-codex"])?);
+        let error = bind_selected_assignment_launch_for_test(
+            launch_fixture_command(),
+            &assignment,
+            &policy,
+            &plan,
+            &launch_fixture_options(SupervisorRuntime::Codex),
+            &catalog,
+        )
+        .expect_err("writable Grok must remain a terminal Worker");
+        assert!(format!("{error:#}")
+            .contains(crate::external_agent::WRITABLE_GROK_TERMINAL_WORKER_REQUIRED));
+        Ok(())
+    }
+
+    #[test]
+    fn selected_grok_refuses_nonexecution_terminal_worker() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let grok = temp.path().join("grok");
+        fs::write(&grok, "fixture")?;
+        let (_environment_lock, _environment_guard) = GrokBinaryEnvironmentGuard::install(&grok);
+        let assignment = OrchestratorAssignment {
+            id: "grok-planner".to_string(),
+            phase: AssignmentPhase::Planning,
+            runtime: None,
+            role: AgentRole::Worker,
+            role_category: Some(RoleCategory::NonDelegatingTerminalWorker),
+            selection_source: Some(AssignmentSelectionSource::Automatic),
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        };
+        let mut policy = AssignmentBudgetPolicy::default();
+        policy.set_selector_binding_for_test(
+            AgentRole::Worker,
+            SupervisorRuntime::Grok,
+            RoleModelSelection {
+                model: Some("grok-4.6".to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        let plan = policy.apply(&worker_plan("gpt-5.6-codex"));
+        let catalog =
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-codex"])?);
+        let error = bind_selected_assignment_launch_for_test(
+            launch_fixture_command(),
+            &assignment,
+            &policy,
+            &plan,
+            &launch_fixture_options(SupervisorRuntime::Codex),
+            &catalog,
+        )
+        .expect_err("Grok planning must remain fail closed");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(crate::external_agent::WRITABLE_GROK_TERMINAL_WORKER_REQUIRED),
+            "{message}"
+        );
+        assert!(message.contains("execution-phase"), "{message}");
+        Ok(())
+    }
+
+    #[test]
+    fn selector_bound_grok_refuses_child_orchestrator_before_model_admission() -> Result<()> {
+        let plan = valid_child_plan_with_nested_worker()?;
+        let assignment = &plan.assignments[0];
+        let mut policy = AssignmentBudgetPolicy::default();
+        policy.set_selector_binding_for_test(
+            AgentRole::ChildOrchestrator,
+            SupervisorRuntime::Grok,
+            RoleModelSelection {
+                model: Some("grok-4.6".to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        let selected_plan = policy.apply(&plan);
+        let catalog =
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-codex"])?);
+        let error = bind_selected_assignment_launch_for_test(
+            launch_fixture_command(),
+            assignment,
+            &policy,
+            &selected_plan,
+            &launch_fixture_options(SupervisorRuntime::Codex),
+            &catalog,
+        )
+        .expect_err("Grok must remain a non-delegating terminal runtime");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("selected runtime 'grok'"), "{message}");
+        assert!(
+            message.contains("cannot launch judgment or delegating role 'child_orchestrator'"),
+            "{message}"
+        );
         Ok(())
     }
 

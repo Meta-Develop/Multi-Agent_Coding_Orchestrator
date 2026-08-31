@@ -259,6 +259,23 @@ fn directory_binding_guard_rejects_pathname_replacement() {
     assert!(error.to_string().contains("binding changed"));
 }
 
+#[test]
+fn directory_binding_guard_allows_child_entry_churn() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let bound = temp.path().join("bound");
+    fs::create_dir(&bound).expect("create bound directory");
+    let guard = DirectoryBindingGuard::bind(&bound).expect("bind directory");
+
+    let child = bound.join("first-child");
+    fs::write(&child, b"entry churn").expect("create child");
+    fs::remove_file(&child).expect("remove child");
+    fs::create_dir(bound.join("second-child")).expect("create replacement child entry");
+
+    guard
+        .verify()
+        .expect("stable directory identity and pathname remain bound");
+}
+
 #[cfg(unix)]
 #[test]
 fn bounded_reader_rejects_same_inode_generation_change_and_truncation() {

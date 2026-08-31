@@ -250,6 +250,63 @@ fn deterministic_fake_cli_emits_stable_shape_artifacts_and_cleans_claims() -> Re
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn deterministic_fake_cli_persists_a_direct_worker_report_without_an_orchestrator_envelope(
+) -> Result<()> {
+    support::require_containment!(
+        "deterministic_fake_cli_persists_a_direct_worker_report_without_an_orchestrator_envelope"
+    );
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let plan_path = temp.path().join("direct-worker.json");
+    fs::write(
+        &plan_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "task": "direct terminal worker",
+            "max_child_retries": 0,
+            "max_gate_corrections": 0,
+            "assignments": [{
+                "id": "direct-worker",
+                "phase": "execution",
+                "role": "worker",
+                "role_category": "non_delegating_terminal_worker",
+                "assigned_paths": ["README.md"],
+                "worker_assignments": []
+            }]
+        }))?,
+    )?;
+
+    let report = run_success_json(&[
+        "supervise",
+        "run",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "direct-worker-fake",
+        "--runtime",
+        "fake",
+        "--json",
+    ])?;
+    assert_eq!(report["success"], true);
+    assert_eq!(report["publishable"], false);
+
+    let run_root = repo_path.join(".maco/o2/runs/direct-worker-fake");
+    let raw_report: Value = serde_json::from_slice(&fs::read(
+        run_root.join("evidence/incoming/direct-worker.json"),
+    )?)?;
+    assert_eq!(raw_report["id"], "direct-worker");
+    assert_eq!(raw_report["role"], "worker");
+    assert_eq!(raw_report["no_further_delegation"], true);
+    assert!(raw_report.get("worker_reports").is_none());
+    assert!(run_root
+        .join("logs/workers/direct-worker/direct-worker.jsonl")
+        .exists());
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn codex_runtime_custom_bin_fails_closed_and_cannot_mutate_primary() -> Result<()> {
@@ -521,6 +578,119 @@ fn primary_worktree_cli_requires_plan_and_flag_and_rejects_invalid_scope() -> Re
             "{name} did not fail with {expected:?}: {error}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn supervise_plan_literal_new_file_emits_parent_gated_direct_worker_contract() -> Result<()> {
+    support::require_containment!(
+        "supervise_plan_literal_new_file_emits_parent_gated_direct_worker_contract"
+    );
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let goal_path = temp.path().join("literal-new-file.md");
+    fs::write(
+        &goal_path,
+        "Create a new file named LITERAL_E2E.md containing exactly one line: MACO literal routing reached the terminal worker.\n",
+    )?;
+
+    let plan = run_success_json(&[
+        "supervise",
+        "plan",
+        "--from-goal",
+        path_str(&goal_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    let assignments = plan["assignments"].as_array().context("assignments")?;
+    assert_eq!(assignments.len(), 2);
+    assert_eq!(assignments[0]["id"], "assignment-001-planning");
+    assert_eq!(assignments[0]["phase"], "planning");
+    assert_eq!(assignments[0]["role"], "child_orchestrator");
+    assert_eq!(assignments[0]["role_category"], "delegating_coordinator");
+    assert_eq!(assignments[1]["id"], "assignment-001");
+    assert_eq!(assignments[1]["phase"], "execution");
+    assert_eq!(assignments[1]["role"], "worker");
+    assert_eq!(
+        assignments[1]["role_category"],
+        "non_delegating_terminal_worker"
+    );
+    assert!(assignments
+        .iter()
+        .all(|assignment| assignment["assigned_paths"] == serde_json::json!(["LITERAL_E2E.md"])));
+    for assignment in assignments {
+        assert_eq!(assignment["semantic_symbols"], serde_json::json!([]));
+        assert_eq!(assignment["semantic_modules"], serde_json::json!([]));
+        assert_eq!(assignment["worker_assignments"], serde_json::json!([]));
+        assert_eq!(
+            assignment["environment_requirements"],
+            serde_json::json!([])
+        );
+        assert!(assignment.get("licensed_breakage").is_none());
+    }
+    assert_eq!(
+        plan["assignment_schedule"],
+        serde_json::json!([
+            {
+                "assignment_id": "assignment-001-planning",
+                "depth": 2,
+                "flattened_index": 0
+            },
+            {
+                "assignment_id": "assignment-001",
+                "parent_assignment_id": "assignment-001-planning",
+                "depth": 3,
+                "flattened_index": 1
+            }
+        ])
+    );
+
+    let contracts = assignments
+        .iter()
+        .map(|assignment| {
+            let notes = assignment["notes"]
+                .as_str()
+                .context("literal assignment notes")?;
+            let payload = notes
+                .strip_prefix("maco-preclaim-v1:")
+                .context("typed preclaim directive prefix")?;
+            serde_json::from_str::<Value>(payload).context("typed preclaim directive JSON")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(contracts[0], contracts[1]);
+    let contract = &contracts[0]["verification_contract"];
+    assert_eq!(contract["kind"], "explicit_new_file_creation");
+    assert_eq!(contract["assigned_path"], "LITERAL_E2E.md");
+    assert_eq!(
+        contract["planning_assignment"]["id"],
+        "assignment-001-planning"
+    );
+    assert_eq!(contract["planning_assignment"]["phase"], "planning");
+    assert_eq!(
+        contract["planning_assignment"]["role"],
+        "child_orchestrator"
+    );
+    assert_eq!(
+        contract["planning_assignment"]["role_category"],
+        "delegating_coordinator"
+    );
+    assert_eq!(contract["execution_assignment"]["id"], "assignment-001");
+    assert_eq!(contract["execution_assignment"]["phase"], "execution");
+    assert_eq!(contract["execution_assignment"]["role"], "worker");
+    assert_eq!(
+        contract["execution_assignment"]["role_category"],
+        "non_delegating_terminal_worker"
+    );
+    assert_eq!(
+        contract["planning_assignment"]["task_sha256"],
+        "dd5eb07b5e6698eb47b432b7d53053f7b097a77a5e9a71db09531040f58a4b72"
+    );
+    assert_eq!(
+        contract["execution_assignment"]["task_sha256"],
+        "4ac87ed5a17996cca85967f242041325e8078cce281b1d9ca0c6719ef7d30541"
+    );
+    assert!(!repo_path.join("LITERAL_E2E.md").exists());
     Ok(())
 }
 
@@ -1750,6 +1920,62 @@ fn fake_prompt_keeps_role_assignment_and_consultant_contract_as_data() -> Result
     assert!(prompt.contains("terminal worker/researcher"));
     assert!(prompt.contains("no_further_delegation"));
     assert!(!repo_path.join("must-not-run").exists());
+    Ok(())
+}
+
+#[test]
+fn workerless_planning_cli_prompt_forbids_child_delegation_and_defers_review() -> Result<()> {
+    support::require_containment!(
+        "workerless_planning_cli_prompt_forbids_child_delegation_and_defers_review"
+    );
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let plan_path = temp.path().join("workerless-planning-plan.json");
+    fs::write(
+        &plan_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "task": "parent task",
+            "assignments": [{
+                "id": "workerless-planning",
+                "phase": "planning",
+                "role": "child_orchestrator",
+                "role_category": "delegating_coordinator",
+                "assigned_paths": ["README.md"],
+                "task": "Read-only planning gate. Review scope without editing files or delegating implementation.",
+                "worker_assignments": []
+            }]
+        }))?,
+    )?;
+
+    let report = run_success_json(&[
+        "supervise",
+        "run",
+        path_str(&plan_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "workerless-planning-prompt",
+        "--runtime",
+        "fake",
+        "--json",
+    ])?;
+    assert_eq!(report["success"], true);
+
+    let prompt = fs::read_to_string(repo_path.join(
+        ".maco/o2/runs/workerless-planning-prompt/assignments/workerless-planning.prompt.md",
+    ))?;
+    assert!(prompt.contains("Workerless planning gate:"));
+    assert!(prompt.contains("Stay read-only: do not edit files, apply patches"));
+    assert!(prompt.contains("Do not launch terminal workers or child-side review auditors"));
+    assert!(prompt.contains("Return worker_reports=[] and audit_reports=[]"));
+    assert!(prompt.contains("parent-enforced review lens"));
+    assert!(prompt.contains("WorkerReport=<not applicable: worker_reports=[]>"));
+    assert!(!prompt.contains("Review auditor prompt template:"));
+    assert!(!prompt.contains("ROLE: TERMINAL_WORKER"));
+    assert!(!prompt.contains("ROLE: REVIEW_AUDITOR"));
+    assert!(!prompt.contains("- Launch each supplied terminal worker prompt"));
+    assert!(!prompt.contains("- Source writes only in assigned worktree paths"));
     Ok(())
 }
 

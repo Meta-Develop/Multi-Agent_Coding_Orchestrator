@@ -6,6 +6,10 @@ use multi_agent_coding_orchestrator::executor::{
     SshConfigInput, SshExecutor, SshTransport, TransportFailure, TransportFailureKind,
     TransportStage,
 };
+use multi_agent_coding_orchestrator::runtime_adapter::{
+    adapter_for, AdapterId, LaunchContext, OutputCaptureMode, RuntimeAdapterConfig, RuntimeId,
+    SideEffectConfinement, TypedRuntime,
+};
 use std::fs;
 use std::path::Path;
 use std::sync::{
@@ -2795,4 +2799,170 @@ fn staged_input_digest_is_deterministic_and_binds_workspace_bytes() {
         fake.request(2).staged_input_digest
     );
     assert_eq!(fake.calls(), 3);
+}
+
+#[test]
+fn grok_46_xhigh_writable_capability_requires_the_bounded_leaf_contract() {
+    let workspace = TempDir::new().expect("typed Grok workspace");
+    let prompt = workspace.path().join("prompt.txt");
+    let output = workspace.path().join("output.jsonl");
+    let context = LaunchContext {
+        prompt: &prompt,
+        model: Some("grok-4.6"),
+        effort: Some("xhigh"),
+        cwd: workspace.path(),
+        output: &output,
+    };
+    let config = RuntimeAdapterConfig::defaults(RuntimeId::Grok);
+    let contract = config
+        .typed_runtime_contract(AdapterId::Grok, &context)
+        .expect("canonical Grok 4.6/xhigh contract");
+
+    assert_eq!(contract.runtime(), TypedRuntime::Grok46Xhigh);
+    assert!(contract.has_bounded_cwd());
+    assert!(contract.has_bounded_output());
+    assert!(contract.subagents_disabled());
+    let mut expected_capabilities = AdapterId::Grok.capabilities();
+    expected_capabilities.side_effect_confinement = SideEffectConfinement::Verified;
+    assert_eq!(contract.capabilities(), expected_capabilities);
+    assert_eq!(
+        contract.capabilities().side_effect_confinement,
+        SideEffectConfinement::Verified
+    );
+    assert!(contract.capabilities().admits_worktree_writable());
+    assert!(!contract.capabilities().admits_writable_release());
+    assert_eq!(
+        adapter_for(AdapterId::Grok).capabilities_for_launch(&context),
+        contract.capabilities()
+    );
+
+    let launch = config.render(&context).expect("render typed Grok launch");
+    assert_eq!(launch.cwd, workspace.path());
+    assert_eq!(launch.output_capture, OutputCaptureMode::Stdout);
+    assert!(launch
+        .argv
+        .windows(2)
+        .any(|pair| { pair[0] == "--cwd" && pair[1] == workspace.path().display().to_string() }));
+    assert_eq!(
+        launch
+            .argv
+            .iter()
+            .filter(|argument| argument.as_str() == "--no-subagents")
+            .count(),
+        1
+    );
+
+    let valid = b"{\"type\":\"end\",\"stopReason\":\"stop\",\"sessionId\":\"session\",\"requestId\":\"request\"}\n";
+    assert!(contract.parse_output(valid).is_ok());
+    let oversized = vec![b'x'; 8 * 1024 * 1024 + 1];
+    let error = contract
+        .parse_output(&oversized)
+        .expect_err("oversized Grok stream must fail closed");
+    assert!(format!("{error:#}").contains("byte limit"));
+}
+
+#[test]
+fn grok_capability_elevation_fails_closed_and_other_runtimes_do_not_change() {
+    let workspace = TempDir::new().expect("typed Grok refusal workspace");
+    let prompt = workspace.path().join("prompt.txt");
+    let output = workspace.path().join("output.jsonl");
+    let canonical = RuntimeAdapterConfig::defaults(RuntimeId::Grok);
+
+    for (model, effort) in [
+        (Some("grok-4.5"), Some("xhigh")),
+        (Some("grok-4.6"), Some("high")),
+        (None, Some("xhigh")),
+        (Some("grok-4.6"), None),
+    ] {
+        let launch = LaunchContext {
+            prompt: &prompt,
+            model,
+            effort,
+            cwd: workspace.path(),
+            output: &output,
+        };
+        assert!(canonical
+            .typed_runtime_contract(AdapterId::Grok, &launch)
+            .is_none());
+        assert_eq!(
+            canonical.capabilities_for_launch(AdapterId::Grok, &launch),
+            AdapterId::Grok.capabilities()
+        );
+    }
+
+    let exact = LaunchContext {
+        prompt: &prompt,
+        model: Some("grok-4.6"),
+        effort: Some("xhigh"),
+        cwd: workspace.path(),
+        output: &output,
+    };
+    let relative_cwd = LaunchContext {
+        cwd: Path::new("relative-worktree"),
+        ..exact.clone()
+    };
+    assert!(canonical
+        .typed_runtime_contract(AdapterId::Grok, &relative_cwd)
+        .is_none());
+
+    let mut mutations = Vec::new();
+    let mut missing_no_subagents = canonical.clone();
+    missing_no_subagents
+        .argument_template
+        .retain(|argument| argument != "--no-subagents");
+    mutations.push(missing_no_subagents);
+    let mut unbounded_output = canonical.clone();
+    unbounded_output.output_capture = OutputCaptureMode::OutputFile;
+    mutations.push(unbounded_output);
+    let mut altered_cwd = canonical.clone();
+    let cwd_value = altered_cwd
+        .argument_template
+        .iter_mut()
+        .find(|argument| argument.as_str() == "{cwd}")
+        .expect("canonical cwd placeholder");
+    *cwd_value = "/tmp/unbounded".to_string();
+    mutations.push(altered_cwd);
+    let mut altered_environment = canonical.clone();
+    altered_environment.env_passthrough.push("PATH".into());
+    mutations.push(altered_environment);
+    let mut altered_stdin = canonical.clone();
+    altered_stdin.feed_prompt_on_stdin = true;
+    mutations.push(altered_stdin);
+    let mut duplicate_cwd = canonical.clone();
+    duplicate_cwd.working_dir_flag = Some("--cwd".into());
+    mutations.push(duplicate_cwd);
+
+    for mutation in mutations {
+        assert!(mutation
+            .typed_runtime_contract(AdapterId::Grok, &exact)
+            .is_none());
+        assert!(!mutation
+            .capabilities_for_launch(AdapterId::Grok, &exact)
+            .admits_worktree_writable());
+    }
+
+    let mut alternate_binary = canonical.clone();
+    alternate_binary.binary = Some("/tmp/operator-grok".into());
+    assert!(alternate_binary
+        .typed_runtime_contract(AdapterId::Grok, &exact)
+        .is_some());
+    assert!(alternate_binary
+        .capabilities_for_launch(AdapterId::Grok, &exact)
+        .admits_worktree_writable());
+
+    for adapter in [
+        AdapterId::Codex,
+        AdapterId::Fake,
+        AdapterId::Cursor,
+        AdapterId::ClaudeCode,
+        AdapterId::GeminiCli,
+    ] {
+        let config = RuntimeAdapterConfig::defaults_for(adapter);
+        assert!(config.typed_runtime_contract(adapter, &exact).is_none());
+        assert_eq!(
+            config.capabilities_for_launch(adapter, &exact),
+            adapter.capabilities(),
+            "{adapter} capability row changed"
+        );
+    }
 }

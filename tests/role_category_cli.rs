@@ -11,59 +11,103 @@ use tempfile::TempDir;
 mod support;
 
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
+const RETIRED_AUTOPILOT_MESSAGE: &str =
+    "autopilot plan/run is retired; use literal instruction routing: maco <instruction>";
 
 #[test]
-fn supervise_and_autopilot_help_advertise_role_category_override() -> Result<()> {
-    for command in ["supervise", "autopilot"] {
-        let output = Command::new(BIN)
-            .arg(command)
-            .arg("run")
-            .arg("--help")
-            .output()
-            .with_context(|| format!("render {command} run help"))?;
-        assert!(
-            output.status.success(),
-            "{command} run --help failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains("--role-category"),
-            "{command} run help omitted --role-category: {stdout}"
-        );
-        assert!(
-            stdout.contains("operator_override") || stdout.contains("operator role-category"),
-            "{command} run help omitted operator-override recording: {stdout}"
-        );
-    }
+fn supervise_help_advertises_role_category_override() -> Result<()> {
+    let output = Command::new(BIN)
+        .args(["supervise", "run", "--help"])
+        .output()
+        .context("render supervise run help")?;
+    assert!(
+        output.status.success(),
+        "supervise run --help failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--role-category"),
+        "supervise run help omitted --role-category: {stdout}"
+    );
+    assert!(
+        stdout.contains("operator_override") || stdout.contains("operator role-category"),
+        "supervise run help omitted operator-override recording: {stdout}"
+    );
     Ok(())
 }
 
 #[test]
-fn supervise_and_autopilot_reject_unknown_role_category_before_launch() -> Result<()> {
-    for command in ["supervise", "autopilot"] {
-        let output = Command::new(BIN)
-            .arg(command)
-            .arg("run")
-            .arg("plan.json")
-            .arg("--role-category")
-            .arg("weak_model")
-            .arg("--machine-global-config")
-            .arg("/tmp/maco-machine-global.json")
-            .arg("--machine-global-runtime-root-id")
-            .arg("runtime")
-            .output()
-            .with_context(|| format!("parse {command} unknown role category"))?;
-        assert!(
-            !output.status.success(),
-            "{command} accepted an unknown role category"
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("role category") || stderr.contains("role-category"),
-            "{command} refusal omitted the flag name: {stderr}"
-        );
+fn supervise_rejects_unknown_role_category_and_autopilot_stays_retired() -> Result<()> {
+    let supervise = Command::new(BIN)
+        .args([
+            "supervise",
+            "run",
+            "plan.json",
+            "--role-category",
+            "weak_model",
+            "--machine-global-config",
+            "/tmp/maco-machine-global.json",
+            "--machine-global-runtime-root-id",
+            "runtime",
+        ])
+        .output()
+        .context("parse supervise unknown role category")?;
+    assert!(
+        !supervise.status.success(),
+        "supervise accepted an unknown role category"
+    );
+    let stderr = String::from_utf8_lossy(&supervise.stderr);
+    assert!(
+        stderr.contains("role category") || stderr.contains("role-category"),
+        "supervise refusal omitted the flag name: {stderr}"
+    );
+
+    let temp = TempDir::new().context("tempdir")?;
+    let repo = temp.path().join("repo");
+    fs::create_dir(&repo).context("create untouched repository")?;
+    let missing_plan = temp.path().join("plan-must-not-be-read.json");
+    let fake_codex = temp.path().join("codex-must-not-launch");
+    let launch_marker = temp.path().join("codex-was-launched");
+    fs::write(
+        &fake_codex,
+        format!("#!/bin/sh\ntouch '{}'\n", launch_marker.display()),
+    )
+    .context("write launch probe")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700))
+            .context("make launch probe executable")?;
     }
+
+    let autopilot = Command::new(BIN)
+        .args([
+            "autopilot",
+            "run",
+            path_str(&missing_plan)?,
+            "--repo",
+            path_str(&repo)?,
+            "--codex-bin",
+            path_str(&fake_codex)?,
+            "--role-category",
+            "weak_model",
+        ])
+        .output()
+        .context("run retired autopilot with legacy role-category flag")?;
+    assert!(!autopilot.status.success());
+    let stderr = String::from_utf8_lossy(&autopilot.stderr);
+    assert!(stderr.contains(RETIRED_AUTOPILOT_MESSAGE), "{stderr}");
+    assert!(!stderr.contains("Usage:"), "{stderr}");
+    assert!(!launch_marker.exists(), "retired autopilot launched Codex");
+    assert!(
+        !missing_plan.exists(),
+        "retired autopilot created its plan input"
+    );
+    assert!(
+        fs::read_dir(&repo)?.next().is_none(),
+        "retired autopilot mutated the repository"
+    );
     Ok(())
 }
 

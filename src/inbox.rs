@@ -9,12 +9,14 @@ use crate::{
         self, AutopilotForgeMode, AutopilotPlan, AutopilotPublishMode, AutopilotRunOptions,
         AutopilotRunStatus, AutopilotTask, AutopilotValidationCommand,
     },
+    external_agent::{load_codex_runtime_model_catalog, run_external_agent, ExternalAgentCommand},
     gate_denial::GateDenialReason,
     live_claim::{self, LiveClock},
     llm::{RedactionSummary, Redactor},
     machine_global::MachineGlobalRetentionBinding,
     orchestrator::RunId,
     planning,
+    process_runner::{ProcessResourceLimits, StdinMode, TrustedFixedNetworkProfile},
     publication::{self, ExternalSourceGuard, ExternalSourceObjectKind},
     review::{ReviewerConfig, ReviewerMode},
     safe_state::{stable_checksum, BoundedRegularReader, SafeRoot},
@@ -25,7 +27,7 @@ use crate::{
 use anyhow::{bail, Context, Result};
 #[cfg(test)]
 use git2::Repository;
-use git2::StatusOptions;
+use git2::{Delta, DiffFindOptions, DiffOptions, ObjectType, Oid, StatusOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -36,6 +38,22 @@ use std::{
     process, thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+use crate::optimizer::merge_authority::{assess_independence, CompletionMode, ProducerFingerprint};
+#[cfg(test)]
+use crate::optimizer::merge_authority::{AgentIdentity, MergeActor, SessionId};
+use crate::publication::forge_transport::{
+    AuthenticatedPullRequestMergeEvidence, ForgeCheckConclusion, ForgeCheckStatus, ForgeItem,
+    ForgeReviewState, PullRequestAuditorEvidence, PullRequestChangedPathsEvidence,
+    PullRequestMergeReceipt, PullRequestMergeSimulationEvidence, PullRequestProducerEvidence,
+    PullRequestReviewSnapshot,
+};
+#[cfg(test)]
+use crate::publication::forge_transport::{
+    FakeForgeTransport, ForgeActor, ForgeReview, ProviderObjectId, ProviderObjectKind,
+    ReportedActorKind,
+};
+use crate::publication::AuthenticatedPullRequestMergeOutcome;
 
 const INBOX_SCHEMA_VERSION: u32 = 1;
 const CONFIG_FILE: &str = "maco-inbox.json";
@@ -78,6 +96,11 @@ const GH_OUTPUT_LIMIT: usize = 512 * 1024;
 const GH_DIAGNOSTIC_LIMIT: usize = 4 * 1024;
 const COMMENT_BODY_LIMIT: usize = 6 * 1024;
 const ARTIFACT_FINAL_MARKER: &str = ".maco-artifact-final.json";
+const PR_OBJECT_FETCH_CAPTURE_LIMIT: usize = 64 * 1024;
+const PR_OBJECT_FETCH_MAX_OBJECTS: usize = 131_072;
+const PR_OBJECT_FETCH_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const PR_OBJECT_FETCH_MAX_GRAPH_STEPS: usize = PR_OBJECT_FETCH_MAX_OBJECTS * 4;
+const PR_OBJECT_FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub const DEFAULT_ROLLING_WINDOW_SECONDS: u64 =
     crate::budget_ledger::DEFAULT_ROLLING_WINDOW_SECONDS;
@@ -525,7 +548,87 @@ pub struct InboxScanReport {
     pub selected_count: usize,
     pub items: Vec<InboxItem>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pr_intake_reports: Vec<InboxPrIntakeReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub review_loops: Vec<review_loop_entry::InboxReviewLoopReport>,
+    pub next_action: String,
+}
+
+/// A non-repair PR intake decision. Clean PRs enter an independent audit lane;
+/// they are never silently treated as having no work to do.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InboxPrIntakeReport {
+    pub version: u32,
+    pub item_id: String,
+    pub source_key: String,
+    pub number: u64,
+    pub task_kind: InboxPrIntakeTaskKind,
+    pub status: InboxPrIntakeStatus,
+    pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<InboxIndependentAuditMergeLaneTask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_block: Option<InboxPrLaunchBlockReport>,
+    pub grants_merge_permission: bool,
+    pub auto_merge_performed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxPrIntakeTaskKind {
+    IndependentAuditMergeLane,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxPrIntakeStatus {
+    Ready,
+    LaunchBlocked,
+}
+
+/// Source-bound work request for an auditor that is independent of the PR
+/// producer. This is evidence for a later merge-authority adapter, not merge
+/// permission and not an instruction to perform a merge.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InboxIndependentAuditMergeLaneTask {
+    pub version: u32,
+    pub task_kind: InboxPrIntakeTaskKind,
+    pub source_snapshot_digest: String,
+    pub source_updated_at: String,
+    pub head_oid: String,
+    pub base_oid: String,
+    pub producer_login: String,
+    #[serde(default)]
+    pub is_draft: bool,
+    #[serde(default)]
+    pub source_trust: GithubPrSourceTrust,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_repository: Option<String>,
+    pub changed_files: Vec<PathBuf>,
+    pub checks: Vec<GithubCheckSummary>,
+    pub requires_trusted_actor_binding: bool,
+    pub requires_fresh_source_revalidation: bool,
+    pub requires_passing_ci: bool,
+    pub requires_independent_auditor: bool,
+    pub grants_merge_permission: bool,
+    pub auto_merge_performed: bool,
+    pub next_action: String,
+}
+
+/// Typed fail-closed evidence explaining why the independent audit lane was
+/// not launched.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InboxPrLaunchBlockReport {
+    pub version: u32,
+    pub status: InboxPrIntakeStatus,
+    pub success: bool,
+    pub reason: String,
+    pub missing_evidence: Vec<String>,
+    pub grants_merge_permission: bool,
+    pub auto_merge_performed: bool,
     pub next_action: String,
 }
 
@@ -574,6 +677,15 @@ pub struct InboxItem {
 pub enum InboxItemKind {
     Issue,
     PullRequest,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GithubPrSourceTrust {
+    TrustedTargetRepository,
+    Fork,
+    #[default]
+    Untrusted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -993,6 +1105,12 @@ pub struct GithubPrCandidate {
     pub head_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_ref: Option<String>,
+    #[serde(default)]
+    pub is_draft: bool,
+    #[serde(default)]
+    pub source_trust: GithubPrSourceTrust,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_repository: Option<String>,
     pub changed_files: Vec<PathBuf>,
     pub checks: Vec<GithubCheckSummary>,
     pub review_feedback: GithubReviewFeedbackSummary,
@@ -1097,6 +1215,10 @@ pub struct InboxItemRunReport {
     pub github_success: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_loop: Option<review_loop_entry::InboxReviewLoopReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_intake: Option<InboxPrIntakeReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub independent_audit_lane: Option<review_loop_entry::InboxIndependentAuditLaneResult>,
     pub next_action: String,
 }
 
@@ -1303,6 +1425,8 @@ struct RawPrCandidate {
     head_oid: String,
     base_oid: String,
     is_draft: bool,
+    source_trust: GithubPrSourceTrust,
+    head_repository: Option<String>,
     changed_files: Vec<PathBuf>,
     checks: Vec<GithubCheckSummary>,
     review_feedback: GithubReviewFeedbackSummary,
@@ -1342,6 +1466,7 @@ fn scan_inbox_with_overrides(
     let action_policy = effective_action_policy(loaded.config.action_policy, permission_mode);
     let github_enabled = permission_mode.uses_github_intake();
     let duplicate_keys = load_duplicate_keys(&repo)?;
+    let duplicate_pr_snapshots = load_duplicate_pr_snapshots(&repo)?;
     let source_repository =
         source_repository_binding_context(&repo, &loaded.config, github_enabled)?;
     let mut items = Vec::new();
@@ -1367,15 +1492,17 @@ fn scan_inbox_with_overrides(
             fake_pr_candidates(&loaded.config)
         };
         for pull_request in pull_requests {
-            if !loaded.config.selection.include_draft_prs && pull_request.is_draft {
+            if !should_include_pr_candidate(&loaded.config, &pull_request) {
                 continue;
             }
-            items.push(pr_item(
+            let mut item = pr_item(
                 pull_request,
                 &loaded.config,
                 &source_repository,
                 &duplicate_keys,
-            )?);
+            )?;
+            apply_pr_snapshot_duplicate(&mut item, &duplicate_pr_snapshots);
+            items.push(item);
         }
     }
     validate_count(items.len(), "inbox candidate items", MAX_GITHUB_ITEMS)?;
@@ -1385,6 +1512,11 @@ fn scan_inbox_with_overrides(
             .then_with(|| left.item_id.cmp(&right.item_id))
     });
     apply_scan_decisions(&mut items, loaded.config.selection.max_items);
+    let pr_intake_reports = items
+        .iter()
+        .filter(|item| item.selected)
+        .filter_map(pr_intake_report_for_item)
+        .collect::<Vec<_>>();
     let review_loops = review_loop_entry::evaluate_inbox_scan_review_loops(&items);
 
     let selected_count = items.iter().filter(|item| item.selected).count();
@@ -1405,6 +1537,7 @@ fn scan_inbox_with_overrides(
             candidate_count,
             selected_count,
             items,
+            pr_intake_reports,
             review_loops,
             next_action: "resolve inbox safety refusals, then scan again".to_string(),
         });
@@ -1422,6 +1555,7 @@ fn scan_inbox_with_overrides(
         candidate_count,
         selected_count,
         items,
+        pr_intake_reports,
         review_loops,
         next_action: if selected_count == 0 {
             "no safe non-duplicate inbox items selected".to_string()
@@ -1640,6 +1774,11 @@ fn run_inbox_with_overrides(
     } else {
         InboxRunStatus::Failed
     };
+    let auto_merge_performed = item_reports.iter().any(|item| {
+        item.independent_audit_lane
+            .as_ref()
+            .is_some_and(|lane| lane.auto_merge_performed && lane.merge_receipt.is_some())
+    });
     let report = InboxRunReport {
         version: INBOX_SCHEMA_VERSION,
         run_id: options.run_id,
@@ -1653,9 +1792,11 @@ fn run_inbox_with_overrides(
         artifacts,
         selected_item_count: selected_items.len(),
         item_reports,
-        auto_merge_performed: false,
+        auto_merge_performed,
         next_action: if status == InboxRunStatus::Refused {
             "increase or wait for the rolling inbox quota before starting another run".to_string()
+        } else if success && auto_merge_performed {
+            "review the verified authenticated pull-request merge receipt".to_string()
         } else if success {
             "review inbox item reports; no automatic merge was performed".to_string()
         } else {
@@ -1885,6 +2026,12 @@ pub fn run_workspace_inbox(options: InboxWorkspaceRunOptions) -> Result<InboxWor
         scan_report: public_run_dir.join("scan-report.json"),
         final_report: public_run_dir.join("final-report.json"),
     };
+    let auto_merge_performed = repositories.iter().any(|repository| {
+        repository
+            .run_report
+            .as_ref()
+            .is_some_and(|report| report.auto_merge_performed)
+    });
     let report = InboxWorkspaceRunReport {
         version: INBOX_SCHEMA_VERSION,
         run_id: options.run_id,
@@ -1900,7 +2047,7 @@ pub fn run_workspace_inbox(options: InboxWorkspaceRunOptions) -> Result<InboxWor
         refused_repo_count: repo_counts.refused,
         repo_counts,
         artifacts,
-        auto_merge_performed: false,
+        auto_merge_performed,
         auto_approval_performed: false,
         repositories,
         next_action: workspace_next_action(success, loaded.config.strict, "workspace run"),
@@ -1934,6 +2081,7 @@ pub fn watch_workspace_inbox(
         thread::sleep(Duration::from_secs(options.poll_seconds));
     }
     let success = runs.iter().all(|run| run.success);
+    let auto_merge_performed = runs.iter().any(|run| run.auto_merge_performed);
     Ok(InboxWorkspaceWatchReport {
         version: INBOX_SCHEMA_VERSION,
         config_path: public_config_path,
@@ -1941,7 +2089,7 @@ pub fn watch_workspace_inbox(
         once: options.once,
         success,
         iteration_count: runs.len(),
-        auto_merge_performed: false,
+        auto_merge_performed,
         auto_approval_performed: false,
         runs,
     })
@@ -2460,8 +2608,12 @@ fn run_inbox_item(
     let action_policy = context.action_policy;
     let permission_mode = context.permission_mode;
     let config = context.config;
-    revalidate_inbox_item_source(repo, item)
-        .context("inbox source changed before item processing started")?;
+    let pr_intake = pr_intake_report_for_item(item);
+    let source_fresh = revalidate_inbox_item_source(repo, item).is_ok();
+    if pr_intake.is_none() && !source_fresh {
+        revalidate_inbox_item_source(repo, item)
+            .context("inbox source changed before item processing started")?;
+    }
     let review_loop = review_loop_entry::evaluate_inbox_item_review_loop(item);
     if let Some(report) = &review_loop {
         write_private_artifact_json(
@@ -2469,6 +2621,15 @@ fn run_inbox_item(
             format!("item-{item_index}-review-loop.json"),
             report,
         )?;
+    }
+    if let Some(pr_intake) = pr_intake {
+        return run_independent_audit_intake_item(
+            writer,
+            input,
+            review_loop,
+            pr_intake,
+            source_fresh,
+        );
     }
     let plan = autopilot_plan_for_item(item, config, permission_mode)?;
     let plan_relative = PathBuf::from(format!("item-{item_index}-plan.json"));
@@ -2533,6 +2694,8 @@ fn run_inbox_item(
                 autopilot_success: None,
                 github_success: true,
                 review_loop,
+                pr_intake: pr_intake_report_for_item(item),
+                independent_audit_lane: None,
                 next_action: if planned_only {
                     "review the plan; this permission mode does not launch work".to_string()
                 } else {
@@ -2652,6 +2815,8 @@ fn run_inbox_item(
             autopilot_success: Some(autopilot_success),
             github_success: github_report.success,
             review_loop,
+            pr_intake: pr_intake_report_for_item(item),
+            independent_audit_lane: None,
             next_action: if refusal.is_some() {
                 "wait for or increase the rolling inbox quota before retrying".to_string()
             } else if success {
@@ -2661,6 +2826,1544 @@ fn run_inbox_item(
             },
         },
         refusal,
+    })
+}
+
+fn run_independent_audit_intake_item(
+    writer: &mut ArtifactRunWriter,
+    input: InboxItemRunInput<'_>,
+    review_loop: Option<review_loop_entry::InboxReviewLoopReport>,
+    pr_intake: InboxPrIntakeReport,
+    source_fresh: bool,
+) -> Result<InboxItemRunOutcome> {
+    run_independent_audit_intake_item_with_runner(
+        writer,
+        input,
+        review_loop,
+        pr_intake,
+        source_fresh,
+        None,
+        verified_independent_audit_runner,
+    )
+}
+
+struct IndependentAuditRunnerResult {
+    raw_output: Option<Vec<u8>>,
+    report_sha256: Option<String>,
+    exit_code: Option<i32>,
+    duration_ms: u64,
+    timed_out: bool,
+    safely_executed: bool,
+    publishable: bool,
+    succeeded: bool,
+    scratch_quiescence_verified: bool,
+    error: Option<String>,
+}
+
+fn verified_independent_audit_runner(
+    command: &ExternalAgentCommand,
+) -> IndependentAuditRunnerResult {
+    let external_run = run_external_agent(command);
+    let raw_output = external_run.output_last_message().map(ToOwned::to_owned);
+    IndependentAuditRunnerResult {
+        report_sha256: raw_output
+            .as_deref()
+            .map(crate::artifacts::state_auth::sha256_hex),
+        raw_output,
+        exit_code: external_run.exit_code,
+        duration_ms: external_run.duration_ms,
+        timed_out: external_run.timed_out,
+        safely_executed: external_run.safely_executed(),
+        publishable: external_run.publishable,
+        succeeded: external_run.succeeded(),
+        scratch_quiescence_verified: external_run.scratch_quiescence_verified(),
+        error: external_run.error,
+    }
+}
+
+fn run_independent_audit_intake_item_with_runner<F>(
+    writer: &mut ArtifactRunWriter,
+    input: InboxItemRunInput<'_>,
+    review_loop: Option<review_loop_entry::InboxReviewLoopReport>,
+    pr_intake: InboxPrIntakeReport,
+    source_fresh: bool,
+    available_models_override: Option<&BTreeSet<String>>,
+    mut external_runner: F,
+) -> Result<InboxItemRunOutcome>
+where
+    F: FnMut(&ExternalAgentCommand) -> IndependentAuditRunnerResult,
+{
+    let context = input.context;
+    let item_index = input.item_index;
+    let item = input.item;
+    let run_id = context.run_id;
+    let action_policy = context.action_policy;
+    let permission_mode = context.permission_mode;
+    let plan_relative = PathBuf::from(format!("item-{item_index}-plan.json"));
+    let autopilot_report_relative =
+        PathBuf::from(format!("item-{item_index}-autopilot-report.json"));
+    let github_report_relative = PathBuf::from(format!("item-{item_index}-github-report.json"));
+    let autopilot_run_id = RunId::new(format!("{}-item-{item_index}", run_id.as_str()))?;
+
+    // The task itself is the plan artifact. Sending it through the existing
+    // repair/producer executor would violate producer/auditor separation.
+    write_private_artifact_json(writer, &plan_relative, &pr_intake)?;
+
+    let planning_only =
+        action_policy == InboxActionPolicy::DryRun || !permission_mode.launches_autopilot();
+    if planning_only && pr_intake.status == InboxPrIntakeStatus::Ready && source_fresh {
+        write_private_artifact_json(
+            writer,
+            &autopilot_report_relative,
+            &json!({
+                "status": "skipped",
+                "success": true,
+                "reason": if action_policy == InboxActionPolicy::DryRun {
+                    "dry_run action policy does not launch the independent audit task"
+                } else {
+                    "permission mode records the independent audit task without launching it"
+                }
+            }),
+        )?;
+        let github_report = InboxGithubActionReport {
+            mode: action_policy,
+            permission_mode,
+            status: "skipped".to_string(),
+            success: true,
+            target: item_target(item),
+            comment_url: None,
+            message: Some(
+                "independent audit task was recorded without launch; no GitHub action or merge was performed"
+                    .to_string(),
+            ),
+        };
+        write_private_artifact_json(writer, &github_report_relative, &github_report)?;
+        return Ok(InboxItemRunOutcome {
+            report: InboxItemRunReport {
+                item_index,
+                item_id: item.item_id.clone(),
+                kind: item.kind,
+                title: item.title.clone(),
+                success: true,
+                status: if action_policy == InboxActionPolicy::DryRun {
+                    "dry_run".to_string()
+                } else {
+                    "planned".to_string()
+                },
+                plan_path: public_item_path(run_id, &format!("item-{item_index}-plan.json")),
+                autopilot_run_id: autopilot_run_id.as_str().to_string(),
+                autopilot_report_path: public_item_path(
+                    run_id,
+                    &format!("item-{item_index}-autopilot-report.json"),
+                ),
+                github_report_path: public_item_path(
+                    run_id,
+                    &format!("item-{item_index}-github-report.json"),
+                ),
+                autopilot_success: None,
+                github_success: true,
+                review_loop,
+                pr_intake: Some(pr_intake),
+                independent_audit_lane: None,
+                next_action:
+                    "launch the recorded task through the independent-audit adapter; no merge was performed"
+                        .to_string(),
+            },
+            refusal: None,
+        });
+    }
+
+    let head_oid = item
+        .source_snapshot
+        .head_oid()
+        .unwrap_or_default()
+        .to_string();
+    let mut initial_blockers = Vec::new();
+    if !source_fresh {
+        initial_blockers.push(
+            review_loop_entry::InboxIndependentAuditLaneBlocker::StaleHead {
+                expected_head_oid: head_oid.clone(),
+            },
+        );
+    }
+    if pr_intake.status == InboxPrIntakeStatus::LaunchBlocked {
+        let block = pr_intake
+            .launch_block
+            .as_ref()
+            .context("blocked PR intake omitted its launch-block report")?;
+        initial_blockers.push(pr_intake_lane_blocker(block));
+    }
+    let task = pr_intake.task.as_ref();
+    if task.is_none() && initial_blockers.is_empty() {
+        initial_blockers.push(
+            review_loop_entry::InboxIndependentAuditLaneBlocker::MissingEvidence {
+                evidence: vec!["source_bound_audit_task".to_string()],
+            },
+        );
+    }
+    if let Some(task) = task {
+        initial_blockers.extend(review_loop_entry::independent_audit_task_blockers(
+            item, task,
+        ));
+    }
+    if !initial_blockers.is_empty() {
+        let lane = review_loop_entry::blocked_independent_audit_lane_result(
+            item,
+            head_oid,
+            initial_blockers,
+            None,
+            None,
+        );
+        return finish_independent_audit_lane_item(writer, input, review_loop, pr_intake, lane);
+    }
+    let task = task.expect("checked source-bound independent-audit task");
+    if item.source_snapshot.provider() == InboxSourceProvider::Github
+        && materialize_and_verify_local_independent_audit_candidate(context.repo, item, task)
+            .is_err()
+    {
+        let lane = review_loop_entry::blocked_independent_audit_lane_result(
+            item,
+            &task.head_oid,
+            vec![
+                review_loop_entry::InboxIndependentAuditLaneBlocker::MissingEvidence {
+                    evidence: vec!["local_exact_pull_request_diff".to_string()],
+                },
+            ],
+            None,
+            None,
+        );
+        return finish_independent_audit_lane_item(writer, input, review_loop, pr_intake, lane);
+    }
+    let timeout = Duration::from_secs(context.config.timeout_seconds.unwrap_or(600));
+    let program = context
+        .codex_bin
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("codex"));
+    let available_models = match available_models_override
+        .cloned()
+        .map(Ok)
+        .unwrap_or_else(|| independent_auditor_available_models(&program, context.repo, timeout))
+    {
+        Ok(models) => models,
+        Err(blocker) => {
+            let lane = review_loop_entry::blocked_independent_audit_lane_result(
+                item,
+                &task.head_oid,
+                vec![blocker],
+                None,
+                None,
+            );
+            return finish_independent_audit_lane_item(writer, input, review_loop, pr_intake, lane);
+        }
+    };
+    let decision = match review_loop_entry::select_critical_independent_auditor(&available_models) {
+        Ok(decision) => decision,
+        Err(error) => {
+            let lane = review_loop_entry::blocked_independent_audit_lane_result(
+                item,
+                &task.head_oid,
+                vec![
+                    review_loop_entry::InboxIndependentAuditLaneBlocker::SelectorRejected {
+                        detail: sanitize_public_text(
+                            context.repo,
+                            &error.to_string(),
+                            GH_DIAGNOSTIC_LIMIT,
+                        )
+                        .text,
+                    },
+                ],
+                None,
+                None,
+            );
+            return finish_independent_audit_lane_item(writer, input, review_loop, pr_intake, lane);
+        }
+    };
+    let selection = match review_loop_entry::compact_independent_auditor_selection(&decision) {
+        Ok(selection) => selection,
+        Err(_) => {
+            let lane = review_loop_entry::blocked_independent_audit_lane_result(
+                item,
+                &task.head_oid,
+                vec![
+                    review_loop_entry::InboxIndependentAuditLaneBlocker::UnavailableEligibleAuditor {
+                        detail: decision.decision_reason,
+                    },
+                ],
+                None,
+                None,
+            );
+            return finish_independent_audit_lane_item(writer, input, review_loop, pr_intake, lane);
+        }
+    };
+    let auditor_session_id = format!("{}-item-{item_index}-auditor", run_id.as_str());
+    let auditor =
+        review_loop_entry::independent_auditor_actor(&auditor_session_id, &selection.model);
+    if let Some(blocker) = review_loop_entry::producer_auditor_separation_blocker(
+        &task.producer_login,
+        &auditor,
+        &task.head_oid,
+    ) {
+        let lane = review_loop_entry::blocked_independent_audit_lane_result(
+            item,
+            &task.head_oid,
+            vec![blocker],
+            Some(selection),
+            None,
+        );
+        return finish_independent_audit_lane_item(writer, input, review_loop, pr_intake, lane);
+    }
+
+    let prompt = review_loop_entry::independent_auditor_prompt(item, task, &selection)?;
+    let prompt_sha256 = crate::artifacts::state_auth::sha256_hex(prompt.as_bytes());
+    let prompt_relative = PathBuf::from(format!("item-{item_index}-independent-audit-prompt.txt"));
+    writer.write_bytes(
+        &prompt_relative,
+        prompt.as_bytes(),
+        ArtifactFileDisposition::PrivateEvidence,
+    )?;
+    let incoming =
+        writer.create_scratch_dir(format!("item-{item_index}-independent-audit-incoming"))?;
+    let output_path = incoming.path().join("auditor-output.json");
+    let json_log_path = incoming.path().join("auditor-events.jsonl");
+    let mut command = ExternalAgentCommand::codex_read_only_consultant(
+        &program,
+        context.repo,
+        writer.run_dir().join(&prompt_relative),
+        &json_log_path,
+        &output_path,
+        timeout,
+    )
+    .with_model_selection(
+        Some(selection.model.clone()),
+        Some(selector_effort_label(selection.effort).to_string()),
+    );
+    if let Some(machine_global) = &context.machine_global {
+        command = command.with_machine_global_retention(
+            machine_global.retention_binding_for_run(&autopilot_run_id),
+        );
+    }
+    let runner_result = external_runner(&command);
+    let raw_output = runner_result.raw_output.clone();
+    let launch = review_loop_entry::InboxIndependentAuditLaunchEvidence {
+        adapter: "codex_read_only_consultant".to_string(),
+        permission_profile: review_loop_entry::independent_auditor_permission_profile().to_string(),
+        auditor_identity: review_loop_entry::independent_auditor_stable_id().to_string(),
+        auditor_session_id,
+        prompt_sha256,
+        report_sha256: runner_result.report_sha256.clone(),
+        exit_code: runner_result.exit_code,
+        duration_ms: runner_result.duration_ms,
+        timed_out: runner_result.timed_out,
+        safely_executed: runner_result.safely_executed,
+        publishable: runner_result.publishable,
+    };
+    drop(command);
+    if !runner_result.scratch_quiescence_verified {
+        bail!(
+            "independent-auditor scratch quiescence was not verified; leaving the Inbox run unfinalized"
+        );
+    }
+    writer
+        .discard_scratch(&incoming)
+        .context("discard independent-auditor invocation scratch")?;
+
+    let lane = if !runner_result.succeeded {
+        let detail = runner_result
+            .error
+            .as_deref()
+            .filter(|message| !message.is_empty())
+            .unwrap_or(if runner_result.timed_out {
+                "independent auditor timed out"
+            } else {
+                "independent auditor did not complete in the verified read-only boundary"
+            });
+        review_loop_entry::blocked_independent_audit_lane_result(
+            item,
+            &task.head_oid,
+            vec![
+                review_loop_entry::InboxIndependentAuditLaneBlocker::LaunchFailed {
+                    detail: sanitize_public_text(context.repo, detail, GH_DIAGNOSTIC_LIMIT).text,
+                },
+            ],
+            Some(selection),
+            Some(launch),
+        )
+    } else if revalidate_inbox_item_source(context.repo, item).is_err() {
+        review_loop_entry::blocked_independent_audit_lane_result(
+            item,
+            &task.head_oid,
+            vec![
+                review_loop_entry::InboxIndependentAuditLaneBlocker::StaleHead {
+                    expected_head_oid: task.head_oid.clone(),
+                },
+            ],
+            Some(selection),
+            Some(launch),
+        )
+    } else {
+        match raw_output {
+            None => review_loop_entry::blocked_independent_audit_lane_result(
+                item,
+                &task.head_oid,
+                vec![
+                    review_loop_entry::InboxIndependentAuditLaneBlocker::MissingAuditEvidence {
+                        evidence: vec!["auditor_output".to_string()],
+                    },
+                ],
+                Some(selection),
+                Some(launch),
+            ),
+            Some(raw_output) => {
+                let report_sha256 = crate::artifacts::state_auth::sha256_hex(&raw_output);
+                if launch.report_sha256.as_deref() != Some(report_sha256.as_str()) {
+                    review_loop_entry::blocked_independent_audit_lane_result(
+                        item,
+                        &task.head_oid,
+                        vec![
+                            review_loop_entry::InboxIndependentAuditLaneBlocker::MissingAuditEvidence {
+                                evidence: vec!["auditor_output_digest".to_string()],
+                            },
+                        ],
+                        Some(selection),
+                        Some(launch),
+                    )
+                } else {
+                    let parsed = serde_json::from_slice::<
+                        review_loop_entry::InboxIndependentAuditorOutput,
+                    >(&raw_output);
+                    match parsed {
+                        Err(_) => review_loop_entry::blocked_independent_audit_lane_result(
+                            item,
+                            &task.head_oid,
+                            vec![
+                                review_loop_entry::InboxIndependentAuditLaneBlocker::MissingAuditEvidence {
+                                    evidence: vec!["strict_auditor_output_json".to_string()],
+                                },
+                            ],
+                            Some(selection),
+                            Some(launch),
+                        ),
+                        Ok(output) => match review_loop_entry::validate_independent_auditor_output(
+                            output, item, task, auditor,
+                        ) {
+                            Ok(auditor_evidence) => complete_authenticated_independent_audit_merge(
+                                context,
+                                item,
+                                task,
+                                selection,
+                                launch,
+                                auditor_evidence,
+                            ),
+                            Err(blocker) => {
+                                review_loop_entry::blocked_independent_audit_lane_result(
+                                    item,
+                                    &task.head_oid,
+                                    vec![blocker],
+                                    Some(selection),
+                                    Some(launch),
+                                )
+                            }
+                        },
+                    }
+                }
+            }
+        }
+    };
+    finish_independent_audit_lane_item(writer, input, review_loop, pr_intake, lane)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrustedGithubPullRequestObjectRequest {
+    remote_url: String,
+    base_remote_ref: String,
+    head_remote_ref: String,
+    expected_base_oid: Oid,
+    expected_head_oid: Oid,
+}
+
+fn materialize_and_verify_local_independent_audit_candidate(
+    repo_path: &Path,
+    item: &InboxItem,
+    task: &InboxIndependentAuditMergeLaneTask,
+) -> Result<()> {
+    materialize_and_verify_local_independent_audit_candidate_with(
+        repo_path,
+        item,
+        task,
+        materialize_trusted_github_pull_request_objects,
+        revalidate_inbox_item_source,
+    )
+}
+
+fn materialize_and_verify_local_independent_audit_candidate_with<M, R>(
+    repo_path: &Path,
+    item: &InboxItem,
+    task: &InboxIndependentAuditMergeLaneTask,
+    mut materialize: M,
+    mut revalidate: R,
+) -> Result<()>
+where
+    M: FnMut(&Path, &TrustedGithubPullRequestObjectRequest) -> Result<()>,
+    R: FnMut(&Path, &InboxItem) -> Result<()>,
+{
+    let request = trusted_github_pull_request_object_request(repo_path, item, task)?;
+    let repository = crate::git_repository::open(repo_path)
+        .context("open repository before exact pull-request object materialization")?;
+    let has_exact_commits = repository.find_commit(request.expected_base_oid).is_ok()
+        && repository.find_commit(request.expected_head_oid).is_ok();
+    drop(repository);
+    if !has_exact_commits {
+        materialize(repo_path, &request)
+            .context("bounded exact pull-request object transport failed")?;
+    }
+
+    // The transport is intentionally followed by a new provider observation.
+    // No diff is inspected before this point, so a PR/base ref that moved while
+    // objects were in flight cannot turn stale objects into audit evidence.
+    revalidate(repo_path, item)
+        .context("GitHub source changed after exact pull-request object materialization")?;
+    verify_local_independent_audit_candidate(repo_path, task)
+}
+
+fn trusted_github_pull_request_object_request(
+    repo_path: &Path,
+    item: &InboxItem,
+    task: &InboxIndependentAuditMergeLaneTask,
+) -> Result<TrustedGithubPullRequestObjectRequest> {
+    item.source_snapshot.validate()?;
+    if item.kind != InboxItemKind::PullRequest
+        || item.source_snapshot.kind() != InboxItemKind::PullRequest
+        || item.source_snapshot.provider() != InboxSourceProvider::Github
+    {
+        bail!("exact pull-request object materialization requires a GitHub PR snapshot");
+    }
+    let pull_request = item
+        .pull_request
+        .as_ref()
+        .context("GitHub PR snapshot omitted its pull-request candidate")?;
+    if pull_request.number != item.source_snapshot.number()
+        || task.source_snapshot_digest != item.source_snapshot.digest()
+        || task.source_updated_at != item.source_snapshot.updated_at()
+        || task.head_oid != item.source_snapshot.head_oid().unwrap_or_default()
+        || task.base_oid != item.source_snapshot.base_oid().unwrap_or_default()
+        || task.changed_files != pull_request.changed_files
+        || task.checks != pull_request.checks
+        || task.head_repository != pull_request.head_repository
+    {
+        bail!("pull-request materialization input drifted from its source-bound audit task");
+    }
+    if pull_request.is_draft
+        || task.is_draft
+        || pull_request.source_trust != GithubPrSourceTrust::TrustedTargetRepository
+        || task.source_trust != GithubPrSourceTrust::TrustedTargetRepository
+    {
+        bail!(
+            "pull-request object materialization requires a trusted non-draft same-repository head"
+        );
+    }
+    let target_owner_name = item
+        .source_snapshot
+        .repository_selector()
+        .split_once('/')
+        .map(|(_, owner_name)| owner_name)
+        .context("GitHub source selector omitted its host")?;
+    if target_owner_name.split('/').count() != 2
+        || pull_request
+            .head_repository
+            .as_deref()
+            .is_none_or(|repository| !repository.eq_ignore_ascii_case(target_owner_name))
+    {
+        bail!("pull-request object materialization refuses fork or unbound head repositories");
+    }
+    let base_ref = pull_request
+        .base_ref
+        .as_deref()
+        .context("GitHub PR snapshot omitted its base branch")?;
+    validate_github_materialization_branch(base_ref)?;
+    let expected_head_oid =
+        Oid::from_str(&task.head_oid).context("parse source-bound pull-request head OID")?;
+    let expected_base_oid =
+        Oid::from_str(&task.base_oid).context("parse source-bound pull-request base OID")?;
+    if expected_head_oid.to_string() != task.head_oid
+        || expected_base_oid.to_string() != task.base_oid
+    {
+        bail!("source-bound pull-request OIDs were not canonical SHA-1 identities");
+    }
+
+    let repository = crate::git_repository::open(repo_path)
+        .context("open repository for trusted pull-request object transport")?;
+    let common = SafeRoot::open_existing(repository.commondir())
+        .context("bind repository identity for trusted pull-request object transport")?;
+    if publication::external_source_repository_identity(
+        common.identity().device,
+        common.identity().file,
+    ) != item.source_snapshot.repository_identity()
+    {
+        bail!("pull-request object materialization repository identity changed");
+    }
+    let origin = repository
+        .find_remote("origin")
+        .context("trusted pull-request object transport requires origin")?;
+    let origin_url = origin
+        .url()
+        .context("trusted pull-request object transport origin was not UTF-8")?;
+    let (origin_host, origin_selector) =
+        publication::canonical_github_source_repository(origin_url)?;
+    if origin_host != item.source_snapshot.repository_host()
+        || origin_selector != item.source_snapshot.repository_selector()
+    {
+        bail!("pull-request object materialization origin changed from its source binding");
+    }
+    common.verify()?;
+
+    Ok(TrustedGithubPullRequestObjectRequest {
+        // Reconstruct the transport URL from validated canonical snapshot
+        // fields. The command never consumes a caller-provided URL, remote
+        // helper, or mutable fetch refspec.
+        remote_url: format!(
+            "https://{}/{}.git",
+            item.source_snapshot.repository_host(),
+            target_owner_name
+        ),
+        base_remote_ref: format!("refs/heads/{base_ref}"),
+        head_remote_ref: format!("refs/pull/{}/head", item.source_snapshot.number()),
+        expected_base_oid,
+        expected_head_oid,
+    })
+}
+
+fn validate_github_materialization_branch(branch: &str) -> Result<()> {
+    if branch.is_empty()
+        || branch.len() > MAX_GITHUB_REF_BYTES
+        || branch.starts_with('/')
+        || branch.ends_with('/')
+        || branch.starts_with('.')
+        || branch.ends_with('.')
+        || branch.contains("..")
+        || branch.contains("@{")
+        || branch.bytes().any(|byte| {
+            !(byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.'))
+        })
+        || branch.split('/').any(|component| {
+            component.is_empty()
+                || component.starts_with('.')
+                || component.ends_with('.')
+                || component.ends_with(".lock")
+        })
+    {
+        bail!("GitHub PR base branch is not a strict transport-safe ref name");
+    }
+    Ok(())
+}
+
+fn materialize_trusted_github_pull_request_objects(
+    repo_path: &Path,
+    request: &TrustedGithubPullRequestObjectRequest,
+) -> Result<()> {
+    let target = crate::git_repository::open(repo_path)
+        .context("open target repository for exact pull-request object materialization")?;
+    let target_common = SafeRoot::open_existing(target.commondir())
+        .context("bind target object database during pull-request materialization")?;
+    let mut runtime = crate::merge::PrivateRuntimeDirectory::create(
+        repo_path,
+        crate::merge::PrivateRuntimeKind::PublicationGit,
+    )?;
+    let directory = runtime.path().to_path_buf();
+    let execution = (|| -> Result<()> {
+        initialize_pull_request_fetch_repository(&directory, request)?;
+        let config_path = directory.join("config");
+        let global_config = directory.join("disabled-global-config");
+        let config_before =
+            fs::read(&config_path).context("read sealed pull-request fetch configuration")?;
+        let global_before =
+            fs::read(&global_config).context("read sealed pull-request global configuration")?;
+        let mut environment = crate::merge::minimal_network_environment()?;
+        environment.insert(
+            "GIT_CONFIG_GLOBAL".to_string(),
+            global_config
+                .to_str()
+                .context("pull-request fetch global config path was not UTF-8")?
+                .to_string(),
+        );
+        let primary = fs::canonicalize(
+            target
+                .commondir()
+                .parent()
+                .context("target Git common directory omitted its repository root")?,
+        )
+        .context("resolve primary worktree for pull-request fetch isolation")?;
+        let source_worktree = fs::canonicalize(repo_path)
+            .context("resolve source worktree for pull-request fetch isolation")?;
+        let profile = TrustedFixedNetworkProfile::read_write(&directory)
+            .with_resource_limits(ProcessResourceLimits {
+                memory_max_bytes: 1024 * 1024 * 1024,
+                tasks_max: 64,
+                cpu_quota_percent: 400,
+                open_files_max: 1024,
+                file_size_max_bytes: PR_OBJECT_FETCH_MAX_BYTES,
+            })
+            .with_visible_read_only_file(&config_path)
+            .with_visible_read_only_file(&global_config)
+            .with_hidden_root(primary)
+            .with_hidden_root(source_worktree);
+        let base_refspec = format!("+{}:refs/maco-inbox/base", request.base_remote_ref);
+        let head_refspec = format!("+{}:refs/maco-inbox/head", request.head_remote_ref);
+        let args = vec![
+            "--git-dir".into(),
+            directory.as_os_str().to_os_string(),
+            "-c".into(),
+            "core.fsmonitor=false".into(),
+            "-c".into(),
+            "core.untrackedCache=false".into(),
+            "-c".into(),
+            "protocol.allow=never".into(),
+            "-c".into(),
+            "protocol.https.allow=always".into(),
+            "fetch".into(),
+            "--force".into(),
+            "--no-tags".into(),
+            "--no-recurse-submodules".into(),
+            "--no-write-fetch-head".into(),
+            "maco-inbox".into(),
+            base_refspec.into(),
+            head_refspec.into(),
+        ];
+        let output = crate::merge::run_required_network_direct(
+            "fetch exact trusted pull-request objects",
+            crate::merge::resolve_trusted_executable("git")?,
+            args,
+            &directory,
+            environment,
+            StdinMode::Null,
+            PR_OBJECT_FETCH_TIMEOUT,
+            PR_OBJECT_FETCH_CAPTURE_LIMIT,
+            0,
+            profile,
+        )?;
+        if !output.success {
+            bail!(
+                "exact pull-request object fetch failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        runtime
+            .verify_identity()
+            .context("pull-request fetch runtime changed during transport")?;
+        if fs::read(&config_path)? != config_before || fs::read(&global_config)? != global_before {
+            bail!("pull-request fetch configuration changed during transport");
+        }
+        let fetched = crate::git_repository::open_bare(&directory)
+            .context("open bounded pull-request fetch repository")?;
+        validate_materialized_pull_request_refs(&fetched, request)?;
+        copy_pull_request_object_closure(
+            &fetched,
+            &target,
+            request.expected_base_oid,
+            request.expected_head_oid,
+        )?;
+        target_common.verify()
+    })();
+    let cleanup = runtime.close();
+    match (execution, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error.context("clean up pull-request fetch runtime")),
+        (Err(error), Err(cleanup)) => Err(anyhow::anyhow!(
+            "{error:#}; pull-request fetch runtime cleanup also failed: {cleanup:#}"
+        )),
+    }
+}
+
+fn initialize_pull_request_fetch_repository(
+    directory: &Path,
+    request: &TrustedGithubPullRequestObjectRequest,
+) -> Result<()> {
+    crate::merge::create_private_directory(&directory.join("objects"))?;
+    crate::merge::create_private_directory(&directory.join("objects/info"))?;
+    crate::merge::create_private_directory(&directory.join("objects/pack"))?;
+    crate::merge::create_private_directory(&directory.join("refs"))?;
+    crate::merge::create_private_directory(&directory.join("refs/heads"))?;
+    crate::merge::create_private_directory(&directory.join("refs/tags"))?;
+    crate::merge::create_private_directory(&directory.join("disabled-hooks"))?;
+    crate::merge::write_private_file(&directory.join("HEAD"), b"ref: refs/heads/maco-inbox\n")?;
+    let config_path = directory.join("config");
+    crate::merge::write_private_file(&config_path, b"")?;
+    crate::merge::write_private_file(&directory.join("disabled-global-config"), b"")?;
+    let mut config = git2::Config::open(&config_path)
+        .context("open private pull-request fetch configuration")?;
+    config.set_i32("core.repositoryformatversion", 0)?;
+    config.set_bool("core.bare", true)?;
+    config.set_bool("core.fsmonitor", false)?;
+    config.set_bool("core.untrackedcache", false)?;
+    config.set_str(
+        "core.hookspath",
+        directory
+            .join("disabled-hooks")
+            .to_str()
+            .context("pull-request disabled-hooks path was not UTF-8")?,
+    )?;
+    config.set_str("protocol.allow", "never")?;
+    config.set_str("protocol.https.allow", "always")?;
+    config.set_str("protocol.ext.allow", "never")?;
+    config.set_str("protocol.file.allow", "never")?;
+    config.set_str("http.followredirects", "false")?;
+    config.set_bool("http.sslverify", true)?;
+    config.set_str("http.proxy", "")?;
+    config.set_str("credential.helper", "")?;
+    config.set_str("core.askpass", "")?;
+    config.set_bool("fetch.fsckobjects", true)?;
+    config.set_bool("transfer.fsckobjects", true)?;
+    config.set_i32("gc.auto", 0)?;
+    config.set_bool("maintenance.auto", false)?;
+    config.set_bool("submodule.recurse", false)?;
+    config.set_str("remote.maco-inbox.url", &request.remote_url)?;
+    config.set_str("remote.maco-inbox.tagopt", "--no-tags")?;
+    Ok(())
+}
+
+fn validate_materialized_pull_request_refs(
+    repository: &git2::Repository,
+    request: &TrustedGithubPullRequestObjectRequest,
+) -> Result<()> {
+    let expected = [
+        ("refs/maco-inbox/base", request.expected_base_oid),
+        ("refs/maco-inbox/head", request.expected_head_oid),
+    ];
+    let mut observed_names = BTreeSet::new();
+    for reference in repository.references()? {
+        let reference = reference.context("inspect pull-request fetch reference")?;
+        let name = reference
+            .name()
+            .context("pull-request fetch produced a non-UTF-8 reference")?;
+        observed_names.insert(name.to_string());
+    }
+    if observed_names
+        != expected
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect::<BTreeSet<_>>()
+    {
+        bail!("pull-request fetch produced refs outside its exact bounded destinations");
+    }
+    for (name, expected_oid) in expected {
+        let reference = repository.find_reference(name)?;
+        let target = reference
+            .target()
+            .context("pull-request fetch produced a symbolic destination ref")?;
+        if target != expected_oid {
+            bail!("pull-request fetch ref drifted from its source-snapshot OID");
+        }
+        repository
+            .find_commit(target)
+            .context("pull-request fetch destination was not an exact commit")?;
+    }
+    Ok(())
+}
+
+fn copy_pull_request_object_closure(
+    source: &git2::Repository,
+    target: &git2::Repository,
+    base_oid: Oid,
+    head_oid: Oid,
+) -> Result<()> {
+    let source_odb = source
+        .odb()
+        .context("open fetched pull-request object database")?;
+    let target_odb = target
+        .odb()
+        .context("open target pull-request object database")?;
+    let mut pending = vec![
+        (base_oid, ObjectType::Commit),
+        (head_oid, ObjectType::Commit),
+    ];
+    let mut objects = BTreeMap::<Oid, ObjectType>::new();
+    let mut total_bytes = 0_u64;
+    let mut steps = 0usize;
+    while let Some((oid, expected_kind)) = pending.pop() {
+        steps = steps
+            .checked_add(1)
+            .context("pull-request object graph step count overflow")?;
+        if steps > PR_OBJECT_FETCH_MAX_GRAPH_STEPS {
+            bail!("pull-request object graph exceeded its traversal bound");
+        }
+        if let Some(prior) = objects.get(&oid) {
+            if *prior != expected_kind {
+                bail!("pull-request object graph reused an OID with contradictory kinds");
+            }
+            continue;
+        }
+        if objects.len() >= PR_OBJECT_FETCH_MAX_OBJECTS {
+            bail!("pull-request object graph exceeded its object-count bound");
+        }
+        let (size, kind) = source_odb
+            .read_header(oid)
+            .with_context(|| format!("fetched pull-request closure omitted object {oid}"))?;
+        if kind != expected_kind {
+            bail!("fetched pull-request closure contained an unexpected object kind");
+        }
+        total_bytes = total_bytes
+            .checked_add(u64::try_from(size).context("pull-request object size did not fit")?)
+            .context("pull-request object byte count overflow")?;
+        if total_bytes > PR_OBJECT_FETCH_MAX_BYTES {
+            bail!("pull-request object graph exceeded its aggregate byte bound");
+        }
+        objects.insert(oid, expected_kind);
+        match expected_kind {
+            ObjectType::Commit => {
+                let commit = source
+                    .find_commit(oid)
+                    .with_context(|| format!("parse fetched pull-request commit {oid}"))?;
+                pending.push((commit.tree_id(), ObjectType::Tree));
+                pending.extend(
+                    commit
+                        .parent_ids()
+                        .map(|parent| (parent, ObjectType::Commit)),
+                );
+            }
+            ObjectType::Tree => {
+                let tree = source
+                    .find_tree(oid)
+                    .with_context(|| format!("parse fetched pull-request tree {oid}"))?;
+                for entry in tree.iter() {
+                    match entry.kind() {
+                        Some(ObjectType::Tree) => pending.push((entry.id(), ObjectType::Tree)),
+                        Some(ObjectType::Blob) => pending.push((entry.id(), ObjectType::Blob)),
+                        Some(ObjectType::Commit) if entry.filemode() == 0o160000 => {
+                            // A gitlink names a commit in another repository. It is
+                            // metadata only and is never fetched or traversed here.
+                        }
+                        _ => bail!("pull-request tree contained an unsupported entry kind"),
+                    }
+                }
+            }
+            ObjectType::Blob => {}
+            _ => bail!("pull-request object graph contained an unsupported object kind"),
+        }
+    }
+    for (oid, kind) in objects {
+        let object = source_odb
+            .read(oid)
+            .with_context(|| format!("read bounded fetched pull-request object {oid}"))?;
+        if object.kind() != kind {
+            bail!("fetched pull-request object changed kind during materialization");
+        }
+        let written = target_odb
+            .write(kind, object.data())
+            .with_context(|| format!("materialize exact pull-request object {oid}"))?;
+        if written != oid {
+            bail!("pull-request object materialization changed an object identity");
+        }
+    }
+    target
+        .find_commit(base_oid)
+        .context("materialized repository omitted exact pull-request base")?;
+    target
+        .find_commit(head_oid)
+        .context("materialized repository omitted exact pull-request head")?;
+    Ok(())
+}
+
+fn verify_local_independent_audit_candidate(
+    repo_path: &Path,
+    task: &InboxIndependentAuditMergeLaneTask,
+) -> Result<()> {
+    let repository = crate::git_repository::open(repo_path)
+        .context("open repository for exact local pull-request audit")?;
+    let head_oid = Oid::from_str(&task.head_oid).context("parse local pull-request head OID")?;
+    let base_oid = Oid::from_str(&task.base_oid).context("parse local pull-request base OID")?;
+    if head_oid.to_string() != task.head_oid || base_oid.to_string() != task.base_oid {
+        bail!("local pull-request OIDs were not canonical SHA-1 object identities");
+    }
+    let head = repository
+        .find_commit(head_oid)
+        .context("local repository omitted the exact pull-request head commit")?;
+    let base = repository
+        .find_commit(base_oid)
+        .context("local repository omitted the exact pull-request base commit")?;
+    let merge_base_oid = repository
+        .merge_base(base.id(), head.id())
+        .context("local pull-request commits had no unique merge base")?;
+    let merge_base = repository
+        .find_commit(merge_base_oid)
+        .context("local repository omitted the pull-request merge-base commit")?;
+    let merge_base_tree = merge_base
+        .tree()
+        .context("load pull-request merge-base tree")?;
+    let head_tree = head.tree().context("load pull-request head tree")?;
+    let mut options = DiffOptions::new();
+    options
+        .include_typechange(true)
+        .recurse_untracked_dirs(false);
+    let mut diff = repository
+        .diff_tree_to_tree(Some(&merge_base_tree), Some(&head_tree), Some(&mut options))
+        .context("compute exact local pull-request diff")?;
+    let mut find = DiffFindOptions::new();
+    find.renames(true);
+    diff.find_similar(Some(&mut find))
+        .context("resolve exact local pull-request renames")?;
+    let mut observed = BTreeSet::new();
+    for delta in diff.deltas() {
+        let path = if delta.status() == Delta::Deleted {
+            delta.old_file().path()
+        } else {
+            delta.new_file().path().or_else(|| delta.old_file().path())
+        }
+        .context("local pull-request diff omitted a changed path")?;
+        observed.insert(
+            normalize_repo_relative_path(path)
+                .context("local pull-request diff contained an invalid changed path")?,
+        );
+    }
+    let expected = task.changed_files.iter().cloned().collect::<BTreeSet<_>>();
+    if expected.is_empty() || expected.len() != task.changed_files.len() || observed != expected {
+        bail!("local pull-request diff paths did not match provider-bound audit paths");
+    }
+    Ok(())
+}
+
+struct TrustedInboxPullRequestMergeGroundTruth {
+    snapshot: PullRequestReviewSnapshot,
+    producer: ProducerFingerprint,
+    producer_login: String,
+    changed_paths: Vec<PathBuf>,
+    merges_cleanly: bool,
+    is_draft: bool,
+    is_open: bool,
+    same_repository_head: bool,
+}
+
+fn complete_authenticated_independent_audit_merge(
+    context: &InboxItemRunContext<'_>,
+    item: &InboxItem,
+    task: &InboxIndependentAuditMergeLaneTask,
+    selection: review_loop_entry::InboxIndependentAuditorSelectionEvidence,
+    launch: review_loop_entry::InboxIndependentAuditLaunchEvidence,
+    auditor_evidence: PullRequestAuditorEvidence,
+) -> review_loop_entry::InboxIndependentAuditLaneResult {
+    if context.action_policy == InboxActionPolicy::DryRun
+        || (context.action_policy == InboxActionPolicy::Github
+            && context.permission_mode != InboxPermissionMode::GithubFull)
+    {
+        return review_loop_entry::blocked_authenticated_merge_lane_result(
+            item,
+            selection,
+            launch,
+            auditor_evidence,
+            review_loop_entry::InboxIndependentAuditLaneBlocker::MergeModeNotAuthorized {
+                action_policy: format!("{:?}", context.action_policy).to_ascii_lowercase(),
+                permission_mode: format!("{:?}", context.permission_mode).to_ascii_lowercase(),
+            },
+        );
+    }
+    #[cfg(not(test))]
+    if context.action_policy == InboxActionPolicy::Fake {
+        return review_loop_entry::blocked_authenticated_merge_lane_result(
+            item,
+            selection,
+            launch,
+            auditor_evidence,
+            review_loop_entry::InboxIndependentAuditLaneBlocker::MergeModeNotAuthorized {
+                action_policy: "fake".to_string(),
+                permission_mode: format!("{:?}", context.permission_mode).to_ascii_lowercase(),
+            },
+        );
+    }
+
+    let ground_truth = match context.action_policy {
+        InboxActionPolicy::DryRun => unreachable!("dry run returned before ground-truth access"),
+        InboxActionPolicy::Fake => {
+            #[cfg(test)]
+            {
+                fake_pull_request_merge_ground_truth(item, task, &auditor_evidence)
+            }
+            #[cfg(not(test))]
+            {
+                unreachable!("production fake merge mode returned before ground-truth access")
+            }
+        }
+        InboxActionPolicy::Github => publication::observe_github_pull_request_merge_ground_truth(
+            context.repo,
+            item.source_snapshot.repository_selector(),
+            item.source_snapshot.number(),
+        )
+        .map(|truth| TrustedInboxPullRequestMergeGroundTruth {
+            snapshot: truth.snapshot,
+            producer: truth.producer,
+            producer_login: truth.producer_login,
+            changed_paths: truth.changed_paths,
+            merges_cleanly: truth.merges_cleanly,
+            is_draft: truth.is_draft,
+            is_open: truth.is_open,
+            same_repository_head: truth.same_repository_head,
+        }),
+    };
+    let ground_truth = match ground_truth {
+        Ok(ground_truth) => ground_truth,
+        Err(error) => {
+            return review_loop_entry::blocked_authenticated_merge_lane_result(
+                item,
+                selection,
+                launch,
+                auditor_evidence,
+                review_loop_entry::InboxIndependentAuditLaneBlocker::MergeGroundTruthUnavailable {
+                    detail: sanitize_public_text(
+                        context.repo,
+                        &format!("{error:#}"),
+                        GH_DIAGNOSTIC_LIMIT,
+                    )
+                    .text,
+                },
+            );
+        }
+    };
+    let (candidate, evidence) = match authenticated_merge_evidence_from_ground_truth(
+        task,
+        &auditor_evidence,
+        &ground_truth,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return review_loop_entry::blocked_authenticated_merge_lane_result(
+                item,
+                selection,
+                launch,
+                auditor_evidence,
+                review_loop_entry::InboxIndependentAuditLaneBlocker::MergeGroundTruthMismatch {
+                    field: sanitize_public_text(
+                        context.repo,
+                        &error.to_string(),
+                        GH_DIAGNOSTIC_LIMIT,
+                    )
+                    .text,
+                },
+            );
+        }
+    };
+
+    let merge = match context.action_policy {
+        InboxActionPolicy::DryRun => unreachable!("dry run returned before merge execution"),
+        InboxActionPolicy::Fake => {
+            #[cfg(test)]
+            {
+                let mut transport = FakeForgeTransport::new();
+                transport
+                    .register_pull_request_merge_observation(
+                        &candidate,
+                        ground_truth.snapshot.clone(),
+                    )
+                    .and_then(|()| {
+                        publication::execute_authenticated_pull_request_merge(
+                            context.repo,
+                            &candidate,
+                            Some(&evidence),
+                            &transport,
+                        )
+                    })
+            }
+            #[cfg(not(test))]
+            {
+                unreachable!("production fake merge mode returned before merge execution")
+            }
+        }
+        InboxActionPolicy::Github => publication::execute_authenticated_github_pull_request_merge(
+            context.repo,
+            item.source_snapshot.repository_selector(),
+            &candidate,
+            Some(&evidence),
+        ),
+    };
+    match merge {
+        Ok(AuthenticatedPullRequestMergeOutcome::Merged { receipt, .. }) => {
+            review_loop_entry::accepted_independent_audit_lane_result(
+                item,
+                selection,
+                launch,
+                auditor_evidence,
+                inbox_merge_receipt(receipt.as_ref()),
+            )
+        }
+        Ok(AuthenticatedPullRequestMergeOutcome::NotMerged { blockers, .. }) => {
+            review_loop_entry::blocked_authenticated_merge_lane_result(
+                item,
+                selection,
+                launch,
+                auditor_evidence,
+                review_loop_entry::InboxIndependentAuditLaneBlocker::AuthenticatedMergeBlocked {
+                    blockers,
+                },
+            )
+        }
+        Err(error) => review_loop_entry::blocked_authenticated_merge_lane_result(
+            item,
+            selection,
+            launch,
+            auditor_evidence,
+            review_loop_entry::InboxIndependentAuditLaneBlocker::AuthenticatedMergeFailed {
+                detail: sanitize_public_text(
+                    context.repo,
+                    &format!("{error:#}"),
+                    GH_DIAGNOSTIC_LIMIT,
+                )
+                .text,
+            },
+        ),
+    }
+}
+
+#[cfg(test)]
+fn fake_pull_request_merge_ground_truth(
+    item: &InboxItem,
+    task: &InboxIndependentAuditMergeLaneTask,
+    auditor_evidence: &PullRequestAuditorEvidence,
+) -> Result<TrustedInboxPullRequestMergeGroundTruth> {
+    let synthesized = review_loop_entry::synthesize_inbox_review_observation(item)?;
+    let provider = synthesized.item.repository().provider_id();
+    let auditor_actor = ForgeActor::new(
+        provider,
+        ProviderObjectId::new(
+            provider,
+            ProviderObjectKind::Actor,
+            auditor_evidence.auditor.agent.stable_id.clone(),
+        )?,
+        auditor_evidence
+            .auditor
+            .agent
+            .stable_id
+            .to_ascii_lowercase(),
+        ReportedActorKind::Human,
+    )?;
+    let approval = ForgeReview::new(
+        ProviderObjectId::new(
+            provider,
+            ProviderObjectKind::Review,
+            format!(
+                "review:{}:independent-auditor",
+                item.source_snapshot.number()
+            ),
+        )?,
+        auditor_actor,
+        ForgeReviewState::Approved,
+        "authenticated independent audit acceptance",
+        synthesized.observed_at.clone(),
+        &task.head_oid,
+    )?;
+    let snapshot = PullRequestReviewSnapshot::new(
+        synthesized.item.clone(),
+        synthesized.observed_at,
+        vec![approval],
+        Vec::new(),
+        synthesized.snapshot.checks().to_vec(),
+    )?;
+    let producer_id = format!("actor:{}", task.producer_login.to_ascii_lowercase());
+    Ok(TrustedInboxPullRequestMergeGroundTruth {
+        snapshot,
+        producer: ProducerFingerprint {
+            actor: MergeActor {
+                agent: AgentIdentity {
+                    stable_id: producer_id.clone(),
+                },
+                session: SessionId {
+                    id: format!("fake-pr-head:{}", task.head_oid),
+                },
+                model_label: "fake-pr-producer".to_string(),
+            },
+            commit_authors: vec![producer_id.clone()],
+            commit_committers: vec![producer_id],
+        },
+        producer_login: task.producer_login.clone(),
+        changed_paths: task.changed_files.clone(),
+        merges_cleanly: true,
+        is_draft: task.is_draft,
+        is_open: true,
+        same_repository_head: task.source_trust == GithubPrSourceTrust::TrustedTargetRepository,
+    })
+}
+
+fn authenticated_merge_evidence_from_ground_truth(
+    task: &InboxIndependentAuditMergeLaneTask,
+    local_auditor: &PullRequestAuditorEvidence,
+    truth: &TrustedInboxPullRequestMergeGroundTruth,
+) -> Result<(ForgeItem, AuthenticatedPullRequestMergeEvidence)> {
+    let candidate = truth.snapshot.item();
+    if candidate.head_oid() != Some(task.head_oid.as_str()) {
+        bail!("head_oid");
+    }
+    if candidate.base_oid() != Some(task.base_oid.as_str()) {
+        bail!("base_oid");
+    }
+    if local_auditor.head_oid != task.head_oid {
+        bail!("auditor_head_oid");
+    }
+    if truth.is_draft {
+        bail!("draft_pull_request");
+    }
+    if !truth.is_open {
+        bail!("open_pull_request");
+    }
+    if !truth.same_repository_head {
+        bail!("trusted_same_repository_head");
+    }
+    if !truth
+        .producer_login
+        .eq_ignore_ascii_case(&task.producer_login)
+    {
+        bail!("producer_identity");
+    }
+    let mut task_paths = task.changed_files.clone();
+    task_paths.sort();
+    if task_paths != truth.changed_paths {
+        bail!("changed_paths");
+    }
+    if !truth.merges_cleanly {
+        bail!("merge_simulation");
+    }
+
+    let mut required_checks = task
+        .checks
+        .iter()
+        .map(|check| check.name.trim().to_string())
+        .collect::<Vec<_>>();
+    required_checks.sort();
+    if required_checks.is_empty()
+        || required_checks.iter().any(|check| check.is_empty())
+        || required_checks.windows(2).any(|pair| pair[0] == pair[1])
+    {
+        bail!("required_checks");
+    }
+    let mut observed_check_names = truth
+        .snapshot
+        .checks()
+        .iter()
+        .map(|check| check.name().to_string())
+        .collect::<Vec<_>>();
+    observed_check_names.sort();
+    if observed_check_names != required_checks {
+        bail!("required_check_set");
+    }
+    if truth.snapshot.checks().iter().any(|check| {
+        check.status() != ForgeCheckStatus::Completed
+            || check.conclusion() != Some(ForgeCheckConclusion::Success)
+    }) {
+        bail!("incomplete_or_unsuccessful_check");
+    }
+    for required in &required_checks {
+        let matches = truth
+            .snapshot
+            .checks()
+            .iter()
+            .filter(|check| check.name() == required)
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            bail!("required_check:{required}");
+        }
+        let check = matches[0];
+        if check.status() != ForgeCheckStatus::Completed
+            || check.conclusion() != Some(ForgeCheckConclusion::Success)
+        {
+            bail!("required_check_not_successful:{required}");
+        }
+    }
+
+    let mut approvals = truth
+        .snapshot
+        .reviews()
+        .iter()
+        .filter(|review| review.state() == ForgeReviewState::Approved)
+        .filter(|review| {
+            let actor = review.author().provider_actor_id().stable_id();
+            actor != truth.producer.actor.agent.stable_id
+                && !truth.producer.commit_authors.iter().any(|id| id == actor)
+                && !truth
+                    .producer
+                    .commit_committers
+                    .iter()
+                    .any(|id| id == actor)
+        })
+        .collect::<Vec<_>>();
+    approvals.sort_by(|left, right| {
+        left.submitted_at().cmp(right.submitted_at()).then_with(|| {
+            left.provider_review_id()
+                .stable_id()
+                .cmp(right.provider_review_id().stable_id())
+        })
+    });
+    let approval = approvals.pop().context("independent_approved_review")?;
+    let auditor = local_auditor.auditor.clone();
+    if !assess_independence(&truth.producer, &auditor).independent {
+        bail!("producer_auditor_separation");
+    }
+    let provider_auditor = PullRequestAuditorEvidence {
+        head_oid: task.head_oid.clone(),
+        snapshot_observed_at: truth.snapshot.observed_at().clone(),
+        auditor,
+        lenses: local_auditor.lenses.clone(),
+    };
+    let evidence = AuthenticatedPullRequestMergeEvidence::from_authenticated_acceptance(
+        candidate.clone(),
+        approval.provider_review_id().clone(),
+        approval.author().clone(),
+        required_checks,
+        PullRequestProducerEvidence {
+            head_oid: task.head_oid.clone(),
+            producer: truth.producer.clone(),
+        },
+        provider_auditor,
+        PullRequestMergeSimulationEvidence {
+            head_oid: task.head_oid.clone(),
+            base_oid: task.base_oid.clone(),
+            snapshot_observed_at: truth.snapshot.observed_at().clone(),
+            merges_cleanly: true,
+        },
+        CompletionMode::MergeCommit,
+        PullRequestChangedPathsEvidence {
+            head_oid: task.head_oid.clone(),
+            paths: truth.changed_paths.clone(),
+        },
+    )?;
+    Ok((candidate.clone(), evidence))
+}
+
+fn inbox_merge_receipt(
+    receipt: &PullRequestMergeReceipt,
+) -> review_loop_entry::InboxAuthenticatedPullRequestMergeReceipt {
+    review_loop_entry::InboxAuthenticatedPullRequestMergeReceipt {
+        provider_merge_id: receipt.provider_merge_id().stable_id().to_string(),
+        merged_oid: receipt.merged_oid().to_string(),
+        url: receipt.url().to_string(),
+        merged_at: receipt.merged_at().as_str().to_string(),
+    }
+}
+
+fn pr_intake_lane_blocker(
+    block: &InboxPrLaunchBlockReport,
+) -> review_loop_entry::InboxIndependentAuditLaneBlocker {
+    match block.reason.as_str() {
+        "draft_pull_request" => {
+            review_loop_entry::InboxIndependentAuditLaneBlocker::DraftPullRequest
+        }
+        "fork_source" => review_loop_entry::InboxIndependentAuditLaneBlocker::ForkSource,
+        "untrusted_source" => review_loop_entry::InboxIndependentAuditLaneBlocker::UntrustedSource,
+        "missing_eligibility" => {
+            review_loop_entry::InboxIndependentAuditLaneBlocker::MissingEligibility {
+                evidence: block.missing_evidence.clone(),
+            }
+        }
+        _ => review_loop_entry::InboxIndependentAuditLaneBlocker::MissingEvidence {
+            evidence: block.missing_evidence.clone(),
+        },
+    }
+}
+
+fn independent_auditor_available_models(
+    program: &Path,
+    repo: &Path,
+    timeout: Duration,
+) -> std::result::Result<BTreeSet<String>, review_loop_entry::InboxIndependentAuditLaneBlocker> {
+    let priors = crate::selection::built_in_prior_dataset().map_err(|error| {
+        review_loop_entry::InboxIndependentAuditLaneBlocker::SelectorRejected {
+            detail: error.to_string(),
+        }
+    })?;
+    let known = priors
+        .models
+        .iter()
+        .filter(|prior| prior.runtime == "codex")
+        .map(|prior| prior.model.clone())
+        .collect::<BTreeSet<_>>();
+    let catalog = load_codex_runtime_model_catalog(program, repo, timeout).map_err(|failure| {
+        review_loop_entry::InboxIndependentAuditLaneBlocker::UnavailableEligibleAuditor {
+            detail: failure.summary,
+        }
+    })?;
+    Ok(known
+        .into_iter()
+        .filter(|model| catalog.contains(model))
+        .collect())
+}
+
+fn selector_effort_label(effort: crate::selection::ReasoningEffort) -> &'static str {
+    match effort {
+        crate::selection::ReasoningEffort::Low => "low",
+        crate::selection::ReasoningEffort::Medium => "medium",
+        crate::selection::ReasoningEffort::High => "high",
+        crate::selection::ReasoningEffort::Xhigh => "xhigh",
+        crate::selection::ReasoningEffort::Max => "max",
+        crate::selection::ReasoningEffort::Ultra => "ultra",
+    }
+}
+
+fn finish_independent_audit_lane_item(
+    writer: &mut ArtifactRunWriter,
+    input: InboxItemRunInput<'_>,
+    review_loop: Option<review_loop_entry::InboxReviewLoopReport>,
+    pr_intake: InboxPrIntakeReport,
+    lane: review_loop_entry::InboxIndependentAuditLaneResult,
+) -> Result<InboxItemRunOutcome> {
+    let context = input.context;
+    let item_index = input.item_index;
+    let item = input.item;
+    let run_id = context.run_id;
+    let autopilot_run_id = RunId::new(format!("{}-item-{item_index}", run_id.as_str()))?;
+    let autopilot_report_relative =
+        PathBuf::from(format!("item-{item_index}-autopilot-report.json"));
+    let github_report_relative = PathBuf::from(format!("item-{item_index}-github-report.json"));
+    write_private_artifact_json(writer, &autopilot_report_relative, &lane)?;
+    let github_report = InboxGithubActionReport {
+        mode: context.action_policy,
+        permission_mode: context.permission_mode,
+        status: if lane.auto_merge_performed {
+            "merged".to_string()
+        } else {
+            "blocked".to_string()
+        },
+        success: lane.success,
+        target: item_target(item),
+        comment_url: lane
+            .merge_receipt
+            .as_ref()
+            .map(|receipt| receipt.url.clone()),
+        message: Some(if lane.auto_merge_performed {
+            "independent audit evidence was accepted and one authenticated merge receipt was verified"
+                .to_string()
+        } else {
+            "independent audit or authenticated merge lane was blocked; no verified merge was reported"
+                .to_string()
+        }),
+    };
+    write_private_artifact_json(writer, &github_report_relative, &github_report)?;
+    let next_action = lane.next_action.clone();
+    Ok(InboxItemRunOutcome {
+        report: InboxItemRunReport {
+            item_index,
+            item_id: item.item_id.clone(),
+            kind: item.kind,
+            title: item.title.clone(),
+            success: lane.success,
+            status: if lane.auto_merge_performed {
+                "merged".to_string()
+            } else if lane.auditor_evidence.is_some() {
+                "merge_blocked".to_string()
+            } else {
+                "launch_blocked".to_string()
+            },
+            plan_path: public_item_path(run_id, &format!("item-{item_index}-plan.json")),
+            autopilot_run_id: autopilot_run_id.as_str().to_string(),
+            autopilot_report_path: public_item_path(
+                run_id,
+                &format!("item-{item_index}-autopilot-report.json"),
+            ),
+            github_report_path: public_item_path(
+                run_id,
+                &format!("item-{item_index}-github-report.json"),
+            ),
+            autopilot_success: None,
+            github_success: github_report.success,
+            review_loop,
+            pr_intake: Some(pr_intake),
+            independent_audit_lane: Some(lane),
+            next_action,
+        },
+        refusal: None,
     })
 }
 
@@ -2786,10 +4489,16 @@ fn task_body_for_item(item: &InboxItem) -> String {
                 })
                 .map(|check| check.name.clone())
                 .collect::<Vec<_>>();
+            let needs_repair = pr_needs_repair(pr);
             let path_reasons = pr_path_reasons(pr, &failing_checks);
-            let validation_expectation = pr_validation_expectation(&failing_checks);
+            let validation_expectation = pr_validation_expectation(pr, &failing_checks);
+            let action = if needs_repair {
+                "Repair failing checks or requested changes in isolated autopilot work. Do not merge automatically."
+            } else {
+                "Perform an independent audit for merge-lane evidence. Revalidate source freshness and CI, preserve producer/auditor separation, and do not edit or merge the pull request."
+            };
             format!(
-                "React to GitHub PR #{}.\nURL: {}\nHead: {}\nBase: {}\n\nChanged files:\n{}\n\nTarget paths and reasons:\n{}\n\nChecks:\n{}\n\nReview feedback:\n{}\n\nValidation expectation:\n{}\n\nRepair failing checks or requested changes in isolated autopilot work. Do not merge automatically.",
+                "React to GitHub PR #{}.\nURL: {}\nHead: {}\nBase: {}\n\nChanged files:\n{}\n\nTarget paths and reasons:\n{}\n\nChecks:\n{}\n\nReview feedback:\n{}\n\nValidation expectation:\n{}\n\n{}",
                 pr.number,
                 pr.url.as_deref().unwrap_or("unknown"),
                 pr.head_ref.as_deref().unwrap_or("unknown"),
@@ -2798,7 +4507,8 @@ fn task_body_for_item(item: &InboxItem) -> String {
                 path_reasons,
                 if checks.is_empty() { "no failing check metadata" } else { &checks },
                 if reviews.is_empty() { "no review summaries" } else { &reviews },
-                validation_expectation
+                validation_expectation,
+                action
             )
         }
         _ => format!(
@@ -2809,13 +4519,15 @@ fn task_body_for_item(item: &InboxItem) -> String {
 }
 
 fn pr_path_reasons(pr: &GithubPrCandidate, failing_checks: &[String]) -> String {
-    let check_reason = if failing_checks.is_empty() {
-        "review feedback requested changes".to_string()
-    } else {
+    let check_reason = if !failing_checks.is_empty() {
         format!(
             "review feedback requested changes; failing checks: {}",
             failing_checks.join(", ")
         )
+    } else if pr.review_feedback.requested_changes {
+        "review feedback requested changes".to_string()
+    } else {
+        "independent audit scope for merge-lane evidence".to_string()
     };
     let paths = if pr.changed_files.is_empty() {
         vec![PathBuf::from("README.md")]
@@ -2829,15 +4541,18 @@ fn pr_path_reasons(pr: &GithubPrCandidate, failing_checks: &[String]) -> String 
         .join("\n")
 }
 
-fn pr_validation_expectation(failing_checks: &[String]) -> String {
-    if failing_checks.is_empty() {
-        "preserve configured validation and confirm requested review changes are addressed"
-            .to_string()
-    } else {
+fn pr_validation_expectation(pr: &GithubPrCandidate, failing_checks: &[String]) -> String {
+    if !failing_checks.is_empty() {
         format!(
             "run or preserve configured validation and address failing check context: {}",
             failing_checks.join(", ")
         )
+    } else if pr.review_feedback.requested_changes {
+        "preserve configured validation and confirm requested review changes are addressed"
+            .to_string()
+    } else {
+        "independently verify the observed checks and fail closed on stale, missing, pending, skipped, or non-success CI evidence"
+            .to_string()
     }
 }
 
@@ -3068,18 +4783,11 @@ fn pr_item(
     let mut privacy = privacy_scan(&raw.body, &config.privacy);
     extend_privacy_reasons(&mut privacy, "title", &raw.title, &config.privacy);
     let duplicate = duplicate_result(&source_key, duplicates);
-    let needs_reaction = raw.review_feedback.requested_changes
-        || raw
-            .checks
-            .iter()
-            .any(|check| check_failed(check.conclusion.as_deref(), check.status.as_deref()));
     let mut skip_reason = None;
     if !privacy.safe {
         skip_reason = Some("privacy_refused".to_string());
     } else if duplicate.duplicate {
         skip_reason = Some("duplicate".to_string());
-    } else if !needs_reaction {
-        skip_reason = Some("no_requested_changes_or_failing_checks".to_string());
     }
     let selected = skip_reason.is_none();
     let title = sanitize_public_field(&raw.title, 512);
@@ -3148,7 +4856,14 @@ fn pr_item(
             base_ref: raw
                 .base_ref
                 .map(|value| sanitize_public_field(&value, MAX_GITHUB_REF_BYTES)),
-            changed_files: normalize_or_default(raw.changed_files, config)?,
+            is_draft: raw.is_draft,
+            source_trust: raw.source_trust,
+            head_repository: raw.head_repository,
+            // Preserve an explicitly empty GitHub file observation. Repair
+            // planning may still use configured fallback paths, but the
+            // independent-audit lane must not mistake a fallback for source
+            // evidence about the PR's actual change set.
+            changed_files: raw.changed_files,
             checks,
             review_feedback,
             body_summary: privacy.body_summary.clone(),
@@ -3159,6 +4874,251 @@ fn pr_item(
         selected,
         skip_reason,
     })
+}
+
+fn should_include_pr_candidate(config: &InboxConfig, candidate: &RawPrCandidate) -> bool {
+    config.selection.include_draft_prs || !candidate.is_draft
+}
+
+fn pr_needs_repair(pull_request: &GithubPrCandidate) -> bool {
+    pull_request.review_feedback.requested_changes
+        || pull_request
+            .checks
+            .iter()
+            .any(|check| check_failed(check.conclusion.as_deref(), check.status.as_deref()))
+}
+
+fn pr_intake_report_for_item(item: &InboxItem) -> Option<InboxPrIntakeReport> {
+    let pull_request = item.pull_request.as_ref()?;
+    if item.kind != InboxItemKind::PullRequest || pr_needs_repair(pull_request) {
+        return None;
+    }
+
+    let task_kind = InboxPrIntakeTaskKind::IndependentAuditMergeLane;
+    let mut missing_evidence = Vec::new();
+    let mut missing_eligibility = Vec::new();
+    let producer_login = pull_request
+        .author
+        .as_deref()
+        .filter(|login| !login.trim().is_empty());
+    if producer_login.is_none() {
+        missing_evidence.push("producer_identity".to_string());
+    }
+    if pull_request.changed_files.is_empty() {
+        missing_evidence.push("changed_files".to_string());
+    }
+    if pull_request.checks.is_empty() {
+        missing_evidence.push("ci_checks".to_string());
+    } else {
+        for check in &pull_request.checks {
+            if check.status.as_deref().is_none_or(str::is_empty) {
+                missing_evidence.push("ci_check_status".to_string());
+            }
+            if check
+                .conclusion
+                .as_deref()
+                .is_none_or(|conclusion| !conclusion.eq_ignore_ascii_case("success"))
+                || check
+                    .status
+                    .as_deref()
+                    .is_none_or(|status| !status.eq_ignore_ascii_case("completed"))
+            {
+                missing_eligibility.push("passing_completed_ci".to_string());
+            }
+        }
+    }
+    if pull_request
+        .review_feedback
+        .unresolved_thread_count
+        .is_some_and(|count| count > 0)
+    {
+        missing_eligibility.push("resolved_review_threads".to_string());
+    }
+
+    let head_oid = item.source_snapshot.head_oid();
+    if head_oid.is_none() {
+        missing_evidence.push("head_oid".to_string());
+    }
+    let base_oid = item.source_snapshot.base_oid();
+    if base_oid.is_none() {
+        missing_evidence.push("base_oid".to_string());
+    }
+    missing_evidence.sort();
+    missing_evidence.dedup();
+    missing_eligibility.sort();
+    missing_eligibility.dedup();
+
+    let block_reason = if pull_request.is_draft {
+        Some(("draft_pull_request", Vec::new()))
+    } else {
+        match pull_request.source_trust {
+            GithubPrSourceTrust::Fork => Some(("fork_source", Vec::new())),
+            GithubPrSourceTrust::Untrusted => Some(("untrusted_source", Vec::new())),
+            GithubPrSourceTrust::TrustedTargetRepository if !missing_eligibility.is_empty() => {
+                Some(("missing_eligibility", missing_eligibility))
+            }
+            GithubPrSourceTrust::TrustedTargetRepository if !missing_evidence.is_empty() => {
+                Some(("missing_required_evidence", missing_evidence))
+            }
+            GithubPrSourceTrust::TrustedTargetRepository => None,
+        }
+    };
+
+    let (status, task, launch_block) = match block_reason {
+        None => (
+            InboxPrIntakeStatus::Ready,
+            Some(InboxIndependentAuditMergeLaneTask {
+                version: INBOX_SCHEMA_VERSION,
+                task_kind,
+                source_snapshot_digest: item.source_snapshot.digest().to_string(),
+                source_updated_at: item.source_snapshot.updated_at().to_string(),
+                head_oid: head_oid.expect("checked PR head OID").to_string(),
+                base_oid: base_oid.expect("checked PR base OID").to_string(),
+                producer_login: producer_login.expect("checked producer identity").to_string(),
+                is_draft: pull_request.is_draft,
+                source_trust: pull_request.source_trust,
+                head_repository: pull_request.head_repository.clone(),
+                changed_files: pull_request.changed_files.clone(),
+                checks: pull_request.checks.clone(),
+                requires_trusted_actor_binding: true,
+                requires_fresh_source_revalidation: true,
+                requires_passing_ci: true,
+                requires_independent_auditor: true,
+                grants_merge_permission: false,
+                auto_merge_performed: false,
+                next_action:
+                    "launch an independent auditor through the merge-lane evidence adapter; do not merge"
+                        .to_string(),
+            }),
+            None,
+        ),
+        Some((reason, evidence)) => (
+            InboxPrIntakeStatus::LaunchBlocked,
+            None,
+            Some(InboxPrLaunchBlockReport {
+                version: INBOX_SCHEMA_VERSION,
+                status: InboxPrIntakeStatus::LaunchBlocked,
+                success: false,
+                reason: reason.to_string(),
+                missing_evidence: evidence,
+                grants_merge_permission: false,
+                auto_merge_performed: false,
+                next_action:
+                    "refresh the PR observation and supply the missing evidence before launching an independent auditor"
+                        .to_string(),
+            }),
+        ),
+    };
+
+    Some(InboxPrIntakeReport {
+        version: INBOX_SCHEMA_VERSION,
+        item_id: item.item_id.clone(),
+        source_key: item.source_key.clone(),
+        number: pull_request.number,
+        task_kind,
+        status,
+        success: status == InboxPrIntakeStatus::Ready,
+        task,
+        launch_block,
+        grants_merge_permission: false,
+        auto_merge_performed: false,
+    })
+}
+
+type PrSnapshotDuplicateKey = (String, String);
+
+/// Prior issue behavior remains keyed by source object identity. PRs also bind
+/// duplicate suppression to the exact observed snapshot so a later source
+/// update becomes visible again while an unchanged observation stays quiet.
+fn load_duplicate_pr_snapshots(repo: &Path) -> Result<BTreeMap<PrSnapshotDuplicateKey, String>> {
+    let mut duplicates = BTreeMap::new();
+    let list = artifacts::list_runs(repo, RunArtifactFamily::Inbox)?;
+    for run in list.runs {
+        if !run.finalized {
+            continue;
+        }
+        let run_id = RunId::new(&run.run_id)?;
+        let reader = ArtifactRunReader::open(repo, RunArtifactFamily::Inbox, &run_id)
+            .with_context(|| {
+                format!(
+                    "finalized inbox run '{}' changed during PR duplicate scan",
+                    run.run_id
+                )
+            })?;
+        let final_report = read_artifact_json(&reader, "final-report.json")?;
+        let completed_successfully = final_report
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let status = final_report.get("status").and_then(Value::as_str);
+        if !completed_successfully || matches!(status, Some("dry_run" | "refused")) {
+            continue;
+        }
+        let selected = reader.read("selected-items.json")?;
+        let value: Value = serde_json::from_slice(&selected).with_context(|| {
+            format!(
+                "failed to parse finalized selected-items.json for inbox run '{}'",
+                run.run_id
+            )
+        })?;
+        let Some(items) = value.as_array() else {
+            continue;
+        };
+        for item in items {
+            if item.get("kind").and_then(Value::as_str) != Some("pull_request") {
+                continue;
+            }
+            let Some(source_key) = item.get("source_key").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(snapshot_digest) = item
+                .get("source_snapshot")
+                .and_then(|snapshot| snapshot.get("digest"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            duplicates
+                .entry((source_key.to_string(), snapshot_digest.to_string()))
+                .or_insert(run.run_id.clone());
+        }
+    }
+    Ok(duplicates)
+}
+
+fn apply_pr_snapshot_duplicate(
+    item: &mut InboxItem,
+    duplicates: &BTreeMap<PrSnapshotDuplicateKey, String>,
+) {
+    if item.kind != InboxItemKind::PullRequest {
+        return;
+    }
+    let matched_run_id = duplicates
+        .get(&(
+            item.source_key.clone(),
+            item.source_snapshot.digest().to_string(),
+        ))
+        .cloned();
+    item.duplicate = DuplicateDetectionResult {
+        duplicate: matched_run_id.is_some(),
+        key: item.source_key.clone(),
+        reason: matched_run_id
+            .as_ref()
+            .map(|run_id| format!("exact PR snapshot already selected by inbox run {run_id}")),
+        matched_run_id,
+    };
+    if item.skip_reason.as_deref() == Some("duplicate") {
+        item.skip_reason = None;
+    }
+    if !item.privacy.safe {
+        item.selected = false;
+        item.skip_reason = Some("privacy_refused".to_string());
+    } else if item.duplicate.duplicate {
+        item.selected = false;
+        item.skip_reason = Some("duplicate".to_string());
+    } else if item.privacy.safe && item.skip_reason.is_none() {
+        item.selected = true;
+    }
 }
 
 fn apply_scan_decisions(items: &mut [InboxItem], max_items: usize) {
@@ -3262,6 +5222,8 @@ fn fake_pr_candidates(config: &InboxConfig) -> Vec<RawPrCandidate> {
         head_oid: "1111111111111111111111111111111111111111".to_string(),
         base_oid: "2222222222222222222222222222222222222222".to_string(),
         is_draft: false,
+        source_trust: GithubPrSourceTrust::TrustedTargetRepository,
+        head_repository: Some("fake/maco/inbox".to_string()),
         changed_files: config.default_assigned_paths.clone(),
         checks: vec![GithubCheckSummary {
             name: "fake-ci".to_string(),
@@ -3466,6 +5428,8 @@ fn raw_pr_from_value(
             .as_bool()
             .context("GitHub PR isDraft must be a boolean")?,
     };
+    let (source_trust, head_repository) =
+        github_pr_source_trust(object, &source_repository.selector)?;
     Ok(RawPrCandidate {
         provider: InboxSourceProvider::Github,
         number,
@@ -3500,10 +5464,75 @@ fn raw_pr_from_value(
         head_oid,
         base_oid,
         is_draft,
+        source_trust,
+        head_repository,
         changed_files: files_from_value(object.get("files"))?,
         checks: checks_from_value(object.get("statusCheckRollup"))?,
         review_feedback: review_feedback_from_value(value)?,
     })
+}
+
+fn github_pr_source_trust(
+    object: &serde_json::Map<String, Value>,
+    target_repository_selector: &str,
+) -> Result<(GithubPrSourceTrust, Option<String>)> {
+    let is_cross_repository = match object.get("isCrossRepository") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_bool()
+                .context("GitHub PR isCrossRepository must be a boolean")?,
+        ),
+    };
+    let head_repository = match object.get("headRepository") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let repository = value
+                .as_object()
+                .context("GitHub PR headRepository must be an object")?;
+            let name_with_owner = required_input_string(
+                repository.get("nameWithOwner"),
+                "GitHub PR headRepository.nameWithOwner",
+                MAX_GITHUB_REF_BYTES,
+            )?;
+            let components = name_with_owner.split('/').collect::<Vec<_>>();
+            if components.len() != 2
+                || components.iter().any(|component| {
+                    component.is_empty()
+                        || !component.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                        })
+                })
+            {
+                bail!("GitHub PR headRepository.nameWithOwner must be canonical owner/name");
+            }
+            Some(name_with_owner.to_ascii_lowercase())
+        }
+    };
+    if is_cross_repository == Some(true) {
+        return Ok((GithubPrSourceTrust::Fork, head_repository));
+    }
+    let target_owner_name = target_repository_selector
+        .split('/')
+        .rev()
+        .take(2)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("/");
+    let trusted = is_cross_repository == Some(false)
+        && head_repository
+            .as_deref()
+            .is_some_and(|repository| repository.eq_ignore_ascii_case(&target_owner_name));
+    Ok((
+        if trusted {
+            GithubPrSourceTrust::TrustedTargetRepository
+        } else {
+            GithubPrSourceTrust::Untrusted
+        },
+        head_repository,
+    ))
 }
 
 fn labels_from_value(value: Option<&Value>) -> Result<Vec<String>> {
@@ -3740,6 +5769,743 @@ fn preflight_refusals(repo: &Path, target_paths: &[PathBuf]) -> Result<Vec<Inbox
 }
 
 include!("inbox/part2.rs");
+
+#[cfg(test)]
+mod pr_intake_always_on_audit_tests {
+    use super::*;
+
+    #[test]
+    fn clean_non_draft_pr_is_visible_as_independent_audit_task() {
+        let config = InboxConfig::default();
+        let raw = fake_pr(901);
+        assert!(should_include_pr_candidate(&config, &raw));
+
+        let item = pr_item(raw, &config, &fake_source(), &BTreeMap::new()).expect("clean PR");
+        assert!(item.selected);
+        assert_eq!(item.skip_reason, None);
+        let intake = pr_intake_report_for_item(&item).expect("independent audit intake");
+        assert_eq!(
+            intake.task_kind,
+            InboxPrIntakeTaskKind::IndependentAuditMergeLane
+        );
+        assert_eq!(intake.status, InboxPrIntakeStatus::Ready);
+        assert!(intake.success);
+        assert!(intake.launch_block.is_none());
+        let task = intake.task.expect("audit task");
+        assert_eq!(task.producer_login, "producer");
+        assert!(task.requires_trusted_actor_binding);
+        assert!(task.requires_fresh_source_revalidation);
+        assert!(task.requires_passing_ci);
+        assert!(task.requires_independent_auditor);
+        assert!(!task.grants_merge_permission);
+        assert!(!task.auto_merge_performed);
+    }
+
+    #[test]
+    fn unhealthy_pr_keeps_the_existing_repair_lane() {
+        let config = InboxConfig::default();
+        let mut raw = fake_pr(902);
+        raw.checks[0].conclusion = Some("failure".to_string());
+        raw.review_feedback.requested_changes = true;
+        raw.review_feedback.review_decision = Some("CHANGES_REQUESTED".to_string());
+
+        let item = pr_item(raw, &config, &fake_source(), &BTreeMap::new()).expect("unhealthy PR");
+        assert!(item.selected);
+        assert!(pr_intake_report_for_item(&item).is_none());
+        let body = task_body_for_item(&item);
+        assert!(body.contains("Repair failing checks or requested changes"));
+        assert!(body.contains("failing checks: ci"));
+    }
+
+    #[test]
+    fn draft_filtering_remains_default_deny() {
+        let mut raw = fake_pr(903);
+        raw.is_draft = true;
+        let mut config = InboxConfig::default();
+        assert!(!should_include_pr_candidate(&config, &raw));
+        config.selection.include_draft_prs = true;
+        assert!(should_include_pr_candidate(&config, &raw));
+    }
+
+    #[test]
+    fn missing_merge_lane_evidence_emits_typed_launch_block() {
+        let config = InboxConfig::default();
+        let mut raw = fake_pr(904);
+        raw.author = None;
+        raw.changed_files.clear();
+        raw.checks.clear();
+
+        let item =
+            pr_item(raw, &config, &fake_source(), &BTreeMap::new()).expect("evidence-deficient PR");
+        assert!(item.selected, "blocked PR must remain visible");
+        let intake = pr_intake_report_for_item(&item).expect("blocked audit intake");
+        assert_eq!(intake.status, InboxPrIntakeStatus::LaunchBlocked);
+        assert!(!intake.success);
+        assert!(intake.task.is_none());
+        let block = intake.launch_block.expect("launch block");
+        assert_eq!(block.reason, "missing_required_evidence");
+        assert!(!block.success);
+        assert_eq!(
+            block.missing_evidence,
+            vec![
+                "changed_files".to_string(),
+                "ci_checks".to_string(),
+                "producer_identity".to_string()
+            ]
+        );
+        assert!(!block.grants_merge_permission);
+        assert!(!block.auto_merge_performed);
+    }
+
+    #[test]
+    fn github_pr_source_trust_requires_explicit_same_repository_evidence() {
+        let absent = serde_json::Map::new();
+        assert_eq!(
+            github_pr_source_trust(&absent, "github.com/acme/repo").expect("absent provenance"),
+            (GithubPrSourceTrust::Untrusted, None)
+        );
+
+        let fork = json!({
+            "isCrossRepository": true,
+            "headRepository": {"nameWithOwner": "contributor/fork"}
+        });
+        assert_eq!(
+            github_pr_source_trust(
+                fork.as_object().expect("fork object"),
+                "github.com/acme/repo"
+            )
+            .expect("fork provenance")
+            .0,
+            GithubPrSourceTrust::Fork
+        );
+
+        let trusted = json!({
+            "isCrossRepository": false,
+            "headRepository": {"nameWithOwner": "acme/repo"}
+        });
+        assert_eq!(
+            github_pr_source_trust(
+                trusted.as_object().expect("trusted object"),
+                "github.com/acme/repo"
+            )
+            .expect("trusted provenance")
+            .0,
+            GithubPrSourceTrust::TrustedTargetRepository
+        );
+    }
+
+    #[test]
+    fn independent_audit_adapter_accepts_strict_fake_command_evidence_and_merges_once() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        crate::worktree::WorktreeManager::init_repository(&repo, "main")
+            .expect("initialize repository");
+        let config = InboxConfig::default();
+        let item = pr_item(fake_pr(906), &config, &fake_source(), &BTreeMap::new())
+            .expect("clean PR item");
+        let pr_intake = pr_intake_report_for_item(&item).expect("audit intake");
+        let task = pr_intake.task.as_ref().expect("audit task").clone();
+        let output = review_loop_entry::InboxIndependentAuditorOutput {
+            version: 1,
+            item_id: item.item_id.clone(),
+            source_snapshot_digest: task.source_snapshot_digest.clone(),
+            head_oid: task.head_oid.clone(),
+            accepted: true,
+            lenses: vec![
+                crate::optimizer::merge_authority::LensVerdict {
+                    lens_id: "diff".to_string(),
+                    model_label: "gpt-5.6-sol".to_string(),
+                    framing: "adversarial-diff".to_string(),
+                    information_scope: "diff-only".to_string(),
+                    decision: crate::optimizer::merge_authority::LensDecision::Accept,
+                },
+                crate::optimizer::merge_authority::LensVerdict {
+                    lens_id: "tests".to_string(),
+                    model_label: "gpt-5.6-sol".to_string(),
+                    framing: "tests-as-contract".to_string(),
+                    information_scope: "tests-only".to_string(),
+                    decision: crate::optimizer::merge_authority::LensDecision::Accept,
+                },
+            ],
+            summary: "accepted exact candidate".to_string(),
+            no_further_delegation: true,
+            read_only: true,
+        };
+        let raw_output = serde_json::to_vec(&output).expect("serialize fake auditor output");
+        let report_sha256 = crate::artifacts::state_auth::sha256_hex(&raw_output);
+        let run_id = RunId::new("independent-audit-fake-command").expect("run id");
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Inbox,
+            run_id.clone(),
+            "inbox-test",
+        )
+        .expect("reserve Inbox artifacts");
+        let run_dir = writer.run_dir().to_path_buf();
+        let context = InboxItemRunContext {
+            repo: &repo,
+            run_dir: &run_dir,
+            run_id: &run_id,
+            config: &config,
+            action_policy: InboxActionPolicy::Fake,
+            permission_mode: InboxPermissionMode::Fake,
+            codex_bin: Some(PathBuf::from("/fake/codex")),
+            machine_global: None,
+            rolling_budget_quota: None,
+        };
+        let review_loop = review_loop_entry::evaluate_inbox_item_review_loop(&item);
+        let available_models = ["gpt-5.6-sol".to_string()].into_iter().collect();
+        let outcome = run_independent_audit_intake_item_with_runner(
+            &mut writer,
+            InboxItemRunInput {
+                context: &context,
+                item_index: 1,
+                item: &item,
+            },
+            review_loop,
+            pr_intake,
+            true,
+            Some(&available_models),
+            |command| {
+                assert_eq!(
+                    command.workspace_access,
+                    crate::process_runner::WorkspaceAccess::ReadOnly
+                );
+                assert_eq!(command.model.as_deref(), Some("gpt-5.6-sol"));
+                assert_eq!(command.reasoning_effort.as_deref(), Some("xhigh"));
+                IndependentAuditRunnerResult {
+                    raw_output: Some(raw_output.clone()),
+                    report_sha256: Some(report_sha256.clone()),
+                    exit_code: Some(0),
+                    duration_ms: 7,
+                    timed_out: false,
+                    safely_executed: true,
+                    publishable: true,
+                    succeeded: true,
+                    scratch_quiescence_verified: true,
+                    error: None,
+                }
+            },
+        )
+        .expect("run fake independent-audit adapter");
+
+        let lane = outcome.report.independent_audit_lane.expect("lane result");
+        assert_eq!(
+            lane.status,
+            review_loop_entry::InboxIndependentAuditLaneStatus::Accepted
+        );
+        assert!(lane.success);
+        assert!(!lane.grants_merge_permission);
+        assert!(lane.auto_merge_performed);
+        assert!(lane.merge_receipt.is_some());
+        assert_eq!(outcome.report.status, "merged");
+    }
+
+    #[test]
+    fn independent_audit_dry_run_neither_launches_nor_merges() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        crate::worktree::WorktreeManager::init_repository(&repo, "main")
+            .expect("initialize repository");
+        let config = InboxConfig::default();
+        let item = pr_item(fake_pr(907), &config, &fake_source(), &BTreeMap::new())
+            .expect("clean PR item");
+        let pr_intake = pr_intake_report_for_item(&item).expect("audit intake");
+        let run_id = RunId::new("independent-audit-dry-run").expect("run id");
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Inbox,
+            run_id.clone(),
+            "inbox-test",
+        )
+        .expect("reserve Inbox artifacts");
+        let run_dir = writer.run_dir().to_path_buf();
+        let context = InboxItemRunContext {
+            repo: &repo,
+            run_dir: &run_dir,
+            run_id: &run_id,
+            config: &config,
+            action_policy: InboxActionPolicy::DryRun,
+            permission_mode: InboxPermissionMode::Fake,
+            codex_bin: Some(PathBuf::from("/must-not-run/codex")),
+            machine_global: None,
+            rolling_budget_quota: None,
+        };
+        let outcome = run_independent_audit_intake_item_with_runner(
+            &mut writer,
+            InboxItemRunInput {
+                context: &context,
+                item_index: 1,
+                item: &item,
+            },
+            review_loop_entry::evaluate_inbox_item_review_loop(&item),
+            pr_intake,
+            true,
+            None,
+            |_| panic!("dry run must not launch the independent auditor"),
+        )
+        .expect("dry-run audit plan");
+
+        assert_eq!(outcome.report.status, "dry_run");
+        assert!(outcome.report.independent_audit_lane.is_none());
+        assert!(outcome.report.github_success);
+    }
+
+    #[test]
+    fn independent_auditor_requires_the_exact_local_head_diff() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        crate::worktree::WorktreeManager::init_repository(&repo_path, "main")
+            .expect("initialize repository");
+        let repository = Repository::open(&repo_path).expect("open repository");
+        let signature =
+            git2::Signature::now("Audit Test", "audit@example.invalid").expect("test signature");
+        fs::write(repo_path.join("base.txt"), "base\n").expect("write base file");
+        let mut index = repository.index().expect("repository index");
+        index
+            .add_path(Path::new("base.txt"))
+            .expect("add base file");
+        index.write().expect("write base index");
+        let base_tree_oid = index.write_tree().expect("write base tree");
+        let base_tree = repository.find_tree(base_tree_oid).expect("find base tree");
+        let base = repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "base",
+                &base_tree,
+                &[],
+            )
+            .expect("commit base");
+        fs::write(repo_path.join("audit.txt"), "audited\n").expect("write audited file");
+        let mut index = repository.index().expect("updated repository index");
+        index
+            .add_path(Path::new("audit.txt"))
+            .expect("add audited file");
+        index.write().expect("write index");
+        let tree_oid = index.write_tree().expect("write tree");
+        let tree = repository.find_tree(tree_oid).expect("find tree");
+        let parent = repository.find_commit(base).expect("find parent");
+        let head = repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "audited head",
+                &tree,
+                &[&parent],
+            )
+            .expect("commit audited head");
+
+        let config = InboxConfig::default();
+        let mut raw = fake_pr(908);
+        raw.base_oid = base.to_string();
+        raw.head_oid = head.to_string();
+        raw.changed_files = vec![PathBuf::from("audit.txt")];
+        let item =
+            pr_item(raw, &config, &fake_source(), &BTreeMap::new()).expect("local audit item");
+        let intake = pr_intake_report_for_item(&item).expect("local audit intake");
+        let task = intake.task.expect("local audit task");
+        verify_local_independent_audit_candidate(&repo_path, &task)
+            .expect("exact local audit candidate");
+
+        let mut mismatched = task;
+        mismatched.changed_files = vec![PathBuf::from("different.txt")];
+        assert!(verify_local_independent_audit_candidate(&repo_path, &mismatched).is_err());
+    }
+
+    #[test]
+    fn github_pr_materialization_missing_objects_fails_closed() {
+        let source_temp = tempfile::TempDir::new().expect("source tempdir");
+        let source_path = source_temp.path().join("source");
+        crate::worktree::WorktreeManager::init_repository(&source_path, "main")
+            .expect("initialize source repository");
+        let (base, head) = create_materialization_test_commits(&source_path);
+
+        let target_temp = tempfile::TempDir::new().expect("target tempdir");
+        let target_path = target_temp.path().join("target");
+        crate::worktree::WorktreeManager::init_repository(&target_path, "main")
+            .expect("initialize target repository");
+        let (item, task) = github_materialization_test_item(&target_path, base, head);
+        let transported = std::cell::Cell::new(false);
+        let revalidated = std::cell::Cell::new(false);
+        let error = materialize_and_verify_local_independent_audit_candidate_with(
+            &target_path,
+            &item,
+            &task,
+            |_, _| {
+                transported.set(true);
+                Ok(())
+            },
+            |_, _| {
+                revalidated.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("missing transported objects must fail closed");
+        assert!(transported.get());
+        assert!(revalidated.get());
+        assert!(error.to_string().contains("omitted the exact pull-request"));
+    }
+
+    #[test]
+    fn github_pr_materialization_ref_swap_is_rejected() {
+        let source_temp = tempfile::TempDir::new().expect("source tempdir");
+        let source_path = source_temp.path().join("source");
+        crate::worktree::WorktreeManager::init_repository(&source_path, "main")
+            .expect("initialize source repository");
+        let (base, head) = create_materialization_test_commits(&source_path);
+
+        let target_temp = tempfile::TempDir::new().expect("target tempdir");
+        let target_path = target_temp.path().join("target");
+        crate::worktree::WorktreeManager::init_repository(&target_path, "main")
+            .expect("initialize target repository");
+        let (item, task) = github_materialization_test_item(&target_path, base, head);
+        let request = trusted_github_pull_request_object_request(&target_path, &item, &task)
+            .expect("trusted materialization request");
+
+        let fetched_path = target_temp.path().join("fetched.git");
+        let fetched = Repository::init_bare(&fetched_path).expect("initialize fetched repository");
+        let source = Repository::open(&source_path).expect("open source repository");
+        copy_pull_request_object_closure(&source, &fetched, base, head)
+            .expect("copy test object closure");
+        fetched
+            .reference("refs/maco-inbox/base", head, true, "test swapped base")
+            .expect("write swapped base");
+        fetched
+            .reference("refs/maco-inbox/head", base, true, "test swapped head")
+            .expect("write swapped head");
+
+        let error = validate_materialized_pull_request_refs(&fetched, &request)
+            .expect_err("swapped transport refs must fail closed");
+        assert!(error.to_string().contains("drifted"));
+    }
+
+    #[test]
+    fn github_pr_materialization_rejects_stale_snapshot_after_valid_objects() {
+        let source_temp = tempfile::TempDir::new().expect("source tempdir");
+        let source_path = source_temp.path().join("source");
+        crate::worktree::WorktreeManager::init_repository(&source_path, "main")
+            .expect("initialize source repository");
+        let (base, head) = create_materialization_test_commits(&source_path);
+        let source = Repository::open(&source_path).expect("open source repository");
+
+        let target_temp = tempfile::TempDir::new().expect("target tempdir");
+        let target_path = target_temp.path().join("target");
+        crate::worktree::WorktreeManager::init_repository(&target_path, "main")
+            .expect("initialize target repository");
+        let target = Repository::open(&target_path).expect("open target repository");
+        let (item, task) = github_materialization_test_item(&target_path, base, head);
+        let error = materialize_and_verify_local_independent_audit_candidate_with(
+            &target_path,
+            &item,
+            &task,
+            |_, request| {
+                copy_pull_request_object_closure(
+                    &source,
+                    &target,
+                    request.expected_base_oid,
+                    request.expected_head_oid,
+                )
+            },
+            |_, _| bail!("external source changed from its exact freshness snapshot"),
+        )
+        .expect_err("stale source snapshot must fail after object materialization");
+        assert!(target.find_commit(base).is_ok());
+        assert!(target.find_commit(head).is_ok());
+        assert!(error
+            .to_string()
+            .contains("GitHub source changed after exact pull-request object materialization"));
+    }
+
+    #[test]
+    fn github_pr_materialization_refuses_untrusted_and_fork_inputs() {
+        let source_temp = tempfile::TempDir::new().expect("source tempdir");
+        let source_path = source_temp.path().join("source");
+        crate::worktree::WorktreeManager::init_repository(&source_path, "main")
+            .expect("initialize source repository");
+        let (base, head) = create_materialization_test_commits(&source_path);
+
+        let target_temp = tempfile::TempDir::new().expect("target tempdir");
+        let target_path = target_temp.path().join("target");
+        crate::worktree::WorktreeManager::init_repository(&target_path, "main")
+            .expect("initialize target repository");
+        let (trusted_item, trusted_task) =
+            github_materialization_test_item(&target_path, base, head);
+        for trust in [GithubPrSourceTrust::Fork, GithubPrSourceTrust::Untrusted] {
+            let mut item = trusted_item.clone();
+            item.pull_request
+                .as_mut()
+                .expect("pull request")
+                .source_trust = trust;
+            let mut task = trusted_task.clone();
+            task.source_trust = trust;
+            let transported = std::cell::Cell::new(false);
+            let revalidated = std::cell::Cell::new(false);
+            materialize_and_verify_local_independent_audit_candidate_with(
+                &target_path,
+                &item,
+                &task,
+                |_, _| {
+                    transported.set(true);
+                    Ok(())
+                },
+                |_, _| {
+                    revalidated.set(true);
+                    Ok(())
+                },
+            )
+            .expect_err("untrusted materialization input must fail closed");
+            assert!(!transported.get());
+            assert!(!revalidated.get());
+        }
+    }
+
+    #[test]
+    fn github_pr_materialization_propagates_bounded_transport_failure() {
+        let source_temp = tempfile::TempDir::new().expect("source tempdir");
+        let source_path = source_temp.path().join("source");
+        crate::worktree::WorktreeManager::init_repository(&source_path, "main")
+            .expect("initialize source repository");
+        let (base, head) = create_materialization_test_commits(&source_path);
+
+        let target_temp = tempfile::TempDir::new().expect("target tempdir");
+        let target_path = target_temp.path().join("target");
+        crate::worktree::WorktreeManager::init_repository(&target_path, "main")
+            .expect("initialize target repository");
+        let (item, task) = github_materialization_test_item(&target_path, base, head);
+        let revalidated = std::cell::Cell::new(false);
+        let error = materialize_and_verify_local_independent_audit_candidate_with(
+            &target_path,
+            &item,
+            &task,
+            |_, _| bail!("transport resource bound exceeded"),
+            |_, _| {
+                revalidated.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("bounded transport failure must fail closed");
+        assert!(!revalidated.get());
+        assert!(error
+            .to_string()
+            .contains("bounded exact pull-request object transport failed"));
+    }
+
+    #[test]
+    fn github_pr_materialization_accepts_valid_exact_objects_after_revalidation() {
+        let source_temp = tempfile::TempDir::new().expect("source tempdir");
+        let source_path = source_temp.path().join("source");
+        crate::worktree::WorktreeManager::init_repository(&source_path, "main")
+            .expect("initialize source repository");
+        let (base, head) = create_materialization_test_commits(&source_path);
+        let source = Repository::open(&source_path).expect("open source repository");
+
+        let target_temp = tempfile::TempDir::new().expect("target tempdir");
+        let target_path = target_temp.path().join("target");
+        crate::worktree::WorktreeManager::init_repository(&target_path, "main")
+            .expect("initialize target repository");
+        let target = Repository::open(&target_path).expect("open target repository");
+        let (item, task) = github_materialization_test_item(&target_path, base, head);
+        let transported = std::cell::Cell::new(false);
+        let revalidated = std::cell::Cell::new(false);
+        materialize_and_verify_local_independent_audit_candidate_with(
+            &target_path,
+            &item,
+            &task,
+            |_, request| {
+                transported.set(true);
+                copy_pull_request_object_closure(
+                    &source,
+                    &target,
+                    request.expected_base_oid,
+                    request.expected_head_oid,
+                )
+            },
+            |_, _| {
+                assert!(
+                    transported.get(),
+                    "revalidation must follow materialization"
+                );
+                assert!(target.find_commit(base).is_ok());
+                assert!(target.find_commit(head).is_ok());
+                revalidated.set(true);
+                Ok(())
+            },
+        )
+        .expect("valid exact materialized objects");
+        assert!(transported.get());
+        assert!(revalidated.get());
+    }
+
+    #[test]
+    fn updated_pr_snapshot_is_not_suppressed_as_the_old_observation() {
+        let config = InboxConfig::default();
+        let raw = fake_pr(905);
+        let source_key = format!("github_pr:{}", raw.number);
+        let prior_objects = BTreeMap::from([(source_key, "old-run".to_string())]);
+        let mut item =
+            pr_item(raw, &config, &fake_source(), &prior_objects).expect("historically seen PR");
+        assert!(
+            !item.selected,
+            "legacy object-key suppression starts closed"
+        );
+
+        let old_snapshot = publication::stable_external_digest(b"older-pr-observation");
+        let prior_snapshots = BTreeMap::from([(
+            (item.source_key.clone(), old_snapshot),
+            "old-run".to_string(),
+        )]);
+        apply_pr_snapshot_duplicate(&mut item, &prior_snapshots);
+        assert!(item.selected, "updated snapshot must re-enter intake");
+        assert!(!item.duplicate.duplicate);
+
+        let exact_snapshots = BTreeMap::from([(
+            (
+                item.source_key.clone(),
+                item.source_snapshot.digest().to_string(),
+            ),
+            "exact-run".to_string(),
+        )]);
+        apply_pr_snapshot_duplicate(&mut item, &exact_snapshots);
+        assert!(!item.selected, "unchanged snapshot remains suppressed");
+        assert_eq!(item.skip_reason.as_deref(), Some("duplicate"));
+    }
+
+    fn create_materialization_test_commits(repo_path: &Path) -> (Oid, Oid) {
+        let repository = Repository::open(repo_path).expect("open materialization repository");
+        let signature = git2::Signature::now("Materialization Test", "test@example.invalid")
+            .expect("test signature");
+        fs::write(repo_path.join("base.txt"), "base\n").expect("write base file");
+        let mut index = repository.index().expect("base index");
+        index
+            .add_path(Path::new("base.txt"))
+            .expect("add base file");
+        index.write().expect("write base index");
+        let base_tree_oid = index.write_tree().expect("write base tree");
+        let base_tree = repository.find_tree(base_tree_oid).expect("find base tree");
+        let base = repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "base",
+                &base_tree,
+                &[],
+            )
+            .expect("commit base");
+        drop(base_tree);
+
+        fs::write(repo_path.join("audit.txt"), "audited\n").expect("write audit file");
+        let mut index = repository.index().expect("head index");
+        index
+            .add_path(Path::new("audit.txt"))
+            .expect("add audit file");
+        index.write().expect("write head index");
+        let head_tree_oid = index.write_tree().expect("write head tree");
+        let head_tree = repository.find_tree(head_tree_oid).expect("find head tree");
+        let parent = repository.find_commit(base).expect("find base parent");
+        let head = repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "head",
+                &head_tree,
+                &[&parent],
+            )
+            .expect("commit head");
+        (base, head)
+    }
+
+    fn github_materialization_test_item(
+        repo_path: &Path,
+        base: Oid,
+        head: Oid,
+    ) -> (InboxItem, InboxIndependentAuditMergeLaneTask) {
+        let repository = Repository::open(repo_path).expect("open target materialization repo");
+        repository
+            .remote("origin", "https://github.com/acme/repo.git")
+            .expect("set canonical origin");
+        let common = SafeRoot::open_existing(repository.commondir()).expect("bind common dir");
+        let source = SourceRepositoryBindingContext {
+            host: "github.com".to_string(),
+            selector: "github.com/acme/repo".to_string(),
+            identity: publication::external_source_repository_identity(
+                common.identity().device,
+                common.identity().file,
+            ),
+        };
+        let mut raw = fake_pr(909);
+        raw.provider = InboxSourceProvider::Github;
+        raw.url = Some("https://github.com/acme/repo/pull/909".to_string());
+        raw.base_oid = base.to_string();
+        raw.head_oid = head.to_string();
+        raw.base_ref = Some("main".to_string());
+        raw.head_ref = Some("feature/exact-audit".to_string());
+        raw.head_repository = Some("acme/repo".to_string());
+        raw.source_trust = GithubPrSourceTrust::TrustedTargetRepository;
+        raw.changed_files = vec![PathBuf::from("audit.txt")];
+        let item = pr_item(raw, &InboxConfig::default(), &source, &BTreeMap::new())
+            .expect("GitHub materialization item");
+        let task = pr_intake_report_for_item(&item)
+            .expect("materialization intake")
+            .task
+            .expect("materialization task");
+        (item, task)
+    }
+
+    fn fake_source() -> SourceRepositoryBindingContext {
+        SourceRepositoryBindingContext {
+            host: "fake".to_string(),
+            selector: ".".to_string(),
+            identity: publication::stable_external_digest(b"clean-pr-intake-test"),
+        }
+    }
+
+    fn fake_pr(number: u64) -> RawPrCandidate {
+        RawPrCandidate {
+            provider: InboxSourceProvider::Fake,
+            number,
+            title: "Clean PR".to_string(),
+            body: "Ready for an independent audit.".to_string(),
+            url: Some(format!("fake://github/pulls/{number}")),
+            author: Some("producer".to_string()),
+            labels: Vec::new(),
+            updated_at: "2026-08-30T00:00:00Z".to_string(),
+            state: "OPEN".to_string(),
+            content_digest: publication::stable_external_digest(
+                format!("clean-pr-content:{number}").as_bytes(),
+            ),
+            action_revision_digest: publication::stable_external_digest(
+                format!("clean-pr-action:{number}").as_bytes(),
+            ),
+            head_ref: Some(format!("feature/{number}")),
+            base_ref: Some("main".to_string()),
+            head_oid: format!("{number:040x}"),
+            base_oid: "2222222222222222222222222222222222222222".to_string(),
+            is_draft: false,
+            source_trust: GithubPrSourceTrust::TrustedTargetRepository,
+            head_repository: Some("fake/maco/inbox".to_string()),
+            changed_files: vec![PathBuf::from("src/feature.rs")],
+            checks: vec![GithubCheckSummary {
+                name: "ci".to_string(),
+                status: Some("completed".to_string()),
+                conclusion: Some("success".to_string()),
+                details_url: Some("fake://github/checks/ci".to_string()),
+                summary: "passing CI".to_string(),
+            }],
+            review_feedback: GithubReviewFeedbackSummary {
+                review_decision: None,
+                requested_changes: false,
+                unresolved_thread_count: None,
+                reviewer_logins: Vec::new(),
+                summaries: Vec::new(),
+            },
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests;

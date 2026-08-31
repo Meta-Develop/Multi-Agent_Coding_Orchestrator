@@ -186,6 +186,8 @@ pub enum CheckStatus {
     Failed,
     Missing,
     Skipped,
+    Stale,
+    Uncertain,
 }
 
 impl CheckStatus {
@@ -317,7 +319,38 @@ pub struct MergeDecision {
     pub lenses: LensAgreement,
     pub failed_checks: Vec<String>,
     pub never_auto_merge: Option<NeverAutoMergeClass>,
+    pub blockers: Vec<MergeBlocker>,
     pub explanation: String,
+}
+
+/// Machine-readable reasons that deny merge authority.
+///
+/// Explanations remain useful for humans, but callers must authorize only from
+/// this closed blocker set and `auto_merge_performed`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "blocker", content = "details", rename_all = "snake_case")]
+pub enum MergeBlocker {
+    AutoMergeNotRequested,
+    CandidateNotCertified,
+    ReviewerNotIndependent,
+    InsufficientDecorrelatedLenses {
+        required_distinct: usize,
+        observed_distinct: usize,
+    },
+    NoAcceptedReviewLens,
+    BlockingReviewLenses {
+        lens_ids: Vec<String>,
+    },
+    RequiredVerificationChecks {
+        checks: Vec<String>,
+    },
+    MergeSimulationFailed,
+    HistoryFlatteningCompletionMode {
+        mode: CompletionMode,
+    },
+    NeverAutoMerge {
+        class: NeverAutoMergeClass,
+    },
 }
 
 /// Default-deny merge authority. `auto_merge_performed` is true only when
@@ -328,20 +361,29 @@ pub fn decide_merge(request: &MergeRequest) -> Result<MergeDecision, OptimizerEr
     let never_auto_merge = never_auto_merge_reason(&request.changed_paths);
     let failed_checks = failed_verification_checks(&request.checks);
 
+    let mut blockers = Vec::new();
     let mut blocked = Vec::new();
     if !request.requested {
+        blockers.push(MergeBlocker::AutoMergeNotRequested);
         blocked.push("auto-merge was not requested".to_string());
     }
     if !request.certified {
+        blockers.push(MergeBlocker::CandidateNotCertified);
         blocked.push("candidate is not certified".to_string());
     }
     if !independence.independent {
-        blocked.extend(independence.notes.iter().cloned());
-        if blocked.is_empty() {
+        blockers.push(MergeBlocker::ReviewerNotIndependent);
+        if independence.notes.is_empty() {
             blocked.push("reviewer is not independent of the producer".to_string());
+        } else {
+            blocked.extend(independence.notes.iter().cloned());
         }
     }
     if lenses.distinct_lenses < lenses.required_distinct {
+        blockers.push(MergeBlocker::InsufficientDecorrelatedLenses {
+            required_distinct: lenses.required_distinct,
+            observed_distinct: lenses.distinct_lenses,
+        });
         blocked.push(format!(
             "need {} decorrelated lenses, found {}",
             lenses.required_distinct, lenses.distinct_lenses
@@ -349,8 +391,12 @@ pub fn decide_merge(request: &MergeRequest) -> Result<MergeDecision, OptimizerEr
     }
     if !lenses.unanimous_accept {
         if lenses.blocking_lenses.is_empty() {
+            blockers.push(MergeBlocker::NoAcceptedReviewLens);
             blocked.push("no review lens accepted".to_string());
         } else {
+            blockers.push(MergeBlocker::BlockingReviewLenses {
+                lens_ids: lenses.blocking_lenses.clone(),
+            });
             blocked.push(format!(
                 "lens rejection/uncertainty blocks completion: {}",
                 lenses.blocking_lenses.join(", ")
@@ -358,22 +404,30 @@ pub fn decide_merge(request: &MergeRequest) -> Result<MergeDecision, OptimizerEr
         }
     }
     if !failed_checks.is_empty() {
+        blockers.push(MergeBlocker::RequiredVerificationChecks {
+            checks: failed_checks.clone(),
+        });
         blocked.push(format!(
             "required checks missing, skipped, or failed: {}",
             failed_checks.join(", ")
         ));
     }
     if !request.branch_merges_cleanly {
+        blockers.push(MergeBlocker::MergeSimulationFailed);
         blocked.push("branch does not merge cleanly".to_string());
     }
     if request.completion_mode.history_flattening() {
+        blockers.push(MergeBlocker::HistoryFlatteningCompletionMode {
+            mode: request.completion_mode,
+        });
         blocked.push("history-flattening completion modes are prohibited".to_string());
     }
     if let Some(class) = never_auto_merge {
+        blockers.push(MergeBlocker::NeverAutoMerge { class });
         blocked.push(format!("change is in the never-auto-merge set ({class:?})"));
     }
 
-    let auto_merge_performed = blocked.is_empty();
+    let auto_merge_performed = blockers.is_empty();
     let explanation = if auto_merge_performed {
         format!(
             "independent reviewer {} accepted under {} distinct lenses; checks: {}",
@@ -397,6 +451,7 @@ pub fn decide_merge(request: &MergeRequest) -> Result<MergeDecision, OptimizerEr
         lenses,
         failed_checks,
         never_auto_merge,
+        blockers,
         explanation,
     })
 }
