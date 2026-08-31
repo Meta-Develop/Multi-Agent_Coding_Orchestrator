@@ -204,19 +204,15 @@ Runtime boundary:
 
 Required behavior:
 - First, read and follow AGENTS.md and project-local .agents instructions in this worktree. When present, specifically read .agents/skills/agent-orchestration/SKILL.md and .agents/docs/AGENT_ORCHESTRATION.md before worker delegation or mutation.
-- For an execution assignment with worker_assignments, use Codex native SubAgent/delegated-worker mechanisms only for the declared lightweight terminal worker or researcher assignments when available, following AGENTS.md and .agents instructions.
+- For an execution assignment with worker_assignments, use Codex native SubAgent/delegated-worker mechanisms only for the declared lightweight terminal worker or researcher assignments when available.
 - When an execution assignment authorizes launching a worker, use the generated worker prompt template verbatim and preserve its trusted shared prefix followed by its six-line TERMINAL_WORKER role metadata block.
-- An execution child orchestrator with worker_assignments must collect the required advisory child-side review-auditor evidence with the generated REVIEW_AUDITOR prompt template, but it is not an acceptance gate unless MACO/O2 collects it through the parent-enforced gate.
-- When an execution assignment authorizes advisory child-side review-auditor evidence, preserve its trusted shared prefix followed by its six-line REVIEW_AUDITOR role metadata block.
-- Do not force raw Codex CLI subprocess workers as the primary worker path.
+- An execution child orchestrator with worker_assignments must collect required advisory child-side review-auditor evidence using the generated REVIEW_AUDITOR prompt template verbatim, preserving its trusted shared prefix followed by its six-line REVIEW_AUDITOR role metadata block. Acceptance-gate review auditors are parent-launched MACO/Codex CLI subprocess roles; a child-launched review auditor is advisory unless MACO/O2 collects it through the parent-enforced gate.
 - If an execution assignment declares worker_assignments but no delegated-worker mechanism is available, stop before mutation and report the exact blocked worker task in your OrchestratorReviewReport findings and remaining_risk.
 - Workers must return WorkerReport JSON matching the worker report contract and include "no_further_delegation": true.
 - WorkerReport, AuditorReport, and OrchestratorReviewReport must include environment_failures. Use [] when no typed failure occurred. A nonempty environment_failures list requires accepted=false, rejected=true, and status=failed; never include credential or secret values.
 - Workers may propose bounded field_guide_entries containing finding and context only. They must never add date, source_run, or other provenance; the trusted parent stamps provenance only after acceptance and audit.
 - Each worker must append JSONL directly to its exact precreated journal path. That file is its only non-source write capability; its parent directory is nonwritable. Never create, replace, rename, link, or swap it. Each command record contains command, cwd, start_timestamp, end_timestamp, and changed_paths. The parent imports incoming/worker-journals/ and rejects missing, aliased, replaced, invalid, or unsupported evidence.
-- Review auditors must return AuditorReport JSON matching the auditor report contract and include "no_further_delegation": true.
-- Review auditors must include "read_only": true in AuditorReport JSON to attest they did not mutate files or repository state.
-- Acceptance-gate review auditors are parent-launched MACO/Codex CLI subprocess roles; a child-launched review auditor is advisory child-side evidence unless MACO/O2 collects it through the parent-enforced acceptance gate.
+- Review auditors must return AuditorReport JSON matching the auditor report contract and include "no_further_delegation": true and "read_only": true to attest they did not mutate files or repository state.
 - For an execution assignment with worker_assignments, embed each accepted terminal WorkerReport in OrchestratorReviewReport.worker_reports without losing or changing any reported evidence, using [] for genuinely empty arrays; represent absent optional evidence as null. Reject the child report if worker evidence is missing or rejected.
 - OrchestratorReviewReport may also propose bounded field_guide_entries containing finding and context only. Do not copy unreviewed or rejected worker suggestions into this field.
 - Preserve each worker assignment_kind and target_path in WorkerReport. A successful megafile_decomposition worker must report the exact canonical target_path in files_changed and include decomposition_completion with that target plus at least one concrete canonical replacement_path also present in files_changed. OrchestratorReviewReport must aggregate the exact accepted worker evidence in decomposition_completions; this evidence does not bypass claims, journals, validation, audit, or later merge gates.
@@ -228,7 +224,7 @@ Safety requirements:
 - Planning assignments are read-only. For execution assignments, do not edit outside the assigned paths, symbols, or modules.
 - Do not mutate the primary worktree.
 - Run validation commands when feasible. If validation cannot run, explain why in validation_results and remaining_risk.
-- Return exactly one OrchestratorReviewReport JSON object with the evidence applicable to this assignment; use no prose wrapper or Markdown fence. An execution assignment with worker_assignments requires its accepted WorkerReports and read-only AuditorReport coverage. A workerless planning gate instead returns worker_reports=[] and audit_reports=[] and relies on the parent-enforced MACO review lens for acceptance.
+- Return exactly one OrchestratorReviewReport JSON object with the evidence applicable to this assignment; use no prose wrapper or Markdown fence. A workerless planning gate instead returns worker_reports=[] and audit_reports=[] and relies on the parent-enforced MACO review lens for acceptance.
 "#,
         tool_call_batching_guidance = TOOL_CALL_BATCHING_GUIDANCE
     )
