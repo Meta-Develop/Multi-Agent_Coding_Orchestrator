@@ -1707,10 +1707,10 @@ fn grok_style_uncommitted_candidate_materializes_exact_tree_and_imports() -> Res
     let primary_repository = crate::git_repository::open(&primary)?;
     let commit = primary_repository.find_commit(materialized)?;
     assert_eq!(commit.parent_id(0)?, base);
-    assert_eq!(commit.author().name(), Some("Fixture Owner"));
-    assert_eq!(commit.author().email(), Some("fixture@example.invalid"));
-    assert_eq!(commit.committer().name(), Some("Fixture Owner"));
-    assert_eq!(commit.committer().email(), Some("fixture@example.invalid"));
+    assert_eq!(commit.author().name()?, "Fixture Owner");
+    assert_eq!(commit.author().email()?, "fixture@example.invalid");
+    assert_eq!(commit.committer().name()?, "Fixture Owner");
+    assert_eq!(commit.committer().email()?, "fixture@example.invalid");
     assert_eq!(linked.head()?.target(), Some(base));
     assert_eq!(
         snapshot_managed_git_tree(&common.join("refs"))?,

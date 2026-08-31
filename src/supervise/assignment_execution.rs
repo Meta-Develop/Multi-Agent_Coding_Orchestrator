@@ -2229,7 +2229,7 @@ fn dispatch_and_collect_child_attempt<'a>(
                 &assignment.assigned_paths,
             )?;
             verify_imported_managed_child_candidate(repo, assignment, write_lease, &imported)?;
-            Ok(imported)
+            Ok::<_, anyhow::Error>(imported)
         })())
     } else {
         None
