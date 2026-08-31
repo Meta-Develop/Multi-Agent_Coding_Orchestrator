@@ -360,6 +360,24 @@ fn run_git_with_input(repo_root: &Path, args: &[&str], input: &[u8]) -> Result<G
     )
 }
 
+fn run_git_with_input_with_writable_worktree(
+    repo_root: &Path,
+    args: &[&str],
+    input: &[u8],
+) -> Result<GitCommandOutput> {
+    let repo = crate::git_repository::open(repo_root)
+        .with_context(|| format!("failed to open Git worktree {}", repo_root.display()))?;
+    let context = TemporaryIndex::create(repo.commondir())?;
+    initialize_isolated_index(&context, repo_root, head_oid(&repo)?)?;
+    run_isolated_git_process_with_writable_worktree(
+        &context,
+        repo_root,
+        args,
+        StdinMode::Bytes(input.to_vec()),
+        "git patch command",
+    )
+}
+
 fn run_isolated_git_process(
     context: &TemporaryIndex,
     worktree_path: &Path,
