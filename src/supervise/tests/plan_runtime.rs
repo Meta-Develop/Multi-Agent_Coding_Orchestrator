@@ -450,7 +450,7 @@ fn completed_quota_refresh_switches_the_next_actual_assignment_launch_to_cursor(
             .observed_usage
             .expect("second completed usage")
             .total_tokens,
-        10
+        3
     );
 
     let observed_launches = launches.lock().expect("launch observations").clone();
