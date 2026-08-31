@@ -1834,10 +1834,22 @@ impl ProtectedWorktreeControls {
 fn protected_worktree_controls(spec: &ExternalAgentCommand) -> Result<ProtectedWorktreeControls> {
     let mut controls =
         protected_worktree_controls_for(&spec.cwd, &spec.worktree_control_exceptions)?;
-    if spec.invocation == ExternalAgentInvocation::CodexSupervisor
+    let managed_git_runtime = spec
+        .invocation
+        .adapter_id()
+        .and_then(AdapterId::to_runtime_id);
+    let prepare_managed_git = spec.workspace_access == WorkspaceAccess::ReadWrite
         && spec.writable_launch_target == WritableLaunchTarget::ManagedChildWorktree
         && spec.agent_lifecycle.is_some()
-    {
+        && managed_git_runtime.is_some_and(|runtime| {
+            spec.verified_writable_capabilities(runtime)
+                .is_ok_and(|capabilities| {
+                    capabilities
+                        .writable_launch_refusal(spec.writable_launch_target)
+                        .is_none()
+                })
+        });
+    if prepare_managed_git {
         controls.managed_git = managed_worktree_git_metadata(&spec.cwd)?;
     }
     controls.exact_read_only_input_files = validate_exact_read_only_input_files(spec, &controls)?;
