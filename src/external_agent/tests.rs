@@ -1514,6 +1514,125 @@ fn managed_git_metadata_is_private_gitdir_write_and_shared_components_read_in_bo
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn selected_writable_grok_prepares_private_git_and_retains_it_through_collection() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (primary, child, _common, child_git_dir) = create_linked_git_metadata_fixture(temp.path())?;
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    let command = selected_writable_grok_command(
+        child.join("grok"),
+        &child,
+        child.join("prompt.md"),
+        &incoming,
+    )?
+    .with_agent_lifecycle(&primary, "worker", "run-grok", "grok-worker")
+    .with_worktree_writable_confinement(writable_grok_confinement(SideEffectConfinement::Verified));
+
+    let controls = protected_worktree_controls(&command)?;
+    let git = controls
+        .managed_git
+        .as_ref()
+        .context("verified writable Grok launch did not prepare managed Git")?;
+    assert_eq!(
+        git.private_git_dir,
+        child_git_dir.join(MANAGED_CHILD_PRIVATE_GIT_DIR)
+    );
+    let managed_environment = managed_git_environment(git)?;
+    assert_eq!(
+        managed_environment.get("GIT_DIR").map(String::as_str),
+        git.private_git_dir.to_str()
+    );
+    let profile = external_side_effect_profile(
+        &command,
+        &child.join("grok"),
+        ExternalProgramTrust::ExplicitCustom,
+        &controls,
+    )?;
+    let SideEffectConfinementProfile::ExternalGrok(profile) = profile else {
+        bail!("expected ExternalGrok profile");
+    };
+    assert!(profile
+        .visible_read_write_roots()
+        .contains(&git.private_git_dir));
+    assert!(profile
+        .visible_read_only_roots()
+        .contains(&git.worktree_git_dir));
+
+    let linked = crate::git_repository::open(&child)?;
+    let base = linked.head()?.target().context("linked base")?;
+    fs::write(
+        child.join("RELEASE_NOTES.md"),
+        "initial\nGrok managed change\n",
+    )?;
+    let private_head = create_private_root_commit(
+        git,
+        base,
+        &[base],
+        "RELEASE_NOTES.md",
+        b"initial\nGrok managed change\n",
+        "Grok managed change",
+    )?;
+    verify_managed_git_boundary_after_launch(git)?;
+
+    let imported = collect_and_import_managed_child_git_commit(
+        &primary,
+        &child,
+        base,
+        &[PathBuf::from("RELEASE_NOTES.md")],
+    )?;
+    assert_eq!(imported.head_oid, private_head);
+    assert_eq!(
+        imported.final_changed_paths,
+        vec![PathBuf::from("RELEASE_NOTES.md")]
+    );
+    assert!(crate::git_repository::open(&primary)?
+        .find_commit(private_head)
+        .is_ok());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_git_authority_requires_supported_writable_managed_child_launch() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (primary, child, _common, child_git_dir) = create_linked_git_metadata_fixture(temp.path())?;
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    let base = ExternalAgentCommand::codex(
+        child.join("agent"),
+        &child,
+        child.join("prompt.md"),
+        child.join("events.jsonl"),
+        incoming.join("report.json"),
+        Duration::from_secs(1),
+    )
+    .with_agent_lifecycle(&primary, "worker", "run-negative", "worker-negative");
+
+    let unsupported = base.clone().with_runtime_adapter(
+        RuntimeId::Cursor,
+        RuntimeAdapterConfig::defaults(RuntimeId::Cursor),
+    );
+    assert!(protected_worktree_controls(&unsupported)?
+        .managed_git
+        .is_none());
+
+    let primary_target = base
+        .clone()
+        .with_writable_launch_target(WritableLaunchTarget::PrimaryWorktree);
+    assert!(protected_worktree_controls(&primary_target)?
+        .managed_git
+        .is_none());
+
+    let read_only = base.with_workspace_access(WorkspaceAccess::ReadOnly);
+    assert!(protected_worktree_controls(&read_only)?
+        .managed_git
+        .is_none());
+    assert!(!child_git_dir.join(MANAGED_CHILD_PRIVATE_GIT_DIR).exists());
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn planning_and_execution_profiles_reach_actual_inner_argv_and_outer_systemd_properties(
