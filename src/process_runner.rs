@@ -1214,6 +1214,11 @@ impl StrictOfflineWorkspaceProfile {
         self
     }
 
+    pub fn with_visible_read_only_file(mut self, file: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_only_file(file);
+        self
+    }
+
     pub fn with_visible_read_write_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_visible_read_write_root(root);
         self
