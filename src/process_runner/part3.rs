@@ -2592,8 +2592,10 @@ trait IoThreadClock {
     fn wait(&self, duration: Duration);
 }
 
+#[cfg(not(test))]
 struct RealIoThreadClock;
 
+#[cfg(not(test))]
 impl IoThreadClock for RealIoThreadClock {
     type Deadline = Instant;
 
