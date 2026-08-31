@@ -1173,8 +1173,10 @@ fn create_linked_git_metadata_fixture(root: &Path) -> Result<(PathBuf, PathBuf, 
     let peer = root.join("peer");
     let repository = git2::Repository::init(&primary)?;
     fs::write(primary.join("RELEASE_NOTES.md"), "initial\n")?;
+    fs::write(primary.join("DELETE.md"), "delete this candidate\n")?;
     let mut index = repository.index()?;
     index.add_path(Path::new("RELEASE_NOTES.md"))?;
+    index.add_path(Path::new("DELETE.md"))?;
     let tree_id = index.write_tree()?;
     index.write()?;
     let tree = repository.find_tree(tree_id)?;
@@ -1273,6 +1275,49 @@ fn create_private_root_commit(
         format!("{oid}\n"),
     )?;
     Ok(oid)
+}
+
+#[cfg(unix)]
+fn expected_managed_candidate_tree(
+    git: &ManagedWorktreeGitMetadata,
+    base: Oid,
+    entries: &[(&str, Option<&[u8]>, u32)],
+) -> Result<Oid> {
+    let repository = git2::Repository::open_bare(&git.private_git_dir)?;
+    repository.odb()?.add_disk_alternate(
+        git.shared_object_dir
+            .to_str()
+            .context("UTF-8 shared objects")?,
+    )?;
+    let base_tree = repository.find_commit(base)?.tree()?;
+    let mut index = git2::Index::new()?;
+    index.read_tree(&base_tree)?;
+    for (path, contents, mode) in entries {
+        match contents {
+            Some(contents) => {
+                let path_bytes = path.as_bytes().to_vec();
+                let blob = repository.blob(contents)?;
+                index.add(&git2::IndexEntry {
+                    ctime: git2::IndexTime::new(0, 0),
+                    mtime: git2::IndexTime::new(0, 0),
+                    dev: 0,
+                    ino: 0,
+                    mode: *mode,
+                    uid: 0,
+                    gid: 0,
+                    file_size: u32::try_from(contents.len()).unwrap_or(u32::MAX),
+                    id: blob,
+                    flags: u16::try_from(path_bytes.len().min(0x0fff)).unwrap_or(0x0fff),
+                    flags_extended: 0,
+                    path: path_bytes,
+                })?;
+            }
+            None => index.remove_path(Path::new(path))?,
+        }
+    }
+    index
+        .write_tree_to(&repository)
+        .map_err(anyhow::Error::from)
 }
 
 #[cfg(unix)]
@@ -1590,6 +1635,153 @@ fn selected_writable_grok_prepares_private_git_and_retains_it_through_collection
     assert!(crate::git_repository::open(&primary)?
         .find_commit(private_head)
         .is_ok());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn grok_style_uncommitted_candidate_materializes_exact_tree_and_imports() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    skip_without_containment!(ok);
+    let temp = tempfile::tempdir()?;
+    let (primary, child, common, _child_git_dir) = create_linked_git_metadata_fixture(temp.path())?;
+    let linked = crate::git_repository::open(&child)?;
+    let mut config = linked.config()?;
+    config.set_str("user.name", "Fixture Owner")?;
+    config.set_str("user.email", "fixture@example.invalid")?;
+    drop(config);
+    fs::remove_file(child.join("fixture-codex"))?;
+    let git = managed_worktree_git_metadata(&child)?.context("managed Git metadata")?;
+    let base = linked.head()?.target().context("linked base")?;
+    let shared_refs_before = snapshot_managed_git_tree(&common.join("refs"))?;
+
+    fs::write(
+        child.join("RELEASE_NOTES.md"),
+        "initial\nGrok-style uncommitted edit\n",
+    )?;
+    fs::remove_file(child.join("DELETE.md"))?;
+    fs::create_dir(child.join("nested"))?;
+    fs::write(child.join("nested/addition.txt"), "nested candidate\n")?;
+    fs::write(child.join("run-candidate"), "#!/bin/sh\nexit 0\n")?;
+    fs::set_permissions(
+        child.join("run-candidate"),
+        fs::Permissions::from_mode(0o755),
+    )?;
+    let candidate_paths = vec![
+        PathBuf::from("DELETE.md"),
+        PathBuf::from("RELEASE_NOTES.md"),
+        PathBuf::from("nested/addition.txt"),
+        PathBuf::from("run-candidate"),
+    ];
+    let candidate_tree = expected_managed_candidate_tree(
+        &git,
+        base,
+        &[
+            ("DELETE.md", None, 0o100644),
+            (
+                "RELEASE_NOTES.md",
+                Some(b"initial\nGrok-style uncommitted edit\n"),
+                0o100644,
+            ),
+            ("nested/addition.txt", Some(b"nested candidate\n"), 0o100644),
+            ("run-candidate", Some(b"#!/bin/sh\nexit 0\n"), 0o100755),
+        ],
+    )?;
+
+    let materialized = materialize_managed_child_git_commit(
+        &primary,
+        &child,
+        base,
+        &candidate_paths,
+        &candidate_paths,
+        candidate_tree,
+    )?
+    .context("uncommitted candidate did not materialize")?;
+    let imported =
+        collect_and_import_managed_child_git_commit(&primary, &child, base, &candidate_paths)?;
+
+    assert_eq!(imported.head_oid, materialized);
+    assert_eq!(imported.head_tree_oid, candidate_tree);
+    assert_eq!(imported.final_changed_paths, candidate_paths);
+    let primary_repository = crate::git_repository::open(&primary)?;
+    let commit = primary_repository.find_commit(materialized)?;
+    assert_eq!(commit.parent_id(0)?, base);
+    assert_eq!(commit.author().name(), Some("Fixture Owner"));
+    assert_eq!(commit.author().email(), Some("fixture@example.invalid"));
+    assert_eq!(commit.committer().name(), Some("Fixture Owner"));
+    assert_eq!(commit.committer().email(), Some("fixture@example.invalid"));
+    assert_eq!(linked.head()?.target(), Some(base));
+    assert_eq!(
+        snapshot_managed_git_tree(&common.join("refs"))?,
+        shared_refs_before
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_child_materialization_refuses_unclaimed_and_symlink_candidates_before_ref_advance(
+) -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    for symlink_candidate in [false, true] {
+        let temp = tempfile::tempdir()?;
+        let (primary, child, _common, _child_git_dir) =
+            create_linked_git_metadata_fixture(temp.path())?;
+        let linked = crate::git_repository::open(&child)?;
+        let git = managed_worktree_git_metadata(&child)?.context("managed Git metadata")?;
+        let base = linked.head()?.target().context("linked base")?;
+        let candidate_path = if symlink_candidate {
+            symlink("RELEASE_NOTES.md", child.join("linked-candidate"))?;
+            PathBuf::from("linked-candidate")
+        } else {
+            fs::write(child.join("UNCLAIMED.md"), "unclaimed candidate\n")?;
+            PathBuf::from("UNCLAIMED.md")
+        };
+        let candidate_tree = expected_managed_candidate_tree(
+            &git,
+            base,
+            &[if symlink_candidate {
+                (
+                    "linked-candidate",
+                    Some(b"RELEASE_NOTES.md".as_slice()),
+                    0o120000,
+                )
+            } else {
+                (
+                    "UNCLAIMED.md",
+                    Some(b"unclaimed candidate\n".as_slice()),
+                    0o100644,
+                )
+            }],
+        )?;
+        let claims = if symlink_candidate {
+            vec![candidate_path.clone()]
+        } else {
+            vec![PathBuf::from("RELEASE_NOTES.md")]
+        };
+
+        let error = materialize_managed_child_git_commit(
+            &primary,
+            &child,
+            base,
+            &claims,
+            std::slice::from_ref(&candidate_path),
+            candidate_tree,
+        )
+        .expect_err("unsafe candidate must fail before private ref advance");
+        let message = format!("{error:#}");
+        if symlink_candidate {
+            assert!(message.contains("contains a symlink"), "{message}");
+        } else {
+            assert!(message.contains("unclaimed path"), "{message}");
+        }
+        assert_eq!(
+            read_managed_child_private_ref_oid(&git.private_git_dir)?,
+            base
+        );
+    }
     Ok(())
 }
 

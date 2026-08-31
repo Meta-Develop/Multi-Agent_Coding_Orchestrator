@@ -1194,6 +1194,443 @@ pub(crate) fn prepare_managed_child_git_boundary_for_test(workspace: &Path) -> R
     Ok(())
 }
 
+/// Materializes one supervisor-captured worktree candidate into the fixed
+/// managed-child private ref when the child left that ref at its captured base.
+///
+/// The caller must retain the managed-worktree write lease that protected the
+/// candidate capture for this complete operation. This function independently
+/// rebinds the private Git boundary, verifies both repository heads and the
+/// fixed private ref, stages only the normalized candidate paths into an index
+/// reset to the captured base, and advances the ref only after the resulting
+/// tree exactly matches the supervisor-captured tree. The ordinary Git commit
+/// path is intentional: repository-projected attribution and the validated
+/// commit-msg hook remain authoritative and are never bypassed.
+pub(crate) fn materialize_managed_child_git_commit(
+    primary_repo: &Path,
+    workspace: &Path,
+    captured_base: Oid,
+    claimed_paths: &[PathBuf],
+    candidate_paths: &[PathBuf],
+    candidate_tree: Oid,
+) -> Result<Option<Oid>> {
+    let boundary = bind_existing_managed_child_git_boundary(workspace)?;
+    let primary_repo = fs::canonicalize(primary_repo)
+        .context("managed child materialization primary repository could not be resolved")?;
+    let primary = crate::git_repository::open(&primary_repo)
+        .context("managed child materialization could not open the primary repository")?;
+    let primary_head = primary
+        .head()
+        .context("managed child materialization primary repository has no HEAD")?
+        .peel_to_commit()
+        .context("managed child materialization primary HEAD is not a commit")?
+        .id();
+    if primary_head != captured_base {
+        bail!(
+            "managed child materialization captured base changed: expected {captured_base}, observed {primary_head}"
+        );
+    }
+    let linked = crate::git_repository::open(workspace)
+        .context("managed child materialization could not reopen the linked worktree")?;
+    let linked_head = linked
+        .head()
+        .context("managed child materialization linked worktree has no shared HEAD")?
+        .peel_to_commit()
+        .context("managed child materialization linked worktree HEAD is not a commit")?
+        .id();
+    if linked_head != captured_base {
+        bail!(
+            "managed child materialization linked worktree base changed: expected {captured_base}, observed {linked_head}"
+        );
+    }
+    let primary_objects = canonical_git_directory(
+        &primary.commondir().join("objects"),
+        "managed child materialization primary object directory",
+    )?;
+    if primary_objects != boundary.shared_object_dir() {
+        bail!(
+            "managed child materialization shared object directory does not belong to the primary repository"
+        );
+    }
+
+    let claimed_paths = claimed_paths
+        .iter()
+        .map(crate::sync::normalize_repo_relative_path)
+        .collect::<std::result::Result<BTreeSet<_>, _>>()
+        .context("managed child materialization claims are invalid")?;
+    if claimed_paths.is_empty() {
+        bail!("managed child materialization requires at least one exact claimed path");
+    }
+    let candidate_paths = candidate_paths
+        .iter()
+        .map(crate::sync::normalize_repo_relative_path)
+        .collect::<std::result::Result<BTreeSet<_>, _>>()
+        .context("managed child materialization candidate paths are invalid")?;
+    if let Some(unclaimed) = candidate_paths.iter().find(|path| {
+        !claimed_paths
+            .iter()
+            .any(|claim| *path == claim || path.starts_with(claim))
+    }) {
+        bail!(
+            "managed child materialization candidate contains unclaimed path '{}'",
+            unclaimed.display()
+        );
+    }
+
+    let initial_private_head = boundary.revalidate()?;
+    if initial_private_head != captured_base {
+        // A child-created private commit remains subject to the existing fsck
+        // and import path. Never overwrite it or synthesize a second commit.
+        return Ok(None);
+    }
+    let base_tree = primary
+        .find_commit(captured_base)
+        .context("managed child materialization captured base commit is missing")?
+        .tree_id();
+    if candidate_paths.is_empty() {
+        if candidate_tree != base_tree {
+            bail!(
+                "managed child materialization empty candidate tree {candidate_tree} differs from captured base tree {base_tree}"
+            );
+        }
+        return Ok(None);
+    }
+    for path in &candidate_paths {
+        validate_managed_child_candidate_path(&boundary.workspace, path)?;
+    }
+
+    run_managed_child_git_command(
+        &boundary,
+        vec![OsString::from("read-tree"), OsString::from(captured_base.to_string())],
+        StdinMode::Null,
+        "initialize managed child materialization index",
+    )?;
+    require_managed_child_private_base(&boundary, captured_base, "after index initialization")?;
+
+    let pathspec_input = managed_child_literal_pathspec_input(&candidate_paths)?;
+    run_managed_child_git_command(
+        &boundary,
+        vec![
+            OsString::from("--literal-pathspecs"),
+            OsString::from("-c"),
+            OsString::from("core.fileMode=true"),
+            OsString::from("add"),
+            OsString::from("--all"),
+            OsString::from("--pathspec-from-file=-"),
+            OsString::from("--pathspec-file-nul"),
+        ],
+        StdinMode::Bytes(pathspec_input),
+        "stage managed child materialization candidate",
+    )?;
+    require_managed_child_private_base(&boundary, captured_base, "after candidate staging")?;
+
+    let tree_output = run_managed_child_git_command(
+        &boundary,
+        vec![OsString::from("write-tree")],
+        StdinMode::Null,
+        "write managed child materialization tree",
+    )?;
+    let tree_text = std::str::from_utf8(&tree_output)
+        .context("managed child materialization tree output is not UTF-8")?;
+    let materialized_tree = Oid::from_str(tree_text.trim())
+        .context("managed child materialization tree output is not an object id")?;
+    if materialized_tree != candidate_tree {
+        bail!(
+            "managed child materialization tree {materialized_tree} differs from supervisor-captured candidate tree {candidate_tree}"
+        );
+    }
+
+    let private = open_managed_child_private_repository(&boundary)?;
+    let base = private
+        .find_commit(captured_base)
+        .context("managed child materialization private view omitted the captured base")?;
+    let tree = private
+        .find_tree(materialized_tree)
+        .context("managed child materialization private tree is missing")?;
+    let materialized_paths = managed_child_tree_edge_paths(&private, &base.tree()?, &tree)?;
+    if materialized_paths != candidate_paths {
+        bail!(
+            "managed child materialization staged paths [{}] differ from supervisor-captured candidate paths [{}]",
+            materialized_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            candidate_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    require_managed_child_clean_unstaged_worktree(&boundary)?;
+    require_managed_child_private_base(&boundary, captured_base, "before private commit")?;
+    require_managed_child_repository_bases(
+        &primary,
+        &linked,
+        captured_base,
+        "before private commit",
+    )?;
+
+    run_managed_child_git_command(
+        &boundary,
+        vec![
+            OsString::from("commit"),
+            OsString::from("--quiet"),
+            OsString::from("-m"),
+            OsString::from("Materialize verified managed child candidate"),
+        ],
+        StdinMode::Null,
+        "commit managed child materialization candidate",
+    )?;
+    let head = boundary.revalidate()?;
+    if head == captured_base {
+        bail!("managed child materialization commit did not advance the fixed private ref");
+    }
+    let commit = private
+        .find_commit(head)
+        .context("managed child materialization fixed private ref is not a commit")?;
+    if commit.parent_count() != 1
+        || commit.parent_id(0).ok() != Some(captured_base)
+        || commit.tree_id() != candidate_tree
+    {
+        bail!(
+            "managed child materialization commit does not preserve the captured base and exact candidate tree"
+        );
+    }
+    require_managed_child_repository_bases(
+        &primary,
+        &linked,
+        captured_base,
+        "after private commit",
+    )?;
+    Ok(Some(head))
+}
+
+fn require_managed_child_private_base(
+    boundary: &ManagedChildGitBoundary,
+    captured_base: Oid,
+    phase: &str,
+) -> Result<()> {
+    let observed = boundary.revalidate()?;
+    if observed != captured_base {
+        bail!(
+            "managed child fixed private ref changed {phase}: expected {captured_base}, observed {observed}"
+        );
+    }
+    Ok(())
+}
+
+fn require_managed_child_repository_bases(
+    primary: &git2::Repository,
+    linked: &git2::Repository,
+    captured_base: Oid,
+    phase: &str,
+) -> Result<()> {
+    let primary_head = primary
+        .head()
+        .with_context(|| format!("managed child primary HEAD disappeared {phase}"))?
+        .peel_to_commit()
+        .with_context(|| format!("managed child primary HEAD is not a commit {phase}"))?
+        .id();
+    let linked_head = linked
+        .head()
+        .with_context(|| format!("managed child linked HEAD disappeared {phase}"))?
+        .peel_to_commit()
+        .with_context(|| format!("managed child linked HEAD is not a commit {phase}"))?
+        .id();
+    if primary_head != captured_base || linked_head != captured_base {
+        bail!(
+            "managed child repository base changed {phase}: expected {captured_base}, primary {primary_head}, linked {linked_head}"
+        );
+    }
+    Ok(())
+}
+
+fn validate_managed_child_candidate_path(workspace: &Path, relative: &Path) -> Result<()> {
+    let mut current = workspace.to_path_buf();
+    let component_count = relative.components().count();
+    for (index, component) in relative.components().enumerate() {
+        let std::path::Component::Normal(component) = component else {
+            bail!("managed child materialization candidate path is not normalized");
+        };
+        current.push(component);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect managed child materialization path {}",
+                        relative.display()
+                    )
+                })
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "managed child materialization candidate path '{}' contains a symlink",
+                relative.display()
+            );
+        }
+        let is_final = index.saturating_add(1) == component_count;
+        if !is_final && !metadata.is_dir() {
+            bail!(
+                "managed child materialization candidate path '{}' has a non-directory parent",
+                relative.display()
+            );
+        }
+        if is_final && !metadata.is_file() {
+            bail!(
+                "managed child materialization candidate path '{}' is not a regular file or deletion",
+                relative.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn managed_child_literal_pathspec_input(paths: &BTreeSet<PathBuf>) -> Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    const MAX_PATHSPEC_INPUT_BYTES: usize = 64 * 1024 * 1024;
+    let mut input = Vec::new();
+    for path in paths {
+        input.extend_from_slice(path.as_os_str().as_bytes());
+        input.push(0);
+        if input.len() > MAX_PATHSPEC_INPUT_BYTES {
+            bail!(
+                "managed child materialization pathspec exceeds its {MAX_PATHSPEC_INPUT_BYTES}-byte bound"
+            );
+        }
+    }
+    Ok(input)
+}
+
+#[cfg(not(unix))]
+fn managed_child_literal_pathspec_input(_paths: &BTreeSet<PathBuf>) -> Result<Vec<u8>> {
+    bail!("managed child materialization path routing is unsupported on this platform")
+}
+
+fn managed_child_tree_edge_paths(
+    source: &git2::Repository,
+    parent: &git2::Tree<'_>,
+    child: &git2::Tree<'_>,
+) -> Result<BTreeSet<PathBuf>> {
+    let mut options = git2::DiffOptions::new();
+    options
+        .include_typechange(true)
+        .include_typechange_trees(true);
+    let diff = source
+        .diff_tree_to_tree(Some(parent), Some(child), Some(&mut options))
+        .context("managed child materialization tree diff could not be computed")?;
+    let mut paths = BTreeSet::new();
+    for delta in diff.deltas() {
+        for path in [delta.old_file().path(), delta.new_file().path()]
+            .into_iter()
+            .flatten()
+        {
+            paths.insert(
+                crate::sync::normalize_repo_relative_path(path)
+                    .context("managed child materialization tree diff contains an invalid path")?,
+            );
+        }
+    }
+    Ok(paths)
+}
+
+fn require_managed_child_clean_unstaged_worktree(
+    boundary: &ManagedChildGitBoundary,
+) -> Result<()> {
+    let unstaged = run_managed_child_git_command_allow_status(
+        boundary,
+        vec![
+            OsString::from("-c"),
+            OsString::from("core.fileMode=true"),
+            OsString::from("diff"),
+            OsString::from("--quiet"),
+            OsString::from("--ignore-submodules=none"),
+            OsString::from("--"),
+        ],
+        StdinMode::Null,
+        "revalidate managed child tracked worktree",
+    )?;
+    if !unstaged.success {
+        bail!("managed child worktree changed after its supervisor candidate capture");
+    }
+    let untracked = run_managed_child_git_command(
+        boundary,
+        vec![
+            OsString::from("ls-files"),
+            OsString::from("--others"),
+            OsString::from("--exclude-standard"),
+            OsString::from("-z"),
+        ],
+        StdinMode::Null,
+        "revalidate managed child untracked worktree",
+    )?;
+    if !untracked.is_empty() {
+        bail!("managed child worktree gained an unstaged untracked path during materialization");
+    }
+    Ok(())
+}
+
+fn run_managed_child_git_command(
+    boundary: &ManagedChildGitBoundary,
+    args: Vec<OsString>,
+    stdin: StdinMode,
+    label: &str,
+) -> Result<Vec<u8>> {
+    let output = run_managed_child_git_command_allow_status(boundary, args, stdin, label)?;
+    if !output.success {
+        bail!(
+            "{label} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout)
+}
+
+fn run_managed_child_git_command_allow_status(
+    boundary: &ManagedChildGitBoundary,
+    args: Vec<OsString>,
+    stdin: StdinMode,
+    label: &str,
+) -> Result<crate::merge::RequiredCommandOutput> {
+    const MATERIALIZATION_GIT_TIMEOUT: Duration = Duration::from_secs(120);
+    const MATERIALIZATION_GIT_CAPTURE_BYTES: usize = 1024 * 1024;
+    const MATERIALIZATION_GIT_STDIN_BYTES: usize = 64 * 1024 * 1024;
+
+    let mut environment = crate::merge::minimal_network_environment()?;
+    environment.extend(managed_git_environment(&boundary.metadata)?);
+    environment.insert(
+        "GIT_WORK_TREE".to_string(),
+        boundary
+            .workspace
+            .to_str()
+            .context("managed child materialization workspace is not UTF-8")?
+            .to_string(),
+    );
+    let mut profile = StrictOfflineWorkspaceProfile::read_only(&boundary.workspace)
+        .with_writable_artifact_root(boundary.private_git_dir())
+        .with_visible_read_only_root(boundary.shared_object_dir());
+    if let Some(hook) = &boundary.metadata.active_commit_hook {
+        profile = profile.with_visible_read_only_root(hook);
+    }
+    crate::merge::run_required_direct(
+        label,
+        crate::merge::resolve_trusted_executable("git")?,
+        args,
+        &boundary.workspace,
+        environment,
+        stdin,
+        MATERIALIZATION_GIT_TIMEOUT,
+        MATERIALIZATION_GIT_CAPTURE_BYTES,
+        MATERIALIZATION_GIT_STDIN_BYTES,
+        profile,
+    )
+}
+
 /// Validates and imports one managed child's private commit closure.
 ///
 /// The complete private chain and reachable commit/tree/blob graph are checked
