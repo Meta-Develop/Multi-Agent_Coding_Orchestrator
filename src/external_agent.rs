@@ -270,6 +270,7 @@ struct WritableRuntimeSelectionEvidence {
     model: Option<String>,
     reasoning_effort: Option<String>,
     adapter_config: Option<RuntimeAdapterConfig>,
+    output_schema: Option<PathBuf>,
 }
 
 impl WritableRuntimeSelectionEvidence {
@@ -289,6 +290,7 @@ impl WritableRuntimeSelectionEvidence {
             model: command.model.clone(),
             reasoning_effort: command.reasoning_effort.clone(),
             adapter_config: command.runtime_adapter.clone(),
+            output_schema: command.output_schema.clone(),
         }
     }
 
@@ -302,6 +304,7 @@ impl WritableRuntimeSelectionEvidence {
             && self.model == command.model
             && self.reasoning_effort == command.reasoning_effort
             && self.adapter_config == command.runtime_adapter
+            && self.output_schema == command.output_schema
     }
 }
 
@@ -1215,7 +1218,7 @@ impl ExternalAgentCommand {
             );
         }
         config
-            .typed_runtime_contract(
+            .typed_runtime_contract_with_output_schema(
                 AdapterId::Grok,
                 &LaunchContext {
                     prompt: &self.prompt,
@@ -1224,6 +1227,7 @@ impl ExternalAgentCommand {
                     cwd: &self.cwd,
                     output: &self.output_last_message,
                 },
+                self.output_schema.as_deref(),
             )
             .with_context(|| {
                 format!(
@@ -3559,6 +3563,23 @@ fn runtime_adapter_captured_output(
             // only through the existing redacted JSON-log path; public failure evidence names the
             // typed terminal condition without reflecting child-controlled text.
             bail!("Grok runtime returned a terminal streaming-json error event");
+        }
+        if spec.output_schema.is_some() {
+            let crate::runtime_adapter::grok::GrokStreamOutcome::Completed(end) = stream.outcome()
+            else {
+                bail!("Grok runtime did not return a completed terminal end event");
+            };
+            if end.structured_output_error().is_some() {
+                // Never reflect the provider-controlled validation diagnostic: it may contain
+                // report content or other sensitive data from the child session.
+                bail!("Grok runtime returned a terminal structuredOutputError");
+            }
+            let structured = end
+                .structured_output()
+                .context("Grok runtime terminal end event is missing structuredOutput")?;
+            return Ok(RuntimeAdapterCapturedOutput::Captured(
+                crate::runtime_adapter::grok::canonical_grok_structured_output(structured)?,
+            ));
         }
         return Ok(RuntimeAdapterCapturedOutput::Captured(
             stream.response_text().as_bytes().to_vec(),

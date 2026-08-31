@@ -573,6 +573,17 @@ impl RuntimeAdapterConfig {
         adapter: AdapterId,
         context: &LaunchContext<'_>,
     ) -> Option<TypedRuntimeContract> {
+        self.typed_runtime_contract_with_output_schema(adapter, context, None)
+    }
+
+    /// Prove the exact Grok contract including its optional native structured
+    /// output schema. Other adapters never call this schema-aware boundary.
+    pub(crate) fn typed_runtime_contract_with_output_schema(
+        &self,
+        adapter: AdapterId,
+        context: &LaunchContext<'_>,
+        output_schema: Option<&Path>,
+    ) -> Option<TypedRuntimeContract> {
         let runtime = TypedRuntime::from_launch(adapter, context.model, context.effort)?;
         match runtime {
             TypedRuntime::Grok46Xhigh => {
@@ -583,7 +594,9 @@ impl RuntimeAdapterConfig {
                 {
                     return None;
                 }
-                let actual = self.render(context).ok()?;
+                let actual = self
+                    .render_grok_with_output_schema(context, output_schema)
+                    .ok()?;
                 // The operator may select an alternate executable pathname, but that is the
                 // only mutable part of the Grok process contract. Compare against a canonical
                 // descriptor carrying that same selected binary so argv, cwd, capture, stdin,
@@ -591,7 +604,9 @@ impl RuntimeAdapterConfig {
                 // the default PATH location.
                 let mut expected_config = Self::defaults_for(AdapterId::Grok);
                 expected_config.binary = self.binary.clone();
-                let expected = expected_config.render(context).ok()?;
+                let expected = expected_config
+                    .render_grok_with_output_schema(context, output_schema)
+                    .ok()?;
                 if actual != expected {
                     return None;
                 }
@@ -665,6 +680,64 @@ impl RuntimeAdapterConfig {
             env,
             output_capture: self.output_capture,
         })
+    }
+
+    /// Render Grok's immutable headless argv, adding the native JSON Schema as
+    /// one bounded JSON value immediately before the still-explicit
+    /// `streaming-json` selection. Absence preserves the prior text contract.
+    pub(crate) fn render_grok_with_output_schema(
+        &self,
+        context: &LaunchContext<'_>,
+        output_schema: Option<&Path>,
+    ) -> Result<LaunchSpec> {
+        let mut launch = self.render(context)?;
+        let Some(output_schema) = output_schema else {
+            return Ok(launch);
+        };
+        if launch
+            .argv
+            .iter()
+            .any(|argument| argument == "--json-schema")
+        {
+            bail!("Grok adapter argv may not supply an operator-controlled --json-schema");
+        }
+        let output_format_positions = launch
+            .argv
+            .windows(2)
+            .enumerate()
+            .filter_map(|(index, pair)| {
+                (pair
+                    == [
+                        "--output-format",
+                        grok::GROK_RUNTIME_DESCRIPTOR.output_format(),
+                    ])
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let [output_format_index] = output_format_positions.as_slice() else {
+            bail!(
+                "schema-bound Grok adapter argv must contain exactly one explicit streaming-json selection"
+            );
+        };
+        let schema = grok::load_grok_output_schema_argv(output_schema)?;
+        launch.argv.splice(
+            *output_format_index..*output_format_index,
+            ["--json-schema".to_string(), schema],
+        );
+        Ok(launch)
+    }
+
+    pub(crate) fn render_grok_os_argv(
+        &self,
+        context: &LaunchContext<'_>,
+        output_schema: Option<&Path>,
+    ) -> Result<Vec<OsString>> {
+        Ok(self
+            .render_grok_with_output_schema(context, output_schema)?
+            .argv
+            .into_iter()
+            .map(OsString::from)
+            .collect())
     }
 
     /// Fail-closed argv for a subprocess runtime. Callers must propagate the
@@ -1011,6 +1084,77 @@ mod tests {
         );
         assert_eq!(spec.output_capture, OutputCaptureMode::Stdout);
         assert!(!spec.argv.iter().any(|arg| arg == "--output"));
+        Ok(())
+    }
+
+    #[test]
+    fn grok_schema_argv_is_one_exact_value_and_keeps_streaming_safety_flags() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let schema = temp.path().join("worker-report.schema.json");
+        fs::write(
+            &schema,
+            "{\n  \"type\": \"object\", \"required\": [\"accepted\"]\n}\n",
+        )?;
+        let mut config = RuntimeAdapterConfig::defaults(RuntimeId::Grok);
+        let immutable = config.argument_template.clone();
+        config.replace_operator_argument_template(
+            AdapterId::Grok,
+            "--json-schema {} --permission-mode dontAsk",
+        );
+        assert_eq!(config.argument_template, immutable);
+        let context = launch_context(
+            Path::new("prompt.txt"),
+            Some("grok-4.6"),
+            Some("xhigh"),
+            Path::new("/tmp/work"),
+            Path::new("out.txt"),
+        );
+        let spec = config.render_grok_with_output_schema(&context, Some(&schema))?;
+        assert_eq!(
+            spec.argv,
+            [
+                "--prompt-file",
+                "prompt.txt",
+                "--model",
+                "grok-4.6",
+                "--reasoning-effort",
+                "xhigh",
+                "--cwd",
+                "/tmp/work",
+                "--json-schema",
+                r#"{"required":["accepted"],"type":"object"}"#,
+                "--output-format",
+                "streaming-json",
+                "--sandbox",
+                "strict",
+                "--always-approve",
+                "--disable-web-search",
+                "--no-memory",
+                "--no-subagents",
+            ]
+        );
+        assert_eq!(
+            spec.argv
+                .iter()
+                .filter(|argument| argument.as_str() == "--json-schema")
+                .count(),
+            1
+        );
+        assert!(config
+            .typed_runtime_contract_with_output_schema(AdapterId::Grok, &context, Some(&schema),)
+            .is_some());
+
+        let mut injected = config;
+        injected.argument_template.push("--json-schema".to_string());
+        injected.argument_template.push("{}".to_string());
+        let error = injected
+            .render_grok_with_output_schema(&context, Some(&schema))
+            .expect_err("template-provided schema flag must fail closed")
+            .to_string();
+        assert!(
+            error.contains("operator-controlled --json-schema"),
+            "{error}"
+        );
         Ok(())
     }
 
@@ -1889,6 +2033,7 @@ mod tests {
                 "--prompt-file",
                 "--model",
                 "--cwd",
+                "--json-schema",
                 "--output-format",
                 "streaming-json",
                 "--sandbox",

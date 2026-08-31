@@ -94,8 +94,10 @@ fn bind_runtime_output_schema(
     command.output_schema = match runtime {
         SupervisorRuntime::Codex => Some(codex_output_schema_path(schema_path)?),
         SupervisorRuntime::Fake => Some(schema_path.to_path_buf()),
-        SupervisorRuntime::Grok
-        | SupervisorRuntime::Cursor
+        // Grok Build consumes the authoritative report schema value directly and returns its
+        // validated structuredOutput on the terminal streaming-json end event.
+        SupervisorRuntime::Grok => Some(schema_path.to_path_buf()),
+        SupervisorRuntime::Cursor
         | SupervisorRuntime::ClaudeCode
         | SupervisorRuntime::GeminiCli => None,
     };
@@ -6058,7 +6060,7 @@ done
     }
 
     #[test]
-    fn codex_binds_compatible_output_schema_without_weakening_local_schema() -> Result<()> {
+    fn codex_and_grok_bind_output_schemas_without_weakening_local_schema() -> Result<()> {
         let schema = Path::new("/hidden-primary/schemas/orchestrator-review-report.schema.json");
         let worker_schema = Path::new("/hidden-primary/schemas/worker.json");
         let auditor_schema = Path::new("/hidden-primary/schemas/auditor.json");
@@ -6082,8 +6084,21 @@ done
                 .collect::<Vec<_>>()
         );
 
-        for runtime in [
+        let grok = bind_runtime_read_only_schema_files(
+            bind_runtime_output_schema(launch_fixture_command(), SupervisorRuntime::Grok, schema)?,
             SupervisorRuntime::Grok,
+            &schemas,
+        );
+        assert_eq!(grok.output_schema.as_deref(), Some(schema));
+        assert_eq!(
+            grok.read_only_input_files,
+            schemas
+                .iter()
+                .map(|path| path.to_path_buf())
+                .collect::<Vec<_>>()
+        );
+
+        for runtime in [
             SupervisorRuntime::Cursor,
             SupervisorRuntime::ClaudeCode,
             SupervisorRuntime::GeminiCli,
@@ -6095,7 +6110,7 @@ done
             );
             assert!(
                 adapter.output_schema.is_none(),
-                "{runtime:?} must not inherit Codex-only output schema staging"
+                "{runtime:?} must not inherit a native output schema contract"
             );
             assert_eq!(
                 adapter.read_only_input_files,
@@ -6172,8 +6187,14 @@ done
         )?;
         assert_eq!(fake.output_schema.as_deref(), Some(worker_schema));
 
-        for runtime in [
+        let grok = bind_runtime_output_schema(
+            launch_fixture_command(),
             SupervisorRuntime::Grok,
+            direct_worker_schema,
+        )?;
+        assert_eq!(grok.output_schema.as_deref(), Some(worker_schema));
+
+        for runtime in [
             SupervisorRuntime::Cursor,
             SupervisorRuntime::ClaudeCode,
             SupervisorRuntime::GeminiCli,
@@ -6556,6 +6577,15 @@ done
             .context("Grok adapter")?
             .output_capture = crate::runtime_adapter::OutputCaptureMode::StdoutAndStderr;
         assert!(admission_error(&stale)
+            .contains(crate::external_agent::WRITABLE_GROK_SELECTION_EVIDENCE_STALE));
+
+        let mut schema_stale = exact.clone().with_writable_runtime_selection(
+            "grok-worker",
+            SupervisorRuntime::Grok,
+            true,
+        )?;
+        schema_stale.output_schema = Some(PathBuf::from("/replaced/worker-report.schema.json"));
+        assert!(admission_error(&schema_stale)
             .contains(crate::external_agent::WRITABLE_GROK_SELECTION_EVIDENCE_STALE));
 
         let mut malformed = exact;

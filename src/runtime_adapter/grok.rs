@@ -41,6 +41,11 @@ const GROK_EVENT_STREAM_MAX_EVENTS: usize = 16 * 1024;
 const GROK_EVENT_TYPE_MAX_BYTES: usize = 64;
 const GROK_EVENT_METADATA_MAX_BYTES: usize = 512;
 const GROK_EVENT_ERROR_MAX_BYTES: usize = 64 * 1024;
+/// Keep one JSON Schema argv element below Linux's `MAX_ARG_STRLEN`, including
+/// the terminating NUL byte added by the process launcher.
+pub const GROK_OUTPUT_SCHEMA_MAX_BYTES: u64 = 131_072 - 1;
+/// Match the external-agent output reservation and supervisor report bound.
+pub const GROK_STRUCTURED_OUTPUT_MAX_BYTES: usize = 8 * 1024 * 1024;
 const GROK_CATALOG_MAX_BYTES: usize = 256 * 1024;
 const GROK_CATALOG_MAX_MODELS: usize = 512;
 const GROK_MODEL_SLUG_MAX_BYTES: usize = 256;
@@ -215,6 +220,8 @@ pub struct GrokEndEvent {
     stop_reason: String,
     session_id: String,
     request_id: String,
+    structured_output: Option<Value>,
+    structured_output_error: Option<Value>,
 }
 
 impl GrokEndEvent {
@@ -228,6 +235,18 @@ impl GrokEndEvent {
 
     pub fn request_id(&self) -> &str {
         &self.request_id
+    }
+
+    /// Grok Build attaches schema-validated output only to the terminal end
+    /// event. Callers without an output schema deliberately ignore this value.
+    pub fn structured_output(&self) -> Option<&Value> {
+        self.structured_output.as_ref()
+    }
+
+    /// A terminal structured-output validation error. Its provider-controlled
+    /// contents must not be reflected into public failure messages.
+    pub fn structured_output_error(&self) -> Option<&Value> {
+        self.structured_output_error.as_ref()
     }
 }
 
@@ -278,8 +297,76 @@ struct RawGrokStreamEvent {
     request_id: Option<String>,
     #[serde(default)]
     message: Option<String>,
+    #[serde(default, rename = "structuredOutput")]
+    structured_output: Option<Value>,
+    #[serde(default, rename = "structuredOutputError")]
+    structured_output_error: Option<Value>,
     #[serde(flatten)]
     _other: BTreeMap<String, Value>,
+}
+
+/// Load one exact JSON Schema file into the bounded argv representation Grok
+/// Build expects. The compact serialization is both validated JSON and one
+/// indivisible argv value; the schema pathname is never passed to Grok.
+pub fn load_grok_output_schema_argv(path: &Path) -> Result<String> {
+    let text =
+        crate::safe_state::BoundedRegularReader::read_utf8(path, GROK_OUTPUT_SCHEMA_MAX_BYTES)
+            .with_context(|| {
+                format!(
+                    "failed to read bounded Grok output schema {}",
+                    path.display()
+                )
+            })?;
+    let schema: Value = serde_json::from_str(&text)
+        .with_context(|| format!("Grok output schema {} is not valid JSON", path.display()))?;
+    if !schema.is_object() {
+        bail!("Grok output schema must be a JSON object");
+    }
+    let rendered = serde_json::to_string(&canonical_json_value(&schema))
+        .context("failed to render Grok output schema")?;
+    if rendered.len() > GROK_OUTPUT_SCHEMA_MAX_BYTES as usize {
+        bail!(
+            "rendered Grok output schema exceeds the {} byte argv limit",
+            GROK_OUTPUT_SCHEMA_MAX_BYTES
+        );
+    }
+    Ok(rendered)
+}
+
+/// Produce the canonical compact JSON that MACO may publish for a
+/// schema-bound Grok command. Native schema validation is represented by the
+/// terminal `structuredOutput` field; MACO additionally requires the report
+/// envelope to be an object and independently enforces its publication bound.
+pub fn canonical_grok_structured_output(value: &Value) -> Result<Vec<u8>> {
+    if !value.is_object() {
+        bail!("Grok terminal structuredOutput is not a JSON object");
+    }
+    let canonical = serde_json::to_vec(&canonical_json_value(value))
+        .context("failed to serialize Grok terminal structuredOutput")?;
+    if canonical.len() > GROK_STRUCTURED_OUTPUT_MAX_BYTES {
+        bail!(
+            "Grok terminal structuredOutput exceeds the {} byte limit",
+            GROK_STRUCTURED_OUTPUT_MAX_BYTES
+        );
+    }
+    Ok(canonical)
+}
+
+fn canonical_json_value(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => {
+            Value::Array(values.iter().map(canonical_json_value).collect::<Vec<_>>())
+        }
+        Value::Object(values) => {
+            let sorted = values.iter().collect::<BTreeMap<_, _>>();
+            let mut canonical = serde_json::Map::new();
+            for (key, value) in sorted {
+                canonical.insert(key.as_str().to_string(), canonical_json_value(value));
+            }
+            Value::Object(canonical)
+        }
+        scalar => scalar.clone(),
+    }
 }
 
 /// Parse Grok's bounded newline-delimited `streaming-json` protocol.
@@ -334,6 +421,13 @@ pub fn parse_grok_event_stream(bytes: &[u8]) -> Result<GrokParsedEventStream> {
             .with_context(|| format!("Grok streaming-json event {index} is malformed"))?;
         validate_grok_event_type(&raw.event_type)
             .with_context(|| format!("Grok streaming-json event {index}"))?;
+        if raw.event_type != "end"
+            && (raw.structured_output.is_some() || raw.structured_output_error.is_some())
+        {
+            bail!(
+                "Grok streaming-json event {index} places structured output outside the terminal end event"
+            );
+        }
         let event = match raw.event_type.as_str() {
             "text" => {
                 require_absent_grok_event_fields(
@@ -385,6 +479,8 @@ pub fn parse_grok_event_stream(bytes: &[u8]) -> Result<GrokParsedEventStream> {
                     stop_reason: validate_grok_event_metadata("stopReason", raw.stop_reason)?,
                     session_id: validate_grok_event_metadata("sessionId", raw.session_id)?,
                     request_id: validate_grok_event_metadata("requestId", raw.request_id)?,
+                    structured_output: raw.structured_output,
+                    structured_output_error: raw.structured_output_error,
                 };
                 outcome = Some(GrokStreamOutcome::Completed(terminal.clone()));
                 GrokStreamEvent::End(terminal)
@@ -1420,6 +1516,87 @@ mod tests {
                 "--no-subagents",
             ]
         );
+    }
+
+    #[test]
+    fn grok_output_schema_loader_is_bounded_validated_and_compact() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let schema = temp.path().join("worker-report.schema.json");
+        fs::write(
+            &schema,
+            "{\n  \"type\": \"object\", \"properties\": {\"accepted\": {\"type\": \"boolean\"}}\n}\n",
+        )?;
+        assert_eq!(
+            load_grok_output_schema_argv(&schema)?,
+            r#"{"properties":{"accepted":{"type":"boolean"}},"type":"object"}"#
+        );
+
+        let non_object = temp.path().join("non-object.json");
+        fs::write(&non_object, "[]")?;
+        let error = load_grok_output_schema_argv(&non_object)
+            .expect_err("non-object schema must fail closed")
+            .to_string();
+        assert!(error.contains("must be a JSON object"), "{error}");
+
+        let oversized = temp.path().join("oversized.json");
+        fs::write(
+            &oversized,
+            vec![b' '; GROK_OUTPUT_SCHEMA_MAX_BYTES as usize + 1],
+        )?;
+        let error = load_grok_output_schema_argv(&oversized)
+            .expect_err("oversized schema must fail closed")
+            .to_string();
+        assert!(error.contains("bounded Grok output schema"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_end_event_alone_carries_structured_output() -> Result<()> {
+        let parsed = parse_grok_event_stream(
+            concat!(
+                "{\"type\":\"text\",\"data\":\"ordinary progress\"}\n",
+                "{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"abc123\",\"requestId\":\"xyz789\",\"structuredOutput\":{\"z\":1,\"a\":true}}\n",
+            )
+            .as_bytes(),
+        )?;
+        let GrokStreamOutcome::Completed(end) = parsed.outcome() else {
+            panic!("structured stream did not complete");
+        };
+        assert_eq!(
+            end.structured_output(),
+            Some(&serde_json::json!({"a": true, "z": 1}))
+        );
+        assert!(end.structured_output_error().is_none());
+        assert_eq!(
+            canonical_grok_structured_output(end.structured_output().unwrap())?,
+            br#"{"a":true,"z":1}"#.to_vec()
+        );
+
+        let misplaced = concat!(
+            "{\"type\":\"text\",\"data\":\"progress\",\"structuredOutput\":{}}\n",
+            "{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"abc123\",\"requestId\":\"xyz789\"}\n",
+        );
+        let error = parse_grok_event_stream(misplaced.as_bytes())
+            .expect_err("non-terminal structured output must fail closed")
+            .to_string();
+        assert!(error.contains("outside the terminal end event"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn structured_output_must_be_an_object_within_the_publication_bound() {
+        let non_object = canonical_grok_structured_output(&serde_json::json!(["report"]))
+            .expect_err("array output must fail closed")
+            .to_string();
+        assert!(non_object.contains("not a JSON object"), "{non_object}");
+
+        let oversized = serde_json::json!({
+            "report": "x".repeat(GROK_STRUCTURED_OUTPUT_MAX_BYTES)
+        });
+        let error = canonical_grok_structured_output(&oversized)
+            .expect_err("oversized structured output must fail closed")
+            .to_string();
+        assert!(error.contains("exceeds the 8388608 byte limit"), "{error}");
     }
 
     #[test]
