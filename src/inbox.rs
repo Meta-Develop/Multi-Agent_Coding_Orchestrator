@@ -16,6 +16,7 @@ use crate::{
     machine_global::MachineGlobalRetentionBinding,
     orchestrator::RunId,
     planning,
+    process_runner::{ProcessResourceLimits, StdinMode, TrustedFixedNetworkProfile},
     publication::{self, ExternalSourceGuard, ExternalSourceObjectKind},
     review::{ReviewerConfig, ReviewerMode},
     safe_state::{stable_checksum, BoundedRegularReader, SafeRoot},
@@ -26,7 +27,7 @@ use crate::{
 use anyhow::{bail, Context, Result};
 #[cfg(test)]
 use git2::Repository;
-use git2::{Delta, DiffFindOptions, DiffOptions, Oid, StatusOptions};
+use git2::{Delta, DiffFindOptions, DiffOptions, ObjectType, Oid, StatusOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -95,6 +96,11 @@ const GH_OUTPUT_LIMIT: usize = 512 * 1024;
 const GH_DIAGNOSTIC_LIMIT: usize = 4 * 1024;
 const COMMENT_BODY_LIMIT: usize = 6 * 1024;
 const ARTIFACT_FINAL_MARKER: &str = ".maco-artifact-final.json";
+const PR_OBJECT_FETCH_CAPTURE_LIMIT: usize = 64 * 1024;
+const PR_OBJECT_FETCH_MAX_OBJECTS: usize = 131_072;
+const PR_OBJECT_FETCH_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const PR_OBJECT_FETCH_MAX_GRAPH_STEPS: usize = PR_OBJECT_FETCH_MAX_OBJECTS * 4;
+const PR_OBJECT_FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub const DEFAULT_ROLLING_WINDOW_SECONDS: u64 =
     crate::budget_ledger::DEFAULT_ROLLING_WINDOW_SECONDS;
@@ -3012,7 +3018,8 @@ where
     }
     let task = task.expect("checked source-bound independent-audit task");
     if item.source_snapshot.provider() == InboxSourceProvider::Github
-        && verify_local_independent_audit_candidate(context.repo, task).is_err()
+        && materialize_and_verify_local_independent_audit_candidate(context.repo, item, task)
+            .is_err()
     {
         let lane = review_loop_entry::blocked_independent_audit_lane_result(
             item,
@@ -3263,6 +3270,497 @@ where
         }
     };
     finish_independent_audit_lane_item(writer, input, review_loop, pr_intake, lane)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrustedGithubPullRequestObjectRequest {
+    remote_url: String,
+    base_remote_ref: String,
+    head_remote_ref: String,
+    expected_base_oid: Oid,
+    expected_head_oid: Oid,
+}
+
+fn materialize_and_verify_local_independent_audit_candidate(
+    repo_path: &Path,
+    item: &InboxItem,
+    task: &InboxIndependentAuditMergeLaneTask,
+) -> Result<()> {
+    materialize_and_verify_local_independent_audit_candidate_with(
+        repo_path,
+        item,
+        task,
+        materialize_trusted_github_pull_request_objects,
+        revalidate_inbox_item_source,
+    )
+}
+
+fn materialize_and_verify_local_independent_audit_candidate_with<M, R>(
+    repo_path: &Path,
+    item: &InboxItem,
+    task: &InboxIndependentAuditMergeLaneTask,
+    mut materialize: M,
+    mut revalidate: R,
+) -> Result<()>
+where
+    M: FnMut(&Path, &TrustedGithubPullRequestObjectRequest) -> Result<()>,
+    R: FnMut(&Path, &InboxItem) -> Result<()>,
+{
+    let request = trusted_github_pull_request_object_request(repo_path, item, task)?;
+    let repository = crate::git_repository::open(repo_path)
+        .context("open repository before exact pull-request object materialization")?;
+    let has_exact_commits = repository.find_commit(request.expected_base_oid).is_ok()
+        && repository.find_commit(request.expected_head_oid).is_ok();
+    drop(repository);
+    if !has_exact_commits {
+        materialize(repo_path, &request)
+            .context("bounded exact pull-request object transport failed")?;
+    }
+
+    // The transport is intentionally followed by a new provider observation.
+    // No diff is inspected before this point, so a PR/base ref that moved while
+    // objects were in flight cannot turn stale objects into audit evidence.
+    revalidate(repo_path, item)
+        .context("GitHub source changed after exact pull-request object materialization")?;
+    verify_local_independent_audit_candidate(repo_path, task)
+}
+
+fn trusted_github_pull_request_object_request(
+    repo_path: &Path,
+    item: &InboxItem,
+    task: &InboxIndependentAuditMergeLaneTask,
+) -> Result<TrustedGithubPullRequestObjectRequest> {
+    item.source_snapshot.validate()?;
+    if item.kind != InboxItemKind::PullRequest
+        || item.source_snapshot.kind() != InboxItemKind::PullRequest
+        || item.source_snapshot.provider() != InboxSourceProvider::Github
+    {
+        bail!("exact pull-request object materialization requires a GitHub PR snapshot");
+    }
+    let pull_request = item
+        .pull_request
+        .as_ref()
+        .context("GitHub PR snapshot omitted its pull-request candidate")?;
+    if pull_request.number != item.source_snapshot.number()
+        || task.source_snapshot_digest != item.source_snapshot.digest()
+        || task.source_updated_at != item.source_snapshot.updated_at()
+        || task.head_oid != item.source_snapshot.head_oid().unwrap_or_default()
+        || task.base_oid != item.source_snapshot.base_oid().unwrap_or_default()
+        || task.changed_files != pull_request.changed_files
+        || task.checks != pull_request.checks
+        || task.head_repository != pull_request.head_repository
+    {
+        bail!("pull-request materialization input drifted from its source-bound audit task");
+    }
+    if pull_request.is_draft
+        || task.is_draft
+        || pull_request.source_trust != GithubPrSourceTrust::TrustedTargetRepository
+        || task.source_trust != GithubPrSourceTrust::TrustedTargetRepository
+    {
+        bail!(
+            "pull-request object materialization requires a trusted non-draft same-repository head"
+        );
+    }
+    let target_owner_name = item
+        .source_snapshot
+        .repository_selector()
+        .split_once('/')
+        .map(|(_, owner_name)| owner_name)
+        .context("GitHub source selector omitted its host")?;
+    if target_owner_name.split('/').count() != 2
+        || pull_request
+            .head_repository
+            .as_deref()
+            .is_none_or(|repository| !repository.eq_ignore_ascii_case(target_owner_name))
+    {
+        bail!("pull-request object materialization refuses fork or unbound head repositories");
+    }
+    let base_ref = pull_request
+        .base_ref
+        .as_deref()
+        .context("GitHub PR snapshot omitted its base branch")?;
+    validate_github_materialization_branch(base_ref)?;
+    let expected_head_oid =
+        Oid::from_str(&task.head_oid).context("parse source-bound pull-request head OID")?;
+    let expected_base_oid =
+        Oid::from_str(&task.base_oid).context("parse source-bound pull-request base OID")?;
+    if expected_head_oid.to_string() != task.head_oid
+        || expected_base_oid.to_string() != task.base_oid
+    {
+        bail!("source-bound pull-request OIDs were not canonical SHA-1 identities");
+    }
+
+    let repository = crate::git_repository::open(repo_path)
+        .context("open repository for trusted pull-request object transport")?;
+    let common = SafeRoot::open_existing(repository.commondir())
+        .context("bind repository identity for trusted pull-request object transport")?;
+    if publication::external_source_repository_identity(
+        common.identity().device,
+        common.identity().file,
+    ) != item.source_snapshot.repository_identity()
+    {
+        bail!("pull-request object materialization repository identity changed");
+    }
+    let origin = repository
+        .find_remote("origin")
+        .context("trusted pull-request object transport requires origin")?;
+    let origin_url = origin
+        .url()
+        .context("trusted pull-request object transport origin was not UTF-8")?;
+    let (origin_host, origin_selector) =
+        publication::canonical_github_source_repository(origin_url)?;
+    if origin_host != item.source_snapshot.repository_host()
+        || origin_selector != item.source_snapshot.repository_selector()
+    {
+        bail!("pull-request object materialization origin changed from its source binding");
+    }
+    common.verify()?;
+
+    Ok(TrustedGithubPullRequestObjectRequest {
+        // Reconstruct the transport URL from validated canonical snapshot
+        // fields. The command never consumes a caller-provided URL, remote
+        // helper, or mutable fetch refspec.
+        remote_url: format!(
+            "https://{}/{}.git",
+            item.source_snapshot.repository_host(),
+            target_owner_name
+        ),
+        base_remote_ref: format!("refs/heads/{base_ref}"),
+        head_remote_ref: format!("refs/pull/{}/head", item.source_snapshot.number()),
+        expected_base_oid,
+        expected_head_oid,
+    })
+}
+
+fn validate_github_materialization_branch(branch: &str) -> Result<()> {
+    if branch.is_empty()
+        || branch.len() > MAX_GITHUB_REF_BYTES
+        || branch.starts_with('/')
+        || branch.ends_with('/')
+        || branch.starts_with('.')
+        || branch.ends_with('.')
+        || branch.contains("..")
+        || branch.contains("@{")
+        || branch.bytes().any(|byte| {
+            !(byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.'))
+        })
+        || branch.split('/').any(|component| {
+            component.is_empty()
+                || component.starts_with('.')
+                || component.ends_with('.')
+                || component.ends_with(".lock")
+        })
+    {
+        bail!("GitHub PR base branch is not a strict transport-safe ref name");
+    }
+    Ok(())
+}
+
+fn materialize_trusted_github_pull_request_objects(
+    repo_path: &Path,
+    request: &TrustedGithubPullRequestObjectRequest,
+) -> Result<()> {
+    let target = crate::git_repository::open(repo_path)
+        .context("open target repository for exact pull-request object materialization")?;
+    let target_common = SafeRoot::open_existing(target.commondir())
+        .context("bind target object database during pull-request materialization")?;
+    let mut runtime = crate::merge::PrivateRuntimeDirectory::create(
+        repo_path,
+        crate::merge::PrivateRuntimeKind::PublicationGit,
+    )?;
+    let directory = runtime.path().to_path_buf();
+    let execution = (|| -> Result<()> {
+        initialize_pull_request_fetch_repository(&directory, request)?;
+        let config_path = directory.join("config");
+        let global_config = directory.join("disabled-global-config");
+        let config_before =
+            fs::read(&config_path).context("read sealed pull-request fetch configuration")?;
+        let global_before =
+            fs::read(&global_config).context("read sealed pull-request global configuration")?;
+        let mut environment = crate::merge::minimal_network_environment()?;
+        environment.insert(
+            "GIT_CONFIG_GLOBAL".to_string(),
+            global_config
+                .to_str()
+                .context("pull-request fetch global config path was not UTF-8")?
+                .to_string(),
+        );
+        let primary = fs::canonicalize(
+            target
+                .commondir()
+                .parent()
+                .context("target Git common directory omitted its repository root")?,
+        )
+        .context("resolve primary worktree for pull-request fetch isolation")?;
+        let source_worktree = fs::canonicalize(repo_path)
+            .context("resolve source worktree for pull-request fetch isolation")?;
+        let profile = TrustedFixedNetworkProfile::read_write(&directory)
+            .with_resource_limits(ProcessResourceLimits {
+                memory_max_bytes: 1024 * 1024 * 1024,
+                tasks_max: 64,
+                cpu_quota_percent: 400,
+                open_files_max: 1024,
+                file_size_max_bytes: PR_OBJECT_FETCH_MAX_BYTES,
+            })
+            .with_visible_read_only_file(&config_path)
+            .with_visible_read_only_file(&global_config)
+            .with_hidden_root(primary)
+            .with_hidden_root(source_worktree);
+        let base_refspec = format!("+{}:refs/maco-inbox/base", request.base_remote_ref);
+        let head_refspec = format!("+{}:refs/maco-inbox/head", request.head_remote_ref);
+        let args = vec![
+            "--git-dir".into(),
+            directory.as_os_str().to_os_string(),
+            "-c".into(),
+            "core.fsmonitor=false".into(),
+            "-c".into(),
+            "core.untrackedCache=false".into(),
+            "-c".into(),
+            "protocol.allow=never".into(),
+            "-c".into(),
+            "protocol.https.allow=always".into(),
+            "fetch".into(),
+            "--force".into(),
+            "--no-tags".into(),
+            "--no-recurse-submodules".into(),
+            "--no-write-fetch-head".into(),
+            "maco-inbox".into(),
+            base_refspec.into(),
+            head_refspec.into(),
+        ];
+        let output = crate::merge::run_required_network_direct(
+            "fetch exact trusted pull-request objects",
+            crate::merge::resolve_trusted_executable("git")?,
+            args,
+            &directory,
+            environment,
+            StdinMode::Null,
+            PR_OBJECT_FETCH_TIMEOUT,
+            PR_OBJECT_FETCH_CAPTURE_LIMIT,
+            0,
+            profile,
+        )?;
+        if !output.success {
+            bail!(
+                "exact pull-request object fetch failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        runtime
+            .verify_identity()
+            .context("pull-request fetch runtime changed during transport")?;
+        if fs::read(&config_path)? != config_before || fs::read(&global_config)? != global_before {
+            bail!("pull-request fetch configuration changed during transport");
+        }
+        let fetched = crate::git_repository::open_bare(&directory)
+            .context("open bounded pull-request fetch repository")?;
+        validate_materialized_pull_request_refs(&fetched, request)?;
+        copy_pull_request_object_closure(
+            &fetched,
+            &target,
+            request.expected_base_oid,
+            request.expected_head_oid,
+        )?;
+        target_common.verify()
+    })();
+    let cleanup = runtime.close();
+    match (execution, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error.context("clean up pull-request fetch runtime")),
+        (Err(error), Err(cleanup)) => Err(anyhow::anyhow!(
+            "{error:#}; pull-request fetch runtime cleanup also failed: {cleanup:#}"
+        )),
+    }
+}
+
+fn initialize_pull_request_fetch_repository(
+    directory: &Path,
+    request: &TrustedGithubPullRequestObjectRequest,
+) -> Result<()> {
+    crate::merge::create_private_directory(&directory.join("objects"))?;
+    crate::merge::create_private_directory(&directory.join("objects/info"))?;
+    crate::merge::create_private_directory(&directory.join("objects/pack"))?;
+    crate::merge::create_private_directory(&directory.join("refs"))?;
+    crate::merge::create_private_directory(&directory.join("refs/heads"))?;
+    crate::merge::create_private_directory(&directory.join("refs/tags"))?;
+    crate::merge::create_private_directory(&directory.join("disabled-hooks"))?;
+    crate::merge::write_private_file(&directory.join("HEAD"), b"ref: refs/heads/maco-inbox\n")?;
+    let config_path = directory.join("config");
+    crate::merge::write_private_file(&config_path, b"")?;
+    crate::merge::write_private_file(&directory.join("disabled-global-config"), b"")?;
+    let mut config = git2::Config::open(&config_path)
+        .context("open private pull-request fetch configuration")?;
+    config.set_i32("core.repositoryformatversion", 0)?;
+    config.set_bool("core.bare", true)?;
+    config.set_bool("core.fsmonitor", false)?;
+    config.set_bool("core.untrackedcache", false)?;
+    config.set_str(
+        "core.hookspath",
+        directory
+            .join("disabled-hooks")
+            .to_str()
+            .context("pull-request disabled-hooks path was not UTF-8")?,
+    )?;
+    config.set_str("protocol.allow", "never")?;
+    config.set_str("protocol.https.allow", "always")?;
+    config.set_str("protocol.ext.allow", "never")?;
+    config.set_str("protocol.file.allow", "never")?;
+    config.set_str("http.followredirects", "false")?;
+    config.set_bool("http.sslverify", true)?;
+    config.set_str("http.proxy", "")?;
+    config.set_str("credential.helper", "")?;
+    config.set_str("core.askpass", "")?;
+    config.set_bool("fetch.fsckobjects", true)?;
+    config.set_bool("transfer.fsckobjects", true)?;
+    config.set_i32("gc.auto", 0)?;
+    config.set_bool("maintenance.auto", false)?;
+    config.set_bool("submodule.recurse", false)?;
+    config.set_str("remote.maco-inbox.url", &request.remote_url)?;
+    config.set_str("remote.maco-inbox.tagopt", "--no-tags")?;
+    Ok(())
+}
+
+fn validate_materialized_pull_request_refs(
+    repository: &git2::Repository,
+    request: &TrustedGithubPullRequestObjectRequest,
+) -> Result<()> {
+    let expected = [
+        ("refs/maco-inbox/base", request.expected_base_oid),
+        ("refs/maco-inbox/head", request.expected_head_oid),
+    ];
+    let mut observed_names = BTreeSet::new();
+    for reference in repository.references()? {
+        let reference = reference.context("inspect pull-request fetch reference")?;
+        let name = reference
+            .name()
+            .context("pull-request fetch produced a non-UTF-8 reference")?;
+        observed_names.insert(name.to_string());
+    }
+    if observed_names
+        != expected
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect::<BTreeSet<_>>()
+    {
+        bail!("pull-request fetch produced refs outside its exact bounded destinations");
+    }
+    for (name, expected_oid) in expected {
+        let reference = repository.find_reference(name)?;
+        let target = reference
+            .target()
+            .context("pull-request fetch produced a symbolic destination ref")?;
+        if target != expected_oid {
+            bail!("pull-request fetch ref drifted from its source-snapshot OID");
+        }
+        repository
+            .find_commit(target)
+            .context("pull-request fetch destination was not an exact commit")?;
+    }
+    Ok(())
+}
+
+fn copy_pull_request_object_closure(
+    source: &git2::Repository,
+    target: &git2::Repository,
+    base_oid: Oid,
+    head_oid: Oid,
+) -> Result<()> {
+    let source_odb = source
+        .odb()
+        .context("open fetched pull-request object database")?;
+    let target_odb = target
+        .odb()
+        .context("open target pull-request object database")?;
+    let mut pending = vec![
+        (base_oid, ObjectType::Commit),
+        (head_oid, ObjectType::Commit),
+    ];
+    let mut objects = BTreeMap::<Oid, ObjectType>::new();
+    let mut total_bytes = 0_u64;
+    let mut steps = 0usize;
+    while let Some((oid, expected_kind)) = pending.pop() {
+        steps = steps
+            .checked_add(1)
+            .context("pull-request object graph step count overflow")?;
+        if steps > PR_OBJECT_FETCH_MAX_GRAPH_STEPS {
+            bail!("pull-request object graph exceeded its traversal bound");
+        }
+        if let Some(prior) = objects.get(&oid) {
+            if *prior != expected_kind {
+                bail!("pull-request object graph reused an OID with contradictory kinds");
+            }
+            continue;
+        }
+        if objects.len() >= PR_OBJECT_FETCH_MAX_OBJECTS {
+            bail!("pull-request object graph exceeded its object-count bound");
+        }
+        let (size, kind) = source_odb
+            .read_header(oid)
+            .with_context(|| format!("fetched pull-request closure omitted object {oid}"))?;
+        if kind != expected_kind {
+            bail!("fetched pull-request closure contained an unexpected object kind");
+        }
+        total_bytes = total_bytes
+            .checked_add(u64::try_from(size).context("pull-request object size did not fit")?)
+            .context("pull-request object byte count overflow")?;
+        if total_bytes > PR_OBJECT_FETCH_MAX_BYTES {
+            bail!("pull-request object graph exceeded its aggregate byte bound");
+        }
+        objects.insert(oid, expected_kind);
+        match expected_kind {
+            ObjectType::Commit => {
+                let commit = source
+                    .find_commit(oid)
+                    .with_context(|| format!("parse fetched pull-request commit {oid}"))?;
+                pending.push((commit.tree_id(), ObjectType::Tree));
+                pending.extend(
+                    commit
+                        .parent_ids()
+                        .map(|parent| (parent, ObjectType::Commit)),
+                );
+            }
+            ObjectType::Tree => {
+                let tree = source
+                    .find_tree(oid)
+                    .with_context(|| format!("parse fetched pull-request tree {oid}"))?;
+                for entry in tree.iter() {
+                    match entry.kind() {
+                        Some(ObjectType::Tree) => pending.push((entry.id(), ObjectType::Tree)),
+                        Some(ObjectType::Blob) => pending.push((entry.id(), ObjectType::Blob)),
+                        Some(ObjectType::Commit) if entry.filemode() == 0o160000 => {
+                            // A gitlink names a commit in another repository. It is
+                            // metadata only and is never fetched or traversed here.
+                        }
+                        _ => bail!("pull-request tree contained an unsupported entry kind"),
+                    }
+                }
+            }
+            ObjectType::Blob => {}
+            _ => bail!("pull-request object graph contained an unsupported object kind"),
+        }
+    }
+    for (oid, kind) in objects {
+        let object = source_odb
+            .read(oid)
+            .with_context(|| format!("read bounded fetched pull-request object {oid}"))?;
+        if object.kind() != kind {
+            bail!("fetched pull-request object changed kind during materialization");
+        }
+        let written = target_odb
+            .write(kind, object.data())
+            .with_context(|| format!("materialize exact pull-request object {oid}"))?;
+        if written != oid {
+            bail!("pull-request object materialization changed an object identity");
+        }
+    }
+    target
+        .find_commit(base_oid)
+        .context("materialized repository omitted exact pull-request base")?;
+    target
+        .find_commit(head_oid)
+        .context("materialized repository omitted exact pull-request head")?;
+    Ok(())
 }
 
 fn verify_local_independent_audit_candidate(
@@ -5618,6 +6116,230 @@ mod pr_intake_always_on_audit_tests {
     }
 
     #[test]
+    fn github_pr_materialization_missing_objects_fails_closed() {
+        let source_temp = tempfile::TempDir::new().expect("source tempdir");
+        let source_path = source_temp.path().join("source");
+        crate::worktree::WorktreeManager::init_repository(&source_path, "main")
+            .expect("initialize source repository");
+        let (base, head) = create_materialization_test_commits(&source_path);
+
+        let target_temp = tempfile::TempDir::new().expect("target tempdir");
+        let target_path = target_temp.path().join("target");
+        crate::worktree::WorktreeManager::init_repository(&target_path, "main")
+            .expect("initialize target repository");
+        let (item, task) = github_materialization_test_item(&target_path, base, head);
+        let transported = std::cell::Cell::new(false);
+        let revalidated = std::cell::Cell::new(false);
+        let error = materialize_and_verify_local_independent_audit_candidate_with(
+            &target_path,
+            &item,
+            &task,
+            |_, _| {
+                transported.set(true);
+                Ok(())
+            },
+            |_, _| {
+                revalidated.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("missing transported objects must fail closed");
+        assert!(transported.get());
+        assert!(revalidated.get());
+        assert!(error.to_string().contains("omitted the exact pull-request"));
+    }
+
+    #[test]
+    fn github_pr_materialization_ref_swap_is_rejected() {
+        let source_temp = tempfile::TempDir::new().expect("source tempdir");
+        let source_path = source_temp.path().join("source");
+        crate::worktree::WorktreeManager::init_repository(&source_path, "main")
+            .expect("initialize source repository");
+        let (base, head) = create_materialization_test_commits(&source_path);
+
+        let target_temp = tempfile::TempDir::new().expect("target tempdir");
+        let target_path = target_temp.path().join("target");
+        crate::worktree::WorktreeManager::init_repository(&target_path, "main")
+            .expect("initialize target repository");
+        let (item, task) = github_materialization_test_item(&target_path, base, head);
+        let request = trusted_github_pull_request_object_request(&target_path, &item, &task)
+            .expect("trusted materialization request");
+
+        let fetched_path = target_temp.path().join("fetched.git");
+        let fetched = Repository::init_bare(&fetched_path).expect("initialize fetched repository");
+        let source = Repository::open(&source_path).expect("open source repository");
+        copy_pull_request_object_closure(&source, &fetched, base, head)
+            .expect("copy test object closure");
+        fetched
+            .reference("refs/maco-inbox/base", head, true, "test swapped base")
+            .expect("write swapped base");
+        fetched
+            .reference("refs/maco-inbox/head", base, true, "test swapped head")
+            .expect("write swapped head");
+
+        let error = validate_materialized_pull_request_refs(&fetched, &request)
+            .expect_err("swapped transport refs must fail closed");
+        assert!(error.to_string().contains("drifted"));
+    }
+
+    #[test]
+    fn github_pr_materialization_rejects_stale_snapshot_after_valid_objects() {
+        let source_temp = tempfile::TempDir::new().expect("source tempdir");
+        let source_path = source_temp.path().join("source");
+        crate::worktree::WorktreeManager::init_repository(&source_path, "main")
+            .expect("initialize source repository");
+        let (base, head) = create_materialization_test_commits(&source_path);
+        let source = Repository::open(&source_path).expect("open source repository");
+
+        let target_temp = tempfile::TempDir::new().expect("target tempdir");
+        let target_path = target_temp.path().join("target");
+        crate::worktree::WorktreeManager::init_repository(&target_path, "main")
+            .expect("initialize target repository");
+        let target = Repository::open(&target_path).expect("open target repository");
+        let (item, task) = github_materialization_test_item(&target_path, base, head);
+        let error = materialize_and_verify_local_independent_audit_candidate_with(
+            &target_path,
+            &item,
+            &task,
+            |_, request| {
+                copy_pull_request_object_closure(
+                    &source,
+                    &target,
+                    request.expected_base_oid,
+                    request.expected_head_oid,
+                )
+            },
+            |_, _| bail!("external source changed from its exact freshness snapshot"),
+        )
+        .expect_err("stale source snapshot must fail after object materialization");
+        assert!(target.find_commit(base).is_ok());
+        assert!(target.find_commit(head).is_ok());
+        assert!(error
+            .to_string()
+            .contains("GitHub source changed after exact pull-request object materialization"));
+    }
+
+    #[test]
+    fn github_pr_materialization_refuses_untrusted_and_fork_inputs() {
+        let source_temp = tempfile::TempDir::new().expect("source tempdir");
+        let source_path = source_temp.path().join("source");
+        crate::worktree::WorktreeManager::init_repository(&source_path, "main")
+            .expect("initialize source repository");
+        let (base, head) = create_materialization_test_commits(&source_path);
+
+        let target_temp = tempfile::TempDir::new().expect("target tempdir");
+        let target_path = target_temp.path().join("target");
+        crate::worktree::WorktreeManager::init_repository(&target_path, "main")
+            .expect("initialize target repository");
+        let (trusted_item, trusted_task) =
+            github_materialization_test_item(&target_path, base, head);
+        for trust in [GithubPrSourceTrust::Fork, GithubPrSourceTrust::Untrusted] {
+            let mut item = trusted_item.clone();
+            item.pull_request
+                .as_mut()
+                .expect("pull request")
+                .source_trust = trust;
+            let mut task = trusted_task.clone();
+            task.source_trust = trust;
+            let transported = std::cell::Cell::new(false);
+            let revalidated = std::cell::Cell::new(false);
+            materialize_and_verify_local_independent_audit_candidate_with(
+                &target_path,
+                &item,
+                &task,
+                |_, _| {
+                    transported.set(true);
+                    Ok(())
+                },
+                |_, _| {
+                    revalidated.set(true);
+                    Ok(())
+                },
+            )
+            .expect_err("untrusted materialization input must fail closed");
+            assert!(!transported.get());
+            assert!(!revalidated.get());
+        }
+    }
+
+    #[test]
+    fn github_pr_materialization_propagates_bounded_transport_failure() {
+        let source_temp = tempfile::TempDir::new().expect("source tempdir");
+        let source_path = source_temp.path().join("source");
+        crate::worktree::WorktreeManager::init_repository(&source_path, "main")
+            .expect("initialize source repository");
+        let (base, head) = create_materialization_test_commits(&source_path);
+
+        let target_temp = tempfile::TempDir::new().expect("target tempdir");
+        let target_path = target_temp.path().join("target");
+        crate::worktree::WorktreeManager::init_repository(&target_path, "main")
+            .expect("initialize target repository");
+        let (item, task) = github_materialization_test_item(&target_path, base, head);
+        let revalidated = std::cell::Cell::new(false);
+        let error = materialize_and_verify_local_independent_audit_candidate_with(
+            &target_path,
+            &item,
+            &task,
+            |_, _| bail!("transport resource bound exceeded"),
+            |_, _| {
+                revalidated.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("bounded transport failure must fail closed");
+        assert!(!revalidated.get());
+        assert!(error
+            .to_string()
+            .contains("bounded exact pull-request object transport failed"));
+    }
+
+    #[test]
+    fn github_pr_materialization_accepts_valid_exact_objects_after_revalidation() {
+        let source_temp = tempfile::TempDir::new().expect("source tempdir");
+        let source_path = source_temp.path().join("source");
+        crate::worktree::WorktreeManager::init_repository(&source_path, "main")
+            .expect("initialize source repository");
+        let (base, head) = create_materialization_test_commits(&source_path);
+        let source = Repository::open(&source_path).expect("open source repository");
+
+        let target_temp = tempfile::TempDir::new().expect("target tempdir");
+        let target_path = target_temp.path().join("target");
+        crate::worktree::WorktreeManager::init_repository(&target_path, "main")
+            .expect("initialize target repository");
+        let target = Repository::open(&target_path).expect("open target repository");
+        let (item, task) = github_materialization_test_item(&target_path, base, head);
+        let transported = std::cell::Cell::new(false);
+        let revalidated = std::cell::Cell::new(false);
+        materialize_and_verify_local_independent_audit_candidate_with(
+            &target_path,
+            &item,
+            &task,
+            |_, request| {
+                transported.set(true);
+                copy_pull_request_object_closure(
+                    &source,
+                    &target,
+                    request.expected_base_oid,
+                    request.expected_head_oid,
+                )
+            },
+            |_, _| {
+                assert!(
+                    transported.get(),
+                    "revalidation must follow materialization"
+                );
+                assert!(target.find_commit(base).is_ok());
+                assert!(target.find_commit(head).is_ok());
+                revalidated.set(true);
+                Ok(())
+            },
+        )
+        .expect("valid exact materialized objects");
+        assert!(transported.get());
+        assert!(revalidated.get());
+    }
+
+    #[test]
     fn updated_pr_snapshot_is_not_suppressed_as_the_old_observation() {
         let config = InboxConfig::default();
         let raw = fake_pr(905);
@@ -5649,6 +6371,89 @@ mod pr_intake_always_on_audit_tests {
         apply_pr_snapshot_duplicate(&mut item, &exact_snapshots);
         assert!(!item.selected, "unchanged snapshot remains suppressed");
         assert_eq!(item.skip_reason.as_deref(), Some("duplicate"));
+    }
+
+    fn create_materialization_test_commits(repo_path: &Path) -> (Oid, Oid) {
+        let repository = Repository::open(repo_path).expect("open materialization repository");
+        let signature = git2::Signature::now("Materialization Test", "test@example.invalid")
+            .expect("test signature");
+        fs::write(repo_path.join("base.txt"), "base\n").expect("write base file");
+        let mut index = repository.index().expect("base index");
+        index
+            .add_path(Path::new("base.txt"))
+            .expect("add base file");
+        index.write().expect("write base index");
+        let base_tree_oid = index.write_tree().expect("write base tree");
+        let base_tree = repository.find_tree(base_tree_oid).expect("find base tree");
+        let base = repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "base",
+                &base_tree,
+                &[],
+            )
+            .expect("commit base");
+        drop(base_tree);
+
+        fs::write(repo_path.join("audit.txt"), "audited\n").expect("write audit file");
+        let mut index = repository.index().expect("head index");
+        index
+            .add_path(Path::new("audit.txt"))
+            .expect("add audit file");
+        index.write().expect("write head index");
+        let head_tree_oid = index.write_tree().expect("write head tree");
+        let head_tree = repository.find_tree(head_tree_oid).expect("find head tree");
+        let parent = repository.find_commit(base).expect("find base parent");
+        let head = repository
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "head",
+                &head_tree,
+                &[&parent],
+            )
+            .expect("commit head");
+        (base, head)
+    }
+
+    fn github_materialization_test_item(
+        repo_path: &Path,
+        base: Oid,
+        head: Oid,
+    ) -> (InboxItem, InboxIndependentAuditMergeLaneTask) {
+        let repository = Repository::open(repo_path).expect("open target materialization repo");
+        repository
+            .remote("origin", "https://github.com/acme/repo.git")
+            .expect("set canonical origin");
+        let common = SafeRoot::open_existing(repository.commondir()).expect("bind common dir");
+        let source = SourceRepositoryBindingContext {
+            host: "github.com".to_string(),
+            selector: "github.com/acme/repo".to_string(),
+            identity: publication::external_source_repository_identity(
+                common.identity().device,
+                common.identity().file,
+            ),
+        };
+        let mut raw = fake_pr(909);
+        raw.provider = InboxSourceProvider::Github;
+        raw.url = Some("https://github.com/acme/repo/pull/909".to_string());
+        raw.base_oid = base.to_string();
+        raw.head_oid = head.to_string();
+        raw.base_ref = Some("main".to_string());
+        raw.head_ref = Some("feature/exact-audit".to_string());
+        raw.head_repository = Some("acme/repo".to_string());
+        raw.source_trust = GithubPrSourceTrust::TrustedTargetRepository;
+        raw.changed_files = vec![PathBuf::from("audit.txt")];
+        let item = pr_item(raw, &InboxConfig::default(), &source, &BTreeMap::new())
+            .expect("GitHub materialization item");
+        let task = pr_intake_report_for_item(&item)
+            .expect("materialization intake")
+            .task
+            .expect("materialization task");
+        (item, task)
     }
 
     fn fake_source() -> SourceRepositoryBindingContext {
