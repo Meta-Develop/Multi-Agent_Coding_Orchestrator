@@ -1,7 +1,8 @@
 //! Pinned Grok launch/event protocol and runtime-advertised model discovery.
 //!
-//! The launch descriptor fixes the headless output and inner-sandbox posture;
-//! the NDJSON parser accepts only bounded, terminally complete event streams.
+//! The launch descriptor fixes headless output, tool approval, and the
+//! inner-sandbox posture; the NDJSON parser accepts only bounded, terminally
+//! complete event streams.
 //! Catalog membership still comes only from one bounded `grok models`
 //! observation or from the typed constructed-entry injection seam. Policy code
 //! may classify returned slugs, but this adapter does not embed a live model
@@ -122,13 +123,15 @@ fn resolve_grok_executable_candidate(
 
 /// Immutable Grok headless protocol supported by this adapter.
 ///
-/// Model and reasoning effort remain selector inputs. Every protocol and
-/// confinement argument below is fixed by MACO and is not an operator template.
+/// Model and reasoning effort remain selector inputs. Every protocol, approval,
+/// and confinement argument below is fixed by MACO and is not an operator
+/// template.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GrokRuntimeDescriptor {
     executable: &'static str,
     output_format: &'static str,
     sandbox_profile: &'static str,
+    headless_approval_flag: &'static str,
 }
 
 impl GrokRuntimeDescriptor {
@@ -142,6 +145,10 @@ impl GrokRuntimeDescriptor {
 
     pub const fn sandbox_profile(self) -> &'static str {
         self.sandbox_profile
+    }
+
+    pub const fn headless_approval_flag(self) -> &'static str {
+        self.headless_approval_flag
     }
 
     pub const fn subagents_disabled(self) -> bool {
@@ -171,6 +178,7 @@ impl GrokRuntimeDescriptor {
             self.output_format,
             "--sandbox",
             self.sandbox_profile,
+            self.headless_approval_flag,
             "--disable-web-search",
             "--no-memory",
             "--no-subagents",
@@ -185,6 +193,7 @@ pub const GROK_RUNTIME_DESCRIPTOR: GrokRuntimeDescriptor = GrokRuntimeDescriptor
     executable: "grok",
     output_format: "streaming-json",
     sandbox_profile: "strict",
+    headless_approval_flag: "--always-approve",
 };
 
 /// One validated event from Grok's `streaming-json` output.
@@ -1383,6 +1392,10 @@ mod tests {
         assert_eq!(GROK_RUNTIME_DESCRIPTOR.executable(), "grok");
         assert_eq!(GROK_RUNTIME_DESCRIPTOR.output_format(), "streaming-json");
         assert_eq!(GROK_RUNTIME_DESCRIPTOR.sandbox_profile(), "strict");
+        assert_eq!(
+            GROK_RUNTIME_DESCRIPTOR.headless_approval_flag(),
+            "--always-approve"
+        );
         assert!(GROK_RUNTIME_DESCRIPTOR.subagents_disabled());
         assert!(GROK_RUNTIME_DESCRIPTOR.memory_disabled());
         assert!(GROK_RUNTIME_DESCRIPTOR.web_search_disabled());
@@ -1401,6 +1414,7 @@ mod tests {
                 "streaming-json",
                 "--sandbox",
                 "strict",
+                "--always-approve",
                 "--disable-web-search",
                 "--no-memory",
                 "--no-subagents",
