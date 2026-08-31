@@ -4111,7 +4111,12 @@ fn external_side_effect_profile(
                 profile = profile.with_visible_read_only_root(program_parent);
             }
             if let Some(schema) = &spec.output_schema {
-                profile = profile.with_visible_read_only_file(schema);
+                if !protected_controls
+                    .exact_read_only_input_files
+                    .contains(schema)
+                {
+                    profile = profile.with_visible_read_only_file(schema);
+                }
             }
             if spec.invocation == ExternalAgentInvocation::Grok {
                 // Grok's pinned headless protocol reads the prompt by pathname. The shared
@@ -4947,13 +4952,18 @@ fn runtime_adapter_argv(spec: &ExternalAgentCommand) -> Result<Vec<OsString>> {
             _ => RuntimeId::Codex,
         })
     });
-    config.render_os_argv(&LaunchContext {
+    let context = LaunchContext {
         prompt: &spec.prompt,
         model: spec.model.as_deref(),
         effort: spec.reasoning_effort.as_deref(),
         cwd: &spec.cwd,
         output: &spec.output_last_message,
-    })
+    };
+    if spec.invocation == ExternalAgentInvocation::Grok {
+        config.render_grok_os_argv(&context, spec.output_schema.as_deref())
+    } else {
+        config.render_os_argv(&context)
+    }
 }
 
 fn codex_supervisor_argv(

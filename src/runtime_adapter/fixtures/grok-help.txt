@@ -7,6 +7,8 @@ Options:
           Working directory
       --disable-web-search
           Disable web search and web fetch tools
+      --json-schema <SCHEMA>
+          JSON Schema for structured output. When set, the model is constrained to produce JSON matching this schema. Implies --output-format json.
       --model <MODEL>
           Model ID to use
       --no-memory

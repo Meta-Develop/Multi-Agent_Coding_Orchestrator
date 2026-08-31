@@ -3977,6 +3977,70 @@ fn grok_runtime_adapter_argv_immutably_disables_subagents() {
         .any(|argument| argument == "--no-subagents"));
 }
 
+#[test]
+fn grok_runtime_adapter_argv_binds_schema_json_without_weakening_operators() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema = temp.path().join("worker-report.schema.json");
+    fs::write(
+        &schema,
+        "{\n  \"type\": \"object\", \"required\": [\"accepted\"]\n}\n",
+    )?;
+    let mut grok = ExternalAgentCommand::codex(
+        "grok",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(1),
+    )
+    .with_runtime_adapter(
+        RuntimeId::Grok,
+        RuntimeAdapterConfig::defaults(RuntimeId::Grok),
+    )
+    .with_model_selection(Some("grok-4.6".to_string()), Some("xhigh".to_string()));
+    grok.output_schema = Some(schema);
+    let argv = runtime_adapter_argv(&grok)?
+        .into_iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        argv,
+        [
+            "--prompt-file",
+            "/run/prompt.md",
+            "--model",
+            "grok-4.6",
+            "--reasoning-effort",
+            "xhigh",
+            "--cwd",
+            "/workspace",
+            "--json-schema",
+            r#"{"required":["accepted"],"type":"object"}"#,
+            "--output-format",
+            "streaming-json",
+            "--sandbox",
+            "strict",
+            "--always-approve",
+            "--disable-web-search",
+            "--no-memory",
+            "--no-subagents",
+        ]
+    );
+    for fixed in [
+        "--output-format",
+        "streaming-json",
+        "--sandbox",
+        "strict",
+        "--always-approve",
+        "--disable-web-search",
+        "--no-memory",
+        "--no-subagents",
+    ] {
+        assert_eq!(argv.iter().filter(|argument| *argument == fixed).count(), 1);
+    }
+    Ok(())
+}
+
 fn selected_writable_grok_command(
     program: impl Into<PathBuf>,
     workspace: impl Into<PathBuf>,
@@ -4264,7 +4328,50 @@ fn grok_runtime_boundary_uses_prompt_file_and_validates_terminal_stream_output()
         "timed-out or nonzero Grok targets must not publish partial final output"
     );
 
+    let mut structured_grok = grok.clone();
+    structured_grok.output_schema = Some(PathBuf::from("/run/worker-report.schema.json"));
+    let structured = br#"{"type":"text","data":"ordinary progress before the report"}
+{"type":"end","stopReason":"EndTurn","sessionId":"session-1","requestId":"request-1","structuredOutput":{"status":"succeeded","accepted":true}}
+"#;
+    assert_eq!(
+        runtime_adapter_captured_output(&grok, structured, b"", true)?,
+        RuntimeAdapterCapturedOutput::Captured(b"ordinary progress before the report".to_vec()),
+        "Grok commands without a schema must retain their text response behavior"
+    );
+    assert_eq!(
+        runtime_adapter_captured_output(&structured_grok, structured, b"", true)?,
+        RuntimeAdapterCapturedOutput::Captured(
+            br#"{"accepted":true,"status":"succeeded"}"#.to_vec()
+        ),
+        "schema-bound publication must use only terminal structuredOutput"
+    );
+
+    let missing = br#"{"type":"text","data":"{\"accepted\":true}"}
+{"type":"end","stopReason":"EndTurn","sessionId":"session-1","requestId":"request-1"}
+"#;
+    let error = runtime_adapter_captured_output(&structured_grok, missing, b"", true)
+        .expect_err("leading report text must not substitute for structuredOutput")
+        .to_string();
+    assert!(error.contains("missing structuredOutput"), "{error}");
+
     let sensitive = "credential-fixture-must-not-escape";
+    let structured_error = format!(
+        "{{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"session-1\",\"requestId\":\"request-1\",\"structuredOutputError\":\"{sensitive}\"}}\n"
+    );
+    let error =
+        runtime_adapter_captured_output(&structured_grok, structured_error.as_bytes(), b"", true)
+            .expect_err("structuredOutputError must fail closed")
+            .to_string();
+    assert!(error.contains("terminal structuredOutputError"), "{error}");
+    assert!(!error.contains(sensitive));
+
+    let non_object = br#"{"type":"end","stopReason":"EndTurn","sessionId":"session-1","requestId":"request-1","structuredOutput":["report"]}
+"#;
+    let error = runtime_adapter_captured_output(&structured_grok, non_object, b"", true)
+        .expect_err("non-object structured output must fail closed")
+        .to_string();
+    assert!(error.contains("not a JSON object"), "{error}");
+
     let terminal_error = format!("{{\"type\":\"error\",\"message\":\"{sensitive}\"}}\n");
     let error = runtime_adapter_captured_output(&grok, terminal_error.as_bytes(), b"", true)
         .expect_err("a terminal Grok error event must fail the external run")
@@ -4284,8 +4391,12 @@ fn grok_prompt_file_is_an_exact_read_only_sandbox_input() -> Result<()> {
     fs::create_dir(&prompt_root)?;
     fs::create_dir(&incoming)?;
     let prompt = prompt_root.join("prompt.md");
+    let schema_root = temp.path().join("schema-root");
+    fs::create_dir(&schema_root)?;
+    let schema = schema_root.join("worker-report.schema.json");
     fs::write(&prompt, "bounded Grok prompt\n")?;
-    let grok = ExternalAgentCommand::codex(
+    fs::write(&schema, "{\"type\":\"object\"}\n")?;
+    let mut grok = ExternalAgentCommand::codex(
         workspace.join("grok"),
         &workspace,
         &prompt,
@@ -4298,6 +4409,7 @@ fn grok_prompt_file_is_an_exact_read_only_sandbox_input() -> Result<()> {
         RuntimeAdapterConfig::defaults(RuntimeId::Grok),
     )
     .with_model_selection(Some("grok-4.6".to_string()), Some("xhigh".to_string()));
+    grok.output_schema = Some(schema.clone());
     let controls = protected_worktree_controls(&grok)?;
     let profile = external_side_effect_profile(
         &grok,
@@ -4309,7 +4421,11 @@ fn grok_prompt_file_is_an_exact_read_only_sandbox_input() -> Result<()> {
         bail!("expected ExternalGrok profile");
     };
     assert!(profile.visible_read_only_files().contains(&prompt));
+    assert!(profile.visible_read_only_files().contains(&schema));
     assert!(!profile.visible_read_only_roots().contains(&prompt_root));
+    assert!(!profile.visible_read_only_roots().contains(&schema_root));
+    assert!(!profile.visible_read_write_files().contains(&schema));
+    assert!(!profile.visible_read_write_roots().contains(&schema_root));
     Ok(())
 }
 
