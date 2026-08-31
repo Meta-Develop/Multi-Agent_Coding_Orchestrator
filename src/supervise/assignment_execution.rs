@@ -6424,10 +6424,17 @@ done
                 "streaming-json".to_string(),
                 "--sandbox".to_string(),
                 "strict".to_string(),
+                "--always-approve".to_string(),
                 "--disable-web-search".to_string(),
                 "--no-memory".to_string(),
                 "--no-subagents".to_string(),
             ]
+        );
+        assert_eq!(
+            argv.iter()
+                .filter(|argument| argument.as_str() == "--always-approve")
+                .count(),
+            1
         );
         #[cfg(target_os = "linux")]
         {
