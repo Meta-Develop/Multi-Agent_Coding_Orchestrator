@@ -412,10 +412,20 @@ fn isolated_git_workspace_profile(
             common_dir.display()
         )
     })?;
+    let repository_root = common_dir
+        .parent()
+        .context("Git common directory omitted its parent repository root")?;
+    let repository_root = fs::canonicalize(repository_root).with_context(|| {
+        format!(
+            "failed to resolve Git repository root {}",
+            repository_root.display()
+        )
+    })?;
     let profile = StrictOfflineWorkspaceProfile::read_write(worktree_path)
         .with_writable_artifact_root(&context.directory)
         .with_visible_read_only_root(&context.alternate_object_directory)
-        .with_visible_read_only_root(&common_dir);
+        .with_visible_read_only_root(&common_dir)
+        .with_visible_read_only_root(&repository_root);
     hide_sensitive_state_if_present(profile, &common_dir)
 }
 
