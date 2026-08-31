@@ -3473,15 +3473,31 @@ fn snapshot_worktree_candidate_from_base(
     head: Option<Oid>,
     base_commit: Option<Oid>,
 ) -> Result<CapturedWorktreeTree> {
-    enforce_candidate_capture_quota(repo, worktree_path)?;
     let index = TemporaryIndex::create(repo.commondir())?;
+    snapshot_worktree_candidate_from_base_with_index(
+        repo,
+        worktree_path,
+        head,
+        base_commit,
+        &index,
+    )
+}
+
+fn snapshot_worktree_candidate_from_base_with_index(
+    repo: &Repository,
+    worktree_path: &Path,
+    head: Option<Oid>,
+    base_commit: Option<Oid>,
+    index: &TemporaryIndex,
+) -> Result<CapturedWorktreeTree> {
+    enforce_candidate_capture_quota(repo, worktree_path)?;
     let head_text = head.map(|oid| oid.to_string());
     let read_tree_args = match head_text.as_deref() {
         Some(oid) => vec!["read-tree", oid],
         None => vec!["read-tree", "--empty"],
     };
     let output = run_isolated_git_process(
-        &index,
+        index,
         worktree_path,
         &read_tree_args,
         StdinMode::Null,
@@ -3490,7 +3506,7 @@ fn snapshot_worktree_candidate_from_base(
     require_git_success(output, "initialize candidate snapshot index")?;
 
     let output = run_isolated_git_process(
-        &index,
+        index,
         worktree_path,
         &["add", "--all", "--", "."],
         StdinMode::Null,
@@ -3499,7 +3515,7 @@ fn snapshot_worktree_candidate_from_base(
     require_git_success(output, "populate candidate snapshot index")?;
 
     let output = run_isolated_git_process(
-        &index,
+        index,
         worktree_path,
         &["write-tree"],
         StdinMode::Null,
@@ -3514,10 +3530,10 @@ fn snapshot_worktree_candidate_from_base(
     let oid =
         String::from_utf8(output.stdout).context("candidate snapshot tree id was not UTF-8")?;
     let oid = Oid::from_str(oid.trim()).context("candidate snapshot tree id was invalid")?;
-    let base_tree = temporary_base_tree_oid(repo, worktree_path, base_commit, &index)?;
-    let changes = collect_snapshot_changes(worktree_path, base_tree, oid, &index)?;
-    let entries = collect_candidate_snapshot_entries(&index, oid, &changes)?;
-    let raw_diff = collect_snapshot_diff(worktree_path, base_tree, oid, &index)?;
+    let base_tree = temporary_base_tree_oid(repo, worktree_path, base_commit, index)?;
+    let changes = collect_snapshot_changes(worktree_path, base_tree, oid, index)?;
+    let entries = collect_candidate_snapshot_entries(index, oid, &changes)?;
+    let raw_diff = collect_snapshot_diff(worktree_path, base_tree, oid, index)?;
     Ok(CapturedWorktreeTree {
         oid,
         entries,

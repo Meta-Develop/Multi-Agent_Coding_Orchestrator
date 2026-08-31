@@ -2335,7 +2335,13 @@ impl CandidateValidationSandbox {
         let base = collection_base_oid(&preview.candidate.metadata)?;
         capture_two_matching(|| {
             let head = head_oid(&repo).context("failed to read validation sandbox HEAD")?;
-            let captured = snapshot_worktree_candidate_from_base(&repo, self.path(), head, base)?;
+            let captured = snapshot_worktree_candidate_from_base_with_index(
+                &repo,
+                self.path(),
+                head,
+                base,
+                &self.git_context,
+            )?;
             let binding =
                 candidate_validation_binding(&preview.candidate.metadata, &captured.raw_diff)?;
             let repository =
