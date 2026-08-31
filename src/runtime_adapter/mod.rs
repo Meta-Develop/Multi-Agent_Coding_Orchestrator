@@ -1146,7 +1146,7 @@ mod tests {
 
         let mut injected = config;
         injected.argument_template.push("--json-schema".to_string());
-        injected.argument_template.push("{}".to_string());
+        injected.argument_template.push("{prompt}".to_string());
         let error = injected
             .render_grok_with_output_schema(&context, Some(&schema))
             .expect_err("template-provided schema flag must fail closed")
