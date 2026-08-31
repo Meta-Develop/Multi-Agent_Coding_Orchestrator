@@ -443,7 +443,7 @@ fn completed_quota_refresh_switches_the_next_actual_assignment_launch_to_cursor(
         .expect("settle completed second Cursor assignment");
     assert_eq!(
         second_settlement.reliability,
-        DispatchUsageReliability::Reliable
+        DispatchUsageReliability::Estimated
     );
     assert_eq!(
         second_settlement
