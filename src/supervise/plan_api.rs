@@ -495,30 +495,69 @@ pub(super) fn explicit_existing_file_edit_verification_task(task: &str, target: 
     }
     let normalized = task
         .to_ascii_lowercase()
-        .replace(|character: char| matches!(character, '`' | '\'' | '"'), "")
+        .replace(['`', '\'', '"'], "")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
+    let normalized = normalized.strip_suffix('.').unwrap_or(&normalized);
     let target = target.to_ascii_lowercase();
-    let edit_directives = [
-        format!("in {target}, replace"),
-        format!("in {target} replace"),
+    let verification_clauses = [
+        format!(
+            ". verify the result with git diff --check and confirm {target} contains exactly that line"
+        ),
+        format!(
+            ". verify the result with git diff --check and confirm that {target} contains exactly that line"
+        ),
     ];
-    let exact_confirmations = [
-        format!("confirm {target} contains exactly that line"),
-        format!("confirm that {target} contains exactly that line"),
-    ];
-    normalized.matches("git diff --check").count() == 1
-        && edit_directives
-            .iter()
-            .filter(|directive| normalized.contains(directive.as_str()))
-            .count()
-            == 1
-        && exact_confirmations
-            .iter()
-            .filter(|confirmation| normalized.contains(confirmation.as_str()))
-            .count()
-            == 1
+    if normalized.matches("git diff --check").count() != 1
+        || normalized.matches("contains exactly that line").count() != 1
+    {
+        return false;
+    }
+    let mut matching_verification_clauses = verification_clauses
+        .iter()
+        .filter_map(|clause| normalized.strip_suffix(clause.as_str()));
+    let Some(edit_clause) = matching_verification_clauses.next() else {
+        return false;
+    };
+    if matching_verification_clauses.next().is_some() {
+        return false;
+    }
+
+    let edit_prefixes = [format!("in {target}, "), format!("in {target} ")];
+    let mut matching_edit_prefixes = edit_prefixes
+        .iter()
+        .filter_map(|prefix| edit_clause.strip_prefix(prefix.as_str()));
+    let Some(replacement_directive) = matching_edit_prefixes.next() else {
+        return false;
+    };
+    if matching_edit_prefixes.next().is_some() {
+        return false;
+    }
+
+    let exact_replacement_markers = ["with exactly:", "with exactly one line:"];
+    if exact_replacement_markers
+        .iter()
+        .map(|marker| replacement_directive.matches(*marker).count())
+        .sum::<usize>()
+        != 1
+    {
+        return false;
+    }
+
+    if let Some(payload) =
+        replacement_directive.strip_prefix("replace the entire contents with exactly one line:")
+    {
+        return !payload.trim().is_empty();
+    }
+
+    let Some(replacement) = replacement_directive.strip_prefix("replace ") else {
+        return false;
+    };
+    let Some((replaced_text, payload)) = replacement.split_once(" with exactly:") else {
+        return false;
+    };
+    !replaced_text.trim().is_empty() && !payload.trim().is_empty()
 }
 
 fn explicit_new_file_preclaim_directive(
@@ -3529,15 +3568,31 @@ mod diagnostics_emission_tests {
     #[test]
     fn existing_file_edit_verification_task_parser_is_exact_and_unambiguous() {
         let target = Path::new("README.md");
-        let task = "In README.md, replace the old line with exactly: replacement. Verify the result with git diff --check and confirm README.md contains exactly that line.";
-        assert!(explicit_existing_file_edit_verification_task(task, target));
+        for exact_literal_edit in [
+            "In README.md, replace the old line with exactly: replacement. Verify the result with git diff --check and confirm README.md contains exactly that line.",
+            "In `README.md`, replace the entire contents with exactly one line: replacement. Verify the result with git diff --check and confirm that `README.md` contains exactly that line.",
+        ] {
+            assert!(
+                explicit_existing_file_edit_verification_task(exact_literal_edit, target),
+                "failed to recognize exact literal edit: {exact_literal_edit}"
+            );
+        }
 
         for untrusted_or_ambiguous in [
             "Update README.md.",
             "In README.md, replace the old line and confirm README.md contains exactly that line.",
+            "In README.md, replace something. Verify the result with git diff --check and confirm README.md contains exactly that line.",
+            "In README.md, replace the old line with exactly: . Verify the result with git diff --check and confirm README.md contains exactly that line.",
+            "In README.md, replace the entire contents with exactly one line: ``. Verify the result with git diff --check and confirm README.md contains exactly that line.",
+            "In README.md, replace the old line with exactly: first, then replace it with exactly: second. Verify the result with git diff --check and confirm README.md contains exactly that line.",
+            "In README.md, replace the entire contents with exactly one line: first, then replace the old line with exactly: second. Verify the result with git diff --check and confirm README.md contains exactly that line.",
             "In README.md, replace the old line. Verify with git diff --check.",
             "In OTHER.md, replace the old line. Verify with git diff --check and confirm OTHER.md contains exactly that line.",
+            "In OTHER.md, replace the old line with exactly: replacement. Verify the result with git diff --check and confirm README.md contains exactly that line.",
+            "In README.md, replace the old line with exactly: replacement. Verify the result with git diff --check and confirm OTHER.md contains exactly that line.",
             "In README.md, replace the old line. Run git diff --check twice: git diff --check, then confirm README.md contains exactly that line.",
+            "In README.md, replace the old line with exactly: replacement. Verify the result with git diff --check and confirm README.md contains exactly that line, then confirm README.md contains exactly that line.",
+            "In README.md, replace the old line with exactly: replacement. Verify the result with git diff --check and confirm README.md contains exactly that line. Verify the result with git diff --check and confirm README.md contains exactly that line.",
         ] {
             assert!(
                 !explicit_existing_file_edit_verification_task(untrusted_or_ambiguous, target),
