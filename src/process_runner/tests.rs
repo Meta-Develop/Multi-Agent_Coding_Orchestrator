@@ -960,6 +960,109 @@ fn external_grok_profile_projects_exact_systemd_properties() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn hidden_roots_are_optional_only_when_absent_and_remain_masked_if_created() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("worktree");
+    let present = temp.path().join("present-hidden");
+    let absent = temp.path().join("absent-hidden");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::create_dir(&present).expect("present hidden root");
+    let profile = ExternalGrokProfile::read_only(&workspace)
+        .with_hidden_root(&present)
+        .with_hidden_root(&absent);
+    let spec = ProcessSpec::direct(
+        "hidden root optionality",
+        PathBuf::from("/bin/true"),
+        Vec::<OsString>::new(),
+        &workspace,
+        128,
+    )
+    .with_side_effect_confinement(SideEffectConfinementProfile::ExternalGrok(profile));
+    let sandbox = resolve_systemd_sandbox(&spec)
+        .expect("resolve sandbox with an absent hidden root")
+        .expect("workspace sandbox");
+
+    let present_check = sandbox
+        .mount_checks
+        .iter()
+        .find(|check| check.path == present && check.access == SandboxMountAccess::Inaccessible)
+        .expect("present hidden-root guardian check");
+    assert!(!present_check.optional);
+    assert!(sandbox
+        .path_identities
+        .iter()
+        .any(|identity| identity.path == present));
+    let absent_check = sandbox
+        .mount_checks
+        .iter()
+        .find(|check| check.path == absent && check.access == SandboxMountAccess::Inaccessible)
+        .expect("absent hidden-root guardian check");
+    assert!(absent_check.optional);
+    assert!(!sandbox
+        .path_identities
+        .iter()
+        .any(|identity| identity.path == absent));
+
+    fs::create_dir(&absent).expect("hidden root appeared before namespace setup");
+    let mut command = Command::new("systemd-run");
+    apply_systemd_sandbox_properties(
+        &mut command,
+        &sandbox,
+        Path::new("/run/user/1000/maco-test-runtime"),
+    );
+    let arguments = command
+        .get_args()
+        .map(OsStr::to_os_string)
+        .collect::<BTreeSet<_>>();
+    assert!(arguments.contains(&systemd_path_property(
+        "InaccessiblePaths=",
+        &present,
+        false
+    )));
+    assert!(arguments.contains(&systemd_path_property("InaccessiblePaths=", &absent, true)));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn grok_profile_accepts_missing_ambient_home_without_relaxing_required_roots() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("worktree");
+    let ambient_grok_home = temp.path().join("home").join(".grok");
+    let required_root = temp.path().join("required-hidden");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::create_dir_all(ambient_grok_home.parent().expect("ambient home parent"))
+        .expect("ambient home");
+    fs::create_dir(&required_root).expect("required hidden root");
+    let profile = ExternalGrokProfile::read_only(&workspace)
+        .with_hidden_root(&ambient_grok_home)
+        .with_hidden_root(&required_root);
+
+    let arguments =
+        external_grok_systemd_properties_for_test(profile, Path::new("/bin/true"), &workspace)
+            .expect("missing ambient Grok home must not prevent profile projection");
+    assert!(arguments.contains(
+        &systemd_path_property("InaccessiblePaths=", &ambient_grok_home, true)
+            .to_string_lossy()
+            .into_owned()
+    ));
+    assert!(arguments.contains(
+        &systemd_path_property("InaccessiblePaths=", &required_root, false)
+            .to_string_lossy()
+            .into_owned()
+    ));
+
+    let missing_visible = temp.path().join("missing-visible-root");
+    let error = external_grok_systemd_properties_for_test(
+        ExternalGrokProfile::read_only(&workspace).with_visible_read_only_root(&missing_visible),
+        Path::new("/bin/true"),
+        &workspace,
+    )
+    .expect_err("semantically required visible roots must still exist");
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn external_grok_profile_resolves_only_declared_managed_paths() {
     let temp = tempfile::tempdir().expect("tempdir");
     let workspace = temp.path().join("worktree");

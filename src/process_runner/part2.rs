@@ -1292,6 +1292,14 @@ impl ResolvedSystemdSandbox {
             .and_then(|capability| capability.private_grok_home_target(runtime_dir))
     }
 
+    fn hidden_root_is_optional(&self, root: &Path) -> bool {
+        self.mount_checks.iter().any(|check| {
+            check.path == root
+                && check.access == SandboxMountAccess::Inaccessible
+                && check.optional
+        })
+    }
+
     fn validate_program_visibility(&self, program: &Path) -> std::io::Result<()> {
         if let Some(hidden_root) = self
             .hidden_roots
@@ -2430,24 +2438,37 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
     let exact_writable_file_parents =
         external_codex_writable_file_parents(&external_codex_writable_file_capabilities);
 
-    let mut hidden_roots = config
+    let hidden_roots = config
         .hidden_roots
         .iter()
-        .map(|root| canonical_sandbox_directory(root, "hidden root"))
+        .map(|root| resolve_hidden_root(root, "hidden root"))
         .collect::<std::io::Result<Vec<_>>>()?;
-    hidden_roots.sort();
-    hidden_roots.dedup();
-    let mut minimal_hidden_roots: Vec<PathBuf> = Vec::new();
-    for root in hidden_roots {
+    let mut unique_hidden_roots = BTreeMap::<PathBuf, bool>::new();
+    for (root, optional) in hidden_roots {
+        unique_hidden_roots
+            .entry(root)
+            .and_modify(|existing| *existing &= optional)
+            .or_insert(optional);
+    }
+    let mut minimal_hidden_roots: Vec<(PathBuf, bool)> = Vec::new();
+    for (root, optional) in unique_hidden_roots {
         if minimal_hidden_roots
             .iter()
-            .any(|ancestor| root.starts_with(ancestor))
+            .any(|(ancestor, _)| root.starts_with(ancestor))
         {
             continue;
         }
-        minimal_hidden_roots.push(root);
+        minimal_hidden_roots.push((root, optional));
     }
-    let hidden_roots = minimal_hidden_roots;
+    let optional_hidden_roots = minimal_hidden_roots
+        .iter()
+        .filter(|(_, optional)| *optional)
+        .map(|(root, _)| root.clone())
+        .collect::<BTreeSet<_>>();
+    let hidden_roots = minimal_hidden_roots
+        .into_iter()
+        .map(|(root, _)| root)
+        .collect::<Vec<_>>();
     if hidden_roots.iter().any(|root| root == Path::new("/")) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -2499,7 +2520,12 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
     identity_paths.extend(visible_read_write_files.iter().cloned());
     identity_paths.extend(exact_writable_file_parents.iter().cloned());
     identity_paths.extend(writable_artifact_roots.iter().cloned());
-    identity_paths.extend(hidden_roots.iter().cloned());
+    identity_paths.extend(
+        hidden_roots
+            .iter()
+            .filter(|root| !optional_hidden_roots.contains(*root))
+            .cloned(),
+    );
     identity_paths.sort();
     identity_paths.dedup();
     let path_identities = identity_paths
@@ -2516,6 +2542,7 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
         exact_writable_file_parents: &exact_writable_file_parents,
         writable_artifact_roots: &writable_artifact_roots,
         hidden_roots: &hidden_roots,
+        optional_hidden_roots: &optional_hidden_roots,
         isolated_host_view: config.isolated_host_view,
     })?;
     if mount_checks.len() > MAX_SANDBOX_MOUNT_CHECKS {
@@ -2578,6 +2605,97 @@ fn canonical_sandbox_directory(path: &Path, label: &str) -> std::io::Result<Path
     }
     validate_systemd_path_syntax(&canonical, label)?;
     Ok(canonical)
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_hidden_root(path: &Path, label: &str) -> std::io::Result<(PathBuf, bool)> {
+    match canonical_sandbox_directory(path, label) {
+        Ok(canonical) => Ok((canonical, false)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let normalized = normalized_absolute_sandbox_path(path, label)?;
+            reject_symlink_ancestors_until_missing(&normalized, label)?;
+            match fs::symlink_metadata(&normalized) {
+                Ok(_) => canonical_sandbox_directory(&normalized, label)
+                    .map(|canonical| (canonical, false)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok((normalized, true))
+                }
+                Err(error) => Err(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to inspect {label} {}: {error}",
+                        normalized.display()
+                    ),
+                )),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn normalized_absolute_sandbox_path(path: &Path, label: &str) -> std::io::Result<PathBuf> {
+    validate_systemd_path_syntax(path, label)?;
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                normalized.push(component.as_os_str());
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{label} may not contain '..': {}", path.display()),
+                ));
+            }
+            std::path::Component::Normal(component) => normalized.push(component),
+        }
+    }
+    validate_systemd_path_syntax(&normalized, label)?;
+    Ok(normalized)
+}
+
+#[cfg(target_os = "linux")]
+fn reject_symlink_ancestors_until_missing(path: &Path, label: &str) -> std::io::Result<()> {
+    let mut current = PathBuf::new();
+    let mut ancestor_missing = false;
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if ancestor_missing || !matches!(component, std::path::Component::Normal(_)) {
+            continue;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "{label} may not traverse a symlink ancestor: {}",
+                        current.display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor_missing = true;
+            }
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to inspect {label} ancestor {}: {error}",
+                        current.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -2692,6 +2810,7 @@ struct SandboxMountPaths<'a> {
     exact_writable_file_parents: &'a BTreeSet<PathBuf>,
     writable_artifact_roots: &'a [PathBuf],
     hidden_roots: &'a [PathBuf],
+    optional_hidden_roots: &'a BTreeSet<PathBuf>,
     isolated_host_view: bool,
 }
 
@@ -2789,7 +2908,7 @@ fn build_sandbox_mount_checks(
         .map(|path| (path, true))
         .collect::<BTreeMap<_, _>>();
     for path in paths.hidden_roots {
-        inaccessible.insert(path.clone(), false);
+        inaccessible.insert(path.clone(), paths.optional_hidden_roots.contains(path));
     }
     for (path, optional) in inaccessible {
         checks.push(SandboxMountCheck {
@@ -2892,7 +3011,11 @@ fn apply_systemd_sandbox_properties(
         ));
 
     for root in &sandbox.hidden_roots {
-        command.arg(systemd_path_property("InaccessiblePaths=", root, false));
+        command.arg(systemd_path_property(
+            "InaccessiblePaths=",
+            root,
+            sandbox.hidden_root_is_optional(root),
+        ));
     }
     for path in known_sensitive_socket_paths() {
         command.arg(systemd_path_property("InaccessiblePaths=", &path, true));
