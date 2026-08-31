@@ -2035,6 +2035,48 @@
     }
 
     #[test]
+    fn delete_branch_fails_closed_when_create_time_registry_binding_is_missing() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+
+        let manager = WorktreeManager::new(&repo_path);
+        let created = manager
+            .create_for_test(WorktreeCreateOptions {
+                agent_id: "agent-unbound-delete".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: Some(worktree_root),
+            })
+            .expect("create worktree");
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("open registry");
+        let lock = store.lock().expect("lock registry");
+        let mut registry = store.load(&lock).expect("load registry");
+        registry
+            .records
+            .remove("agent-unbound-delete")
+            .expect("remove create-time binding");
+        store
+            .save(&lock, &mut registry)
+            .expect("persist missing binding state");
+        drop(lock);
+        drop(store);
+
+        let error = manager
+            .remove("agent-unbound-delete", true, true)
+            .expect_err("missing binding must refuse every destructive phase");
+
+        assert!(error.to_string().contains("no create-time managed binding"));
+        assert!(created.path.exists());
+        assert!(repo
+            .find_branch("maco/agent-unbound-delete", BranchType::Local)
+            .is_ok());
+    }
+
+    #[test]
     fn remove_reports_custom_worktree_branch() {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
