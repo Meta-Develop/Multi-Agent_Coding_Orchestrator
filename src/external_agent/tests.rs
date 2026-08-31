@@ -1589,10 +1589,51 @@ fn planning_and_execution_profiles_reach_actual_inner_argv_and_outer_systemd_pro
             .iter()
             .find(|argument| argument.starts_with("permissions.maco_external_codex.filesystem="))
             .context("actual Codex argv filesystem profile")?;
+        let (workspace_permission, forbidden_workspace_permission) = match access {
+            WorkspaceAccess::ReadOnly => (
+                "\":workspace_roots\"={\".\"=\"read\"}",
+                "\":workspace_roots\"={\".\"=\"write\"}",
+            ),
+            WorkspaceAccess::ReadWrite => (
+                "\":workspace_roots\"={\".\"=\"write\"}",
+                "\":workspace_roots\"={\".\"=\"read\"}",
+            ),
+        };
+        assert!(filesystem.contains(workspace_permission));
+        assert!(!filesystem.contains(forbidden_workspace_permission));
         assert_eq!(
-            filesystem.contains("\":workspace_roots\"={\".\"=\"write\"}"),
-            access == WorkspaceAccess::ReadWrite
+            filesystem.matches("\":workspace_roots\"").count(),
+            1,
+            "workspace root permission must be projected exactly once: {filesystem}"
         );
+        for control in controls
+            .read_only_roots
+            .iter()
+            .chain(&controls.read_only_files)
+        {
+            let path = toml_basic_string(
+                control
+                    .absolute
+                    .to_str()
+                    .context("UTF-8 protected read-only control")?,
+            );
+            assert!(filesystem.contains(&format!("{path}=\"read\"")));
+            assert!(!filesystem.contains(&format!("{path}=\"write\"")));
+        }
+        for control in controls
+            .read_write_roots
+            .iter()
+            .chain(&controls.read_write_files)
+        {
+            let path = toml_basic_string(
+                control
+                    .absolute
+                    .to_str()
+                    .context("UTF-8 protected read-write control")?,
+            );
+            assert!(filesystem.contains(&format!("{path}=\"write\"")));
+            assert!(!filesystem.contains(&format!("{path}=\"read\"")));
+        }
         let child_git_read = format!(
             "{}=\"read\"",
             toml_basic_string(child_git_dir.to_str().context("UTF-8 child gitdir")?)
@@ -5808,6 +5849,33 @@ fn structured_failed_command_denials_are_typed_deduplicated_and_redacted() -> Re
             assert!(sandbox_denials_from_codex_jsonl(&controls, noise).is_empty());
         }
     Ok(())
+}
+
+#[test]
+fn codex_inner_permissions_project_workspace_root_access_exactly() {
+    let command = ExternalAgentCommand::codex(
+        "codex",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(1),
+    );
+    let controls = ProtectedWorktreeControls::default();
+
+    for (access, permission) in [
+        (WorkspaceAccess::ReadOnly, "read"),
+        (WorkspaceAccess::ReadWrite, "write"),
+    ] {
+        let permissions =
+            codex_filesystem_permissions(&command.clone().with_workspace_access(access), &controls);
+        assert_eq!(
+            permissions,
+            format!(
+                "permissions.maco_external_codex.filesystem={{\":minimal\"=\"read\",\":workspace_roots\"={{\".\"=\"{permission}\"}}}}"
+            )
+        );
+    }
 }
 
 #[test]
