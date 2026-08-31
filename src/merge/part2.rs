@@ -2248,7 +2248,7 @@ impl CandidateValidationSandbox {
         if let Some(base_oid) = base_oid {
             sandbox.git_context.set_detached_head(base_oid)?;
         }
-        let checkout = run_isolated_git_process(
+        let checkout = run_isolated_git_process_with_writable_worktree(
             &sandbox.git_context,
             sandbox.path(),
             &["checkout-index", "--all", "--force"],
@@ -2264,7 +2264,7 @@ impl CandidateValidationSandbox {
             ApplyMode::None => Vec::new(),
         };
         if !args.is_empty() {
-            let apply_output = run_isolated_git_process(
+            let apply_output = run_isolated_git_process_with_writable_worktree(
                 &sandbox.git_context,
                 sandbox.path(),
                 &args,

@@ -376,6 +376,24 @@ fn run_isolated_git_process(
     )
 }
 
+fn run_isolated_git_process_with_writable_worktree(
+    context: &TemporaryIndex,
+    worktree_path: &Path,
+    operation: &[&str],
+    stdin: StdinMode,
+    label: &str,
+) -> Result<GitCommandOutput> {
+    let profile =
+        isolated_git_workspace_profile_with_writable_worktree(context, worktree_path)?;
+    run_isolated_git_process_os_with_profile(
+        worktree_path,
+        context.command_args(worktree_path, operation),
+        stdin,
+        label,
+        profile,
+    )
+}
+
 fn run_isolated_git_process_os(
     context: &TemporaryIndex,
     worktree_path: &Path,
@@ -384,6 +402,22 @@ fn run_isolated_git_process_os(
     label: &str,
 ) -> Result<GitCommandOutput> {
     let profile = isolated_git_workspace_profile(context, worktree_path)?;
+    run_isolated_git_process_os_with_profile(
+        worktree_path,
+        command_args,
+        stdin,
+        label,
+        profile,
+    )
+}
+
+fn run_isolated_git_process_os_with_profile(
+    worktree_path: &Path,
+    command_args: Vec<OsString>,
+    stdin: StdinMode,
+    label: &str,
+    profile: StrictOfflineWorkspaceProfile,
+) -> Result<GitCommandOutput> {
     run_required_direct(
         label,
         resolve_trusted_executable("git")?,
@@ -401,6 +435,29 @@ fn run_isolated_git_process_os(
 fn isolated_git_workspace_profile(
     context: &TemporaryIndex,
     worktree_path: &Path,
+) -> Result<StrictOfflineWorkspaceProfile> {
+    configure_isolated_git_workspace_profile(
+        context,
+        worktree_path,
+        StrictOfflineWorkspaceProfile::read_only(worktree_path),
+    )
+}
+
+fn isolated_git_workspace_profile_with_writable_worktree(
+    context: &TemporaryIndex,
+    worktree_path: &Path,
+) -> Result<StrictOfflineWorkspaceProfile> {
+    configure_isolated_git_workspace_profile(
+        context,
+        worktree_path,
+        StrictOfflineWorkspaceProfile::read_write(worktree_path),
+    )
+}
+
+fn configure_isolated_git_workspace_profile(
+    context: &TemporaryIndex,
+    worktree_path: &Path,
+    profile: StrictOfflineWorkspaceProfile,
 ) -> Result<StrictOfflineWorkspaceProfile> {
     let common_dir = context
         .alternate_object_directory
@@ -427,7 +484,7 @@ fn isolated_git_workspace_profile(
             worktree_path.display()
         )
     })?;
-    let mut profile = StrictOfflineWorkspaceProfile::read_write(worktree_path)
+    let mut profile = profile
         .with_writable_artifact_root(&context.directory)
         .with_visible_read_only_root(&context.alternate_object_directory)
         .with_visible_read_only_root(&common_dir);
