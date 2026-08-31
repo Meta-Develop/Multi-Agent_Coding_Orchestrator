@@ -550,7 +550,14 @@ fn issue32_auditor_is_read_only_while_incoming_report_remains_writable() {
         .iter()
         .find(|argument| argument.starts_with("permissions.maco_external_codex.filesystem="))
         .expect("filesystem permission config");
-    assert!(!filesystem.contains("\":workspace_roots\""));
+    assert!(
+        filesystem.contains("\":workspace_roots\"={\".\"=\"read\"}"),
+        "auditor workspace root must serialize as read: {filesystem}"
+    );
+    assert!(
+        !filesystem.contains("\":workspace_roots\"={\".\"=\"write\"}"),
+        "auditor workspace root must not serialize as write: {filesystem}"
+    );
     assert!(filesystem.contains(&format!(
         "{}=\"write\"",
         serde_json::to_string(
