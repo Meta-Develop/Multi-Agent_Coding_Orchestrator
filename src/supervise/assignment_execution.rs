@@ -1756,12 +1756,12 @@ struct CollectedChildAttempt<'a> {
     _command: ExternalAgentCommand,
 }
 
-fn verify_imported_managed_child_candidate(
+fn capture_managed_child_candidate(
     repo: &Path,
     assignment: &OrchestratorAssignment,
     write_lease: &ManagedWorktreeWriteLease,
-    imported: &ManagedChildGitImport,
-) -> Result<()> {
+    context: &str,
+) -> Result<(Vec<PathBuf>, Oid)> {
     let candidate = collect_agent_result_with_evidence_and_write_lease(
         MergeCollectOptions {
             repo: repo.to_path_buf(),
@@ -1774,15 +1774,30 @@ fn verify_imported_managed_child_candidate(
         ValidationEvidenceBundle::default(),
         write_lease,
     )
-    .context("failed to capture the imported managed child candidate")?;
+    .with_context(|| format!("failed to capture {context}"))?;
     if !candidate.unclaimed_changed_paths.is_empty() {
         bail!(
-            "imported managed child candidate contains unclaimed paths: {}",
+            "{context} contains unclaimed paths: {}",
             display_paths(&candidate.unclaimed_changed_paths)
         );
     }
     let candidate_paths = normalize_paths(candidate.changed_paths)
-        .context("imported managed child candidate paths are invalid")?;
+        .with_context(|| format!("{context} paths are invalid"))?;
+    Ok((candidate_paths, candidate.snapshot_tree))
+}
+
+fn verify_imported_managed_child_candidate(
+    repo: &Path,
+    assignment: &OrchestratorAssignment,
+    write_lease: &ManagedWorktreeWriteLease,
+    imported: &ManagedChildGitImport,
+) -> Result<()> {
+    let (candidate_paths, candidate_tree) = capture_managed_child_candidate(
+        repo,
+        assignment,
+        write_lease,
+        "the imported managed child candidate",
+    )?;
     if candidate_paths != imported.final_changed_paths {
         bail!(
             "imported managed child commit paths differ from the collected worktree candidate: commit [{}], worktree [{}]",
@@ -1790,14 +1805,49 @@ fn verify_imported_managed_child_candidate(
             display_paths(&candidate_paths)
         );
     }
-    if candidate.snapshot_tree != imported.head_tree_oid {
+    if candidate_tree != imported.head_tree_oid {
         bail!(
             "imported managed child commit tree {} differs from collected worktree tree {}",
             imported.head_tree_oid,
-            candidate.snapshot_tree
+            candidate_tree
         );
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ManagedChildMaterializationGate {
+    codex_supervisor: bool,
+    verified_execution: bool,
+    process_completed: bool,
+    containment_verified: bool,
+    publishable: bool,
+    structured_report_valid: bool,
+    report_succeeded: bool,
+    writable_workspace: bool,
+    isolated_managed_child: bool,
+    primary_integrity_verified: bool,
+    sandbox_denials_absent: bool,
+    pre_action_refusals_absent: bool,
+    external_side_effect_absent: bool,
+}
+
+impl ManagedChildMaterializationGate {
+    fn eligible(self) -> bool {
+        self.codex_supervisor
+            && self.verified_execution
+            && self.process_completed
+            && self.containment_verified
+            && self.publishable
+            && self.structured_report_valid
+            && self.report_succeeded
+            && self.writable_workspace
+            && self.isolated_managed_child
+            && self.primary_integrity_verified
+            && self.sandbox_denials_absent
+            && self.pre_action_refusals_absent
+            && self.external_side_effect_absent
+    }
 }
 
 fn dispatch_and_collect_child_attempt<'a>(
@@ -2089,33 +2139,6 @@ fn dispatch_and_collect_child_attempt<'a>(
             ))
         }
     };
-    let managed_child_git_import = if options.runtime == SupervisorRuntime::Codex
-        && *execution_runtime == SupervisorExecutionRuntime::Verified
-        && external_process_completed(&external_run, launch_runtime)
-        && attempt_containment_verified
-        && external_run.publishable
-        && raw_report_validated
-        && preflight.primary_scope_baseline.is_none()
-    {
-        let write_lease = preflight
-            .worktree_write_lease
-            .as_ref()
-            .context("verified managed child Git collection has no write lease")?;
-        Some(
-            collect_and_import_managed_child_git_commit(
-                repo,
-                &worktree.path,
-                preflight.child_base_head,
-                &assignment.assigned_paths,
-            )
-            .and_then(|imported| {
-                verify_imported_managed_child_candidate(repo, assignment, write_lease, &imported)?;
-                Ok(imported)
-            }),
-        )
-    } else {
-        None
-    };
     let primary_after = primary_worktree_snapshot(repo, *execution_runtime)?;
     let primary_changes = primary_integrity_changes(&primary_before, &primary_after);
     let primary_scope_after = primary_scope_before
@@ -2164,6 +2187,53 @@ fn dispatch_and_collect_child_attempt<'a>(
         },
         launch_runtime,
     );
+    let materialization_gate = ManagedChildMaterializationGate {
+        codex_supervisor: options.runtime == SupervisorRuntime::Codex,
+        verified_execution: *execution_runtime == SupervisorExecutionRuntime::Verified,
+        process_completed: external_process_completed(&external_run, launch_runtime),
+        containment_verified: attempt_containment_verified,
+        publishable: external_run.publishable,
+        structured_report_valid: raw_report_validated,
+        report_succeeded: !report_failed(&attempt_report),
+        writable_workspace: command.workspace_access == WorkspaceAccess::ReadWrite,
+        isolated_managed_child: preflight.primary_scope_baseline.is_none(),
+        primary_integrity_verified: primary_changes.is_empty(),
+        sandbox_denials_absent: sandbox_denials.is_empty(),
+        pre_action_refusals_absent: pre_action_refusals.is_empty(),
+        external_side_effect_absent: external_side_effect_state.is_none(),
+    };
+    let managed_child_git_import = if materialization_gate.eligible() {
+        let write_lease = preflight
+            .worktree_write_lease
+            .as_ref()
+            .context("verified managed child Git materialization has no write lease")?;
+        Some((|| {
+            let (candidate_paths, candidate_tree) = capture_managed_child_candidate(
+                repo,
+                assignment,
+                write_lease,
+                "the pre-materialization managed child candidate",
+            )?;
+            crate::external_agent::materialize_managed_child_git_commit(
+                repo,
+                &worktree.path,
+                preflight.child_base_head,
+                &assignment.assigned_paths,
+                &candidate_paths,
+                candidate_tree,
+            )?;
+            let imported = collect_and_import_managed_child_git_commit(
+                repo,
+                &worktree.path,
+                preflight.child_base_head,
+                &assignment.assigned_paths,
+            )?;
+            verify_imported_managed_child_candidate(repo, assignment, write_lease, &imported)?;
+            Ok::<_, anyhow::Error>(imported)
+        })())
+    } else {
+        None
+    };
     if let Some(import) = managed_child_git_import {
         match import {
             Ok(imported) => attempt_report.findings.push(Finding {
@@ -5732,6 +5802,89 @@ done
             WorkspaceAccess::ReadWrite
         );
         assert!(execution_command.worktree_control_exceptions.is_empty());
+    }
+
+    fn eligible_managed_child_materialization_gate() -> ManagedChildMaterializationGate {
+        ManagedChildMaterializationGate {
+            codex_supervisor: true,
+            verified_execution: true,
+            process_completed: true,
+            containment_verified: true,
+            publishable: true,
+            structured_report_valid: true,
+            report_succeeded: true,
+            writable_workspace: true,
+            isolated_managed_child: true,
+            primary_integrity_verified: true,
+            sandbox_denials_absent: true,
+            pre_action_refusals_absent: true,
+            external_side_effect_absent: true,
+        }
+    }
+
+    #[test]
+    fn successful_writable_adapter_report_is_eligible_for_private_materialization() {
+        assert!(eligible_managed_child_materialization_gate().eligible());
+    }
+
+    #[test]
+    fn private_materialization_gate_refuses_failed_unverified_and_read_only_attempts() {
+        let baseline = eligible_managed_child_materialization_gate();
+        for refused in [
+            ManagedChildMaterializationGate {
+                process_completed: false,
+                ..baseline
+            },
+            ManagedChildMaterializationGate {
+                containment_verified: false,
+                ..baseline
+            },
+            ManagedChildMaterializationGate {
+                publishable: false,
+                ..baseline
+            },
+            ManagedChildMaterializationGate {
+                structured_report_valid: false,
+                ..baseline
+            },
+            ManagedChildMaterializationGate {
+                report_succeeded: false,
+                ..baseline
+            },
+            ManagedChildMaterializationGate {
+                verified_execution: false,
+                ..baseline
+            },
+            ManagedChildMaterializationGate {
+                writable_workspace: false,
+                ..baseline
+            },
+            ManagedChildMaterializationGate {
+                isolated_managed_child: false,
+                ..baseline
+            },
+            ManagedChildMaterializationGate {
+                primary_integrity_verified: false,
+                ..baseline
+            },
+            ManagedChildMaterializationGate {
+                sandbox_denials_absent: false,
+                ..baseline
+            },
+            ManagedChildMaterializationGate {
+                pre_action_refusals_absent: false,
+                ..baseline
+            },
+            ManagedChildMaterializationGate {
+                external_side_effect_absent: false,
+                ..baseline
+            },
+        ] {
+            assert!(
+                !refused.eligible(),
+                "refused gate became eligible: {refused:?}"
+            );
+        }
     }
 
     #[test]
