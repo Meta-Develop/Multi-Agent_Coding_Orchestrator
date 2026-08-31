@@ -487,6 +487,9 @@ fn authoritative_existing_file_edit_workstream_id(
 }
 
 pub(super) fn explicit_existing_file_edit_verification_task(task: &str, target: &Path) -> bool {
+    if explicit_existing_file_rust_test_contract_task(task, target) {
+        return true;
+    }
     let Some(target) = target.to_str() else {
         return false;
     };
@@ -558,6 +561,431 @@ pub(super) fn explicit_existing_file_edit_verification_task(task: &str, target: 
         return false;
     };
     !replaced_text.trim().is_empty() && !payload.trim().is_empty()
+}
+
+fn explicit_existing_file_rust_test_contract_task(task: &str, target: &Path) -> bool {
+    let Ok(target) = normalize_repo_relative_path(target) else {
+        return false;
+    };
+    let Some(clauses) = existing_file_task_clauses(task) else {
+        return false;
+    };
+    let Some(task_paths) = existing_file_task_paths(&clauses) else {
+        return false;
+    };
+    if task_paths.len() != 1 || task_paths[0] != target {
+        return false;
+    }
+
+    if clauses.iter().any(|clause| {
+        clause_has_fail_closed_marker(clause)
+            && (path_bearing_edit_clause(clause) || verification_related_clause(clause))
+    }) {
+        return false;
+    }
+
+    let mut path_bearing_edit_clauses = clauses
+        .iter()
+        .enumerate()
+        .filter(|(_, clause)| path_bearing_edit_clause(clause));
+    let Some((edit_clause_index, edit_clause)) = path_bearing_edit_clauses.next() else {
+        return false;
+    };
+    if path_bearing_edit_clauses.next().is_some() {
+        return false;
+    }
+    if !explicit_positive_existing_file_edit_clause(edit_clause, &target) {
+        return false;
+    }
+
+    let mut contract_clauses = clauses
+        .iter()
+        .enumerate()
+        .filter(|(_, clause)| verification_contract_language(clause));
+    let Some((contract_clause_index, contract_clause)) = contract_clauses.next() else {
+        return false;
+    };
+    if contract_clauses.next().is_some() {
+        return false;
+    }
+    rust_test_verification_contract(contract_clause).is_some()
+        && edit_clause_index != contract_clause_index
+}
+
+fn existing_file_task_clauses(task: &str) -> Option<Vec<&str>> {
+    let mut clauses = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    let mut chars = task.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        match quote {
+            Some(expected) if ch == expected => quote = None,
+            Some(_) => continue,
+            None if matches!(ch, '`' | '\'' | '"') => {
+                quote = Some(ch);
+                continue;
+            }
+            None => {}
+        }
+
+        let sentence_period =
+            ch == '.' && chars.peek().is_none_or(|(_, next)| next.is_whitespace());
+        if sentence_period || matches!(ch, '\n' | ';' | '!' | '?') {
+            let clause = task[start..index].trim();
+            if !clause.is_empty() {
+                clauses.push(clause);
+            }
+            start = index + ch.len_utf8();
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    let clause = task[start..].trim();
+    if !clause.is_empty() {
+        clauses.push(clause);
+    }
+    Some(clauses)
+}
+
+fn existing_file_task_paths(clauses: &[&str]) -> Option<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for clause in clauses {
+        let tokens = existing_file_clause_tokens(clause)?;
+        let extensionless_operands = extensionless_edit_operand_indices(&tokens);
+        for (index, raw) in tokens.iter().enumerate() {
+            let token = trimmed_existing_file_task_token(raw);
+            let path_like = looks_like_existing_file_task_path(token)
+                || looks_like_unambiguous_extensionless_filename(token)
+                || (extensionless_operands.contains(&index)
+                    && looks_like_extensionless_edit_operand(token));
+            if path_like {
+                paths.push(normalize_repo_relative_path(token).ok()?);
+            }
+        }
+    }
+    Some(paths)
+}
+
+fn existing_file_clause_tokens(clause: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    for ch in clause.chars() {
+        match quote {
+            Some(expected) if ch == expected => quote = None,
+            Some(_) => current.push(ch),
+            None if matches!(ch, '`' | '\'' | '"') => quote = Some(ch),
+            None if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            None => current.push(ch),
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    Some(tokens)
+}
+
+fn extensionless_edit_operand_indices(tokens: &[String]) -> Vec<usize> {
+    const OPERAND_MODIFIERS: &[&str] = &[
+        "just",
+        "only",
+        "the",
+        "an",
+        "a",
+        "existing",
+        "repository",
+        "repo",
+        "root",
+        "file",
+        "filename",
+    ];
+
+    structurally_plausible_edit_verb_indices(tokens)
+        .into_iter()
+        .filter_map(|verb_index| {
+            ((verb_index + 1)..tokens.len()).find(|index| {
+                !OPERAND_MODIFIERS.iter().any(|modifier| {
+                    trimmed_clause_word(&tokens[*index]).eq_ignore_ascii_case(modifier)
+                })
+            })
+        })
+        .collect()
+}
+
+fn structurally_plausible_edit_verb_indices(tokens: &[String]) -> Vec<usize> {
+    tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| is_path_bearing_edit_verb(trimmed_clause_word(token)))
+        .filter(|(verb_index, _)| plausible_edit_directive_prefix(&tokens[..*verb_index]))
+        .map(|(verb_index, _)| verb_index)
+        .collect()
+}
+
+fn plausible_edit_directive_prefix(prefix: &[String]) -> bool {
+    const PREFIX_WORDS: &str = concat!(
+        "also appropriate be can could do dont don't ever if is it may maybe might must ",
+        "need needs necessary needed never no not only optionally please practical ready ",
+        "required shall should skip then to unless when will without we you",
+    );
+    let segment_start = prefix
+        .iter()
+        .rposition(|token| {
+            token.ends_with(',')
+                || token.ends_with(':')
+                || matches!(
+                    trimmed_clause_word(token).to_ascii_lowercase().as_str(),
+                    "and" | "but" | "then"
+                )
+        })
+        .map_or(0, |index| index + 1);
+    prefix[segment_start..].iter().all(|token| {
+        PREFIX_WORDS
+            .split_ascii_whitespace()
+            .any(|prefix_word| trimmed_clause_word(token).eq_ignore_ascii_case(prefix_word))
+    })
+}
+
+fn trimmed_clause_word(raw: &str) -> &str {
+    raw.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+}
+
+fn trimmed_existing_file_task_token(raw: &str) -> &str {
+    raw.trim()
+        .trim_start_matches(|ch: char| {
+            matches!(
+                ch,
+                ',' | ';' | ':' | ')' | '(' | '[' | ']' | '{' | '}' | '!' | '?'
+            )
+        })
+        .trim_end_matches(|ch: char| {
+            matches!(
+                ch,
+                ',' | ';' | ':' | ')' | '(' | '[' | ']' | '{' | '}' | '!' | '?' | '.'
+            )
+        })
+}
+
+fn looks_like_existing_file_task_path(token: &str) -> bool {
+    if token.is_empty()
+        || token == "."
+        || token == ".."
+        || token.contains("://")
+        || token.contains("::")
+    {
+        return false;
+    }
+    token.contains('/')
+        || token.starts_with('.')
+        || Path::new(token)
+            .extension()
+            .is_some_and(|extension| !extension.is_empty())
+}
+
+fn looks_like_extensionless_edit_operand(token: &str) -> bool {
+    if token.is_empty()
+        || token.contains(['/', '.', ':', '_'])
+        || !token
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '+'))
+    {
+        return false;
+    }
+    !matches!(
+        token.to_ascii_lowercase().as_str(),
+        "anything"
+            | "nothing"
+            | "something"
+            | "it"
+            | "this"
+            | "that"
+            | "these"
+            | "those"
+            | "code"
+            | "behavior"
+            | "behaviour"
+            | "logic"
+            | "semantics"
+    )
+}
+
+fn looks_like_unambiguous_extensionless_filename(token: &str) -> bool {
+    if token.len() < 2 || !token.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+        return false;
+    }
+    let lowercase = token.to_ascii_lowercase();
+    (lowercase != "file" && lowercase.ends_with("file"))
+        || token
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
+}
+
+fn path_bearing_edit_clause(clause: &str) -> bool {
+    let Some(tokens) = existing_file_clause_tokens(clause) else {
+        return true;
+    };
+    let Some(paths) = existing_file_task_paths(&[clause]) else {
+        return true;
+    };
+    !paths.is_empty() && !structurally_plausible_edit_verb_indices(&tokens).is_empty()
+}
+
+fn explicit_positive_existing_file_edit_clause(clause: &str, target: &Path) -> bool {
+    let words = clause_words(clause);
+    let Some(first) = words.first() else {
+        return false;
+    };
+    let edit_verbs = words
+        .iter()
+        .filter(|word| is_path_bearing_edit_verb(word))
+        .collect::<Vec<_>>();
+    matches!(
+        first.to_ascii_lowercase().as_str(),
+        "edit" | "change" | "update"
+    ) && edit_verbs.len() == 1
+        && matches!(
+            edit_verbs[0].to_ascii_lowercase().as_str(),
+            "edit" | "change" | "update"
+        )
+        && existing_file_task_paths(&[clause])
+            .is_some_and(|paths| paths.len() == 1 && paths[0].as_path() == target)
+}
+
+fn is_path_bearing_edit_verb(word: &str) -> bool {
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "edit" | "change" | "update" | "modify" | "alter" | "touch" | "patch" | "rewrite"
+    )
+}
+
+fn clause_has_fail_closed_marker(clause: &str) -> bool {
+    let words = clause_words(clause);
+    words.iter().enumerate().any(|(index, word)| {
+        let word = word.to_ascii_lowercase();
+        let cfg_not_test = word == "not"
+            && index > 0
+            && index + 1 < words.len()
+            && words[index - 1].eq_ignore_ascii_case("cfg")
+            && words[index + 1].eq_ignore_ascii_case("test");
+        !cfg_not_test
+            && matches!(
+                word.as_str(),
+                "dont"
+                    | "not"
+                    | "no"
+                    | "never"
+                    | "without"
+                    | "skip"
+                    | "if"
+                    | "unless"
+                    | "when"
+                    | "maybe"
+                    | "optionally"
+                    | "may"
+                    | "might"
+                    | "could"
+            )
+    }) || words.windows(2).any(|pair| {
+        (pair[0].eq_ignore_ascii_case("do") && pair[1].eq_ignore_ascii_case("not"))
+            || (pair[0].eq_ignore_ascii_case("don") && pair[1].eq_ignore_ascii_case("t"))
+    })
+}
+
+fn verification_related_clause(clause: &str) -> bool {
+    clause_words(clause).iter().any(|word| {
+        matches!(
+            word.to_ascii_lowercase().as_str(),
+            "verify"
+                | "verification"
+                | "contract"
+                | "cargo"
+                | "git"
+                | "run"
+                | "running"
+                | "execute"
+                | "executing"
+                | "command"
+                | "commands"
+                | "test"
+                | "tests"
+        )
+    })
+}
+
+fn verification_contract_language(clause: &str) -> bool {
+    clause_words(clause).iter().any(|word| {
+        matches!(
+            word.to_ascii_lowercase().as_str(),
+            "verification" | "contract"
+        )
+    })
+}
+
+fn rust_test_verification_contract(clause: &str) -> Option<&str> {
+    if clause_words(clause).iter().any(|word| {
+        matches!(
+            word.to_ascii_lowercase().as_str(),
+            "cargo" | "git" | "run" | "running" | "execute" | "executing" | "command" | "commands"
+        )
+    }) {
+        return None;
+    }
+
+    let words = clause.split_whitespace().collect::<Vec<_>>();
+    let lowered = words
+        .iter()
+        .map(|word| {
+            word.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                .to_ascii_lowercase()
+        })
+        .collect::<Vec<_>>();
+    let test_index = if lowered.ends_with(&[
+        "is".to_string(),
+        "the".to_string(),
+        "verification".to_string(),
+        "contract".to_string(),
+    ]) {
+        words.len().checked_sub(5)?
+    } else if lowered.ends_with(&[
+        "is".to_string(),
+        "the".to_string(),
+        "exact".to_string(),
+        "verification".to_string(),
+        "contract".to_string(),
+    ]) {
+        words.len().checked_sub(6)?
+    } else {
+        return None;
+    };
+    let test_path = words[test_index].trim_matches(['`', '\'', '"']);
+    syntactically_valid_rust_test_path(test_path).then_some(test_path)
+}
+
+fn syntactically_valid_rust_test_path(test_path: &str) -> bool {
+    let Ok(path) = syn::parse_str::<syn::Path>(test_path) else {
+        return false;
+    };
+    path.leading_colon.is_none()
+        && path.segments.len() >= 2
+        && path
+            .segments
+            .iter()
+            .all(|segment| matches!(&segment.arguments, syn::PathArguments::None))
+}
+
+fn clause_words(clause: &str) -> Vec<&str> {
+    clause
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .filter(|word| !word.is_empty())
+        .collect()
 }
 
 fn explicit_new_file_preclaim_directive(
@@ -3597,6 +4025,142 @@ mod diagnostics_emission_tests {
             assert!(
                 !explicit_existing_file_edit_verification_task(untrusted_or_ambiguous, target),
                 "unexpectedly recognized: {untrusted_or_ambiguous}"
+            );
+        }
+    }
+
+    #[test]
+    fn existing_file_edit_rust_test_contract_fallback_is_fail_closed() {
+        const TARGET: &str = "src/process_runner/part3.rs";
+        const TEST_PATH: &str =
+            "process_runner::tests::stuck_owned_io_thread_aborts_instead_of_detaching";
+        let target = Path::new(TARGET);
+        let edit_task = format!(
+            "Edit only the existing file {TARGET}. Change OwnedIoThread::finish so cfg(test) uses \
+             TestIoFinalizationClock and cfg(not(test)) uses RealIoThreadClock, matching \
+             finish_child_io. Do not alter THREAD_JOIN_GRACE, production behavior, or any other \
+             file. "
+        );
+        let accepted = format!(
+            "{edit_task}The existing exact test {TEST_PATH} is the verification contract. Run \
+             that exact test, commit the one-file change, and report the commit."
+        );
+
+        assert_eq!(
+            existing_file_task_paths(&[
+                "Run that exact test, commit the one-file change, and report the commit"
+            ]),
+            Some(Vec::new()),
+            "noun change in the final clause must not create a path"
+        );
+
+        for positive_directive in ["Edit", "Change", "Update"] {
+            let task = accepted.replacen("Edit", positive_directive, 1);
+            assert!(
+                explicit_existing_file_edit_verification_task(&task, target),
+                "failed to recognize positive {positive_directive} directive"
+            );
+        }
+
+        for appended in [
+            "Update Makefile.",
+            "Also inspect Makefile.",
+            "Also inspect `Dockerfile`.",
+            "Do not modify src/process_runner/part3.rs.",
+            "Modify src/process_runner/part3.rs when needed.",
+            "Never run the test.",
+            "Also inspect src/other.rs.",
+            "Also inspect `src/other.rs`.",
+            "Also inspect README.md.",
+            "Also inspect \"README.md\".",
+            "Also inspect src/process_runner/part3.rs.",
+        ] {
+            let task = format!("{accepted} {appended}");
+            assert!(
+                !explicit_existing_file_edit_verification_task(&task, target),
+                "unexpectedly accepted appended clause: {appended}"
+            );
+        }
+
+        for alternate_edit_verb in ["Modify", "Alter", "Touch", "Patch", "Rewrite"] {
+            let task = accepted.replacen("Edit", alternate_edit_verb, 1);
+            assert!(
+                !explicit_existing_file_edit_verification_task(&task, target),
+                "unexpectedly accepted {alternate_edit_verb} as the positive directive"
+            );
+        }
+
+        for rejected_verification_clause in [
+            "Do not run the test.",
+            "Dont run the test.",
+            "Not running the test is acceptable.",
+            "No test execution is required.",
+            "Never run the test.",
+            "Verify without running the test.",
+            "Skip the test.",
+            "If needed, run the test.",
+            "Unless convenient, skip the test.",
+            "When practical, run the test.",
+            "Maybe run the test.",
+            "Optionally run the test.",
+            "You may run the test.",
+            "You might run the test.",
+            "You could run the test.",
+        ] {
+            let task = format!("{accepted} {rejected_verification_clause}");
+            assert!(
+                !explicit_existing_file_edit_verification_task(&task, target),
+                "unexpectedly accepted qualified verification: {rejected_verification_clause}"
+            );
+        }
+
+        for generic_contract in [
+            "Cargo test is the verification contract.",
+            "Git status is the verification contract.",
+            "Run tests is the verification contract.",
+            "Execute tests is the verification contract.",
+            "A command is the verification contract.",
+        ] {
+            let task = format!("{edit_task}{generic_contract}");
+            assert!(
+                !explicit_existing_file_edit_verification_task(&task, target),
+                "unexpectedly accepted generic contract: {generic_contract}"
+            );
+        }
+
+        assert!(
+            !explicit_existing_file_edit_verification_task(&edit_task, target),
+            "accepted a task with no verification contract"
+        );
+        let same_clause = format!(
+            "Edit only the existing file {TARGET} and {TEST_PATH} is the verification contract."
+        );
+        assert!(
+            !explicit_existing_file_edit_verification_task(&same_clause, target),
+            "accepted an edit and contract in the same clause"
+        );
+        let unbalanced_quote = format!("{accepted} Also inspect \"src/other.rs.");
+        assert!(
+            !explicit_existing_file_edit_verification_task(&unbalanced_quote, target),
+            "accepted an unbalanced quoted path"
+        );
+
+        for malformed_test_path in [
+            "process_runner",
+            "process_runner::tests::",
+            "process_runner:tests::stuck_owned_io_thread",
+            "process_runner::tests::stuck-owned-io-thread",
+            "process_runner::tests::stuck_owned_io_thread()",
+            "::process_runner::tests::stuck_owned_io_thread",
+            "process_runner::tests::<stuck_owned_io_thread>",
+        ] {
+            let task = format!(
+                "{edit_task}The existing exact test {malformed_test_path} is the exact \
+                 verification contract."
+            );
+            assert!(
+                !explicit_existing_file_edit_verification_task(&task, target),
+                "unexpectedly accepted malformed Rust test path: {malformed_test_path}"
             );
         }
     }
