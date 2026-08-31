@@ -1615,7 +1615,7 @@ fn run_managed_child_git_command_allow_status(
         .with_writable_artifact_root(boundary.private_git_dir())
         .with_visible_read_only_root(boundary.shared_object_dir());
     if let Some(hook) = &boundary.metadata.active_commit_hook {
-        profile = profile.with_visible_read_only_root(hook);
+        profile = profile.with_visible_read_only_file(hook);
     }
     crate::merge::run_required_direct(
         label,
