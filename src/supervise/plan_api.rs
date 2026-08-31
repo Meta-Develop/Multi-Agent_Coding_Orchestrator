@@ -255,6 +255,8 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         .context("goal/spec workstreams are not independently assignable")?;
 
     let explicit_new_file_workstream = authoritative_new_file_workstream_id(&proposal);
+    let explicit_existing_file_edit_workstream =
+        authoritative_existing_file_edit_workstream_id(&proposal);
 
     let spec_fragment_ids = proposal
         .fragments
@@ -277,11 +279,23 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         );
         let is_explicit_new_file_workstream =
             explicit_new_file_workstream.as_deref() == Some(assignment.id.as_str());
-        let explicit_new_file_notes = is_explicit_new_file_workstream
-            .then(|| {
-                explicit_new_file_preclaim_directive(&assignment, &planning_id, &planning_task)
-            })
-            .transpose()?;
+        let is_explicit_existing_file_edit_workstream =
+            explicit_existing_file_edit_workstream.as_deref() == Some(assignment.id.as_str());
+        let generated_preclaim_notes = if is_explicit_new_file_workstream {
+            Some(explicit_new_file_preclaim_directive(
+                &assignment,
+                &planning_id,
+                &planning_task,
+            )?)
+        } else if is_explicit_existing_file_edit_workstream {
+            Some(explicit_existing_file_edit_preclaim_directive(
+                &assignment,
+                &planning_id,
+                &planning_task,
+            )?)
+        } else {
+            None
+        };
         let planning_index = assignments.len();
         assignments.push(OrchestratorAssignment {
             id: planning_id.clone(),
@@ -297,7 +311,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
             worker_assignments: Vec::new(),
             environment_requirements: Vec::new(),
             licensed_breakage: None,
-            notes: explicit_new_file_notes.clone().or_else(|| {
+            notes: generated_preclaim_notes.clone().or_else(|| {
                 Some(
                     "MACO-visible read-only planning root; its execution child is parent-gated"
                         .to_string(),
@@ -314,7 +328,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         spec_fragment_ids_by_assignment
             .insert(assignment.id.clone(), assignment.fragment_ids.clone());
         let (execution_role, execution_role_category, worker_assignments) =
-            if is_explicit_new_file_workstream {
+            if is_explicit_new_file_workstream || is_explicit_existing_file_edit_workstream {
                 (
                     AgentRole::Worker,
                     AgentRole::Worker.authority_category(),
@@ -358,7 +372,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
             worker_assignments,
             environment_requirements: Vec::new(),
             licensed_breakage: None,
-            notes: explicit_new_file_notes.or_else(|| {
+            notes: generated_preclaim_notes.or_else(|| {
                 Some(format!(
                     "Execution child admitted only after read-only planning root '{planning_id}' succeeds"
                 ))
@@ -441,6 +455,72 @@ fn authoritative_new_file_workstream_id(
     .then(|| assignment.id.clone())
 }
 
+fn authoritative_existing_file_edit_workstream_id(
+    proposal: &planning::TaskDecompositionProposal,
+) -> Option<String> {
+    let [assignment] = proposal.assignments.as_slice() else {
+        return None;
+    };
+    let [assigned_path] = assignment.assigned_paths.as_slice() else {
+        return None;
+    };
+    let fragment_ids = proposal
+        .fragments
+        .iter()
+        .map(|fragment| fragment.id.as_str())
+        .collect::<Vec<_>>();
+    let assignment_fragment_ids = assignment
+        .fragment_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    (!proposal.diagnostics.degraded
+        && proposal.coverage_gaps.is_empty()
+        && proposal.disjointness.disjoint
+        && proposal.disjointness.conflicts.is_empty()
+        && !proposal.disjointness.conflicts_truncated
+        && assignment_fragment_ids == fragment_ids
+        && assignment.semantic_symbols.is_empty()
+        && assignment.semantic_modules.is_empty()
+        && explicit_existing_file_edit_verification_task(&assignment.task, assigned_path))
+    .then(|| assignment.id.clone())
+}
+
+pub(super) fn explicit_existing_file_edit_verification_task(task: &str, target: &Path) -> bool {
+    let Some(target) = target.to_str() else {
+        return false;
+    };
+    if target.is_empty() {
+        return false;
+    }
+    let normalized = task
+        .to_ascii_lowercase()
+        .replace(|character: char| matches!(character, '`' | '\'' | '"'), "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let target = target.to_ascii_lowercase();
+    let edit_directives = [
+        format!("in {target}, replace"),
+        format!("in {target} replace"),
+    ];
+    let exact_confirmations = [
+        format!("confirm {target} contains exactly that line"),
+        format!("confirm that {target} contains exactly that line"),
+    ];
+    normalized.matches("git diff --check").count() == 1
+        && edit_directives
+            .iter()
+            .filter(|directive| normalized.contains(directive.as_str()))
+            .count()
+            == 1
+        && exact_confirmations
+            .iter()
+            .filter(|confirmation| normalized.contains(confirmation.as_str()))
+            .count()
+            == 1
+}
+
 fn explicit_new_file_preclaim_directive(
     assignment: &planning::TaskAssignmentProposal,
     planning_id: &str,
@@ -482,6 +562,50 @@ fn explicit_new_file_preclaim_directive(
         "{GENERATED_PRECLAIM_DIRECTIVE_PREFIX}{}",
         serde_json::to_string(&payload)
             .context("failed to serialize explicit new-file pre-claim contract")?
+    ))
+}
+
+fn explicit_existing_file_edit_preclaim_directive(
+    assignment: &planning::TaskAssignmentProposal,
+    planning_id: &str,
+    planning_task: &str,
+) -> Result<String> {
+    let [assigned_path] = assignment.assigned_paths.as_slice() else {
+        bail!(
+            "explicit existing-file workstream '{}' lost its single-path binding",
+            assignment.id
+        );
+    };
+    let assigned_path = assigned_path.to_str().with_context(|| {
+        format!(
+            "explicit existing-file workstream '{}' path is not UTF-8",
+            assignment.id
+        )
+    })?;
+    let payload = serde_json::json!({
+        "verification_contract": {
+            "kind": "existing_git_visible_regular_file_edit",
+            "assigned_path": assigned_path,
+            "planning_assignment": {
+                "id": planning_id,
+                "phase": AssignmentPhase::Planning,
+                "role": AgentRole::ChildOrchestrator,
+                "role_category": AgentRole::ChildOrchestrator.authority_category(),
+                "task_sha256": crate::artifacts::state_auth::sha256_hex(planning_task.as_bytes()),
+            },
+            "execution_assignment": {
+                "id": assignment.id,
+                "phase": AssignmentPhase::Execution,
+                "role": AgentRole::Worker,
+                "role_category": AgentRole::Worker.authority_category(),
+                "task_sha256": crate::artifacts::state_auth::sha256_hex(assignment.task.as_bytes()),
+            }
+        }
+    });
+    Ok(format!(
+        "{GENERATED_PRECLAIM_DIRECTIVE_PREFIX}{}",
+        serde_json::to_string(&payload)
+            .context("failed to serialize explicit existing-file pre-claim contract")?
     ))
 }
 
@@ -3400,6 +3524,26 @@ mod diagnostics_emission_tests {
             commit_all(&nested, "nested");
         }
         (temp, repo_path)
+    }
+
+    #[test]
+    fn existing_file_edit_verification_task_parser_is_exact_and_unambiguous() {
+        let target = Path::new("README.md");
+        let task = "In README.md, replace the old line with exactly: replacement. Verify the result with git diff --check and confirm README.md contains exactly that line.";
+        assert!(explicit_existing_file_edit_verification_task(task, target));
+
+        for untrusted_or_ambiguous in [
+            "Update README.md.",
+            "In README.md, replace the old line and confirm README.md contains exactly that line.",
+            "In README.md, replace the old line. Verify with git diff --check.",
+            "In OTHER.md, replace the old line. Verify with git diff --check and confirm OTHER.md contains exactly that line.",
+            "In README.md, replace the old line. Run git diff --check twice: git diff --check, then confirm README.md contains exactly that line.",
+        ] {
+            assert!(
+                !explicit_existing_file_edit_verification_task(untrusted_or_ambiguous, target),
+                "unexpectedly recognized: {untrusted_or_ambiguous}"
+            );
+        }
     }
 
     #[test]
