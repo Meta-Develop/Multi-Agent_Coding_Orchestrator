@@ -2101,7 +2101,7 @@ mod regression_tests {
         assert!(prompt.contains("Review auditor prompt template:"));
         assert!(prompt.contains("ROLE: REVIEW_AUDITOR"));
         assert!(prompt
-            .contains("Include at least one accepted read-only AuditorReport in audit_reports"));
+            .contains("include at least one accepted read-only AuditorReport in audit_reports"));
         assert!(prompt.contains("- Worker runtime: codex"));
         assert!(prompt.contains("runtime-side role-tagged usage reporting is required before worker execution, usage, or cost can be reported"));
         Ok(())
