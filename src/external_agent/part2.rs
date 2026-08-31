@@ -5249,10 +5249,14 @@ fn codex_filesystem_permissions(
         }
     }
 
-    let mut entries = vec!["\":minimal\"=\"read\"".to_string()];
-    if spec.workspace_access == WorkspaceAccess::ReadWrite {
-        entries.push("\":workspace_roots\"={\".\"=\"write\"}".to_string());
-    }
+    let workspace_access = match spec.workspace_access {
+        WorkspaceAccess::ReadOnly => "read",
+        WorkspaceAccess::ReadWrite => "write",
+    };
+    let mut entries = vec![
+        "\":minimal\"=\"read\"".to_string(),
+        format!("\":workspace_roots\"={{\".\"=\"{workspace_access}\"}}"),
+    ];
     entries.extend(path_permissions.into_iter().map(|(path, access)| {
         format!("{}={}", toml_basic_string(&path), toml_basic_string(access))
     }));
