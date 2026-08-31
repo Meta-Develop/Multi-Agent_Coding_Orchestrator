@@ -327,7 +327,10 @@ fn observe_optional_live_grok_catalog(
 ) -> Result<Option<crate::runtime_adapter::grok::GrokAdvertisedCatalogObservation>> {
     match observe_grok_catalog(runner, repo, observed_at_unix_millis, program_override) {
         Ok(observation) => Ok(Some(observation)),
-        Err(error) if program_override.is_none() && grok_catalog_executable_is_missing(&error) => {
+        Err(error)
+            if program_override.is_none()
+                && grok_catalog_is_omittable_implicit_unavailability(&error) =>
+        {
             Ok(None)
         }
         Err(error) => Err(error).context("live Grok catalog observation failed closed"),
@@ -353,9 +356,16 @@ fn observe_grok_catalog(
     )
 }
 
-fn grok_catalog_executable_is_missing(error: &anyhow::Error) -> bool {
-    let text = format!("{error:#}").to_ascii_lowercase();
-    text.contains("grok catalog executable") && text.contains("is missing")
+fn grok_catalog_is_omittable_implicit_unavailability(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message == "Grok authentication source auth.json is missing"
+            || message == "Grok authentication source auth.json is unavailable"
+            || message == "Grok runtime model catalog has an invalid header"
+            || ((message.starts_with("Grok catalog executable '")
+                || message.starts_with("Grok executable '"))
+                && message.ends_with("' is missing"))
+    })
 }
 
 #[cfg(not(test))]
@@ -5259,6 +5269,17 @@ mod tests {
         }
     }
 
+    struct UnavailableGrokRunner(&'static str);
+
+    impl crate::runtime_adapter::grok::GrokCatalogCommandRunner for UnavailableGrokRunner {
+        fn run(
+            &self,
+            _spec: &crate::runtime_adapter::grok::GrokCatalogCommandSpec,
+        ) -> Result<crate::runtime_adapter::grok::GrokCatalogCommandOutput> {
+            bail!(self.0)
+        }
+    }
+
     fn grok_listing(default: &str, model_lines: &[&str]) -> Vec<u8> {
         let mut text = format!(
             "You are logged in with grok.com.\n\nDefault model: {default}\n\nAvailable models:\n"
@@ -5954,6 +5975,86 @@ mod tests {
             "{error:#}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn live_grok_catalog_bridge_omits_implicit_missing_or_unavailable_authentication() -> Result<()>
+    {
+        for message in [
+            "Grok authentication source auth.json is missing",
+            "Grok authentication source auth.json is unavailable",
+        ] {
+            assert_eq!(
+                observe_optional_live_grok_catalog(
+                    &UnavailableGrokRunner(message),
+                    Path::new("/workspace"),
+                    CAPTURED_CURSOR_AT_UNIX_MILLIS,
+                    None,
+                )?,
+                None
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn live_grok_catalog_bridge_omits_an_implicit_unauthenticated_invalid_header() -> Result<()> {
+        let runner = FakeGrokRunner::successful(b"You are not logged in.\n");
+        assert_eq!(
+            observe_optional_live_grok_catalog(
+                &runner,
+                Path::new("/workspace"),
+                CAPTURED_CURSOR_AT_UNIX_MILLIS,
+                None,
+            )?,
+            None
+        );
+        assert_eq!(runner.observed_specs.borrow().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn live_grok_catalog_bridge_fails_closed_for_explicit_unauthenticated_invalid_header() {
+        let error = observe_optional_live_grok_catalog(
+            &FakeGrokRunner::successful(b"You are not logged in.\n"),
+            Path::new("/workspace"),
+            CAPTURED_CURSOR_AT_UNIX_MILLIS,
+            Some(std::ffi::OsStr::new("/configured/grok")),
+        )
+        .expect_err("an explicit unauthenticated Grok listing must fail closed");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("live Grok catalog observation failed closed"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Grok runtime model catalog has an invalid header"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn live_grok_catalog_bridge_fails_closed_for_suspicious_implicit_credentials() {
+        for suspicious in [
+            "Grok authentication source auth.json is not a regular file",
+            "Grok authentication source auth.json identity changed",
+        ] {
+            let error = observe_optional_live_grok_catalog(
+                &UnavailableGrokRunner(suspicious),
+                Path::new("/workspace"),
+                CAPTURED_CURSOR_AT_UNIX_MILLIS,
+                None,
+            )
+            .expect_err("suspicious Grok credential state must fail closed");
+
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("live Grok catalog observation failed closed"),
+                "{message}"
+            );
+            assert!(message.contains(suspicious), "{message}");
+        }
     }
 
     #[test]
