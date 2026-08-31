@@ -4,15 +4,19 @@ use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
 use serde_json::Value;
 use std::{
-    env, fs,
-    path::Path,
-    process::{Command, Stdio},
+    collections::BTreeSet,
+    env,
+    ffi::OsString,
+    fs,
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
+const PAUSED_CANDIDATE_VALIDATION_COMMAND: &str = "printf ready > validation-ready; while [ ! -f validation-release ]; do sleep 0.05; done; rm -f validation-ready validation-release";
 
 #[test]
 fn merge_arbitrate_help_exposes_only_the_explicit_neutral_entrypoint() -> Result<()> {
@@ -363,26 +367,45 @@ fn merge_apply_revalidates_clean_committed_primary_after_candidate_validation() 
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\ncandidate\n")
         .context("edit worktree")?;
-    let mutation_command = format!(
-        "printf 'pub fn ok() -> bool {{ false }}\\n' > {} && git -C {} add src/lib.rs && git -C {} -c user.name='maco test' -c user.email='maco-test@example.invalid' commit -m concurrent-primary",
-        repo_path.join("src/lib.rs").display(),
-        repo_path.display(),
-        repo_path.display()
-    );
+    let runtime_root = candidate_validation_runtime_root()?;
+    let existing_runtime_entries = candidate_validation_runtime_entries(&runtime_root)?;
+    let mut apply = Command::new(BIN)
+        .args([
+            "merge",
+            "apply",
+            "agent-a",
+            "--repo",
+            repo,
+            "--claim",
+            "README.md",
+            "--validation-command",
+            PAUSED_CANDIDATE_VALIDATION_COMMAND,
+            "--force-stale-base",
+            "--json",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("start merge apply")?;
+    let validation_sandbox = wait_for_candidate_validation_ready(
+        &mut apply,
+        &runtime_root,
+        &existing_runtime_entries,
+    )?;
 
-    let report = run_failure_json(&[
-        "merge",
-        "apply",
-        "agent-a",
-        "--repo",
-        repo,
-        "--claim",
-        "README.md",
-        "--validation-command",
-        &mutation_command,
-        "--force-stale-base",
-        "--json",
-    ])?;
+    fs::write(
+        repo_path.join("src/lib.rs"),
+        "pub fn ok() -> bool { false }\n",
+    )
+    .context("edit primary during candidate validation")?;
+    let primary = Repository::open(&repo_path).context("open primary repo")?;
+    commit_all(&primary, "concurrent primary")?;
+    fs::write(validation_sandbox.join("validation-release"), "release\n")
+        .context("release validation")?;
+    let applied = apply.wait_with_output().context("wait for merge apply")?;
+
+    assert!(!applied.status.success());
+    let report: Value = serde_json::from_slice(&applied.stdout).context("parse apply report")?;
 
     assert_eq!(report["status"], "blocked");
     assert_eq!(
@@ -499,13 +522,8 @@ fn pr_publish_cannot_run_while_merge_apply_validates_candidate() -> Result<()> {
         "# Smoke\n\nvalidate lock\n",
     )
     .context("edit worktree")?;
-    let ready = temp.path().join("validation-ready");
-    let release = temp.path().join("validation-release");
-    let validation_command = format!(
-        "printf ready > '{}'; while [ ! -f '{}' ]; do sleep 0.05; done",
-        ready.display(),
-        release.display()
-    );
+    let runtime_root = candidate_validation_runtime_root()?;
+    let existing_runtime_entries = candidate_validation_runtime_entries(&runtime_root)?;
 
     let mut apply = Command::new(BIN)
         .args([
@@ -517,21 +535,18 @@ fn pr_publish_cannot_run_while_merge_apply_validates_candidate() -> Result<()> {
             "--claim",
             "README.md",
             "--validation-command",
-            &validation_command,
+            PAUSED_CANDIDATE_VALIDATION_COMMAND,
             "--json",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context("start merge apply")?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !ready.exists() {
-        if Instant::now() >= deadline {
-            let _ = apply.kill();
-            anyhow::bail!("merge validation command did not start before timeout");
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
+    let validation_sandbox = wait_for_candidate_validation_ready(
+        &mut apply,
+        &runtime_root,
+        &existing_runtime_entries,
+    )?;
 
     let publish = Command::new(BIN)
         .args([
@@ -548,7 +563,8 @@ fn pr_publish_cannot_run_while_merge_apply_validates_candidate() -> Result<()> {
         ])
         .output()
         .context("run concurrent pr publish")?;
-    fs::write(&release, "release\n").context("release validation")?;
+    fs::write(validation_sandbox.join("validation-release"), "release\n")
+        .context("release validation")?;
     let applied = apply.wait_with_output().context("wait for merge apply")?;
 
     assert!(!publish.status.success());
@@ -1235,9 +1251,9 @@ fn merge_apply_kills_setsid_validation_descendant_before_accepting_success() -> 
 }
 
 #[test]
-fn merge_apply_rejects_successful_validation_that_mutates_initialized_submodule() -> Result<()> {
+fn merge_apply_rejects_successful_validation_that_mutates_uninitialized_gitlink() -> Result<()> {
     support::require_containment!(
-        "merge_apply_rejects_successful_validation_that_mutates_initialized_submodule"
+        "merge_apply_rejects_successful_validation_that_mutates_uninitialized_gitlink"
     );
     let temp = TempDir::new().context("tempdir")?;
     let dependency_path = temp.path().join("dependency");
@@ -1269,8 +1285,9 @@ fn merge_apply_rejects_successful_validation_that_mutates_initialized_submodule(
         "# Smoke\n\nsubmodule candidate\n",
     )
     .context("edit worktree")?;
-    let marker_removed = "git -c protocol.file.allow=always submodule update --init --no-fetch modules/dependency && printf 'mutated\\n' > modules/dependency/tracked.txt && rm modules/dependency/.git";
-    let checkout_removed = "git -c protocol.file.allow=always submodule update --init --no-fetch modules/dependency && rm -rf modules/dependency";
+    let created_file =
+        "mkdir -p modules/dependency && printf 'mutated\\n' > modules/dependency/tracked.txt";
+    let created_nested_file = "mkdir -p modules/dependency/nested && printf 'mutated\\n' > modules/dependency/nested/untracked.txt";
 
     let report = run_failure_json(&[
         "merge",
@@ -1281,23 +1298,24 @@ fn merge_apply_rejects_successful_validation_that_mutates_initialized_submodule(
         "--claim",
         "README.md",
         "--validation-command",
-        marker_removed,
+        created_file,
         "--validation-command",
-        checkout_removed,
+        created_nested_file,
         "--json",
     ])?;
 
     assert_eq!(report["status"], "blocked");
     assert_eq!(report["applied"], false);
-    for validation in report["preview"]["candidate"]["validations"]
+    let validations = report["preview"]["candidate"]["validations"]
         .as_array()
-        .context("validation reports")?
-    {
+        .context("validation reports")?;
+    assert_eq!(validations.len(), 2);
+    for validation in validations {
         assert_eq!(validation["status"], "failed");
-        assert!(validation["message"]
-            .as_str()
-            .context("validation message")?
-            .contains("mutated tracked or non-ignored candidate state"));
+        assert_eq!(
+            validation["message"].as_str().context("validation message")?,
+            "validation command mutated tracked or non-ignored candidate state; its result was rejected"
+        );
     }
     assert_eq!(
         fs::read_to_string(repo_path.join("README.md")).context("read primary readme")?,
@@ -1734,6 +1752,133 @@ fn write_bound_validation(path: &Path, binding: &Value) -> Result<()> {
         serde_json::to_vec_pretty(&evidence).context("serialize evidence")?,
     )
     .context("write bound validation")
+}
+
+fn candidate_validation_runtime_root() -> Result<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let uid = fs::metadata("/proc/self")?.uid();
+        let user_runtime = PathBuf::from(format!("/run/user/{uid}"));
+        let metadata = fs::symlink_metadata(&user_runtime)
+            .with_context(|| format!("inspect trusted runtime {}", user_runtime.display()))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.uid() != uid
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            anyhow::bail!(
+                "trusted per-user runtime {} is not an owner-only real directory",
+                user_runtime.display()
+            );
+        }
+        return Ok(user_runtime.join(format!("maco-runtime-{uid}")));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    anyhow::bail!("candidate validation containment requires Linux")
+}
+
+fn candidate_validation_runtime_entries(runtime_root: &Path) -> Result<BTreeSet<OsString>> {
+    let metadata = match fs::symlink_metadata(runtime_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "inspect candidate validation runtime root {}",
+                    runtime_root.display()
+                )
+            })
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!(
+            "candidate validation runtime root {} is not a real directory",
+            runtime_root.display()
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let uid = fs::metadata("/proc/self")?.uid();
+        if metadata.uid() != uid || metadata.permissions().mode() & 0o077 != 0 {
+            anyhow::bail!(
+                "candidate validation runtime root {} is not owner-only",
+                runtime_root.display()
+            );
+        }
+    }
+    let entries = fs::read_dir(runtime_root).with_context(|| {
+        format!(
+            "read candidate validation runtime root {}",
+            runtime_root.display()
+        )
+    })?;
+    entries
+        .map(|entry| Ok(entry.context("read candidate validation runtime entry")?.file_name()))
+        .collect()
+}
+
+fn wait_for_candidate_validation_ready(
+    apply: &mut Child,
+    runtime_root: &Path,
+    existing_runtime_entries: &BTreeSet<OsString>,
+) -> Result<PathBuf> {
+    let result = (|| {
+        let prefix = format!("maco-candidate-validation-{}-", apply.id());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut matches = Vec::new();
+            for name in candidate_validation_runtime_entries(runtime_root)? {
+                if existing_runtime_entries.contains(&name)
+                    || !name
+                        .to_str()
+                        .is_some_and(|name| name.starts_with(&prefix))
+                {
+                    continue;
+                }
+                let path = runtime_root.join(&name);
+                match fs::symlink_metadata(&path) {
+                    Ok(metadata) if metadata.file_type().is_dir() => matches.push(path),
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("inspect candidate validation sandbox {}", path.display())
+                        })
+                    }
+                }
+            }
+            if matches.len() > 1 {
+                anyhow::bail!(
+                    "found multiple fresh candidate validation sandboxes for apply pid {}",
+                    apply.id()
+                );
+            }
+            if let Some(sandbox) = matches.pop() {
+                if fs::symlink_metadata(sandbox.join("validation-ready"))
+                    .is_ok_and(|metadata| metadata.file_type().is_file())
+                {
+                    return Ok(sandbox);
+                }
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "candidate validation sandbox for apply pid {} did not become ready before timeout",
+                    apply.id()
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    })();
+    if result.is_err() {
+        let _ = apply.kill();
+        let _ = apply.wait();
+    }
+    result
 }
 
 fn run_success_json(args: &[&str]) -> Result<Value> {
