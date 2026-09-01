@@ -1190,6 +1190,51 @@ fn orchestration_holds_write_lease_through_child_validation_and_finalization() {
 
 #[cfg(unix)]
 #[test]
+fn orchestration_created_lane_removal_deletes_its_authenticated_branch() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    fs::write(repo_path.join("README.md"), "# Test\n").expect("write README");
+    commit_all(&repo, "initial commit").expect("commit");
+    let plan_file = temp.path().join("plan.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "agents": [{
+                "id": "orchestrated-delete",
+                "paths": ["README.md"],
+                "command": "true"
+            }]
+        }))
+        .expect("encode plan"),
+    )
+    .expect("write plan");
+
+    let summary = run_plan_file(OrchestrationRunOptions {
+        repo: repo_path.clone(),
+        plan_file,
+        keep_claims: false,
+        jobs: 1,
+        patch_dir: None,
+    })
+    .expect("run orchestration");
+    assert!(summary.success);
+
+    let manager = WorktreeManager::new(&repo_path);
+    let removed = manager
+        .remove("orchestrated-delete", true, true)
+        .expect("remove orchestration-created lane and branch");
+
+    assert!(!removed.path.exists());
+    assert!(repo
+        .find_branch("maco/orchestrated-delete", git2::BranchType::Local)
+        .is_err());
+    assert!(manager.list().expect("list after removal").is_empty());
+}
+
+#[cfg(unix)]
+#[test]
 fn orchestration_releases_write_lease_after_timeout() {
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
