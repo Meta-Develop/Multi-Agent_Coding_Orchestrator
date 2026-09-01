@@ -331,27 +331,19 @@ pub(super) fn pre_action_review_context(
         assignment.notes.as_deref(),
         &assignment.id,
     );
-    let validated = ReviewContext::new(
-        options.run_id.as_str(),
-        &assignment.id,
-        &normalized_intent,
-        claims.clone(),
-        std::iter::empty::<RepoPathRule>(),
-    )
-    .context("failed to construct pre-action review context")?;
-    if normalized_intent.len() <= PRE_ACTION_INTENT_SUMMARY_MAX_BYTES {
-        return Ok(validated);
-    }
-
-    let bounded_intent = pre_action_intent_summary(
-        assignment.task.as_deref(),
-        assignment.notes.as_deref(),
-        &assignment.id,
-    );
+    let intent_summary = if normalized_intent.len() > PRE_ACTION_INTENT_SUMMARY_MAX_BYTES {
+        pre_action_intent_summary(
+            assignment.task.as_deref(),
+            assignment.notes.as_deref(),
+            &assignment.id,
+        )
+    } else {
+        normalized_intent
+    };
     ReviewContext::new(
         options.run_id.as_str(),
         &assignment.id,
-        &bounded_intent,
+        &intent_summary,
         claims,
         std::iter::empty::<RepoPathRule>(),
     )
@@ -370,6 +362,42 @@ pub(super) fn configure_read_only_auditor_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn review_options(run_id: &str) -> SupervisorRunOptions {
+        SupervisorRunOptions {
+            repo: PathBuf::from("."),
+            plan_file: PathBuf::from("unused-plan.json"),
+            run_id: RunId::new(run_id).expect("valid review test run id"),
+            parent_node: None,
+            codex_bin: PathBuf::from("unused-codex"),
+            runtime: SupervisorRuntime::Codex,
+            allow_dirty_primary: false,
+            allow_live_run_collision: false,
+            admission_overrides: SupervisorAdmissionConfig::default(),
+            budget_overrides: RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
+            machine_global_retention: None,
+        }
+    }
+
+    fn review_assignment(id: &str, task: String) -> OrchestratorAssignment {
+        OrchestratorAssignment {
+            id: id.to_string(),
+            phase: AssignmentPhase::Execution,
+            runtime: None,
+            role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
+            assigned_paths: vec![PathBuf::from("src/pre_action_review.rs")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: Some(task),
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        }
+    }
 
     #[test]
     fn pre_action_intent_summary_flattens_unicode_whitespace_and_controls() {
@@ -422,5 +450,47 @@ mod tests {
             pre_action_intent_summary(Some("\n"), Some("\t"), "\u{0000}"),
             PRE_ACTION_INTENT_SUMMARY_FALLBACK
         );
+    }
+
+    #[test]
+    fn pre_action_review_context_bounds_oversized_normalized_task_before_validation() {
+        let task = "界".repeat((8 * 1024 / '界'.len_utf8()) + 1);
+        assert!(normalize_pre_action_intent_candidate(&task).len() > 8 * 1024);
+        let assignment = review_assignment("child-a", task);
+
+        let context = pre_action_review_context(
+            &review_options("run-long-intent"),
+            &assignment,
+            Path::new("."),
+        )
+        .expect("oversized normalized task must use the bounded intent summary");
+        let expected = "界".repeat(PRE_ACTION_INTENT_SUMMARY_MAX_BYTES / '界'.len_utf8());
+
+        assert_eq!(context.intent_summary(), expected);
+        assert!(context.intent_summary().len() <= PRE_ACTION_INTENT_SUMMARY_MAX_BYTES);
+    }
+
+    #[test]
+    fn pre_action_review_context_preserves_typed_non_size_validation_error() {
+        let assignment = review_assignment("invalid/owner", "bounded task".to_string());
+
+        let error = pre_action_review_context(
+            &review_options("run-invalid-owner"),
+            &assignment,
+            Path::new("."),
+        )
+        .expect_err("malformed non-size context data must fail closed");
+        let typed = error
+            .chain()
+            .find_map(|cause| {
+                cause.downcast_ref::<crate::pre_action_review::PreActionReviewError>()
+            })
+            .expect("anyhow chain must preserve the typed pre-action review error");
+
+        assert!(matches!(
+            typed,
+            crate::pre_action_review::PreActionReviewError::Invalid(message)
+                if message.contains("review owner is invalid")
+        ));
     }
 }
