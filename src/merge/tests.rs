@@ -1549,6 +1549,82 @@ fn required_network_output_rejects_even_verified_wrong_profile() {
 }
 
 #[test]
+fn local_git_timeout_override_reaches_candidate_snapshot_diff_deadline() {
+    let timeout = parse_local_git_process_timeout(Some("900")).expect("parse raised budget");
+    let base = Oid::from_str("1111111111111111111111111111111111111111").expect("base oid");
+    let snapshot = Oid::from_str("2222222222222222222222222222222222222222").expect("snapshot oid");
+
+    let diff = collect_snapshot_diff_with_runner(
+        base,
+        snapshot,
+        timeout,
+        |operation, stdin, label, effective_timeout| {
+            assert_eq!(effective_timeout, Duration::from_secs(900));
+            assert_eq!(label, "collect candidate snapshot diff");
+            assert_eq!(operation.first(), Some(&"diff"));
+            assert!(matches!(stdin, StdinMode::Null));
+            Ok(RequiredCommandOutput {
+                success: true,
+                stdout: b"raised-budget-diff".to_vec(),
+                stderr: Vec::new(),
+            })
+        },
+    )
+    .expect("collect snapshot diff");
+
+    assert_eq!(diff, b"raised-budget-diff");
+}
+
+#[test]
+fn local_git_timeout_default_and_invalid_overrides_are_typed() {
+    assert_eq!(
+        parse_local_git_process_timeout(None).expect("default timeout"),
+        Duration::from_secs(120)
+    );
+    assert!(matches!(
+        parse_local_git_process_timeout(Some("0")),
+        Err(LocalGitProcessTimeoutError::OutOfRange { seconds: 0, .. })
+    ));
+    assert!(matches!(
+        parse_local_git_process_timeout(Some("86401")),
+        Err(LocalGitProcessTimeoutError::OutOfRange {
+            seconds: 86401,
+            max_seconds: 86400,
+        })
+    ));
+}
+
+#[test]
+fn local_git_deadline_diagnostic_names_effective_budget_and_knob() {
+    let output = ProcessOutput {
+        status: None,
+        duration: Duration::from_secs(900),
+        timed_out: true,
+        process_tree: ContainmentEvidence::VerifiedEmpty(
+            crate::process_runner::ContainmentBackend::DirectChild,
+        ),
+        side_effects: SideEffectConfinementEvidence::Verified(
+            SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+        ),
+        stdout: crate::process_runner::CapturedBytes::default(),
+        stderr: crate::process_runner::CapturedBytes::default(),
+        process_error: None,
+        stdin_error: None,
+    };
+
+    let error = require_verified_process_output_with_deadline_hint(
+        "collect candidate snapshot diff",
+        &output,
+        SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+        Some((Duration::from_secs(900), LOCAL_GIT_PROCESS_TIMEOUT_ENV)),
+    )
+    .expect_err("deadline must fail");
+    let message = error.to_string();
+    assert!(message.contains("effective 900-second"));
+    assert!(message.contains(LOCAL_GIT_PROCESS_TIMEOUT_ENV));
+}
+
+#[test]
 fn trusted_network_environment_and_stdin_fail_closed() {
     let temp = tempfile::tempdir().expect("tempdir");
     let global_config = temp.path().join("global-config");

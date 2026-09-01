@@ -84,6 +84,8 @@ const MAX_BOUND_VALIDATION_NAME_BYTES: usize = 1024;
 const MAX_BOUND_VALIDATION_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_BOUND_VALIDATION_PATHS_PER_REPORT: usize = 8192;
 const LOCAL_GIT_PROCESS_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_LOCAL_GIT_PROCESS_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+const LOCAL_GIT_PROCESS_TIMEOUT_ENV: &str = "MACO_MERGE_LOCAL_GIT_TIMEOUT_SECONDS";
 pub(crate) const NETWORK_PROCESS_TIMEOUT: Duration = Duration::from_secs(300);
 const CANDIDATE_VALIDATION_PROCESS_TIMEOUT: Duration = Duration::from_secs(600);
 const GIT_CAPTURE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
@@ -97,6 +99,53 @@ const PRIVATE_RUNTIME_OWNER_MAX_BYTES: u64 = 4 * 1024;
 const PRIVATE_RUNTIME_SCAN_MAX_DIRECTORIES: usize = 128;
 const PRIVATE_RUNTIME_REMOVAL_MAX_ENTRIES: usize = 32 * 1024;
 const PRIVATE_RUNTIME_REMOVAL_MAX_DEPTH: usize = 128;
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+enum LocalGitProcessTimeoutError {
+    #[error("MACO_MERGE_LOCAL_GIT_TIMEOUT_SECONDS must be valid Unicode")]
+    NotUnicode,
+    #[error(
+        "MACO_MERGE_LOCAL_GIT_TIMEOUT_SECONDS must be an integer number of seconds, got {value:?}"
+    )]
+    InvalidInteger { value: String },
+    #[error(
+        "MACO_MERGE_LOCAL_GIT_TIMEOUT_SECONDS must be between 1 and {max_seconds} seconds, got {seconds}"
+    )]
+    OutOfRange { seconds: u64, max_seconds: u64 },
+}
+
+fn parse_local_git_process_timeout(
+    value: Option<&str>,
+) -> std::result::Result<Duration, LocalGitProcessTimeoutError> {
+    let Some(value) = value else {
+        return Ok(LOCAL_GIT_PROCESS_TIMEOUT);
+    };
+    let seconds =
+        value
+            .parse::<u64>()
+            .map_err(|_| LocalGitProcessTimeoutError::InvalidInteger {
+                value: value.to_string(),
+            })?;
+    let max_seconds = MAX_LOCAL_GIT_PROCESS_TIMEOUT.as_secs();
+    if seconds == 0 || seconds > max_seconds {
+        return Err(LocalGitProcessTimeoutError::OutOfRange {
+            seconds,
+            max_seconds,
+        });
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+fn local_git_process_timeout() -> Result<Duration> {
+    let value = match env::var(LOCAL_GIT_PROCESS_TIMEOUT_ENV) {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(LocalGitProcessTimeoutError::NotUnicode.into())
+        }
+    };
+    parse_local_git_process_timeout(value.as_deref()).map_err(Into::into)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeCollectOptions {
