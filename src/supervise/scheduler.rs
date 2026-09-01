@@ -2193,7 +2193,14 @@ fn resolved_role_execution_bindings(
     plan: &SupervisorPlan,
     runtime: SupervisorRuntime,
     runtime_model_catalog: Option<&RuntimeModelCatalog>,
+    assignment_selection_ledger: &[AssignmentSelectionLedgerEntry],
+    selection_decisions: &[SupervisorSelectionEvent],
 ) -> BTreeMap<AgentRole, ResolvedRoleExecutionBinding> {
+    let assignment_specific_worker_binding = assignment_specific_worker_role_binding(
+        plan,
+        assignment_selection_ledger,
+        selection_decisions,
+    );
     [
         AgentRole::Supervisor,
         AgentRole::ChildOrchestrator,
@@ -2203,6 +2210,11 @@ fn resolved_role_execution_bindings(
     ]
     .into_iter()
     .map(|role| {
+        if role == AgentRole::Worker {
+            if let Some(binding) = assignment_specific_worker_binding.as_ref() {
+                return (role, binding.clone());
+            }
+        }
         let configured = configured_role_model_selection(plan, role);
         let mut effective = configured.clone();
         effective.reasoning_effort =
@@ -2300,6 +2312,68 @@ fn resolved_role_execution_bindings(
         )
     })
     .collect()
+}
+
+fn assignment_specific_worker_role_binding(
+    plan: &SupervisorPlan,
+    assignment_selection_ledger: &[AssignmentSelectionLedgerEntry],
+    selection_decisions: &[SupervisorSelectionEvent],
+) -> Option<ResolvedRoleExecutionBinding> {
+    // This is a final-report projection only. Launch authorization and runtime binding have
+    // already completed before the scheduler constructs this evidence aggregate.
+    let observed = assignment_selection_ledger
+        .iter()
+        .filter(|entry| entry.role == AgentRole::Worker)
+        .filter(|entry| {
+            selection_decisions.iter().rev().any(|event| {
+                event.role == AgentRole::Worker
+                    && event
+                        .assignment_id
+                        .as_deref()
+                        .is_none_or(|assignment_id| assignment_id == entry.assignment_id)
+                    && event.attempt == entry.attempt
+                    && event.provenance.status == crate::selection::DecisionStatus::Selected
+                    && event.provenance.choice.is_some()
+            })
+        })
+        .filter_map(|entry| {
+            Some((
+                entry.selected_runtime.clone()?,
+                entry.selected_model.clone()?,
+                entry.selected_reasoning_effort.clone()?,
+            ))
+        })
+        .collect::<BTreeSet<_>>();
+    let observed_count = observed.len();
+    if observed_count == 0 {
+        return None;
+    }
+
+    let configured = configured_role_model_selection(plan, AgentRole::Worker);
+    let (resolved_model, resolved_reasoning_effort, unavailable_reason) = if observed_count == 1 {
+        let (_, model, effort) = observed.into_iter().next()?;
+        (Some(model), Some(effort), None)
+    } else {
+        (
+            None,
+            None,
+            Some(format!(
+                "retained Worker selections contain {observed_count} distinct runtime/model/reasoning-effort bindings, so no single aggregate Worker model or reasoning effort is truthful; inspect role_economics_profile.execution.assignment_selection_ledger for each assignment's selected_runtime, selected_model, and selected_reasoning_effort"
+            )),
+        )
+    };
+    let configured_model_chain = configured.configured_model_chain();
+    Some(ResolvedRoleExecutionBinding {
+        configured_model: configured.model,
+        configured_reasoning_effort: configured.reasoning_effort,
+        resolved_model,
+        resolved_reasoning_effort,
+        observation: RoleBindingObservation::AssignmentSpecific,
+        resolution_observation: ModelResolutionObservation::NotResolved,
+        configured_model_chain,
+        resolved_candidate_index: None,
+        unavailable_reason,
+    })
 }
 
 fn execution_role_economics_profile(
@@ -2412,31 +2486,6 @@ fn build_supervisor_final_report(
     let role_usage = complete_role_usage_reports(role_usage);
     let mut role_economics_profile =
         execution_role_economics_profile(plan, runtime, runtime_model_catalog);
-    let mut role_bindings = resolved_role_execution_bindings(plan, runtime, runtime_model_catalog);
-    if budget_degradations.iter().any(|record| {
-        matches!(
-            record.change,
-            BudgetDegradationChange::ReasoningEffort {
-                role: AgentRole::Worker,
-                ..
-            } | BudgetDegradationChange::ModelTier {
-                role: AgentRole::Worker,
-                ..
-            }
-        )
-    }) {
-        if let Some(binding) = role_bindings.get_mut(&AgentRole::Worker) {
-            binding.resolved_model = None;
-            binding.resolved_reasoning_effort = None;
-            binding.observation = RoleBindingObservation::AssignmentSpecific;
-            binding.resolution_observation = ModelResolutionObservation::NotResolved;
-            binding.resolved_candidate_index = None;
-            binding.unavailable_reason = Some(
-                "mechanical Worker degradation produced assignment-specific model or effort bindings; inspect budget_degradations for the typed trigger and resolved per-assignment policy"
-                    .to_string(),
-            );
-        }
-    }
     if has_multiple_independent_assignment_scopes && achieved_concurrency.peak == 1 {
         collected.findings.push(Finding {
             severity: FindingSeverity::Warning,
@@ -2480,6 +2529,40 @@ fn build_supervisor_final_report(
             "assignment parked by the pre-claim viability gate before model or effort selection"
                 .to_string(),
         );
+    }
+    let mut role_bindings = resolved_role_execution_bindings(
+        plan,
+        runtime,
+        runtime_model_catalog,
+        &assignment_selection_ledger,
+        &selection_decisions,
+    );
+    if budget_degradations.iter().any(|record| {
+        matches!(
+            record.change,
+            BudgetDegradationChange::ReasoningEffort {
+                role: AgentRole::Worker,
+                ..
+            } | BudgetDegradationChange::ModelTier {
+                role: AgentRole::Worker,
+                ..
+            }
+        )
+    }) {
+        if let Some(binding) = role_bindings
+            .get_mut(&AgentRole::Worker)
+            .filter(|binding| binding.observation != RoleBindingObservation::AssignmentSpecific)
+        {
+            binding.resolved_model = None;
+            binding.resolved_reasoning_effort = None;
+            binding.observation = RoleBindingObservation::AssignmentSpecific;
+            binding.resolution_observation = ModelResolutionObservation::NotResolved;
+            binding.resolved_candidate_index = None;
+            binding.unavailable_reason = Some(
+                "mechanical Worker degradation produced assignment-specific model or effort bindings; inspect budget_degradations for the typed trigger and resolved per-assignment policy"
+                    .to_string(),
+            );
+        }
     }
     let (serialized_admission_policy_input, policy_input_unavailable_reason) =
         match serde_json::to_string(&admission_policy_input) {
@@ -2845,8 +2928,20 @@ fn persist_supervisor_final_report(
     orchestration_journal: &mut Option<OrchestrationEventJournal>,
     mut artifact_writer: ArtifactRunWriter,
     checkpoint_writer: Option<&mut SupervisorCheckpointWriter>,
+    invocation_scratch_quiescence: Option<crate::artifacts::ArtifactScratchQuiescence>,
     release_after_terminal_record: impl FnOnce() -> Result<()>,
 ) -> Result<SupervisorFinalReport> {
+    if let Some(quiescence) = invocation_scratch_quiescence {
+        // Incoming/capture trees are identity-bound reservations counted by the
+        // artifact writer, even when a post-reservation admission check returns
+        // before the normal import/discard path. This terminal boundary receives
+        // proof only after every invocation has joined (or no child launched), so
+        // it can discard those run-owned trees without weakening the gate for
+        // unverified or foreign scratch.
+        artifact_writer
+            .discard_supervisor_invocation_scratches_after_quiescence(quiescence)
+            .context("failed to discard quiescent supervisor invocation scratches")?;
+    }
     enforce_supervisor_final_environment_failure_outcome(&mut final_report);
     record_orchestration_event(
         orchestration_journal,
@@ -2981,6 +3076,10 @@ fn initialize_scheduler_evidence(
     write_worker_schema(
         initialization.artifact_writer,
         Path::new("schemas/worker-report.schema.json"),
+    )?;
+    write_codex_worker_schema(
+        initialization.artifact_writer,
+        Path::new("schemas/worker-report.codex-output.schema.json"),
     )?;
     write_auditor_schema(
         initialization.artifact_writer,
@@ -3707,6 +3806,7 @@ fn persist_supervisor_predispatch_failure(
         &mut orchestration_journal,
         artifact_writer,
         Some(checkpoint_writer),
+        Some(crate::artifacts::ArtifactScratchQuiescence::Verified),
         || Ok(()),
     )
 }
@@ -4287,6 +4387,8 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         &mut orchestration_journal,
         artifact_writer,
         checkpoint_finalization.then_some(&mut checkpoint_writer),
+        (!external_containment_failed)
+            .then_some(crate::artifacts::ArtifactScratchQuiescence::Verified),
         || {
             let released = release_collected_scheduler_resources(
                 sync_store_slot.as_ref(),
@@ -4413,6 +4515,193 @@ mod selection_policy_tests {
             .next()
             .map(|event| event.provenance)
             .context("initial selector provenance")
+    }
+
+    fn terminal_worker_assignment(id: &str) -> OrchestratorAssignment {
+        OrchestratorAssignment {
+            id: id.to_string(),
+            phase: AssignmentPhase::Execution,
+            runtime: None,
+            role: AgentRole::Worker,
+            role_category: None,
+            selection_source: None,
+            assigned_paths: vec![PathBuf::from(SELECTOR_TEST_TARGET)],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        }
+    }
+
+    fn selected_worker_event(
+        mut provenance: crate::selection::SelectionProvenance,
+        assignment_id: &str,
+        runtime: &str,
+        model: &str,
+        effort: crate::selection::ReasoningEffort,
+    ) -> SupervisorSelectionEvent {
+        let choice = provenance
+            .choice
+            .as_mut()
+            .expect("automatic selection provenance has a selected choice");
+        choice.candidate.runtime = runtime.to_string();
+        choice.candidate.model = model.to_string();
+        choice.candidate.effort = effort;
+        SupervisorSelectionEvent {
+            assignment_id: Some(assignment_id.to_string()),
+            attempt: 1,
+            role: AgentRole::Worker,
+            primary_cause: SupervisorSelectionEventCause::Initial,
+            provenance,
+        }
+    }
+
+    #[test]
+    fn worker_role_binding_uses_unanimous_cross_runtime_assignment_evidence() -> Result<()> {
+        let (catalog, _, initial_events, mut plan) = automatic_selection_fixture()?;
+        plan.assignments = vec![
+            terminal_worker_assignment("worker-a"),
+            terminal_worker_assignment("worker-b"),
+        ];
+        plan.role_models
+            .insert(AgentRole::Worker, role_selection("grok-4.6", "xhigh"));
+
+        let legacy = resolved_role_execution_bindings(
+            &plan,
+            SupervisorRuntime::Codex,
+            Some(&catalog),
+            &[],
+            &[],
+        );
+        let legacy_worker = legacy
+            .get(&AgentRole::Worker)
+            .context("legacy Worker role binding")?;
+        assert_eq!(
+            legacy_worker.observation,
+            RoleBindingObservation::ResolutionFailed
+        );
+        assert!(legacy_worker
+            .unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("grok-4.6")));
+
+        let provenance = initial_events
+            .into_iter()
+            .find(|event| event.role == AgentRole::Worker)
+            .context("initial Worker selection provenance")?
+            .provenance;
+        let decisions = vec![
+            selected_worker_event(
+                provenance.clone(),
+                "worker-a",
+                "grok",
+                "grok-4.6",
+                crate::selection::ReasoningEffort::Xhigh,
+            ),
+            selected_worker_event(
+                provenance,
+                "worker-b",
+                "grok",
+                "grok-4.6",
+                crate::selection::ReasoningEffort::Xhigh,
+            ),
+        ];
+        let ledger = build_assignment_selection_ledger(&plan, &decisions, SupervisorRuntime::Codex);
+        let worker_rows = ledger
+            .iter()
+            .filter(|entry| entry.role == AgentRole::Worker)
+            .collect::<Vec<_>>();
+        assert_eq!(worker_rows.len(), 2);
+        assert!(worker_rows.iter().all(|entry| {
+            entry.selected_runtime.as_deref() == Some("grok")
+                && entry.selected_model.as_deref() == Some("grok-4.6")
+                && entry.selected_reasoning_effort.as_deref() == Some("xhigh")
+                && entry.catalog_source == AssignmentCatalogSource::RuntimeAdvertised
+        }));
+
+        let bindings = resolved_role_execution_bindings(
+            &plan,
+            SupervisorRuntime::Codex,
+            Some(&catalog),
+            &ledger,
+            &decisions,
+        );
+        let worker = bindings
+            .get(&AgentRole::Worker)
+            .context("assignment-specific Worker role binding")?;
+        assert_eq!(
+            worker.observation,
+            RoleBindingObservation::AssignmentSpecific
+        );
+        assert_eq!(worker.resolved_model.as_deref(), Some("grok-4.6"));
+        assert_eq!(worker.resolved_reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(
+            worker.resolution_observation,
+            ModelResolutionObservation::NotResolved
+        );
+        assert!(worker.unavailable_reason.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn worker_role_binding_keeps_heterogeneous_assignments_explicit() -> Result<()> {
+        let (catalog, _, initial_events, mut plan) = automatic_selection_fixture()?;
+        plan.assignments = vec![
+            terminal_worker_assignment("worker-a"),
+            terminal_worker_assignment("worker-b"),
+        ];
+        let provenance = initial_events
+            .into_iter()
+            .find(|event| event.role == AgentRole::Worker)
+            .context("initial Worker selection provenance")?
+            .provenance;
+        let decisions = vec![
+            selected_worker_event(
+                provenance.clone(),
+                "worker-a",
+                "grok",
+                "grok-4.6",
+                crate::selection::ReasoningEffort::Xhigh,
+            ),
+            selected_worker_event(
+                provenance,
+                "worker-b",
+                "codex",
+                "gpt-5.6-sol",
+                crate::selection::ReasoningEffort::High,
+            ),
+        ];
+        let ledger = build_assignment_selection_ledger(&plan, &decisions, SupervisorRuntime::Codex);
+
+        let bindings = resolved_role_execution_bindings(
+            &plan,
+            SupervisorRuntime::Codex,
+            Some(&catalog),
+            &ledger,
+            &decisions,
+        );
+        let worker = bindings
+            .get(&AgentRole::Worker)
+            .context("heterogeneous Worker role binding")?;
+        assert_eq!(
+            worker.observation,
+            RoleBindingObservation::AssignmentSpecific
+        );
+        assert!(worker.resolved_model.is_none());
+        assert!(worker.resolved_reasoning_effort.is_none());
+        let reason = worker
+            .unavailable_reason
+            .as_deref()
+            .context("heterogeneous Worker explanation")?;
+        assert!(reason.contains("2 distinct runtime/model/reasoning-effort bindings"));
+        assert!(reason.contains("assignment_selection_ledger"));
+        assert!(reason.contains("selected_runtime"));
+        assert!(reason.contains("selected_model"));
+        assert!(reason.contains("selected_reasoning_effort"));
+        Ok(())
     }
 
     fn initialized_repository() -> (tempfile::TempDir, PathBuf) {
@@ -5289,18 +5578,21 @@ mod selection_policy_tests {
             .as_ref()
             .context("selection failure execution metadata")?
             .selection_decisions;
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].role, AgentRole::Auditor);
+        assert_eq!(events.len(), provisional_default_role_models().len());
+        let auditor_event = events
+            .iter()
+            .find(|event| event.role == AgentRole::Auditor)
+            .context("persisted fail-closed auditor selection event")?;
         assert_eq!(
-            events[0].primary_cause,
+            auditor_event.primary_cause,
             SupervisorSelectionEventCause::DebugOverride
         );
         assert_eq!(
-            events[0].provenance.status,
+            auditor_event.provenance.status,
             crate::selection::DecisionStatus::FailClosed
         );
-        assert!(events[0].provenance.choice.is_none());
-        assert!(!events[0].provenance.candidate_set.is_empty());
+        assert!(auditor_event.provenance.choice.is_none());
+        assert!(!auditor_event.provenance.candidate_set.is_empty());
         let ledger = &profile
             .execution
             .as_ref()

@@ -130,8 +130,36 @@ pub(super) fn read_child_report(
             display_path.display()
         )
     })?;
-    parse_report_json(contents)
-        .with_context(|| format!("failed to parse child report {}", display_path.display()))
+    let parsed: ParsedReport<OrchestratorReviewReport> = parse_report_json(contents)
+        .with_context(|| format!("failed to parse child report {}", display_path.display()))?;
+    if parsed.report.role != AgentRole::ChildOrchestrator {
+        bail!(
+            "child report {} declared non-child role {:?}",
+            display_path.display(),
+            parsed.report.role
+        );
+    }
+    Ok(parsed)
+}
+
+pub(super) fn read_worker_report(
+    contents: Option<&[u8]>,
+    display_path: &Path,
+) -> Result<ParsedReport<WorkerReport>> {
+    let contents =
+        contents.context("external run did not capture a descriptor-held direct worker report")?;
+    let contents = std::str::from_utf8(contents).with_context(|| {
+        format!(
+            "descriptor-held direct worker report is not UTF-8: {}",
+            display_path.display()
+        )
+    })?;
+    parse_report_json(contents).with_context(|| {
+        format!(
+            "failed to parse direct worker report {}",
+            display_path.display()
+        )
+    })
 }
 
 pub(super) fn write_child_report(
@@ -160,6 +188,96 @@ pub(super) fn write_child_report(
     })
 }
 
+pub(super) fn write_worker_report(
+    writer: &mut ArtifactRunWriter,
+    relative: &Path,
+    report: &WorkerReport,
+) -> Result<()> {
+    let mut normalized_report = report.clone();
+    enforce_worker_environment_failure_outcome(&mut normalized_report);
+    write_artifact_json(
+        writer,
+        relative,
+        &normalized_report,
+        MAX_SUPERVISOR_REPORT_BYTES,
+        ArtifactFileDisposition::PrivateEvidence,
+    )
+    .with_context(|| {
+        format!(
+            "failed to update normalized direct worker report {}",
+            relative.display()
+        )
+    })
+}
+
+pub(super) fn finalized_direct_worker_report(
+    assignment: &OrchestratorAssignment,
+    envelope: &OrchestratorReviewReport,
+    report_path: &Path,
+) -> WorkerReport {
+    let matching_worker = match envelope.worker_reports.as_slice() {
+        [worker] if worker.id == assignment.id => Some(worker.clone()),
+        _ => None,
+    };
+    let matched = matching_worker.is_some();
+    let mut report = matching_worker.unwrap_or_else(|| WorkerReport {
+        id: assignment.id.clone(),
+        role: AgentRole::Worker,
+        assignment_kind: AssignmentKind::Ordinary,
+        target_path: None,
+        assigned_paths: assignment.assigned_paths.clone(),
+        semantic_symbols: assignment.semantic_symbols.clone(),
+        semantic_modules: assignment.semantic_modules.clone(),
+        claim_token: envelope.claim_token,
+        semantic_intent_token: envelope.semantic_intent_token,
+        commands_run: envelope.commands_run.clone(),
+        environment_failures: envelope.environment_failures.clone(),
+        files_changed: envelope.files_changed.clone(),
+        validation_results: envelope.validation_results.clone(),
+        findings: vec![Finding {
+            severity: FindingSeverity::Error,
+            message: format!(
+                "direct worker finalization envelope contained {} WorkerReport entries instead of exactly one report bound to assignment '{}'",
+                envelope.worker_reports.len(),
+                assignment.id
+            ),
+            paths: vec![report_path.to_path_buf()],
+        }],
+        field_guide_entries: Vec::new(),
+        bloated_file_flags: Vec::new(),
+        decomposition_completion: None,
+        no_further_delegation: None,
+        accepted: false,
+        rejected: true,
+        status: if envelope.status == ReviewStatus::Succeeded {
+            ReviewStatus::Failed
+        } else {
+            envelope.status
+        },
+        remaining_risk: envelope.remaining_risk.clone(),
+        next_safe_action: envelope.next_safe_action.clone(),
+    });
+    for finding in &envelope.findings {
+        if !report.findings.contains(finding) {
+            report.findings.push(finding.clone());
+        }
+    }
+    if matched {
+        report.accepted = envelope.accepted;
+        report.rejected = envelope.rejected;
+        report.status = envelope.status;
+    }
+    report
+        .environment_failures
+        .clone_from(&envelope.environment_failures);
+    report.remaining_risk.clone_from(&envelope.remaining_risk);
+    report
+        .next_safe_action
+        .clone_from(&envelope.next_safe_action);
+    enforce_worker_environment_failure_outcome(&mut report);
+    report
+}
+
 pub(super) fn read_auditor_report(
     contents: Option<&[u8]>,
     display_path: &Path,
@@ -176,6 +294,25 @@ pub(super) fn read_auditor_report(
         .with_context(|| format!("failed to parse auditor report {}", display_path.display()))
 }
 
+pub(super) fn assignment_worker_journal_subject_ids(
+    assignment: &OrchestratorAssignment,
+) -> Result<Vec<&str>> {
+    if assignment.role == AgentRole::Worker {
+        if !assignment.worker_assignments.is_empty() {
+            bail!(
+                "direct terminal-worker assignment '{}' attempted nested worker delegation",
+                assignment.id
+            );
+        }
+        return Ok(vec![assignment.id.as_str()]);
+    }
+    Ok(assignment
+        .worker_assignments
+        .iter()
+        .map(|worker| worker.id.as_str())
+        .collect())
+}
+
 pub(super) fn import_worker_execution_journals(
     writer: &mut ArtifactRunWriter,
     assignment: &OrchestratorAssignment,
@@ -183,18 +320,19 @@ pub(super) fn import_worker_execution_journals(
     external_run: &ExternalAgentRun,
 ) -> Result<WorkerExecutionJournalEvidenceSet> {
     let mut journals = WorkerExecutionJournalEvidenceSet::new();
+    let worker_ids = assignment_worker_journal_subject_ids(assignment)?;
     let process_quiescent = external_run.scratch_quiescence_verified();
     let mut capture_contract_error = None;
     let mut seen_capture_ids = BTreeSet::new();
     for capture in external_run.worker_journal_artifacts() {
-        let expected_path = assignment
-            .worker_assignments
+        let expected_path = worker_ids
             .iter()
-            .find(|worker| worker.id == capture.worker_id)
-            .map(|worker| {
+            .copied()
+            .find(|worker_id| capture.worker_id.as_str() == *worker_id)
+            .map(|worker_id| {
                 incoming_scratch
                     .path()
-                    .join(worker_execution_journal_incoming_relative(worker))
+                    .join(worker_execution_journal_incoming_relative_for_id(worker_id))
             });
         if !seen_capture_ids.insert(capture.worker_id.clone()) {
             capture_contract_error = Some(format!(
@@ -227,15 +365,15 @@ pub(super) fn import_worker_execution_journals(
     if let Some(error) = capture_contract_error {
         bail!("trusted worker journal capture set violates the assignment contract: {error}");
     }
-    for worker in &assignment.worker_assignments {
-        let incoming_relative_path = worker_execution_journal_incoming_relative(worker);
+    for worker_id in worker_ids {
+        let incoming_relative_path = worker_execution_journal_incoming_relative_for_id(worker_id);
         let scratch_path = incoming_scratch.path().join(&incoming_relative_path);
         let evidence_relative_path =
-            worker_execution_journal_evidence_relative(&assignment.id, &worker.id);
+            worker_execution_journal_evidence_relative(&assignment.id, worker_id);
         let matching_capture = external_run
             .worker_journal_artifacts()
             .iter()
-            .find(|capture| capture.worker_id == worker.id);
+            .find(|capture| capture.worker_id.as_str() == worker_id);
         let status = if !process_quiescent {
             WorkerExecutionJournalStatus::Invalid(
                 "worker journal evidence was not imported because external process quiescence was not verified"
@@ -245,7 +383,7 @@ pub(super) fn import_worker_execution_journals(
             if capture.path != scratch_path {
                 WorkerExecutionJournalStatus::Invalid(format!(
                     "trusted worker journal capture for '{}' had unexpected contract path {}; expected {}",
-                    worker.id,
+                    worker_id,
                     capture.path.display(),
                     scratch_path.display()
                 ))
@@ -271,7 +409,7 @@ pub(super) fn import_worker_execution_journals(
             WorkerExecutionJournalStatus::Missing
         };
         journals.insert(
-            worker.id.clone(),
+            worker_id.to_string(),
             WorkerExecutionJournalEvidence {
                 incoming_relative_path,
                 evidence_relative_path,
@@ -483,7 +621,8 @@ pub(super) fn import_external_attempt_evidence(
             stdout_bytes,
             ArtifactFileDisposition::PrivateEvidence,
         )?;
-        let command_record = command_record_from_external(external_run, external_command);
+        let command_record =
+            command_record_from_external_for_runtime(external_run, external_command, runtime);
         write_artifact_json(
             writer,
             &artifacts.command_record_relative,
@@ -519,8 +658,8 @@ pub(super) fn create_named_invocation_scratches(
     incoming_name: &Path,
     capture_name: &Path,
 ) -> Result<(ArtifactScratchDirectory, ArtifactScratchDirectory)> {
-    let incoming = writer.create_scratch_dir(incoming_name)?;
-    match writer.create_scratch_dir(capture_name) {
+    let incoming = writer.create_supervisor_invocation_scratch_dir(incoming_name)?;
+    match writer.create_supervisor_invocation_scratch_dir(capture_name) {
         Ok(capture) => Ok((incoming, capture)),
         Err(error) => {
             writer.discard_scratch(&incoming)?;
@@ -533,7 +672,8 @@ pub(super) fn precreate_worker_execution_journals(
     assignment: &OrchestratorAssignment,
     incoming_scratch: &ArtifactScratchDirectory,
 ) -> Result<Vec<PathBuf>> {
-    if assignment.worker_assignments.is_empty() {
+    let worker_ids = assignment_worker_journal_subject_ids(assignment)?;
+    if worker_ids.is_empty() {
         return Ok(Vec::new());
     }
     let journal_root = incoming_scratch.path().join("worker-journals");
@@ -576,9 +716,9 @@ pub(super) fn precreate_worker_execution_journals(
             })?;
         }
     }
-    let mut paths = Vec::with_capacity(assignment.worker_assignments.len());
-    for worker in &assignment.worker_assignments {
-        let file_name = worker_execution_journal_file_name(&worker.id);
+    let mut paths = Vec::with_capacity(worker_ids.len());
+    for worker_id in worker_ids {
+        let file_name = worker_execution_journal_file_name(worker_id);
         let path = journal_root.join(&file_name);
         let mut options = fs::OpenOptions::new();
         options.read(true).write(true).create_new(true);
@@ -1057,6 +1197,7 @@ pub(super) fn environment_blocked_child_report(
     report_path: &Path,
     external_run: &ExternalAgentRun,
     external_command: &ExternalAgentCommand,
+    runtime: SupervisorRuntime,
 ) -> OrchestratorReviewReport {
     let failures = sanitized_environment_failures(external_run.environment_failures().to_vec());
     let categories = environment_failure_categories(&failures);
@@ -1108,7 +1249,11 @@ pub(super) fn environment_blocked_child_report(
         semantic_modules: assignment.semantic_modules.clone(),
         claim_token: None,
         semantic_intent_token: None,
-        commands_run: vec![command_record_from_external(external_run, external_command)],
+        commands_run: vec![command_record_from_external_for_runtime(
+            external_run,
+            external_command,
+            runtime,
+        )],
         environment_failures: failures,
         files_changed: Vec::new(),
         validation_results: Vec::new(),
@@ -1143,6 +1288,7 @@ pub(super) fn missing_child_report(
     report_path: &Path,
     external_run: &ExternalAgentRun,
     external_command: &ExternalAgentCommand,
+    runtime: SupervisorRuntime,
     error: String,
 ) -> OrchestratorReviewReport {
     OrchestratorReviewReport {
@@ -1153,7 +1299,11 @@ pub(super) fn missing_child_report(
         semantic_modules: assignment.semantic_modules.clone(),
         claim_token: None,
         semantic_intent_token: None,
-        commands_run: vec![command_record_from_external(external_run, external_command)],
+        commands_run: vec![command_record_from_external_for_runtime(
+            external_run,
+            external_command,
+            runtime,
+        )],
         environment_failures: sanitized_environment_failures(
             external_run.environment_failures().to_vec(),
         ),
@@ -1482,47 +1632,38 @@ pub(super) fn deterministic_fake_child_run(
         bail!("deterministic fake child command retained a provider model slug");
     }
     let worker_journal_artifacts = write_deterministic_fake_worker_journals(command, assignment)?;
+    if assignment.role == AgentRole::Worker {
+        let report = deterministic_fake_worker_report(
+            &assignment.id,
+            &assignment.assigned_paths,
+            &assignment.semantic_symbols,
+            &assignment.semantic_modules,
+            AssignmentKind::Ordinary,
+            None,
+            Some(claim_token),
+            semantic_intent_token,
+        );
+        let mut output = serde_json::to_vec_pretty(&report)?;
+        output.push(b'\n');
+        let mut run = deterministic_fake_run(command, output);
+        run.replace_worker_journal_artifacts(worker_journal_artifacts);
+        return Ok(run);
+    }
     let worker_reports = assignment
         .worker_assignments
         .iter()
         .map(|worker| {
             let metadata = worker_assignment_metadata(assignment_metadata, assignment, worker);
-            WorkerReport {
-                id: worker.id.clone(),
-                role: AgentRole::Worker,
-                assignment_kind: metadata.kind,
-                target_path: metadata.target_path.clone(),
-                assigned_paths: worker.assigned_paths.clone(),
-                semantic_symbols: worker.semantic_symbols.clone(),
-                semantic_modules: worker.semantic_modules.clone(),
-                claim_token: None,
-                semantic_intent_token: None,
-                commands_run: Vec::new(),
-                environment_failures: Vec::new(),
-                files_changed: Vec::new(),
-                validation_results: vec![ValidationResult {
-                    name: "deterministic fake worker validation".to_string(),
-                    status: ReviewStatus::Succeeded,
-                    command: Vec::new(),
-                    message: None,
-                }],
-                findings: Vec::new(),
-                field_guide_entries: Vec::new(),
-                bloated_file_flags: Vec::new(),
-                decomposition_completion: metadata.target_path.map(|target_path| {
-                    DecompositionCompletion {
-                        target_path,
-                        replacement_paths: Vec::new(),
-                        supervisor_candidate_binding: None,
-                    }
-                }),
-                no_further_delegation: Some(true),
-                accepted: true,
-                rejected: false,
-                status: ReviewStatus::Succeeded,
-                remaining_risk: "simulation-only evidence".to_string(),
-                next_safe_action: "rerun with the verified Codex runtime".to_string(),
-            }
+            deterministic_fake_worker_report(
+                &worker.id,
+                &worker.assigned_paths,
+                &worker.semantic_symbols,
+                &worker.semantic_modules,
+                metadata.kind,
+                metadata.target_path,
+                None,
+                None,
+            )
         })
         .collect::<Vec<_>>();
     let decomposition_completions = worker_reports
@@ -1569,10 +1710,58 @@ pub(super) fn deterministic_fake_child_run(
     Ok(run)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn deterministic_fake_worker_report(
+    id: &str,
+    assigned_paths: &[PathBuf],
+    semantic_symbols: &[String],
+    semantic_modules: &[String],
+    assignment_kind: AssignmentKind,
+    target_path: Option<PathBuf>,
+    claim_token: Option<u64>,
+    semantic_intent_token: Option<u64>,
+) -> WorkerReport {
+    WorkerReport {
+        id: id.to_string(),
+        role: AgentRole::Worker,
+        assignment_kind,
+        target_path: target_path.clone(),
+        assigned_paths: assigned_paths.to_vec(),
+        semantic_symbols: semantic_symbols.to_vec(),
+        semantic_modules: semantic_modules.to_vec(),
+        claim_token,
+        semantic_intent_token,
+        commands_run: Vec::new(),
+        environment_failures: Vec::new(),
+        files_changed: Vec::new(),
+        validation_results: vec![ValidationResult {
+            name: "deterministic fake worker validation".to_string(),
+            status: ReviewStatus::Succeeded,
+            command: Vec::new(),
+            message: None,
+        }],
+        findings: Vec::new(),
+        field_guide_entries: Vec::new(),
+        bloated_file_flags: Vec::new(),
+        decomposition_completion: target_path.map(|target_path| DecompositionCompletion {
+            target_path,
+            replacement_paths: Vec::new(),
+            supervisor_candidate_binding: None,
+        }),
+        no_further_delegation: Some(true),
+        accepted: true,
+        rejected: false,
+        status: ReviewStatus::Succeeded,
+        remaining_risk: "simulation-only evidence".to_string(),
+        next_safe_action: "rerun with the verified Codex runtime".to_string(),
+    }
+}
+
 fn write_deterministic_fake_worker_journals(
     command: &ExternalAgentCommand,
     assignment: &OrchestratorAssignment,
 ) -> Result<Vec<WorkerJournalArtifactCapture>> {
+    let worker_ids = assignment_worker_journal_subject_ids(assignment)?;
     let incoming_path = command
         .output_last_message
         .parent()
@@ -1584,13 +1773,13 @@ fn write_deterministic_fake_worker_journals(
             journal_root.display()
         )
     })?;
-    let mut captures = Vec::with_capacity(assignment.worker_assignments.len());
-    for worker in &assignment.worker_assignments {
-        let journal_path = journal_root.join(worker_execution_journal_file_name(&worker.id));
+    let mut captures = Vec::with_capacity(worker_ids.len());
+    for worker_id in worker_ids {
+        let journal_path = journal_root.join(worker_execution_journal_file_name(worker_id));
         let matching_specs = command
             .worker_journal_artifacts
             .iter()
-            .filter(|artifact| artifact.worker_id == worker.id)
+            .filter(|artifact| artifact.worker_id.as_str() == worker_id)
             .collect::<Vec<_>>();
         if matching_specs.len() != 1
             || matching_specs[0].incoming_root != incoming_path
@@ -1598,7 +1787,7 @@ fn write_deterministic_fake_worker_journals(
         {
             bail!(
                 "deterministic fake worker journal capability does not exactly match worker '{}'",
-                worker.id
+                worker_id
             );
         }
         fs::write(&journal_path, b"").with_context(|| {
@@ -1608,7 +1797,7 @@ fn write_deterministic_fake_worker_journals(
             )
         })?;
         captures.push(WorkerJournalArtifactCapture {
-            worker_id: worker.id.clone(),
+            worker_id: worker_id.to_string(),
             path: journal_path,
             status: WorkerJournalArtifactCaptureStatus::Loaded(Vec::new()),
         });
@@ -1728,9 +1917,19 @@ pub(super) fn external_containment_verified(
     }
 }
 
-pub(super) fn external_process_completed(run: &ExternalAgentRun) -> bool {
-    run.succeeded()
-        || (run.simulation_succeeded() && run.program_trust == ExternalProgramTrust::ExplicitCustom)
+pub(super) fn external_process_completed(
+    run: &ExternalAgentRun,
+    runtime: SupervisorRuntime,
+) -> bool {
+    if runtime == SupervisorRuntime::Fake {
+        return run.simulation_succeeded()
+            && run.program_trust == ExternalProgramTrust::ExplicitCustom;
+    }
+    run.publishable
+        && run.exit_code == Some(0)
+        && !run.timed_out
+        && run.error.is_none()
+        && external_safety_verified(run, runtime)
 }
 
 pub(super) fn complete_external_codex_usage(
@@ -1791,7 +1990,10 @@ pub(super) fn role_usage_report(
     for (sample_sequence, sample) in samples.into_iter().enumerate() {
         if !matches!(
             sample.role,
-            AgentRole::ChildOrchestrator | AgentRole::GateClassifier | AgentRole::Auditor
+            AgentRole::ChildOrchestrator
+                | AgentRole::Worker
+                | AgentRole::GateClassifier
+                | AgentRole::Auditor
         ) {
             bail!(
                 "{} usage is not directly process-observable",
@@ -1881,9 +2083,9 @@ pub(super) fn role_usage_report(
         })
         .collect::<BTreeMap<_, _>>();
     let mut reports = reports;
-    reports.insert(
-        AgentRole::Worker,
-        RoleUsageReport {
+    reports
+        .entry(AgentRole::Worker)
+        .or_insert_with(|| RoleUsageReport {
             models: Vec::new(),
             usage: None,
             cost_usd: None,
@@ -1892,8 +2094,7 @@ pub(super) fn role_usage_report(
                 "nested-worker delegation is requested through the child-orchestrator contract, but MACO does not separately observe a worker process or runtime identity; runtime-side role-tagged usage reporting is required before worker usage or cost can be reported"
                     .to_string(),
             ),
-        },
-    );
+        });
     reports
         .entry(AgentRole::GateClassifier)
         .or_insert_with(|| RoleUsageReport {
@@ -1992,7 +2193,7 @@ pub(super) fn role_usage_report(
             cost_usd: total_cost_usd,
             observation: RoleUsageObservation::SupervisorAggregate,
             unavailable_reason: total_usage.is_none().then(|| {
-                "no MACO-launched child-orchestrator or auditor process usage was observed"
+                "no MACO-launched worker, child-orchestrator, or auditor process usage was observed"
                     .to_string()
             }),
         },
@@ -2025,15 +2226,16 @@ pub(super) fn finalize_supervisor_cost(
     None
 }
 
-pub(super) fn command_record_from_external(
+pub(super) fn command_record_from_external_for_runtime(
     run: &ExternalAgentRun,
     command: &ExternalAgentCommand,
+    runtime: SupervisorRuntime,
 ) -> CommandRunRecord {
     CommandRunRecord {
         command: serializable_external_command(&run.command, command),
         cwd: PathBuf::from("<child-worktree>"),
         exit_code: run.exit_code,
-        status: if external_process_completed(run) {
+        status: if external_process_completed(run, runtime) {
             ReviewStatus::Succeeded
         } else {
             ReviewStatus::Failed
@@ -2048,6 +2250,25 @@ pub(super) fn command_record_from_external(
         environment_failures: sanitized_environment_failures(run.environment_failures().to_vec()),
         error: run.error.clone(),
     }
+}
+
+#[cfg(test)]
+pub(super) fn command_record_from_external(
+    run: &ExternalAgentRun,
+    command: &ExternalAgentCommand,
+) -> CommandRunRecord {
+    let runtime = if run.simulation_succeeded()
+        && run.program_trust == ExternalProgramTrust::ExplicitCustom
+    {
+        SupervisorRuntime::Fake
+    } else {
+        command
+            .invocation
+            .adapter_id()
+            .and_then(crate::runtime_adapter::AdapterId::to_runtime_id)
+            .unwrap_or(SupervisorRuntime::Codex)
+    };
+    command_record_from_external_for_runtime(run, command, runtime)
 }
 
 pub(super) fn sandbox_denials_for_report(

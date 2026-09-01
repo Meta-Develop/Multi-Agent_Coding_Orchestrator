@@ -923,13 +923,14 @@ pub struct BoundedTreeWalker;
 
 /// Binds a directory pathname to the exact opened filesystem object.  The
 /// descriptor is retained so callers can fence multi-phase, path-based work
-/// against a concurrent rename/replacement of the directory.
+/// against a concurrent rename/replacement of the directory. Directory entry
+/// churn is allowed because it changes directory timestamps without changing
+/// the bound object or its pathname association.
 #[derive(Debug)]
 pub struct DirectoryBindingGuard {
     path: PathBuf,
     directory: File,
     identity: FileIdentity,
-    generation: fs::Metadata,
 }
 
 /// Retains an opened regular file and its exact bounded contents so a caller
@@ -1014,7 +1015,6 @@ impl DirectoryBindingGuard {
             Ok(Self {
                 path,
                 identity: identity_from_stat(&stat),
-                generation: directory.metadata()?,
                 directory,
             })
         }
@@ -1035,7 +1035,6 @@ impl DirectoryBindingGuard {
             Ok(Self {
                 path,
                 identity,
-                generation: metadata,
                 directory,
             })
         }
@@ -1103,10 +1102,8 @@ impl DirectoryBindingGuard {
         #[cfg(unix)]
         {
             let held = fstat(self.directory.as_raw_fd())?;
-            let held_generation = self.directory.metadata()?;
             if held.st_mode & libc::S_IFMT != libc::S_IFDIR
                 || identity_from_stat(&held) != self.identity
-                || !same_file_generation(&self.generation, &held_generation)
             {
                 bail!("held directory binding changed: {}", self.path.display());
             }
@@ -1117,10 +1114,8 @@ impl DirectoryBindingGuard {
                 )
             })?;
             let rebound = fstat(rebound_directory.as_raw_fd())?;
-            let rebound_generation = rebound_directory.metadata()?;
             if rebound.st_mode & libc::S_IFMT != libc::S_IFDIR
                 || identity_from_stat(&rebound) != self.identity
-                || !same_file_generation(&self.generation, &rebound_generation)
             {
                 bail!(
                     "directory pathname binding changed: {}",
@@ -1139,7 +1134,6 @@ impl DirectoryBindingGuard {
             })?;
             if !held.file_type().is_dir()
                 || identity_from_open_handle(&self.directory, &self.path)? != self.identity
-                || !same_file_generation(&self.generation, &held)
             {
                 bail!("held directory binding changed: {}", self.path.display());
             }
@@ -1157,7 +1151,6 @@ impl DirectoryBindingGuard {
             })?;
             if !rebound.file_type().is_dir()
                 || identity_from_open_handle(&rebound_directory, &self.path)? != self.identity
-                || !same_file_generation(&self.generation, &rebound)
             {
                 bail!(
                     "directory pathname binding changed: {}",

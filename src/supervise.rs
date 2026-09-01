@@ -2,6 +2,8 @@
 use crate::external_agent::CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS;
 #[cfg(test)]
 use crate::follow_up_queue::GeneratedFollowUpQueueEntrypoint;
+#[cfg(test)]
+use crate::review::{build_review_lens_request, ReviewLensRequestSources};
 pub use crate::supervise_budget::{
     BudgetAction, BudgetAmount, BudgetReason, BudgetRemaining, RoleBudgetReport, RunBudgetLimits,
     RunBudgetReport, RunBudgetSource, RunBudgetSources,
@@ -56,12 +58,12 @@ use crate::{
         SideEffectConfinementProfile, StdinMode, StrictOfflineWorkspaceProfile, WorkspaceAccess,
     },
     review::{
-        aggregate_review_lenses_against_requests, build_review_lens_request,
-        validate_review_lens_set, ReviewAggregationDecision, ReviewAggregationPolicy,
-        ReviewCoverageRequirement, ReviewInformationScope, ReviewLensAggregate,
-        ReviewLensAggregateAuthority, ReviewLensBackendConfig, ReviewLensConfig,
-        ReviewLensCoverage, ReviewLensEvidenceKind, ReviewLensRequest, ReviewLensRequestSources,
-        ReviewLensVerdict, ReviewLensVerdictStatus, REVIEW_LENS_REQUEST_LIMIT_BYTES,
+        aggregate_review_lenses_against_requests, validate_review_lens_set,
+        ReviewAggregationDecision, ReviewAggregationPolicy, ReviewCoverageRequirement,
+        ReviewInformationScope, ReviewLensAggregate, ReviewLensAggregateAuthority,
+        ReviewLensBackendConfig, ReviewLensConfig, ReviewLensCoverage, ReviewLensEvidenceKind,
+        ReviewLensRequest, ReviewLensVerdict, ReviewLensVerdictStatus,
+        REVIEW_LENS_REQUEST_LIMIT_BYTES,
     },
     runtime_adapter::RuntimeId,
     safe_state::BoundedRegularReader,
@@ -275,6 +277,8 @@ pub use scheduler::*;
 mod selection_bridge;
 use selection_bridge::*;
 
+mod messaging_bridge;
+
 mod assignment_execution;
 #[cfg(test)]
 pub(crate) use assignment_execution::configure_assignment_phase_command_for_test;
@@ -303,6 +307,45 @@ use reporting::*;
 
 mod schema_artifacts;
 use schema_artifacts::*;
+
+/// Persists the normalized plan and establishes its authenticated messaging identity set before
+/// scheduler dispatch. This local definition intentionally takes precedence over the private
+/// schema-module helper imported above.
+fn write_plan_snapshot(
+    writer: &mut ArtifactRunWriter,
+    relative: &Path,
+    plan: &SupervisorPlan,
+    consultant: &SupervisorConsultantPlan,
+    assignment_metadata: &AssignmentMetadata,
+    plan_metadata: &SupervisorPlanMetadata,
+) -> Result<()> {
+    schema_artifacts::write_plan_snapshot(
+        writer,
+        relative,
+        plan,
+        consultant,
+        assignment_metadata,
+        plan_metadata,
+    )?;
+    messaging_bridge::initialize_supervisor_messaging_session(writer, plan, plan_metadata)
+        .context("supervisor messaging pre-launch initialization failed")
+}
+
+/// Recovers a run's existing messaging journal before the authenticated supervisor finalization
+/// resume path proceeds. A finalized run needs no live identities; an unfinished journal never
+/// receives replacement credentials when the original process-local session is absent.
+pub fn resume_supervisor_run(
+    repo: impl AsRef<Path>,
+    run_id: RunId,
+) -> Result<SupervisorResumeReport> {
+    let repo = discover_repo_root(repo.as_ref())?;
+    let status = plan_api::supervisor_status(&repo, run_id.clone())?;
+    if status.lifecycle != SupervisorRunLifecycle::Finalized {
+        messaging_bridge::recover_supervisor_messaging_session(&run_dir(&repo, &run_id))
+            .context("supervisor messaging resume preflight failed")?;
+    }
+    plan_api::resume_supervisor_run(&repo, run_id)
+}
 
 mod primary_integrity;
 use primary_integrity::*;

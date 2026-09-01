@@ -156,7 +156,7 @@ fn role_binding_telemetry_retains_catalog_fallback_resolution() {
         CodexRuntimeModelCatalog::from_slugs([FRONTIER_PROFILE_MODEL]).expect("fallback catalog"),
     );
     let bindings =
-        resolved_role_execution_bindings(&plan, SupervisorRuntime::Codex, Some(&catalog));
+        resolved_role_execution_bindings(&plan, SupervisorRuntime::Codex, Some(&catalog), &[], &[]);
     let binding = &bindings[&AgentRole::ChildOrchestrator];
     assert_eq!(
         binding.configured_model.as_deref(),
@@ -2396,6 +2396,189 @@ fn verified_acquire_without_evidence_still_fails_closed() {
 }
 
 #[test]
+fn literal_new_file_lowering_preclaims_planning_root_and_direct_execution_worker() {
+    let (_temp, repo) = test_repository();
+    let task = "Create a new file named LITERAL_E2E.md containing exactly one line: MACO literal routing reached the terminal worker.";
+    let (plan, document) = supervisor_plan_and_document_from_goal_spec(&repo, "", task)
+        .expect("lower authoritative literal new-file directive");
+    assert_eq!(plan.assignments.len(), 2);
+    let [planning, execution] = plan.assignments.as_slice() else {
+        panic!("literal lowering must emit exactly two assignments");
+    };
+    assert_eq!(planning.id, "assignment-001-planning");
+    assert_eq!(planning.phase, AssignmentPhase::Planning);
+    assert_eq!(planning.role, AgentRole::ChildOrchestrator);
+    assert_eq!(
+        planning.role_category,
+        Some(RoleCategory::DelegatingCoordinator)
+    );
+    assert!(planning.worker_assignments.is_empty());
+    assert_eq!(execution.id, "assignment-001");
+    assert_eq!(execution.phase, AssignmentPhase::Execution);
+    assert_eq!(execution.role, AgentRole::Worker);
+    assert_eq!(
+        execution.role_category,
+        Some(RoleCategory::NonDelegatingTerminalWorker)
+    );
+    assert!(execution.worker_assignments.is_empty());
+    for assignment in [planning, execution] {
+        assert_eq!(assignment.assigned_paths, [PathBuf::from("LITERAL_E2E.md")]);
+        assert!(assignment.semantic_symbols.is_empty());
+        assert!(assignment.semantic_modules.is_empty());
+        assert!(assignment.environment_requirements.is_empty());
+        assert!(assignment.licensed_breakage.is_none());
+    }
+    assert_eq!(planning.notes, execution.notes);
+    assert_eq!(
+        document["assignment_schedule"],
+        serde_json::json!([
+            {
+                "assignment_id": "assignment-001-planning",
+                "depth": 2,
+                "flattened_index": 0
+            },
+            {
+                "assignment_id": "assignment-001",
+                "parent_assignment_id": "assignment-001-planning",
+                "depth": 3,
+                "flattened_index": 1
+            }
+        ])
+    );
+
+    let evidence = PreclaimRunEvidence::acquire(
+        &repo,
+        SupervisorRuntime::Codex,
+        SupervisorExecutionRuntime::Verified,
+    );
+    assert!(evidence.repo_map.is_some());
+    assert!(evidence.runtime.is_some());
+    for assignment in &plan.assignments {
+        let risk = evidence
+            .risk_for(&assignment.assigned_paths)
+            .expect("literal assignment risk evidence");
+        let decision = evaluate_preclaim_viability(
+            assignment,
+            &plan.assignments,
+            evidence.repo_map.as_ref(),
+            Some(&risk),
+            evidence.runtime,
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(
+            decision.dimensions,
+            preclaim::PreclaimViabilityDimensions {
+                limited_scope: preclaim::ViabilityFinding::Yes,
+                clear_verification_path: preclaim::ViabilityFinding::Yes,
+                autonomously_completable: preclaim::ViabilityFinding::Yes,
+            },
+            "{}: {}",
+            assignment.id,
+            decision.reason
+        );
+        assert_eq!(
+            decision.disposition,
+            preclaim::PreclaimDisposition::Claim,
+            "{}: {}",
+            assignment.id,
+            decision.reason
+        );
+    }
+    assert!(!repo.join("LITERAL_E2E.md").exists());
+}
+
+#[test]
+fn literal_existing_file_edit_preclaims_planning_root_and_direct_execution_worker() {
+    let (_temp, repo) = test_repository();
+    let task = "In README.md, replace scheduler fixture with exactly: MACO literal routing reached the terminal worker. Verify the result with git diff --check and confirm README.md contains exactly that line.";
+    let (plan, document) = supervisor_plan_and_document_from_goal_spec(&repo, "", task)
+        .expect("lower authoritative literal existing-file directive");
+    let [planning, execution] = plan.assignments.as_slice() else {
+        panic!("literal lowering must emit exactly two assignments");
+    };
+    assert_eq!(planning.phase, AssignmentPhase::Planning);
+    assert_eq!(planning.role, AgentRole::ChildOrchestrator);
+    assert_eq!(
+        planning.role_category,
+        Some(RoleCategory::DelegatingCoordinator)
+    );
+    assert!(planning.worker_assignments.is_empty());
+    assert_eq!(execution.phase, AssignmentPhase::Execution);
+    assert_eq!(execution.role, AgentRole::Worker);
+    assert_eq!(
+        execution.role_category,
+        Some(RoleCategory::NonDelegatingTerminalWorker)
+    );
+    assert!(execution.worker_assignments.is_empty());
+    for assignment in [planning, execution] {
+        assert_eq!(assignment.assigned_paths, [PathBuf::from("README.md")]);
+        assert!(assignment.semantic_symbols.is_empty());
+        assert!(assignment.semantic_modules.is_empty());
+        assert!(assignment.environment_requirements.is_empty());
+        assert!(assignment.licensed_breakage.is_none());
+    }
+    assert_eq!(planning.notes, execution.notes);
+    assert!(planning
+        .notes
+        .as_deref()
+        .is_some_and(|notes| notes.contains("existing_git_visible_regular_file_edit")));
+    assert_eq!(
+        document["assignment_schedule"],
+        serde_json::json!([
+            {
+                "assignment_id": "assignment-001-planning",
+                "depth": 2,
+                "flattened_index": 0
+            },
+            {
+                "assignment_id": "assignment-001",
+                "parent_assignment_id": "assignment-001-planning",
+                "depth": 3,
+                "flattened_index": 1
+            }
+        ])
+    );
+
+    let evidence = PreclaimRunEvidence::acquire(
+        &repo,
+        SupervisorRuntime::Codex,
+        SupervisorExecutionRuntime::Verified,
+    );
+    assert!(evidence.repo_map.is_some());
+    for assignment in &plan.assignments {
+        let risk = evidence
+            .risk_for(&assignment.assigned_paths)
+            .expect("existing-file assignment risk evidence");
+        let decision = evaluate_preclaim_viability(
+            assignment,
+            &plan.assignments,
+            evidence.repo_map.as_ref(),
+            Some(&risk),
+            evidence.runtime,
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(
+            decision.dimensions,
+            preclaim::PreclaimViabilityDimensions {
+                limited_scope: preclaim::ViabilityFinding::Yes,
+                clear_verification_path: preclaim::ViabilityFinding::Yes,
+                autonomously_completable: preclaim::ViabilityFinding::Yes,
+            },
+            "{}: {}",
+            assignment.id,
+            decision.reason
+        );
+        assert_eq!(
+            decision.disposition,
+            preclaim::PreclaimDisposition::Claim,
+            "{}: {}",
+            assignment.id,
+            decision.reason
+        );
+    }
+}
+
+#[test]
 fn concurrency_tracker_measures_live_guards_and_closes_on_unwind() {
     let tracker = SchedulerConcurrencyTracker::new();
     {
@@ -3078,17 +3261,29 @@ fn persistence_records_gate_before_status_and_finalizes_report() {
             budget_ledger.report().expect("scheduler close budget"),
         )
         .expect("close checkpoint scheduler");
+    let (incoming_scratch, capture_scratch) =
+        crate::supervise::reporting::create_named_invocation_scratches(
+            &mut writer,
+            Path::new("incoming-assignment-0001-attempt-01"),
+            Path::new("capture-assignment-0001-attempt-01"),
+        )
+        .expect("reserve tagged invocation scratches before terminal persistence");
+    let incoming_scratch_path = incoming_scratch.path().to_path_buf();
+    let capture_scratch_path = capture_scratch.path().to_path_buf();
 
     let persisted = persist_supervisor_final_report(
         report,
         &mut journal,
         writer,
         Some(&mut checkpoint),
+        Some(crate::artifacts::ArtifactScratchQuiescence::Verified),
         || Ok(()),
     )
     .expect("persist scheduler final report directly");
 
     assert_eq!(persisted.run_id, run_id);
+    assert!(!incoming_scratch_path.exists());
+    assert!(!capture_scratch_path.exists());
     let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)
         .expect("open finalized scheduler artifacts");
     let journal_bytes = reader
@@ -3140,10 +3335,17 @@ fn persist_releases_terminal_claims_without_checkpoint_writer() {
     );
     let released = std::sync::atomic::AtomicBool::new(false);
 
-    persist_supervisor_final_report(report, &mut journal, writer, None, || {
-        released.store(true, std::sync::atomic::Ordering::SeqCst);
-        Ok(())
-    })
+    persist_supervisor_final_report(
+        report,
+        &mut journal,
+        writer,
+        None,
+        Some(crate::artifacts::ArtifactScratchQuiescence::Verified),
+        || {
+            released.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        },
+    )
     .expect("persist without a checkpoint writer");
 
     assert!(

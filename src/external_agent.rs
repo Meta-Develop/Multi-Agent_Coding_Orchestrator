@@ -13,16 +13,18 @@ use crate::pre_action_review::{
 };
 use crate::process_runner::{
     read_bounded_regular_file_nofollow, run_process_cancellable, run_process_interactive,
-    CapturedBytes, ContainmentBackend, EnvironmentMode, ExternalCodexProfile,
+    CapturedBytes, ContainmentBackend, EnvironmentMode, ExternalCodexProfile, ExternalGrokProfile,
     InteractiveProcessOutput, ProcessCancellation, ProcessOutput, ProcessRunError, ProcessSpec,
     ProcessTreeEvidence, SideEffectConfinementEvidence, SideEffectConfinementProfile,
     SideEffectConfinementProfileKind, StdinMode, StreamCapture, StrictOfflineWorkspaceProfile,
     WorkspaceAccess,
 };
 use crate::protected_path::{DeclaredPathCoordinate, ProtectedPathSpec};
+#[cfg(target_os = "linux")]
+use crate::runtime_adapter::grok::GrokCredentialSource;
 use crate::runtime_adapter::{
-    AdapterId, LaunchContext, RuntimeAdapterConfig, RuntimeId, SideEffectConfinement,
-    WritableLaunchTarget,
+    AdapterId, LaunchContext, RuntimeAdapterConfig, RuntimeId, SideEffectConfinement, TypedRuntime,
+    TypedRuntimeContract, WritableLaunchTarget,
 };
 use crate::safe_state::{unsigned_to_u32, ReservedDirectory};
 use crate::secure_output::{ReservedOutputFile, SecureOutputRoot};
@@ -230,6 +232,122 @@ pub struct ExternalAgentCommand {
     /// Isolated child worktree vs primary checkout. Default constructors use a
     /// managed child worktree; primary-target launch stays fail-closed.
     pub writable_launch_target: WritableLaunchTarget,
+    /// Opaque supervisor-selected launch identity. Only the MACO assignment binder can create
+    /// this evidence; writable Grok admission rechecks it against the live command so a later
+    /// model, effort, executable, cwd, invocation, or adapter-config change fails closed.
+    writable_runtime_selection: Option<WritableRuntimeSelectionEvidence>,
+    /// Opaque MACO-owned proof that the selected command, held claims, disposable worktree, and
+    /// verified native confinement were authenticated together immediately before launch.
+    worktree_writable_confinement: Option<WorktreeWritableConfinementProof>,
+}
+
+pub(crate) const WRITABLE_GROK_TERMINAL_WORKER_REQUIRED: &str =
+    "writable_grok_terminal_worker_required";
+pub(crate) const WRITABLE_GROK_SELECTION_EVIDENCE_MISSING: &str =
+    "writable_grok_selection_evidence_missing";
+pub(crate) const WRITABLE_GROK_SELECTION_EVIDENCE_STALE: &str =
+    "writable_grok_selection_evidence_stale";
+pub(crate) const WRITABLE_GROK_EXACT_MODEL_REQUIRED: &str = "writable_grok_exact_model_required";
+pub(crate) const WRITABLE_GROK_XHIGH_EFFORT_REQUIRED: &str = "writable_grok_xhigh_effort_required";
+pub(crate) const WRITABLE_GROK_ADAPTER_CONFIGURATION_UNVERIFIED: &str =
+    "writable_grok_adapter_configuration_unverified";
+pub(crate) const WRITABLE_GROK_CONFINEMENT_PROOF_MISSING: &str =
+    "writable_grok_confinement_proof_missing";
+pub(crate) const WRITABLE_GROK_CONFINEMENT_PROOF_STALE: &str =
+    "writable_grok_confinement_proof_stale";
+pub(crate) const WRITABLE_GROK_CONFINEMENT_UNVERIFIED: &str =
+    "writable_grok_confinement_unverified";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WritableRuntimeSelectionEvidence {
+    assignment_id: String,
+    runtime: RuntimeId,
+    invocation: ExternalAgentInvocation,
+    program: PathBuf,
+    cwd: PathBuf,
+    workspace_access: WorkspaceAccess,
+    writable_launch_target: WritableLaunchTarget,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    adapter_config: Option<RuntimeAdapterConfig>,
+    output_schema: Option<PathBuf>,
+}
+
+impl WritableRuntimeSelectionEvidence {
+    fn from_command(
+        assignment_id: impl Into<String>,
+        runtime: RuntimeId,
+        command: &ExternalAgentCommand,
+    ) -> Self {
+        Self {
+            assignment_id: assignment_id.into(),
+            runtime,
+            invocation: command.invocation,
+            program: command.program.clone(),
+            cwd: command.cwd.clone(),
+            workspace_access: command.workspace_access,
+            writable_launch_target: command.writable_launch_target,
+            model: command.model.clone(),
+            reasoning_effort: command.reasoning_effort.clone(),
+            adapter_config: command.runtime_adapter.clone(),
+            output_schema: command.output_schema.clone(),
+        }
+    }
+
+    fn matches_command(&self, command: &ExternalAgentCommand, runtime: RuntimeId) -> bool {
+        self.runtime == runtime
+            && self.invocation == command.invocation
+            && self.program == command.program
+            && self.cwd == command.cwd
+            && self.workspace_access == command.workspace_access
+            && self.writable_launch_target == command.writable_launch_target
+            && self.model == command.model
+            && self.reasoning_effort == command.reasoning_effort
+            && self.adapter_config == command.runtime_adapter
+            && self.output_schema == command.output_schema
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorktreeWritableConfinementProof {
+    admission: WorktreeWritableAdmission,
+    selected_launch: Option<WritableRuntimeSelectionEvidence>,
+    command: WorktreeConfinementSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorktreeConfinementSnapshot {
+    prompt: PathBuf,
+    json_log: PathBuf,
+    output_last_message: PathBuf,
+    output_schema: Option<PathBuf>,
+    read_only_input_files: Vec<PathBuf>,
+    worker_journal_artifacts: Vec<WorkerJournalArtifactSpec>,
+    workspace_access: WorkspaceAccess,
+    hidden_roots: Vec<PathBuf>,
+    worktree_control_exceptions: Vec<PathBuf>,
+    writable_launch_target: WritableLaunchTarget,
+}
+
+impl WorktreeConfinementSnapshot {
+    fn from_command(command: &ExternalAgentCommand) -> Self {
+        Self {
+            prompt: command.prompt.clone(),
+            json_log: command.json_log.clone(),
+            output_last_message: command.output_last_message.clone(),
+            output_schema: command.output_schema.clone(),
+            read_only_input_files: command.read_only_input_files.clone(),
+            worker_journal_artifacts: command.worker_journal_artifacts.clone(),
+            workspace_access: command.workspace_access,
+            hidden_roots: command.hidden_roots.clone(),
+            worktree_control_exceptions: command.worktree_control_exceptions.clone(),
+            writable_launch_target: command.writable_launch_target,
+        }
+    }
+
+    fn matches_command(&self, command: &ExternalAgentCommand) -> bool {
+        self == &Self::from_command(command)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -496,6 +614,7 @@ pub enum EnvironmentCredential {
 #[serde(rename_all = "snake_case")]
 pub enum EnvironmentConfiguration {
     CodexAuthFile,
+    GrokAuthFile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -509,6 +628,7 @@ pub enum EnvironmentNetworkAccess {
 #[serde(rename_all = "snake_case")]
 pub enum EnvironmentSandboxCapability {
     VerifiedExternalCodex,
+    VerifiedExternalGrok,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -877,6 +997,8 @@ impl ExternalAgentCommand {
             machine_global_retention: None,
             runtime_adapter: None,
             writable_launch_target: WritableLaunchTarget::ManagedChildWorktree,
+            writable_runtime_selection: None,
+            worktree_writable_confinement: None,
         }
     }
 
@@ -910,6 +1032,8 @@ impl ExternalAgentCommand {
             machine_global_retention: None,
             runtime_adapter: None,
             writable_launch_target: WritableLaunchTarget::ManagedChildWorktree,
+            writable_runtime_selection: None,
+            worktree_writable_confinement: None,
         }
     }
 
@@ -943,6 +1067,8 @@ impl ExternalAgentCommand {
             machine_global_retention: None,
             runtime_adapter: None,
             writable_launch_target: WritableLaunchTarget::ManagedChildWorktree,
+            writable_runtime_selection: None,
+            worktree_writable_confinement: None,
         }
     }
 
@@ -1005,6 +1131,192 @@ impl ExternalAgentCommand {
         self.model = model;
         self.reasoning_effort = reasoning_effort;
         self
+    }
+
+    /// Bind the supervisor-resolved identity used for writable Grok admission.
+    ///
+    /// This is deliberately crate-private and snapshots the already rendered command rather than
+    /// accepting provider-controlled evidence. Both writable consumers compare the snapshot with
+    /// the live command and independently re-prove the immutable adapter contract.
+    pub(crate) fn with_writable_runtime_selection(
+        mut self,
+        assignment_id: impl Into<String>,
+        runtime: RuntimeId,
+        non_delegating_terminal_worker: bool,
+    ) -> Result<Self> {
+        if runtime != RuntimeId::Grok || !non_delegating_terminal_worker {
+            bail!(
+                "{WRITABLE_GROK_TERMINAL_WORKER_REQUIRED}: writable Grok requires an explicitly bound non-delegating terminal Worker"
+            );
+        }
+        if self.invocation != ExternalAgentInvocation::Grok {
+            bail!(
+                "{WRITABLE_GROK_SELECTION_EVIDENCE_STALE}: selected Grok runtime does not match the executable invocation"
+            );
+        }
+        self.writable_runtime_selection = Some(WritableRuntimeSelectionEvidence::from_command(
+            assignment_id,
+            runtime,
+            &self,
+        ));
+        self.worktree_writable_confinement = None;
+        Ok(self)
+    }
+
+    /// Attach the parent-authenticated managed-worktree proof to the exact selected launch.
+    /// A later command mutation cannot reuse it because verification compares both snapshots.
+    pub(crate) fn with_worktree_writable_confinement(
+        mut self,
+        admission: WorktreeWritableAdmission,
+    ) -> Self {
+        self.worktree_writable_confinement = Some(WorktreeWritableConfinementProof {
+            admission,
+            selected_launch: self.writable_runtime_selection.clone(),
+            command: WorktreeConfinementSnapshot::from_command(&self),
+        });
+        self
+    }
+
+    fn current_grok_writable_contract(&self) -> Result<TypedRuntimeContract> {
+        if self.writable_launch_target != WritableLaunchTarget::ManagedChildWorktree {
+            bail!(
+                "writable_grok_managed_worktree_required: writable Grok is restricted to a managed child worktree"
+            );
+        }
+        if self.model.as_deref() != Some(TypedRuntime::Grok46Xhigh.model()) {
+            bail!(
+                "{WRITABLE_GROK_EXACT_MODEL_REQUIRED}: writable Grok requires exact model '{}'",
+                TypedRuntime::Grok46Xhigh.model()
+            );
+        }
+        if self.reasoning_effort.as_deref() != Some(TypedRuntime::Grok46Xhigh.reasoning_effort()) {
+            bail!(
+                "{WRITABLE_GROK_XHIGH_EFFORT_REQUIRED}: writable Grok requires exact reasoning effort '{}'",
+                TypedRuntime::Grok46Xhigh.reasoning_effort()
+            );
+        }
+        let selected = self.writable_runtime_selection.as_ref().with_context(|| {
+            format!(
+                "{WRITABLE_GROK_SELECTION_EVIDENCE_MISSING}: writable Grok has no supervisor-selected launch evidence"
+            )
+        })?;
+        if !selected.matches_command(self, RuntimeId::Grok) {
+            bail!(
+                "{WRITABLE_GROK_SELECTION_EVIDENCE_STALE}: writable Grok launch no longer matches its supervisor-selected evidence"
+            );
+        }
+        let config = self.runtime_adapter.as_ref().with_context(|| {
+            format!(
+                "{WRITABLE_GROK_ADAPTER_CONFIGURATION_UNVERIFIED}: writable Grok has no adapter configuration"
+            )
+        })?;
+        if self.invocation != ExternalAgentInvocation::Grok
+            || config.binary_path() != self.program.as_path()
+        {
+            bail!(
+                "{WRITABLE_GROK_ADAPTER_CONFIGURATION_UNVERIFIED}: writable Grok adapter executable is not bound to the selected program"
+            );
+        }
+        config
+            .typed_runtime_contract_with_output_schema(
+                AdapterId::Grok,
+                &LaunchContext {
+                    prompt: &self.prompt,
+                    model: self.model.as_deref(),
+                    effort: self.reasoning_effort.as_deref(),
+                    cwd: &self.cwd,
+                    output: &self.output_last_message,
+                },
+                self.output_schema.as_deref(),
+            )
+            .with_context(|| {
+                format!(
+                    "{WRITABLE_GROK_ADAPTER_CONFIGURATION_UNVERIFIED}: writable Grok adapter contract is not the immutable bounded 4.6/xhigh contract"
+                )
+            })
+    }
+
+    fn selected_grok_writable_workspace(&self) -> Result<&Path> {
+        if self.workspace_access != WorkspaceAccess::ReadWrite {
+            bail!(
+                "{WRITABLE_GROK_SELECTION_EVIDENCE_STALE}: writable Grok workspace no longer matches its supervisor-selected evidence"
+            );
+        }
+        self.current_grok_writable_contract()?;
+        let selected = self.writable_runtime_selection.as_ref().with_context(|| {
+            format!(
+                "{WRITABLE_GROK_SELECTION_EVIDENCE_MISSING}: writable Grok has no supervisor-selected launch evidence"
+            )
+        })?;
+        Ok(&selected.cwd)
+    }
+
+    /// Concrete capabilities used by the supervisor while creating MACO-owned confinement
+    /// evidence. Static capabilities remain authoritative for every non-Grok runtime.
+    pub(crate) fn selected_writable_capabilities(
+        &self,
+        runtime: RuntimeId,
+        expected_assignment_id: Option<&str>,
+    ) -> Result<crate::runtime_adapter::RuntimeCapabilities> {
+        if runtime != RuntimeId::Grok {
+            return Ok(runtime.capabilities());
+        }
+        let contract = self.current_grok_writable_contract()?;
+        if expected_assignment_id.is_some_and(|expected| {
+            self.writable_runtime_selection
+                .as_ref()
+                .is_none_or(|selected| selected.assignment_id != expected)
+        }) {
+            bail!(
+                "{WRITABLE_GROK_SELECTION_EVIDENCE_STALE}: writable Grok selection evidence belongs to a different assignment"
+            );
+        }
+        Ok(contract.capabilities())
+    }
+
+    /// Concrete capabilities used at the external process boundary. Writable Grok must carry the
+    /// exact MACO-owned proof produced after worktree and claim reauthentication.
+    fn verified_writable_capabilities(
+        &self,
+        runtime: RuntimeId,
+    ) -> Result<crate::runtime_adapter::RuntimeCapabilities> {
+        let capabilities = self.selected_writable_capabilities(runtime, None)?;
+        if runtime != RuntimeId::Grok {
+            return Ok(capabilities);
+        }
+        let selected = self.writable_runtime_selection.as_ref().with_context(|| {
+            format!(
+                "{WRITABLE_GROK_SELECTION_EVIDENCE_MISSING}: writable Grok selection evidence disappeared before confinement verification"
+            )
+        })?;
+        let proof = self.worktree_writable_confinement.as_ref().with_context(|| {
+            format!(
+                "{WRITABLE_GROK_CONFINEMENT_PROOF_MISSING}: writable Grok has no MACO-owned managed-worktree confinement proof"
+            )
+        })?;
+        if proof.selected_launch.as_ref() != Some(selected) || !proof.command.matches_command(self)
+        {
+            bail!(
+                "{WRITABLE_GROK_CONFINEMENT_PROOF_STALE}: writable Grok confinement proof does not bind the current selected launch"
+            );
+        }
+        let admission = &proof.admission;
+        if admission.version != WORKTREE_WRITABLE_ADMISSION_SCHEMA_VERSION
+            || admission.assignment_id != selected.assignment_id
+            || admission.target != WritableLaunchTarget::ManagedChildWorktree
+            || admission.worktree.kind != ManagedWorktreeAdmissionKind::ManagedDisposable
+            || admission.worktree.worktree_id != selected.assignment_id
+            || admission.claims.state != HeldPathClaimsAdmissionState::Held
+            || admission.native_sandbox.runtime != RuntimeId::Grok
+            || admission.native_sandbox.workspace_access != WorkspaceAccess::ReadWrite
+            || admission.native_sandbox.side_effect_confinement != SideEffectConfinement::Verified
+            || self.workspace_access != WorkspaceAccess::ReadWrite
+        {
+            bail!(
+                "{WRITABLE_GROK_CONFINEMENT_UNVERIFIED}: writable Grok confinement proof does not authenticate the current bounded managed-worktree launch"
+            );
+        }
+        Ok(capabilities)
     }
 
     pub fn with_model_provider(mut self, model_provider: Option<String>) -> Self {
@@ -1537,6 +1849,59 @@ fn default_environment_preflight_process_started() -> bool {
     true
 }
 
+struct AdmittedGrokCredentials {
+    #[cfg(target_os = "linux")]
+    source: GrokCredentialSource,
+}
+
+impl AdmittedGrokCredentials {
+    fn from_ambient_environment() -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            Ok(Self {
+                source: GrokCredentialSource::from_ambient_environment()?,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            bail!("Grok credential capability confinement requires Linux");
+        }
+    }
+
+    fn grok_home_environment(&self) -> Result<&str> {
+        #[cfg(target_os = "linux")]
+        {
+            Ok(self.source.grok_home_environment())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            bail!("Grok credential capability confinement requires Linux");
+        }
+    }
+
+    fn bind_to_profile(&self, profile: ExternalGrokProfile) -> Result<ExternalGrokProfile> {
+        #[cfg(target_os = "linux")]
+        {
+            self.source.bind_to_profile(profile)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = profile;
+            bail!("Grok credential capability confinement requires Linux");
+        }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn from_environment(
+        ambient_home: Option<&OsStr>,
+        ambient_grok_home: Option<&OsStr>,
+    ) -> Result<Self> {
+        Ok(Self {
+            source: GrokCredentialSource::from_environment(ambient_home, ambient_grok_home)?,
+        })
+    }
+}
+
 pub fn run_external_agent(spec: &ExternalAgentCommand) -> ExternalAgentRun {
     run_external_agent_cancellable(spec, &ProcessCancellation::new())
 }
@@ -1631,16 +1996,36 @@ fn run_external_agent_runtime(
     }
     if spec.workspace_access == WorkspaceAccess::ReadWrite {
         if let Some(adapter) = spec.invocation.adapter_id() {
-            if let Some(capability) = adapter.writable_launch_refusal(spec.writable_launch_target) {
+            let capabilities = if adapter == AdapterId::Grok
+                && spec.writable_launch_target == WritableLaunchTarget::ManagedChildWorktree
+            {
+                match spec.verified_writable_capabilities(RuntimeId::Grok) {
+                    Ok(capabilities) => capabilities,
+                    Err(error) => {
+                        return failed_external_environment_run(
+                            spec,
+                            started,
+                            command_display(&spec.program, &[]),
+                            false,
+                            EnvironmentFailureCategory::SandboxUnavailable,
+                            Some(external_sandbox_requirement(spec.invocation)),
+                            format!("writable grok failed closed before launch: {error:#}"),
+                        );
+                    }
+                }
+            } else {
+                adapter.capabilities()
+            };
+            if let Some(capability) =
+                capabilities.writable_launch_refusal(spec.writable_launch_target)
+            {
                 return failed_external_environment_run(
                     spec,
                     started,
                     command_display(&spec.program, &[]),
                     false,
                     EnvironmentFailureCategory::SandboxUnavailable,
-                    Some(EnvironmentRequirement::sandbox(
-                        EnvironmentSandboxCapability::VerifiedExternalCodex,
-                    )),
+                    Some(external_sandbox_requirement(spec.invocation)),
                     format!(
                         "writable {} failed closed before launch: {capability}",
                         adapter.as_str()
@@ -1663,9 +2048,7 @@ fn run_external_agent_runtime(
                 command_display(&spec.program, &[]),
                 false,
                 EnvironmentFailureCategory::SandboxUnavailable,
-                Some(EnvironmentRequirement::sandbox(
-                    EnvironmentSandboxCapability::VerifiedExternalCodex,
-                )),
+                Some(external_sandbox_requirement(spec.invocation)),
                 error.to_string(),
             );
         }
@@ -1758,9 +2141,7 @@ fn run_external_agent_runtime(
                 command_display(&resolved_program, &[]),
                 false,
                 EnvironmentFailureCategory::SandboxUnavailable,
-                Some(EnvironmentRequirement::sandbox(
-                    EnvironmentSandboxCapability::VerifiedExternalCodex,
-                )),
+                Some(external_sandbox_requirement(spec.invocation)),
                 format!("failed to validate protected worktree controls: {error}"),
             );
         }
@@ -2091,6 +2472,21 @@ fn run_external_agent_runtime(
         None
     };
 
+    let grok_credentials = if runtime == ExternalExecutionRuntime::Verified
+        && spec.invocation == ExternalAgentInvocation::Grok
+    {
+        match AdmittedGrokCredentials::from_ambient_environment() {
+            Ok(credentials) => Some(credentials),
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_grok_credential_environment_failure(&mut report, &error);
+                return report;
+            }
+        }
+    } else {
+        None
+    };
+
     let side_effect_profile = if runtime == ExternalExecutionRuntime::Verified
         && (program_trust == ExternalProgramTrust::TrustedSystemCodex
             || spec.invocation.is_adapter_subprocess())
@@ -2105,9 +2501,7 @@ fn run_external_agent_runtime(
             Err(error) => {
                 report.duration_ms = duration_millis(started.elapsed());
                 report.error = Some(format!("failed to prepare external-agent sandbox: {error}"));
-                let requirement = EnvironmentRequirement::sandbox(
-                    EnvironmentSandboxCapability::VerifiedExternalCodex,
-                );
+                let requirement = external_sandbox_requirement(spec.invocation);
                 report
                     .stdout
                     .run_metadata
@@ -2124,7 +2518,11 @@ fn run_external_agent_runtime(
                     .push(environment_failure(
                         EnvironmentFailureCategory::SandboxUnavailable,
                         Some(requirement),
-                        format!("failed to prepare the fixed ExternalCodex sandbox: {error}"),
+                        if spec.invocation == ExternalAgentInvocation::Grok {
+                            format!("failed to prepare the fixed ExternalGrok sandbox: {error}")
+                        } else {
+                            format!("failed to prepare the fixed ExternalCodex sandbox: {error}")
+                        },
                     ));
                 return report;
             }
@@ -2132,12 +2530,61 @@ fn run_external_agent_runtime(
     } else {
         None
     };
+    let side_effect_profile = match (grok_credentials.as_ref(), side_effect_profile) {
+        (Some(credentials), Some(SideEffectConfinementProfile::ExternalGrok(profile))) => {
+            match credentials.bind_to_profile(profile) {
+                Ok(profile) => Some(SideEffectConfinementProfile::ExternalGrok(profile)),
+                Err(error) => {
+                    report.duration_ms = duration_millis(started.elapsed());
+                    record_grok_credential_environment_failure(&mut report, &error);
+                    return report;
+                }
+            }
+        }
+        (Some(_), Some(_)) => {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_environment_failure(
+                &mut report,
+                EnvironmentFailureCategory::SandboxUnavailable,
+                Some(external_sandbox_requirement(spec.invocation)),
+                "Grok credential capability was not paired with an ExternalGrok profile"
+                    .to_string(),
+            );
+            return report;
+        }
+        (Some(_), None) => {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_environment_failure(
+                &mut report,
+                EnvironmentFailureCategory::SandboxUnavailable,
+                Some(EnvironmentRequirement::sandbox(
+                    EnvironmentSandboxCapability::VerifiedExternalGrok,
+                )),
+                "Grok credential capability was not paired with an ExternalGrok profile"
+                    .to_string(),
+            );
+            return report;
+        }
+        (None, profile) => profile,
+    };
     let mut external_environment = allowed_env(spec.invocation, program_trust);
     if let Some(config) = &target_spec.runtime_adapter {
         for key in &config.env_passthrough {
+            if !runtime_environment_passthrough_allowed(spec.invocation, key) {
+                continue;
+            }
             if let Ok(value) = env::var(key) {
                 external_environment.insert(key.clone(), value);
             }
+        }
+    }
+    if let Some(credentials) = grok_credentials.as_ref() {
+        if let Err(error) =
+            insert_admitted_grok_home_environment(&mut external_environment, credentials)
+        {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_grok_credential_environment_failure(&mut report, &error);
+            return report;
         }
     }
     if let Some(metadata) = &agent_lifecycle {
@@ -2321,11 +2768,11 @@ fn run_external_agent_runtime(
         &target_spec.cwd,
         OUTPUT_TEE_LIMIT_BYTES,
     )
-    .with_stdin(if duplex_review_required {
-        StdinMode::Interactive
-    } else {
-        StdinMode::Bytes(prompt)
-    })
+    .with_stdin(external_agent_stdin_mode(
+        &target_spec,
+        duplex_review_required,
+        prompt,
+    ))
     .with_stdin_limit(MAX_PROMPT_BYTES)
     .with_timeout(Some(timeout))
     .with_stdout(StreamCapture::bounded(OUTPUT_TEE_LIMIT_BYTES));
@@ -2336,9 +2783,7 @@ fn run_external_agent_runtime(
                 record_environment_failure(
                     &mut report,
                     EnvironmentFailureCategory::SandboxUnavailable,
-                    Some(EnvironmentRequirement::sandbox(
-                        EnvironmentSandboxCapability::VerifiedExternalCodex,
-                    )),
+                    Some(external_sandbox_requirement(target_spec.invocation)),
                     "verified external-agent runtime did not prepare a side-effect profile"
                         .to_string(),
                 );
@@ -2348,6 +2793,7 @@ fn run_external_agent_runtime(
                 process_spec,
                 external_environment,
                 side_effect_profile,
+                target_spec.invocation,
                 codex_auth.as_ref(),
                 agent_lifecycle.as_ref(),
             )
@@ -2496,7 +2942,8 @@ fn run_external_agent_runtime(
         Ok(()) => {}
         Err(error) => {
             report.timed_out = matches!(&error, ProcessRunError::SetupTimeout { .. });
-            let preparation_failure = target_process_environment_failure(&error);
+            let preparation_failure =
+                target_process_environment_failure(&error, target_spec.invocation);
             if let Some((category, requirement)) = preparation_failure {
                 if process_run_error_definitely_before_process_start(&error) {
                     report.stdout.target_launch_attempted = false;
@@ -3092,6 +3539,69 @@ struct CompletedTargetContext<'a> {
     program_identity: &'a ExternalProgramIdentity,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeAdapterCapturedOutput {
+    ExistingStagedOutput,
+    Captured(Vec<u8>),
+    Unavailable,
+}
+
+fn runtime_adapter_captured_output(
+    spec: &ExternalAgentCommand,
+    stdout: &[u8],
+    stderr: &[u8],
+    target_completed_successfully: bool,
+) -> Result<RuntimeAdapterCapturedOutput> {
+    if spec.invocation == ExternalAgentInvocation::Grok {
+        if !target_completed_successfully {
+            return Ok(RuntimeAdapterCapturedOutput::Unavailable);
+        }
+        let stream = crate::runtime_adapter::grok::parse_grok_event_stream(stdout)
+            .context("Grok runtime output failed bounded streaming-json validation")?;
+        if !stream.completed() {
+            // Grok error text can contain provider-owned diagnostics. The raw stream is retained
+            // only through the existing redacted JSON-log path; public failure evidence names the
+            // typed terminal condition without reflecting child-controlled text.
+            bail!("Grok runtime returned a terminal streaming-json error event");
+        }
+        if spec.output_schema.is_some() {
+            let crate::runtime_adapter::grok::GrokStreamOutcome::Completed(end) = stream.outcome()
+            else {
+                bail!("Grok runtime did not return a completed terminal end event");
+            };
+            if end.structured_output_error().is_some() {
+                // Never reflect the provider-controlled validation diagnostic: it may contain
+                // report content or other sensitive data from the child session.
+                bail!("Grok runtime returned a terminal structuredOutputError");
+            }
+            let structured = end
+                .structured_output()
+                .context("Grok runtime terminal end event is missing structuredOutput")?;
+            return Ok(RuntimeAdapterCapturedOutput::Captured(
+                crate::runtime_adapter::grok::canonical_grok_structured_output(structured)?,
+            ));
+        }
+        return Ok(RuntimeAdapterCapturedOutput::Captured(
+            stream.response_text().as_bytes().to_vec(),
+        ));
+    }
+
+    let Some(config) = &spec.runtime_adapter else {
+        return Ok(RuntimeAdapterCapturedOutput::ExistingStagedOutput);
+    };
+    Ok(match config.output_capture {
+        crate::runtime_adapter::OutputCaptureMode::OutputFile => {
+            RuntimeAdapterCapturedOutput::ExistingStagedOutput
+        }
+        crate::runtime_adapter::OutputCaptureMode::Stdout => {
+            RuntimeAdapterCapturedOutput::Captured(stdout.to_vec())
+        }
+        crate::runtime_adapter::OutputCaptureMode::StdoutAndStderr => {
+            RuntimeAdapterCapturedOutput::Captured(stdout.iter().chain(stderr).copied().collect())
+        }
+    })
+}
+
 fn record_completed_target(
     report: &mut ExternalAgentRun,
     output: ProcessOutput,
@@ -3102,6 +3612,10 @@ fn record_completed_target(
     context: CompletedTargetContext<'_>,
 ) {
     let safety_verified = output.safety_evidence_verified();
+    let target_completed_successfully = !output.timed_out
+        && output.status.is_some_and(|status| status.success())
+        && output.process_error.is_none()
+        && output.stdin_error.is_none();
     let mut sandbox_denials =
         sandbox_denials_from_codex_jsonl(context.protected_controls, output.stdout.as_bytes());
     deduplicate_sandbox_denials(&mut sandbox_denials);
@@ -3161,41 +3675,48 @@ fn record_completed_target(
         };
         report.error = append_external_error(report.error.take(), Some(status_error));
     }
-    if let Some(config) = &context.spec.runtime_adapter {
-        let captured = match config.output_capture {
-            crate::runtime_adapter::OutputCaptureMode::OutputFile => None,
-            crate::runtime_adapter::OutputCaptureMode::Stdout => {
-                Some(output.stdout.as_bytes().to_vec())
-            }
-            crate::runtime_adapter::OutputCaptureMode::StdoutAndStderr => Some(
-                output
-                    .stdout
-                    .as_bytes()
-                    .iter()
-                    .chain(output.stderr.as_bytes().iter())
-                    .copied()
-                    .collect(),
-            ),
-        };
-        if let Some(captured) = captured {
-            if let Err(error) = staged_output.write_bytes_atomic(&captured, OUTPUT_TEE_LIMIT_BYTES)
-            {
-                report.error = append_external_error(
-                    report.error.take(),
-                    Some(format!("failed to stage runtime adapter output: {error:#}")),
-                );
+    let staged_output_available = match runtime_adapter_captured_output(
+        context.spec,
+        output.stdout.as_bytes(),
+        output.stderr.as_bytes(),
+        target_completed_successfully,
+    ) {
+        Ok(RuntimeAdapterCapturedOutput::ExistingStagedOutput) => true,
+        Ok(RuntimeAdapterCapturedOutput::Captured(captured)) => {
+            match staged_output.write_bytes_atomic(&captured, OUTPUT_TEE_LIMIT_BYTES) {
+                Ok(()) => true,
+                Err(error) => {
+                    report.error = append_external_error(
+                        report.error.take(),
+                        Some(format!("failed to stage runtime adapter output: {error:#}")),
+                    );
+                    false
+                }
             }
         }
-    }
-    match capture_redacted_staged_output(staged_output, output_reservation, credential_redactor) {
-        Ok(bytes) => report.output_last_message = Some(bytes),
+        Ok(RuntimeAdapterCapturedOutput::Unavailable) => false,
         Err(error) => {
             report.error = append_external_error(
                 report.error.take(),
-                Some(format!(
-                    "external-agent output reservation changed: {error}"
-                )),
+                Some(credential_redactor.redact_string(&format!(
+                    "runtime adapter output validation failed: {error:#}"
+                ))),
             );
+            false
+        }
+    };
+    if staged_output_available {
+        match capture_redacted_staged_output(staged_output, output_reservation, credential_redactor)
+        {
+            Ok(bytes) => report.output_last_message = Some(bytes),
+            Err(error) => {
+                report.error = append_external_error(
+                    report.error.take(),
+                    Some(format!(
+                        "external-agent output reservation changed: {error}"
+                    )),
+                );
+            }
         }
     }
     if let Some(git) = &context.protected_controls.managed_git {
@@ -3695,20 +4216,18 @@ fn process_run_error_definitely_before_process_start(error: &ProcessRunError) ->
 
 fn target_process_environment_failure(
     error: &ProcessRunError,
+    invocation: ExternalAgentInvocation,
 ) -> Option<(EnvironmentFailureCategory, Option<EnvironmentRequirement>)> {
     match error {
         ProcessRunError::ContainmentUnavailable { .. }
         | ProcessRunError::ProcessOwnership { .. } => Some((
             EnvironmentFailureCategory::SandboxUnavailable,
-            Some(EnvironmentRequirement::sandbox(
-                EnvironmentSandboxCapability::VerifiedExternalCodex,
-            )),
+            Some(external_sandbox_requirement(invocation)),
         )),
         ProcessRunError::EnvironmentFailure { failure, .. } => Some((
             failure.category,
-            (failure.category == EnvironmentFailureCategory::SandboxUnavailable).then(|| {
-                EnvironmentRequirement::sandbox(EnvironmentSandboxCapability::VerifiedExternalCodex)
-            }),
+            (failure.category == EnvironmentFailureCategory::SandboxUnavailable)
+                .then(|| external_sandbox_requirement(invocation)),
         )),
         ProcessRunError::Cancelled { .. }
         | ProcessRunError::OpenTee { .. }
@@ -4143,15 +4662,22 @@ fn evaluate_environment_requirement(
             }
         }
         EnvironmentRequirement::Sandbox { capability } => {
-            let verified = *capability == EnvironmentSandboxCapability::VerifiedExternalCodex
-                && verified_confinement == Some(SideEffectConfinementProfileKind::ExternalCodex);
+            let required_profile = match capability {
+                EnvironmentSandboxCapability::VerifiedExternalCodex => {
+                    SideEffectConfinementProfileKind::ExternalCodex
+                }
+                EnvironmentSandboxCapability::VerifiedExternalGrok => {
+                    SideEffectConfinementProfileKind::ExternalGrok
+                }
+            };
+            let verified = verified_confinement == Some(required_profile);
             if verified {
                 (
                     EnvironmentPreflightResult {
                         requirement: requirement.clone(),
                         status: EnvironmentPreflightStatus::Satisfied,
                         observation: Some(EnvironmentPreflightObservation::Sandbox {
-                            profile: SideEffectConfinementProfileKind::ExternalCodex,
+                            profile: required_profile,
                         }),
                     },
                     None,
@@ -4168,8 +4694,9 @@ fn evaluate_environment_requirement(
                     Some(environment_failure(
                         EnvironmentFailureCategory::SandboxUnavailable,
                         Some(requirement.clone()),
-                        "the fixed ExternalCodex confinement profile was not safely verified"
-                            .to_string(),
+                        format!(
+                            "the fixed {required_profile:?} confinement profile was not safely verified"
+                        ),
                     )),
                     false,
                 )

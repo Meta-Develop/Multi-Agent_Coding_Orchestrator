@@ -23,6 +23,57 @@
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn first_managed_worktree_from_fresh_clone_preserves_repository_binding() {
+        skip_without_containment!();
+        let temp = TempDir::new().expect("tempdir");
+        let origin_path = temp.path().join("origin");
+        WorktreeManager::init_repository(&origin_path, "main").expect("init origin");
+        let origin = crate::git_repository::open(&origin_path).expect("open origin");
+        commit_readme(&origin).expect("initial commit");
+        drop(origin);
+
+        let clone_path = temp.path().join("fresh-clone");
+        let cloned = git2::Repository::clone(
+            origin_path.to_str().expect("UTF-8 origin path"),
+            &clone_path,
+        )
+        .expect("clone repository");
+        assert!(
+            !cloned.commondir().join("worktrees").exists(),
+            "fresh clone must exercise creation of the worktrees metadata directory"
+        );
+        drop(cloned);
+
+        let manager = WorktreeManager::new(&clone_path);
+        let cleanliness = manager
+            .acquire_repository_cleanliness()
+            .expect("bind clean fresh clone");
+        assert!(
+            !clone_path.join(".git/worktrees").exists(),
+            "cleanliness capture must not pre-create worktree metadata"
+        );
+        let record = manager
+            .create_with_repository_cleanliness(
+                WorktreeCreateOptions {
+                    agent_id: "first-bound".to_string(),
+                    branch: None,
+                    base: None,
+                    worktree_root: Some(temp.path().join("worktrees")),
+                },
+                &cleanliness,
+            )
+            .expect("create first capability-bound managed worktree");
+
+        assert!(record.path.is_dir());
+        assert!(clone_path.join(".git/worktrees/first-bound").is_dir());
+        assert_eq!(
+            manager.list_managed_verified().expect("list managed lanes"),
+            vec![record]
+        );
+    }
+
     #[test]
     fn target_only_mode_rejects_conflicting_gc_policies() {
         let retention = WorktreeRetentionPolicy {
@@ -1984,6 +2035,48 @@
     }
 
     #[test]
+    fn delete_branch_fails_closed_when_create_time_registry_binding_is_missing() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+
+        let manager = WorktreeManager::new(&repo_path);
+        let created = manager
+            .create_for_test(WorktreeCreateOptions {
+                agent_id: "agent-unbound-delete".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: Some(worktree_root),
+            })
+            .expect("create worktree");
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("open registry");
+        let lock = store.lock().expect("lock registry");
+        let mut registry = store.load(&lock).expect("load registry");
+        registry
+            .records
+            .remove("agent-unbound-delete")
+            .expect("remove create-time binding");
+        store
+            .save(&lock, &mut registry)
+            .expect("persist missing binding state");
+        drop(lock);
+        drop(store);
+
+        let error = manager
+            .remove("agent-unbound-delete", true, true)
+            .expect_err("missing binding must refuse every destructive phase");
+
+        assert!(error.to_string().contains("no create-time managed binding"));
+        assert!(created.path.exists());
+        assert!(repo
+            .find_branch("maco/agent-unbound-delete", BranchType::Local)
+            .is_ok());
+    }
+
+    #[test]
     fn remove_reports_custom_worktree_branch() {
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
@@ -2527,6 +2620,109 @@
             .load(&lock)
             .expect_err("replaced state root must fail");
         assert!(error.to_string().contains("replaced"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_managed_worktree_creations_wait_for_registry_and_serialize() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let worktree_root = temp.path().join("worktrees");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        commit_readme(&repo).expect("initial commit");
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
+        let blocker = store.lock().expect("initial registry lock");
+
+        assert!(MANAGED_WORKTREE_REGISTRY_LOCK_TIMEOUT > Duration::from_secs(5));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let records = std::thread::scope(|scope| {
+            let handles = ["concurrent-a", "concurrent-b"].map(|agent_id| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                let repo_path = repo_path.clone();
+                let worktree_root = worktree_root.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    WorktreeManager::new(repo_path).create_for_test(WorktreeCreateOptions {
+                        agent_id: agent_id.to_string(),
+                        branch: None,
+                        base: None,
+                        worktree_root: Some(worktree_root),
+                    })
+                })
+            });
+
+            barrier.wait();
+            // Keep both creators queued beyond the generic five-second state
+            // lock budget that caused the NTFS parallel-launch regression.
+            std::thread::sleep(Duration::from_millis(5_250));
+            drop(blocker);
+            handles.map(|handle| {
+                handle
+                    .join()
+                    .expect("managed creation thread panicked")
+                    .expect("contending managed creation")
+            })
+        });
+
+        let mut names = records.map(|record| record.name);
+        names.sort();
+        assert_eq!(names, ["concurrent-a", "concurrent-b"]);
+        let listed = WorktreeManager::new(&repo_path)
+            .list()
+            .expect("serialized registry remains readable");
+        assert_eq!(listed.len(), 2);
+        let lock = store.lock().expect("registry lock after serialized creates");
+        let registry = store.load(&lock).expect("authenticated registry");
+        assert!(registry.operations.is_empty());
+        assert_eq!(
+            registry.records.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["concurrent-a", "concurrent-b"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_lock_contention_and_corruption_fail_closed_within_bounds() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
+        let active = store.lock().expect("active registry lock");
+
+        let active_started = Instant::now();
+        let active_error = store
+            .lock_with_timeout(Duration::from_millis(100))
+            .expect_err("active registry lock must time out");
+        assert!(
+            active_started.elapsed() < Duration::from_secs(2),
+            "active registry lock exceeded its bounded test wait"
+        );
+        assert!(
+            active_error.to_string().contains("timed out"),
+            "unexpected active-lock error: {active_error:#}"
+        );
+
+        let lock_path = active.lock.path().to_path_buf();
+        drop(active);
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o640))
+            .expect("corrupt stable lock mode");
+        let corrupt_started = Instant::now();
+        let corrupt_error = store
+            .lock_with_timeout(Duration::from_millis(100))
+            .expect_err("corrupt registry lock must fail closed");
+        assert!(
+            corrupt_started.elapsed() < Duration::from_secs(2),
+            "corrupt registry lock exceeded its bounded test wait"
+        );
+        assert!(
+            corrupt_error.to_string().contains("unsafe mode")
+                || corrupt_error.to_string().contains("owner-private"),
+            "unexpected corrupt-lock error: {corrupt_error:#}"
+        );
     }
 
     #[cfg(unix)]

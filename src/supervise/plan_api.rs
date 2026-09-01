@@ -254,6 +254,10 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
     planning::validate_task_assignment_disjointness(&proposal.assignments)
         .context("goal/spec workstreams are not independently assignable")?;
 
+    let explicit_new_file_workstream = authoritative_new_file_workstream_id(&proposal);
+    let explicit_existing_file_edit_workstream =
+        authoritative_existing_file_edit_workstream_id(&proposal);
+
     let spec_fragment_ids = proposal
         .fragments
         .iter()
@@ -269,6 +273,29 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
     let mut assignment_schedule = Vec::with_capacity(assignment_capacity);
     for assignment in proposal.assignments {
         let planning_id = format!("{}-planning", assignment.id);
+        let planning_task = format!(
+            "Read-only planning gate for workstream '{}'. Review the proposed scope and implementation task without editing files or delegating implementation. Confirm whether the execution child can proceed safely.\n\nExecution task:\n{}",
+            assignment.id, assignment.task
+        );
+        let is_explicit_new_file_workstream =
+            explicit_new_file_workstream.as_deref() == Some(assignment.id.as_str());
+        let is_explicit_existing_file_edit_workstream =
+            explicit_existing_file_edit_workstream.as_deref() == Some(assignment.id.as_str());
+        let generated_preclaim_notes = if is_explicit_new_file_workstream {
+            Some(explicit_new_file_preclaim_directive(
+                &assignment,
+                &planning_id,
+                &planning_task,
+            )?)
+        } else if is_explicit_existing_file_edit_workstream {
+            Some(explicit_existing_file_edit_preclaim_directive(
+                &assignment,
+                &planning_id,
+                &planning_task,
+            )?)
+        } else {
+            None
+        };
         let planning_index = assignments.len();
         assignments.push(OrchestratorAssignment {
             id: planning_id.clone(),
@@ -280,17 +307,16 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
             assigned_paths: assignment.assigned_paths.clone(),
             semantic_symbols: assignment.semantic_symbols.clone(),
             semantic_modules: assignment.semantic_modules.clone(),
-            task: Some(format!(
-                "Read-only planning gate for workstream '{}'. Review the proposed scope and implementation task without editing files or delegating implementation. Confirm whether the execution child can proceed safely.\n\nExecution task:\n{}",
-                assignment.id, assignment.task
-            )),
+            task: Some(planning_task),
             worker_assignments: Vec::new(),
             environment_requirements: Vec::new(),
             licensed_breakage: None,
-            notes: Some(
-                "MACO-visible read-only planning root; its execution child is parent-gated"
-                    .to_string(),
-            ),
+            notes: generated_preclaim_notes.clone().or_else(|| {
+                Some(
+                    "MACO-visible read-only planning root; its execution child is parent-gated"
+                        .to_string(),
+                )
+            }),
         });
         assignment_schedule.push(AssignmentScheduleEntry {
             assignment_id: planning_id.clone(),
@@ -301,40 +327,56 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
 
         spec_fragment_ids_by_assignment
             .insert(assignment.id.clone(), assignment.fragment_ids.clone());
-        let worker = WorkerAssignment {
-            id: format!("{}-worker", assignment.id),
-            role: AgentRole::Worker,
-            role_category: Some(AgentRole::Worker.authority_category()),
-            selection_source: None,
-            assigned_paths: assignment.assigned_paths.clone(),
-            semantic_symbols: assignment.semantic_symbols.clone(),
-            semantic_modules: assignment.semantic_modules.clone(),
-            task: Some(assignment.task.clone()),
-            environment_requirements: Vec::new(),
-            report_path: None,
-        };
-        assignment_metadata.insert(
-            (assignment.id.clone(), worker.id.clone()),
-            WorkerAssignmentMetadata::default(),
-        );
+        let (execution_role, execution_role_category, worker_assignments) =
+            if is_explicit_new_file_workstream || is_explicit_existing_file_edit_workstream {
+                (
+                    AgentRole::Worker,
+                    AgentRole::Worker.authority_category(),
+                    Vec::new(),
+                )
+            } else {
+                let worker = WorkerAssignment {
+                    id: format!("{}-worker", assignment.id),
+                    role: AgentRole::Worker,
+                    role_category: Some(AgentRole::Worker.authority_category()),
+                    selection_source: None,
+                    assigned_paths: assignment.assigned_paths.clone(),
+                    semantic_symbols: assignment.semantic_symbols.clone(),
+                    semantic_modules: assignment.semantic_modules.clone(),
+                    task: Some(assignment.task.clone()),
+                    environment_requirements: Vec::new(),
+                    report_path: None,
+                };
+                assignment_metadata.insert(
+                    (assignment.id.clone(), worker.id.clone()),
+                    WorkerAssignmentMetadata::default(),
+                );
+                (
+                    AgentRole::ChildOrchestrator,
+                    AgentRole::ChildOrchestrator.authority_category(),
+                    vec![worker],
+                )
+            };
         let execution_index = assignments.len();
         assignments.push(OrchestratorAssignment {
             id: assignment.id.clone(),
             phase: AssignmentPhase::Execution,
             runtime: None,
-            role: AgentRole::ChildOrchestrator,
-            role_category: Some(AgentRole::ChildOrchestrator.authority_category()),
+            role: execution_role,
+            role_category: Some(execution_role_category),
             selection_source: None,
             assigned_paths: assignment.assigned_paths,
             semantic_symbols: assignment.semantic_symbols,
             semantic_modules: assignment.semantic_modules,
             task: Some(assignment.task),
-            worker_assignments: vec![worker],
+            worker_assignments,
             environment_requirements: Vec::new(),
             licensed_breakage: None,
-            notes: Some(format!(
-                "Execution child admitted only after read-only planning root '{planning_id}' succeeds"
-            )),
+            notes: generated_preclaim_notes.or_else(|| {
+                Some(format!(
+                    "Execution child admitted only after read-only planning root '{planning_id}' succeeds"
+                ))
+            }),
         });
         assignment_schedule.push(AssignmentScheduleEntry {
             assignment_id: assignment.id,
@@ -383,6 +425,655 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         assignment_metadata,
         plan_metadata,
     })
+}
+
+const AUTHORITATIVE_NEW_FILE_DIAGNOSTIC: &str =
+    "an explicit safe new-file creation directive bounded the task before semantic inference";
+const GENERATED_PRECLAIM_DIRECTIVE_PREFIX: &str = "maco-preclaim-v1:";
+
+fn authoritative_new_file_workstream_id(
+    proposal: &planning::TaskDecompositionProposal,
+) -> Option<String> {
+    let [assignment] = proposal.assignments.as_slice() else {
+        return None;
+    };
+    let [_assigned_path] = assignment.assigned_paths.as_slice() else {
+        return None;
+    };
+    let authoritative_diagnostic_count = proposal
+        .diagnostics
+        .notes
+        .iter()
+        .filter(|note| note.as_str() == AUTHORITATIVE_NEW_FILE_DIAGNOSTIC)
+        .count();
+    (authoritative_diagnostic_count == 1
+        && proposal.coverage_gaps.is_empty()
+        && proposal.disjointness.disjoint
+        && proposal.disjointness.conflicts.is_empty()
+        && assignment.semantic_symbols.is_empty()
+        && assignment.semantic_modules.is_empty())
+    .then(|| assignment.id.clone())
+}
+
+fn authoritative_existing_file_edit_workstream_id(
+    proposal: &planning::TaskDecompositionProposal,
+) -> Option<String> {
+    let [assignment] = proposal.assignments.as_slice() else {
+        return None;
+    };
+    let [assigned_path] = assignment.assigned_paths.as_slice() else {
+        return None;
+    };
+    let fragment_ids = proposal
+        .fragments
+        .iter()
+        .map(|fragment| fragment.id.as_str())
+        .collect::<Vec<_>>();
+    let assignment_fragment_ids = assignment
+        .fragment_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    (!proposal.diagnostics.degraded
+        && proposal.coverage_gaps.is_empty()
+        && proposal.disjointness.disjoint
+        && proposal.disjointness.conflicts.is_empty()
+        && !proposal.disjointness.conflicts_truncated
+        && assignment_fragment_ids == fragment_ids
+        && assignment.semantic_symbols.is_empty()
+        && assignment.semantic_modules.is_empty()
+        && explicit_existing_file_edit_verification_task(&assignment.task, assigned_path))
+    .then(|| assignment.id.clone())
+}
+
+pub(super) fn explicit_existing_file_edit_verification_task(task: &str, target: &Path) -> bool {
+    if explicit_existing_file_rust_test_contract_task(task, target) {
+        return true;
+    }
+    let Some(target) = target.to_str() else {
+        return false;
+    };
+    if target.is_empty() {
+        return false;
+    }
+    let normalized = task
+        .to_ascii_lowercase()
+        .replace(['`', '\'', '"'], "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let normalized = normalized.strip_suffix('.').unwrap_or(&normalized);
+    let target = target.to_ascii_lowercase();
+    let verification_clauses = [
+        format!(
+            ". verify the result with git diff --check and confirm {target} contains exactly that line"
+        ),
+        format!(
+            ". verify the result with git diff --check and confirm that {target} contains exactly that line"
+        ),
+    ];
+    if normalized.matches("git diff --check").count() != 1
+        || normalized.matches("contains exactly that line").count() != 1
+    {
+        return false;
+    }
+    let mut matching_verification_clauses = verification_clauses
+        .iter()
+        .filter_map(|clause| normalized.strip_suffix(clause.as_str()));
+    let Some(edit_clause) = matching_verification_clauses.next() else {
+        return false;
+    };
+    if matching_verification_clauses.next().is_some() {
+        return false;
+    }
+
+    let edit_prefixes = [format!("in {target}, "), format!("in {target} ")];
+    let mut matching_edit_prefixes = edit_prefixes
+        .iter()
+        .filter_map(|prefix| edit_clause.strip_prefix(prefix.as_str()));
+    let Some(replacement_directive) = matching_edit_prefixes.next() else {
+        return false;
+    };
+    if matching_edit_prefixes.next().is_some() {
+        return false;
+    }
+
+    let exact_replacement_markers = ["with exactly:", "with exactly one line:"];
+    if exact_replacement_markers
+        .iter()
+        .map(|marker| replacement_directive.matches(*marker).count())
+        .sum::<usize>()
+        != 1
+    {
+        return false;
+    }
+
+    if let Some(payload) =
+        replacement_directive.strip_prefix("replace the entire contents with exactly one line:")
+    {
+        return !payload.trim().is_empty();
+    }
+
+    let Some(replacement) = replacement_directive.strip_prefix("replace ") else {
+        return false;
+    };
+    let Some((replaced_text, payload)) = replacement.split_once(" with exactly:") else {
+        return false;
+    };
+    !replaced_text.trim().is_empty() && !payload.trim().is_empty()
+}
+
+fn explicit_existing_file_rust_test_contract_task(task: &str, target: &Path) -> bool {
+    let Ok(target) = normalize_repo_relative_path(target) else {
+        return false;
+    };
+    let Some(clauses) = existing_file_task_clauses(task) else {
+        return false;
+    };
+    let Some(task_paths) = existing_file_task_paths(&clauses) else {
+        return false;
+    };
+    if task_paths.len() != 1 || task_paths[0] != target {
+        return false;
+    }
+
+    if clauses.iter().any(|clause| {
+        clause_has_fail_closed_marker(clause)
+            && (path_bearing_edit_clause(clause) || verification_related_clause(clause))
+    }) {
+        return false;
+    }
+
+    let mut path_bearing_edit_clauses = clauses
+        .iter()
+        .enumerate()
+        .filter(|(_, clause)| path_bearing_edit_clause(clause));
+    let Some((edit_clause_index, edit_clause)) = path_bearing_edit_clauses.next() else {
+        return false;
+    };
+    if path_bearing_edit_clauses.next().is_some() {
+        return false;
+    }
+    if !explicit_positive_existing_file_edit_clause(edit_clause, &target) {
+        return false;
+    }
+
+    let mut contract_clauses = clauses
+        .iter()
+        .enumerate()
+        .filter(|(_, clause)| verification_contract_language(clause));
+    let Some((contract_clause_index, contract_clause)) = contract_clauses.next() else {
+        return false;
+    };
+    if contract_clauses.next().is_some() {
+        return false;
+    }
+    rust_test_verification_contract(contract_clause).is_some()
+        && edit_clause_index != contract_clause_index
+}
+
+fn existing_file_task_clauses(task: &str) -> Option<Vec<&str>> {
+    let mut clauses = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    let mut chars = task.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        match quote {
+            Some(expected) if ch == expected => quote = None,
+            Some(_) => continue,
+            None if matches!(ch, '`' | '\'' | '"') => {
+                quote = Some(ch);
+                continue;
+            }
+            None => {}
+        }
+
+        let sentence_period =
+            ch == '.' && chars.peek().is_none_or(|(_, next)| next.is_whitespace());
+        if sentence_period || matches!(ch, '\n' | ';' | '!' | '?') {
+            let clause = task[start..index].trim();
+            if !clause.is_empty() {
+                clauses.push(clause);
+            }
+            start = index + ch.len_utf8();
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    let clause = task[start..].trim();
+    if !clause.is_empty() {
+        clauses.push(clause);
+    }
+    Some(clauses)
+}
+
+fn existing_file_task_paths(clauses: &[&str]) -> Option<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for clause in clauses {
+        let tokens = existing_file_clause_tokens(clause)?;
+        let extensionless_operands = extensionless_edit_operand_indices(&tokens);
+        for (index, raw) in tokens.iter().enumerate() {
+            let token = trimmed_existing_file_task_token(raw);
+            let path_like = looks_like_existing_file_task_path(token)
+                || looks_like_unambiguous_extensionless_filename(token)
+                || (extensionless_operands.contains(&index)
+                    && looks_like_extensionless_edit_operand(token));
+            if path_like {
+                paths.push(normalize_repo_relative_path(token).ok()?);
+            }
+        }
+    }
+    Some(paths)
+}
+
+fn existing_file_clause_tokens(clause: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    for ch in clause.chars() {
+        match quote {
+            Some(expected) if ch == expected => quote = None,
+            Some(_) => current.push(ch),
+            None if matches!(ch, '`' | '\'' | '"') => quote = Some(ch),
+            None if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            None => current.push(ch),
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    Some(tokens)
+}
+
+fn extensionless_edit_operand_indices(tokens: &[String]) -> Vec<usize> {
+    const OPERAND_MODIFIERS: &[&str] = &[
+        "just",
+        "only",
+        "the",
+        "an",
+        "a",
+        "existing",
+        "repository",
+        "repo",
+        "root",
+        "file",
+        "filename",
+    ];
+
+    structurally_plausible_edit_verb_indices(tokens)
+        .into_iter()
+        .filter_map(|verb_index| {
+            ((verb_index + 1)..tokens.len()).find(|index| {
+                !OPERAND_MODIFIERS.iter().any(|modifier| {
+                    trimmed_clause_word(&tokens[*index]).eq_ignore_ascii_case(modifier)
+                })
+            })
+        })
+        .collect()
+}
+
+fn structurally_plausible_edit_verb_indices(tokens: &[String]) -> Vec<usize> {
+    tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| is_path_bearing_edit_verb(trimmed_clause_word(token)))
+        .filter(|(verb_index, _)| plausible_edit_directive_prefix(&tokens[..*verb_index]))
+        .map(|(verb_index, _)| verb_index)
+        .collect()
+}
+
+fn plausible_edit_directive_prefix(prefix: &[String]) -> bool {
+    const PREFIX_WORDS: &str = concat!(
+        "also appropriate be can could do dont don't ever if is it may maybe might must ",
+        "need needs necessary needed never no not only optionally please practical ready ",
+        "required shall should skip then to unless when will without we you",
+    );
+    let segment_start = prefix
+        .iter()
+        .rposition(|token| {
+            token.ends_with(',')
+                || token.ends_with(':')
+                || matches!(
+                    trimmed_clause_word(token).to_ascii_lowercase().as_str(),
+                    "and" | "but" | "then"
+                )
+        })
+        .map_or(0, |index| index + 1);
+    prefix[segment_start..].iter().all(|token| {
+        PREFIX_WORDS
+            .split_ascii_whitespace()
+            .any(|prefix_word| trimmed_clause_word(token).eq_ignore_ascii_case(prefix_word))
+    })
+}
+
+fn trimmed_clause_word(raw: &str) -> &str {
+    raw.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+}
+
+fn trimmed_existing_file_task_token(raw: &str) -> &str {
+    raw.trim()
+        .trim_start_matches(|ch: char| {
+            matches!(
+                ch,
+                ',' | ';' | ':' | ')' | '(' | '[' | ']' | '{' | '}' | '!' | '?'
+            )
+        })
+        .trim_end_matches(|ch: char| {
+            matches!(
+                ch,
+                ',' | ';' | ':' | ')' | '(' | '[' | ']' | '{' | '}' | '!' | '?' | '.'
+            )
+        })
+}
+
+fn looks_like_existing_file_task_path(token: &str) -> bool {
+    if token.is_empty()
+        || token == "."
+        || token == ".."
+        || token.contains("://")
+        || token.contains("::")
+    {
+        return false;
+    }
+    token.contains('/')
+        || token.starts_with('.')
+        || Path::new(token)
+            .extension()
+            .is_some_and(|extension| !extension.is_empty())
+}
+
+fn looks_like_extensionless_edit_operand(token: &str) -> bool {
+    if token.is_empty()
+        || token.contains(['/', '.', ':', '_'])
+        || !token
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '+'))
+    {
+        return false;
+    }
+    !matches!(
+        token.to_ascii_lowercase().as_str(),
+        "anything"
+            | "nothing"
+            | "something"
+            | "it"
+            | "this"
+            | "that"
+            | "these"
+            | "those"
+            | "code"
+            | "behavior"
+            | "behaviour"
+            | "logic"
+            | "semantics"
+    )
+}
+
+fn looks_like_unambiguous_extensionless_filename(token: &str) -> bool {
+    if token.len() < 2 || !token.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+        return false;
+    }
+    let lowercase = token.to_ascii_lowercase();
+    (lowercase != "file" && lowercase.ends_with("file"))
+        || token
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
+}
+
+fn path_bearing_edit_clause(clause: &str) -> bool {
+    let Some(tokens) = existing_file_clause_tokens(clause) else {
+        return true;
+    };
+    let Some(paths) = existing_file_task_paths(&[clause]) else {
+        return true;
+    };
+    !paths.is_empty() && !structurally_plausible_edit_verb_indices(&tokens).is_empty()
+}
+
+fn explicit_positive_existing_file_edit_clause(clause: &str, target: &Path) -> bool {
+    let words = clause_words(clause);
+    let Some(first) = words.first() else {
+        return false;
+    };
+    let edit_verbs = words
+        .iter()
+        .filter(|word| is_path_bearing_edit_verb(word))
+        .collect::<Vec<_>>();
+    matches!(
+        first.to_ascii_lowercase().as_str(),
+        "edit" | "change" | "update"
+    ) && edit_verbs.len() == 1
+        && matches!(
+            edit_verbs[0].to_ascii_lowercase().as_str(),
+            "edit" | "change" | "update"
+        )
+        && existing_file_task_paths(&[clause])
+            .is_some_and(|paths| paths.len() == 1 && paths[0].as_path() == target)
+}
+
+fn is_path_bearing_edit_verb(word: &str) -> bool {
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "edit" | "change" | "update" | "modify" | "alter" | "touch" | "patch" | "rewrite"
+    )
+}
+
+fn clause_has_fail_closed_marker(clause: &str) -> bool {
+    let words = clause_words(clause);
+    words.iter().enumerate().any(|(index, word)| {
+        let word = word.to_ascii_lowercase();
+        let cfg_not_test = word == "not"
+            && index > 0
+            && index + 1 < words.len()
+            && words[index - 1].eq_ignore_ascii_case("cfg")
+            && words[index + 1].eq_ignore_ascii_case("test");
+        !cfg_not_test
+            && matches!(
+                word.as_str(),
+                "dont"
+                    | "not"
+                    | "no"
+                    | "never"
+                    | "without"
+                    | "skip"
+                    | "if"
+                    | "unless"
+                    | "when"
+                    | "maybe"
+                    | "optionally"
+                    | "may"
+                    | "might"
+                    | "could"
+            )
+    }) || words.windows(2).any(|pair| {
+        (pair[0].eq_ignore_ascii_case("do") && pair[1].eq_ignore_ascii_case("not"))
+            || (pair[0].eq_ignore_ascii_case("don") && pair[1].eq_ignore_ascii_case("t"))
+    })
+}
+
+fn verification_related_clause(clause: &str) -> bool {
+    clause_words(clause).iter().any(|word| {
+        matches!(
+            word.to_ascii_lowercase().as_str(),
+            "verify"
+                | "verification"
+                | "contract"
+                | "cargo"
+                | "git"
+                | "run"
+                | "running"
+                | "execute"
+                | "executing"
+                | "command"
+                | "commands"
+                | "test"
+                | "tests"
+        )
+    })
+}
+
+fn verification_contract_language(clause: &str) -> bool {
+    clause_words(clause).iter().any(|word| {
+        matches!(
+            word.to_ascii_lowercase().as_str(),
+            "verification" | "contract"
+        )
+    })
+}
+
+fn rust_test_verification_contract(clause: &str) -> Option<&str> {
+    if clause_words(clause).iter().any(|word| {
+        matches!(
+            word.to_ascii_lowercase().as_str(),
+            "cargo" | "git" | "run" | "running" | "execute" | "executing" | "command" | "commands"
+        )
+    }) {
+        return None;
+    }
+
+    let words = clause.split_whitespace().collect::<Vec<_>>();
+    let lowered = words
+        .iter()
+        .map(|word| {
+            word.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                .to_ascii_lowercase()
+        })
+        .collect::<Vec<_>>();
+    let test_index = if lowered.ends_with(&[
+        "is".to_string(),
+        "the".to_string(),
+        "verification".to_string(),
+        "contract".to_string(),
+    ]) {
+        words.len().checked_sub(5)?
+    } else if lowered.ends_with(&[
+        "is".to_string(),
+        "the".to_string(),
+        "exact".to_string(),
+        "verification".to_string(),
+        "contract".to_string(),
+    ]) {
+        words.len().checked_sub(6)?
+    } else {
+        return None;
+    };
+    let test_path = words[test_index].trim_matches(['`', '\'', '"']);
+    syntactically_valid_rust_test_path(test_path).then_some(test_path)
+}
+
+fn syntactically_valid_rust_test_path(test_path: &str) -> bool {
+    let Ok(path) = syn::parse_str::<syn::Path>(test_path) else {
+        return false;
+    };
+    path.leading_colon.is_none()
+        && path.segments.len() >= 2
+        && path
+            .segments
+            .iter()
+            .all(|segment| matches!(&segment.arguments, syn::PathArguments::None))
+}
+
+fn clause_words(clause: &str) -> Vec<&str> {
+    clause
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+fn explicit_new_file_preclaim_directive(
+    assignment: &planning::TaskAssignmentProposal,
+    planning_id: &str,
+    planning_task: &str,
+) -> Result<String> {
+    let [assigned_path] = assignment.assigned_paths.as_slice() else {
+        bail!(
+            "explicit new-file workstream '{}' lost its single-path binding",
+            assignment.id
+        );
+    };
+    let assigned_path = assigned_path.to_str().with_context(|| {
+        format!(
+            "explicit new-file workstream '{}' path is not UTF-8",
+            assignment.id
+        )
+    })?;
+    let payload = serde_json::json!({
+        "verification_contract": {
+            "kind": "explicit_new_file_creation",
+            "assigned_path": assigned_path,
+            "planning_assignment": {
+                "id": planning_id,
+                "phase": AssignmentPhase::Planning,
+                "role": AgentRole::ChildOrchestrator,
+                "role_category": AgentRole::ChildOrchestrator.authority_category(),
+                "task_sha256": crate::artifacts::state_auth::sha256_hex(planning_task.as_bytes()),
+            },
+            "execution_assignment": {
+                "id": assignment.id,
+                "phase": AssignmentPhase::Execution,
+                "role": AgentRole::Worker,
+                "role_category": AgentRole::Worker.authority_category(),
+                "task_sha256": crate::artifacts::state_auth::sha256_hex(assignment.task.as_bytes()),
+            }
+        }
+    });
+    Ok(format!(
+        "{GENERATED_PRECLAIM_DIRECTIVE_PREFIX}{}",
+        serde_json::to_string(&payload)
+            .context("failed to serialize explicit new-file pre-claim contract")?
+    ))
+}
+
+fn explicit_existing_file_edit_preclaim_directive(
+    assignment: &planning::TaskAssignmentProposal,
+    planning_id: &str,
+    planning_task: &str,
+) -> Result<String> {
+    let [assigned_path] = assignment.assigned_paths.as_slice() else {
+        bail!(
+            "explicit existing-file workstream '{}' lost its single-path binding",
+            assignment.id
+        );
+    };
+    let assigned_path = assigned_path.to_str().with_context(|| {
+        format!(
+            "explicit existing-file workstream '{}' path is not UTF-8",
+            assignment.id
+        )
+    })?;
+    let payload = serde_json::json!({
+        "verification_contract": {
+            "kind": "existing_git_visible_regular_file_edit",
+            "assigned_path": assigned_path,
+            "planning_assignment": {
+                "id": planning_id,
+                "phase": AssignmentPhase::Planning,
+                "role": AgentRole::ChildOrchestrator,
+                "role_category": AgentRole::ChildOrchestrator.authority_category(),
+                "task_sha256": crate::artifacts::state_auth::sha256_hex(planning_task.as_bytes()),
+            },
+            "execution_assignment": {
+                "id": assignment.id,
+                "phase": AssignmentPhase::Execution,
+                "role": AgentRole::Worker,
+                "role_category": AgentRole::Worker.authority_category(),
+                "task_sha256": crate::artifacts::state_auth::sha256_hex(assignment.task.as_bytes()),
+            }
+        }
+    });
+    Ok(format!(
+        "{GENERATED_PRECLAIM_DIRECTIVE_PREFIX}{}",
+        serde_json::to_string(&payload)
+            .context("failed to serialize explicit existing-file pre-claim contract")?
+    ))
 }
 
 const CONSERVATIVE_GENERATED_ROLE_RESERVATION_TOKENS: usize = 1_024;
@@ -1956,21 +2647,41 @@ pub fn run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_work
     let mut loaded = supervisor_plan_and_consultant_from_goal_spec(&repo, goal, spec, None)?;
     apply_objective_profile_override(&mut loaded, objective_profile_override.as_deref());
     validate_execution_target_pre_dispatch(&loaded, allow_primary_worktree)?;
-    let manager = WorktreeManager::new(&repo);
-    let cleanliness = manager.acquire_repository_cleanliness()?;
     let source_loaded = loaded.clone();
     let template = options.clone();
     let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
-    let source_report = run_supervisor_plan_with_runner_and_creation(
-        loaded,
-        options,
-        max_concurrent_children,
-        SupervisorExecutionRuntime::Verified,
-        SupervisorWorktreeCreation::Bound(&cleanliness),
-        runtime_model_catalog,
-        &run_external_agent_cancellable_reviewed,
-    )?;
-    drop(cleanliness);
+    let source_report = if template.runtime == SupervisorRuntime::Fake {
+        if source_loaded.plan_metadata.execution_target.is_some() {
+            bail!("nonpublishable Fake cascade cannot use primary-worktree execution");
+        }
+        let no_external_runner = |_command: &ExternalAgentCommand,
+                                  _cancellation: &ProcessCancellation,
+                                  _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>|
+         -> ExternalAgentRun {
+            panic!("nonpublishable Fake cascade must not launch an external process")
+        };
+        run_supervisor_plan_with_runner_and_creation(
+            loaded,
+            options,
+            max_concurrent_children,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            SupervisorWorktreeCreation::NonpublishableSimulation,
+            runtime_model_catalog,
+            &no_external_runner,
+        )?
+    } else {
+        let manager = WorktreeManager::new(&repo);
+        let cleanliness = manager.acquire_repository_cleanliness()?;
+        run_supervisor_plan_with_runner_and_creation(
+            loaded,
+            options,
+            max_concurrent_children,
+            SupervisorExecutionRuntime::Verified,
+            SupervisorWorktreeCreation::Bound(&cleanliness),
+            runtime_model_catalog,
+            &run_external_agent_cancellable_reviewed,
+        )?
+    };
     let mut permit = |_plan: &SupervisorPlan| Ok(None);
     let cancellation_observed = AtomicBool::new(false);
     run_generated_follow_up_cascade(
@@ -3280,6 +3991,178 @@ mod diagnostics_emission_tests {
             commit_all(&nested, "nested");
         }
         (temp, repo_path)
+    }
+
+    #[test]
+    fn existing_file_edit_verification_task_parser_is_exact_and_unambiguous() {
+        let target = Path::new("README.md");
+        for exact_literal_edit in [
+            "In README.md, replace the old line with exactly: replacement. Verify the result with git diff --check and confirm README.md contains exactly that line.",
+            "In `README.md`, replace the entire contents with exactly one line: replacement. Verify the result with git diff --check and confirm that `README.md` contains exactly that line.",
+        ] {
+            assert!(
+                explicit_existing_file_edit_verification_task(exact_literal_edit, target),
+                "failed to recognize exact literal edit: {exact_literal_edit}"
+            );
+        }
+
+        for untrusted_or_ambiguous in [
+            "Update README.md.",
+            "In README.md, replace the old line and confirm README.md contains exactly that line.",
+            "In README.md, replace something. Verify the result with git diff --check and confirm README.md contains exactly that line.",
+            "In README.md, replace the old line with exactly: . Verify the result with git diff --check and confirm README.md contains exactly that line.",
+            "In README.md, replace the entire contents with exactly one line: ``. Verify the result with git diff --check and confirm README.md contains exactly that line.",
+            "In README.md, replace the old line with exactly: first, then replace it with exactly: second. Verify the result with git diff --check and confirm README.md contains exactly that line.",
+            "In README.md, replace the entire contents with exactly one line: first, then replace the old line with exactly: second. Verify the result with git diff --check and confirm README.md contains exactly that line.",
+            "In README.md, replace the old line. Verify with git diff --check.",
+            "In OTHER.md, replace the old line. Verify with git diff --check and confirm OTHER.md contains exactly that line.",
+            "In OTHER.md, replace the old line with exactly: replacement. Verify the result with git diff --check and confirm README.md contains exactly that line.",
+            "In README.md, replace the old line with exactly: replacement. Verify the result with git diff --check and confirm OTHER.md contains exactly that line.",
+            "In README.md, replace the old line. Run git diff --check twice: git diff --check, then confirm README.md contains exactly that line.",
+            "In README.md, replace the old line with exactly: replacement. Verify the result with git diff --check and confirm README.md contains exactly that line, then confirm README.md contains exactly that line.",
+            "In README.md, replace the old line with exactly: replacement. Verify the result with git diff --check and confirm README.md contains exactly that line. Verify the result with git diff --check and confirm README.md contains exactly that line.",
+        ] {
+            assert!(
+                !explicit_existing_file_edit_verification_task(untrusted_or_ambiguous, target),
+                "unexpectedly recognized: {untrusted_or_ambiguous}"
+            );
+        }
+    }
+
+    #[test]
+    fn existing_file_edit_rust_test_contract_fallback_is_fail_closed() {
+        const TARGET: &str = "src/process_runner/part3.rs";
+        const TEST_PATH: &str =
+            "process_runner::tests::stuck_owned_io_thread_aborts_instead_of_detaching";
+        let target = Path::new(TARGET);
+        let edit_task = format!(
+            "Edit only the existing file {TARGET}. Change OwnedIoThread::finish so cfg(test) uses \
+             TestIoFinalizationClock and cfg(not(test)) uses RealIoThreadClock, matching \
+             finish_child_io. Do not alter THREAD_JOIN_GRACE, production behavior, or any other \
+             file. "
+        );
+        let accepted = format!(
+            "{edit_task}The existing exact test {TEST_PATH} is the verification contract. Run \
+             that exact test, commit the one-file change, and report the commit."
+        );
+
+        assert_eq!(
+            existing_file_task_paths(&[
+                "Run that exact test, commit the one-file change, and report the commit"
+            ]),
+            Some(Vec::new()),
+            "noun change in the final clause must not create a path"
+        );
+
+        for positive_directive in ["Edit", "Change", "Update"] {
+            let task = accepted.replacen("Edit", positive_directive, 1);
+            assert!(
+                explicit_existing_file_edit_verification_task(&task, target),
+                "failed to recognize positive {positive_directive} directive"
+            );
+        }
+
+        for appended in [
+            "Update Makefile.",
+            "Also inspect Makefile.",
+            "Also inspect `Dockerfile`.",
+            "Do not modify src/process_runner/part3.rs.",
+            "Modify src/process_runner/part3.rs when needed.",
+            "Never run the test.",
+            "Also inspect src/other.rs.",
+            "Also inspect `src/other.rs`.",
+            "Also inspect README.md.",
+            "Also inspect \"README.md\".",
+            "Also inspect src/process_runner/part3.rs.",
+        ] {
+            let task = format!("{accepted} {appended}");
+            assert!(
+                !explicit_existing_file_edit_verification_task(&task, target),
+                "unexpectedly accepted appended clause: {appended}"
+            );
+        }
+
+        for alternate_edit_verb in ["Modify", "Alter", "Touch", "Patch", "Rewrite"] {
+            let task = accepted.replacen("Edit", alternate_edit_verb, 1);
+            assert!(
+                !explicit_existing_file_edit_verification_task(&task, target),
+                "unexpectedly accepted {alternate_edit_verb} as the positive directive"
+            );
+        }
+
+        for rejected_verification_clause in [
+            "Do not run the test.",
+            "Dont run the test.",
+            "Not running the test is acceptable.",
+            "No test execution is required.",
+            "Never run the test.",
+            "Verify without running the test.",
+            "Skip the test.",
+            "If needed, run the test.",
+            "Unless convenient, skip the test.",
+            "When practical, run the test.",
+            "Maybe run the test.",
+            "Optionally run the test.",
+            "You may run the test.",
+            "You might run the test.",
+            "You could run the test.",
+        ] {
+            let task = format!("{accepted} {rejected_verification_clause}");
+            assert!(
+                !explicit_existing_file_edit_verification_task(&task, target),
+                "unexpectedly accepted qualified verification: {rejected_verification_clause}"
+            );
+        }
+
+        for generic_contract in [
+            "Cargo test is the verification contract.",
+            "Git status is the verification contract.",
+            "Run tests is the verification contract.",
+            "Execute tests is the verification contract.",
+            "A command is the verification contract.",
+        ] {
+            let task = format!("{edit_task}{generic_contract}");
+            assert!(
+                !explicit_existing_file_edit_verification_task(&task, target),
+                "unexpectedly accepted generic contract: {generic_contract}"
+            );
+        }
+
+        assert!(
+            !explicit_existing_file_edit_verification_task(&edit_task, target),
+            "accepted a task with no verification contract"
+        );
+        let same_clause = format!(
+            "Edit only the existing file {TARGET} and {TEST_PATH} is the verification contract."
+        );
+        assert!(
+            !explicit_existing_file_edit_verification_task(&same_clause, target),
+            "accepted an edit and contract in the same clause"
+        );
+        let unbalanced_quote = format!("{accepted} Also inspect \"src/other.rs.");
+        assert!(
+            !explicit_existing_file_edit_verification_task(&unbalanced_quote, target),
+            "accepted an unbalanced quoted path"
+        );
+
+        for malformed_test_path in [
+            "process_runner",
+            "process_runner::tests::",
+            "process_runner:tests::stuck_owned_io_thread",
+            "process_runner::tests::stuck-owned-io-thread",
+            "process_runner::tests::stuck_owned_io_thread()",
+            "::process_runner::tests::stuck_owned_io_thread",
+            "process_runner::tests::<stuck_owned_io_thread>",
+        ] {
+            let task = format!(
+                "{edit_task}The existing exact test {malformed_test_path} is the exact \
+                 verification contract."
+            );
+            assert!(
+                !explicit_existing_file_edit_verification_task(&task, target),
+                "unexpectedly accepted malformed Rust test path: {malformed_test_path}"
+            );
+        }
     }
 
     #[test]

@@ -381,6 +381,15 @@ impl RuntimeCapabilities {
         session_resume: SessionResume::Supported,
     };
 
+    /// Capabilities of a launch that has proved the immutable Grok 4.6/xhigh
+    /// adapter contract. This is deliberately separate from [`Self::GROK`]: a
+    /// vendor id or model name alone is not evidence that cwd, output, and
+    /// delegation are bounded.
+    pub(super) const GROK_4_6_XHIGH: Self = Self {
+        side_effect_confinement: SideEffectConfinement::Verified,
+        ..Self::GROK
+    };
+
     pub const CURSOR: Self = Self {
         blocking_pre_action_callback: BlockingPreActionCallback::None,
         writable_workspace: WorkspaceWritability::Partial,

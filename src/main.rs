@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use multi_agent_coding_orchestrator::cli::Cli;
+use multi_agent_coding_orchestrator::cli::{route_literal_instruction_args, Cli};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<()> {
@@ -17,5 +17,5 @@ async fn run_cli() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    Cli::parse().run()
+    Cli::parse_from(route_literal_instruction_args(std::env::args_os())).run()
 }

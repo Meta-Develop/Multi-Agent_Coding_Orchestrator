@@ -85,7 +85,8 @@
         "start_byte",
         "end_byte",
         "start_line",
-        "end_line"
+        "end_line",
+        "signature_end_line"
       ],
       "properties": {
         "start_byte": {
@@ -103,6 +104,11 @@
         "end_line": {
           "type": "integer",
           "minimum": 0
+        },
+        "signature_end_line": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Last line of the declaration signature, not the body. For Rust this is the line containing `{` or `;`. Live SourceSpan JSON always emits this field."
         }
       }
     },
@@ -301,7 +307,8 @@
           "type": "string",
           "enum": [
             "read",
-            "parse"
+            "parse",
+            "unsupported"
           ]
         },
         "message": {

@@ -245,6 +245,16 @@ impl PreferenceProfile {
         }
         Ok(())
     }
+
+    /// Content binding for the exact effective profile used by a decision.
+    /// `BTreeMap` fields make the serialized representation deterministic.
+    pub fn content_hash(&self) -> Result<String, OptimizerError> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self).map_err(|error| {
+            OptimizerError::invalid(format!("serialize preference profile for hashing: {error}"))
+        })?;
+        Ok(super::digest::sha256_hex(&bytes))
+    }
 }
 
 /// Provenance recorded on every replay snapshot and decision explanation.
@@ -350,6 +360,26 @@ fn forbidden_preference_error(key: &str) -> OptimizerError {
 pub struct PreferenceCandidate {
     pub policy_id: PolicyId,
     pub provider: ProviderId,
+    /// Concrete terminal execution identity. Legacy policy-only candidates may
+    /// omit all three fields, but partial identities fail closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(
+        default,
+        alias = "reasoning_effort",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub effort: Option<String>,
+    /// Recorded admission evidence. Omission remains observable: it is
+    /// compatible only for legacy policy-only candidates and fails closed for
+    /// a concrete runtime/model/effort identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted: Option<bool>,
+    /// Authority denials are evidence, never a soft score term.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authority_refusals: Vec<String>,
     pub certified: bool,
     pub quality_lower_confidence_bp: u16,
     pub expected_cost_micros: i64,
@@ -358,6 +388,259 @@ pub struct PreferenceCandidate {
     pub human_minutes_micros: i64,
     #[serde(default)]
     pub uncertainty_bp: u16,
+}
+
+pub const DEFAULT_TERMINAL_RUNTIME: &str = "grok";
+pub const DEFAULT_TERMINAL_MODEL: &str = "grok-4.6";
+pub const DEFAULT_TERMINAL_EFFORT: &str = "xhigh";
+pub const DEFAULT_TERMINAL_PROVIDER: &str = "xai";
+pub const DEFAULT_TERMINAL_EVIDENCE_OBSERVED_ON: &str = "2026-08-22";
+pub const DEFAULT_TERMINAL_EVIDENCE_SOURCE_ID: &str =
+    "optimizer-seed-grok-4-6-cost-quality-2026-08";
+
+// Selector class-fit costs use the same 100,000-microunit-per-USD scale as
+// the shipped dated priors. Keeping the scale explicit prevents a measured
+// dollar value from silently becoming a model preference table.
+const SELECTOR_COST_MICROUNITS_PER_USD: f64 = 100_000.0;
+
+/// Objective evidence used to admit, score, and explain the default terminal
+/// worker candidate. Runtime membership remains a separate live hard gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalWorkerRoutingEconomics {
+    pub runtime: String,
+    pub model: String,
+    pub effort: String,
+    pub observed_on: String,
+    pub source_id: String,
+    pub prior_scope: String,
+    pub limitations: Vec<String>,
+    pub quality_basis_points: u16,
+    pub sample_size: u32,
+    pub execution_cost_microunits: u64,
+}
+
+/// Evaluate the tracked Grok observations into selector-compatible economics.
+///
+/// This function does not select a role or bypass catalog membership. It
+/// converts the exact shipped cost and software-engineering quality axes into
+/// a bounded class-fit prior; the selector still applies availability,
+/// authority, operator, quality, and pool gates before ranking it.
+pub fn terminal_worker_routing_economics() -> Result<TerminalWorkerRoutingEconomics, OptimizerError>
+{
+    let document = super::seed_evidence::load_shipped_seed_evidence()?;
+    let measured_cost = exact_seed_observation(
+        &document,
+        DEFAULT_TERMINAL_MODEL,
+        "measured_cost_per_task_usd",
+    )?;
+    let software_quality = exact_seed_observation(&document, DEFAULT_TERMINAL_MODEL, "swe_bench")?;
+    let execution_cost_microunits = scaled_observation_value(
+        measured_cost,
+        SELECTOR_COST_MICROUNITS_PER_USD,
+        "measured_cost_per_task_usd",
+    )?;
+    let quality_basis_points = u16::try_from(scaled_observation_value(
+        software_quality,
+        10_000.0,
+        "swe_bench",
+    )?)
+    .map_err(|_| {
+        OptimizerError::invalid("grok-4.6 SWE-bench seed observation exceeds basis-point range")
+    })?;
+    if quality_basis_points > 10_000 {
+        return Err(OptimizerError::invalid(
+            "grok-4.6 SWE-bench seed observation exceeds 10000 basis points",
+        ));
+    }
+    Ok(TerminalWorkerRoutingEconomics {
+        runtime: DEFAULT_TERMINAL_RUNTIME.to_string(),
+        model: DEFAULT_TERMINAL_MODEL.to_string(),
+        effort: DEFAULT_TERMINAL_EFFORT.to_string(),
+        observed_on: DEFAULT_TERMINAL_EVIDENCE_OBSERVED_ON.to_string(),
+        source_id: DEFAULT_TERMINAL_EVIDENCE_SOURCE_ID.to_string(),
+        prior_scope: "tracked cost and software-engineering quality observations evaluated for bounded terminal implementation work"
+            .to_string(),
+        limitations: vec![
+            format!(
+                "quality is the shipped aggregate SWE-bench observation from {}; local accepted-task outcomes remain authoritative",
+                software_quality.source
+            ),
+            format!(
+                "execution cost is the shipped measured cost-per-task observation from {} on the explicit selector scale",
+                measured_cost.source
+            ),
+            "bounded terminal implementation work only; no delegation, review, audit, gate, or publication authority"
+                .to_string(),
+        ],
+        quality_basis_points,
+        sample_size: 1,
+        execution_cost_microunits,
+    })
+}
+
+fn exact_seed_observation<'a>(
+    document: &'a super::seed_evidence::SeedEvidenceDocument,
+    model: &str,
+    axis: &str,
+) -> Result<&'a super::seed_evidence::SeedObservation, OptimizerError> {
+    let mut matches = document
+        .observations
+        .iter()
+        .filter(|observation| observation.model == model && observation.axis == axis);
+    let observation = matches.next().ok_or_else(|| {
+        OptimizerError::invalid(format!(
+            "shipped seed evidence has no exact '{model}' observation for axis '{axis}'"
+        ))
+    })?;
+    if matches.next().is_some() {
+        return Err(OptimizerError::invalid(format!(
+            "shipped seed evidence has duplicate '{model}' observations for axis '{axis}'"
+        )));
+    }
+    Ok(observation)
+}
+
+fn scaled_observation_value(
+    observation: &super::seed_evidence::SeedObservation,
+    scale: f64,
+    axis: &str,
+) -> Result<u64, OptimizerError> {
+    let value = observation
+        .value
+        .as_ref()
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| {
+            OptimizerError::invalid(format!(
+                "'{axis}' seed observation must contain a numeric value"
+            ))
+        })?;
+    let scaled = value * scale;
+    let rounded = scaled.round();
+    if !scaled.is_finite()
+        || scaled < 0.0
+        || (scaled - rounded).abs() > f64::EPSILON * scale
+        || rounded > u64::MAX as f64
+    {
+        return Err(OptimizerError::invalid(format!(
+            "'{axis}' seed observation cannot be represented on its objective scale"
+        )));
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Ok(rounded as u64)
+}
+
+/// Stable identity used in decision evidence and deterministic tie-breaking.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreferenceCandidateIdentity {
+    pub policy_id: PolicyId,
+    pub provider: ProviderId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl PreferenceCandidate {
+    pub fn identity(&self) -> PreferenceCandidateIdentity {
+        PreferenceCandidateIdentity {
+            policy_id: self.policy_id.clone(),
+            provider: self.provider.clone(),
+            runtime: self.runtime.clone(),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+        }
+    }
+
+    fn validate_execution_identity(&self) -> Result<(), OptimizerError> {
+        let fields = [
+            self.runtime.as_deref(),
+            self.model.as_deref(),
+            self.effort.as_deref(),
+        ];
+        let populated = fields.iter().filter(|field| field.is_some()).count();
+        if populated != 0 && populated != fields.len() {
+            return Err(OptimizerError::invalid(format!(
+                "candidate '{}' must provide runtime, model, and effort together",
+                self.policy_id
+            )));
+        }
+        if fields
+            .iter()
+            .flatten()
+            .any(|value| value.is_empty() || *value != value.trim())
+        {
+            return Err(OptimizerError::invalid(format!(
+                "candidate '{}' runtime, model, and effort must be non-empty trimmed strings",
+                self.policy_id
+            )));
+        }
+        if self
+            .authority_refusals
+            .iter()
+            .any(|reason| reason.is_empty() || reason != reason.trim())
+        {
+            return Err(OptimizerError::invalid(format!(
+                "candidate '{}' authority refusals must be non-empty trimmed strings",
+                self.policy_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn is_default_terminal_preference(&self) -> bool {
+        self.effective_admission()
+            && self.authority_refusals.is_empty()
+            && self.provider.as_str() == DEFAULT_TERMINAL_PROVIDER
+            && self.runtime.as_deref() == Some(DEFAULT_TERMINAL_RUNTIME)
+            && self.model.as_deref() == Some(DEFAULT_TERMINAL_MODEL)
+            && self.effort.as_deref() == Some(DEFAULT_TERMINAL_EFFORT)
+    }
+
+    fn effective_admission(&self) -> bool {
+        match self.admitted {
+            Some(admitted) => admitted,
+            None => self.runtime.is_none() && self.model.is_none() && self.effort.is_none(),
+        }
+    }
+}
+
+/// Score and hard-gate evidence for every candidate, including refusals.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreferenceCandidateScore {
+    pub identity: PreferenceCandidateIdentity,
+    pub score_micros: i64,
+    /// Exact input evidence; `None` distinguishes omission from denial.
+    pub admitted: Option<bool>,
+    pub effective_admission: bool,
+    pub eligible: bool,
+    pub default_terminal_preference: bool,
+    pub rejection_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreferenceAuthorityRefusal {
+    pub identity: PreferenceCandidateIdentity,
+    pub reasons: Vec<String>,
+}
+
+/// Self-contained, replayable selection decision. It records the exact
+/// effective objective, every score, and both leading identities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreferenceDecision {
+    pub objective_profile: PreferenceProfile,
+    pub objective_profile_hash: String,
+    pub quality_threshold_bp: u16,
+    pub candidate_scores: Vec<PreferenceCandidateScore>,
+    pub selected: Option<PreferenceCandidateIdentity>,
+    pub runner_up: Option<PreferenceCandidateIdentity>,
+    pub authority_refusals: Vec<PreferenceAuthorityRefusal>,
+    pub selection: PreferenceSelection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -420,27 +703,103 @@ pub fn select_with_profile(
     profile: &PreferenceProfile,
     quality_threshold_bp: u16,
 ) -> Result<PreferenceSelection, OptimizerError> {
+    Ok(decide_with_profile(candidates, profile, quality_threshold_bp)?.selection)
+}
+
+pub fn decide_with_profile(
+    candidates: &[PreferenceCandidate],
+    profile: &PreferenceProfile,
+    quality_threshold_bp: u16,
+) -> Result<PreferenceDecision, OptimizerError> {
     profile.validate()?;
+    let objective_profile_hash = profile.content_hash()?;
     let attribution = profile.attribution();
-    let mut eligible: Vec<(&PreferenceCandidate, i64)> = candidates
-        .iter()
-        .filter(|candidate| {
-            candidate.certified && candidate.quality_lower_confidence_bp >= quality_threshold_bp
-        })
-        .map(|candidate| (candidate, score_candidate(candidate, profile)))
-        .collect();
-    if eligible.is_empty() {
-        return Ok(PreferenceSelection::Infeasible {
-            reason: "no candidate satisfies the quality contract".to_string(),
-            attribution,
+    let mut identities = BTreeSet::new();
+    let mut candidate_scores = Vec::with_capacity(candidates.len());
+    let mut authority_refusals = Vec::new();
+    for candidate in candidates {
+        candidate.validate_execution_identity()?;
+        let identity = candidate.identity();
+        if !identities.insert(identity.clone()) {
+            return Err(OptimizerError::invalid(format!(
+                "duplicate preference candidate identity for policy '{}'",
+                candidate.policy_id
+            )));
+        }
+        let mut rejection_reasons = Vec::new();
+        let effective_admission = candidate.effective_admission();
+        if !effective_admission {
+            rejection_reasons.push("candidate_not_admitted".to_string());
+        }
+        let mut refusal_reasons = candidate.authority_refusals.clone();
+        refusal_reasons.sort();
+        refusal_reasons.dedup();
+        if !refusal_reasons.is_empty() {
+            rejection_reasons.push("authority_refused".to_string());
+            authority_refusals.push(PreferenceAuthorityRefusal {
+                identity: identity.clone(),
+                reasons: refusal_reasons,
+            });
+        }
+        if !candidate.certified {
+            rejection_reasons.push("candidate_not_certified".to_string());
+        }
+        if candidate.quality_lower_confidence_bp < quality_threshold_bp {
+            rejection_reasons.push("quality_contract_not_satisfied".to_string());
+        }
+        candidate_scores.push(PreferenceCandidateScore {
+            identity,
+            score_micros: score_candidate(candidate, profile),
+            admitted: candidate.admitted,
+            effective_admission,
+            eligible: rejection_reasons.is_empty(),
+            default_terminal_preference: candidate.is_default_terminal_preference(),
+            rejection_reasons,
         });
     }
-    eligible.sort_by_key(|(candidate, score)| (*score, candidate.policy_id.as_str().to_string()));
-    let (winner, score) = eligible[0];
-    Ok(PreferenceSelection::Selected {
-        policy_id: winner.policy_id.clone(),
-        score_micros: score,
-        attribution,
+    candidate_scores.sort_by(|left, right| left.identity.cmp(&right.identity));
+    authority_refusals.sort_by(|left, right| left.identity.cmp(&right.identity));
+
+    let mut ranked = candidate_scores
+        .iter()
+        .filter(|candidate| candidate.eligible)
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        left.score_micros
+            .cmp(&right.score_micros)
+            // The explicit terminal default is only a tie-break after the
+            // resolved profile score and only exists for an admitted candidate.
+            .then_with(|| {
+                right
+                    .default_terminal_preference
+                    .cmp(&left.default_terminal_preference)
+            })
+            .then_with(|| left.identity.cmp(&right.identity))
+    });
+    let selected = ranked.first().map(|candidate| candidate.identity.clone());
+    let runner_up = ranked.get(1).map(|candidate| candidate.identity.clone());
+    let selection = if let Some(winner) = ranked.first() {
+        PreferenceSelection::Selected {
+            policy_id: winner.identity.policy_id.clone(),
+            score_micros: winner.score_micros,
+            attribution,
+        }
+    } else {
+        PreferenceSelection::Infeasible {
+            reason: "no candidate satisfies admission, authority, certification, and quality gates"
+                .to_string(),
+            attribution,
+        }
+    };
+    Ok(PreferenceDecision {
+        objective_profile: profile.clone(),
+        objective_profile_hash,
+        quality_threshold_bp,
+        candidate_scores,
+        selected,
+        runner_up,
+        authority_refusals,
+        selection,
     })
 }
 
@@ -456,6 +815,8 @@ pub struct PreferencePreview {
     pub hard_constraint_bound: bool,
     pub selection_a: PreferenceSelection,
     pub selection_b: PreferenceSelection,
+    pub decision_a: PreferenceDecision,
+    pub decision_b: PreferenceDecision,
 }
 
 pub fn preview_profile_effect(
@@ -464,15 +825,16 @@ pub fn preview_profile_effect(
     profile_b: &PreferenceProfile,
     quality_threshold_bp: u16,
 ) -> Result<PreferencePreview, OptimizerError> {
-    let selection_a = select_with_profile(candidates, profile_a, quality_threshold_bp)?;
-    let selection_b = select_with_profile(candidates, profile_b, quality_threshold_bp)?;
+    let decision_a = decide_with_profile(candidates, profile_a, quality_threshold_bp)?;
+    let decision_b = decide_with_profile(candidates, profile_b, quality_threshold_bp)?;
+    let selection_a = decision_a.selection.clone();
+    let selection_b = decision_b.selection.clone();
     let selected_a = selection_a.selected_policy().cloned();
     let selected_b = selection_b.selected_policy().cloned();
-    let eligible_count = candidates
+    let eligible_count = decision_a
+        .candidate_scores
         .iter()
-        .filter(|candidate| {
-            candidate.certified && candidate.quality_lower_confidence_bp >= quality_threshold_bp
-        })
+        .filter(|candidate| candidate.eligible)
         .count();
     Ok(PreferencePreview {
         quality_threshold_bp,
@@ -484,6 +846,8 @@ pub fn preview_profile_effect(
         selected_b,
         selection_a,
         selection_b,
+        decision_a,
+        decision_b,
     })
 }
 
@@ -824,6 +1188,11 @@ mod tests {
         PreferenceCandidate {
             policy_id: policy(id),
             provider: provider(provider_name),
+            runtime: None,
+            model: None,
+            effort: None,
+            admitted: None,
+            authority_refusals: Vec::new(),
             certified: true,
             quality_lower_confidence_bp: 9_000,
             expected_cost_micros: cost,
@@ -848,6 +1217,21 @@ mod tests {
         assert!(profile.exploration.is_empty());
         assert!(profile.task_class_overrides.is_empty());
         assert_eq!(profile.hedge, HedgeAggressiveness::default());
+    }
+
+    #[test]
+    fn terminal_worker_economics_are_derived_from_exact_shipped_observations() {
+        let evidence = terminal_worker_routing_economics().expect("terminal worker economics");
+        assert_eq!(evidence.runtime, DEFAULT_TERMINAL_RUNTIME);
+        assert_eq!(evidence.model, DEFAULT_TERMINAL_MODEL);
+        assert_eq!(evidence.effort, DEFAULT_TERMINAL_EFFORT);
+        assert_eq!(evidence.quality_basis_points, 9_560);
+        assert_eq!(evidence.execution_cost_microunits, 83_700);
+        assert_eq!(evidence.sample_size, 1);
+        assert!(evidence
+            .limitations
+            .iter()
+            .any(|limitation| limitation.contains("no delegation")));
     }
 
     #[test]
@@ -932,6 +1316,11 @@ mod tests {
             PreferenceCandidate {
                 policy_id: policy("uncertified-cheap"),
                 provider: provider("pool-a"),
+                runtime: None,
+                model: None,
+                effort: None,
+                admitted: None,
+                authority_refusals: Vec::new(),
                 certified: false,
                 quality_lower_confidence_bp: 4_000,
                 expected_cost_micros: 1,

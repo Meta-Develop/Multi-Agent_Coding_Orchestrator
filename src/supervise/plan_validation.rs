@@ -308,11 +308,28 @@ pub(super) fn validate_supervisor_plan(
         if !seen.insert(assignment.id.clone()) {
             bail!("duplicate orchestrator assignment id '{}'", assignment.id);
         }
-        if assignment.role != AgentRole::ChildOrchestrator {
-            bail!(
-                "assignment '{}' role must be child_orchestrator",
-                assignment.id
-            );
+        match assignment.role {
+            AgentRole::ChildOrchestrator => {}
+            AgentRole::Worker => {
+                if assignment.role_category != Some(RoleCategory::NonDelegatingTerminalWorker) {
+                    bail!(
+                        "direct worker assignment '{}' must explicitly declare role_category non_delegating_terminal_worker",
+                        assignment.id
+                    );
+                }
+                if !assignment.worker_assignments.is_empty() {
+                    bail!(
+                        "direct worker assignment '{}' may not declare nested worker assignments",
+                        assignment.id
+                    );
+                }
+            }
+            _ => {
+                bail!(
+                    "assignment '{}' role must be child_orchestrator or an explicitly declared direct worker",
+                    assignment.id
+                );
+            }
         }
         assignment.assigned_paths = normalize_paths(std::mem::take(&mut assignment.assigned_paths))
             .with_context(|| format!("assignment '{}' has invalid paths", assignment.id))?;

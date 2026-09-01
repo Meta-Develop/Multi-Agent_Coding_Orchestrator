@@ -1,6 +1,16 @@
 pub mod forge_coordination;
 pub mod forge_transport;
 
+use self::forge_transport::{
+    decide_pull_request_merge, AuthenticatedPullRequestMergeEvidence, ForgeActor, ForgeCheck,
+    ForgeCheckConclusion, ForgeCheckStatus, ForgeItem, ForgeItemKind, ForgeRepository, ForgeReview,
+    ForgeReviewState, ForgeTimestamp, ProviderObjectId, ProviderObjectKind,
+    PullRequestAuditorEvidence, PullRequestFreshnessEvidence, PullRequestFreshnessStatus,
+    PullRequestMergeAuthorityBlocker, PullRequestMergeAuthorityDecision,
+    PullRequestMergeAuthorityInput, PullRequestMergeEffect, PullRequestMergeReceipt,
+    PullRequestMergeSimulationEvidence, PullRequestMergeTransport, PullRequestReviewSnapshot,
+    ReportedActorKind,
+};
 use crate::{
     artifacts::{repository_auth_writer, state_auth::sha256_hex},
     effect_wal::{EffectPhase, EffectWal},
@@ -12,6 +22,7 @@ use crate::{
         RepoCommonLock, SafetyCheckStatus, ValidationEvidenceBundle, ValidationReport,
         WorktreeMergeMetadata,
     },
+    optimizer::{ids::TimestampMillis, merge_authority::ProducerFingerprint},
     process_runner::{StdinMode, TrustedFixedNetworkProfile},
     safe_state::SafeRoot,
     sync::normalize_repo_relative_path,
@@ -69,7 +80,7 @@ const MAX_PUBLICATION_COMMIT_DEPTH: usize = 262_144;
 const MAX_EXCLUSION_REFERENCE_FILE_BYTES: usize = 1024 * 1024;
 const GITHUB_PR_RECEIPT_FIELDS: &str = "url,headRefOid,baseRefOid,number,baseRefName,state,isDraft,title,body,headRefName,headRepository,headRepositoryOwner,isCrossRepository,author";
 const GITHUB_ISSUE_SOURCE_FIELDS: &str = "number,title,body,labels,author,url,updatedAt,state";
-const GITHUB_PR_SOURCE_FIELDS: &str = "number,title,body,labels,author,url,updatedAt,state,headRefName,baseRefName,headRefOid,baseRefOid,isDraft,files,reviewDecision,latestReviews,statusCheckRollup";
+const GITHUB_PR_SOURCE_FIELDS: &str = "number,title,body,labels,author,url,updatedAt,state,headRefName,baseRefName,headRefOid,baseRefOid,isDraft,headRepository,isCrossRepository,files,reviewDecision,latestReviews,statusCheckRollup";
 const GITHUB_ISSUE_EFFECT_FIELDS: &str = "number,url,title,body,labels,author,state";
 const EXTERNAL_EFFECT_VERSION: u32 = 2;
 const EXTERNAL_SOURCE_GUARD_VERSION: u32 = 2;
@@ -756,6 +767,1849 @@ fn stable_json_digest(value: &impl Serialize) -> Result<String> {
     )?))
 }
 
+const AUTHENTICATED_PR_MERGE_VERSION: u32 = 1;
+
+/// Typed reasons why the authenticated merge executor performed no effect.
+/// Provider failures after the durable `Started` transition are intentionally
+/// returned as errors instead: at that point claiming "not merged" would be
+/// unsafe without successful reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "blocker", content = "details", rename_all = "snake_case")]
+pub enum AuthenticatedPullRequestMergeBlocker {
+    MissingAuthenticatedAuditorEvidence,
+    CurrentGroundTruthUnavailable {
+        message: String,
+    },
+    AuthenticatedEvidenceCandidateMismatch,
+    CurrentPullRequestIdentityMismatch,
+    StaleCandidateHead {
+        candidate_head_oid: String,
+        current_head_oid: String,
+    },
+    CurrentCheckSetMismatch,
+    MissingApprovedAuditorReview,
+    AuditorReviewNotApproved {
+        state: ForgeReviewState,
+    },
+    ApprovedActorMismatch {
+        expected_actor_id: String,
+        observed_actor_id: String,
+    },
+    Authority(PullRequestMergeAuthorityBlocker),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum AuthenticatedPullRequestMergeOutcome {
+    NotMerged {
+        blockers: Vec<AuthenticatedPullRequestMergeBlocker>,
+        authority: Option<PullRequestMergeAuthorityDecision>,
+    },
+    Merged {
+        authority: PullRequestMergeAuthorityDecision,
+        receipt: Box<PullRequestMergeReceipt>,
+    },
+}
+
+#[cfg(test)]
+impl AuthenticatedPullRequestMergeOutcome {
+    pub(crate) fn is_merged(&self) -> bool {
+        matches!(self, Self::Merged { .. })
+    }
+
+    pub(crate) fn blockers(&self) -> &[AuthenticatedPullRequestMergeBlocker] {
+        match self {
+            Self::NotMerged { blockers, .. } => blockers,
+            Self::Merged { .. } => &[],
+        }
+    }
+
+    pub(crate) fn receipt(&self) -> Option<&PullRequestMergeReceipt> {
+        match self {
+            Self::NotMerged { .. } => None,
+            Self::Merged { receipt, .. } => Some(receipt.as_ref()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AuthenticatedPullRequestMergeRecord {
+    version: u32,
+    plan_digest: String,
+    candidate: ForgeItem,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effect: Option<PullRequestMergeEffect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authority: Option<PullRequestMergeAuthorityDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    receipt: Option<PullRequestMergeReceipt>,
+}
+
+struct AuthorizedPullRequestMerge {
+    snapshot: forge_transport::PullRequestReviewSnapshot,
+    approved_actor: ForgeActor,
+    authority: PullRequestMergeAuthorityDecision,
+}
+
+enum PullRequestMergePreflight {
+    Allowed(Box<AuthorizedPullRequestMerge>),
+    Blocked(Box<AuthenticatedPullRequestMergeOutcome>),
+}
+
+/// Execute one authenticated, head-bound pull-request merge exactly once.
+///
+/// The evidence capability cannot be deserialized or publicly constructed.
+/// On the first attempt this function opens an authenticated effect WAL,
+/// observes and authorizes current forge state, proves no pre-existing remote
+/// effect, then repeats the complete observation immediately before the
+/// durable start and provider compare-and-swap merge. Retries reconcile the
+/// exact stored effect and receipt without issuing a blind second merge.
+pub(crate) fn execute_authenticated_pull_request_merge(
+    repo: &Path,
+    candidate: &ForgeItem,
+    evidence: Option<&AuthenticatedPullRequestMergeEvidence>,
+    transport: &impl PullRequestMergeTransport,
+) -> Result<AuthenticatedPullRequestMergeOutcome> {
+    let Some(evidence) = evidence else {
+        return Ok(AuthenticatedPullRequestMergeOutcome::NotMerged {
+            blockers: vec![
+                AuthenticatedPullRequestMergeBlocker::MissingAuthenticatedAuditorEvidence,
+            ],
+            authority: None,
+        });
+    };
+
+    let plan_digest = stable_json_digest(&(
+        "maco_authenticated_pull_request_merge_plan_v1",
+        candidate,
+        evidence,
+    ))?;
+    validate_external_digest(&plan_digest, "authenticated PR merge plan digest")?;
+    let effect_id = format!("merge:{plan_digest}");
+    let logical_id = format!("pr-merge-{plan_digest}");
+    let planned = AuthenticatedPullRequestMergeRecord {
+        version: AUTHENTICATED_PR_MERGE_VERSION,
+        plan_digest: plan_digest.clone(),
+        candidate: candidate.clone(),
+        effect: None,
+        authority: None,
+        receipt: None,
+    };
+    let mut wal = EffectWal::open_or_create_planned(
+        || {
+            repository_auth_writer(repo)?
+                .into_authenticator()
+                .context("failed to bind authenticated pull-request merge ledger")
+        },
+        &logical_id,
+        &effect_id,
+        &planned,
+    )?;
+    execute_authenticated_pull_request_merge_with_wal(
+        &mut wal,
+        candidate,
+        evidence,
+        &plan_digest,
+        &effect_id,
+        transport,
+    )
+}
+
+fn execute_authenticated_pull_request_merge_with_wal(
+    wal: &mut EffectWal,
+    candidate: &ForgeItem,
+    evidence: &AuthenticatedPullRequestMergeEvidence,
+    plan_digest: &str,
+    effect_id: &str,
+    transport: &impl PullRequestMergeTransport,
+) -> Result<AuthenticatedPullRequestMergeOutcome> {
+    let (phase, current) = latest_authenticated_pull_request_merge_record(wal, effect_id)?;
+    if current.plan_digest != plan_digest || current.candidate != *candidate {
+        bail!("authenticated pull-request merge ledger belongs to a different exact plan");
+    }
+
+    match phase {
+        EffectPhase::Completed => {
+            let effect = current
+                .effect
+                .context("completed pull-request merge omitted its durable effect")?;
+            let authority = current
+                .authority
+                .context("completed pull-request merge omitted its authority decision")?;
+            let receipt = current
+                .receipt
+                .context("completed pull-request merge omitted its durable receipt")?;
+            let verified = transport
+                .verify_pull_request_merge(&effect, &receipt)
+                .context("completed pull-request merge receipt changed or disappeared")?;
+            Ok(AuthenticatedPullRequestMergeOutcome::Merged {
+                authority,
+                receipt: Box::new(verified),
+            })
+        }
+        EffectPhase::Observed => {
+            let effect = current
+                .effect
+                .context("observed pull-request merge omitted its durable effect")?;
+            let authority = current
+                .authority
+                .context("observed pull-request merge omitted its authority decision")?;
+            let receipt = current
+                .receipt
+                .context("observed pull-request merge omitted its durable receipt")?;
+            let verified = transport
+                .verify_pull_request_merge(&effect, &receipt)
+                .context("observed pull-request merge receipt could not be reverified")?;
+            complete_authenticated_pull_request_merge(
+                wal,
+                plan_digest,
+                candidate,
+                effect_id,
+                effect,
+                authority,
+                verified,
+                transport,
+                false,
+            )
+        }
+        EffectPhase::Started => {
+            let effect = current
+                .effect
+                .context("started pull-request merge omitted its durable effect")?;
+            let authority = current
+                .authority
+                .context("started pull-request merge omitted its authority decision")?;
+            let receipt = reconcile_authenticated_pull_request_merge(transport, &effect)?;
+            complete_authenticated_pull_request_merge(
+                wal,
+                plan_digest,
+                candidate,
+                effect_id,
+                effect,
+                authority,
+                receipt,
+                transport,
+                true,
+            )
+        }
+        EffectPhase::Planned => {
+            let first = match authorize_current_pull_request_merge(candidate, evidence, transport)?
+            {
+                PullRequestMergePreflight::Allowed(authorized) => authorized,
+                PullRequestMergePreflight::Blocked(outcome) => return Ok(*outcome),
+            };
+            let probe = pull_request_merge_effect(effect_id, plan_digest, evidence, &first)?;
+            match transport.lookup_pull_request_merge(&probe) {
+                Ok(matches) if matches.is_empty() => {}
+                Ok(_) => bail!(
+                    "planned pull-request merge already has a remote effect; refusing a possible front-run"
+                ),
+                Err(error) => bail!(
+                    "planned pull-request merge lookup failed before durable start: {error:#}"
+                ),
+            }
+
+            let authorized =
+                match authorize_current_pull_request_merge(candidate, evidence, transport)? {
+                    PullRequestMergePreflight::Allowed(authorized) => authorized,
+                    PullRequestMergePreflight::Blocked(outcome) => return Ok(*outcome),
+                };
+            let effect = pull_request_merge_effect(effect_id, plan_digest, evidence, &authorized)?;
+            let started = AuthenticatedPullRequestMergeRecord {
+                version: AUTHENTICATED_PR_MERGE_VERSION,
+                plan_digest: plan_digest.to_string(),
+                candidate: candidate.clone(),
+                effect: Some(effect.clone()),
+                authority: Some(authorized.authority.clone()),
+                receipt: None,
+            };
+            wal.started(effect_id, &started)?;
+
+            let receipt = match transport.execute_pull_request_merge(&effect) {
+                Ok(receipt) => transport
+                    .verify_pull_request_merge(&effect, &receipt)
+                    .context("forge returned an unverifiable pull-request merge receipt")?,
+                Err(invoke_error) => {
+                    reconcile_authenticated_pull_request_merge(transport, &effect).with_context(
+                        || {
+                            format!(
+                                "forge merge failed or lost its response ({invoke_error:#}); blind retry is forbidden"
+                            )
+                        },
+                    )?
+                }
+            };
+            complete_authenticated_pull_request_merge(
+                wal,
+                plan_digest,
+                candidate,
+                effect_id,
+                effect,
+                authorized.authority,
+                receipt,
+                transport,
+                true,
+            )
+        }
+    }
+}
+
+fn authorize_current_pull_request_merge(
+    candidate: &ForgeItem,
+    evidence: &AuthenticatedPullRequestMergeEvidence,
+    transport: &impl PullRequestMergeTransport,
+) -> Result<PullRequestMergePreflight> {
+    let snapshot = match transport.observe_pull_request_for_merge(candidate) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return Ok(PullRequestMergePreflight::Blocked(Box::new(
+                AuthenticatedPullRequestMergeOutcome::NotMerged {
+                    blockers: vec![
+                        AuthenticatedPullRequestMergeBlocker::CurrentGroundTruthUnavailable {
+                            message: format!("{error:#}"),
+                        },
+                    ],
+                    authority: None,
+                },
+            )));
+        }
+    };
+    let current = snapshot.item();
+    let mut blockers = Vec::new();
+    if evidence.candidate != *candidate {
+        blockers.push(AuthenticatedPullRequestMergeBlocker::AuthenticatedEvidenceCandidateMismatch);
+    }
+    if candidate.kind() != current.kind()
+        || candidate.repository() != current.repository()
+        || candidate.number() != current.number()
+        || candidate.provider_item_id() != current.provider_item_id()
+    {
+        blockers.push(AuthenticatedPullRequestMergeBlocker::CurrentPullRequestIdentityMismatch);
+    }
+    let candidate_head = candidate.head_oid().unwrap_or_default();
+    let current_head = current.head_oid().unwrap_or_default();
+    if candidate_head != current_head {
+        blockers.push(AuthenticatedPullRequestMergeBlocker::StaleCandidateHead {
+            candidate_head_oid: candidate_head.to_string(),
+            current_head_oid: current_head.to_string(),
+        });
+    }
+    let mut expected_checks = evidence.required_checks.clone();
+    expected_checks.sort();
+    let mut current_checks = snapshot
+        .checks()
+        .iter()
+        .map(|check| check.name().to_string())
+        .collect::<Vec<_>>();
+    current_checks.sort();
+    if expected_checks.is_empty()
+        || expected_checks.windows(2).any(|pair| pair[0] == pair[1])
+        || current_checks != expected_checks
+    {
+        blockers.push(AuthenticatedPullRequestMergeBlocker::CurrentCheckSetMismatch);
+    }
+
+    let approved_review = snapshot
+        .reviews()
+        .iter()
+        .find(|review| review.provider_review_id() == &evidence.approved_review_id);
+    let approved_actor = match approved_review {
+        None => {
+            blockers.push(AuthenticatedPullRequestMergeBlocker::MissingApprovedAuditorReview);
+            None
+        }
+        Some(review) if review.state() != ForgeReviewState::Approved => {
+            blockers.push(
+                AuthenticatedPullRequestMergeBlocker::AuditorReviewNotApproved {
+                    state: review.state(),
+                },
+            );
+            None
+        }
+        Some(review) => {
+            let expected = evidence.approved_reviewer.provider_actor_id().stable_id();
+            let observed = review.author().provider_actor_id().stable_id();
+            if evidence.approved_reviewer != *review.author() {
+                blockers.push(
+                    AuthenticatedPullRequestMergeBlocker::ApprovedActorMismatch {
+                        expected_actor_id: expected.to_string(),
+                        observed_actor_id: observed.to_string(),
+                    },
+                );
+                None
+            } else {
+                Some(review.author().clone())
+            }
+        }
+    };
+
+    if !blockers.is_empty() {
+        return Ok(PullRequestMergePreflight::Blocked(Box::new(
+            AuthenticatedPullRequestMergeOutcome::NotMerged {
+                blockers,
+                authority: None,
+            },
+        )));
+    }
+
+    let decided_at = current_timestamp_millis()?;
+    let input = PullRequestMergeAuthorityInput {
+        freshness: Some(PullRequestFreshnessEvidence {
+            current_item: current.clone(),
+            snapshot_observed_at: snapshot.observed_at().clone(),
+            status: PullRequestFreshnessStatus::Fresh,
+            decided_at,
+        }),
+        required_checks: Some(evidence.required_checks.clone()),
+        producer: Some(evidence.producer.clone()),
+        auditor: Some(PullRequestAuditorEvidence {
+            head_oid: evidence.auditor.head_oid.clone(),
+            snapshot_observed_at: snapshot.observed_at().clone(),
+            auditor: evidence.auditor.auditor.clone(),
+            lenses: evidence.auditor.lenses.clone(),
+        }),
+        merge_simulation: Some(PullRequestMergeSimulationEvidence {
+            head_oid: evidence.merge_simulation.head_oid.clone(),
+            base_oid: evidence.merge_simulation.base_oid.clone(),
+            snapshot_observed_at: snapshot.observed_at().clone(),
+            merges_cleanly: evidence.merge_simulation.merges_cleanly,
+        }),
+        completion_mode: Some(evidence.completion_mode),
+        changed_paths: Some(evidence.changed_paths.clone()),
+    };
+    let authority = decide_pull_request_merge(&snapshot, &input);
+    if !authority.is_allowed() {
+        let blockers = authority
+            .blockers()
+            .iter()
+            .cloned()
+            .map(AuthenticatedPullRequestMergeBlocker::Authority)
+            .collect();
+        return Ok(PullRequestMergePreflight::Blocked(Box::new(
+            AuthenticatedPullRequestMergeOutcome::NotMerged {
+                blockers,
+                authority: Some(authority),
+            },
+        )));
+    }
+
+    Ok(PullRequestMergePreflight::Allowed(Box::new(
+        AuthorizedPullRequestMerge {
+            snapshot,
+            approved_actor: approved_actor.expect("unblocked approval contains an actor"),
+            authority,
+        },
+    )))
+}
+
+fn pull_request_merge_effect(
+    effect_id: &str,
+    plan_digest: &str,
+    evidence: &AuthenticatedPullRequestMergeEvidence,
+    authorized: &AuthorizedPullRequestMerge,
+) -> Result<PullRequestMergeEffect> {
+    let ground_truth_digest = stable_json_digest(&(
+        "maco_authenticated_pull_request_merge_ground_truth_v1",
+        &authorized.snapshot,
+        &authorized.approved_actor,
+        &authorized.authority,
+        plan_digest,
+    ))?;
+    PullRequestMergeEffect::new(
+        effect_id,
+        authorized.snapshot.item().clone(),
+        authorized.approved_actor.clone(),
+        format!("sha256:{plan_digest}"),
+        format!("sha256:{ground_truth_digest}"),
+        evidence.completion_mode,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn complete_authenticated_pull_request_merge(
+    wal: &mut EffectWal,
+    plan_digest: &str,
+    candidate: &ForgeItem,
+    effect_id: &str,
+    effect: PullRequestMergeEffect,
+    authority: PullRequestMergeAuthorityDecision,
+    receipt: PullRequestMergeReceipt,
+    transport: &impl PullRequestMergeTransport,
+    write_observed: bool,
+) -> Result<AuthenticatedPullRequestMergeOutcome> {
+    let verified = transport.verify_pull_request_merge(&effect, &receipt)?;
+    let record = AuthenticatedPullRequestMergeRecord {
+        version: AUTHENTICATED_PR_MERGE_VERSION,
+        plan_digest: plan_digest.to_string(),
+        candidate: candidate.clone(),
+        effect: Some(effect.clone()),
+        authority: Some(authority.clone()),
+        receipt: Some(verified.clone()),
+    };
+    if write_observed {
+        wal.observed(effect_id, &record)?;
+    }
+    let completed_receipt = transport
+        .verify_pull_request_merge(&effect, &verified)
+        .context("authenticated merge receipt changed before completion")?;
+    let completed = AuthenticatedPullRequestMergeRecord {
+        receipt: Some(completed_receipt.clone()),
+        ..record
+    };
+    wal.completed(effect_id, &completed)?;
+    Ok(AuthenticatedPullRequestMergeOutcome::Merged {
+        authority,
+        receipt: Box::new(completed_receipt),
+    })
+}
+
+fn reconcile_authenticated_pull_request_merge(
+    transport: &impl PullRequestMergeTransport,
+    effect: &PullRequestMergeEffect,
+) -> Result<PullRequestMergeReceipt> {
+    let matches = transport
+        .lookup_pull_request_merge(effect)
+        .context("started pull-request merge lookup failed; blind provider retry is forbidden")?;
+    if matches.len() != 1 {
+        bail!(
+            "started pull-request merge lookup found {} exact receipts; blind provider retry is forbidden",
+            matches.len()
+        );
+    }
+    transport.verify_pull_request_merge(effect, &matches[0])
+}
+
+fn latest_authenticated_pull_request_merge_record(
+    wal: &EffectWal,
+    effect_id: &str,
+) -> Result<(EffectPhase, AuthenticatedPullRequestMergeRecord)> {
+    let phase = wal
+        .phase(effect_id)
+        .context("authenticated pull-request merge ledger omitted its effect")?;
+    let event = wal
+        .events()
+        .iter()
+        .rev()
+        .find(|event| event.effect_id == effect_id)
+        .context("authenticated pull-request merge ledger omitted its latest event")?;
+    let record: AuthenticatedPullRequestMergeRecord = serde_json::from_value(event.data.clone())
+        .context("authenticated pull-request merge record is malformed")?;
+    if event.phase != phase || record.version != AUTHENTICATED_PR_MERGE_VERSION {
+        bail!("authenticated pull-request merge phase or version is inconsistent");
+    }
+    validate_external_digest(&record.plan_digest, "authenticated PR merge record digest")?;
+    match phase {
+        EffectPhase::Planned
+            if record.effect.is_none()
+                && record.authority.is_none()
+                && record.receipt.is_none() => {}
+        EffectPhase::Started
+            if record.effect.is_some()
+                && record
+                    .authority
+                    .as_ref()
+                    .is_some_and(|value| value.is_allowed())
+                && record.receipt.is_none() => {}
+        EffectPhase::Observed | EffectPhase::Completed
+            if record.effect.is_some()
+                && record
+                    .authority
+                    .as_ref()
+                    .is_some_and(|value| value.is_allowed())
+                && record.receipt.is_some() =>
+        {
+            record
+                .receipt
+                .as_ref()
+                .expect("checked receipt")
+                .validate_for_effect(record.effect.as_ref().expect("checked effect"))?;
+        }
+        _ => bail!("authenticated pull-request merge record does not match its durable phase"),
+    }
+    Ok((phase, record))
+}
+
+fn current_timestamp_millis() -> Result<TimestampMillis> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_millis();
+    Ok(TimestampMillis::from_millis(
+        u64::try_from(millis).context("system clock milliseconds exceed u64")?,
+    ))
+}
+
+const AUTHENTICATED_GITHUB_PAGE_SIZE: usize = 100;
+const AUTHENTICATED_GITHUB_MAX_PAGES: usize = 64;
+
+/// Exact provider observation used by the inbox to mint the private merge
+/// evidence capability. Every field comes from authenticated GitHub API
+/// responses collected after the independent audit completed.
+pub(crate) struct GithubPullRequestMergeGroundTruth {
+    pub(crate) snapshot: PullRequestReviewSnapshot,
+    pub(crate) producer: ProducerFingerprint,
+    pub(crate) producer_login: String,
+    pub(crate) changed_paths: Vec<PathBuf>,
+    pub(crate) merges_cleanly: bool,
+    pub(crate) is_draft: bool,
+    pub(crate) is_open: bool,
+    pub(crate) same_repository_head: bool,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct GithubApiActor {
+    node_id: String,
+    login: String,
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct GithubApiRepository {
+    node_id: String,
+    full_name: String,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct GithubApiPullRef {
+    sha: String,
+    repo: Option<GithubApiRepository>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct GithubApiPullRequest {
+    node_id: String,
+    number: u64,
+    state: String,
+    draft: bool,
+    merged: bool,
+    mergeable: Option<bool>,
+    mergeable_state: String,
+    changed_files: usize,
+    commits: usize,
+    merge_commit_sha: Option<String>,
+    merged_at: Option<String>,
+    merged_by: Option<GithubApiActor>,
+    html_url: String,
+    updated_at: String,
+    user: GithubApiActor,
+    head: GithubApiPullRef,
+    base: GithubApiPullRef,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubApiReview {
+    id: u64,
+    node_id: String,
+    user: Option<GithubApiActor>,
+    body: String,
+    state: String,
+    submitted_at: Option<String>,
+    commit_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubApiFile {
+    filename: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubApiCommitActor {
+    node_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubApiPullCommit {
+    author: Option<GithubApiCommitActor>,
+    committer: Option<GithubApiCommitActor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubApiCheckApp {
+    node_id: String,
+    slug: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubApiCheckRun {
+    node_id: String,
+    name: String,
+    status: String,
+    conclusion: Option<String>,
+    head_sha: String,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    app: Option<GithubApiCheckApp>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubApiCheckRunsPage {
+    total_count: usize,
+    check_runs: Vec<GithubApiCheckRun>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubApiStatus {
+    node_id: String,
+    context: String,
+    state: String,
+    updated_at: String,
+    creator: Option<GithubApiActor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubApiCommitReceipt {
+    node_id: String,
+    html_url: String,
+    sha: String,
+    commit: GithubApiCommitMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubApiCommitMessage {
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubApiMergeResponse {
+    sha: Option<String>,
+    merged: bool,
+    message: String,
+}
+
+enum AuthenticatedGithubOperation {
+    AuthenticatedActor,
+    PullRequest {
+        number: u64,
+    },
+    Reviews {
+        number: u64,
+        page: usize,
+    },
+    Files {
+        number: u64,
+        page: usize,
+    },
+    Commits {
+        number: u64,
+        page: usize,
+    },
+    CheckRuns {
+        head_oid: String,
+        page: usize,
+    },
+    Statuses {
+        head_oid: String,
+        page: usize,
+    },
+    Commit {
+        oid: String,
+    },
+    Merge {
+        number: u64,
+        expected_head_oid: String,
+        effect_id: String,
+        evidence_digest: String,
+        ground_truth_digest: String,
+    },
+}
+
+impl AuthenticatedGithubOperation {
+    fn is_mutation(&self) -> bool {
+        matches!(self, Self::Merge { .. })
+    }
+
+    fn command(&self, repository: &GithubRepositoryIdentity) -> Result<(Vec<OsString>, StdinMode)> {
+        let base = format!("repos/{}/{}", repository.owner, repository.name);
+        let get = |endpoint: String| {
+            (
+                ["api", "--method", "GET", endpoint.as_str()]
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect(),
+                StdinMode::Null,
+            )
+        };
+        Ok(match self {
+            Self::AuthenticatedActor => get("user".to_string()),
+            Self::PullRequest { number } => {
+                validate_authenticated_github_number(*number)?;
+                get(format!("{base}/pulls/{number}"))
+            }
+            Self::Reviews { number, page } => {
+                validate_authenticated_github_number(*number)?;
+                validate_authenticated_github_page(*page)?;
+                get(format!(
+                    "{base}/pulls/{number}/reviews?per_page={AUTHENTICATED_GITHUB_PAGE_SIZE}&page={page}"
+                ))
+            }
+            Self::Files { number, page } => {
+                validate_authenticated_github_number(*number)?;
+                validate_authenticated_github_page(*page)?;
+                get(format!(
+                    "{base}/pulls/{number}/files?per_page={AUTHENTICATED_GITHUB_PAGE_SIZE}&page={page}"
+                ))
+            }
+            Self::Commits { number, page } => {
+                validate_authenticated_github_number(*number)?;
+                validate_authenticated_github_page(*page)?;
+                get(format!(
+                    "{base}/pulls/{number}/commits?per_page={AUTHENTICATED_GITHUB_PAGE_SIZE}&page={page}"
+                ))
+            }
+            Self::CheckRuns { head_oid, page } => {
+                validate_authenticated_github_oid(head_oid)?;
+                validate_authenticated_github_page(*page)?;
+                get(format!(
+                    "{base}/commits/{head_oid}/check-runs?per_page={AUTHENTICATED_GITHUB_PAGE_SIZE}&filter=latest&page={page}"
+                ))
+            }
+            Self::Statuses { head_oid, page } => {
+                validate_authenticated_github_oid(head_oid)?;
+                validate_authenticated_github_page(*page)?;
+                get(format!(
+                    "{base}/commits/{head_oid}/statuses?per_page={AUTHENTICATED_GITHUB_PAGE_SIZE}&page={page}"
+                ))
+            }
+            Self::Commit { oid } => {
+                validate_authenticated_github_oid(oid)?;
+                get(format!("{base}/commits/{oid}"))
+            }
+            Self::Merge {
+                number,
+                expected_head_oid,
+                effect_id,
+                evidence_digest,
+                ground_truth_digest,
+            } => {
+                validate_authenticated_github_number(*number)?;
+                validate_authenticated_github_oid(expected_head_oid)?;
+                validate_external_digest(
+                    effect_id
+                        .strip_prefix("merge:")
+                        .context("authenticated merge effect id omitted its fixed prefix")?,
+                    "authenticated GitHub merge effect id",
+                )?;
+                validate_external_digest(
+                    evidence_digest
+                        .strip_prefix("sha256:")
+                        .context("authenticated merge evidence digest omitted its prefix")?,
+                    "authenticated GitHub merge evidence digest",
+                )?;
+                validate_external_digest(
+                    ground_truth_digest
+                        .strip_prefix("sha256:")
+                        .context("authenticated merge ground-truth digest omitted its prefix")?,
+                    "authenticated GitHub merge ground-truth digest",
+                )?;
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "sha": expected_head_oid,
+                    "merge_method": "merge",
+                    "commit_title": "maco authenticated merge",
+                    "commit_message": authenticated_github_merge_marker(
+                        effect_id,
+                        evidence_digest,
+                        ground_truth_digest,
+                    ),
+                }))
+                .context("serialize authenticated GitHub compare-and-swap merge")?;
+                let endpoint = format!("{base}/pulls/{number}/merge");
+                (
+                    vec![
+                        OsString::from("api"),
+                        OsString::from("--method"),
+                        OsString::from("PUT"),
+                        OsString::from(endpoint),
+                        OsString::from("--input"),
+                        OsString::from("-"),
+                    ],
+                    StdinMode::Bytes(body),
+                )
+            }
+        })
+    }
+}
+
+fn validate_authenticated_github_number(number: u64) -> Result<()> {
+    if number == 0 {
+        bail!("authenticated GitHub pull-request number must be positive");
+    }
+    Ok(())
+}
+
+fn validate_authenticated_github_page(page: usize) -> Result<()> {
+    if !(1..=AUTHENTICATED_GITHUB_MAX_PAGES).contains(&page) {
+        bail!("authenticated GitHub page was outside its finite bound");
+    }
+    Ok(())
+}
+
+fn validate_authenticated_github_oid(oid: &str) -> Result<()> {
+    if !matches!(oid.len(), 40 | 64)
+        || !oid
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("authenticated GitHub operation requires an exact lowercase Git OID");
+    }
+    Ok(())
+}
+
+fn authenticated_github_merge_marker(
+    effect_id: &str,
+    evidence_digest: &str,
+    ground_truth_digest: &str,
+) -> String {
+    format!(
+        "MACO authenticated effect: {effect_id}\nEvidence: {evidence_digest}\nGround truth: {ground_truth_digest}"
+    )
+}
+
+impl GhCommandContext {
+    fn run_authenticated_pull_request_operation(
+        mut self,
+        label: &str,
+        operation: AuthenticatedGithubOperation,
+    ) -> Result<merge::RequiredCommandOutput> {
+        let execution = (|| {
+            let actor_binding = if operation.is_mutation() {
+                let binding = capture_approved_github_actor_binding(&self.source_config_path)?;
+                let actual = self.authenticated_github_actor()?;
+                if actual != binding.login {
+                    bail!(
+                        "authenticated GitHub actor does not exactly match the approved repository login"
+                    );
+                }
+                verify_private_config_files(std::slice::from_ref(&binding.source_config)).context(
+                    "repository-local approved GitHub login changed after actor verification",
+                )?;
+                Some(binding)
+            } else {
+                None
+            };
+            let output = self.run_authenticated_pull_request_operation_inner(label, &operation)?;
+            if let Some(binding) = &actor_binding {
+                verify_private_config_files(std::slice::from_ref(&binding.source_config)).context(
+                    "repository-local approved GitHub login changed during the merge operation",
+                )?;
+            }
+            Ok(output)
+        })();
+        self.finish(execution)
+    }
+
+    fn authenticated_approved_github_actor(mut self) -> Result<ForgeActor> {
+        let execution = (|| {
+            let binding = capture_approved_github_actor_binding(&self.source_config_path)?;
+            let output = self.run_authenticated_pull_request_operation_inner(
+                "gh authenticated merge actor",
+                &AuthenticatedGithubOperation::AuthenticatedActor,
+            )?;
+            let stdout = required_command_stdout(output, "gh authenticated merge actor")?;
+            let actual: GithubApiActor =
+                parse_authenticated_github_json(&stdout, "GitHub authenticated merge actor")?;
+            if actual.login != binding.login {
+                bail!(
+                    "authenticated GitHub actor does not exactly match the approved repository login"
+                );
+            }
+            let actual = github_api_actor(&actual)?;
+            verify_private_config_files(std::slice::from_ref(&binding.source_config)).context(
+                "repository-local approved GitHub login changed after actor verification",
+            )?;
+            Ok(actual)
+        })();
+        let cleanup = self.close();
+        match (execution, cleanup) {
+            (Ok(actor), Ok(())) => Ok(actor),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error
+                .context("GitHub actor guard succeeded but private token runtime cleanup failed")),
+            (Err(error), Err(cleanup)) => Err(anyhow::anyhow!(
+                "{error:#}; gh private token runtime cleanup also failed: {cleanup:#}"
+            )),
+        }
+    }
+
+    fn run_authenticated_pull_request_operation_inner(
+        &self,
+        label: &str,
+        operation: &AuthenticatedGithubOperation,
+    ) -> Result<merge::RequiredCommandOutput> {
+        self.runtime_directory
+            .verify_identity()
+            .context("private gh runtime changed before authenticated PR operation")?;
+        verify_private_config_files(&self.config_files)?;
+        validate_gh_environment(&self.environment, self.runtime_directory.path())?;
+        let (args, stdin) = operation.command(&self.repository)?;
+        let output = merge::run_required_network_direct(
+            label,
+            merge::resolve_trusted_executable("gh")?,
+            args,
+            self.runtime_directory.path(),
+            self.environment.clone(),
+            stdin,
+            merge::NETWORK_PROCESS_TIMEOUT,
+            GH_CAPTURE_LIMIT_BYTES,
+            GH_STDIN_LIMIT_BYTES,
+            self.profile.clone(),
+        )
+        .map_err(|error| {
+            let mut message = format!("{error:#}");
+            for private in [self.token.as_str(), self.token.basic_str()]
+                .into_iter()
+                .flatten()
+            {
+                message = message.replace(private, "<redacted:network-token>");
+            }
+            anyhow::anyhow!(message)
+        })?;
+        self.runtime_directory
+            .verify_identity()
+            .context("private gh runtime changed during authenticated PR operation")?;
+        verify_private_config_files(&self.config_files)?;
+        let mut output = output;
+        redact_private_bytes(&mut output.stdout, &self.token.bytes);
+        redact_private_bytes(&mut output.stderr, &self.token.bytes);
+        redact_private_bytes(&mut output.stdout, &self.token.basic);
+        redact_private_bytes(&mut output.stderr, &self.token.basic);
+        Ok(output)
+    }
+}
+
+struct GithubPullRequestMergeTransport {
+    repo: PathBuf,
+    repository: GithubRepositoryIdentity,
+}
+
+impl GithubPullRequestMergeTransport {
+    fn new(repo: &Path, repository_selector: &str) -> Result<Self> {
+        Ok(Self {
+            repo: repo.to_path_buf(),
+            repository: github_repository_identity_from_selector(repository_selector)?,
+        })
+    }
+
+    fn json(&self, label: &str, operation: AuthenticatedGithubOperation) -> Result<String> {
+        let context = GhCommandContext::create(&self.repo, &self.repository)?;
+        let output = context.run_authenticated_pull_request_operation(label, operation)?;
+        required_command_stdout(output, label)
+    }
+
+    fn approved_merge_actor(&self) -> Result<ForgeActor> {
+        GhCommandContext::create(&self.repo, &self.repository)?
+            .authenticated_approved_github_actor()
+    }
+
+    fn collect_array_pages<T: serde::de::DeserializeOwned>(
+        &self,
+        label: &str,
+        expected_count: Option<usize>,
+        mut operation: impl FnMut(usize) -> AuthenticatedGithubOperation,
+    ) -> Result<Vec<T>> {
+        let maximum = AUTHENTICATED_GITHUB_PAGE_SIZE
+            .checked_mul(AUTHENTICATED_GITHUB_MAX_PAGES)
+            .context("authenticated GitHub pagination capacity overflowed")?;
+        if expected_count.is_some_and(|count| count > maximum) {
+            bail!("{label} provider total exceeded its finite pagination bound");
+        }
+        let mut result = Vec::new();
+        let mut page_lengths = Vec::new();
+        for page in 1..=AUTHENTICATED_GITHUB_MAX_PAGES {
+            let page_items: Vec<T> = parse_authenticated_github_json(
+                &self.json(&format!("{label} page {page}"), operation(page))?,
+                label,
+            )?;
+            let page_len = page_items.len();
+            if page_len > AUTHENTICATED_GITHUB_PAGE_SIZE {
+                bail!("{label} returned an oversized provider page");
+            }
+            page_lengths.push(page_len);
+            result.extend(page_items);
+            match expected_count {
+                Some(expected) if result.len() == expected => {
+                    validate_authenticated_github_page_shape(page_lengths, label)?;
+                    return Ok(result);
+                }
+                Some(expected) if result.len() > expected => {
+                    bail!("{label} returned more entries than its provider total");
+                }
+                Some(_) if page_len < AUTHENTICATED_GITHUB_PAGE_SIZE => {
+                    bail!("{label} pagination ended before its provider total");
+                }
+                None if page_len < AUTHENTICATED_GITHUB_PAGE_SIZE => {
+                    validate_authenticated_github_page_shape(page_lengths, label)?;
+                    return Ok(result);
+                }
+                _ => {}
+            }
+        }
+        bail!("{label} pagination exceeded its finite page bound")
+    }
+
+    fn collect_check_run_pages(&self, head_oid: &str) -> Result<Vec<GithubApiCheckRun>> {
+        let label = "GitHub pull-request check runs";
+        let maximum = AUTHENTICATED_GITHUB_PAGE_SIZE
+            .checked_mul(AUTHENTICATED_GITHUB_MAX_PAGES)
+            .context("authenticated GitHub check-run pagination capacity overflowed")?;
+        let mut total = None;
+        let mut result = Vec::new();
+        let mut page_lengths = Vec::new();
+        for page in 1..=AUTHENTICATED_GITHUB_MAX_PAGES {
+            let response: GithubApiCheckRunsPage = parse_authenticated_github_json(
+                &self.json(
+                    &format!("{label} page {page}"),
+                    AuthenticatedGithubOperation::CheckRuns {
+                        head_oid: head_oid.to_string(),
+                        page,
+                    },
+                )?,
+                label,
+            )?;
+            if response.total_count > maximum {
+                bail!("{label} provider total exceeded its finite pagination bound");
+            }
+            if total
+                .replace(response.total_count)
+                .is_some_and(|observed| observed != response.total_count)
+            {
+                bail!("{label} provider total changed during pagination");
+            }
+            let page_len = response.check_runs.len();
+            if page_len > AUTHENTICATED_GITHUB_PAGE_SIZE {
+                bail!("{label} returned an oversized provider page");
+            }
+            page_lengths.push(page_len);
+            result.extend(response.check_runs);
+            let expected = response.total_count;
+            if result.len() == expected {
+                validate_authenticated_github_page_shape(page_lengths, label)?;
+                return Ok(result);
+            }
+            if result.len() > expected || page_len < AUTHENTICATED_GITHUB_PAGE_SIZE {
+                bail!("{label} pagination was incomplete or exceeded its provider total");
+            }
+        }
+        bail!("{label} pagination exceeded its finite page bound")
+    }
+
+    fn observe_number(&self, number: u64) -> Result<GithubPullRequestMergeGroundTruth> {
+        let pull: GithubApiPullRequest = parse_authenticated_github_json(
+            &self.json(
+                "gh authenticated pull-request observation",
+                AuthenticatedGithubOperation::PullRequest { number },
+            )?,
+            "GitHub pull-request observation",
+        )?;
+        self.validate_pull_request_repository(&pull, number)?;
+        validate_authenticated_github_oid(&pull.head.sha)?;
+        validate_authenticated_github_oid(&pull.base.sha)?;
+
+        let reviews: Vec<GithubApiReview> =
+            self.collect_array_pages("GitHub pull-request reviews", None, |page| {
+                AuthenticatedGithubOperation::Reviews { number, page }
+            })?;
+        let files: Vec<GithubApiFile> = self.collect_array_pages(
+            "GitHub pull-request files",
+            Some(pull.changed_files),
+            |page| AuthenticatedGithubOperation::Files { number, page },
+        )?;
+        let commits: Vec<GithubApiPullCommit> =
+            self.collect_array_pages("GitHub pull-request commits", Some(pull.commits), |page| {
+                AuthenticatedGithubOperation::Commits { number, page }
+            })?;
+        let check_runs = self.collect_check_run_pages(&pull.head.sha)?;
+        let statuses: Vec<GithubApiStatus> =
+            self.collect_array_pages("GitHub pull-request commit statuses", None, |page| {
+                AuthenticatedGithubOperation::Statuses {
+                    head_oid: pull.head.sha.clone(),
+                    page,
+                }
+            })?;
+
+        let confirmed: GithubApiPullRequest = parse_authenticated_github_json(
+            &self.json(
+                "gh authenticated pull-request confirmation",
+                AuthenticatedGithubOperation::PullRequest { number },
+            )?,
+            "GitHub pull-request confirmation",
+        )?;
+        self.validate_pull_request_repository(&confirmed, number)?;
+        if confirmed != pull {
+            bail!("GitHub pull-request identity or merge state changed during observation");
+        }
+
+        self.ground_truth_from_api(pull, reviews, files, commits, check_runs, statuses)
+    }
+
+    fn validate_pull_request_repository(
+        &self,
+        pull: &GithubApiPullRequest,
+        expected_number: u64,
+    ) -> Result<()> {
+        if pull.number != expected_number {
+            bail!("GitHub returned a different pull-request number");
+        }
+        validate_github_receipt_url(&pull.html_url, &self.repository, expected_number)?;
+        let expected = format!("{}/{}", self.repository.owner, self.repository.name);
+        let base = pull
+            .base
+            .repo
+            .as_ref()
+            .context("GitHub pull request omitted its base repository")?;
+        if base.full_name.to_ascii_lowercase() != expected {
+            bail!("GitHub pull request base repository changed or was untrusted");
+        }
+        Ok(())
+    }
+
+    fn ground_truth_from_api(
+        &self,
+        pull: GithubApiPullRequest,
+        reviews: Vec<GithubApiReview>,
+        files: Vec<GithubApiFile>,
+        commits: Vec<GithubApiPullCommit>,
+        check_runs: Vec<GithubApiCheckRun>,
+        statuses: Vec<GithubApiStatus>,
+    ) -> Result<GithubPullRequestMergeGroundTruth> {
+        if files.len() != pull.changed_files {
+            bail!(
+                "GitHub changed-file pagination was incomplete: observed {}, provider reported {}",
+                files.len(),
+                pull.changed_files
+            );
+        }
+        if commits.len() != pull.commits {
+            bail!(
+                "GitHub pull-request commit pagination was incomplete: observed {}, provider reported {}",
+                commits.len(),
+                pull.commits
+            );
+        }
+        if files.is_empty() {
+            bail!("GitHub pull request has no provider-observed changed paths");
+        }
+        if commits.is_empty() {
+            bail!("GitHub pull request has no provider-observed commits");
+        }
+        let base_repository = pull
+            .base
+            .repo
+            .as_ref()
+            .context("GitHub pull request omitted its base repository")?;
+        let locator = format!(
+            "{}/{}",
+            self.repository.host,
+            base_repository.full_name.to_ascii_lowercase()
+        );
+        let repository = ForgeRepository::new(
+            "github",
+            locator,
+            github_node_object_id(ProviderObjectKind::Repository, &base_repository.node_id)?,
+        )?;
+        let item = ForgeItem::new(
+            repository,
+            ForgeItemKind::PullRequest,
+            pull.number,
+            github_node_object_id(ProviderObjectKind::Item, &pull.node_id)?,
+            format!("github-pr-{}-{}", pull.number, pull.head.sha),
+            Some(pull.head.sha.clone()),
+            Some(pull.base.sha.clone()),
+        )?;
+        let producer_actor = github_api_actor(&pull.user)?;
+
+        let mut observed_at = ForgeTimestamp::new(&pull.updated_at)?;
+        let mut forge_reviews = Vec::new();
+        let mut review_ids = BTreeSet::new();
+        let mut review_sequences = BTreeSet::new();
+        for review in reviews {
+            if review.commit_id != pull.head.sha {
+                continue;
+            }
+            if review.id == 0
+                || !review_ids.insert(review.node_id.clone())
+                || !review_sequences.insert(review.id)
+            {
+                bail!("GitHub returned a zero or duplicate pull-request review identity");
+            }
+            let submitted_at = review.submitted_at.context(
+                "GitHub returned an unsubmitted review for the current pull-request head",
+            )?;
+            let timestamp = ForgeTimestamp::new(submitted_at)?;
+            observed_at = observed_at.max(timestamp.clone());
+            let actor = github_api_actor(
+                review
+                    .user
+                    .as_ref()
+                    .context("GitHub pull-request review omitted its author")?,
+            )?;
+            forge_reviews.push(SequencedGithubReview {
+                sequence: review.id,
+                review: ForgeReview::new(
+                    github_node_object_id(ProviderObjectKind::Review, &review.node_id)?,
+                    actor,
+                    github_review_state(&review.state)?,
+                    review.body,
+                    timestamp,
+                    &review.commit_id,
+                )?,
+            });
+        }
+        let forge_reviews = latest_effective_github_reviews(forge_reviews);
+
+        let mut forge_checks = Vec::new();
+        for check in check_runs {
+            if check.head_sha != pull.head.sha {
+                bail!("GitHub returned a check run for a different pull-request head");
+            }
+            let timestamp_text = check
+                .completed_at
+                .as_deref()
+                .or(check.started_at.as_deref())
+                .unwrap_or(&pull.updated_at);
+            let timestamp = ForgeTimestamp::new(timestamp_text)?;
+            observed_at = observed_at.max(timestamp.clone());
+            let app = check
+                .app
+                .as_ref()
+                .context("GitHub check run omitted its authenticated application actor")?;
+            let actor = ForgeActor::new(
+                "github",
+                github_node_object_id(ProviderObjectKind::Actor, &app.node_id)?,
+                app.slug.to_ascii_lowercase(),
+                ReportedActorKind::Bot,
+            )?;
+            let (status, conclusion) =
+                github_check_state(&check.status, check.conclusion.as_deref())?;
+            forge_checks.push(ForgeCheck::new(
+                github_node_object_id(ProviderObjectKind::Check, &check.node_id)?,
+                actor,
+                check.name,
+                status,
+                conclusion,
+                &pull.head.sha,
+                timestamp,
+            )?);
+        }
+
+        // The statuses endpoint returns newest first. Retain exactly the newest
+        // provider status for each context and reject contradictory timestamps.
+        for status in latest_github_statuses(statuses)? {
+            let timestamp = ForgeTimestamp::new(&status.updated_at)?;
+            observed_at = observed_at.max(timestamp.clone());
+            let creator = status
+                .creator
+                .as_ref()
+                .context("GitHub commit status omitted its authenticated creator")?;
+            let actor = github_api_actor(creator)?;
+            let (check_status, conclusion) = github_commit_status_state(&status.state)?;
+            forge_checks.push(ForgeCheck::new(
+                github_node_object_id(ProviderObjectKind::Check, &status.node_id)?,
+                actor,
+                status.context,
+                check_status,
+                conclusion,
+                &pull.head.sha,
+                timestamp,
+            )?);
+        }
+        forge_checks.sort_by(|left, right| {
+            left.name().cmp(right.name()).then_with(|| {
+                left.provider_check_id()
+                    .stable_id()
+                    .cmp(right.provider_check_id().stable_id())
+            })
+        });
+
+        let snapshot = PullRequestReviewSnapshot::new(
+            item,
+            observed_at,
+            forge_reviews,
+            Vec::new(),
+            forge_checks,
+        )?;
+        let mut changed_paths = files
+            .into_iter()
+            .map(|file| {
+                normalize_repo_relative_path(Path::new(&file.filename)).with_context(|| {
+                    format!("GitHub returned an invalid changed path {}", file.filename)
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        changed_paths.sort();
+        if changed_paths.windows(2).any(|pair| pair[0] == pair[1]) {
+            bail!("GitHub returned duplicate changed paths");
+        }
+
+        let mut commit_authors = Vec::with_capacity(commits.len().saturating_add(1));
+        let mut commit_committers = Vec::with_capacity(commits.len().saturating_add(1));
+        for commit in commits {
+            let author = commit
+                .author
+                .context("GitHub PR commit omitted its authenticated author identity")?
+                .node_id;
+            let committer = commit
+                .committer
+                .context("GitHub PR commit omitted its authenticated committer identity")?
+                .node_id;
+            commit_authors.push(
+                github_node_object_id(ProviderObjectKind::Actor, &author)?
+                    .stable_id()
+                    .to_string(),
+            );
+            commit_committers.push(
+                github_node_object_id(ProviderObjectKind::Actor, &committer)?
+                    .stable_id()
+                    .to_string(),
+            );
+        }
+        commit_authors.push(producer_actor.provider_actor_id().stable_id().to_string());
+        commit_committers.push(producer_actor.provider_actor_id().stable_id().to_string());
+        commit_authors.sort();
+        commit_authors.dedup();
+        commit_committers.sort();
+        commit_committers.dedup();
+        let producer = ProducerFingerprint {
+            actor: crate::optimizer::merge_authority::MergeActor {
+                agent: crate::optimizer::merge_authority::AgentIdentity {
+                    stable_id: producer_actor.provider_actor_id().stable_id().to_string(),
+                },
+                session: crate::optimizer::merge_authority::SessionId {
+                    id: format!("github-pr-head:{}", pull.head.sha),
+                },
+                model_label: "github-pr-producer".to_string(),
+            },
+            commit_authors,
+            commit_committers,
+        };
+        let expected_repository = format!("{}/{}", self.repository.owner, self.repository.name);
+        let same_repository_head = github_same_repository_head(
+            pull.head.repo.as_ref(),
+            base_repository,
+            &expected_repository,
+        );
+        Ok(GithubPullRequestMergeGroundTruth {
+            snapshot,
+            producer,
+            producer_login: pull.user.login.to_ascii_lowercase(),
+            changed_paths,
+            merges_cleanly: pull.mergeable == Some(true)
+                && pull.mergeable_state.eq_ignore_ascii_case("clean"),
+            is_draft: pull.draft,
+            is_open: pull.state.eq_ignore_ascii_case("open") && !pull.merged,
+            same_repository_head,
+        })
+    }
+
+    fn lookup_receipt(
+        &self,
+        effect: &PullRequestMergeEffect,
+    ) -> Result<Vec<PullRequestMergeReceipt>> {
+        let pull: GithubApiPullRequest = parse_authenticated_github_json(
+            &self.json(
+                "gh authenticated merge reconciliation",
+                AuthenticatedGithubOperation::PullRequest {
+                    number: effect.item().number(),
+                },
+            )?,
+            "GitHub merge reconciliation",
+        )?;
+        self.validate_pull_request_repository(&pull, effect.item().number())?;
+        let base_repository = pull
+            .base
+            .repo
+            .as_ref()
+            .context("GitHub merge reconciliation omitted its base repository")?;
+        if github_node_object_id(ProviderObjectKind::Repository, &base_repository.node_id)?
+            != *effect.item().repository().provider_repository_id()
+            || github_node_object_id(ProviderObjectKind::Item, &pull.node_id)?
+                != *effect.item().provider_item_id()
+        {
+            bail!("GitHub merge reconciliation returned a different provider PR identity");
+        }
+        if !pull.merged {
+            return Ok(Vec::new());
+        }
+        if pull.head.sha != effect.item().head_oid().unwrap_or_default() {
+            bail!("merged GitHub pull request no longer binds the authorized head");
+        }
+        let actual_actor = self.approved_merge_actor()?;
+        let merged_by = pull
+            .merged_by
+            .as_ref()
+            .context("merged GitHub pull request omitted its authenticated merge actor")?;
+        let merged_by = github_api_actor(merged_by)?;
+        if merged_by != actual_actor {
+            bail!("merged GitHub pull request was completed by a different actor");
+        }
+        let merged_oid = pull
+            .merge_commit_sha
+            .as_deref()
+            .context("merged GitHub pull request omitted its merge commit")?;
+        validate_authenticated_github_oid(merged_oid)?;
+        let commit: GithubApiCommitReceipt = parse_authenticated_github_json(
+            &self.json(
+                "gh authenticated merge commit receipt",
+                AuthenticatedGithubOperation::Commit {
+                    oid: merged_oid.to_string(),
+                },
+            )?,
+            "GitHub merge commit receipt",
+        )?;
+        if commit.sha != merged_oid {
+            bail!("GitHub returned a different merge commit during receipt verification");
+        }
+        let expected_message = format!(
+            "maco authenticated merge\n\n{}",
+            authenticated_github_merge_marker(
+                effect.effect_id(),
+                effect.evidence_digest(),
+                effect.ground_truth_digest(),
+            )
+        );
+        if commit.commit.message != expected_message {
+            bail!("merged GitHub commit did not contain the exact authenticated effect marker");
+        }
+        let expected_commit_url = format!(
+            "https://{}/{}/{}/commit/{merged_oid}",
+            self.repository.host, self.repository.owner, self.repository.name
+        );
+        if commit.html_url != expected_commit_url {
+            bail!("GitHub merge commit receipt URL did not match the bound repository and OID");
+        }
+        let receipt = PullRequestMergeReceipt::new(
+            effect.effect_id().to_string(),
+            effect.item().clone(),
+            effect.approved_actor().clone(),
+            effect.evidence_digest().to_string(),
+            effect.ground_truth_digest().to_string(),
+            effect.completion_mode(),
+            github_node_object_id(ProviderObjectKind::Merge, &commit.node_id)?,
+            merged_oid,
+            commit.html_url,
+            ForgeTimestamp::new(
+                pull.merged_at
+                    .context("merged GitHub pull request omitted merged_at")?,
+            )?,
+        )?;
+        Ok(vec![receipt])
+    }
+}
+
+impl PullRequestMergeTransport for GithubPullRequestMergeTransport {
+    fn observe_pull_request_for_merge(
+        &self,
+        candidate: &ForgeItem,
+    ) -> Result<PullRequestReviewSnapshot> {
+        let truth = self.observe_number(candidate.number())?;
+        if truth.is_draft || !truth.is_open || !truth.same_repository_head || !truth.merges_cleanly
+        {
+            bail!(
+                "GitHub pull request is draft, closed, forked, protected, conflicted, or not cleanly mergeable"
+            );
+        }
+        if truth.snapshot.item() != candidate {
+            bail!("GitHub returned a different exact pull-request candidate");
+        }
+        Ok(truth.snapshot)
+    }
+
+    fn lookup_pull_request_merge(
+        &self,
+        effect: &PullRequestMergeEffect,
+    ) -> Result<Vec<PullRequestMergeReceipt>> {
+        effect.validate()?;
+        self.lookup_receipt(effect)
+    }
+
+    fn execute_pull_request_merge(
+        &self,
+        effect: &PullRequestMergeEffect,
+    ) -> Result<PullRequestMergeReceipt> {
+        effect.validate()?;
+        if effect.completion_mode()
+            != crate::optimizer::merge_authority::CompletionMode::MergeCommit
+        {
+            bail!("production GitHub transport permits only a merge-commit completion mode");
+        }
+        let response: GithubApiMergeResponse = parse_authenticated_github_json(
+            &self.json(
+                "gh authenticated compare-and-swap merge",
+                AuthenticatedGithubOperation::Merge {
+                    number: effect.item().number(),
+                    expected_head_oid: effect
+                        .item()
+                        .head_oid()
+                        .context("authenticated merge effect omitted its expected head")?
+                        .to_string(),
+                    effect_id: effect.effect_id().to_string(),
+                    evidence_digest: effect.evidence_digest().to_string(),
+                    ground_truth_digest: effect.ground_truth_digest().to_string(),
+                },
+            )?,
+            "GitHub compare-and-swap merge response",
+        )?;
+        if !response.merged {
+            bail!(
+                "GitHub refused the compare-and-swap merge: {}",
+                response.message
+            );
+        }
+        let response_oid = response
+            .sha
+            .as_deref()
+            .context("GitHub merge response omitted its merge commit")?;
+        validate_authenticated_github_oid(response_oid)?;
+        let receipts = self.lookup_receipt(effect)?;
+        if receipts.len() != 1 || receipts[0].merged_oid() != response_oid {
+            bail!("GitHub merge response could not be reconciled to one verified provider receipt");
+        }
+        Ok(receipts.into_iter().next().expect("checked one receipt"))
+    }
+
+    fn verify_pull_request_merge(
+        &self,
+        effect: &PullRequestMergeEffect,
+        receipt: &PullRequestMergeReceipt,
+    ) -> Result<PullRequestMergeReceipt> {
+        receipt.validate_for_effect(effect)?;
+        let receipts = self.lookup_receipt(effect)?;
+        if receipts.as_slice() != [receipt.clone()] {
+            bail!("GitHub merge receipt was missing, duplicated, or changed");
+        }
+        Ok(receipt.clone())
+    }
+}
+
+fn parse_authenticated_github_json<T: serde::de::DeserializeOwned>(
+    stdout: &str,
+    label: &str,
+) -> Result<T> {
+    if stdout.len() > GH_CAPTURE_LIMIT_BYTES {
+        bail!("{label} exceeded its authenticated response bound");
+    }
+    serde_json::from_str(stdout).with_context(|| format!("{label} was not strict JSON"))
+}
+
+fn validate_authenticated_github_page_shape(
+    page_lengths: impl IntoIterator<Item = usize>,
+    label: &str,
+) -> Result<()> {
+    let page_lengths = page_lengths.into_iter().collect::<Vec<_>>();
+    if page_lengths.is_empty() || page_lengths.len() > AUTHENTICATED_GITHUB_MAX_PAGES {
+        bail!("{label} pagination was empty, incomplete, or exceeded its finite bound");
+    }
+    if page_lengths
+        .iter()
+        .any(|length| *length > AUTHENTICATED_GITHUB_PAGE_SIZE)
+    {
+        bail!("{label} returned an oversized provider page");
+    }
+    if page_lengths.len() > 1
+        && (page_lengths.last() == Some(&0)
+            || page_lengths[..page_lengths.len() - 1]
+                .iter()
+                .any(|length| *length != AUTHENTICATED_GITHUB_PAGE_SIZE))
+    {
+        bail!("{label} pagination contained an incomplete non-final or empty final page");
+    }
+    Ok(())
+}
+
+struct SequencedGithubReview {
+    sequence: u64,
+    review: ForgeReview,
+}
+
+fn latest_effective_github_reviews(reviews: Vec<SequencedGithubReview>) -> Vec<ForgeReview> {
+    let mut latest = BTreeMap::<ProviderObjectId, SequencedGithubReview>::new();
+    for candidate in reviews {
+        let actor = candidate.review.author().provider_actor_id().clone();
+        match latest.entry(actor) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(candidate);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let current = entry.get();
+                let candidate_decisive = github_review_state_is_decisive(candidate.review.state());
+                let current_decisive = github_review_state_is_decisive(current.review.state());
+                let candidate_is_later = (candidate.review.submitted_at(), candidate.sequence)
+                    > (current.review.submitted_at(), current.sequence);
+                if (candidate_decisive && !current_decisive)
+                    || (candidate_decisive == current_decisive && candidate_is_later)
+                {
+                    entry.insert(candidate);
+                }
+            }
+        }
+    }
+    let mut reviews = latest
+        .into_values()
+        .map(|entry| entry.review)
+        .collect::<Vec<_>>();
+    reviews.sort_by(|left, right| {
+        left.author()
+            .provider_actor_id()
+            .cmp(right.author().provider_actor_id())
+            .then_with(|| left.provider_review_id().cmp(right.provider_review_id()))
+    });
+    reviews
+}
+
+fn github_review_state_is_decisive(state: ForgeReviewState) -> bool {
+    matches!(
+        state,
+        ForgeReviewState::Approved
+            | ForgeReviewState::ChangesRequested
+            | ForgeReviewState::Dismissed
+    )
+}
+
+fn latest_github_statuses(statuses: Vec<GithubApiStatus>) -> Result<Vec<GithubApiStatus>> {
+    let mut latest = BTreeMap::<String, GithubApiStatus>::new();
+    for status in statuses {
+        match latest.entry(status.context.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(status);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if status.updated_at == entry.get().updated_at {
+                    bail!(
+                        "GitHub returned ambiguous or duplicate commit statuses for one context and timestamp"
+                    );
+                }
+                if status.updated_at > entry.get().updated_at {
+                    entry.insert(status);
+                }
+            }
+        }
+    }
+    Ok(latest.into_values().collect())
+}
+
+fn github_same_repository_head(
+    head: Option<&GithubApiRepository>,
+    base: &GithubApiRepository,
+    expected_owner_name: &str,
+) -> bool {
+    head.is_some_and(|head| {
+        head.full_name.to_ascii_lowercase() == expected_owner_name && head.node_id == base.node_id
+    })
+}
+
+fn github_api_actor(actor: &GithubApiActor) -> Result<ForgeActor> {
+    let reported = match actor.kind.to_ascii_lowercase().as_str() {
+        "user" => ReportedActorKind::Human,
+        "bot" => ReportedActorKind::Bot,
+        "organization" => ReportedActorKind::Organization,
+        _ => ReportedActorKind::Unknown,
+    };
+    ForgeActor::new(
+        "github",
+        github_node_object_id(ProviderObjectKind::Actor, &actor.node_id)?,
+        actor.login.to_ascii_lowercase(),
+        reported,
+    )
+}
+
+fn github_node_object_id(kind: ProviderObjectKind, raw: &str) -> Result<ProviderObjectId> {
+    if raw.is_empty()
+        || raw.len() > 1024
+        || raw
+            .bytes()
+            .any(|byte| byte == 0 || byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        bail!("GitHub provider node id was empty, malformed, or oversized");
+    }
+    ProviderObjectId::new(
+        "github",
+        kind,
+        format!("node:sha256:{}", sha256_hex(raw.as_bytes())),
+    )
+}
+
+fn github_review_state(state: &str) -> Result<ForgeReviewState> {
+    Ok(match state.to_ascii_uppercase().as_str() {
+        "APPROVED" => ForgeReviewState::Approved,
+        "CHANGES_REQUESTED" => ForgeReviewState::ChangesRequested,
+        "COMMENTED" => ForgeReviewState::Commented,
+        "DISMISSED" => ForgeReviewState::Dismissed,
+        "PENDING" => ForgeReviewState::Pending,
+        _ => bail!("GitHub returned an unknown review state"),
+    })
+}
+
+fn github_check_state(
+    status: &str,
+    conclusion: Option<&str>,
+) -> Result<(ForgeCheckStatus, Option<ForgeCheckConclusion>)> {
+    let status = match status.to_ascii_lowercase().as_str() {
+        "queued" | "waiting" | "requested" => ForgeCheckStatus::Queued,
+        "in_progress" | "pending" => ForgeCheckStatus::InProgress,
+        "completed" => ForgeCheckStatus::Completed,
+        _ => bail!("GitHub returned an unknown check-run status"),
+    };
+    if status != ForgeCheckStatus::Completed {
+        if conclusion.is_some() {
+            bail!("GitHub returned a conclusion for an incomplete check run");
+        }
+        return Ok((status, None));
+    }
+    let conclusion = match conclusion
+        .context("completed GitHub check run omitted its conclusion")?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "success" => ForgeCheckConclusion::Success,
+        "failure" => ForgeCheckConclusion::Failure,
+        "neutral" => ForgeCheckConclusion::Neutral,
+        "cancelled" => ForgeCheckConclusion::Cancelled,
+        "skipped" => ForgeCheckConclusion::Skipped,
+        "timed_out" => ForgeCheckConclusion::TimedOut,
+        "action_required" => ForgeCheckConclusion::ActionRequired,
+        "startup_failure" => ForgeCheckConclusion::StartupFailure,
+        "stale" => ForgeCheckConclusion::Stale,
+        _ => bail!("GitHub returned an unknown check-run conclusion"),
+    };
+    Ok((status, Some(conclusion)))
+}
+
+fn github_commit_status_state(
+    state: &str,
+) -> Result<(ForgeCheckStatus, Option<ForgeCheckConclusion>)> {
+    Ok(match state.to_ascii_lowercase().as_str() {
+        "pending" => (ForgeCheckStatus::InProgress, None),
+        "success" => (
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+        ),
+        "failure" | "error" => (
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Failure),
+        ),
+        _ => bail!("GitHub returned an unknown commit-status state"),
+    })
+}
+
+pub(crate) fn observe_github_pull_request_merge_ground_truth(
+    repo: &Path,
+    repository_selector: &str,
+    number: u64,
+) -> Result<GithubPullRequestMergeGroundTruth> {
+    GithubPullRequestMergeTransport::new(repo, repository_selector)?.observe_number(number)
+}
+
+pub(crate) fn execute_authenticated_github_pull_request_merge(
+    repo: &Path,
+    repository_selector: &str,
+    candidate: &ForgeItem,
+    evidence: Option<&AuthenticatedPullRequestMergeEvidence>,
+) -> Result<AuthenticatedPullRequestMergeOutcome> {
+    let transport = GithubPullRequestMergeTransport::new(repo, repository_selector)?;
+    execute_authenticated_pull_request_merge(repo, candidate, evidence, &transport)
+}
+
 pub(crate) fn external_source_repository_identity(device: u64, file: u64) -> String {
     let mut payload = b"MACO\0external-source-repository\0v2\0".to_vec();
     payload.extend_from_slice(&device.to_be_bytes());
@@ -848,6 +2702,12 @@ pub(crate) fn github_source_guard_from_value(
                 .get("isDraft")
                 .and_then(serde_json::Value::as_bool)
                 .context("GitHub source observation omitted boolean isDraft")?;
+            let is_cross_repository = object
+                .get("isCrossRepository")
+                .and_then(serde_json::Value::as_bool)
+                .context("GitHub source observation omitted boolean isCrossRepository")?;
+            let head_repository =
+                canonical_external_source_head_repository(object.get("headRepository"))?;
             let file_values = required_bounded_external_source_array(
                 object.get("files"),
                 "GitHub source files",
@@ -881,25 +2741,31 @@ pub(crate) fn github_source_guard_from_value(
             )?;
             let review_decision = nullable_external_source_string(object, "reviewDecision")?;
             let action = stable_json_digest(&(
-                "maco_github_pull_request_action_revision_v1",
-                repository_selector,
-                kind,
-                number,
-                title,
-                body,
-                url,
-                author,
-                &labels,
-                &state,
-                head_ref,
-                base_ref,
-                &head_oid,
-                &base_oid,
-                is_draft,
-                &files,
+                "maco_github_pull_request_action_revision_v2",
+                (
+                    repository_selector,
+                    kind,
+                    number,
+                    title,
+                    body,
+                    url,
+                    author,
+                    &labels,
+                    &state,
+                ),
+                (
+                    head_ref,
+                    base_ref,
+                    &head_oid,
+                    &base_oid,
+                    is_draft,
+                    is_cross_repository,
+                    &head_repository,
+                    &files,
+                ),
             ))?;
             let full = stable_json_digest(&(
-                "maco_github_pull_request_content_v1",
+                "maco_github_pull_request_content_v2",
                 (
                     number,
                     title,
@@ -910,7 +2776,16 @@ pub(crate) fn github_source_guard_from_value(
                     &state,
                     &updated_at,
                 ),
-                (head_ref, base_ref, &head_oid, &base_oid, is_draft, &files),
+                (
+                    head_ref,
+                    base_ref,
+                    &head_oid,
+                    &base_oid,
+                    is_draft,
+                    is_cross_repository,
+                    &head_repository,
+                    &files,
+                ),
                 (&checks, &reviews, review_decision),
             ))?;
             (Some(head_oid), Some(base_oid), full, action)
@@ -930,6 +2805,42 @@ pub(crate) fn github_source_guard_from_value(
         content_digest,
         action_revision_digest,
     )
+}
+
+fn canonical_external_source_head_repository(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<String>> {
+    let value = value.context("GitHub source observation omitted headRepository")?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    let name_with_owner = value
+        .as_object()
+        .and_then(|repository| repository.get("nameWithOwner"))
+        .and_then(serde_json::Value::as_str)
+        .context("GitHub source headRepository omitted nameWithOwner")?;
+    validate_external_source_field(
+        name_with_owner,
+        "GitHub source head repository",
+        MAX_PUBLICATION_PATH_BYTES,
+    )?;
+    let mut components = name_with_owner.split('/');
+    let owner = components
+        .next()
+        .context("GitHub source head repository omitted owner")?;
+    let name = components
+        .next()
+        .context("GitHub source head repository omitted name")?;
+    if components.next().is_some() {
+        bail!("GitHub source head repository was not canonical owner/name");
+    }
+    validate_github_slug(owner, "GitHub source head repository owner")?;
+    validate_github_slug(name, "GitHub source head repository name")?;
+    Ok(Some(format!(
+        "{}/{}",
+        owner.to_ascii_lowercase(),
+        name.to_ascii_lowercase()
+    )))
 }
 
 fn required_bounded_external_source_array<'a>(

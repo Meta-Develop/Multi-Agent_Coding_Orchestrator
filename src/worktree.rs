@@ -149,6 +149,11 @@ const WORKTREE_STATUS_SCAVENGE_LIMITS: PrivateDirectoryScavengeLimits =
         max_duration: Duration::from_secs(10),
     };
 const WORKTREE_STATUS_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
+// Managed worktree creation intentionally keeps the authenticated registry
+// lock across its WAL-backed Git/worktree transaction. That transaction can
+// exceed the generic state-lock budget on local NTFS, so registry contenders
+// get a larger bounded serialization window without weakening other locks.
+const MANAGED_WORKTREE_REGISTRY_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(not(test))]
 const WORKTREE_STATUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 // Full library suites share the finite systemd containment slots with other
@@ -2151,6 +2156,22 @@ fn worktree_guard_report(
     }
 }
 
+fn capture_managed_removal_authorization(
+    repo: &Repository,
+    repository: &ManagedRepositoryBinding,
+    registry: &ManagedWorktreeRegistry,
+    name: &str,
+    delete_branch: bool,
+) -> Result<(ManagedWorktreeBinding, Oid)> {
+    let binding = registry.records.get(name).cloned().with_context(|| {
+        format!(
+            "worktree '{name}' has no create-time managed binding; refusing filesystem or branch deletion even with --force"
+        )
+    })?;
+    let verified = verify_managed_worktree_binding(repo, repository, &binding, delete_branch)?;
+    Ok((binding, verified.branch_oid))
+}
+
 impl WorktreeManager {
     pub fn new(repo_path: impl Into<PathBuf>) -> Self {
         Self {
@@ -2720,11 +2741,43 @@ impl WorktreeManager {
         let registry_lock = registry_store.lock()?;
         let mut registry = registry_store.load(&registry_lock)?;
         if let Some(operation) = registry.operations.get_mut(&name) {
-            operation.force = true;
             if operation.kind == ManagedWorktreeOperationKind::Remove {
+                if delete_branch && !operation.delete_branch {
+                    if operation.phase != ManagedWorktreeOperationPhase::RemovePrepared {
+                        bail!(
+                            "pending removal '{name}' cannot add branch deletion after its destructive phase began"
+                        );
+                    }
+                    let binding = operation.binding.as_ref().with_context(|| {
+                        format!(
+                            "pending removal '{name}' has no create-time binding; refusing branch deletion"
+                        )
+                    })?;
+                    let verified = verify_managed_worktree_binding(
+                        &repo,
+                        &registry_store.repository,
+                        binding,
+                        true,
+                    )?;
+                    let expected = operation
+                        .expected_branch_oid
+                        .as_deref()
+                        .map(Oid::from_str)
+                        .transpose()
+                        .context("pending removal has malformed expected branch OID")?
+                        .context("pending removal lacks its expected branch OID")?;
+                    if verified.branch_oid != expected {
+                        bail!(
+                            "pending removal '{name}' branch changed before branch deletion was authorized"
+                        );
+                    }
+                }
+                operation.force = true;
                 operation.delete_branch = delete_branch;
                 operation.gc_dirtiness_checksum = None;
                 operation.removal_safety = Some(ManagedRemovalSafety::Explicit);
+            } else {
+                operation.force = true;
             }
             registry_store.save(&registry_lock, &mut registry)?;
         }
@@ -2733,6 +2786,22 @@ impl WorktreeManager {
                 .then(|| operation.binding.clone())
                 .flatten()
         });
+        // A fresh removal captures the exact authenticated binding and branch
+        // tip before recovery can perform any destructive lifecycle work. A
+        // pending remove instead carries those inputs in its authenticated WAL
+        // entry and must never reconstruct them from a record that recovery may
+        // legitimately consume.
+        let captured_authorization = if registry.operations.contains_key(&name) {
+            None
+        } else {
+            Some(capture_managed_removal_authorization(
+                &repo,
+                &registry_store.repository,
+                &registry,
+                &name,
+                delete_branch,
+            )?)
+        };
         recover_pending_operations(&repo, &registry_store, &registry_lock, &mut registry)?;
         if let Some(binding) = pending_remove_binding {
             if !registry.records.contains_key(&name) && !registry.operations.contains_key(&name) {
@@ -2743,17 +2812,23 @@ impl WorktreeManager {
                 });
             }
         }
-        let binding = registry.records.get(&name).cloned().with_context(|| {
-            format!(
-                "worktree '{name}' has no create-time managed binding; refusing filesystem or branch deletion even with --force"
-            )
-        })?;
-        let verified = verify_managed_worktree_binding(
-            &repo,
-            &registry_store.repository,
-            &binding,
-            delete_branch,
-        )?;
+        let (binding, expected_branch_oid) = match captured_authorization {
+            Some((binding, expected_branch_oid)) => {
+                if registry.records.get(&name) != Some(&binding) {
+                    bail!(
+                        "worktree '{name}' create-time managed binding changed before removal intent was persisted"
+                    );
+                }
+                (binding, expected_branch_oid)
+            }
+            None => capture_managed_removal_authorization(
+                &repo,
+                &registry_store.repository,
+                &registry,
+                &name,
+                delete_branch,
+            )?,
+        };
         let _removal_lease = registry_store
             .try_acquire_worktree_removal_lease(&registry_lock, &name)
             .with_context(|| {
@@ -2807,7 +2882,7 @@ impl WorktreeManager {
                 binding: Some(binding.clone()),
                 delete_branch,
                 force,
-                expected_branch_oid: Some(verified.branch_oid.to_string()),
+                expected_branch_oid: Some(expected_branch_oid.to_string()),
                 gc_dirtiness_checksum: None,
                 removal_safety: Some(ManagedRemovalSafety::Explicit),
                 worktree_quarantine_path: Some(worktree_quarantine_path),

@@ -76,6 +76,17 @@ impl AdvertisedCatalogSet {
             cursor_evidence_gap: None,
         }
     }
+
+    #[cfg(test)]
+    pub(super) fn with_grok(
+        observation: crate::runtime_adapter::grok::GrokAdvertisedCatalogObservation,
+    ) -> Self {
+        Self {
+            cursor: None,
+            grok: Some(observation),
+            cursor_evidence_gap: None,
+        }
+    }
 }
 
 fn bounded_cursor_catalog_gap_detail(detail: &str) -> &str {
@@ -103,12 +114,18 @@ fn cursor_catalog_optional_unavailability(error: &anyhow::Error) -> bool {
 const TEST_CURSOR_CATALOG_FIXTURE_ENV: &str = "MACO_TEST_CURSOR_CATALOG_FIXTURE";
 #[cfg(test)]
 const TEST_CURSOR_CATALOG_OBSERVED_AT_ENV: &str = "MACO_TEST_CURSOR_CATALOG_OBSERVED_AT";
+#[cfg(test)]
+const TEST_SELECTOR_TRIPLE_RUNNER_UP_MODEL: &str = "gpt-5.6-sol-selector-triple-runner-up";
+#[cfg(test)]
+const TEST_BELOW_FLOOR_REVIEW_AUDITOR_MODEL: &str = "gpt-5.6-sol-review-auditor-below-floor";
 
 #[cfg(test)]
 thread_local! {
     static TEST_ADVERTISED_CATALOGS: RefCell<Option<AdvertisedCatalogSet>> = const {
         RefCell::new(None)
     };
+    static TEST_SELECTOR_TRIPLE_RUNNER_UP_ENABLED: Cell<bool> = const { Cell::new(false) };
+    static TEST_BELOW_FLOOR_REVIEW_AUDITOR_ENABLED: Cell<bool> = const { Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -137,12 +154,86 @@ pub(super) fn bind_test_cursor_catalog_fixture(
     )
 }
 
+#[cfg(test)]
+pub(super) struct TestSelectorTripleCatalogBindGuard {
+    previous_runner_up_enabled: bool,
+    _model_capability: InstalledModelCapabilityPolicy,
+}
+
+#[cfg(test)]
+impl Drop for TestSelectorTripleCatalogBindGuard {
+    fn drop(&mut self) {
+        TEST_SELECTOR_TRIPLE_RUNNER_UP_ENABLED.with(|enabled| {
+            enabled.set(self.previous_runner_up_enabled);
+        });
+    }
+}
+
+#[cfg(test)]
+pub(super) fn bind_test_selector_triple_catalog(
+) -> Result<(TestSelectorTripleCatalogBindGuard, RuntimeModelCatalog)> {
+    let mut slugs = selection::built_in_prior_dataset()?
+        .models
+        .into_iter()
+        .filter(|prior| prior.runtime == runtime_name(SupervisorRuntime::Codex))
+        .map(|prior| prior.model)
+        .collect::<BTreeSet<_>>();
+    slugs.insert(TEST_SELECTOR_TRIPLE_RUNNER_UP_MODEL.to_string());
+    let catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(slugs)?);
+    let model_capability = install_test_fixture_models(&[(
+        TEST_SELECTOR_TRIPLE_RUNNER_UP_MODEL,
+        ModelCapabilityClass::CriticalJudgment,
+    )])?;
+    let previous_runner_up_enabled =
+        TEST_SELECTOR_TRIPLE_RUNNER_UP_ENABLED.with(|enabled| enabled.replace(true));
+    Ok((
+        TestSelectorTripleCatalogBindGuard {
+            previous_runner_up_enabled,
+            _model_capability: model_capability,
+        },
+        catalog,
+    ))
+}
+
+#[cfg(test)]
+struct TestBelowFloorReviewAuditorBindGuard {
+    _model_capability: InstalledModelCapabilityPolicy,
+}
+
+#[cfg(test)]
+impl Drop for TestBelowFloorReviewAuditorBindGuard {
+    fn drop(&mut self) {
+        TEST_BELOW_FLOOR_REVIEW_AUDITOR_ENABLED.with(|enabled| enabled.set(false));
+    }
+}
+
+#[cfg(test)]
+fn bind_test_below_floor_review_auditor() -> Result<(
+    TestBelowFloorReviewAuditorBindGuard,
+    CodexRuntimeModelCatalog,
+)> {
+    let model_capability = install_test_fixture_models(&[(
+        TEST_BELOW_FLOOR_REVIEW_AUDITOR_MODEL,
+        ModelCapabilityClass::GeneralJudgment,
+    )])?;
+    let catalog = CodexRuntimeModelCatalog::from_slugs([TEST_BELOW_FLOOR_REVIEW_AUDITOR_MODEL])?;
+    TEST_BELOW_FLOOR_REVIEW_AUDITOR_ENABLED.with(|enabled| {
+        assert!(!enabled.replace(true), "test fixture cannot be nested");
+    });
+    Ok((
+        TestBelowFloorReviewAuditorBindGuard {
+            _model_capability: model_capability,
+        },
+        catalog,
+    ))
+}
+
 /// Observe advertised runtime catalogs for supervisor launch.
 ///
 /// Under `cargo test` this stays hermetic: it never resolves or starts a
-/// third-party CLI. Production binaries screen a live `cursor-agent models`
-/// observation and retain a private evidence gap when that optional catalog
-/// cannot be observed.
+/// third-party CLI. Production binaries screen live `cursor-agent models` and
+/// `grok models` observations and retain a private evidence gap when the
+/// optional Cursor catalog cannot be observed.
 pub(super) fn advertised_catalogs_for_launch(repo: &Path) -> Result<AdvertisedCatalogSet> {
     #[cfg(test)]
     {
@@ -214,10 +305,66 @@ fn advertised_catalogs_from_live_runtimes(repo: &Path) -> Result<AdvertisedCatal
                 return Err(error).context("live Cursor catalog observation failed closed");
             }
         };
+    let grok_program = std::env::var_os("MACO_GROK_BIN");
+    let grok = observe_optional_live_grok_catalog(
+        &crate::runtime_adapter::grok::ScreenedGrokCatalogCommandRunner,
+        repo,
+        observed_at_unix_millis,
+        grok_program.as_deref(),
+    )?;
     Ok(AdvertisedCatalogSet {
         cursor,
-        grok: None,
+        grok,
         cursor_evidence_gap,
+    })
+}
+
+fn observe_optional_live_grok_catalog(
+    runner: &dyn crate::runtime_adapter::grok::GrokCatalogCommandRunner,
+    repo: &Path,
+    observed_at_unix_millis: u64,
+    program_override: Option<&std::ffi::OsStr>,
+) -> Result<Option<crate::runtime_adapter::grok::GrokAdvertisedCatalogObservation>> {
+    match observe_grok_catalog(runner, repo, observed_at_unix_millis, program_override) {
+        Ok(observation) => Ok(Some(observation)),
+        Err(error)
+            if program_override.is_none()
+                && grok_catalog_is_omittable_implicit_unavailability(&error) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error).context("live Grok catalog observation failed closed"),
+    }
+}
+
+fn observe_grok_catalog(
+    runner: &dyn crate::runtime_adapter::grok::GrokCatalogCommandRunner,
+    repo: &Path,
+    observed_at_unix_millis: u64,
+    program_override: Option<&std::ffi::OsStr>,
+) -> Result<crate::runtime_adapter::grok::GrokAdvertisedCatalogObservation> {
+    let mut spec = crate::runtime_adapter::grok::GrokCatalogCommandSpec::new(repo);
+    if let Some(program) = program_override {
+        spec = spec.with_program(crate::runtime_adapter::grok::explicit_grok_executable(
+            program,
+        )?);
+    }
+    crate::runtime_adapter::grok::discover_grok_model_catalog(
+        runner,
+        &spec,
+        Some(observed_at_unix_millis),
+    )
+}
+
+fn grok_catalog_is_omittable_implicit_unavailability(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message == "Grok authentication source auth.json is missing"
+            || message == "Grok authentication source auth.json is unavailable"
+            || message == "Grok runtime model catalog has an invalid header"
+            || ((message.starts_with("Grok catalog executable '")
+                || message.starts_with("Grok executable '"))
+                && message.ends_with("' is missing"))
     })
 }
 
@@ -468,6 +615,171 @@ pub(super) struct SupervisorExecutableSelectionBindings {
     pub(super) runtime_overrides: BTreeMap<AgentRole, SupervisorRuntime>,
 }
 
+/// Executable, authority-checked selection for one non-delegating review auditor.
+///
+/// The full selector provenance remains attached so inbox callers can retain the
+/// same catalog, objective-profile, candidate-set, and scoring evidence that
+/// authorized the exact runtime/model/effort triple.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct ExecutableReviewAuditorSelection {
+    pub(crate) candidate: CandidateKey,
+    pub(crate) authority: PhaseModelPolicyDecision,
+    pub(crate) provenance: SelectionProvenance,
+}
+
+impl CodexRuntimeModelCatalog {
+    /// Invoke the shared bridge without importing its private module path.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn select_executable_review_auditor(
+        &self,
+    ) -> Result<ExecutableReviewAuditorSelection> {
+        select_executable_review_auditor(self)
+    }
+}
+
+/// Select one executable `ReviewAuditor` directly from a live Codex catalog.
+///
+/// This is deliberately independent of supervisor-plan authority: it admits a
+/// single read-only auditor, requests only `ReviewAuditor` authority, and never
+/// constructs a supervisor or delegating role binding. Unknown, unavailable,
+/// measured-ineligible, below-`CriticalJudgment`, and below-xhigh candidates
+/// all fail closed before an executable selection is returned.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn select_executable_review_auditor(
+    catalog: &CodexRuntimeModelCatalog,
+) -> Result<ExecutableReviewAuditorSelection> {
+    let task = task_profile_for_role(AgentRole::Auditor);
+    let priors = selector_priors_with_terminal_worker_economics()?;
+    let runtime_catalog = runtime_catalog_from_priors(
+        runtime_name(SupervisorRuntime::Codex),
+        &RuntimeModelCatalog::Codex(catalog.clone()),
+        &task,
+        &priors,
+    )?;
+    let catalog_revision = runtime_catalog.revision.clone();
+    let (calibration_name, calibration_version) = priors
+        .objective_profiles
+        .first()
+        .map(|calibration| (calibration.name.clone(), calibration.version))
+        .context("built-in selector data has no objective profile")?;
+    let mut input = SelectionInput {
+        task,
+        catalogs: vec![runtime_catalog],
+        pools: vec![RuntimePoolState {
+            runtime: runtime_name(SupervisorRuntime::Codex).to_string(),
+            admission_open: true,
+            pool_reference: None,
+            pool_kind: None,
+            entitlement_bounded: true,
+            entitlement_capacity_units: 1,
+            entitlement_remaining_units: 1,
+            pool_pressure_basis_points: 0,
+            observed_consumption_units: 0,
+            marginal_cost_microunits: 0,
+            exhausted: false,
+            exhaustion_behavior: None,
+            authorized_alternatives: Vec::new(),
+            observation_revision: catalog_revision,
+            observation_source: None,
+            admission_provenance:
+                "crate-internal launch adapter admits one non-delegating read-only review auditor"
+                    .to_string(),
+            failover_provenance: None,
+        }],
+        quota_source: None,
+        constraints: OperatorConstraints {
+            allowed_runtimes: [runtime_name(SupervisorRuntime::Codex).to_string()]
+                .into_iter()
+                .collect(),
+            allowed_models: BTreeSet::new(),
+            forbidden_runtimes: BTreeSet::new(),
+            forbidden_models: BTreeSet::new(),
+            forbidden_candidates: BTreeSet::new(),
+            allow_debug_override: false,
+        },
+        priors,
+        objective_profile: ObjectiveProfileRef {
+            name: calibration_name,
+            version: calibration_version,
+            expected_digest: None,
+        },
+        resolved_objective_profile: crate::objective_profile::default_resolved_objective_profile()
+            .context("resolve review-auditor objective profile")?,
+        outcomes: Vec::new(),
+        signals: DynamicSignals {
+            retry_count: 0,
+            budget_signal: BudgetSignal::Continue,
+            previous_choice: None,
+            previous_catalog_digest: None,
+            environment_rejections: Vec::new(),
+        },
+        debug_override: None,
+        operational_observations: None,
+    };
+    input.operational_observations = Some(live_operational_observations(&input));
+
+    let provenance = select_with_live_switch_cost(&input)
+        .map_err(|error| anyhow!("critical ReviewAuditor selector rejected its input: {error}"))?;
+    if provenance.status != DecisionStatus::Selected {
+        bail!(
+            "critical ReviewAuditor selector failed closed against the supplied live catalog: {}",
+            provenance.decision_reason
+        );
+    }
+    if provenance.normalized_task.authority_role != AuthorityRole::ReviewAuditor {
+        bail!("critical ReviewAuditor selector returned mismatched authority provenance");
+    }
+    let choice = provenance
+        .choice
+        .as_ref()
+        .context("critical ReviewAuditor selector reported selected status without a choice")?;
+    if choice.candidate.runtime != runtime_name(SupervisorRuntime::Codex)
+        || !catalog.contains(&choice.candidate.model)
+    {
+        bail!(
+            "critical ReviewAuditor selector returned a runtime/model pair absent from the supplied live catalog"
+        );
+    }
+    if choice.candidate.effort < SelectorEffort::Xhigh {
+        bail!(
+            "critical ReviewAuditor selector returned effort '{}' below the xhigh execution floor",
+            selector_effort_as_str(choice.candidate.effort)
+        );
+    }
+    validate_known_judgment_role_model(AgentRole::Auditor, Some(&choice.candidate.model))
+        .with_context(|| {
+            format!(
+                "selected model '{}' cannot receive ReviewAuditor authority",
+                choice.candidate.model
+            )
+        })?;
+    let capability = trusted_model_capability(&choice.candidate.model).with_context(|| {
+        format!(
+            "selected ReviewAuditor model '{}' lost its trusted capability evidence",
+            choice.candidate.model
+        )
+    })?;
+    let authority = validate_phase_model_binding(
+        AgentRole::Auditor,
+        OrchestrationPhase::Audit,
+        None,
+        capability,
+    )
+    .with_context(|| {
+        format!(
+            "selected model '{}' is below the CriticalJudgment ReviewAuditor floor",
+            choice.candidate.model
+        )
+    })?;
+    let candidate = choice.candidate.clone();
+    Ok(ExecutableReviewAuditorSelection {
+        candidate,
+        authority,
+        provenance,
+    })
+}
+
 #[cfg(test)]
 pub(super) fn initialize_supervisor_selection(
     plan: &mut SupervisorPlan,
@@ -522,11 +834,12 @@ pub(super) fn initialize_supervisor_selection_with_quota(
     } = quota;
 
     let automatic = plan.role_models.is_empty();
-    let roles = if automatic {
-        all_selector_roles().to_vec()
-    } else {
-        plan.role_models.keys().copied().collect()
-    };
+    // A resolved profile is an input to selection, not permission to leave
+    // unspecified roles on the provisional catalog-order path. Resolve every
+    // executable role and apply authored entries only as exact debug
+    // overrides so launch and persisted evidence share one complete decision
+    // set.
+    let roles = all_selector_roles().to_vec();
     if runtime == SupervisorRuntime::Cursor && advertised.cursor.is_none() {
         let role = roles.first().copied().unwrap_or(AgentRole::Worker);
         let detail = advertised
@@ -585,10 +898,10 @@ pub(super) fn initialize_supervisor_selection_with_quota(
                 role.as_str()
             )
         })?;
-        let primary_cause = if automatic {
-            SupervisorSelectionEventCause::Initial
-        } else {
+        let primary_cause = if configured.is_some() {
             SupervisorSelectionEventCause::DebugOverride
+        } else {
+            SupervisorSelectionEventCause::Initial
         };
         let event = SupervisorSelectionEvent {
             assignment_id: None,
@@ -1115,6 +1428,123 @@ fn select_with_live_switch_cost(
     Ok(provenance)
 }
 
+fn selector_priors_with_terminal_worker_economics() -> Result<selection::PriorDataset> {
+    let mut priors = selection::built_in_prior_dataset()?;
+    #[cfg(test)]
+    if TEST_SELECTOR_TRIPLE_RUNNER_UP_ENABLED.with(Cell::get) {
+        let mut runner_up = priors
+            .models
+            .iter()
+            .find(|prior| {
+                prior.runtime == runtime_name(SupervisorRuntime::Codex)
+                    && prior.model == FRONTIER_PROFILE_MODEL
+            })
+            .cloned()
+            .context("selector-triple fixture requires the frontier Codex prior")?;
+        runner_up.model = TEST_SELECTOR_TRIPLE_RUNNER_UP_MODEL.to_string();
+        runner_up.source_id = "test-selector-triple-runner-up-fixture".to_string();
+        runner_up.prior_scope =
+            "test-only deterministic second delegating candidate for selector-triple coverage"
+                .to_string();
+        runner_up.limitations =
+            vec!["test fixture only; not production model or authority evidence".to_string()];
+        runner_up.prohibited_authority_roles = [
+            AuthorityRole::TerminalLeaf,
+            AuthorityRole::AcceptanceGate,
+            AuthorityRole::ReviewAuditor,
+            AuthorityRole::Audit,
+            AuthorityRole::ConflictResolution,
+            AuthorityRole::FailureClassification,
+            AuthorityRole::GitPublication,
+            AuthorityRole::UnknownJudgment,
+        ]
+        .into_iter()
+        .collect();
+        runner_up.one_shot_environment_fallbacks.clear();
+        priors.revision = format!("{}+selector-triple-runner-up-fixture", priors.revision);
+        priors.models.push(runner_up);
+    }
+    #[cfg(test)]
+    if TEST_BELOW_FLOOR_REVIEW_AUDITOR_ENABLED.with(Cell::get) {
+        let mut below_floor = priors
+            .models
+            .iter()
+            .find(|prior| {
+                prior.runtime == runtime_name(SupervisorRuntime::Codex)
+                    && prior.model == FRONTIER_PROFILE_MODEL
+            })
+            .cloned()
+            .context("below-floor ReviewAuditor fixture requires the frontier Codex prior")?;
+        below_floor.model = TEST_BELOW_FLOOR_REVIEW_AUDITOR_MODEL.to_string();
+        below_floor.source_id = "test-below-floor-review-auditor-fixture".to_string();
+        below_floor.prior_scope =
+            "test-only ReviewAuditor candidate whose static capability is below the role floor"
+                .to_string();
+        below_floor.limitations = vec![
+            "test fixture only; exercises the post-selection CriticalJudgment floor".to_string(),
+        ];
+        priors.revision = format!("{}+below-floor-review-auditor-fixture", priors.revision);
+        priors.models.push(below_floor);
+    }
+    let economics = crate::optimizer::objective::terminal_worker_routing_economics()?;
+    if priors
+        .models
+        .iter()
+        .any(|prior| prior.runtime == economics.runtime && prior.model == economics.model)
+    {
+        bail!(
+            "built-in selector data already defines terminal routing evidence for '{}:{}'; refusing an ambiguous duplicate",
+            economics.runtime,
+            economics.model
+        );
+    }
+    let effort = selector_effort_from_str(&economics.effort).with_context(|| {
+        format!(
+            "terminal routing economics names unsupported reasoning effort '{}'",
+            economics.effort
+        )
+    })?;
+    priors.revision = format!("{}+{}", priors.revision, economics.source_id);
+    priors.models.push(selection::ModelPrior {
+        runtime: economics.runtime,
+        model: economics.model,
+        observed_on: economics.observed_on,
+        source_id: economics.source_id,
+        prior_scope: economics.prior_scope,
+        limitations: economics.limitations,
+        prohibited: false,
+        prohibition_reason: None,
+        prohibited_authority_roles: [
+            AuthorityRole::Delegating,
+            AuthorityRole::AcceptanceGate,
+            AuthorityRole::ReviewAuditor,
+            AuthorityRole::Audit,
+            AuthorityRole::ConflictResolution,
+            AuthorityRole::FailureClassification,
+            AuthorityRole::GitPublication,
+            AuthorityRole::UnknownJudgment,
+        ]
+        .into_iter()
+        .collect(),
+        long_context_eligible: false,
+        strong_gate_fallback_efforts: BTreeSet::new(),
+        strength_rank: 40,
+        class_fit: vec![selection::ClassFitPrior {
+            task_class: AUTOMATIC_SELECTION_TASK_CLASS.to_string(),
+            effort,
+            quality_basis_points: economics.quality_basis_points,
+            sample_size: economics.sample_size,
+            execution_cost_microunits: economics.execution_cost_microunits,
+            review_cost_microunits: 0,
+            rework_cost_microunits: 0,
+            rereview_cost_microunits: 0,
+        }],
+        authority_evidence: Vec::new(),
+        one_shot_environment_fallbacks: Vec::new(),
+    });
+    Ok(priors)
+}
+
 fn selection_input_for_role(args: SelectionInputForRoleArgs<'_>) -> Result<SelectionInput> {
     let SelectionInputForRoleArgs {
         role,
@@ -1128,7 +1558,7 @@ fn selection_input_for_role(args: SelectionInputForRoleArgs<'_>) -> Result<Selec
         signals,
         debug_override,
     } = args;
-    let priors = selection::built_in_prior_dataset()?;
+    let priors = selector_priors_with_terminal_worker_economics()?;
     let task = task_profile_for_role(role);
     let runtime_name = runtime_name(runtime);
     let catalogs = constructed_selection_catalogs(runtime, catalog, advertised, &task, &priors)?;
@@ -1321,6 +1751,19 @@ fn constructed_selection_catalogs(
         } else {
             runtime_catalog_from_priors(runtime_name(runtime), catalog, task, priors)?
         }
+    } else if runtime == SupervisorRuntime::Grok {
+        if let Some(observation) = &advertised.grok {
+            runtime_catalog_from_advertised_slugs(
+                "grok",
+                observation.catalog().slugs(),
+                format!("grok-advertised-sha256:{}", observation.source_sha256()),
+                observation.observed_at_unix_millis().to_string(),
+                task,
+                priors,
+            )?
+        } else {
+            runtime_catalog_from_priors(runtime_name(runtime), catalog, task, priors)?
+        }
     } else {
         runtime_catalog_from_priors(runtime_name(runtime), catalog, task, priors)?
     };
@@ -1341,15 +1784,17 @@ fn constructed_selection_catalogs(
             ));
         }
     }
-    if let Some(observation) = &advertised.grok {
-        catalogs.push(runtime_catalog_from_advertised_slugs(
-            "grok",
-            observation.catalog().slugs(),
-            format!("grok-advertised-sha256:{}", observation.source_sha256()),
-            observation.observed_at_unix_millis().to_string(),
-            task,
-            priors,
-        )?);
+    if runtime != SupervisorRuntime::Grok {
+        if let Some(observation) = &advertised.grok {
+            catalogs.push(runtime_catalog_from_advertised_slugs(
+                "grok",
+                observation.catalog().slugs(),
+                format!("grok-advertised-sha256:{}", observation.source_sha256()),
+                observation.observed_at_unix_millis().to_string(),
+                task,
+                priors,
+            )?);
+        }
     }
     Ok(catalogs)
 }
@@ -2747,7 +3192,7 @@ fn selector_effort_from_str(value: &str) -> Option<SelectorEffort> {
     }
 }
 
-fn selector_effort_as_str(effort: SelectorEffort) -> &'static str {
+pub(super) fn selector_effort_as_str(effort: SelectorEffort) -> &'static str {
     match effort {
         SelectorEffort::Low => "low",
         SelectorEffort::Medium => "medium",
@@ -2800,6 +3245,120 @@ mod tests {
                     .map(|prior| prior.model.clone()),
             )?,
         ))
+    }
+
+    #[test]
+    fn executable_review_auditor_selects_strongest_eligible_live_model() -> Result<()> {
+        let catalog = CodexRuntimeModelCatalog::from_slugs([
+            FRONTIER_PROFILE_MODEL,
+            ECONOMY_PROFILE_MODEL,
+            BALANCED_PROFILE_MODEL,
+        ])?;
+
+        let selected = catalog.select_executable_review_auditor()?;
+
+        assert_eq!(selected.candidate.runtime, "codex");
+        assert_eq!(selected.candidate.model, FRONTIER_PROFILE_MODEL);
+        assert_eq!(selected.candidate.effort, SelectorEffort::Xhigh);
+        assert_eq!(
+            selected
+                .provenance
+                .choice
+                .as_ref()
+                .context("ReviewAuditor choice")?
+                .reason,
+            selection::ChoiceReason::StrongestNoEvidenceJudgmentFallback
+        );
+        assert!(selected.provenance.candidate_set.iter().all(|candidate| {
+            candidate.candidate.model == FRONTIER_PROFILE_MODEL || !candidate.eligible
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn executable_review_auditor_refuses_selected_model_below_capability_floor() -> Result<()> {
+        let (_guard, catalog) = bind_test_below_floor_review_auditor()?;
+
+        let error = catalog
+            .select_executable_review_auditor()
+            .expect_err("GeneralJudgment model must not receive ReviewAuditor authority");
+        let detail = format!("{error:#}");
+
+        assert!(detail.contains(TEST_BELOW_FLOOR_REVIEW_AUDITOR_MODEL));
+        assert!(detail.contains("ReviewAuditor authority"));
+        assert!(detail.contains("critical_judgment"));
+        assert!(detail.contains("general_judgment"));
+        Ok(())
+    }
+
+    #[test]
+    fn executable_review_auditor_fails_closed_for_ineligible_unavailable_and_unknown_models(
+    ) -> Result<()> {
+        for (case, models) in [
+            ("ineligible", vec![BALANCED_PROFILE_MODEL]),
+            ("unavailable", vec![ECONOMY_PROFILE_MODEL]),
+            ("unknown", vec!["provider-unknown-review-model"]),
+        ] {
+            let catalog = CodexRuntimeModelCatalog::from_slugs(models)?;
+            let error = catalog
+                .select_executable_review_auditor()
+                .expect_err("non-executable ReviewAuditor catalog must fail closed");
+            assert!(
+                error.to_string().contains("failed closed"),
+                "{case}: {error:#}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn executable_review_auditor_returns_authority_and_selector_provenance() -> Result<()> {
+        let catalog = CodexRuntimeModelCatalog::from_slugs([FRONTIER_PROFILE_MODEL])?;
+
+        let selected = catalog.select_executable_review_auditor()?;
+        let provenance = &selected.provenance;
+
+        assert_eq!(selected.authority.role, AgentRole::Auditor);
+        assert_eq!(selected.authority.phase, OrchestrationPhase::Audit);
+        assert_eq!(
+            selected.authority.required_capability,
+            ModelCapabilityClass::CriticalJudgment
+        );
+        assert_eq!(
+            selected.authority.selected_capability,
+            ModelCapabilityClass::CriticalJudgment
+        );
+        assert_eq!(provenance.status, DecisionStatus::Selected);
+        assert_eq!(
+            provenance.normalized_task.authority_role,
+            AuthorityRole::ReviewAuditor
+        );
+        assert_eq!(
+            provenance.normalized_task.task_class,
+            JUDGMENT_SELECTION_TASK_CLASS
+        );
+        assert_eq!(
+            provenance
+                .choice
+                .as_ref()
+                .context("ReviewAuditor choice")?
+                .candidate,
+            selected.candidate
+        );
+        assert!(!provenance.input_digests.normalized_input.value.is_empty());
+        assert!(!provenance.resolved_objective_profile.profile.id.is_empty());
+        assert!(provenance.normalized_input.catalogs.iter().any(|runtime| {
+            runtime.runtime == "codex"
+                && runtime.models.iter().any(|model| {
+                    model.model == FRONTIER_PROFILE_MODEL
+                        && model.available
+                        && model
+                            .capabilities
+                            .authority_roles
+                            .contains(&AuthorityRole::ReviewAuditor)
+                })
+        }));
+        Ok(())
     }
 
     fn test_plan() -> SupervisorPlan {
@@ -3904,6 +4463,62 @@ mod tests {
     }
 
     #[test]
+    fn partial_profile_retains_typed_authority_refusal_instead_of_catalog_fallback() -> Result<()> {
+        let worker_prior = codex_prior_for(|prior| {
+            prior
+                .prohibited_authority_roles
+                .contains(&AuthorityRole::AcceptanceGate)
+                && prior
+                    .class_fit
+                    .iter()
+                    .any(|class_fit| class_fit.task_class == AUTOMATIC_SELECTION_TASK_CLASS)
+        })?;
+        let worker_effort = worker_prior
+            .class_fit
+            .iter()
+            .find(|class_fit| class_fit.task_class == AUTOMATIC_SELECTION_TASK_CLASS)
+            .map(|class_fit| selector_effort_as_str(class_fit.effort))
+            .context("worker-only prior effort")?;
+        let catalog =
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs([worker_prior
+                .model
+                .clone()])?);
+        let mut plan = test_plan();
+        plan.role_models.insert(
+            AgentRole::Worker,
+            role_selection(worker_prior.model, Some(worker_effort)),
+        );
+
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+        )?;
+
+        assert_eq!(resolution.mode, SupervisorSelectionMode::DebugOverride);
+        let failure = resolution
+            .selection_preflight_failure
+            .as_ref()
+            .context("authority selection must fail closed")?;
+        assert_eq!(failure.role, AgentRole::Supervisor);
+        assert_eq!(
+            failure.kind,
+            SupervisorSelectionPreflightFailureKind::FailClosed
+        );
+        assert!(failure.message.contains("selector failed closed"));
+        let decision = resolution
+            .decisions
+            .first()
+            .context("typed authority refusal decision")?;
+        assert_eq!(decision.role, AgentRole::Supervisor);
+        assert_eq!(decision.provenance.status, DecisionStatus::FailClosed);
+        assert!(decision.provenance.choice.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn debug_mode_applies_exact_selector_triple_to_plan() -> Result<()> {
         let catalog = codex_catalog()?;
         let prior = codex_prior_for(|prior| {
@@ -3930,16 +4545,20 @@ mod tests {
         )?;
 
         assert_eq!(resolution.mode, SupervisorSelectionMode::DebugOverride);
-        assert_eq!(resolution.decisions.len(), 1);
-        assert_eq!(resolution.decisions[0].role, AgentRole::Worker);
-        assert_eq!(resolution.decisions[0].attempt, 0);
-        assert!(resolution.decisions[0].assignment_id.is_none());
+        assert_eq!(resolution.decisions.len(), all_selector_roles().len());
+        let worker = resolution
+            .decisions
+            .iter()
+            .find(|decision| decision.role == AgentRole::Worker)
+            .context("Worker debug decision")?;
+        assert_eq!(worker.attempt, 0);
+        assert!(worker.assignment_id.is_none());
         assert_eq!(
-            resolution.decisions[0].primary_cause,
+            worker.primary_cause,
             SupervisorSelectionEventCause::DebugOverride
         );
         assert_eq!(
-            resolution.decisions[0]
+            worker
                 .provenance
                 .choice
                 .as_ref()
@@ -3947,6 +4566,15 @@ mod tests {
                 .candidate,
             requested
         );
+        assert!(resolution.decisions.iter().all(|decision| {
+            decision.role == AgentRole::Worker
+                || decision.primary_cause == SupervisorSelectionEventCause::Initial
+        }));
+        assert_eq!(plan.role_models.len(), all_selector_roles().len());
+        assert!(plan.role_models.values().all(|selection| matches!(
+            selection.unavailable_model_fallback,
+            UnavailableModelFallback::FailClosed
+        )));
         assert_eq!(
             plan.role_models
                 .get(&AgentRole::Worker)
@@ -4514,6 +5142,10 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/runtime_adapter/cursor/hand-authored-withdrawn.txt"
     ));
+    const CAPTURED_GROK_CATALOG: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/runtime_adapter/grok/captured-minimal-20260821.txt"
+    ));
     const CAPTURED_CURSOR_AT_UNIX_MILLIS: u64 = 1_787_240_463_000;
 
     struct FakeCursorRunner {
@@ -4591,6 +5223,7 @@ mod tests {
 
     struct FakeGrokRunner {
         output: crate::runtime_adapter::grok::GrokCatalogCommandOutput,
+        observed_specs: RefCell<Vec<crate::runtime_adapter::grok::GrokCatalogCommandSpec>>,
     }
 
     impl FakeGrokRunner {
@@ -4610,6 +5243,7 @@ mod tests {
                         crate::process_runner::SideEffectConfinementProfileKind::TrustedFixedNetwork,
                     ),
                 },
+                observed_specs: RefCell::new(Vec::new()),
             }
         }
     }
@@ -4617,9 +5251,32 @@ mod tests {
     impl crate::runtime_adapter::grok::GrokCatalogCommandRunner for FakeGrokRunner {
         fn run(
             &self,
+            spec: &crate::runtime_adapter::grok::GrokCatalogCommandSpec,
+        ) -> Result<crate::runtime_adapter::grok::GrokCatalogCommandOutput> {
+            self.observed_specs.borrow_mut().push(spec.clone());
+            Ok(self.output.clone())
+        }
+    }
+
+    struct MissingGrokRunner;
+
+    impl crate::runtime_adapter::grok::GrokCatalogCommandRunner for MissingGrokRunner {
+        fn run(
+            &self,
             _spec: &crate::runtime_adapter::grok::GrokCatalogCommandSpec,
         ) -> Result<crate::runtime_adapter::grok::GrokCatalogCommandOutput> {
-            Ok(self.output.clone())
+            bail!("Grok catalog executable 'grok' is missing")
+        }
+    }
+
+    struct UnavailableGrokRunner(&'static str);
+
+    impl crate::runtime_adapter::grok::GrokCatalogCommandRunner for UnavailableGrokRunner {
+        fn run(
+            &self,
+            _spec: &crate::runtime_adapter::grok::GrokCatalogCommandSpec,
+        ) -> Result<crate::runtime_adapter::grok::GrokCatalogCommandOutput> {
+            bail!(self.0)
         }
     }
 
@@ -5075,6 +5732,60 @@ mod tests {
     }
 
     #[test]
+    fn selected_grok_uses_one_authenticated_advertised_primary_catalog() -> Result<()> {
+        let advertised = advertised_with_grok(discover_grok_observation(CAPTURED_GROK_CATALOG)?);
+        let priors = selector_priors_with_terminal_worker_economics()?;
+        let catalogs = constructed_selection_catalogs(
+            SupervisorRuntime::Grok,
+            &RuntimeModelCatalog::OperatorDeclared,
+            &advertised,
+            &task_profile_for_role(AgentRole::Worker),
+            &priors,
+        )?;
+
+        assert_eq!(catalogs.len(), 1);
+        assert_eq!(catalogs[0].runtime, "grok");
+        assert!(catalogs[0].revision.starts_with("grok-advertised-sha256:"));
+        assert!(catalogs[0]
+            .models
+            .iter()
+            .any(|model| model.model == "grok-4.6"));
+        Ok(())
+    }
+
+    #[test]
+    fn genuinely_duplicated_grok_catalog_input_still_fails_closed() -> Result<()> {
+        let advertised = advertised_with_grok(discover_grok_observation(CAPTURED_GROK_CATALOG)?);
+        let resolved = default_resolved_profile();
+        let mut input = selection_input_for_role(SelectionInputForRoleArgs {
+            role: AgentRole::Worker,
+            runtime: SupervisorRuntime::Grok,
+            catalog: &RuntimeModelCatalog::OperatorDeclared,
+            advertised: &advertised,
+            admission: &test_admission(),
+            resolved_objective_profile: &resolved,
+            quota_context: None,
+            quota_ledger: None,
+            signals: DynamicSignals {
+                retry_count: 0,
+                budget_signal: BudgetSignal::Continue,
+                previous_choice: None,
+                previous_catalog_digest: None,
+                environment_rejections: Vec::new(),
+            },
+            debug_override: None,
+        })?;
+        input.catalogs.push(input.catalogs[0].clone());
+
+        let error = selection::select(&input).expect_err("duplicate runtime must fail closed");
+        assert_eq!(
+            error.to_string(),
+            "invalid selection input: runtime catalogs contain a duplicate runtime"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn cursor_catalog_gap_detail_is_utf8_safe_and_bounded() {
         let detail = "界".repeat(CURSOR_CATALOG_EVIDENCE_GAP_MAX_BYTES);
         let bounded = bounded_cursor_catalog_gap_detail(&detail);
@@ -5170,6 +5881,435 @@ mod tests {
             format!("{missing:#}").contains("failed to read hermetic Cursor catalog fixture"),
             "{missing:#}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn live_grok_catalog_bridge_observes_the_default_catalog_hermetically() -> Result<()> {
+        let runner = FakeGrokRunner::successful(CAPTURED_GROK_CATALOG);
+        let observation = observe_optional_live_grok_catalog(
+            &runner,
+            Path::new("/workspace"),
+            CAPTURED_CURSOR_AT_UNIX_MILLIS,
+            None,
+        )?
+        .context("installed Grok catalog observation")?;
+
+        assert!(observation.catalog().contains("grok-4.6"));
+        assert_eq!(
+            observation.observed_at_unix_millis(),
+            CAPTURED_CURSOR_AT_UNIX_MILLIS
+        );
+        let specs = runner.observed_specs.borrow();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            specs[0].program(),
+            Path::new(crate::runtime_adapter::grok::default_grok_executable())
+        );
+        assert!(specs[0].program().is_absolute());
+        assert_eq!(specs[0].args(), &[std::ffi::OsString::from("models")]);
+        assert_eq!(specs[0].current_dir(), Path::new("/workspace"));
+        Ok(())
+    }
+
+    #[test]
+    fn live_grok_catalog_bridge_applies_the_explicit_program_override() -> Result<()> {
+        let runner = FakeGrokRunner::successful(CAPTURED_GROK_CATALOG);
+        let program = std::ffi::OsStr::new("/opt/maco/bin/grok-pinned");
+        let observation = observe_optional_live_grok_catalog(
+            &runner,
+            Path::new("/workspace"),
+            CAPTURED_CURSOR_AT_UNIX_MILLIS,
+            Some(program),
+        )?
+        .context("overridden Grok catalog observation")?;
+
+        assert!(observation.catalog().contains("grok-4.6"));
+        let specs = runner.observed_specs.borrow();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].program(), Path::new(program));
+        Ok(())
+    }
+
+    #[test]
+    fn live_grok_catalog_bridge_refuses_a_relative_explicit_program_without_running_it() {
+        let runner = FakeGrokRunner::successful(CAPTURED_GROK_CATALOG);
+        let error = observe_optional_live_grok_catalog(
+            &runner,
+            Path::new("/workspace"),
+            CAPTURED_CURSOR_AT_UNIX_MILLIS,
+            Some(std::ffi::OsStr::new("relative/grok")),
+        )
+        .expect_err("a relative MACO_GROK_BIN must fail closed");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("MACO_GROK_BIN must be an absolute path"),
+            "{message}"
+        );
+        assert!(message.contains("ambient PATH"), "{message}");
+        assert!(runner.observed_specs.borrow().is_empty());
+    }
+
+    #[test]
+    fn live_grok_catalog_bridge_only_omits_an_unconfigured_missing_binary() -> Result<()> {
+        assert_eq!(
+            observe_optional_live_grok_catalog(
+                &MissingGrokRunner,
+                Path::new("/workspace"),
+                CAPTURED_CURSOR_AT_UNIX_MILLIS,
+                None,
+            )?,
+            None
+        );
+
+        let error = observe_optional_live_grok_catalog(
+            &MissingGrokRunner,
+            Path::new("/workspace"),
+            CAPTURED_CURSOR_AT_UNIX_MILLIS,
+            Some(std::ffi::OsStr::new("/configured/grok")),
+        )
+        .expect_err("an explicit missing Grok binary must fail closed");
+        assert!(
+            format!("{error:#}").contains("live Grok catalog observation failed closed"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn live_grok_catalog_bridge_omits_implicit_missing_or_unavailable_authentication() -> Result<()>
+    {
+        for message in [
+            "Grok authentication source auth.json is missing",
+            "Grok authentication source auth.json is unavailable",
+        ] {
+            assert_eq!(
+                observe_optional_live_grok_catalog(
+                    &UnavailableGrokRunner(message),
+                    Path::new("/workspace"),
+                    CAPTURED_CURSOR_AT_UNIX_MILLIS,
+                    None,
+                )?,
+                None
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn live_grok_catalog_bridge_omits_an_implicit_unauthenticated_invalid_header() -> Result<()> {
+        let runner = FakeGrokRunner::successful(b"You are not logged in.\n");
+        assert_eq!(
+            observe_optional_live_grok_catalog(
+                &runner,
+                Path::new("/workspace"),
+                CAPTURED_CURSOR_AT_UNIX_MILLIS,
+                None,
+            )?,
+            None
+        );
+        assert_eq!(runner.observed_specs.borrow().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn live_grok_catalog_bridge_fails_closed_for_explicit_unauthenticated_invalid_header() {
+        let error = observe_optional_live_grok_catalog(
+            &FakeGrokRunner::successful(b"You are not logged in.\n"),
+            Path::new("/workspace"),
+            CAPTURED_CURSOR_AT_UNIX_MILLIS,
+            Some(std::ffi::OsStr::new("/configured/grok")),
+        )
+        .expect_err("an explicit unauthenticated Grok listing must fail closed");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("live Grok catalog observation failed closed"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Grok runtime model catalog has an invalid header"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn live_grok_catalog_bridge_fails_closed_for_suspicious_implicit_credentials() {
+        for suspicious in [
+            "Grok authentication source auth.json is not a regular file",
+            "Grok authentication source auth.json identity changed",
+        ] {
+            let error = observe_optional_live_grok_catalog(
+                &UnavailableGrokRunner(suspicious),
+                Path::new("/workspace"),
+                CAPTURED_CURSOR_AT_UNIX_MILLIS,
+                None,
+            )
+            .expect_err("suspicious Grok credential state must fail closed");
+
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("live Grok catalog observation failed closed"),
+                "{message}"
+            );
+            assert!(message.contains(suspicious), "{message}");
+        }
+    }
+
+    #[test]
+    fn live_grok_46_xhigh_is_selected_by_recorded_worker_economics() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let observation = discover_grok_observation(CAPTURED_GROK_CATALOG)?;
+        let mut plan = test_plan();
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &advertised_with_grok(observation),
+        )?;
+        let worker = resolution
+            .decisions
+            .iter()
+            .find(|decision| decision.role == AgentRole::Worker)
+            .context("worker decision")?;
+        assert_eq!(worker.primary_cause, SupervisorSelectionEventCause::Initial);
+        assert_eq!(
+            worker.provenance.resolved_objective_profile.source,
+            crate::objective_profile::ObjectiveProfileSource::BuiltIn
+        );
+        assert_eq!(
+            worker.provenance.resolved_objective_profile.profile.id,
+            crate::objective_profile::DEFAULT_OBJECTIVE_PROFILE_ID
+        );
+        worker
+            .provenance
+            .resolved_objective_profile
+            .profile
+            .validate()?;
+        let choice = worker.provenance.choice.as_ref().context("worker choice")?;
+        assert_eq!(
+            choice.candidate.runtime,
+            crate::optimizer::objective::DEFAULT_TERMINAL_RUNTIME
+        );
+        assert_eq!(
+            choice.candidate.model,
+            crate::optimizer::objective::DEFAULT_TERMINAL_MODEL
+        );
+        assert_eq!(choice.candidate.effort, SelectorEffort::Xhigh);
+        assert_eq!(
+            choice.reason,
+            selection::ChoiceReason::LowestExpectedTotalCostPerAcceptedTask
+        );
+        let evaluation = worker
+            .provenance
+            .candidate_set
+            .iter()
+            .find(|evaluation| evaluation.candidate == choice.candidate)
+            .context("selected worker evaluation")?;
+        assert!(evaluation.eligible);
+        assert_eq!(
+            evaluation.prior_source_id.as_deref(),
+            Some(crate::optimizer::objective::DEFAULT_TERMINAL_EVIDENCE_SOURCE_ID)
+        );
+        let selected_score = evaluation.score.as_ref().context("selected worker score")?;
+        assert_eq!(selected_score.posterior_quality_basis_points, 9_560);
+        assert_eq!(
+            selected_score.expected_total_cost_per_accepted_task_microunits,
+            87_552
+        );
+        assert_eq!(
+            choice.total_score_microunits,
+            selected_score.total_score_microunits
+        );
+        let runner_up = worker
+            .provenance
+            .runner_up_scores
+            .first()
+            .context("worker runner-up score")?;
+        assert_eq!(runner_up.rank, 2);
+        assert_ne!(runner_up.candidate, choice.candidate);
+        assert!(runner_up.total_score_microunits > choice.total_score_microunits);
+        assert!(worker.provenance.candidate_set.iter().all(|candidate| {
+            !candidate.eligible
+                || candidate.candidate == choice.candidate
+                || candidate.score.as_ref().is_some_and(|score| {
+                    score.total_score_microunits > selected_score.total_score_microunits
+                })
+        }));
+        assert!(worker
+            .provenance
+            .normalized_input
+            .catalogs
+            .iter()
+            .any(|runtime_catalog| {
+                runtime_catalog.runtime == crate::optimizer::objective::DEFAULT_TERMINAL_RUNTIME
+                    && runtime_catalog
+                        .revision
+                        .starts_with("grok-advertised-sha256:")
+                    && runtime_catalog.models.iter().any(|model| {
+                        model.model == crate::optimizer::objective::DEFAULT_TERMINAL_MODEL
+                            && model.supported_efforts == [SelectorEffort::Xhigh]
+                    })
+            }));
+        assert_eq!(
+            plan.role_models
+                .get(&AgentRole::Worker)
+                .and_then(|selection| selection.reasoning_effort.as_deref()),
+            Some("xhigh")
+        );
+        assert!(matches!(
+            plan.role_models[&AgentRole::Worker].unavailable_model_fallback,
+            UnavailableModelFallback::FailClosed
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_grok_46_falls_back_to_scored_codex_with_honest_membership() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let withdrawn =
+            discover_grok_observation(&grok_listing("grok-4.5", &["  * grok-4.5 (default)"]))?;
+        let mut plan = test_plan();
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &advertised_with_grok(withdrawn),
+        )?;
+        let worker = resolution
+            .decisions
+            .iter()
+            .find(|decision| decision.role == AgentRole::Worker)
+            .context("worker decision")?;
+        assert!(worker.provenance.candidate_set.iter().all(|evaluation| {
+            evaluation.candidate.model != crate::optimizer::objective::DEFAULT_TERMINAL_MODEL
+        }));
+        let choice = worker
+            .provenance
+            .choice
+            .as_ref()
+            .context("fallback worker choice")?;
+        assert_eq!(choice.candidate.runtime, "codex");
+        assert_eq!(
+            choice.reason,
+            selection::ChoiceReason::LowestExpectedTotalCostPerAcceptedTask
+        );
+        assert!(worker
+            .provenance
+            .normalized_input
+            .catalogs
+            .iter()
+            .find(|runtime_catalog| runtime_catalog.runtime == "grok")
+            .is_some_and(|runtime_catalog| runtime_catalog.models.is_empty()));
+        Ok(())
+    }
+
+    #[test]
+    fn grok_worker_economics_never_grant_delegating_or_judgment_authority() -> Result<()> {
+        let priors = selector_priors_with_terminal_worker_economics()?;
+        for authority in [
+            AuthorityRole::Delegating,
+            AuthorityRole::ReviewAuditor,
+            AuthorityRole::GitPublication,
+        ] {
+            assert!(matches!(
+                priors.measured_authority_eligibility(
+                    crate::optimizer::objective::DEFAULT_TERMINAL_MODEL,
+                    authority,
+                ),
+                selection::MeasuredAuthorityEligibility::Ineligible { .. }
+            ));
+        }
+
+        let catalog = codex_catalog()?;
+        let observation = discover_grok_observation(CAPTURED_GROK_CATALOG)?;
+        let mut plan = test_plan();
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &advertised_with_grok(observation),
+        )?;
+        for role in [
+            AgentRole::Supervisor,
+            AgentRole::ChildOrchestrator,
+            AgentRole::Auditor,
+            AgentRole::GateClassifier,
+        ] {
+            let decision = resolution
+                .decisions
+                .iter()
+                .find(|decision| decision.role == role)
+                .with_context(|| format!("{} decision", role.as_str()))?;
+            assert_eq!(
+                decision
+                    .provenance
+                    .choice
+                    .as_ref()
+                    .with_context(|| format!("{} choice", role.as_str()))?
+                    .candidate
+                    .runtime,
+                "codex",
+                "{}",
+                role.as_str()
+            );
+            assert!(decision.provenance.candidate_set.iter().all(|evaluation| {
+                evaluation.candidate.model != crate::optimizer::objective::DEFAULT_TERMINAL_MODEL
+                    || !evaluation.eligible
+            }));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_worker_override_wins_over_live_grok_worker_economics() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let observation = discover_grok_observation(CAPTURED_GROK_CATALOG)?;
+        let requested = codex_prior_for(|prior| {
+            prior.class_fit.iter().any(|class_fit| {
+                class_fit.task_class == AUTOMATIC_SELECTION_TASK_CLASS
+                    && class_fit.effort == SelectorEffort::High
+            })
+        })?;
+        let mut plan = test_plan();
+        plan.role_models.insert(
+            AgentRole::Worker,
+            role_selection(requested.model.clone(), Some("high")),
+        );
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &advertised_with_grok(observation),
+        )?;
+        let worker = resolution
+            .decisions
+            .iter()
+            .find(|decision| decision.role == AgentRole::Worker)
+            .context("worker decision")?;
+        let choice = worker
+            .provenance
+            .choice
+            .as_ref()
+            .context("worker override choice")?;
+        assert_eq!(choice.candidate.runtime, "codex");
+        assert_eq!(choice.candidate.model, requested.model);
+        assert_eq!(choice.candidate.effort, SelectorEffort::High);
+        assert_eq!(choice.reason, selection::ChoiceReason::DebugOverride);
+        assert!(matches!(
+            worker
+                .provenance
+                .debug_override
+                .as_ref()
+                .context("worker debug override provenance")?
+                .disposition,
+            selection::DebugOverrideDisposition::Applied
+        ));
         Ok(())
     }
 

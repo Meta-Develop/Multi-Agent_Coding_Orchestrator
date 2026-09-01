@@ -609,6 +609,8 @@ fn external_source_guard_separates_full_freshness_from_action_revision_and_accep
         "headRefOid": "1".repeat(40),
         "baseRefOid": "2".repeat(40),
         "isDraft": false,
+        "headRepository": {"nameWithOwner": "acme/repo"},
+        "isCrossRepository": false,
         "files": [{"path": "src/lib.rs"}],
         "reviewDecision": "",
         "latestReviews": [],
@@ -639,6 +641,22 @@ fn external_source_guard_separates_full_freshness_from_action_revision_and_accep
         volatile_guard.action_revision_digest
     );
     assert!(revalidate_external_source_value(&expected, &volatile).is_err());
+
+    let mut forked = original.clone();
+    forked["headRepository"] = serde_json::json!({"nameWithOwner": "contributor/repo"});
+    forked["isCrossRepository"] = serde_json::json!(true);
+    let forked_guard = github_source_guard_from_value(
+        "github.example",
+        "github.example/acme/repo",
+        &stable_external_digest(b"source-repo"),
+        ExternalSourceObjectKind::PullRequest,
+        &forked,
+    )
+    .expect("forked guard");
+    assert_ne!(
+        expected.action_revision_digest,
+        forked_guard.action_revision_digest
+    );
 
     let mut changed = volatile;
     changed["title"] = serde_json::json!("changed title");
@@ -672,6 +690,8 @@ fn github_source_guard_requires_exact_typed_fields_and_only_documented_nulls() {
         "headRefOid": "1".repeat(40),
         "baseRefOid": "2".repeat(40),
         "isDraft": false,
+        "headRepository": {"nameWithOwner": "acme/repo"},
+        "isCrossRepository": false,
         "files": [],
         "reviewDecision": null,
         "latestReviews": [],
@@ -702,6 +722,8 @@ fn github_source_guard_requires_exact_typed_fields_and_only_documented_nulls() {
         "headRefOid",
         "baseRefOid",
         "isDraft",
+        "headRepository",
+        "isCrossRepository",
         "files",
         "reviewDecision",
         "latestReviews",
@@ -717,6 +739,8 @@ fn github_source_guard_requires_exact_typed_fields_and_only_documented_nulls() {
         ("labels", serde_json::json!(null)),
         ("labels", serde_json::json!([null])),
         ("isDraft", serde_json::json!(null)),
+        ("headRepository", serde_json::json!("acme/repo")),
+        ("isCrossRepository", serde_json::json!(null)),
         ("files", serde_json::json!({})),
         ("files", serde_json::json!([null])),
         ("reviewDecision", serde_json::json!(false)),
@@ -3283,14 +3307,22 @@ fn publication_network_capability_callsites_are_exactly_audited() {
     assert_eq!(
         constructors,
         [
+            "inbox.rs",
             "process_runner.rs",
             "publication.rs",
             "publication.rs",
-            "runtime_adapter.rs",
             "supervise.rs",
         ]
     );
-    assert_eq!(runners, ["publication.rs", "publication.rs"]);
+    assert_eq!(
+        runners,
+        [
+            "inbox.rs",
+            "publication.rs",
+            "publication.rs",
+            "publication.rs",
+        ]
+    );
 }
 
 fn rust_sources_under(root: &Path) -> Vec<PathBuf> {
@@ -3700,4 +3732,1481 @@ fn publication_remote_binding_key_recovers_only_known_crash_temp_link() {
         .expect_err("unknown hard link must fail")
         .to_string()
         .contains("multiple hard links"));
+}
+
+use crate::optimizer::{
+    ids::TimestampMillis,
+    merge_authority::{
+        AgentIdentity, CompletionMode, LensDecision, LensVerdict, MergeActor, MergeBlocker,
+        ProducerFingerprint, SessionId,
+    },
+};
+use crate::publication::forge_transport::{
+    decide_pull_request_merge, AuthenticatedPullRequestMergeEvidence, FakeForgeTransport,
+    ForgeActor, ForgeCheck, ForgeCheckConclusion, ForgeCheckStatus, ForgeItem, ForgeItemKind,
+    ForgeRepository, ForgeReview, ForgeReviewState, ForgeTimestamp, ProviderObjectId,
+    ProviderObjectKind, PullRequestAuditorEvidence, PullRequestChangedPathsEvidence,
+    PullRequestFreshnessEvidence, PullRequestFreshnessStatus, PullRequestMergeAuthorityBlocker,
+    PullRequestMergeAuthorityDecision, PullRequestMergeAuthorityInput,
+    PullRequestMergeSimulationEvidence, PullRequestProducerEvidence, PullRequestReviewSnapshot,
+    ReportedActorKind,
+};
+
+const MERGE_AUTHORITY_OBSERVED_AT: &str = "2026-08-30T09:00:00Z";
+
+fn merge_authority_object(kind: ProviderObjectKind, stable_id: &str) -> ProviderObjectId {
+    ProviderObjectId::new("github", kind, stable_id).expect("valid provider object")
+}
+
+fn merge_authority_repository() -> ForgeRepository {
+    ForgeRepository::new(
+        "github",
+        "github.example/acme/repo",
+        merge_authority_object(ProviderObjectKind::Repository, "R_authority"),
+    )
+    .expect("valid repository")
+}
+
+fn merge_authority_item(head_oid: &str) -> ForgeItem {
+    ForgeItem::new(
+        merge_authority_repository(),
+        ForgeItemKind::PullRequest,
+        327,
+        merge_authority_object(ProviderObjectKind::Item, "PR_327"),
+        "revision:327",
+        Some(head_oid.to_string()),
+        Some("2".repeat(40)),
+    )
+    .expect("valid pull request")
+}
+
+fn merge_authority_check(
+    stable_id: &str,
+    name: &str,
+    status: ForgeCheckStatus,
+    conclusion: Option<ForgeCheckConclusion>,
+    head_oid: &str,
+) -> ForgeCheck {
+    ForgeCheck::new(
+        merge_authority_object(ProviderObjectKind::Check, stable_id),
+        ForgeActor::new(
+            "github",
+            merge_authority_object(ProviderObjectKind::Actor, "BOT_ci"),
+            "ci-bot",
+            ReportedActorKind::Bot,
+        )
+        .expect("valid check actor"),
+        name,
+        status,
+        conclusion,
+        head_oid,
+        ForgeTimestamp::new(MERGE_AUTHORITY_OBSERVED_AT).expect("valid check timestamp"),
+    )
+    .expect("valid check")
+}
+
+fn merge_authority_auditor_review(
+    head_oid: &str,
+    actor_id: &str,
+    state: ForgeReviewState,
+) -> ForgeReview {
+    ForgeReview::new(
+        merge_authority_object(ProviderObjectKind::Review, "R_auditor"),
+        ForgeActor::new(
+            "github",
+            merge_authority_object(ProviderObjectKind::Actor, actor_id),
+            actor_id,
+            ReportedActorKind::Human,
+        )
+        .expect("valid auditor actor"),
+        state,
+        "authenticated auditor approval",
+        ForgeTimestamp::new(MERGE_AUTHORITY_OBSERVED_AT).expect("valid review timestamp"),
+        head_oid,
+    )
+    .expect("valid auditor review")
+}
+
+fn merge_execution_snapshot(
+    head_oid: &str,
+    lint_status: ForgeCheckStatus,
+    lint_conclusion: Option<ForgeCheckConclusion>,
+    auditor_actor_id: &str,
+    review_state: ForgeReviewState,
+) -> PullRequestReviewSnapshot {
+    PullRequestReviewSnapshot::new(
+        merge_authority_item(head_oid),
+        ForgeTimestamp::new(MERGE_AUTHORITY_OBSERVED_AT).expect("valid observation timestamp"),
+        vec![merge_authority_auditor_review(
+            head_oid,
+            auditor_actor_id,
+            review_state,
+        )],
+        Vec::new(),
+        vec![
+            merge_authority_check(
+                "C_unit",
+                "ci/unit",
+                ForgeCheckStatus::Completed,
+                Some(ForgeCheckConclusion::Success),
+                head_oid,
+            ),
+            merge_authority_check("C_lint", "ci/lint", lint_status, lint_conclusion, head_oid),
+        ],
+    )
+    .expect("valid review snapshot")
+}
+
+fn merge_authority_fixture(
+    lint_status: ForgeCheckStatus,
+    lint_conclusion: Option<ForgeCheckConclusion>,
+) -> (PullRequestReviewSnapshot, PullRequestMergeAuthorityInput) {
+    let snapshot = merge_execution_snapshot(
+        &"1".repeat(40),
+        lint_status,
+        lint_conclusion,
+        "auditor",
+        ForgeReviewState::Approved,
+    );
+    let producer_actor = MergeActor {
+        agent: AgentIdentity {
+            stable_id: "producer".to_string(),
+        },
+        session: SessionId {
+            id: "producer-session".to_string(),
+        },
+        model_label: "worker-model".to_string(),
+    };
+    let input = PullRequestMergeAuthorityInput {
+        freshness: Some(PullRequestFreshnessEvidence {
+            current_item: snapshot.item().clone(),
+            snapshot_observed_at: snapshot.observed_at().clone(),
+            status: PullRequestFreshnessStatus::Fresh,
+            decided_at: TimestampMillis::from_millis(1_777_777_777_000),
+        }),
+        required_checks: Some(vec!["ci/unit".to_string(), "ci/lint".to_string()]),
+        producer: Some(PullRequestProducerEvidence {
+            head_oid: "1".repeat(40),
+            producer: ProducerFingerprint {
+                actor: producer_actor,
+                commit_authors: vec!["producer".to_string()],
+                commit_committers: vec!["producer".to_string()],
+            },
+        }),
+        auditor: Some(PullRequestAuditorEvidence {
+            head_oid: "1".repeat(40),
+            snapshot_observed_at: snapshot.observed_at().clone(),
+            auditor: MergeActor {
+                agent: AgentIdentity {
+                    stable_id: "auditor".to_string(),
+                },
+                session: SessionId {
+                    id: "auditor-session".to_string(),
+                },
+                model_label: "auditor-model".to_string(),
+            },
+            lenses: vec![
+                LensVerdict {
+                    lens_id: "diff-lens".to_string(),
+                    model_label: "review-model-a".to_string(),
+                    framing: "adversarial-diff".to_string(),
+                    information_scope: "diff-only".to_string(),
+                    decision: LensDecision::Accept,
+                },
+                LensVerdict {
+                    lens_id: "test-lens".to_string(),
+                    model_label: "review-model-b".to_string(),
+                    framing: "tests-as-contract".to_string(),
+                    information_scope: "tests-only".to_string(),
+                    decision: LensDecision::Accept,
+                },
+            ],
+        }),
+        merge_simulation: Some(PullRequestMergeSimulationEvidence {
+            head_oid: "1".repeat(40),
+            base_oid: "2".repeat(40),
+            snapshot_observed_at: snapshot.observed_at().clone(),
+            merges_cleanly: true,
+        }),
+        completion_mode: Some(CompletionMode::MergeCommit),
+        changed_paths: Some(PullRequestChangedPathsEvidence {
+            head_oid: "1".repeat(40),
+            paths: vec![PathBuf::from("src/publication/forge_coordination.rs")],
+        }),
+    };
+    (snapshot, input)
+}
+
+fn assert_merge_authority_blocker(
+    decision: &PullRequestMergeAuthorityDecision,
+    expected: impl Fn(&PullRequestMergeAuthorityBlocker) -> bool,
+) {
+    assert!(
+        !decision.is_allowed(),
+        "unexpected allowed decision: {decision:?}"
+    );
+    assert!(
+        decision.blockers().iter().any(expected),
+        "expected blocker was absent: {decision:?}"
+    );
+}
+
+#[test]
+fn pull_request_merge_evidence_adapter_allows_fully_bound_green_evidence() {
+    let (snapshot, input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+
+    let decision = decide_pull_request_merge(&snapshot, &input);
+
+    assert!(
+        decision.is_allowed(),
+        "green evidence was blocked: {decision:?}"
+    );
+    let optimizer = decision.merge_decision().expect("optimizer decision");
+    assert!(optimizer.auto_merge_performed);
+    assert!(optimizer.blockers.is_empty());
+    assert!(optimizer.failed_checks.is_empty());
+    assert!(optimizer.explanation.contains("ci/unit, ci/lint"));
+}
+
+#[test]
+fn pull_request_merge_evidence_adapter_types_every_missing_input() {
+    let (snapshot, baseline) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+
+    let mut input = baseline.clone();
+    input.freshness = None;
+    assert_merge_authority_blocker(&decide_pull_request_merge(&snapshot, &input), |blocker| {
+        matches!(
+            blocker,
+            PullRequestMergeAuthorityBlocker::MissingFreshnessEvidence
+        )
+    });
+
+    let mut input = baseline.clone();
+    input.required_checks = None;
+    assert_merge_authority_blocker(&decide_pull_request_merge(&snapshot, &input), |blocker| {
+        matches!(
+            blocker,
+            PullRequestMergeAuthorityBlocker::MissingRequiredChecks
+        )
+    });
+
+    let mut input = baseline.clone();
+    input.producer = None;
+    assert_merge_authority_blocker(&decide_pull_request_merge(&snapshot, &input), |blocker| {
+        matches!(
+            blocker,
+            PullRequestMergeAuthorityBlocker::MissingProducerEvidence
+        )
+    });
+
+    let mut input = baseline.clone();
+    input.auditor = None;
+    assert_merge_authority_blocker(&decide_pull_request_merge(&snapshot, &input), |blocker| {
+        matches!(
+            blocker,
+            PullRequestMergeAuthorityBlocker::MissingAuditorEvidence
+        )
+    });
+
+    let mut input = baseline.clone();
+    input.merge_simulation = None;
+    assert_merge_authority_blocker(&decide_pull_request_merge(&snapshot, &input), |blocker| {
+        matches!(
+            blocker,
+            PullRequestMergeAuthorityBlocker::MissingMergeSimulationEvidence
+        )
+    });
+
+    let mut input = baseline.clone();
+    input.completion_mode = None;
+    assert_merge_authority_blocker(&decide_pull_request_merge(&snapshot, &input), |blocker| {
+        matches!(
+            blocker,
+            PullRequestMergeAuthorityBlocker::MissingCompletionMode
+        )
+    });
+
+    let mut input = baseline;
+    input.changed_paths = None;
+    assert_merge_authority_blocker(&decide_pull_request_merge(&snapshot, &input), |blocker| {
+        matches!(
+            blocker,
+            PullRequestMergeAuthorityBlocker::MissingChangedPathsEvidence
+        )
+    });
+}
+
+#[test]
+fn pull_request_merge_evidence_adapter_rejects_every_stale_binding() {
+    let (snapshot, baseline) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+
+    let mut input = baseline.clone();
+    input.freshness.as_mut().expect("freshness").status = PullRequestFreshnessStatus::Stale;
+    assert_merge_authority_blocker(&decide_pull_request_merge(&snapshot, &input), |blocker| {
+        matches!(
+            blocker,
+            PullRequestMergeAuthorityBlocker::StaleSnapshotObservation
+        )
+    });
+
+    let mut input = baseline.clone();
+    input.freshness.as_mut().expect("freshness").status = PullRequestFreshnessStatus::Uncertain;
+    assert_merge_authority_blocker(&decide_pull_request_merge(&snapshot, &input), |blocker| {
+        matches!(
+            blocker,
+            PullRequestMergeAuthorityBlocker::UncertainSnapshotFreshness
+        )
+    });
+
+    let mut input = baseline.clone();
+    input.freshness.as_mut().expect("freshness").current_item =
+        merge_authority_item(&"3".repeat(40));
+    assert_merge_authority_blocker(&decide_pull_request_merge(&snapshot, &input), |blocker| {
+        matches!(
+            blocker,
+            PullRequestMergeAuthorityBlocker::StaleSnapshotHead { .. }
+        )
+    });
+
+    let mut input = baseline.clone();
+    input.producer.as_mut().expect("producer").head_oid = "3".repeat(40);
+    assert_merge_authority_blocker(&decide_pull_request_merge(&snapshot, &input), |blocker| {
+        matches!(
+            blocker,
+            PullRequestMergeAuthorityBlocker::StaleProducerEvidence
+        )
+    });
+
+    let mut input = baseline.clone();
+    input.auditor.as_mut().expect("auditor").head_oid = "3".repeat(40);
+    assert_merge_authority_blocker(&decide_pull_request_merge(&snapshot, &input), |blocker| {
+        matches!(
+            blocker,
+            PullRequestMergeAuthorityBlocker::StaleAuditorEvidence
+        )
+    });
+
+    let mut input = baseline.clone();
+    input
+        .merge_simulation
+        .as_mut()
+        .expect("merge simulation")
+        .base_oid = "3".repeat(40);
+    assert_merge_authority_blocker(&decide_pull_request_merge(&snapshot, &input), |blocker| {
+        matches!(
+            blocker,
+            PullRequestMergeAuthorityBlocker::StaleMergeSimulationEvidence
+        )
+    });
+
+    let mut input = baseline;
+    input
+        .changed_paths
+        .as_mut()
+        .expect("changed paths")
+        .head_oid = "3".repeat(40);
+    assert_merge_authority_blocker(&decide_pull_request_merge(&snapshot, &input), |blocker| {
+        matches!(
+            blocker,
+            PullRequestMergeAuthorityBlocker::StaleChangedPathsEvidence
+        )
+    });
+}
+
+#[test]
+fn pull_request_merge_evidence_adapter_maps_all_non_success_check_states() {
+    let (snapshot, mut input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    input.required_checks = Some(vec!["ci/missing".to_string()]);
+    assert_merge_authority_blocker(&decide_pull_request_merge(&snapshot, &input), |blocker| {
+        matches!(
+            blocker,
+            PullRequestMergeAuthorityBlocker::MissingRequiredCheck { .. }
+        )
+    });
+
+    let (snapshot, input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Stale),
+    );
+    assert_merge_authority_blocker(&decide_pull_request_merge(&snapshot, &input), |blocker| {
+        matches!(
+            blocker,
+            PullRequestMergeAuthorityBlocker::StaleRequiredCheck { .. }
+        )
+    });
+
+    let (snapshot, input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Skipped),
+    );
+    assert_merge_authority_blocker(&decide_pull_request_merge(&snapshot, &input), |blocker| {
+        matches!(
+            blocker,
+            PullRequestMergeAuthorityBlocker::SkippedRequiredCheck { .. }
+        )
+    });
+
+    let (snapshot, input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Failure),
+    );
+    assert_merge_authority_blocker(&decide_pull_request_merge(&snapshot, &input), |blocker| {
+        matches!(
+            blocker,
+            PullRequestMergeAuthorityBlocker::FailedRequiredCheck { .. }
+        )
+    });
+
+    let (snapshot, input) = merge_authority_fixture(ForgeCheckStatus::InProgress, None);
+    assert_merge_authority_blocker(&decide_pull_request_merge(&snapshot, &input), |blocker| {
+        matches!(
+            blocker,
+            PullRequestMergeAuthorityBlocker::UncertainRequiredCheck { .. }
+        )
+    });
+}
+
+#[test]
+fn pull_request_merge_evidence_adapter_requires_two_decorrelated_accepted_lenses() {
+    let (snapshot, mut input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    let lenses = &mut input.auditor.as_mut().expect("auditor").lenses;
+    lenses[1].model_label = lenses[0].model_label.clone();
+    lenses[1].framing = lenses[0].framing.clone();
+    lenses[1].information_scope = lenses[0].information_scope.clone();
+    assert_merge_authority_blocker(&decide_pull_request_merge(&snapshot, &input), |blocker| {
+        matches!(
+            blocker,
+            PullRequestMergeAuthorityBlocker::OptimizerBlocked(
+                MergeBlocker::InsufficientDecorrelatedLenses { .. }
+            )
+        )
+    });
+
+    let (snapshot, mut input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    input.auditor.as_mut().expect("auditor").lenses[0].decision = LensDecision::Uncertain;
+    assert_merge_authority_blocker(&decide_pull_request_merge(&snapshot, &input), |blocker| {
+        matches!(
+            blocker,
+            PullRequestMergeAuthorityBlocker::OptimizerBlocked(
+                MergeBlocker::BlockingReviewLenses { .. }
+            )
+        )
+    });
+}
+
+#[test]
+fn pull_request_merge_evidence_adapter_preserves_independence_and_never_auto_merge() {
+    let (snapshot, mut input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    let producer_actor = input
+        .producer
+        .as_ref()
+        .expect("producer")
+        .producer
+        .actor
+        .clone();
+    input.auditor.as_mut().expect("auditor").auditor = producer_actor;
+    assert_merge_authority_blocker(&decide_pull_request_merge(&snapshot, &input), |blocker| {
+        matches!(
+            blocker,
+            PullRequestMergeAuthorityBlocker::OptimizerBlocked(
+                MergeBlocker::ReviewerNotIndependent
+            )
+        )
+    });
+
+    let (snapshot, mut input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    input.changed_paths.as_mut().expect("changed paths").paths =
+        vec![PathBuf::from("src/optimizer/merge_authority.rs")];
+    assert_merge_authority_blocker(&decide_pull_request_merge(&snapshot, &input), |blocker| {
+        matches!(
+            blocker,
+            PullRequestMergeAuthorityBlocker::OptimizerBlocked(MergeBlocker::NeverAutoMerge { .. })
+        )
+    });
+}
+
+#[test]
+fn pull_request_merge_evidence_adapter_requires_clean_non_flattening_simulation() {
+    let (snapshot, mut input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    input
+        .merge_simulation
+        .as_mut()
+        .expect("merge simulation")
+        .merges_cleanly = false;
+    assert_merge_authority_blocker(&decide_pull_request_merge(&snapshot, &input), |blocker| {
+        matches!(
+            blocker,
+            PullRequestMergeAuthorityBlocker::OptimizerBlocked(MergeBlocker::MergeSimulationFailed)
+        )
+    });
+
+    let (snapshot, mut input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    input.completion_mode = Some(CompletionMode::Squash);
+    assert_merge_authority_blocker(&decide_pull_request_merge(&snapshot, &input), |blocker| {
+        matches!(
+            blocker,
+            PullRequestMergeAuthorityBlocker::OptimizerBlocked(
+                MergeBlocker::HistoryFlatteningCompletionMode { .. }
+            )
+        )
+    });
+}
+
+fn authenticated_merge_evidence(
+    snapshot: &PullRequestReviewSnapshot,
+    input: &PullRequestMergeAuthorityInput,
+) -> AuthenticatedPullRequestMergeEvidence {
+    AuthenticatedPullRequestMergeEvidence::from_authenticated_acceptance(
+        snapshot.item().clone(),
+        merge_authority_object(ProviderObjectKind::Review, "R_auditor"),
+        ForgeActor::new(
+            "github",
+            merge_authority_object(
+                ProviderObjectKind::Actor,
+                &input
+                    .auditor
+                    .as_ref()
+                    .expect("fixture auditor")
+                    .auditor
+                    .agent
+                    .stable_id,
+            ),
+            input
+                .auditor
+                .as_ref()
+                .expect("fixture auditor")
+                .auditor
+                .agent
+                .stable_id
+                .clone(),
+            ReportedActorKind::Human,
+        )
+        .expect("fixture approved reviewer"),
+        input
+            .required_checks
+            .clone()
+            .expect("fixture required checks"),
+        input.producer.clone().expect("fixture producer"),
+        input.auditor.clone().expect("fixture auditor"),
+        input
+            .merge_simulation
+            .clone()
+            .expect("fixture merge simulation"),
+        input.completion_mode.expect("fixture completion mode"),
+        input.changed_paths.clone().expect("fixture changed paths"),
+    )
+    .expect("authenticated merge evidence")
+}
+
+fn authenticated_merge_repository() -> tempfile::TempDir {
+    let repository = tempfile::tempdir().expect("merge repository tempdir");
+    Repository::init(repository.path()).expect("initialize merge repository");
+    repository
+}
+
+#[derive(Default)]
+struct ScriptedAuthenticatedMergeState {
+    lookup_override: Option<Vec<PullRequestMergeReceipt>>,
+    lose_execute_response: bool,
+    lookup_calls: usize,
+    execute_calls: usize,
+    verify_calls: usize,
+}
+
+struct ScriptedAuthenticatedMergeTransport {
+    inner: FakeForgeTransport,
+    state: Mutex<ScriptedAuthenticatedMergeState>,
+}
+
+impl ScriptedAuthenticatedMergeTransport {
+    fn new(snapshot: &PullRequestReviewSnapshot) -> Self {
+        let mut inner = FakeForgeTransport::new();
+        inner
+            .register_pull_request_merge_observation(snapshot.item(), snapshot.clone())
+            .expect("register scripted merge ground truth");
+        Self {
+            inner,
+            state: Mutex::new(ScriptedAuthenticatedMergeState::default()),
+        }
+    }
+
+    fn override_lookup(&self, receipts: Option<Vec<PullRequestMergeReceipt>>) {
+        self.state
+            .lock()
+            .expect("scripted merge state")
+            .lookup_override = receipts;
+    }
+
+    fn lose_execute_response(&self) {
+        self.state
+            .lock()
+            .expect("scripted merge state")
+            .lose_execute_response = true;
+    }
+
+    fn call_counts(&self) -> (usize, usize, usize) {
+        let state = self.state.lock().expect("scripted merge state");
+        (state.lookup_calls, state.execute_calls, state.verify_calls)
+    }
+}
+
+impl PullRequestMergeTransport for ScriptedAuthenticatedMergeTransport {
+    fn observe_pull_request_for_merge(
+        &self,
+        candidate: &ForgeItem,
+    ) -> Result<PullRequestReviewSnapshot> {
+        self.inner.observe_pull_request_for_merge(candidate)
+    }
+
+    fn lookup_pull_request_merge(
+        &self,
+        effect: &PullRequestMergeEffect,
+    ) -> Result<Vec<PullRequestMergeReceipt>> {
+        let lookup_override = {
+            let mut state = self.state.lock().expect("scripted merge state");
+            state.lookup_calls += 1;
+            state.lookup_override.clone()
+        };
+        match lookup_override {
+            Some(receipts) => Ok(receipts),
+            None => self.inner.lookup_pull_request_merge(effect),
+        }
+    }
+
+    fn execute_pull_request_merge(
+        &self,
+        effect: &PullRequestMergeEffect,
+    ) -> Result<PullRequestMergeReceipt> {
+        let lose_response = {
+            let mut state = self.state.lock().expect("scripted merge state");
+            state.execute_calls += 1;
+            state.lose_execute_response
+        };
+        let receipt = self.inner.execute_pull_request_merge(effect)?;
+        if lose_response {
+            bail!("injected authenticated merge response loss");
+        }
+        Ok(receipt)
+    }
+
+    fn verify_pull_request_merge(
+        &self,
+        effect: &PullRequestMergeEffect,
+        receipt: &PullRequestMergeReceipt,
+    ) -> Result<PullRequestMergeReceipt> {
+        self.state
+            .lock()
+            .expect("scripted merge state")
+            .verify_calls += 1;
+        receipt.validate_for_effect(effect)?;
+        if self.lookup_pull_request_merge(effect)?.as_slice() != [receipt.clone()] {
+            bail!("scripted merge receipt was missing, duplicated, or changed");
+        }
+        Ok(receipt.clone())
+    }
+}
+
+fn seed_authenticated_merge_phase(
+    repo: &Path,
+    candidate: &ForgeItem,
+    evidence: &AuthenticatedPullRequestMergeEvidence,
+    transport: &ScriptedAuthenticatedMergeTransport,
+    phase: EffectPhase,
+    seed_provider_effect: bool,
+) -> Option<PullRequestMergeReceipt> {
+    let plan_digest = stable_json_digest(&(
+        "maco_authenticated_pull_request_merge_plan_v1",
+        candidate,
+        evidence,
+    ))
+    .expect("authenticated merge plan digest");
+    let effect_id = format!("merge:{plan_digest}");
+    let logical_id = format!("pr-merge-{plan_digest}");
+    let planned = AuthenticatedPullRequestMergeRecord {
+        version: AUTHENTICATED_PR_MERGE_VERSION,
+        plan_digest: plan_digest.clone(),
+        candidate: candidate.clone(),
+        effect: None,
+        authority: None,
+        receipt: None,
+    };
+    let auth = repository_auth_writer(repo)
+        .expect("seed authenticated merge auth writer")
+        .into_authenticator()
+        .expect("seed authenticated merge authenticator");
+    let mut wal: EffectWal = EffectWal::create_planned(auth, &logical_id, &effect_id, &planned)
+        .expect("seed planned authenticated merge");
+    if phase == EffectPhase::Planned {
+        return None;
+    }
+
+    let authorized = match authorize_current_pull_request_merge(candidate, evidence, transport)
+        .expect("authorize seeded authenticated merge")
+    {
+        PullRequestMergePreflight::Allowed(authorized) => authorized,
+        PullRequestMergePreflight::Blocked(outcome) => {
+            panic!("seeded authenticated merge was blocked: {outcome:?}")
+        }
+    };
+    let effect = pull_request_merge_effect(&effect_id, &plan_digest, evidence, &authorized)
+        .expect("seed authenticated merge effect");
+    let started = AuthenticatedPullRequestMergeRecord {
+        version: AUTHENTICATED_PR_MERGE_VERSION,
+        plan_digest: plan_digest.clone(),
+        candidate: candidate.clone(),
+        effect: Some(effect.clone()),
+        authority: Some(authorized.authority.clone()),
+        receipt: None,
+    };
+    wal.started(&effect_id, &started)
+        .expect("seed started authenticated merge");
+
+    let receipt = seed_provider_effect.then(|| {
+        transport
+            .execute_pull_request_merge(&effect)
+            .expect("seed provider merge receipt")
+    });
+    if matches!(phase, EffectPhase::Observed | EffectPhase::Completed) {
+        let observed = AuthenticatedPullRequestMergeRecord {
+            receipt: Some(
+                receipt
+                    .clone()
+                    .expect("observed seeded merge requires a provider receipt"),
+            ),
+            ..started
+        };
+        wal.observed(&effect_id, &observed)
+            .expect("seed observed authenticated merge");
+        if phase == EffectPhase::Completed {
+            wal.completed(&effect_id, &observed)
+                .expect("seed completed authenticated merge");
+        }
+    }
+    receipt
+}
+
+fn mismatched_effect_merge_receipt(receipt: &PullRequestMergeReceipt) -> PullRequestMergeReceipt {
+    PullRequestMergeReceipt::new(
+        "merge:mismatched-effect",
+        receipt.item().clone(),
+        receipt.approved_actor().clone(),
+        receipt.evidence_digest(),
+        receipt.ground_truth_digest(),
+        receipt.completion_mode(),
+        receipt.provider_merge_id().clone(),
+        receipt.merged_oid(),
+        receipt.url(),
+        receipt.merged_at().clone(),
+    )
+    .expect("valid receipt for a different merge effect")
+}
+
+fn changed_provider_merge_receipt(receipt: &PullRequestMergeReceipt) -> PullRequestMergeReceipt {
+    let changed_oid = if receipt.merged_oid().bytes().all(|byte| byte == b'f') {
+        "e".repeat(40)
+    } else {
+        "f".repeat(40)
+    };
+    let plan_digest = receipt
+        .evidence_digest()
+        .strip_prefix("sha256:")
+        .expect("merge evidence digest prefix");
+    PullRequestMergeReceipt::new(
+        format!("merge:{plan_digest}"),
+        receipt.item().clone(),
+        receipt.approved_actor().clone(),
+        receipt.evidence_digest(),
+        receipt.ground_truth_digest(),
+        receipt.completion_mode(),
+        receipt.provider_merge_id().clone(),
+        changed_oid,
+        receipt.url(),
+        receipt.merged_at().clone(),
+    )
+    .expect("valid changed provider merge receipt")
+}
+
+#[test]
+fn authenticated_pull_request_merge_recovers_every_wal_phase_without_a_second_merge() {
+    for phase in [
+        EffectPhase::Planned,
+        EffectPhase::Started,
+        EffectPhase::Observed,
+        EffectPhase::Completed,
+    ] {
+        let (snapshot, input) = merge_authority_fixture(
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+        );
+        let evidence = authenticated_merge_evidence(&snapshot, &input);
+        let repository = authenticated_merge_repository();
+        let transport = ScriptedAuthenticatedMergeTransport::new(&snapshot);
+        let seeded_receipt = seed_authenticated_merge_phase(
+            repository.path(),
+            snapshot.item(),
+            &evidence,
+            &transport,
+            phase,
+            phase != EffectPhase::Planned,
+        );
+
+        let recovered = execute_authenticated_pull_request_merge(
+            repository.path(),
+            snapshot.item(),
+            Some(&evidence),
+            &transport,
+        )
+        .unwrap_or_else(|error| panic!("recover {phase:?} authenticated merge: {error:#}"));
+        let retry = execute_authenticated_pull_request_merge(
+            repository.path(),
+            snapshot.item(),
+            Some(&evidence),
+            &transport,
+        )
+        .unwrap_or_else(|error| panic!("retry recovered {phase:?} authenticated merge: {error:#}"));
+
+        assert!(recovered.is_merged(), "{phase:?} recovery was blocked");
+        assert_eq!(recovered.receipt(), retry.receipt());
+        if let Some(seeded_receipt) = seeded_receipt.as_ref() {
+            assert_eq!(recovered.receipt(), Some(seeded_receipt));
+        }
+        assert_eq!(
+            transport.call_counts().1,
+            1,
+            "{phase:?} recovery issued a second provider merge"
+        );
+    }
+}
+
+#[test]
+fn authenticated_pull_request_merge_reconciles_a_lost_response_without_resending() {
+    let (snapshot, input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    let evidence = authenticated_merge_evidence(&snapshot, &input);
+    let repository = authenticated_merge_repository();
+    let transport = ScriptedAuthenticatedMergeTransport::new(&snapshot);
+    transport.lose_execute_response();
+
+    let recovered = execute_authenticated_pull_request_merge(
+        repository.path(),
+        snapshot.item(),
+        Some(&evidence),
+        &transport,
+    )
+    .expect("lost merge response reconciles by exact lookup");
+    let retry = execute_authenticated_pull_request_merge(
+        repository.path(),
+        snapshot.item(),
+        Some(&evidence),
+        &transport,
+    )
+    .expect("completed lost-response recovery is reusable");
+
+    assert_eq!(recovered.receipt(), retry.receipt());
+    let (lookup_calls, execute_calls, verify_calls) = transport.call_counts();
+    assert!(
+        lookup_calls > 0,
+        "lost response was not reconciled by lookup"
+    );
+    assert!(verify_calls > 0, "reconciled receipt was not verified");
+    assert_eq!(execute_calls, 1, "lost response caused a blind resend");
+}
+
+#[test]
+fn authenticated_pull_request_merge_started_lookup_ambiguity_fails_closed() {
+    for case in ["zero", "multiple", "mismatched"] {
+        let (snapshot, input) = merge_authority_fixture(
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+        );
+        let evidence = authenticated_merge_evidence(&snapshot, &input);
+        let repository = authenticated_merge_repository();
+        let transport = ScriptedAuthenticatedMergeTransport::new(&snapshot);
+        let seeded_receipt = seed_authenticated_merge_phase(
+            repository.path(),
+            snapshot.item(),
+            &evidence,
+            &transport,
+            EffectPhase::Started,
+            case != "zero",
+        );
+        match case {
+            "zero" => transport.override_lookup(Some(Vec::new())),
+            "multiple" => {
+                let receipt = seeded_receipt.expect("multiple case provider receipt");
+                transport.override_lookup(Some(vec![receipt.clone(), receipt]));
+            }
+            "mismatched" => {
+                let receipt = seeded_receipt.expect("mismatched case provider receipt");
+                transport.override_lookup(Some(vec![mismatched_effect_merge_receipt(&receipt)]));
+            }
+            _ => unreachable!(),
+        }
+        let execute_calls_before = transport.call_counts().1;
+
+        let error = execute_authenticated_pull_request_merge(
+            repository.path(),
+            snapshot.item(),
+            Some(&evidence),
+            &transport,
+        )
+        .unwrap_err();
+
+        let error_text = format!("{error:#}");
+        assert!(
+            if case == "mismatched" {
+                error_text.contains("does not bind the exact authorized effect")
+            } else {
+                error_text.contains("started pull-request merge")
+            },
+            "unexpected {case} lookup error: {error_text}"
+        );
+        assert_eq!(
+            transport.call_counts().1,
+            execute_calls_before,
+            "{case} lookup ambiguity caused a blind provider merge"
+        );
+    }
+}
+
+#[test]
+fn authenticated_pull_request_merge_completed_receipt_is_revalidated_and_stale_state_fails() {
+    let (snapshot, input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    let evidence = authenticated_merge_evidence(&snapshot, &input);
+    let repository = authenticated_merge_repository();
+    let transport = ScriptedAuthenticatedMergeTransport::new(&snapshot);
+    let receipt = seed_authenticated_merge_phase(
+        repository.path(),
+        snapshot.item(),
+        &evidence,
+        &transport,
+        EffectPhase::Completed,
+        true,
+    )
+    .expect("completed provider receipt");
+
+    let exact = execute_authenticated_pull_request_merge(
+        repository.path(),
+        snapshot.item(),
+        Some(&evidence),
+        &transport,
+    )
+    .expect("completed receipt revalidates against exact provider state");
+    assert_eq!(exact.receipt(), Some(&receipt));
+
+    for stale in [Vec::new(), vec![changed_provider_merge_receipt(&receipt)]] {
+        transport.override_lookup(Some(stale));
+        let error = execute_authenticated_pull_request_merge(
+            repository.path(),
+            snapshot.item(),
+            Some(&evidence),
+            &transport,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("completed pull-request merge receipt changed or disappeared"),
+            "unexpected completed-receipt revalidation error: {error:#}"
+        );
+        assert_eq!(
+            transport.call_counts().1,
+            1,
+            "stale completed receipt caused a second provider merge"
+        );
+    }
+    assert!(
+        transport.call_counts().2 >= 3,
+        "completed receipt was not reverified on every retry"
+    );
+}
+
+#[test]
+fn authenticated_github_merge_operation_is_finite_and_head_bound() {
+    let repository = GithubRepositoryIdentity {
+        host: "github.example".to_string(),
+        owner: "acme".to_string(),
+        name: "repo".to_string(),
+    };
+    let digest = "a".repeat(64);
+    let operation = AuthenticatedGithubOperation::Merge {
+        number: 327,
+        expected_head_oid: "1".repeat(40),
+        effect_id: format!("merge:{digest}"),
+        evidence_digest: format!("sha256:{digest}"),
+        ground_truth_digest: format!("sha256:{}", "b".repeat(64)),
+    };
+    let (args, stdin) = operation
+        .command(&repository)
+        .expect("finite merge operation");
+    let args = args
+        .iter()
+        .map(|argument| argument.to_str().expect("UTF-8 argument"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        args,
+        [
+            "api",
+            "--method",
+            "PUT",
+            "repos/acme/repo/pulls/327/merge",
+            "--input",
+            "-"
+        ]
+    );
+    let StdinMode::Bytes(body) = stdin else {
+        panic!("merge operation must send one bounded JSON body");
+    };
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("merge JSON");
+    assert_eq!(body["sha"], "1".repeat(40));
+    assert_eq!(body["merge_method"], "merge");
+    assert!(body["commit_message"]
+        .as_str()
+        .expect("effect marker")
+        .contains(&format!("merge:{digest}")));
+
+    let invalid = AuthenticatedGithubOperation::Merge {
+        number: 327,
+        expected_head_oid: "not-a-head".to_string(),
+        effect_id: format!("merge:{digest}"),
+        evidence_digest: format!("sha256:{digest}"),
+        ground_truth_digest: format!("sha256:{}", "b".repeat(64)),
+    };
+    assert!(invalid.command(&repository).is_err());
+
+    let node = github_node_object_id(ProviderObjectKind::Actor, "MDQ6VXNlcjE=")
+        .expect("real GitHub base64 node id");
+    assert_eq!(node.provider_id(), "github");
+    assert_eq!(node.kind(), ProviderObjectKind::Actor);
+    assert!(node.stable_id().starts_with("node:sha256:"));
+}
+
+fn assert_authenticated_no_merge(
+    outcome: &AuthenticatedPullRequestMergeOutcome,
+    expected: impl Fn(&AuthenticatedPullRequestMergeBlocker) -> bool,
+) {
+    assert!(
+        !outcome.is_merged(),
+        "unexpected merge outcome: {outcome:?}"
+    );
+    assert!(
+        outcome.blockers().iter().any(expected),
+        "expected no-merge blocker was absent: {outcome:?}"
+    );
+}
+
+#[test]
+fn authenticated_pull_request_merge_types_missing_evidence_without_effect() {
+    let (snapshot, _) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    let repository = authenticated_merge_repository();
+    let fake = FakeForgeTransport::new();
+
+    let outcome =
+        execute_authenticated_pull_request_merge(repository.path(), snapshot.item(), None, &fake)
+            .expect("typed missing evidence");
+
+    assert_authenticated_no_merge(&outcome, |blocker| {
+        matches!(
+            blocker,
+            AuthenticatedPullRequestMergeBlocker::MissingAuthenticatedAuditorEvidence
+        )
+    });
+    assert_eq!(fake.pull_request_merge_count().expect("merge count"), 0);
+}
+
+#[test]
+fn authenticated_pull_request_merge_refuses_stale_head_without_effect() {
+    let (candidate_snapshot, input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    let evidence = authenticated_merge_evidence(&candidate_snapshot, &input);
+    let current_snapshot = merge_execution_snapshot(
+        &"3".repeat(40),
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+        "auditor",
+        ForgeReviewState::Approved,
+    );
+    let mut fake = FakeForgeTransport::new();
+    fake.register_pull_request_merge_observation(candidate_snapshot.item(), current_snapshot)
+        .expect("register stale current head");
+    let repository = authenticated_merge_repository();
+
+    let outcome = execute_authenticated_pull_request_merge(
+        repository.path(),
+        candidate_snapshot.item(),
+        Some(&evidence),
+        &fake,
+    )
+    .expect("typed stale head");
+
+    assert_authenticated_no_merge(&outcome, |blocker| {
+        matches!(
+            blocker,
+            AuthenticatedPullRequestMergeBlocker::StaleCandidateHead { .. }
+        )
+    });
+    assert_eq!(fake.pull_request_merge_count().expect("merge count"), 0);
+}
+
+#[test]
+fn authenticated_pull_request_merge_refuses_red_ci_without_effect() {
+    let (snapshot, input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Failure),
+    );
+    let evidence = authenticated_merge_evidence(&snapshot, &input);
+    let mut fake = FakeForgeTransport::new();
+    fake.register_pull_request_merge_observation(snapshot.item(), snapshot.clone())
+        .expect("register red CI ground truth");
+    let repository = authenticated_merge_repository();
+
+    let outcome = execute_authenticated_pull_request_merge(
+        repository.path(),
+        snapshot.item(),
+        Some(&evidence),
+        &fake,
+    )
+    .expect("typed red CI");
+
+    assert_authenticated_no_merge(&outcome, |blocker| {
+        matches!(
+            blocker,
+            AuthenticatedPullRequestMergeBlocker::Authority(
+                PullRequestMergeAuthorityBlocker::FailedRequiredCheck { .. }
+            )
+        )
+    });
+    assert_eq!(fake.pull_request_merge_count().expect("merge count"), 0);
+}
+
+#[test]
+fn authenticated_pull_request_merge_refuses_a_changed_check_union_without_effect() {
+    let (candidate_snapshot, input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    let evidence = authenticated_merge_evidence(&candidate_snapshot, &input);
+    let current_snapshot = PullRequestReviewSnapshot::new(
+        candidate_snapshot.item().clone(),
+        candidate_snapshot.observed_at().clone(),
+        candidate_snapshot.reviews().to_vec(),
+        Vec::new(),
+        [
+            candidate_snapshot.checks().to_vec(),
+            vec![merge_authority_check(
+                "C_late",
+                "ci/late",
+                ForgeCheckStatus::Completed,
+                Some(ForgeCheckConclusion::Success),
+                candidate_snapshot.item().head_oid().expect("head OID"),
+            )],
+        ]
+        .concat(),
+    )
+    .expect("changed provider check union");
+    let mut fake = FakeForgeTransport::new();
+    fake.register_pull_request_merge_observation(candidate_snapshot.item(), current_snapshot)
+        .expect("register changed check union");
+    let repository = authenticated_merge_repository();
+
+    let outcome = execute_authenticated_pull_request_merge(
+        repository.path(),
+        candidate_snapshot.item(),
+        Some(&evidence),
+        &fake,
+    )
+    .expect("typed changed-check refusal");
+
+    assert_authenticated_no_merge(&outcome, |blocker| {
+        matches!(
+            blocker,
+            AuthenticatedPullRequestMergeBlocker::CurrentCheckSetMismatch
+        )
+    });
+    assert_eq!(fake.pull_request_merge_count().expect("merge count"), 0);
+}
+
+#[test]
+fn authenticated_pull_request_merge_refuses_self_audit_without_effect() {
+    let (candidate_snapshot, mut input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    input.auditor.as_mut().expect("fixture auditor").auditor = input
+        .producer
+        .as_ref()
+        .expect("fixture producer")
+        .producer
+        .actor
+        .clone();
+    let evidence = authenticated_merge_evidence(&candidate_snapshot, &input);
+    let current_snapshot = merge_execution_snapshot(
+        &"1".repeat(40),
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+        "producer",
+        ForgeReviewState::Approved,
+    );
+    let mut fake = FakeForgeTransport::new();
+    fake.register_pull_request_merge_observation(candidate_snapshot.item(), current_snapshot)
+        .expect("register self-audit ground truth");
+    let repository = authenticated_merge_repository();
+
+    let outcome = execute_authenticated_pull_request_merge(
+        repository.path(),
+        candidate_snapshot.item(),
+        Some(&evidence),
+        &fake,
+    )
+    .expect("typed self-audit");
+
+    assert_authenticated_no_merge(&outcome, |blocker| {
+        matches!(
+            blocker,
+            AuthenticatedPullRequestMergeBlocker::Authority(
+                PullRequestMergeAuthorityBlocker::OptimizerBlocked(
+                    MergeBlocker::ReviewerNotIndependent
+                )
+            )
+        )
+    });
+    assert_eq!(fake.pull_request_merge_count().expect("merge count"), 0);
+}
+
+#[test]
+fn authenticated_pull_request_merge_records_exact_success_receipt() {
+    let (snapshot, input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    let evidence = authenticated_merge_evidence(&snapshot, &input);
+    let mut fake = FakeForgeTransport::new();
+    fake.register_pull_request_merge_observation(snapshot.item(), snapshot.clone())
+        .expect("register green merge ground truth");
+    let repository = authenticated_merge_repository();
+
+    let outcome = execute_authenticated_pull_request_merge(
+        repository.path(),
+        snapshot.item(),
+        Some(&evidence),
+        &fake,
+    )
+    .expect("successful authenticated merge");
+
+    assert!(outcome.is_merged(), "green merge was blocked: {outcome:?}");
+    let receipt = outcome.receipt().expect("authenticated merge receipt");
+    assert_eq!(receipt.item(), snapshot.item());
+    assert_eq!(
+        receipt.approved_actor().provider_actor_id().stable_id(),
+        "auditor"
+    );
+    assert_eq!(receipt.completion_mode(), CompletionMode::MergeCommit);
+    assert!(receipt.evidence_digest().starts_with("sha256:"));
+    assert!(receipt.ground_truth_digest().starts_with("sha256:"));
+    assert_eq!(receipt.merged_oid().len(), 40);
+    assert_eq!(
+        receipt.provider_merge_id().kind(),
+        ProviderObjectKind::Merge
+    );
+    assert!(receipt.url().contains("/pull/327/merge/"));
+    assert_eq!(receipt.merged_at().as_str(), "2000-01-01T00:00:00Z");
+    assert_eq!(fake.pull_request_merge_count().expect("merge count"), 1);
+}
+
+#[test]
+fn authenticated_pull_request_merge_duplicate_retry_reconciles_one_effect() {
+    let (snapshot, input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    let evidence = authenticated_merge_evidence(&snapshot, &input);
+    let mut fake = FakeForgeTransport::new();
+    fake.register_pull_request_merge_observation(snapshot.item(), snapshot.clone())
+        .expect("register retry merge ground truth");
+    let repository = authenticated_merge_repository();
+
+    let first = execute_authenticated_pull_request_merge(
+        repository.path(),
+        snapshot.item(),
+        Some(&evidence),
+        &fake,
+    )
+    .expect("first authenticated merge");
+    let retry = execute_authenticated_pull_request_merge(
+        repository.path(),
+        snapshot.item(),
+        Some(&evidence),
+        &fake,
+    )
+    .expect("reconciled authenticated merge retry");
+
+    assert_eq!(first.receipt(), retry.receipt());
+    assert_eq!(fake.pull_request_merge_count().expect("merge count"), 1);
+}
+
+fn sequenced_provider_review(
+    sequence: u64,
+    submitted_at: &str,
+    state: ForgeReviewState,
+) -> SequencedGithubReview {
+    SequencedGithubReview {
+        sequence,
+        review: ForgeReview::new(
+            merge_authority_object(ProviderObjectKind::Review, &format!("R_review_{sequence}")),
+            ForgeActor::new(
+                "github",
+                merge_authority_object(ProviderObjectKind::Actor, "A_reviewer"),
+                "reviewer",
+                ReportedActorKind::Human,
+            )
+            .expect("review actor"),
+            state,
+            "review",
+            ForgeTimestamp::new(submitted_at).expect("review timestamp"),
+            "1".repeat(40),
+        )
+        .expect("provider review"),
+    }
+}
+
+#[test]
+fn github_merge_ground_truth_uses_latest_decisive_review_state() {
+    let reviews = latest_effective_github_reviews(vec![
+        sequenced_provider_review(1, "2026-08-30T00:00:01Z", ForgeReviewState::Approved),
+        sequenced_provider_review(2, "2026-08-30T00:00:02Z", ForgeReviewState::Commented),
+        sequenced_provider_review(
+            3,
+            "2026-08-30T00:00:03Z",
+            ForgeReviewState::ChangesRequested,
+        ),
+    ]);
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].state(), ForgeReviewState::ChangesRequested);
+
+    let dismissed = latest_effective_github_reviews(vec![
+        sequenced_provider_review(4, "2026-08-30T00:00:04Z", ForgeReviewState::Approved),
+        sequenced_provider_review(5, "2026-08-30T00:00:05Z", ForgeReviewState::Dismissed),
+    ]);
+    assert_eq!(dismissed.len(), 1);
+    assert_eq!(dismissed[0].state(), ForgeReviewState::Dismissed);
+}
+
+#[test]
+fn authenticated_github_pagination_rejects_incomplete_shapes() {
+    validate_authenticated_github_page_shape([0], "empty collection")
+        .expect("one empty page is a complete empty collection");
+    validate_authenticated_github_page_shape([100, 1], "complete collection")
+        .expect("full non-final page and nonempty final page");
+    assert!(validate_authenticated_github_page_shape([99, 1], "short page").is_err());
+    assert!(validate_authenticated_github_page_shape([100, 0], "empty tail").is_err());
+    assert!(validate_authenticated_github_page_shape(
+        std::iter::repeat_n(100, AUTHENTICATED_GITHUB_MAX_PAGES + 1),
+        "excessive pages",
+    )
+    .is_err());
+}
+
+#[test]
+fn github_same_repository_head_requires_the_provider_node_identity() {
+    let base = GithubApiRepository {
+        node_id: "R_base".to_string(),
+        full_name: "acme/repo".to_string(),
+    };
+    let exact = GithubApiRepository {
+        node_id: "R_base".to_string(),
+        full_name: "ACME/REPO".to_string(),
+    };
+    let lookalike = GithubApiRepository {
+        node_id: "R_other".to_string(),
+        full_name: "acme/repo".to_string(),
+    };
+    assert!(github_same_repository_head(
+        Some(&exact),
+        &base,
+        "acme/repo"
+    ));
+    assert!(!github_same_repository_head(
+        Some(&lookalike),
+        &base,
+        "acme/repo"
+    ));
+    assert!(!github_same_repository_head(None, &base, "acme/repo"));
+}
+
+fn github_status(id: &str, state: &str, updated_at: &str) -> GithubApiStatus {
+    GithubApiStatus {
+        node_id: id.to_string(),
+        context: "ci/status".to_string(),
+        state: state.to_string(),
+        updated_at: updated_at.to_string(),
+        creator: Some(GithubApiActor {
+            node_id: "A_status".to_string(),
+            login: "status-bot".to_string(),
+            kind: "Bot".to_string(),
+        }),
+    }
+}
+
+#[test]
+fn github_commit_status_union_rejects_equal_timestamp_ambiguity() {
+    let latest = latest_github_statuses(vec![
+        github_status("S_old", "pending", "2026-08-30T00:00:01Z"),
+        github_status("S_new", "success", "2026-08-30T00:00:02Z"),
+    ])
+    .expect("strict latest status");
+    assert_eq!(latest.len(), 1);
+    assert_eq!(latest[0].state, "success");
+
+    assert!(latest_github_statuses(vec![
+        github_status("S_red", "failure", "2026-08-30T00:00:03Z"),
+        github_status("S_green", "success", "2026-08-30T00:00:03Z"),
+    ])
+    .is_err());
+}
+
+#[test]
+fn github_pr_source_fields_include_fail_closed_source_provenance() {
+    let fields = GITHUB_PR_SOURCE_FIELDS.split(',').collect::<BTreeSet<_>>();
+    assert!(fields.contains("headRepository"));
+    assert!(fields.contains("isCrossRepository"));
 }

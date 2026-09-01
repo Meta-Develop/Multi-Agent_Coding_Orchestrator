@@ -7,7 +7,7 @@ use crate::{
     artifacts::{
         self, ArtifactRetentionFamily, ArtifactRetentionPolicy, ResolvedRunId, RunArtifactFamily,
     },
-    autopilot::{self, AutopilotRunOptions},
+    autopilot,
     consult::{self, ConsultAskOptions, ConsultantRuntime, DEFAULT_CONSULT_TIMEOUT_SECONDS},
     hierarchy_ledger::{is_coordinator_role_label, observe_hierarchy, ObservedHierarchyNode},
     inbox::{
@@ -18,7 +18,8 @@ use crate::{
     live_claim::{self, LiveClock},
     llm::{FakeProvider, PromptContext, ProviderCapabilities, Redactor, RepoExcerpt, WorkProposal},
     machine_global::{
-        DestructiveTargetInput, GateOutcome, MachineGlobalClaimSummary, MachineGlobalClaimToken,
+        machine_global_config_content_binding, DestructiveTargetInput, GateOutcome,
+        MachineGlobalClaimSummary, MachineGlobalClaimToken, MachineGlobalConfig,
         MachineGlobalRetentionBinding, MachineGlobalStore, RetentionOperationId,
         RetentionOperationToken,
     },
@@ -73,11 +74,12 @@ use crate::{
     },
 };
 use anyhow::{bail, Context, Result};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::BTreeSet,
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -103,9 +105,12 @@ const MAX_PROMPT_EXCERPT_BYTES: u64 = 32 * 1024;
 const MAX_PROMPT_EXCERPT_TOTAL_BYTES: usize = 48 * 1024;
 const MAX_PROMPT_PATHS: usize = 64;
 const MAX_SUPERVISE_GOAL_FILE_BYTES: u64 = 256 * 1024;
+const MAX_DEFAULT_MACHINE_GLOBAL_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_EVALUATION_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_EVALUATION_PLAN_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_EXTERNAL_EVENT_PAYLOAD_CLI_BYTES: usize = 4 * 1024;
+const RETIRED_AUTOPILOT_EXECUTION_MESSAGE: &str =
+    "autopilot plan/run is retired; use literal instruction routing: maco <instruction>";
 
 #[derive(Debug, Parser)]
 #[command(name = "maco")]
@@ -114,6 +119,172 @@ const MAX_EXTERNAL_EVENT_PAYLOAD_CLI_BYTES: usize = 4 * 1024;
 pub struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+/// Routes a bare instruction into the existing supervised goal/spec entrypoint.
+///
+/// Explicit subcommand names and option-shaped first arguments retain Clap's
+/// normal behavior. `--` can be used as the first argument to force an
+/// instruction whose first word is an explicit subcommand name or looks like
+/// an option. Every routed argument is joined with one ASCII space and passed
+/// as one literal goal/spec, so option-shaped words after the first instruction
+/// word remain instruction text rather than becoming MACO options.
+pub fn route_literal_instruction_args<I, T>(args: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let Some(first) = args.get(1) else {
+        return args;
+    };
+
+    let instruction_start = if first == OsStr::new("--") {
+        if args.len() == 2 {
+            return args;
+        }
+        2
+    } else {
+        if is_option_shaped(first) || is_explicit_cli_subcommand(first) {
+            return args;
+        }
+        1
+    };
+
+    let mut instruction = OsString::new();
+    for (index, argument) in args[instruction_start..].iter().enumerate() {
+        if index != 0 {
+            instruction.push(" ");
+        }
+        instruction.push(argument);
+    }
+
+    vec![
+        args[0].clone(),
+        OsString::from("supervise"),
+        OsString::from("run"),
+        OsString::from("--literal-goal"),
+        instruction,
+    ]
+}
+
+fn is_option_shaped(argument: &OsStr) -> bool {
+    argument.as_encoded_bytes().starts_with(b"-")
+}
+
+fn is_explicit_cli_subcommand(argument: &OsStr) -> bool {
+    let Some(argument) = argument.to_str() else {
+        return false;
+    };
+    argument == "help"
+        || Cli::command().get_subcommands().any(|subcommand| {
+            subcommand.get_name() == argument
+                || subcommand.get_all_aliases().any(|alias| alias == argument)
+        })
+}
+
+fn resolve_supervise_machine_global_binding(
+    routed_literal: bool,
+    config: Option<PathBuf>,
+    runtime_root_id: Option<String>,
+) -> Result<(PathBuf, String)> {
+    match (config, runtime_root_id) {
+        (Some(config), Some(runtime_root_id)) => Ok((config, runtime_root_id)),
+        (None, None) if routed_literal => resolve_literal_machine_global_defaults().context(
+            "failed to resolve default machine-global binding for routed literal instruction",
+        ),
+        (None, None) => bail!(
+            "explicit supervise run requires --machine-global-config and \
+             --machine-global-runtime-root-id"
+        ),
+        _ => bail!(
+            "--machine-global-config and --machine-global-runtime-root-id must be supplied together"
+        ),
+    }
+}
+
+fn physical_xdg_machine_global_config_path() -> Result<PathBuf> {
+    let config_home = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(value) if !value.is_empty() => {
+            let path = PathBuf::from(value);
+            if !path.is_absolute() {
+                bail!("XDG_CONFIG_HOME must be an absolute physical path");
+            }
+            path
+        }
+        _ => {
+            let home = std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .context("HOME must be set when XDG_CONFIG_HOME is absent")?;
+            let home = PathBuf::from(home);
+            if !home.is_absolute() {
+                bail!("HOME must be an absolute physical path");
+            }
+            home.join(".config")
+        }
+    };
+    Ok(config_home.join("maco").join("machine-global.json"))
+}
+
+fn select_literal_machine_global_runtime_root<'a>(
+    config: &'a MachineGlobalConfig,
+    trusted_runtime_root: &Path,
+) -> Result<&'a str> {
+    let mut candidates = config
+        .roots
+        .iter()
+        .filter(|root| root.path.starts_with(trusted_runtime_root));
+    let Some(selected) = candidates.next() else {
+        bail!(
+            "default machine-global config must declare exactly one reviewed root canonically inside the current user's runtime root"
+        );
+    };
+    if candidates.next().is_some() {
+        bail!(
+            "default machine-global config must declare exactly one reviewed root canonically inside the current user's runtime root"
+        );
+    }
+    Ok(selected.id.as_str())
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_literal_machine_global_defaults() -> Result<(PathBuf, String)> {
+    let config_path = physical_xdg_machine_global_config_path()?;
+    let binding_before = machine_global_config_content_binding(&config_path)
+        .context("default machine-global config is not a safe physical file")?;
+    let bytes = BoundedRegularReader::read_tree_no_follow(
+        &config_path,
+        MAX_DEFAULT_MACHINE_GLOBAL_CONFIG_BYTES,
+    )
+    .context("failed to read the default machine-global config without following links")?;
+    let store = MachineGlobalStore::open_config(&config_path)
+        .context("failed to authenticate the default machine-global config")?;
+    let binding_after = machine_global_config_content_binding(&config_path)
+        .context("default machine-global config changed after authentication")?;
+    if binding_before != binding_after
+        || binding_before.0 != crate::artifacts::state_auth::sha256_hex(&bytes)
+    {
+        bail!("default machine-global config changed while resolving runtime defaults");
+    }
+    let config: MachineGlobalConfig = serde_json::from_slice(&bytes)
+        .context("authenticated default machine-global config is invalid JSON")?;
+    let runtime_root = crate::process_runner::trusted_linux_runtime_root()
+        .context("current user's runtime root is unavailable or unsafe")?;
+    let selected = select_literal_machine_global_runtime_root(&config, &runtime_root)?;
+    store
+        .revalidate_root(selected)
+        .context("selected default machine-global runtime root is no longer safe")?;
+    let binding_final = machine_global_config_content_binding(&config_path)
+        .context("default machine-global config changed after runtime-root selection")?;
+    if binding_after != binding_final {
+        bail!("default machine-global config changed while selecting the runtime root");
+    }
+    Ok((config_path, selected.to_string()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resolve_literal_machine_global_defaults() -> Result<(PathBuf, String)> {
+    bail!("routed literal machine-global defaults require the strict Linux runtime")
 }
 
 impl Cli {
@@ -188,7 +359,7 @@ enum Command {
     Inbox(InboxCommand),
     /// Serve read-only real-time orchestration observability APIs.
     Scope(ScopeCommand),
-    /// Run local-first autopilot workflow phases.
+    /// Inspect artifacts from retired autopilot runs.
     Autopilot(AutopilotCommand),
     /// Apply retention to one repository-local bulk artifact family.
     Artifacts(RepositoryArtifactsCommand),
@@ -860,18 +1031,29 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
             print_query_report(&plan, json)
         }
         SuperviseSubcommand::Run(args) => {
+            let routed_literal = args.literal_goal.is_some();
+            let (machine_global_config, machine_global_runtime_root_id) =
+                resolve_supervise_machine_global_binding(
+                    routed_literal,
+                    args.machine_global_config.clone(),
+                    args.machine_global_runtime_root_id.clone(),
+                )?;
             let quota_config = args.quota_config.clone();
             let rolling_quota = args.budget.rolling_quota();
             let budget_overrides = args.budget.limits();
             let budget_max_duration_seconds = args.budget.max_duration_seconds();
-            let (plan_file, goal_spec) = match (args.supervisor_plan, args.from_goal) {
-                (Some(plan_file), None) => (plan_file, None),
-                (None, Some(goal_file)) => {
+            let (plan_file, goal_spec) =
+                match (args.supervisor_plan, args.from_goal, args.literal_goal) {
+                (Some(plan_file), None, None) => (plan_file, None),
+                (None, Some(goal_file), None) => {
                     let goal_spec = read_supervise_goal_file(&goal_file)?;
                     (goal_file, Some(goal_spec))
                 }
+                (None, None, Some(goal_spec)) => {
+                    (PathBuf::from("<literal-instruction>"), Some(goal_spec))
+                }
                 _ => bail!(
-                    "supervise run requires exactly one positional SUPERVISOR_PLAN or --from-goal <FILE>"
+                    "supervise run requires exactly one positional SUPERVISOR_PLAN, --from-goal <FILE>, or routed literal instruction"
                 ),
             };
             let existing = if let Some(explicit) = args.run_id.as_deref() {
@@ -974,8 +1156,8 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                 budget_overrides,
                 budget_max_duration_seconds,
                 machine_global_retention: Some(MachineGlobalRetentionBinding {
-                    config: args.machine_global_config,
-                    root_id: args.machine_global_runtime_root_id,
+                    config: machine_global_config,
+                    root_id: machine_global_runtime_root_id,
                     owner: "maco-supervise".to_string(),
                     correction_correlation_id: resolved_run_id.as_str().to_string(),
                 }),
@@ -1388,13 +1570,26 @@ struct RunSuperviseArgs {
     /// JSON supervisor plan file to run.
     #[arg(
         value_name = "SUPERVISOR_PLAN",
-        required_unless_present = "from_goal",
-        conflicts_with = "from_goal"
+        required_unless_present_any = ["from_goal", "literal_goal"],
+        conflicts_with_all = ["from_goal", "literal_goal"]
     )]
     supervisor_plan: Option<PathBuf>,
     /// High-level goal/spec file to decompose and run through the supervisor gates.
-    #[arg(long, value_name = "FILE", conflicts_with = "supervisor_plan")]
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with_all = ["supervisor_plan", "literal_goal"]
+    )]
     from_goal: Option<PathBuf>,
+    /// Internal argv-routing source for a bare literal instruction.
+    #[arg(
+        long,
+        value_name = "TEXT",
+        hide = true,
+        allow_hyphen_values = true,
+        conflicts_with_all = ["supervisor_plan", "from_goal"]
+    )]
+    literal_goal: Option<String>,
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
@@ -1461,11 +1656,21 @@ struct RunSuperviseArgs {
     #[command(flatten)]
     role_category_override: OperatorRoleCategoryArgs,
     /// Exact reviewed config used to gate private runtime output-staging cleanup.
-    #[arg(long, required = true)]
-    machine_global_config: PathBuf,
-    /// Reviewed root id whose canonical root must contain `/run/user/<uid>`.
-    #[arg(long, required = true)]
-    machine_global_runtime_root_id: String,
+    #[arg(
+        long,
+        env = "MACO_MACHINE_GLOBAL_CONFIG",
+        required_unless_present = "literal_goal",
+        requires = "machine_global_runtime_root_id"
+    )]
+    machine_global_config: Option<PathBuf>,
+    /// Reviewed root id whose canonical root must be inside `/run/user/<uid>`.
+    #[arg(
+        long,
+        env = "MACO_MACHINE_GLOBAL_RUNTIME_ROOT_ID",
+        required_unless_present = "literal_goal",
+        requires = "machine_global_config"
+    )]
+    machine_global_runtime_root_id: Option<String>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -2186,106 +2391,8 @@ struct AutopilotCommand {
 impl AutopilotCommand {
     fn run(self) -> Result<()> {
         match self.command {
-            AutopilotSubcommand::Plan(args) => {
-                let plan = autopilot::autopilot_plan_from_task_file(args.repo, args.task_file)?;
-                print_query_report(&plan, args.json)
-            }
-            AutopilotSubcommand::Run(args) => {
-                let json = args.json;
-                let quota_config = args.quota_config.clone();
-                let rolling_quota = args.budget.rolling_quota();
-                let budget_overrides = args.budget.limits();
-                let budget_max_duration_seconds = args.budget.max_duration_seconds();
-                let (plan_file, goal_spec) = match (args.task_file, args.from_goal) {
-                    (Some(plan_file), None) => (plan_file, None),
-                    (None, Some(goal_file)) => {
-                        let goal_spec = read_supervise_goal_file(&goal_file)?;
-                        (goal_file, Some(goal_spec))
-                    }
-                    _ => bail!(
-                        "autopilot run requires exactly one positional TASK_FILE or --from-goal <FILE>"
-                    ),
-                };
-                let profile = args
-                    .profile
-                    .as_ref()
-                    .map(autopilot::autopilot_profile_from_file)
-                    .transpose()?;
-                let resolved = resolve_run_id_for_run(
-                    &args.repo,
-                    RunArtifactFamily::Autopilot,
-                    args.run_id.as_deref(),
-                    args.json,
-                )?;
-                let parent_node = args.parent_node.map(Into::into);
-                let (plan_file, goal_spec) = materialize_launch_plan_for_operator_role_category(
-                    plan_file,
-                    goal_spec,
-                    &resolved.repo,
-                    resolved.run_id.as_str(),
-                    args.role_category_override.role_category,
-                )?;
-                let reap_repo = resolved.repo.clone();
-                let _rolling_guard = rolling_quota
-                    .map(|quota| {
-                        crate::budget_ledger::bind_rolling_budget(
-                            &resolved.repo,
-                            quota,
-                            resolved.run_id.as_str(),
-                        )
-                    })
-                    .transpose()?;
-                let _quota_config_guard = quota_config
-                    .as_deref()
-                    .map(|path| supervise::bind_operator_quota_config(&resolved.repo, path))
-                    .transpose()?;
-                let options = AutopilotRunOptions {
-                    repo: resolved.repo,
-                    plan_file,
-                    run_id: resolved.run_id.clone(),
-                    codex_bin: args.codex_bin,
-                    reviewer_command: args.reviewer_command,
-                    allow_dirty_primary: args.allow_dirty_primary,
-                    allow_live_run_collision: args.force_live_run,
-                    max_child_dispatches: args.max_child_dispatches,
-                    budget_overrides,
-                    budget_max_duration_seconds,
-                    cancellation: None,
-                };
-                let retention = Some(MachineGlobalRetentionBinding {
-                    config: args.machine_global_config,
-                    root_id: args.machine_global_runtime_root_id,
-                    owner: "maco-autopilot".to_string(),
-                    correction_correlation_id: resolved.run_id.as_str().to_string(),
-                });
-                let outcome = (|| {
-                    let report = match goal_spec {
-                        Some(goal_spec) => {
-                            autopilot::run_autopilot_goal_spec_with_profile_retention_and_parent(
-                                options,
-                                "",
-                                &goal_spec,
-                                profile,
-                                retention,
-                                parent_node,
-                            )?
-                        }
-                        None => {
-                            autopilot::run_autopilot_plan_file_with_profile_retention_and_parent(
-                                options,
-                                profile,
-                                retention,
-                                parent_node,
-                            )?
-                        }
-                    };
-                    print_query_report(&report, json)?;
-                    if !report.success {
-                        bail!("autopilot run failed");
-                    }
-                    Ok(())
-                })();
-                finish_with_merged_worktree_reap(&reap_repo, json, outcome)
+            AutopilotSubcommand::Plan(_) | AutopilotSubcommand::Run(_) => {
+                bail!(RETIRED_AUTOPILOT_EXECUTION_MESSAGE)
             }
             AutopilotSubcommand::Status(args) => {
                 let report = autopilot::autopilot_status(args.repo, RunId::new(&args.run_id)?)?;
@@ -2311,10 +2418,12 @@ impl AutopilotCommand {
 
 #[derive(Debug, Subcommand)]
 enum AutopilotSubcommand {
-    /// Normalize a task file or JSON autopilot plan without running it.
-    Plan(PlanAutopilotArgs),
-    /// Run one depth-2 plan through the live supervise gates without applying to primary.
-    Run(Box<RunAutopilotArgs>),
+    /// Retired. Use `maco <instruction>`.
+    #[command(hide = true)]
+    Plan(RetiredAutopilotArgs),
+    /// Retired. Use `maco <instruction>`.
+    #[command(hide = true)]
+    Run(RetiredAutopilotArgs),
     /// Report durable autopilot run artifact state.
     Status(StatusAutopilotArgs),
     /// Collect the durable autopilot final report.
@@ -2324,73 +2433,10 @@ enum AutopilotSubcommand {
 }
 
 #[derive(Debug, Args)]
-struct PlanAutopilotArgs {
-    /// Task file or JSON autopilot plan file.
-    task_file: PathBuf,
-    /// Repository path.
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
-    /// Emit machine-readable JSON.
-    #[arg(long)]
-    json: bool,
-}
-
-#[derive(Debug, Args)]
-struct RunAutopilotArgs {
-    /// Task file or JSON autopilot plan file.
-    #[arg(
-        value_name = "TASK_FILE",
-        required_unless_present = "from_goal",
-        conflicts_with = "from_goal"
-    )]
-    task_file: Option<PathBuf>,
-    /// High-level goal/spec file to decompose and run through the autopilot gates.
-    #[arg(long, value_name = "FILE", conflicts_with = "task_file")]
-    from_goal: Option<PathBuf>,
-    /// Repository path.
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
-    /// Stable run id for durable `.maco/autopilot/runs/<run-id>` artifacts. Omit to generate one.
-    #[arg(long)]
-    run_id: Option<String>,
-    /// External orchestration node that directly spawned this autopilot run.
-    #[arg(long, value_parser = parse_boxed_orchestration_node_id)]
-    parent_node: Option<Box<str>>,
-    /// Codex-compatible executable to invoke. Omit for deterministic local fake mode.
-    #[arg(long)]
-    codex_bin: Option<PathBuf>,
-    /// Versioned role/model, pricing, and review-lens profile manifest.
-    #[arg(long)]
-    profile: Option<PathBuf>,
-    /// Disabled legacy reviewer shell string; supplying it fails closed.
-    #[arg(long)]
-    reviewer_command: Option<String>,
-    /// Allow autopilot to run when the primary worktree is dirty.
-    #[arg(long)]
-    allow_dirty_primary: bool,
-    /// Launch even when another live supervise or autopilot run still targets this repository.
-    /// Launch-only: grants no authority to kill, interrupt, revert, or discard another run.
-    #[arg(long)]
-    force_live_run: bool,
-    /// Maximum source plus generated follow-up supervisor-plan dispatches admitted by this run.
-    #[arg(long, value_name = "COUNT")]
-    max_child_dispatches: Option<usize>,
-    /// Repository-relative strict versioned quota entitlement config propagated to supervise.
-    #[arg(long, value_name = "REPO_RELATIVE_FILE")]
-    quota_config: Option<PathBuf>,
-    #[command(flatten)]
-    budget: RunBudgetArgs,
-    #[command(flatten)]
-    role_category_override: OperatorRoleCategoryArgs,
-    /// Exact reviewed config used to gate private runtime output-staging cleanup.
-    #[arg(long, required = true)]
-    machine_global_config: PathBuf,
-    /// Reviewed root id whose canonical root must contain `/run/user/<uid>`.
-    #[arg(long, required = true)]
-    machine_global_runtime_root_id: String,
-    /// Emit machine-readable JSON.
-    #[arg(long)]
-    json: bool,
+struct RetiredAutopilotArgs {
+    /// Ignored legacy arguments. The command always returns the retirement message.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    _legacy_args: Vec<OsString>,
 }
 
 #[derive(Debug, Args)]
@@ -4275,6 +4321,74 @@ include!("cli/part2.rs");
 mod cli_integration_tests {
     use super::*;
 
+    fn literal_default_config_with_roots(roots: &[(&str, &str)]) -> MachineGlobalConfig {
+        MachineGlobalConfig {
+            version: 1,
+            state_root: PathBuf::from("/state"),
+            roots: roots
+                .iter()
+                .map(
+                    |(id, path)| crate::machine_global::DeclaredGlobalRootConfig {
+                        id: (*id).to_string(),
+                        path: PathBuf::from(path),
+                        protected_paths: Vec::new(),
+                        quarantine_grace_seconds: 60,
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn literal_default_runtime_root_selector_accepts_one_descendant() {
+        let config = literal_default_config_with_roots(&[
+            ("elsewhere", "/srv/maco/runtime"),
+            ("runtime", "/run/user/1000/maco/runtime"),
+        ]);
+        assert_eq!(
+            select_literal_machine_global_runtime_root(&config, Path::new("/run/user/1000"))
+                .expect("select the one reviewed descendant"),
+            "runtime"
+        );
+    }
+
+    #[test]
+    fn literal_default_runtime_root_selector_refuses_outside_sibling_and_broad_ancestor() {
+        for root in [
+            "/srv/maco/runtime",
+            "/run/user/1001/maco/runtime",
+            "/run/user",
+        ] {
+            let config = literal_default_config_with_roots(&[("runtime", root)]);
+            assert!(
+                select_literal_machine_global_runtime_root(&config, Path::new("/run/user/1000"))
+                    .is_err(),
+                "must refuse {root}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_default_runtime_root_selector_refuses_duplicate_and_overlapping_candidates() {
+        for roots in [
+            vec![
+                ("runtime-a", "/run/user/1000/maco/runtime"),
+                ("runtime-b", "/run/user/1000/maco/runtime"),
+            ],
+            vec![
+                ("runtime-parent", "/run/user/1000/maco"),
+                ("runtime-child", "/run/user/1000/maco/runtime"),
+            ],
+        ] {
+            let config = literal_default_config_with_roots(&roots);
+            assert!(
+                select_literal_machine_global_runtime_root(&config, Path::new("/run/user/1000"))
+                    .is_err(),
+                "must refuse ambiguous roots {roots:?}"
+            );
+        }
+    }
+
     fn inbox_run_args(argv: &[&str]) -> RunInboxArgs {
         let parsed = Cli::try_parse_from(argv).expect("inbox run arguments should parse");
         let Command::Inbox(InboxCommand {
@@ -4483,17 +4597,6 @@ mod cli_integration_tests {
         args
     }
 
-    fn autopilot_run_args(argv: &[&str]) -> Box<RunAutopilotArgs> {
-        let parsed = Cli::try_parse_from(argv).expect("autopilot run arguments should parse");
-        let Command::Autopilot(AutopilotCommand {
-            command: AutopilotSubcommand::Run(args),
-        }) = parsed.command
-        else {
-            panic!("expected autopilot run command");
-        };
-        args
-    }
-
     const LAUNCH_RETENTION: [&str; 4] = [
         "--machine-global-config",
         "/tmp/maco-machine-global.json",
@@ -4502,7 +4605,7 @@ mod cli_integration_tests {
     ];
 
     #[test]
-    fn supervise_and_autopilot_role_category_override_defaults_to_automatic() {
+    fn supervise_role_category_override_defaults_to_automatic() {
         let supervise = supervise_run_args(&[
             "maco",
             "supervise",
@@ -4514,22 +4617,10 @@ mod cli_integration_tests {
             LAUNCH_RETENTION[3],
         ]);
         assert_eq!(supervise.role_category_override.role_category, None);
-
-        let autopilot = autopilot_run_args(&[
-            "maco",
-            "autopilot",
-            "run",
-            "plan.json",
-            LAUNCH_RETENTION[0],
-            LAUNCH_RETENTION[1],
-            LAUNCH_RETENTION[2],
-            LAUNCH_RETENTION[3],
-        ]);
-        assert_eq!(autopilot.role_category_override.role_category, None);
     }
 
     #[test]
-    fn supervise_and_autopilot_role_category_override_parses_operator_values() {
+    fn supervise_role_category_override_parses_operator_values() {
         let supervise = supervise_run_args(&[
             "maco",
             "supervise",
@@ -4546,45 +4637,26 @@ mod cli_integration_tests {
             supervise.role_category_override.role_category,
             Some(OperatorRoleCategory::ReadOnlyResearcher)
         );
+    }
 
-        let autopilot = autopilot_run_args(&[
+    #[test]
+    fn supervise_rejects_unknown_role_category() {
+        let argv = [
             "maco",
-            "autopilot",
+            "supervise",
             "run",
             "plan.json",
             "--role-category",
-            "non-delegating-terminal-worker",
+            "weak_model",
             LAUNCH_RETENTION[0],
             LAUNCH_RETENTION[1],
             LAUNCH_RETENTION[2],
             LAUNCH_RETENTION[3],
-        ]);
-        assert_eq!(
-            autopilot.role_category_override.role_category,
-            Some(OperatorRoleCategory::NonDelegatingTerminalWorker)
+        ];
+        assert!(
+            Cli::try_parse_from(argv).is_err(),
+            "supervise must reject an unknown role category"
         );
-    }
-
-    #[test]
-    fn supervise_and_autopilot_reject_unknown_role_category() {
-        for command in ["supervise", "autopilot"] {
-            let argv = [
-                "maco",
-                command,
-                "run",
-                "plan.json",
-                "--role-category",
-                "weak_model",
-                LAUNCH_RETENTION[0],
-                LAUNCH_RETENTION[1],
-                LAUNCH_RETENTION[2],
-                LAUNCH_RETENTION[3],
-            ];
-            assert!(
-                Cli::try_parse_from(argv).is_err(),
-                "{command} must reject an unknown role category"
-            );
-        }
     }
 
     #[test]
