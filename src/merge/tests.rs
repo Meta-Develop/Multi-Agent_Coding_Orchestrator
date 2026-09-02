@@ -1550,16 +1550,23 @@ fn required_network_output_rejects_even_verified_wrong_profile() {
 
 #[test]
 fn local_git_timeout_override_reaches_candidate_snapshot_diff_deadline() {
-    let timeout = parse_local_git_process_timeout(Some("900")).expect("parse raised budget");
+    let local_git = MergeLocalGitOptions::from_seconds(900).expect("parse raised budget");
     let base = Oid::from_str("1111111111111111111111111111111111111111").expect("base oid");
     let snapshot = Oid::from_str("2222222222222222222222222222222222222222").expect("snapshot oid");
 
     let diff = collect_snapshot_diff_with_runner(
         base,
         snapshot,
-        timeout,
-        |operation, stdin, label, effective_timeout| {
+        local_git,
+        |operation, stdin, label, effective_timeout, deadline_knobs| {
             assert_eq!(effective_timeout, Duration::from_secs(900));
+            assert_eq!(
+                deadline_knobs,
+                Some((
+                    LOCAL_GIT_PROCESS_TIMEOUT_FLAG,
+                    LOCAL_GIT_PROCESS_TIMEOUT_ENV,
+                ))
+            );
             assert_eq!(label, "collect candidate snapshot diff");
             assert_eq!(operation.first(), Some(&"diff"));
             assert!(matches!(stdin, StdinMode::Null));
@@ -1576,6 +1583,62 @@ fn local_git_timeout_override_reaches_candidate_snapshot_diff_deadline() {
 }
 
 #[test]
+fn local_git_timeout_reaches_apply_validation_recapture_boundary() {
+    let local_git = MergeLocalGitOptions::from_seconds(900).expect("parse raised budget");
+    let mut captures = 0;
+
+    let captured = capture_matching_candidate_validation_snapshot(local_git, |effective| {
+        captures += 1;
+        assert_eq!(effective, local_git);
+        Ok(Some(b"stable-validation-snapshot".to_vec()))
+    })
+    .expect("capture matching validation snapshots");
+
+    assert_eq!(captures, 2);
+    assert_eq!(captured, b"stable-validation-snapshot");
+}
+
+#[test]
+fn local_git_timeout_reaches_megafile_recapture_boundary() {
+    let local_git = MergeLocalGitOptions::from_seconds(900).expect("parse raised budget");
+    let mut captures = 0;
+
+    let captured = capture_matching_decomposition_snapshot(local_git, |effective| {
+        captures += 1;
+        assert_eq!(effective, local_git);
+        Ok(Some(b"stable-decomposition-snapshot".to_vec()))
+    })
+    .expect("capture matching decomposition snapshots");
+
+    assert_eq!(captures, 2);
+    assert_eq!(captured, b"stable-decomposition-snapshot");
+}
+
+#[test]
+fn default_only_candidate_snapshot_diff_omits_knob_hint() {
+    let base = Oid::from_str("1111111111111111111111111111111111111111").expect("base oid");
+    let snapshot = Oid::from_str("2222222222222222222222222222222222222222").expect("snapshot oid");
+
+    let diff = collect_snapshot_diff_with_runner(
+        base,
+        snapshot,
+        MergeLocalGitOptions::default(),
+        |_, _, _, effective_timeout, deadline_knobs| {
+            assert_eq!(effective_timeout, Duration::from_secs(120));
+            assert_eq!(deadline_knobs, None);
+            Ok(RequiredCommandOutput {
+                success: true,
+                stdout: b"default-budget-diff".to_vec(),
+                stderr: Vec::new(),
+            })
+        },
+    )
+    .expect("collect default snapshot diff");
+
+    assert_eq!(diff, b"default-budget-diff");
+}
+
+#[test]
 fn local_git_timeout_default_and_invalid_overrides_are_typed() {
     assert_eq!(
         parse_local_git_process_timeout(None).expect("default timeout"),
@@ -1584,6 +1647,10 @@ fn local_git_timeout_default_and_invalid_overrides_are_typed() {
     assert_eq!(
         MergeLocalGitOptions::default().candidate_snapshot_diff_timeout,
         Duration::from_secs(120)
+    );
+    assert_eq!(
+        MergeLocalGitOptions::default().candidate_snapshot_diff_deadline_knobs,
+        None
     );
     assert_eq!(
         parse_local_git_process_timeout(Some("86400")).expect("maximum timeout"),
@@ -2247,16 +2314,28 @@ fn initialized_repository_fingerprint_ignores_ignored_output() {
     repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
         .expect("commit");
 
-    let before = validation_repository_fingerprint(&repo, temp.path(), None, 0)
-        .expect("baseline fingerprint");
+    let before = validation_repository_fingerprint_with_local_git_options(
+        &repo,
+        temp.path(),
+        None,
+        MergeLocalGitOptions::default(),
+        0,
+    )
+    .expect("baseline fingerprint");
     fs::create_dir(temp.path().join("ignored")).expect("create ignored output");
     fs::write(
         temp.path().join("ignored/build.bin"),
         vec![7_u8; 1024 * 1024],
     )
     .expect("write ignored output");
-    let after = validation_repository_fingerprint(&repo, temp.path(), None, 0)
-        .expect("updated fingerprint");
+    let after = validation_repository_fingerprint_with_local_git_options(
+        &repo,
+        temp.path(),
+        None,
+        MergeLocalGitOptions::default(),
+        0,
+    )
+    .expect("updated fingerprint");
 
     assert_eq!(before, after);
 }
@@ -2399,7 +2478,10 @@ fn candidate_validation_sandbox_is_removed_when_patch_apply_fails() {
         },
     };
 
-    let result = CandidateValidationSandbox::create(&preview);
+    let result = CandidateValidationSandbox::create_with_local_git_options(
+        &preview,
+        MergeLocalGitOptions::default(),
+    );
 
     assert!(result.is_err());
     let output = Command::new("git")

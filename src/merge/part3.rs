@@ -401,6 +401,7 @@ fn run_isolated_git_process_with_timeout(
     stdin: StdinMode,
     label: &str,
     timeout: Duration,
+    deadline_knobs: Option<(&str, &str)>,
 ) -> Result<GitCommandOutput> {
     let profile = isolated_git_workspace_profile(context, worktree_path)?;
     run_isolated_git_process_os_with_profile_and_timeout(
@@ -410,10 +411,7 @@ fn run_isolated_git_process_with_timeout(
         label,
         profile,
         timeout,
-        Some((
-            LOCAL_GIT_PROCESS_TIMEOUT_FLAG,
-            LOCAL_GIT_PROCESS_TIMEOUT_ENV,
-        )),
+        deadline_knobs,
     )
 }
 

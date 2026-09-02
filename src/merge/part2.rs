@@ -136,13 +136,13 @@ fn collect_snapshot_diff(
     base_tree: Oid,
     snapshot_tree: Oid,
     index: &TemporaryIndex,
-    timeout: Duration,
+    local_git: MergeLocalGitOptions,
 ) -> Result<Vec<u8>> {
     collect_snapshot_diff_with_runner(
         base_tree,
         snapshot_tree,
-        timeout,
-        |operation, stdin, label, timeout| {
+        local_git,
+        |operation, stdin, label, timeout, deadline_knobs| {
             run_isolated_git_process_with_timeout(
                 index,
                 worktree_path,
@@ -150,6 +150,7 @@ fn collect_snapshot_diff(
                 stdin,
                 label,
                 timeout,
+                deadline_knobs,
             )
         },
     )
@@ -158,11 +159,17 @@ fn collect_snapshot_diff(
 fn collect_snapshot_diff_with_runner<F>(
     base_tree: Oid,
     snapshot_tree: Oid,
-    timeout: Duration,
+    local_git: MergeLocalGitOptions,
     run: F,
 ) -> Result<Vec<u8>>
 where
-    F: FnOnce(&[&str], StdinMode, &str, Duration) -> Result<GitCommandOutput>,
+    F: FnOnce(
+        &[&str],
+        StdinMode,
+        &str,
+        Duration,
+        Option<(&'static str, &'static str)>,
+    ) -> Result<GitCommandOutput>,
 {
     let base = base_tree.to_string();
     let snapshot = snapshot_tree.to_string();
@@ -180,7 +187,8 @@ where
         ],
         StdinMode::Null,
         "collect candidate snapshot diff",
-        timeout,
+        local_git.candidate_snapshot_diff_timeout,
+        local_git.candidate_snapshot_diff_deadline_knobs,
     )?;
     if !output.success {
         bail!(
@@ -2135,9 +2143,22 @@ fn run_candidate_validation_commands(
     preview: &MergeApplyPreview,
     commands: &[CandidateValidationCommand],
 ) -> Result<Vec<ValidationReport>> {
+    run_candidate_validation_commands_with_local_git_options(
+        preview,
+        commands,
+        MergeLocalGitOptions::default(),
+    )
+}
+
+fn run_candidate_validation_commands_with_local_git_options(
+    preview: &MergeApplyPreview,
+    commands: &[CandidateValidationCommand],
+    local_git: MergeLocalGitOptions,
+) -> Result<Vec<ValidationReport>> {
     let mut reports = Vec::new();
     for (index, command) in commands.iter().enumerate() {
-        let sandbox = CandidateValidationSandbox::create(preview)?;
+        let sandbox =
+            CandidateValidationSandbox::create_with_local_git_options(preview, local_git)?;
         let environment_root = sandbox.validation_environment_root();
         let redactor = validation_diagnostics_redactor(&environment_root);
         let report = run_candidate_validation_command(
@@ -2160,6 +2181,7 @@ struct CandidateValidationSandbox {
     runtime_directory: PrivateRuntimeDirectory,
     git_context: TemporaryIndex,
     baseline_integrity: Option<CandidateValidationSandboxIntegrity>,
+    local_git: MergeLocalGitOptions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2241,7 +2263,10 @@ struct ValidationFilesystemBudget {
 }
 
 impl CandidateValidationSandbox {
-    fn create(preview: &MergeApplyPreview) -> Result<Self> {
+    fn create_with_local_git_options(
+        preview: &MergeApplyPreview,
+        local_git: MergeLocalGitOptions,
+    ) -> Result<Self> {
         let primary_repo_root = preview.candidate.metadata.primary_repo_root.clone();
         let runtime_directory = PrivateRuntimeDirectory::create(
             &primary_repo_root,
@@ -2269,6 +2294,7 @@ impl CandidateValidationSandbox {
             runtime_directory,
             git_context,
             baseline_integrity: None,
+            local_git,
         };
         initialize_isolated_index(&sandbox.git_context, sandbox.path(), base_oid)?;
         if let Some(base_oid) = base_oid {
@@ -2359,19 +2385,25 @@ impl CandidateValidationSandbox {
             )
         })?;
         let base = collection_base_oid(&preview.candidate.metadata)?;
-        capture_two_matching(|| {
+        capture_matching_candidate_validation_snapshot(self.local_git, |local_git| {
             let head = head_oid(&repo).context("failed to read validation sandbox HEAD")?;
-            let captured = snapshot_worktree_candidate_from_base_with_index(
+            let captured = snapshot_worktree_candidate_from_base_with_index_and_local_git_options(
                 &repo,
                 self.path(),
                 head,
                 base,
                 &self.git_context,
+                local_git,
             )?;
             let binding =
                 candidate_validation_binding(&preview.candidate.metadata, &captured.raw_diff)?;
-            let repository =
-                validation_repository_fingerprint(&repo, self.path(), Some(captured.oid), 0)?;
+            let repository = validation_repository_fingerprint_with_local_git_options(
+                &repo,
+                self.path(),
+                Some(captured.oid),
+                local_git,
+                0,
+            )?;
             Ok(Some(CandidateValidationSandboxIntegrity {
                 binding,
                 repository,
@@ -2380,10 +2412,22 @@ impl CandidateValidationSandbox {
     }
 }
 
-fn validation_repository_fingerprint(
+fn capture_matching_candidate_validation_snapshot<T, F>(
+    local_git: MergeLocalGitOptions,
+    mut capture: F,
+) -> Result<T>
+where
+    T: PartialEq,
+    F: FnMut(MergeLocalGitOptions) -> Result<Option<T>>,
+{
+    capture_two_matching(|| capture(local_git))
+}
+
+fn validation_repository_fingerprint_with_local_git_options(
     repo: &Repository,
     worktree_path: &Path,
     known_snapshot_tree: Option<Oid>,
+    local_git: MergeLocalGitOptions,
     depth: usize,
 ) -> Result<ValidationRepositoryFingerprint> {
     if depth > 32 {
@@ -2395,7 +2439,15 @@ fn validation_repository_fingerprint(
         .context("failed to capture recursive validation repository status")?;
     let snapshot_tree = match known_snapshot_tree {
         Some(snapshot_tree) => snapshot_tree,
-        None => snapshot_worktree_candidate(repo, worktree_path, head)?.oid,
+        None => {
+            snapshot_worktree_candidate_with_local_git_options(
+                repo,
+                worktree_path,
+                head,
+                local_git,
+            )?
+            .oid
+        }
     };
 
     let mut submodules = Vec::new();
@@ -2429,8 +2481,13 @@ fn validation_repository_fingerprint(
                 path_json_text(&path)
             )
         })?;
-        let repository =
-            validation_repository_fingerprint(&submodule_repo, &submodule_path, None, depth + 1)?;
+        let repository = validation_repository_fingerprint_with_local_git_options(
+            &submodule_repo,
+            &submodule_path,
+            None,
+            local_git,
+            depth + 1,
+        )?;
         submodules.push(ValidationSubmoduleFingerprint {
             path,
             expected_gitlink,

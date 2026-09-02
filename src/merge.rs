@@ -153,6 +153,7 @@ pub(crate) fn parse_local_git_process_timeout_seconds(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MergeLocalGitOptions {
     candidate_snapshot_diff_timeout: Duration,
+    candidate_snapshot_diff_deadline_knobs: Option<(&'static str, &'static str)>,
 }
 
 impl MergeLocalGitOptions {
@@ -161,6 +162,10 @@ impl MergeLocalGitOptions {
     ) -> std::result::Result<Self, LocalGitProcessTimeoutError> {
         Ok(Self {
             candidate_snapshot_diff_timeout: local_git_process_timeout_from_seconds(seconds)?,
+            candidate_snapshot_diff_deadline_knobs: Some((
+                LOCAL_GIT_PROCESS_TIMEOUT_FLAG,
+                LOCAL_GIT_PROCESS_TIMEOUT_ENV,
+            )),
         })
     }
 }
@@ -169,6 +174,7 @@ impl Default for MergeLocalGitOptions {
     fn default() -> Self {
         Self {
             candidate_snapshot_diff_timeout: LOCAL_GIT_PROCESS_TIMEOUT,
+            candidate_snapshot_diff_deadline_knobs: None,
         }
     }
 }
@@ -2364,7 +2370,7 @@ pub(crate) fn preview_merge_apply_with_megafile_policy_and_local_git_options(
     )?;
     let mut preview =
         build_merge_apply_preview(candidate, options.forces, options.require_validation)?;
-    assess_megafile_policy(&mut preview, &megafile_policy)?;
+    assess_megafile_policy_with_local_git_options(&mut preview, &megafile_policy, local_git)?;
     Ok(preview)
 }
 
@@ -2463,6 +2469,18 @@ fn assess_megafile_policy(
     preview: &mut MergeApplyPreview,
     policy: &MegafileMergePolicy,
 ) -> Result<()> {
+    assess_megafile_policy_with_local_git_options(
+        preview,
+        policy,
+        MergeLocalGitOptions::default(),
+    )
+}
+
+fn assess_megafile_policy_with_local_git_options(
+    preview: &mut MergeApplyPreview,
+    policy: &MegafileMergePolicy,
+    local_git: MergeLocalGitOptions,
+) -> Result<()> {
     policy
         .thresholds
         .validate()
@@ -2506,7 +2524,7 @@ fn assess_megafile_policy(
                 &preview.candidate.changed_paths,
             )
             .context("megafile decomposition supervise evidence was rejected")?;
-            verify_decomposition_candidate_structure(&preview.candidate, &evidence)?;
+            verify_decomposition_candidate_structure(&preview.candidate, &evidence, local_git)?;
             Some(evidence)
         }
         _ => None,
@@ -2589,6 +2607,7 @@ fn assess_megafile_policy(
 fn verify_decomposition_candidate_structure(
     candidate: &MergeCandidate,
     evidence: &VerifiedMegafileDecompositionEvidence,
+    local_git: MergeLocalGitOptions,
 ) -> Result<()> {
     let target_change = candidate
         .changes
@@ -2628,7 +2647,7 @@ fn verify_decomposition_candidate_structure(
         .context("failed to resolve candidate primary base commit")?
         .tree()
         .context("failed to resolve candidate primary base tree")?;
-    let snapshot_entries = recapture_candidate_snapshot_entries(candidate)?;
+    let snapshot_entries = recapture_candidate_snapshot_entries(candidate, local_git)?;
     if candidate.validation_binding != evidence.supervisor_candidate_binding {
         bail!(
             "current decomposition candidate content binding does not match the exact supervisor-inspected candidate finalized by run '{}'",
@@ -2730,8 +2749,20 @@ fn candidate_regular_file_size(
     }
 }
 
+fn capture_matching_decomposition_snapshot<T, F>(
+    local_git: MergeLocalGitOptions,
+    mut capture: F,
+) -> Result<T>
+where
+    T: PartialEq,
+    F: FnMut(MergeLocalGitOptions) -> Result<Option<T>>,
+{
+    capture_two_matching(|| capture(local_git))
+}
+
 fn recapture_candidate_snapshot_entries(
     candidate: &MergeCandidate,
+    local_git: MergeLocalGitOptions,
 ) -> Result<BTreeMap<PathBuf, CandidateSnapshotEntry>> {
     let agent_repo =
         crate::git_repository::open(&candidate.metadata.worktree_path).with_context(|| {
@@ -2748,12 +2779,13 @@ fn recapture_candidate_snapshot_entries(
         .transpose()
         .context("candidate agent head is invalid")?;
     let base = collection_base_oid(&candidate.metadata)?;
-    let captured = capture_two_matching(|| {
-        snapshot_worktree_candidate_from_base(
+    let captured = capture_matching_decomposition_snapshot(local_git, |local_git| {
+        snapshot_worktree_candidate_from_base_with_local_git_options(
             &agent_repo,
             &candidate.metadata.worktree_path,
             agent_head,
             base,
+            local_git,
         )
         .map(Some)
     })
@@ -2902,6 +2934,7 @@ pub(crate) fn merge_apply_report_with_megafile_policy_and_local_git_options(
         options.candidate_validation_commands,
         require_validation_after_candidate,
         &expected_primary_state,
+        local_git,
     )?;
     report.recorded_collision_paths = recorded_collision_paths;
     if report.recorded_collision_paths.is_empty() {
@@ -3050,6 +3083,7 @@ pub fn apply_prechecked_merge_with_candidate_validation(
         candidate_validation_commands,
         require_validation_after_candidate,
         &expected_primary_state,
+        MergeLocalGitOptions::default(),
     )
 }
 
@@ -3058,6 +3092,7 @@ fn apply_prechecked_merge_with_candidate_validation_locked(
     candidate_validation_commands: Vec<CandidateValidationCommand>,
     require_validation_after_candidate: bool,
     expected_primary_state: &PrimaryRepositoryState,
+    local_git: MergeLocalGitOptions,
 ) -> Result<MergeApplyReport> {
     if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
         bail!(
@@ -3091,7 +3126,11 @@ fn apply_prechecked_merge_with_candidate_validation_locked(
             .iter()
             .map(|command| command.command.clone())
             .collect::<Vec<_>>();
-        let reports = run_candidate_validation_commands(&preview, &candidate_validation_commands)?;
+        let reports = run_candidate_validation_commands_with_local_git_options(
+            &preview,
+            &candidate_validation_commands,
+            local_git,
+        )?;
         preview.candidate.validation_evidence.push_bound_reports(
             preview.candidate.validation_binding.clone(),
             reports.clone(),
@@ -3360,12 +3399,12 @@ fn capture_candidate_snapshot_once(
         before.agent_head,
     )?;
     let base_oid = collection_base_oid(&metadata)?;
-    let mut captured = snapshot_worktree_candidate_from_base_with_local_git_timeout(
+    let mut captured = snapshot_worktree_candidate_from_base_with_local_git_options(
         agent_repo,
         &record.path,
         before.agent_head,
         base_oid,
-        local_git.candidate_snapshot_diff_timeout,
+        local_git,
     )?;
     preserve_untracked_change_kinds(&before.worktree_status, &mut captured.changes)?;
     let after = capture_candidate_boundary(primary_repo, agent_repo)?;
@@ -3609,6 +3648,21 @@ fn snapshot_worktree_candidate(
     snapshot_worktree_candidate_from_base(repo, worktree_path, head, head)
 }
 
+fn snapshot_worktree_candidate_with_local_git_options(
+    repo: &Repository,
+    worktree_path: &Path,
+    head: Option<Oid>,
+    local_git: MergeLocalGitOptions,
+) -> Result<CapturedWorktreeTree> {
+    snapshot_worktree_candidate_from_base_with_local_git_options(
+        repo,
+        worktree_path,
+        head,
+        head,
+        local_git,
+    )
+}
+
 pub(crate) fn capture_worktree_diff_from_commit(
     repo: &Repository,
     worktree_path: &Path,
@@ -3632,57 +3686,40 @@ fn snapshot_worktree_candidate_from_base(
     head: Option<Oid>,
     base_commit: Option<Oid>,
 ) -> Result<CapturedWorktreeTree> {
-    snapshot_worktree_candidate_from_base_with_local_git_timeout(
+    snapshot_worktree_candidate_from_base_with_local_git_options(
         repo,
         worktree_path,
         head,
         base_commit,
-        LOCAL_GIT_PROCESS_TIMEOUT,
+        MergeLocalGitOptions::default(),
     )
 }
 
-fn snapshot_worktree_candidate_from_base_with_local_git_timeout(
+fn snapshot_worktree_candidate_from_base_with_local_git_options(
     repo: &Repository,
     worktree_path: &Path,
     head: Option<Oid>,
     base_commit: Option<Oid>,
-    local_git_timeout: Duration,
+    local_git: MergeLocalGitOptions,
 ) -> Result<CapturedWorktreeTree> {
     let index = TemporaryIndex::create(repo.commondir())?;
-    snapshot_worktree_candidate_from_base_with_index_and_local_git_timeout(
+    snapshot_worktree_candidate_from_base_with_index_and_local_git_options(
         repo,
         worktree_path,
         head,
         base_commit,
         &index,
-        local_git_timeout,
+        local_git,
     )
 }
 
-fn snapshot_worktree_candidate_from_base_with_index(
+fn snapshot_worktree_candidate_from_base_with_index_and_local_git_options(
     repo: &Repository,
     worktree_path: &Path,
     head: Option<Oid>,
     base_commit: Option<Oid>,
     index: &TemporaryIndex,
-) -> Result<CapturedWorktreeTree> {
-    snapshot_worktree_candidate_from_base_with_index_and_local_git_timeout(
-        repo,
-        worktree_path,
-        head,
-        base_commit,
-        index,
-        LOCAL_GIT_PROCESS_TIMEOUT,
-    )
-}
-
-fn snapshot_worktree_candidate_from_base_with_index_and_local_git_timeout(
-    repo: &Repository,
-    worktree_path: &Path,
-    head: Option<Oid>,
-    base_commit: Option<Oid>,
-    index: &TemporaryIndex,
-    local_git_timeout: Duration,
+    local_git: MergeLocalGitOptions,
 ) -> Result<CapturedWorktreeTree> {
     enforce_candidate_capture_quota(repo, worktree_path)?;
     let head_text = head.map(|oid| oid.to_string());
@@ -3727,13 +3764,7 @@ fn snapshot_worktree_candidate_from_base_with_index_and_local_git_timeout(
     let base_tree = temporary_base_tree_oid(repo, worktree_path, base_commit, index)?;
     let changes = collect_snapshot_changes(worktree_path, base_tree, oid, index)?;
     let entries = collect_candidate_snapshot_entries(index, oid, &changes)?;
-    let raw_diff = collect_snapshot_diff(
-        worktree_path,
-        base_tree,
-        oid,
-        index,
-        local_git_timeout,
-    )?;
+    let raw_diff = collect_snapshot_diff(worktree_path, base_tree, oid, index, local_git)?;
     Ok(CapturedWorktreeTree {
         oid,
         entries,
