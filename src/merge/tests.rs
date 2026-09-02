@@ -1581,6 +1581,14 @@ fn local_git_timeout_default_and_invalid_overrides_are_typed() {
         parse_local_git_process_timeout(None).expect("default timeout"),
         Duration::from_secs(120)
     );
+    assert_eq!(
+        MergeLocalGitOptions::default().candidate_snapshot_diff_timeout,
+        Duration::from_secs(120)
+    );
+    assert_eq!(
+        parse_local_git_process_timeout(Some("86400")).expect("maximum timeout"),
+        Duration::from_secs(86_400)
+    );
     assert!(matches!(
         parse_local_git_process_timeout(Some("0")),
         Err(LocalGitProcessTimeoutError::OutOfRange { seconds: 0, .. })
@@ -1616,12 +1624,32 @@ fn local_git_deadline_diagnostic_names_effective_budget_and_knob() {
         "collect candidate snapshot diff",
         &output,
         SideEffectConfinementProfileKind::StrictOfflineWorkspace,
-        Some((Duration::from_secs(900), LOCAL_GIT_PROCESS_TIMEOUT_ENV)),
+        Some((
+            Duration::from_secs(900),
+            LOCAL_GIT_PROCESS_TIMEOUT_FLAG,
+            LOCAL_GIT_PROCESS_TIMEOUT_ENV,
+        )),
     )
     .expect_err("deadline must fail");
     let message = error.to_string();
     assert!(message.contains("effective 900-second"));
+    assert!(message.contains(LOCAL_GIT_PROCESS_TIMEOUT_FLAG));
     assert!(message.contains(LOCAL_GIT_PROCESS_TIMEOUT_ENV));
+
+    let generic_error = require_verified_process_output_with_deadline_hint(
+        "other local Git operation",
+        &output,
+        SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+        None,
+    )
+    .expect_err("generic deadline must fail");
+    let generic_message = generic_error.to_string();
+    assert_eq!(
+        generic_message,
+        "other local Git operation exceeded its total operation deadline"
+    );
+    assert!(!generic_message.contains(LOCAL_GIT_PROCESS_TIMEOUT_FLAG));
+    assert!(!generic_message.contains(LOCAL_GIT_PROCESS_TIMEOUT_ENV));
 }
 
 #[test]

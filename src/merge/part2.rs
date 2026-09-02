@@ -136,18 +136,23 @@ fn collect_snapshot_diff(
     base_tree: Oid,
     snapshot_tree: Oid,
     index: &TemporaryIndex,
+    timeout: Duration,
 ) -> Result<Vec<u8>> {
-    let timeout = local_git_process_timeout()?;
-    collect_snapshot_diff_with_runner(base_tree, snapshot_tree, timeout, |operation, stdin, label, timeout| {
-        run_isolated_git_process_with_timeout(
-            index,
-            worktree_path,
-            operation,
-            stdin,
-            label,
-            timeout,
-        )
-    })
+    collect_snapshot_diff_with_runner(
+        base_tree,
+        snapshot_tree,
+        timeout,
+        |operation, stdin, label, timeout| {
+            run_isolated_git_process_with_timeout(
+                index,
+                worktree_path,
+                operation,
+                stdin,
+                label,
+                timeout,
+            )
+        },
+    )
 }
 
 fn collect_snapshot_diff_with_runner<F>(

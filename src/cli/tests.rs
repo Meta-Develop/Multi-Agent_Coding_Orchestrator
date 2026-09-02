@@ -723,6 +723,83 @@ fn existing_merge_preview_and_apply_parsing_remains_separate_from_arbitration() 
 }
 
 #[test]
+fn merge_local_git_timeout_flag_and_clap_env_wire_preview_and_apply_with_typed_bounds() {
+    assert_eq!(
+        MergeLocalGitTimeoutArgs::default().local_git_timeout_seconds,
+        120
+    );
+    let command = Cli::command();
+    let merge = command
+        .find_subcommand("merge")
+        .expect("merge subcommand");
+    for subcommand in ["preview", "apply"] {
+        let timeout = merge
+            .find_subcommand(subcommand)
+            .expect("merge timeout subcommand")
+            .get_arguments()
+            .find(|argument| argument.get_id().as_str() == "local_git_timeout_seconds")
+            .expect("merge local Git timeout argument");
+        assert_eq!(
+            timeout.get_env(),
+            Some(std::ffi::OsStr::new("MACO_MERGE_LOCAL_GIT_TIMEOUT_SECONDS"))
+        );
+    }
+
+    let preview = Cli::try_parse_from([
+        "maco",
+        "merge",
+        "preview",
+        "agent-a",
+        "--local-git-timeout-seconds",
+        "900",
+    ])
+    .expect("merge preview local Git timeout should parse");
+    let Command::Merge(MergeCommand {
+        command: MergeSubcommand::Preview(preview),
+    }) = preview.command
+    else {
+        panic!("expected merge preview command");
+    };
+    assert_eq!(preview.local_git.local_git_timeout_seconds, 900);
+
+    let apply = Cli::try_parse_from([
+        "maco",
+        "merge",
+        "apply",
+        "agent-a",
+        "--local-git-timeout-seconds",
+        "900",
+    ])
+    .expect("merge apply local Git timeout should parse");
+    let Command::Merge(MergeCommand {
+        command: MergeSubcommand::Apply(apply),
+    }) = apply.command
+    else {
+        panic!("expected merge apply command");
+    };
+    assert_eq!(apply.local_git.local_git_timeout_seconds, 900);
+
+    for subcommand in ["preview", "apply"] {
+        for (invalid, expected) in [
+            ("0", "between 1 and 86400 seconds"),
+            ("86401", "between 1 and 86400 seconds"),
+            ("not-a-number", "integer number of seconds"),
+        ] {
+            let error = Cli::try_parse_from([
+                "maco",
+                "merge",
+                subcommand,
+                "agent-a",
+                "--local-git-timeout-seconds",
+                invalid,
+            ])
+            .expect_err("invalid local Git timeout must be rejected");
+            assert!(error.to_string().contains(expected));
+        }
+    }
+}
+
+#[test]
 fn merge_auto_reap_is_default_off_and_apply_requires_classification() {
     let parsed = Cli::try_parse_from(["maco", "merge", "apply", "agent-a"])
         .expect("default merge apply should parse");
@@ -820,6 +897,7 @@ fn merge_apply_json_delivers_unclaimed_edits_denial_to_integration_controller() 
         decomposition_run_id: None,
         megafile_thresholds: MegafileThresholdArgs::default(),
         reviewed_watermark: None,
+        local_git: MergeLocalGitTimeoutArgs::default(),
         forces: MergeForceArgs {
             force_dirty_primary: false,
             force_stale_base: false,
@@ -951,6 +1029,7 @@ fn merge_apply_auto_reap_waits_for_trunk_then_reaps_on_finalization_rerun() {
         decomposition_run_id: None,
         megafile_thresholds: MegafileThresholdArgs::default(),
         reviewed_watermark: None,
+        local_git: MergeLocalGitTimeoutArgs::default(),
         forces: MergeForceArgs {
             force_dirty_primary: false,
             force_stale_base: false,
@@ -1015,6 +1094,7 @@ fn merge_apply_auto_reap_waits_for_trunk_then_reaps_on_finalization_rerun() {
         decomposition_run_id: None,
         megafile_thresholds: MegafileThresholdArgs::default(),
         reviewed_watermark: None,
+        local_git: MergeLocalGitTimeoutArgs::default(),
         forces: MergeForceArgs {
             force_dirty_primary: false,
             force_stale_base: true,

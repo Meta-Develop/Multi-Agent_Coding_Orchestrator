@@ -83,9 +83,13 @@ const MAX_BOUND_VALIDATION_REPORTS: usize = 1024;
 const MAX_BOUND_VALIDATION_NAME_BYTES: usize = 1024;
 const MAX_BOUND_VALIDATION_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_BOUND_VALIDATION_PATHS_PER_REPORT: usize = 8192;
-const LOCAL_GIT_PROCESS_TIMEOUT: Duration = Duration::from_secs(120);
-const MAX_LOCAL_GIT_PROCESS_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
-const LOCAL_GIT_PROCESS_TIMEOUT_ENV: &str = "MACO_MERGE_LOCAL_GIT_TIMEOUT_SECONDS";
+pub(crate) const DEFAULT_LOCAL_GIT_PROCESS_TIMEOUT_SECONDS: u64 = 120;
+pub(crate) const MAX_LOCAL_GIT_PROCESS_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
+pub(crate) const LOCAL_GIT_PROCESS_TIMEOUT_ENV: &str =
+    "MACO_MERGE_LOCAL_GIT_TIMEOUT_SECONDS";
+const LOCAL_GIT_PROCESS_TIMEOUT_FLAG: &str = "--local-git-timeout-seconds";
+const LOCAL_GIT_PROCESS_TIMEOUT: Duration =
+    Duration::from_secs(DEFAULT_LOCAL_GIT_PROCESS_TIMEOUT_SECONDS);
 pub(crate) const NETWORK_PROCESS_TIMEOUT: Duration = Duration::from_secs(300);
 const CANDIDATE_VALIDATION_PROCESS_TIMEOUT: Duration = Duration::from_secs(600);
 const GIT_CAPTURE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
@@ -101,20 +105,18 @@ const PRIVATE_RUNTIME_REMOVAL_MAX_ENTRIES: usize = 32 * 1024;
 const PRIVATE_RUNTIME_REMOVAL_MAX_DEPTH: usize = 128;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-enum LocalGitProcessTimeoutError {
-    #[error("MACO_MERGE_LOCAL_GIT_TIMEOUT_SECONDS must be valid Unicode")]
-    NotUnicode,
+pub(crate) enum LocalGitProcessTimeoutError {
     #[error(
-        "MACO_MERGE_LOCAL_GIT_TIMEOUT_SECONDS must be an integer number of seconds, got {value:?}"
+        "local Git timeout must be an integer number of seconds, got {value:?}"
     )]
     InvalidInteger { value: String },
     #[error(
-        "MACO_MERGE_LOCAL_GIT_TIMEOUT_SECONDS must be between 1 and {max_seconds} seconds, got {seconds}"
+        "local Git timeout must be between 1 and {max_seconds} seconds, got {seconds}"
     )]
     OutOfRange { seconds: u64, max_seconds: u64 },
 }
 
-fn parse_local_git_process_timeout(
+pub(crate) fn parse_local_git_process_timeout(
     value: Option<&str>,
 ) -> std::result::Result<Duration, LocalGitProcessTimeoutError> {
     let Some(value) = value else {
@@ -126,7 +128,13 @@ fn parse_local_git_process_timeout(
             .map_err(|_| LocalGitProcessTimeoutError::InvalidInteger {
                 value: value.to_string(),
             })?;
-    let max_seconds = MAX_LOCAL_GIT_PROCESS_TIMEOUT.as_secs();
+    local_git_process_timeout_from_seconds(seconds)
+}
+
+fn local_git_process_timeout_from_seconds(
+    seconds: u64,
+) -> std::result::Result<Duration, LocalGitProcessTimeoutError> {
+    let max_seconds = MAX_LOCAL_GIT_PROCESS_TIMEOUT_SECONDS;
     if seconds == 0 || seconds > max_seconds {
         return Err(LocalGitProcessTimeoutError::OutOfRange {
             seconds,
@@ -136,15 +144,33 @@ fn parse_local_git_process_timeout(
     Ok(Duration::from_secs(seconds))
 }
 
-fn local_git_process_timeout() -> Result<Duration> {
-    let value = match env::var(LOCAL_GIT_PROCESS_TIMEOUT_ENV) {
-        Ok(value) => Some(value),
-        Err(env::VarError::NotPresent) => None,
-        Err(env::VarError::NotUnicode(_)) => {
-            return Err(LocalGitProcessTimeoutError::NotUnicode.into())
+pub(crate) fn parse_local_git_process_timeout_seconds(
+    value: &str,
+) -> std::result::Result<u64, LocalGitProcessTimeoutError> {
+    parse_local_git_process_timeout(Some(value)).map(|timeout| timeout.as_secs())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MergeLocalGitOptions {
+    candidate_snapshot_diff_timeout: Duration,
+}
+
+impl MergeLocalGitOptions {
+    pub(crate) fn from_seconds(
+        seconds: u64,
+    ) -> std::result::Result<Self, LocalGitProcessTimeoutError> {
+        Ok(Self {
+            candidate_snapshot_diff_timeout: local_git_process_timeout_from_seconds(seconds)?,
+        })
+    }
+}
+
+impl Default for MergeLocalGitOptions {
+    fn default() -> Self {
+        Self {
+            candidate_snapshot_diff_timeout: LOCAL_GIT_PROCESS_TIMEOUT,
         }
-    };
-    parse_local_git_process_timeout(value.as_deref()).map_err(Into::into)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2167,9 +2193,39 @@ fn collect_agent_result_with_evidence(
     collect_agent_result_with_evidence_after_lease(options, validation_evidence, || {})
 }
 
+fn collect_agent_result_with_evidence_and_local_git_options(
+    options: MergeCollectOptions,
+    validation_evidence: ValidationEvidenceBundle,
+    local_git: MergeLocalGitOptions,
+) -> Result<MergeCandidate> {
+    collect_agent_result_with_evidence_after_lease_and_local_git_options(
+        options,
+        validation_evidence,
+        local_git,
+        || {},
+    )
+}
+
 fn collect_agent_result_with_evidence_after_lease<F>(
     options: MergeCollectOptions,
     validation_evidence: ValidationEvidenceBundle,
+    after_lease: F,
+) -> Result<MergeCandidate>
+where
+    F: FnOnce(),
+{
+    collect_agent_result_with_evidence_after_lease_and_local_git_options(
+        options,
+        validation_evidence,
+        MergeLocalGitOptions::default(),
+        after_lease,
+    )
+}
+
+fn collect_agent_result_with_evidence_after_lease_and_local_git_options<F>(
+    options: MergeCollectOptions,
+    validation_evidence: ValidationEvidenceBundle,
+    local_git: MergeLocalGitOptions,
     after_lease: F,
 ) -> Result<MergeCandidate>
 where
@@ -2184,6 +2240,7 @@ where
         validation_evidence,
         repo_root,
         leased_worktree.record(),
+        local_git,
     )
 }
 
@@ -2207,6 +2264,7 @@ pub(crate) fn collect_agent_result_with_evidence_and_write_lease(
         validation_evidence,
         repo_root,
         write_lease.record(),
+        MergeLocalGitOptions::default(),
     )
 }
 
@@ -2215,6 +2273,7 @@ fn collect_agent_result_from_verified_record(
     validation_evidence: ValidationEvidenceBundle,
     repo_root: PathBuf,
     record: &WorktreeRecord,
+    local_git: MergeLocalGitOptions,
 ) -> Result<MergeCandidate> {
     let primary_repo = crate::git_repository::open(&repo_root)
         .with_context(|| format!("failed to open primary repository {}", repo_root.display()))?;
@@ -2222,8 +2281,13 @@ fn collect_agent_result_from_verified_record(
         .with_context(|| format!("failed to open agent worktree {}", record.path.display()))?;
 
     let claimed_paths = normalize_claim_paths(options.claimed_paths)?;
-    let snapshot =
-        capture_consistent_candidate_snapshot(&primary_repo, &agent_repo, record, repo_root)?;
+    let snapshot = capture_consistent_candidate_snapshot(
+        &primary_repo,
+        &agent_repo,
+        record,
+        repo_root,
+        local_git,
+    )?;
     let snapshot_tree = snapshot.snapshot_tree;
     let metadata = snapshot.metadata;
     let changes = snapshot.changes;
@@ -2277,9 +2341,27 @@ pub fn preview_merge_apply_with_megafile_policy(
     validation_evidence: ValidationEvidenceBundle,
     megafile_policy: MegafileMergePolicy,
 ) -> Result<MergeApplyPreview> {
+    preview_merge_apply_with_megafile_policy_and_local_git_options(
+        options,
+        validation_evidence,
+        megafile_policy,
+        MergeLocalGitOptions::default(),
+    )
+}
+
+pub(crate) fn preview_merge_apply_with_megafile_policy_and_local_git_options(
+    options: MergePreviewOptions,
+    validation_evidence: ValidationEvidenceBundle,
+    megafile_policy: MegafileMergePolicy,
+    local_git: MergeLocalGitOptions,
+) -> Result<MergeApplyPreview> {
     let mut collect = options.collect;
     collect.include_full_diff = true;
-    let candidate = collect_agent_result_with_evidence(collect, validation_evidence)?;
+    let candidate = collect_agent_result_with_evidence_and_local_git_options(
+        collect,
+        validation_evidence,
+        local_git,
+    )?;
     let mut preview =
         build_merge_apply_preview(candidate, options.forces, options.require_validation)?;
     assess_megafile_policy(&mut preview, &megafile_policy)?;
@@ -2772,6 +2854,20 @@ pub fn merge_apply_report_with_megafile_policy(
     validation_evidence: ValidationEvidenceBundle,
     megafile_policy: MegafileMergePolicy,
 ) -> Result<MergeApplyReport> {
+    merge_apply_report_with_megafile_policy_and_local_git_options(
+        options,
+        validation_evidence,
+        megafile_policy,
+        MergeLocalGitOptions::default(),
+    )
+}
+
+pub(crate) fn merge_apply_report_with_megafile_policy_and_local_git_options(
+    options: MergeApplyOptions,
+    validation_evidence: ValidationEvidenceBundle,
+    megafile_policy: MegafileMergePolicy,
+    local_git: MergeLocalGitOptions,
+) -> Result<MergeApplyReport> {
     let repo_root = discover_primary_repo_root(&options.preview.collect.repo)?;
     let _lock = RepoCommonLock::acquire(&repo_root, "merge-apply")?;
     let mut preview_options = options.preview;
@@ -2779,10 +2875,11 @@ pub fn merge_apply_report_with_megafile_policy(
     if !options.candidate_validation_commands.is_empty() {
         preview_options.require_validation = false;
     }
-    let preview = preview_merge_apply_with_megafile_policy(
+    let preview = preview_merge_apply_with_megafile_policy_and_local_git_options(
         preview_options,
         validation_evidence,
         megafile_policy.clone(),
+        local_git,
     )?;
     if let Some(reviewed) = options.reviewed_watermark.as_ref() {
         let current =
@@ -3213,9 +3310,16 @@ fn capture_consistent_candidate_snapshot(
     agent_repo: &Repository,
     record: &WorktreeRecord,
     primary_repo_root: PathBuf,
+    local_git: MergeLocalGitOptions,
 ) -> Result<CandidateRepositorySnapshot> {
     capture_two_matching(|| {
-        capture_candidate_snapshot_once(primary_repo, agent_repo, record, primary_repo_root.clone())
+        capture_candidate_snapshot_once(
+            primary_repo,
+            agent_repo,
+            record,
+            primary_repo_root.clone(),
+            local_git,
+        )
     })
 }
 
@@ -3245,6 +3349,7 @@ fn capture_candidate_snapshot_once(
     agent_repo: &Repository,
     record: &WorktreeRecord,
     primary_repo_root: PathBuf,
+    local_git: MergeLocalGitOptions,
 ) -> Result<Option<CandidateRepositorySnapshot>> {
     let before = capture_candidate_boundary(primary_repo, agent_repo)?;
     let metadata = metadata_from_heads(
@@ -3255,11 +3360,12 @@ fn capture_candidate_snapshot_once(
         before.agent_head,
     )?;
     let base_oid = collection_base_oid(&metadata)?;
-    let mut captured = snapshot_worktree_candidate_from_base(
+    let mut captured = snapshot_worktree_candidate_from_base_with_local_git_timeout(
         agent_repo,
         &record.path,
         before.agent_head,
         base_oid,
+        local_git.candidate_snapshot_diff_timeout,
     )?;
     preserve_untracked_change_kinds(&before.worktree_status, &mut captured.changes)?;
     let after = capture_candidate_boundary(primary_repo, agent_repo)?;
@@ -3526,8 +3632,31 @@ fn snapshot_worktree_candidate_from_base(
     head: Option<Oid>,
     base_commit: Option<Oid>,
 ) -> Result<CapturedWorktreeTree> {
+    snapshot_worktree_candidate_from_base_with_local_git_timeout(
+        repo,
+        worktree_path,
+        head,
+        base_commit,
+        LOCAL_GIT_PROCESS_TIMEOUT,
+    )
+}
+
+fn snapshot_worktree_candidate_from_base_with_local_git_timeout(
+    repo: &Repository,
+    worktree_path: &Path,
+    head: Option<Oid>,
+    base_commit: Option<Oid>,
+    local_git_timeout: Duration,
+) -> Result<CapturedWorktreeTree> {
     let index = TemporaryIndex::create(repo.commondir())?;
-    snapshot_worktree_candidate_from_base_with_index(repo, worktree_path, head, base_commit, &index)
+    snapshot_worktree_candidate_from_base_with_index_and_local_git_timeout(
+        repo,
+        worktree_path,
+        head,
+        base_commit,
+        &index,
+        local_git_timeout,
+    )
 }
 
 fn snapshot_worktree_candidate_from_base_with_index(
@@ -3536,6 +3665,24 @@ fn snapshot_worktree_candidate_from_base_with_index(
     head: Option<Oid>,
     base_commit: Option<Oid>,
     index: &TemporaryIndex,
+) -> Result<CapturedWorktreeTree> {
+    snapshot_worktree_candidate_from_base_with_index_and_local_git_timeout(
+        repo,
+        worktree_path,
+        head,
+        base_commit,
+        index,
+        LOCAL_GIT_PROCESS_TIMEOUT,
+    )
+}
+
+fn snapshot_worktree_candidate_from_base_with_index_and_local_git_timeout(
+    repo: &Repository,
+    worktree_path: &Path,
+    head: Option<Oid>,
+    base_commit: Option<Oid>,
+    index: &TemporaryIndex,
+    local_git_timeout: Duration,
 ) -> Result<CapturedWorktreeTree> {
     enforce_candidate_capture_quota(repo, worktree_path)?;
     let head_text = head.map(|oid| oid.to_string());
@@ -3580,7 +3727,13 @@ fn snapshot_worktree_candidate_from_base_with_index(
     let base_tree = temporary_base_tree_oid(repo, worktree_path, base_commit, index)?;
     let changes = collect_snapshot_changes(worktree_path, base_tree, oid, index)?;
     let entries = collect_candidate_snapshot_entries(index, oid, &changes)?;
-    let raw_diff = collect_snapshot_diff(worktree_path, base_tree, oid, index)?;
+    let raw_diff = collect_snapshot_diff(
+        worktree_path,
+        base_tree,
+        oid,
+        index,
+        local_git_timeout,
+    )?;
     Ok(CapturedWorktreeTree {
         oid,
         entries,

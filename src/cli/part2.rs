@@ -802,10 +802,11 @@ fn preview_merge_from_args(
     forces: MergeForceOptions,
     require_validation: bool,
     megafile_policy: MegafileMergePolicy,
+    local_git: merge::MergeLocalGitOptions,
 ) -> Result<MergeApplyPreview> {
     let claims = resolve_claims(&repo, &agent_id, explicit_claims)?;
     let validation_evidence = load_validation_evidence(&validation_report_paths, &agent_id)?;
-    merge::preview_merge_apply_with_megafile_policy(
+    merge::preview_merge_apply_with_megafile_policy_and_local_git_options(
         MergePreviewOptions {
             collect: collect_options_from_claims(&repo, &agent_id, claims, true, Vec::new()),
             forces,
@@ -813,6 +814,7 @@ fn preview_merge_from_args(
         },
         validation_evidence,
         megafile_policy,
+        local_git,
     )
 }
 
@@ -827,6 +829,7 @@ impl MergeCommand {
         match self.command {
             MergeSubcommand::Preview(args) => {
                 let megafile_policy = args.megafile_policy()?;
+                let local_git = args.local_git.options()?;
                 let preview = preview_merge_from_args(
                     args.repo,
                     args.agent_id,
@@ -835,6 +838,7 @@ impl MergeCommand {
                     args.forces.into_force_options(),
                     args.require_validation,
                     megafile_policy,
+                    local_git,
                 )?;
                 print_merge_preview(&preview, args.json)
             }
@@ -880,6 +884,7 @@ fn run_merge_apply_controller(
     let lifecycle_trunk_ref = args.trunk_ref.clone();
     let json = args.json;
     let megafile_policy = args.megafile_policy()?;
+    let local_git = args.local_git.options()?;
     let claims = resolve_claims(&args.repo, &args.agent_id, args.claim)?;
     let validation_evidence = load_validation_evidence(&args.validation_report, &args.agent_id)?;
     let candidate_validation_commands = args
@@ -892,7 +897,7 @@ fn run_merge_apply_controller(
         forces: args.forces.into_force_options(),
         require_validation: args.require_validation,
     };
-    let mut report = merge::merge_apply_report_with_megafile_policy(
+    let mut report = merge::merge_apply_report_with_megafile_policy_and_local_git_options(
         MergeApplyOptions {
             preview: preview_options,
             candidate_validation_commands,
@@ -912,6 +917,7 @@ fn run_merge_apply_controller(
         },
         validation_evidence,
         megafile_policy,
+        local_git,
     )?;
     if report.status == merge::MergeApplyReportStatus::Blocked {
         if json {
@@ -1063,6 +1069,36 @@ enum MergeSubcommand {
     Arbitrate(MergeArbitrateArgs),
 }
 
+#[derive(Debug, Clone, Copy, Args)]
+struct MergeLocalGitTimeoutArgs {
+    /// Candidate snapshot Git diff deadline in seconds.
+    ///
+    /// The CLI value overrides MACO_MERGE_LOCAL_GIT_TIMEOUT_SECONDS; the
+    /// environment value overrides the 120-second default.
+    #[arg(
+        long,
+        env = "MACO_MERGE_LOCAL_GIT_TIMEOUT_SECONDS",
+        default_value_t = merge::DEFAULT_LOCAL_GIT_PROCESS_TIMEOUT_SECONDS,
+        value_parser = merge::parse_local_git_process_timeout_seconds
+    )]
+    local_git_timeout_seconds: u64,
+}
+
+impl Default for MergeLocalGitTimeoutArgs {
+    fn default() -> Self {
+        Self {
+            local_git_timeout_seconds: merge::DEFAULT_LOCAL_GIT_PROCESS_TIMEOUT_SECONDS,
+        }
+    }
+}
+
+impl MergeLocalGitTimeoutArgs {
+    fn options(self) -> Result<merge::MergeLocalGitOptions> {
+        merge::MergeLocalGitOptions::from_seconds(self.local_git_timeout_seconds)
+            .map_err(Into::into)
+    }
+}
+
 #[derive(Debug, Args)]
 struct MergePreviewArgs {
     /// Stable agent id used when the worktree was created.
@@ -1092,6 +1128,8 @@ struct MergePreviewArgs {
     megafile_thresholds: MegafileThresholdArgs,
     #[command(flatten)]
     forces: MergeForceArgs,
+    #[command(flatten)]
+    local_git: MergeLocalGitTimeoutArgs,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -1129,6 +1167,8 @@ struct MergeApplyArgs {
     megafile_thresholds: MegafileThresholdArgs,
     #[command(flatten)]
     forces: MergeForceArgs,
+    #[command(flatten)]
+    local_git: MergeLocalGitTimeoutArgs,
     /// After a non-blocked merge result, classify this lane for guarded merged-lane reaping.
     #[arg(long, requires = "trunk_ref")]
     auto_reap_merged: bool,
