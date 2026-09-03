@@ -222,6 +222,7 @@ pub struct GrokEndEvent {
     request_id: String,
     structured_output: Option<Value>,
     structured_output_error: Option<Value>,
+    usage_status: GrokUsageStatus,
 }
 
 impl GrokEndEvent {
@@ -247,6 +248,75 @@ impl GrokEndEvent {
     /// contents must not be reflected into public failure messages.
     pub fn structured_output_error(&self) -> Option<&Value> {
         self.structured_output_error.as_ref()
+    }
+
+    /// Exact native spend observation from this end event. This is never a
+    /// Codex `turn.completed` mapping and never invents MACO `Usage` counts.
+    pub fn usage_status(&self) -> &GrokUsageStatus {
+        &self.usage_status
+    }
+}
+
+/// Exact token fields from Grok's native `end.usage` object.
+///
+/// `input_tokens` is uncached prompt spend. Cache buckets stay on their native
+/// names; they are not renamed to Codex `cached_input_tokens`. Missing totals
+/// are left absent instead of being recomputed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrokNativeUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+}
+
+impl GrokNativeUsage {
+    pub fn input_tokens(&self) -> u64 {
+        self.input_tokens
+    }
+
+    pub fn output_tokens(&self) -> u64 {
+        self.output_tokens
+    }
+
+    pub fn cache_read_input_tokens(&self) -> Option<u64> {
+        self.cache_read_input_tokens
+    }
+
+    pub fn cache_creation_input_tokens(&self) -> Option<u64> {
+        self.cache_creation_input_tokens
+    }
+
+    pub fn reasoning_tokens(&self) -> Option<u64> {
+        self.reasoning_tokens
+    }
+
+    pub fn total_tokens(&self) -> Option<u64> {
+        self.total_tokens
+    }
+}
+
+/// Honest adapter-boundary spend status for a bounded Grok stream.
+///
+/// Native `end` events may omit spend entirely, mark it incomplete, or carry
+/// exact token fields. MACO does not convert those fields into Codex events or
+/// `Usage` counts; the capability matrix remains `UsageReporting::None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrokUsageStatus {
+    NotProcessObservable,
+    Incomplete,
+    Native(GrokNativeUsage),
+}
+
+impl GrokUsageStatus {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotProcessObservable => "not_process_observable",
+            Self::Incomplete => "incomplete",
+            Self::Native(_) => "native",
+        }
     }
 }
 
@@ -281,6 +351,15 @@ impl GrokParsedEventStream {
     pub const fn completed(&self) -> bool {
         matches!(self.outcome, GrokStreamOutcome::Completed(_))
     }
+
+    /// Spend status for this bounded stream. Failed terminals stay
+    /// not-process-observable even if an error event carried extra spend keys.
+    pub fn usage_status(&self) -> GrokUsageStatus {
+        match &self.outcome {
+            GrokStreamOutcome::Completed(end) => end.usage_status().clone(),
+            GrokStreamOutcome::Failed { .. } => GrokUsageStatus::NotProcessObservable,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -301,8 +380,26 @@ struct RawGrokStreamEvent {
     structured_output: Option<Value>,
     #[serde(default, rename = "structuredOutputError")]
     structured_output_error: Option<Value>,
+    #[serde(default)]
+    usage: Option<RawGrokUsage>,
+    #[serde(default, rename = "usage_is_incomplete")]
+    usage_is_incomplete: Option<bool>,
     #[serde(flatten)]
     _other: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawGrokUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
+    #[serde(default)]
+    reasoning_tokens: Option<u64>,
+    #[serde(default)]
+    total_tokens: Option<u64>,
 }
 
 /// Load one exact JSON Schema file into the bounded argv representation Grok
@@ -428,6 +525,11 @@ pub fn parse_grok_event_stream(bytes: &[u8]) -> Result<GrokParsedEventStream> {
                 "Grok streaming-json event {index} places structured output outside the terminal end event"
             );
         }
+        if matches!(raw.event_type.as_str(), "text" | "thought" | "error")
+            && (raw.usage.is_some() || raw.usage_is_incomplete.is_some())
+        {
+            bail!("Grok streaming-json event {index} places usage outside the terminal end event");
+        }
         let event = match raw.event_type.as_str() {
             "text" => {
                 require_absent_grok_event_fields(
@@ -481,6 +583,7 @@ pub fn parse_grok_event_stream(bytes: &[u8]) -> Result<GrokParsedEventStream> {
                     request_id: validate_grok_event_metadata("requestId", raw.request_id)?,
                     structured_output: raw.structured_output,
                     structured_output_error: raw.structured_output_error,
+                    usage_status: grok_end_usage_status(raw.usage, raw.usage_is_incomplete),
                 };
                 outcome = Some(GrokStreamOutcome::Completed(terminal.clone()));
                 GrokStreamEvent::End(terminal)
@@ -534,6 +637,26 @@ fn require_absent_grok_event_fields(
         bail!("Grok streaming-json event {index} mixes fields from incompatible event types");
     }
     Ok(())
+}
+
+fn grok_end_usage_status(
+    usage: Option<RawGrokUsage>,
+    usage_is_incomplete: Option<bool>,
+) -> GrokUsageStatus {
+    if usage_is_incomplete == Some(true) {
+        return GrokUsageStatus::Incomplete;
+    }
+    match usage {
+        None => GrokUsageStatus::NotProcessObservable,
+        Some(usage) => GrokUsageStatus::Native(GrokNativeUsage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+            total_tokens: usage.total_tokens,
+        }),
+    }
 }
 
 fn validate_grok_event_type(event_type: &str) -> Result<()> {
@@ -1431,6 +1554,10 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/runtime_adapter/grok/captured-minimal-20260821.provenance.json"
     ));
+    const WRITABLE_MANAGED_CHILD_STREAM: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/runtime_adapter/grok/writable-managed-child.streaming-json"
+    ));
     const CAPTURED_AT_UNIX_MILLIS: u64 = 1_787_303_960_000;
 
     fn worker_entry() -> Result<GrokModelCatalogEntry> {
@@ -1567,6 +1694,7 @@ mod tests {
             Some(&serde_json::json!({"a": true, "z": 1}))
         );
         assert!(end.structured_output_error().is_none());
+        assert_eq!(parsed.usage_status(), GrokUsageStatus::NotProcessObservable);
         assert_eq!(
             canonical_grok_structured_output(end.structured_output().unwrap())?,
             br#"{"a":true,"z":1}"#.to_vec()
@@ -1627,6 +1755,7 @@ mod tests {
         assert_eq!(end.stop_reason(), "EndTurn");
         assert_eq!(end.session_id(), "abc123");
         assert_eq!(end.request_id(), "xyz789");
+        assert_eq!(parsed.usage_status(), GrokUsageStatus::NotProcessObservable);
         Ok(())
     }
 
@@ -1645,6 +1774,123 @@ mod tests {
             parsed.events(),
             [GrokStreamEvent::Error(message)] if message == "Couldn't start session"
         ));
+        assert_eq!(parsed.usage_status(), GrokUsageStatus::NotProcessObservable);
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_end_event_parses_only_exact_native_usage_fields() -> Result<()> {
+        let parsed = parse_grok_event_stream(
+            concat!(
+                "{\"type\":\"usage\",\"messageId\":\"resp_1\",\"stopReason\":\"end_turn\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}\n",
+                "{\"type\":\"end\",\"stopReason\":\"end_turn\",\"sessionId\":\"abc123\",\"requestId\":\"xyz789\",\"usage\":{\"input_tokens\":12,\"cache_read_input_tokens\":4,\"cache_creation_input_tokens\":0,\"output_tokens\":5,\"reasoning_tokens\":2,\"total_tokens\":21,\"cached_input_tokens\":99}}\n",
+            )
+            .as_bytes(),
+        )?;
+        assert!(matches!(
+            &parsed.events()[0],
+            GrokStreamEvent::Other { event_type } if event_type == "usage"
+        ));
+        let GrokUsageStatus::Native(usage) = parsed.usage_status() else {
+            panic!("native end usage must be process-observable as exact Grok fields");
+        };
+        assert_eq!(usage.input_tokens(), 12);
+        assert_eq!(usage.output_tokens(), 5);
+        assert_eq!(usage.cache_read_input_tokens(), Some(4));
+        assert_eq!(usage.cache_creation_input_tokens(), Some(0));
+        assert_eq!(usage.reasoning_tokens(), Some(2));
+        assert_eq!(usage.total_tokens(), Some(21));
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_or_omitted_native_spend_is_not_fabricated_into_counts() -> Result<()> {
+        let omitted = parse_grok_event_stream(
+            b"{\"type\":\"end\",\"stopReason\":\"end_turn\",\"sessionId\":\"abc123\",\"requestId\":\"xyz789\"}\n",
+        )?;
+        assert_eq!(omitted.usage_status().as_str(), "not_process_observable");
+
+        let incomplete = parse_grok_event_stream(
+            concat!(
+                "{\"type\":\"end\",\"stopReason\":\"end_turn\",\"sessionId\":\"abc123\",\"requestId\":\"xyz789\",",
+                "\"usage_is_incomplete\":true,\"usage\":{\"input_tokens\":8,\"output_tokens\":2}}\n",
+            )
+            .as_bytes(),
+        )?;
+        assert_eq!(incomplete.usage_status(), GrokUsageStatus::Incomplete);
+        Ok(())
+    }
+
+    #[test]
+    fn grok_parser_refuses_codex_usage_events_and_text_spend() {
+        let error = parse_grok_event_stream(
+            concat!(
+                "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}\n",
+                "{\"type\":\"end\",\"stopReason\":\"end_turn\",\"sessionId\":\"abc123\",\"requestId\":\"xyz789\"}\n",
+            )
+            .as_bytes(),
+        )
+        .expect_err("Codex turn.completed is not a Grok event");
+        let codex = format!("{error:#}");
+        assert!(codex.contains("invalid event type"), "{codex}");
+
+        let misplaced = parse_grok_event_stream(
+            concat!(
+                "{\"type\":\"text\",\"data\":\"progress\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n",
+                "{\"type\":\"end\",\"stopReason\":\"end_turn\",\"sessionId\":\"abc123\",\"requestId\":\"xyz789\"}\n",
+            )
+            .as_bytes(),
+        )
+        .expect_err("text events may not carry spend")
+        .to_string();
+        assert!(
+            misplaced.contains("places usage outside the terminal end event"),
+            "{misplaced}"
+        );
+    }
+
+    #[test]
+    fn malformed_or_overflowing_native_usage_fails_closed() {
+        let cases = [
+            (
+                "missing required output_tokens",
+                b"{\"type\":\"end\",\"stopReason\":\"end_turn\",\"sessionId\":\"s\",\"requestId\":\"r\",\"usage\":{\"input_tokens\":1}}\n".as_slice(),
+            ),
+            (
+                "negative input_tokens",
+                b"{\"type\":\"end\",\"stopReason\":\"end_turn\",\"sessionId\":\"s\",\"requestId\":\"r\",\"usage\":{\"input_tokens\":-1,\"output_tokens\":1}}\n".as_slice(),
+            ),
+            (
+                "overflowing output_tokens",
+                b"{\"type\":\"end\",\"stopReason\":\"end_turn\",\"sessionId\":\"s\",\"requestId\":\"r\",\"usage\":{\"input_tokens\":1,\"output_tokens\":18446744073709551616}}\n".as_slice(),
+            ),
+        ];
+
+        for (label, bytes) in cases {
+            let error = parse_grok_event_stream(bytes).expect_err(label).to_string();
+            assert!(error.contains("is malformed"), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn hermetic_managed_child_stream_fixture_is_schema_bound_native_usage() -> Result<()> {
+        let parsed = parse_grok_event_stream(WRITABLE_MANAGED_CHILD_STREAM)?;
+        assert!(parsed.completed());
+        assert_eq!(parsed.response_text(), "claimed path written");
+        let GrokStreamOutcome::Completed(end) = parsed.outcome() else {
+            panic!("fixture stream must complete");
+        };
+        assert_eq!(
+            end.structured_output(),
+            Some(&serde_json::json!({"accepted": true, "path": "bounded-result.txt"}))
+        );
+        let GrokUsageStatus::Native(usage) = parsed.usage_status() else {
+            panic!("fixture end event carries exact native usage");
+        };
+        assert_eq!(usage.input_tokens(), 12);
+        assert_eq!(usage.output_tokens(), 4);
+        assert_eq!(usage.total_tokens(), Some(16));
+        assert!(!std::str::from_utf8(WRITABLE_MANAGED_CHILD_STREAM)?.contains("turn.completed"));
         Ok(())
     }
 
