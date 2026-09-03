@@ -1,8 +1,52 @@
-use std::fs;
+use std::{
+    ffi::OsString,
+    fs,
+    sync::{Mutex, MutexGuard},
+};
 
 use git2::Signature;
 
 use super::*;
+
+static MERGE_LOCAL_GIT_TIMEOUT_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+
+struct MergeLocalGitTimeoutEnvironmentGuard {
+    _lock: MutexGuard<'static, ()>,
+    previous: Option<OsString>,
+}
+
+impl MergeLocalGitTimeoutEnvironmentGuard {
+    fn install_unset() -> Self {
+        let lock = MERGE_LOCAL_GIT_TIMEOUT_ENVIRONMENT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::var_os(merge::LOCAL_GIT_PROCESS_TIMEOUT_ENV);
+        // SAFETY: this guard serializes every merge CLI parser test that can observe this
+        // process-global variable and restores the exact prior value before releasing the lock.
+        unsafe { std::env::remove_var(merge::LOCAL_GIT_PROCESS_TIMEOUT_ENV) };
+        Self {
+            _lock: lock,
+            previous,
+        }
+    }
+
+    fn set(&self, value: &str) {
+        // SAFETY: the guard holds the environment lock for its entire lifetime.
+        unsafe { std::env::set_var(merge::LOCAL_GIT_PROCESS_TIMEOUT_ENV, value) };
+    }
+}
+
+impl Drop for MergeLocalGitTimeoutEnvironmentGuard {
+    fn drop(&mut self) {
+        // SAFETY: restoration occurs while the guard still holds the environment lock.
+        unsafe {
+            match &self.previous {
+                Some(previous) => std::env::set_var(merge::LOCAL_GIT_PROCESS_TIMEOUT_ENV, previous),
+                None => std::env::remove_var(merge::LOCAL_GIT_PROCESS_TIMEOUT_ENV),
+            }
+        }
+    }
+}
 
 #[test]
 fn artifact_prune_parses_family_age_size_and_unfinalized_grace() {
@@ -684,6 +728,7 @@ fn merge_arbitration_is_an_explicit_typed_opt_in() {
 
 #[test]
 fn existing_merge_preview_and_apply_parsing_remains_separate_from_arbitration() {
+    let _environment = MergeLocalGitTimeoutEnvironmentGuard::install_unset();
     let preview = Cli::try_parse_from([
         "maco",
         "merge",
@@ -722,8 +767,27 @@ fn existing_merge_preview_and_apply_parsing_remains_separate_from_arbitration() 
     ));
 }
 
+fn parse_merge_local_git_timeout(
+    subcommand: &str,
+    trailing_args: &[&str],
+) -> std::result::Result<u64, clap::Error> {
+    let mut args = vec!["maco", "merge", subcommand, "agent-a"];
+    args.extend_from_slice(trailing_args);
+    let parsed = Cli::try_parse_from(args)?;
+    match parsed.command {
+        Command::Merge(MergeCommand {
+            command: MergeSubcommand::Preview(args),
+        }) => Ok(args.local_git.local_git_timeout_seconds),
+        Command::Merge(MergeCommand {
+            command: MergeSubcommand::Apply(args),
+        }) => Ok(args.local_git.local_git_timeout_seconds),
+        _ => panic!("expected merge preview or apply command"),
+    }
+}
+
 #[test]
 fn merge_local_git_timeout_flag_and_clap_env_wire_preview_and_apply_with_typed_bounds() {
+    let environment = MergeLocalGitTimeoutEnvironmentGuard::install_unset();
     assert_eq!(
         MergeLocalGitTimeoutArgs::default().local_git_timeout_seconds,
         120
@@ -792,6 +856,39 @@ fn merge_local_git_timeout_flag_and_clap_env_wire_preview_and_apply_with_typed_b
                 invalid,
             ])
             .expect_err("invalid local Git timeout must be rejected");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+            assert!(error.to_string().contains(expected));
+        }
+    }
+
+    environment.set("37");
+    for subcommand in ["preview", "apply"] {
+        assert_eq!(
+            parse_merge_local_git_timeout(subcommand, &[])
+                .expect("environment local Git timeout should parse"),
+            37
+        );
+    }
+
+    environment.set("not-a-number");
+    for subcommand in ["preview", "apply"] {
+        assert_eq!(
+            parse_merge_local_git_timeout(subcommand, &["--local-git-timeout-seconds", "901"],)
+                .expect("CLI local Git timeout should override the environment"),
+            901
+        );
+    }
+
+    for subcommand in ["preview", "apply"] {
+        for (invalid, expected) in [
+            ("0", "between 1 and 86400 seconds"),
+            ("86401", "between 1 and 86400 seconds"),
+            ("not-a-number", "integer number of seconds"),
+        ] {
+            environment.set(invalid);
+            let error = parse_merge_local_git_timeout(subcommand, &[])
+                .expect_err("invalid environment local Git timeout must be rejected");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
             assert!(error.to_string().contains(expected));
         }
     }
@@ -799,6 +896,7 @@ fn merge_local_git_timeout_flag_and_clap_env_wire_preview_and_apply_with_typed_b
 
 #[test]
 fn merge_auto_reap_is_default_off_and_apply_requires_classification() {
+    let _environment = MergeLocalGitTimeoutEnvironmentGuard::install_unset();
     let parsed = Cli::try_parse_from(["maco", "merge", "apply", "agent-a"])
         .expect("default merge apply should parse");
     let Command::Merge(MergeCommand {
