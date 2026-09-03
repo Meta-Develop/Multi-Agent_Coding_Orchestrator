@@ -2140,7 +2140,7 @@ fn resume_skips_completed_agent_and_runs_pending_dependent() {
 
 #[cfg(unix)]
 #[test]
-fn resume_reacquires_fresh_write_lease_and_releases_it_on_every_return() {
+fn resume_reacquires_write_lease_until_final_and_allows_cleaned_worktree() {
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");
     let checkpoint_dir = temp.path().join("checkpoints");
@@ -2216,6 +2216,14 @@ fn resume_reacquires_fresh_write_lease_and_releases_it_on_every_return() {
     };
     let checkpoint_file =
         write_run_checkpoint(&checkpoint_dir, &checkpoint).expect("write checkpoint");
+    let missing_worktree_run_id =
+        RunId::new("resume-missing-worktree").expect("missing worktree run id");
+    let mut missing_worktree_checkpoint =
+        read_run_checkpoint(&checkpoint_file).expect("read authenticated checkpoint to clone");
+    missing_worktree_checkpoint.run_id = missing_worktree_run_id.clone();
+    let missing_worktree_checkpoint_file =
+        write_run_checkpoint(&checkpoint_dir, &missing_worktree_checkpoint)
+            .expect("write authenticated missing worktree checkpoint");
     let run_checkpoint = checkpoint_file.clone();
     let run_repo = repo_path.clone();
     let run_plan = plan_file.clone();
@@ -2237,42 +2245,107 @@ fn resume_reacquires_fresh_write_lease_and_releases_it_on_every_return() {
     fs::write(&release, "release\n").expect("release resume command");
     let summary = runner.join().expect("join resume").expect("resume plan");
     assert!(summary.success);
+    assert_eq!(summary.agents[0].status, AgentRunStatus::Succeeded);
     assert!(writer_blocked);
     assert!(removal_blocked);
+
+    let final_checkpoint =
+        read_run_checkpoint(&checkpoint_file).expect("read authenticated final checkpoint");
+    assert_eq!(final_checkpoint.stage, RunCheckpointStage::Final);
+    assert!(final_checkpoint.success);
+    let expected_candidate_binding = final_checkpoint.agents[0]
+        .candidate_binding
+        .clone()
+        .expect("final checkpoint candidate binding");
+    let expected_command_completed_binding = final_checkpoint.agents[0]
+        .command_completed_binding
+        .clone()
+        .expect("final checkpoint command-completed binding");
+    let expected_repo_validation_target = final_checkpoint
+        .repo_validation_target
+        .clone()
+        .expect("final checkpoint validation target");
+    assert_eq!(
+        expected_repo_validation_target.kind,
+        RepoValidationTargetKind::BaseNoChanges
+    );
 
     let external_writer = manager
         .acquire_write_execution_lease("agent-resume")
         .expect("first resume released its write lease");
-    let reacquire_error = resume_plan_file(OrchestrationResumeOptions {
+    let leased_replay = resume_plan_file(OrchestrationResumeOptions {
         checkpoint_file: checkpoint_file.clone(),
         repo: Some(repo_path.clone()),
         plan_file: Some(plan_file.clone()),
         jobs: 1,
         patch_dir: None,
     })
-    .expect_err("each resume must reacquire instead of reusing a stale handle");
-    assert!(reacquire_error
-        .to_string()
-        .contains("could not reacquire the exclusive execution lease"));
+    .expect("final replay must not reacquire the completed worktree lease");
+    assert!(leased_replay.success);
+    assert_eq!(leased_replay.agents[0].status, AgentRunStatus::Succeeded);
+    assert_eq!(
+        leased_replay.agents[0].candidate_binding.as_ref(),
+        Some(&expected_candidate_binding)
+    );
+    assert_eq!(
+        leased_replay.agents[0].command_completed_binding.as_ref(),
+        Some(&expected_command_completed_binding)
+    );
+    assert_eq!(
+        leased_replay.repo_validation_target.as_ref(),
+        Some(&expected_repo_validation_target)
+    );
     drop(external_writer);
 
-    let replay = resume_plan_file(OrchestrationResumeOptions {
-        checkpoint_file,
+    let removed = manager
+        .remove("agent-resume", true, false)
+        .expect("remove completed managed worktree");
+    assert!(!removed.path.exists());
+
+    let cleaned_replay = resume_plan_file(OrchestrationResumeOptions {
+        checkpoint_file: checkpoint_file.clone(),
         repo: Some(repo_path.clone()),
+        plan_file: Some(plan_file.clone()),
+        jobs: 1,
+        patch_dir: None,
+    })
+    .expect("resume final checkpoint after removing completed worktree");
+    assert!(cleaned_replay.success);
+    assert_eq!(cleaned_replay.agents[0].status, AgentRunStatus::Succeeded);
+    assert!(cleaned_replay.agents[0]
+        .worktree
+        .as_ref()
+        .is_some_and(|record| record.name == worktree.name
+            && record.path == worktree.path
+            && record.branch == worktree.branch));
+    assert_eq!(
+        cleaned_replay.agents[0].candidate_binding.as_ref(),
+        Some(&expected_candidate_binding)
+    );
+    assert_eq!(
+        cleaned_replay.agents[0].command_completed_binding.as_ref(),
+        Some(&expected_command_completed_binding)
+    );
+    assert_eq!(
+        cleaned_replay.repo_validation_target.as_ref(),
+        Some(&expected_repo_validation_target)
+    );
+
+    let missing_worktree_error = resume_plan_file(OrchestrationResumeOptions {
+        checkpoint_file: missing_worktree_checkpoint_file,
+        repo: Some(repo_path),
         plan_file: Some(plan_file),
         jobs: 1,
         patch_dir: None,
     })
-    .expect("resume final checkpoint after releasing external writer");
-    assert!(replay.success);
-    let released = manager
-        .acquire_write_execution_lease("agent-resume")
-        .expect("final checkpoint resume releases its reacquired lease");
-    drop(released);
-    let removed = manager
-        .remove("agent-resume", true, false)
-        .expect("resume releases removal authority");
-    assert!(!removed.path.exists());
+    .expect_err("non-final checkpoint must fail closed on a missing worktree");
+    assert!(
+        missing_worktree_error.to_string().contains(&format!(
+            "checkpoint '{}' references missing worktree 'agent-resume'",
+            missing_worktree_run_id.as_str()
+        )),
+        "{missing_worktree_error:#}"
+    );
 }
 
 #[test]

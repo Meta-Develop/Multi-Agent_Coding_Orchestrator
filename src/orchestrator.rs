@@ -1307,22 +1307,7 @@ fn resume_plan_file_runtime(
         let plan = load_plan(&plan_file)?;
 
         validate_checkpoint_for_resume(&checkpoint, &plan, &repo_head)?;
-        let manager = WorktreeManager::new(&repo);
-        let store = SyncStore::open(&repo)?;
-        let semantic_store = SemanticIntentStore::open(&repo)?;
         let mut summaries = summaries_from_checkpoint(&plan, &checkpoint)?;
-        let worktrees = validate_resume_worktrees(
-            &manager,
-            &plan,
-            &checkpoint,
-            &mut summaries,
-            &repo_head,
-            runtime,
-        )?;
-        if let Some(writer) = checkpoint_writer.as_ref() {
-            writer.reject_inside_worktrees(&worktrees)?;
-        }
-
         if checkpoint.stage == RunCheckpointStage::Final {
             return Ok(summary_from_parts(SummaryParts {
                 run_id: checkpoint.run_id,
@@ -1339,6 +1324,21 @@ fn resume_plan_file_runtime(
                 released_semantic_intents: checkpoint.released_semantic_intents,
                 semantic_release_errors: checkpoint.semantic_release_errors,
             }));
+        }
+
+        let manager = WorktreeManager::new(&repo);
+        let store = SyncStore::open(&repo)?;
+        let semantic_store = SemanticIntentStore::open(&repo)?;
+        let worktrees = validate_resume_worktrees(
+            &manager,
+            &plan,
+            &checkpoint,
+            &mut summaries,
+            &repo_head,
+            runtime,
+        )?;
+        if let Some(writer) = checkpoint_writer.as_ref() {
+            writer.reject_inside_worktrees(&worktrees)?;
         }
 
         let controls = OrchestrationRunControls {
