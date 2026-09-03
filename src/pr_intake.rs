@@ -17,8 +17,8 @@ use crate::inbox::review_loop_entry::{
 };
 use crate::inbox::{
     bind_approved_github_actor, observe_inbox_pr_event, preflight_inbox_pr_event,
-    run_inbox_for_pr_event, GithubCheckSummary, GithubPrSourceTrust,
-    InboxApprovedGithubActorBinding, InboxApprovedGithubActorError,
+    run_inbox_for_pr_event, sanitize_pr_intake_provider_detail, GithubCheckSummary,
+    GithubPrSourceTrust, InboxApprovedGithubActorBinding, InboxApprovedGithubActorError,
     InboxApprovedGithubActorFailure, InboxIndependentAuditMergeLaneTask, InboxItem, InboxItemKind,
     InboxPrIntakeTaskKind, InboxPrObservationError, InboxPrObservationFailureClass,
     InboxRunOptions, InboxSourceProvider,
@@ -622,6 +622,7 @@ pub struct PrIntakeProducerReport {
 
 impl PrIntakeProducerReport {
     pub(crate) fn provider_observation_refusal(
+        repo: &Path,
         number: Option<u64>,
         classification: PrIntakeObservationFailureClass,
         detail: &str,
@@ -638,7 +639,7 @@ impl PrIntakeProducerReport {
             intake_report: None,
             refusal: Some(PrIntakeProducerRefusalCause::ProviderObservation {
                 classification,
-                detail: bounded_detail(detail),
+                detail: sanitize_pr_intake_provider_detail(repo, detail),
             }),
             grants_merge_permission: false,
             auto_merge_performed: false,
@@ -1185,6 +1186,7 @@ where
         Ok(item) => item,
         Err(error) => {
             return PrIntakeProducerReport::provider_observation_refusal(
+                repo,
                 Some(number),
                 producer_observation_classification(error.classification),
                 &error.detail,
@@ -1198,6 +1200,7 @@ where
             .is_none_or(|pull_request| pull_request.number != number)
     {
         return PrIntakeProducerReport::provider_observation_refusal(
+            repo,
             Some(number),
             PrIntakeObservationFailureClass::InvalidProviderGroundTruth,
             "provider returned a different pull-request identity",
@@ -1207,6 +1210,7 @@ where
         Ok(prepared) => prepared,
         Err(error) => {
             return PrIntakeProducerReport::provider_observation_refusal(
+                repo,
                 Some(number),
                 PrIntakeObservationFailureClass::InvalidProviderGroundTruth,
                 &format!("{error:#}"),
@@ -2492,7 +2496,20 @@ mod tests {
     }
 
     fn provider_pr_item() -> InboxItem {
-        let updated_at = "2026-09-03T00:00:00Z";
+        provider_pr_item_version(
+            "2026-09-03T00:00:00Z",
+            &"b".repeat(40),
+            &"d".repeat(64),
+            &"e".repeat(64),
+        )
+    }
+
+    fn provider_pr_item_version(
+        updated_at: &str,
+        head_oid: &str,
+        content_digest: &str,
+        action_revision_digest: &str,
+    ) -> InboxItem {
         let snapshot = InboxSourceSnapshotBinding::for_pull_request(
             InboxSourceProvider::Github,
             "github.com",
@@ -2501,10 +2518,10 @@ mod tests {
             17,
             updated_at,
             "OPEN",
-            "b".repeat(40),
+            head_oid.to_string(),
             "c".repeat(40),
-            "d".repeat(64),
-            "e".repeat(64),
+            content_digest,
+            action_revision_digest,
         )
         .expect("provider snapshot");
         InboxItem {
@@ -2658,6 +2675,70 @@ mod tests {
         assert_eq!(
             observer.calls, 2,
             "each delivery is re-observed at provider"
+        );
+    }
+
+    #[test]
+    fn updated_timestamp_and_head_create_distinct_effects_and_launch_once_each() {
+        let (_temp, repo) = repository();
+        let deliveries = [
+            provider_pr_item_version(
+                "2026-09-03T00:00:00Z",
+                &"b".repeat(40),
+                &"d".repeat(64),
+                &"e".repeat(64),
+            ),
+            provider_pr_item_version(
+                "2026-09-03T00:00:01Z",
+                &"b".repeat(40),
+                &"d".repeat(64),
+                &"e".repeat(64),
+            ),
+            provider_pr_item_version(
+                "2026-09-03T00:00:01Z",
+                &"a".repeat(40),
+                &"d".repeat(64),
+                &"e".repeat(64),
+            ),
+        ];
+        let mut provider = FakeProvider::default();
+        let mut reports = Vec::new();
+        for item in deliveries {
+            let mut observer = FakeObservationProvider::returning(item);
+            reports.push(produce_repository_pr_intake_with(
+                &repo,
+                17,
+                &mut observer,
+                loaded_sol_catalog,
+                &mut provider,
+            ));
+        }
+
+        assert_eq!(
+            provider.requests.len(),
+            3,
+            "each changed delivery launches once"
+        );
+        assert!(reports.iter().all(|report| {
+            report.success && report.disposition == PrIntakeProducerDisposition::Launched
+        }));
+        assert_eq!(
+            reports
+                .iter()
+                .filter_map(|report| report.delivery_id.as_ref())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            3,
+            "updated_at and head changes must create distinct deliveries"
+        );
+        assert_eq!(
+            reports
+                .iter()
+                .filter_map(|report| report.effect_id.as_ref())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            3,
+            "updated_at and head changes must create distinct effects"
         );
     }
 
@@ -2862,6 +2943,50 @@ mod tests {
             })
         ));
         assert!(provider.requests.is_empty());
+    }
+
+    #[test]
+    fn provider_observation_refusal_serialization_redacts_sensitive_public_detail() {
+        let (_temp, repo) = repository();
+        let mut provider = FakeProvider::default();
+        let mut observer = FakeObservationProvider::refusing(
+            InboxPrObservationFailureClass::ProviderUnavailable,
+            "provider failed at /home/private/token-123456789012345678901234567890 API_TOKEN=secret-value",
+        );
+
+        let report = produce_repository_pr_intake_with(
+            &repo,
+            17,
+            &mut observer,
+            loaded_sol_catalog,
+            &mut provider,
+        );
+        let detail = match report.refusal.as_ref() {
+            Some(PrIntakeProducerRefusalCause::ProviderObservation {
+                classification: PrIntakeObservationFailureClass::ProviderUnavailable,
+                detail,
+            }) => detail,
+            other => panic!("unexpected typed provider refusal: {other:?}"),
+        };
+        assert!(detail.chars().count() <= MAX_DETAIL_CHARS);
+        let serialized = serde_json::to_string(&report).expect("serialize producer refusal");
+        assert!(!serialized.contains("/home/private"));
+        assert!(!serialized.contains("token-123456789012345678901234567890"));
+        assert!(!serialized.contains("secret-value"));
+        assert!(serialized.contains("redacted"));
+        assert!(provider.requests.is_empty());
+
+        let private_key = PrIntakeProducerReport::provider_observation_refusal(
+            &repo,
+            Some(18),
+            PrIntakeObservationFailureClass::MalformedProviderResponse,
+            "provider emitted -----BEGIN PRIVATE KEY----- private-material",
+        );
+        let serialized =
+            serde_json::to_string(&private_key).expect("serialize private-key refusal");
+        assert!(serialized.contains("redacted:private-key-material"));
+        assert!(!serialized.contains("BEGIN PRIVATE KEY"));
+        assert!(!serialized.contains("private-material"));
     }
 
     #[test]

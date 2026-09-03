@@ -10,6 +10,195 @@ use super::*;
 
 static MERGE_LOCAL_GIT_TIMEOUT_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
+fn inbox_intake_args(argv: &[&str]) -> IntakeInboxArgs {
+    let parsed = Cli::try_parse_from(argv).expect("inbox intake arguments should parse");
+    let Command::Inbox(InboxCommand {
+        command: InboxSubcommand::Intake(args),
+    }) = parsed.command
+    else {
+        panic!("expected inbox intake command");
+    };
+    args
+}
+
+fn pr_intake_producer_report(success: bool) -> crate::pr_intake::PrIntakeProducerReport {
+    crate::pr_intake::PrIntakeProducerReport {
+        version: 1,
+        repository: Some("github.com/acme/repo".to_string()),
+        number: Some(17),
+        delivery_id: Some("delivery".to_string()),
+        logical_id: Some("logical".to_string()),
+        effect_id: Some("effect".to_string()),
+        disposition: if success {
+            crate::pr_intake::PrIntakeProducerDisposition::Launched
+        } else {
+            crate::pr_intake::PrIntakeProducerDisposition::Refused
+        },
+        success,
+        intake_report: None,
+        refusal: (!success).then(|| {
+            crate::pr_intake::PrIntakeProducerRefusalCause::CatalogUnavailable {
+                detail: "catalog unavailable".to_string(),
+            }
+        }),
+        grants_merge_permission: false,
+        auto_merge_performed: false,
+    }
+}
+
+#[test]
+fn inbox_intake_parses_exact_operator_inputs_and_positive_u64_max() {
+    let maximum = u64::MAX.to_string();
+    let args = inbox_intake_args(&[
+        "maco",
+        "inbox",
+        "intake",
+        "--pr",
+        &maximum,
+        "--repo",
+        "repo",
+        "--codex-bin",
+        "review-codex",
+        "--json",
+    ]);
+
+    assert_eq!(args.pr, u64::MAX);
+    assert_eq!(args.repo, PathBuf::from("repo"));
+    assert_eq!(args.codex_bin, Some(PathBuf::from("review-codex")));
+    assert!(args.json);
+
+    let defaults = inbox_intake_args(&["maco", "inbox", "intake", "--pr", "1"]);
+    assert_eq!(defaults.repo, PathBuf::from("."));
+    assert_eq!(defaults.codex_bin, None);
+    assert!(!defaults.json);
+}
+
+#[test]
+fn inbox_intake_rejects_missing_or_non_positive_u64_values() {
+    assert!(Cli::try_parse_from(["maco", "inbox", "intake"]).is_err());
+    assert!(Cli::try_parse_from(["maco", "inbox", "intake", "--pr"]).is_err());
+    for invalid in ["0", "-1", "not-a-number", "18446744073709551616"] {
+        assert!(
+            Cli::try_parse_from(["maco", "inbox", "intake", "--pr", invalid]).is_err(),
+            "invalid PR number {invalid:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn inbox_intake_rejects_caller_controlled_trust_fields() {
+    for flag in [
+        "--github",
+        "--permission",
+        "--run-id",
+        "--max-items",
+        "--dry-run",
+        "--envelope",
+        "--model",
+        "--actor",
+        "--head",
+        "--base",
+        "--repository",
+        "--provider",
+        "--delivery-id",
+        "--effect-id",
+    ] {
+        let argv = ["maco", "inbox", "intake", "--pr", "17", flag, "attacker"];
+        assert!(
+            Cli::try_parse_from(argv).is_err(),
+            "trust-field injection {flag} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn inbox_intake_maps_only_fixed_production_options() {
+    let args = inbox_intake_args(&[
+        "maco",
+        "inbox",
+        "intake",
+        "--pr",
+        "17",
+        "--repo",
+        "repo",
+        "--codex-bin",
+        "review-codex",
+    ]);
+    let options = inbox_intake_options(&args).expect("fixed intake options");
+
+    assert_eq!(options.repo, PathBuf::from("repo"));
+    assert_eq!(options.run_id.as_str(), PR_INTAKE_PLACEHOLDER_RUN_ID);
+    assert!(options.github);
+    assert_eq!(
+        options.permission_mode,
+        Some(InboxPermissionMode::GithubFull)
+    );
+    assert!(!options.dry_run);
+    assert_eq!(options.max_items, None);
+    assert_eq!(options.codex_bin, Some(PathBuf::from("review-codex")));
+    assert!(options.machine_global.is_none());
+}
+
+#[test]
+fn inbox_intake_dispatch_seam_delivers_typed_report_before_failure() {
+    let args = inbox_intake_args(&["maco", "inbox", "intake", "--pr", "17", "--json"]);
+    let expected = pr_intake_producer_report(false);
+    let produced = expected.clone();
+    let mut observed_options = None;
+    let mut delivered = None;
+
+    let error = run_inbox_intake_controller(
+        args,
+        |options, number| {
+            observed_options = Some((options, number));
+            produced
+        },
+        |report, json| {
+            delivered = Some((report.clone(), json));
+            Ok(())
+        },
+    )
+    .expect_err("unsuccessful producer report must return an error");
+
+    let (options, number) = observed_options.expect("producer invocation");
+    assert_eq!(number, 17);
+    assert!(options.github);
+    assert_eq!(
+        options.permission_mode,
+        Some(InboxPermissionMode::GithubFull)
+    );
+    assert_eq!(delivered, Some((expected, true)));
+    assert_eq!(error.to_string(), "authenticated PR intake failed");
+}
+
+#[test]
+fn inbox_intake_dispatch_seam_returns_success_after_typed_delivery() {
+    let args = inbox_intake_args(&["maco", "inbox", "intake", "--pr", "17"]);
+    let expected = pr_intake_producer_report(true);
+    let first_json = serde_json::to_string_pretty(&expected).expect("serialize typed report");
+    let second_json = serde_json::to_string_pretty(&expected).expect("repeat serialization");
+    assert_eq!(first_json, second_json);
+    assert_eq!(
+        serde_json::from_str::<crate::pr_intake::PrIntakeProducerReport>(&first_json)
+            .expect("round-trip typed report"),
+        expected
+    );
+    let produced = expected.clone();
+    let mut delivered = None;
+
+    run_inbox_intake_controller(
+        args,
+        |_, _| produced,
+        |report, json| {
+            delivered = Some((report.clone(), json));
+            Ok(())
+        },
+    )
+    .expect("successful producer report");
+
+    assert_eq!(delivered, Some((expected, false)));
+}
+
 struct MergeLocalGitTimeoutEnvironmentGuard {
     _lock: MutexGuard<'static, ()>,
     previous: Option<OsString>,

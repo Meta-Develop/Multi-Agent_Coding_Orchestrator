@@ -109,6 +109,7 @@ const MAX_DEFAULT_MACHINE_GLOBAL_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_EVALUATION_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_EVALUATION_PLAN_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_EXTERNAL_EVENT_PAYLOAD_CLI_BYTES: usize = 4 * 1024;
+const PR_INTAKE_PLACEHOLDER_RUN_ID: &str = "pr-intake-producer-placeholder";
 const RETIRED_AUTOPILOT_EXECUTION_MESSAGE: &str =
     "autopilot plan/run is retired; use literal instruction routing: maco <instruction>";
 
@@ -1892,6 +1893,11 @@ impl InboxCommand {
                 }
                 Ok(())
             }
+            InboxSubcommand::Intake(args) => run_inbox_intake_controller(
+                args,
+                crate::pr_intake::produce_repository_pr_intake,
+                print_query_report,
+            ),
             InboxSubcommand::Status(args) => {
                 let report = inbox::inbox_status(args.repo, RunId::new(&args.run_id)?)?;
                 print_query_report(&report, args.json)
@@ -1935,6 +1941,34 @@ impl InboxCommand {
     }
 }
 
+fn inbox_intake_options(args: &IntakeInboxArgs) -> Result<InboxRunOptions> {
+    Ok(InboxRunOptions {
+        repo: args.repo.clone(),
+        run_id: RunId::new(PR_INTAKE_PLACEHOLDER_RUN_ID)
+            .context("invalid internal PR intake placeholder run id")?,
+        github: true,
+        permission_mode: Some(InboxPermissionMode::GithubFull),
+        dry_run: false,
+        max_items: None,
+        codex_bin: args.codex_bin.clone(),
+        machine_global: None,
+    })
+}
+
+fn run_inbox_intake_controller(
+    args: IntakeInboxArgs,
+    produce: impl FnOnce(InboxRunOptions, u64) -> crate::pr_intake::PrIntakeProducerReport,
+    mut deliver_report: impl FnMut(&crate::pr_intake::PrIntakeProducerReport, bool) -> Result<()>,
+) -> Result<()> {
+    let options = inbox_intake_options(&args)?;
+    let report = produce(options, args.pr);
+    deliver_report(&report, args.json)?;
+    if !report.success {
+        bail!("authenticated PR intake failed");
+    }
+    Ok(())
+}
+
 fn inbox_machine_global_input(
     config: Option<PathBuf>,
     runtime_root_id: Option<String>,
@@ -1954,6 +1988,8 @@ enum InboxSubcommand {
     Scan(ScanInboxArgs),
     /// Scan and process selected inbox items under a stable run id.
     Run(RunInboxArgs),
+    /// Authenticate and process one exact provider-observed GitHub pull request.
+    Intake(IntakeInboxArgs),
     /// Report durable inbox run artifact state.
     Status(StatusInboxArgs),
     /// Collect the durable inbox final report.
@@ -2283,6 +2319,22 @@ struct RunInboxArgs {
     /// Reviewed root id whose canonical root must contain `/run/user/<uid>`.
     #[arg(long, requires = "machine_global_config")]
     machine_global_runtime_root_id: Option<String>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct IntakeInboxArgs {
+    /// Exact GitHub pull request number to observe and authenticate.
+    #[arg(long, value_parser = parse_positive_u64, allow_hyphen_values = true)]
+    pr: u64,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Codex-compatible executable used for catalog loading and the independent audit.
+    #[arg(long)]
+    codex_bin: Option<PathBuf>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
