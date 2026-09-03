@@ -3088,6 +3088,12 @@ mod tests {
     use super::*;
     use crate::messaging::envelope::{MessageAddress, MessageEnvelope};
 
+    const DATA_FILE_LOCK_CHILD_EXPECTATION: &str = "MACO_MESSAGING_LOCK_CHILD_EXPECTATION";
+    const DATA_FILE_LOCK_CHILD_EXPECT_BLOCKED: &str = "blocked";
+    const DATA_FILE_LOCK_CHILD_EXPECT_RELEASED: &str = "released";
+    const DATA_FILE_LOCK_CHILD_BLOCKED: &str = "maco-messaging-data-file-lock-child-blocked";
+    const DATA_FILE_LOCK_CHILD_RELEASED: &str = "maco-messaging-data-file-lock-child-released";
+
     fn test_limits() -> MessagingLimits {
         MessagingLimits {
             max_credentials: 8,
@@ -4275,6 +4281,33 @@ mod tests {
             .expect("lock released on drop");
     }
 
+    fn run_data_file_lock_child_probe(path: &Path, expectation: &str, completion_marker: &str) {
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .arg("--exact")
+            .arg("messaging::store::tests::data_file_lock_child_probe")
+            .arg("--nocapture")
+            .env("MACO_MESSAGING_LOCK_CHILD", path)
+            .env(DATA_FILE_LOCK_CHILD_EXPECTATION, expectation)
+            .output()
+            .expect("run child lock probe");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "child lock probe failed: stdout={} stderr={}",
+            stdout,
+            stderr
+        );
+        assert_eq!(
+            stdout
+                .lines()
+                .filter(|line| *line == completion_marker)
+                .count(),
+            1,
+            "child lock probe did not complete exactly once: stdout={stdout} stderr={stderr}"
+        );
+    }
+
     #[test]
     fn data_file_lock_refuses_a_separate_process() {
         let temp = TempDir::new().expect("tempdir");
@@ -4292,24 +4325,19 @@ mod tests {
         assert!(path.is_file());
         assert!(tail_anchor_path(&path).is_file());
 
-        let output = Command::new(std::env::current_exe().expect("current test executable"))
-            .arg("--exact")
-            .arg("messaging::store::tests::data_file_lock_child_probe")
-            .arg("--nocapture")
-            .env("MACO_MESSAGING_LOCK_CHILD", &path)
-            .output()
-            .expect("run child lock probe");
-        assert!(
-            output.status.success(),
-            "child lock probe failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+        run_data_file_lock_child_probe(
+            &path,
+            DATA_FILE_LOCK_CHILD_EXPECT_BLOCKED,
+            DATA_FILE_LOCK_CHILD_BLOCKED,
         );
 
         drop(store);
         assert!(path.is_file());
-        MessagingStore::open(&path, "broker", &authority, &limits, integrity_key())
-            .expect("data-file lock is released on drop");
+        run_data_file_lock_child_probe(
+            &path,
+            DATA_FILE_LOCK_CHILD_EXPECT_RELEASED,
+            DATA_FILE_LOCK_CHILD_RELEASED,
+        );
     }
 
     #[test]
@@ -4318,16 +4346,29 @@ mod tests {
             return;
         };
         let path = PathBuf::from(path);
-        assert!(matches!(
-            MessagingStore::open(
-                &path,
-                "broker",
-                &authority(),
-                &test_limits(),
-                integrity_key(),
-            ),
-            Err(StoreError::WriterAlreadyActive { .. })
-        ));
+        let expectation = std::env::var(DATA_FILE_LOCK_CHILD_EXPECTATION)
+            .expect("child lock expectation is set when the child path is set");
+        let result = MessagingStore::open(
+            &path,
+            "broker",
+            &authority(),
+            &test_limits(),
+            integrity_key(),
+        );
+        match expectation.as_str() {
+            DATA_FILE_LOCK_CHILD_EXPECT_BLOCKED => {
+                assert!(matches!(
+                    result,
+                    Err(StoreError::WriterAlreadyActive { .. })
+                ));
+                println!("{DATA_FILE_LOCK_CHILD_BLOCKED}");
+            }
+            DATA_FILE_LOCK_CHILD_EXPECT_RELEASED => {
+                let _store = result.expect("data-file lock is released on drop");
+                println!("{DATA_FILE_LOCK_CHILD_RELEASED}");
+            }
+            other => panic!("unexpected child lock expectation {other:?}"),
+        }
     }
 
     #[test]
