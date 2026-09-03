@@ -4758,7 +4758,19 @@ const GROK_PRODUCTION_HELPER_RECEIPT: &[u8] = b"writable Grok production helper 
 const GROK_PRODUCTION_TEST_NAME: &str = "external_agent::tests::writable_grok_run_external_agent_accepts_one_isolated_effect_and_preserves_primary";
 
 #[cfg(target_os = "linux")]
+fn write_visible_grok_production_skip(message: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let stderr = std::io::stderr();
+    let mut stderr = stderr.lock();
+    writeln!(stderr, "{message}")?;
+    stderr.flush()
+}
+
+#[cfg(target_os = "linux")]
 fn run_writable_grok_production_helper_subprocess() -> Result<()> {
+    const HELPER_STDERR_MAX_BYTES: usize = 64 * 1024;
+
     let temp = tempfile::tempdir()?;
     let grok_home = temp.path().join("grok-home");
     let receipt = temp.path().join("helper-completed");
@@ -4768,29 +4780,77 @@ fn run_writable_grok_production_helper_subprocess() -> Result<()> {
         bail!("writable Grok helper receipt must start absent");
     }
 
-    let status = std::process::Command::new(std::env::current_exe()?)
-        .args([
-            "--exact",
-            GROK_PRODUCTION_TEST_NAME,
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(GROK_PRODUCTION_HELPER_ENV, "1")
-        .env(GROK_PRODUCTION_HELPER_RECEIPT_ENV, &receipt)
-        .env("GROK_HOME", &grok_home)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .context("spawn exact writable Grok production helper test")?;
-    if !status.success() {
-        bail!("writable Grok production helper failed with status {status}");
+    let environment = BTreeMap::from([
+        (GROK_PRODUCTION_HELPER_ENV.to_string(), "1".to_string()),
+        (
+            GROK_PRODUCTION_HELPER_RECEIPT_ENV.to_string(),
+            receipt
+                .to_str()
+                .context("writable Grok helper receipt path is not UTF-8")?
+                .to_string(),
+        ),
+        (
+            "GROK_HOME".to_string(),
+            grok_home
+                .to_str()
+                .context("writable Grok helper home path is not UTF-8")?
+                .to_string(),
+        ),
+    ]);
+    let output = crate::process_runner::run_process(
+        ProcessSpec::direct(
+            "exact writable Grok production helper test",
+            std::env::current_exe()?,
+            [
+                "--exact",
+                GROK_PRODUCTION_TEST_NAME,
+                "--nocapture",
+                "--test-threads=1",
+            ],
+            std::env::current_dir()?,
+            HELPER_STDERR_MAX_BYTES,
+        )
+        .with_environment(EnvironmentMode::InheritAndSet(environment))
+        .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort)
+        .with_stdin(StdinMode::Null)
+        .with_timeout(Some(Duration::from_secs(90)))
+        .with_stdout(StreamCapture::bounded(0))
+        .with_stderr(StreamCapture::bounded(HELPER_STDERR_MAX_BYTES)),
+    )
+    .context("spawn exact writable Grok production helper test")?;
+    let stderr_truncated = output.stderr.is_truncated();
+    let stderr = String::from_utf8_lossy(output.stderr.as_bytes());
+    if !output
+        .status
+        .as_ref()
+        .is_some_and(|status| status.success())
+        || output.timed_out
+        || output.process_error.is_some()
+        || output.stdin_error.is_some()
+    {
+        let status = output
+            .status
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "unavailable".to_string());
+        bail!(
+            "writable Grok production helper failed with status {status}; timed_out={}; process_error={:?}; stdin_error={:?}; captured stderr (truncated={}):\n{}",
+            output.timed_out,
+            output.process_error.as_deref(),
+            output.stdin_error.as_deref(),
+            stderr_truncated,
+            stderr
+        );
     }
-    let observed_receipt = fs::read(&receipt).context(
-        "exact writable Grok test subprocess returned success without its helper receipt",
-    )?;
+    let observed_receipt = fs::read(&receipt).with_context(|| {
+        format!(
+            "exact writable Grok test subprocess returned success without its helper receipt; captured stderr (truncated={stderr_truncated}):\n{stderr}"
+        )
+    })?;
     if observed_receipt.as_slice() != GROK_PRODUCTION_HELPER_RECEIPT {
-        bail!("exact writable Grok test subprocess wrote an invalid helper receipt");
+        bail!(
+            "exact writable Grok test subprocess wrote an invalid helper receipt; captured stderr (truncated={stderr_truncated}):\n{stderr}"
+        );
     }
     Ok(())
 }
@@ -4799,6 +4859,21 @@ fn run_writable_grok_production_helper_subprocess() -> Result<()> {
 #[test]
 fn writable_grok_run_external_agent_accepts_one_isolated_effect_and_preserves_primary() -> Result<()>
 {
+    let cgroups = fs::read_to_string("/proc/self/cgroup")?;
+    if let Some(message) =
+        crate::containment_probe::skip_reason(GROK_PRODUCTION_TEST_NAME, &cgroups)
+    {
+        write_visible_grok_production_skip(&message)?;
+        return Ok(());
+    }
+    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none()
+        && std::env::var_os("XDG_RUNTIME_DIR").is_none()
+    {
+        write_visible_grok_production_skip(&format!(
+            "SKIP {GROK_PRODUCTION_TEST_NAME}: DBUS_SESSION_BUS_ADDRESS and XDG_RUNTIME_DIR are both absent"
+        ))?;
+        return Ok(());
+    }
     match std::env::var_os(GROK_PRODUCTION_HELPER_ENV) {
         None => return run_writable_grok_production_helper_subprocess(),
         Some(value) if value == std::ffi::OsStr::new("1") => {}
