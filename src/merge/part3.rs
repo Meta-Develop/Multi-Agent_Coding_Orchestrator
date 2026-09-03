@@ -394,6 +394,27 @@ fn run_isolated_git_process(
     )
 }
 
+fn run_isolated_git_process_with_timeout(
+    context: &TemporaryIndex,
+    worktree_path: &Path,
+    operation: &[&str],
+    stdin: StdinMode,
+    label: &str,
+    timeout: Duration,
+    deadline_knobs: Option<(&str, &str)>,
+) -> Result<GitCommandOutput> {
+    let profile = isolated_git_workspace_profile(context, worktree_path)?;
+    run_isolated_git_process_os_with_profile_and_timeout(
+        worktree_path,
+        context.command_args(worktree_path, operation),
+        stdin,
+        label,
+        profile,
+        timeout,
+        deadline_knobs,
+    )
+}
+
 fn run_isolated_git_process_with_writable_worktree(
     context: &TemporaryIndex,
     worktree_path: &Path,
@@ -436,17 +457,38 @@ fn run_isolated_git_process_os_with_profile(
     label: &str,
     profile: StrictOfflineWorkspaceProfile,
 ) -> Result<GitCommandOutput> {
-    run_required_direct(
+    run_isolated_git_process_os_with_profile_and_timeout(
+        worktree_path,
+        command_args,
+        stdin,
+        label,
+        profile,
+        LOCAL_GIT_PROCESS_TIMEOUT,
+        None,
+    )
+}
+
+fn run_isolated_git_process_os_with_profile_and_timeout(
+    worktree_path: &Path,
+    command_args: Vec<OsString>,
+    stdin: StdinMode,
+    label: &str,
+    profile: StrictOfflineWorkspaceProfile,
+    timeout: Duration,
+    deadline_knobs: Option<(&str, &str)>,
+) -> Result<GitCommandOutput> {
+    run_required_local_git_direct(
         label,
         resolve_trusted_executable("git")?,
         command_args,
         worktree_path,
         capture_git_environment(worktree_path)?,
         stdin,
-        LOCAL_GIT_PROCESS_TIMEOUT,
+        timeout,
         GIT_CAPTURE_LIMIT_BYTES,
         GIT_STDIN_LIMIT_BYTES,
         profile,
+        deadline_knobs,
     )
 }
 
@@ -755,6 +797,37 @@ pub(crate) fn run_required_direct(
         stdin_limit_bytes,
         SideEffectConfinementProfile::StrictOfflineWorkspace(profile),
         SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_required_local_git_direct(
+    label: &str,
+    program: PathBuf,
+    args: Vec<OsString>,
+    current_dir: &Path,
+    environment: BTreeMap<String, String>,
+    stdin: StdinMode,
+    timeout: Duration,
+    capture_limit_bytes: usize,
+    stdin_limit_bytes: usize,
+    profile: StrictOfflineWorkspaceProfile,
+    deadline_knobs: Option<(&str, &str)>,
+) -> Result<RequiredCommandOutput> {
+    run_required_direct_with_profile(
+        label,
+        program,
+        args,
+        current_dir,
+        environment,
+        stdin,
+        timeout,
+        capture_limit_bytes,
+        stdin_limit_bytes,
+        SideEffectConfinementProfile::StrictOfflineWorkspace(profile),
+        SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+        deadline_knobs,
     )
 }
 
@@ -794,6 +867,7 @@ pub(crate) fn run_required_network_direct(
         stdin_limit_bytes,
         SideEffectConfinementProfile::TrustedFixedNetwork(profile),
         SideEffectConfinementProfileKind::TrustedFixedNetwork,
+        None,
     )
 }
 
@@ -810,6 +884,7 @@ fn run_required_direct_with_profile(
     stdin_limit_bytes: usize,
     profile: SideEffectConfinementProfile,
     expected_profile: SideEffectConfinementProfileKind,
+    deadline_knobs: Option<(&str, &str)>,
 ) -> Result<RequiredCommandOutput> {
     if let StdinMode::Bytes(bytes) = &stdin {
         if bytes.len() > stdin_limit_bytes {
@@ -824,7 +899,12 @@ fn run_required_direct_with_profile(
             .with_timeout(Some(timeout)),
     )
     .with_context(|| format!("failed to run {label}"))?;
-    require_verified_process_output(label, &output, expected_profile)?;
+    require_verified_process_output_with_deadline_hint(
+        label,
+        &output,
+        expected_profile,
+        deadline_knobs.map(|(flag, environment)| (timeout, flag, environment)),
+    )?;
     Ok(RequiredCommandOutput {
         success: output.status.is_some_and(|status| status.success()),
         stdout: output.stdout.as_bytes().to_vec(),
@@ -837,6 +917,15 @@ fn require_verified_process_output(
     output: &ProcessOutput,
     expected_profile: SideEffectConfinementProfileKind,
 ) -> Result<()> {
+    require_verified_process_output_with_deadline_hint(label, output, expected_profile, None)
+}
+
+fn require_verified_process_output_with_deadline_hint(
+    label: &str,
+    output: &ProcessOutput,
+    expected_profile: SideEffectConfinementProfileKind,
+    deadline_hint: Option<(Duration, &str, &str)>,
+) -> Result<()> {
     require_verified_containment(label, output.process_tree)?;
     if output.side_effects != SideEffectConfinementEvidence::Verified(expected_profile) {
         bail!(
@@ -845,6 +934,12 @@ fn require_verified_process_output(
         );
     }
     if output.timed_out {
+        if let Some((timeout, flag, environment)) = deadline_hint {
+            bail!(
+                "{label} exceeded its effective {}-second total operation deadline; raise {flag} or {environment} to allow more time",
+                timeout.as_secs()
+            );
+        }
         bail!("{label} exceeded its total operation deadline");
     }
     if let Some(error) = &output.process_error {
