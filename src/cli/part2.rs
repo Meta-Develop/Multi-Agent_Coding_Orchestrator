@@ -794,6 +794,7 @@ fn collect_options_from_claims(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn preview_merge_from_args(
     repo: PathBuf,
     agent_id: String,
