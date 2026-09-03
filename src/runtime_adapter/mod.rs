@@ -413,6 +413,12 @@ impl TypedRuntimeContract {
             TypedRuntime::Grok46Xhigh => grok::parse_grok_event_stream(bytes),
         }
     }
+
+    /// Exact native Grok spend status for a bounded stream. Codex usage events
+    /// are not accepted here.
+    pub fn usage_status(self, bytes: &[u8]) -> Result<grok::GrokUsageStatus> {
+        Ok(self.parse_output(bytes)?.usage_status())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -1930,6 +1936,63 @@ mod tests {
         }
         // Codex remains the unresolved default by operator policy.
         assert_eq!(resolve_runtime(None, None), RuntimeId::Codex);
+        Ok(())
+    }
+
+    #[test]
+    fn grok_usage_is_native_or_unobserved_and_codex_fake_contracts_stay_put() -> Result<()> {
+        assert_eq!(
+            AdapterId::Codex.capabilities().usage_reporting,
+            UsageReporting::PerTurn
+        );
+        assert!(AdapterId::Codex.capabilities().admits_worktree_writable());
+        assert_eq!(
+            AdapterId::Fake.capabilities().usage_reporting,
+            UsageReporting::None
+        );
+        assert_eq!(
+            AdapterId::Fake.capabilities().worktree_writable_refusal(),
+            Some("writable_workspace == unsupported")
+        );
+        assert!(!AdapterId::Fake.capabilities().admits_writable_release());
+        assert_eq!(
+            AdapterId::Grok.capabilities().usage_reporting,
+            UsageReporting::None
+        );
+        let context = launch_context(
+            Path::new("prompt.txt"),
+            Some("grok-4.6"),
+            Some("xhigh"),
+            Path::new("/tmp/work"),
+            Path::new("out.txt"),
+        );
+        let contract = RuntimeAdapterConfig::defaults(RuntimeId::Grok)
+            .typed_runtime_contract(AdapterId::Grok, &context)
+            .expect("canonical Grok 4.6/xhigh contract");
+        assert_eq!(
+            contract.capabilities().usage_reporting,
+            UsageReporting::None
+        );
+        assert!(contract.capabilities().admits_worktree_writable());
+        assert!(!contract.capabilities().admits_writable_release());
+        assert_eq!(
+            contract.usage_status(
+                b"{\"type\":\"end\",\"stopReason\":\"end_turn\",\"sessionId\":\"s\",\"requestId\":\"r\"}\n"
+            )?,
+            grok::GrokUsageStatus::NotProcessObservable
+        );
+        let native = contract.usage_status(
+            concat!(
+                "{\"type\":\"end\",\"stopReason\":\"end_turn\",\"sessionId\":\"s\",\"requestId\":\"r\",",
+                "\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}\n",
+            )
+            .as_bytes(),
+        )?;
+        let grok::GrokUsageStatus::Native(usage) = native else {
+            panic!("exact native end usage must be preserved");
+        };
+        assert_eq!(usage.input_tokens(), 2);
+        assert_eq!(usage.output_tokens(), 1);
         Ok(())
     }
 
