@@ -5344,6 +5344,12 @@ enum CodexServiceTierOverride {
     Priority,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexMultiAgentMode {
+    Enabled,
+    Disabled,
+}
+
 fn parse_codex_service_tier_override(
     value: Option<&OsStr>,
 ) -> Result<Option<CodexServiceTierOverride>> {
@@ -5423,7 +5429,12 @@ fn codex_supervisor_argv(
     controls: &ProtectedWorktreeControls,
     service_tier: Option<CodexServiceTierOverride>,
 ) -> Vec<OsString> {
-    let mut argv = codex_hardened_argv_with_service_tier(spec, controls, service_tier);
+    let mut argv = codex_hardened_argv_with_service_tier(
+        spec,
+        controls,
+        CodexMultiAgentMode::Enabled,
+        service_tier,
+    );
     argv.extend([
         OsString::from("--enable"),
         OsString::from("goals"),
@@ -5456,12 +5467,18 @@ fn codex_hardened_argv(
     spec: &ExternalAgentCommand,
     controls: &ProtectedWorktreeControls,
 ) -> Vec<OsString> {
-    codex_hardened_argv_with_service_tier(spec, controls, None)
+    codex_hardened_argv_with_service_tier(
+        spec,
+        controls,
+        CodexMultiAgentMode::Disabled,
+        None,
+    )
 }
 
 fn codex_hardened_argv_with_service_tier(
     spec: &ExternalAgentCommand,
     controls: &ProtectedWorktreeControls,
+    multi_agent: CodexMultiAgentMode,
     service_tier: Option<CodexServiceTierOverride>,
 ) -> Vec<OsString> {
     let filesystem_permissions = codex_filesystem_permissions(spec, controls);
@@ -5473,7 +5490,13 @@ fn codex_hardened_argv_with_service_tier(
         OsString::from("--strict-config"),
         OsString::from("--ignore-user-config"),
         OsString::from("--ignore-rules"),
-        OsString::from("--ephemeral"),
+    ];
+    if multi_agent == CodexMultiAgentMode::Disabled {
+        // Codex CLI 0.144.4 cannot find the calling thread when collab spawn runs from an
+        // ephemeral session, so multi_agent launches must retain their session state.
+        argv.push(OsString::from("--ephemeral"));
+    }
+    argv.extend([
         OsString::from("--cd"),
         spec.cwd.as_os_str().to_os_string(),
         OsString::from("-c"),
@@ -5490,7 +5513,7 @@ fn codex_hardened_argv_with_service_tier(
         OsString::from(shell_environment_include_only),
         OsString::from("-c"),
         OsString::from("web_search=\"disabled\""),
-    ];
+    ]);
     for feature in [
         "apps",
         "plugins",
@@ -5501,11 +5524,15 @@ fn codex_hardened_argv_with_service_tier(
         "browser_use_external",
         "computer_use",
         "image_generation",
-        "multi_agent",
     ] {
         argv.push(OsString::from("--disable"));
         argv.push(OsString::from(feature));
     }
+    argv.push(OsString::from(match multi_agent {
+        CodexMultiAgentMode::Enabled => "--enable",
+        CodexMultiAgentMode::Disabled => "--disable",
+    }));
+    argv.push(OsString::from("multi_agent"));
     if let Some(model) = &spec.model {
         argv.push(OsString::from("-m"));
         argv.push(OsString::from(model));
