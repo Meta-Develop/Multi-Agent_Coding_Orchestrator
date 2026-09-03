@@ -40,6 +40,7 @@ pub mod optimizer;
 pub mod orchestration_event;
 pub mod orchestrator;
 pub mod planning;
+pub mod pr_intake;
 pub mod pre_action_review;
 pub mod process_runner;
 pub mod protected_path;

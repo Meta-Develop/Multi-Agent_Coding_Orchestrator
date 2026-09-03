@@ -783,6 +783,16 @@ fn cli_github_source_view(
     Ok(value)
 }
 
+pub(crate) fn view_github_source_item(
+    repo: &Path,
+    repository_selector: &str,
+    number: u64,
+    kind: ExternalSourceObjectKind,
+) -> Result<serde_json::Value> {
+    let repository = github_repository_identity_from_selector(repository_selector)?;
+    cli_github_source_view(repo, number, kind, &repository)
+}
+
 fn github_source_list_args(
     repository: &GithubRepositoryIdentity,
     kind: ExternalSourceObjectKind,
