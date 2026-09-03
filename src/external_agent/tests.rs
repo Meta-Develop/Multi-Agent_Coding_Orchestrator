@@ -1214,9 +1214,10 @@ fn create_linked_git_metadata_fixture(root: &Path) -> Result<(PathBuf, PathBuf, 
 }
 
 #[cfg(unix)]
-fn snapshot_primary_git_surface(
-    repo: &Path,
-) -> Result<(git2::Oid, Vec<(Vec<u8>, git2::Oid, u32)>)> {
+type PrimaryGitSurfaceSnapshot = (git2::Oid, Vec<(Vec<u8>, git2::Oid, u32)>);
+
+#[cfg(unix)]
+fn snapshot_primary_git_surface(repo: &Path) -> Result<PrimaryGitSurfaceSnapshot> {
     let repository = crate::git_repository::open(repo)?;
     let head = repository.head()?.target().context("primary HEAD")?;
     let index = repository.index()?;
