@@ -2104,6 +2104,17 @@ fn parse_positive_seconds(value: &str) -> std::result::Result<u64, String> {
     }
 }
 
+fn parse_positive_u64(value: &str) -> std::result::Result<u64, String> {
+    let value = value
+        .parse::<u64>()
+        .map_err(|_| "expected a positive 64-bit unsigned integer".to_string())?;
+    if value == 0 {
+        Err("value must be greater than zero".to_string())
+    } else {
+        Ok(value)
+    }
+}
+
 fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
     let value = value
         .parse::<usize>()

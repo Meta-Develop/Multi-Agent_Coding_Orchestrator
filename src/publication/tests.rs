@@ -3308,6 +3308,7 @@ fn publication_network_capability_callsites_are_exactly_audited() {
         constructors,
         [
             "inbox.rs",
+            "inbox.rs",
             "process_runner.rs",
             "publication.rs",
             "publication.rs",
@@ -3317,6 +3318,7 @@ fn publication_network_capability_callsites_are_exactly_audited() {
     assert_eq!(
         runners,
         [
+            "inbox.rs",
             "inbox.rs",
             "publication.rs",
             "publication.rs",

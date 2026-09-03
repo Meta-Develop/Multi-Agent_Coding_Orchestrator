@@ -160,6 +160,11 @@ The current implementation covers a local-first command-line slice:
   or automatic merge by default. `inbox run` accepts optional rolling-quota
   ceilings `--max-rolling-tokens`, `--max-rolling-cost-usd`, and
   `--rolling-window-seconds`.
+- `maco inbox intake --pr <positive-u64>` invokes the authenticated production
+  producer for one exact provider-observed GitHub pull request. The command
+  accepts only the PR number, repository path, optional Codex executable, and
+  the conventional JSON-output flag; provider and trust evidence are resolved
+  internally.
 - `maco inbox workspace scan/run/watch` supervises the same inbox loop across
   a workspace JSON of repositories. `scan` reports per-repository intake
   without launching Autopilot; `run` and `watch` execute the same per-repository
@@ -3551,6 +3556,7 @@ cargo run -- inbox run --repo . --run-id inbox-demo --json
 cargo run -- inbox run --repo . --run-id inbox-codex --permission github_local --codex-bin codex --json
 cargo run -- inbox run --repo . --run-id inbox-quota \
   --max-rolling-tokens 42000 --max-rolling-cost-usd 12.5 --json
+cargo run -- inbox intake --pr 123 --repo . --codex-bin codex --json
 cargo run -- inbox status inbox-demo --repo . --json
 cargo run -- inbox collect inbox-demo --repo . --json
 cargo run -- inbox watch --repo . --poll-seconds 60 --once --json
@@ -3587,13 +3593,15 @@ item is used. Duplicate detection remains stable by repository, kind, and number
 while the snapshot digest separately identifies the observed source revision.
 Fake fixtures use fixed timestamps and canonical fake OIDs for reproducibility.
 
-`maco inbox run` and `maco inbox watch` execute effectfully: item work
-dispatches through Autopilot, whose supervisor cascade derives the
-capability-bound repository cleanliness input before creating managed
-worktrees. `scan`, `status`, `collect`, and read-only artifact inspection
-remain available. The fake-first reaction flow described below is the
-executable behavior; the unbound Fake reviewer still stops as nonpublishable
-before real publication effects.
+`maco inbox run` and `maco inbox watch` execute effectfully. Items that need
+repair remain on the ordinary Autopilot repair path, whose supervisor cascade
+derives the capability-bound repository cleanliness input before creating
+managed worktrees. Watch also offers bounded, source-bound open-PR tasks to the
+authenticated intake lane; `maco inbox intake --pr <number>` re-observes the
+exact provider-owned PR before admitting that lane. `scan`, `status`, `collect`,
+and read-only artifact inspection remain available. The fake-first reaction
+flow described below is the executable behavior; the unbound Fake reviewer
+still stops as nonpublishable before real publication effects.
 
 `maco inbox run` accepts optional workspace rolling-quota ceilings
 `--max-rolling-tokens`, `--max-rolling-cost-usd`, and
@@ -3632,8 +3640,12 @@ same path-scoped safety boundary as autopilot: it refuses dirty primary worktree
 files, active local locks, active sync claims, active semantic intents, and
 active/blocked live claim locks only when they overlap selected target paths,
 while ignoring its own `.maco/**` and `.maco-cache/**` runtime artifacts.
-Refusal JSON includes paths and lock details. Inbox never performs automatic
-merge; human review remains the next action after a successful reaction.
+Refusal JSON includes paths and lock details. Ordinary repair does not merge.
+Only the authenticated clean-PR intake lane may merge, and only under
+`github_full` after fresh provider ground truth, approved-actor binding,
+producer/auditor separation, passing CI, exact source/head/base/path identity,
+clean merge simulation, and merge-receipt verification all pass; every failed
+gate reports a blocked lane without a verified merge.
 Live GitHub intake uses the same pinned trusted `gh` network boundary as
 publication: private host-specific token/config state, a minimal environment,
 bounded capture and timeout, an exact host-qualified `--repo`, and a fixed

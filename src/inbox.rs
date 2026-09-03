@@ -1,6 +1,8 @@
 pub mod review_loop;
 pub mod review_loop_entry;
 
+use self::review_loop_entry::InboxIndependentAuditorSelectionEvidence;
+
 use crate::{
     artifacts::{
         self, ArtifactFileDisposition, ArtifactRunReader, ArtifactRunWriter, RunArtifactFamily,
@@ -31,9 +33,11 @@ use git2::{Delta, DiffFindOptions, DiffOptions, ObjectType, Oid, StatusOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs::{self, File},
-    io::Write,
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    env,
+    ffi::OsString,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
     process, thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -54,6 +58,9 @@ use crate::publication::forge_transport::{
     ReportedActorKind,
 };
 use crate::publication::AuthenticatedPullRequestMergeOutcome;
+
+pub(crate) type InboxBeforeAuditorLaunch<'a> =
+    &'a mut dyn FnMut(&str, &InboxIndependentAuditorSelectionEvidence) -> Result<()>;
 
 const INBOX_SCHEMA_VERSION: u32 = 1;
 const CONFIG_FILE: &str = "maco-inbox.json";
@@ -83,6 +90,9 @@ const MAX_GITHUB_URL_BYTES: usize = 2 * 1024;
 const MAX_GITHUB_LOGIN_BYTES: usize = 128;
 const MAX_GITHUB_REF_BYTES: usize = 512;
 const MAX_GITHUB_ITEMS: usize = MAX_SELECTION_ITEMS;
+const GITHUB_WATCH_PR_DISCOVERY_SENTINEL: usize = MAX_GITHUB_ITEMS;
+const MAX_GITHUB_WATCH_PR_PRODUCERS: usize = GITHUB_WATCH_PR_DISCOVERY_SENTINEL - 1;
+const MAX_WATCH_RETAINED_ITERATIONS: usize = MAX_GITHUB_ITEMS;
 const MAX_GITHUB_FILES: usize = MAX_ASSIGNED_PATHS;
 const MAX_GITHUB_CHECKS: usize = 512;
 const MAX_GITHUB_REVIEWS: usize = 512;
@@ -101,6 +111,12 @@ const PR_OBJECT_FETCH_MAX_OBJECTS: usize = 131_072;
 const PR_OBJECT_FETCH_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const PR_OBJECT_FETCH_MAX_GRAPH_STEPS: usize = PR_OBJECT_FETCH_MAX_OBJECTS * 4;
 const PR_OBJECT_FETCH_TIMEOUT: Duration = Duration::from_secs(300);
+const APPROVED_GITHUB_LOGIN_CONFIG_KEY: &str = "agentFiles.approvedGitHubLogin";
+const APPROVED_GITHUB_ACTOR_CAPTURE_LIMIT: usize = 4 * 1024;
+const APPROVED_GITHUB_ACTOR_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_GITHUB_TOKEN_BYTES: usize = 16 * 1024;
+const MAX_PR_OBSERVATION_DETAIL_CHARS: usize = 256;
+const MAX_REPOSITORY_CONFIG_BYTES: usize = 128 * 1024;
 
 pub const DEFAULT_ROLLING_WINDOW_SECONDS: u64 =
     crate::budget_ledger::DEFAULT_ROLLING_WINDOW_SECONDS;
@@ -1175,6 +1191,8 @@ pub struct InboxRunReport {
     pub artifacts: InboxRunArtifacts,
     pub selected_item_count: usize,
     pub item_reports: Vec<InboxItemRunReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_intake_producer: Option<InboxPrIntakeProducerBatchReport>,
     pub auto_merge_performed: bool,
     pub next_action: String,
 }
@@ -1260,7 +1278,53 @@ pub struct InboxWatchReport {
     pub poll_seconds: u64,
     pub once: bool,
     pub iteration_count: usize,
+    pub retained_iteration_count: usize,
+    pub dropped_iteration_count: usize,
     pub runs: Vec<InboxRunReport>,
+}
+
+/// Typed result of the watch-only, repository-bound open-PR discovery pass.
+/// The list payload contributes only positive, unique PR numbers; every other
+/// provider field is deliberately ignored and re-observed by the producer.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "cause", rename_all = "snake_case")]
+pub enum InboxPrDiscoveryRefusalCause {
+    ProviderUnavailable {
+        detail: String,
+    },
+    MalformedProviderResponse {
+        detail: String,
+    },
+    BoundExceeded {
+        returned_count: usize,
+        maximum_processable: usize,
+    },
+    DuplicateNumber {
+        number: u64,
+    },
+    ZeroNumber {
+        entry_index: usize,
+    },
+}
+
+/// Additive watch report containing the complete bounded producer batch for
+/// one ordinary Inbox iteration.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InboxPrIntakeProducerBatchReport {
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    pub discovery_sentinel: usize,
+    pub maximum_processable: usize,
+    pub discovered_count: usize,
+    pub producer_report_count: usize,
+    pub producer_refusal_count: usize,
+    pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_refusal: Option<InboxPrDiscoveryRefusalCause>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub producer_reports: Vec<crate::pr_intake::PrIntakeProducerReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1391,6 +1455,17 @@ struct InboxConfigOverrides {
     pr_event_target: Option<InboxPrEventTarget>,
     pr_event_task: Option<InboxIndependentAuditMergeLaneTask>,
     authenticated_pr_event: bool,
+    pr_dispatch_mode: InboxPrDispatchMode,
+    pr_intake_producer: Option<InboxPrIntakeProducerBatchReport>,
+    #[cfg(test)]
+    fixed_scan_items: Option<Vec<InboxItem>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum InboxPrDispatchMode {
+    #[default]
+    All,
+    RepairOnly,
 }
 
 #[derive(Debug, Clone)]
@@ -1479,47 +1554,64 @@ fn scan_inbox_with_overrides(
     let source_repository =
         source_repository_binding_context(&repo, &loaded.config, github_enabled)?;
     let mut items = Vec::new();
-    if loaded.config.selection.issues {
-        let issues = if github_enabled {
-            github_issue_candidates(&repo, &loaded.config, &source_repository)?
-        } else {
-            fake_issue_candidates(&loaded.config)
-        };
-        for issue in issues {
-            items.push(issue_item(
-                issue,
-                &loaded.config,
-                &source_repository,
-                &duplicate_keys,
-            )?);
+    #[cfg(test)]
+    let uses_fixed_scan_items = overrides.fixed_scan_items.is_some();
+    #[cfg(not(test))]
+    let uses_fixed_scan_items = false;
+    #[cfg(test)]
+    if let Some(fixed_scan_items) = overrides.fixed_scan_items.clone() {
+        for item in fixed_scan_items {
+            if pr_dispatch_mode_allows_item(overrides.pr_dispatch_mode, &item) {
+                items.push(item);
+            }
         }
     }
-    if loaded.config.selection.pull_requests {
-        let pull_requests = if github_enabled {
-            match &overrides.pr_event_target {
-                Some(target) => vec![github_pr_candidate(
-                    &repo,
+    if !uses_fixed_scan_items {
+        if loaded.config.selection.issues {
+            let issues = if github_enabled {
+                github_issue_candidates(&repo, &loaded.config, &source_repository)?
+            } else {
+                fake_issue_candidates(&loaded.config)
+            };
+            for issue in issues {
+                items.push(issue_item(
+                    issue,
                     &loaded.config,
                     &source_repository,
-                    target.number,
-                )?],
-                None => github_pr_candidates(&repo, &loaded.config, &source_repository)?,
+                    &duplicate_keys,
+                )?);
             }
-        } else {
-            fake_pr_candidates(&loaded.config)
-        };
-        for pull_request in pull_requests {
-            if !should_include_pr_candidate(&loaded.config, &pull_request) {
-                continue;
+        }
+        if loaded.config.selection.pull_requests {
+            let pull_requests = if github_enabled {
+                match &overrides.pr_event_target {
+                    Some(target) => vec![github_pr_candidate(
+                        &repo,
+                        &loaded.config,
+                        &source_repository,
+                        target.number,
+                    )?],
+                    None => github_pr_candidates(&repo, &loaded.config, &source_repository)?,
+                }
+            } else {
+                fake_pr_candidates(&loaded.config)
+            };
+            for pull_request in pull_requests {
+                if !should_include_pr_candidate(&loaded.config, &pull_request) {
+                    continue;
+                }
+                let mut item = pr_item(
+                    pull_request,
+                    &loaded.config,
+                    &source_repository,
+                    &duplicate_keys,
+                )?;
+                if !pr_dispatch_mode_allows_item(overrides.pr_dispatch_mode, &item) {
+                    continue;
+                }
+                apply_pr_snapshot_duplicate(&mut item, &duplicate_pr_snapshots);
+                items.push(item);
             }
-            let mut item = pr_item(
-                pull_request,
-                &loaded.config,
-                &source_repository,
-                &duplicate_keys,
-            )?;
-            apply_pr_snapshot_duplicate(&mut item, &duplicate_pr_snapshots);
-            items.push(item);
         }
     }
     validate_count(items.len(), "inbox candidate items", MAX_GITHUB_ITEMS)?;
@@ -1612,6 +1704,551 @@ pub fn run_inbox(options: InboxRunOptions) -> Result<InboxRunReport> {
     run_inbox_with_rolling_budget(options, None)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxPrObservationFailureClass {
+    ProviderUnavailable,
+    MalformedProviderResponse,
+    InvalidProviderGroundTruth,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxPrObservationError {
+    pub classification: InboxPrObservationFailureClass,
+    pub detail: String,
+}
+
+impl InboxPrObservationError {
+    fn new(classification: InboxPrObservationFailureClass, detail: impl AsRef<str>) -> Self {
+        Self {
+            classification,
+            detail: bounded_pr_observation_detail(detail.as_ref()),
+        }
+    }
+}
+
+impl std::fmt::Display for InboxPrObservationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.detail)
+    }
+}
+
+impl std::error::Error for InboxPrObservationError {}
+
+fn bounded_pr_observation_detail(detail: &str) -> String {
+    let mut bounded = detail
+        .chars()
+        .take(MAX_PR_OBSERVATION_DETAIL_CHARS)
+        .collect::<String>();
+    if detail.chars().count() > MAX_PR_OBSERVATION_DETAIL_CHARS {
+        bounded.push_str("...");
+    }
+    bounded
+}
+
+pub(crate) fn sanitize_pr_intake_provider_detail(repo: &Path, detail: &str) -> String {
+    sanitize_public_text(repo, detail, MAX_PR_OBSERVATION_DETAIL_CHARS).text
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxApprovedGithubActorFailure {
+    MissingOrAmbiguousPin,
+    MalformedPin,
+    ActorUnavailable,
+    MalformedActorResponse,
+    PinMismatch,
+    BindingChanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxApprovedGithubActorError {
+    pub failure: InboxApprovedGithubActorFailure,
+    pub detail: String,
+}
+
+impl InboxApprovedGithubActorError {
+    fn new(failure: InboxApprovedGithubActorFailure, detail: impl AsRef<str>) -> Self {
+        Self {
+            failure,
+            detail: bounded_pr_observation_detail(detail.as_ref()),
+        }
+    }
+}
+
+impl std::fmt::Display for InboxApprovedGithubActorError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.detail)
+    }
+}
+
+impl std::error::Error for InboxApprovedGithubActorError {}
+
+pub(crate) struct InboxApprovedGithubActorBinding {
+    config_path: PathBuf,
+    approved_login: String,
+    config_bytes: Vec<u8>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl InboxApprovedGithubActorBinding {
+    pub(crate) fn verify_fresh(&self) -> Result<(), InboxApprovedGithubActorError> {
+        let current = capture_repository_config(&self.config_path).map_err(|_| {
+            InboxApprovedGithubActorError::new(
+                InboxApprovedGithubActorFailure::BindingChanged,
+                "repository-local approved GitHub login binding became unavailable",
+            )
+        })?;
+        #[cfg(unix)]
+        let same_identity = self.device == current.device && self.inode == current.inode;
+        #[cfg(not(unix))]
+        let same_identity = false;
+        if !same_identity || self.config_bytes != current.bytes {
+            return Err(InboxApprovedGithubActorError::new(
+                InboxApprovedGithubActorFailure::BindingChanged,
+                "repository-local approved GitHub login binding changed before launch",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for InboxApprovedGithubActorBinding {
+    fn drop(&mut self) {
+        self.config_bytes.fill(0);
+        self.approved_login.clear();
+    }
+}
+
+struct RepositoryConfigCapture {
+    bytes: Vec<u8>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+pub(crate) fn bind_approved_github_actor(
+    repo: &Path,
+) -> Result<InboxApprovedGithubActorBinding, InboxApprovedGithubActorError> {
+    bind_approved_github_actor_with(repo, || authenticated_github_actor(repo))
+}
+
+pub(crate) fn bind_approved_github_actor_with<F>(
+    repo: &Path,
+    actor_lookup: F,
+) -> Result<InboxApprovedGithubActorBinding, InboxApprovedGithubActorError>
+where
+    F: FnOnce() -> Result<String, InboxApprovedGithubActorError>,
+{
+    let repository = crate::git_repository::discover(repo).map_err(|_| {
+        InboxApprovedGithubActorError::new(
+            InboxApprovedGithubActorFailure::MissingOrAmbiguousPin,
+            "repository-local approved GitHub login configuration was unavailable",
+        )
+    })?;
+    let config_path = repository.commondir().join("config");
+    let capture = capture_repository_config(&config_path).map_err(|_| {
+        InboxApprovedGithubActorError::new(
+            InboxApprovedGithubActorFailure::MissingOrAmbiguousPin,
+            "repository-local approved GitHub login configuration was unavailable",
+        )
+    })?;
+    let config = git2::Config::open(&config_path).map_err(|_| {
+        InboxApprovedGithubActorError::new(
+            InboxApprovedGithubActorFailure::MissingOrAmbiguousPin,
+            "repository-local approved GitHub login configuration was unreadable",
+        )
+    })?;
+    let mut values = Vec::new();
+    match config.multivar(APPROVED_GITHUB_LOGIN_CONFIG_KEY, None) {
+        Ok(mut entries) => {
+            while let Some(entry) = entries.next() {
+                let entry = entry.map_err(|_| {
+                    InboxApprovedGithubActorError::new(
+                        InboxApprovedGithubActorFailure::MissingOrAmbiguousPin,
+                        "repository-local approved GitHub login pins could not be enumerated",
+                    )
+                })?;
+                if entry.include_depth() == 0 {
+                    let value = std::str::from_utf8(entry.value_bytes()).map_err(|_| {
+                        InboxApprovedGithubActorError::new(
+                            InboxApprovedGithubActorFailure::MalformedPin,
+                            "repository-local approved GitHub login was not UTF-8",
+                        )
+                    })?;
+                    values.push(value.to_string());
+                }
+            }
+        }
+        Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+        Err(_) => {
+            return Err(InboxApprovedGithubActorError::new(
+                InboxApprovedGithubActorFailure::MissingOrAmbiguousPin,
+                "repository-local approved GitHub login pins could not be enumerated",
+            ));
+        }
+    }
+    if values.len() != 1 || values[0].is_empty() {
+        return Err(InboxApprovedGithubActorError::new(
+            InboxApprovedGithubActorFailure::MissingOrAmbiguousPin,
+            "repository-local approved GitHub login must contain exactly one non-empty value",
+        ));
+    }
+    validate_github_actor_login(&values[0]).map_err(|_| {
+        InboxApprovedGithubActorError::new(
+            InboxApprovedGithubActorFailure::MalformedPin,
+            "repository-local approved GitHub login was malformed",
+        )
+    })?;
+    let binding = InboxApprovedGithubActorBinding {
+        config_path,
+        approved_login: values.remove(0),
+        config_bytes: capture.bytes,
+        #[cfg(unix)]
+        device: capture.device,
+        #[cfg(unix)]
+        inode: capture.inode,
+    };
+    binding.verify_fresh()?;
+    let actual = actor_lookup()?;
+    validate_github_actor_login(&actual).map_err(|_| {
+        InboxApprovedGithubActorError::new(
+            InboxApprovedGithubActorFailure::MalformedActorResponse,
+            "authenticated GitHub actor response was malformed",
+        )
+    })?;
+    if actual != binding.approved_login {
+        return Err(InboxApprovedGithubActorError::new(
+            InboxApprovedGithubActorFailure::PinMismatch,
+            "authenticated GitHub actor did not exactly match the approved repository login",
+        ));
+    }
+    binding.verify_fresh()?;
+    Ok(binding)
+}
+
+fn capture_repository_config(
+    path: &Path,
+) -> std::result::Result<RepositoryConfigCapture, anyhow::Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        let before = fs::symlink_metadata(path)?;
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        let mut file = options.open(path)?;
+        let opened = file.metadata()?;
+        let after = fs::symlink_metadata(path)?;
+        let safe = |metadata: &fs::Metadata| {
+            !metadata.file_type().is_symlink()
+                && metadata.file_type().is_file()
+                && metadata.permissions().mode() & 0o022 == 0
+                && (metadata.uid() == unsafe { libc::geteuid() } || metadata.uid() == 0)
+                && metadata.nlink() == 1
+        };
+        let same = |left: &fs::Metadata, right: &fs::Metadata| {
+            left.dev() == right.dev() && left.ino() == right.ino()
+        };
+        if !safe(&before)
+            || !safe(&opened)
+            || !safe(&after)
+            || !same(&before, &opened)
+            || !same(&opened, &after)
+        {
+            bail!("repository config was not a path-bound trusted regular file");
+        }
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take((MAX_REPOSITORY_CONFIG_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_REPOSITORY_CONFIG_BYTES {
+            bytes.fill(0);
+            bail!("repository config exceeded its safety bound");
+        }
+        Ok(RepositoryConfigCapture {
+            bytes,
+            device: opened.dev(),
+            inode: opened.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        bail!("repository config identity verification is unsupported on this platform")
+    }
+}
+
+fn validate_github_actor_login(login: &str) -> Result<()> {
+    if login.is_empty()
+        || login.len() > MAX_GITHUB_LOGIN_BYTES
+        || matches!(login, "." | "..")
+        || !login
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        bail!("GitHub actor login was malformed");
+    }
+    Ok(())
+}
+
+fn authenticated_github_actor(repo: &Path) -> Result<String, InboxApprovedGithubActorError> {
+    let mut token = approved_github_actor_token()?;
+    let mut runtime = crate::merge::PrivateRuntimeDirectory::create(
+        repo,
+        crate::merge::PrivateRuntimeKind::GhConfig,
+    )
+    .map_err(|_| {
+        InboxApprovedGithubActorError::new(
+            InboxApprovedGithubActorFailure::ActorUnavailable,
+            "authenticated GitHub actor runtime was unavailable",
+        )
+    })?;
+    let directory = runtime.path().to_path_buf();
+    let result = (|| {
+        let token_text = std::str::from_utf8(&token).map_err(|_| {
+            InboxApprovedGithubActorError::new(
+                InboxApprovedGithubActorFailure::ActorUnavailable,
+                "GitHub authentication token was malformed",
+            )
+        })?;
+        let hosts_path = directory.join("hosts.yml");
+        let hosts =
+            format!("'github.com':\n    oauth_token: '{token_text}'\n    git_protocol: https\n");
+        crate::merge::write_private_file(&hosts_path, hosts.as_bytes()).map_err(|_| {
+            InboxApprovedGithubActorError::new(
+                InboxApprovedGithubActorFailure::ActorUnavailable,
+                "authenticated GitHub actor configuration was unavailable",
+            )
+        })?;
+        let mut environment = crate::merge::minimal_network_environment().map_err(|_| {
+            InboxApprovedGithubActorError::new(
+                InboxApprovedGithubActorFailure::ActorUnavailable,
+                "authenticated GitHub actor environment was unavailable",
+            )
+        })?;
+        for key in [
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_ATTR_NOSYSTEM",
+            "GIT_OPTIONAL_LOCKS",
+            "GIT_TERMINAL_PROMPT",
+        ] {
+            environment.remove(key);
+        }
+        environment.insert(
+            "GH_CONFIG_DIR".to_string(),
+            directory
+                .to_str()
+                .ok_or_else(|| {
+                    InboxApprovedGithubActorError::new(
+                        InboxApprovedGithubActorFailure::ActorUnavailable,
+                        "authenticated GitHub actor runtime path was not UTF-8",
+                    )
+                })?
+                .to_string(),
+        );
+        environment.insert("GH_PROMPT_DISABLED".to_string(), "1".to_string());
+        let output = crate::merge::run_required_network_direct(
+            "gh authenticated actor",
+            crate::merge::resolve_trusted_executable("gh").map_err(|_| {
+                InboxApprovedGithubActorError::new(
+                    InboxApprovedGithubActorFailure::ActorUnavailable,
+                    "trusted gh executable was unavailable",
+                )
+            })?,
+            ["api", "user", "--jq", ".login"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+            &directory,
+            environment,
+            StdinMode::Null,
+            APPROVED_GITHUB_ACTOR_TIMEOUT,
+            APPROVED_GITHUB_ACTOR_CAPTURE_LIMIT,
+            0,
+            TrustedFixedNetworkProfile::read_write(&directory)
+                .with_resource_limits(ProcessResourceLimits::default())
+                .with_visible_read_only_file(&hosts_path),
+        )
+        .map_err(|_| {
+            InboxApprovedGithubActorError::new(
+                InboxApprovedGithubActorFailure::ActorUnavailable,
+                "authenticated GitHub actor lookup was unavailable",
+            )
+        })?;
+        if !output.success {
+            return Err(InboxApprovedGithubActorError::new(
+                InboxApprovedGithubActorFailure::ActorUnavailable,
+                "authenticated GitHub actor lookup failed",
+            ));
+        }
+        let stdout = std::str::from_utf8(&output.stdout).map_err(|_| {
+            InboxApprovedGithubActorError::new(
+                InboxApprovedGithubActorFailure::MalformedActorResponse,
+                "authenticated GitHub actor response was not UTF-8",
+            )
+        })?;
+        let login = stdout.strip_suffix('\n').unwrap_or(stdout);
+        if login.contains(['\r', '\n']) {
+            return Err(InboxApprovedGithubActorError::new(
+                InboxApprovedGithubActorFailure::MalformedActorResponse,
+                "authenticated GitHub actor response contained multiple lines",
+            ));
+        }
+        Ok(login.to_string())
+    })();
+    token.fill(0);
+    let cleanup = runtime.close().map_err(|_| {
+        InboxApprovedGithubActorError::new(
+            InboxApprovedGithubActorFailure::ActorUnavailable,
+            "authenticated GitHub actor runtime cleanup failed",
+        )
+    });
+    match (result, cleanup) {
+        (Ok(login), Ok(())) => Ok(login),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn approved_github_actor_token() -> Result<Vec<u8>, InboxApprovedGithubActorError> {
+    let values = ["GH_TOKEN", "GITHUB_TOKEN"]
+        .into_iter()
+        .filter_map(|key| env::var(key).ok())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let Some(first) = values.first() else {
+        return Err(InboxApprovedGithubActorError::new(
+            InboxApprovedGithubActorFailure::ActorUnavailable,
+            "authenticated GitHub actor lookup requires GH_TOKEN or GITHUB_TOKEN",
+        ));
+    };
+    if values.iter().any(|value| value != first) {
+        return Err(InboxApprovedGithubActorError::new(
+            InboxApprovedGithubActorFailure::ActorUnavailable,
+            "GitHub authentication token variables were ambiguous",
+        ));
+    }
+    if first.len() < 4
+        || first.len() > MAX_GITHUB_TOKEN_BYTES
+        || first
+            .bytes()
+            .any(|byte| !byte.is_ascii_alphanumeric() && !matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(InboxApprovedGithubActorError::new(
+            InboxApprovedGithubActorFailure::ActorUnavailable,
+            "GitHub authentication token was malformed or oversized",
+        ));
+    }
+    Ok(first.as_bytes().to_vec())
+}
+
+/// Read one exact GitHub pull request through the trusted Inbox source
+/// boundary without accepting requester-supplied PR fields as ground truth.
+pub(crate) fn observe_inbox_pr_event(
+    options: &InboxRunOptions,
+    number: u64,
+) -> std::result::Result<InboxItem, InboxPrObservationError> {
+    observe_inbox_pr_event_with(options, number, |repo, selector, number| {
+        publication::view_github_source_item(
+            repo,
+            selector,
+            number,
+            ExternalSourceObjectKind::PullRequest,
+        )
+        .map_err(|error| {
+            InboxPrObservationError::new(
+                InboxPrObservationFailureClass::ProviderUnavailable,
+                format!("GitHub PR provider transport was unavailable: {error:#}"),
+            )
+        })
+    })
+}
+
+fn observe_inbox_pr_event_with<F>(
+    options: &InboxRunOptions,
+    number: u64,
+    view: F,
+) -> std::result::Result<InboxItem, InboxPrObservationError>
+where
+    F: FnOnce(&Path, &str, u64) -> std::result::Result<Value, InboxPrObservationError>,
+{
+    let unavailable = |error: anyhow::Error| {
+        InboxPrObservationError::new(
+            InboxPrObservationFailureClass::ProviderUnavailable,
+            format!("GitHub PR observation preflight was unavailable: {error:#}"),
+        )
+    };
+    if number == 0 {
+        return Err(InboxPrObservationError::new(
+            InboxPrObservationFailureClass::InvalidProviderGroundTruth,
+            "GitHub PR observation requires a positive pull-request number",
+        ));
+    }
+    validate_cli_source_options(
+        options.github,
+        options.permission_mode,
+        options.max_items,
+        options.codex_bin.as_deref(),
+    )
+    .map_err(unavailable)?;
+    let repo = discover_repo_root(&options.repo).map_err(unavailable)?;
+    let loaded = load_config_with_config_overrides(
+        &repo,
+        InboxConfigOverrides {
+            max_items: Some(1),
+            issues: Some(false),
+            pull_requests: Some(true),
+            authenticated_pr_event: true,
+            ..InboxConfigOverrides::default()
+        },
+    )
+    .map_err(unavailable)?;
+    let permission_mode =
+        effective_permission_mode(&loaded.config, options.github, options.permission_mode);
+    if !permission_mode.uses_github_intake() {
+        return Err(InboxPrObservationError::new(
+            InboxPrObservationFailureClass::ProviderUnavailable,
+            "production PR observation requires an explicit GitHub Inbox permission mode",
+        ));
+    }
+    let source_repository =
+        source_repository_binding_context(&repo, &loaded.config, true).map_err(unavailable)?;
+    let value = view(&repo, &source_repository.selector, number)?;
+    let raw = raw_pr_from_value(&value, &loaded.config, &source_repository).map_err(|error| {
+        InboxPrObservationError::new(
+            InboxPrObservationFailureClass::MalformedProviderResponse,
+            format!("GitHub PR provider response was malformed: {error:#}"),
+        )
+    })?;
+    if raw.number != number {
+        return Err(InboxPrObservationError::new(
+            InboxPrObservationFailureClass::InvalidProviderGroundTruth,
+            "exact GitHub PR observation returned a different pull-request number",
+        ));
+    }
+    let item =
+        pr_item(raw, &loaded.config, &source_repository, &BTreeMap::new()).map_err(|error| {
+            InboxPrObservationError::new(
+                InboxPrObservationFailureClass::InvalidProviderGroundTruth,
+                format!("GitHub PR provider ground truth was invalid: {error:#}"),
+            )
+        })?;
+    item.source_snapshot.validate().map_err(|error| {
+        InboxPrObservationError::new(
+            InboxPrObservationFailureClass::InvalidProviderGroundTruth,
+            format!("GitHub PR provider snapshot was invalid: {error:#}"),
+        )
+    })?;
+    Ok(item)
+}
+
 /// Resolve the exact provider-owned PR snapshot before any auditor or
 /// publication effect is admitted for an authenticated intake event.
 pub(crate) fn preflight_inbox_pr_event(
@@ -1657,6 +2294,7 @@ pub(crate) fn run_inbox_for_pr_event(
     number: u64,
     expected_head_oid: &str,
     expected_task: &InboxIndependentAuditMergeLaneTask,
+    before_auditor_launch: Option<InboxBeforeAuditorLaunch<'_>>,
 ) -> Result<InboxRunReport> {
     options.max_items = None;
     run_inbox_with_overrides(
@@ -1674,6 +2312,7 @@ pub(crate) fn run_inbox_for_pr_event(
             authenticated_pr_event: true,
             ..InboxConfigOverrides::default()
         },
+        before_auditor_launch,
     )
 }
 
@@ -1685,6 +2324,7 @@ pub fn run_inbox_with_rolling_budget(
         options,
         rolling_budget_quota,
         InboxConfigOverrides::default(),
+        None,
     )
 }
 
@@ -1692,6 +2332,7 @@ fn run_inbox_with_overrides(
     options: InboxRunOptions,
     rolling_budget_quota: Option<InboxRollingBudgetQuota>,
     mut overrides: InboxConfigOverrides,
+    mut before_auditor_launch: Option<InboxBeforeAuditorLaunch<'_>>,
 ) -> Result<InboxRunReport> {
     validate_cli_source_options(
         options.github,
@@ -1774,6 +2415,7 @@ fn run_inbox_with_overrides(
                 artifacts,
                 selected_item_count: 0,
                 item_reports: Vec::new(),
+                pr_intake_producer: overrides.pr_intake_producer.clone(),
                 auto_merge_performed: false,
                 next_action: "repair inbox intake, then rerun with the same bounded configuration"
                     .to_string(),
@@ -1807,6 +2449,7 @@ fn run_inbox_with_overrides(
             artifacts,
             selected_item_count: 0,
             item_reports: Vec::new(),
+            pr_intake_producer: overrides.pr_intake_producer.clone(),
             auto_merge_performed: false,
             next_action: "resolve inbox safety refusals, then rerun".to_string(),
         };
@@ -1829,6 +2472,7 @@ fn run_inbox_with_overrides(
             artifacts,
             selected_item_count: 0,
             item_reports: Vec::new(),
+            pr_intake_producer: overrides.pr_intake_producer.clone(),
             auto_merge_performed: false,
             next_action: "no safe non-duplicate inbox items were available".to_string(),
         };
@@ -1858,14 +2502,15 @@ fn run_inbox_with_overrides(
     let mut refusals = Vec::new();
     for (zero_index, item) in selected_items.iter().enumerate() {
         let item_index = zero_index.saturating_add(1);
-        let outcome = run_inbox_item(
-            &mut artifact_writer,
-            InboxItemRunInput {
-                context: &item_context,
-                item_index,
-                item,
-            },
-        )?;
+        let input = InboxItemRunInput {
+            context: &item_context,
+            item_index,
+            item,
+        };
+        let outcome = match before_auditor_launch.as_mut() {
+            Some(hook) => run_inbox_item(&mut artifact_writer, input, Some(&mut **hook))?,
+            None => run_inbox_item(&mut artifact_writer, input, None)?,
+        };
         item_reports.push(outcome.report);
         if let Some(refusal) = outcome.refusal {
             refusals.push(refusal);
@@ -1903,6 +2548,7 @@ fn run_inbox_with_overrides(
         artifacts,
         selected_item_count: selected_items.len(),
         item_reports,
+        pr_intake_producer: overrides.pr_intake_producer,
         auto_merge_performed,
         next_action: if status == InboxRunStatus::Refused {
             "increase or wait for the rolling inbox quota before starting another run".to_string()
@@ -1957,6 +2603,244 @@ pub fn collect_inbox_run(repo: impl AsRef<Path>, run_id: RunId) -> Result<Value>
     }
 }
 
+fn pr_discovery_refusal(cause: InboxPrDiscoveryRefusalCause) -> InboxPrIntakeProducerBatchReport {
+    InboxPrIntakeProducerBatchReport {
+        version: INBOX_SCHEMA_VERSION,
+        repository: None,
+        discovery_sentinel: GITHUB_WATCH_PR_DISCOVERY_SENTINEL,
+        maximum_processable: MAX_GITHUB_WATCH_PR_PRODUCERS,
+        discovered_count: 0,
+        producer_report_count: 0,
+        producer_refusal_count: 0,
+        success: false,
+        discovery_refusal: Some(cause),
+        producer_reports: Vec::new(),
+    }
+}
+
+fn bounded_pr_discovery_detail(detail: &str) -> String {
+    sanitize_public_field(detail, MAX_PR_OBSERVATION_DETAIL_CHARS)
+}
+
+fn malformed_pr_discovery(detail: &str) -> InboxPrDiscoveryRefusalCause {
+    InboxPrDiscoveryRefusalCause::MalformedProviderResponse {
+        detail: bounded_pr_discovery_detail(detail),
+    }
+}
+
+fn provider_pr_discovery(detail: &str) -> InboxPrDiscoveryRefusalCause {
+    InboxPrDiscoveryRefusalCause::ProviderUnavailable {
+        detail: bounded_pr_discovery_detail(detail),
+    }
+}
+
+fn publication_pr_list_refusal(error: &anyhow::Error) -> InboxPrDiscoveryRefusalCause {
+    let detail = format!("{error:#}");
+    if [
+        "did not return valid JSON",
+        "did not return a JSON array",
+        "exceeded its JSON byte limit",
+        "returned more items than requested",
+    ]
+    .iter()
+    .any(|marker| detail.contains(marker))
+    {
+        malformed_pr_discovery(&detail)
+    } else {
+        provider_pr_discovery(&detail)
+    }
+}
+
+fn github_watch_pr_list(
+    options: &InboxRunOptions,
+    kind: ExternalSourceObjectKind,
+    limit: usize,
+    labels: &[String],
+) -> std::result::Result<(String, Value), InboxPrDiscoveryRefusalCause> {
+    let preflight = || -> Result<(PathBuf, SourceRepositoryBindingContext)> {
+        validate_cli_source_options(
+            options.github,
+            options.permission_mode,
+            options.max_items,
+            options.codex_bin.as_deref(),
+        )?;
+        let repo = discover_repo_root(&options.repo)?;
+        let loaded = load_config(&repo)?;
+        let permission_mode =
+            effective_permission_mode(&loaded.config, options.github, options.permission_mode);
+        if !permission_mode.uses_github_intake() {
+            bail!("watch PR discovery requires an explicit GitHub Inbox permission mode");
+        }
+        let source_repository = source_repository_binding_context(&repo, &loaded.config, true)?;
+        Ok((repo, source_repository))
+    };
+    let (repo, source_repository) =
+        preflight().map_err(|error| provider_pr_discovery(&format!("{error:#}")))?;
+    let output = publication::list_github_source_items(
+        &repo,
+        &source_repository.selector,
+        kind,
+        limit,
+        labels,
+    )
+    .map_err(|error| publication_pr_list_refusal(&error))?;
+    Ok((source_repository.selector, output))
+}
+
+fn parse_github_watch_pr_numbers(
+    value: &Value,
+) -> std::result::Result<Vec<u64>, InboxPrDiscoveryRefusalCause> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| malformed_pr_discovery("GitHub PR discovery response was not an array"))?;
+    if values.len() >= GITHUB_WATCH_PR_DISCOVERY_SENTINEL {
+        return Err(InboxPrDiscoveryRefusalCause::BoundExceeded {
+            returned_count: values.len(),
+            maximum_processable: MAX_GITHUB_WATCH_PR_PRODUCERS,
+        });
+    }
+    let mut numbers = BTreeSet::new();
+    for (index, value) in values.iter().enumerate() {
+        let number = value
+            .as_object()
+            .and_then(|object| object.get("number"))
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                malformed_pr_discovery(&format!(
+                    "GitHub PR discovery entry {} omitted an unsigned number",
+                    index.saturating_add(1)
+                ))
+            })?;
+        if number == 0 {
+            return Err(InboxPrDiscoveryRefusalCause::ZeroNumber {
+                entry_index: index.saturating_add(1),
+            });
+        }
+        if !numbers.insert(number) {
+            return Err(InboxPrDiscoveryRefusalCause::DuplicateNumber { number });
+        }
+    }
+    Ok(numbers.into_iter().collect())
+}
+
+fn produce_github_watch_pr_intakes_with<L, P>(
+    list: L,
+    mut produce: P,
+) -> InboxPrIntakeProducerBatchReport
+where
+    L: FnOnce(
+        ExternalSourceObjectKind,
+        usize,
+        &[String],
+    ) -> std::result::Result<(String, Value), InboxPrDiscoveryRefusalCause>,
+    P: FnMut(u64) -> crate::pr_intake::PrIntakeProducerReport,
+{
+    let no_labels = Vec::new();
+    let (repository, value) = match list(
+        ExternalSourceObjectKind::PullRequest,
+        GITHUB_WATCH_PR_DISCOVERY_SENTINEL,
+        &no_labels,
+    ) {
+        Ok(response) => response,
+        Err(cause) => return pr_discovery_refusal(cause),
+    };
+    let numbers = match parse_github_watch_pr_numbers(&value) {
+        Ok(numbers) => numbers,
+        Err(cause) => {
+            let mut report = pr_discovery_refusal(cause);
+            report.repository = Some(repository);
+            return report;
+        }
+    };
+
+    let mut producer_reports = Vec::with_capacity(numbers.len());
+    for number in numbers {
+        let mut report = produce(number);
+        if report.repository.is_none() {
+            report.repository = Some(repository.clone());
+        }
+        if report.number.is_none() {
+            report.number = Some(number);
+        }
+        producer_reports.push(report);
+    }
+    let producer_refusal_count = producer_reports
+        .iter()
+        .filter(|report| {
+            report.disposition == crate::pr_intake::PrIntakeProducerDisposition::Refused
+        })
+        .count();
+    InboxPrIntakeProducerBatchReport {
+        version: INBOX_SCHEMA_VERSION,
+        repository: Some(repository),
+        discovery_sentinel: GITHUB_WATCH_PR_DISCOVERY_SENTINEL,
+        maximum_processable: MAX_GITHUB_WATCH_PR_PRODUCERS,
+        discovered_count: producer_reports.len(),
+        producer_report_count: producer_reports.len(),
+        producer_refusal_count,
+        success: producer_refusal_count == 0,
+        discovery_refusal: None,
+        producer_reports,
+    }
+}
+
+fn watch_iteration_uses_github(options: &InboxRunOptions) -> Result<bool> {
+    let repo = discover_repo_root(&options.repo)?;
+    let loaded = load_config(&repo)?;
+    Ok(
+        effective_permission_mode(&loaded.config, options.github, options.permission_mode)
+            .uses_github_intake(),
+    )
+}
+
+fn run_github_watch_iteration_with<L, P, R>(
+    options: InboxRunOptions,
+    list: L,
+    produce: P,
+    run_ordinary: R,
+) -> Result<InboxRunReport>
+where
+    L: FnOnce(
+        &InboxRunOptions,
+        ExternalSourceObjectKind,
+        usize,
+        &[String],
+    ) -> std::result::Result<(String, Value), InboxPrDiscoveryRefusalCause>,
+    P: FnMut(InboxRunOptions, u64) -> crate::pr_intake::PrIntakeProducerReport,
+    R: FnOnce(InboxRunOptions, InboxConfigOverrides) -> Result<InboxRunReport>,
+{
+    let producer_options = options.clone();
+    let mut produce = produce;
+    let producer_report = produce_github_watch_pr_intakes_with(
+        |kind, limit, labels| list(&producer_options, kind, limit, labels),
+        |number| produce(producer_options.clone(), number),
+    );
+    run_ordinary(
+        options,
+        InboxConfigOverrides {
+            pr_dispatch_mode: InboxPrDispatchMode::RepairOnly,
+            pr_intake_producer: Some(producer_report),
+            ..InboxConfigOverrides::default()
+        },
+    )
+}
+
+fn run_github_watch_iteration(options: InboxRunOptions) -> Result<InboxRunReport> {
+    run_github_watch_iteration_with(
+        options,
+        github_watch_pr_list,
+        crate::pr_intake::produce_repository_pr_intake,
+        |options, overrides| run_inbox_with_overrides(options, None, overrides, None),
+    )
+}
+
+fn retain_watch_run(runs: &mut VecDeque<InboxRunReport>, report: InboxRunReport) {
+    if runs.len() == MAX_WATCH_RETAINED_ITERATIONS {
+        runs.pop_front();
+    }
+    runs.push_back(report);
+}
+
 pub fn watch_inbox(options: InboxWatchOptions) -> Result<InboxWatchReport> {
     validate_poll_seconds(options.poll_seconds)?;
     validate_cli_source_options(
@@ -1966,15 +2850,17 @@ pub fn watch_inbox(options: InboxWatchOptions) -> Result<InboxWatchReport> {
         options.codex_bin.as_deref(),
     )?;
     let repo = discover_repo_root(&options.repo)?;
-    let mut runs = Vec::new();
+    let mut runs = VecDeque::with_capacity(MAX_WATCH_RETAINED_ITERATIONS);
     let mut iteration = 0usize;
     loop {
-        iteration = iteration.saturating_add(1);
+        iteration = iteration
+            .checked_add(1)
+            .context("inbox watch iteration count overflowed")?;
         let run_id =
             artifacts::generate_run_id(&repo, RunArtifactFamily::Inbox).with_context(|| {
                 format!("failed to generate inbox watch run id for iteration {iteration}")
             })?;
-        let report = run_inbox(InboxRunOptions {
+        let run_options = InboxRunOptions {
             repo: repo.clone(),
             run_id,
             github: options.github,
@@ -1983,19 +2869,28 @@ pub fn watch_inbox(options: InboxWatchOptions) -> Result<InboxWatchReport> {
             max_items: options.max_items,
             codex_bin: options.codex_bin.clone(),
             machine_global: options.machine_global.clone(),
-        })?;
-        runs.push(report);
+        };
+        let report = if watch_iteration_uses_github(&run_options)? {
+            run_github_watch_iteration(run_options)?
+        } else {
+            run_inbox(run_options)?
+        };
+        retain_watch_run(&mut runs, report);
         if options.once {
             break;
         }
         thread::sleep(Duration::from_secs(options.poll_seconds));
     }
+    let retained_iteration_count = runs.len();
+    let dropped_iteration_count = iteration.saturating_sub(retained_iteration_count);
     Ok(InboxWatchReport {
         repo: public_repo_path(),
         poll_seconds: options.poll_seconds,
         once: options.once,
-        iteration_count: runs.len(),
-        runs,
+        iteration_count: iteration,
+        retained_iteration_count,
+        dropped_iteration_count,
+        runs: runs.into_iter().collect(),
     })
 }
 
@@ -2077,6 +2972,7 @@ pub fn run_workspace_inbox(options: InboxWorkspaceRunOptions) -> Result<InboxWor
             },
             None,
             workspace_overrides_for_repo(&spec),
+            None,
         );
         match run_result {
             Ok(run_report) => {
@@ -2501,6 +3397,7 @@ fn workspace_overrides_for_repo(spec: &WorkspaceRepoSpec) -> InboxConfigOverride
         pr_event_target: None,
         pr_event_task: None,
         authenticated_pr_event: false,
+        ..InboxConfigOverrides::default()
     }
 }
 
@@ -2710,9 +3607,17 @@ struct InboxItemRunInput<'a> {
     item: &'a InboxItem,
 }
 
+struct IndependentAuditIntakeRunInput<'a> {
+    item_run: InboxItemRunInput<'a>,
+    review_loop: Option<review_loop_entry::InboxReviewLoopReport>,
+    pr_intake: InboxPrIntakeReport,
+    source_fresh: bool,
+}
+
 fn run_inbox_item(
     writer: &mut ArtifactRunWriter,
     input: InboxItemRunInput<'_>,
+    before_auditor_launch: Option<InboxBeforeAuditorLaunch<'_>>,
 ) -> Result<InboxItemRunOutcome> {
     let context = input.context;
     let item_index = input.item_index;
@@ -2743,6 +3648,7 @@ fn run_inbox_item(
             review_loop,
             pr_intake,
             source_fresh,
+            before_auditor_launch,
         );
     }
     let plan = autopilot_plan_for_item(item, config, permission_mode)?;
@@ -2949,14 +3855,18 @@ fn run_independent_audit_intake_item(
     review_loop: Option<review_loop_entry::InboxReviewLoopReport>,
     pr_intake: InboxPrIntakeReport,
     source_fresh: bool,
+    before_auditor_launch: Option<InboxBeforeAuditorLaunch<'_>>,
 ) -> Result<InboxItemRunOutcome> {
     run_independent_audit_intake_item_with_runner(
         writer,
-        input,
-        review_loop,
-        pr_intake,
-        source_fresh,
+        IndependentAuditIntakeRunInput {
+            item_run: input,
+            review_loop,
+            pr_intake,
+            source_fresh,
+        },
         None,
+        before_auditor_launch,
         verified_independent_audit_runner,
     )
 }
@@ -2997,16 +3907,20 @@ fn verified_independent_audit_runner(
 
 fn run_independent_audit_intake_item_with_runner<F>(
     writer: &mut ArtifactRunWriter,
-    input: InboxItemRunInput<'_>,
-    review_loop: Option<review_loop_entry::InboxReviewLoopReport>,
-    pr_intake: InboxPrIntakeReport,
-    source_fresh: bool,
+    input: IndependentAuditIntakeRunInput<'_>,
     available_models_override: Option<&BTreeSet<String>>,
+    before_auditor_launch: Option<InboxBeforeAuditorLaunch<'_>>,
     mut external_runner: F,
 ) -> Result<InboxItemRunOutcome>
 where
     F: FnMut(&ExternalAgentCommand) -> IndependentAuditRunnerResult,
 {
+    let IndependentAuditIntakeRunInput {
+        item_run: input,
+        review_loop,
+        pr_intake,
+        source_fresh,
+    } = input;
     let context = input.context;
     let item_index = input.item_index;
     let item = input.item;
@@ -3130,7 +4044,9 @@ where
         );
         return finish_independent_audit_lane_item(writer, input, review_loop, pr_intake, lane);
     }
-    let task = task.expect("checked source-bound independent-audit task");
+    let Some(task) = task else {
+        bail!("source-bound independent-audit task disappeared after blocker evaluation");
+    };
     if item.source_snapshot.provider() == InboxSourceProvider::Github
         && materialize_and_verify_local_independent_audit_candidate(context.repo, item, task)
             .is_err()
@@ -3255,6 +4171,11 @@ where
         command = command.with_machine_global_retention(
             machine_global.retention_binding_for_run(&autopilot_run_id),
         );
+    }
+    if let Some(hook) = before_auditor_launch {
+        hook(&auditor_session_id, &selection).context(
+            "persist authenticated PR intake start immediately before independent-auditor launch",
+        )?;
     }
     let runner_result = external_runner(&command);
     let raw_output = runner_result.raw_output.clone();
@@ -5002,6 +5923,16 @@ fn pr_needs_repair(pull_request: &GithubPrCandidate) -> bool {
             .any(|check| check_failed(check.conclusion.as_deref(), check.status.as_deref()))
 }
 
+fn pr_dispatch_mode_allows_item(mode: InboxPrDispatchMode, item: &InboxItem) -> bool {
+    match (mode, item.kind, item.pull_request.as_ref()) {
+        (InboxPrDispatchMode::RepairOnly, InboxItemKind::PullRequest, Some(pull_request)) => {
+            pr_needs_repair(pull_request)
+        }
+        (InboxPrDispatchMode::RepairOnly, InboxItemKind::PullRequest, None) => false,
+        _ => true,
+    }
+}
+
 fn pr_intake_report_for_item(item: &InboxItem) -> Option<InboxPrIntakeReport> {
     let pull_request = item.pull_request.as_ref()?;
     if item.kind != InboxItemKind::PullRequest || pr_needs_repair(pull_request) {
@@ -5078,17 +6009,23 @@ fn pr_intake_report_for_item(item: &InboxItem) -> Option<InboxPrIntakeReport> {
         }
     };
 
-    let (status, task, launch_block) = match block_reason {
-        None => (
+    let ready_evidence = match (head_oid, base_oid, producer_login) {
+        (Some(head_oid), Some(base_oid), Some(producer_login)) => {
+            Some((head_oid, base_oid, producer_login))
+        }
+        _ => None,
+    };
+    let (status, task, launch_block) = match (block_reason, ready_evidence) {
+        (None, Some((head_oid, base_oid, producer_login))) => (
             InboxPrIntakeStatus::Ready,
             Some(InboxIndependentAuditMergeLaneTask {
                 version: INBOX_SCHEMA_VERSION,
                 task_kind,
                 source_snapshot_digest: item.source_snapshot.digest().to_string(),
                 source_updated_at: item.source_snapshot.updated_at().to_string(),
-                head_oid: head_oid.expect("checked PR head OID").to_string(),
-                base_oid: base_oid.expect("checked PR base OID").to_string(),
-                producer_login: producer_login.expect("checked producer identity").to_string(),
+                head_oid: head_oid.to_string(),
+                base_oid: base_oid.to_string(),
+                producer_login: producer_login.to_string(),
                 is_draft: pull_request.is_draft,
                 source_trust: pull_request.source_trust,
                 head_repository: pull_request.head_repository.clone(),
@@ -5106,7 +6043,7 @@ fn pr_intake_report_for_item(item: &InboxItem) -> Option<InboxPrIntakeReport> {
             }),
             None,
         ),
-        Some((reason, evidence)) => (
+        (Some((reason, evidence)), _) => (
             InboxPrIntakeStatus::LaunchBlocked,
             None,
             Some(InboxPrLaunchBlockReport {
@@ -5115,6 +6052,22 @@ fn pr_intake_report_for_item(item: &InboxItem) -> Option<InboxPrIntakeReport> {
                 success: false,
                 reason: reason.to_string(),
                 missing_evidence: evidence,
+                grants_merge_permission: false,
+                auto_merge_performed: false,
+                next_action:
+                    "refresh the PR observation and supply the missing evidence before launching an independent auditor"
+                        .to_string(),
+            }),
+        ),
+        (None, None) => (
+            InboxPrIntakeStatus::LaunchBlocked,
+            None,
+            Some(InboxPrLaunchBlockReport {
+                version: INBOX_SCHEMA_VERSION,
+                status: InboxPrIntakeStatus::LaunchBlocked,
+                success: false,
+                reason: "missing_required_evidence".to_string(),
+                missing_evidence: vec!["internally_inconsistent_ready_evidence".to_string()],
                 grants_merge_permission: false,
                 auto_merge_performed: false,
                 next_action:
@@ -5917,6 +6870,7 @@ include!("inbox/part2.rs");
 #[cfg(test)]
 mod pr_intake_always_on_audit_tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn clean_non_draft_pr_is_visible_as_independent_audit_task() {
@@ -6120,18 +7074,34 @@ mod pr_intake_always_on_audit_tests {
         };
         let review_loop = review_loop_entry::evaluate_inbox_item_review_loop(&item);
         let available_models = ["gpt-5.6-sol".to_string()].into_iter().collect();
+        let callback_called = Cell::new(false);
+        let mut before_launch =
+            |session_id: &str, selection: &InboxIndependentAuditorSelectionEvidence| {
+                assert_eq!(session_id, "independent-audit-fake-command-item-1-auditor");
+                assert_eq!(selection.model, "gpt-5.6-sol");
+                assert_eq!(selection.effort, crate::selection::ReasoningEffort::Xhigh);
+                callback_called.set(true);
+                Ok(())
+            };
         let outcome = run_independent_audit_intake_item_with_runner(
             &mut writer,
-            InboxItemRunInput {
-                context: &context,
-                item_index: 1,
-                item: &item,
+            IndependentAuditIntakeRunInput {
+                item_run: InboxItemRunInput {
+                    context: &context,
+                    item_index: 1,
+                    item: &item,
+                },
+                review_loop,
+                pr_intake,
+                source_fresh: true,
             },
-            review_loop,
-            pr_intake,
-            true,
             Some(&available_models),
+            Some(&mut before_launch),
             |command| {
+                assert!(
+                    callback_called.get(),
+                    "prelaunch callback must complete before the external runner"
+                );
                 assert_eq!(
                     command.workspace_access,
                     crate::process_runner::WorkspaceAccess::ReadOnly
@@ -6153,6 +7123,7 @@ mod pr_intake_always_on_audit_tests {
             },
         )
         .expect("run fake independent-audit adapter");
+        assert!(callback_called.get());
 
         let lane = outcome.report.independent_audit_lane.expect("lane result");
         assert_eq!(
@@ -6198,14 +7169,17 @@ mod pr_intake_always_on_audit_tests {
         };
         let outcome = run_independent_audit_intake_item_with_runner(
             &mut writer,
-            InboxItemRunInput {
-                context: &context,
-                item_index: 1,
-                item: &item,
+            IndependentAuditIntakeRunInput {
+                item_run: InboxItemRunInput {
+                    context: &context,
+                    item_index: 1,
+                    item: &item,
+                },
+                review_loop: review_loop_entry::evaluate_inbox_item_review_loop(&item),
+                pr_intake,
+                source_fresh: true,
             },
-            review_loop_entry::evaluate_inbox_item_review_loop(&item),
-            pr_intake,
-            true,
+            None,
             None,
             |_| panic!("dry run must not launch the independent auditor"),
         )
@@ -6669,6 +7643,690 @@ mod pr_intake_always_on_audit_tests {
                 summaries: Vec::new(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod pr_intake_observation_seam_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn observation_options() -> (TempDir, InboxRunOptions) {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let repository = Repository::init(&repo_path).expect("initialize repository");
+        repository
+            .remote("origin", "https://github.com/acme/repo.git")
+            .expect("configure canonical origin");
+        let options = InboxRunOptions {
+            repo: repo_path,
+            run_id: RunId::new("typed-pr-observation").expect("run id"),
+            github: true,
+            permission_mode: Some(InboxPermissionMode::GithubRead),
+            dry_run: false,
+            max_items: None,
+            codex_bin: None,
+            machine_global: None,
+        };
+        (temp, options)
+    }
+
+    fn exact_pr_value(number: u64) -> Value {
+        json!({
+            "number": number,
+            "title": "Contributor PR",
+            "body": "Ready for independent audit",
+            "url": format!("https://github.com/acme/repo/pull/{number}"),
+            "author": {"login": "external-contributor"},
+            "labels": [],
+            "updatedAt": "2026-09-03T00:00:00Z",
+            "state": "OPEN",
+            "headRefName": "feature/typed-observation",
+            "baseRefName": "main",
+            "headRefOid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "baseRefOid": "cccccccccccccccccccccccccccccccccccccccc",
+            "isDraft": false,
+            "headRepository": {"nameWithOwner": "acme/repo"},
+            "isCrossRepository": false,
+            "files": [{"path": "src/lib.rs"}],
+            "statusCheckRollup": [{
+                "name": "test",
+                "status": "completed",
+                "conclusion": "success"
+            }],
+            "reviewDecision": null,
+            "latestReviews": []
+        })
+    }
+
+    #[test]
+    fn pr_intake_observation_seam_classifies_provider_unavailability() {
+        let (_temp, options) = observation_options();
+        let error = observe_inbox_pr_event_with(&options, 17, |_, _, _| {
+            Err(InboxPrObservationError::new(
+                InboxPrObservationFailureClass::ProviderUnavailable,
+                "injected transport failure",
+            ))
+        })
+        .expect_err("transport failure must refuse observation");
+        assert_eq!(
+            error.classification,
+            InboxPrObservationFailureClass::ProviderUnavailable
+        );
+    }
+
+    #[test]
+    fn pr_intake_observation_seam_classifies_malformed_provider_schema() {
+        let (_temp, options) = observation_options();
+        let error = observe_inbox_pr_event_with(&options, 17, |_, _, _| Ok(json!({"number": 17})))
+            .expect_err("malformed schema must refuse observation");
+        assert_eq!(
+            error.classification,
+            InboxPrObservationFailureClass::MalformedProviderResponse
+        );
+    }
+
+    #[test]
+    fn pr_intake_observation_seam_classifies_invalid_provider_identity() {
+        let (_temp, options) = observation_options();
+        let error = observe_inbox_pr_event_with(&options, 17, |_, _, _| Ok(exact_pr_value(18)))
+            .expect_err("cross-field identity mismatch must refuse observation");
+        assert_eq!(
+            error.classification,
+            InboxPrObservationFailureClass::InvalidProviderGroundTruth
+        );
+    }
+}
+
+#[cfg(test)]
+mod github_watch_pr_producer_tests {
+    use super::*;
+    use crate::pr_intake::{
+        PrIntakeObservationFailureClass, PrIntakeProducerDisposition, PrIntakeProducerRefusalCause,
+        PrIntakeRefusalCause,
+    };
+    use std::cell::{Cell, RefCell};
+
+    fn synthetic_producer_report(
+        number: u64,
+        disposition: PrIntakeProducerDisposition,
+        refusal: Option<PrIntakeProducerRefusalCause>,
+    ) -> crate::pr_intake::PrIntakeProducerReport {
+        crate::pr_intake::PrIntakeProducerReport {
+            version: 1,
+            repository: None,
+            number: Some(number),
+            delivery_id: None,
+            logical_id: None,
+            effect_id: None,
+            disposition,
+            success: disposition != PrIntakeProducerDisposition::Refused,
+            intake_report: None,
+            refusal,
+            grants_merge_permission: false,
+            auto_merge_performed: false,
+        }
+    }
+
+    fn synthetic_batch(number: u64) -> InboxPrIntakeProducerBatchReport {
+        let producer_reports = vec![synthetic_producer_report(
+            number,
+            PrIntakeProducerDisposition::Refused,
+            Some(PrIntakeProducerRefusalCause::ProviderObservation {
+                classification: PrIntakeObservationFailureClass::ProviderUnavailable,
+                detail: "bounded synthetic refusal".to_string(),
+            }),
+        )];
+        InboxPrIntakeProducerBatchReport {
+            version: INBOX_SCHEMA_VERSION,
+            repository: Some("github.com/acme/repo".to_string()),
+            discovery_sentinel: GITHUB_WATCH_PR_DISCOVERY_SENTINEL,
+            maximum_processable: MAX_GITHUB_WATCH_PR_PRODUCERS,
+            discovered_count: 1,
+            producer_report_count: 1,
+            producer_refusal_count: 1,
+            success: false,
+            discovery_refusal: None,
+            producer_reports,
+        }
+    }
+
+    fn synthetic_run(
+        run_id: RunId,
+        producer: Option<InboxPrIntakeProducerBatchReport>,
+    ) -> InboxRunReport {
+        InboxRunReport {
+            version: INBOX_SCHEMA_VERSION,
+            run_id,
+            repo: PathBuf::from("."),
+            action_policy: InboxActionPolicy::Fake,
+            permission_mode: InboxPermissionMode::Fake,
+            github_enabled: false,
+            success: true,
+            status: InboxRunStatus::NoItems,
+            refusals: Vec::new(),
+            artifacts: InboxRunArtifacts {
+                run_dir: PathBuf::from(".maco/inbox/runs/test"),
+                scan_report: PathBuf::from("scan-report.json"),
+                selected_items: PathBuf::from("selected-items.json"),
+                final_report: PathBuf::from("final-report.json"),
+            },
+            selected_item_count: 0,
+            item_reports: Vec::new(),
+            pr_intake_producer: producer,
+            auto_merge_performed: false,
+            next_action: "none".to_string(),
+        }
+    }
+
+    fn test_pr_item(number: u64, needs_repair: bool) -> InboxItem {
+        let config = InboxConfig::default();
+        let mut raw = fake_pr_candidates(&config)
+            .into_iter()
+            .next()
+            .expect("fake PR candidate");
+        raw.number = number;
+        raw.title = format!("PR {number}");
+        raw.url = Some(format!("fake://github/pulls/{number}"));
+        raw.updated_at = format!("2026-09-04T00:00:{:02}Z", number % 60);
+        raw.content_digest = fake_source_content_digest(InboxItemKind::PullRequest, number);
+        raw.action_revision_digest = raw.content_digest.clone();
+        raw.head_oid = format!("{number:040x}");
+        raw.checks[0].conclusion =
+            Some(if needs_repair { "failure" } else { "success" }.to_string());
+        raw.review_feedback.requested_changes = needs_repair;
+        let source = SourceRepositoryBindingContext {
+            host: "fake".to_string(),
+            selector: ".".to_string(),
+            identity: publication::stable_external_digest(b"watch-repair-mode"),
+        };
+        pr_item(raw, &config, &source, &BTreeMap::new()).expect("test PR item")
+    }
+
+    fn test_issue_item(number: u64) -> InboxItem {
+        let config = InboxConfig::default();
+        let mut raw = fake_issue_candidates(&config)
+            .into_iter()
+            .next()
+            .expect("fake issue candidate");
+        raw.number = number;
+        raw.title = format!("Issue {number}");
+        raw.url = Some(format!("fake://github/issues/{number}"));
+        raw.content_digest = fake_source_content_digest(InboxItemKind::Issue, number);
+        raw.action_revision_digest = raw.content_digest.clone();
+        let source = SourceRepositoryBindingContext {
+            host: "fake".to_string(),
+            selector: ".".to_string(),
+            identity: publication::stable_external_digest(b"watch-repair-mode"),
+        };
+        issue_item(raw, &config, &source, &BTreeMap::new()).expect("test issue item")
+    }
+
+    #[test]
+    fn github_watch_discovery_uses_the_overflow_sentinel_and_offers_all_99_prs() {
+        let listed = (1..=MAX_GITHUB_WATCH_PR_PRODUCERS as u64)
+            .rev()
+            .map(|number| {
+                json!({
+                    "number": number,
+                    "title": "ignored listing title",
+                    "labels": ["ignored-selection-label"],
+                    "issue_pressure": 10_000
+                })
+            })
+            .collect::<Vec<_>>();
+        let produced = RefCell::new(Vec::new());
+
+        let report = produce_github_watch_pr_intakes_with(
+            |kind, limit, labels| {
+                assert_eq!(kind, ExternalSourceObjectKind::PullRequest);
+                assert_eq!(limit, GITHUB_WATCH_PR_DISCOVERY_SENTINEL);
+                assert!(
+                    labels.is_empty(),
+                    "selection labels must not constrain discovery"
+                );
+                Ok(("github.com/acme/repo".to_string(), Value::Array(listed)))
+            },
+            |number| {
+                produced.borrow_mut().push(number);
+                synthetic_producer_report(number, PrIntakeProducerDisposition::Launched, None)
+            },
+        );
+
+        assert!(report.success, "{report:#?}");
+        assert!(report.maximum_processable > DEFAULT_MAX_ITEMS);
+        assert_eq!(report.discovered_count, MAX_GITHUB_WATCH_PR_PRODUCERS);
+        assert_eq!(report.producer_report_count, MAX_GITHUB_WATCH_PR_PRODUCERS);
+        assert_eq!(report.producer_refusal_count, 0);
+        assert!(report.producer_reports.iter().all(|producer| {
+            producer.repository.as_deref() == Some("github.com/acme/repo")
+                && producer.number.is_some()
+        }));
+        assert_eq!(
+            produced.into_inner(),
+            (1..=MAX_GITHUB_WATCH_PR_PRODUCERS as u64).collect::<Vec<_>>(),
+            "producer inputs must be the sorted number field only"
+        );
+    }
+
+    #[test]
+    fn github_watch_discovery_failures_are_typed_and_never_partially_produce() {
+        let malformed = json!([{"number": "17"}]);
+        let duplicate = json!([{"number": 17}, {"number": 17}]);
+        let zero = json!([{"number": 0}]);
+        let bound = Value::Array(
+            (1..=GITHUB_WATCH_PR_DISCOVERY_SENTINEL)
+                .map(|number| json!({"number": number}))
+                .collect(),
+        );
+        for (label, value) in [
+            ("malformed", malformed),
+            ("duplicate", duplicate),
+            ("zero", zero),
+            ("bound", bound),
+        ] {
+            let producer_calls = Cell::new(0usize);
+            let report = produce_github_watch_pr_intakes_with(
+                |kind, limit, labels| {
+                    assert_eq!(kind, ExternalSourceObjectKind::PullRequest);
+                    assert_eq!(limit, GITHUB_WATCH_PR_DISCOVERY_SENTINEL);
+                    assert!(labels.is_empty());
+                    Ok(("github.com/acme/repo".to_string(), value))
+                },
+                |number| {
+                    producer_calls.set(producer_calls.get().saturating_add(1));
+                    synthetic_producer_report(number, PrIntakeProducerDisposition::Launched, None)
+                },
+            );
+            assert_eq!(producer_calls.get(), 0, "{label} partially produced");
+            assert!(report.producer_reports.is_empty(), "{label}: {report:#?}");
+            assert!(matches!(
+                (label, report.discovery_refusal),
+                (
+                    "malformed",
+                    Some(InboxPrDiscoveryRefusalCause::MalformedProviderResponse { .. }),
+                ) | (
+                    "duplicate",
+                    Some(InboxPrDiscoveryRefusalCause::DuplicateNumber { number: 17 }),
+                ) | (
+                    "zero",
+                    Some(InboxPrDiscoveryRefusalCause::ZeroNumber { entry_index: 1 })
+                ) | (
+                    "bound",
+                    Some(InboxPrDiscoveryRefusalCause::BoundExceeded {
+                        returned_count: GITHUB_WATCH_PR_DISCOVERY_SENTINEL,
+                        maximum_processable: MAX_GITHUB_WATCH_PR_PRODUCERS,
+                    }),
+                )
+            ));
+        }
+
+        let producer_calls = Cell::new(0usize);
+        let provider_failure = produce_github_watch_pr_intakes_with(
+            |kind, _, _| {
+                assert_eq!(kind, ExternalSourceObjectKind::PullRequest);
+                Err(provider_pr_discovery(
+                    "provider unavailable at /home/private/token-123456789012345678901234567890 API_TOKEN=secret-value",
+                ))
+            },
+            |number| {
+                producer_calls.set(producer_calls.get().saturating_add(1));
+                synthetic_producer_report(number, PrIntakeProducerDisposition::Launched, None)
+            },
+        );
+        assert_eq!(producer_calls.get(), 0);
+        assert!(matches!(
+            provider_failure.discovery_refusal,
+            Some(InboxPrDiscoveryRefusalCause::ProviderUnavailable { .. })
+        ));
+        let serialized = serde_json::to_string(&provider_failure).expect("serialize refusal");
+        assert!(!serialized.contains("/home/private"));
+        assert!(!serialized.contains("token-123456789012345678901234567890"));
+        assert!(!serialized.contains("secret-value"));
+
+        let private_key_failure = pr_discovery_refusal(provider_pr_discovery(
+            "provider emitted -----BEGIN PRIVATE KEY----- private-material",
+        ));
+        let serialized =
+            serde_json::to_string(&private_key_failure).expect("serialize private-key refusal");
+        assert!(serialized.contains("redacted:private-key-material"));
+        assert!(!serialized.contains("BEGIN PRIVATE KEY"));
+        assert!(!serialized.contains("private-material"));
+    }
+
+    #[test]
+    fn github_watch_empty_discovery_is_a_successful_zero_report_batch() {
+        let producer_calls = Cell::new(0usize);
+        let report = produce_github_watch_pr_intakes_with(
+            |kind, limit, labels| {
+                assert_eq!(kind, ExternalSourceObjectKind::PullRequest);
+                assert_eq!(limit, GITHUB_WATCH_PR_DISCOVERY_SENTINEL);
+                assert!(labels.is_empty());
+                Ok(("github.com/acme/repo".to_string(), json!([])))
+            },
+            |number| {
+                producer_calls.set(producer_calls.get().saturating_add(1));
+                synthetic_producer_report(number, PrIntakeProducerDisposition::Launched, None)
+            },
+        );
+
+        assert_eq!(producer_calls.get(), 0);
+        assert_eq!(report.repository.as_deref(), Some("github.com/acme/repo"));
+        assert_eq!(report.discovered_count, 0);
+        assert_eq!(report.producer_report_count, 0);
+        assert_eq!(report.producer_refusal_count, 0);
+        assert!(report.success);
+        assert!(report.discovery_refusal.is_none());
+        assert!(report.producer_reports.is_empty());
+    }
+
+    #[test]
+    fn github_watch_producer_continues_after_draft_and_other_refusals() {
+        let produced = RefCell::new(Vec::new());
+        let report = produce_github_watch_pr_intakes_with(
+            |kind, _, _| {
+                assert_eq!(kind, ExternalSourceObjectKind::PullRequest);
+                Ok((
+                    "github.com/acme/repo".to_string(),
+                    json!([{"number": 3}, {"number": 1}, {"number": 2}]),
+                ))
+            },
+            |number| {
+                produced.borrow_mut().push(number);
+                let refusal = match number {
+                    1 => None,
+                    2 => Some(PrIntakeProducerRefusalCause::IntakeRefused {
+                        refusal: PrIntakeRefusalCause::DraftPullRequest,
+                    }),
+                    _ => Some(PrIntakeProducerRefusalCause::ProviderObservation {
+                        classification: PrIntakeObservationFailureClass::ProviderUnavailable,
+                        detail: "bounded refusal".to_string(),
+                    }),
+                };
+                synthetic_producer_report(
+                    number,
+                    if refusal.is_some() {
+                        PrIntakeProducerDisposition::Refused
+                    } else {
+                        PrIntakeProducerDisposition::Launched
+                    },
+                    refusal,
+                )
+            },
+        );
+
+        assert_eq!(produced.into_inner(), vec![1, 2, 3]);
+        assert_eq!(report.producer_report_count, 3);
+        assert_eq!(report.producer_refusal_count, 2);
+        assert_eq!(report.producer_reports.len(), 3);
+        assert!(!report.success);
+    }
+
+    #[test]
+    fn github_watch_connected_iteration_discovers_all_then_runs_repair_only_once() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        crate::worktree::WorktreeManager::init_repository(&repo, "main")
+            .expect("initialize repository");
+        Repository::open(&repo)
+            .expect("open repository")
+            .remote("origin", "https://github.com/acme/repo.git")
+            .expect("create origin");
+
+        let listed_count = DEFAULT_MAX_ITEMS.saturating_add(2);
+        assert!(listed_count < GITHUB_WATCH_PR_DISCOVERY_SENTINEL);
+        let listed = (1..=listed_count as u64)
+            .rev()
+            .map(|number| json!({"number": number}))
+            .collect::<Vec<_>>();
+        let produced = RefCell::new(Vec::new());
+        let ordinary_calls = Cell::new(0usize);
+        let ordinary_auditor_launches = Cell::new(0usize);
+        let options = InboxRunOptions {
+            repo: repo.clone(),
+            run_id: RunId::new("watch-structural-no-double-launch").expect("run id"),
+            github: true,
+            permission_mode: Some(InboxPermissionMode::GithubRead),
+            dry_run: true,
+            max_items: Some(DEFAULT_MAX_ITEMS),
+            codex_bin: None,
+            machine_global: None,
+        };
+        let fixed_scan_items = vec![
+            test_pr_item(1, false),
+            test_pr_item(2, true),
+            test_pr_item(3, true),
+            test_pr_item(4, true),
+            test_pr_item(5, true),
+            test_issue_item(101),
+        ];
+
+        let report = run_github_watch_iteration_with(
+            options,
+            |options, kind, limit, labels| {
+                assert_eq!(options.repo, repo);
+                assert_eq!(kind, ExternalSourceObjectKind::PullRequest);
+                assert_eq!(limit, GITHUB_WATCH_PR_DISCOVERY_SENTINEL);
+                assert!(labels.is_empty());
+                Ok(("github.com/acme/repo".to_string(), Value::Array(listed)))
+            },
+            |options, number| {
+                assert_eq!(options.repo, repo);
+                produced.borrow_mut().push(number);
+                let (disposition, refusal) = match number {
+                    1 => (PrIntakeProducerDisposition::Launched, None),
+                    2 => (
+                        PrIntakeProducerDisposition::Refused,
+                        Some(PrIntakeProducerRefusalCause::ProviderObservation {
+                            classification: PrIntakeObservationFailureClass::ProviderUnavailable,
+                            detail: "bounded refusal".to_string(),
+                        }),
+                    ),
+                    _ => (PrIntakeProducerDisposition::Replayed, None),
+                };
+                synthetic_producer_report(number, disposition, refusal)
+            },
+            |options, mut overrides| {
+                ordinary_calls.set(ordinary_calls.get().saturating_add(1));
+                assert_eq!(overrides.pr_dispatch_mode, InboxPrDispatchMode::RepairOnly);
+                overrides.fixed_scan_items = Some(fixed_scan_items);
+                let mut before_auditor_launch =
+                    |_: &str, _: &InboxIndependentAuditorSelectionEvidence| {
+                        ordinary_auditor_launches
+                            .set(ordinary_auditor_launches.get().saturating_add(1));
+                        Ok(())
+                    };
+                run_inbox_with_overrides(options, None, overrides, Some(&mut before_auditor_launch))
+            },
+        )
+        .expect("watch iteration");
+
+        assert_eq!(
+            produced.into_inner(),
+            (1..=listed_count as u64).collect::<Vec<_>>()
+        );
+        assert_eq!(ordinary_calls.get(), 1);
+        assert_eq!(ordinary_auditor_launches.get(), 0);
+        assert_eq!(report.selected_item_count, DEFAULT_MAX_ITEMS);
+        assert!(report
+            .item_reports
+            .iter()
+            .any(|item| item.item_id == "issue-101" && item.kind == InboxItemKind::Issue));
+        assert!(report
+            .item_reports
+            .iter()
+            .any(|item| item.item_id == "pr-2" && item.kind == InboxItemKind::PullRequest));
+        assert!(!report
+            .item_reports
+            .iter()
+            .any(|item| item.item_id == "pr-1"));
+        assert_eq!(
+            report
+                .pr_intake_producer
+                .as_ref()
+                .map(|batch| batch.producer_refusal_count),
+            Some(1)
+        );
+        assert_eq!(
+            report
+                .pr_intake_producer
+                .as_ref()
+                .into_iter()
+                .flat_map(|batch| &batch.producer_reports)
+                .filter(|producer| {
+                    producer.disposition == PrIntakeProducerDisposition::Launched
+                })
+                .count(),
+            1
+        );
+
+        let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Inbox, &report.run_id)
+            .expect("open connected watch run");
+        let scan: Value =
+            serde_json::from_slice(&reader.read("scan-report.json").expect("read scan report"))
+                .expect("parse scan report");
+        assert_eq!(scan["candidate_count"], listed_count - 1);
+        assert_eq!(scan["selected_count"], DEFAULT_MAX_ITEMS);
+        assert!(scan["items"]
+            .as_array()
+            .expect("scan items")
+            .iter()
+            .any(|item| { item["item_id"] == "pr-5" && item["skip_reason"] == "selection_limit" }));
+        assert!(!scan["items"]
+            .as_array()
+            .expect("scan items")
+            .iter()
+            .any(|item| item["item_id"] == "pr-1"));
+    }
+
+    #[test]
+    fn fake_watch_once_keeps_empty_producer_json_compatible_and_final_report_empty() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        crate::worktree::WorktreeManager::init_repository(&repo, "main")
+            .expect("initialize repository");
+
+        let report = watch_inbox(InboxWatchOptions {
+            repo: repo.clone(),
+            poll_seconds: 1,
+            once: true,
+            github: false,
+            permission_mode: None,
+            dry_run: true,
+            max_items: Some(1),
+            codex_bin: None,
+            machine_global: None,
+        })
+        .expect("fake watch once");
+
+        assert_eq!(report.iteration_count, 1);
+        assert_eq!(report.retained_iteration_count, 1);
+        assert_eq!(report.dropped_iteration_count, 0);
+        assert_eq!(report.runs.len(), 1);
+        assert!(report.runs[0].pr_intake_producer.is_none());
+        let watch_json = serde_json::to_value(&report).expect("serialize watch report");
+        assert!(watch_json["runs"][0].get("pr_intake_producer").is_none());
+        let final_report =
+            collect_inbox_run(&repo, report.runs[0].run_id.clone()).expect("collect final report");
+        assert!(final_report.get("pr_intake_producer").is_none());
+    }
+
+    #[test]
+    fn watch_iteration_final_report_artifact_contains_every_producer_disposition() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        crate::worktree::WorktreeManager::init_repository(&repo, "main")
+            .expect("initialize repository");
+        let run_id = RunId::new("watch-producer-final-report").expect("run id");
+        let mut batch = synthetic_batch(17);
+        batch.producer_reports.push(synthetic_producer_report(
+            18,
+            PrIntakeProducerDisposition::Replayed,
+            None,
+        ));
+        batch.discovered_count = 2;
+        batch.producer_report_count = 2;
+
+        let report = run_inbox_with_overrides(
+            InboxRunOptions {
+                repo: repo.clone(),
+                run_id: run_id.clone(),
+                github: false,
+                permission_mode: None,
+                dry_run: true,
+                max_items: Some(1),
+                codex_bin: None,
+                machine_global: None,
+            },
+            None,
+            InboxConfigOverrides {
+                pr_dispatch_mode: InboxPrDispatchMode::RepairOnly,
+                pr_intake_producer: Some(batch),
+                ..InboxConfigOverrides::default()
+            },
+            None,
+        )
+        .expect("watch-augmented ordinary run");
+
+        assert_eq!(
+            report
+                .pr_intake_producer
+                .as_ref()
+                .map(|batch| batch.producer_reports.len()),
+            Some(2)
+        );
+        let final_report = collect_inbox_run(&repo, run_id).expect("collect final report");
+        assert_eq!(
+            final_report["pr_intake_producer"]["producer_reports"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            final_report["pr_intake_producer"]["producer_reports"][0]["disposition"],
+            "refused"
+        );
+        assert_eq!(
+            final_report["pr_intake_producer"]["producer_reports"][1]["disposition"],
+            "replayed"
+        );
+    }
+
+    #[test]
+    fn watch_retention_drops_ordinary_and_producer_detail_together_beyond_cap() {
+        let total = MAX_WATCH_RETAINED_ITERATIONS.saturating_add(7);
+        let mut runs = VecDeque::new();
+        for index in 0..total {
+            let run_id =
+                RunId::new(format!("watch-retention-{index}")).expect("bounded retention run id");
+            retain_watch_run(
+                &mut runs,
+                synthetic_run(run_id, Some(synthetic_batch(index as u64 + 1))),
+            );
+        }
+
+        assert_eq!(runs.len(), MAX_WATCH_RETAINED_ITERATIONS);
+        let first = runs.front().expect("retained first run");
+        assert_eq!(first.run_id.as_str(), "watch-retention-7");
+        assert_eq!(
+            first
+                .pr_intake_producer
+                .as_ref()
+                .and_then(|batch| batch.producer_reports.first())
+                .and_then(|report| report.number),
+            Some(8)
+        );
+        let report = InboxWatchReport {
+            repo: PathBuf::from("."),
+            poll_seconds: 1,
+            once: false,
+            iteration_count: total,
+            retained_iteration_count: runs.len(),
+            dropped_iteration_count: total.saturating_sub(runs.len()),
+            runs: runs.into_iter().collect(),
+        };
+        assert_eq!(report.dropped_iteration_count, 7);
+        assert_eq!(report.iteration_count, MAX_WATCH_RETAINED_ITERATIONS + 7);
     }
 }
 
