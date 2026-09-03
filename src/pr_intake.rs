@@ -200,6 +200,9 @@ pub enum MergeAuditorLaneProviderError {
     Failed { detail: String },
 }
 
+type BeforeIrreversibleLaunch<'a> =
+    &'a mut dyn FnMut(&MergeAuditorLaneLaunchRequest) -> Result<(), MergeAuditorLaneProviderError>;
+
 /// Provider-neutral launch seam. Implementations must launch at most the one
 /// request supplied by [`handle_intake_event`].
 pub trait MergeAuditorLaneProvider {
@@ -235,11 +238,7 @@ impl InboxMergeAuditorLaneProvider {
     fn launch_inbox(
         &mut self,
         request: &MergeAuditorLaneLaunchRequest,
-        before_irreversible_launch: Option<
-            &mut dyn FnMut(
-                &MergeAuditorLaneLaunchRequest,
-            ) -> Result<(), MergeAuditorLaneProviderError>,
-        >,
+        before_irreversible_launch: Option<BeforeIrreversibleLaunch<'_>>,
     ) -> Result<MergeAuditorLaneLaunchReceipt, MergeAuditorLaneProviderError> {
         let IntakeCandidateIdentity::PullRequest { number, .. } = &request.candidate else {
             return Err(MergeAuditorLaneProviderError::Refused {
@@ -639,11 +638,12 @@ impl PrIntakeProducerReport {
             intake_report: None,
             refusal: Some(PrIntakeProducerRefusalCause::ProviderObservation {
                 classification,
-                detail: sanitize_pr_intake_provider_detail(repo, detail),
+                detail: detail.to_string(),
             }),
             grants_merge_permission: false,
             auto_merge_performed: false,
         }
+        .sanitized_for_repository(repo)
     }
 
     fn for_contract(contract: &PrIntakeEffectContract) -> Self {
@@ -663,12 +663,22 @@ impl PrIntakeProducerReport {
         }
     }
 
-    fn refuse(mut self, cause: PrIntakeProducerRefusalCause) -> Self {
+    fn refuse(mut self, repo: &Path, cause: PrIntakeProducerRefusalCause) -> Self {
         self.disposition = PrIntakeProducerDisposition::Refused;
         self.success = false;
         self.refusal = Some(cause);
         self.grants_merge_permission = false;
         self.auto_merge_performed = false;
+        self.sanitized_for_repository(repo)
+    }
+
+    fn sanitized_for_repository(mut self, repo: &Path) -> Self {
+        if let Some(report) = &mut self.intake_report {
+            sanitize_pr_intake_report(repo, report);
+        }
+        if let Some(refusal) = &mut self.refusal {
+            sanitize_producer_refusal(repo, refusal);
+        }
         self
     }
 }
@@ -802,9 +812,7 @@ fn handle_intake_event_with_catalog_loader<A, P, F>(
     authenticator: &A,
     provider: &mut P,
     trusted_head_repository: Option<&str>,
-    before_irreversible_launch: Option<
-        &mut dyn FnMut(&MergeAuditorLaneLaunchRequest) -> Result<(), MergeAuditorLaneProviderError>,
-    >,
+    before_irreversible_launch: Option<BeforeIrreversibleLaunch<'_>>,
     load_catalog: F,
 ) -> PrIntakeReport
 where
@@ -1217,16 +1225,7 @@ where
             );
         }
     };
-    produce_authenticated_pr_intake_with(
-        repo,
-        prepared.contract,
-        prepared.envelope,
-        &prepared.authenticator,
-        &prepared.trusted_head_repository,
-        actor_preflight,
-        load_catalog,
-        provider,
-    )
+    produce_authenticated_pr_intake_with(repo, prepared, actor_preflight, load_catalog, provider)
 }
 
 fn prepare_repository_pr_intake(
@@ -1265,10 +1264,7 @@ fn prepare_repository_pr_intake(
 
 fn produce_authenticated_pr_intake_with<A, P, F>(
     repo: &Path,
-    contract: PrIntakeEffectContract,
-    envelope: IntakeEventEnvelope,
-    authenticator: &RepositoryIntakeAuthenticator,
-    trusted_head_repository: &str,
+    prepared: PreparedRepositoryPrIntake,
     actor_preflight: &mut A,
     load_catalog: F,
     provider: &mut P,
@@ -1278,9 +1274,18 @@ where
     P: MergeAuditorLaneProvider,
     F: FnOnce() -> Result<CodexRuntimeModelCatalog, String>,
 {
+    let PreparedRepositoryPrIntake {
+        contract,
+        envelope,
+        authenticator,
+        trusted_head_repository,
+    } = prepared;
     let mut producer_report = PrIntakeProducerReport::for_contract(&contract);
     if let Err(failure) = authenticator.authenticate(&envelope) {
-        return producer_report.refuse(PrIntakeProducerRefusalCause::Authentication { failure });
+        return producer_report.refuse(
+            repo,
+            PrIntakeProducerRefusalCause::Authentication { failure },
+        );
     }
 
     let planned = PrIntakeEffectRecord {
@@ -1290,135 +1295,165 @@ where
         report: None,
     };
     let mut wal = match EffectWal::open_or_create_planned(
-        || {
-            repository_auth_writer(repo)?
-                .into_authenticator()
-                .map_err(Into::into)
-        },
+        || repository_auth_writer(repo)?.into_authenticator(),
         &contract.logical_id,
         &contract.effect_id,
         &planned,
     ) {
         Ok(wal) => wal,
         Err(error) => {
-            return producer_report.refuse(PrIntakeProducerRefusalCause::PersistenceFailure {
-                operation: PrIntakePersistenceOperation::OpenOrCreate,
-                detail: bounded_detail(&format!("{error:#}")),
-            });
+            return producer_report.refuse(
+                repo,
+                PrIntakeProducerRefusalCause::PersistenceFailure {
+                    operation: PrIntakePersistenceOperation::OpenOrCreate,
+                    detail: bounded_detail(&format!("{error:#}")),
+                },
+            );
         }
     };
     let (phase, current) = match latest_pr_intake_effect_record(&wal, &contract.effect_id) {
         Ok(value) => value,
         Err(error) => {
-            return producer_report.refuse(PrIntakeProducerRefusalCause::PersistenceFailure {
-                operation: PrIntakePersistenceOperation::Read,
-                detail: bounded_detail(&format!("{error:#}")),
-            });
+            return producer_report.refuse(
+                repo,
+                PrIntakeProducerRefusalCause::PersistenceFailure {
+                    operation: PrIntakePersistenceOperation::Read,
+                    detail: bounded_detail(&format!("{error:#}")),
+                },
+            );
         }
     };
     if current.contract != contract {
-        return producer_report.refuse(PrIntakeProducerRefusalCause::ContractMismatch {
-            detail: "authenticated PR intake effect contract did not match the provider delivery"
-                .to_string(),
-        });
+        return producer_report.refuse(
+            repo,
+            PrIntakeProducerRefusalCause::ContractMismatch {
+                detail:
+                    "authenticated PR intake effect contract did not match the provider delivery"
+                        .to_string(),
+            },
+        );
     }
     match phase {
         EffectPhase::Completed => {
             let Some(report) = current.report else {
-                return producer_report.refuse(PrIntakeProducerRefusalCause::PersistenceFailure {
-                    operation: PrIntakePersistenceOperation::Read,
-                    detail: "completed PR intake effect omitted its validated report".to_string(),
-                });
+                return producer_report.refuse(
+                    repo,
+                    PrIntakeProducerRefusalCause::PersistenceFailure {
+                        operation: PrIntakePersistenceOperation::Read,
+                        detail: "completed PR intake effect omitted its validated report"
+                            .to_string(),
+                    },
+                );
             };
             producer_report.disposition = PrIntakeProducerDisposition::Replayed;
             producer_report.success = true;
             producer_report.auto_merge_performed = report.auto_merge_performed;
             producer_report.intake_report = Some(report);
-            return producer_report;
+            return producer_report.sanitized_for_repository(repo);
         }
         EffectPhase::Started => {
-            return producer_report.refuse(PrIntakeProducerRefusalCause::ReplayAmbiguous {
-                phase: PrIntakeReplayPhase::Started,
-            });
+            return producer_report.refuse(
+                repo,
+                PrIntakeProducerRefusalCause::ReplayAmbiguous {
+                    phase: PrIntakeReplayPhase::Started,
+                },
+            );
         }
         EffectPhase::Observed => {
-            return producer_report.refuse(PrIntakeProducerRefusalCause::ReplayAmbiguous {
-                phase: PrIntakeReplayPhase::Observed,
-            });
+            return producer_report.refuse(
+                repo,
+                PrIntakeProducerRefusalCause::ReplayAmbiguous {
+                    phase: PrIntakeReplayPhase::Observed,
+                },
+            );
         }
         EffectPhase::Planned => {}
     }
 
     if let Err(error) = actor_preflight.verify(repo) {
-        return producer_report.refuse(PrIntakeProducerRefusalCause::ApprovedGithubActor {
-            failure: error.failure,
-            detail: bounded_detail(&error.detail),
-        });
+        return producer_report.refuse(
+            repo,
+            PrIntakeProducerRefusalCause::ApprovedGithubActor {
+                failure: error.failure,
+                detail: bounded_detail(&error.detail),
+            },
+        );
     }
 
     let catalog = match load_catalog() {
         Ok(catalog) => catalog,
         Err(detail) => {
-            return producer_report.refuse(PrIntakeProducerRefusalCause::CatalogUnavailable {
-                detail: bounded_detail(&detail),
-            });
+            return producer_report.refuse(
+                repo,
+                PrIntakeProducerRefusalCause::CatalogUnavailable {
+                    detail: bounded_detail(&detail),
+                },
+            );
         }
     };
     let mut started_request = None;
     let mut start_failure = None;
     let mut actor_failure = None;
-    let mut start = |request: &MergeAuditorLaneLaunchRequest| {
-        if let Err(error) = actor_preflight.verify(repo) {
-            actor_failure = Some(error);
-            return Err(MergeAuditorLaneProviderError::Refused {
-                detail: "approved GitHub actor binding changed before auditor launch".to_string(),
-            });
-        }
-        let started = PrIntakeEffectRecord {
-            version: PRODUCER_EFFECT_VERSION,
-            contract: contract.clone(),
-            request: Some(request.clone()),
-            report: None,
+    let intake_report = {
+        let mut start = |request: &MergeAuditorLaneLaunchRequest| {
+            if let Err(error) = actor_preflight.verify(repo) {
+                actor_failure = Some(error);
+                return Err(MergeAuditorLaneProviderError::Refused {
+                    detail: "approved GitHub actor binding changed before auditor launch"
+                        .to_string(),
+                });
+            }
+            let started = PrIntakeEffectRecord {
+                version: PRODUCER_EFFECT_VERSION,
+                contract: contract.clone(),
+                request: Some(request.clone()),
+                report: None,
+            };
+            if let Err(error) = validate_pr_intake_effect_record(EffectPhase::Started, &started) {
+                let detail = bounded_detail(&format!("{error:#}"));
+                start_failure = Some(detail);
+                return Err(MergeAuditorLaneProviderError::Refused {
+                    detail: "authenticated PR intake start contract was invalid".to_string(),
+                });
+            }
+            if let Err(error) = wal.started(&contract.effect_id, &started) {
+                let detail = bounded_detail(&format!("{error:#}"));
+                start_failure = Some(detail);
+                return Err(MergeAuditorLaneProviderError::Unavailable {
+                    detail: "authenticated PR intake start could not be persisted".to_string(),
+                });
+            }
+            started_request = Some(request.clone());
+            Ok(())
         };
-        if let Err(error) = validate_pr_intake_effect_record(EffectPhase::Started, &started) {
-            let detail = bounded_detail(&format!("{error:#}"));
-            start_failure = Some(detail);
-            return Err(MergeAuditorLaneProviderError::Refused {
-                detail: "authenticated PR intake start contract was invalid".to_string(),
-            });
-        }
-        if let Err(error) = wal.started(&contract.effect_id, &started) {
-            let detail = bounded_detail(&format!("{error:#}"));
-            start_failure = Some(detail);
-            return Err(MergeAuditorLaneProviderError::Unavailable {
-                detail: "authenticated PR intake start could not be persisted".to_string(),
-            });
-        }
-        started_request = Some(request.clone());
-        Ok(())
+        handle_intake_event_with_observed_catalog_and_start(
+            &envelope,
+            catalog,
+            &authenticator,
+            provider,
+            &trusted_head_repository,
+            &mut start,
+        )
     };
-    let intake_report = handle_intake_event_with_observed_catalog_and_start(
-        &envelope,
-        catalog,
-        authenticator,
-        provider,
-        trusted_head_repository,
-        &mut start,
-    );
-    drop(start);
     if let Some(error) = actor_failure {
         producer_report.intake_report = Some(intake_report);
-        return producer_report.refuse(PrIntakeProducerRefusalCause::ApprovedGithubActor {
-            failure: error.failure,
-            detail: bounded_detail(&error.detail),
-        });
+        return producer_report.refuse(
+            repo,
+            PrIntakeProducerRefusalCause::ApprovedGithubActor {
+                failure: error.failure,
+                detail: bounded_detail(&error.detail),
+            },
+        );
     }
     if let Some(detail) = start_failure {
         producer_report.intake_report = Some(intake_report);
-        return producer_report.refuse(PrIntakeProducerRefusalCause::PersistenceFailure {
-            operation: PrIntakePersistenceOperation::Start,
-            detail,
-        });
+        return producer_report.refuse(
+            repo,
+            PrIntakeProducerRefusalCause::PersistenceFailure {
+                operation: PrIntakePersistenceOperation::Start,
+                detail,
+            },
+        );
     }
     if !intake_report.success {
         let refusal =
@@ -1429,13 +1464,19 @@ where
                     field: "missing_refusal".to_string(),
                 });
         producer_report.intake_report = Some(intake_report);
-        return producer_report.refuse(PrIntakeProducerRefusalCause::IntakeRefused { refusal });
+        return producer_report.refuse(
+            repo,
+            PrIntakeProducerRefusalCause::IntakeRefused { refusal },
+        );
     }
     let Some(request) = started_request else {
         producer_report.intake_report = Some(intake_report);
-        return producer_report.refuse(PrIntakeProducerRefusalCause::ContractMismatch {
-            detail: "successful PR intake omitted its durable launch start".to_string(),
-        });
+        return producer_report.refuse(
+            repo,
+            PrIntakeProducerRefusalCause::ContractMismatch {
+                detail: "successful PR intake omitted its durable launch start".to_string(),
+            },
+        );
     };
     let observed = PrIntakeEffectRecord {
         version: PRODUCER_EFFECT_VERSION,
@@ -1445,29 +1486,38 @@ where
     };
     if let Err(error) = validate_pr_intake_effect_record(EffectPhase::Observed, &observed) {
         producer_report.intake_report = Some(intake_report);
-        return producer_report.refuse(PrIntakeProducerRefusalCause::ContractMismatch {
-            detail: bounded_detail(&format!("{error:#}")),
-        });
+        return producer_report.refuse(
+            repo,
+            PrIntakeProducerRefusalCause::ContractMismatch {
+                detail: bounded_detail(&format!("{error:#}")),
+            },
+        );
     }
     if let Err(error) = wal.observed(&contract.effect_id, &observed) {
         producer_report.intake_report = Some(intake_report);
-        return producer_report.refuse(PrIntakeProducerRefusalCause::PersistenceFailure {
-            operation: PrIntakePersistenceOperation::Observe,
-            detail: bounded_detail(&format!("{error:#}")),
-        });
+        return producer_report.refuse(
+            repo,
+            PrIntakeProducerRefusalCause::PersistenceFailure {
+                operation: PrIntakePersistenceOperation::Observe,
+                detail: bounded_detail(&format!("{error:#}")),
+            },
+        );
     }
     if let Err(error) = wal.completed(&contract.effect_id, &observed) {
         producer_report.intake_report = Some(intake_report);
-        return producer_report.refuse(PrIntakeProducerRefusalCause::PersistenceFailure {
-            operation: PrIntakePersistenceOperation::Complete,
-            detail: bounded_detail(&format!("{error:#}")),
-        });
+        return producer_report.refuse(
+            repo,
+            PrIntakeProducerRefusalCause::PersistenceFailure {
+                operation: PrIntakePersistenceOperation::Complete,
+                detail: bounded_detail(&format!("{error:#}")),
+            },
+        );
     }
     producer_report.disposition = PrIntakeProducerDisposition::Launched;
     producer_report.success = true;
     producer_report.auto_merge_performed = intake_report.auto_merge_performed;
     producer_report.intake_report = Some(intake_report);
-    producer_report
+    producer_report.sanitized_for_repository(repo)
 }
 
 type ProductionEventParts = (IntakeEvent, String, String, String, String, String);
@@ -2143,6 +2193,74 @@ fn bounded_detail(detail: &str) -> String {
     detail.chars().take(MAX_DETAIL_CHARS).collect()
 }
 
+fn sanitize_authentication_failure(repo: &Path, failure: &mut AuthenticationFailure) {
+    let detail = match failure {
+        AuthenticationFailure::Rejected { detail }
+        | AuthenticationFailure::VerifierUnavailable { detail } => detail,
+    };
+    *detail = sanitize_pr_intake_provider_detail(repo, detail);
+}
+
+fn sanitize_provider_error(repo: &Path, error: &mut MergeAuditorLaneProviderError) {
+    let detail = match error {
+        MergeAuditorLaneProviderError::Unavailable { detail }
+        | MergeAuditorLaneProviderError::Refused { detail }
+        | MergeAuditorLaneProviderError::Failed { detail } => detail,
+    };
+    *detail = sanitize_pr_intake_provider_detail(repo, detail);
+}
+
+fn sanitize_intake_refusal(repo: &Path, refusal: &mut PrIntakeRefusalCause) {
+    match refusal {
+        PrIntakeRefusalCause::Unauthenticated { failure } => {
+            sanitize_authentication_failure(repo, failure);
+        }
+        PrIntakeRefusalCause::InvalidEnvelope { detail, .. }
+        | PrIntakeRefusalCause::MalformedEvent { detail }
+        | PrIntakeRefusalCause::InvalidGateEvidence { detail, .. }
+        | PrIntakeRefusalCause::SelectionFailure { detail } => {
+            *detail = sanitize_pr_intake_provider_detail(repo, detail);
+        }
+        PrIntakeRefusalCause::ProviderLaunchFailure { error } => {
+            sanitize_provider_error(repo, error);
+        }
+        PrIntakeRefusalCause::UnknownEvent { .. }
+        | PrIntakeRefusalCause::DraftPullRequest
+        | PrIntakeRefusalCause::UntrustedSource { .. }
+        | PrIntakeRefusalCause::StaleHead { .. }
+        | PrIntakeRefusalCause::MissingChangedPaths
+        | PrIntakeRefusalCause::MissingCiEvidence
+        | PrIntakeRefusalCause::CiNotGreen { .. }
+        | PrIntakeRefusalCause::IndependenceConflict { .. }
+        | PrIntakeRefusalCause::InvalidReceipt { .. } => {}
+    }
+}
+
+fn sanitize_pr_intake_report(repo: &Path, report: &mut PrIntakeReport) {
+    if let Some(refusal) = &mut report.refusal {
+        sanitize_intake_refusal(repo, refusal);
+    }
+}
+
+fn sanitize_producer_refusal(repo: &Path, refusal: &mut PrIntakeProducerRefusalCause) {
+    match refusal {
+        PrIntakeProducerRefusalCause::ProviderObservation { detail, .. }
+        | PrIntakeProducerRefusalCause::ApprovedGithubActor { detail, .. }
+        | PrIntakeProducerRefusalCause::CatalogUnavailable { detail }
+        | PrIntakeProducerRefusalCause::PersistenceFailure { detail, .. }
+        | PrIntakeProducerRefusalCause::ContractMismatch { detail } => {
+            *detail = sanitize_pr_intake_provider_detail(repo, detail);
+        }
+        PrIntakeProducerRefusalCause::Authentication { failure } => {
+            sanitize_authentication_failure(repo, failure);
+        }
+        PrIntakeProducerRefusalCause::IntakeRefused { refusal } => {
+            sanitize_intake_refusal(repo, refusal);
+        }
+        PrIntakeProducerRefusalCause::ReplayAmbiguous { .. } => {}
+    }
+}
+
 fn bounded_authentication_failure(failure: AuthenticationFailure) -> AuthenticationFailure {
     match failure {
         AuthenticationFailure::Rejected { detail } => AuthenticationFailure::Rejected {
@@ -2237,6 +2355,7 @@ mod tests {
         requests: Vec<MergeAuditorLaneLaunchRequest>,
         corrupt_field: Option<&'static str>,
         fail: bool,
+        failure_detail: Option<String>,
     }
 
     #[derive(Clone)]
@@ -2331,7 +2450,10 @@ mod tests {
             self.requests.push(request.clone());
             if self.fail {
                 return Err(MergeAuditorLaneProviderError::Failed {
-                    detail: "deterministic_failure".to_string(),
+                    detail: self
+                        .failure_detail
+                        .clone()
+                        .unwrap_or_else(|| "deterministic_failure".to_string()),
                 });
             }
             let mut receipt = matching_receipt(request);
@@ -2990,6 +3112,107 @@ mod tests {
     }
 
     #[test]
+    fn producer_persistence_refusal_serialization_redacts_sensitive_error_chain() {
+        let (_temp, repo) = repository();
+        let prepared =
+            prepare_repository_pr_intake(&repo, &provider_pr_item()).expect("prepared intake");
+        let report = PrIntakeProducerReport::for_contract(&prepared.contract).refuse(
+            &repo,
+            PrIntakeProducerRefusalCause::PersistenceFailure {
+                operation: PrIntakePersistenceOperation::OpenOrCreate,
+                detail: "WAL failed at /home/private/acceptance with abcdefghijklmnopqrstuvwxyz1234567890"
+                    .to_string(),
+            },
+        );
+
+        assert!(matches!(
+            report.refusal.as_ref(),
+            Some(PrIntakeProducerRefusalCause::PersistenceFailure {
+                operation: PrIntakePersistenceOperation::OpenOrCreate,
+                ..
+            })
+        ));
+        let serialized = serde_json::to_string(&report).expect("serialize persistence refusal");
+        assert!(!serialized.contains("/home/private/acceptance"));
+        assert!(!serialized.contains("abcdefghijklmnopqrstuvwxyz1234567890"));
+        assert!(serialized.contains("redacted"));
+    }
+
+    #[test]
+    fn producer_actor_and_nested_provider_refusals_redact_sensitive_error_chains() {
+        let (_actor_temp, actor_repo) = repository();
+        set_approved_github_login(&actor_repo, "publication-owner");
+        let mut actor = InjectedActorPreflight {
+            actor_result: Err(InboxApprovedGithubActorError {
+                failure: InboxApprovedGithubActorFailure::ActorUnavailable,
+                detail: "actor lookup exposed /home/private/actor-state".to_string(),
+            }),
+            binding: None,
+            change_pin_before_start: false,
+        };
+        let mut actor_provider = FakeProvider::default();
+        let actor_report = produce_with_injected_actor(
+            &actor_repo,
+            provider_pr_item(),
+            &mut actor,
+            &mut actor_provider,
+        );
+
+        assert!(matches!(
+            actor_report.refusal.as_ref(),
+            Some(PrIntakeProducerRefusalCause::ApprovedGithubActor {
+                failure: InboxApprovedGithubActorFailure::ActorUnavailable,
+                ..
+            })
+        ));
+        let serialized =
+            serde_json::to_string(&actor_report).expect("serialize approved-actor refusal");
+        assert!(!serialized.contains("/home/private/actor-state"));
+        assert!(actor_provider.requests.is_empty());
+
+        let (_provider_temp, provider_repo) = repository();
+        let mut observer = FakeObservationProvider::returning(provider_pr_item());
+        let mut provider = FakeProvider {
+            fail: true,
+            failure_detail: Some(
+                "provider emitted -----BEGIN PRIVATE KEY----- private-material".to_string(),
+            ),
+            ..FakeProvider::default()
+        };
+        let provider_report = produce_repository_pr_intake_with(
+            &provider_repo,
+            17,
+            &mut observer,
+            loaded_sol_catalog,
+            &mut provider,
+        );
+
+        assert!(matches!(
+            provider_report.refusal.as_ref(),
+            Some(PrIntakeProducerRefusalCause::IntakeRefused {
+                refusal: PrIntakeRefusalCause::ProviderLaunchFailure {
+                    error: MergeAuditorLaneProviderError::Failed { .. }
+                }
+            })
+        ));
+        assert!(matches!(
+            provider_report
+                .intake_report
+                .as_ref()
+                .and_then(|report| report.refusal.as_ref()),
+            Some(PrIntakeRefusalCause::ProviderLaunchFailure {
+                error: MergeAuditorLaneProviderError::Failed { .. }
+            })
+        ));
+        let serialized =
+            serde_json::to_string(&provider_report).expect("serialize provider-launch refusal");
+        assert!(serialized.contains("redacted:private-key-material"));
+        assert!(!serialized.contains("BEGIN PRIVATE KEY"));
+        assert!(!serialized.contains("private-material"));
+        assert_eq!(provider.requests.len(), 1);
+    }
+
+    #[test]
     fn tampered_repository_envelope_refuses_before_wal_or_launch() {
         let (_temp, repo) = repository();
         let mut prepared =
@@ -3000,10 +3223,7 @@ mod tests {
 
         let report = produce_authenticated_pr_intake_with(
             &repo,
-            prepared.contract,
-            prepared.envelope,
-            &prepared.authenticator,
-            &prepared.trusted_head_repository,
+            prepared,
             &mut actor_preflight,
             loaded_sol_catalog,
             &mut provider,

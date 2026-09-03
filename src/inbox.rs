@@ -59,6 +59,9 @@ use crate::publication::forge_transport::{
 };
 use crate::publication::AuthenticatedPullRequestMergeOutcome;
 
+pub(crate) type InboxBeforeAuditorLaunch<'a> =
+    &'a mut dyn FnMut(&str, &InboxIndependentAuditorSelectionEvidence) -> Result<()>;
+
 const INBOX_SCHEMA_VERSION: u32 = 1;
 const CONFIG_FILE: &str = "maco-inbox.json";
 const DEFAULT_MAX_ITEMS: usize = 4;
@@ -2291,9 +2294,7 @@ pub(crate) fn run_inbox_for_pr_event(
     number: u64,
     expected_head_oid: &str,
     expected_task: &InboxIndependentAuditMergeLaneTask,
-    before_auditor_launch: Option<
-        &mut dyn FnMut(&str, &InboxIndependentAuditorSelectionEvidence) -> Result<()>,
-    >,
+    before_auditor_launch: Option<InboxBeforeAuditorLaunch<'_>>,
 ) -> Result<InboxRunReport> {
     options.max_items = None;
     run_inbox_with_overrides(
@@ -2331,9 +2332,7 @@ fn run_inbox_with_overrides(
     options: InboxRunOptions,
     rolling_budget_quota: Option<InboxRollingBudgetQuota>,
     mut overrides: InboxConfigOverrides,
-    mut before_auditor_launch: Option<
-        &mut dyn FnMut(&str, &InboxIndependentAuditorSelectionEvidence) -> Result<()>,
-    >,
+    mut before_auditor_launch: Option<InboxBeforeAuditorLaunch<'_>>,
 ) -> Result<InboxRunReport> {
     validate_cli_source_options(
         options.github,
@@ -2829,8 +2828,8 @@ where
 fn run_github_watch_iteration(options: InboxRunOptions) -> Result<InboxRunReport> {
     run_github_watch_iteration_with(
         options,
-        |options, kind, limit, labels| github_watch_pr_list(options, kind, limit, labels),
-        |options, number| crate::pr_intake::produce_repository_pr_intake(options, number),
+        github_watch_pr_list,
+        crate::pr_intake::produce_repository_pr_intake,
         |options, overrides| run_inbox_with_overrides(options, None, overrides, None),
     )
 }
@@ -3608,12 +3607,17 @@ struct InboxItemRunInput<'a> {
     item: &'a InboxItem,
 }
 
+struct IndependentAuditIntakeRunInput<'a> {
+    item_run: InboxItemRunInput<'a>,
+    review_loop: Option<review_loop_entry::InboxReviewLoopReport>,
+    pr_intake: InboxPrIntakeReport,
+    source_fresh: bool,
+}
+
 fn run_inbox_item(
     writer: &mut ArtifactRunWriter,
     input: InboxItemRunInput<'_>,
-    before_auditor_launch: Option<
-        &mut dyn FnMut(&str, &InboxIndependentAuditorSelectionEvidence) -> Result<()>,
-    >,
+    before_auditor_launch: Option<InboxBeforeAuditorLaunch<'_>>,
 ) -> Result<InboxItemRunOutcome> {
     let context = input.context;
     let item_index = input.item_index;
@@ -3851,16 +3855,16 @@ fn run_independent_audit_intake_item(
     review_loop: Option<review_loop_entry::InboxReviewLoopReport>,
     pr_intake: InboxPrIntakeReport,
     source_fresh: bool,
-    before_auditor_launch: Option<
-        &mut dyn FnMut(&str, &InboxIndependentAuditorSelectionEvidence) -> Result<()>,
-    >,
+    before_auditor_launch: Option<InboxBeforeAuditorLaunch<'_>>,
 ) -> Result<InboxItemRunOutcome> {
     run_independent_audit_intake_item_with_runner(
         writer,
-        input,
-        review_loop,
-        pr_intake,
-        source_fresh,
+        IndependentAuditIntakeRunInput {
+            item_run: input,
+            review_loop,
+            pr_intake,
+            source_fresh,
+        },
         None,
         before_auditor_launch,
         verified_independent_audit_runner,
@@ -3903,19 +3907,20 @@ fn verified_independent_audit_runner(
 
 fn run_independent_audit_intake_item_with_runner<F>(
     writer: &mut ArtifactRunWriter,
-    input: InboxItemRunInput<'_>,
-    review_loop: Option<review_loop_entry::InboxReviewLoopReport>,
-    pr_intake: InboxPrIntakeReport,
-    source_fresh: bool,
+    input: IndependentAuditIntakeRunInput<'_>,
     available_models_override: Option<&BTreeSet<String>>,
-    before_auditor_launch: Option<
-        &mut dyn FnMut(&str, &InboxIndependentAuditorSelectionEvidence) -> Result<()>,
-    >,
+    before_auditor_launch: Option<InboxBeforeAuditorLaunch<'_>>,
     mut external_runner: F,
 ) -> Result<InboxItemRunOutcome>
 where
     F: FnMut(&ExternalAgentCommand) -> IndependentAuditRunnerResult,
 {
+    let IndependentAuditIntakeRunInput {
+        item_run: input,
+        review_loop,
+        pr_intake,
+        source_fresh,
+    } = input;
     let context = input.context;
     let item_index = input.item_index;
     let item = input.item;
@@ -7080,14 +7085,16 @@ mod pr_intake_always_on_audit_tests {
             };
         let outcome = run_independent_audit_intake_item_with_runner(
             &mut writer,
-            InboxItemRunInput {
-                context: &context,
-                item_index: 1,
-                item: &item,
+            IndependentAuditIntakeRunInput {
+                item_run: InboxItemRunInput {
+                    context: &context,
+                    item_index: 1,
+                    item: &item,
+                },
+                review_loop,
+                pr_intake,
+                source_fresh: true,
             },
-            review_loop,
-            pr_intake,
-            true,
             Some(&available_models),
             Some(&mut before_launch),
             |command| {
@@ -7162,14 +7169,16 @@ mod pr_intake_always_on_audit_tests {
         };
         let outcome = run_independent_audit_intake_item_with_runner(
             &mut writer,
-            InboxItemRunInput {
-                context: &context,
-                item_index: 1,
-                item: &item,
+            IndependentAuditIntakeRunInput {
+                item_run: InboxItemRunInput {
+                    context: &context,
+                    item_index: 1,
+                    item: &item,
+                },
+                review_loop: review_loop_entry::evaluate_inbox_item_review_loop(&item),
+                pr_intake,
+                source_fresh: true,
             },
-            review_loop_entry::evaluate_inbox_item_review_loop(&item),
-            pr_intake,
-            true,
             None,
             None,
             |_| panic!("dry run must not launch the independent auditor"),
@@ -7855,7 +7864,6 @@ mod github_watch_pr_producer_tests {
 
     #[test]
     fn github_watch_discovery_uses_the_overflow_sentinel_and_offers_all_99_prs() {
-        assert!(MAX_GITHUB_WATCH_PR_PRODUCERS > DEFAULT_MAX_ITEMS);
         let listed = (1..=MAX_GITHUB_WATCH_PR_PRODUCERS as u64)
             .rev()
             .map(|number| {
@@ -7886,6 +7894,7 @@ mod github_watch_pr_producer_tests {
         );
 
         assert!(report.success, "{report:#?}");
+        assert!(report.maximum_processable > DEFAULT_MAX_ITEMS);
         assert_eq!(report.discovered_count, MAX_GITHUB_WATCH_PR_PRODUCERS);
         assert_eq!(report.producer_report_count, MAX_GITHUB_WATCH_PR_PRODUCERS);
         assert_eq!(report.producer_refusal_count, 0);
@@ -7931,25 +7940,25 @@ mod github_watch_pr_producer_tests {
             );
             assert_eq!(producer_calls.get(), 0, "{label} partially produced");
             assert!(report.producer_reports.is_empty(), "{label}: {report:#?}");
-            assert!(match (label, report.discovery_refusal) {
+            assert!(matches!(
+                (label, report.discovery_refusal),
                 (
                     "malformed",
                     Some(InboxPrDiscoveryRefusalCause::MalformedProviderResponse { .. }),
-                )
-                | (
+                ) | (
                     "duplicate",
                     Some(InboxPrDiscoveryRefusalCause::DuplicateNumber { number: 17 }),
-                )
-                | ("zero", Some(InboxPrDiscoveryRefusalCause::ZeroNumber { entry_index: 1 }))
-                | (
+                ) | (
+                    "zero",
+                    Some(InboxPrDiscoveryRefusalCause::ZeroNumber { entry_index: 1 })
+                ) | (
                     "bound",
                     Some(InboxPrDiscoveryRefusalCause::BoundExceeded {
                         returned_count: GITHUB_WATCH_PR_DISCOVERY_SENTINEL,
                         maximum_processable: MAX_GITHUB_WATCH_PR_PRODUCERS,
                     }),
-                ) => true,
-                _ => false,
-            });
+                )
+            ));
         }
 
         let producer_calls = Cell::new(0usize);
