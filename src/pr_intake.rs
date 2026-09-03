@@ -10,8 +10,8 @@ use crate::inbox::review_loop_entry::{
     InboxIndependentAuditorSelectionEvidence,
 };
 use crate::inbox::{
-    GithubCheckSummary, GithubPrSourceTrust, InboxIndependentAuditMergeLaneTask,
-    InboxPrIntakeTaskKind,
+    preflight_inbox_pr_event, run_inbox_for_pr_event, GithubCheckSummary, GithubPrSourceTrust,
+    InboxIndependentAuditMergeLaneTask, InboxPrIntakeTaskKind, InboxRunOptions,
 };
 use crate::selection::ReasoningEffort;
 use crate::supervise::PhaseModelPolicyDecision;
@@ -65,7 +65,6 @@ pub trait IntakeAuthenticator {
 #[serde(deny_unknown_fields)]
 pub struct IntakeCandidateEvidence {
     pub event_id: String,
-    pub source_key: String,
     pub source_snapshot_digest: String,
     pub source_updated_at: String,
     pub producer_identity: String,
@@ -117,6 +116,15 @@ pub enum SupportedIntakeEventKind {
     CandidateBranchRegistered,
 }
 
+/// Canonical source identity retained across authentication, selection, and
+/// launch. Providers must use this identity for their fresh source query.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IntakeCandidateIdentity {
+    PullRequest { repository: String, number: u64 },
+    CandidateBranch { repository: String, branch: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MergeAuditorLaneLaunchRequest {
@@ -124,6 +132,7 @@ pub struct MergeAuditorLaneLaunchRequest {
     pub delivery_id: String,
     pub event_id: String,
     pub event_kind: SupportedIntakeEventKind,
+    pub candidate: IntakeCandidateIdentity,
     pub source_key: String,
     pub task_sha256: String,
     pub task: InboxIndependentAuditMergeLaneTask,
@@ -143,6 +152,7 @@ pub struct MergeAuditorLaneLaunchReceipt {
     pub delivery_id: String,
     pub event_id: String,
     pub event_kind: SupportedIntakeEventKind,
+    pub candidate: IntakeCandidateIdentity,
     pub source_key: String,
     pub task_sha256: String,
     pub source_snapshot_digest: String,
@@ -154,6 +164,11 @@ pub struct MergeAuditorLaneLaunchReceipt {
     pub effort: ReasoningEffort,
     pub authority: PhaseModelPolicyDecision,
     pub launched: bool,
+    pub source_revalidated: bool,
+    pub ci_revalidated: bool,
+    pub safely_executed: bool,
+    pub read_only: bool,
+    pub merge_receipt_present: bool,
     pub grants_merge_permission: bool,
     pub auto_merge_performed: bool,
 }
@@ -173,6 +188,155 @@ pub trait MergeAuditorLaneProvider {
         &mut self,
         request: &MergeAuditorLaneLaunchRequest,
     ) -> Result<MergeAuditorLaneLaunchReceipt, MergeAuditorLaneProviderError>;
+}
+
+/// Production adapter into the existing Inbox independent-audit and
+/// authenticated-publication pipeline. It performs a fresh provider scan for
+/// the exact PR identity and head carried by the authenticated event.
+struct InboxMergeAuditorLaneProvider {
+    options: InboxRunOptions,
+}
+
+impl MergeAuditorLaneProvider for InboxMergeAuditorLaneProvider {
+    fn launch(
+        &mut self,
+        request: &MergeAuditorLaneLaunchRequest,
+    ) -> Result<MergeAuditorLaneLaunchReceipt, MergeAuditorLaneProviderError> {
+        let IntakeCandidateIdentity::PullRequest { number, .. } = &request.candidate else {
+            return Err(MergeAuditorLaneProviderError::Refused {
+                detail: "registered branch intake requires a branch-capable provider".to_string(),
+            });
+        };
+        let mut options = self.options.clone();
+        let observed_task = preflight_inbox_pr_event(&options, *number, &request.task.head_oid)
+            .map_err(|error| MergeAuditorLaneProviderError::Refused {
+                detail: bounded_detail(&format!("Inbox event preflight failed: {error:#}")),
+            })?;
+        if !same_source_task(&observed_task, &request.task) {
+            return Err(MergeAuditorLaneProviderError::Refused {
+                detail: "fresh Inbox task differed from authenticated event evidence".to_string(),
+            });
+        }
+        options.run_id =
+            crate::orchestrator::RunId::new(format!("{}-dispatch", request.auditor_session_id))
+                .map_err(|error| MergeAuditorLaneProviderError::Failed {
+                    detail: bounded_detail(&format!("event run id was invalid: {error:#}")),
+                })?;
+        let report =
+            run_inbox_for_pr_event(options, *number, &request.task.head_oid, &observed_task)
+                .map_err(|error| MergeAuditorLaneProviderError::Failed {
+                    detail: bounded_detail(&format!("Inbox event dispatch failed: {error:#}")),
+                })?;
+        let item = report.item_reports.into_iter().next().ok_or_else(|| {
+            MergeAuditorLaneProviderError::Refused {
+                detail: "fresh Inbox scan produced no dispatchable event target".to_string(),
+            }
+        })?;
+        let dispatched_task = item
+            .pr_intake
+            .as_ref()
+            .and_then(|intake| intake.task.as_ref())
+            .ok_or_else(|| MergeAuditorLaneProviderError::Refused {
+                detail: "fresh Inbox scan produced no source-bound audit task".to_string(),
+            })?;
+        if !same_source_task(dispatched_task, &request.task) {
+            return Err(MergeAuditorLaneProviderError::Refused {
+                detail: "fresh Inbox task differed from authenticated event evidence".to_string(),
+            });
+        }
+        let lane =
+            item.independent_audit_lane
+                .ok_or_else(|| MergeAuditorLaneProviderError::Refused {
+                    detail: "Inbox event target produced no independent-audit lane report"
+                        .to_string(),
+                })?;
+        if lane.number != *number
+            || lane.source_key != request.source_key
+            || lane.head_oid != request.task.head_oid
+            || lane.source_snapshot_digest != request.task.source_snapshot_digest
+        {
+            return Err(MergeAuditorLaneProviderError::Refused {
+                detail: "Inbox lane result did not match the authenticated event target"
+                    .to_string(),
+            });
+        }
+        if lane.blockers.iter().any(|blocker| {
+            matches!(
+                blocker,
+                crate::inbox::review_loop_entry::InboxIndependentAuditLaneBlocker::StaleHead { .. }
+                    | crate::inbox::review_loop_entry::InboxIndependentAuditLaneBlocker::MissingEvidence { .. }
+                    | crate::inbox::review_loop_entry::InboxIndependentAuditLaneBlocker::MissingEligibility { .. }
+            )
+        }) {
+            return Err(MergeAuditorLaneProviderError::Refused {
+                detail: "Inbox refused stale or incomplete event ground truth".to_string(),
+            });
+        }
+        let selection = lane
+            .selection
+            .ok_or_else(|| MergeAuditorLaneProviderError::Refused {
+                detail: "Inbox lane omitted selector evidence".to_string(),
+            })?;
+        let launch = lane
+            .launch
+            .ok_or_else(|| MergeAuditorLaneProviderError::Refused {
+                detail: "Inbox lane did not launch an independent auditor".to_string(),
+            })?;
+        if selection != request.selection {
+            return Err(MergeAuditorLaneProviderError::Refused {
+                detail: "Inbox lane selection differed from the authenticated dispatch".to_string(),
+            });
+        }
+        if !launch.safely_executed || !launch.publishable {
+            return Err(MergeAuditorLaneProviderError::Refused {
+                detail: "Inbox auditor did not complete its screened execution boundary"
+                    .to_string(),
+            });
+        }
+        Ok(MergeAuditorLaneLaunchReceipt {
+            version: INTAKE_VERSION,
+            launch_id: launch.auditor_session_id.clone(),
+            delivery_id: request.delivery_id.clone(),
+            event_id: request.event_id.clone(),
+            event_kind: request.event_kind,
+            candidate: request.candidate.clone(),
+            source_key: lane.source_key,
+            task_sha256: request.task_sha256.clone(),
+            source_snapshot_digest: lane.source_snapshot_digest,
+            head_oid: lane.head_oid,
+            auditor_identity: launch.auditor_identity,
+            auditor_session_id: launch.auditor_session_id,
+            runtime: selection.runtime,
+            model: selection.model,
+            effort: selection.effort,
+            authority: request.authority,
+            launched: true,
+            source_revalidated: true,
+            ci_revalidated: true,
+            safely_executed: true,
+            read_only: launch.permission_profile
+                == crate::inbox::review_loop_entry::independent_auditor_permission_profile(),
+            merge_receipt_present: lane.merge_receipt.is_some(),
+            grants_merge_permission: false,
+            auto_merge_performed: lane.auto_merge_performed,
+        })
+    }
+}
+
+fn same_source_task(
+    observed: &InboxIndependentAuditMergeLaneTask,
+    authenticated: &InboxIndependentAuditMergeLaneTask,
+) -> bool {
+    observed.source_snapshot_digest == authenticated.source_snapshot_digest
+        && observed.source_updated_at == authenticated.source_updated_at
+        && observed.head_oid == authenticated.head_oid
+        && observed.base_oid == authenticated.base_oid
+        && observed.producer_login == authenticated.producer_login
+        && observed.is_draft == authenticated.is_draft
+        && observed.source_trust == authenticated.source_trust
+        && observed.head_repository == authenticated.head_repository
+        && observed.changed_files == authenticated.changed_files
+        && observed.checks == authenticated.checks
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -278,6 +442,7 @@ impl PrIntakeReport {
 struct NormalizedIntake {
     event_id: String,
     event_kind: SupportedIntakeEventKind,
+    candidate: IntakeCandidateIdentity,
     source_key: String,
     task: InboxIndependentAuditMergeLaneTask,
 }
@@ -322,7 +487,29 @@ where
         });
     }
 
-    let event = match serde_json::from_str::<IntakeEvent>(&envelope.payload_json) {
+    let raw_event = match serde_json::from_str::<serde_json::Value>(&envelope.payload_json) {
+        Ok(event) => event,
+        Err(error) => {
+            return report.refuse(PrIntakeRefusalCause::MalformedEvent {
+                detail: bounded_detail(&error.to_string()),
+            });
+        }
+    };
+    let Some(raw_kind) = raw_event.get("kind").and_then(serde_json::Value::as_str) else {
+        return report.refuse(PrIntakeRefusalCause::MalformedEvent {
+            detail: "event omitted its string kind discriminator".to_string(),
+        });
+    };
+    if !matches!(
+        raw_kind,
+        "pull_request" | "candidate_branch_registered" | "unknown"
+    ) {
+        report.event_kind = Some(bounded_detail(raw_kind));
+        return report.refuse(PrIntakeRefusalCause::UnknownEvent {
+            event_kind: bounded_detail(raw_kind),
+        });
+    }
+    let event = match serde_json::from_value::<IntakeEvent>(raw_event) {
         Ok(event) => event,
         Err(error) => {
             return report.refuse(PrIntakeRefusalCause::MalformedEvent {
@@ -410,6 +597,7 @@ where
         delivery_id: envelope.delivery_id.clone(),
         event_id: normalized.event_id,
         event_kind: normalized.event_kind,
+        candidate: normalized.candidate,
         source_key: normalized.source_key,
         task_sha256,
         task: normalized.task,
@@ -435,11 +623,35 @@ where
     }
 
     report.success = true;
+    report.auto_merge_performed = receipt.auto_merge_performed;
     report.launch_receipt = Some(receipt);
     report.refusal = None;
     report.grants_merge_permission = false;
-    report.auto_merge_performed = false;
     report
+}
+
+/// Authenticate one event and dispatch it through the existing production
+/// Inbox lane. The Inbox adapter performs the fresh provider scan, exact-head
+/// filtering, screened auditor launch, output validation, and authenticated
+/// publication gates.
+pub fn handle_inbox_intake_event<A, I, S>(
+    envelope: &IntakeEventEnvelope,
+    observed_available_model_slugs: I,
+    authenticator: &A,
+    options: InboxRunOptions,
+) -> PrIntakeReport
+where
+    A: IntakeAuthenticator,
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut provider = InboxMergeAuditorLaneProvider { options };
+    handle_intake_event(
+        envelope,
+        observed_available_model_slugs,
+        authenticator,
+        &mut provider,
+    )
 }
 
 fn normalize_event(
@@ -478,12 +690,17 @@ fn normalize_event(
                     },
                 ));
             }
+            let candidate = IntakeCandidateIdentity::PullRequest {
+                repository: event.repository.clone(),
+                number: event.number,
+            };
             normalize_supported(
                 SupportedIntakeEventKind::PullRequest,
                 event.repository,
                 false,
                 event.source_trust,
                 event.evidence,
+                candidate,
             )
             .map_err(|cause| (Some(event_id), kind, cause))
         }
@@ -496,12 +713,17 @@ fn normalize_event(
             if let Err(cause) = validate_identifier("branch", &event.branch) {
                 return Err((Some(event_id), kind, cause));
             }
+            let candidate = IntakeCandidateIdentity::CandidateBranch {
+                repository: event.repository.clone(),
+                branch: event.branch,
+            };
             normalize_supported(
                 SupportedIntakeEventKind::CandidateBranchRegistered,
                 event.repository,
                 false,
                 GithubPrSourceTrust::TrustedTargetRepository,
                 event.evidence,
+                candidate,
             )
             .map_err(|cause| (Some(event_id), kind, cause))
         }
@@ -514,9 +736,9 @@ fn normalize_supported(
     is_draft: bool,
     source_trust: GithubPrSourceTrust,
     evidence: IntakeCandidateEvidence,
+    candidate: IntakeCandidateIdentity,
 ) -> Result<NormalizedIntake, PrIntakeRefusalCause> {
     validate_identifier("event_id", &evidence.event_id)?;
-    validate_identifier("source_key", &evidence.source_key)?;
     validate_identifier("producer_identity", &evidence.producer_identity)?;
     validate_bounded_text("source_updated_at", &evidence.source_updated_at)?;
     validate_digest("source_snapshot_digest", &evidence.source_snapshot_digest)?;
@@ -556,7 +778,17 @@ fn normalize_supported(
     Ok(NormalizedIntake {
         event_id: evidence.event_id,
         event_kind,
-        source_key: evidence.source_key,
+        source_key: match &candidate {
+            IntakeCandidateIdentity::PullRequest { number, .. } => {
+                format!("github_pr:{number}")
+            }
+            IntakeCandidateIdentity::CandidateBranch { repository, branch } => {
+                let material = format!("{repository}\0{branch}");
+                let digest = crate::artifacts::state_auth::sha256_hex(material.as_bytes());
+                format!("candidate_branch:{}", &digest[..24])
+            }
+        },
+        candidate,
         task,
     })
 }
@@ -713,6 +945,9 @@ fn invalid_receipt_field(
     if receipt.event_kind != request.event_kind {
         return Some("event_kind");
     }
+    if receipt.candidate != request.candidate {
+        return Some("candidate");
+    }
     if receipt.source_key != request.source_key {
         return Some("source_key");
     }
@@ -746,11 +981,23 @@ fn invalid_receipt_field(
     if !receipt.launched {
         return Some("launched");
     }
+    if !receipt.source_revalidated {
+        return Some("source_revalidated");
+    }
+    if !receipt.ci_revalidated {
+        return Some("ci_revalidated");
+    }
+    if !receipt.safely_executed {
+        return Some("safely_executed");
+    }
+    if !receipt.read_only {
+        return Some("read_only");
+    }
     if receipt.grants_merge_permission {
         return Some("grants_merge_permission");
     }
-    if receipt.auto_merge_performed {
-        return Some("auto_merge_performed");
+    if receipt.auto_merge_performed != receipt.merge_receipt_present {
+        return Some("merge_receipt_present");
     }
     None
 }
@@ -880,6 +1127,7 @@ mod tests {
             delivery_id: request.delivery_id.clone(),
             event_id: request.event_id.clone(),
             event_kind: request.event_kind,
+            candidate: request.candidate.clone(),
             source_key: request.source_key.clone(),
             task_sha256: request.task_sha256.clone(),
             source_snapshot_digest: request.task.source_snapshot_digest.clone(),
@@ -891,6 +1139,11 @@ mod tests {
             effort: request.selection.effort,
             authority: request.authority,
             launched: true,
+            source_revalidated: true,
+            ci_revalidated: true,
+            safely_executed: true,
+            read_only: true,
+            merge_receipt_present: false,
             grants_merge_permission: false,
             auto_merge_performed: false,
         }
@@ -909,7 +1162,6 @@ mod tests {
     fn evidence() -> IntakeCandidateEvidence {
         IntakeCandidateEvidence {
             event_id: "event-1".to_string(),
-            source_key: "repo/pr/17".to_string(),
             source_snapshot_digest: "a".repeat(64),
             source_updated_at: "2026-09-03T00:00:00Z".to_string(),
             producer_identity: "producer".to_string(),
@@ -934,7 +1186,6 @@ mod tests {
     fn candidate_branch_event() -> IntakeEvent {
         let mut evidence = evidence();
         evidence.event_id = "candidate-event-1".to_string();
-        evidence.source_key = "repo/branch/candidate".to_string();
         IntakeEvent::CandidateBranchRegistered(CandidateBranchRegisteredIntakeEvent {
             repository: "Meta-Develop/MACO".to_string(),
             branch: "maco/candidate".to_string(),
@@ -1022,6 +1273,13 @@ mod tests {
             SupportedIntakeEventKind::CandidateBranchRegistered
         );
         assert_eq!(
+            provider.requests[0].candidate,
+            IntakeCandidateIdentity::CandidateBranch {
+                repository: "Meta-Develop/MACO".to_string(),
+                branch: "maco/candidate".to_string(),
+            }
+        );
+        assert_eq!(
             report.task.expect("candidate task").head_repository,
             Some("Meta-Develop/MACO".to_string())
         );
@@ -1050,9 +1308,10 @@ mod tests {
 
     #[test]
     fn authenticated_unknown_event_refuses_without_launch() {
-        let envelope = envelope(IntakeEvent::Unknown(UnsupportedIntakeEvent {
+        let mut envelope = envelope(IntakeEvent::Unknown(UnsupportedIntakeEvent {
             event_kind: "repository_deleted".to_string(),
         }));
+        envelope.payload_json = r#"{"kind":"repository_deleted","payload":{}}"#.to_string();
         let authenticator = FakeAuthenticator::accepting();
         let mut provider = FakeProvider::default();
 
@@ -1119,7 +1378,12 @@ mod tests {
 
     #[test]
     fn empty_and_ineligible_catalogs_fail_closed_without_launch() {
-        for catalog in [Vec::<String>::new(), vec!["gpt-5.6-luna".to_string()]] {
+        for catalog in [
+            Vec::<String>::new(),
+            vec!["gpt-5.6-luna".to_string()],
+            vec!["gpt-5.6-terra".to_string()],
+            vec!["unknown-model".to_string()],
+        ] {
             let envelope = envelope(pull_request_event());
             let authenticator = FakeAuthenticator::accepting();
             let mut provider = FakeProvider::default();

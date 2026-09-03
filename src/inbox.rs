@@ -1388,6 +1388,15 @@ struct InboxConfigOverrides {
     labels: Option<Vec<String>>,
     issues: Option<bool>,
     pull_requests: Option<bool>,
+    pr_event_target: Option<InboxPrEventTarget>,
+    pr_event_task: Option<InboxIndependentAuditMergeLaneTask>,
+    authenticated_pr_event: bool,
+}
+
+#[derive(Debug, Clone)]
+struct InboxPrEventTarget {
+    number: u64,
+    head_oid: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1460,7 +1469,7 @@ fn scan_inbox_with_overrides(
     if options.action_policy_override.is_some() {
         overrides.action_policy = options.action_policy_override;
     }
-    let loaded = load_config_with_config_overrides(&repo, overrides)?;
+    let loaded = load_config_with_config_overrides(&repo, overrides.clone())?;
     let permission_mode =
         effective_permission_mode(&loaded.config, options.github, options.permission_mode);
     let action_policy = effective_action_policy(loaded.config.action_policy, permission_mode);
@@ -1487,7 +1496,15 @@ fn scan_inbox_with_overrides(
     }
     if loaded.config.selection.pull_requests {
         let pull_requests = if github_enabled {
-            github_pr_candidates(&repo, &loaded.config, &source_repository)?
+            match &overrides.pr_event_target {
+                Some(target) => vec![github_pr_candidate(
+                    &repo,
+                    &loaded.config,
+                    &source_repository,
+                    target.number,
+                )?],
+                None => github_pr_candidates(&repo, &loaded.config, &source_repository)?,
+            }
         } else {
             fake_pr_candidates(&loaded.config)
         };
@@ -1506,6 +1523,32 @@ fn scan_inbox_with_overrides(
         }
     }
     validate_count(items.len(), "inbox candidate items", MAX_GITHUB_ITEMS)?;
+    if let Some(target) = &overrides.pr_event_target {
+        let number_seen = items.iter().any(|item| {
+            item.kind == InboxItemKind::PullRequest
+                && item
+                    .pull_request
+                    .as_ref()
+                    .is_some_and(|pull_request| pull_request.number == target.number)
+        });
+        items.retain(|item| {
+            item.kind == InboxItemKind::PullRequest
+                && item
+                    .pull_request
+                    .as_ref()
+                    .is_some_and(|pull_request| pull_request.number == target.number)
+                && item.source_snapshot.head_oid() == Some(target.head_oid.as_str())
+        });
+        if !number_seen {
+            bail!("authenticated PR intake target was not present in the fresh provider scan");
+        }
+        if items.is_empty() {
+            bail!("authenticated PR intake target head changed before dispatch");
+        }
+    }
+    if let Some(expected_task) = &overrides.pr_event_task {
+        verify_pr_event_task(&items, expected_task)?;
+    }
     items.sort_by(|left, right| {
         left.kind
             .cmp(&right.kind)
@@ -1569,6 +1612,71 @@ pub fn run_inbox(options: InboxRunOptions) -> Result<InboxRunReport> {
     run_inbox_with_rolling_budget(options, None)
 }
 
+/// Resolve the exact provider-owned PR snapshot before any auditor or
+/// publication effect is admitted for an authenticated intake event.
+pub(crate) fn preflight_inbox_pr_event(
+    options: &InboxRunOptions,
+    number: u64,
+    expected_head_oid: &str,
+) -> Result<InboxIndependentAuditMergeLaneTask> {
+    let scan = scan_inbox_with_overrides(
+        InboxScanOptions {
+            repo: options.repo.clone(),
+            github: options.github,
+            permission_mode: options.permission_mode,
+            max_items: None,
+            action_policy_override: None,
+        },
+        InboxConfigOverrides {
+            max_items: Some(1),
+            issues: Some(false),
+            pull_requests: Some(true),
+            pr_event_target: Some(InboxPrEventTarget {
+                number,
+                head_oid: expected_head_oid.to_string(),
+            }),
+            authenticated_pr_event: true,
+            ..InboxConfigOverrides::default()
+        },
+    )?;
+    let item = scan
+        .items
+        .into_iter()
+        .find(|item| item.selected)
+        .context("authenticated PR event target was not eligible for a new Inbox run")?;
+    pr_intake_report_for_item(&item)
+        .and_then(|report| report.task)
+        .context("authenticated PR event target produced no source-bound audit task")
+}
+
+/// Run the ordinary Inbox pipeline for exactly one authenticated PR event.
+/// The provider scan remains the source of truth; the event supplies only the
+/// identity and expected freshness watermark used to filter that scan.
+pub(crate) fn run_inbox_for_pr_event(
+    mut options: InboxRunOptions,
+    number: u64,
+    expected_head_oid: &str,
+    expected_task: &InboxIndependentAuditMergeLaneTask,
+) -> Result<InboxRunReport> {
+    options.max_items = None;
+    run_inbox_with_overrides(
+        options,
+        None,
+        InboxConfigOverrides {
+            max_items: Some(1),
+            issues: Some(false),
+            pull_requests: Some(true),
+            pr_event_target: Some(InboxPrEventTarget {
+                number,
+                head_oid: expected_head_oid.to_string(),
+            }),
+            pr_event_task: Some(expected_task.clone()),
+            authenticated_pr_event: true,
+            ..InboxConfigOverrides::default()
+        },
+    )
+}
+
 pub fn run_inbox_with_rolling_budget(
     options: InboxRunOptions,
     rolling_budget_quota: Option<InboxRollingBudgetQuota>,
@@ -1606,8 +1714,11 @@ fn run_inbox_with_overrides(
         effective_permission_mode(&loaded.config, options.github, options.permission_mode);
     let preflight_action_policy =
         effective_action_policy(loaded.config.action_policy, preflight_permission_mode);
+    let event_reviewer_bound = overrides.authenticated_pr_event
+        && (options.codex_bin.is_some() || loaded.config.codex_bin.is_some());
     if preflight_permission_mode.publishes_real_branch_or_pr()
         && preflight_action_policy != InboxActionPolicy::DryRun
+        && !event_reviewer_bound
     {
         bail!(
             "real Inbox publication requires an explicitly bound external reviewer; the deterministic fake reviewer is not publication authority"
@@ -2387,6 +2498,9 @@ fn workspace_overrides_for_repo(spec: &WorkspaceRepoSpec) -> InboxConfigOverride
         labels: Some(spec.labels.clone()),
         issues: Some(spec.include_issues),
         pull_requests: Some(spec.include_pull_requests),
+        pr_event_target: None,
+        pr_event_task: None,
+        authenticated_pr_event: false,
     }
 }
 
@@ -5025,6 +5139,21 @@ fn pr_intake_report_for_item(item: &InboxItem) -> Option<InboxPrIntakeReport> {
     })
 }
 
+fn verify_pr_event_task(
+    items: &[InboxItem],
+    expected: &InboxIndependentAuditMergeLaneTask,
+) -> Result<()> {
+    let observed = items
+        .iter()
+        .find_map(pr_intake_report_for_item)
+        .and_then(|report| report.task)
+        .context("authenticated PR event rescan produced no source-bound audit task")?;
+    if &observed != expected {
+        bail!("authenticated PR event evidence changed before dispatch");
+    }
+    Ok(())
+}
+
 type PrSnapshotDuplicateKey = (String, String);
 
 /// Prior issue behavior remains keyed by source object identity. PRs also bind
@@ -5298,6 +5427,21 @@ fn github_pr_candidates(
                 .with_context(|| format!("invalid gh pr list item {}", index + 1))
         })
         .collect()
+}
+
+fn github_pr_candidate(
+    repo: &Path,
+    config: &InboxConfig,
+    source_repository: &SourceRepositoryBindingContext,
+    number: u64,
+) -> Result<RawPrCandidate> {
+    let value = publication::view_github_source_item(
+        repo,
+        &source_repository.selector,
+        number,
+        ExternalSourceObjectKind::PullRequest,
+    )?;
+    raw_pr_from_value(&value, config, source_repository).context("invalid exact gh pr view item")
 }
 
 fn raw_issue_from_value(
@@ -5799,6 +5943,27 @@ mod pr_intake_always_on_audit_tests {
         assert!(task.requires_independent_auditor);
         assert!(!task.grants_merge_permission);
         assert!(!task.auto_merge_performed);
+    }
+
+    #[test]
+    fn same_head_pr_event_task_drift_is_refused_before_dispatch() {
+        let config = InboxConfig::default();
+        let initial =
+            pr_item(fake_pr(912), &config, &fake_source(), &BTreeMap::new()).expect("initial PR");
+        let expected = pr_intake_report_for_item(&initial)
+            .and_then(|report| report.task)
+            .expect("initial source-bound task");
+
+        let mut changed = fake_pr(912);
+        changed.base_oid = "e".repeat(40);
+        let changed = pr_item(changed, &config, &fake_source(), &BTreeMap::new())
+            .expect("same-head changed PR");
+        let error = verify_pr_event_task(&[changed], &expected)
+            .expect_err("same-head evidence drift must block before dispatch");
+
+        assert!(error
+            .to_string()
+            .contains("evidence changed before dispatch"));
     }
 
     #[test]
