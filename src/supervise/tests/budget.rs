@@ -709,12 +709,82 @@ fn budget_integration_parseable_partial_usage_from_timeout_is_estimated_and_latc
     );
 }
 
+fn assert_budget_pre_runner_dispatch_cleanup(
+    report: &SupervisorFinalReport,
+    repo: &Path,
+    run_id: &str,
+    started_worktree: &str,
+    unstarted_worktrees: &[&str],
+    expected_paths: &[PathBuf],
+) {
+    assert_eq!(report.released_claims.len(), 1);
+    assert!(report.release_errors.is_empty());
+    assert_eq!(report.released_semantic_intents.len(), 1);
+    assert_eq!(report.released_semantic_intents[0].agent_id, "child-a");
+    assert_eq!(
+        report.released_semantic_intents[0].paths,
+        expected_paths.to_vec()
+    );
+    assert!(report.semantic_release_errors.is_empty());
+    assert!(report.breaker_trip.is_none());
+    assert!(report.gate_denials.is_empty());
+    assert!(report.gate_correction_outcomes.is_empty());
+    assert!(SyncStore::open(repo)
+        .expect("reopen lifecycle sync store")
+        .snapshot()
+        .expect("snapshot lifecycle claims")
+        .is_empty());
+    assert!(SemanticIntentStore::open(repo)
+        .expect("reopen lifecycle semantic store")
+        .snapshot()
+        .expect("snapshot lifecycle semantic intents")
+        .is_empty());
+
+    let run_root = repo
+        .join(RunArtifactFamily::Supervise.run_root())
+        .join(run_id);
+    let scratch_entries = fs::read_dir(&run_root)
+        .expect("read finalized lifecycle artifact root")
+        .map(|entry| {
+            entry
+                .expect("read lifecycle artifact entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| name.starts_with("incoming") || name.starts_with("capture"))
+        .collect::<Vec<_>>();
+    assert!(
+        scratch_entries.is_empty(),
+        "invocation scratch artifacts leaked: {scratch_entries:?}"
+    );
+    assert!(run_root.join(ARTIFACT_FINALIZATION_MARKER).exists());
+
+    let manager = WorktreeManager::new(repo);
+    let records = manager.list().expect("list lifecycle worktrees");
+    assert!(records.iter().any(|record| record.name == started_worktree));
+    for unstarted in unstarted_worktrees {
+        assert!(
+            records.iter().all(|record| record.name != *unstarted),
+            "pending assignment worktree {unstarted} was unexpectedly created"
+        );
+    }
+    let lease = manager
+        .acquire_write_execution_lease(started_worktree)
+        .expect("started worktree execution lease must be released");
+    drop(lease);
+}
+
 #[test]
 fn budget_lifecycle_child_pre_runner_failure_releases_reservation_and_stops_pending() {
     let _capability = install_budget_fixture_models();
     let (temp, repo_path) = injected_repository();
+    // Sync coordination accepts this claim set, but ReviewContext rejects more than 256 rules.
+    let malformed_claims = (0..257)
+        .map(|index| PathBuf::from(format!("claims/claim-{index:03}.txt")))
+        .collect::<Vec<_>>();
     let mut child_a = injected_named_assignment("child-a", "README.md");
-    child_a.task = Some("x".repeat(8 * 1024 + 1));
+    child_a.assigned_paths = malformed_claims.clone();
     let child_b = injected_named_assignment("child-b", "src/lib.rs");
     let mut plan = injected_multi_plan(vec![child_a, child_b], 0);
     plan.semantic_coordination = SemanticCoordinationMode::Block;
@@ -741,9 +811,12 @@ fn budget_lifecycle_child_pre_runner_failure_releases_reservation_and_stops_pend
     assert!(!report.success);
     assert_eq!(invocations, 0);
     assert!(report.usage_complete);
-    assert!(report.findings.iter().any(|finding| finding
-        .message
-        .contains("failed to construct pre-action review context")));
+    assert!(report.findings.iter().any(|finding| {
+        finding
+            .message
+            .contains("failed to construct pre-action review context")
+            && finding.message.contains("claim rule count exceeds")
+    }));
     let budget = report.run_budget.as_ref().expect("child lifecycle budget");
     assert_eq!(budget.consumed.tokens, 0);
     assert_eq!(budget.reserved.tokens, 0);
@@ -760,7 +833,57 @@ fn budget_lifecycle_child_pre_runner_failure_releases_reservation_and_stops_pend
             .map(|role| (role.consumed.tokens, role.usage_complete)),
         Some((0, true))
     );
-    assert_injected_dispatch_cleanup(&report, &repo_path, run_id, "child-a", &["child-b"], false);
+    assert_budget_pre_runner_dispatch_cleanup(
+        &report,
+        &repo_path,
+        run_id,
+        "child-a",
+        &["child-b"],
+        &malformed_claims,
+    );
+}
+
+#[test]
+fn budget_lifecycle_oversized_child_intent_reaches_runner_once() {
+    let _capability = install_budget_fixture_models();
+    let (temp, repo_path) = injected_repository();
+    let mut child = injected_named_assignment("child-a", "README.md");
+    child.task = Some("x".repeat(8 * 1024 + 1));
+    let mut plan = injected_plan(child.clone(), 0);
+    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    let budget = injected_run_budget(None, Some(200), None, None, 50, 50);
+    let options = injected_options(&repo_path, temp.path(), "budget-oversized-child-intent");
+    let mut invocations = 0usize;
+    let mut runner = |command: &ExternalAgentCommand| {
+        invocations = invocations.saturating_add(1);
+        assert_eq!(injected_command_assignment_id(command), "child-a");
+        write_injected_assignment_report(command, &child);
+        write_injected_usage(command, 7, 3);
+        injected_verified_nonzero_run(command, 17)
+    };
+
+    let report = run_supervisor_plan_with_budget_and_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        budget,
+        options,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        &mut runner,
+    )
+    .expect("finalize oversized child intent after runner execution");
+
+    assert!(!report.success);
+    assert_eq!(invocations, 1);
+    assert!(report
+        .orchestrator_reports
+        .iter()
+        .any(|orchestrator| orchestrator.id == "child-a"));
+    assert!(report.findings.iter().any(|finding| finding
+        .message
+        .contains("child orchestrator 'child-a' failed")));
+    assert!(report.findings.iter().all(|finding| !finding
+        .message
+        .contains("failed to construct pre-action review context")));
 }
 
 #[test]
