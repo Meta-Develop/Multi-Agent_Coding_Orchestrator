@@ -729,9 +729,7 @@ fn merge_local_git_timeout_flag_and_clap_env_wire_preview_and_apply_with_typed_b
         120
     );
     let command = Cli::command();
-    let merge = command
-        .find_subcommand("merge")
-        .expect("merge subcommand");
+    let merge = command.find_subcommand("merge").expect("merge subcommand");
     for subcommand in ["preview", "apply"] {
         let timeout = merge
             .find_subcommand(subcommand)

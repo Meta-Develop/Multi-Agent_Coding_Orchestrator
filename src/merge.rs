@@ -85,8 +85,7 @@ const MAX_BOUND_VALIDATION_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_BOUND_VALIDATION_PATHS_PER_REPORT: usize = 8192;
 pub(crate) const DEFAULT_LOCAL_GIT_PROCESS_TIMEOUT_SECONDS: u64 = 120;
 pub(crate) const MAX_LOCAL_GIT_PROCESS_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
-pub(crate) const LOCAL_GIT_PROCESS_TIMEOUT_ENV: &str =
-    "MACO_MERGE_LOCAL_GIT_TIMEOUT_SECONDS";
+pub(crate) const LOCAL_GIT_PROCESS_TIMEOUT_ENV: &str = "MACO_MERGE_LOCAL_GIT_TIMEOUT_SECONDS";
 const LOCAL_GIT_PROCESS_TIMEOUT_FLAG: &str = "--local-git-timeout-seconds";
 const LOCAL_GIT_PROCESS_TIMEOUT: Duration =
     Duration::from_secs(DEFAULT_LOCAL_GIT_PROCESS_TIMEOUT_SECONDS);
@@ -106,13 +105,9 @@ const PRIVATE_RUNTIME_REMOVAL_MAX_DEPTH: usize = 128;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum LocalGitProcessTimeoutError {
-    #[error(
-        "local Git timeout must be an integer number of seconds, got {value:?}"
-    )]
+    #[error("local Git timeout must be an integer number of seconds, got {value:?}")]
     InvalidInteger { value: String },
-    #[error(
-        "local Git timeout must be between 1 and {max_seconds} seconds, got {seconds}"
-    )]
+    #[error("local Git timeout must be between 1 and {max_seconds} seconds, got {seconds}")]
     OutOfRange { seconds: u64, max_seconds: u64 },
 }
 
@@ -2469,11 +2464,7 @@ fn assess_megafile_policy(
     preview: &mut MergeApplyPreview,
     policy: &MegafileMergePolicy,
 ) -> Result<()> {
-    assess_megafile_policy_with_local_git_options(
-        preview,
-        policy,
-        MergeLocalGitOptions::default(),
-    )
+    assess_megafile_policy_with_local_git_options(preview, policy, MergeLocalGitOptions::default())
 }
 
 fn assess_megafile_policy_with_local_git_options(
