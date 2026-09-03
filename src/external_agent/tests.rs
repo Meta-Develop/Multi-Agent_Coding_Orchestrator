@@ -4023,7 +4023,7 @@ fn executable_remediation_separates_project_and_persistent_nixos_changes() {
 }
 
 #[test]
-fn absent_model_selection_preserves_the_exact_hardened_codex_argv() {
+fn supervisor_argv_enables_multi_agent_without_ephemeral() {
     let command = ExternalAgentCommand::codex(
         "codex",
         "/workspace",
@@ -4043,7 +4043,6 @@ fn absent_model_selection_preserves_the_exact_hardened_codex_argv() {
             "--strict-config",
             "--ignore-user-config",
             "--ignore-rules",
-            "--ephemeral",
             "--cd",
             "/workspace",
             "-c",
@@ -4078,7 +4077,7 @@ fn absent_model_selection_preserves_the_exact_hardened_codex_argv() {
             "computer_use",
             "--disable",
             "image_generation",
-            "--disable",
+            "--enable",
             "multi_agent",
             "--enable",
             "goals",
@@ -4088,15 +4087,46 @@ fn absent_model_selection_preserves_the_exact_hardened_codex_argv() {
             "-",
         ];
     assert_eq!(actual, expected);
+    assert!(!actual.iter().any(|argument| argument == "--ephemeral"));
+    assert!(!actual
+        .windows(2)
+        .any(|arguments| arguments == ["--disable", "multi_agent"]));
+    assert!(actual
+        .windows(2)
+        .any(|arguments| arguments == ["--enable", "multi_agent"]));
+    assert!(!actual
+        .iter()
+        .any(|argument| argument.starts_with("service_tier=")));
+}
+
+#[test]
+fn non_multi_agent_hardened_argv_retains_ephemeral() {
+    let command = ExternalAgentCommand::codex_read_only_consultant(
+        "codex",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(1),
+    );
+    let actual = command_argv(&command)
+        .into_iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        actual
+            .iter()
+            .filter(|argument| argument.as_str() == "--ephemeral")
+            .count(),
+        1
+    );
     assert!(actual
         .windows(2)
         .any(|arguments| arguments == ["--disable", "multi_agent"]));
     assert!(!actual
         .windows(2)
         .any(|arguments| arguments == ["--enable", "multi_agent"]));
-    assert!(!actual
-        .iter()
-        .any(|argument| argument.starts_with("service_tier=")));
 }
 
 #[test]
@@ -4145,9 +4175,12 @@ fn priority_service_tier_is_an_exact_opt_in_argv_delta() {
                 OsString::from("model_reasoning_effort=\"xhigh\""),
             ]
     }));
-    assert!(default
+    assert!(!default
         .windows(2)
         .any(|arguments| arguments == ["--disable", "multi_agent"]));
+    assert!(default
+        .windows(2)
+        .any(|arguments| arguments == ["--enable", "multi_agent"]));
     assert!(default.windows(2).any(|arguments| {
         arguments
             == [
