@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "fixture": "writable-managed-child.streaming-json",
+  "classification": "hand-authored-grok-compatible",
+  "argv": [
+    "--prompt-file",
+    "{prompt}",
+    "--model",
+    "grok-4.6",
+    "--reasoning-effort",
+    "xhigh",
+    "--cwd",
+    "{cwd}",
+    "--json-schema",
+    "{schema}",
+    "--output-format",
+    "streaming-json",
+    "--sandbox",
+    "strict",
+    "--always-approve",
+    "--disable-web-search",
+    "--no-memory",
+    "--no-subagents"
+  ],
+  "redactions": "none",
+  "scope_note": "Hermetic Grok-compatible streaming-json fixture for a schema-bound managed-child write. Not a live capture. Native end.usage fields are exact Grok spend keys, not Codex turn.completed events."
+}

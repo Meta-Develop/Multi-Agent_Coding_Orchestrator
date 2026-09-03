@@ -1214,6 +1214,80 @@ fn create_linked_git_metadata_fixture(root: &Path) -> Result<(PathBuf, PathBuf, 
 }
 
 #[cfg(unix)]
+type PrimaryGitSurfaceSnapshot = (git2::Oid, Vec<(Vec<u8>, git2::Oid, u32)>);
+
+#[cfg(unix)]
+fn snapshot_primary_git_surface(repo: &Path) -> Result<PrimaryGitSurfaceSnapshot> {
+    let repository = crate::git_repository::open(repo)?;
+    let head = repository.head()?.target().context("primary HEAD")?;
+    let index = repository.index()?;
+    let mut entries = Vec::new();
+    for entry in index.iter() {
+        entries.push((entry.path.to_vec(), entry.id, entry.mode));
+    }
+    Ok((head, entries))
+}
+
+#[cfg(unix)]
+fn snapshot_tracked_head_blobs(
+    repo: &Path,
+    head: git2::Oid,
+) -> Result<BTreeMap<PathBuf, git2::Oid>> {
+    fn collect(
+        repository: &git2::Repository,
+        tree: &git2::Tree,
+        prefix: PathBuf,
+        blobs: &mut BTreeMap<PathBuf, git2::Oid>,
+    ) -> Result<()> {
+        for entry in tree.iter() {
+            let name = entry
+                .name()
+                .context("primary HEAD tree entry is not valid UTF-8")?;
+            let path = prefix.join(name);
+            match entry.kind() {
+                Some(git2::ObjectType::Blob) => {
+                    blobs.insert(path, entry.id());
+                }
+                Some(git2::ObjectType::Tree) => {
+                    let subtree = repository.find_tree(entry.id())?;
+                    collect(repository, &subtree, path, blobs)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    let repository = crate::git_repository::open(repo)?;
+    let tree = repository.find_commit(head)?.tree()?;
+    let mut blobs = BTreeMap::new();
+    collect(&repository, &tree, PathBuf::new(), &mut blobs)?;
+    Ok(blobs)
+}
+
+#[cfg(unix)]
+fn snapshot_worktree_status(repo: &Path) -> Result<BTreeMap<PathBuf, u32>> {
+    let repository = crate::git_repository::open(repo)?;
+    let mut options = git2::StatusOptions::new();
+    options.include_untracked(true).recurse_untracked_dirs(true);
+    let statuses = repository.statuses(Some(&mut options))?;
+    let mut snapshot = BTreeMap::new();
+    for entry in statuses.iter() {
+        let status = entry.status();
+        let path = PathBuf::from(
+            entry
+                .path()
+                .context("worktree status path is not valid UTF-8")?,
+        );
+        if status == git2::Status::WT_NEW && crate::repo_map::is_runtime_control_path(&path) {
+            continue;
+        }
+        snapshot.insert(path, status.bits());
+    }
+    Ok(snapshot)
+}
+
+#[cfg(unix)]
 fn snapshot_managed_git_tree(root: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
     fn visit(root: &Path, current: &Path, snapshot: &mut BTreeMap<PathBuf, Vec<u8>>) -> Result<()> {
         for entry in fs::read_dir(current)? {
@@ -4671,6 +4745,412 @@ printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-sessio
         "bounded worktree effect\n"
     );
     assert_eq!(fs::read_to_string(outside)?, "outside\n");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+const GROK_PRODUCTION_HELPER_ENV: &str = "MACO_TEST_GROK_PRODUCTION_HELPER";
+#[cfg(target_os = "linux")]
+const GROK_PRODUCTION_HELPER_RECEIPT_ENV: &str = "MACO_TEST_GROK_PRODUCTION_HELPER_RECEIPT";
+#[cfg(target_os = "linux")]
+const GROK_PRODUCTION_HELPER_RECEIPT: &[u8] = b"writable Grok production helper completed\n";
+#[cfg(target_os = "linux")]
+const GROK_PRODUCTION_TEST_NAME: &str = "external_agent::tests::writable_grok_run_external_agent_accepts_one_isolated_effect_and_preserves_primary";
+
+#[cfg(target_os = "linux")]
+fn write_visible_grok_production_skip(message: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let stderr = std::io::stderr();
+    let mut stderr = stderr.lock();
+    writeln!(stderr, "{message}")?;
+    stderr.flush()
+}
+
+#[cfg(target_os = "linux")]
+fn run_writable_grok_production_helper_subprocess() -> Result<()> {
+    const HELPER_STDERR_MAX_BYTES: usize = 64 * 1024;
+
+    let temp = tempfile::tempdir()?;
+    let grok_home = temp.path().join("grok-home");
+    let receipt = temp.path().join("helper-completed");
+    fs::create_dir(&grok_home)?;
+    fs::write(grok_home.join("auth.json"), "hermetic-grok-auth-fixture\n")?;
+    if receipt.try_exists()? {
+        bail!("writable Grok helper receipt must start absent");
+    }
+
+    let environment = BTreeMap::from([
+        (GROK_PRODUCTION_HELPER_ENV.to_string(), "1".to_string()),
+        (
+            GROK_PRODUCTION_HELPER_RECEIPT_ENV.to_string(),
+            receipt
+                .to_str()
+                .context("writable Grok helper receipt path is not UTF-8")?
+                .to_string(),
+        ),
+        (
+            "GROK_HOME".to_string(),
+            grok_home
+                .to_str()
+                .context("writable Grok helper home path is not UTF-8")?
+                .to_string(),
+        ),
+    ]);
+    let output = crate::process_runner::run_process(
+        ProcessSpec::direct(
+            "exact writable Grok production helper test",
+            std::env::current_exe()?,
+            [
+                "--exact",
+                GROK_PRODUCTION_TEST_NAME,
+                "--nocapture",
+                "--test-threads=1",
+            ],
+            std::env::current_dir()?,
+            HELPER_STDERR_MAX_BYTES,
+        )
+        .with_environment(EnvironmentMode::InheritAndSet(environment))
+        .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort)
+        .with_stdin(StdinMode::Null)
+        .with_timeout(Some(Duration::from_secs(90)))
+        .with_stdout(StreamCapture::bounded(0))
+        .with_stderr(StreamCapture::bounded(HELPER_STDERR_MAX_BYTES)),
+    )
+    .context("spawn exact writable Grok production helper test")?;
+    let stderr_truncated = output.stderr.is_truncated();
+    let stderr = String::from_utf8_lossy(output.stderr.as_bytes());
+    if !output
+        .status
+        .as_ref()
+        .is_some_and(|status| status.success())
+        || output.timed_out
+        || output.process_error.is_some()
+        || output.stdin_error.is_some()
+    {
+        let status = output
+            .status
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "unavailable".to_string());
+        bail!(
+            "writable Grok production helper failed with status {status}; timed_out={}; process_error={:?}; stdin_error={:?}; captured stderr (truncated={}):\n{}",
+            output.timed_out,
+            output.process_error.as_deref(),
+            output.stdin_error.as_deref(),
+            stderr_truncated,
+            stderr
+        );
+    }
+    let observed_receipt = fs::read(&receipt).with_context(|| {
+        format!(
+            "exact writable Grok test subprocess returned success without its helper receipt; captured stderr (truncated={stderr_truncated}):\n{stderr}"
+        )
+    })?;
+    if observed_receipt.as_slice() != GROK_PRODUCTION_HELPER_RECEIPT {
+        bail!(
+            "exact writable Grok test subprocess wrote an invalid helper receipt; captured stderr (truncated={stderr_truncated}):\n{stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn writable_grok_run_external_agent_accepts_one_isolated_effect_and_preserves_primary() -> Result<()>
+{
+    let cgroups = fs::read_to_string("/proc/self/cgroup")?;
+    if let Some(message) =
+        crate::containment_probe::skip_reason(GROK_PRODUCTION_TEST_NAME, &cgroups)
+    {
+        write_visible_grok_production_skip(&message)?;
+        return Ok(());
+    }
+    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none()
+        && std::env::var_os("XDG_RUNTIME_DIR").is_none()
+    {
+        write_visible_grok_production_skip(&format!(
+            "SKIP {GROK_PRODUCTION_TEST_NAME}: DBUS_SESSION_BUS_ADDRESS and XDG_RUNTIME_DIR are both absent"
+        ))?;
+        return Ok(());
+    }
+    match std::env::var_os(GROK_PRODUCTION_HELPER_ENV) {
+        None => return run_writable_grok_production_helper_subprocess(),
+        Some(value) if value == std::ffi::OsStr::new("1") => {}
+        Some(_) => bail!("writable Grok production helper selector must be unset or exactly 1"),
+    }
+    writable_grok_run_external_agent_helper()
+}
+
+#[cfg(target_os = "linux")]
+fn writable_grok_run_external_agent_helper() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    const STRUCTURED_OUTPUT_SCHEMA: &str = r#"{"properties":{"accepted":{"type":"boolean"},"path":{"type":"string"}},"required":["accepted","path"],"type":"object"}"#;
+    const APPROVAL_RECORD: &str = "approval-contract:sandbox=strict;headless=always-approve;web-search=disabled;memory=disabled;subagents=disabled";
+
+    let grok_home = PathBuf::from(
+        std::env::var_os("GROK_HOME")
+            .context("writable Grok production helper requires process-local GROK_HOME")?,
+    );
+    assert_eq!(
+        fs::read_to_string(grok_home.join("auth.json"))?,
+        "hermetic-grok-auth-fixture\n"
+    );
+    let helper_receipt = PathBuf::from(
+        std::env::var_os(GROK_PRODUCTION_HELPER_RECEIPT_ENV)
+            .context("writable Grok production helper requires a completion receipt path")?,
+    );
+    if helper_receipt.try_exists()? {
+        bail!("writable Grok production helper receipt must start absent");
+    }
+
+    let temp = tempfile::tempdir()?;
+    let repos = temp.path().join("repos");
+    fs::create_dir(&repos)?;
+    let (primary, child, _common, _child_git_dir) = create_linked_git_metadata_fixture(&repos)?;
+    let incoming = temp.path().join("incoming");
+    let prompt_root = temp.path().join("prompt-root");
+    let schema_root = temp.path().join("schema-root");
+    let bin = temp.path().join("bin");
+    fs::create_dir(&incoming)?;
+    fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+    fs::create_dir(&prompt_root)?;
+    fs::create_dir(&schema_root)?;
+    fs::create_dir(&bin)?;
+    let prompt = prompt_root.join("prompt.md");
+    fs::write(&prompt, "write the claimed bounded result\n")?;
+    let schema = schema_root.join("worker-report.schema.json");
+    fs::write(&schema, STRUCTURED_OUTPUT_SCHEMA)?;
+    let program = bin.join("fake-grok-provider");
+    fs::write(
+        &program,
+        r#"#!/bin/sh
+set -eu
+[ "$#" -eq 18 ]
+[ "$1" = "--prompt-file" ]
+[ "$3" = "--model" ]
+[ "$4" = "grok-4.6" ]
+[ "$5" = "--reasoning-effort" ]
+[ "$6" = "xhigh" ]
+[ "$7" = "--cwd" ]
+[ "$9" = "--json-schema" ]
+[ "${11}" = "--output-format" ]
+[ "${12}" = "streaming-json" ]
+[ "${13}" = "--sandbox" ]
+[ "${14}" = "strict" ]
+[ "${15}" = "--always-approve" ]
+[ "${16}" = "--disable-web-search" ]
+[ "${17}" = "--no-memory" ]
+[ "${18}" = "--no-subagents" ]
+printf '%s\n' 'request-begin' "$@" 'request-end' >&2
+printf '%s\n' 'approval-contract:sandbox=strict;headless=always-approve;web-search=disabled;memory=disabled;subagents=disabled' >&2
+printf '%s\n' 'bounded managed child write' > bounded-result.txt
+printf '%s\n' '{"type":"text","data":"claimed path written"}'
+printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-session","requestId":"fixture-request","structuredOutput":{"accepted":true,"path":"bounded-result.txt"},"usage":{"input_tokens":12,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":4,"reasoning_tokens":0,"total_tokens":16}}'
+"#,
+    )?;
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755))?;
+
+    let primary_before = snapshot_primary_git_surface(&primary)?;
+    let tracked_before = snapshot_tracked_head_blobs(&primary, primary_before.0)?;
+    let primary_status_before = snapshot_worktree_status(&primary)?;
+    let child_status_before = snapshot_worktree_status(&child)?;
+
+    let unproved = ExternalAgentCommand::codex(
+        &program,
+        &child,
+        &prompt,
+        incoming.join("unproved-events.jsonl"),
+        incoming.join("unproved-report.json"),
+        Duration::from_secs(30),
+    )
+    .with_runtime_adapter(
+        RuntimeId::Grok,
+        RuntimeAdapterConfig::defaults(RuntimeId::Grok),
+    )
+    .with_model_selection(Some("grok-4.6".to_string()), Some("xhigh".to_string()))
+    .with_workspace_access(WorkspaceAccess::ReadWrite)
+    .with_writable_launch_target(WritableLaunchTarget::ManagedChildWorktree);
+    let unproved_report = run_external_agent(&unproved);
+    assert!(!unproved_report.stdout.target_launch_attempted);
+    assert_eq!(unproved_report.environment_failures().len(), 1);
+    assert_eq!(
+        unproved_report.environment_failures()[0].category,
+        EnvironmentFailureCategory::SandboxUnavailable
+    );
+    assert!(unproved_report.error.as_deref().is_some_and(|error| {
+        error.contains("writable grok failed closed before launch")
+            && error.contains(WRITABLE_GROK_SELECTION_EVIDENCE_MISSING)
+    }));
+    assert!(!child.join("bounded-result.txt").exists());
+
+    let mut declared =
+        unproved.with_agent_lifecycle(&primary, "worker", "run-grok-acceptance", "grok-worker");
+    declared.json_log = incoming.join("events.jsonl");
+    declared.output_last_message = incoming.join("report.json");
+    declared.output_schema = Some(schema.clone());
+    let command = declared
+        .with_writable_runtime_selection("grok-worker", RuntimeId::Grok, true)?
+        .with_worktree_writable_confinement(writable_grok_confinement(
+            SideEffectConfinement::Verified,
+        ));
+
+    let capabilities = command.verified_writable_capabilities(RuntimeId::Grok)?;
+    assert!(capabilities.admits_worktree_writable());
+    assert!(!capabilities.admits_writable_release());
+    assert_eq!(
+        capabilities.usage_reporting,
+        crate::runtime_adapter::UsageReporting::None
+    );
+    assert_eq!(
+        RuntimeId::Codex.capabilities().usage_reporting,
+        crate::runtime_adapter::UsageReporting::PerTurn
+    );
+    assert!(RuntimeId::Codex.capabilities().admits_worktree_writable());
+    assert_eq!(
+        RuntimeId::Fake.capabilities().worktree_writable_refusal(),
+        Some("writable_workspace == unsupported")
+    );
+    assert!(!RuntimeId::Fake.capabilities().admits_writable_release());
+
+    let controls = protected_worktree_controls(&command)?;
+    let profile = external_side_effect_profile(
+        &command,
+        &program,
+        ExternalProgramTrust::ExplicitCustom,
+        &controls,
+    )?;
+    let SideEffectConfinementProfile::ExternalGrok(profile) = profile else {
+        bail!("expected MACO ExternalGrok confinement profile");
+    };
+    assert_eq!(profile.workspace_access(), WorkspaceAccess::ReadWrite);
+    let canonical_primary = fs::canonicalize(&primary)?;
+    let canonical_incoming = fs::canonicalize(&incoming)?;
+    assert!(!profile
+        .visible_read_write_roots()
+        .contains(&canonical_primary));
+    assert!(profile.writable_artifact_roots().is_empty());
+    assert!(!profile
+        .visible_read_write_roots()
+        .contains(&canonical_incoming));
+
+    let expected_request = vec![
+        "--prompt-file".to_string(),
+        prompt.to_str().context("UTF-8 prompt path")?.to_string(),
+        "--model".to_string(),
+        "grok-4.6".to_string(),
+        "--reasoning-effort".to_string(),
+        "xhigh".to_string(),
+        "--cwd".to_string(),
+        child.to_str().context("UTF-8 child path")?.to_string(),
+        "--json-schema".to_string(),
+        STRUCTURED_OUTPUT_SCHEMA.to_string(),
+        "--output-format".to_string(),
+        "streaming-json".to_string(),
+        "--sandbox".to_string(),
+        "strict".to_string(),
+        "--always-approve".to_string(),
+        "--disable-web-search".to_string(),
+        "--no-memory".to_string(),
+        "--no-subagents".to_string(),
+    ];
+    let mut expected_stderr = vec!["request-begin".to_string()];
+    expected_stderr.extend(expected_request);
+    expected_stderr.push("request-end".to_string());
+    expected_stderr.push(APPROVAL_RECORD.to_string());
+
+    let report = run_external_agent(&command);
+    assert!(
+        report.error.is_none(),
+        "writable Grok production path failed: {:?}",
+        report.error
+    );
+    assert_eq!(report.exit_code, Some(0));
+    assert!(!report.timed_out);
+    assert!(report.stdout.target_launch_attempted);
+    assert_eq!(
+        report.side_effects,
+        Some(SideEffectConfinementEvidence::Verified(
+            SideEffectConfinementProfileKind::ExternalGrok
+        ))
+    );
+    assert!(report
+        .process_tree
+        .is_some_and(ProcessTreeEvidence::is_verified_empty));
+    assert_eq!(
+        std::str::from_utf8(&report.stderr.bytes)?,
+        format!("{}\n", expected_stderr.join("\n"))
+    );
+    assert_eq!(
+        fs::read_to_string(child.join("bounded-result.txt"))?,
+        "bounded managed child write\n"
+    );
+    let mut expected_child_status = child_status_before;
+    expected_child_status.insert(
+        PathBuf::from("bounded-result.txt"),
+        git2::Status::WT_NEW.bits(),
+    );
+    assert_eq!(snapshot_worktree_status(&child)?, expected_child_status);
+    assert!(!primary.join("bounded-result.txt").exists());
+    assert_eq!(
+        report.output_last_message(),
+        Some(br#"{"accepted":true,"path":"bounded-result.txt"}"#.as_slice())
+    );
+
+    let captured = if report.stdout_bytes().is_empty() {
+        fs::read(&command.json_log)?
+    } else {
+        report.stdout_bytes().to_vec()
+    };
+    let parsed = command
+        .current_grok_writable_contract()?
+        .parse_output(&captured)?;
+    assert_eq!(parsed.events().len(), 2);
+    assert_eq!(parsed.response_text(), "claimed path written");
+    let crate::runtime_adapter::grok::GrokUsageStatus::Native(usage) = parsed.usage_status() else {
+        bail!(
+            "fixture native end event must expose exact usage, got {:?}",
+            parsed.usage_status()
+        );
+    };
+    assert_eq!(usage.input_tokens(), 12);
+    assert_eq!(usage.output_tokens(), 4);
+    assert_eq!(usage.total_tokens(), Some(16));
+    assert!(codex_usage_from_jsonl(&captured)?.is_none());
+
+    assert_eq!(snapshot_primary_git_surface(&primary)?, primary_before);
+    assert_eq!(snapshot_worktree_status(&primary)?, primary_status_before);
+    assert_eq!(
+        snapshot_tracked_head_blobs(&primary, primary_before.0)?,
+        tracked_before
+    );
+    assert_eq!(
+        fs::read_to_string(primary.join("RELEASE_NOTES.md"))?,
+        "initial\n"
+    );
+
+    let primary_launch = command
+        .clone()
+        .with_writable_launch_target(WritableLaunchTarget::PrimaryWorktree);
+    let primary_report = run_external_agent(&primary_launch);
+    assert!(!primary_report.stdout.target_launch_attempted);
+    assert_eq!(primary_report.environment_failures().len(), 1);
+    assert_eq!(
+        primary_report.environment_failures()[0].category,
+        EnvironmentFailureCategory::SandboxUnavailable
+    );
+    assert!(primary_report.error.as_deref().is_some_and(|error| {
+        error.contains("writable grok failed closed before launch")
+            && error.contains("blocking_pre_action_callback != All")
+    }));
+    assert_eq!(snapshot_primary_git_surface(&primary)?, primary_before);
+    assert_eq!(snapshot_worktree_status(&primary)?, primary_status_before);
+    assert_eq!(
+        snapshot_tracked_head_blobs(&primary, primary_before.0)?,
+        tracked_before
+    );
+    fs::write(&helper_receipt, GROK_PRODUCTION_HELPER_RECEIPT)?;
     Ok(())
 }
 

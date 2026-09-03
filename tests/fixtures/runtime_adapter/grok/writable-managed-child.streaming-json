@@ -1,0 +1,2 @@
+{"type":"text","data":"claimed path written"}
+{"type":"end","stopReason":"end_turn","sessionId":"fixture-session","requestId":"fixture-request","structuredOutput":{"accepted":true,"path":"bounded-result.txt"},"usage":{"input_tokens":12,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":4,"reasoning_tokens":0,"total_tokens":16}}
