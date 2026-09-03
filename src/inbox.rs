@@ -1,6 +1,8 @@
 pub mod review_loop;
 pub mod review_loop_entry;
 
+use self::review_loop_entry::InboxIndependentAuditorSelectionEvidence;
+
 use crate::{
     artifacts::{
         self, ArtifactFileDisposition, ArtifactRunReader, ArtifactRunWriter, RunArtifactFamily,
@@ -32,8 +34,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File},
-    io::Write,
+    env,
+    ffi::OsString,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
     process, thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -101,6 +105,12 @@ const PR_OBJECT_FETCH_MAX_OBJECTS: usize = 131_072;
 const PR_OBJECT_FETCH_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const PR_OBJECT_FETCH_MAX_GRAPH_STEPS: usize = PR_OBJECT_FETCH_MAX_OBJECTS * 4;
 const PR_OBJECT_FETCH_TIMEOUT: Duration = Duration::from_secs(300);
+const APPROVED_GITHUB_LOGIN_CONFIG_KEY: &str = "agentFiles.approvedGitHubLogin";
+const APPROVED_GITHUB_ACTOR_CAPTURE_LIMIT: usize = 4 * 1024;
+const APPROVED_GITHUB_ACTOR_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_GITHUB_TOKEN_BYTES: usize = 16 * 1024;
+const MAX_PR_OBSERVATION_DETAIL_CHARS: usize = 256;
+const MAX_REPOSITORY_CONFIG_BYTES: usize = 128 * 1024;
 
 pub const DEFAULT_ROLLING_WINDOW_SECONDS: u64 =
     crate::budget_ledger::DEFAULT_ROLLING_WINDOW_SECONDS;
@@ -1612,6 +1622,547 @@ pub fn run_inbox(options: InboxRunOptions) -> Result<InboxRunReport> {
     run_inbox_with_rolling_budget(options, None)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxPrObservationFailureClass {
+    ProviderUnavailable,
+    MalformedProviderResponse,
+    InvalidProviderGroundTruth,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxPrObservationError {
+    pub classification: InboxPrObservationFailureClass,
+    pub detail: String,
+}
+
+impl InboxPrObservationError {
+    fn new(classification: InboxPrObservationFailureClass, detail: impl AsRef<str>) -> Self {
+        Self {
+            classification,
+            detail: bounded_pr_observation_detail(detail.as_ref()),
+        }
+    }
+}
+
+impl std::fmt::Display for InboxPrObservationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.detail)
+    }
+}
+
+impl std::error::Error for InboxPrObservationError {}
+
+fn bounded_pr_observation_detail(detail: &str) -> String {
+    let mut bounded = detail
+        .chars()
+        .take(MAX_PR_OBSERVATION_DETAIL_CHARS)
+        .collect::<String>();
+    if detail.chars().count() > MAX_PR_OBSERVATION_DETAIL_CHARS {
+        bounded.push_str("...");
+    }
+    bounded
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxApprovedGithubActorFailure {
+    MissingOrAmbiguousPin,
+    MalformedPin,
+    ActorUnavailable,
+    MalformedActorResponse,
+    PinMismatch,
+    BindingChanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxApprovedGithubActorError {
+    pub failure: InboxApprovedGithubActorFailure,
+    pub detail: String,
+}
+
+impl InboxApprovedGithubActorError {
+    fn new(failure: InboxApprovedGithubActorFailure, detail: impl AsRef<str>) -> Self {
+        Self {
+            failure,
+            detail: bounded_pr_observation_detail(detail.as_ref()),
+        }
+    }
+}
+
+impl std::fmt::Display for InboxApprovedGithubActorError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.detail)
+    }
+}
+
+impl std::error::Error for InboxApprovedGithubActorError {}
+
+pub(crate) struct InboxApprovedGithubActorBinding {
+    config_path: PathBuf,
+    approved_login: String,
+    config_bytes: Vec<u8>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl InboxApprovedGithubActorBinding {
+    pub(crate) fn verify_fresh(&self) -> Result<(), InboxApprovedGithubActorError> {
+        let current = capture_repository_config(&self.config_path).map_err(|_| {
+            InboxApprovedGithubActorError::new(
+                InboxApprovedGithubActorFailure::BindingChanged,
+                "repository-local approved GitHub login binding became unavailable",
+            )
+        })?;
+        #[cfg(unix)]
+        let same_identity = self.device == current.device && self.inode == current.inode;
+        #[cfg(not(unix))]
+        let same_identity = false;
+        if !same_identity || self.config_bytes != current.bytes {
+            return Err(InboxApprovedGithubActorError::new(
+                InboxApprovedGithubActorFailure::BindingChanged,
+                "repository-local approved GitHub login binding changed before launch",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for InboxApprovedGithubActorBinding {
+    fn drop(&mut self) {
+        self.config_bytes.fill(0);
+        self.approved_login.clear();
+    }
+}
+
+struct RepositoryConfigCapture {
+    bytes: Vec<u8>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+pub(crate) fn bind_approved_github_actor(
+    repo: &Path,
+) -> Result<InboxApprovedGithubActorBinding, InboxApprovedGithubActorError> {
+    bind_approved_github_actor_with(repo, || authenticated_github_actor(repo))
+}
+
+pub(crate) fn bind_approved_github_actor_with<F>(
+    repo: &Path,
+    actor_lookup: F,
+) -> Result<InboxApprovedGithubActorBinding, InboxApprovedGithubActorError>
+where
+    F: FnOnce() -> Result<String, InboxApprovedGithubActorError>,
+{
+    let repository = crate::git_repository::discover(repo).map_err(|_| {
+        InboxApprovedGithubActorError::new(
+            InboxApprovedGithubActorFailure::MissingOrAmbiguousPin,
+            "repository-local approved GitHub login configuration was unavailable",
+        )
+    })?;
+    let config_path = repository.commondir().join("config");
+    let capture = capture_repository_config(&config_path).map_err(|_| {
+        InboxApprovedGithubActorError::new(
+            InboxApprovedGithubActorFailure::MissingOrAmbiguousPin,
+            "repository-local approved GitHub login configuration was unavailable",
+        )
+    })?;
+    let config = git2::Config::open(&config_path).map_err(|_| {
+        InboxApprovedGithubActorError::new(
+            InboxApprovedGithubActorFailure::MissingOrAmbiguousPin,
+            "repository-local approved GitHub login configuration was unreadable",
+        )
+    })?;
+    let mut values = Vec::new();
+    match config.multivar(APPROVED_GITHUB_LOGIN_CONFIG_KEY, None) {
+        Ok(mut entries) => {
+            while let Some(entry) = entries.next() {
+                let entry = entry.map_err(|_| {
+                    InboxApprovedGithubActorError::new(
+                        InboxApprovedGithubActorFailure::MissingOrAmbiguousPin,
+                        "repository-local approved GitHub login pins could not be enumerated",
+                    )
+                })?;
+                if entry.include_depth() == 0 {
+                    let value = std::str::from_utf8(entry.value_bytes()).map_err(|_| {
+                        InboxApprovedGithubActorError::new(
+                            InboxApprovedGithubActorFailure::MalformedPin,
+                            "repository-local approved GitHub login was not UTF-8",
+                        )
+                    })?;
+                    values.push(value.to_string());
+                }
+            }
+        }
+        Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+        Err(_) => {
+            return Err(InboxApprovedGithubActorError::new(
+                InboxApprovedGithubActorFailure::MissingOrAmbiguousPin,
+                "repository-local approved GitHub login pins could not be enumerated",
+            ));
+        }
+    }
+    if values.len() != 1 || values[0].is_empty() {
+        return Err(InboxApprovedGithubActorError::new(
+            InboxApprovedGithubActorFailure::MissingOrAmbiguousPin,
+            "repository-local approved GitHub login must contain exactly one non-empty value",
+        ));
+    }
+    validate_github_actor_login(&values[0]).map_err(|_| {
+        InboxApprovedGithubActorError::new(
+            InboxApprovedGithubActorFailure::MalformedPin,
+            "repository-local approved GitHub login was malformed",
+        )
+    })?;
+    let binding = InboxApprovedGithubActorBinding {
+        config_path,
+        approved_login: values.remove(0),
+        config_bytes: capture.bytes,
+        #[cfg(unix)]
+        device: capture.device,
+        #[cfg(unix)]
+        inode: capture.inode,
+    };
+    binding.verify_fresh()?;
+    let actual = actor_lookup()?;
+    validate_github_actor_login(&actual).map_err(|_| {
+        InboxApprovedGithubActorError::new(
+            InboxApprovedGithubActorFailure::MalformedActorResponse,
+            "authenticated GitHub actor response was malformed",
+        )
+    })?;
+    if actual != binding.approved_login {
+        return Err(InboxApprovedGithubActorError::new(
+            InboxApprovedGithubActorFailure::PinMismatch,
+            "authenticated GitHub actor did not exactly match the approved repository login",
+        ));
+    }
+    binding.verify_fresh()?;
+    Ok(binding)
+}
+
+fn capture_repository_config(
+    path: &Path,
+) -> std::result::Result<RepositoryConfigCapture, anyhow::Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        let before = fs::symlink_metadata(path)?;
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        let mut file = options.open(path)?;
+        let opened = file.metadata()?;
+        let after = fs::symlink_metadata(path)?;
+        let safe = |metadata: &fs::Metadata| {
+            !metadata.file_type().is_symlink()
+                && metadata.file_type().is_file()
+                && metadata.permissions().mode() & 0o022 == 0
+                && (metadata.uid() == unsafe { libc::geteuid() } || metadata.uid() == 0)
+                && metadata.nlink() == 1
+        };
+        let same = |left: &fs::Metadata, right: &fs::Metadata| {
+            left.dev() == right.dev() && left.ino() == right.ino()
+        };
+        if !safe(&before)
+            || !safe(&opened)
+            || !safe(&after)
+            || !same(&before, &opened)
+            || !same(&opened, &after)
+        {
+            bail!("repository config was not a path-bound trusted regular file");
+        }
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take((MAX_REPOSITORY_CONFIG_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_REPOSITORY_CONFIG_BYTES {
+            bytes.fill(0);
+            bail!("repository config exceeded its safety bound");
+        }
+        Ok(RepositoryConfigCapture {
+            bytes,
+            device: opened.dev(),
+            inode: opened.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        bail!("repository config identity verification is unsupported on this platform")
+    }
+}
+
+fn validate_github_actor_login(login: &str) -> Result<()> {
+    if login.is_empty()
+        || login.len() > MAX_GITHUB_LOGIN_BYTES
+        || matches!(login, "." | "..")
+        || !login
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        bail!("GitHub actor login was malformed");
+    }
+    Ok(())
+}
+
+fn authenticated_github_actor(repo: &Path) -> Result<String, InboxApprovedGithubActorError> {
+    let mut token = approved_github_actor_token()?;
+    let mut runtime = crate::merge::PrivateRuntimeDirectory::create(
+        repo,
+        crate::merge::PrivateRuntimeKind::GhConfig,
+    )
+    .map_err(|_| {
+        InboxApprovedGithubActorError::new(
+            InboxApprovedGithubActorFailure::ActorUnavailable,
+            "authenticated GitHub actor runtime was unavailable",
+        )
+    })?;
+    let directory = runtime.path().to_path_buf();
+    let result = (|| {
+        let token_text = std::str::from_utf8(&token).map_err(|_| {
+            InboxApprovedGithubActorError::new(
+                InboxApprovedGithubActorFailure::ActorUnavailable,
+                "GitHub authentication token was malformed",
+            )
+        })?;
+        let hosts_path = directory.join("hosts.yml");
+        let hosts =
+            format!("'github.com':\n    oauth_token: '{token_text}'\n    git_protocol: https\n");
+        crate::merge::write_private_file(&hosts_path, hosts.as_bytes()).map_err(|_| {
+            InboxApprovedGithubActorError::new(
+                InboxApprovedGithubActorFailure::ActorUnavailable,
+                "authenticated GitHub actor configuration was unavailable",
+            )
+        })?;
+        let mut environment = crate::merge::minimal_network_environment().map_err(|_| {
+            InboxApprovedGithubActorError::new(
+                InboxApprovedGithubActorFailure::ActorUnavailable,
+                "authenticated GitHub actor environment was unavailable",
+            )
+        })?;
+        for key in [
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_ATTR_NOSYSTEM",
+            "GIT_OPTIONAL_LOCKS",
+            "GIT_TERMINAL_PROMPT",
+        ] {
+            environment.remove(key);
+        }
+        environment.insert(
+            "GH_CONFIG_DIR".to_string(),
+            directory
+                .to_str()
+                .ok_or_else(|| {
+                    InboxApprovedGithubActorError::new(
+                        InboxApprovedGithubActorFailure::ActorUnavailable,
+                        "authenticated GitHub actor runtime path was not UTF-8",
+                    )
+                })?
+                .to_string(),
+        );
+        environment.insert("GH_PROMPT_DISABLED".to_string(), "1".to_string());
+        let output = crate::merge::run_required_network_direct(
+            "gh authenticated actor",
+            crate::merge::resolve_trusted_executable("gh").map_err(|_| {
+                InboxApprovedGithubActorError::new(
+                    InboxApprovedGithubActorFailure::ActorUnavailable,
+                    "trusted gh executable was unavailable",
+                )
+            })?,
+            ["api", "user", "--jq", ".login"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+            &directory,
+            environment,
+            StdinMode::Null,
+            APPROVED_GITHUB_ACTOR_TIMEOUT,
+            APPROVED_GITHUB_ACTOR_CAPTURE_LIMIT,
+            0,
+            TrustedFixedNetworkProfile::read_write(&directory)
+                .with_resource_limits(ProcessResourceLimits::default())
+                .with_visible_read_only_file(&hosts_path),
+        )
+        .map_err(|_| {
+            InboxApprovedGithubActorError::new(
+                InboxApprovedGithubActorFailure::ActorUnavailable,
+                "authenticated GitHub actor lookup was unavailable",
+            )
+        })?;
+        if !output.success {
+            return Err(InboxApprovedGithubActorError::new(
+                InboxApprovedGithubActorFailure::ActorUnavailable,
+                "authenticated GitHub actor lookup failed",
+            ));
+        }
+        let stdout = std::str::from_utf8(&output.stdout).map_err(|_| {
+            InboxApprovedGithubActorError::new(
+                InboxApprovedGithubActorFailure::MalformedActorResponse,
+                "authenticated GitHub actor response was not UTF-8",
+            )
+        })?;
+        let login = stdout.strip_suffix('\n').unwrap_or(stdout);
+        if login.contains(['\r', '\n']) {
+            return Err(InboxApprovedGithubActorError::new(
+                InboxApprovedGithubActorFailure::MalformedActorResponse,
+                "authenticated GitHub actor response contained multiple lines",
+            ));
+        }
+        Ok(login.to_string())
+    })();
+    token.fill(0);
+    let cleanup = runtime.close().map_err(|_| {
+        InboxApprovedGithubActorError::new(
+            InboxApprovedGithubActorFailure::ActorUnavailable,
+            "authenticated GitHub actor runtime cleanup failed",
+        )
+    });
+    match (result, cleanup) {
+        (Ok(login), Ok(())) => Ok(login),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn approved_github_actor_token() -> Result<Vec<u8>, InboxApprovedGithubActorError> {
+    let values = ["GH_TOKEN", "GITHUB_TOKEN"]
+        .into_iter()
+        .filter_map(|key| env::var(key).ok())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let Some(first) = values.first() else {
+        return Err(InboxApprovedGithubActorError::new(
+            InboxApprovedGithubActorFailure::ActorUnavailable,
+            "authenticated GitHub actor lookup requires GH_TOKEN or GITHUB_TOKEN",
+        ));
+    };
+    if values.iter().any(|value| value != first) {
+        return Err(InboxApprovedGithubActorError::new(
+            InboxApprovedGithubActorFailure::ActorUnavailable,
+            "GitHub authentication token variables were ambiguous",
+        ));
+    }
+    if first.len() < 4
+        || first.len() > MAX_GITHUB_TOKEN_BYTES
+        || first
+            .bytes()
+            .any(|byte| !byte.is_ascii_alphanumeric() && !matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(InboxApprovedGithubActorError::new(
+            InboxApprovedGithubActorFailure::ActorUnavailable,
+            "GitHub authentication token was malformed or oversized",
+        ));
+    }
+    Ok(first.as_bytes().to_vec())
+}
+
+/// Read one exact GitHub pull request through the trusted Inbox source
+/// boundary without accepting requester-supplied PR fields as ground truth.
+pub(crate) fn observe_inbox_pr_event(
+    options: &InboxRunOptions,
+    number: u64,
+) -> std::result::Result<InboxItem, InboxPrObservationError> {
+    observe_inbox_pr_event_with(options, number, |repo, selector, number| {
+        publication::view_github_source_item(
+            repo,
+            selector,
+            number,
+            ExternalSourceObjectKind::PullRequest,
+        )
+        .map_err(|error| {
+            InboxPrObservationError::new(
+                InboxPrObservationFailureClass::ProviderUnavailable,
+                format!("GitHub PR provider transport was unavailable: {error:#}"),
+            )
+        })
+    })
+}
+
+fn observe_inbox_pr_event_with<F>(
+    options: &InboxRunOptions,
+    number: u64,
+    view: F,
+) -> std::result::Result<InboxItem, InboxPrObservationError>
+where
+    F: FnOnce(&Path, &str, u64) -> std::result::Result<Value, InboxPrObservationError>,
+{
+    let unavailable = |error: anyhow::Error| {
+        InboxPrObservationError::new(
+            InboxPrObservationFailureClass::ProviderUnavailable,
+            format!("GitHub PR observation preflight was unavailable: {error:#}"),
+        )
+    };
+    if number == 0 {
+        return Err(InboxPrObservationError::new(
+            InboxPrObservationFailureClass::InvalidProviderGroundTruth,
+            "GitHub PR observation requires a positive pull-request number",
+        ));
+    }
+    validate_cli_source_options(
+        options.github,
+        options.permission_mode,
+        options.max_items,
+        options.codex_bin.as_deref(),
+    )
+    .map_err(unavailable)?;
+    let repo = discover_repo_root(&options.repo).map_err(unavailable)?;
+    let loaded = load_config_with_config_overrides(
+        &repo,
+        InboxConfigOverrides {
+            max_items: Some(1),
+            issues: Some(false),
+            pull_requests: Some(true),
+            authenticated_pr_event: true,
+            ..InboxConfigOverrides::default()
+        },
+    )
+    .map_err(unavailable)?;
+    let permission_mode =
+        effective_permission_mode(&loaded.config, options.github, options.permission_mode);
+    if !permission_mode.uses_github_intake() {
+        return Err(InboxPrObservationError::new(
+            InboxPrObservationFailureClass::ProviderUnavailable,
+            "production PR observation requires an explicit GitHub Inbox permission mode",
+        ));
+    }
+    let source_repository =
+        source_repository_binding_context(&repo, &loaded.config, true).map_err(unavailable)?;
+    let value = view(&repo, &source_repository.selector, number)?;
+    let raw = raw_pr_from_value(&value, &loaded.config, &source_repository).map_err(|error| {
+        InboxPrObservationError::new(
+            InboxPrObservationFailureClass::MalformedProviderResponse,
+            format!("GitHub PR provider response was malformed: {error:#}"),
+        )
+    })?;
+    if raw.number != number {
+        return Err(InboxPrObservationError::new(
+            InboxPrObservationFailureClass::InvalidProviderGroundTruth,
+            "exact GitHub PR observation returned a different pull-request number",
+        ));
+    }
+    let item =
+        pr_item(raw, &loaded.config, &source_repository, &BTreeMap::new()).map_err(|error| {
+            InboxPrObservationError::new(
+                InboxPrObservationFailureClass::InvalidProviderGroundTruth,
+                format!("GitHub PR provider ground truth was invalid: {error:#}"),
+            )
+        })?;
+    item.source_snapshot.validate().map_err(|error| {
+        InboxPrObservationError::new(
+            InboxPrObservationFailureClass::InvalidProviderGroundTruth,
+            format!("GitHub PR provider snapshot was invalid: {error:#}"),
+        )
+    })?;
+    Ok(item)
+}
+
 /// Resolve the exact provider-owned PR snapshot before any auditor or
 /// publication effect is admitted for an authenticated intake event.
 pub(crate) fn preflight_inbox_pr_event(
@@ -1657,6 +2208,9 @@ pub(crate) fn run_inbox_for_pr_event(
     number: u64,
     expected_head_oid: &str,
     expected_task: &InboxIndependentAuditMergeLaneTask,
+    before_auditor_launch: Option<
+        &mut dyn FnMut(&str, &InboxIndependentAuditorSelectionEvidence) -> Result<()>,
+    >,
 ) -> Result<InboxRunReport> {
     options.max_items = None;
     run_inbox_with_overrides(
@@ -1674,6 +2228,7 @@ pub(crate) fn run_inbox_for_pr_event(
             authenticated_pr_event: true,
             ..InboxConfigOverrides::default()
         },
+        before_auditor_launch,
     )
 }
 
@@ -1685,6 +2240,7 @@ pub fn run_inbox_with_rolling_budget(
         options,
         rolling_budget_quota,
         InboxConfigOverrides::default(),
+        None,
     )
 }
 
@@ -1692,6 +2248,9 @@ fn run_inbox_with_overrides(
     options: InboxRunOptions,
     rolling_budget_quota: Option<InboxRollingBudgetQuota>,
     mut overrides: InboxConfigOverrides,
+    mut before_auditor_launch: Option<
+        &mut dyn FnMut(&str, &InboxIndependentAuditorSelectionEvidence) -> Result<()>,
+    >,
 ) -> Result<InboxRunReport> {
     validate_cli_source_options(
         options.github,
@@ -1858,14 +2417,15 @@ fn run_inbox_with_overrides(
     let mut refusals = Vec::new();
     for (zero_index, item) in selected_items.iter().enumerate() {
         let item_index = zero_index.saturating_add(1);
-        let outcome = run_inbox_item(
-            &mut artifact_writer,
-            InboxItemRunInput {
-                context: &item_context,
-                item_index,
-                item,
-            },
-        )?;
+        let input = InboxItemRunInput {
+            context: &item_context,
+            item_index,
+            item,
+        };
+        let outcome = match before_auditor_launch.as_mut() {
+            Some(hook) => run_inbox_item(&mut artifact_writer, input, Some(&mut **hook))?,
+            None => run_inbox_item(&mut artifact_writer, input, None)?,
+        };
         item_reports.push(outcome.report);
         if let Some(refusal) = outcome.refusal {
             refusals.push(refusal);
@@ -2077,6 +2637,7 @@ pub fn run_workspace_inbox(options: InboxWorkspaceRunOptions) -> Result<InboxWor
             },
             None,
             workspace_overrides_for_repo(&spec),
+            None,
         );
         match run_result {
             Ok(run_report) => {
@@ -2713,6 +3274,9 @@ struct InboxItemRunInput<'a> {
 fn run_inbox_item(
     writer: &mut ArtifactRunWriter,
     input: InboxItemRunInput<'_>,
+    before_auditor_launch: Option<
+        &mut dyn FnMut(&str, &InboxIndependentAuditorSelectionEvidence) -> Result<()>,
+    >,
 ) -> Result<InboxItemRunOutcome> {
     let context = input.context;
     let item_index = input.item_index;
@@ -2743,6 +3307,7 @@ fn run_inbox_item(
             review_loop,
             pr_intake,
             source_fresh,
+            before_auditor_launch,
         );
     }
     let plan = autopilot_plan_for_item(item, config, permission_mode)?;
@@ -2949,6 +3514,9 @@ fn run_independent_audit_intake_item(
     review_loop: Option<review_loop_entry::InboxReviewLoopReport>,
     pr_intake: InboxPrIntakeReport,
     source_fresh: bool,
+    before_auditor_launch: Option<
+        &mut dyn FnMut(&str, &InboxIndependentAuditorSelectionEvidence) -> Result<()>,
+    >,
 ) -> Result<InboxItemRunOutcome> {
     run_independent_audit_intake_item_with_runner(
         writer,
@@ -2957,6 +3525,7 @@ fn run_independent_audit_intake_item(
         pr_intake,
         source_fresh,
         None,
+        before_auditor_launch,
         verified_independent_audit_runner,
     )
 }
@@ -3002,6 +3571,9 @@ fn run_independent_audit_intake_item_with_runner<F>(
     pr_intake: InboxPrIntakeReport,
     source_fresh: bool,
     available_models_override: Option<&BTreeSet<String>>,
+    before_auditor_launch: Option<
+        &mut dyn FnMut(&str, &InboxIndependentAuditorSelectionEvidence) -> Result<()>,
+    >,
     mut external_runner: F,
 ) -> Result<InboxItemRunOutcome>
 where
@@ -3130,7 +3702,9 @@ where
         );
         return finish_independent_audit_lane_item(writer, input, review_loop, pr_intake, lane);
     }
-    let task = task.expect("checked source-bound independent-audit task");
+    let Some(task) = task else {
+        bail!("source-bound independent-audit task disappeared after blocker evaluation");
+    };
     if item.source_snapshot.provider() == InboxSourceProvider::Github
         && materialize_and_verify_local_independent_audit_candidate(context.repo, item, task)
             .is_err()
@@ -3255,6 +3829,11 @@ where
         command = command.with_machine_global_retention(
             machine_global.retention_binding_for_run(&autopilot_run_id),
         );
+    }
+    if let Some(hook) = before_auditor_launch {
+        hook(&auditor_session_id, &selection).context(
+            "persist authenticated PR intake start immediately before independent-auditor launch",
+        )?;
     }
     let runner_result = external_runner(&command);
     let raw_output = runner_result.raw_output.clone();
@@ -5078,17 +5657,23 @@ fn pr_intake_report_for_item(item: &InboxItem) -> Option<InboxPrIntakeReport> {
         }
     };
 
-    let (status, task, launch_block) = match block_reason {
-        None => (
+    let ready_evidence = match (head_oid, base_oid, producer_login) {
+        (Some(head_oid), Some(base_oid), Some(producer_login)) => {
+            Some((head_oid, base_oid, producer_login))
+        }
+        _ => None,
+    };
+    let (status, task, launch_block) = match (block_reason, ready_evidence) {
+        (None, Some((head_oid, base_oid, producer_login))) => (
             InboxPrIntakeStatus::Ready,
             Some(InboxIndependentAuditMergeLaneTask {
                 version: INBOX_SCHEMA_VERSION,
                 task_kind,
                 source_snapshot_digest: item.source_snapshot.digest().to_string(),
                 source_updated_at: item.source_snapshot.updated_at().to_string(),
-                head_oid: head_oid.expect("checked PR head OID").to_string(),
-                base_oid: base_oid.expect("checked PR base OID").to_string(),
-                producer_login: producer_login.expect("checked producer identity").to_string(),
+                head_oid: head_oid.to_string(),
+                base_oid: base_oid.to_string(),
+                producer_login: producer_login.to_string(),
                 is_draft: pull_request.is_draft,
                 source_trust: pull_request.source_trust,
                 head_repository: pull_request.head_repository.clone(),
@@ -5106,7 +5691,7 @@ fn pr_intake_report_for_item(item: &InboxItem) -> Option<InboxPrIntakeReport> {
             }),
             None,
         ),
-        Some((reason, evidence)) => (
+        (Some((reason, evidence)), _) => (
             InboxPrIntakeStatus::LaunchBlocked,
             None,
             Some(InboxPrLaunchBlockReport {
@@ -5115,6 +5700,22 @@ fn pr_intake_report_for_item(item: &InboxItem) -> Option<InboxPrIntakeReport> {
                 success: false,
                 reason: reason.to_string(),
                 missing_evidence: evidence,
+                grants_merge_permission: false,
+                auto_merge_performed: false,
+                next_action:
+                    "refresh the PR observation and supply the missing evidence before launching an independent auditor"
+                        .to_string(),
+            }),
+        ),
+        (None, None) => (
+            InboxPrIntakeStatus::LaunchBlocked,
+            None,
+            Some(InboxPrLaunchBlockReport {
+                version: INBOX_SCHEMA_VERSION,
+                status: InboxPrIntakeStatus::LaunchBlocked,
+                success: false,
+                reason: "missing_required_evidence".to_string(),
+                missing_evidence: vec!["internally_inconsistent_ready_evidence".to_string()],
                 grants_merge_permission: false,
                 auto_merge_performed: false,
                 next_action:
@@ -5917,6 +6518,7 @@ include!("inbox/part2.rs");
 #[cfg(test)]
 mod pr_intake_always_on_audit_tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn clean_non_draft_pr_is_visible_as_independent_audit_task() {
@@ -6120,6 +6722,15 @@ mod pr_intake_always_on_audit_tests {
         };
         let review_loop = review_loop_entry::evaluate_inbox_item_review_loop(&item);
         let available_models = ["gpt-5.6-sol".to_string()].into_iter().collect();
+        let callback_called = Cell::new(false);
+        let mut before_launch =
+            |session_id: &str, selection: &InboxIndependentAuditorSelectionEvidence| {
+                assert_eq!(session_id, "independent-audit-fake-command-item-1-auditor");
+                assert_eq!(selection.model, "gpt-5.6-sol");
+                assert_eq!(selection.effort, crate::selection::ReasoningEffort::Xhigh);
+                callback_called.set(true);
+                Ok(())
+            };
         let outcome = run_independent_audit_intake_item_with_runner(
             &mut writer,
             InboxItemRunInput {
@@ -6131,7 +6742,12 @@ mod pr_intake_always_on_audit_tests {
             pr_intake,
             true,
             Some(&available_models),
+            Some(&mut before_launch),
             |command| {
+                assert!(
+                    callback_called.get(),
+                    "prelaunch callback must complete before the external runner"
+                );
                 assert_eq!(
                     command.workspace_access,
                     crate::process_runner::WorkspaceAccess::ReadOnly
@@ -6153,6 +6769,7 @@ mod pr_intake_always_on_audit_tests {
             },
         )
         .expect("run fake independent-audit adapter");
+        assert!(callback_called.get());
 
         let lane = outcome.report.independent_audit_lane.expect("lane result");
         assert_eq!(
@@ -6206,6 +6823,7 @@ mod pr_intake_always_on_audit_tests {
             review_loop_entry::evaluate_inbox_item_review_loop(&item),
             pr_intake,
             true,
+            None,
             None,
             |_| panic!("dry run must not launch the independent auditor"),
         )
@@ -6669,6 +7287,98 @@ mod pr_intake_always_on_audit_tests {
                 summaries: Vec::new(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod pr_intake_observation_seam_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn observation_options() -> (TempDir, InboxRunOptions) {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        let repository = Repository::init(&repo_path).expect("initialize repository");
+        repository
+            .remote("origin", "https://github.com/acme/repo.git")
+            .expect("configure canonical origin");
+        let options = InboxRunOptions {
+            repo: repo_path,
+            run_id: RunId::new("typed-pr-observation").expect("run id"),
+            github: true,
+            permission_mode: Some(InboxPermissionMode::GithubRead),
+            dry_run: false,
+            max_items: None,
+            codex_bin: None,
+            machine_global: None,
+        };
+        (temp, options)
+    }
+
+    fn exact_pr_value(number: u64) -> Value {
+        json!({
+            "number": number,
+            "title": "Contributor PR",
+            "body": "Ready for independent audit",
+            "url": format!("https://github.com/acme/repo/pull/{number}"),
+            "author": {"login": "external-contributor"},
+            "labels": [],
+            "updatedAt": "2026-09-03T00:00:00Z",
+            "state": "OPEN",
+            "headRefName": "feature/typed-observation",
+            "baseRefName": "main",
+            "headRefOid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "baseRefOid": "cccccccccccccccccccccccccccccccccccccccc",
+            "isDraft": false,
+            "headRepository": {"nameWithOwner": "acme/repo"},
+            "isCrossRepository": false,
+            "files": [{"path": "src/lib.rs"}],
+            "statusCheckRollup": [{
+                "name": "test",
+                "status": "completed",
+                "conclusion": "success"
+            }],
+            "reviewDecision": null,
+            "latestReviews": []
+        })
+    }
+
+    #[test]
+    fn pr_intake_observation_seam_classifies_provider_unavailability() {
+        let (_temp, options) = observation_options();
+        let error = observe_inbox_pr_event_with(&options, 17, |_, _, _| {
+            Err(InboxPrObservationError::new(
+                InboxPrObservationFailureClass::ProviderUnavailable,
+                "injected transport failure",
+            ))
+        })
+        .expect_err("transport failure must refuse observation");
+        assert_eq!(
+            error.classification,
+            InboxPrObservationFailureClass::ProviderUnavailable
+        );
+    }
+
+    #[test]
+    fn pr_intake_observation_seam_classifies_malformed_provider_schema() {
+        let (_temp, options) = observation_options();
+        let error = observe_inbox_pr_event_with(&options, 17, |_, _, _| Ok(json!({"number": 17})))
+            .expect_err("malformed schema must refuse observation");
+        assert_eq!(
+            error.classification,
+            InboxPrObservationFailureClass::MalformedProviderResponse
+        );
+    }
+
+    #[test]
+    fn pr_intake_observation_seam_classifies_invalid_provider_identity() {
+        let (_temp, options) = observation_options();
+        let error = observe_inbox_pr_event_with(&options, 17, |_, _, _| Ok(exact_pr_value(18)))
+            .expect_err("cross-field identity mismatch must refuse observation");
+        assert_eq!(
+            error.classification,
+            InboxPrObservationFailureClass::InvalidProviderGroundTruth
+        );
     }
 }
 
