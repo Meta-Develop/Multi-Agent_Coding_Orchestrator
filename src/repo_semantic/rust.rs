@@ -183,7 +183,7 @@ impl FileScanner<'_> {
                 let impl_trait = item_impl
                     .trait_
                     .as_ref()
-                    .map(|(_, path, _)| path_to_string(path));
+                    .map(|(path, _)| path_to_string(path));
                 let name = match &impl_trait {
                     Some(trait_name) => format!("impl {trait_name} for {impl_target}"),
                     None => format!("impl {impl_target}"),
