@@ -828,7 +828,7 @@ impl OrchestrateCommand {
             }
             OrchestrateSubcommand::Resume(args) => {
                 let json = args.json;
-                let reap_repo = args.repo.clone().unwrap_or_else(|| PathBuf::from("."));
+                let mut reap_repo = args.repo.clone();
                 let outcome = (|| {
                     let summary = orchestrator::resume_plan_file(OrchestrationResumeOptions {
                         checkpoint_file: args.checkpoint_file,
@@ -837,6 +837,7 @@ impl OrchestrateCommand {
                         jobs: args.jobs,
                         patch_dir: args.patch_dir,
                     })?;
+                    reap_repo = Some(summary.repo.clone());
                     print_orchestration_summary(&summary, json)?;
                     if !summary.success {
                         if let Some(agent_id) = summary.first_failed_agent() {
@@ -846,7 +847,10 @@ impl OrchestrateCommand {
                     }
                     Ok(())
                 })();
-                finish_with_merged_worktree_reap(&reap_repo, json, outcome)
+                match reap_repo {
+                    Some(reap_repo) => finish_with_merged_worktree_reap(&reap_repo, json, outcome),
+                    None => outcome,
+                }
             }
             OrchestrateSubcommand::Collect(args) => {
                 let report = collect_orchestration_results(
