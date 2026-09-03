@@ -1272,14 +1272,16 @@ fn snapshot_worktree_status(repo: &Path) -> Result<BTreeMap<PathBuf, u32>> {
     let statuses = repository.statuses(Some(&mut options))?;
     let mut snapshot = BTreeMap::new();
     for entry in statuses.iter() {
-        snapshot.insert(
-            PathBuf::from(
-                entry
-                    .path()
-                    .context("worktree status path is not valid UTF-8")?,
-            ),
-            entry.status().bits(),
+        let status = entry.status();
+        let path = PathBuf::from(
+            entry
+                .path()
+                .context("worktree status path is not valid UTF-8")?,
         );
+        if status == git2::Status::WT_NEW && crate::repo_map::is_runtime_control_path(&path) {
+            continue;
+        }
+        snapshot.insert(path, status.bits());
     }
     Ok(snapshot)
 }
