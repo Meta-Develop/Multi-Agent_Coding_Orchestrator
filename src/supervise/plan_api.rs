@@ -2,6 +2,86 @@ use super::*;
 use crate::follow_up_queue::GeneratedFollowUpQueueEntrypoint;
 use crate::hierarchy_ledger::{observe_hierarchy, ObservedHierarchyNode};
 
+pub const SUPERVISOR_COLLECT_ARTIFACT_KIND: &str = "supervisor_collect_report";
+pub const SUPERVISOR_COLLECT_SCHEMA_VERSION: u32 = 1;
+pub const SUPERVISOR_COLLECT_SCHEMA_ID: &str = "https://raw.githubusercontent.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/main/schemas/supervisor-collect-report-v1.schema.json";
+pub(super) const SUPERVISOR_COLLECT_UNFINALIZED_PLAN_FILE: &str = "<unavailable-until-finalized>";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorCollectState {
+    Active,
+    Resumable,
+    Uncertain,
+    Interrupted,
+    Finalized,
+    InconsistentFinalized,
+}
+
+impl SupervisorCollectState {
+    fn from_lifecycle(lifecycle: SupervisorRunLifecycle) -> Self {
+        match lifecycle {
+            SupervisorRunLifecycle::Active => Self::Active,
+            SupervisorRunLifecycle::Resumable => Self::Resumable,
+            SupervisorRunLifecycle::Uncertain => Self::Uncertain,
+            SupervisorRunLifecycle::Interrupted => Self::Interrupted,
+            SupervisorRunLifecycle::Finalized => Self::Finalized,
+        }
+    }
+}
+
+/// Public `supervise collect` artifact.
+///
+/// The flattened report projection preserves the version-1 Rust and JSON field
+/// surface for existing finalized consumers. The leading metadata identifies
+/// this as a distinct lifecycle-aware artifact, so non-finalized snapshots are
+/// never advertised as `supervisor-final-report-v1`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SupervisorCollectReport {
+    pub artifact_kind: &'static str,
+    pub schema: &'static str,
+    pub schema_version: u32,
+    pub collection_state: SupervisorCollectState,
+    pub final_report_available: bool,
+    #[serde(flatten)]
+    pub report: SupervisorFinalReport,
+}
+
+impl std::ops::Deref for SupervisorCollectReport {
+    type Target = SupervisorFinalReport;
+
+    fn deref(&self) -> &Self::Target {
+        &self.report
+    }
+}
+
+impl SupervisorCollectReport {
+    fn finalized(report: SupervisorFinalReport) -> Self {
+        Self {
+            artifact_kind: SUPERVISOR_COLLECT_ARTIFACT_KIND,
+            schema: SUPERVISOR_COLLECT_SCHEMA_ID,
+            schema_version: SUPERVISOR_COLLECT_SCHEMA_VERSION,
+            collection_state: SupervisorCollectState::Finalized,
+            final_report_available: true,
+            report,
+        }
+    }
+
+    fn lifecycle_snapshot(
+        report: SupervisorFinalReport,
+        collection_state: SupervisorCollectState,
+    ) -> Self {
+        Self {
+            artifact_kind: SUPERVISOR_COLLECT_ARTIFACT_KIND,
+            schema: SUPERVISOR_COLLECT_SCHEMA_ID,
+            schema_version: SUPERVISOR_COLLECT_SCHEMA_VERSION,
+            collection_state,
+            final_report_available: false,
+            report,
+        }
+    }
+}
+
 /// Planner/executor coordination-depth output. Depth is derived from the
 /// assignment graph; it is not an operator-selected input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -3617,12 +3697,35 @@ pub fn supervisor_status(repo: impl AsRef<Path>, run_id: RunId) -> Result<Superv
 pub fn collect_supervisor_run(
     repo: impl AsRef<Path>,
     run_id: RunId,
-) -> Result<SupervisorFinalReport> {
+) -> Result<SupervisorCollectReport> {
     let repo = discover_repo_root(repo.as_ref())?;
     let run_dir = run_dir(&repo, &run_id);
     let final_report_path = supervisor_final_report_path(&run_dir);
-    if let Some(report) = read_finalized_supervisor_report(&repo, &run_id, &run_dir)? {
-        return Ok(report);
+    let finalization_marker_present =
+        fs::symlink_metadata(run_dir.join(ARTIFACT_FINALIZATION_MARKER)).is_ok();
+    match read_finalized_supervisor_report(&repo, &run_id, &run_dir) {
+        Ok(Some(report)) => {
+            if supervisor_final_report_is_current_contract(&report) {
+                return Ok(SupervisorCollectReport::finalized(report));
+            }
+            return supervisor_inconsistent_collect_report(
+                &repo,
+                &run_dir,
+                &final_report_path,
+                run_id,
+            );
+        }
+        Ok(None) => {}
+        Err(error) if finalization_marker_present => {
+            let _ = error;
+            return supervisor_inconsistent_collect_report(
+                &repo,
+                &run_dir,
+                &final_report_path,
+                run_id,
+            );
+        }
+        Err(error) => return Err(error),
     }
     let status = supervisor_status(&repo, run_id.clone())?;
     let lifecycle = status.lifecycle;
@@ -3651,14 +3754,105 @@ pub fn collect_supervisor_run(
         ),
     };
 
-    Ok(SupervisorFinalReport {
+    let report = supervisor_collect_lifecycle_snapshot(
+        &repo,
+        &run_dir,
+        &final_report_path,
+        run_id,
+        lifecycle,
+        gate_denials,
+        SupervisorCollectSnapshotNarrative {
+            remaining_risk: &remaining_risk,
+            next_safe_action: &next_safe_action,
+            finding_message: "supervisor final report is missing",
+        },
+    );
+    let report = SupervisorCollectReport::lifecycle_snapshot(
+        report,
+        SupervisorCollectState::from_lifecycle(lifecycle),
+    );
+    Ok(report)
+}
+
+fn supervisor_final_report_is_current_contract(report: &SupervisorFinalReport) -> bool {
+    report.version == SUPERVISOR_SCHEMA_VERSION
+        && report.role == AgentRole::Supervisor
+        && report.repo == Path::new(".")
+        && !report.plan_file.as_os_str().is_empty()
+        && report.plan_file != Path::new(SUPERVISOR_COLLECT_UNFINALIZED_PLAN_FILE)
+        && report.run_lifecycle == SupervisorRunLifecycle::Finalized
+        && report.role_economics_profile.is_some()
+        && report.role_usage.len() == 5
+        && report.publishable == report.accepted
+        && (report.environment_failures.is_empty()
+            || (!report.accepted && report.rejected && report.status == ReviewStatus::Failed))
+}
+
+fn supervisor_inconsistent_collect_report(
+    repo: &Path,
+    run_dir: &Path,
+    final_report_path: &Path,
+    run_id: RunId,
+) -> Result<SupervisorCollectReport> {
+    let gate_denial = GateDenial::new(
+        run_id.as_str(),
+        GateDenialReason::ResumeCheckpoint {
+            denial: ResumeCheckpointDenial::IntegrityFailure,
+        },
+        VerifiedGateContext::new(
+            run_id.as_str(),
+            GateCheckSource::AuthenticatedCheckpoint,
+            std::iter::empty::<&Path>(),
+        )?,
+    )?;
+    let report = supervisor_collect_lifecycle_snapshot(
+        repo,
+        run_dir,
+        final_report_path,
+        run_id,
+        SupervisorRunLifecycle::Finalized,
+        vec![gate_denial],
+        SupervisorCollectSnapshotNarrative {
+            remaining_risk: "the finalized marker or its authenticated report is inconsistent",
+            next_safe_action:
+                "inspect and reconcile the authenticated finalized artifact before proceeding",
+            finding_message: "supervisor finalized artifact is inconsistent",
+        },
+    );
+    let report = SupervisorCollectReport::lifecycle_snapshot(
+        report,
+        SupervisorCollectState::InconsistentFinalized,
+    );
+    Ok(report)
+}
+
+struct SupervisorCollectSnapshotNarrative<'a> {
+    remaining_risk: &'a str,
+    next_safe_action: &'a str,
+    finding_message: &'a str,
+}
+
+fn supervisor_collect_lifecycle_snapshot(
+    repo: &Path,
+    run_dir: &Path,
+    final_report_path: &Path,
+    run_id: RunId,
+    lifecycle: SupervisorRunLifecycle,
+    gate_denials: Vec<GateDenial>,
+    narrative: SupervisorCollectSnapshotNarrative<'_>,
+) -> SupervisorFinalReport {
+    let relative_final_report_path = final_report_path
+        .strip_prefix(repo)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| RunArtifactFamily::Supervise.final_report_relative_path());
+    SupervisorFinalReport {
         version: SUPERVISOR_SCHEMA_VERSION,
         run_id,
         role: AgentRole::Supervisor,
         repo: PathBuf::from("."),
-        plan_file: PathBuf::new(),
+        plan_file: PathBuf::from(SUPERVISOR_COLLECT_UNFINALIZED_PLAN_FILE),
         run_dir: run_dir
-            .strip_prefix(&repo)
+            .strip_prefix(repo)
             .map(Path::to_path_buf)
             .unwrap_or_else(|_| RunArtifactFamily::Supervise.run_root()),
         runtime: SupervisorRuntime::Codex,
@@ -3694,8 +3888,8 @@ pub fn collect_supervisor_run(
         validation_results: Vec::new(),
         findings: vec![Finding {
             severity: FindingSeverity::Error,
-            message: "supervisor final report is missing".to_string(),
-            paths: vec![final_report_path],
+            message: narrative.finding_message.to_string(),
+            paths: vec![relative_final_report_path],
         }],
         bloated_file_flags: Vec::new(),
         decomposition_candidates: Vec::new(),
@@ -3708,9 +3902,9 @@ pub fn collect_supervisor_run(
         release_errors: Vec::new(),
         released_semantic_intents: Vec::new(),
         semantic_release_errors: Vec::new(),
-        remaining_risk,
-        next_safe_action,
-    })
+        remaining_risk: narrative.remaining_risk.to_string(),
+        next_safe_action: narrative.next_safe_action.to_string(),
+    }
 }
 
 pub fn verified_megafile_decomposition_evidence(

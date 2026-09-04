@@ -1,0 +1,171 @@
+{
+  "preview": {
+    "candidate": {
+      "metadata": {
+        "agent_id": "agent-a",
+        "worktree_path": "/workspace/repository/.worktrees/agent-a",
+        "branch": "agent/agent-a",
+        "primary_repo_root": "/workspace/repository",
+        "primary_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "agent_head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "merge_base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "base_matches_primary": true
+      },
+      "claimed_paths": [
+        "src/lib.rs"
+      ],
+      "changed_paths": [
+        "src/lib.rs"
+      ],
+      "changes": [
+        {
+          "path": "src/lib.rs",
+          "kind": "modified"
+        }
+      ],
+      "unclaimed_changed_paths": [],
+      "diff": {
+        "summary": {
+          "text": "diff --git a/src/lib.rs b/src/lib.rs\nindex 1111111111111111111111111111111111111111..2222222222222222222222222222222222222222 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub fn old() {}\n+pub fn new() {}\n",
+          "truncated": false
+        },
+        "full": "diff --git a/src/lib.rs b/src/lib.rs\nindex 1111111111111111111111111111111111111111..2222222222222222222222222222222222222222 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub fn old() {}\n+pub fn new() {}\n"
+      },
+      "validations": [],
+      "validation_binding": {
+        "version": 1,
+        "agent_id": "agent-a",
+        "primary_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "agent_head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "merge_base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "diff_oid": "de370353f8ed230e3a07c31f3a6c84dc68ba4eb1"
+      }
+    },
+    "safety": {
+      "primary_state_unchanged": {
+        "status": "failed",
+        "message": "primary repository state changed after preview",
+        "paths": []
+      },
+      "dirty_primary": {
+        "status": "passed",
+        "message": null,
+        "paths": []
+      },
+      "stale_base": {
+        "status": "passed",
+        "message": null,
+        "paths": []
+      },
+      "apply_check": {
+        "status": "passed",
+        "message": null,
+        "paths": []
+      },
+      "unclaimed_edits": {
+        "status": "passed",
+        "message": null,
+        "paths": []
+      },
+      "validation": {
+        "status": "skipped",
+        "message": "validation was not required",
+        "paths": []
+      },
+      "validation_evidence": {
+        "status": "skipped",
+        "binding_status": "not_required",
+        "message": "validation evidence was not required",
+        "paths": []
+      },
+      "megafile": {
+        "status": "passed",
+        "message": null,
+        "paths": []
+      },
+      "megafile_warnings": [],
+      "megafile_decomposition_target": null,
+      "megafile_decomposition_evidence": null,
+      "megafile_blocking": false,
+      "validation_required": false,
+      "candidate_validation_commands": [],
+      "force_options": {
+        "allow_dirty_primary": false,
+        "allow_stale_base": false,
+        "allow_unclaimed_edits": false,
+        "allow_validation_failures": false,
+        "allow_apply_conflicts": false
+      },
+      "apply_mode": "direct",
+      "semantic_conflicts": {
+        "advisory": true,
+        "status": "no_conflict",
+        "risk": "none",
+        "confidence": "high",
+        "degraded": false,
+        "conflict_paths": [],
+        "overlaps": []
+      },
+      "readiness": {
+        "status": "blocked",
+        "blockers": [
+          "primary_state_changed"
+        ],
+        "forced": [],
+        "details": [
+          {
+            "kind": "primary_state_changed",
+            "disposition": "blocked",
+            "check_status": "failed",
+            "paths": [],
+            "message": "primary repository state changed after preview",
+            "validation_reports": [],
+            "validation_commands": [],
+            "next_safe_operation": "run merge preview again"
+          }
+        ]
+      }
+    },
+    "review_intent": {
+      "candidate_validation_commands": [],
+      "require_validation_after_candidate": false,
+      "auto_reap_merged": false,
+      "trunk_ref": null,
+      "apply_auto_reap": false
+    }
+  },
+  "status": "blocked",
+  "applied": false,
+  "review_bound": true,
+  "review_binding_status": "matched",
+  "gate_denials": [
+    {
+      "version": 1,
+      "denial_id": "2222222222222222222222222222222222222222222222222222222222222222",
+      "correction_correlation_id": "merge-apply-agent-a-1",
+      "reason": {
+        "family": "merge_remediation",
+        "blocker": "primary_state_changed"
+      },
+      "retryability": "retry_after_correction",
+      "context": {
+        "owner": "agent-a",
+        "source": "primary_drift",
+        "paths": []
+      },
+      "route": "child_controller",
+      "next_safe_operation": "refresh_candidate_base"
+    }
+  ],
+  "stdout": {
+    "text": "",
+    "truncated": false
+  },
+  "stderr": {
+    "text": "",
+    "truncated": false
+  },
+  "error": "merge apply blocked: primary_state_changed",
+  "recorded_collision_paths": [],
+  "accepted_decomposition": null
+}

@@ -1170,6 +1170,18 @@ fn merge_apply_json_delivers_unclaimed_edits_denial_to_integration_controller() 
     )
     .expect("edit unclaimed path");
 
+    let reviewed_watermark = write_reviewed_merge_preview(
+        &repo_path,
+        "agent-a",
+        vec![PathBuf::from("README.md")],
+        MergeForceOptions::default(),
+        merge::MergeApplyReviewIntent {
+            auto_reap_merged: true,
+            trunk_ref: Some("refs/heads/main".to_string()),
+            ..Default::default()
+        },
+    );
+
     let args = MergeApplyArgs {
         agent_id: "agent-a".to_string(),
         repo: repo_path.clone(),
@@ -1181,7 +1193,7 @@ fn merge_apply_json_delivers_unclaimed_edits_denial_to_integration_controller() 
         decomposition_target: None,
         decomposition_run_id: None,
         megafile_thresholds: MegafileThresholdArgs::default(),
-        reviewed_watermark: None,
+        reviewed_watermark: Some(reviewed_watermark),
         local_git: MergeLocalGitTimeoutArgs::default(),
         forces: MergeForceArgs {
             force_dirty_primary: false,
@@ -1196,11 +1208,15 @@ fn merge_apply_json_delivers_unclaimed_edits_denial_to_integration_controller() 
         json: true,
     };
     let mut delivered = None;
-    let error = run_merge_apply_controller(args, |report, json| {
-        assert!(json);
-        delivered = Some(report.clone());
-        Ok(())
-    })
+    let error = run_merge_apply_controller(
+        args,
+        |report, json| {
+            assert!(json);
+            delivered = Some(report.clone());
+            Ok(())
+        },
+        |_refusal, _json| panic!("exact reviewed blocked preview must not be refused"),
+    )
     .expect_err("unclaimed merge edit must remain blocked");
 
     assert!(error.to_string().contains("unclaimed_edits"));
@@ -1302,6 +1318,18 @@ fn merge_apply_auto_reap_waits_for_trunk_then_reaps_on_finalization_rerun() {
     drop(tree);
     drop(agent_repo);
 
+    let reviewed_watermark = write_reviewed_merge_preview(
+        &repo_path,
+        "agent-merge-hook",
+        vec![PathBuf::from("README.md")],
+        MergeForceOptions::default(),
+        merge::MergeApplyReviewIntent {
+            auto_reap_merged: true,
+            trunk_ref: Some("refs/heads/main".to_string()),
+            ..Default::default()
+        },
+    );
+
     let args = MergeApplyArgs {
         agent_id: "agent-merge-hook".to_string(),
         repo: repo_path.clone(),
@@ -1313,7 +1341,7 @@ fn merge_apply_auto_reap_waits_for_trunk_then_reaps_on_finalization_rerun() {
         decomposition_target: None,
         decomposition_run_id: None,
         megafile_thresholds: MegafileThresholdArgs::default(),
-        reviewed_watermark: None,
+        reviewed_watermark: Some(reviewed_watermark),
         local_git: MergeLocalGitTimeoutArgs::default(),
         forces: MergeForceArgs {
             force_dirty_primary: false,
@@ -1328,11 +1356,15 @@ fn merge_apply_auto_reap_waits_for_trunk_then_reaps_on_finalization_rerun() {
         json: true,
     };
     let mut delivered = None;
-    run_merge_apply_controller(args, |report, json| {
-        assert!(json);
-        delivered = Some(report.clone());
-        Ok(())
-    })
+    run_merge_apply_controller(
+        args,
+        |report, json| {
+            assert!(json);
+            delivered = Some(report.clone());
+            Ok(())
+        },
+        |_refusal, _json| panic!("exact reviewed apply must not be refused"),
+    )
     .expect("merge and lifecycle classification should succeed");
 
     let report = delivered.expect("merge report");
@@ -1367,6 +1399,22 @@ fn merge_apply_auto_reap_waits_for_trunk_then_reaps_on_finalization_rerun() {
     drop(lane_commit);
     drop(primary);
 
+    let reviewed_watermark = write_reviewed_merge_preview(
+        &repo_path,
+        "agent-merge-hook",
+        vec![PathBuf::from("README.md")],
+        MergeForceOptions {
+            allow_stale_base: true,
+            ..MergeForceOptions::default()
+        },
+        merge::MergeApplyReviewIntent {
+            auto_reap_merged: true,
+            trunk_ref: Some("refs/heads/main".to_string()),
+            apply_auto_reap: true,
+            ..Default::default()
+        },
+    );
+
     let args = MergeApplyArgs {
         agent_id: "agent-merge-hook".to_string(),
         repo: repo_path,
@@ -1378,7 +1426,7 @@ fn merge_apply_auto_reap_waits_for_trunk_then_reaps_on_finalization_rerun() {
         decomposition_target: None,
         decomposition_run_id: None,
         megafile_thresholds: MegafileThresholdArgs::default(),
-        reviewed_watermark: None,
+        reviewed_watermark: Some(reviewed_watermark),
         local_git: MergeLocalGitTimeoutArgs::default(),
         forces: MergeForceArgs {
             force_dirty_primary: false,
@@ -1393,11 +1441,15 @@ fn merge_apply_auto_reap_waits_for_trunk_then_reaps_on_finalization_rerun() {
         json: true,
     };
     let mut finalized = None;
-    run_merge_apply_controller(args, |report, json| {
-        assert!(json);
-        finalized = Some(report.clone());
-        Ok(())
-    })
+    run_merge_apply_controller(
+        args,
+        |report, json| {
+            assert!(json);
+            finalized = Some(report.clone());
+            Ok(())
+        },
+        |_refusal, _json| panic!("exact reviewed finalization must not be refused"),
+    )
     .expect("fully merged finalization rerun should reap the lane");
     let finalized = finalized.expect("finalized report");
     let lifecycle = finalized.lifecycle.expect("final lifecycle report");
@@ -1406,6 +1458,44 @@ fn merge_apply_auto_reap_waits_for_trunk_then_reaps_on_finalization_rerun() {
     assert_eq!(gc.entries[0].status, WorktreeGcStatus::Removed);
     assert_eq!(gc.entries[0].reason, WorktreeGcReason::FinishedBranch);
     assert!(!worktree.path.exists());
+}
+
+fn write_reviewed_merge_preview(
+    repo_path: &Path,
+    agent_id: &str,
+    claims: Vec<PathBuf>,
+    forces: MergeForceOptions,
+    review_intent: merge::MergeApplyReviewIntent,
+) -> PathBuf {
+    let require_validation = review_intent.require_validation_after_candidate;
+    let preview = preview_merge_from_args(
+        repo_path.to_path_buf(),
+        agent_id.to_string(),
+        claims,
+        Vec::new(),
+        forces,
+        require_validation,
+        review_intent,
+        MegafileMergePolicy::default(),
+        merge::MergeLocalGitOptions::default(),
+    )
+    .expect("capture reviewed merge preview");
+    let watermark = merge::MergePreviewFreshnessWatermark::capture_from_preview(&preview)
+        .expect("capture reviewed merge watermark");
+    let mut value = serde_json::to_value(preview).expect("serialize reviewed merge preview");
+    value.as_object_mut().expect("preview object").insert(
+        "freshness_watermark".to_string(),
+        serde_json::to_value(watermark).expect("serialize reviewed watermark"),
+    );
+    let path = repo_path
+        .join(".git")
+        .join(format!("reviewed-preview-{agent_id}.json"));
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&value).expect("encode reviewed preview"),
+    )
+    .expect("write reviewed preview");
+    path
 }
 
 fn init_committed_repo(repo_path: &Path) -> git2::Signature<'static> {

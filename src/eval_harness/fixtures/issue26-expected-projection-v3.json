@@ -1,0 +1,35 @@
+{
+  "version": 3,
+  "schema": "eval_harness_comparable_fake_results_v3",
+  "experiment_id": "issue26-reproducible-model-mix-v2",
+  "manifest_digest": "6952ca4355dc030c7d557433288fe0bf0d1d159c6ff553d9a58cc108978b5df3",
+  "fixture_digest": "76d138e74c07dc404150e9b38d7fd6bb60db4e372965fb42acc3176733d62968",
+  "objective_citation": {
+    "id": "maco-default-objective-v2",
+    "version": 2,
+    "content_hash": "82e6de7f5e27768fdad19b5dfa70d70ed1fb9d041262678e3174d5373330b4f9",
+    "source": "built_in"
+  },
+  "run_fingerprints": [
+    ["economy-mix", 1, "52903a5ed276cac5bcdb186cacc32b5dc2c2ac8d0854b5263baadb9a05453295"],
+    ["economy-mix", 2, "f69a904a4497a397afc3bae84b213e5daba1413e433268e3961043db2a0944d9"],
+    ["quality-mix", 1, "cf5760ca4803a1691a10a3f1a2f7e15154fe3df27ecf5f42c48be8a07403673f"],
+    ["quality-mix", 2, "97d8ad45c6698e77f30919b918147935d21d4941be97c9420bdde620ac85e1dc"]
+  ],
+  "equivalent_initial_state_fingerprint": "1ac7b45dd3d242496023f405936a8eb99fa0cdff0f39fdcb2c298ecf3eb2f1d9",
+  "pareto_frontier": ["economy-mix", "quality-mix"],
+  "objective_selection": {
+    "profile_id": "maco-default-objective-v2",
+    "profile_hash": "82e6de7f5e27768fdad19b5dfa70d70ed1fb9d041262678e3174d5373330b4f9",
+    "selected_profile_id": "economy-mix",
+    "selected_score": 0.46179899645808736,
+    "runner_up_profile_id": "quality-mix",
+    "runner_up_score": 0.51375,
+    "scores": {
+      "economy-mix": 0.46179899645808736,
+      "quality-mix": 0.51375
+    }
+  },
+  "production_eligible": false,
+  "production_default_claim": "ineligible_to_justify_production_default"
+}

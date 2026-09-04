@@ -163,6 +163,7 @@ fn fake_arbitration_preview(
         snapshot_tree: Oid::from_str(ARBITRATION_BASE).expect("fake tree"),
     };
     MergeApplyPreview {
+        review_intent: MergeApplyReviewIntent::default(),
         candidate,
         safety: MergeApplySafety {
             primary_state_unchanged: passed_safety_check(),
@@ -692,7 +693,23 @@ fn semantic_preview_options(repo_path: &Path, claim: &str) -> MergePreviewOption
         },
         forces: MergeForceOptions::default(),
         require_validation: false,
+        review_intent: MergeApplyReviewIntent::default(),
     }
+}
+
+fn reviewed_watermark_with_policy(
+    options: &MergePreviewOptions,
+    validation_evidence: &ValidationEvidenceBundle,
+    policy: &MegafileMergePolicy,
+) -> MergePreviewFreshnessWatermark {
+    let preview = preview_merge_apply_with_megafile_policy(
+        options.clone(),
+        validation_evidence.clone(),
+        policy.clone(),
+    )
+    .expect("capture exact reviewed preview");
+    MergePreviewFreshnessWatermark::capture_from_preview(&preview)
+        .expect("capture reviewed preview watermark")
 }
 
 fn megafile_test_policy(block: bool, decomposition_target: Option<&str>) -> MegafileMergePolicy {
@@ -737,6 +754,10 @@ fn megafile_preview_options(
         },
         forces: MergeForceOptions::default(),
         require_validation,
+        review_intent: MergeApplyReviewIntent {
+            require_validation_after_candidate: require_validation,
+            ..MergeApplyReviewIntent::default()
+        },
     }
 }
 
@@ -1002,13 +1023,17 @@ fn decomposition_completion_is_persisted_only_after_successful_merge() {
         PathBuf::from("src/readme_part.md"),
     ];
 
-    let blocked = merge_apply_report_with_megafile_policy(
+    let blocked_options = megafile_preview_options(&repo_path, claims.clone(), Vec::new(), true);
+    let blocked_evidence = ValidationEvidenceBundle::default();
+    let blocked_review =
+        reviewed_watermark_with_policy(&blocked_options, &blocked_evidence, &policy);
+    let blocked = merge_apply_report_with_megafile_policy_internal(
         MergeApplyOptions {
-            preview: megafile_preview_options(&repo_path, claims.clone(), Vec::new(), true),
+            preview: blocked_options,
             candidate_validation_commands: Vec::new(),
-            reviewed_watermark: None,
+            reviewed_watermark: blocked_review,
         },
-        ValidationEvidenceBundle::default(),
+        blocked_evidence,
         policy.clone(),
     )
     .expect("validation-blocked decomposition");
@@ -1027,13 +1052,17 @@ fn decomposition_completion_is_persisted_only_after_successful_merge() {
             ))
     );
 
-    let applied = merge_apply_report_with_megafile_policy(
+    let applied_options = megafile_preview_options(&repo_path, claims, Vec::new(), false);
+    let applied_evidence = ValidationEvidenceBundle::default();
+    let applied_review =
+        reviewed_watermark_with_policy(&applied_options, &applied_evidence, &policy);
+    let applied = merge_apply_report_with_megafile_policy_internal(
         MergeApplyOptions {
-            preview: megafile_preview_options(&repo_path, claims, Vec::new(), false),
+            preview: applied_options,
             candidate_validation_commands: Vec::new(),
-            reviewed_watermark: None,
+            reviewed_watermark: applied_review,
         },
-        ValidationEvidenceBundle::default(),
+        applied_evidence,
         policy.clone(),
     )
     .expect("apply typed decomposition");
@@ -1063,7 +1092,7 @@ fn decomposition_completion_is_persisted_only_after_successful_merge() {
 }
 
 #[test]
-fn decomposition_rejects_same_path_content_substitution_after_finalized_review() {
+fn review_freshness_rejects_content_substitution_before_decomposition_telemetry() {
     skip_without_containment!();
     for changed_file in ["target", "replacement"] {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1084,6 +1113,18 @@ fn decomposition_rejects_same_path_content_substitution_after_finalized_review()
         )
         .expect("write content-bound finalized evidence");
 
+        let mut policy = megafile_test_policy(true, Some("README.md"));
+        policy.decomposition_run_id = Some(run_id);
+        seed_megafile(&repo_path, &policy);
+        let claims = vec![
+            PathBuf::from("README.md"),
+            PathBuf::from("src/readme_part.md"),
+        ];
+        let preview_options = megafile_preview_options(&repo_path, claims, Vec::new(), false);
+        let validation_evidence = ValidationEvidenceBundle::default();
+        let reviewed =
+            reviewed_watermark_with_policy(&preview_options, &validation_evidence, &policy);
+
         match changed_file {
             "target" => {
                 fs::write(agent.path.join("README.md"), "y\n").expect("substitute target bytes");
@@ -1095,29 +1136,24 @@ fn decomposition_rejects_same_path_content_substitution_after_finalized_review()
             _ => unreachable!(),
         }
 
-        let mut policy = megafile_test_policy(true, Some("README.md"));
-        policy.decomposition_run_id = Some(run_id);
-        seed_megafile(&repo_path, &policy);
-        let claims = vec![
-            PathBuf::from("README.md"),
-            PathBuf::from("src/readme_part.md"),
-        ];
-        let error = merge_apply_report_with_megafile_policy(
+        let error = merge_apply_report_with_megafile_policy_internal(
             MergeApplyOptions {
-                preview: megafile_preview_options(&repo_path, claims, Vec::new(), false),
+                preview: preview_options,
                 candidate_validation_commands: Vec::new(),
-                reviewed_watermark: None,
+                reviewed_watermark: reviewed,
             },
-            ValidationEvidenceBundle::default(),
+            validation_evidence,
             policy.clone(),
         )
         .expect_err("post-review same-path content substitution must be rejected");
         assert!(
-                format!("{error:#}").contains(
+            format!("{error:#}").contains("candidate snapshot")
+                || format!("{error:#}").contains("candidate diff")
+                || format!("{error:#}").contains(
                     "current decomposition candidate content binding does not match the exact supervisor-inspected candidate"
                 ),
-                "unexpected {changed_file} substitution error: {error:#}"
-            );
+            "unexpected {changed_file} substitution error: {error:#}"
+        );
         assert!(
             !MegafileStore::open_with_thresholds(&repo_path, policy.thresholds)
                 .expect("reopen store after rejected substitution")
@@ -1144,18 +1180,21 @@ fn collision_decision_is_persisted_without_weakening_merge_blockers() {
     fs::write(repo_path.join("README.md"), "# Primary\n").expect("edit primary");
     let policy = megafile_test_policy(false, None);
 
-    let report = merge_apply_report_with_megafile_policy(
+    let preview_options = megafile_preview_options(
+        &repo_path,
+        vec![PathBuf::from("README.md")],
+        Vec::new(),
+        false,
+    );
+    let validation_evidence = ValidationEvidenceBundle::default();
+    let reviewed = reviewed_watermark_with_policy(&preview_options, &validation_evidence, &policy);
+    let report = merge_apply_report_with_megafile_policy_internal(
         MergeApplyOptions {
-            preview: megafile_preview_options(
-                &repo_path,
-                vec![PathBuf::from("README.md")],
-                Vec::new(),
-                false,
-            ),
+            preview: preview_options,
             candidate_validation_commands: Vec::new(),
-            reviewed_watermark: None,
+            reviewed_watermark: reviewed,
         },
-        ValidationEvidenceBundle::default(),
+        validation_evidence,
         policy.clone(),
     )
     .expect("blocked collision report");
@@ -1179,6 +1218,118 @@ fn collision_decision_is_persisted_without_weakening_merge_blockers() {
 }
 
 #[test]
+fn public_programmatic_apply_wrappers_fail_closed_without_repository_access() {
+    skip_without_containment!();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (repo_path, agent) =
+        create_semantic_merge_fixture(temp.path(), &[("README.md", "# Test\n")]);
+    fs::write(agent.path.join("README.md"), "# Candidate\n").expect("edit candidate");
+    let preview_options = megafile_preview_options(
+        &repo_path,
+        vec![PathBuf::from("README.md")],
+        Vec::new(),
+        false,
+    );
+    let preview = preview_merge_apply(preview_options.clone()).expect("review preview");
+    let reviewed =
+        MergePreviewFreshnessWatermark::capture_from_preview(&preview).expect("review watermark");
+    let lock_path = repo_path
+        .join(".git/maco/state")
+        .join(REPOSITORY_MUTATION_LOCK_FILE);
+    fs::create_dir_all(lock_path.parent().expect("lock parent")).expect("create lock parent");
+    fs::write(&lock_path, b"existing lock bytes\n").expect("seed lock bytes");
+    let repo = crate::git_repository::open(&repo_path).expect("open primary repository");
+    let observe_primary = || {
+        let head = repo.head().ok().and_then(|head| head.target());
+        let index = fs::read(repo.path().join("index")).expect("read primary index");
+        let status = repo
+            .statuses(None)
+            .expect("read primary status")
+            .iter()
+            .map(|entry| (entry.path_bytes().to_vec(), entry.status().bits()))
+            .collect::<Vec<_>>();
+        (head, index, status)
+    };
+    let before = observe_primary();
+    let lock_before = fs::read(&lock_path).expect("read initial lock bytes");
+    let apply_options = || MergeApplyOptions {
+        preview: preview_options.clone(),
+        candidate_validation_commands: Vec::new(),
+        reviewed_watermark: reviewed.clone(),
+    };
+    let validation_evidence = ValidationEvidenceBundle::default();
+    let results = [
+        apply_merge_result(apply_options()),
+        apply_merge_result_with_evidence(apply_options(), validation_evidence.clone()),
+        merge_apply_report(apply_options()),
+        merge_apply_report_with_evidence(apply_options(), validation_evidence.clone()),
+        merge_apply_report_with_megafile_policy(
+            apply_options(),
+            validation_evidence,
+            MegafileMergePolicy::default(),
+        ),
+    ];
+
+    for result in results {
+        let error = result.expect_err("direct programmatic apply must be disabled");
+        assert_eq!(error.to_string(), DIRECT_PROGRAMMATIC_APPLY_DISABLED);
+    }
+    assert_eq!(observe_primary(), before);
+    assert_eq!(
+        fs::read(&lock_path).expect("read final lock bytes"),
+        lock_before
+    );
+}
+
+#[test]
+fn valid_mismatched_watermark_refuses_before_touching_existing_lock_bytes() {
+    skip_without_containment!();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (repo_path, agent) =
+        create_semantic_merge_fixture(temp.path(), &[("README.md", "# Test\n")]);
+    fs::write(agent.path.join("README.md"), "# Candidate\n").expect("edit candidate");
+    let preview_options = megafile_preview_options(
+        &repo_path,
+        vec![PathBuf::from("README.md")],
+        Vec::new(),
+        false,
+    );
+    let preview = preview_merge_apply(preview_options.clone()).expect("review preview");
+    let mut reviewed =
+        MergePreviewFreshnessWatermark::capture_from_preview(&preview).expect("review watermark");
+    reviewed.base_preview.sha256 = "ab".repeat(32);
+    let lock_path = repo_path
+        .join(".git/maco/state")
+        .join(REPOSITORY_MUTATION_LOCK_FILE);
+    fs::create_dir_all(lock_path.parent().expect("lock parent")).expect("create lock parent");
+    fs::write(&lock_path, b"existing lock bytes\n").expect("seed lock bytes");
+    let lock_before = fs::read(&lock_path).expect("read initial lock bytes");
+
+    let error = merge_apply_report_with_megafile_policy_and_local_git_options(
+        MergeApplyOptions {
+            preview: preview_options,
+            candidate_validation_commands: Vec::new(),
+            reviewed_watermark: reviewed,
+        },
+        ValidationEvidenceBundle::default(),
+        MegafileMergePolicy::default(),
+        MergeLocalGitOptions::default(),
+    )
+    .expect_err("valid mismatched watermark must refuse before lock acquisition");
+    let freshness = error
+        .downcast_ref::<MergePreviewFreshnessError>()
+        .expect("typed review freshness error");
+    assert_eq!(
+        freshness.binding_status(),
+        MergeReviewBindingStatus::Substituted
+    );
+    assert_eq!(
+        fs::read(&lock_path).expect("read final lock bytes"),
+        lock_before
+    );
+}
+
+#[test]
 fn authenticated_megafile_failure_refuses_merge_before_primary_mutation() {
     skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
@@ -1187,24 +1338,27 @@ fn authenticated_megafile_failure_refuses_merge_before_primary_mutation() {
     fs::write(agent.path.join("README.md"), "# Candidate\n").expect("edit candidate");
     let policy = megafile_test_policy(false, None);
     seed_megafile(&repo_path, &policy);
+    let preview_options = megafile_preview_options(
+        &repo_path,
+        vec![PathBuf::from("README.md")],
+        Vec::new(),
+        false,
+    );
+    let validation_evidence = ValidationEvidenceBundle::default();
+    let reviewed = reviewed_watermark_with_policy(&preview_options, &validation_evidence, &policy);
     let snapshot = newest_numeric_state_json(
         &repo_path.join(".git/maco/state/authenticated-megafile-history-v1"),
     )
     .expect("authenticated megafile snapshot");
     fs::write(snapshot, b"{\"tampered\":true}\n").expect("tamper authenticated snapshot");
 
-    let error = merge_apply_report_with_megafile_policy(
+    let error = merge_apply_report_with_megafile_policy_internal(
         MergeApplyOptions {
-            preview: megafile_preview_options(
-                &repo_path,
-                vec![PathBuf::from("README.md")],
-                Vec::new(),
-                false,
-            ),
+            preview: preview_options,
             candidate_validation_commands: Vec::new(),
-            reviewed_watermark: None,
+            reviewed_watermark: reviewed,
         },
-        ValidationEvidenceBundle::default(),
+        validation_evidence,
         policy,
     )
     .expect_err("tampered telemetry must refuse merge");
@@ -1282,10 +1436,16 @@ fn semantic_conflicts_report_same_function_and_dependent_files() {
         "symbol_level"
     );
 
-    let report = merge_apply_report(MergeApplyOptions {
-        preview: semantic_preview_options(&repo_path, "src/shared.rs"),
+    let apply_options = semantic_preview_options(&repo_path, "src/shared.rs");
+    let reviewed_preview = preview_merge_apply(apply_options.clone())
+        .expect("capture exact reviewed semantic preview");
+    let reviewed_watermark =
+        MergePreviewFreshnessWatermark::capture_from_preview(&reviewed_preview)
+            .expect("capture semantic reviewed watermark");
+    let report = merge_apply_report_internal(MergeApplyOptions {
+        preview: apply_options,
         candidate_validation_commands: Vec::new(),
-        reviewed_watermark: None,
+        reviewed_watermark,
     })
     .expect("build blocked apply report");
     assert_eq!(report.status, MergeApplyReportStatus::Blocked);
@@ -2407,6 +2567,7 @@ fn candidate_validation_sandbox_is_removed_when_patch_apply_fails() {
         paths: Vec::new(),
     };
     let preview = MergeApplyPreview {
+        review_intent: MergeApplyReviewIntent::default(),
         candidate: MergeCandidate {
             metadata: WorktreeMergeMetadata {
                 agent_id: "agent-a".to_string(),

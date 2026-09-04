@@ -1,0 +1,326 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/main/schemas/eval-harness-comparable-fake-results-v3.schema.json",
+  "title": "MACO Eval Harness Comparable Fake Results v3",
+  "description": "Closed contract for current `eval-harness run-v2` / version-2 `eval-harness run` machine-readable output from `execute_v2_local_fake`. Version 2 remains published for historical compatibility; current exact output uses version 3. Network and real-provider execution are refused.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version", "schema", "experiment_id", "manifest_schema", "manifest_digest",
+    "fixture", "provider", "objective_profile", "objective_citation", "runs",
+    "profile_summaries", "pareto_frontier", "objective_selection", "comparability",
+    "production_eligible", "production_default_claim"
+  ],
+  "properties": {
+    "version": { "type": "integer", "const": 3 },
+    "schema": { "type": "string", "const": "eval_harness_comparable_fake_results_v3" },
+    "experiment_id": { "$ref": "#/$defs/nonEmptyString" },
+    "manifest_schema": { "type": "string", "const": "eval_harness_manifest_v2" },
+    "manifest_digest": { "$ref": "#/$defs/digest" },
+    "fixture": { "$ref": "#/$defs/fixture" },
+    "provider": { "$ref": "#/$defs/provider" },
+    "objective_profile": { "$ref": "#/$defs/resolvedObjectiveProfile" },
+    "objective_citation": { "$ref": "#/$defs/objectiveCitation" },
+    "runs": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/run" } },
+    "profile_summaries": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/profileSummary" } },
+    "pareto_frontier": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": { "$ref": "#/$defs/nonEmptyString" }
+    },
+    "objective_selection": { "$ref": "#/$defs/objectiveSelection" },
+    "comparability": { "$ref": "#/$defs/comparability" },
+    "production_eligible": { "type": "boolean", "const": false },
+    "production_default_claim": { "type": "string", "const": "ineligible_to_justify_production_default" }
+  },
+  "$defs": {
+    "nonEmptyString": { "type": "string", "minLength": 1 },
+    "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "objectiveSource": { "type": "string", "enum": ["built_in", "repository_override"] },
+    "role": { "type": "string", "enum": ["planner", "worker", "supervisor", "auditor"] },
+    "quality": {
+      "type": "object", "additionalProperties": false,
+      "required": ["held_out_basis_points", "breadth_basis_points", "anti_shortcut_basis_points", "overall_basis_points"],
+      "properties": {
+        "held_out_basis_points": { "type": "integer", "minimum": 0, "maximum": 10000 },
+        "breadth_basis_points": { "type": "integer", "minimum": 0, "maximum": 10000 },
+        "anti_shortcut_basis_points": { "type": "integer", "minimum": 0, "maximum": 10000 },
+        "overall_basis_points": { "type": "integer", "minimum": 0, "maximum": 10000 }
+      }
+    },
+    "qualityWeights": {
+      "type": "object", "additionalProperties": false,
+      "required": ["held_out_percent", "breadth_percent", "anti_shortcut_percent"],
+      "properties": {
+        "held_out_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "breadth_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "anti_shortcut_percent": { "type": "integer", "minimum": 0, "maximum": 100 }
+      }
+    },
+    "tradeoffWeights": {
+      "type": "object", "additionalProperties": false,
+      "required": ["monetary_cost_percent", "quota_consumption_percent", "latency_percent", "retry_rework_percent", "human_review_percent"],
+      "properties": {
+        "monetary_cost_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "quota_consumption_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "latency_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "retry_rework_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "human_review_percent": { "type": "integer", "minimum": 0, "maximum": 100 }
+      }
+    },
+    "switchCosts": {
+      "type": "object", "additionalProperties": false,
+      "required": ["model_change_same_runtime_microunits", "runtime_change_microunits"],
+      "properties": {
+        "model_change_same_runtime_microunits": { "type": "integer", "minimum": 0 },
+        "runtime_change_microunits": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "qualityOperationsBalance": {
+      "type": "object", "additionalProperties": false,
+      "required": ["quality_percent", "operations_percent"],
+      "properties": {
+        "quality_percent": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "operations_percent": { "type": "integer", "minimum": 0, "maximum": 100 }
+      }
+    },
+    "objectiveProfileBinding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "version", "content_hash", "quality", "tradeoffs", "switch_costs"],
+      "properties": {
+        "id": { "$ref": "#/$defs/nonEmptyString" },
+        "version": { "type": "integer", "minimum": 1 },
+        "content_hash": { "$ref": "#/$defs/digest" },
+        "quality": { "$ref": "#/$defs/qualityWeights" },
+        "tradeoffs": { "$ref": "#/$defs/tradeoffWeights" },
+        "switch_costs": { "$ref": "#/$defs/switchCosts" },
+        "quality_operations_balance": { "$ref": "#/$defs/qualityOperationsBalance" }
+      }
+    },
+    "resolvedObjectiveProfile": {
+      "type": "object", "additionalProperties": false,
+      "required": ["profile", "source"],
+      "properties": {
+        "profile": { "$ref": "#/$defs/objectiveProfileBinding" },
+        "source": { "$ref": "#/$defs/objectiveSource" }
+      }
+    },
+    "fixture": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "version", "id", "digest"],
+      "properties": {
+        "schema": { "type": "string", "const": "eval_harness_fake_execution_fixture_v1" },
+        "version": { "type": "integer", "const": 1 },
+        "id": { "$ref": "#/$defs/nonEmptyString" },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "provider": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "network_providers"],
+      "properties": {
+        "kind": { "type": "string", "const": "local_fake" },
+        "network_providers": { "type": "boolean", "const": false }
+      }
+    },
+    "objectiveCitation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "version", "content_hash", "source"],
+      "properties": {
+        "id": { "$ref": "#/$defs/nonEmptyString" },
+        "version": { "type": "integer", "minimum": 1 },
+        "content_hash": { "$ref": "#/$defs/digest" },
+        "source": { "$ref": "#/$defs/objectiveSource" }
+      }
+    },
+    "recordedRole": {
+      "type": "object", "additionalProperties": false,
+      "required": ["role", "model"],
+      "properties": {
+        "role": { "$ref": "#/$defs/role" },
+        "model": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "runProvenance": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "manifest_digest", "manifest_version", "fixture_digest", "fixture_version",
+        "provider_id", "deterministic_local_fake", "network_access",
+        "real_provider_adapter_invoked", "state_isolation", "mix_digest",
+        "objective_id", "objective_hash", "objective_source"
+      ],
+      "properties": {
+        "manifest_digest": { "$ref": "#/$defs/digest" },
+        "manifest_version": { "type": "integer", "const": 2 },
+        "fixture_digest": { "$ref": "#/$defs/digest" },
+        "fixture_version": { "type": "integer", "const": 1 },
+        "provider_id": { "type": "string", "const": "local_fake" },
+        "deterministic_local_fake": { "type": "boolean", "const": true },
+        "network_access": { "type": "boolean", "const": false },
+        "real_provider_adapter_invoked": { "type": "boolean", "const": false },
+        "state_isolation": { "type": "string", "const": "equivalent_isolated_in_memory" },
+        "mix_digest": { "$ref": "#/$defs/digest" },
+        "objective_id": { "$ref": "#/$defs/nonEmptyString" },
+        "objective_hash": { "$ref": "#/$defs/digest" },
+        "objective_source": { "$ref": "#/$defs/objectiveSource" }
+      }
+    },
+    "stageWitness": {
+      "type": "object", "additionalProperties": false,
+      "required": ["stage", "input_fingerprint", "output_fingerprint", "logical_tick"],
+      "properties": {
+        "stage": { "type": "string", "enum": ["goal_bound", "supervision_complete", "integration_preview", "integration_applied"] },
+        "input_fingerprint": { "$ref": "#/$defs/digest" },
+        "output_fingerprint": { "$ref": "#/$defs/digest" },
+        "logical_tick": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "usage": {
+      "type": "object", "additionalProperties": false,
+      "required": ["input_tokens", "output_tokens", "total_tokens"],
+      "properties": {
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 },
+        "total_tokens": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "roleObservation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["role", "model", "request_id", "provider_id", "usage", "cost_microusd", "cost_provenance", "response_digest"],
+      "properties": {
+        "role": { "$ref": "#/$defs/role" },
+        "model": { "$ref": "#/$defs/nonEmptyString" },
+        "request_id": { "$ref": "#/$defs/nonEmptyString" },
+        "provider_id": { "type": "string", "const": "local_fake" },
+        "usage": { "$ref": "#/$defs/usage" },
+        "cost_microusd": { "type": "integer", "minimum": 0 },
+        "cost_provenance": { "type": "string", "const": "committed_local_fake_price_schedule_v1" },
+        "response_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "heldOutEvidence": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "content_digest", "executed", "assertions_run", "assertions_passed"],
+      "properties": {
+        "id": { "$ref": "#/$defs/nonEmptyString" },
+        "content_digest": { "$ref": "#/$defs/digest" },
+        "executed": { "type": "boolean", "const": true },
+        "assertions_run": { "type": "integer", "minimum": 1 },
+        "assertions_passed": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "reviewFinding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "severity", "disposition"],
+      "properties": {
+        "id": { "$ref": "#/$defs/nonEmptyString" },
+        "severity": { "type": "string", "const": "informational" },
+        "disposition": { "type": "string", "const": "accepted_fake_fixture_evidence" }
+      }
+    },
+    "reviewEvidence": {
+      "type": "object", "additionalProperties": false,
+      "required": ["findings", "breadth_checks_run", "breadth_checks_passed", "anti_shortcut_checks_run", "anti_shortcut_checks_passed"],
+      "properties": {
+        "findings": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/reviewFinding" } },
+        "breadth_checks_run": { "type": "integer", "minimum": 1 },
+        "breadth_checks_passed": { "type": "integer", "minimum": 0 },
+        "anti_shortcut_checks_run": { "type": "integer", "minimum": 1 },
+        "anti_shortcut_checks_passed": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "metrics": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "total_usage", "total_cost_microusd", "deterministic_wall_time_ms",
+        "wall_time_provenance", "logical_time_ticks", "churn_count", "conflict_count",
+        "loc_added", "loc_deleted", "diff_bytes", "held_out", "review", "quality"
+      ],
+      "properties": {
+        "total_usage": { "$ref": "#/$defs/usage" },
+        "total_cost_microusd": { "type": "integer", "minimum": 0 },
+        "deterministic_wall_time_ms": { "type": "integer", "minimum": 1 },
+        "wall_time_provenance": { "type": "string", "const": "committed_deterministic_fake_clock_v1" },
+        "logical_time_ticks": { "type": "integer", "minimum": 1 },
+        "churn_count": { "type": "integer", "minimum": 0 },
+        "conflict_count": { "type": "integer", "minimum": 0 },
+        "loc_added": { "type": "integer", "minimum": 0 },
+        "loc_deleted": { "type": "integer", "minimum": 0 },
+        "diff_bytes": { "type": "integer", "minimum": 0 },
+        "held_out": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/heldOutEvidence" } },
+        "review": { "$ref": "#/$defs/reviewEvidence" },
+        "quality": { "$ref": "#/$defs/quality" }
+      }
+    },
+    "run": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "profile_id", "repetition", "provenance", "mix", "initial_state_fingerprint",
+        "final_state_fingerprint", "stages", "roles", "metrics", "integration_outcome",
+        "record_fingerprint"
+      ],
+      "properties": {
+        "profile_id": { "$ref": "#/$defs/nonEmptyString" },
+        "repetition": { "type": "integer", "minimum": 1 },
+        "provenance": { "$ref": "#/$defs/runProvenance" },
+        "mix": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/recordedRole" } },
+        "initial_state_fingerprint": { "$ref": "#/$defs/digest" },
+        "final_state_fingerprint": { "$ref": "#/$defs/digest" },
+        "stages": { "type": "array", "minItems": 4, "maxItems": 4, "items": { "$ref": "#/$defs/stageWitness" } },
+        "roles": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/roleObservation" } },
+        "metrics": { "$ref": "#/$defs/metrics" },
+        "integration_outcome": { "type": "string", "const": "applied" },
+        "record_fingerprint": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "profileSummary": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "profile_id", "repetitions", "mean_cost_microusd", "mean_tokens",
+        "mean_wall_time_ms", "mean_churn_count", "mean_review_findings", "quality",
+        "pareto_optimal"
+      ],
+      "properties": {
+        "profile_id": { "$ref": "#/$defs/nonEmptyString" },
+        "repetitions": { "type": "integer", "minimum": 1 },
+        "mean_cost_microusd": { "type": "integer", "minimum": 0 },
+        "mean_tokens": { "type": "integer", "minimum": 0 },
+        "mean_wall_time_ms": { "type": "integer", "minimum": 1 },
+        "mean_churn_count": { "type": "integer", "minimum": 0 },
+        "mean_review_findings": { "type": "integer", "minimum": 0 },
+        "quality": { "$ref": "#/$defs/quality" },
+        "pareto_optimal": { "type": "boolean" }
+      }
+    },
+    "objectiveSelection": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "profile_id", "profile_hash", "selected_profile_id", "selected_score",
+        "runner_up_profile_id", "runner_up_score", "scores"
+      ],
+      "properties": {
+        "profile_id": { "$ref": "#/$defs/nonEmptyString" },
+        "profile_hash": { "$ref": "#/$defs/digest" },
+        "selected_profile_id": { "$ref": "#/$defs/nonEmptyString" },
+        "selected_score": { "type": "number" },
+        "runner_up_profile_id": { "type": ["string", "null"], "minLength": 1 },
+        "runner_up_score": { "type": ["number", "null"] },
+        "scores": {
+          "type": "object", "minProperties": 1,
+          "patternProperties": { "^.+$": { "type": "number" } },
+          "additionalProperties": false
+        }
+      }
+    },
+    "comparability": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "equivalent_initial_state_fingerprint", "expected_run_count", "validated_run_count", "replay_verified"],
+      "properties": {
+        "status": { "type": "string", "const": "comparable" },
+        "equivalent_initial_state_fingerprint": { "$ref": "#/$defs/digest" },
+        "expected_run_count": { "type": "integer", "minimum": 1 },
+        "validated_run_count": { "type": "integer", "minimum": 1 },
+        "replay_verified": { "type": "boolean", "const": true }
+      }
+    }
+  }
+}

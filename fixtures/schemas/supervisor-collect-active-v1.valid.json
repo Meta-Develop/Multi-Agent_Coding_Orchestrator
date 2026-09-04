@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "run_id": "schema-fixture",
+  "role": "supervisor",
+  "repo": ".",
+  "plan_file": "<unavailable-until-finalized>",
+  "run_dir": ".maco/o2/runs/schema-fixture",
+  "runtime": "fake",
+  "publishable": false,
+  "success": false,
+  "accepted": false,
+  "rejected": true,
+  "status": "missing",
+  "run_lifecycle": "active",
+  "assigned_paths": [
+    "src/lib.rs"
+  ],
+  "semantic_symbols": [],
+  "semantic_modules": [],
+  "claim_tokens": [],
+  "semantic_intent_tokens": [],
+  "usage_complete": false,
+  "commands_run": [],
+  "environment_failures": [],
+  "autonomy_kpis": {
+    "observation": "not_process_observable",
+    "population": "reviewed_gate_actions",
+    "coverage": {
+      "review_decisions": {
+        "observation": "not_process_observable",
+        "unavailable_reason": "synthetic fixture"
+      },
+      "reviewed_denial_terminal_lifecycles": {
+        "observation": "not_process_observable",
+        "unavailable_reason": "synthetic fixture"
+      },
+      "human_follow_up_responses": {
+        "observation": "not_process_observable",
+        "unavailable_reason": "synthetic fixture"
+      },
+      "scheduler_budget_denial_lifecycles": {
+        "observation": "not_process_observable",
+        "unavailable_reason": "synthetic fixture"
+      },
+      "rate_denominators": {
+        "observation": "not_process_observable",
+        "unavailable_reason": "synthetic fixture"
+      }
+    },
+    "actions_reviewed": null,
+    "denials": null,
+    "self_corrections": null,
+    "human_escalations": null,
+    "interrupted": null,
+    "unavailable_reason": "synthetic fixture"
+  },
+  "files_changed": [],
+  "validation_results": [],
+  "findings": [],
+  "bloated_file_flags": [],
+  "decomposition_candidates": [],
+  "breaker_trip": null,
+  "orchestrator_reports": [],
+  "released_claims": [],
+  "release_errors": [],
+  "released_semantic_intents": [],
+  "semantic_release_errors": [],
+  "remaining_risk": "the supervisor run is still active",
+  "next_safe_action": "wait for finalization or inspect status",
+  "artifact_kind": "supervisor_collect_report",
+  "schema": "https://raw.githubusercontent.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/main/schemas/supervisor-collect-report-v1.schema.json",
+  "schema_version": 1,
+  "collection_state": "active",
+  "final_report_available": false
+}

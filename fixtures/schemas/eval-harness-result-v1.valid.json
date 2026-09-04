@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "schema": "eval_harness_result_v1",
+  "experiment_id": "local-fake-planner-worker-v1",
+  "task": "compare planner and worker proposals for a held-out fixture task",
+  "task_digest": "ad1b92a3d851016e392dd7dae3790918f7e930d14b96ed7b33bb6e7a40543ccd",
+  "provider": {
+    "kind": "local_fake",
+    "network_providers": false
+  },
+  "runs": [
+    {
+      "profile_id": "frontier-planner-cheap-worker",
+      "mix": [
+        {
+          "role": "planner",
+          "model": "fake-frontier"
+        },
+        {
+          "role": "worker",
+          "model": "fake-fast"
+        }
+      ],
+      "outcomes": [
+        {
+          "role": "planner",
+          "model": "fake-frontier",
+          "request_id": "frontier-planner-cheap-worker:planner",
+          "provider_id": "local_fake",
+          "status": "completed",
+          "usage": {
+            "input_tokens": 142,
+            "output_tokens": 17,
+            "total_tokens": 159
+          },
+          "proposal_summary": "eval-harness local-fake role=planner model=fake-frontier"
+        },
+        {
+          "role": "worker",
+          "model": "fake-fast",
+          "request_id": "frontier-planner-cheap-worker:worker",
+          "provider_id": "local_fake",
+          "status": "completed",
+          "usage": {
+            "input_tokens": 142,
+            "output_tokens": 16,
+            "total_tokens": 158
+          },
+          "proposal_summary": "eval-harness local-fake role=worker model=fake-fast"
+        }
+      ],
+      "totals": {
+        "input_tokens": 284,
+        "output_tokens": 33,
+        "total_tokens": 317
+      }
+    },
+    {
+      "profile_id": "cheap-planner-cheap-worker",
+      "mix": [
+        {
+          "role": "planner",
+          "model": "fake-fast"
+        },
+        {
+          "role": "worker",
+          "model": "fake-fast"
+        }
+      ],
+      "outcomes": [
+        {
+          "role": "planner",
+          "model": "fake-fast",
+          "request_id": "cheap-planner-cheap-worker:planner",
+          "provider_id": "local_fake",
+          "status": "completed",
+          "usage": {
+            "input_tokens": 142,
+            "output_tokens": 16,
+            "total_tokens": 158
+          },
+          "proposal_summary": "eval-harness local-fake role=planner model=fake-fast"
+        },
+        {
+          "role": "worker",
+          "model": "fake-fast",
+          "request_id": "cheap-planner-cheap-worker:worker",
+          "provider_id": "local_fake",
+          "status": "completed",
+          "usage": {
+            "input_tokens": 142,
+            "output_tokens": 16,
+            "total_tokens": 158
+          },
+          "proposal_summary": "eval-harness local-fake role=worker model=fake-fast"
+        }
+      ],
+      "totals": {
+        "input_tokens": 284,
+        "output_tokens": 32,
+        "total_tokens": 316
+      }
+    }
+  ]
+}

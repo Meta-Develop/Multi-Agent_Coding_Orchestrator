@@ -1,7 +1,6 @@
 use super::{
     bind_v2_experiment, EvalHarnessManifestV2, EvalHarnessProviderClaim, EvalHarnessProviderKind,
-    EvalHarnessRoleBinding, MixRole, EVAL_HARNESS_MANIFEST_V2_SCHEMA,
-    EVAL_HARNESS_RESULT_V2_VERSION, LOCAL_FAKE_PROVIDER_ID,
+    EvalHarnessRoleBinding, MixRole, EVAL_HARNESS_MANIFEST_V2_SCHEMA, LOCAL_FAKE_PROVIDER_ID,
 };
 use crate::llm::{
     FakeProvider, LlmProvider, LlmRequest, PromptContext, Redactor, Usage, WorkProposal,
@@ -15,7 +14,8 @@ use std::collections::BTreeSet;
 use thiserror::Error;
 
 const EXECUTION_FIXTURE: &[u8] = include_bytes!("fixtures/issue26-execution-fixture-v1.json");
-const RESULT_SCHEMA: &str = "eval_harness_comparable_fake_results_v2";
+const RESULT_VERSION: u32 = 3;
+const RESULT_SCHEMA: &str = "eval_harness_comparable_fake_results_v3";
 const FIXTURE_SCHEMA: &str = "eval_harness_fake_execution_fixture_v1";
 const PRODUCTION_DEFAULT_REFUSAL: &str = "ineligible_to_justify_production_default";
 
@@ -465,7 +465,7 @@ fn execute_validated(
         .map_err(|error| incomparable("objective_selection", error.to_string()))?
         .ok_or_else(|| incomparable("pareto_frontier", "frontier unexpectedly empty"))?;
     Ok(EvalHarnessV2ExecutionResults {
-        version: EVAL_HARNESS_RESULT_V2_VERSION,
+        version: RESULT_VERSION,
         schema: RESULT_SCHEMA.to_string(),
         experiment_id: manifest.experiment_id.clone(),
         manifest_schema: EVAL_HARNESS_MANIFEST_V2_SCHEMA.to_string(),

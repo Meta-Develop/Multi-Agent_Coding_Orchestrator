@@ -1,0 +1,475 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/main/schemas/merge-apply-report-v2.schema.json",
+  "title": "MACO Merge Apply Report v2",
+  "description": "Current v2 contract for mandatory-reviewed `maco merge apply --json`. Ordinary reports are bound to an exact reviewed candidate, safety result, and review intent; review-evidence failures use a disjoint version-2 structured refusal envelope without a fabricated preview.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "preview": {
+      "$ref": "merge-preview-report-v2.schema.json#/$defs/basePreview"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "applied",
+        "nothing_to_apply",
+        "blocked",
+        "refused"
+      ]
+    },
+    "applied": {
+      "type": "boolean"
+    },
+    "review_bound": {
+      "type": "boolean"
+    },
+    "review_binding_status": {
+      "type": "string",
+      "enum": [
+        "matched",
+        "missing",
+        "malformed",
+        "unsupported_version",
+        "stale",
+        "substituted"
+      ]
+    },
+    "gate_denials": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/mergeGateDenial"
+      }
+    },
+    "stdout": {
+      "$ref": "merge-preview-report-v1.schema.json#/$defs/outputSummary"
+    },
+    "stderr": {
+      "$ref": "merge-preview-report-v1.schema.json#/$defs/outputSummary"
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "recorded_collision_paths": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "merge-preview-report-v1.schema.json#/$defs/repositoryRelativePath"
+      }
+    },
+    "accepted_decomposition": {
+      "anyOf": [
+        {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/megafileAssessment"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "lifecycle": {
+      "$ref": "merge-apply-report-v1.schema.json#/$defs/mergeLifecycle"
+    },
+    "version": {
+      "type": "integer",
+      "const": 2
+    },
+    "refusal": {
+      "$ref": "#/$defs/reviewRefusal"
+    }
+  },
+  "oneOf": [
+    {
+      "required": [
+        "preview",
+        "status",
+        "applied",
+        "review_bound",
+        "review_binding_status",
+        "gate_denials",
+        "stdout",
+        "stderr",
+        "error",
+        "recorded_collision_paths",
+        "accepted_decomposition"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "applied",
+            "nothing_to_apply",
+            "blocked"
+          ]
+        },
+        "review_bound": {
+          "const": true
+        },
+        "review_binding_status": {
+          "const": "matched"
+        }
+      },
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "version"
+            ]
+          },
+          {
+            "required": [
+              "refusal"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "required": [
+        "version",
+        "status",
+        "applied",
+        "review_bound",
+        "review_binding_status",
+        "refusal"
+      ],
+      "properties": {
+        "version": {
+          "const": 2
+        },
+        "status": {
+          "const": "refused"
+        },
+        "applied": {
+          "const": false
+        },
+        "review_bound": {
+          "const": false
+        }
+      },
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "preview"
+            ]
+          },
+          {
+            "required": [
+              "gate_denials"
+            ]
+          },
+          {
+            "required": [
+              "stdout"
+            ]
+          },
+          {
+            "required": [
+              "stderr"
+            ]
+          },
+          {
+            "required": [
+              "error"
+            ]
+          },
+          {
+            "required": [
+              "recorded_collision_paths"
+            ]
+          },
+          {
+            "required": [
+              "accepted_decomposition"
+            ]
+          },
+          {
+            "required": [
+              "lifecycle"
+            ]
+          }
+        ]
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "review_binding_status": {
+              "const": "missing"
+            },
+            "refusal": {
+              "$ref": "#/$defs/nonMismatchRefusal"
+            }
+          }
+        },
+        {
+          "properties": {
+            "review_binding_status": {
+              "const": "malformed"
+            },
+            "refusal": {
+              "$ref": "#/$defs/nonMismatchRefusal"
+            }
+          }
+        },
+        {
+          "properties": {
+            "review_binding_status": {
+              "const": "unsupported_version"
+            },
+            "refusal": {
+              "$ref": "#/$defs/nonMismatchRefusal"
+            }
+          }
+        },
+        {
+          "properties": {
+            "review_binding_status": {
+              "const": "stale"
+            },
+            "refusal": {
+              "$ref": "#/$defs/staleRefusal"
+            }
+          }
+        },
+        {
+          "properties": {
+            "review_binding_status": {
+              "const": "substituted"
+            },
+            "refusal": {
+              "$ref": "#/$defs/substitutedRefusal"
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "applied"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "applied": {
+            "const": true
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "applied": {
+            "const": false
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "reviewRefusal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "message",
+        "axes",
+        "next_safe_operation"
+      ],
+      "properties": {
+        "kind": {
+          "const": "reviewed_preview_evidence"
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "axes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/driftAxis"
+          }
+        },
+        "next_safe_operation": {
+          "const": "run_merge_preview_again_with_the_same_options"
+        }
+      }
+    },
+    "nonMismatchRefusal": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/reviewRefusal"
+        },
+        {
+          "properties": {
+            "axes": {
+              "const": []
+            }
+          }
+        }
+      ]
+    },
+    "staleRefusal": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/reviewRefusal"
+        },
+        {
+          "properties": {
+            "axes": {
+              "type": "array",
+              "minItems": 1,
+              "contains": {
+                "enum": [
+                  "primary_head",
+                  "primary_index",
+                  "primary_worktree",
+                  "source_head"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "substitutedRefusal": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/reviewRefusal"
+        },
+        {
+          "properties": {
+            "axes": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "enum": [
+                  "source_identity",
+                  "candidate_snapshot",
+                  "candidate_diff",
+                  "base_preview"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "driftAxis": {
+      "type": "string",
+      "enum": [
+        "primary_head",
+        "primary_index",
+        "primary_worktree",
+        "source_head",
+        "source_identity",
+        "candidate_snapshot",
+        "candidate_diff",
+        "base_preview"
+      ]
+    },
+    "mergeGateDenial": {
+      "anyOf": [
+        {
+          "$ref": "merge-apply-report-v1.schema.json#/$defs/mergeGateDenial"
+        },
+        {
+          "$ref": "#/$defs/primaryStateChangedGateDenial"
+        }
+      ]
+    },
+    "primaryStateChangedGateDenial": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "denial_id",
+        "correction_correlation_id",
+        "reason",
+        "retryability",
+        "context",
+        "route",
+        "next_safe_operation"
+      ],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "const": 1
+        },
+        "denial_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "correction_correlation_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
+        "reason": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "family",
+            "blocker"
+          ],
+          "properties": {
+            "family": {
+              "const": "merge_remediation"
+            },
+            "blocker": {
+              "const": "primary_state_changed"
+            }
+          }
+        },
+        "retryability": {
+          "const": "retry_after_correction"
+        },
+        "context": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "owner",
+            "source",
+            "paths"
+          ],
+          "properties": {
+            "owner": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._-]+$"
+            },
+            "source": {
+              "const": "primary_drift"
+            },
+            "paths": {
+              "type": "array",
+              "maxItems": 256,
+              "uniqueItems": true,
+              "items": {
+                "$ref": "merge-preview-report-v1.schema.json#/$defs/repositoryRelativePath"
+              }
+            }
+          }
+        },
+        "route": {
+          "const": "integration_controller"
+        },
+        "next_safe_operation": {
+          "const": "refresh_candidate_base"
+        }
+      }
+    }
+  }
+}

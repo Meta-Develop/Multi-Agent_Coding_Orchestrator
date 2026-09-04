@@ -1,3 +1,7 @@
+pub use crate::merge_freshness::{
+    MergeApplyReviewRefusalEnvelope, MergePreviewDriftAxis, MergePreviewFreshnessError,
+    MergePreviewFreshnessWatermark, MergeReviewBindingStatus,
+};
 pub use crate::merge_semantic::{
     SemanticConflictClassification, SemanticConflictClassificationStatus,
     SemanticConflictConfidence, SemanticConflictDependencyImpact, SemanticConflictDependencySide,
@@ -189,15 +193,51 @@ pub struct MergePreviewOptions {
     pub collect: MergeCollectOptions,
     pub forces: MergeForceOptions,
     pub require_validation: bool,
+    pub review_intent: MergeApplyReviewIntent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeApplyOptions {
     pub preview: MergePreviewOptions,
     pub candidate_validation_commands: Vec<CandidateValidationCommand>,
-    /// Previously reviewed preview watermark. When present, apply recaptures
-    /// current HEADs and refuses if the primary or source side drifted.
-    pub reviewed_watermark: Option<crate::merge_freshness::MergePreviewFreshnessWatermark>,
+    /// Mandatory evidence from the exact previously reviewed preview. Apply
+    /// recaptures and compares every bound axis before any primary mutation.
+    pub reviewed_watermark: MergePreviewFreshnessWatermark,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct MergeApplyReviewIntent {
+    pub candidate_validation_commands: Vec<String>,
+    pub require_validation_after_candidate: bool,
+    pub auto_reap_merged: bool,
+    pub trunk_ref: Option<String>,
+    pub apply_auto_reap: bool,
+}
+
+impl MergeApplyReviewIntent {
+    pub fn validate(&self) -> Result<()> {
+        if self
+            .candidate_validation_commands
+            .iter()
+            .any(|command| command.trim().is_empty())
+        {
+            bail!("merge apply review intent contains an empty candidate validation command");
+        }
+        if self
+            .trunk_ref
+            .as_deref()
+            .is_some_and(|trunk_ref| trunk_ref.trim().is_empty())
+        {
+            bail!("merge apply review intent contains an empty trunk reference");
+        }
+        if self.auto_reap_merged != self.trunk_ref.is_some() {
+            bail!("merge apply review intent requires auto_reap_merged and trunk_ref together");
+        }
+        if self.apply_auto_reap && !self.auto_reap_merged {
+            bail!("merge apply review intent apply_auto_reap requires auto_reap_merged");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1190,6 +1230,7 @@ impl ArbitrationEnvironment for ProductionArbitrationEnvironment {
                 allow_apply_conflicts: true,
             },
             false,
+            MergeApplyReviewIntent::default(),
         )
     }
 
@@ -1848,6 +1889,7 @@ fn canonical_bound_validation_reports(
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MergeApplyPreview {
+    pub review_intent: MergeApplyReviewIntent,
     pub candidate: MergeCandidate,
     pub safety: MergeApplySafety,
 }
@@ -1976,6 +2018,8 @@ pub struct MergeApplyReport {
     pub preview: MergeApplyPreview,
     pub status: MergeApplyReportStatus,
     pub applied: bool,
+    pub review_bound: bool,
+    pub review_binding_status: MergeReviewBindingStatus,
     pub gate_denials: Vec<GateDenial>,
     pub stdout: OutputSummary,
     pub stderr: OutputSummary,
@@ -2123,7 +2167,7 @@ enum CandidateSnapshotEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PrimaryRepositoryState {
+pub(crate) struct PrimaryRepositoryState {
     head: Option<Oid>,
     index_digest: Option<Oid>,
     worktree_digest: Oid,
@@ -2356,17 +2400,34 @@ pub(crate) fn preview_merge_apply_with_megafile_policy_and_local_git_options(
     megafile_policy: MegafileMergePolicy,
     local_git: MergeLocalGitOptions,
 ) -> Result<MergeApplyPreview> {
-    let mut collect = options.collect;
+    let mut preview = build_unassessed_merge_apply_preview_with_local_git_options(
+        options,
+        validation_evidence,
+        local_git,
+    )?;
+    assess_megafile_policy_with_local_git_options(&mut preview, &megafile_policy, local_git)?;
+    Ok(preview)
+}
+
+fn build_unassessed_merge_apply_preview_with_local_git_options(
+    options: MergePreviewOptions,
+    validation_evidence: ValidationEvidenceBundle,
+    local_git: MergeLocalGitOptions,
+) -> Result<MergeApplyPreview> {
+    options.review_intent.validate()?;
+    let MergePreviewOptions {
+        mut collect,
+        forces,
+        require_validation,
+        review_intent,
+    } = options;
     collect.include_full_diff = true;
     let candidate = collect_agent_result_with_evidence_and_local_git_options(
         collect,
         validation_evidence,
         local_git,
     )?;
-    let mut preview =
-        build_merge_apply_preview(candidate, options.forces, options.require_validation)?;
-    assess_megafile_policy_with_local_git_options(&mut preview, &megafile_policy, local_git)?;
-    Ok(preview)
+    build_merge_apply_preview(candidate, forces, require_validation, review_intent)
 }
 
 /// Builds a merge preview without attempting to acquire a nested shared
@@ -2376,7 +2437,13 @@ pub(crate) fn preview_merge_apply_with_evidence_and_write_lease(
     validation_evidence: ValidationEvidenceBundle,
     write_lease: &ManagedWorktreeWriteLease,
 ) -> Result<MergeApplyPreview> {
-    let mut collect = options.collect;
+    options.review_intent.validate()?;
+    let MergePreviewOptions {
+        mut collect,
+        forces,
+        require_validation,
+        review_intent,
+    } = options;
     collect.include_full_diff = true;
     let candidate = collect_agent_result_with_evidence_and_write_lease(
         collect,
@@ -2384,7 +2451,7 @@ pub(crate) fn preview_merge_apply_with_evidence_and_write_lease(
         write_lease,
     )?;
     let mut preview =
-        build_merge_apply_preview(candidate, options.forces, options.require_validation)?;
+        build_merge_apply_preview(candidate, forces, require_validation, review_intent)?;
     assess_megafile_policy(&mut preview, &MegafileMergePolicy::default())?;
     Ok(preview)
 }
@@ -2393,19 +2460,27 @@ pub(crate) fn build_merge_apply_preview(
     candidate: MergeCandidate,
     forces: MergeForceOptions,
     require_validation: bool,
+    review_intent: MergeApplyReviewIntent,
 ) -> Result<MergeApplyPreview> {
+    review_intent.validate()?;
+    if require_validation != review_intent.require_validation_after_candidate {
+        bail!(
+            "merge preview validation requirement does not match the reviewed merge apply intent"
+        );
+    }
     let patch = candidate.raw_diff.as_slice();
-    let candidate_validation_commands = Vec::new();
+    let candidate_validation_commands = review_intent.candidate_validation_commands.clone();
+    let base_require_validation = require_validation && candidate_validation_commands.is_empty();
 
     let primary_state_unchanged = passed_safety_check();
     let dirty_primary = dirty_primary_check(&candidate.metadata.primary_repo_root)?;
     let stale_base = stale_base_check(&candidate.metadata);
     let unclaimed_edits = unclaimed_edits_check(&candidate.unclaimed_changed_paths);
-    let validation = validation_check(&candidate.validations, require_validation);
+    let validation = validation_check(&candidate.validations, base_require_validation);
     let validation_evidence = validation_evidence_check(
         &candidate.validation_evidence,
         &candidate.validation_binding,
-        require_validation,
+        base_require_validation,
         &candidate.changed_paths,
     );
     let megafile = SafetyCheck {
@@ -2429,13 +2504,14 @@ pub(crate) fn build_merge_apply_preview(
         validation_evidence: &validation_evidence,
         megafile: &megafile,
         validations: &candidate.validations,
-        require_validation,
+        require_validation: base_require_validation,
         validation_commands: &candidate_validation_commands,
         validation_related_paths: &candidate.changed_paths,
     };
     let readiness = classify_apply_safety(checks, &forces);
 
     Ok(MergeApplyPreview {
+        review_intent,
         candidate,
         safety: MergeApplySafety {
             primary_state_unchanged,
@@ -2450,7 +2526,7 @@ pub(crate) fn build_merge_apply_preview(
             megafile_decomposition_target: None,
             megafile_decomposition_evidence: None,
             megafile_blocking: false,
-            validation_required: require_validation,
+            validation_required: base_require_validation,
             candidate_validation_commands,
             force_options: forces,
             apply_mode,
@@ -2836,36 +2912,46 @@ fn reclassify_preview_readiness(preview: &mut MergeApplyPreview) {
     preview.safety.readiness = classify_apply_safety(checks, &preview.safety.force_options);
 }
 
-pub fn apply_merge_result(options: MergeApplyOptions) -> Result<MergeApplyReport> {
-    let evidence = ValidationEvidenceBundle::legacy(options.preview.collect.validations.clone());
-    apply_merge_result_with_evidence(options, evidence)
+const DIRECT_PROGRAMMATIC_APPLY_DISABLED: &str = "direct programmatic apply is disabled; callers must use the guarded merge apply CLI with previously emitted reviewed preview evidence";
+
+fn direct_programmatic_apply_disabled() -> Result<MergeApplyReport> {
+    bail!(DIRECT_PROGRAMMATIC_APPLY_DISABLED)
+}
+
+pub fn apply_merge_result(_options: MergeApplyOptions) -> Result<MergeApplyReport> {
+    direct_programmatic_apply_disabled()
 }
 
 pub fn apply_merge_result_with_evidence(
-    options: MergeApplyOptions,
-    validation_evidence: ValidationEvidenceBundle,
+    _options: MergeApplyOptions,
+    _validation_evidence: ValidationEvidenceBundle,
 ) -> Result<MergeApplyReport> {
-    let report = merge_apply_report_with_evidence(options, validation_evidence)?;
-    if report.status == MergeApplyReportStatus::Blocked {
-        bail!(
-            "merge apply refused: {}",
-            format_blockers(&report.preview.safety.readiness.blockers)
-        );
-    }
-
-    Ok(report)
+    direct_programmatic_apply_disabled()
 }
 
-pub fn merge_apply_report(options: MergeApplyOptions) -> Result<MergeApplyReport> {
+pub fn merge_apply_report(_options: MergeApplyOptions) -> Result<MergeApplyReport> {
+    direct_programmatic_apply_disabled()
+}
+
+#[cfg(test)]
+pub(crate) fn merge_apply_report_internal(options: MergeApplyOptions) -> Result<MergeApplyReport> {
     let evidence = ValidationEvidenceBundle::legacy(options.preview.collect.validations.clone());
-    merge_apply_report_with_evidence(options, evidence)
+    merge_apply_report_with_evidence_internal(options, evidence)
 }
 
 pub fn merge_apply_report_with_evidence(
+    _options: MergeApplyOptions,
+    _validation_evidence: ValidationEvidenceBundle,
+) -> Result<MergeApplyReport> {
+    direct_programmatic_apply_disabled()
+}
+
+#[cfg(test)]
+pub(crate) fn merge_apply_report_with_evidence_internal(
     options: MergeApplyOptions,
     validation_evidence: ValidationEvidenceBundle,
 ) -> Result<MergeApplyReport> {
-    merge_apply_report_with_megafile_policy(
+    merge_apply_report_with_megafile_policy_internal(
         options,
         validation_evidence,
         MegafileMergePolicy::default(),
@@ -2873,6 +2959,15 @@ pub fn merge_apply_report_with_evidence(
 }
 
 pub fn merge_apply_report_with_megafile_policy(
+    _options: MergeApplyOptions,
+    _validation_evidence: ValidationEvidenceBundle,
+    _megafile_policy: MegafileMergePolicy,
+) -> Result<MergeApplyReport> {
+    direct_programmatic_apply_disabled()
+}
+
+#[cfg(test)]
+pub(crate) fn merge_apply_report_with_megafile_policy_internal(
     options: MergeApplyOptions,
     validation_evidence: ValidationEvidenceBundle,
     megafile_policy: MegafileMergePolicy,
@@ -2891,29 +2986,62 @@ pub(crate) fn merge_apply_report_with_megafile_policy_and_local_git_options(
     megafile_policy: MegafileMergePolicy,
     local_git: MergeLocalGitOptions,
 ) -> Result<MergeApplyReport> {
-    let repo_root = discover_primary_repo_root(&options.preview.collect.repo)?;
-    let _lock = RepoCommonLock::acquire(&repo_root, "merge-apply")?;
-    let mut preview_options = options.preview;
-    let require_validation_after_candidate = preview_options.require_validation;
-    if !options.candidate_validation_commands.is_empty() {
-        preview_options.require_validation = false;
+    let MergeApplyOptions {
+        preview,
+        candidate_validation_commands,
+        reviewed_watermark,
+    } = options;
+    // Validate and bind caller-provided authority before any repository read,
+    // lock acquisition, or merge-domain telemetry.
+    preview.review_intent.validate()?;
+    let candidate_validation_command_labels = candidate_validation_commands
+        .iter()
+        .map(|command| command.command.clone())
+        .collect::<Vec<_>>();
+    if candidate_validation_command_labels != preview.review_intent.candidate_validation_commands
+        || preview.require_validation != preview.review_intent.require_validation_after_candidate
+    {
+        return Err(MergePreviewFreshnessError::Mismatch {
+            axes: vec![MergePreviewDriftAxis::BasePreview],
+            moved: "base preview".to_string(),
+        }
+        .into());
     }
-    let preview = preview_merge_apply_with_megafile_policy_and_local_git_options(
-        preview_options,
-        validation_evidence,
+    let reviewed_watermark = reviewed_watermark.canonicalized()?;
+    let current_preview = preview_merge_apply_with_megafile_policy_and_local_git_options(
+        preview.clone(),
+        validation_evidence.clone(),
         megafile_policy.clone(),
         local_git,
     )?;
-    if let Some(reviewed) = options.reviewed_watermark.as_ref() {
-        let current =
-            crate::merge_freshness::MergePreviewFreshnessWatermark::capture_from_candidate(
-                &preview.candidate,
-            )?;
-        crate::merge_freshness::refuse_if_drifted(reviewed, &current)?;
-    }
-    let recorded_collision_paths =
-        record_merge_collision_decision(&preview, &megafile_policy.thresholds)?;
+    let current_watermark = MergePreviewFreshnessWatermark::capture_from_preview(&current_preview)?;
+    crate::merge_freshness::refuse_if_drifted(&reviewed_watermark, &current_watermark)?;
+    let repo_root = discover_primary_repo_root(&preview.collect.repo)?;
+    let _lock = RepoCommonLock::acquire(&repo_root, "merge-apply")?;
+    let require_validation_after_candidate =
+        preview.review_intent.require_validation_after_candidate;
+    let review_context = MergeReviewRevalidationContext {
+        reviewed: reviewed_watermark,
+        preview_options: preview.clone(),
+        validation_evidence: validation_evidence.clone(),
+        megafile_policy: megafile_policy.clone(),
+        local_git,
+    };
+    let mut preview = build_unassessed_merge_apply_preview_with_local_git_options(
+        preview,
+        validation_evidence,
+        local_git,
+    )?;
+    let preliminary = MergePreviewFreshnessWatermark::capture_from_preview(&preview)?;
+    crate::merge_freshness::refuse_if_state_or_candidate_drifted(
+        &review_context.reviewed,
+        &preliminary,
+    )?;
+    assess_megafile_policy_with_local_git_options(&mut preview, &megafile_policy, local_git)?;
+    review_context.verify_preview(&preview)?;
     if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
+        let recorded_collision_paths =
+            record_merge_collision_decision(&preview, &megafile_policy.thresholds)?;
         let mut report = blocked_merge_apply_report(preview)?;
         report.recorded_collision_paths = recorded_collision_paths;
         return Ok(report);
@@ -2922,16 +3050,13 @@ pub(crate) fn merge_apply_report_with_megafile_policy_and_local_git_options(
 
     let mut report = apply_prechecked_merge_with_candidate_validation_locked(
         preview,
-        options.candidate_validation_commands,
+        candidate_validation_commands,
         require_validation_after_candidate,
         &expected_primary_state,
+        &review_context,
+        &megafile_policy.thresholds,
         local_git,
     )?;
-    report.recorded_collision_paths = recorded_collision_paths;
-    if report.recorded_collision_paths.is_empty() {
-        report.recorded_collision_paths =
-            record_merge_collision_decision(&report.preview, &megafile_policy.thresholds)?;
-    }
     if report.applied {
         if let Some(evidence) = report
             .preview
@@ -2957,6 +3082,32 @@ pub(crate) fn merge_apply_report_with_megafile_policy_and_local_git_options(
         }
     }
     Ok(report)
+}
+
+struct MergeReviewRevalidationContext {
+    reviewed: MergePreviewFreshnessWatermark,
+    preview_options: MergePreviewOptions,
+    validation_evidence: ValidationEvidenceBundle,
+    megafile_policy: MegafileMergePolicy,
+    local_git: MergeLocalGitOptions,
+}
+
+impl MergeReviewRevalidationContext {
+    fn verify_preview(&self, preview: &MergeApplyPreview) -> Result<()> {
+        let current = MergePreviewFreshnessWatermark::capture_from_preview(preview)?;
+        crate::merge_freshness::refuse_if_drifted(&self.reviewed, &current)?;
+        Ok(())
+    }
+
+    fn recapture_and_verify(&self) -> Result<()> {
+        let current_preview = preview_merge_apply_with_megafile_policy_and_local_git_options(
+            self.preview_options.clone(),
+            self.validation_evidence.clone(),
+            self.megafile_policy.clone(),
+            self.local_git,
+        )?;
+        self.verify_preview(&current_preview)
+    }
 }
 
 fn record_merge_collision_decision(
@@ -2990,7 +3141,7 @@ fn record_merge_collision_decision(
     Ok(paths)
 }
 
-pub fn blocked_merge_apply_report(preview: MergeApplyPreview) -> Result<MergeApplyReport> {
+fn blocked_merge_apply_report(preview: MergeApplyPreview) -> Result<MergeApplyReport> {
     let error = if preview.safety.readiness.blockers.is_empty() {
         None
     } else {
@@ -3005,6 +3156,8 @@ pub fn blocked_merge_apply_report(preview: MergeApplyPreview) -> Result<MergeApp
         preview,
         status: MergeApplyReportStatus::Blocked,
         applied: false,
+        review_bound: true,
+        review_binding_status: MergeReviewBindingStatus::Matched,
         gate_denials,
         stdout: OutputSummary::default(),
         stderr: OutputSummary::default(),
@@ -3057,32 +3210,13 @@ fn gate_check_source_for_apply_blocker(blocker: ApplyBlocker) -> GateCheckSource
     }
 }
 
-pub fn apply_prechecked_merge(preview: MergeApplyPreview) -> Result<MergeApplyReport> {
-    apply_prechecked_merge_with_candidate_validation(preview, Vec::new(), false)
-}
-
-pub fn apply_prechecked_merge_with_candidate_validation(
-    preview: MergeApplyPreview,
-    candidate_validation_commands: Vec<CandidateValidationCommand>,
-    require_validation_after_candidate: bool,
-) -> Result<MergeApplyReport> {
-    let repo_root = preview.candidate.metadata.primary_repo_root.clone();
-    let _lock = RepoCommonLock::acquire(&repo_root, "merge-apply")?;
-    let expected_primary_state = PrimaryRepositoryState::capture(&repo_root)?;
-    apply_prechecked_merge_with_candidate_validation_locked(
-        preview,
-        candidate_validation_commands,
-        require_validation_after_candidate,
-        &expected_primary_state,
-        MergeLocalGitOptions::default(),
-    )
-}
-
 fn apply_prechecked_merge_with_candidate_validation_locked(
     mut preview: MergeApplyPreview,
     candidate_validation_commands: Vec<CandidateValidationCommand>,
     require_validation_after_candidate: bool,
     expected_primary_state: &PrimaryRepositoryState,
+    review_context: &MergeReviewRevalidationContext,
+    megafile_thresholds: &MegafileThresholds,
     local_git: MergeLocalGitOptions,
 ) -> Result<MergeApplyReport> {
     if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
@@ -3094,10 +3228,13 @@ fn apply_prechecked_merge_with_candidate_validation_locked(
 
     let patch = preview.candidate.raw_diff.clone();
     if patch.is_empty() {
+        review_context.recapture_and_verify()?;
         return Ok(MergeApplyReport {
             preview,
             status: MergeApplyReportStatus::NothingToApply,
             applied: false,
+            review_bound: true,
+            review_binding_status: MergeReviewBindingStatus::Matched,
             gate_denials: Vec::new(),
             stdout: OutputSummary::default(),
             stderr: OutputSummary::default(),
@@ -3151,9 +3288,6 @@ fn apply_prechecked_merge_with_candidate_validation_locked(
             validation_related_paths: &preview.candidate.changed_paths,
         };
         preview.safety.readiness = classify_apply_safety(checks, &preview.safety.force_options);
-        if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
-            return blocked_merge_apply_report(preview);
-        }
     } else if require_validation_after_candidate {
         preview.safety.validation_required = true;
         preview.safety.validation = validation_check(&preview.candidate.validations, true);
@@ -3178,14 +3312,18 @@ fn apply_prechecked_merge_with_candidate_validation_locked(
             validation_related_paths: &preview.candidate.changed_paths,
         };
         preview.safety.readiness = classify_apply_safety(checks, &preview.safety.force_options);
-        if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
-            return blocked_merge_apply_report(preview);
-        }
     }
 
     refresh_apply_safety(&mut preview, expected_primary_state)?;
+    // The implicit preview above is only a comparison observation. Rebuild it
+    // after candidate validation and target refresh so the reviewed authority
+    // is checked again immediately before telemetry or primary mutation.
+    review_context.recapture_and_verify()?;
+    let recorded_collision_paths = record_merge_collision_decision(&preview, megafile_thresholds)?;
     if preview.safety.readiness.status == ApplyReadinessStatus::Blocked {
-        return blocked_merge_apply_report(preview);
+        let mut report = blocked_merge_apply_report(preview)?;
+        report.recorded_collision_paths = recorded_collision_paths;
+        return Ok(report);
     }
 
     let args = match preview.safety.apply_mode {
@@ -3198,11 +3336,13 @@ fn apply_prechecked_merge_with_candidate_validation_locked(
             preview,
             status: MergeApplyReportStatus::NothingToApply,
             applied: false,
+            review_bound: true,
+            review_binding_status: MergeReviewBindingStatus::Matched,
             gate_denials: Vec::new(),
             stdout: OutputSummary::default(),
             stderr: OutputSummary::default(),
             error: None,
-            recorded_collision_paths: Vec::new(),
+            recorded_collision_paths,
             accepted_decomposition: None,
             lifecycle: None,
         });
@@ -3225,6 +3365,8 @@ fn apply_prechecked_merge_with_candidate_validation_locked(
         preview,
         status: MergeApplyReportStatus::Applied,
         applied: true,
+        review_bound: true,
+        review_binding_status: MergeReviewBindingStatus::Matched,
         gate_denials: Vec::new(),
         stdout: summarize_text(
             &String::from_utf8_lossy(&output.stdout),
@@ -3235,7 +3377,7 @@ fn apply_prechecked_merge_with_candidate_validation_locked(
             DEFAULT_DIFF_SUMMARY_CHAR_LIMIT,
         ),
         error: None,
-        recorded_collision_paths: Vec::new(),
+        recorded_collision_paths,
         accepted_decomposition: None,
         lifecycle: None,
     })

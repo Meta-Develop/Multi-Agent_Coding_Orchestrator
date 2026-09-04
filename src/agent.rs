@@ -449,6 +449,7 @@ where
         },
         forces: MergeForceOptions::default(),
         require_validation: false,
+        review_intent: merge::MergeApplyReviewIntent::default(),
     })?;
 
     let boundary_error = if candidate.unclaimed_changed_paths.is_empty() {

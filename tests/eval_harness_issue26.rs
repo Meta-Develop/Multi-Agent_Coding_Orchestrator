@@ -8,7 +8,7 @@ use serde_json::json;
 const MANIFEST: &[u8] = include_bytes!("../src/eval_harness/fixtures/issue26-manifest-v2.json");
 
 const EXPECTED_PROJECTION: &str =
-    include_str!("../src/eval_harness/fixtures/issue26-expected-projection-v2.json");
+    include_str!("../src/eval_harness/fixtures/issue26-expected-projection-v3.json");
 
 fn execute() -> Result<(
     multi_agent_coding_orchestrator::eval_harness::EvalHarnessManifestV2,

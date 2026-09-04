@@ -320,7 +320,7 @@ impl Drop for RepoCommonLock {
 }
 
 impl PrimaryRepositoryState {
-    fn capture(repo_root: &Path) -> Result<Self> {
+    pub(crate) fn capture(repo_root: &Path) -> Result<Self> {
         let first = Self::capture_once(repo_root)?;
         let second = Self::capture_once(repo_root)?;
         if first != second {
@@ -343,6 +343,18 @@ impl PrimaryRepositoryState {
             index_digest,
             worktree_digest,
         })
+    }
+
+    pub(crate) fn head_string(&self) -> Option<String> {
+        self.head.map(|oid| oid.to_string())
+    }
+
+    pub(crate) fn index_digest_string(&self) -> Option<String> {
+        self.index_digest.map(|oid| oid.to_string())
+    }
+
+    pub(crate) fn worktree_digest_string(&self) -> String {
+        self.worktree_digest.to_string()
     }
 }
 

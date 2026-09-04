@@ -27,6 +27,8 @@ exceptions = [
     # This is the repository's declared package license, not an allowance for
     # arbitrary AGPL dependencies.
     { allow = ["AGPL-3.0-or-later"], crate = "multi-agent-coding-orchestrator@0.3.0" },
+    # Reachable through the standards-complete Boon Draft 2020-12 test validator.
+    { allow = ["MIT-0"], crate = "borrow-or-share@0.2.4" },
     # libz-sys embeds stock zlib when the static vendored build is selected.
     # Keep Zlib scoped to that crate; the clarification below verifies the
     # exact expression and license-file hashes for every resolved release.

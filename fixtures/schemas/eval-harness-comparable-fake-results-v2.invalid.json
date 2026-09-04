@@ -1,43 +1,439 @@
 {
-  "version": 2,
-  "schema": "eval_harness_result_v2",
   "experiment_id": "issue26-cli-operator-path-v2",
-  "manifest_schema": "eval_harness_manifest_v2",
-  "manifest_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "fixture": {
-    "schema": "eval_harness_fake_execution_fixture_v1",
-    "version": 1,
+    "digest": "76d138e74c07dc404150e9b38d7fd6bb60db4e372965fb42acc3176733d62968",
     "id": "issue26-local-fake-lifecycle-v1",
-    "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    "schema": "eval_harness_fake_execution_fixture_v1",
+    "version": 1
   },
+  "manifest_digest": "bbe48d684575513f5a2db264a71a1389a9b3cbdb78b553536aec99eb8a8e9137",
+  "manifest_schema": "eval_harness_manifest_v2",
+  "objective_citation": {
+    "content_hash": "82e6de7f5e27768fdad19b5dfa70d70ed1fb9d041262678e3174d5373330b4f9",
+    "id": "maco-default-objective-v2",
+    "source": "built_in",
+    "version": 2
+  },
+  "objective_profile": {
+    "profile": {
+      "content_hash": "82e6de7f5e27768fdad19b5dfa70d70ed1fb9d041262678e3174d5373330b4f9",
+      "id": "maco-default-objective-v2",
+      "quality": {
+        "anti_shortcut_percent": 25,
+        "breadth_percent": 25,
+        "held_out_percent": 50
+      },
+      "switch_costs": {
+        "model_change_same_runtime_microunits": 10000,
+        "runtime_change_microunits": 25000
+      },
+      "tradeoffs": {
+        "human_review_percent": 0,
+        "latency_percent": 0,
+        "monetary_cost_percent": 100,
+        "quota_consumption_percent": 0,
+        "retry_rework_percent": 0
+      },
+      "version": 2
+    },
+    "source": "built_in"
+  },
+  "objective_selection": {
+    "profile_hash": "82e6de7f5e27768fdad19b5dfa70d70ed1fb9d041262678e3174d5373330b4f9",
+    "profile_id": "maco-default-objective-v2",
+    "runner_up_profile_id": "quality-mix",
+    "runner_up_score": 0.51375,
+    "scores": {
+      "economy-mix": 0.46179899645808736,
+      "quality-mix": 0.51375
+    },
+    "selected_profile_id": "economy-mix",
+    "selected_score": 0.46179899645808736
+  },
+  "pareto_frontier": [
+    "economy-mix",
+    "quality-mix"
+  ],
+  "production_default_claim": "ineligible_to_justify_production_default",
+  "production_eligible": false,
+  "profile_summaries": [
+    {
+      "mean_churn_count": 4,
+      "mean_cost_microusd": 1374,
+      "mean_review_findings": 1,
+      "mean_tokens": 614,
+      "mean_wall_time_ms": 100,
+      "pareto_optimal": true,
+      "profile_id": "economy-mix",
+      "quality": {
+        "anti_shortcut_basis_points": 8700,
+        "breadth_basis_points": 8800,
+        "held_out_basis_points": 9000,
+        "overall_basis_points": 8875
+      },
+      "repetitions": 1
+    },
+    {
+      "mean_churn_count": 8,
+      "mean_cost_microusd": 1694,
+      "mean_review_findings": 1,
+      "mean_tokens": 694,
+      "mean_wall_time_ms": 100,
+      "pareto_optimal": true,
+      "profile_id": "quality-mix",
+      "quality": {
+        "anti_shortcut_basis_points": 9600,
+        "breadth_basis_points": 9700,
+        "held_out_basis_points": 9800,
+        "overall_basis_points": 9725
+      },
+      "repetitions": 1
+    }
+  ],
   "provider": {
     "kind": "local_fake",
     "network_providers": false
   },
-  "objective_profile": {},
-  "objective_citation": {
-    "id": "maco-default-objective-v2",
-    "version": 2,
-    "content_hash": "82e6de7f5e27768fdad19b5dfa70d70ed1fb9d041262678e3174d5373330b4f9",
-    "source": "built_in"
-  },
-  "runs": [{ "profile_id": "economy-mix" }],
-  "profile_summaries": [{ "profile_id": "economy-mix" }],
-  "pareto_frontier": ["economy-mix"],
-  "objective_selection": {
-    "profile_id": "maco-default-objective-v2",
-    "profile_hash": "82e6de7f5e27768fdad19b5dfa70d70ed1fb9d041262678e3174d5373330b4f9",
-    "selected_profile_id": "economy-mix",
-    "selected_score": 0.5,
-    "scores": { "economy-mix": 0.5 }
-  },
-  "comparability": {
-    "status": "comparable",
-    "equivalent_initial_state_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-    "expected_run_count": 1,
-    "validated_run_count": 1,
-    "replay_verified": true
-  },
-  "production_eligible": false,
-  "production_default_claim": "ineligible_to_justify_production_default"
+  "runs": [
+    {
+      "final_state_fingerprint": "7242f1abfcc6867bc280869fc7142761c3d642b4a40a83674318b9d751fa6bb8",
+      "initial_state_fingerprint": "1ac7b45dd3d242496023f405936a8eb99fa0cdff0f39fdcb2c298ecf3eb2f1d9",
+      "integration_outcome": "applied",
+      "metrics": {
+        "churn_count": 4,
+        "conflict_count": 0,
+        "deterministic_wall_time_ms": 100,
+        "diff_bytes": 1920,
+        "held_out": [
+          {
+            "assertions_passed": 90,
+            "assertions_run": 100,
+            "content_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+            "executed": true,
+            "id": "issue26-comparability-contract"
+          }
+        ],
+        "loc_added": 32,
+        "loc_deleted": 8,
+        "logical_time_ticks": 4,
+        "quality": {
+          "anti_shortcut_basis_points": 8700,
+          "breadth_basis_points": 8800,
+          "held_out_basis_points": 9000,
+          "overall_basis_points": 8875
+        },
+        "review": {
+          "anti_shortcut_checks_passed": 87,
+          "anti_shortcut_checks_run": 100,
+          "breadth_checks_passed": 88,
+          "breadth_checks_run": 100,
+          "findings": [
+            {
+              "disposition": "accepted_fake_fixture_evidence",
+              "id": "economy-mix-fixture-review",
+              "severity": "informational"
+            }
+          ]
+        },
+        "total_cost_microusd": 1374,
+        "total_usage": {
+          "input_tokens": 541,
+          "output_tokens": 73,
+          "total_tokens": 614
+        },
+        "wall_time_provenance": "committed_deterministic_fake_clock_v1"
+      },
+      "mix": [
+        {
+          "model": "fake-economy",
+          "role": "planner"
+        },
+        {
+          "model": "fake-economy",
+          "role": "worker"
+        },
+        {
+          "model": "fake-economy",
+          "role": "supervisor"
+        },
+        {
+          "model": "fake-economy",
+          "role": "auditor"
+        }
+      ],
+      "profile_id": "economy-mix",
+      "provenance": {
+        "deterministic_local_fake": true,
+        "fixture_digest": "76d138e74c07dc404150e9b38d7fd6bb60db4e372965fb42acc3176733d62968",
+        "fixture_version": 1,
+        "manifest_digest": "bbe48d684575513f5a2db264a71a1389a9b3cbdb78b553536aec99eb8a8e9137",
+        "manifest_version": 2,
+        "mix_digest": "46a08fdfe2c11d4ba8a01fdc2be4ede7648e88e92c6055f86be2089dad5db931",
+        "network_access": false,
+        "objective_hash": "82e6de7f5e27768fdad19b5dfa70d70ed1fb9d041262678e3174d5373330b4f9",
+        "objective_id": "maco-default-objective-v2",
+        "objective_source": "built_in",
+        "provider_id": "local_fake",
+        "real_provider_adapter_invoked": false,
+        "state_isolation": "equivalent_isolated_in_memory"
+      },
+      "record_fingerprint": "defa724eea85ff5535b25cbb6144fe1a30ca16d5bbc4152aea5389928648285e",
+      "repetition": 1,
+      "roles": [
+        {
+          "cost_microusd": 342,
+          "cost_provenance": "committed_local_fake_price_schedule_v1",
+          "model": "fake-economy",
+          "provider_id": "local_fake",
+          "request_id": "issue26-cli-operator-path-v2:economy-mix:1:planner",
+          "response_digest": "ed279a3b333b38e1dd740b381d0bd018537ac14b38c8d3c741b0cbdaba4ef012",
+          "role": "planner",
+          "usage": {
+            "input_tokens": 135,
+            "output_tokens": 18,
+            "total_tokens": 153
+          }
+        },
+        {
+          "cost_microusd": 342,
+          "cost_provenance": "committed_local_fake_price_schedule_v1",
+          "model": "fake-economy",
+          "provider_id": "local_fake",
+          "request_id": "issue26-cli-operator-path-v2:economy-mix:1:worker",
+          "response_digest": "f354c8780381d74e253ab9e1972c84c1c88affe8aa92abc9422abf277cdaf934",
+          "role": "worker",
+          "usage": {
+            "input_tokens": 135,
+            "output_tokens": 18,
+            "total_tokens": 153
+          }
+        },
+        {
+          "cost_microusd": 348,
+          "cost_provenance": "committed_local_fake_price_schedule_v1",
+          "model": "fake-economy",
+          "provider_id": "local_fake",
+          "request_id": "issue26-cli-operator-path-v2:economy-mix:1:supervisor",
+          "response_digest": "4d83abf2ff17bd6282e6ce84d8b5e9fef9eb216ed8bfd9731ca8c21b383b53a5",
+          "role": "supervisor",
+          "usage": {
+            "input_tokens": 136,
+            "output_tokens": 19,
+            "total_tokens": 155
+          }
+        },
+        {
+          "cost_microusd": 342,
+          "cost_provenance": "committed_local_fake_price_schedule_v1",
+          "model": "fake-economy",
+          "provider_id": "local_fake",
+          "request_id": "issue26-cli-operator-path-v2:economy-mix:1:auditor",
+          "response_digest": "9761532ff5c9a3e03d2c4197d1dd3722d0358ea460e7cd71efbd04ab6f651702",
+          "role": "auditor",
+          "usage": {
+            "input_tokens": 135,
+            "output_tokens": 18,
+            "total_tokens": 153
+          }
+        }
+      ],
+      "stages": [
+        {
+          "input_fingerprint": "1ac7b45dd3d242496023f405936a8eb99fa0cdff0f39fdcb2c298ecf3eb2f1d9",
+          "logical_tick": 1,
+          "output_fingerprint": "fc635df5b4178b1881cb452dc53eae8c51b9154dc35098468241af2196dcde70",
+          "stage": "goal_bound"
+        },
+        {
+          "input_fingerprint": "fc635df5b4178b1881cb452dc53eae8c51b9154dc35098468241af2196dcde70",
+          "logical_tick": 2,
+          "output_fingerprint": "cc38f3ee0ed0ab3fdb29828ff4de00bd82f0e88ab6e8cfe943f425a4b3fa5790",
+          "stage": "supervision_complete"
+        },
+        {
+          "input_fingerprint": "cc38f3ee0ed0ab3fdb29828ff4de00bd82f0e88ab6e8cfe943f425a4b3fa5790",
+          "logical_tick": 3,
+          "output_fingerprint": "7242f1abfcc6867bc280869fc7142761c3d642b4a40a83674318b9d751fa6bb8",
+          "stage": "integration_preview"
+        },
+        {
+          "input_fingerprint": "cc38f3ee0ed0ab3fdb29828ff4de00bd82f0e88ab6e8cfe943f425a4b3fa5790",
+          "logical_tick": 4,
+          "output_fingerprint": "7242f1abfcc6867bc280869fc7142761c3d642b4a40a83674318b9d751fa6bb8",
+          "stage": "integration_applied"
+        }
+      ]
+    },
+    {
+      "final_state_fingerprint": "c509a4d8cf6d810321a2531f7543915a2180358b60a5202437d2bfd715b65b59",
+      "initial_state_fingerprint": "1ac7b45dd3d242496023f405936a8eb99fa0cdff0f39fdcb2c298ecf3eb2f1d9",
+      "integration_outcome": "applied",
+      "metrics": {
+        "churn_count": 8,
+        "conflict_count": 0,
+        "deterministic_wall_time_ms": 100,
+        "diff_bytes": 2880,
+        "held_out": [
+          {
+            "assertions_passed": 98,
+            "assertions_run": 100,
+            "content_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+            "executed": true,
+            "id": "issue26-comparability-contract"
+          }
+        ],
+        "loc_added": 48,
+        "loc_deleted": 12,
+        "logical_time_ticks": 4,
+        "quality": {
+          "anti_shortcut_basis_points": 9600,
+          "breadth_basis_points": 9700,
+          "held_out_basis_points": 9800,
+          "overall_basis_points": 9725
+        },
+        "review": {
+          "anti_shortcut_checks_passed": 96,
+          "anti_shortcut_checks_run": 100,
+          "breadth_checks_passed": 97,
+          "breadth_checks_run": 100,
+          "findings": [
+            {
+              "disposition": "accepted_fake_fixture_evidence",
+              "id": "quality-mix-fixture-review",
+              "severity": "informational"
+            }
+          ]
+        },
+        "total_cost_microusd": 1694,
+        "total_usage": {
+          "input_tokens": 541,
+          "output_tokens": 153,
+          "total_tokens": 694
+        },
+        "wall_time_provenance": "committed_deterministic_fake_clock_v1"
+      },
+      "mix": [
+        {
+          "model": "fake-quality",
+          "role": "planner"
+        },
+        {
+          "model": "fake-quality",
+          "role": "worker"
+        },
+        {
+          "model": "fake-quality",
+          "role": "supervisor"
+        },
+        {
+          "model": "fake-quality",
+          "role": "auditor"
+        }
+      ],
+      "profile_id": "quality-mix",
+      "provenance": {
+        "deterministic_local_fake": true,
+        "fixture_digest": "76d138e74c07dc404150e9b38d7fd6bb60db4e372965fb42acc3176733d62968",
+        "fixture_version": 1,
+        "manifest_digest": "bbe48d684575513f5a2db264a71a1389a9b3cbdb78b553536aec99eb8a8e9137",
+        "manifest_version": 2,
+        "mix_digest": "de6950bc9c905a84c28f9dfac2edd2cb5b251fd33b747587e67be2b35b1a86bc",
+        "network_access": false,
+        "objective_hash": "82e6de7f5e27768fdad19b5dfa70d70ed1fb9d041262678e3174d5373330b4f9",
+        "objective_id": "maco-default-objective-v2",
+        "objective_source": "built_in",
+        "provider_id": "local_fake",
+        "real_provider_adapter_invoked": false,
+        "state_isolation": "equivalent_isolated_in_memory"
+      },
+      "record_fingerprint": "e9544c52f34c0b890030889a6427a7fc75d2de8fbba1fe3cf70192085432b089",
+      "repetition": 1,
+      "roles": [
+        {
+          "cost_microusd": 422,
+          "cost_provenance": "committed_local_fake_price_schedule_v1",
+          "model": "fake-quality",
+          "provider_id": "local_fake",
+          "request_id": "issue26-cli-operator-path-v2:quality-mix:1:planner",
+          "response_digest": "0d00d1997b0d341980050c0b0ac08ebf5df19ab61ab4a5c7d84e413647dfecd0",
+          "role": "planner",
+          "usage": {
+            "input_tokens": 135,
+            "output_tokens": 38,
+            "total_tokens": 173
+          }
+        },
+        {
+          "cost_microusd": 422,
+          "cost_provenance": "committed_local_fake_price_schedule_v1",
+          "model": "fake-quality",
+          "provider_id": "local_fake",
+          "request_id": "issue26-cli-operator-path-v2:quality-mix:1:worker",
+          "response_digest": "0438df1592f6c1be1cca7f56e08a75a057628c9ad9fa274dfc8348ff7b4298f3",
+          "role": "worker",
+          "usage": {
+            "input_tokens": 135,
+            "output_tokens": 38,
+            "total_tokens": 173
+          }
+        },
+        {
+          "cost_microusd": 428,
+          "cost_provenance": "committed_local_fake_price_schedule_v1",
+          "model": "fake-quality",
+          "provider_id": "local_fake",
+          "request_id": "issue26-cli-operator-path-v2:quality-mix:1:supervisor",
+          "response_digest": "54545399b61aa3a79ec19aef69aaea10b34fa1939bcf2e95a82c570e46167a71",
+          "role": "supervisor",
+          "usage": {
+            "input_tokens": 136,
+            "output_tokens": 39,
+            "total_tokens": 175
+          }
+        },
+        {
+          "cost_microusd": 422,
+          "cost_provenance": "committed_local_fake_price_schedule_v1",
+          "model": "fake-quality",
+          "provider_id": "local_fake",
+          "request_id": "issue26-cli-operator-path-v2:quality-mix:1:auditor",
+          "response_digest": "b608d964f2b7a69f62a50dbf1070169538313adad82d74b1f5eab86aeaa6fc06",
+          "role": "auditor",
+          "usage": {
+            "input_tokens": 135,
+            "output_tokens": 38,
+            "total_tokens": 173
+          }
+        }
+      ],
+      "stages": [
+        {
+          "input_fingerprint": "1ac7b45dd3d242496023f405936a8eb99fa0cdff0f39fdcb2c298ecf3eb2f1d9",
+          "logical_tick": 1,
+          "output_fingerprint": "fc635df5b4178b1881cb452dc53eae8c51b9154dc35098468241af2196dcde70",
+          "stage": "goal_bound"
+        },
+        {
+          "input_fingerprint": "fc635df5b4178b1881cb452dc53eae8c51b9154dc35098468241af2196dcde70",
+          "logical_tick": 2,
+          "output_fingerprint": "58de6cdad5c1a281383c6aebabc9ed6de0f654f192c47f2403c715c54a913560",
+          "stage": "supervision_complete"
+        },
+        {
+          "input_fingerprint": "58de6cdad5c1a281383c6aebabc9ed6de0f654f192c47f2403c715c54a913560",
+          "logical_tick": 3,
+          "output_fingerprint": "c509a4d8cf6d810321a2531f7543915a2180358b60a5202437d2bfd715b65b59",
+          "stage": "integration_preview"
+        },
+        {
+          "input_fingerprint": "58de6cdad5c1a281383c6aebabc9ed6de0f654f192c47f2403c715c54a913560",
+          "logical_tick": 4,
+          "output_fingerprint": "c509a4d8cf6d810321a2531f7543915a2180358b60a5202437d2bfd715b65b59",
+          "stage": "integration_applied"
+        }
+      ]
+    }
+  ],
+  "schema": "eval_harness_comparable_fake_results_v2",
+  "version": 2
 }

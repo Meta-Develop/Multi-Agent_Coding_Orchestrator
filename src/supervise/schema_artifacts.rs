@@ -51,6 +51,22 @@ pub(super) fn write_worktree_writable_admission_schema(
     write_schema(writer, relative, worktree_writable_admission_schema_value())
 }
 
+const REACHABLE_SUPERVISOR_RUNTIMES: [SupervisorRuntime; 6] = [
+    SupervisorRuntime::Codex,
+    SupervisorRuntime::Fake,
+    SupervisorRuntime::Grok,
+    SupervisorRuntime::Cursor,
+    SupervisorRuntime::ClaudeCode,
+    SupervisorRuntime::GeminiCli,
+];
+
+fn supervisor_runtime_schema_value() -> serde_json::Value {
+    json!({
+        "type": "string",
+        "enum": REACHABLE_SUPERVISOR_RUNTIMES.map(SupervisorRuntime::as_str)
+    })
+}
+
 pub(super) fn worktree_writable_admission_schema_value() -> serde_json::Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -98,10 +114,7 @@ pub(super) fn worktree_writable_admission_schema_value() -> serde_json::Value {
                 "additionalProperties": false,
                 "required": ["runtime", "workspace_access", "side_effect_confinement"],
                 "properties": {
-                    "runtime": {
-                        "type": "string",
-                        "enum": ["codex", "fake", "grok", "cursor", "claude-code", "gemini-cli"]
-                    },
+                    "runtime": supervisor_runtime_schema_value(),
                     "workspace_access": {"const": "read_write"},
                     "side_effect_confinement": {"const": "verified"}
                 }
@@ -111,62 +124,608 @@ pub(super) fn worktree_writable_admission_schema_value() -> serde_json::Value {
 }
 
 pub(super) fn supervisor_final_report_schema_value() -> serde_json::Value {
+    const SCHEMA_ID: &str = "https://raw.githubusercontent.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/main/schemas/supervisor-final-report-v1.schema.json";
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "title": "SupervisorFinalReport",
+        "$id": SCHEMA_ID,
+        "title": "MACO Newly Finalized Supervisor Report v1",
+        "description": "Contract for newly finalized `supervisor-final.json` reports. Historical top-level version-1 reports that predate finalized economics telemetry are outside this publication contract.",
         "type": "object",
-        "required": ["version", "role_economics_profile", "role_usage", "usage_complete"],
+        "additionalProperties": false,
+        "required": supervisor_report_required_fields(),
+        "properties": supervisor_report_properties_value("finalized"),
+        "allOf": supervisor_report_outcome_constraints()
+    })
+}
+
+#[cfg(test)]
+pub(super) fn supervisor_collect_report_schema_value() -> serde_json::Value {
+    let mut properties = supervisor_report_properties_value("finalized");
+    let Some(properties) = properties.as_object_mut() else {
+        return serde_json::Value::Bool(false);
+    };
+    properties.insert(
+        "artifact_kind".to_string(),
+        json!({"const": SUPERVISOR_COLLECT_ARTIFACT_KIND}),
+    );
+    properties.insert(
+        "schema".to_string(),
+        json!({"const": SUPERVISOR_COLLECT_SCHEMA_ID}),
+    );
+    properties.insert(
+        "schema_version".to_string(),
+        json!({"type": "integer", "const": SUPERVISOR_COLLECT_SCHEMA_VERSION}),
+    );
+    properties.insert(
+        "collection_state".to_string(),
+        json!({
+            "type": "string",
+            "enum": [
+                "active", "resumable", "uncertain", "interrupted", "finalized",
+                "inconsistent_finalized"
+            ]
+        }),
+    );
+    properties.insert(
+        "final_report_available".to_string(),
+        json!({"type": "boolean"}),
+    );
+    properties.insert(
+        "run_lifecycle".to_string(),
+        supervisor_run_lifecycle_schema_value(),
+    );
+
+    let mut required = supervisor_report_required_fields();
+    required.retain(|field| !matches!(*field, "role_economics_profile" | "role_usage"));
+    required.extend([
+        "artifact_kind",
+        "schema",
+        "schema_version",
+        "collection_state",
+        "final_report_available",
+    ]);
+    let mut constraints = supervisor_report_outcome_constraints();
+    constraints.push(json!({
+        "oneOf": [
+            collect_nonfinal_state_schema_value("active", "active"),
+            collect_nonfinal_state_schema_value("resumable", "resumable"),
+            collect_nonfinal_state_schema_value("uncertain", "uncertain"),
+            collect_nonfinal_state_schema_value("interrupted", "interrupted"),
+            collect_finalized_state_schema_value(),
+            collect_nonfinal_state_schema_value("inconsistent_finalized", "finalized")
+        ]
+    }));
+
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": SUPERVISOR_COLLECT_SCHEMA_ID,
+        "title": "MACO Supervisor Collect Report v1",
+        "description": "Lifecycle-aware public output from `maco supervise collect`. Finalized reports preserve the historical supervisor-final v1 fields; nonfinal states are explicit incomplete snapshots.",
+        "type": "object",
+        "additionalProperties": false,
+        "required": required,
+        "properties": properties,
+        "allOf": constraints
+    })
+}
+
+fn supervisor_report_required_fields() -> Vec<&'static str> {
+    vec![
+        "version",
+        "run_id",
+        "role",
+        "repo",
+        "plan_file",
+        "run_dir",
+        "runtime",
+        "publishable",
+        "success",
+        "accepted",
+        "rejected",
+        "status",
+        "run_lifecycle",
+        "assigned_paths",
+        "semantic_symbols",
+        "semantic_modules",
+        "claim_tokens",
+        "semantic_intent_tokens",
+        "role_economics_profile",
+        "role_usage",
+        "usage_complete",
+        "commands_run",
+        "environment_failures",
+        "autonomy_kpis",
+        "files_changed",
+        "validation_results",
+        "findings",
+        "bloated_file_flags",
+        "decomposition_candidates",
+        "breaker_trip",
+        "orchestrator_reports",
+        "released_claims",
+        "release_errors",
+        "released_semantic_intents",
+        "semantic_release_errors",
+        "remaining_risk",
+        "next_safe_action",
+    ]
+}
+
+fn supervisor_report_properties_value(run_lifecycle: &str) -> serde_json::Value {
+    merge_schema_property_groups([
+        json!({
+          "version": {"type": "integer", "const": SUPERVISOR_SCHEMA_VERSION},
+          "run_id": identifier_schema_value(),
+          "role": {"const": "supervisor"},
+          "repo": {"const": "."},
+          "plan_file": safe_published_path_schema_value(),
+          "run_dir": safe_published_path_schema_value(),
+          "runtime": supervisor_runtime_schema_value(),
+          "publishable": {"type": "boolean"},
+          "success": {"type": "boolean"},
+          "accepted": {"type": "boolean"},
+          "rejected": {"type": "boolean"},
+          "status": review_status_schema_value(),
+          "run_lifecycle": {"const": run_lifecycle},
+          "evidence_only_reaudit": evidence_only_reaudit_schema_value(),
+          "assigned_paths": path_array_schema_value(),
+          "semantic_symbols": string_array_schema_value(),
+          "semantic_modules": string_array_schema_value(),
+          "claim_tokens": nonnegative_integer_array_schema_value(),
+          "semantic_intent_tokens": nonnegative_integer_array_schema_value()
+        }),
+        json!({
+          "role_economics_profile": role_economics_profile_schema_value(),
+          "run_budget": run_budget_report_schema_value(),
+          "role_usage": complete_role_usage_schema_value(),
+          "review_lens_usage": {
+              "type": "array",
+              "items": review_lens_usage_report_schema_value()
+          },
+          "review_lens_total_usage": usage_schema_value(),
+          "review_lens_total_cost_usd": {"type": "number", "minimum": 0},
+          "total_usage": usage_schema_value(),
+          "total_cost_usd": {"type": "number", "minimum": 0},
+          "usage_complete": {"type": "boolean"},
+          "commands_run": {"type": "array", "items": command_run_record_schema_value()},
+          "environment_failures": {"type": "array", "items": environment_failure_schema_value()},
+          "sandbox_denials": {"type": "array", "uniqueItems": true, "items": sandbox_denial_evidence_schema_value()},
+          "gate_denials": {"type": "array", "items": gate_denial_schema_value()},
+          "pre_action_review_metrics": {"type": "array", "items": review_metric_snapshot_schema_value()},
+          "gate_correction_outcomes": {"type": "array", "items": gate_correction_outcome_schema_value()}
+        }),
+        json!({
+          "autonomy_kpis": autonomy_kpi_report_schema_value(),
+          "files_changed": path_array_schema_value(),
+          "validation_results": {"type": "array", "items": validation_result_schema_value()},
+          "findings": {"type": "array", "items": finding_schema_value()},
+          "bloated_file_flags": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": bloated_file_flag_schema_value()
+          },
+          "decomposition_candidates": {
+              "type": "array",
+              "items": supervisor_final_decomposition_completion_object_schema_value()
+          },
+          "generated_follow_up_tasks": generated_follow_up_tasks_schema_value(),
+          "assignment_traceability": {
+              "type": "array",
+              "items": assignment_traceability_schema_value()
+          },
+          "coverage_gaps": {"type": "array", "items": coverage_gap_schema_value()},
+          "breaker_trip": {
+              "anyOf": [supervisor_breaker_trip_schema_value(), {"type": "null"}]
+          },
+          "orchestrator_reports": {"type": "array", "items": supervisor_final_orchestrator_report_schema_value()}
+        }),
+        json!({
+          "released_claims": {"type": "array", "items": path_claim_schema_value()},
+          "release_errors": string_array_schema_value(),
+          "released_semantic_intents": {"type": "array", "items": semantic_intent_schema_value()},
+          "semantic_release_errors": string_array_schema_value(),
+          "remaining_risk": {"type": "string"},
+          "next_safe_action": {"type": "string"}
+        }),
+    ])
+}
+
+fn merge_schema_property_groups<const N: usize>(
+    groups: [serde_json::Value; N],
+) -> serde_json::Value {
+    let mut properties = serde_json::Map::new();
+    for group in groups {
+        if let serde_json::Value::Object(group) = group {
+            properties.extend(group);
+        }
+    }
+    serde_json::Value::Object(properties)
+}
+
+fn supervisor_report_outcome_constraints() -> Vec<serde_json::Value> {
+    vec![
+        json!({
+            "if": {"properties": {"publishable": {"const": true}}, "required": ["publishable"]},
+            "then": {"properties": {"accepted": {"const": true}}},
+            "else": {"properties": {"accepted": {"const": false}}}
+        }),
+        environment_failure_outcome_schema_value(),
+    ]
+}
+
+#[cfg(test)]
+fn collect_nonfinal_state_schema_value(
+    collection_state: &str,
+    run_lifecycle: &str,
+) -> serde_json::Value {
+    json!({
         "properties": {
-            "version": {"type": "integer", "const": SUPERVISOR_SCHEMA_VERSION},
-            "role_economics_profile": role_economics_profile_schema_value(),
-            "role_usage": complete_role_usage_schema_value(),
-            "usage_complete": {"type": "boolean"},
-            "run_lifecycle": {
-                "type": "string",
-                "enum": ["active", "interrupted", "uncertain", "resumable", "finalized"]
+            "collection_state": {"const": collection_state},
+            "final_report_available": {"const": false},
+            "run_lifecycle": {"const": run_lifecycle},
+            "plan_file": {"const": SUPERVISOR_COLLECT_UNFINALIZED_PLAN_FILE},
+            "publishable": {"const": false},
+            "success": {"const": false},
+            "accepted": {"const": false},
+            "rejected": {"const": true},
+            "status": {"const": "missing"},
+            "usage_complete": {"const": false}
+        },
+        "required": [
+            "collection_state", "final_report_available", "run_lifecycle", "plan_file",
+            "publishable", "success", "accepted", "rejected", "status", "usage_complete"
+        ],
+        "not": {
+            "anyOf": [
+                {"required": ["role_economics_profile"]},
+                {"required": ["role_usage"]}
+            ]
+        }
+    })
+}
+
+#[cfg(test)]
+fn collect_finalized_state_schema_value() -> serde_json::Value {
+    json!({
+        "properties": {
+            "collection_state": {"const": "finalized"},
+            "final_report_available": {"const": true},
+            "run_lifecycle": {"const": "finalized"}
+        },
+        "required": [
+            "collection_state", "final_report_available", "run_lifecycle",
+            "role_economics_profile", "role_usage"
+        ],
+        "not": {
+            "properties": {
+                "plan_file": {"const": SUPERVISOR_COLLECT_UNFINALIZED_PLAN_FILE}
             },
-            "gate_denials": {
-                "type": "array",
-                "items": gate_denial_schema_value()
-            },
-            "gate_correction_outcomes": {
-                "type": "array",
-                "items": gate_correction_outcome_schema_value()
-            },
-            "autonomy_kpis": autonomy_kpi_report_schema_value(),
-            "run_budget": run_budget_report_schema_value(),
-            "review_lens_usage": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["lens_id", "backend_id", "model", "observation"],
-                    "properties": {
-                        "lens_id": {"type": "string"},
-                        "backend_id": {"type": "string"},
-                        "model": {"type": "string"},
-                        "usage": usage_schema_value(),
-                        "cost_usd": {"type": "number", "minimum": 0},
-                        "observation": {
-                            "type": "string",
-                            "enum": [
-                                "process_observed",
-                                "supervisor_aggregate",
-                                "not_process_observable",
-                                "synthetic_fake"
-                            ]
-                        },
-                        "unavailable_reason": {"type": "string"}
-                    }
+            "required": ["plan_file"]
+        }
+    })
+}
+
+fn identifier_schema_value() -> serde_json::Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9._-]+$"
+    })
+}
+
+fn safe_published_path_schema_value() -> serde_json::Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "pattern": "^([A-Za-z]($|[^:\\u0000-\\u001F])|[^A-Za-z\\\\/\\u0000-\\u001F])[^\\u0000-\\u001F]*$",
+        "not": {"pattern": "(^|[\\\\/])\\.\\.([\\\\/]|$)"}
+    })
+}
+
+fn repository_relative_path_schema_value() -> serde_json::Value {
+    let mut schema = safe_published_path_schema_value();
+    schema["maxLength"] = json!(4096);
+    schema
+}
+
+fn path_array_schema_value() -> serde_json::Value {
+    json!({
+        "type": "array",
+        "uniqueItems": true,
+        "items": repository_relative_path_schema_value()
+    })
+}
+
+fn string_array_schema_value() -> serde_json::Value {
+    json!({"type": "array", "items": {"type": "string"}})
+}
+
+fn nonnegative_integer_array_schema_value() -> serde_json::Value {
+    json!({
+        "type": "array",
+        "uniqueItems": true,
+        "items": {"type": "integer", "minimum": 0}
+    })
+}
+
+fn review_status_schema_value() -> serde_json::Value {
+    json!({
+        "type": "string",
+        "enum": ["pending", "succeeded", "failed", "rejected", "missing"]
+    })
+}
+
+#[cfg(test)]
+fn supervisor_run_lifecycle_schema_value() -> serde_json::Value {
+    json!({
+        "type": "string",
+        "enum": ["active", "interrupted", "uncertain", "resumable", "finalized"]
+    })
+}
+
+fn review_lens_usage_report_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["lens_id", "backend_id", "model", "observation"],
+        "properties": {
+            "lens_id": {"type": "string"},
+            "backend_id": {"type": "string"},
+            "model": {"type": "string"},
+            "usage": usage_schema_value(),
+            "cost_usd": {"type": "number", "minimum": 0},
+            "observation": role_usage_observation_schema_value(),
+            "unavailable_reason": {"type": "string"}
+        }
+    })
+}
+
+fn candidate_validation_binding_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["version", "agent_id", "primary_head", "agent_head", "merge_base", "diff_oid"],
+        "properties": {
+            "version": {"type": "integer", "minimum": 1},
+            "agent_id": identifier_schema_value(),
+            "primary_head": {"type": ["string", "null"]},
+            "agent_head": {"type": ["string", "null"]},
+            "merge_base": {"type": ["string", "null"]},
+            "diff_oid": {"type": "string", "minLength": 1}
+        }
+    })
+}
+
+fn evidence_only_reaudit_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "source_run_id", "assignment_id", "attempt", "preserved_candidate_binding",
+            "accepted"
+        ],
+        "properties": {
+            "source_run_id": identifier_schema_value(),
+            "assignment_id": identifier_schema_value(),
+            "attempt": {"type": "integer", "minimum": 0, "maximum": 255},
+            "preserved_candidate_binding": candidate_validation_binding_schema_value(),
+            "accepted": {"type": "boolean"}
+        }
+    })
+}
+
+fn review_metric_snapshot_schema_value() -> serde_json::Value {
+    let ratio = || {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["numerator", "denominator"],
+            "properties": {
+                "numerator": {"type": "integer", "minimum": 0},
+                "denominator": {"type": "integer", "minimum": 0}
+            }
+        })
+    };
+    let latency_budget = || {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["p50_ms", "p95_ms", "timeout_ms"],
+            "properties": {
+                "p50_ms": {"type": "integer", "minimum": 0},
+                "p95_ms": {"type": "integer", "minimum": 0},
+                "timeout_ms": {"type": "integer", "minimum": 0}
+            }
+        })
+    };
+    let latency = || {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "sample_count", "measured_p50_ms", "measured_p95_ms", "budget",
+                "p50_within_budget", "p95_within_budget"
+            ],
+            "properties": {
+                "sample_count": {"type": "integer", "minimum": 0},
+                "measured_p50_ms": {"type": ["integer", "null"], "minimum": 0},
+                "measured_p95_ms": {"type": ["integer", "null"], "minimum": 0},
+                "budget": latency_budget(),
+                "p50_within_budget": {"type": ["boolean", "null"]},
+                "p95_within_budget": {"type": ["boolean", "null"]}
+            }
+        })
+    };
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "reviewed_action_denials", "eligible_run_human_interruptions",
+            "classifier_invocations", "review_latency", "classifier_latency",
+            "latency_budget_latched"
+        ],
+        "properties": {
+            "reviewed_action_denials": ratio(),
+            "eligible_run_human_interruptions": ratio(),
+            "classifier_invocations": {"type": "integer", "minimum": 0},
+            "review_latency": latency(),
+            "classifier_latency": latency(),
+            "latency_budget_latched": {"type": "boolean"}
+        }
+    })
+}
+
+fn assignment_traceability_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "assignment_id", "depth", "flattened_index", "spec_fragment_ids",
+            "assigned_paths", "produced_changed_paths"
+        ],
+        "properties": {
+            "assignment_id": identifier_schema_value(),
+            "parent_assignment_id": identifier_schema_value(),
+            "depth": {"type": "integer", "minimum": 0, "maximum": 255},
+            "flattened_index": {"type": "integer", "minimum": 0},
+            "spec_fragment_ids": string_array_schema_value(),
+            "assigned_paths": path_array_schema_value(),
+            "produced_changed_paths": path_array_schema_value(),
+            "produced_diff_binding": candidate_validation_binding_schema_value(),
+            "report_status": review_status_schema_value()
+        }
+    })
+}
+
+fn coverage_gap_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "message"],
+        "properties": {
+            "kind": {"enum": [
+                "unassigned_spec_fragment", "missing_assignment_report",
+                "no_produced_changes", "missing_diff_binding"
+            ]},
+            "spec_fragment_id": identifier_schema_value(),
+            "assignment_id": identifier_schema_value(),
+            "message": {"type": "string", "minLength": 1}
+        }
+    })
+}
+
+fn supervisor_breaker_trip_schema_value() -> serde_json::Value {
+    let count = json!({"type": "integer", "minimum": 0});
+    let reason = json!({
+        "oneOf": [
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind", "failures", "retries", "threshold"],
+                "properties": {
+                    "kind": {"const": "sustained_assignment_failures"},
+                    "failures": count.clone(), "retries": count.clone(), "threshold": count.clone()
                 }
             },
-            "review_lens_total_usage": usage_schema_value(),
-            "review_lens_total_cost_usd": {"type": "number", "minimum": 0},
-            "environment_failures": {
-                "type": "array",
-                "items": environment_failure_schema_value()
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind", "denials", "failures", "threshold"],
+                "properties": {
+                    "kind": {"const": "repeated_claim_denial"},
+                    "denials": count.clone(), "failures": count.clone(), "threshold": count.clone()
+                }
             },
-            "generated_follow_up_tasks": generated_follow_up_tasks_schema_value()
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind", "rejections", "retries", "threshold"],
+                "properties": {
+                    "kind": {"const": "repeated_rejection_loop"},
+                    "rejections": count.clone(), "retries": count.clone(), "threshold": count.clone()
+                }
+            },
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind", "blocked", "warned", "conflicts", "threshold"],
+                "properties": {
+                    "kind": {"const": "sustained_semantic_conflicts"},
+                    "blocked": count.clone(), "warned": count.clone(),
+                    "conflicts": count.clone(), "threshold": count.clone()
+                }
+            }
+        ]
+    });
+    let window = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "window_len", "accepted_assignments", "repeated_rejections",
+            "failed_assignments", "retries", "claim_denials", "claim_failures",
+            "semantic_conflict_blocks", "semantic_conflict_warnings", "semantic_conflicts"
+        ],
+        "properties": {
+            "window_len": count.clone(), "accepted_assignments": count.clone(),
+            "repeated_rejections": count.clone(), "failed_assignments": count.clone(),
+            "retries": count.clone(), "claim_denials": count.clone(),
+            "claim_failures": count.clone(), "semantic_conflict_blocks": count.clone(),
+            "semantic_conflict_warnings": count.clone(), "semantic_conflicts": count
+        }
+    });
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["reason", "window", "autonomy_kpis", "recovery_guidance"],
+        "properties": {
+            "reason": reason,
+            "window": window,
+            "autonomy_kpis": autonomy_kpi_report_schema_value(),
+            "recovery_guidance": {"type": "string", "minLength": 1}
+        }
+    })
+}
+
+fn path_claim_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["token", "agent_id", "paths"],
+        "properties": {
+            "token": {"type": "integer", "minimum": 1},
+            "agent_id": identifier_schema_value(),
+            "paths": path_array_schema_value()
+        }
+    })
+}
+
+fn semantic_intent_schema_value() -> serde_json::Value {
+    let symbol = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "qualified_path", "name", "kind", "file"],
+        "properties": {
+            "id": {"type": "string", "minLength": 1},
+            "qualified_path": {"type": "string", "minLength": 1},
+            "name": {"type": "string", "minLength": 1},
+            "kind": {"type": "string", "minLength": 1},
+            "file": repository_relative_path_schema_value()
+        }
+    });
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "token", "agent_id", "paths", "symbols", "modules", "impacted_files",
+            "task_digest", "task_excerpt", "notes", "warnings"
+        ],
+        "properties": {
+            "token": {"type": "integer", "minimum": 1},
+            "agent_id": identifier_schema_value(),
+            "paths": path_array_schema_value(),
+            "symbols": {"type": "array", "items": symbol},
+            "modules": string_array_schema_value(),
+            "impacted_files": path_array_schema_value(),
+            "task_digest": {"type": ["string", "null"]},
+            "task_excerpt": {"type": ["string", "null"]},
+            "notes": string_array_schema_value(),
+            "warnings": string_array_schema_value()
         }
     })
 }
@@ -352,6 +911,24 @@ fn resolved_objective_profile_schema_value() -> serde_json::Value {
                             "latency_percent": {"type": "integer", "minimum": 0, "maximum": 100},
                             "retry_rework_percent": {"type": "integer", "minimum": 0, "maximum": 100},
                             "human_review_percent": {"type": "integer", "minimum": 0, "maximum": 100}
+                        }
+                    },
+                    "switch_costs": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                            "model_change_same_runtime_microunits",
+                            "runtime_change_microunits"
+                        ],
+                        "properties": {
+                            "model_change_same_runtime_microunits": {
+                                "type": "integer",
+                                "minimum": 0
+                            },
+                            "runtime_change_microunits": {
+                                "type": "integer",
+                                "minimum": 0
+                            }
                         }
                     },
                     "quality_operations_balance": {
@@ -1185,6 +1762,23 @@ fn run_budget_report_schema_value() -> serde_json::Value {
 }
 
 pub(super) fn orchestrator_report_schema_value() -> serde_json::Value {
+    orchestrator_report_schema_value_with_decomposition(
+        worker_report_schema_value(),
+        decomposition_completion_object_schema_value(),
+    )
+}
+
+fn supervisor_final_orchestrator_report_schema_value() -> serde_json::Value {
+    orchestrator_report_schema_value_with_decomposition(
+        supervisor_final_worker_report_schema_value(),
+        supervisor_final_decomposition_completion_object_schema_value(),
+    )
+}
+
+fn orchestrator_report_schema_value_with_decomposition(
+    worker_report_schema: serde_json::Value,
+    decomposition_completion_schema: serde_json::Value,
+) -> serde_json::Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "OrchestratorReviewReport",
@@ -1196,8 +1790,6 @@ pub(super) fn orchestrator_report_schema_value() -> serde_json::Value {
             "assigned_paths",
             "semantic_symbols",
             "semantic_modules",
-            "claim_token",
-            "semantic_intent_token",
             "commands_run",
             "environment_failures",
             "files_changed",
@@ -1227,12 +1819,13 @@ pub(super) fn orchestrator_report_schema_value() -> serde_json::Value {
             "validation_results": {"type": "array", "items": validation_result_schema_value()},
             "findings": {"type": "array", "items": finding_schema_value()},
             "field_guide_entries": field_guide_entries_schema_value(),
-            "worker_reports": {"type": "array", "items": worker_report_schema_value()},
+            "worker_reports": {"type": "array", "items": worker_report_schema},
             "audit_reports": {"type": "array", "items": auditor_report_schema_value()},
+            "review_lens_aggregate": review_lens_aggregate_schema_value(),
             "decomposition_completions": {
                 "type": "array",
                 "uniqueItems": true,
-                "items": decomposition_completion_object_schema_value()
+                "items": decomposition_completion_schema
             },
             "licensed_breakage_review": licensed_breakage_review_schema_value(),
             "generated_follow_up_tasks": generated_follow_up_tasks_schema_value(),
@@ -1248,6 +1841,95 @@ pub(super) fn orchestrator_report_schema_value() -> serde_json::Value {
             "next_safe_action": {"type": "string"}
         },
         "allOf": [orchestrator_environment_failure_outcome_schema_value()]
+    })
+}
+
+fn review_lens_descriptor_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "id", "backend_id", "model", "information_scope", "expected_evidence_kind"
+        ],
+        "properties": {
+            "id": identifier_schema_value(),
+            "backend_id": {"type": "string", "minLength": 1},
+            "model": {"type": "string", "minLength": 1},
+            "reasoning_effort": {"type": "string", "minLength": 1},
+            "information_scope": review_information_scope_schema_value(),
+            "expected_evidence_kind": review_lens_evidence_kind_schema_value()
+        }
+    })
+}
+
+fn review_lens_coverage_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "worker_ids": string_array_schema_value(),
+            "paths": path_array_schema_value()
+        }
+    })
+}
+
+fn review_lens_evidence_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "kind", "binding", "lens", "backend_configuration_id", "request_binding",
+            "coverage"
+        ],
+        "properties": {
+            "kind": review_lens_evidence_kind_schema_value(),
+            "binding": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+            "lens": review_lens_descriptor_schema_value(),
+            "backend_configuration_id": {"type": "string", "minLength": 1},
+            "request_binding": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+            "coverage": review_lens_coverage_schema_value()
+        }
+    })
+}
+
+fn review_lens_aggregate_schema_value() -> serde_json::Value {
+    let verdict_status = json!({"enum": ["accept", "reject", "procedural_failure"]});
+    let verdict = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "lens", "reported", "reported_verdict", "effective_verdict", "coverage",
+            "evidence"
+        ],
+        "properties": {
+            "lens": review_lens_descriptor_schema_value(),
+            "reported": {"type": "boolean"},
+            "request_binding": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+            "reported_verdict": verdict_status.clone(),
+            "effective_verdict": verdict_status,
+            "coverage": review_lens_coverage_schema_value(),
+            "evidence": {"type": "array", "items": review_lens_evidence_schema_value()},
+            "validation_errors": string_array_schema_value()
+        }
+    });
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "version", "policy", "decision", "required_accepts", "validated_accepts",
+            "rejected_lenses", "procedural_failures", "required_coverage", "lens_verdicts"
+        ],
+        "properties": {
+            "version": {"type": "integer", "minimum": 1},
+            "policy": review_aggregation_policy_schema_value(),
+            "decision": {"enum": ["accept", "reject", "procedural_failure"]},
+            "required_accepts": {"type": "integer", "minimum": 0},
+            "validated_accepts": {"type": "integer", "minimum": 0},
+            "rejected_lenses": {"type": "integer", "minimum": 0},
+            "procedural_failures": {"type": "integer", "minimum": 0},
+            "required_coverage": review_lens_coverage_schema_value(),
+            "lens_verdicts": {"type": "array", "items": verdict}
+        }
     })
 }
 
@@ -1367,19 +2049,283 @@ fn generated_follow_up_supervisor_plan_schema_value() -> serde_json::Value {
             "max_gate_corrections": {"type": "integer"},
             "child_timeout_seconds": {"type": "integer", "minimum": 1},
             "semantic_coordination": {"type": "string", "enum": ["off", "warn", "block"]},
-            "role_models": {"type": "object"},
-            "model_pricing": {"type": "object"},
-            "review_lenses": {"type": "array", "minItems": 1},
-            "review_aggregation_policy": {"type": "object"},
-            "assignments": {"type": "array", "minItems": 1, "maxItems": 1},
-            "spec_fragment_ids": {"type": "array", "maxItems": 0},
-            "assignment_schedule": {"type": "array", "minItems": 1, "maxItems": 1},
-            "run_budget": {
+            "role_models": partial_role_map_schema_value(role_model_selection_schema_value()),
+            "model_pricing": {
                 "type": "object",
-                "required": ["soft_tokens", "hard_tokens", "role_token_reservations"]
+                "additionalProperties": model_pricing_schema_value()
             },
-            "consultant": {"type": "object"},
+            "review_lenses": {
+                "type": "array", "minItems": 1,
+                "items": review_lens_config_schema_value()
+            },
+            "review_aggregation_policy": review_aggregation_policy_schema_value(),
+            "assignments": {
+                "type": "array", "minItems": 1, "maxItems": 1,
+                "items": orchestrator_assignment_schema_value()
+            },
+            "spec_fragment_ids": {"type": "array", "maxItems": 0, "items": {"type": "string"}},
+            "assignment_schedule": {
+                "type": "array", "minItems": 1, "maxItems": 1,
+                "items": assignment_schedule_entry_schema_value()
+            },
+            "run_budget": supervisor_budget_config_schema_value(),
+            "consultant": supervisor_consultant_plan_schema_value(),
             "generated_follow_up": generated_follow_up_plan_context_schema_value()
+        }
+    })
+}
+
+fn partial_role_map_schema_value(value_schema: serde_json::Value) -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "supervisor": value_schema.clone(),
+            "child_orchestrator": value_schema.clone(),
+            "worker": value_schema.clone(),
+            "gate_classifier": value_schema.clone(),
+            "auditor": value_schema
+        }
+    })
+}
+
+fn role_model_selection_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "model": {"type": "string", "minLength": 1},
+            "reasoning_effort": {"type": "string", "minLength": 1},
+            "unavailable_model_fallback": {
+                "oneOf": [
+                    {"enum": ["fail_closed", "runtime_default", "local_deterministic_fake"]},
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["ordered_catalog_chain"],
+                        "properties": {
+                            "ordered_catalog_chain": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["models", "on_exhausted"],
+                                "properties": {
+                                    "models": {"type": "array", "items": {"type": "string", "minLength": 1}},
+                                    "budget_degrade_models": {"type": "array", "items": {"type": "string", "minLength": 1}},
+                                    "on_exhausted": {"enum": ["fail_closed", "runtime_default", "local_deterministic_fake"]}
+                                }
+                            }
+                        }
+                    }
+                ]
+            }
+        }
+    })
+}
+
+fn model_pricing_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["input_usd_per_million_tokens", "output_usd_per_million_tokens"],
+        "properties": {
+            "input_usd_per_million_tokens": {"type": "number", "minimum": 0},
+            "output_usd_per_million_tokens": {"type": "number", "minimum": 0}
+        }
+    })
+}
+
+fn review_lens_config_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "backend", "information_scope"],
+        "properties": {
+            "id": identifier_schema_value(),
+            "backend": {
+                "oneOf": [
+                    {
+                        "type": "object", "additionalProperties": false,
+                        "required": ["kind", "backend_id", "model"],
+                        "properties": {
+                            "kind": {"const": "model"},
+                            "backend_id": {"type": "string", "minLength": 1},
+                            "model": {"type": "string", "minLength": 1},
+                            "reasoning_effort": {"type": "string", "minLength": 1}
+                        }
+                    },
+                    {
+                        "type": "object", "additionalProperties": false,
+                        "required": ["kind", "backend_id", "model", "evidence_kind"],
+                        "properties": {
+                            "kind": {"const": "precomputed"},
+                            "backend_id": {"type": "string", "minLength": 1},
+                            "model": {"type": "string", "minLength": 1},
+                            "evidence_kind": review_lens_evidence_kind_schema_value()
+                        }
+                    }
+                ]
+            },
+            "information_scope": review_information_scope_schema_value()
+        }
+    })
+}
+
+fn review_information_scope_schema_value() -> serde_json::Value {
+    json!({"enum": ["full_child_transcript", "diff_only", "output_report_only"]})
+}
+
+fn review_lens_evidence_kind_schema_value() -> serde_json::Value {
+    json!({"enum": ["model_review", "process_evidence", "external_validation"]})
+}
+
+fn review_aggregation_policy_schema_value() -> serde_json::Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind"], "properties": {"kind": {"const": "all_must_accept"}}
+            },
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind", "minimum_accepts"],
+                "properties": {
+                    "kind": {"const": "validated_quorum"},
+                    "minimum_accepts": {"type": "integer", "minimum": 1}
+                }
+            }
+        ]
+    })
+}
+
+fn role_category_schema_value() -> serde_json::Value {
+    json!({"enum": [
+        "delegating_coordinator", "non_delegating_terminal_worker",
+        "read_only_researcher", "read_only_review_auditor"
+    ]})
+}
+
+fn assignment_selection_source_schema_value() -> serde_json::Value {
+    json!({"enum": [
+        "automatic", "plan_role_models", "operator_override", "budget_degrade",
+        "low_difficulty_mechanical", "retry", "legacy_fake",
+        "legacy_nonpublishable_simulation"
+    ]})
+}
+
+fn worker_assignment_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "id", "role", "assigned_paths", "semantic_symbols", "semantic_modules",
+            "environment_requirements"
+        ],
+        "properties": {
+            "id": identifier_schema_value(),
+            "role": {"const": "worker"},
+            "role_category": role_category_schema_value(),
+            "selection_source": assignment_selection_source_schema_value(),
+            "assigned_paths": path_array_schema_value(),
+            "semantic_symbols": string_array_schema_value(),
+            "semantic_modules": string_array_schema_value(),
+            "task": {"type": "string"},
+            "environment_requirements": {
+                "type": "array", "items": environment_requirement_schema_value()
+            },
+            "report_path": repository_relative_path_schema_value()
+        }
+    })
+}
+
+fn licensed_breakage_declaration_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["migration_rationale", "dependents"],
+        "properties": {
+            "migration_rationale": {"type": "string", "minLength": 1},
+            "dependents": {
+                "type": "array",
+                "items": {
+                    "type": "object", "additionalProperties": false,
+                    "required": ["dependent_id", "paths", "interfaces"],
+                    "properties": {
+                        "dependent_id": identifier_schema_value(),
+                        "paths": path_array_schema_value(),
+                        "interfaces": string_array_schema_value()
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn orchestrator_assignment_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "id", "phase", "role", "assigned_paths", "semantic_symbols", "semantic_modules",
+            "worker_assignments", "environment_requirements"
+        ],
+        "properties": {
+            "id": identifier_schema_value(),
+            "phase": {"enum": ["planning", "execution"]},
+            "runtime": {"enum": ["codex", "fake", "grok", "cursor", "claude-code", "gemini-cli"]},
+            "role": {"const": "child_orchestrator"},
+            "role_category": role_category_schema_value(),
+            "selection_source": assignment_selection_source_schema_value(),
+            "assigned_paths": path_array_schema_value(),
+            "semantic_symbols": string_array_schema_value(),
+            "semantic_modules": string_array_schema_value(),
+            "task": {"type": "string"},
+            "worker_assignments": {"type": "array", "items": worker_assignment_schema_value()},
+            "environment_requirements": {"type": "array", "items": environment_requirement_schema_value()},
+            "licensed_breakage": licensed_breakage_declaration_schema_value(),
+            "notes": {"type": "string"}
+        }
+    })
+}
+
+fn assignment_schedule_entry_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["assignment_id", "depth", "flattened_index"],
+        "properties": {
+            "assignment_id": identifier_schema_value(),
+            "parent_assignment_id": identifier_schema_value(),
+            "depth": {"type": "integer", "minimum": 0, "maximum": 255},
+            "flattened_index": {"type": "integer", "minimum": 0}
+        }
+    })
+}
+
+fn supervisor_budget_config_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "soft_tokens": {"type": "integer", "minimum": 1},
+            "hard_tokens": {"type": "integer", "minimum": 1},
+            "soft_cost_usd": {"type": "number", "exclusiveMinimum": 0},
+            "hard_cost_usd": {"type": "number", "exclusiveMinimum": 0},
+            "role_token_reservations": partial_role_map_schema_value(
+                json!({"type": "integer", "minimum": 1})
+            )
+        }
+    })
+}
+
+fn supervisor_consultant_plan_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["enabled", "runtime", "max_consultations"],
+        "properties": {
+            "enabled": {"type": "boolean"},
+            "runtime": {"type": "string", "minLength": 1},
+            "max_consultations": {"type": "integer", "minimum": 0}
         }
     })
 }
@@ -1395,7 +2341,7 @@ fn generated_follow_up_plan_context_schema_value() -> serde_json::Value {
         ],
         "properties": {
             "breaking_assignment_id": {"type": "string", "minLength": 1},
-            "breaking_change": {"type": "object"},
+            "breaking_change": candidate_validation_binding_schema_value(),
             "declaration_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
             "failure_signature": {"type": "string", "minLength": 1},
             "migration_rationale": {"type": "string", "minLength": 1},
@@ -1441,7 +2387,7 @@ fn gate_denial_schema_value() -> serde_json::Value {
                 "pattern": "^[0-9a-f]{64}$"
             },
             "correction_correlation_id": {"type": "string", "minLength": 1, "maxLength": 128},
-            "reason": {"type": "object"},
+            "reason": gate_denial_reason_schema_value(),
             "retryability": {
                 "type": "string",
                 "enum": ["retry_after_correction", "not_retryable"]
@@ -1452,16 +2398,104 @@ fn gate_denial_schema_value() -> serde_json::Value {
                 "required": ["owner", "source", "paths"],
                 "properties": {
                     "owner": {"type": "string"},
-                    "source": {"type": "string"},
-                    "paths": {"type": "array", "items": {"type": "string"}}
+                    "source": {"enum": [
+                        "claim_acquisition", "destructive_target_preflight", "budget_admission",
+                        "auditor", "validation", "primary_drift", "git_apply_check",
+                        "merge_scope", "validation_binding", "validation_state", "sandbox_policy",
+                        "containment", "primary_integrity", "external_side_effect",
+                        "authenticated_checkpoint", "future_approval_review"
+                    ]},
+                    "paths": path_array_schema_value()
                 }
             },
             "route": {
                 "type": "string",
                 "enum": ["planner_parent", "child_controller", "integration_controller"]
             },
-            "next_safe_operation": {"type": "string"}
+            "next_safe_operation": {"enum": [
+                "narrow_or_replan_claim_ownership", "review_run_budget_and_start_new_run",
+                "repair_auditor_findings", "evidence_only_reaudit", "repair_validation",
+                "restore_clean_primary", "refresh_candidate_base", "repair_merge_conflict",
+                "remediate_unclaimed_merge_edits", "remediate_excluded_reference",
+                "restore_containment", "restore_primary_integrity",
+                "inspect_authenticated_checkpoint", "reconcile_external_side_effect",
+                "escalate_sandbox_policy", "replan_destructive_targets",
+                "narrow_action_or_choose_another_tool", "restore_pre_action_review_service"
+            ]}
         }
+    })
+}
+
+fn gate_denial_reason_schema_value() -> serde_json::Value {
+    let blocker = json!({"enum": [
+        "dirty_primary", "stale_base", "primary_state_changed", "apply_check_failed",
+        "excluded_reference", "unclaimed_edits", "validation_missing", "validation_not_run",
+        "validation_skipped", "validation_failed"
+    ]});
+    let coordinate = json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["root_id", "relative"],
+        "properties": {
+            "root_id": identifier_schema_value(),
+            "relative": repository_relative_path_schema_value()
+        }
+    });
+    let destructive = json!({
+        "oneOf": [
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind", "target", "active_claim"],
+                "properties": {
+                    "kind": {"const": "active_claim_intersection"},
+                    "target": coordinate.clone(), "active_claim": coordinate.clone()
+                }
+            },
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind", "target", "protected"],
+                "properties": {
+                    "kind": {"const": "protected_path_intersection"},
+                    "target": coordinate.clone(),
+                    "protected": {
+                        "type": "object", "additionalProperties": false,
+                        "required": ["coordinate", "retryability"],
+                        "properties": {
+                            "coordinate": coordinate,
+                            "retryability": {"enum": ["requires_declared_exception", "not_retryable"]}
+                        }
+                    }
+                }
+            },
+            {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind", "target_fingerprint"],
+                "properties": {
+                    "kind": {"const": "undeclared_target"},
+                    "target_fingerprint": {"type": "string", "minLength": 1}
+                }
+            }
+        ]
+    });
+    json!({
+        "oneOf": [
+            {"type": "object", "additionalProperties": false, "required": ["family"], "properties": {"family": {"const": "claim_conflict"}}},
+            {"type": "object", "additionalProperties": false, "required": ["family", "denial"], "properties": {"family": {"const": "budget_admission"}, "denial": {"enum": ["new_dispatch_stopped", "missing_cost_estimate", "hard_token_ceiling", "hard_cost_ceiling"]}}},
+            {"type": "object", "additionalProperties": false, "required": ["family", "rejection"], "properties": {"family": {"const": "auditor_repair"}, "rejection": {"enum": ["implementation_defect", "evidence_quality"]}}},
+            {"type": "object", "additionalProperties": false, "required": ["family", "blocker"], "properties": {"family": {"const": "validation_repair"}, "blocker": blocker.clone()}},
+            {"type": "object", "additionalProperties": false, "required": ["family", "blocker"], "properties": {"family": {"const": "merge_remediation"}, "blocker": blocker}},
+            {"type": "object", "additionalProperties": false, "required": ["family"], "properties": {"family": {"const": "containment_failure"}}},
+            {"type": "object", "additionalProperties": false, "required": ["family"], "properties": {"family": {"const": "primary_integrity_failure"}}},
+            {"type": "object", "additionalProperties": false, "required": ["family", "denial"], "properties": {"family": {"const": "resume_checkpoint"}, "denial": {"enum": ["integrity_failure", "unsupported_lifecycle"]}}},
+            {"type": "object", "additionalProperties": false, "required": ["family", "state"], "properties": {"family": {"const": "external_side_effect"}, "state": {"enum": ["ambiguous", "completed"]}}},
+            {"type": "object", "additionalProperties": false, "required": ["family", "evidence"], "properties": {"family": {"const": "sandbox"}, "evidence": sandbox_denial_evidence_schema_value()}},
+            {"type": "object", "additionalProperties": false, "required": ["family", "denial"], "properties": {"family": {"const": "destructive_target"}, "denial": destructive}},
+            {"type": "object", "additionalProperties": false, "required": ["family", "denial"], "properties": {"family": {"const": "approval_review"}, "denial": {"enum": [
+                "permission_expansion", "outside_workspace", "destructive_workspace_operation",
+                "claim_escape", "sensitive_read", "inconsistent_request", "classifier_denied",
+                "classifier_timeout", "classifier_malformed_response", "classifier_protocol_error",
+                "human_review_required", "latency_budget_exceeded", "duplex_fallback_required"
+            ]}}}
+        ]
     })
 }
 
@@ -1474,7 +2508,8 @@ fn gate_correction_outcome_schema_value() -> serde_json::Value {
             "correction_correlation_id",
             "route",
             "terminal_class",
-            "correction_attempts"
+            "correction_attempts",
+            "unavailable_reason"
         ],
         "properties": {
             "denial_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
@@ -1491,7 +2526,8 @@ fn gate_correction_outcome_schema_value() -> serde_json::Value {
                 "type": "integer",
                 "minimum": 0,
                 "maximum": MAX_GATE_CORRECTIONS_LIMIT
-            }
+            },
+            "unavailable_reason": {"type": ["string", "null"]}
         }
     })
 }
@@ -2048,6 +3084,18 @@ pub(super) fn auditor_report_schema_value() -> serde_json::Value {
 }
 
 pub(super) fn worker_report_schema_value() -> serde_json::Value {
+    worker_report_schema_value_with_decomposition(decomposition_completion_schema_value())
+}
+
+fn supervisor_final_worker_report_schema_value() -> serde_json::Value {
+    worker_report_schema_value_with_decomposition(
+        supervisor_final_decomposition_completion_schema_value(),
+    )
+}
+
+fn worker_report_schema_value_with_decomposition(
+    decomposition_completion_schema: serde_json::Value,
+) -> serde_json::Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "WorkerReport",
@@ -2061,8 +3109,6 @@ pub(super) fn worker_report_schema_value() -> serde_json::Value {
             "assigned_paths",
             "semantic_symbols",
             "semantic_modules",
-            "claim_token",
-            "semantic_intent_token",
             "commands_run",
             "environment_failures",
             "files_changed",
@@ -2100,7 +3146,7 @@ pub(super) fn worker_report_schema_value() -> serde_json::Value {
                 "uniqueItems": true,
                 "items": bloated_file_flag_schema_value()
             },
-            "decomposition_completion": decomposition_completion_schema_value(),
+            "decomposition_completion": decomposition_completion_schema,
             "no_further_delegation": {"type": "boolean", "const": true},
             "accepted": {"type": "boolean"},
             "rejected": {"type": "boolean"},
@@ -2155,38 +3201,50 @@ fn bloated_file_flag_schema_value() -> serde_json::Value {
 }
 
 pub(super) fn decomposition_completion_schema_value() -> serde_json::Value {
-    json!({
-        "type": ["object", "null"],
-        "additionalProperties": false,
-        "required": ["target_path", "replacement_paths"],
-        "properties": {
-            "target_path": {"type": "string", "minLength": 1},
-            "replacement_paths": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": MAX_DECOMPOSITION_REPLACEMENT_PATHS,
-                "uniqueItems": true,
-                "items": {"type": "string", "minLength": 1}
-            }
-        }
-    })
+    decomposition_completion_schema_value_with_binding(json!(["object", "null"]), false)
 }
 
 fn decomposition_completion_object_schema_value() -> serde_json::Value {
+    decomposition_completion_schema_value_with_binding(json!("object"), false)
+}
+
+fn supervisor_final_decomposition_completion_schema_value() -> serde_json::Value {
+    decomposition_completion_schema_value_with_binding(json!(["object", "null"]), true)
+}
+
+fn supervisor_final_decomposition_completion_object_schema_value() -> serde_json::Value {
+    decomposition_completion_schema_value_with_binding(json!("object"), true)
+}
+
+fn decomposition_completion_schema_value_with_binding(
+    schema_type: serde_json::Value,
+    include_supervisor_binding: bool,
+) -> serde_json::Value {
+    let base_properties = json!({
+        "target_path": {"type": "string", "minLength": 1},
+        "replacement_paths": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": MAX_DECOMPOSITION_REPLACEMENT_PATHS,
+            "uniqueItems": true,
+            "items": {"type": "string", "minLength": 1}
+        }
+    });
+    let properties = if include_supervisor_binding {
+        merge_schema_property_groups([
+            base_properties,
+            json!({
+                "supervisor_candidate_binding": candidate_validation_binding_schema_value()
+            }),
+        ])
+    } else {
+        base_properties
+    };
     json!({
-        "type": "object",
+        "type": schema_type,
         "additionalProperties": false,
         "required": ["target_path", "replacement_paths"],
-        "properties": {
-            "target_path": {"type": "string", "minLength": 1},
-            "replacement_paths": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": MAX_DECOMPOSITION_REPLACEMENT_PATHS,
-                "uniqueItems": true,
-                "items": {"type": "string", "minLength": 1}
-            }
-        }
+        "properties": properties
     })
 }
 
@@ -2197,18 +3255,18 @@ pub(super) fn command_run_record_schema_value() -> serde_json::Value {
         "required": [
             "command",
             "cwd",
-            "exit_code",
             "status",
             "timeout_seconds",
             "duration_ms",
             "timed_out",
             "stdout",
             "stderr",
-            "error"
+            "environment_preflight_results",
+            "environment_failures"
         ],
         "properties": {
             "command": {"type": "array", "items": {"type": "string"}},
-            "cwd": {"type": "string"},
+            "cwd": safe_published_path_schema_value(),
             "exit_code": {"type": ["integer", "null"]},
             "status": {"type": "string", "enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
             "timeout_seconds": {"type": "integer"},
@@ -2376,9 +3434,7 @@ fn environment_preflight_result_schema_value() -> serde_json::Value {
         "properties": {
             "requirement": environment_requirement_schema_value(),
             "status": {"type": "string", "enum": ["satisfied", "blocked"]},
-            "observation": {
-                "type": "object"
-            }
+            "observation": codex_environment_preflight_observation_schema_value()
         }
     })
 }
@@ -2488,7 +3544,7 @@ fn validation_result_schema_value() -> serde_json::Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["name", "status", "command", "message"],
+        "required": ["name", "status", "command"],
         "properties": {
             "name": {"type": "string"},
             "status": {"type": "string", "enum": ["pending", "succeeded", "failed", "rejected", "missing"]},
@@ -2686,171 +3742,76 @@ pub(super) fn write_private_prompt(
 mod selection_schema_tests {
     use super::*;
 
-    const TRACKED_SUPERVISOR_SCHEMA: &str = "schemas/supervisor-final-report-v1.schema.json";
-
-    fn skip_json_whitespace(bytes: &[u8], cursor: &mut usize) {
-        while bytes
-            .get(*cursor)
-            .is_some_and(|byte| byte.is_ascii_whitespace())
-        {
-            *cursor += 1;
-        }
-    }
-
-    fn json_value_end(bytes: &[u8], start: usize) -> Result<usize> {
-        let first = *bytes
-            .get(start)
-            .with_context(|| format!("JSON value starts beyond byte {start}"))?;
-        if first == b'"' {
-            let mut escaped = false;
-            for (offset, byte) in bytes[start + 1..].iter().enumerate() {
-                if escaped {
-                    escaped = false;
-                } else if *byte == b'\\' {
-                    escaped = true;
-                } else if *byte == b'"' {
-                    return Ok(start + offset + 2);
-                }
-            }
-            bail!("unterminated JSON string at byte {start}");
-        }
-        if matches!(first, b'{' | b'[') {
-            let mut stack = vec![if first == b'{' { b'}' } else { b']' }];
-            let mut escaped = false;
-            let mut in_string = false;
-            for (offset, byte) in bytes[start + 1..].iter().enumerate() {
-                if in_string {
-                    if escaped {
-                        escaped = false;
-                    } else if *byte == b'\\' {
-                        escaped = true;
-                    } else if *byte == b'"' {
-                        in_string = false;
+    fn open_object_schema_paths(value: &serde_json::Value) -> Vec<String> {
+        fn walk(value: &serde_json::Value, path: &str, open: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(object) => {
+                    let object_type = object.get("type").is_some_and(|schema_type| {
+                        schema_type == "object"
+                            || schema_type
+                                .as_array()
+                                .is_some_and(|types| types.iter().any(|value| value == "object"))
+                    });
+                    if object_type && !object.contains_key("additionalProperties") {
+                        open.push(path.to_string());
                     }
-                    continue;
-                }
-                match *byte {
-                    b'"' => in_string = true,
-                    b'{' => stack.push(b'}'),
-                    b'[' => stack.push(b']'),
-                    b'}' | b']' if stack.last() == Some(byte) => {
-                        stack.pop();
-                        if stack.is_empty() {
-                            return Ok(start + offset + 2);
-                        }
+                    for (name, child) in object {
+                        walk(child, &format!("{path}/{name}"), open);
                     }
-                    b'}' | b']' => bail!("mismatched JSON delimiter at byte {start}"),
-                    _ => {}
                 }
+                serde_json::Value::Array(values) => {
+                    for (index, child) in values.iter().enumerate() {
+                        walk(child, &format!("{path}/{index}"), open);
+                    }
+                }
+                _ => {}
             }
-            bail!("unterminated JSON container at byte {start}");
         }
-        let end = bytes[start..]
-            .iter()
-            .position(|byte| byte.is_ascii_whitespace() || matches!(*byte, b',' | b'}' | b']'))
-            .map(|offset| start + offset)
-            .unwrap_or(bytes.len());
-        if end == start {
-            bail!("empty JSON primitive at byte {start}");
-        }
-        Ok(end)
+
+        let mut open = Vec::new();
+        walk(value, "$", &mut open);
+        open
     }
 
-    fn json_object_property_range(
-        bytes: &[u8],
-        object: std::ops::Range<usize>,
-        wanted: &str,
-    ) -> Result<std::ops::Range<usize>> {
-        if bytes.get(object.start) != Some(&b'{') {
-            bail!("JSON pointer parent for '{wanted}' is not an object");
-        }
-        let mut cursor = object.start + 1;
-        loop {
-            skip_json_whitespace(bytes, &mut cursor);
-            if bytes.get(cursor) == Some(&b'}') {
-                bail!("JSON object is missing property '{wanted}'");
-            }
-            let key_start = cursor;
-            let key_end = json_value_end(bytes, key_start)?;
-            let key: String = serde_json::from_slice(&bytes[key_start..key_end])
-                .with_context(|| format!("parse JSON object key for '{wanted}'"))?;
-            cursor = key_end;
-            skip_json_whitespace(bytes, &mut cursor);
-            if bytes.get(cursor) != Some(&b':') {
-                bail!("JSON object property '{key}' is missing its colon");
-            }
-            cursor += 1;
-            skip_json_whitespace(bytes, &mut cursor);
-            let value_start = cursor;
-            let value_end = json_value_end(bytes, value_start)?;
-            if key == wanted {
-                return Ok(value_start..value_end);
-            }
-            cursor = value_end;
-            skip_json_whitespace(bytes, &mut cursor);
-            match bytes.get(cursor) {
-                Some(b',') => cursor += 1,
-                Some(b'}') => bail!("JSON object is missing property '{wanted}'"),
-                _ => bail!("JSON object property '{key}' has an invalid terminator"),
-            }
-        }
+    #[test]
+    fn generated_supervisor_contract_has_no_open_object_schema() {
+        assert_eq!(
+            open_object_schema_paths(&supervisor_final_report_schema_value()),
+            Vec::<String>::new()
+        );
     }
 
-    fn json_pointer_range(bytes: &[u8], segments: &[&str]) -> Result<std::ops::Range<usize>> {
-        let mut cursor = 0;
-        skip_json_whitespace(bytes, &mut cursor);
-        let mut range = cursor..json_value_end(bytes, cursor)?;
-        for segment in segments {
-            range = json_object_property_range(bytes, range, segment)?;
-        }
-        Ok(range)
+    #[test]
+    fn generated_supervisor_contract_accepts_published_valid_fixture() -> Result<()> {
+        let instance: serde_json::Value = serde_json::from_str(include_str!(
+            "../../fixtures/schemas/supervisor-final-report-v1.valid.json"
+        ))?;
+        let schema = supervisor_final_report_schema_value();
+        assert!(
+            schema_accepts_instance(&schema, &instance),
+            "generated complete supervisor contract rejected the published valid fixture"
+        );
+        Ok(())
     }
 
-    fn indented_json_replacement(
-        document: &[u8],
-        range: &std::ops::Range<usize>,
-        value: &serde_json::Value,
-    ) -> Result<Vec<u8>> {
-        let line_start = document[..range.start]
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map_or(0, |index| index + 1);
-        let indent = document[line_start..range.start]
-            .iter()
-            .take_while(|byte| **byte == b' ')
-            .count();
-        let pretty = serde_json::to_string_pretty(value).context("serialize JSON replacement")?;
-        let mut rendered = Vec::with_capacity(pretty.len() + indent * 4);
-        for (index, line) in pretty.lines().enumerate() {
-            if index > 0 {
-                rendered.push(b'\n');
-                rendered.extend(std::iter::repeat_n(b' ', indent));
-            }
-            rendered.extend_from_slice(line.as_bytes());
-        }
-        Ok(rendered)
+    #[test]
+    #[ignore = "maintainer-only schema rendering helper"]
+    fn print_complete_supervisor_final_contract() -> Result<()> {
+        println!(
+            "FINAL_SCHEMA_BEGIN{}FINAL_SCHEMA_END",
+            serde_json::to_string(&supervisor_final_report_schema_value())?
+        );
+        Ok(())
     }
 
-    fn replace_json_values_preserving_document(
-        original: &[u8],
-        replacements: &[(&[&str], serde_json::Value)],
-    ) -> Result<Vec<u8>> {
-        let mut ranged = replacements
-            .iter()
-            .map(|(segments, value)| {
-                let range = json_pointer_range(original, segments)?;
-                let rendered = indented_json_replacement(original, &range, value)?;
-                Ok((range, rendered))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        ranged.sort_by(|left, right| right.0.start.cmp(&left.0.start));
-        let mut output = original.to_vec();
-        for (range, replacement) in ranged {
-            output.splice(range, replacement);
-        }
-        serde_json::from_slice::<serde_json::Value>(&output)
-            .context("synchronized tracked supervisor schema is invalid JSON")?;
-        Ok(output)
+    #[test]
+    #[ignore = "maintainer-only schema rendering helper"]
+    fn print_complete_supervisor_collect_contract() -> Result<()> {
+        println!(
+            "COLLECT_SCHEMA_BEGIN{}COLLECT_SCHEMA_END",
+            serde_json::to_string(&supervisor_collect_report_schema_value())?
+        );
+        Ok(())
     }
 
     fn required_contains(schema: &serde_json::Value, field: &str) -> bool {
@@ -3220,11 +4181,12 @@ mod selection_schema_tests {
         let tracked: serde_json::Value = serde_json::from_str(include_str!(
             "../../schemas/supervisor-final-report-v1.schema.json"
         ))?;
-        let tracked_event =
-            &tracked["$defs"]["execution"]["properties"]["selection_decisions"]["items"];
+        let tracked_execution =
+            &tracked["properties"]["role_economics_profile"]["properties"]["execution"];
+        let tracked_event = &tracked_execution["properties"]["selection_decisions"]["items"];
         assert_eq!(tracked_event, event);
         assert!(required_contains(
-            &tracked["$defs"]["execution"],
+            tracked_execution,
             "assignment_selection_ledger"
         ));
         assert!(required_contains(
@@ -3235,91 +4197,45 @@ mod selection_schema_tests {
         Ok(())
     }
 
-    /// Explicit maintainer action for synchronizing generated execution
-    /// subcontracts into the broader published supervisor-report envelope.
-    ///
-    /// Run with:
-    /// `cargo test --lib supervise::schema_artifacts::selection_schema_tests::regenerate_tracked_supervisor_execution_schemas -- --ignored --exact`
     #[test]
-    #[ignore = "explicitly rewrites the tracked supervisor schema"]
-    fn regenerate_tracked_supervisor_execution_schemas() -> Result<()> {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(TRACKED_SUPERVISOR_SCHEMA);
-        let metadata = fs::symlink_metadata(&path)
-            .with_context(|| format!("inspect tracked schema {}", path.display()))?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
-            bail!(
-                "tracked supervisor schema must be a regular nofollow file: {}",
-                path.display()
-            );
-        }
-        let original =
-            fs::read(&path).with_context(|| format!("read tracked schema {}", path.display()))?;
-        let tracked: serde_json::Value = serde_json::from_slice(&original)
-            .with_context(|| format!("parse tracked schema {}", path.display()))?;
-        let published_id = tracked["$id"].clone();
-        let published_title = tracked["title"].clone();
-        let published_required = tracked["required"].clone();
+    fn generated_complete_contracts_match_tracked_schemas() -> Result<()> {
+        let tracked: serde_json::Value = serde_json::from_str(include_str!(
+            "../../schemas/supervisor-final-report-v1.schema.json"
+        ))?;
+        let tracked_collect: serde_json::Value = serde_json::from_str(include_str!(
+            "../../schemas/supervisor-collect-report-v1.schema.json"
+        ))?;
+        assert_eq!(tracked, supervisor_final_report_schema_value());
+        assert_eq!(tracked_collect, supervisor_collect_report_schema_value());
+        Ok(())
+    }
 
+    #[test]
+    fn reachable_runtime_schema_is_synchronized_across_generated_and_published_contracts(
+    ) -> Result<()> {
+        let runtime_schema = supervisor_runtime_schema_value();
         let generated = supervisor_final_report_schema_value();
-        let generated_execution =
-            &generated["properties"]["role_economics_profile"]["properties"]["execution"];
-        let generated_concurrency = &generated_execution["properties"]["concurrency"];
-        let generated_admission =
-            &generated_concurrency["properties"]["policy_input_details"]["anyOf"][0];
-        let mut admission_properties =
-            tracked["$defs"]["admissionPolicyInput"]["properties"].clone();
-        let admission_properties_object = admission_properties
-            .as_object_mut()
-            .context("tracked admissionPolicyInput properties are not an object")?;
-        for field in [
-            "quota_inflight_bound",
-            "quota_inflight_source",
-            "quota_config_path",
-        ] {
-            admission_properties_object.insert(
-                field.to_string(),
-                generated_admission["properties"][field].clone(),
-            );
-        }
-        let replacements: &[(&[&str], serde_json::Value)] = &[
-            (
-                &["$defs", "execution", "properties", "selection_decisions"],
-                generated_execution["properties"]["selection_decisions"].clone(),
-            ),
-            (
-                &[
-                    "$defs",
-                    "execution",
-                    "properties",
-                    "assignment_selection_ledger",
-                ],
-                generated_execution["properties"]["assignment_selection_ledger"].clone(),
-            ),
-            (
-                &["$defs", "admissionPolicyInput", "properties"],
-                admission_properties,
-            ),
-            (
-                &["$defs", "admissionInputSource", "enum"],
-                json!([
-                    "configured",
-                    "operator_quota_config",
-                    "conservative_default",
-                    "measured"
-                ]),
-            ),
-        ];
-        let rendered = replace_json_values_preserving_document(&original, replacements)?;
-        let rendered_value: serde_json::Value = serde_json::from_slice(&rendered)
-            .context("parse synchronized tracked supervisor schema")?;
-        if rendered_value["$id"] != published_id
-            || rendered_value["title"] != published_title
-            || rendered_value["required"] != published_required
-        {
-            bail!("schema regeneration changed the published report envelope");
-        }
-        fs::write(&path, rendered)
-            .with_context(|| format!("write tracked schema {}", path.display()))?;
+        let admission = worktree_writable_admission_schema_value();
+        let tracked: serde_json::Value = serde_json::from_str(include_str!(
+            "../../schemas/supervisor-final-report-v1.schema.json"
+        ))?;
+
+        assert_eq!(generated["properties"]["runtime"], runtime_schema);
+        assert_eq!(
+            admission["properties"]["native_sandbox"]["properties"]["runtime"],
+            runtime_schema
+        );
+        assert_eq!(tracked["properties"]["runtime"], runtime_schema);
+        assert_eq!(
+            tracked["properties"]["role_economics_profile"]["properties"]
+                ["resolved_objective_profile"],
+            generated["properties"]["role_economics_profile"]["properties"]
+                ["resolved_objective_profile"]
+        );
+        assert_eq!(
+            runtime_schema["enum"],
+            json!(REACHABLE_SUPERVISOR_RUNTIMES.map(SupervisorRuntime::as_str))
+        );
         Ok(())
     }
 
@@ -3331,27 +4247,9 @@ mod selection_schema_tests {
         let tracked: serde_json::Value = serde_json::from_str(include_str!(
             "../../schemas/supervisor-final-report-v1.schema.json"
         ))?;
-        let tracked_execution = &tracked["$defs"]["execution"];
-
-        assert_eq!(
-            tracked_execution["properties"]["assignment_selection_ledger"]["items"]["properties"]
-                ["selection_source"],
-            dynamic_execution["properties"]["assignment_selection_ledger"]["items"]["properties"]
-                ["selection_source"]
-        );
-        let tracked_degradations = &tracked_execution["properties"]["budget_degradations"];
-        let dynamic_degradations = &dynamic_execution["properties"]["budget_degradations"];
-        assert_eq!(tracked_degradations["type"], dynamic_degradations["type"]);
-        let mut tracked_record = tracked["$defs"]["budgetDegradationRecord"].clone();
-        tracked_record["properties"]["budget_reasons"]["items"] =
-            tracked["$defs"]["budgetReason"].clone();
-        tracked_record["properties"]["change"] =
-            tracked["$defs"]["budgetDegradationChange"].clone();
-        for index in [0, 1] {
-            tracked_record["properties"]["change"]["oneOf"][index]["properties"]["role"] =
-                tracked["$defs"]["agentRole"].clone();
-        }
-        assert_eq!(tracked_record, dynamic_degradations["items"]);
+        let tracked_execution =
+            &tracked["properties"]["role_economics_profile"]["properties"]["execution"];
+        assert_eq!(tracked_execution, dynamic_execution);
         Ok(())
     }
 }

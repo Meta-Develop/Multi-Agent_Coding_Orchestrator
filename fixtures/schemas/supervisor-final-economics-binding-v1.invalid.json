@@ -1,11 +1,189 @@
 {
+  "version": 1,
+  "run_id": "schema-fixture",
+  "role": "supervisor",
+  "repo": ".",
+  "plan_file": "plans/schema-fixture.json",
+  "run_dir": ".maco/o2/runs/schema-fixture",
+  "runtime": "fake",
+  "publishable": false,
+  "success": true,
+  "accepted": false,
+  "rejected": false,
+  "status": "succeeded",
+  "run_lifecycle": "finalized",
+  "assigned_paths": [
+    "src/lib.rs"
+  ],
+  "semantic_symbols": [],
+  "semantic_modules": [],
+  "claim_tokens": [],
+  "semantic_intent_tokens": [],
   "role_economics_profile": {
+    "schema_version": 6,
+    "name": "schema-fixture-profile",
+    "evidence": "synthetic fixture evidence",
+    "evidence_notice": "fixture only",
+    "production_eligible": false,
+    "model_availability": "available",
+    "overridden_roles": [],
+    "role_models": {
+      "supervisor": {},
+      "child_orchestrator": {},
+      "worker": {},
+      "gate_classifier": {},
+      "auditor": {}
+    },
+    "model_catalog_observation": "not_consulted",
+    "resolved_objective_profile": {
+      "profile": {
+        "id": "maco-default-objective-v1",
+        "version": 1,
+        "content_hash": "64a1962f8f603c668ecb15713baf7541b3f33899a4f8159026dafa3004c092c8",
+        "quality": {
+          "held_out_percent": 50,
+          "breadth_percent": 25,
+          "anti_shortcut_percent": 25
+        },
+        "tradeoffs": {
+          "monetary_cost_percent": 100,
+          "quota_consumption_percent": 0,
+          "latency_percent": 0,
+          "retry_rework_percent": 0,
+          "human_review_percent": 0
+        }
+      },
+      "source": "built_in"
+    },
     "execution": {
+      "assignment_count": 0,
+      "started_assignment_count": 0,
+      "completed_assignment_count": 0,
+      "concurrency": {
+        "configured_max_concurrent_children": 1,
+        "policy_input_observation": "not_retained",
+        "policy_input": null,
+        "policy_input_details": null,
+        "policy_input_unavailable_reason": "synthetic fixture",
+        "achieved_max_concurrent_children": 0,
+        "achieved_mean_concurrent_children": 0.0,
+        "achieved_mean_observation": "scheduler_observed",
+        "achieved_mean_unavailable_reason": null
+      },
+      "role_bindings": {
+        "supervisor": {
+          "resolved_model": null,
+          "resolved_reasoning_effort": null,
+          "observation": "synthetic_fake",
+          "resolution_observation": "local_deterministic_fake"
+        },
+        "child_orchestrator": {
+          "resolved_model": null,
+          "resolved_reasoning_effort": null,
+          "observation": "synthetic_fake",
+          "resolution_observation": "local_deterministic_fake"
+        },
+        "worker": {
+          "resolved_model": null,
+          "resolved_reasoning_effort": null,
+          "observation": "synthetic_fake",
+          "resolution_observation": "local_deterministic_fake"
+        },
+        "gate_classifier": {
+          "resolved_model": null,
+          "resolved_reasoning_effort": null,
+          "observation": "synthetic_fake",
+          "resolution_observation": "local_deterministic_fake"
+        },
+        "auditor": {
+          "resolved_model": null,
+          "resolved_reasoning_effort": null,
+          "observation": "synthetic_fake",
+          "resolution_observation": "local_deterministic_fake"
+        }
+      },
       "assignment_effort_bindings": [
         {
           "impossible": true
         }
-      ]
+      ],
+      "budget_degradations": [],
+      "assignment_selection_ledger": [],
+      "usage": {
+        "total_usage": {
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "total_tokens": 0
+        },
+        "total_cost_usd": 0.0,
+        "usage_complete": true,
+        "observation": "synthetic_fake"
+      }
     }
-  }
+  },
+  "role_usage": {
+    "supervisor": {
+      "observation": "synthetic_fake"
+    },
+    "child_orchestrator": {
+      "observation": "synthetic_fake"
+    },
+    "worker": {
+      "observation": "synthetic_fake"
+    },
+    "gate_classifier": {
+      "observation": "synthetic_fake"
+    },
+    "auditor": {
+      "observation": "synthetic_fake"
+    }
+  },
+  "usage_complete": true,
+  "commands_run": [],
+  "environment_failures": [],
+  "autonomy_kpis": {
+    "observation": "not_process_observable",
+    "population": "reviewed_gate_actions",
+    "coverage": {
+      "review_decisions": {
+        "observation": "not_process_observable",
+        "unavailable_reason": "synthetic fixture"
+      },
+      "reviewed_denial_terminal_lifecycles": {
+        "observation": "not_process_observable",
+        "unavailable_reason": "synthetic fixture"
+      },
+      "human_follow_up_responses": {
+        "observation": "not_process_observable",
+        "unavailable_reason": "synthetic fixture"
+      },
+      "scheduler_budget_denial_lifecycles": {
+        "observation": "not_process_observable",
+        "unavailable_reason": "synthetic fixture"
+      },
+      "rate_denominators": {
+        "observation": "not_process_observable",
+        "unavailable_reason": "synthetic fixture"
+      }
+    },
+    "actions_reviewed": null,
+    "denials": null,
+    "self_corrections": null,
+    "human_escalations": null,
+    "interrupted": null,
+    "unavailable_reason": "synthetic fixture"
+  },
+  "files_changed": [],
+  "validation_results": [],
+  "findings": [],
+  "bloated_file_flags": [],
+  "decomposition_candidates": [],
+  "breaker_trip": null,
+  "orchestrator_reports": [],
+  "released_claims": [],
+  "release_errors": [],
+  "released_semantic_intents": [],
+  "semantic_release_errors": [],
+  "remaining_risk": "none in synthetic fixture",
+  "next_safe_action": "none"
 }

@@ -55,6 +55,69 @@
       ]
     },
     {
+      "schema": "merge-preview-report-v2.schema.json",
+      "valid": [
+        "merge-preview-report-v2.valid.json"
+      ],
+      "invalid": [
+        {
+          "path": "merge-preview-report-v2.invalid.json",
+          "expected_error": "$.safety.semantic_conflicts.overlaps[0].dependency_impacts[0].impact.dependency.span.signature_end_line: required"
+        },
+        {
+          "path": "merge-preview-watermark-v2.invalid.json",
+          "expected_error": "$.freshness_watermark.base_preview.substituted: additionalProperties"
+        },
+        {
+          "path": "merge-preview-watermark-version-v2.invalid.json",
+          "expected_error": "$.freshness_watermark.version: const"
+        },
+        {
+          "path": "merge-preview-intent-v2.invalid.json",
+          "expected_error": "$.review_intent.trunk_ref: type"
+        },
+        {
+          "path": "merge-preview-trunk-ref-whitespace-v2.invalid.json",
+          "expected_error": "$.review_intent.trunk_ref: pattern"
+        }
+      ]
+    },
+    {
+      "schema": "merge-apply-report-v2.schema.json",
+      "valid": [
+        "merge-apply-applied-report-v2.valid.json",
+        "merge-apply-nothing-to-apply-report-v2.valid.json",
+        "merge-apply-blocked-report-v2.valid.json",
+        "merge-apply-refusal-missing-report-v2.valid.json",
+        "merge-apply-refusal-malformed-report-v2.valid.json",
+        "merge-apply-refusal-unsupported-version-report-v2.valid.json",
+        "merge-apply-refusal-drift-report-v2.valid.json",
+        "merge-apply-refusal-substituted-report-v2.valid.json"
+      ],
+      "invalid": [
+        {
+          "path": "merge-apply-ordinary-unbound-report-v2.invalid.json",
+          "expected_error": "$.review_binding_status: enum"
+        },
+        {
+          "path": "merge-apply-ordinary-bound-report-v2.invalid.json",
+          "expected_error": "$.review_binding_status: enum"
+        },
+        {
+          "path": "merge-apply-hybrid-report-v2.invalid.json",
+          "expected_error": "$: oneOf"
+        },
+        {
+          "path": "merge-apply-refusal-drift-axis-v2.invalid.json",
+          "expected_error": "$.refusal.axes[0]: enum"
+        },
+        {
+          "path": "merge-apply-primary-state-denial-route-v2.invalid.json",
+          "expected_error": "$.gate_denials[0].route: const"
+        }
+      ]
+    },
+    {
       "schema": "supervisor-final-report-v1.schema.json",
       "valid": [
         "supervisor-final-report-v1.valid.json"
@@ -78,11 +141,24 @@
         },
         {
           "path": "supervisor-final-autonomy-v1.invalid.json",
-          "expected_error": "$.autonomy_kpis.denial_rate: required"
+          "expected_error": "$.autonomy_kpis.denial_rate.denominator: required"
         },
         {
           "path": "supervisor-final-admission-config-null-v1.invalid.json",
           "expected_error": "$.role_economics_profile.execution.concurrency.policy_input_details: anyOf"
+        }
+      ]
+    },
+    {
+      "schema": "supervisor-collect-report-v1.schema.json",
+      "valid": [
+        "supervisor-collect-finalized-v1.valid.json",
+        "supervisor-collect-active-v1.valid.json"
+      ],
+      "invalid": [
+        {
+          "path": "supervisor-collect-plan-file-v1.invalid.json",
+          "expected_error": "$.plan_file: const"
         }
       ]
     },
@@ -94,7 +170,31 @@
       "invalid": [
         {
           "path": "eval-harness-comparable-fake-results-v2.invalid.json",
-          "expected_error": "$.schema: const"
+          "expected_error": "$.comparability: required"
+        }
+      ]
+    },
+    {
+      "schema": "eval-harness-result-v1.schema.json",
+      "valid": [
+        "eval-harness-result-v1.valid.json"
+      ],
+      "invalid": [
+        {
+          "path": "eval-harness-result-v1.invalid.json",
+          "expected_error": "$.provider: required"
+        }
+      ]
+    },
+    {
+      "schema": "eval-harness-comparable-fake-results-v3.schema.json",
+      "valid": [
+        "eval-harness-comparable-fake-results-v3.valid.json"
+      ],
+      "invalid": [
+        {
+          "path": "eval-harness-comparable-fake-results-v3.invalid.json",
+          "expected_error": "$.profile_summaries[0].mean_tokens: required"
         }
       ]
     }

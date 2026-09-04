@@ -1,0 +1,752 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/main/schemas/merge-preview-report-v2.schema.json",
+  "title": "MACO Merge Preview Report v2",
+  "description": "Current v2 contract for `maco merge preview --json`. It closes the complete report shape and binds the candidate, safety, and review intent preview to a nested version-2 freshness watermark.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "candidate",
+    "safety",
+    "review_intent",
+    "freshness_watermark"
+  ],
+  "properties": {
+    "candidate": {
+      "$ref": "merge-preview-report-v1.schema.json#/$defs/candidate"
+    },
+    "safety": {
+      "$ref": "#/$defs/safety"
+    },
+    "review_intent": {
+      "$ref": "#/$defs/reviewIntent"
+    },
+    "freshness_watermark": {
+      "$ref": "#/$defs/freshnessWatermark"
+    }
+  },
+  "$defs": {
+    "basePreview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate",
+        "safety",
+        "review_intent"
+      ],
+      "properties": {
+        "candidate": {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/candidate"
+        },
+        "safety": {
+          "$ref": "#/$defs/safety"
+        },
+        "review_intent": {
+          "$ref": "#/$defs/reviewIntent"
+        }
+      }
+    },
+    "reviewIntent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_validation_commands",
+        "require_validation_after_candidate",
+        "auto_reap_merged",
+        "trunk_ref",
+        "apply_auto_reap"
+      ],
+      "properties": {
+        "candidate_validation_commands": {
+          "type": "array",
+      "description": "Candidate validation commands in their requested execution order.",
+      "items": {
+        "type": "string",
+        "pattern": "\\S"
+      }
+        },
+        "require_validation_after_candidate": {
+          "type": "boolean"
+        },
+        "auto_reap_merged": {
+          "type": "boolean"
+        },
+        "trunk_ref": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "\\S"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "apply_auto_reap": {
+          "type": "boolean"
+        }
+      },
+  "allOf": [
+    {
+          "if": {
+            "properties": {
+              "apply_auto_reap": {
+                "const": true
+              }
+            },
+            "required": [
+              "apply_auto_reap"
+            ]
+          },
+          "then": {
+            "properties": {
+              "auto_reap_merged": {
+                "const": true
+              }
+            }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "auto_reap_merged": {
+            "const": false
+          }
+        },
+        "required": [
+          "auto_reap_merged"
+        ]
+      },
+      "then": {
+        "properties": {
+          "trunk_ref": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "auto_reap_merged": {
+            "const": true
+          }
+        },
+        "required": [
+          "auto_reap_merged"
+        ]
+      },
+          "then": {
+            "properties": {
+              "trunk_ref": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "oid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "nullableOid": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/oid"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "freshnessWatermark": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "primary",
+        "source",
+        "candidate",
+        "base_preview"
+      ],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "const": 2
+        },
+        "primary": {
+          "$ref": "#/$defs/primaryFreshness"
+        },
+        "source": {
+          "$ref": "#/$defs/sourceFreshness"
+        },
+        "candidate": {
+          "$ref": "#/$defs/candidateFreshness"
+        },
+        "base_preview": {
+          "$ref": "#/$defs/basePreviewIdentity"
+        }
+      }
+    },
+    "primaryFreshness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "head",
+        "index_digest",
+        "worktree_digest"
+      ],
+      "properties": {
+        "head": {
+          "$ref": "#/$defs/nullableOid"
+        },
+        "index_digest": {
+          "$ref": "#/$defs/nullableOid"
+        },
+        "worktree_digest": {
+          "$ref": "#/$defs/oid"
+        }
+      }
+    },
+    "sourceFreshness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent_id",
+        "head"
+      ],
+      "properties": {
+        "agent_id": {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/agentId"
+        },
+        "head": {
+          "$ref": "#/$defs/nullableOid"
+        }
+      }
+    },
+    "candidateFreshness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "snapshot_tree",
+        "diff_oid"
+      ],
+      "properties": {
+        "snapshot_tree": {
+          "$ref": "#/$defs/oid"
+        },
+        "diff_oid": {
+          "$ref": "#/$defs/oid"
+        }
+      }
+    },
+    "basePreviewIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sha256"
+      ],
+      "properties": {
+        "sha256": {
+          "$ref": "#/$defs/sha256",
+          "description": "Lowercase SHA-256 of the domain bytes `maco-reviewed-merge-preview-v2\\0` followed by compact JSON for the complete `{candidate,safety,review_intent}` base preview with object keys sorted recursively."
+        }
+      }
+    },
+    "safety": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "primary_state_unchanged",
+        "dirty_primary",
+        "stale_base",
+        "apply_check",
+        "unclaimed_edits",
+        "validation",
+        "validation_evidence",
+        "megafile",
+        "megafile_warnings",
+        "megafile_decomposition_target",
+        "megafile_decomposition_evidence",
+        "megafile_blocking",
+        "validation_required",
+        "candidate_validation_commands",
+        "force_options",
+        "apply_mode",
+        "semantic_conflicts",
+        "readiness"
+      ],
+      "properties": {
+        "primary_state_unchanged": {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/safetyCheck"
+        },
+        "dirty_primary": {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/safetyCheck"
+        },
+        "stale_base": {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/safetyCheck"
+        },
+        "apply_check": {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/safetyCheck"
+        },
+        "unclaimed_edits": {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/safetyCheck"
+        },
+        "validation": {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/safetyCheck"
+        },
+        "validation_evidence": {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/validationEvidenceCheck"
+        },
+        "megafile": {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/safetyCheck"
+        },
+        "megafile_warnings": {
+          "type": "array",
+          "items": {
+            "$ref": "merge-preview-report-v1.schema.json#/$defs/megafileAssessment"
+          }
+        },
+        "megafile_decomposition_target": {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/nullableRepositoryRelativePath"
+        },
+        "megafile_decomposition_evidence": {
+          "anyOf": [
+            {
+              "$ref": "merge-preview-report-v1.schema.json#/$defs/verifiedDecompositionEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "megafile_blocking": {
+          "type": "boolean"
+        },
+        "validation_required": {
+          "type": "boolean"
+        },
+        "candidate_validation_commands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "force_options": {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/forceOptions"
+        },
+        "apply_mode": {
+          "type": "string",
+          "enum": [
+            "none",
+            "direct",
+            "three_way"
+          ]
+        },
+        "semantic_conflicts": {
+          "$ref": "#/$defs/semanticConflicts"
+        },
+        "readiness": {
+          "$ref": "#/$defs/readiness"
+        }
+      }
+    },
+    "applyBlocker": {
+      "type": "string",
+      "enum": [
+        "dirty_primary",
+        "stale_base",
+        "primary_state_changed",
+        "apply_check_failed",
+        "excluded_reference",
+        "unclaimed_edits",
+        "validation_missing",
+        "validation_not_run",
+        "validation_skipped",
+        "validation_failed"
+      ]
+    },
+    "readiness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "blockers",
+        "forced",
+        "details"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "safe",
+            "forced",
+            "blocked"
+          ]
+        },
+        "blockers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/applyBlocker"
+          }
+        },
+        "forced": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/applyBlocker"
+          }
+        },
+        "details": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/blockerDetail"
+          }
+        }
+      }
+    },
+    "blockerDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "disposition",
+        "check_status",
+        "paths",
+        "message",
+        "validation_reports",
+        "validation_commands",
+        "next_safe_operation"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/applyBlocker"
+        },
+        "disposition": {
+          "type": "string",
+          "enum": [
+            "blocked",
+            "forced"
+          ]
+        },
+        "check_status": {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/safetyCheckStatus"
+        },
+        "paths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "merge-preview-report-v1.schema.json#/$defs/repositoryRelativePath"
+          }
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "validation_reports": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "$ref": "merge-preview-report-v1.schema.json#/$defs/validationReport"
+          }
+        },
+        "validation_commands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "next_safe_operation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "semanticConflicts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "advisory",
+        "status",
+        "risk",
+        "confidence",
+        "degraded",
+        "conflict_paths",
+        "overlaps"
+      ],
+      "properties": {
+        "advisory": {
+          "type": "boolean"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "no_conflict",
+            "classified",
+            "degraded"
+          ]
+        },
+        "risk": {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/semanticRisk"
+        },
+        "confidence": {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/semanticConfidence"
+        },
+        "degraded": {
+          "type": "boolean"
+        },
+        "notes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "type": "string"
+          }
+        },
+        "conflict_paths": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "merge-preview-report-v1.schema.json#/$defs/repositoryRelativePath"
+          }
+        },
+        "overlaps": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "$ref": "#/$defs/semanticOverlap"
+          }
+        }
+      }
+    },
+    "semanticOverlap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "kind",
+        "risk",
+        "confidence",
+        "primary",
+        "candidate",
+        "common_symbols",
+        "common_impls",
+        "common_modules",
+        "impacted_files",
+        "dependency_impacts"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/repositoryRelativePath"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "import_only",
+            "formatting_only",
+            "signature_level",
+            "symbol_level",
+            "impl_level",
+            "module_level",
+            "file_level",
+            "unresolved"
+          ]
+        },
+        "risk": {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/semanticRisk"
+        },
+        "confidence": {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/semanticConfidence"
+        },
+        "primary": {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/semanticSide"
+        },
+        "candidate": {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/semanticSide"
+        },
+        "common_symbols": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "$ref": "merge-preview-report-v1.schema.json#/$defs/semanticSymbol"
+          }
+        },
+        "common_impls": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "$ref": "merge-preview-report-v1.schema.json#/$defs/semanticSymbol"
+          }
+        },
+        "common_modules": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "impacted_files": {
+          "type": "array",
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "merge-preview-report-v1.schema.json#/$defs/repositoryRelativePath"
+          }
+        },
+        "dependency_impacts": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "$ref": "#/$defs/conflictDependencyImpact"
+          }
+        },
+        "notes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "sourceSpan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start_byte",
+        "end_byte",
+        "start_line",
+        "end_line",
+        "signature_end_line"
+      ],
+      "properties": {
+        "start_byte": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end_byte": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "start_line": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end_line": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "signature_end_line": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Last line of the declaration signature rather than its body; emitted by every merge-semantic SourceSpan."
+        }
+      }
+    },
+    "dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "from_file",
+        "from_module",
+        "to",
+        "to_file",
+        "kind",
+        "span"
+      ],
+      "properties": {
+        "from_file": {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/repositoryRelativePath"
+        },
+        "from_module": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "to": {
+          "type": "string",
+          "minLength": 1
+        },
+        "to_file": {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/nullableRepositoryRelativePath"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "import",
+            "module_declaration",
+            "inline_module"
+          ]
+        },
+        "span": {
+          "$ref": "#/$defs/sourceSpan"
+        }
+      }
+    },
+    "dependencyImpact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "direction",
+        "changed_path",
+        "related_file",
+        "dependency"
+      ],
+      "properties": {
+        "direction": {
+          "type": "string",
+          "enum": [
+            "incoming",
+            "outgoing"
+          ]
+        },
+        "changed_path": {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/repositoryRelativePath"
+        },
+        "related_file": {
+          "$ref": "merge-preview-report-v1.schema.json#/$defs/nullableRepositoryRelativePath"
+        },
+        "dependency": {
+          "$ref": "#/$defs/dependency"
+        }
+      }
+    },
+    "conflictDependencyImpact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "side",
+        "impact"
+      ],
+      "properties": {
+        "side": {
+          "type": "string",
+          "enum": [
+            "primary",
+            "candidate"
+          ]
+        },
+        "impact": {
+          "$ref": "#/$defs/dependencyImpact"
+        }
+      }
+    }
+  }
+}

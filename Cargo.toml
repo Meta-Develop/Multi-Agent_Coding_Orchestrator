@@ -64,6 +64,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+boon = { version = "=0.6.1", default-features = false }
 criterion = "0.8.2"
 
 [profile.dev]
