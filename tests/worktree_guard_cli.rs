@@ -344,6 +344,54 @@ fn tampered_outer_dispatcher_refuses_an_ordinary_push_before_the_user_hook() -> 
 }
 
 #[test]
+fn executable_outer_without_nested_guard_is_cli_detected_but_ordinary_push_succeeds() -> Result<()>
+{
+    let fixture = GuardFixture::new("outer-omits-nested-guard")?;
+    let pre_push = fixture.hooks.join("pre-push");
+    let chained = fixture.hooks.join("pre-push.human-authorship-previous");
+    let user_backup = fixture
+        .hooks
+        .join("pre-push.human-authorship-previous.maco-worktree-guard-previous");
+    let replacement_log = fixture.common.join("outer-replacement.log");
+    write_executable(&pre_push, USER_PRE_PUSH)?;
+    install_v5_guard_bundle(&fixture)?;
+    install_canonical_v5_dispatcher(&fixture)?;
+    run_guard_json("install", &fixture.primary)?;
+    stage_file(&fixture.primary, "outer-omits-guard.txt", "replacement\n")?;
+    git_success(
+        &fixture.primary,
+        &["commit", "-q", "-m", "prepare omitted nested guard push"],
+    )?;
+
+    let replacement = r#"#!/bin/sh
+common=$(git rev-parse --path-format=absolute --git-common-dir) || exit 1
+printf 'replacement-only\n' >> "$common/outer-replacement.log"
+"#;
+    assert!(!replacement.contains("human-authorship-previous"));
+    write_executable(&pre_push, replacement)?;
+
+    let verify = run_guard("verify", &fixture.primary)?;
+    assert!(!verify.status.success());
+    assert!(String::from_utf8_lossy(&verify.stderr)
+        .contains("human-authorship dispatcher v5 is missing or modified"));
+    assert!(!replacement_log.exists());
+
+    let push = git(
+        &fixture.primary,
+        &["push", "origin", "HEAD:refs/heads/main"],
+    )?;
+    assert_success(push, "push with outer dispatcher replacement");
+    assert_eq!(fs::read_to_string(&replacement_log)?, "replacement-only\n");
+    assert_eq!(fs::read(&chained)?, WORKTREE_GUARD_ASSET);
+    assert_eq!(fs::read(&user_backup)?, USER_PRE_PUSH.as_bytes());
+    assert!(
+        !fixture.common.join("user-hooks.log").exists(),
+        "the preserved user hook ran despite the omitted nested invocation"
+    );
+    Ok(())
+}
+
+#[test]
 fn executable_outer_mode_drift_refuses_commit_merge_and_push_before_prior_hooks() -> Result<()> {
     let commit_fixture = GuardFixture::new("outer-mode-commit")?;
     write_executable(

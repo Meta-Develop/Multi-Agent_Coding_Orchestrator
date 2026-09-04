@@ -1752,11 +1752,18 @@ backups; arbitrary or ambiguous payload, mode, state, or staged-file drift is
 still refused. `uninstall` completes that same exact legacy upgrade before it
 restores the recorded backups.
 
-For an ordinary push this runtime check exists only while Git
-executes the outer `pre-push` dispatcher: if all of its executable bits are
-removed, Git skips that hook entirely. `worktree guard verify` still detects
-that mode change, as do the independently invoked commit and merge hooks, but
-no skipped local push hook can refuse the push that skipped it.
+For an ordinary push, push-time refusal exists only while Git executes an outer
+`pre-push` dispatcher that reaches the nested worktree guard. If all executable
+bits are removed from the outer hook, Git skips it. If the outer hook is
+replaced by an executable script that omits the nested invocation, Git runs
+only that replacement; the nested guard and all other checks normally reached
+through the dispatcher are bypassed for that push.
+
+`maco worktree guard verify` detects either form of outer drift. Another
+installed guard hook that Git still executes, such as `pre-commit` or
+`pre-merge-commit`, also detects it. These checks provide defense in depth
+against accidental or partial drift, not tamper-proof enforcement by local
+hooks.
 
 Inspect a repository:
 
