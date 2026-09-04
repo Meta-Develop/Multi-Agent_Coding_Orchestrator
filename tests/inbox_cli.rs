@@ -279,6 +279,35 @@ fn run_processes_default_fake_items_and_writes_expected_artifacts() -> Result<()
     assert!(autopilot["pr"].is_null());
     assert_eq!(autopilot["auto_merge_performed"], false);
     assert_eq!(autopilot["check_status"]["ci_reaction_supported"], false);
+    let supervisor_run_id = autopilot["supervisor"]["run_id"]
+        .as_str()
+        .context("ordinary Inbox item Supervisor run id")?;
+    let manifest = read_json_file(
+        &repo_path
+            .join(".maco/o2/runs")
+            .join(supervisor_run_id)
+            .join("effective-mutation-manifest.json"),
+    )?;
+    assert_eq!(manifest["execution_runtime"], "nonpublishable_simulation");
+    assert_eq!(manifest["worktree_mode"], "nonpublishable_simulation");
+    let manifest_operations = manifest["operations"]
+        .as_array()
+        .context("ordinary Inbox item effective mutation operations")?;
+    assert!(manifest_operations.iter().any(|operation| {
+        operation["operation_id"] == "supervisor-run-artifact-authenticated-finalize"
+    }));
+    assert!(manifest_operations
+        .iter()
+        .any(|operation| operation["operation_id"] == "worktree-create"));
+    assert!(!manifest_operations
+        .iter()
+        .any(|operation| operation["operation_id"] == "hook-install"));
+    assert!(!manifest_operations
+        .iter()
+        .any(|operation| operation["operation_id"] == "supervisor-process-spawn"));
+    assert!(manifest["canonical_manifest_sha256"]
+        .as_str()
+        .is_some_and(|digest| digest.len() == 64));
 
     let github = read_json_file(&run_dir.join("item-2-github-report.json"))?;
     assert_eq!(github["mode"], "fake");
@@ -2796,6 +2825,9 @@ fn run_json_command(
 ) -> Result<Value> {
     let mut command = Command::new(BIN);
     command.args(args);
+    // JSON-mode assertions must not inherit a developer RUST_LOG setting:
+    // tracing currently writes to stdout and would corrupt the CLI payload.
+    command.env("RUST_LOG", "off");
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }

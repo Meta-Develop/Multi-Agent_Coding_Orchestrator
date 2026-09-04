@@ -2518,7 +2518,7 @@ pub(crate) fn run_fake_supervisor_plan_file_for_test(
      -> ExternalAgentRun {
         panic!("hermetic Fake plan-file execution must not launch an external process")
     };
-    run_supervisor_plan_with_runner_and_creation(
+    authorize_and_run_supervisor_plan_with_runner_and_creation(
         loaded,
         options,
         1,
@@ -2593,6 +2593,7 @@ pub fn run_supervisor_plan_file_cascade_with_concurrency_policy_and_primary_work
         None,
         &cancellation_observed,
         None,
+        None,
         allow_primary_worktree,
         objective_profile_override.as_deref(),
         &mut permit,
@@ -2649,7 +2650,6 @@ pub fn run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_work
     validate_execution_target_pre_dispatch(&loaded, allow_primary_worktree)?;
     let source_loaded = loaded.clone();
     let template = options.clone();
-    let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
     let source_report = if template.runtime == SupervisorRuntime::Fake {
         if source_loaded.plan_metadata.execution_target.is_some() {
             bail!("nonpublishable Fake cascade cannot use primary-worktree execution");
@@ -2660,25 +2660,25 @@ pub fn run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_work
          -> ExternalAgentRun {
             panic!("nonpublishable Fake cascade must not launch an external process")
         };
-        run_supervisor_plan_with_runner_and_creation(
+        authorize_acquire_catalog_and_run_supervisor_plan_with_runner_and_creation(
             loaded,
             options,
             max_concurrent_children,
             SupervisorExecutionRuntime::NonpublishableSimulation,
             SupervisorWorktreeCreation::NonpublishableSimulation,
-            runtime_model_catalog,
+            None,
             &no_external_runner,
         )?
     } else {
         let manager = WorktreeManager::new(&repo);
         let cleanliness = manager.acquire_repository_cleanliness()?;
-        run_supervisor_plan_with_runner_and_creation(
+        authorize_acquire_catalog_and_run_supervisor_plan_with_runner_and_creation(
             loaded,
             options,
             max_concurrent_children,
             SupervisorExecutionRuntime::Verified,
             SupervisorWorktreeCreation::Bound(&cleanliness),
-            runtime_model_catalog,
+            None,
             &run_external_agent_cancellable_reviewed,
         )?
     };
@@ -2785,6 +2785,7 @@ pub(crate) fn run_supervisor_plan_file_cascade_for_autopilot(
     caller_cancellation: Option<&ProcessCancellation>,
     cancellation_observed: &AtomicBool,
     source_dispatch_started: &AtomicBool,
+    source_mutation_grant: EffectiveSupervisorMutationGrant,
     before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<Option<GateDenial>>,
 ) -> Result<SupervisorCascadeOutcome> {
     match caller_cancellation {
@@ -2814,6 +2815,7 @@ pub(crate) fn run_supervisor_plan_file_cascade_for_autopilot(
                 Some(caller_cancellation),
                 cancellation_observed,
                 Some(source_dispatch_started),
+                Some(source_mutation_grant),
                 false,
                 None,
                 before_dispatch,
@@ -2828,6 +2830,7 @@ pub(crate) fn run_supervisor_plan_file_cascade_for_autopilot(
             None,
             cancellation_observed,
             Some(source_dispatch_started),
+            Some(source_mutation_grant),
             false,
             None,
             before_dispatch,
@@ -2845,6 +2848,7 @@ fn run_supervisor_plan_file_cascade_with_gate(
     caller_cancellation: Option<&ProcessCancellation>,
     cancellation_observed: &AtomicBool,
     source_dispatch_started: Option<&AtomicBool>,
+    mut source_mutation_grant: Option<EffectiveSupervisorMutationGrant>,
     allow_primary_worktree: bool,
     objective_profile_override: Option<&str>,
     before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<Option<GateDenial>>,
@@ -2870,13 +2874,6 @@ fn run_supervisor_plan_file_cascade_with_gate(
     }
     let source_loaded = loaded.clone();
     let template = options.clone();
-    let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
-    if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
-        bail!("autopilot caller cancelled after runtime catalog resolution before exact loaded-plan dispatch");
-    }
-    if let Some(source_dispatch_started) = source_dispatch_started {
-        source_dispatch_started.store(true, Ordering::SeqCst);
-    }
     let source_report = if template.runtime == SupervisorRuntime::Fake {
         if source_loaded.plan_metadata.execution_target.is_some() {
             bail!("nonpublishable Fake cascade cannot use primary-worktree execution");
@@ -2887,6 +2884,25 @@ fn run_supervisor_plan_file_cascade_with_gate(
          -> ExternalAgentRun {
             panic!("nonpublishable Fake cascade must not launch an external process")
         };
+        let mutation_grant = match source_mutation_grant.take() {
+            Some(grant) => grant,
+            None => {
+                let manifest = effective_supervisor_mutation_manifest(
+                    &loaded,
+                    &options,
+                    SupervisorExecutionRuntime::NonpublishableSimulation,
+                    SupervisorWorktreeCreation::NonpublishableSimulation,
+                )?;
+                authorize_effective_supervisor_manifest(manifest)?
+            }
+        };
+        let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
+        if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
+            bail!("autopilot caller cancelled after runtime catalog resolution before exact loaded-plan dispatch");
+        }
+        if let Some(source_dispatch_started) = source_dispatch_started {
+            source_dispatch_started.store(true, Ordering::SeqCst);
+        }
         run_supervisor_plan_with_runner_and_creation(
             loaded,
             options,
@@ -2894,9 +2910,29 @@ fn run_supervisor_plan_file_cascade_with_gate(
             SupervisorExecutionRuntime::NonpublishableSimulation,
             SupervisorWorktreeCreation::NonpublishableSimulation,
             runtime_model_catalog,
+            mutation_grant,
             &no_external_runner,
         )?
     } else if source_loaded.plan_metadata.execution_target.is_some() {
+        let mutation_grant = match source_mutation_grant.take() {
+            Some(grant) => grant,
+            None => {
+                let manifest = effective_supervisor_mutation_manifest(
+                    &loaded,
+                    &options,
+                    SupervisorExecutionRuntime::Verified,
+                    SupervisorWorktreeCreation::PrimaryWorktree,
+                )?;
+                authorize_effective_supervisor_manifest(manifest)?
+            }
+        };
+        let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
+        if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
+            bail!("autopilot caller cancelled after runtime catalog resolution before exact loaded-plan dispatch");
+        }
+        if let Some(source_dispatch_started) = source_dispatch_started {
+            source_dispatch_started.store(true, Ordering::SeqCst);
+        }
         run_supervisor_plan_with_runner_and_creation(
             loaded,
             options,
@@ -2904,11 +2940,31 @@ fn run_supervisor_plan_file_cascade_with_gate(
             SupervisorExecutionRuntime::Verified,
             SupervisorWorktreeCreation::PrimaryWorktree,
             runtime_model_catalog,
+            mutation_grant,
             external_runner,
         )?
     } else {
         let manager = WorktreeManager::new(&repo);
         let cleanliness = manager.acquire_repository_cleanliness()?;
+        let mutation_grant = match source_mutation_grant.take() {
+            Some(grant) => grant,
+            None => {
+                let manifest = effective_supervisor_mutation_manifest(
+                    &loaded,
+                    &options,
+                    SupervisorExecutionRuntime::Verified,
+                    SupervisorWorktreeCreation::Bound(&cleanliness),
+                )?;
+                authorize_effective_supervisor_manifest(manifest)?
+            }
+        };
+        let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
+        if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
+            bail!("autopilot caller cancelled after runtime catalog resolution before exact loaded-plan dispatch");
+        }
+        if let Some(source_dispatch_started) = source_dispatch_started {
+            source_dispatch_started.store(true, Ordering::SeqCst);
+        }
         run_supervisor_plan_with_runner_and_creation(
             loaded,
             options,
@@ -2916,6 +2972,7 @@ fn run_supervisor_plan_file_cascade_with_gate(
             SupervisorExecutionRuntime::Verified,
             SupervisorWorktreeCreation::Bound(&cleanliness),
             runtime_model_catalog,
+            mutation_grant,
             external_runner,
         )?
     };
@@ -2949,15 +3006,42 @@ fn run_supervisor_goal_spec_with_max_concurrent_children(
     validate_execution_target_pre_dispatch(&loaded, false)?;
     let manager = WorktreeManager::new(&repo);
     let cleanliness = manager.acquire_repository_cleanliness()?;
-    let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
-    run_supervisor_plan_with_runner_and_creation(
+    authorize_acquire_catalog_and_run_supervisor_plan_with_runner_and_creation(
         loaded,
         options,
         max_concurrent_children,
         SupervisorExecutionRuntime::Verified,
         SupervisorWorktreeCreation::Bound(&cleanliness),
-        runtime_model_catalog,
+        None,
         &run_external_agent_cancellable_reviewed,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn run_supervisor_goal_spec_with_runner_for_test(
+    options: SupervisorRunOptions,
+    goal: &str,
+    spec: &str,
+    external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
+) -> Result<SupervisorFinalReport> {
+    let repo = discover_repo_root(&options.repo)?;
+    let loaded = supervisor_plan_and_consultant_from_goal_spec(&repo, goal, spec, None)?;
+    validate_execution_target_pre_dispatch(&loaded, false)?;
+    let manager = WorktreeManager::new(&repo);
+    let cleanliness = manager.acquire_repository_cleanliness()?;
+    let runtime_model_catalog = test_runtime_model_catalog(&loaded.plan, options.runtime)?;
+    let serialized_runner = Mutex::new(external_runner);
+    authorize_and_run_supervisor_plan_with_runner_and_creation(
+        loaded,
+        options,
+        1,
+        SupervisorExecutionRuntime::Verified,
+        SupervisorWorktreeCreation::Bound(&cleanliness),
+        Ok(runtime_model_catalog),
+        &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
+            Ok(mut runner) => runner(command),
+            Err(poisoned) => poisoned.into_inner()(command),
+        },
     )
 }
 
@@ -3015,14 +3099,13 @@ pub fn reaudit_supervisor_assignment(
         budget_max_duration_seconds: None,
         machine_global_retention: request.machine_global_retention,
     };
-    let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
-    let final_report = run_supervisor_plan_with_runner_and_creation(
+    let final_report = authorize_acquire_catalog_and_run_supervisor_plan_with_runner_and_creation(
         loaded,
         options,
         1,
         SupervisorExecutionRuntime::Verified,
         SupervisorWorktreeCreation::ExistingOnly,
-        runtime_model_catalog,
+        None,
         &run_external_agent_cancellable_reviewed,
     )?;
     Ok(SupervisorEvidenceOnlyReauditReport {
@@ -3284,14 +3367,13 @@ fn run_supervisor_plan_file_with_runner_and_max_concurrent_children(
     let cleanliness = manager.acquire_repository_cleanliness()?;
     let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
     validate_execution_target_pre_dispatch(&loaded, false)?;
-    let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
-    run_supervisor_plan_with_runner_and_creation(
+    authorize_acquire_catalog_and_run_supervisor_plan_with_runner_and_creation(
         loaded,
         options,
         max_concurrent_children,
         SupervisorExecutionRuntime::Verified,
         SupervisorWorktreeCreation::Bound(&cleanliness),
-        runtime_model_catalog,
+        None,
         external_runner,
     )
 }

@@ -9,11 +9,47 @@ use crate::{
     },
     gate_denial::ApprovalReviewDenial,
     machine_global::MachineGlobalRetentionBinding,
-    mutation_taxonomy::autonomous_decision_for_supervisor_child_dispatch,
+    mutation_taxonomy::{
+        EffectiveSupervisorDispatchIdentity, EffectiveSupervisorExecutionRuntime,
+        EffectiveSupervisorMutationManifest, EffectiveSupervisorMutationManifestInput,
+        EffectiveSupervisorWorktreeMode, MutationOperation,
+    },
 };
 use std::io::Write;
 
 const FOLLOW_UP_CASCADE_VERSION: u32 = 1;
+
+pub(super) fn effective_generated_follow_up_queue_mutation_manifest(
+    source_run_id: &RunId,
+    source_plan_sha256: &str,
+    task_count: usize,
+) -> EffectiveSupervisorMutationManifest {
+    EffectiveSupervisorMutationManifest::new(EffectiveSupervisorMutationManifestInput {
+        run_id: source_run_id.as_str().to_string(),
+        parent_node: None,
+        normalized_plan_sha256: source_plan_sha256.to_string(),
+        dispatch_identity: EffectiveSupervisorDispatchIdentity::GeneratedFollowUpQueue {
+            source_run_id: source_run_id.as_str().to_string(),
+            task_count,
+        },
+        execution_runtime: EffectiveSupervisorExecutionRuntime::Verified,
+        worktree_mode: EffectiveSupervisorWorktreeMode::NotApplicable,
+        operations: vec![
+            MutationOperation::GeneratedFollowUpQueueReserve,
+            MutationOperation::GeneratedFollowUpQueueWriteAppend,
+            MutationOperation::GeneratedFollowUpQueueAuthenticatedCommit,
+            MutationOperation::GeneratedFollowUpQueueClaim,
+            MutationOperation::GeneratedFollowUpQueueRelease,
+            MutationOperation::GeneratedFollowUpRefusalEvidenceWrite,
+            MutationOperation::GeneratedSupervisorPlanStage,
+        ],
+        // This builder is called only after the finalized source report and
+        // normalized source plan have authenticated the exact queue identity.
+        demonstrated_gates: vec![
+            crate::mutation_taxonomy::ExplicitMutationGate::BoundGeneratedFollowUpQueueLifecycleAuthority,
+        ],
+    })
+}
 
 pub(super) struct FollowUpCascadeInvocation<'a> {
     pub(super) outer_entrypoint: GeneratedFollowUpQueueEntrypoint,
@@ -154,6 +190,14 @@ pub(super) fn run_generated_follow_up_cascade(
     if !source_report.success || !source_report.accepted || !source_report.publishable {
         return Ok(source_only_cascade_outcome(source_report));
     }
+    let effective_queue_manifest = effective_generated_follow_up_queue_mutation_manifest(
+        &source_report.run_id,
+        &source_plan_sha256,
+        source_report.generated_follow_up_tasks.len(),
+    );
+    let queue_mutation_grant =
+        authorize_effective_supervisor_manifest(effective_queue_manifest.clone())?;
+    queue_mutation_grant.consume(&effective_queue_manifest)?;
     let primary_baseline =
         primary_worktree_snapshot_sha256(repo, SupervisorExecutionRuntime::Verified)?;
     let retention = supervisor_template
@@ -178,6 +222,9 @@ pub(super) fn run_generated_follow_up_cascade(
     let source = GeneratedFollowUpQueueSource::root(GeneratedFollowUpQueueRootInput {
         source_supervisor_run_id: source_report.run_id.as_str().to_string(),
         source_normalized_plan_sha256: source_plan_sha256,
+        effective_mutation_manifest_sha256: effective_queue_manifest
+            .canonical_manifest_sha256()
+            .to_string(),
         source_report_accepted: source_report.accepted,
         source_report_publishable: source_report.publishable,
         outer_entrypoint: invocation.outer_entrypoint,
@@ -296,23 +343,6 @@ pub(super) fn run_generated_follow_up_cascade(
             if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
                 return Ok(FollowUpPreparation::Cancelled);
             }
-            let taxonomy_decision = autonomous_decision_for_supervisor_child_dispatch();
-            if let Some(gate_id) = taxonomy_decision.gate_id() {
-                let effective_paths = reloaded
-                    .plan
-                    .assignments
-                    .iter()
-                    .flat_map(|assignment| assignment.assigned_paths.iter().cloned())
-                    .collect::<Vec<_>>();
-                return Ok(FollowUpPreparation::Refused(
-                    GateDenial::from_approval_review(
-                        &item_id,
-                        gate_id,
-                        ApprovalReviewDenial::HumanReviewRequired,
-                        effective_paths,
-                    )?,
-                ));
-            }
             if let Some(denial) = before_dispatch(&reloaded.plan)? {
                 return Ok(FollowUpPreparation::Refused(denial));
             }
@@ -382,7 +412,75 @@ pub(super) fn run_generated_follow_up_cascade(
                 ));
             }
         };
-        let started = queue.mark_dispatch_started(&item_id)?;
+        let subordinate_run_id = RunId::new(queue.planned_subordinate_run_id(&item_id)?)?;
+        let subordinate_options = SupervisorRunOptions {
+            repo: repo.to_path_buf(),
+            plan_file: plan_file.path().to_path_buf(),
+            run_id: subordinate_run_id.clone(),
+            parent_node: Some(supervisor_template.run_id.as_str().to_string()),
+            codex_bin: supervisor_template.codex_bin.clone(),
+            runtime: supervisor_template.runtime,
+            allow_dirty_primary: supervisor_template.allow_dirty_primary,
+            allow_live_run_collision: supervisor_template.allow_live_run_collision,
+            admission_overrides: supervisor_template.admission_overrides,
+            budget_overrides: supervisor_template.budget_overrides,
+            budget_max_duration_seconds: supervisor_template.budget_max_duration_seconds,
+            machine_global_retention: Some(retention.clone()),
+        };
+        let max_concurrent_children = invocation
+            .concurrency_policy
+            .resolve(HostProcessCapacity::measured());
+        validate_max_concurrent_children(max_concurrent_children)?;
+        let manager = WorktreeManager::new(repo);
+        let cleanliness = manager.acquire_repository_cleanliness()?;
+        let subordinate_manifest = effective_supervisor_mutation_manifest(
+            &reloaded,
+            &subordinate_options,
+            SupervisorExecutionRuntime::Verified,
+            SupervisorWorktreeCreation::Bound(&cleanliness),
+        )?;
+        let subordinate_mutation_grant = match authorize_effective_supervisor_manifest(
+            subordinate_manifest,
+        ) {
+            Ok(authority) => authority,
+            Err(error) => {
+                let gate_id = supervisor_mutation_admission_gate_id(&error)
+                    .unwrap_or(crate::mutation_taxonomy::TAXONOMY_REVIEW_REQUIRED_GATE_ID);
+                let effective_paths = reloaded
+                    .plan
+                    .assignments
+                    .iter()
+                    .flat_map(|assignment| assignment.assigned_paths.iter().cloned())
+                    .collect::<Vec<_>>();
+                let denial = GateDenial::from_approval_review(
+                    &item_id,
+                    gate_id,
+                    ApprovalReviewDenial::HumanReviewRequired,
+                    effective_paths,
+                )?;
+                queue.release_before_dispatch(&item_id, Some(denial), Vec::new())?;
+                #[cfg(test)]
+                record_queue_test_observation(
+                    "mutation_admission_refused",
+                    &queue,
+                    authenticated_child_dispatch_started_count,
+                );
+                return Err(error.context(
+                        "generated follow-up Supervisor mutation admission failed before durable dispatch start",
+                    ));
+            }
+        };
+        let runtime_model_catalog = match invocation.runtime_catalog {
+            FollowUpRuntimeCatalog::Production => {
+                RuntimeModelCatalog::for_supervisor(&subordinate_options, repo)
+            }
+            #[cfg(test)]
+            FollowUpRuntimeCatalog::Injected => Ok(test_runtime_model_catalog(
+                &reloaded.plan,
+                subordinate_options.runtime,
+            )?),
+        };
+        let _started = queue.mark_dispatch_started(&item_id)?;
         #[cfg(test)]
         record_queue_test_observation(
             "dispatch_started",
@@ -400,31 +498,14 @@ pub(super) fn run_generated_follow_up_cascade(
             );
             bail!("injected interruption after durable generated follow-up ambiguous hold");
         }
-        let subordinate_run_id = RunId::new(
-            started
-                .subordinate_run_id
-                .as_deref()
-                .context("durable generated follow-up dispatch has no subordinate run id")?,
-        )?;
-        let subordinate_options = SupervisorRunOptions {
-            repo: repo.to_path_buf(),
-            plan_file: plan_file.path().to_path_buf(),
-            run_id: subordinate_run_id.clone(),
-            parent_node: Some(supervisor_template.run_id.as_str().to_string()),
-            codex_bin: supervisor_template.codex_bin.clone(),
-            runtime: supervisor_template.runtime,
-            allow_dirty_primary: supervisor_template.allow_dirty_primary,
-            allow_live_run_collision: supervisor_template.allow_live_run_collision,
-            admission_overrides: supervisor_template.admission_overrides,
-            budget_overrides: supervisor_template.budget_overrides,
-            budget_max_duration_seconds: supervisor_template.budget_max_duration_seconds,
-            machine_global_retention: Some(retention.clone()),
-        };
-        let result = run_follow_up_supervisor_loaded_plan(
-            subordinate_options,
+        let result = run_supervisor_plan_with_runner_and_creation(
             reloaded,
-            invocation.concurrency_policy,
-            invocation.runtime_catalog,
+            subordinate_options,
+            max_concurrent_children,
+            SupervisorExecutionRuntime::Verified,
+            SupervisorWorktreeCreation::Bound(&cleanliness),
+            runtime_model_catalog,
+            subordinate_mutation_grant,
             external_runner,
         );
         #[cfg(test)]
@@ -690,36 +771,6 @@ pub(crate) fn normalized_supervisor_plan_file_sha256(path: &Path) -> Result<Stri
         &loaded.consultant,
         &loaded.assignment_metadata,
         &loaded.plan_metadata,
-    )
-}
-
-fn run_follow_up_supervisor_loaded_plan(
-    options: SupervisorRunOptions,
-    loaded: LoadedSupervisorPlan,
-    concurrency_policy: SupervisorConcurrencyPolicy,
-    runtime_catalog: FollowUpRuntimeCatalog,
-    external_runner: &CancellableExternalRunner<'_>,
-) -> Result<SupervisorFinalReport> {
-    let max_concurrent_children = concurrency_policy.resolve(HostProcessCapacity::measured());
-    validate_max_concurrent_children(max_concurrent_children)?;
-    let repo = discover_repo_root(&options.repo)?;
-    let manager = WorktreeManager::new(&repo);
-    let cleanliness = manager.acquire_repository_cleanliness()?;
-    let runtime_model_catalog = match runtime_catalog {
-        FollowUpRuntimeCatalog::Production => RuntimeModelCatalog::for_supervisor(&options, &repo),
-        #[cfg(test)]
-        FollowUpRuntimeCatalog::Injected => {
-            Ok(test_runtime_model_catalog(&loaded.plan, options.runtime)?)
-        }
-    };
-    run_supervisor_plan_with_runner_and_creation(
-        loaded,
-        options,
-        max_concurrent_children,
-        SupervisorExecutionRuntime::Verified,
-        SupervisorWorktreeCreation::Bound(&cleanliness),
-        runtime_model_catalog,
-        external_runner,
     )
 }
 

@@ -466,7 +466,7 @@ fn run_supervisor_plan_with_budget_catalog_and_runner(
             SupervisorWorktreeCreation::TestOnly
         }
     };
-    run_supervisor_plan_with_runner_and_creation(
+    authorize_and_run_supervisor_plan_with_runner_and_creation(
         LoadedSupervisorPlan {
             plan,
             consultant,
@@ -496,7 +496,7 @@ fn run_loaded_supervisor_plan_with_runner(
 ) -> Result<SupervisorFinalReport> {
     let runtime_model_catalog = test_runtime_model_catalog(&loaded.plan, options.runtime)?;
     let serialized_runner = Mutex::new(external_runner);
-    run_supervisor_plan_with_runner_and_creation(
+    authorize_and_run_supervisor_plan_with_runner_and_creation(
         loaded,
         options,
         1,
@@ -538,7 +538,7 @@ fn run_supervisor_plan_with_budget_and_concurrent_runner(
     external_runner: &(dyn Fn(&ExternalAgentCommand) -> ExternalAgentRun + Send + Sync),
 ) -> Result<SupervisorFinalReport> {
     let runtime_model_catalog = test_runtime_model_catalog(&plan, options.runtime)?;
-    run_supervisor_plan_with_runner_and_creation(
+    authorize_and_run_supervisor_plan_with_runner_and_creation(
         LoadedSupervisorPlan {
             plan,
             consultant,
@@ -566,7 +566,7 @@ fn run_supervisor_plan_with_concurrent_cancellable_runner(
     external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorFinalReport> {
     let runtime_model_catalog = test_runtime_model_catalog(&plan, options.runtime)?;
-    run_supervisor_plan_with_runner_and_creation(
+    authorize_and_run_supervisor_plan_with_runner_and_creation(
         LoadedSupervisorPlan {
             plan,
             consultant,

@@ -1,5 +1,280 @@
 use super::*;
 
+#[test]
+fn plan_file_unknown_effect_is_refused_before_run_reservation_or_dispatch() {
+    let (temp, repo_path) = injected_repository();
+    let plan = injected_plan(injected_assignment(false), 0);
+    let options = injected_options(
+        &repo_path,
+        temp.path(),
+        "plan-file-unknown-mutation-admission",
+    );
+    fs::write(
+        &options.plan_file,
+        serde_json::to_vec(&plan).expect("serialize mutation-admission plan"),
+    )
+    .expect("write mutation-admission plan");
+    let run_id = options.run_id.clone();
+    let dispatches = AtomicUsize::new(0);
+    let _manifest_mutation = set_effective_supervisor_manifest_test_mutations([
+        EffectiveSupervisorManifestTestMutation::AppendUnknownOperation(
+            "actual-unlisted-plan-file-effect",
+        ),
+    ]);
+    let mut runner = |_command: &ExternalAgentCommand| {
+        dispatches.fetch_add(1, Ordering::SeqCst);
+        panic!("unknown mutation must refuse before external dispatch")
+    };
+
+    let error = run_supervisor_plan_file_with_runner(options, &mut runner)
+        .expect_err("unknown effective plan-file mutation must fail closed");
+
+    assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        supervisor_mutation_admission_gate_id(&error),
+        Some(crate::mutation_taxonomy::TAXONOMY_REVIEW_REQUIRED_GATE_ID)
+    );
+    assert!(!repo_path
+        .join(RunArtifactFamily::Supervise.run_root())
+        .join(run_id.as_str())
+        .exists());
+}
+
+#[test]
+fn literal_goal_missing_irreversible_gate_is_refused_before_run_reservation_or_dispatch() {
+    let (temp, repo_path) = injected_repository();
+    let options = injected_options(
+        &repo_path,
+        temp.path(),
+        "literal-goal-missing-mutation-gate",
+    );
+    let run_id = options.run_id.clone();
+    let dispatches = AtomicUsize::new(0);
+    let _manifest_mutation = set_effective_supervisor_manifest_test_mutations([
+        EffectiveSupervisorManifestTestMutation::RemoveRequiredGate(
+            ExplicitMutationGate::BoundSupervisorRunLifecycleAuthority,
+        ),
+    ]);
+    let mut runner = |_command: &ExternalAgentCommand| {
+        dispatches.fetch_add(1, Ordering::SeqCst);
+        panic!("missing mutation gate must refuse before external dispatch")
+    };
+
+    let error = plan_api::run_supervisor_goal_spec_with_runner_for_test(
+        options,
+        "In README.md, replace the old line with exactly: replacement. Verify the result with git diff --check and confirm README.md contains exactly that line.",
+        "",
+        &mut runner,
+    )
+    .expect_err("irreversible effective goal mutation without its gate must fail closed");
+
+    assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        supervisor_mutation_admission_gate_id(&error),
+        Some(ExplicitMutationGate::BoundSupervisorRunLifecycleAuthority.id())
+    );
+    assert!(!repo_path
+        .join(RunArtifactFamily::Supervise.run_root())
+        .join(run_id.as_str())
+        .exists());
+}
+
+#[test]
+fn evidence_only_reaudit_unknown_effect_is_refused_at_common_scheduler_admission() {
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(false);
+    let loaded = LoadedSupervisorPlan {
+        plan: injected_plan(assignment.clone(), 0),
+        consultant: SupervisorConsultantPlan::default(),
+        assignment_metadata: AssignmentMetadata::new(),
+        plan_metadata: SupervisorPlanMetadata {
+            evidence_only_reaudit: Some(EvidenceOnlyReauditPlan {
+                source_run_id: RunId::new("manifest-reaudit-source").expect("valid source run id"),
+                assignment_id: assignment.id.clone(),
+                attempt: 1,
+                preserved_candidate_binding: CandidateValidationBinding {
+                    version: 1,
+                    agent_id: assignment.id,
+                    primary_head: Some("1111111111111111111111111111111111111111".to_string()),
+                    agent_head: Some("2222222222222222222222222222222222222222".to_string()),
+                    merge_base: Some("1111111111111111111111111111111111111111".to_string()),
+                    diff_oid: "3333333333333333333333333333333333333333".to_string(),
+                },
+            }),
+            ..SupervisorPlanMetadata::default()
+        },
+    };
+    let options = injected_options(
+        &repo_path,
+        temp.path(),
+        "reaudit-unknown-mutation-admission",
+    );
+    let run_id = options.run_id.clone();
+    let catalog = test_runtime_model_catalog(&loaded.plan, options.runtime)
+        .expect("derive re-audit test catalog");
+    let _manifest_mutation = set_effective_supervisor_manifest_test_mutations([
+        EffectiveSupervisorManifestTestMutation::AppendUnknownOperation(
+            "actual-unlisted-reaudit-effect",
+        ),
+    ]);
+    let runner = |_command: &ExternalAgentCommand,
+                  _cancellation: &ProcessCancellation,
+                  _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
+        panic!("re-audit mutation admission must precede external dispatch")
+    };
+
+    let error = authorize_and_run_supervisor_plan_with_runner_and_creation(
+        loaded,
+        options,
+        1,
+        SupervisorExecutionRuntime::Verified,
+        SupervisorWorktreeCreation::ExistingOnly,
+        Ok(catalog),
+        &runner,
+    )
+    .expect_err("unknown re-audit mutation must fail closed");
+
+    assert_eq!(
+        supervisor_mutation_admission_gate_id(&error),
+        Some(crate::mutation_taxonomy::TAXONOMY_REVIEW_REQUIRED_GATE_ID)
+    );
+    assert!(!repo_path
+        .join(RunArtifactFamily::Supervise.run_root())
+        .join(run_id.as_str())
+        .exists());
+}
+
+#[test]
+fn every_effective_manifest_operation_is_registered_and_modes_are_conditional() {
+    let (temp, repo_path) = injected_repository();
+    let mut semantic_plan = injected_plan(injected_assignment(false), 0);
+    semantic_plan.semantic_coordination = SemanticCoordinationMode::Block;
+    let loaded = LoadedSupervisorPlan {
+        plan: semantic_plan,
+        consultant: SupervisorConsultantPlan::default(),
+        assignment_metadata: AssignmentMetadata::new(),
+        plan_metadata: SupervisorPlanMetadata::default(),
+    };
+    let verified_options =
+        injected_options(&repo_path, temp.path(), "effective-manifest-verified-modes");
+    let mut fake_options = verified_options.clone();
+    fake_options.run_id =
+        RunId::new("effective-manifest-fake-mode").expect("valid fake manifest run id");
+    fake_options.runtime = SupervisorRuntime::Fake;
+    fake_options.machine_global_retention = None;
+    let mut unbound_verified_options = verified_options.clone();
+    unbound_verified_options.run_id =
+        RunId::new("effective-manifest-unbound-output").expect("valid unbound manifest run id");
+    unbound_verified_options.machine_global_retention = None;
+    let manager = WorktreeManager::new(&repo_path);
+    let cleanliness = manager
+        .acquire_repository_cleanliness()
+        .expect("acquire manifest fixture cleanliness");
+    let scenarios = [
+        effective_supervisor_mutation_manifest(
+            &loaded,
+            &verified_options,
+            SupervisorExecutionRuntime::Verified,
+            SupervisorWorktreeCreation::Bound(&cleanliness),
+        )
+        .expect("derive bound verified manifest"),
+        effective_supervisor_mutation_manifest(
+            &loaded,
+            &verified_options,
+            SupervisorExecutionRuntime::Verified,
+            SupervisorWorktreeCreation::ExistingOnly,
+        )
+        .expect("derive existing-only manifest"),
+        effective_supervisor_mutation_manifest(
+            &loaded,
+            &fake_options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            SupervisorWorktreeCreation::NonpublishableSimulation,
+        )
+        .expect("derive nonpublishable Fake manifest"),
+        effective_supervisor_mutation_manifest(
+            &loaded,
+            &verified_options,
+            SupervisorExecutionRuntime::Verified,
+            SupervisorWorktreeCreation::PrimaryWorktree,
+        )
+        .expect("derive primary-worktree manifest"),
+        effective_supervisor_mutation_manifest(
+            &loaded,
+            &unbound_verified_options,
+            SupervisorExecutionRuntime::Verified,
+            SupervisorWorktreeCreation::ExistingOnly,
+        )
+        .expect("derive unbound-output manifest"),
+        follow_up_cascade::effective_generated_follow_up_queue_mutation_manifest(
+            &RunId::new("effective-manifest-queue-mode").expect("valid queue manifest run id"),
+            &"a".repeat(64),
+            1,
+        ),
+    ];
+    for manifest in &scenarios {
+        for operation in manifest.operations() {
+            assert!(
+                crate::mutation_taxonomy::classification_for(operation.operation_id()).is_some(),
+                "effective manifest emitted unregistered operation {}",
+                operation.operation_id()
+            );
+        }
+        assert!(!manifest
+            .operations()
+            .iter()
+            .any(|operation| operation.operation_id() == MutationOperation::HookInstall.id()));
+        let grant = authorize_effective_supervisor_mutation_manifest(manifest)
+            .expect("actual effective manifest must include every exact required gate")
+            .consume(manifest)
+            .expect("actual effective manifest authority must consume its exact manifest");
+        grant
+            .consume(manifest)
+            .expect("actual effective manifest grant must consume its exact manifest");
+    }
+    let bound_ids = scenarios[0]
+        .operations()
+        .iter()
+        .map(|operation| operation.operation_id())
+        .collect::<BTreeSet<_>>();
+    let existing_ids = scenarios[1]
+        .operations()
+        .iter()
+        .map(|operation| operation.operation_id())
+        .collect::<BTreeSet<_>>();
+    let fake_ids = scenarios[2]
+        .operations()
+        .iter()
+        .map(|operation| operation.operation_id())
+        .collect::<BTreeSet<_>>();
+    let primary_ids = scenarios[3]
+        .operations()
+        .iter()
+        .map(|operation| operation.operation_id())
+        .collect::<BTreeSet<_>>();
+    let unbound_ids = scenarios[4]
+        .operations()
+        .iter()
+        .map(|operation| operation.operation_id())
+        .collect::<BTreeSet<_>>();
+    assert!(bound_ids.contains(MutationOperation::WorktreeCreate.id()));
+    assert!(!existing_ids.contains(MutationOperation::WorktreeCreate.id()));
+    assert!(bound_ids.contains(MutationOperation::SemanticIntentAcquire.id()));
+    assert!(bound_ids.contains(MutationOperation::SupervisorProcessSpawn.id()));
+    assert!(bound_ids.contains(MutationOperation::MachineGlobalQuarantine.id()));
+    assert!(!bound_ids.contains(MutationOperation::SupervisorProcessOutputCleanup.id()));
+    assert!(unbound_ids.contains(MutationOperation::SupervisorProcessOutputCleanup.id()));
+    assert!(!unbound_ids.contains(MutationOperation::MachineGlobalQuarantine.id()));
+    assert!(!fake_ids.contains(MutationOperation::SupervisorProcessSpawn.id()));
+    assert!(!fake_ids.contains(MutationOperation::SandboxWorktreeEdit.id()));
+    assert!(!fake_ids.contains(MutationOperation::SupervisorPrimaryObjectDatabaseImport.id()));
+    assert!(primary_ids.contains(MutationOperation::PrimaryWorktreeMutation.id()));
+    assert!(!primary_ids.contains(MutationOperation::WorktreeCreate.id()));
+    assert!(!primary_ids.contains(MutationOperation::SupervisorMandatoryControlProvision.id()));
+    assert!(!primary_ids.contains(MutationOperation::SandboxWorktreeEdit.id()));
+    assert!(!primary_ids.contains(MutationOperation::SupervisorPrimaryObjectDatabaseImport.id()));
+}
+
 #[cfg(unix)]
 #[test]
 fn worker_codex_schema_artifact_is_authenticated_across_resume_and_refuses_mutation() {

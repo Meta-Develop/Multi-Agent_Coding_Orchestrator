@@ -188,6 +188,8 @@ impl GeneratedFollowUpRetentionBinding {
 pub(crate) struct GeneratedFollowUpQueueSource {
     source_supervisor_run_id: String,
     source_normalized_plan_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    effective_mutation_manifest_sha256: Option<String>,
     source_report_accepted: bool,
     source_report_publishable: bool,
     outer_entrypoint: GeneratedFollowUpQueueEntrypoint,
@@ -201,6 +203,7 @@ pub(crate) struct GeneratedFollowUpQueueSource {
 pub(crate) struct GeneratedFollowUpQueueRootInput {
     pub(crate) source_supervisor_run_id: String,
     pub(crate) source_normalized_plan_sha256: String,
+    pub(crate) effective_mutation_manifest_sha256: String,
     pub(crate) source_report_accepted: bool,
     pub(crate) source_report_publishable: bool,
     pub(crate) outer_entrypoint: GeneratedFollowUpQueueEntrypoint,
@@ -215,6 +218,7 @@ impl GeneratedFollowUpQueueSource {
         let source = Self {
             source_supervisor_run_id: input.source_supervisor_run_id,
             source_normalized_plan_sha256: input.source_normalized_plan_sha256,
+            effective_mutation_manifest_sha256: Some(input.effective_mutation_manifest_sha256),
             source_report_accepted: input.source_report_accepted,
             source_report_publishable: input.source_report_publishable,
             outer_entrypoint: input.outer_entrypoint,
@@ -285,6 +289,7 @@ impl GeneratedFollowUpQueueSource {
     fn has_same_execution_basis(&self, other: &Self) -> bool {
         self.source_supervisor_run_id == other.source_supervisor_run_id
             && self.source_normalized_plan_sha256 == other.source_normalized_plan_sha256
+            && self.effective_mutation_manifest_sha256 == other.effective_mutation_manifest_sha256
             && self.source_report_accepted == other.source_report_accepted
             && self.source_report_publishable == other.source_report_publishable
             && self.repository_id == other.repository_id
@@ -301,6 +306,12 @@ impl GeneratedFollowUpQueueSource {
             &self.source_normalized_plan_sha256,
             "source normalized supervisor plan digest",
         )?;
+        if let Some(digest) = &self.effective_mutation_manifest_sha256 {
+            validate_sha256_id(
+                digest,
+                "effective generated follow-up mutation manifest digest",
+            )?;
+        }
         if !self.source_report_accepted || !self.source_report_publishable {
             bail!("generated follow-up queue source must be observed accepted and publishable");
         }
@@ -1413,6 +1424,17 @@ impl GeneratedFollowUpQueue {
         })
     }
 
+    pub(crate) fn planned_subordinate_run_id(&self, item_id: &str) -> Result<String> {
+        let item = self
+            .snapshot
+            .item(item_id)
+            .context("generated follow-up item does not exist")?;
+        if item.phase() != GeneratedFollowUpQueuePhase::Claimed {
+            bail!("generated follow-up subordinate identity requires a claimed queue item");
+        }
+        subordinate_run_id(item_id)
+    }
+
     fn mark_dispatch_observed(
         &mut self,
         item_id: &str,
@@ -2274,22 +2296,26 @@ fn ordinary_plan_from_generated(
 
 fn queue_instance_id(source: &GeneratedFollowUpQueueSource) -> Result<String> {
     source.validate()?;
-    let digest = domain_separated_sha256(
-        QUEUE_ID_DOMAIN,
-        &[
-            source.source_supervisor_run_id.as_bytes(),
-            source.source_normalized_plan_sha256.as_bytes(),
-            b"accepted",
-            b"publishable",
-            source.outer_entrypoint.as_str().as_bytes(),
-            source.outer_command_run_id.as_bytes(),
-            source.repository_id.as_bytes(),
-            source.whole_primary_baseline_sha256.as_bytes(),
-            source.machine_global_retention.binding_sha256.as_bytes(),
-            source.machine_global_retention.root_id.as_bytes(),
-            &[source.cascade_depth],
-        ],
-    )?;
+    let cascade_depth = [source.cascade_depth];
+    let mut identity_parts = vec![
+        source.source_supervisor_run_id.as_bytes(),
+        source.source_normalized_plan_sha256.as_bytes(),
+    ];
+    if let Some(manifest_sha256) = &source.effective_mutation_manifest_sha256 {
+        identity_parts.push(manifest_sha256.as_bytes());
+    }
+    identity_parts.extend([
+        b"accepted".as_slice(),
+        b"publishable".as_slice(),
+        source.outer_entrypoint.as_str().as_bytes(),
+        source.outer_command_run_id.as_bytes(),
+        source.repository_id.as_bytes(),
+        source.whole_primary_baseline_sha256.as_bytes(),
+        source.machine_global_retention.binding_sha256.as_bytes(),
+        source.machine_global_retention.root_id.as_bytes(),
+        cascade_depth.as_slice(),
+    ]);
+    let digest = domain_separated_sha256(QUEUE_ID_DOMAIN, &identity_parts)?;
     Ok(format!("follow-up-{digest}"))
 }
 
@@ -2626,6 +2652,7 @@ mod tests {
         GeneratedFollowUpQueueSource::root(GeneratedFollowUpQueueRootInput {
             source_supervisor_run_id: run_id.to_string(),
             source_normalized_plan_sha256: "1".repeat(64),
+            effective_mutation_manifest_sha256: "2".repeat(64),
             source_report_accepted: true,
             source_report_publishable: true,
             outer_entrypoint: GeneratedFollowUpQueueEntrypoint::SuperviseRun,

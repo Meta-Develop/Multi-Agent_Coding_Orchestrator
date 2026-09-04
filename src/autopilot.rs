@@ -15,9 +15,6 @@ use crate::{
         CandidateValidationBinding, SafetyCheckStatus, ValidationEvidenceBundle, ValidationReport,
         ValidationStatus,
     },
-    mutation_taxonomy::{
-        autonomous_decision_for_supervisor_child_dispatch, is_reviewed_taxonomy_gate_id,
-    },
     orchestrator::{RunId, SemanticCoordinationMode},
     planning,
     process_runner::{
@@ -1346,27 +1343,6 @@ fn cancelled_pre_dispatch_cleanup_completed(
     Ok(primary_worktree_untouched && WorktreeManager::new(repo).pending_operations()?.is_empty())
 }
 
-fn find_generated_follow_up_taxonomy_gate_id(
-    cascade_denials: &[GateDenial],
-    dispatched_subordinate_denials: &[&GateDenial],
-) -> Option<String> {
-    cascade_denials.iter().find_map(|denial| {
-        // Finalized subordinate denials are folded into the cascade vector.
-        // Exclude those exact records before interpreting a queue-local
-        // pre-dispatch refusal as the generated plan's taxonomy outcome.
-        let originated_in_dispatched_subordinate = dispatched_subordinate_denials.contains(&denial);
-        (matches!(
-            denial.reason,
-            GateDenialReason::ApprovalReview {
-                denial: ApprovalReviewDenial::HumanReviewRequired
-            }
-        ) && denial.context.source == GateCheckSource::FutureApprovalReview
-            && is_reviewed_taxonomy_gate_id(&denial.context.owner)
-            && !originated_in_dispatched_subordinate)
-            .then(|| denial.context.owner.clone())
-    })
-}
-
 #[cfg(test)]
 fn run_autopilot_plan_file_with_injected_supervisor_and_runner(
     options: AutopilotRunOptions,
@@ -1419,16 +1395,6 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     let source_dispatch_started = AtomicBool::new(false);
 
     let repo = discover_repo_root(&options.repo)?;
-    let collision = crate::run_ops::refuse_live_run_collision(
-        &repo,
-        RunArtifactFamily::Autopilot,
-        &options.run_id,
-        options.allow_live_run_collision,
-    )?;
-    let _process_registration =
-        crate::run_ops::register_current_supervisor_process(&repo, "autopilot", &options.run_id)
-            .ok()
-            .flatten();
     let selected_supervisor_runtime = if options.codex_bin.is_some() {
         SupervisorRuntime::Codex
     } else {
@@ -1458,6 +1424,55 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         derived_supervisor_plan = Some(injected_supervisor_plan);
     }
     let goal_derived_supervisor_plan = source_is_goal_derived || injected_dispatch;
+    let agent_id = attempt_agent_id(&options.run_id, 1)?;
+    let supervisor_run_id = RunId::new(format!("{}-supervise", options.run_id.as_str()))?;
+    let supervisor_plan = match derived_supervisor_plan.clone() {
+        Some(derived_supervisor_plan) => derived_supervisor_plan,
+        None => serde_json::to_value(supervisor_plan_for_attempt(
+            &plan,
+            &requested_profile,
+            &agent_id,
+            1,
+            &[],
+        ))
+        .context("failed to serialize the effective autopilot supervisor plan")?,
+    };
+    let (codex_bin, runtime) = match options.codex_bin.clone() {
+        Some(codex_bin) => (codex_bin, SupervisorRuntime::Codex),
+        None => (PathBuf::from("codex-not-executed"), SupervisorRuntime::Fake),
+    };
+    debug_assert_eq!(runtime, selected_supervisor_runtime);
+    let supervisor_plan_relative = PathBuf::from("supervisor-plan.json");
+    let mut supervisor_options = SupervisorRunOptions {
+        repo: repo.clone(),
+        // The plan path is not part of the canonical mutation identity. It is
+        // replaced with the authenticated Autopilot artifact path below.
+        plan_file: PathBuf::from("preauthorized-autopilot-supervisor-plan.json"),
+        run_id: supervisor_run_id.clone(),
+        parent_node,
+        codex_bin,
+        runtime,
+        allow_dirty_primary: true,
+        allow_live_run_collision: options.allow_live_run_collision,
+        admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+        budget_overrides,
+        budget_max_duration_seconds,
+        machine_global_retention: Some(machine_global_retention),
+    };
+    let source_mutation_grant = supervise::preauthorize_autopilot_source_supervisor_mutations(
+        &supervisor_plan,
+        &supervisor_options,
+    )?;
+    let collision = crate::run_ops::refuse_live_run_collision(
+        &repo,
+        RunArtifactFamily::Autopilot,
+        &options.run_id,
+        options.allow_live_run_collision,
+    )?;
+    let _process_registration =
+        crate::run_ops::register_current_supervisor_process(&repo, "autopilot", &options.run_id)
+            .ok()
+            .flatten();
     if let Some(source) = &plan.external_source {
         publication::revalidate_external_source(&repo, source)
             .context("autopilot source changed immediately before supervised work")?;
@@ -1579,26 +1594,13 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         return Ok(report);
     }
 
-    let agent_id = attempt_agent_id(&options.run_id, 1)?;
-    let supervisor_run_id = RunId::new(format!("{}-supervise", options.run_id.as_str()))?;
-    let supervisor_plan = match derived_supervisor_plan {
-        Some(derived_supervisor_plan) => derived_supervisor_plan,
-        None => serde_json::to_value(supervisor_plan_for_attempt(
-            &plan,
-            &requested_profile,
-            &agent_id,
-            1,
-            &[],
-        ))
-        .context("failed to serialize the effective autopilot supervisor plan")?,
-    };
-    let supervisor_plan_relative = PathBuf::from("supervisor-plan.json");
     write_private_json(
         &mut artifact_writer,
         &supervisor_plan_relative,
         &supervisor_plan,
     )?;
     let supervisor_plan_path = run_dir.join(&supervisor_plan_relative);
+    supervisor_options.plan_file = supervisor_plan_path.clone();
     let effective_supervisor_plan = supervise::load_supervisor_plan_file(&supervisor_plan_path)
         .context("failed to verify the effective autopilot supervisor profile")?;
     let authority_plan = autopilot_authority_plan(
@@ -1690,11 +1692,6 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         finalize_autopilot_run_artifacts(artifact_writer, &report, false)?;
         return Ok(report);
     }
-    let (codex_bin, runtime) = match options.codex_bin {
-        Some(codex_bin) => (codex_bin, SupervisorRuntime::Codex),
-        None => (PathBuf::from("codex-not-executed"), SupervisorRuntime::Fake),
-    };
-    debug_assert_eq!(runtime, selected_supervisor_runtime);
     let mut attempt = AutopilotAttemptSummary {
         attempt: 1,
         supervisor_run_id: supervisor_run_id.as_str().to_string(),
@@ -1712,22 +1709,6 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         prepublication_stage: "not_dispatched_manual_integration".to_string(),
         repair_reason: None,
     };
-    let supervisor_options = SupervisorRunOptions {
-        repo: repo.clone(),
-        plan_file: supervisor_plan_path,
-        run_id: supervisor_run_id,
-        parent_node,
-        codex_bin,
-        runtime,
-        // Autopilot's own authenticated artifacts are local runtime state. The
-        // outer typed dirty-primary gate already handled operator worktree state.
-        allow_dirty_primary: true,
-        allow_live_run_collision: options.allow_live_run_collision,
-        admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
-        budget_overrides,
-        budget_max_duration_seconds,
-        machine_global_retention: Some(machine_global_retention),
-    };
     // Goal decomposition can admit multiple independent planning roots. Capability-bound
     // worktree creation revalidates one shared repository-cleanliness capability before and after
     // each create, so overlapping creates can invalidate a peer's held Git-directory generation.
@@ -1740,7 +1721,6 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     };
     let mut follow_up_profile_refusal = None;
     let mut before_dispatch_denial = None;
-    let mut taxonomy_gate_id = None::<String>;
     let mut admitted_child_dispatches = 0_usize;
     let error_evidence_source_plan_sha256 =
         supervise::normalized_supervisor_plan_file_sha256(&supervisor_options.plan_file)?;
@@ -1762,23 +1742,6 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                 .iter()
                 .flat_map(|assignment| assignment.assigned_paths.iter().cloned())
                 .collect::<Vec<_>>();
-            // Generated plans are checked at the central queue boundary after
-            // authenticated reload. Only the initial source reaches this
-            // admission check, so one dispatch consumes one decision.
-            if !source_dispatch_started.load(Ordering::SeqCst) {
-                let taxonomy_decision = autonomous_decision_for_supervisor_child_dispatch();
-                if let Some(gate_id) = taxonomy_decision.gate_id() {
-                    taxonomy_gate_id = Some(gate_id.to_string());
-                    let denial = GateDenial::from_approval_review(
-                        options.run_id.as_str(),
-                        gate_id,
-                        ApprovalReviewDenial::HumanReviewRequired,
-                        effective_paths.clone(),
-                    )?;
-                    before_dispatch_denial = Some(denial.clone());
-                    return Ok(Some(denial));
-                }
-            }
             let binding = AutopilotProfileBindingReport::from_effective(
                 follow_up_requested_profile.clone(),
                 effective,
@@ -1824,6 +1787,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                     caller_cancellation.as_ref(),
                     &cancellation_observed,
                     &source_dispatch_started,
+                    source_mutation_grant,
                     &mut follow_up_profile_gate,
                 )
             }
@@ -1836,6 +1800,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                 caller_cancellation.as_ref(),
                 &cancellation_observed,
                 &source_dispatch_started,
+                source_mutation_grant,
                 &mut follow_up_profile_gate,
                 *external_runner,
             ),
@@ -1854,6 +1819,16 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     let cascade = match supervisor_result {
         Ok(cascade) => cascade,
         Err(error) => {
+            let taxonomy_gate_id =
+                supervise::supervisor_mutation_admission_gate_id(&error).map(str::to_string);
+            if let Some(gate_id) = taxonomy_gate_id.as_deref() {
+                before_dispatch_denial = Some(GateDenial::from_approval_review(
+                    options.run_id.as_str(),
+                    gate_id,
+                    ApprovalReviewDenial::HumanReviewRequired,
+                    &plan.assigned_paths,
+                )?);
+            }
             let cancellation_was_observed = cancellation_observed.load(Ordering::SeqCst);
             let source_dispatch_started = source_dispatch_started.load(Ordering::SeqCst);
             let cancellation_cleanup_completed = if cancellation_was_observed
@@ -1870,12 +1845,17 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                 && before_dispatch_denial.as_ref().is_some_and(|denial| {
                     matches!(denial.reason, GateDenialReason::BudgetAdmission { .. })
                 });
-            let taxonomy_refused_before_source_dispatch =
-                !source_dispatch_started && taxonomy_gate_id.is_some();
+            let taxonomy_refused = taxonomy_gate_id.is_some();
             let taxonomy_refusal_next_action = taxonomy_gate_id.as_deref().map(|gate_id| {
-                format!(
-                    "the mutation taxonomy requires gate `{gate_id}`; the named gate, including taxonomy review for `taxonomy-review-required`, is required before retrying; no supervisor or generated follow-up dispatch occurred"
-                )
+                if source_dispatch_started {
+                    format!(
+                        "the mutation taxonomy requires gate `{gate_id}`; the named gate, including taxonomy review for `taxonomy-review-required`, is required before retrying; the source Supervisor finalized but no generated follow-up queue or subordinate dispatch was admitted"
+                    )
+                } else {
+                    format!(
+                        "the mutation taxonomy requires gate `{gate_id}`; the named gate, including taxonomy review for `taxonomy-review-required`, is required before retrying; no Supervisor or generated follow-up dispatch was admitted"
+                    )
+                }
             });
             let generated_follow_up_dispatch_performed = if !source_dispatch_started {
                 false
@@ -1939,9 +1919,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                 run_id: &options.run_id,
                 status: if cancellation_cleanup_completed {
                     AutopilotRunStatus::Cancelled
-                } else if taxonomy_refused_before_source_dispatch
-                    || admission_refused_before_source_dispatch
-                {
+                } else if taxonomy_refused || admission_refused_before_source_dispatch {
                     AutopilotRunStatus::Refused
                 } else {
                     AutopilotRunStatus::Failed
@@ -1988,15 +1966,6 @@ fn run_autopilot_with_profile_retention_and_dispatch(
             return Ok(report);
         }
     };
-    let dispatched_subordinate_denials = cascade
-        .follow_up_reports
-        .iter()
-        .flat_map(|report| report.gate_denials.iter())
-        .collect::<Vec<_>>();
-    let generated_follow_up_taxonomy_gate_id = find_generated_follow_up_taxonomy_gate_id(
-        &cascade.follow_up_gate_denials,
-        &dispatched_subordinate_denials,
-    );
     let generated_follow_up_dispatch_performed = cascade.generated_follow_up_dispatch_performed();
     let follow_up_cascade_success = cascade.follow_up_cascade_success;
     let follow_up_gate_denials = cascade.follow_up_gate_denials.clone();
@@ -2029,12 +1998,6 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     )?;
     let execution_profile_mismatch =
         profile_binding.status == AutopilotProfileBindingStatus::Mismatch;
-    let taxonomy_refusal_gate_id = taxonomy_gate_id.or(generated_follow_up_taxonomy_gate_id);
-    let taxonomy_refusal_next_action = taxonomy_refusal_gate_id.as_deref().map(|gate_id| {
-        format!(
-            "the mutation taxonomy requires gate `{gate_id}`; the named gate, including taxonomy review for `taxonomy-review-required`, is required before retrying; the taxonomy-refused generated follow-up was not dispatched"
-        )
-    });
     let child_dispatch_admission_refused = before_dispatch_denial
         .as_ref()
         .is_some_and(|denial| matches!(denial.reason, GateDenialReason::BudgetAdmission { .. }));
@@ -2042,7 +2005,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         AutopilotRunStatus::Cancelled
     } else if cancellation_was_observed {
         AutopilotRunStatus::Failed
-    } else if taxonomy_refusal_gate_id.is_some() || child_dispatch_admission_refused {
+    } else if child_dispatch_admission_refused {
         AutopilotRunStatus::Refused
     } else if supervisor.success && follow_up_cascade_success && !execution_profile_mismatch {
         AutopilotRunStatus::Succeeded
@@ -2058,8 +2021,6 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         "caller cancellation was observed and the supervised cleanup path completed; inspect the durable supervisor and queue evidence before starting a new run"
     } else if cancellation_was_observed {
         "caller cancellation was observed but terminal cleanup evidence is incomplete; reconcile supervisor claims, semantic intents, worktrees, and the authenticated follow-up queue before retrying"
-    } else if let Some(next_action) = taxonomy_refusal_next_action.as_deref() {
-        next_action
     } else if child_dispatch_admission_refused {
         "review the configured child-dispatch maximum and start a new run with an adequate bound; the refused generated follow-up was not dispatched"
     } else if execution_profile_mismatch {

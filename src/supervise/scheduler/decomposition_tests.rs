@@ -1374,7 +1374,7 @@ fn verified_preparation_uses_requested_plan_override_before_assignment_selection
     let mut options = test_options(&repo, "verified-operator-claim");
     options.runtime = SupervisorRuntime::Codex;
 
-    let prepared = prepare_supervisor_run(
+    let prepared = prepare_supervisor_run_for_test(
         LoadedSupervisorPlan {
             plan,
             consultant: SupervisorConsultantPlan::default(),
@@ -1526,7 +1526,7 @@ fn preclaim_early_durability_survives_objective_preselection_failure() {
     let mut options = test_options(&repo, run_id.as_str());
     options.runtime = SupervisorRuntime::Codex;
 
-    let error = match prepare_supervisor_run(
+    let error = match prepare_supervisor_run_for_test(
         LoadedSupervisorPlan {
             plan,
             consultant: SupervisorConsultantPlan::default(),
@@ -1591,7 +1591,7 @@ fn preclaim_early_durability_gate_failure_stops_before_assignment_side_effects()
     options.runtime = SupervisorRuntime::Codex;
     crate::orchestration_event::set_orchestration_event_append_fault();
 
-    let error = match prepare_supervisor_run(
+    let error = match prepare_supervisor_run_for_test(
         LoadedSupervisorPlan {
             plan,
             consultant: SupervisorConsultantPlan::default(),
@@ -1975,7 +1975,7 @@ fn assert_authenticated_park_has_no_assignment_side_effects(
         preclaim_evidence,
         [primary_snapshot.clone(), primary_snapshot],
     );
-    let report = run_supervisor_plan_with_runner_and_creation(
+    let report = authorize_and_run_supervisor_plan_with_runner_and_creation(
         loaded,
         options,
         max_concurrent_children,
@@ -2999,7 +2999,7 @@ fn preflight_preserves_typed_runtime_catalog_failure_for_materialization() {
         "catalog probe failed".to_string(),
     ));
 
-    let prepared = prepare_supervisor_run(
+    let prepared = prepare_supervisor_run_for_test(
         loaded,
         &options,
         1,
@@ -3031,7 +3031,7 @@ fn preflight_directly_validates_schedule_and_reserves_artifacts() {
     };
     let options = test_options(&repo, "direct-preflight-success");
 
-    let prepared = prepare_supervisor_run(
+    let prepared = prepare_supervisor_run_for_test(
         loaded,
         &options,
         1,
@@ -3084,7 +3084,7 @@ fn preflight_composes_cli_budget_overrides_with_plan_by_strictest_limit() {
     };
     options.budget_max_duration_seconds = Some(300);
 
-    let prepared = prepare_supervisor_run(
+    let prepared = prepare_supervisor_run_for_test(
         loaded,
         &options,
         1,

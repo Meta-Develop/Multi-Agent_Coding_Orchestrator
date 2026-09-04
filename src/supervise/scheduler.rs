@@ -3347,7 +3347,10 @@ fn prepare_supervisor_run(
     execution_runtime: SupervisorExecutionRuntime,
     worktree_creation: SupervisorWorktreeCreation<'_>,
     runtime_model_catalog: RuntimeModelCatalogAcquisition,
+    mutation_grant: EffectiveSupervisorMutationGrant,
+    effective_mutation_manifest: &EffectiveSupervisorMutationManifest,
 ) -> Result<PreparedSupervisorRun> {
+    mutation_grant.consume(effective_mutation_manifest)?;
     let LoadedSupervisorPlan {
         mut plan,
         consultant,
@@ -3426,16 +3429,23 @@ fn prepare_supervisor_run(
         &options.run_id,
         options.allow_live_run_collision,
     )?;
-    let process_registration =
-        crate::run_ops::register_current_supervisor_process(&repo, "supervise", &options.run_id)
-            .ok()
-            .flatten();
     let mut artifact_writer = ArtifactRunWriter::reserve(
         &repo,
         RunArtifactFamily::Supervise,
         options.run_id.clone(),
         "maco-supervise",
     )?;
+    write_artifact_json(
+        &mut artifact_writer,
+        Path::new("effective-mutation-manifest.json"),
+        effective_mutation_manifest,
+        MAX_SUPERVISOR_REPORT_BYTES,
+        ArtifactFileDisposition::PrivateEvidence,
+    )?;
+    let process_registration =
+        crate::run_ops::register_current_supervisor_process(&repo, "supervise", &options.run_id)
+            .ok()
+            .flatten();
     let preflight_spec = crate::run_ops::LaunchPreflightSpec {
         family: RunArtifactFamily::Supervise,
         run_id: options.run_id.clone(),
@@ -3614,6 +3624,35 @@ fn prepare_supervisor_run(
         manager,
         _process_registration: process_registration,
     })
+}
+
+#[cfg(test)]
+fn prepare_supervisor_run_for_test(
+    loaded: LoadedSupervisorPlan,
+    options: &SupervisorRunOptions,
+    max_concurrent_children: usize,
+    execution_runtime: SupervisorExecutionRuntime,
+    worktree_creation: SupervisorWorktreeCreation<'_>,
+    runtime_model_catalog: RuntimeModelCatalogAcquisition,
+) -> Result<PreparedSupervisorRun> {
+    let effective_mutation_manifest = effective_supervisor_mutation_manifest(
+        &loaded,
+        options,
+        execution_runtime,
+        worktree_creation,
+    )?;
+    let mutation_grant =
+        authorize_effective_supervisor_manifest(effective_mutation_manifest.clone())?;
+    prepare_supervisor_run(
+        loaded,
+        options,
+        max_concurrent_children,
+        execution_runtime,
+        worktree_creation,
+        runtime_model_catalog,
+        mutation_grant,
+        &effective_mutation_manifest,
+    )
 }
 
 pub(super) struct PreparedSupervisorSelectionRequest<'a> {
@@ -3818,8 +3857,15 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
     execution_runtime: SupervisorExecutionRuntime,
     worktree_creation: SupervisorWorktreeCreation<'_>,
     runtime_model_catalog: RuntimeModelCatalogAcquisition,
+    mutation_grant: EffectiveSupervisorMutationGrant,
     external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorFinalReport> {
+    let effective_mutation_manifest = effective_supervisor_mutation_manifest(
+        &loaded,
+        &options,
+        execution_runtime,
+        worktree_creation,
+    )?;
     let PreparedSupervisorRun {
         plan,
         requested_plan,
@@ -3852,6 +3898,8 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         execution_runtime,
         worktree_creation,
         runtime_model_catalog,
+        mutation_grant,
+        &effective_mutation_manifest,
     )?;
     let preclaim_parked_assignment_ids = preclaim_decisions
         .iter()
@@ -5431,6 +5479,19 @@ mod selection_policy_tests {
         let options =
             predispatch_options(&repo, temporary.path(), "automatic-requested-plan-identity");
 
+        let effective_mutation_manifest = effective_supervisor_mutation_manifest(
+            &LoadedSupervisorPlan {
+                plan: plan.clone(),
+                consultant: SupervisorConsultantPlan::default(),
+                assignment_metadata: AssignmentMetadata::new(),
+                plan_metadata: SupervisorPlanMetadata::default(),
+            },
+            &options,
+            SupervisorExecutionRuntime::Verified,
+            SupervisorWorktreeCreation::ExistingOnly,
+        )?;
+        let mutation_grant =
+            authorize_effective_supervisor_manifest(effective_mutation_manifest.clone())?;
         let prepared = prepare_supervisor_run(
             LoadedSupervisorPlan {
                 plan,
@@ -5443,6 +5504,8 @@ mod selection_policy_tests {
             SupervisorExecutionRuntime::Verified,
             SupervisorWorktreeCreation::ExistingOnly,
             Ok(catalog),
+            mutation_grant,
+            &effective_mutation_manifest,
         )?;
 
         assert_eq!(prepared.requested_plan, requested_plan);
@@ -5532,7 +5595,7 @@ mod selection_policy_tests {
                 panic!("selection preflight failure must prevent external dispatch")
             };
 
-        let report = run_supervisor_plan_with_runner_and_creation(
+        let report = authorize_and_run_supervisor_plan_with_runner_and_creation(
             LoadedSupervisorPlan {
                 plan,
                 consultant: SupervisorConsultantPlan::default(),

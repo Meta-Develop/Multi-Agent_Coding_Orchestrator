@@ -101,7 +101,7 @@ fn run_primary_with_runner(
     runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorFinalReport> {
     let runtime_model_catalog = test_runtime_model_catalog(&loaded.plan, options.runtime)?;
-    run_supervisor_plan_with_runner_and_creation(
+    authorize_and_run_supervisor_plan_with_runner_and_creation(
         loaded,
         options,
         1,
@@ -110,6 +110,39 @@ fn run_primary_with_runner(
         Ok(runtime_model_catalog),
         runner,
     )
+}
+
+#[test]
+fn primary_missing_double_opt_in_gate_is_refused_before_artifact_or_dispatch() {
+    let (temp, repo) = injected_primary_repository();
+    let loaded = validated_primary_loaded(primary_assignment(false));
+    let options = injected_options(&repo, temp.path(), "primary-missing-mutation-gate");
+    let run_id = options.run_id.clone();
+    let dispatches = AtomicUsize::new(0);
+    let _manifest_mutation = set_effective_supervisor_manifest_test_mutations([
+        EffectiveSupervisorManifestTestMutation::RemoveRequiredGate(
+            ExplicitMutationGate::PrimaryPlanCliDoubleOptIn,
+        ),
+    ]);
+    let runner = |_command: &ExternalAgentCommand,
+                  _cancellation: &ProcessCancellation,
+                  _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
+        dispatches.fetch_add(1, Ordering::SeqCst);
+        panic!("missing primary mutation gate must precede dispatch")
+    };
+
+    let error = run_primary_with_runner(loaded, options, &runner)
+        .expect_err("primary mutation without double opt-in gate must fail closed");
+
+    assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        supervisor_mutation_admission_gate_id(&error),
+        Some(ExplicitMutationGate::PrimaryPlanCliDoubleOptIn.id())
+    );
+    assert!(!repo
+        .join(RunArtifactFamily::Supervise.run_root())
+        .join(run_id.as_str())
+        .exists());
 }
 
 #[test]
