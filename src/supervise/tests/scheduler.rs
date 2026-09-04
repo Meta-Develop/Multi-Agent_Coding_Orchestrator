@@ -1,4 +1,272 @@
 use super::*;
+use std::io::Write;
+use std::sync::atomic::AtomicBool;
+
+#[derive(Debug)]
+enum ConcurrencyFixtureWaitError {
+    TimedOut {
+        test: &'static str,
+        run_id: &'static str,
+        stage: &'static str,
+        bound: Duration,
+    },
+    ChannelDisconnected {
+        test: &'static str,
+        run_id: &'static str,
+        stage: &'static str,
+        bound: Duration,
+    },
+}
+
+impl std::fmt::Display for ConcurrencyFixtureWaitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TimedOut {
+                test,
+                run_id,
+                stage,
+                bound,
+            } => write!(
+                formatter,
+                "concurrency fixture wait timed out: test={test} run_id={run_id} stage={stage} bound={bound:?}"
+            ),
+            Self::ChannelDisconnected {
+                test,
+                run_id,
+                stage,
+                bound,
+            } => write!(
+                formatter,
+                "concurrency fixture channel disconnected: test={test} run_id={run_id} stage={stage} bound={bound:?}"
+            ),
+        }
+    }
+}
+
+fn fixture_wait_timed_out(
+    test: &'static str,
+    run_id: &'static str,
+    stage: &'static str,
+    bound: Duration,
+) -> ! {
+    panic!(
+        "{}",
+        ConcurrencyFixtureWaitError::TimedOut {
+            test,
+            run_id,
+            stage,
+            bound,
+        }
+    )
+}
+
+fn recv_fixture_stage<T>(
+    receiver: &mpsc::Receiver<T>,
+    test: &'static str,
+    run_id: &'static str,
+    stage: &'static str,
+    bound: Duration,
+) -> T {
+    match receiver.recv_timeout(bound) {
+        Ok(value) => value,
+        Err(mpsc::RecvTimeoutError::Timeout) => fixture_wait_timed_out(test, run_id, stage, bound),
+        Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
+            "{}",
+            ConcurrencyFixtureWaitError::ChannelDisconnected {
+                test,
+                run_id,
+                stage,
+                bound,
+            }
+        ),
+    }
+}
+
+fn wait_for_fixture_state<'a, T>(
+    condvar: &Condvar,
+    state: std::sync::MutexGuard<'a, T>,
+    ready: impl Fn(&T) -> bool,
+    test: &'static str,
+    run_id: &'static str,
+    stage: &'static str,
+    bound: Duration,
+) -> std::sync::MutexGuard<'a, T> {
+    let (state, _) = condvar
+        .wait_timeout_while(state, bound, |state| !ready(state))
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !ready(&state) {
+        fixture_wait_timed_out(test, run_id, stage, bound);
+    }
+    state
+}
+
+fn fixture_condition_reached(ready: impl Fn() -> bool, bound: Duration) -> bool {
+    let deadline = Instant::now() + bound;
+    loop {
+        if ready() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn wait_for_fixture_condition(
+    ready: impl Fn() -> bool,
+    test: &'static str,
+    run_id: &'static str,
+    stage: &'static str,
+    bound: Duration,
+) {
+    if !fixture_condition_reached(ready, bound) {
+        fixture_wait_timed_out(test, run_id, stage, bound);
+    }
+}
+
+fn wait_for_fixture_file_marker(
+    path: &Path,
+    marker: &str,
+    test: &'static str,
+    run_id: &'static str,
+    stage: &'static str,
+    bound: Duration,
+) {
+    let deadline = Instant::now() + bound;
+    loop {
+        if fs::read_to_string(path).is_ok_and(|contents| contents.contains(marker)) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            fixture_wait_timed_out(test, run_id, stage, bound);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn wait_for_fixture_thread_finish<T>(
+    handle: &thread::JoinHandle<T>,
+    test: &'static str,
+    run_id: &'static str,
+    stage: &'static str,
+    bound: Duration,
+) {
+    wait_for_fixture_condition(|| handle.is_finished(), test, run_id, stage, bound);
+}
+
+struct UnwindCleanup<F: FnOnce()> {
+    action: Option<F>,
+}
+
+impl<F: FnOnce()> UnwindCleanup<F> {
+    fn new(action: F) -> Self {
+        Self {
+            action: Some(action),
+        }
+    }
+
+    fn run(&mut self) {
+        if let Some(action) = self.action.take() {
+            action();
+        }
+    }
+}
+
+impl<F: FnOnce()> Drop for UnwindCleanup<F> {
+    fn drop(&mut self) {
+        self.run();
+    }
+}
+
+struct SupervisorThreadGuard<T, F: FnOnce()> {
+    handle: Option<thread::JoinHandle<T>>,
+    release_fixture: Option<F>,
+    test: &'static str,
+    run_id: &'static str,
+    cleanup_stage: &'static str,
+    cleanup_bound: Duration,
+}
+
+impl<T, F: FnOnce()> SupervisorThreadGuard<T, F> {
+    fn new(
+        handle: thread::JoinHandle<T>,
+        release_fixture: F,
+        test: &'static str,
+        run_id: &'static str,
+        cleanup_stage: &'static str,
+        cleanup_bound: Duration,
+    ) -> Self {
+        Self {
+            handle: Some(handle),
+            release_fixture: Some(release_fixture),
+            test,
+            run_id,
+            cleanup_stage,
+            cleanup_bound,
+        }
+    }
+
+    fn release_fixture(&mut self) {
+        if let Some(release_fixture) = self.release_fixture.take() {
+            release_fixture();
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_none_or(thread::JoinHandle::is_finished)
+    }
+
+    fn join(mut self, stage: &'static str, bound: Duration) -> thread::Result<T> {
+        wait_for_fixture_thread_finish(
+            self.handle
+                .as_ref()
+                .expect("supervisor thread handle must be owned until join"),
+            self.test,
+            self.run_id,
+            stage,
+            bound,
+        );
+        let handle = self
+            .handle
+            .take()
+            .expect("finished supervisor thread handle must still be owned");
+        debug_assert!(handle.is_finished());
+        handle.join()
+    }
+}
+
+impl<T, F: FnOnce()> Drop for SupervisorThreadGuard<T, F> {
+    fn drop(&mut self) {
+        self.release_fixture();
+        if let Some(handle) = self.handle.as_ref() {
+            if !fixture_condition_reached(|| handle.is_finished(), self.cleanup_bound) {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "{}",
+                    ConcurrencyFixtureWaitError::TimedOut {
+                        test: self.test,
+                        run_id: self.run_id,
+                        stage: self.cleanup_stage,
+                        bound: self.cleanup_bound,
+                    }
+                );
+                return;
+            }
+        }
+        if self
+            .handle
+            .as_ref()
+            .is_some_and(thread::JoinHandle::is_finished)
+        {
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
 
 #[test]
 fn concurrent_disjoint_assignments_make_progress_and_finalize_in_plan_order() {
@@ -1228,31 +1496,41 @@ fn degraded_manifest_boundary_finalization_still_releases_serial_claims() {
 
 #[test]
 fn admission_commit_recv_failure_cancels_and_drains_active_assignments() {
+    const TEST: &str = "admission_commit_recv_failure_cancels_and_drains_active_assignments";
+    const RUN_ID: &str = "admission-recv-drain";
+    const WAIT_BOUND: Duration = Duration::from_secs(30);
+    const SUPERVISOR_REAP_BOUND: Duration = Duration::from_secs(60);
+
     let (temp, repo_path) = injected_repository();
     let assignments = vec![
         injected_named_assignment("admit-a", "README.md"),
         injected_named_assignment("admit-b", "src/lib.rs"),
     ];
     let plan = injected_multi_plan(assignments.clone(), 0);
-    let options = injected_options(&repo_path, temp.path(), "admission-recv-drain");
+    let options = injected_options(&repo_path, temp.path(), RUN_ID);
     let cancelled_active = Arc::new(AtomicUsize::new(0));
+    let runner_unwind_release = Arc::new(AtomicBool::new(false));
+    let (runner_started_sender, runner_started_receiver) = mpsc::channel();
     let runner = {
         let assignments = assignments.clone();
         let cancelled_active = Arc::clone(&cancelled_active);
+        let runner_unwind_release = Arc::clone(&runner_unwind_release);
         move |command: &ExternalAgentCommand,
               cancellation: &ProcessCancellation,
               _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
             let id = injected_command_assignment_id(command);
             if id == "admit-a" {
-                let deadline = Instant::now() + Duration::from_secs(30);
-                while !cancellation.is_cancelled() {
-                    assert!(
-                        Instant::now() < deadline,
-                        "active assignment was not cancelled after admission-commit recv failure"
-                    );
-                    thread::sleep(Duration::from_millis(5));
+                let _ = runner_started_sender.send(());
+                wait_for_fixture_condition(
+                    || cancellation.is_cancelled() || runner_unwind_release.load(Ordering::SeqCst),
+                    TEST,
+                    RUN_ID,
+                    "admit-a observes cancellation or unwind release",
+                    WAIT_BOUND,
+                );
+                if cancellation.is_cancelled() {
+                    cancelled_active.fetch_add(1, Ordering::SeqCst);
                 }
-                cancelled_active.fetch_add(1, Ordering::SeqCst);
             }
             let assignment = assignments
                 .iter()
@@ -1263,15 +1541,48 @@ fn admission_commit_recv_failure_cancels_and_drains_active_assignments() {
         }
     };
     set_abort_admission_commit_on_spawn(&options.run_id, 2);
+    let injection_run_id = options.run_id.clone();
+    let injection_cleanup = UnwindCleanup::new(move || {
+        set_abort_admission_commit_on_spawn(&injection_run_id, 0);
+    });
 
-    let report = run_supervisor_plan_with_concurrent_cancellable_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        2,
-        &runner,
-    )
-    .expect("admission-commit recv failure remains reportable after drain");
+    let supervisor_handle = thread::spawn(move || {
+        let _injection_cleanup = injection_cleanup;
+        let result = run_supervisor_plan_with_concurrent_cancellable_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        );
+        (temp, result)
+    });
+    let supervisor_thread = SupervisorThreadGuard::new(
+        supervisor_handle,
+        {
+            let runner_unwind_release = Arc::clone(&runner_unwind_release);
+            move || runner_unwind_release.store(true, Ordering::SeqCst)
+        },
+        TEST,
+        RUN_ID,
+        "reap supervisor after admission test unwind",
+        SUPERVISOR_REAP_BOUND,
+    );
+
+    recv_fixture_stage(
+        &runner_started_receiver,
+        TEST,
+        RUN_ID,
+        "admit-a runner-entry milestone",
+        WAIT_BOUND,
+    );
+    let (_temp, result) = supervisor_thread
+        .join(
+            "supervisor completion after admission failure drain",
+            SUPERVISOR_REAP_BOUND,
+        )
+        .unwrap_or_else(|_| panic!("admission-drain supervisor test thread panicked"));
+    let report = result.expect("admission-commit recv failure remains reportable after drain");
 
     assert!(!report.success);
     assert!(
@@ -1412,10 +1723,16 @@ fn concurrent_assignment_terminal_checkpoint_precedes_claim_release() {
 
 #[test]
 fn cascade_breaker_stops_admission_drains_active_and_releases_claims() {
+    const TEST: &str = "cascade_breaker_stops_admission_drains_active_and_releases_claims";
+    const RUN_ID: &str = "circuit-breaker-cascade";
+    const WAIT_BOUND: Duration = Duration::from_secs(30);
+    const BREAKER_MARKER_BOUND: Duration = Duration::from_secs(60);
+    const CHILD_D_RELEASE_BOUND: Duration = Duration::from_secs(120);
+    const SUPERVISOR_REAP_BOUND: Duration = Duration::from_secs(60);
+
     #[derive(Default)]
     struct BreakerState {
         started: BTreeSet<String>,
-        release_child_d: bool,
         child_d_finished: bool,
         child_d_observed_cancellation: bool,
     }
@@ -1429,11 +1746,13 @@ fn cascade_breaker_stops_admission_drains_active_and_releases_claims() {
         injected_named_assignment("child-e", "SECURITY.md"),
     ];
     let plan = injected_multi_plan(assignments.clone(), 0);
-    let options = injected_options(&repo_path, temp.path(), "circuit-breaker-cascade");
+    let options = injected_options(&repo_path, temp.path(), RUN_ID);
     let state = Arc::new((Mutex::new(BreakerState::default()), Condvar::new()));
+    let release_child_d = Arc::new(AtomicBool::new(false));
     let runner = {
         let assignments = assignments.clone();
         let state = Arc::clone(&state);
+        let release_child_d = Arc::clone(&release_child_d);
         move |command: &ExternalAgentCommand,
               cancellation: &ProcessCancellation,
               _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
@@ -1443,26 +1762,38 @@ fn cascade_breaker_stops_admission_drains_active_and_releases_claims() {
             breaker.started.insert(id.clone());
             condvar.notify_all();
             if id == "child-b" {
-                while !breaker.started.contains("child-c") {
-                    breaker = condvar
-                        .wait(breaker)
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                }
+                breaker = wait_for_fixture_state(
+                    condvar,
+                    breaker,
+                    |breaker| breaker.started.contains("child-c"),
+                    TEST,
+                    RUN_ID,
+                    "child-b waits for child-c runner entry",
+                    WAIT_BOUND,
+                );
             } else if id == "child-c" {
-                while !breaker.started.contains("child-d") {
-                    breaker = condvar
-                        .wait(breaker)
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                }
-            } else if id == "child-d" {
-                while !breaker.release_child_d {
-                    breaker.child_d_observed_cancellation |= cancellation.is_cancelled();
-                    breaker = condvar
-                        .wait(breaker)
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                }
+                breaker = wait_for_fixture_state(
+                    condvar,
+                    breaker,
+                    |breaker| breaker.started.contains("child-d"),
+                    TEST,
+                    RUN_ID,
+                    "child-c waits for child-d runner entry",
+                    WAIT_BOUND,
+                );
             }
             drop(breaker);
+            if id == "child-d" {
+                wait_for_fixture_condition(
+                    || release_child_d.load(Ordering::SeqCst),
+                    TEST,
+                    RUN_ID,
+                    "child-d waits for unconditional main-test release",
+                    CHILD_D_RELEASE_BOUND,
+                );
+                let mut breaker = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                breaker.child_d_observed_cancellation |= cancellation.is_cancelled();
+            }
 
             let assignment = assignments
                 .iter()
@@ -1485,8 +1816,7 @@ fn cascade_breaker_stops_admission_drains_active_and_releases_claims() {
         }
     };
 
-    let (done_sender, done_receiver) = mpsc::channel();
-    let supervisor_thread = thread::spawn(move || {
+    let supervisor_handle = thread::spawn(move || {
         let result = run_supervisor_plan_with_concurrent_cancellable_runner(
             plan,
             SupervisorConsultantPlan::default(),
@@ -1494,47 +1824,62 @@ fn cascade_breaker_stops_admission_drains_active_and_releases_claims() {
             2,
             &runner,
         );
-        let _ = done_sender.send(result);
+        (temp, result)
     });
+    let mut supervisor_thread = SupervisorThreadGuard::new(
+        supervisor_handle,
+        {
+            let release_child_d = Arc::clone(&release_child_d);
+            move || release_child_d.store(true, Ordering::SeqCst)
+        },
+        TEST,
+        RUN_ID,
+        "reap supervisor after cascade test unwind",
+        SUPERVISOR_REAP_BOUND,
+    );
 
     let event_path = repo_path
-        .join(".maco/o2/runs/circuit-breaker-cascade")
+        .join(format!(".maco/o2/runs/{RUN_ID}"))
         .join(ORCHESTRATION_EVENT_PATH);
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        let breaker_recorded = fs::read_to_string(&event_path)
-            .is_ok_and(|events| events.contains("swarm_health_circuit_breaker"));
-        if breaker_recorded {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "breaker transition was not journaled before the deadline"
-        );
-        thread::sleep(Duration::from_millis(5));
-    }
-
     let (lock, condvar) = &*state;
-    let mut breaker = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let breaker = wait_for_fixture_state(
+        condvar,
+        lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+        |breaker| breaker.started.contains("child-d"),
+        TEST,
+        RUN_ID,
+        "main test observes child-d runner entry",
+        WAIT_BOUND,
+    );
+    drop(breaker);
+    wait_for_fixture_file_marker(
+        &event_path,
+        "swarm_health_circuit_breaker",
+        TEST,
+        RUN_ID,
+        "breaker transition journal visibility",
+        BREAKER_MARKER_BOUND,
+    );
+
+    let breaker = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     assert!(breaker.started.contains("child-d"));
     assert!(!breaker.started.contains("child-e"));
     assert!(!breaker.child_d_finished);
     assert!(!breaker.child_d_observed_cancellation);
-    assert!(matches!(
-        done_receiver.try_recv(),
-        Err(mpsc::TryRecvError::Empty)
-    ));
-    breaker.release_child_d = true;
-    condvar.notify_all();
+    assert!(
+        !supervisor_thread.is_finished(),
+        "supervisor completed before child-d release"
+    );
     drop(breaker);
+    supervisor_thread.release_fixture();
 
-    let report = done_receiver
-        .recv()
-        .expect("supervisor breaker result after active child drain")
-        .expect("breaker trip remains reportable");
-    supervisor_thread
-        .join()
+    let (_temp, result) = supervisor_thread
+        .join(
+            "supervisor completion after active child-d drain",
+            SUPERVISOR_REAP_BOUND,
+        )
         .unwrap_or_else(|_| panic!("supervisor test thread panicked"));
+    let report = result.expect("breaker trip remains reportable");
 
     assert!(!report.success);
     assert_eq!(report.orchestrator_reports.len(), 4);
@@ -1571,7 +1916,7 @@ fn cascade_breaker_stops_admission_drains_active_and_releases_claims() {
         .expect("snapshot claims after breaker drain")
         .is_empty());
 
-    let run_id = RunId::new("circuit-breaker-cascade").expect("valid breaker run id");
+    let run_id = RunId::new(RUN_ID).expect("valid breaker run id");
     let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
         .expect("open finalized breaker artifacts");
     let events = read_finalized_orchestration_events(&reader);
