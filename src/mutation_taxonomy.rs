@@ -8,6 +8,7 @@
 
 use crate::artifacts::state_auth::sha256_hex;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 /// Current reviewed registry version.
 ///
@@ -113,7 +114,7 @@ impl ExplicitMutationGate {
 }
 
 /// Typed inventory of reviewed MACO operation boundaries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MutationOperation {
     RepositoryInitialize,
     MegafileTelemetrySeed,
@@ -855,28 +856,27 @@ impl EffectiveSupervisorWorktreeMode {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum EffectiveSupervisorMutationLifecycle {
     SupervisorRun {
-        semantic_coordination: bool,
-        external_process_runtime: bool,
-        machine_global_retention_bound: bool,
-        field_guide_mutation: bool,
-        primary_object_import: bool,
+        process_lifecycle: SupervisorRunProcessLifecycle,
     },
-    CatalogPreflight {
-        launches_process: bool,
-    },
-    ResumeRecovery {
-        semantic_release: bool,
-    },
+    CatalogPreflight,
+    ResumeRecovery,
     AutopilotOuter,
     GeneratedFollowUpQueue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SupervisorRunProcessLifecycle {
+    LocalOnly,
+    External,
 }
 
 impl EffectiveSupervisorMutationLifecycle {
     const fn id(&self) -> &'static str {
         match self {
             Self::SupervisorRun { .. } => "supervisor-run",
-            Self::CatalogPreflight { .. } => "catalog-preflight",
-            Self::ResumeRecovery { .. } => "resume-recovery",
+            Self::CatalogPreflight => "catalog-preflight",
+            Self::ResumeRecovery => "resume-recovery",
             Self::AutopilotOuter => "autopilot-outer",
             Self::GeneratedFollowUpQueue => "generated-follow-up-queue",
         }
@@ -887,13 +887,7 @@ impl EffectiveSupervisorMutationLifecycle {
         worktree_mode: EffectiveSupervisorWorktreeMode,
     ) -> Vec<MutationOperation> {
         let mut operations = match self {
-            Self::SupervisorRun {
-                semantic_coordination,
-                external_process_runtime,
-                machine_global_retention_bound,
-                field_guide_mutation,
-                primary_object_import,
-            } => {
+            Self::SupervisorRun { process_lifecycle } => {
                 let mut operations = vec![
                     MutationOperation::SupervisorRunArtifactReserve,
                     MutationOperation::SupervisorRunArtifactWriteAppend,
@@ -907,12 +901,19 @@ impl EffectiveSupervisorMutationLifecycle {
                     MutationOperation::ClaimAcquire,
                     MutationOperation::SupervisorClaimAcquisitionTelemetry,
                     MutationOperation::ClaimRelease,
+                    MutationOperation::SemanticIntentAcquire,
+                    MutationOperation::SemanticIntentRelease,
                     MutationOperation::SupervisorProcessRegister,
+                    MutationOperation::SupervisorFieldGuideMutation,
                 ];
-                if *semantic_coordination {
+                if *process_lifecycle == SupervisorRunProcessLifecycle::External {
                     operations.extend([
-                        MutationOperation::SemanticIntentAcquire,
-                        MutationOperation::SemanticIntentRelease,
+                        MutationOperation::SupervisorProcessSpawn,
+                        MutationOperation::SupervisorProcessOutputStage,
+                        MutationOperation::SupervisorProcessOutputWrite,
+                        MutationOperation::SupervisorProcessOutputCleanup,
+                        MutationOperation::SupervisorProcessTerminate,
+                        MutationOperation::MachineGlobalQuarantine,
                     ]);
                 }
                 match worktree_mode {
@@ -936,44 +937,32 @@ impl EffectiveSupervisorMutationLifecycle {
                         MutationOperation::SupervisorMandatoryControlProvision,
                     ]),
                 }
-                if *external_process_runtime {
+                if *process_lifecycle == SupervisorRunProcessLifecycle::External
+                    && !matches!(
+                        worktree_mode,
+                        EffectiveSupervisorWorktreeMode::PrimaryWorktree
+                            | EffectiveSupervisorWorktreeMode::NotApplicable
+                    )
+                {
                     operations.extend([
-                        MutationOperation::SupervisorProcessSpawn,
-                        MutationOperation::SupervisorProcessOutputStage,
-                        MutationOperation::SupervisorProcessOutputWrite,
-                        MutationOperation::SupervisorProcessTerminate,
-                    ]);
-                    operations.push(if *machine_global_retention_bound {
-                        MutationOperation::MachineGlobalQuarantine
-                    } else {
-                        MutationOperation::SupervisorProcessOutputCleanup
-                    });
-                    if *field_guide_mutation {
-                        operations.push(MutationOperation::SupervisorFieldGuideMutation);
-                    }
-                    if *primary_object_import {
-                        operations.extend([
-                            MutationOperation::SandboxWorktreeEdit,
-                            MutationOperation::SandboxWorktreeCommit,
-                            MutationOperation::SupervisorPrimaryObjectDatabaseImport,
-                        ]);
-                    }
-                }
-                operations
-            }
-            Self::CatalogPreflight { launches_process } => {
-                let mut operations =
-                    vec![MutationOperation::SupervisorBudgetLedgerBootstrapRecovery];
-                if *launches_process {
-                    operations.extend([
-                        MutationOperation::SupervisorProcessSpawn,
-                        MutationOperation::SupervisorProcessTerminate,
+                        MutationOperation::SandboxWorktreeEdit,
+                        MutationOperation::SandboxWorktreeCommit,
+                        MutationOperation::SupervisorPrimaryObjectDatabaseImport,
                     ]);
                 }
                 operations
             }
-            Self::ResumeRecovery { semantic_release } => {
-                let mut operations = vec![
+            Self::CatalogPreflight => vec![
+                MutationOperation::SupervisorBudgetLedgerBootstrapRecovery,
+                MutationOperation::SupervisorProcessSpawn,
+                MutationOperation::SupervisorProcessOutputStage,
+                MutationOperation::SupervisorProcessOutputWrite,
+                MutationOperation::SupervisorProcessOutputCleanup,
+                MutationOperation::SupervisorProcessTerminate,
+                MutationOperation::MachineGlobalQuarantine,
+            ],
+            Self::ResumeRecovery => {
+                vec![
                     MutationOperation::SupervisorRunArtifactWriteAppend,
                     MutationOperation::SupervisorRunArtifactAuthenticatedFinalize,
                     MutationOperation::SupervisorCheckpointJournalLifecycle,
@@ -981,11 +970,8 @@ impl EffectiveSupervisorMutationLifecycle {
                     MutationOperation::SupervisorMessagingJournalLifecycle,
                     MutationOperation::SupervisorCoordinationStoreBootstrap,
                     MutationOperation::ClaimRelease,
-                ];
-                if *semantic_release {
-                    operations.push(MutationOperation::SemanticIntentRelease);
-                }
-                operations
+                    MutationOperation::SemanticIntentRelease,
+                ]
             }
             Self::AutopilotOuter => vec![
                 MutationOperation::SupervisorRunArtifactReserve,
@@ -1009,46 +995,34 @@ impl EffectiveSupervisorMutationLifecycle {
         operations
     }
 
-    fn supplies_gate(
+    fn owns_gate(
         &self,
         gate: ExplicitMutationGate,
         worktree_mode: EffectiveSupervisorWorktreeMode,
     ) -> bool {
         match self {
-            Self::SupervisorRun {
-                semantic_coordination,
-                external_process_runtime,
-                machine_global_retention_bound: _,
-                field_guide_mutation,
-                primary_object_import,
-            } => match gate {
+            Self::SupervisorRun { process_lifecycle } => match gate {
                 ExplicitMutationGate::BoundSupervisorRunLifecycleAuthority
-                | ExplicitMutationGate::ExactClaimReleaseAuthority => true,
-                ExplicitMutationGate::ExactSemanticIntentReleaseAuthority => *semantic_coordination,
+                | ExplicitMutationGate::ExactClaimReleaseAuthority
+                | ExplicitMutationGate::ExactSemanticIntentReleaseAuthority => true,
                 ExplicitMutationGate::PrimaryPlanCliDoubleOptIn => {
                     worktree_mode == EffectiveSupervisorWorktreeMode::PrimaryWorktree
                 }
                 ExplicitMutationGate::VerifiedSupervisorProcessLifecycleAuthority => {
-                    *external_process_runtime
+                    *process_lifecycle == SupervisorRunProcessLifecycle::External
                 }
-                ExplicitMutationGate::BoundSupervisorFieldGuideMutationAuthority => {
-                    *field_guide_mutation
-                }
-                ExplicitMutationGate::VerifiedSupervisorPrimaryObjectImportAuthority => {
-                    *primary_object_import
-                }
+                ExplicitMutationGate::BoundSupervisorFieldGuideMutationAuthority
+                | ExplicitMutationGate::VerifiedSupervisorPrimaryObjectImportAuthority => true,
                 _ => false,
             },
-            Self::CatalogPreflight { launches_process } => {
+            Self::CatalogPreflight => {
                 gate == ExplicitMutationGate::BoundSupervisorRunLifecycleAuthority
-                    || (*launches_process
-                        && gate
-                            == ExplicitMutationGate::VerifiedSupervisorProcessLifecycleAuthority)
+                    || gate == ExplicitMutationGate::VerifiedSupervisorProcessLifecycleAuthority
             }
-            Self::ResumeRecovery { semantic_release } => match gate {
+            Self::ResumeRecovery => match gate {
                 ExplicitMutationGate::BoundSupervisorRunLifecycleAuthority
-                | ExplicitMutationGate::ExactClaimReleaseAuthority => true,
-                ExplicitMutationGate::ExactSemanticIntentReleaseAuthority => *semantic_release,
+                | ExplicitMutationGate::ExactClaimReleaseAuthority
+                | ExplicitMutationGate::ExactSemanticIntentReleaseAuthority => true,
                 _ => false,
             },
             Self::AutopilotOuter => {
@@ -1083,21 +1057,14 @@ pub(crate) struct EffectiveSupervisorMutationIdentityInput {
 
 pub(crate) struct EffectiveSupervisorRunManifestInput {
     pub(crate) identity: EffectiveSupervisorMutationIdentityInput,
-    pub(crate) semantic_coordination: bool,
-    pub(crate) external_process_runtime: bool,
-    pub(crate) machine_global_retention_bound: bool,
-    pub(crate) field_guide_mutation: bool,
-    pub(crate) primary_object_import: bool,
 }
 
 pub(crate) struct EffectiveCatalogPreflightManifestInput {
     pub(crate) identity: EffectiveSupervisorMutationIdentityInput,
-    pub(crate) launches_process: bool,
 }
 
 pub(crate) struct EffectiveResumeRecoveryManifestInput {
     pub(crate) identity: EffectiveSupervisorMutationIdentityInput,
-    pub(crate) semantic_release: bool,
 }
 
 pub(crate) struct EffectiveGeneratedFollowUpQueueManifestInput {
@@ -1106,6 +1073,19 @@ pub(crate) struct EffectiveGeneratedFollowUpQueueManifestInput {
 
 pub(crate) struct EffectiveAutopilotOuterManifestInput {
     pub(crate) identity: EffectiveSupervisorMutationIdentityInput,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct EffectiveSupervisorMutationOperation {
+    operation_id: String,
+}
+
+impl EffectiveSupervisorMutationOperation {
+    fn new(operation: MutationOperation) -> Self {
+        Self {
+            operation_id: operation.id().to_string(),
+        }
+    }
 }
 
 /// Authorizable exact effective mutation set. This object is deliberately not
@@ -1130,6 +1110,8 @@ pub(crate) struct EffectiveSupervisorMutationManifest {
     primary_baseline_sha256: Option<String>,
     outer_entrypoint: Option<String>,
     outer_run_id: Option<String>,
+    operations: Vec<EffectiveSupervisorMutationOperation>,
+    #[serde(skip)]
     operation_ids: Vec<String>,
     canonical_manifest_sha256: String,
 }
@@ -1148,40 +1130,442 @@ impl EffectiveSupervisorMutationAuditEvidence {
     }
 }
 
-macro_rules! lifecycle_permit {
+struct LifecycleMutationSession {
+    canonical_manifest_sha256: String,
+    run_id: String,
+    operations: BTreeSet<MutationOperation>,
+}
+
+impl LifecycleMutationSession {
+    fn new(manifest: &EffectiveSupervisorMutationManifest) -> Self {
+        Self {
+            canonical_manifest_sha256: manifest.canonical_manifest_sha256.clone(),
+            run_id: manifest.run_id.clone(),
+            operations: manifest
+                .lifecycle
+                .fixed_operations(manifest.worktree_mode)
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    fn permit(
+        &self,
+        operation: MutationOperation,
+    ) -> Result<SupervisorOperationPermit<'_>, EffectiveSupervisorMutationAdmissionError> {
+        if !self.operations.contains(&operation) {
+            return Err(
+                EffectiveSupervisorMutationAdmissionError::MissingOperationPermit {
+                    operation_id: operation.id(),
+                },
+            );
+        }
+        Ok(SupervisorOperationPermit {
+            canonical_manifest_sha256: &self.canonical_manifest_sha256,
+            operation,
+        })
+    }
+}
+
+/// Borrowed, operation-specific sink authority. Its fields and constructor are
+/// private, so audit JSON and caller-declared gate labels cannot fabricate it.
+pub(crate) struct SupervisorOperationPermit<'session> {
+    canonical_manifest_sha256: &'session str,
+    operation: MutationOperation,
+}
+
+impl SupervisorOperationPermit<'_> {
+    pub(crate) fn verify(
+        &self,
+        expected_operation: MutationOperation,
+    ) -> Result<(), EffectiveSupervisorMutationAdmissionError> {
+        if self.operation != expected_operation || self.canonical_manifest_sha256.is_empty() {
+            return Err(
+                EffectiveSupervisorMutationAdmissionError::OperationPermitMismatch {
+                    expected_operation_id: expected_operation.id(),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn invalid_for_test() -> Self {
+        Self {
+            canonical_manifest_sha256: "",
+            operation: MutationOperation::StateMigrationPreview,
+        }
+    }
+}
+
+macro_rules! lifecycle_session {
     ($name:ident) => {
         pub(crate) struct $name {
-            canonical_manifest_sha256: String,
+            inner: LifecycleMutationSession,
         }
+    };
+}
 
+lifecycle_session!(SupervisorRunMutationSession);
+lifecycle_session!(CatalogPreflightMutationSession);
+lifecycle_session!(ResumeRecoveryMutationSession);
+lifecycle_session!(AutopilotOuterMutationSession);
+lifecycle_session!(GeneratedFollowUpQueueMutationSession);
+
+macro_rules! lifecycle_operation_session {
+    ($name:ident) => {
         impl $name {
-            pub(crate) fn consume(
-                self,
-                expected_manifest_sha256: &str,
-            ) -> Result<(), EffectiveSupervisorMutationAdmissionError> {
-                if self.canonical_manifest_sha256 != expected_manifest_sha256 {
-                    return Err(EffectiveSupervisorMutationAdmissionError::ManifestBindingMismatch);
-                }
-                Ok(())
+            pub(crate) fn permit(
+                &self,
+                operation: MutationOperation,
+            ) -> Result<SupervisorOperationPermit<'_>, EffectiveSupervisorMutationAdmissionError>
+            {
+                self.inner.permit(operation)
             }
 
-            #[cfg(test)]
-            #[allow(dead_code)]
-            pub(crate) fn invalid_for_test() -> Self {
-                Self {
-                    canonical_manifest_sha256: sha256_hex(b"invalid-test-permit"),
-                }
+            pub(crate) fn canonical_manifest_sha256(&self) -> &str {
+                &self.inner.canonical_manifest_sha256
             }
         }
     };
 }
 
-lifecycle_permit!(SupervisorRunMutationPermit);
-lifecycle_permit!(CatalogPreflightMutationPermit);
-lifecycle_permit!(SupervisorResolutionPreflightPermit);
-lifecycle_permit!(ResumeRecoveryMutationPermit);
-lifecycle_permit!(AutopilotOuterMutationPermit);
-lifecycle_permit!(GeneratedFollowUpQueueMutationPermit);
+lifecycle_operation_session!(SupervisorRunMutationSession);
+lifecycle_operation_session!(ResumeRecoveryMutationSession);
+lifecycle_operation_session!(AutopilotOuterMutationSession);
+lifecycle_operation_session!(GeneratedFollowUpQueueMutationSession);
+
+impl CatalogPreflightMutationSession {
+    pub(crate) fn canonical_manifest_sha256(&self) -> &str {
+        &self.inner.canonical_manifest_sha256
+    }
+
+    pub(crate) fn run_id(&self) -> &str {
+        &self.inner.run_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(run_id: &str) -> Self {
+        Self {
+            inner: LifecycleMutationSession {
+                canonical_manifest_sha256: format!("test-catalog-session:{run_id}"),
+                run_id: run_id.to_string(),
+                operations: EffectiveSupervisorMutationLifecycle::CatalogPreflight
+                    .fixed_operations(EffectiveSupervisorWorktreeMode::NotApplicable)
+                    .into_iter()
+                    .collect(),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+fn invalid_lifecycle_session() -> LifecycleMutationSession {
+    LifecycleMutationSession {
+        canonical_manifest_sha256: String::new(),
+        run_id: String::new(),
+        operations: BTreeSet::new(),
+    }
+}
+
+#[cfg(test)]
+impl AutopilotOuterMutationSession {
+    pub(crate) fn invalid_for_test() -> Self {
+        Self {
+            inner: invalid_lifecycle_session(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl GeneratedFollowUpQueueMutationSession {
+    pub(crate) fn invalid_for_test() -> Self {
+        Self {
+            inner: invalid_lifecycle_session(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SupervisorProcessLaunchKind {
+    CatalogCodexProbe,
+    CatalogCursorProbe,
+    CatalogGrokProbe,
+    Assignment,
+    ParentAuditor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ExactSupervisorProcessLaunchIdentity {
+    pub(crate) run_id: String,
+    pub(crate) subject_id: String,
+    pub(crate) attempt: usize,
+    pub(crate) adapter: String,
+    pub(crate) model: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
+    pub(crate) program_identity: String,
+    pub(crate) execution_mode: String,
+    pub(crate) delivery_identity: String,
+    pub(crate) kind: SupervisorProcessLaunchKind,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct SupervisorProcessLaunchAuditEvidence {
+    version: u32,
+    parent_manifest_sha256: String,
+    identity: ExactSupervisorProcessLaunchIdentity,
+    canonical_manifest_sha256: String,
+}
+
+impl SupervisorProcessLaunchAuditEvidence {
+    #[cfg(test)]
+    pub(crate) fn invalid_for_test(identity: ExactSupervisorProcessLaunchIdentity) -> Self {
+        Self {
+            version: 1,
+            parent_manifest_sha256: String::new(),
+            identity,
+            canonical_manifest_sha256: sha256_hex(b"invalid-process-launch-evidence"),
+        }
+    }
+}
+
+struct SupervisorProcessLaunchPermit {
+    parent_manifest_sha256: String,
+    identity: ExactSupervisorProcessLaunchIdentity,
+    canonical_manifest_sha256: String,
+}
+
+impl SupervisorProcessLaunchPermit {
+    pub(crate) fn consume(
+        self,
+        evidence_sha256: &str,
+        actual: &ExactSupervisorProcessLaunchIdentity,
+    ) -> Result<(), EffectiveSupervisorMutationAdmissionError> {
+        if self.parent_manifest_sha256.is_empty()
+            || self.canonical_manifest_sha256 != evidence_sha256
+            || &self.identity != actual
+        {
+            return Err(EffectiveSupervisorMutationAdmissionError::ProcessLaunchBindingMismatch);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn invalid_for_test(actual: ExactSupervisorProcessLaunchIdentity) -> Self {
+        Self {
+            parent_manifest_sha256: String::new(),
+            identity: actual,
+            canonical_manifest_sha256: sha256_hex(b"invalid-process-launch-permit"),
+        }
+    }
+}
+
+/// Non-forgeable, single-use authority for one exact Supervisor-owned process
+/// family. The central launch sink consumes this value before it performs any
+/// executable preflight or target process mutation.
+pub(crate) struct SupervisorProcessLaunchAuthorization {
+    identity: ExactSupervisorProcessLaunchIdentity,
+    evidence_sha256: String,
+    permit: SupervisorProcessLaunchPermit,
+}
+
+impl SupervisorProcessLaunchAuthorization {
+    pub(crate) fn consume(self) -> Result<(), EffectiveSupervisorMutationAdmissionError> {
+        self.permit.consume(&self.evidence_sha256, &self.identity)
+    }
+
+    pub(crate) fn consume_for_external_binding(
+        self,
+        adapter: &str,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+        program_identity: &str,
+        execution_mode: &str,
+        delivery_identity: &str,
+    ) -> Result<(), EffectiveSupervisorMutationAdmissionError> {
+        if self.identity.adapter != adapter
+            || self.identity.model.as_deref() != model
+            || self.identity.reasoning_effort.as_deref() != reasoning_effort
+            || self.identity.program_identity != program_identity
+            || self.identity.execution_mode != execution_mode
+            || self.identity.delivery_identity != delivery_identity
+        {
+            return Err(EffectiveSupervisorMutationAdmissionError::ProcessLaunchBindingMismatch);
+        }
+        self.consume()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn invalid_for_test(identity: ExactSupervisorProcessLaunchIdentity) -> Self {
+        Self {
+            evidence_sha256: sha256_hex(b"invalid-process-launch-evidence"),
+            permit: SupervisorProcessLaunchPermit::invalid_for_test(identity.clone()),
+            identity,
+        }
+    }
+}
+
+fn authorize_process_launch(
+    session: &LifecycleMutationSession,
+    identity: ExactSupervisorProcessLaunchIdentity,
+) -> Result<
+    (
+        SupervisorProcessLaunchAuditEvidence,
+        SupervisorProcessLaunchAuthorization,
+    ),
+    EffectiveSupervisorMutationAdmissionError,
+> {
+    for operation in [
+        MutationOperation::SupervisorProcessSpawn,
+        MutationOperation::SupervisorProcessOutputStage,
+        MutationOperation::SupervisorProcessOutputWrite,
+        MutationOperation::SupervisorProcessOutputCleanup,
+        MutationOperation::SupervisorProcessTerminate,
+        MutationOperation::MachineGlobalQuarantine,
+    ] {
+        session.permit(operation)?;
+    }
+    if identity.run_id != session.run_id
+        || identity.subject_id.is_empty()
+        || identity.attempt == 0
+        || identity.adapter.is_empty()
+        || identity.program_identity.is_empty()
+        || identity.execution_mode.is_empty()
+        || identity.delivery_identity.is_empty()
+        || identity.model.as_ref().is_some_and(String::is_empty)
+        || identity
+            .reasoning_effort
+            .as_ref()
+            .is_some_and(String::is_empty)
+    {
+        return Err(EffectiveSupervisorMutationAdmissionError::InvalidManifest {
+            reason: "exact Supervisor process launch identity is incomplete".to_string(),
+        });
+    }
+    let mut canonical = Vec::new();
+    push_canonical_manifest_field(&mut canonical, "domain", "maco-supervisor-process-launch");
+    push_canonical_manifest_field(&mut canonical, "version", "1");
+    push_canonical_manifest_field(
+        &mut canonical,
+        "parent_manifest_sha256",
+        &session.canonical_manifest_sha256,
+    );
+    push_canonical_manifest_field(&mut canonical, "run_id", &identity.run_id);
+    push_canonical_manifest_field(&mut canonical, "subject_id", &identity.subject_id);
+    push_canonical_manifest_field(&mut canonical, "attempt", &identity.attempt.to_string());
+    push_canonical_manifest_field(&mut canonical, "adapter", &identity.adapter);
+    push_canonical_optional_manifest_field(&mut canonical, "model", identity.model.as_deref());
+    push_canonical_optional_manifest_field(
+        &mut canonical,
+        "reasoning_effort",
+        identity.reasoning_effort.as_deref(),
+    );
+    push_canonical_manifest_field(
+        &mut canonical,
+        "program_identity",
+        &identity.program_identity,
+    );
+    push_canonical_manifest_field(&mut canonical, "execution_mode", &identity.execution_mode);
+    push_canonical_manifest_field(
+        &mut canonical,
+        "delivery_identity",
+        &identity.delivery_identity,
+    );
+    push_canonical_manifest_field(
+        &mut canonical,
+        "kind",
+        match identity.kind {
+            SupervisorProcessLaunchKind::CatalogCodexProbe => "catalog-codex-probe",
+            SupervisorProcessLaunchKind::CatalogCursorProbe => "catalog-cursor-probe",
+            SupervisorProcessLaunchKind::CatalogGrokProbe => "catalog-grok-probe",
+            SupervisorProcessLaunchKind::Assignment => "assignment",
+            SupervisorProcessLaunchKind::ParentAuditor => "parent-auditor",
+        },
+    );
+    let canonical_manifest_sha256 = sha256_hex(&canonical);
+    Ok((
+        SupervisorProcessLaunchAuditEvidence {
+            version: 1,
+            parent_manifest_sha256: session.canonical_manifest_sha256.clone(),
+            identity: identity.clone(),
+            canonical_manifest_sha256: canonical_manifest_sha256.clone(),
+        },
+        SupervisorProcessLaunchAuthorization {
+            identity: identity.clone(),
+            evidence_sha256: canonical_manifest_sha256.clone(),
+            permit: SupervisorProcessLaunchPermit {
+                parent_manifest_sha256: session.canonical_manifest_sha256.clone(),
+                identity,
+                canonical_manifest_sha256,
+            },
+        },
+    ))
+}
+
+impl SupervisorRunMutationSession {
+    pub(crate) fn authorize_process_launch(
+        &self,
+        identity: ExactSupervisorProcessLaunchIdentity,
+    ) -> Result<
+        (
+            SupervisorProcessLaunchAuditEvidence,
+            SupervisorProcessLaunchAuthorization,
+        ),
+        EffectiveSupervisorMutationAdmissionError,
+    > {
+        authorize_process_launch(&self.inner, identity)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_for_test(run_id: &str) -> Self {
+        let lifecycle = EffectiveSupervisorMutationLifecycle::SupervisorRun {
+            process_lifecycle: SupervisorRunProcessLifecycle::LocalOnly,
+        };
+        Self {
+            inner: LifecycleMutationSession {
+                canonical_manifest_sha256: format!("test-supervisor-session:{run_id}"),
+                run_id: run_id.to_string(),
+                operations: lifecycle
+                    .fixed_operations(EffectiveSupervisorWorktreeMode::TestOnly)
+                    .into_iter()
+                    .collect(),
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn external_for_test(run_id: &str) -> Self {
+        let lifecycle = EffectiveSupervisorMutationLifecycle::SupervisorRun {
+            process_lifecycle: SupervisorRunProcessLifecycle::External,
+        };
+        Self {
+            inner: LifecycleMutationSession {
+                canonical_manifest_sha256: format!("test-supervisor-session:{run_id}"),
+                run_id: run_id.to_string(),
+                operations: lifecycle
+                    .fixed_operations(EffectiveSupervisorWorktreeMode::TestOnly)
+                    .into_iter()
+                    .collect(),
+            },
+        }
+    }
+}
+
+impl CatalogPreflightMutationSession {
+    pub(crate) fn authorize_process_launch(
+        &self,
+        identity: ExactSupervisorProcessLaunchIdentity,
+    ) -> Result<
+        (
+            SupervisorProcessLaunchAuditEvidence,
+            SupervisorProcessLaunchAuthorization,
+        ),
+        EffectiveSupervisorMutationAdmissionError,
+    > {
+        authorize_process_launch(&self.inner, identity)
+    }
+}
 
 /// One consumed authorizer result. The lifecycle-specific conversion consumes
 /// this wrapper and yields non-serializable sink authority plus inert evidence.
@@ -1189,50 +1573,48 @@ pub(crate) struct AuthorizedEffectiveSupervisorMutation {
     manifest: EffectiveSupervisorMutationManifest,
 }
 
-macro_rules! into_lifecycle_permit {
-    ($method:ident, $pattern:pat, $permit:ident) => {
+macro_rules! into_lifecycle_session {
+    ($method:ident, $pattern:pat, $session:ident) => {
         pub(crate) fn $method(
             self,
         ) -> Result<
-            (EffectiveSupervisorMutationAuditEvidence, $permit),
+            (EffectiveSupervisorMutationAuditEvidence, $session),
             EffectiveSupervisorMutationAdmissionError,
         > {
             if !matches!(self.manifest.lifecycle, $pattern) {
                 return Err(EffectiveSupervisorMutationAdmissionError::WrongLifecycle);
             }
-            let canonical_manifest_sha256 = self.manifest.canonical_manifest_sha256.clone();
+            let inner = LifecycleMutationSession::new(&self.manifest);
             Ok((
                 EffectiveSupervisorMutationAuditEvidence {
                     manifest: self.manifest,
                 },
-                $permit {
-                    canonical_manifest_sha256,
-                },
+                $session { inner },
             ))
         }
     };
 }
 
 impl AuthorizedEffectiveSupervisorMutation {
-    into_lifecycle_permit!(
+    into_lifecycle_session!(
         into_supervisor_run,
         EffectiveSupervisorMutationLifecycle::SupervisorRun { .. },
-        SupervisorRunMutationPermit
+        SupervisorRunMutationSession
     );
-    into_lifecycle_permit!(
+    into_lifecycle_session!(
         into_resume_recovery,
-        EffectiveSupervisorMutationLifecycle::ResumeRecovery { .. },
-        ResumeRecoveryMutationPermit
+        EffectiveSupervisorMutationLifecycle::ResumeRecovery,
+        ResumeRecoveryMutationSession
     );
-    into_lifecycle_permit!(
+    into_lifecycle_session!(
         into_autopilot_outer,
         EffectiveSupervisorMutationLifecycle::AutopilotOuter,
-        AutopilotOuterMutationPermit
+        AutopilotOuterMutationSession
     );
-    into_lifecycle_permit!(
+    into_lifecycle_session!(
         into_generated_follow_up_queue,
         EffectiveSupervisorMutationLifecycle::GeneratedFollowUpQueue,
-        GeneratedFollowUpQueueMutationPermit
+        GeneratedFollowUpQueueMutationSession
     );
 
     pub(crate) fn into_catalog_preflight(
@@ -1240,28 +1622,22 @@ impl AuthorizedEffectiveSupervisorMutation {
     ) -> Result<
         (
             EffectiveSupervisorMutationAuditEvidence,
-            CatalogPreflightMutationPermit,
-            SupervisorResolutionPreflightPermit,
+            CatalogPreflightMutationSession,
         ),
         EffectiveSupervisorMutationAdmissionError,
     > {
         if !matches!(
             self.manifest.lifecycle,
-            EffectiveSupervisorMutationLifecycle::CatalogPreflight { .. }
+            EffectiveSupervisorMutationLifecycle::CatalogPreflight
         ) {
             return Err(EffectiveSupervisorMutationAdmissionError::WrongLifecycle);
         }
-        let canonical_manifest_sha256 = self.manifest.canonical_manifest_sha256.clone();
+        let inner = LifecycleMutationSession::new(&self.manifest);
         Ok((
             EffectiveSupervisorMutationAuditEvidence {
                 manifest: self.manifest,
             },
-            CatalogPreflightMutationPermit {
-                canonical_manifest_sha256: canonical_manifest_sha256.clone(),
-            },
-            SupervisorResolutionPreflightPermit {
-                canonical_manifest_sha256,
-            },
+            CatalogPreflightMutationSession { inner },
         ))
     }
 }
@@ -1278,6 +1654,11 @@ impl EffectiveSupervisorMutationManifest {
             .fixed_operations(input.worktree_mode)
             .into_iter()
             .map(|operation| operation.id().to_string())
+            .collect::<Vec<_>>();
+        let operations = lifecycle
+            .fixed_operations(input.worktree_mode)
+            .into_iter()
+            .map(EffectiveSupervisorMutationOperation::new)
             .collect();
         let mut manifest = Self {
             version: EFFECTIVE_SUPERVISOR_MUTATION_MANIFEST_VERSION,
@@ -1298,6 +1679,7 @@ impl EffectiveSupervisorMutationManifest {
             primary_baseline_sha256: input.primary_baseline_sha256,
             outer_entrypoint: input.outer_entrypoint,
             outer_run_id: input.outer_run_id,
+            operations,
             operation_ids,
             canonical_manifest_sha256: String::new(),
         };
@@ -1306,33 +1688,28 @@ impl EffectiveSupervisorMutationManifest {
     }
 
     pub(crate) fn supervisor_run(input: EffectiveSupervisorRunManifestInput) -> Self {
+        let process_lifecycle = if input.identity.runtime_adapter.as_deref() == Some("fake") {
+            SupervisorRunProcessLifecycle::LocalOnly
+        } else {
+            SupervisorRunProcessLifecycle::External
+        };
         Self::new(
             input.identity,
-            EffectiveSupervisorMutationLifecycle::SupervisorRun {
-                semantic_coordination: input.semantic_coordination,
-                external_process_runtime: input.external_process_runtime,
-                machine_global_retention_bound: input.machine_global_retention_bound,
-                field_guide_mutation: input.field_guide_mutation,
-                primary_object_import: input.primary_object_import,
-            },
+            EffectiveSupervisorMutationLifecycle::SupervisorRun { process_lifecycle },
         )
     }
 
     pub(crate) fn catalog_preflight(input: EffectiveCatalogPreflightManifestInput) -> Self {
         Self::new(
             input.identity,
-            EffectiveSupervisorMutationLifecycle::CatalogPreflight {
-                launches_process: input.launches_process,
-            },
+            EffectiveSupervisorMutationLifecycle::CatalogPreflight,
         )
     }
 
     pub(crate) fn resume_recovery(input: EffectiveResumeRecoveryManifestInput) -> Self {
         Self::new(
             input.identity,
-            EffectiveSupervisorMutationLifecycle::ResumeRecovery {
-                semantic_release: input.semantic_release,
-            },
+            EffectiveSupervisorMutationLifecycle::ResumeRecovery,
         )
     }
 
@@ -1370,6 +1747,18 @@ impl EffectiveSupervisorMutationManifest {
         push_canonical_manifest_field(&mut bytes, "domain", "maco-effective-supervisor-mutations");
         push_canonical_manifest_field(&mut bytes, "version", &self.version.to_string());
         push_canonical_manifest_field(&mut bytes, "lifecycle", self.lifecycle.id());
+        if let EffectiveSupervisorMutationLifecycle::SupervisorRun { process_lifecycle } =
+            &self.lifecycle
+        {
+            push_canonical_manifest_field(
+                &mut bytes,
+                "process_lifecycle",
+                match process_lifecycle {
+                    SupervisorRunProcessLifecycle::LocalOnly => "local-only",
+                    SupervisorRunProcessLifecycle::External => "external",
+                },
+            );
+        }
         push_canonical_manifest_field(&mut bytes, "run_id", &self.run_id);
         push_canonical_optional_manifest_field(
             &mut bytes,
@@ -1430,8 +1819,8 @@ impl EffectiveSupervisorMutationManifest {
             "outer_run_id",
             self.outer_run_id.as_deref(),
         );
-        for operation_id in &self.operation_ids {
-            push_canonical_manifest_field(&mut bytes, "operation", operation_id);
+        for operation in &self.operations {
+            push_canonical_manifest_field(&mut bytes, "operation", &operation.operation_id);
         }
         bytes
     }
@@ -1467,20 +1856,20 @@ impl EffectiveSupervisorMutationManifest {
                 .is_some_and(|digest| !is_canonical_sha256(digest))
             || self.outer_entrypoint.as_ref().is_some_and(String::is_empty)
             || self.outer_run_id.as_ref().is_some_and(String::is_empty)
-            || (self.operation_ids.is_empty()
-                && !matches!(
-                    self.lifecycle,
-                    EffectiveSupervisorMutationLifecycle::CatalogPreflight {
-                        launches_process: false
-                    }
-                ))
+            || self.operations.is_empty()
         {
             return Err(EffectiveSupervisorMutationAdmissionError::InvalidManifest {
                 reason: "effective Supervisor mutation manifest identity is incomplete".to_string(),
             });
         }
-        if self.operation_ids.windows(2).any(|pair| pair[0] >= pair[1])
-            || self.operation_ids.iter().any(String::is_empty)
+        if self
+            .operations
+            .windows(2)
+            .any(|pair| pair[0].operation_id >= pair[1].operation_id)
+            || self
+                .operations
+                .iter()
+                .any(|operation| operation.operation_id.is_empty())
         {
             return Err(EffectiveSupervisorMutationAdmissionError::InvalidManifest {
                 reason:
@@ -1493,15 +1882,27 @@ impl EffectiveSupervisorMutationManifest {
                 reason: "effective Supervisor mutation manifest digest is invalid".to_string(),
             });
         }
-        let expected_operation_ids = self
+        let expected_operations = self
             .lifecycle
             .fixed_operations(self.worktree_mode)
             .into_iter()
-            .map(|operation| operation.id().to_string())
+            .map(EffectiveSupervisorMutationOperation::new)
             .collect::<Vec<_>>();
-        if self.operation_ids != expected_operation_ids {
+        if self.operations != expected_operations {
             return Err(EffectiveSupervisorMutationAdmissionError::InvalidManifest {
                 reason: "effective mutation operation set is not the fixed lifecycle set"
+                    .to_string(),
+            });
+        }
+        if self.operation_ids
+            != self
+                .operations
+                .iter()
+                .map(|operation| operation.operation_id.clone())
+                .collect::<Vec<_>>()
+        {
+            return Err(EffectiveSupervisorMutationAdmissionError::InvalidManifest {
+                reason: "effective mutation audit objects differ from canonical operations"
                     .to_string(),
             });
         }
@@ -1528,38 +1929,28 @@ impl EffectiveSupervisorMutationManifest {
             }
         }
         match &self.lifecycle {
-            EffectiveSupervisorMutationLifecycle::SupervisorRun {
-                machine_global_retention_bound,
-                primary_object_import,
-                ..
-            } => {
+            EffectiveSupervisorMutationLifecycle::SupervisorRun { process_lifecycle } => {
                 if self.artifact_family != "supervise"
                     || self.runtime_adapter.is_none()
                     || self.primary_baseline_sha256.is_none()
-                    || *machine_global_retention_bound
-                        != self.machine_global_retention_sha256.is_some()
-                    || (*primary_object_import
-                        && self.worktree_mode
-                            != EffectiveSupervisorWorktreeMode::BoundCreateOrReuse
-                        && !cfg!(test))
+                    || (*process_lifecycle == SupervisorRunProcessLifecycle::LocalOnly
+                        && self.runtime_adapter.as_deref() != Some("fake"))
+                    || (*process_lifecycle == SupervisorRunProcessLifecycle::External
+                        && self.runtime_adapter.as_deref() == Some("fake"))
                 {
                     return Err(EffectiveSupervisorMutationAdmissionError::InvalidManifest {
                         reason: "effective Supervisor run identity is incomplete".to_string(),
                     });
                 }
             }
-            EffectiveSupervisorMutationLifecycle::CatalogPreflight { launches_process } => {
-                if self.artifact_family != "supervise-preflight"
-                    || self.runtime_adapter.is_none()
-                    || (*launches_process
-                        && self.execution_runtime != EffectiveSupervisorExecutionRuntime::Verified)
-                {
+            EffectiveSupervisorMutationLifecycle::CatalogPreflight => {
+                if self.artifact_family != "supervise-preflight" || self.runtime_adapter.is_none() {
                     return Err(EffectiveSupervisorMutationAdmissionError::InvalidManifest {
                         reason: "catalog preflight identity is incomplete".to_string(),
                     });
                 }
             }
-            EffectiveSupervisorMutationLifecycle::ResumeRecovery { .. } => {
+            EffectiveSupervisorMutationLifecycle::ResumeRecovery => {
                 if self.artifact_family != "supervise"
                     || self.primary_baseline_sha256.is_none()
                     || self.runtime_adapter.is_none()
@@ -1641,8 +2032,12 @@ pub(crate) enum EffectiveSupervisorMutationAdmissionError {
     MissingCapability { gate_id: &'static str },
     #[error("effective Supervisor mutation authorization was consumed as the wrong lifecycle")]
     WrongLifecycle,
-    #[error("effective Supervisor mutation authority is bound to a different canonical manifest")]
-    ManifestBindingMismatch,
+    #[error("effective Supervisor mutation session has no permit for operation '{operation_id}'")]
+    MissingOperationPermit { operation_id: &'static str },
+    #[error("Supervisor sink received a permit for a different operation than '{expected_operation_id}'")]
+    OperationPermitMismatch { expected_operation_id: &'static str },
+    #[error("exact Supervisor process-launch permit does not match the launch sink identity")]
+    ProcessLaunchBindingMismatch,
 }
 
 impl EffectiveSupervisorMutationAdmissionError {
@@ -1652,7 +2047,9 @@ impl EffectiveSupervisorMutationAdmissionError {
             Self::InvalidManifest { .. }
             | Self::UnknownOperation { .. }
             | Self::WrongLifecycle
-            | Self::ManifestBindingMismatch => TAXONOMY_REVIEW_REQUIRED_GATE_ID,
+            | Self::MissingOperationPermit { .. }
+            | Self::OperationPermitMismatch { .. }
+            | Self::ProcessLaunchBindingMismatch => TAXONOMY_REVIEW_REQUIRED_GATE_ID,
         }
     }
 }
@@ -1668,10 +2065,7 @@ pub(crate) fn authorize_effective_supervisor_mutation_manifest(
         match autonomous_decision_for(operation_id) {
             AutonomousMutationDecision::Allow => {}
             AutonomousMutationDecision::RequireExplicitGate(gate) => {
-                if !manifest
-                    .lifecycle
-                    .supplies_gate(gate, manifest.worktree_mode)
-                {
+                if !manifest.lifecycle.owns_gate(gate, manifest.worktree_mode) {
                     return Err(
                         EffectiveSupervisorMutationAdmissionError::MissingCapability {
                             gate_id: gate.id(),
@@ -1804,7 +2198,7 @@ mod tests {
             dispatch_identity: EffectiveSupervisorDispatchIdentity::Root,
             execution_runtime: EffectiveSupervisorExecutionRuntime::Verified,
             worktree_mode: EffectiveSupervisorWorktreeMode::ExistingOnly,
-            runtime_adapter: Some("fake".to_string()),
+            runtime_adapter: Some("codex".to_string()),
             repository_identity: sha256_hex(b"repository-fixture"),
             artifact_family: "supervise".to_string(),
             delivery_identity: "plan-file-fixture".to_string(),
@@ -1820,11 +2214,6 @@ mod tests {
     fn effective_manifest(run_id: &str) -> EffectiveSupervisorMutationManifest {
         EffectiveSupervisorMutationManifest::supervisor_run(EffectiveSupervisorRunManifestInput {
             identity: effective_identity(run_id, None),
-            semantic_coordination: true,
-            external_process_runtime: false,
-            machine_global_retention_bound: false,
-            field_guide_mutation: false,
-            primary_object_import: false,
         })
     }
 
@@ -1860,13 +2249,11 @@ mod tests {
             EffectiveSupervisorMutationManifest::catalog_preflight(
                 EffectiveCatalogPreflightManifestInput {
                     identity: catalog_identity,
-                    launches_process: true,
                 },
             ),
             EffectiveSupervisorMutationManifest::resume_recovery(
                 EffectiveResumeRecoveryManifestInput {
                     identity: effective_identity("resume-fixture", None),
-                    semantic_release: true,
                 },
             ),
             EffectiveSupervisorMutationManifest::autopilot_outer(
@@ -1909,18 +2296,34 @@ mod tests {
         let manifest_a_sha256 = manifest_a.canonical_manifest_sha256().to_string();
         let authority = authorize_effective_supervisor_mutation_manifest(manifest_a)
             .expect("authorize manifest A");
-        let (evidence_a, permit_a) = authority
+        let (evidence_a, session_a) = authority
             .into_supervisor_run()
             .expect("convert exact Supervisor lifecycle");
         assert_eq!(evidence_a.canonical_manifest_sha256(), manifest_a_sha256);
         let authority_b = authorize_effective_supervisor_mutation_manifest(manifest_b)
             .expect("authorize manifest B");
-        let (evidence_b, _permit_b) = authority_b
+        let (evidence_b, _session_b) = authority_b
             .into_supervisor_run()
             .expect("convert second Supervisor lifecycle");
+        assert_ne!(
+            session_a.canonical_manifest_sha256(),
+            evidence_b.canonical_manifest_sha256()
+        );
+        let wrong_run_identity = ExactSupervisorProcessLaunchIdentity {
+            run_id: "manifest-b".to_string(),
+            subject_id: "child-a".to_string(),
+            attempt: 1,
+            adapter: "codex".to_string(),
+            model: Some("model-a".to_string()),
+            reasoning_effort: Some("high".to_string()),
+            program_identity: "program-a".to_string(),
+            execution_mode: "verified".to_string(),
+            delivery_identity: "delivery-a".to_string(),
+            kind: SupervisorProcessLaunchKind::Assignment,
+        };
         assert!(matches!(
-            permit_a.consume(evidence_b.canonical_manifest_sha256()),
-            Err(EffectiveSupervisorMutationAdmissionError::ManifestBindingMismatch)
+            session_a.authorize_process_launch(wrong_run_identity),
+            Err(EffectiveSupervisorMutationAdmissionError::InvalidManifest { .. })
         ));
         serde_json::to_vec(&evidence_a).expect("consumed evidence remains serializable for audit");
     }
@@ -1931,11 +2334,6 @@ mod tests {
         let present_empty = EffectiveSupervisorMutationManifest::supervisor_run(
             EffectiveSupervisorRunManifestInput {
                 identity: effective_identity("optional-identity", Some(String::new())),
-                semantic_coordination: true,
-                external_process_runtime: false,
-                machine_global_retention_bound: false,
-                field_guide_mutation: false,
-                primary_object_import: false,
             },
         );
         assert_ne!(
@@ -1951,10 +2349,7 @@ mod tests {
         identity.primary_baseline_sha256 = None;
         let authorization = authorize_effective_supervisor_mutation_manifest(
             EffectiveSupervisorMutationManifest::catalog_preflight(
-                EffectiveCatalogPreflightManifestInput {
-                    identity,
-                    launches_process: false,
-                },
+                EffectiveCatalogPreflightManifestInput { identity },
             ),
         )
         .expect("authorize catalog preflight");

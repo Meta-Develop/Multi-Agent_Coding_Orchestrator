@@ -1,14 +1,24 @@
 use super::*;
+use crate::mutation_taxonomy::ExplicitMutationGate;
+
+fn initialize_mutation_admission_auth(repo: &Path) {
+    drop(
+        crate::artifacts::repository_auth_writer(repo)
+            .expect("initialize repository authentication before mutation admission"),
+    );
+}
 
 #[test]
 fn plan_file_unknown_effect_is_refused_before_run_reservation_or_dispatch() {
     let (temp, repo_path) = injected_repository();
     let plan = injected_plan(injected_assignment(false), 0);
-    let options = injected_options(
+    initialize_mutation_admission_auth(&repo_path);
+    let mut options = injected_options(
         &repo_path,
         temp.path(),
         "plan-file-unknown-mutation-admission",
     );
+    options.machine_global_retention = None;
     fs::write(
         &options.plan_file,
         serde_json::to_vec(&plan).expect("serialize mutation-admission plan"),
@@ -32,7 +42,8 @@ fn plan_file_unknown_effect_is_refused_before_run_reservation_or_dispatch() {
     assert_eq!(dispatches.load(Ordering::SeqCst), 0);
     assert_eq!(
         supervisor_mutation_admission_gate_id(&error),
-        Some(crate::mutation_taxonomy::TAXONOMY_REVIEW_REQUIRED_GATE_ID)
+        Some(crate::mutation_taxonomy::TAXONOMY_REVIEW_REQUIRED_GATE_ID),
+        "unexpected plan-file refusal: {error:#}"
     );
     assert!(!repo_path
         .join(RunArtifactFamily::Supervise.run_root())
@@ -44,11 +55,13 @@ fn plan_file_unknown_effect_is_refused_before_run_reservation_or_dispatch() {
 fn production_catalog_unknown_effect_is_refused_before_catalog_or_run_artifact() {
     let (temp, repo_path) = injected_repository();
     let plan = injected_plan(injected_assignment(false), 0);
-    let options = injected_options(
+    initialize_mutation_admission_auth(&repo_path);
+    let mut options = injected_options(
         &repo_path,
         temp.path(),
         "catalog-unknown-mutation-admission",
     );
+    options.machine_global_retention = None;
     fs::write(
         &options.plan_file,
         serde_json::to_vec(&plan).expect("serialize catalog-admission plan"),
@@ -77,11 +90,13 @@ fn production_catalog_unknown_effect_is_refused_before_catalog_or_run_artifact()
 #[test]
 fn literal_goal_missing_irreversible_gate_is_refused_before_run_reservation_or_dispatch() {
     let (temp, repo_path) = injected_repository();
-    let options = injected_options(
+    let mut options = injected_options(
         &repo_path,
         temp.path(),
         "literal-goal-missing-mutation-gate",
     );
+    options.machine_global_retention = None;
+    initialize_mutation_admission_auth(&repo_path);
     let run_id = options.run_id.clone();
     let dispatches = AtomicUsize::new(0);
     let _manifest_mutation = set_effective_supervisor_manifest_test_mutations([
@@ -153,7 +168,8 @@ fn evidence_only_reaudit_unknown_effect_is_refused_at_common_scheduler_admission
     ]);
     let runner = |_command: &ExternalAgentCommand,
                   _cancellation: &ProcessCancellation,
-                  _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
+                  _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>,
+                  _authorization: SupervisorProcessLaunchAuthorization| {
         panic!("re-audit mutation admission must precede external dispatch")
     };
 
@@ -302,8 +318,8 @@ fn every_effective_manifest_operation_is_registered_and_modes_are_conditional() 
     assert!(bound_ids.contains(MutationOperation::SemanticIntentAcquire.id()));
     assert!(bound_ids.contains(MutationOperation::SupervisorProcessSpawn.id()));
     assert!(bound_ids.contains(MutationOperation::MachineGlobalQuarantine.id()));
-    assert!(!bound_ids.contains(MutationOperation::SupervisorProcessOutputCleanup.id()));
-    assert!(!unbound_ids.contains(MutationOperation::MachineGlobalQuarantine.id()));
+    assert!(bound_ids.contains(MutationOperation::SupervisorProcessOutputCleanup.id()));
+    assert!(unbound_ids.contains(MutationOperation::MachineGlobalQuarantine.id()));
     assert!(unbound_ids.contains(MutationOperation::SupervisorProcessOutputCleanup.id()));
     assert!(!fake_ids.contains(MutationOperation::SupervisorProcessSpawn.id()));
     assert!(!fake_ids.contains(MutationOperation::SandboxWorktreeEdit.id()));
@@ -2020,7 +2036,7 @@ fn supervise_scratch_rebind_is_refused_without_deleting_replacement() {
 }
 
 #[test]
-fn supervise_status_distinguishes_absent_active_finalized_and_corrupt_runs() {
+fn supervise_status_is_lock_free_for_fresh_v2_and_distinguishes_finalized_and_corrupt_runs() {
     let (_temp, repo_path) = injected_repository();
     let absent_id = RunId::new("artifact-status-absent").expect("valid absent id");
     let absent = supervisor_status(&repo_path, absent_id).expect("status absent run");
@@ -2056,9 +2072,50 @@ fn supervise_status_distinguishes_absent_active_finalized_and_corrupt_runs() {
         ),
     )
     .expect("create active authenticated checkpoint");
+    let checkpoint_dir = repo_path
+        .join(".git/maco/state")
+        .join(crate::state_journal::JOURNAL_ROOT_NAME)
+        .join(run_id.as_str());
+    let head_before = fs::read(checkpoint_dir.join(".head.json")).expect("fresh v2 head before");
+    let entries_before = fs::read_dir(&checkpoint_dir)
+        .expect("fresh v2 entries before")
+        .map(|entry| entry.expect("fresh v2 entry").file_name())
+        .collect::<BTreeSet<_>>();
     let active = supervisor_status(&repo_path, run_id.clone()).expect("status active run");
     assert!(!active.final_report_exists);
-    assert_eq!(active.lifecycle, SupervisorRunLifecycle::Active);
+    assert_eq!(active.lifecycle, SupervisorRunLifecycle::Interrupted);
+    assert!(matches!(
+        active.resume_gate_denial,
+        Some(GateDenial {
+            reason: GateDenialReason::ResumeCheckpoint {
+                denial: ResumeCheckpointDenial::UnsupportedLifecycle,
+            },
+            ..
+        })
+    ));
+    assert_eq!(
+        fs::read(checkpoint_dir.join(".head.json")).expect("fresh v2 head after"),
+        head_before
+    );
+    assert_eq!(
+        fs::read_dir(&checkpoint_dir)
+            .expect("fresh v2 entries after")
+            .map(|entry| entry.expect("fresh v2 entry after").file_name())
+            .collect::<BTreeSet<_>>(),
+        entries_before,
+        "status must not create, remove, or acquire a journal lock"
+    );
+    let fresh_resume =
+        resume_supervisor_run(&repo_path, run_id.clone()).expect("fresh v2 resume refusal");
+    assert!(matches!(
+        fresh_resume.gate_denial,
+        Some(GateDenial {
+            reason: GateDenialReason::ResumeCheckpoint {
+                denial: ResumeCheckpointDenial::UnsupportedLifecycle,
+            },
+            ..
+        })
+    ));
     drop(checkpoint);
 
     let final_report = artifact_test_final_report(&run_id);
@@ -2137,6 +2194,80 @@ fn status_and_resume_do_not_repair_an_incomplete_checkpoint_head() {
         !head.exists(),
         "resume preflight must not repair before admission"
     );
+}
+
+#[test]
+fn status_and_resume_report_precise_unsupported_v1_without_recovery() {
+    let (_temp, repo) = injected_repository();
+    let run_id = RunId::new("unsupported-v1-checkpoint").expect("valid v1 run id");
+    let writer = ArtifactRunWriter::reserve(
+        &repo,
+        RunArtifactFamily::Supervise,
+        run_id.clone(),
+        "unsupported-v1-test",
+    )
+    .expect("reserve v1 artifact run");
+    let plan = injected_plan(injected_assignment(false), 0);
+    let ledger = RunBudgetLedger::new(RunBudgetLimits::default()).expect("v1 budget ledger");
+    let checkpoint = SupervisorCheckpointWriter::create_unsupported_v1_for_test(
+        &repo,
+        SupervisorCheckpointPreparation::new(
+            &run_id,
+            &current_head_oid(&repo).expect("v1 primary base"),
+            normalized_supervisor_plan_sha256(
+                &plan,
+                &SupervisorConsultantPlan::default(),
+                &AssignmentMetadata::new(),
+                &SupervisorPlanMetadata::default(),
+            )
+            .expect("v1 normalized plan"),
+            1,
+            &plan,
+            writer.resume_binding().expect("v1 artifact binding"),
+            ledger.report().expect("v1 initial budget"),
+        ),
+    )
+    .expect("create authenticated unsupported v1 checkpoint");
+    let checkpoint_dir = repo
+        .join(".git/maco/state")
+        .join(crate::state_journal::JOURNAL_ROOT_NAME)
+        .join(run_id.as_str());
+    let head_before = fs::read(checkpoint_dir.join(".head.json")).expect("v1 head before");
+
+    let status = supervisor_status(&repo, run_id.clone()).expect("typed v1 status refusal");
+    assert!(matches!(
+        status.resume_gate_denial,
+        Some(GateDenial {
+            reason: GateDenialReason::ResumeCheckpoint {
+                denial: ResumeCheckpointDenial::UnsupportedCheckpointVersion {
+                    observed: 1,
+                    supported: 2,
+                },
+            },
+            ..
+        })
+    ));
+    let resume = resume_supervisor_run(&repo, run_id).expect("typed v1 resume refusal");
+    assert!(matches!(
+        resume.gate_denial,
+        Some(GateDenial {
+            reason: GateDenialReason::ResumeCheckpoint {
+                denial: ResumeCheckpointDenial::UnsupportedCheckpointVersion {
+                    observed: 1,
+                    supported: 2,
+                },
+            },
+            ..
+        })
+    ));
+    assert!(!resume.resumed);
+    assert_eq!(
+        fs::read(checkpoint_dir.join(".head.json")).expect("v1 head after"),
+        head_before,
+        "unsupported v1 inspection must not recover or rewrite the checkpoint"
+    );
+    drop(checkpoint);
+    drop(writer);
 }
 
 #[test]

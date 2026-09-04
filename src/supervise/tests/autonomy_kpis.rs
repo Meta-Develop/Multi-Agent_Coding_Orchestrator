@@ -304,6 +304,7 @@ fn human_intervention_cancellation_producer_path_suppresses_partial_run_rates() 
         "producer-human-cancellation",
         ApprovalReviewDenial::HumanReviewRequired,
     );
+    let mutation_session = SupervisorRunMutationSession::local_for_test(run_id.as_str());
 
     {
         let artifacts = Mutex::new(SharedSupervisorArtifacts {
@@ -311,6 +312,7 @@ fn human_intervention_cancellation_producer_path_suppresses_partial_run_rates() 
             journal: &mut journal,
             autonomy_kpis: &mut collector,
             checkpoint: None,
+            mutation_session: &mutation_session,
         });
         let mut review_sink = SupervisorPreActionJournalSink {
             artifacts: &artifacts,
@@ -471,6 +473,7 @@ fn producer_path_join_report(
         "producer-unreviewed-correlation",
         ApprovalReviewDenial::ClassifierDenied,
     );
+    let mutation_session = SupervisorRunMutationSession::local_for_test(run_id.as_str());
 
     {
         let artifacts = Mutex::new(SharedSupervisorArtifacts {
@@ -478,6 +481,7 @@ fn producer_path_join_report(
             journal: &mut journal,
             autonomy_kpis: &mut collector,
             checkpoint: None,
+            mutation_session: &mutation_session,
         });
         let mut review_sink = SupervisorPreActionJournalSink {
             artifacts: &artifacts,
@@ -606,6 +610,7 @@ fn terminal_and_peer_routing_events_do_not_count_as_reviewed_human_actions() {
     terminal.request = None;
     terminal.allowed = None;
     collector.observe_pre_action_event(&terminal);
+    let mutation_session = SupervisorRunMutationSession::local_for_test(run_id.as_str());
 
     {
         let artifacts = Mutex::new(SharedSupervisorArtifacts {
@@ -613,6 +618,7 @@ fn terminal_and_peer_routing_events_do_not_count_as_reviewed_human_actions() {
             journal: &mut journal,
             autonomy_kpis: &mut collector,
             checkpoint: None,
+            mutation_session: &mutation_session,
         });
         record_shared_orchestration_event(
             &artifacts,

@@ -1913,6 +1913,48 @@ pub fn run_external_agent_cancellable(
     run_external_agent_runtime(spec, ExternalExecutionRuntime::Verified, cancellation, None)
 }
 
+pub(crate) fn run_external_agent_cancellable_reviewed_authorized(
+    spec: &ExternalAgentCommand,
+    cancellation: &ProcessCancellation,
+    review_runtime: Option<ExternalPreActionReviewRuntime<'_>>,
+    authorization: crate::mutation_taxonomy::SupervisorProcessLaunchAuthorization,
+) -> ExternalAgentRun {
+    let exact_binding = exact_external_process_launch_binding(spec);
+    let admission = exact_binding.and_then(|(program_identity, delivery_identity)| {
+        let adapter = spec
+            .invocation
+            .adapter_id()
+            .context("external Supervisor command has no runtime adapter identity")?;
+        let execution_mode = format!("Verified:{:?}", spec.workspace_access);
+        authorization
+            .consume_for_external_binding(
+                adapter.as_str(),
+                spec.model.as_deref(),
+                spec.reasoning_effort.as_deref(),
+                &program_identity,
+                &execution_mode,
+                &delivery_identity,
+            )
+            .map_err(anyhow::Error::from)
+    });
+    if let Err(error) = admission {
+        return failed_external_run(
+            spec,
+            Instant::now(),
+            command_display(&spec.program, &[]),
+            false,
+            format!("exact Supervisor process authorization was refused: {error}"),
+        );
+    }
+    forward_local_external_agent_run(
+        &run_external_agent_cancellable_reviewed_local,
+        spec,
+        cancellation,
+        review_runtime,
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn run_external_agent_cancellable_reviewed(
     spec: &ExternalAgentCommand,
     cancellation: &ProcessCancellation,

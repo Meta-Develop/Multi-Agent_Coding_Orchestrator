@@ -40,6 +40,76 @@ fn nested_worker_launch_runtime(
         .unwrap_or(enclosing_child_runtime)
 }
 
+fn require_run_operation(
+    context: &AssignmentExecutionContext<'_, '_>,
+    operation: MutationOperation,
+) -> Result<()> {
+    context
+        .mutation_session
+        .permit(operation)?
+        .verify(operation)
+        .map_err(anyhow::Error::from)
+}
+
+fn create_supervisor_worktree_authorized(
+    manager: &WorktreeManager,
+    create_options: WorktreeCreateOptions,
+    worktree_creation: SupervisorWorktreeCreation<'_>,
+    permit: &SupervisorOperationPermit<'_>,
+) -> Result<WorktreeRecord> {
+    permit
+        .verify(MutationOperation::WorktreeCreate)
+        .map_err(anyhow::Error::from)?;
+    match worktree_creation {
+        SupervisorWorktreeCreation::Bound(cleanliness) => manager
+            .create_with_repository_cleanliness(create_options, cleanliness)
+            .context("failed to create capability-bound child worktree"),
+        SupervisorWorktreeCreation::ExistingOnly => {
+            bail!("existing-only supervisor operation cannot create a child worktree")
+        }
+        SupervisorWorktreeCreation::PrimaryWorktree(_) => {
+            bail!("primary-worktree execution does not create a managed child worktree")
+        }
+        SupervisorWorktreeCreation::NonpublishableSimulation => {
+            manager.create_for_nonpublishable_simulation(create_options)
+        }
+        #[cfg(test)]
+        SupervisorWorktreeCreation::TestOnly | SupervisorWorktreeCreation::VerifiedTestOnly => {
+            manager.create_for_test(create_options)
+        }
+    }
+}
+
+fn claim_assignment_paths_authorized(
+    store: &SyncStore,
+    run_id: &RunId,
+    assignment: &OrchestratorAssignment,
+    claim_permit: &SupervisorOperationPermit<'_>,
+    telemetry_permit: &SupervisorOperationPermit<'_>,
+) -> Result<PathClaim> {
+    claim_permit
+        .verify(MutationOperation::ClaimAcquire)
+        .map_err(anyhow::Error::from)?;
+    telemetry_permit
+        .verify(MutationOperation::SupervisorClaimAcquisitionTelemetry)
+        .map_err(anyhow::Error::from)?;
+    store.claim_paths_for_run(run_id, &assignment.id, assignment.assigned_paths.iter())
+}
+
+fn record_dispatch_checkpoint_authorized(
+    context: &AssignmentExecutionContext<'_, '_>,
+    auditor: bool,
+    completed: bool,
+    subject: &str,
+    attempt: usize,
+) -> Result<()> {
+    require_run_operation(
+        context,
+        MutationOperation::SupervisorCheckpointJournalLifecycle,
+    )?;
+    record_dispatch_checkpoint(context.artifacts, auditor, completed, subject, attempt)
+}
+
 fn runtime_model_catalog_for_launch(
     catalog: &RuntimeModelCatalog,
     run_runtime: SupervisorRuntime,
@@ -763,6 +833,12 @@ fn prepare_assignment_execution<'a>(
         artifacts,
         ..
     } = context;
+    let claim_permit = context
+        .mutation_session
+        .permit(MutationOperation::ClaimAcquire)?;
+    let claim_telemetry_permit = context
+        .mutation_session
+        .permit(MutationOperation::SupervisorClaimAcquisitionTelemetry)?;
     outcome
         .findings
         .extend(prepared_semantic_findings.iter().cloned());
@@ -785,10 +861,12 @@ fn prepare_assignment_execution<'a>(
     };
     let mut effective_assignment = (*assignment).clone();
     let claim = loop {
-        match sync_store.claim_paths_for_run(
+        match claim_assignment_paths_authorized(
+            sync_store,
             &options.run_id,
-            &effective_assignment.id,
-            effective_assignment.assigned_paths.iter(),
+            &effective_assignment,
+            &claim_permit,
+            &claim_telemetry_permit,
         ) {
             Ok(claim) => {
                 if matches!(
@@ -843,7 +921,7 @@ fn prepare_assignment_execution<'a>(
                 .context("failed to construct pre-launch claim-conflict denial")?;
                 if matches!(
                     worktree_creation,
-                    SupervisorWorktreeCreation::PrimaryWorktree
+                    SupervisorWorktreeCreation::PrimaryWorktree(_)
                 ) {
                     outcome
                         .gate_tracker
@@ -913,7 +991,7 @@ fn prepare_assignment_execution<'a>(
     let current_primary_head = current_head_oid(repo)?;
     let primary_scope_baseline = if matches!(
         worktree_creation,
-        SupervisorWorktreeCreation::PrimaryWorktree
+        SupervisorWorktreeCreation::PrimaryWorktree(_)
     ) {
         match capture_primary_scope_snapshot(repo, &claim.paths, true, context.execution_runtime) {
             Ok(snapshot) => Some(snapshot),
@@ -933,9 +1011,12 @@ fn prepare_assignment_execution<'a>(
     if !reused
         && !matches!(
             worktree_creation,
-            SupervisorWorktreeCreation::PrimaryWorktree
+            SupervisorWorktreeCreation::PrimaryWorktree(_)
         )
     {
+        let worktree_create_permit = context
+            .mutation_session
+            .permit(MutationOperation::WorktreeCreate)?;
         if evidence_only_reaudit.is_some() {
             record_isolated_assignment_failure(
                 outcome,
@@ -951,29 +1032,18 @@ fn prepare_assignment_execution<'a>(
             base: None,
             worktree_root: None,
         };
-        let create_result = match worktree_creation {
-            SupervisorWorktreeCreation::Bound(cleanliness) => manager
-                .create_with_repository_cleanliness(create_options, cleanliness)
-                .with_context(|| {
-                    format!(
-                        "failed to create capability-bound child worktree '{}'",
-                        effective_assignment.id
-                    )
-                }),
-            SupervisorWorktreeCreation::ExistingOnly => {
-                bail!("existing-only supervisor operation cannot create a child worktree")
-            }
-            SupervisorWorktreeCreation::PrimaryWorktree => {
-                bail!("primary-worktree execution does not create a managed child worktree")
-            }
-            SupervisorWorktreeCreation::NonpublishableSimulation => {
-                manager.create_for_nonpublishable_simulation(create_options)
-            }
-            #[cfg(test)]
-            SupervisorWorktreeCreation::TestOnly | SupervisorWorktreeCreation::VerifiedTestOnly => {
-                manager.create_for_test(create_options)
-            }
-        };
+        let create_result = create_supervisor_worktree_authorized(
+            manager,
+            create_options,
+            *worktree_creation,
+            &worktree_create_permit,
+        )
+        .with_context(|| {
+            format!(
+                "failed to create capability-bound child worktree '{}'",
+                effective_assignment.id
+            )
+        });
         if let Err(error) = create_result {
             record_isolated_assignment_failure(
                 outcome,
@@ -986,7 +1056,7 @@ fn prepare_assignment_execution<'a>(
     }
     let worktree_write_lease = if matches!(
         worktree_creation,
-        SupervisorWorktreeCreation::PrimaryWorktree
+        SupervisorWorktreeCreation::PrimaryWorktree(_)
     ) {
         None
     } else {
@@ -1076,11 +1146,15 @@ fn prepare_assignment_execution<'a>(
             return Ok(AssignmentExecutionDisposition::Complete);
         }
     }
-    let mandatory_worktree_controls = match if primary_scope_baseline.is_some() {
+    let mandatory_worktree_controls_result = if primary_scope_baseline.is_some() {
         bind_primary_worktree_controls(&worktree.path)
     } else {
-        provision_mandatory_worktree_controls(&worktree.path)
-    } {
+        let worktree_control_permit = context
+            .mutation_session
+            .permit(MutationOperation::SupervisorMandatoryControlProvision)?;
+        provision_mandatory_worktree_controls_authorized(&worktree.path, &worktree_control_permit)
+    };
+    let mandatory_worktree_controls = match mandatory_worktree_controls_result {
         Ok(controls) => controls,
         Err(error) => {
             record_isolated_assignment_failure(
@@ -1120,6 +1194,9 @@ fn prepare_assignment_execution<'a>(
             return Ok(AssignmentExecutionDisposition::Complete);
         }
     };
+    let semantic_acquire_permit = context
+        .mutation_session
+        .permit(MutationOperation::SemanticIntentAcquire)?;
     let semantic_token = if plan.semantic_coordination == SemanticCoordinationMode::Warn {
         if let Some(planned_intents) = serial_semantic_warn_intents {
             let coordination_result = {
@@ -1137,6 +1214,7 @@ fn prepare_assignment_execution<'a>(
                     semantic_store,
                     &effective_assignment,
                     plan.semantic_coordination,
+                    &semantic_acquire_permit,
                     &mut outcome.semantic_tokens,
                     &mut relevant_intents,
                     &mut outcome.findings,
@@ -1175,6 +1253,7 @@ fn prepare_assignment_execution<'a>(
             semantic_store,
             &effective_assignment,
             plan.semantic_coordination,
+            &semantic_acquire_permit,
             &mut outcome.semantic_tokens,
             &mut planned_semantic_intents,
             &mut outcome.findings,
@@ -1240,6 +1319,72 @@ struct PreparedChildAttempt<'a> {
     launch_runtime: SupervisorRuntime,
     budget_reservation: DispatchBudgetReservation<'a>,
     pre_action_review_context: Option<ReviewContext>,
+    process_launch: Option<AuthorizedAttemptProcessLaunch>,
+}
+
+struct AuthorizedAttemptProcessLaunch {
+    evidence: SupervisorProcessLaunchAuditEvidence,
+    authorization: SupervisorProcessLaunchAuthorization,
+}
+
+fn admit_attempt_process_launch(
+    context: &AssignmentExecutionContext<'_, '_>,
+    subject_id: &str,
+    attempt: usize,
+    runtime: SupervisorRuntime,
+    command: &ExternalAgentCommand,
+    kind: SupervisorProcessLaunchKind,
+) -> Result<Option<AuthorizedAttemptProcessLaunch>> {
+    if runtime == SupervisorRuntime::Fake {
+        return Ok(None);
+    }
+    let (program_identity, delivery_identity) = exact_external_process_launch_binding(command)?;
+    let identity = ExactSupervisorProcessLaunchIdentity {
+        run_id: context.options.run_id.as_str().to_string(),
+        subject_id: subject_id.to_string(),
+        attempt,
+        adapter: crate::runtime_adapter::AdapterId::from_runtime(runtime)
+            .as_str()
+            .to_string(),
+        model: command.model.clone(),
+        reasoning_effort: command.reasoning_effort.clone(),
+        program_identity,
+        execution_mode: format!(
+            "{:?}:{:?}",
+            context.execution_runtime, command.workspace_access
+        ),
+        delivery_identity,
+        kind,
+    };
+    let (evidence, authorization) = context
+        .mutation_session
+        .authorize_process_launch(identity.clone())?;
+    require_run_operation(context, MutationOperation::SupervisorRunArtifactWriteAppend)?;
+    let evidence_relative = PathBuf::from("process-launch-admissions")
+        .join(format!("{subject_id}.attempt-{attempt}.json"));
+    with_supervisor_artifacts(context.artifacts, |writer, _| {
+        write_artifact_json(
+            writer,
+            &evidence_relative,
+            &evidence,
+            MAX_SUPERVISOR_REPORT_BYTES,
+            ArtifactFileDisposition::PrivateEvidence,
+        )
+    })?;
+    Ok(Some(AuthorizedAttemptProcessLaunch {
+        evidence,
+        authorization,
+    }))
+}
+
+fn invoke_authorized_external_runner(
+    launch: Option<AuthorizedAttemptProcessLaunch>,
+    invoke: impl FnOnce(SupervisorProcessLaunchAuthorization) -> ExternalAgentRun,
+) -> Result<ExternalAgentRun> {
+    let launch =
+        launch.context("exact process-launch permit is missing at the real launch sink")?;
+    let _ = launch.evidence;
+    Ok(invoke(launch.authorization))
 }
 
 pub(super) fn bind_worker_journal_artifacts(
@@ -1710,6 +1855,14 @@ fn prepare_child_attempt<'a>(
             })?;
         }
     }
+    let process_launch = admit_attempt_process_launch(
+        context,
+        &assignment.id,
+        attempt,
+        launch_runtime,
+        &command,
+        SupervisorProcessLaunchKind::Assignment,
+    )?;
     if let Some(signal) = &context.admission_commit {
         signal.notify();
     }
@@ -1728,6 +1881,7 @@ fn prepare_child_attempt<'a>(
             launch_runtime,
             budget_reservation,
             pre_action_review_context,
+            process_launch,
         },
     ))
 }
@@ -1883,6 +2037,7 @@ fn dispatch_and_collect_child_attempt<'a>(
     let launch_runtime = prepared.launch_runtime;
     let mut budget_reservation = prepared.budget_reservation;
     let pre_action_review_context = prepared.pre_action_review_context;
+    let mut process_launch = prepared.process_launch;
     let assignment_journal_role = direct_assignment_orchestration_role(assignment.role)?;
 
     record_shared_orchestration_event(
@@ -1952,27 +2107,30 @@ fn dispatch_and_collect_child_attempt<'a>(
                 })?;
                 return Err(error);
             }
-            record_dispatch_checkpoint(artifacts, false, false, &assignment.id, attempt)?;
+            record_dispatch_checkpoint_authorized(context, false, false, &assignment.id, attempt)?;
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if let Some(review_context) = review_context.as_ref() {
-                    let mut review_journal = SupervisorPreActionJournalSink {
-                        artifacts,
-                        node: &assignment.id,
-                        parent: Some(journal_parent_id),
-                    };
-                    external_runner(
-                        &command,
-                        cancellation,
-                        Some(ExternalPreActionReviewRuntime {
-                            context: review_context,
-                            journal: &mut review_journal,
-                        }),
-                    )
-                } else {
-                    external_runner(&command, cancellation, None)
-                }
+                invoke_authorized_external_runner(process_launch.take(), |authorization| {
+                    if let Some(review_context) = review_context.as_ref() {
+                        let mut review_journal = SupervisorPreActionJournalSink {
+                            artifacts,
+                            node: &assignment.id,
+                            parent: Some(journal_parent_id),
+                        };
+                        external_runner(
+                            &command,
+                            cancellation,
+                            Some(ExternalPreActionReviewRuntime {
+                                context: review_context,
+                                journal: &mut review_journal,
+                            }),
+                            authorization,
+                        )
+                    } else {
+                        external_runner(&command, cancellation, None, authorization)
+                    }
+                })
             })) {
-                Ok(run) => Ok(run),
+                Ok(run) => run,
                 Err(payload) => {
                     drop(incoming_output_root);
                     drop(capture_output_root);
@@ -1995,8 +2153,10 @@ fn dispatch_and_collect_child_attempt<'a>(
                 })?;
                 return Err(error);
             }
-            record_dispatch_checkpoint(artifacts, false, false, &assignment.id, attempt)?;
-            Ok(external_runner(&command, cancellation, None))
+            record_dispatch_checkpoint_authorized(context, false, false, &assignment.id, attempt)?;
+            invoke_authorized_external_runner(process_launch.take(), |authorization| {
+                external_runner(&command, cancellation, None, authorization)
+            })
         }
         SupervisorRuntime::Fake => {
             if let Err(error) = budget_reservation.mark_invoked_for_runtime(launch_runtime) {
@@ -2007,7 +2167,10 @@ fn dispatch_and_collect_child_attempt<'a>(
                 })?;
                 return Err(error);
             }
-            record_dispatch_checkpoint(artifacts, false, false, &assignment.id, attempt)?;
+            record_dispatch_checkpoint_authorized(context, false, false, &assignment.id, attempt)?;
+            if process_launch.is_some() {
+                bail!("fake assignment unexpectedly received a process-launch permit");
+            }
             deterministic_fake_child_run(
                 &command,
                 assignment,
@@ -2017,7 +2180,7 @@ fn dispatch_and_collect_child_attempt<'a>(
             )
         }
     };
-    record_dispatch_checkpoint(artifacts, false, true, &assignment.id, attempt)?;
+    record_dispatch_checkpoint_authorized(context, false, true, &assignment.id, attempt)?;
     let external_run = match external_run_result {
         Ok(run) => run,
         Err(error) => {
@@ -2214,19 +2377,27 @@ fn dispatch_and_collect_child_attempt<'a>(
                 write_lease,
                 "the pre-materialization managed child candidate",
             )?;
-            crate::external_agent::materialize_managed_child_git_commit(
+            let commit_permit = context
+                .mutation_session
+                .permit(MutationOperation::SandboxWorktreeCommit)?;
+            materialize_managed_child_git_commit_authorized(
                 repo,
                 &worktree.path,
                 preflight.child_base_head,
                 &assignment.assigned_paths,
                 &candidate_paths,
                 candidate_tree,
+                ManagedChildCommitAuthorization::new(write_lease, &commit_permit)?,
             )?;
-            let imported = collect_and_import_managed_child_git_commit(
+            let import_permit = context
+                .mutation_session
+                .permit(MutationOperation::SupervisorPrimaryObjectDatabaseImport)?;
+            let imported = collect_and_import_managed_child_git_commit_authorized(
                 repo,
                 &worktree.path,
                 preflight.child_base_head,
                 &assignment.assigned_paths,
+                ManagedChildImportAuthorization::new(write_lease, &import_permit)?,
             )?;
             verify_imported_managed_child_candidate(repo, assignment, write_lease, &imported)?;
             Ok::<_, anyhow::Error>(imported)
@@ -2753,6 +2924,7 @@ struct PreparedParentAuditor<'a> {
     auditor_budget_reservation: DispatchBudgetReservation<'a>,
     launch_runtime: SupervisorRuntime,
     scope_workspace: tempfile::TempDir,
+    process_launch: Option<AuthorizedAttemptProcessLaunch>,
 }
 
 struct ParentAuditorLensExecution<'a> {
@@ -3153,6 +3325,14 @@ fn prepare_parent_auditor<'a>(
             return Ok(ParentAuditorPreparation::GateComplete { verdict });
         }
     };
+    let process_launch = admit_attempt_process_launch(
+        context,
+        &auditor_id,
+        *auditor_attempt,
+        launch_runtime,
+        &auditor_command,
+        SupervisorProcessLaunchKind::ParentAuditor,
+    )?;
     Ok(ParentAuditorPreparation::Ready(PreparedParentAuditor {
         lens: lens.clone(),
         expected_request: expected_request.clone(),
@@ -3167,6 +3347,7 @@ fn prepare_parent_auditor<'a>(
         auditor_budget_reservation,
         launch_runtime,
         scope_workspace,
+        process_launch,
     }))
 }
 
@@ -3211,6 +3392,7 @@ fn dispatch_and_collect_parent_auditor(
         mut auditor_budget_reservation,
         launch_runtime,
         scope_workspace: _scope_workspace,
+        mut process_launch,
     } = prepared;
     record_shared_orchestration_event(
         artifacts,
@@ -3254,11 +3436,19 @@ fn dispatch_and_collect_parent_auditor(
                 })?;
                 return Err(error);
             }
-            record_dispatch_checkpoint(artifacts, true, false, &auditor_id, auditor_attempt)?;
+            record_dispatch_checkpoint_authorized(
+                context,
+                true,
+                false,
+                &auditor_id,
+                auditor_attempt,
+            )?;
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                external_runner(&auditor_command, cancellation, None)
+                invoke_authorized_external_runner(process_launch.take(), |authorization| {
+                    external_runner(&auditor_command, cancellation, None, authorization)
+                })
             })) {
-                Ok(run) => Ok(run),
+                Ok(run) => run,
                 Err(payload) => {
                     drop(auditor_incoming_root);
                     drop(auditor_capture_root);
@@ -3290,8 +3480,16 @@ fn dispatch_and_collect_parent_auditor(
                 })?;
                 return Err(error);
             }
-            record_dispatch_checkpoint(artifacts, true, false, &auditor_id, auditor_attempt)?;
-            Ok(external_runner(&auditor_command, cancellation, None))
+            record_dispatch_checkpoint_authorized(
+                context,
+                true,
+                false,
+                &auditor_id,
+                auditor_attempt,
+            )?;
+            invoke_authorized_external_runner(process_launch.take(), |authorization| {
+                external_runner(&auditor_command, cancellation, None, authorization)
+            })
         }
         SupervisorRuntime::Fake => {
             if let Err(error) = auditor_budget_reservation.mark_invoked_for_runtime(launch_runtime)
@@ -3307,11 +3505,20 @@ fn dispatch_and_collect_parent_auditor(
                 })?;
                 return Err(error);
             }
-            record_dispatch_checkpoint(artifacts, true, false, &auditor_id, auditor_attempt)?;
+            record_dispatch_checkpoint_authorized(
+                context,
+                true,
+                false,
+                &auditor_id,
+                auditor_attempt,
+            )?;
+            if process_launch.is_some() {
+                bail!("fake parent auditor unexpectedly received a process-launch permit");
+            }
             deterministic_fake_auditor_run(&auditor_command, &auditor_id, assignment, child_report)
         }
     };
-    record_dispatch_checkpoint(artifacts, true, true, &auditor_id, auditor_attempt)?;
+    record_dispatch_checkpoint_authorized(context, true, true, &auditor_id, auditor_attempt)?;
     let auditor_run = match auditor_run_result {
         Ok(run) => run,
         Err(error) => {
@@ -4382,6 +4589,54 @@ mod decomposition_tests {
 
     static GROK_BINARY_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
+    #[test]
+    fn real_assignment_runner_sink_refuses_an_invalid_exact_process_permit() {
+        let identity = ExactSupervisorProcessLaunchIdentity {
+            run_id: "permit-run".to_string(),
+            subject_id: "permit-child".to_string(),
+            attempt: 1,
+            adapter: "codex".to_string(),
+            model: Some("model-a".to_string()),
+            reasoning_effort: Some("high".to_string()),
+            program_identity: "program-a".to_string(),
+            execution_mode: "verified".to_string(),
+            delivery_identity: "delivery-a".to_string(),
+            kind: SupervisorProcessLaunchKind::Assignment,
+        };
+        let evidence = SupervisorProcessLaunchAuditEvidence::invalid_for_test(identity.clone());
+        let authorization = SupervisorProcessLaunchAuthorization::invalid_for_test(identity);
+        let temp = tempfile::tempdir().expect("create invalid launch sink fixture");
+        let command = ExternalAgentCommand::codex(
+            "must-not-launch-invalid-supervisor-permit",
+            temp.path(),
+            temp.path().join("prompt.md"),
+            temp.path().join("events.jsonl"),
+            temp.path().join("report.json"),
+            Duration::from_secs(1),
+        );
+
+        let run = invoke_authorized_external_runner(
+            Some(AuthorizedAttemptProcessLaunch {
+                evidence,
+                authorization,
+            }),
+            |authorization| {
+                run_external_agent_cancellable_reviewed_authorized(
+                    &command,
+                    &ProcessCancellation::new(),
+                    None,
+                    authorization,
+                )
+            },
+        )
+        .expect("invalid authorization must return a refused real-sink report");
+
+        assert!(run.error.as_deref().is_some_and(
+            |error| error.contains("exact Supervisor process authorization was refused")
+        ));
+        assert!(run.process_tree.is_none());
+    }
+
     struct GrokBinaryEnvironmentGuard {
         previous: Option<OsString>,
     }
@@ -4432,6 +4687,7 @@ mod decomposition_tests {
         _command: &ExternalAgentCommand,
         _cancellation: &ProcessCancellation,
         _review: Option<ExternalPreActionReviewRuntime<'_>>,
+        _authorization: SupervisorProcessLaunchAuthorization,
     ) -> ExternalAgentRun {
         panic!("fake-runtime phase fixture must not invoke the external runner")
     }
@@ -4670,6 +4926,8 @@ mod decomposition_tests {
         // model would be refused.
         let runtime_model_catalog = RuntimeModelCatalog::LocalDeterministicFake;
         let cancellation = ProcessCancellation::new();
+        let mutation_session =
+            SupervisorRunMutationSession::local_for_test(options.run_id.as_str());
         let mut journal = initialize_orchestration_event_journal(
             &repo,
             &options.run_id,
@@ -4681,6 +4939,7 @@ mod decomposition_tests {
             journal: &mut journal,
             autonomy_kpis: &mut autonomy_kpis,
             checkpoint: None,
+            mutation_session: &mutation_session,
         });
         let runner = unused_external_runner;
         let context = AssignmentExecutionContext {
@@ -4720,6 +4979,7 @@ mod decomposition_tests {
             runtime_model_catalog: &runtime_model_catalog,
             cancellation,
             external_runner: &runner,
+            mutation_session: &mutation_session,
         };
         let mut outcome = AssignmentExecutionOutcome {
             gate_tracker: Some(GateCorrectionTracker::new(plan.max_gate_corrections)),
@@ -5099,6 +5359,8 @@ mod decomposition_tests {
                 .expect("fixture runtime model catalog"),
         );
         let cancellation = ProcessCancellation::new();
+        let mutation_session =
+            SupervisorRunMutationSession::external_for_test(options.run_id.as_str());
         let mut journal = initialize_orchestration_event_journal(
             &repo,
             &options.run_id,
@@ -5110,10 +5372,12 @@ mod decomposition_tests {
             journal: &mut journal,
             autonomy_kpis: &mut autonomy_kpis,
             checkpoint: None,
+            mutation_session: &mutation_session,
         });
         let runner = |command: &ExternalAgentCommand,
                       _cancellation: &ProcessCancellation,
-                      _review: Option<ExternalPreActionReviewRuntime<'_>>| {
+                      _review: Option<ExternalPreActionReviewRuntime<'_>>,
+                      _authorization: SupervisorProcessLaunchAuthorization| {
             let mut report_command = command.clone();
             report_command.model = None;
             let mut run = deterministic_fake_child_run(
@@ -5196,6 +5460,7 @@ mod decomposition_tests {
             runtime_model_catalog: &runtime_model_catalog,
             cancellation,
             external_runner: &runner,
+            mutation_session: &mutation_session,
         };
         let mut outcome = AssignmentExecutionOutcome {
             gate_tracker: Some(GateCorrectionTracker::new(plan.max_gate_corrections)),

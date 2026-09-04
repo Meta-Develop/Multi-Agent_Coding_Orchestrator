@@ -20,11 +20,11 @@ use crate::{
         ValidationStatus,
     },
     mutation_taxonomy::{
-        authorize_effective_supervisor_mutation_manifest, AutopilotOuterMutationPermit,
+        authorize_effective_supervisor_mutation_manifest, AutopilotOuterMutationSession,
         EffectiveAutopilotOuterManifestInput, EffectiveSupervisorDispatchIdentity,
         EffectiveSupervisorExecutionRuntime, EffectiveSupervisorMutationAuditEvidence,
         EffectiveSupervisorMutationIdentityInput, EffectiveSupervisorMutationManifest,
-        EffectiveSupervisorWorktreeMode,
+        EffectiveSupervisorWorktreeMode, MutationOperation,
     },
     orchestrator::{RunId, SemanticCoordinationMode},
     planning,
@@ -477,7 +477,7 @@ struct AutopilotMutationStartRequest<'a> {
     repo: &'a Path,
     options: &'a AutopilotRunOptions,
     evidence: EffectiveSupervisorMutationAuditEvidence,
-    permit: AutopilotOuterMutationPermit,
+    session: &'a AutopilotOuterMutationSession,
 }
 
 fn begin_autopilot_mutations(
@@ -490,25 +490,37 @@ fn begin_autopilot_mutations(
         repo,
         options,
         evidence,
-        permit,
+        session,
     } = request;
-    permit.consume(evidence.canonical_manifest_sha256())?;
+    if session.canonical_manifest_sha256() != evidence.canonical_manifest_sha256() {
+        bail!("outer Autopilot mutation session is bound to different audit evidence");
+    }
     let collision = crate::run_ops::refuse_live_run_collision(
         repo,
         RunArtifactFamily::Autopilot,
         &options.run_id,
         options.allow_live_run_collision,
     )?;
-    let process_registration =
-        crate::run_ops::register_current_supervisor_process(repo, "autopilot", &options.run_id)
-            .ok()
-            .flatten();
-    let mut writer = ArtifactRunWriter::reserve(
+    let process_permit = session.permit(MutationOperation::SupervisorProcessRegister)?;
+    let process_registration = crate::supervise::register_current_supervisor_process_authorized(
+        repo,
+        "autopilot",
+        &options.run_id,
+        &process_permit,
+    )
+    .ok()
+    .flatten();
+    let artifact_permit = session.permit(MutationOperation::SupervisorRunArtifactReserve)?;
+    let mut writer = crate::supervise::reserve_supervisor_artifact_run(
         repo,
         RunArtifactFamily::Autopilot,
         options.run_id.clone(),
         "autopilot",
+        &artifact_permit,
     )?;
+    session
+        .permit(MutationOperation::SupervisorRunArtifactWriteAppend)?
+        .verify(MutationOperation::SupervisorRunArtifactWriteAppend)?;
     write_private_json(&mut writer, "effective-mutation-manifest.json", &evidence)?;
     persist_autopilot_launch_preflight(&mut writer, repo, options, &collision)?;
     crate::run_ops::append_run_heartbeat_best_effort(&mut writer, "initialized", None, "ok", None);
@@ -519,7 +531,16 @@ fn finalize_autopilot_run_artifacts(
     mut writer: ArtifactRunWriter,
     report: &AutopilotFinalReport,
     publish_requested: bool,
+    session: &AutopilotOuterMutationSession,
 ) -> Result<()> {
+    if report.status == AutopilotRunStatus::Refused {
+        session
+            .permit(MutationOperation::SupervisorRefusalEvidenceWrite)?
+            .verify(MutationOperation::SupervisorRefusalEvidenceWrite)?;
+    }
+    session
+        .permit(MutationOperation::SupervisorRunArtifactWriteAppend)?
+        .verify(MutationOperation::SupervisorRunArtifactWriteAppend)?;
     crate::run_ops::append_run_heartbeat_best_effort(
         &mut writer,
         "finalizing",
@@ -532,7 +553,14 @@ fn finalize_autopilot_run_artifacts(
         &render_autopilot_operator_summary(report),
     )?;
     write_private_json(&mut writer, "final-report.json", report)?;
-    writer.finalize("final-report.json", publish_requested)?;
+    let finalization_permit =
+        session.permit(MutationOperation::SupervisorRunArtifactAuthenticatedFinalize)?;
+    crate::supervise::finalize_supervisor_artifact_run(
+        writer,
+        Path::new("final-report.json"),
+        publish_requested,
+        &finalization_permit,
+    )?;
     Ok(())
 }
 
@@ -1599,14 +1627,14 @@ fn run_autopilot_with_profile_retention_and_dispatch(
             },
         },
     );
-    let (outer_mutation_evidence, outer_mutation_permit) =
+    let (outer_mutation_evidence, outer_mutation_session) =
         authorize_effective_supervisor_mutation_manifest(outer_manifest)?.into_autopilot_outer()?;
     let (mut artifact_writer, _process_registration) =
         begin_autopilot_mutations(AutopilotMutationStartRequest {
             repo: &repo,
             options: &options,
             evidence: outer_mutation_evidence,
-            permit: outer_mutation_permit,
+            session: &outer_mutation_session,
         })?;
     let run_dir = artifact_writer.run_dir().to_path_buf();
     if let Some(derived_supervisor_plan) = &derived_supervisor_plan {
@@ -1645,7 +1673,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
             auto_merge_requested: plan.auto_merge,
             generated_follow_up_dispatch_performed: false,
         });
-        finalize_autopilot_run_artifacts(artifact_writer, &report, false)?;
+        finalize_autopilot_run_artifacts(artifact_writer, &report, false, &outer_mutation_session)?;
         return Ok(report);
     }
 
@@ -1690,7 +1718,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
             auto_merge_requested: plan.auto_merge,
             generated_follow_up_dispatch_performed: false,
         });
-        finalize_autopilot_run_artifacts(artifact_writer, &report, false)?;
+        finalize_autopilot_run_artifacts(artifact_writer, &report, false, &outer_mutation_session)?;
         return Ok(report);
     }
 
@@ -1754,7 +1782,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
             auto_merge_requested: plan.auto_merge,
             generated_follow_up_dispatch_performed: false,
         });
-        finalize_autopilot_run_artifacts(artifact_writer, &report, false)?;
+        finalize_autopilot_run_artifacts(artifact_writer, &report, false, &outer_mutation_session)?;
         return Ok(report);
     }
     if authority_plan.refusal_reason.is_some() {
@@ -1789,7 +1817,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
             auto_merge_requested: plan.auto_merge,
             generated_follow_up_dispatch_performed: false,
         });
-        finalize_autopilot_run_artifacts(artifact_writer, &report, false)?;
+        finalize_autopilot_run_artifacts(artifact_writer, &report, false, &outer_mutation_session)?;
         return Ok(report);
     }
     let mut attempt = AutopilotAttemptSummary {
@@ -2062,7 +2090,12 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                 auto_merge_requested: plan.auto_merge,
                 generated_follow_up_dispatch_performed,
             });
-            finalize_autopilot_run_artifacts(artifact_writer, &report, false)?;
+            finalize_autopilot_run_artifacts(
+                artifact_writer,
+                &report,
+                false,
+                &outer_mutation_session,
+            )?;
             return Ok(report);
         }
     };
@@ -2153,13 +2186,21 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         auto_merge_requested: plan.auto_merge,
         generated_follow_up_dispatch_performed,
     });
-    finalize_autopilot_run_artifacts(artifact_writer, &report, false)?;
+    finalize_autopilot_run_artifacts(artifact_writer, &report, false, &outer_mutation_session)?;
     Ok(report)
 }
 
+/// Deliberately uninhabited authority for the retained legacy implementation.
+/// Keeping the implementation compiled prevents its supporting helpers from
+/// silently rotting, while safe production code cannot construct this value or
+/// reach the legacy orchestration path.
+enum DisabledLegacyAutopilotAuthority {}
+
 #[allow(dead_code)]
 fn run_autopilot_plan_file_disabled_legacy(
+    _disabled: DisabledLegacyAutopilotAuthority,
     options: AutopilotRunOptions,
+    outer_mutation_session: &AutopilotOuterMutationSession,
 ) -> Result<AutopilotFinalReport> {
     let repo = discover_repo_root(&options.repo)?;
     let mut plan = autopilot_plan_from_task_file(&repo, &options.plan_file)?;
@@ -2178,12 +2219,18 @@ fn run_autopilot_plan_file_disabled_legacy(
     } else {
         SupervisorRuntime::Fake
     };
-    let mut artifact_writer = ArtifactRunWriter::reserve(
+    let artifact_reserve_permit =
+        outer_mutation_session.permit(MutationOperation::SupervisorRunArtifactReserve)?;
+    let mut artifact_writer = crate::supervise::reserve_supervisor_artifact_run(
         &repo,
         RunArtifactFamily::Autopilot,
         options.run_id.clone(),
         "autopilot",
+        &artifact_reserve_permit,
     )?;
+    outer_mutation_session
+        .permit(MutationOperation::SupervisorRunArtifactWriteAppend)?
+        .verify(MutationOperation::SupervisorRunArtifactWriteAppend)?;
     let run_dir = artifact_writer.run_dir().to_path_buf();
     write_private_json(&mut artifact_writer, &artifacts.plan, &plan)?;
 
@@ -2227,7 +2274,7 @@ fn run_autopilot_plan_file_disabled_legacy(
             auto_merge_requested: plan.auto_merge,
             generated_follow_up_dispatch_performed: false,
         });
-        finalize_autopilot_run_artifacts(artifact_writer, &report, false)?;
+        finalize_autopilot_run_artifacts(artifact_writer, &report, false, &outer_mutation_session)?;
         return Ok(report);
     }
 
@@ -2553,7 +2600,12 @@ fn run_autopilot_plan_file_disabled_legacy(
             .iter()
             .any(|attempt| attempt.publication_attempted),
     );
-    finalize_autopilot_run_artifacts(artifact_writer, &report, publish_requested)?;
+    finalize_autopilot_run_artifacts(
+        artifact_writer,
+        &report,
+        publish_requested,
+        &outer_mutation_session,
+    )?;
     Ok(report)
 }
 

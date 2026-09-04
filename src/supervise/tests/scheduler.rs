@@ -1517,7 +1517,8 @@ fn admission_commit_recv_failure_cancels_and_drains_active_assignments() {
         let runner_unwind_release = Arc::clone(&runner_unwind_release);
         move |command: &ExternalAgentCommand,
               cancellation: &ProcessCancellation,
-              _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
+              _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>,
+              _authorization: SupervisorProcessLaunchAuthorization| {
             let id = injected_command_assignment_id(command);
             if id == "admit-a" {
                 let _ = runner_started_sender.send(());
@@ -1755,7 +1756,8 @@ fn cascade_breaker_stops_admission_drains_active_and_releases_claims() {
         let release_child_d = Arc::clone(&release_child_d);
         move |command: &ExternalAgentCommand,
               cancellation: &ProcessCancellation,
-              _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
+              _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>,
+              _authorization: SupervisorProcessLaunchAuthorization| {
             let id = injected_command_assignment_id(command);
             let (lock, condvar) = &*state;
             let mut breaker = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2160,7 +2162,8 @@ fn fatal_scheduler_abort_cancels_active_sibling_without_manual_release() {
         let assignments = assignments.clone();
         move |command: &ExternalAgentCommand,
               cancellation: &ProcessCancellation,
-              _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
+              _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>,
+              _authorization: SupervisorProcessLaunchAuthorization| {
             let id = injected_command_assignment_id(command);
             let (lock, condvar) = &*state;
             if id == "child-b" {

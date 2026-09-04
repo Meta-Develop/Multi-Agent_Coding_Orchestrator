@@ -234,15 +234,28 @@ fn bind_test_below_floor_review_auditor() -> Result<(
 /// third-party CLI. Production binaries screen live `cursor-agent models` and
 /// `grok models` observations and retain a private evidence gap when the
 /// optional Cursor catalog cannot be observed.
+#[cfg(test)]
 pub(super) fn advertised_catalogs_for_launch(repo: &Path) -> Result<AdvertisedCatalogSet> {
+    let _ = repo;
+    advertised_catalogs_from_test_fixtures()
+}
+
+pub(super) fn advertised_catalogs_for_supervisor_selection(
+    repo: &Path,
+    session: Option<&CatalogPreflightMutationSession>,
+    process_launch_evidence: &mut Vec<SupervisorProcessLaunchAuditEvidence>,
+) -> Result<AdvertisedCatalogSet> {
     #[cfg(test)]
     {
-        let _ = repo;
-        advertised_catalogs_from_test_fixtures()
+        let _ = (session, process_launch_evidence);
+        advertised_catalogs_for_launch(repo)
     }
     #[cfg(not(test))]
     {
-        advertised_catalogs_from_live_runtimes(repo)
+        let session = session.context(
+            "catalog probe process admission is missing from the Supervisor preflight session",
+        )?;
+        advertised_catalogs_from_live_runtimes(repo, session, process_launch_evidence)
     }
 }
 
@@ -289,29 +302,44 @@ fn observe_cursor_catalog_from_fixture(path: &Path) -> Result<AdvertisedCatalogS
 }
 
 #[cfg(not(test))]
-fn advertised_catalogs_from_live_runtimes(repo: &Path) -> Result<AdvertisedCatalogSet> {
+fn advertised_catalogs_from_live_runtimes(
+    repo: &Path,
+    session: &CatalogPreflightMutationSession,
+    process_launch_evidence: &mut Vec<SupervisorProcessLaunchAuditEvidence>,
+) -> Result<AdvertisedCatalogSet> {
     let observed_at_unix_millis = cursor_catalog_observation_time()?;
-    let (cursor, cursor_evidence_gap) =
-        match observe_live_cursor_catalog(repo, observed_at_unix_millis) {
-            Ok(observation) => (Some(observation), None),
-            Err(error) if cursor_catalog_optional_unavailability(&error) => (
-                None,
-                Some(CursorCatalogEvidenceGap::from_error(
-                    &error,
-                    observed_at_unix_millis,
-                )),
-            ),
-            Err(error) => {
-                return Err(error).context("live Cursor catalog observation failed closed");
-            }
-        };
+    let (cursor, cursor_evidence_gap) = match observe_live_cursor_catalog(
+        repo,
+        observed_at_unix_millis,
+        session,
+        process_launch_evidence,
+    ) {
+        Ok(observation) => (Some(observation), None),
+        Err(error) if cursor_catalog_optional_unavailability(&error) => (
+            None,
+            Some(CursorCatalogEvidenceGap::from_error(
+                &error,
+                observed_at_unix_millis,
+            )),
+        ),
+        Err(error) => {
+            return Err(error).context("live Cursor catalog observation failed closed");
+        }
+    };
     let grok_program = std::env::var_os("MACO_GROK_BIN");
+    let grok_evidence = std::cell::RefCell::new(Vec::new());
+    let grok_runner = AuthorizedGrokCatalogRunner {
+        session,
+        evidence: &grok_evidence,
+    };
     let grok = observe_optional_live_grok_catalog(
-        &crate::runtime_adapter::grok::ScreenedGrokCatalogCommandRunner,
+        &grok_runner,
         repo,
         observed_at_unix_millis,
         grok_program.as_deref(),
-    )?;
+    );
+    process_launch_evidence.extend(grok_evidence.into_inner());
+    let grok = grok?;
     Ok(AdvertisedCatalogSet {
         cursor,
         grok,
@@ -372,17 +400,26 @@ fn grok_catalog_is_omittable_implicit_unavailability(error: &anyhow::Error) -> b
 fn observe_live_cursor_catalog(
     repo: &Path,
     observed_at_unix_millis: u64,
+    session: &CatalogPreflightMutationSession,
+    process_launch_evidence: &mut Vec<SupervisorProcessLaunchAuditEvidence>,
 ) -> Result<crate::runtime_adapter::cursor::CursorAdvertisedCatalogObservation> {
     let mut spec = crate::runtime_adapter::cursor::CursorCatalogCommandSpec::new(repo);
     if let Some(program) = std::env::var_os("MACO_CURSOR_BIN") {
         spec = spec.with_program(program);
     }
     spec = apply_cursor_catalog_env_setting(spec, std::env::var("MACO_CURSOR_ENV"))?;
-    crate::runtime_adapter::cursor::discover_cursor_model_catalog(
-        &ScreenedCursorCatalogRunner { repo },
+    let cursor_evidence = std::cell::RefCell::new(Vec::new());
+    let observation = crate::runtime_adapter::cursor::discover_cursor_model_catalog(
+        &ScreenedCursorCatalogRunner {
+            repo,
+            session,
+            evidence: &cursor_evidence,
+        },
         &spec,
         Some(observed_at_unix_millis),
-    )
+    );
+    process_launch_evidence.extend(cursor_evidence.into_inner());
+    observation
 }
 
 fn apply_cursor_catalog_env_setting(
@@ -446,6 +483,8 @@ impl crate::runtime_adapter::cursor::CursorCatalogCommandRunner for HermeticCurs
 #[cfg(not(test))]
 struct ScreenedCursorCatalogRunner<'a> {
     repo: &'a Path,
+    session: &'a CatalogPreflightMutationSession,
+    evidence: &'a std::cell::RefCell<Vec<SupervisorProcessLaunchAuditEvidence>>,
 }
 
 #[cfg(not(test))]
@@ -472,7 +511,7 @@ impl crate::runtime_adapter::cursor::CursorCatalogCommandRunner
             spec.current_dir(),
             spec.capture_limit_bytes(),
         )
-        .with_environment(EnvironmentMode::ClearAndSet(environment))
+        .with_environment(EnvironmentMode::ClearAndSet(environment.clone()))
         .with_stdin(StdinMode::Null)
         .with_timeout(Some(spec.timeout()))
         .with_private_runtime_home(true)
@@ -480,6 +519,30 @@ impl crate::runtime_adapter::cursor::CursorCatalogCommandRunner
             crate::process_runner::TrustedFixedNetworkProfile::read_write(self.repo)
                 .with_visible_read_only_root(program_parent),
         ));
+        let program_identity = catalog_executable_identity(&program)?;
+        let identity = ExactSupervisorProcessLaunchIdentity {
+            run_id: self.session.run_id().to_string(),
+            subject_id: "catalog-cursor".to_string(),
+            attempt: 1,
+            adapter: "cursor".to_string(),
+            model: None,
+            reasoning_effort: None,
+            program_identity: program_identity.clone(),
+            execution_mode: "verified-catalog-preflight".to_string(),
+            delivery_identity: serde_json::to_string(&(
+                spec.args(),
+                spec.current_dir(),
+                spec.timeout().as_millis(),
+                &environment,
+            ))?,
+            kind: SupervisorProcessLaunchKind::CatalogCursorProbe,
+        };
+        let (evidence, authorization) = self.session.authorize_process_launch(identity.clone())?;
+        if catalog_executable_identity(&program)? != program_identity {
+            bail!("Cursor catalog executable changed after exact process admission");
+        }
+        authorization.consume()?;
+        self.evidence.borrow_mut().push(evidence);
         let output = run_process(process_spec)
             .context("Cursor runtime model catalog process failed before verified evidence")?;
         Ok(crate::runtime_adapter::cursor::CursorCatalogCommandOutput {
@@ -504,6 +567,68 @@ fn cursor_catalog_process_environment(
     )]);
     environment.extend(spec.environment().clone());
     environment
+}
+
+#[cfg(not(test))]
+struct AuthorizedGrokCatalogRunner<'a> {
+    session: &'a CatalogPreflightMutationSession,
+    evidence: &'a std::cell::RefCell<Vec<SupervisorProcessLaunchAuditEvidence>>,
+}
+
+#[cfg(not(test))]
+impl crate::runtime_adapter::grok::GrokCatalogCommandRunner for AuthorizedGrokCatalogRunner<'_> {
+    fn run(
+        &self,
+        spec: &crate::runtime_adapter::grok::GrokCatalogCommandSpec,
+    ) -> Result<crate::runtime_adapter::grok::GrokCatalogCommandOutput> {
+        let mut evidence = None;
+        let output = crate::runtime_adapter::grok::run_screened_grok_catalog_command_authorized(
+            spec,
+            self.session,
+            &mut evidence,
+        );
+        self.evidence.borrow_mut().extend(evidence);
+        output
+    }
+}
+
+#[cfg(not(test))]
+fn catalog_executable_identity(program: &Path) -> Result<String> {
+    let metadata = std::fs::symlink_metadata(program).with_context(|| {
+        format!(
+            "failed to inspect catalog executable identity {}",
+            program.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("catalog executable identity is not a regular file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(format!(
+            "{};dev={};ino={};len={};mtime_ns={}",
+            program.display(),
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                .map(|value| value.as_nanos().to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(format!(
+            "{};len={};mtime={:?}",
+            program.display(),
+            metadata.len(),
+            metadata.modified().ok()
+        ))
+    }
 }
 
 fn resolve_cursor_catalog_program(

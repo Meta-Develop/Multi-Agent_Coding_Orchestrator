@@ -1513,7 +1513,34 @@ fn push_accepted_field_guide_draft(
     Ok(())
 }
 
+pub(super) fn append_accepted_field_guide_drafts_authorized(
+    plan: &SupervisorPlan,
+    reports: &[OrchestratorReviewReport],
+    run_id: &RunId,
+    store: Option<&FieldGuideStore>,
+    journal: &mut Option<OrchestrationEventJournal>,
+    writer: &mut ArtifactRunWriter,
+    permit: &crate::mutation_taxonomy::SupervisorOperationPermit<'_>,
+) -> Result<usize> {
+    permit
+        .verify(crate::mutation_taxonomy::MutationOperation::SupervisorFieldGuideMutation)
+        .map_err(anyhow::Error::from)?;
+    append_accepted_field_guide_drafts_impl(plan, reports, run_id, store, journal, writer)
+}
+
+#[cfg(test)]
 pub(super) fn append_accepted_field_guide_drafts(
+    plan: &SupervisorPlan,
+    reports: &[OrchestratorReviewReport],
+    run_id: &RunId,
+    store: Option<&FieldGuideStore>,
+    journal: &mut Option<OrchestrationEventJournal>,
+    writer: &mut ArtifactRunWriter,
+) -> Result<usize> {
+    append_accepted_field_guide_drafts_impl(plan, reports, run_id, store, journal, writer)
+}
+
+fn append_accepted_field_guide_drafts_impl(
     plan: &SupervisorPlan,
     reports: &[OrchestratorReviewReport],
     run_id: &RunId,

@@ -885,16 +885,20 @@ macro_rules! with_invalid_schedule_context {
             options.parent_node.as_deref(),
         );
         let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let mutation_session =
+            SupervisorRunMutationSession::local_for_test(options.run_id.as_str());
         let shared_artifacts = Mutex::new(SharedSupervisorArtifacts {
             writer: &mut artifact_writer,
             journal: &mut journal,
             autonomy_kpis: &mut autonomy_kpis,
             checkpoint: None,
+            mutation_session: &mutation_session,
         });
         let runtime_model_catalog = RuntimeModelCatalog::LocalDeterministicFake;
         let runner = |_: &ExternalAgentCommand,
                       _: &ProcessCancellation,
-                      _: Option<ExternalPreActionReviewRuntime<'_>>|
+                      _: Option<ExternalPreActionReviewRuntime<'_>>,
+                      _: SupervisorProcessLaunchAuthorization|
          -> ExternalAgentRun {
             panic!("invalid schedule must fail before external dispatch")
         };
@@ -924,6 +928,7 @@ macro_rules! with_invalid_schedule_context {
             runtime_model_catalog: &runtime_model_catalog,
             external_runner: &runner,
             release_per_assignment: false,
+            mutation_session: &mutation_session,
         };
         $body
     }};
@@ -1001,16 +1006,20 @@ macro_rules! with_valid_schedule_context {
             options.parent_node.as_deref(),
         );
         let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let mutation_session =
+            SupervisorRunMutationSession::local_for_test(options.run_id.as_str());
         let shared_artifacts = Mutex::new(SharedSupervisorArtifacts {
             writer: &mut artifact_writer,
             journal: &mut journal,
             autonomy_kpis: &mut autonomy_kpis,
             checkpoint: None,
+            mutation_session: &mutation_session,
         });
         let runtime_model_catalog = RuntimeModelCatalog::LocalDeterministicFake;
         let runner = |_: &ExternalAgentCommand,
                       _: &ProcessCancellation,
-                      _: Option<ExternalPreActionReviewRuntime<'_>>|
+                      _: Option<ExternalPreActionReviewRuntime<'_>>,
+                      _: SupervisorProcessLaunchAuthorization|
          -> ExternalAgentRun {
             panic!("fake scheduler success fixture must not invoke the external runner")
         };
@@ -1040,6 +1049,7 @@ macro_rules! with_valid_schedule_context {
             runtime_model_catalog: &runtime_model_catalog,
             external_runner: &runner,
             release_per_assignment: true,
+            mutation_session: &mutation_session,
         };
         $body
     }};
@@ -1903,7 +1913,8 @@ fn assert_authenticated_park_has_no_assignment_side_effects(
     let runner_calls = std::sync::atomic::AtomicUsize::new(0);
     let runner = |_: &ExternalAgentCommand,
                   _: &ProcessCancellation,
-                  _: Option<ExternalPreActionReviewRuntime<'_>>|
+                  _: Option<ExternalPreActionReviewRuntime<'_>>,
+                  _: SupervisorProcessLaunchAuthorization|
      -> ExternalAgentRun {
         runner_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         panic!("parked assignment must not invoke the child runner")
@@ -2725,8 +2736,21 @@ fn resource_release_collection_preserves_concurrent_release_evidence_without_sto
         concurrent_semantic_release_errors: vec!["semantic release failed".to_string()],
         ..CollectedSchedulerResources::default()
     };
+    let mutation_session = SupervisorRunMutationSession::local_for_test("release-collection");
+    let claim_permit = mutation_session
+        .permit(MutationOperation::ClaimRelease)
+        .expect("claim release permit");
+    let semantic_permit = mutation_session
+        .permit(MutationOperation::SemanticIntentRelease)
+        .expect("semantic release permit");
 
-    let released = release_collected_scheduler_resources(None, None, &mut collected);
+    let released = release_collected_scheduler_resources(
+        None,
+        None,
+        &mut collected,
+        &claim_permit,
+        &semantic_permit,
+    );
 
     assert_eq!(released.released_claims, vec![released_claim]);
     assert_eq!(released.release_errors, vec!["claim release failed"]);
@@ -3154,6 +3178,7 @@ fn evidence_initialization_populates_stores_journal_and_baseline() {
     let mut semantic_store = None;
     let mut journal = None;
     let mut baseline = None;
+    let mutation_session = SupervisorRunMutationSession::local_for_test(options.run_id.as_str());
 
     initialize_scheduler_evidence(&mut SchedulerEvidenceInitialization {
         plan: &plan,
@@ -3171,6 +3196,7 @@ fn evidence_initialization_populates_stores_journal_and_baseline() {
         semantic_store_slot: &mut semantic_store,
         orchestration_journal: &mut journal,
         primary_run_baseline: &mut baseline,
+        mutation_session: &mutation_session,
     })
     .expect("initialize scheduler evidence directly");
 
@@ -3270,6 +3296,7 @@ fn persistence_records_gate_before_status_and_finalizes_report() {
         .expect("reserve tagged invocation scratches before terminal persistence");
     let incoming_scratch_path = incoming_scratch.path().to_path_buf();
     let capture_scratch_path = capture_scratch.path().to_path_buf();
+    let mutation_session = SupervisorRunMutationSession::local_for_test(run_id.as_str());
 
     let persisted = persist_supervisor_final_report(
         report,
@@ -3277,6 +3304,7 @@ fn persistence_records_gate_before_status_and_finalizes_report() {
         writer,
         Some(&mut checkpoint),
         Some(crate::artifacts::ArtifactScratchQuiescence::Verified),
+        &mutation_session,
         || Ok(()),
     )
     .expect("persist scheduler final report directly");
@@ -3334,6 +3362,7 @@ fn persist_releases_terminal_claims_without_checkpoint_writer() {
             .expect("default objective profile"),
     );
     let released = std::sync::atomic::AtomicBool::new(false);
+    let mutation_session = SupervisorRunMutationSession::local_for_test(run_id.as_str());
 
     persist_supervisor_final_report(
         report,
@@ -3341,6 +3370,7 @@ fn persist_releases_terminal_claims_without_checkpoint_writer() {
         writer,
         None,
         Some(crate::artifacts::ArtifactScratchQuiescence::Verified),
+        &mutation_session,
         || {
             released.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())

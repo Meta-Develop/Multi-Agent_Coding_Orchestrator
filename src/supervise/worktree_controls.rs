@@ -143,7 +143,7 @@ fn open_direct_worktree_directory(
 }
 
 #[cfg(unix)]
-pub(super) fn provision_mandatory_worktree_controls(
+fn provision_mandatory_worktree_controls_impl(
     workspace_path: &Path,
 ) -> Result<MandatoryWorktreeControls> {
     let mut options = fs::OpenOptions::new();
@@ -247,10 +247,27 @@ pub(super) fn bind_primary_worktree_controls(
 }
 
 #[cfg(not(unix))]
-pub(super) fn provision_mandatory_worktree_controls(
+fn provision_mandatory_worktree_controls_impl(
     _workspace_path: &Path,
 ) -> Result<MandatoryWorktreeControls> {
     bail!("mandatory worktree control provisioning is unsupported on this platform")
+}
+
+pub(super) fn provision_mandatory_worktree_controls_authorized(
+    workspace_path: &Path,
+    permit: &crate::mutation_taxonomy::SupervisorOperationPermit<'_>,
+) -> Result<MandatoryWorktreeControls> {
+    permit
+        .verify(crate::mutation_taxonomy::MutationOperation::SupervisorMandatoryControlProvision)
+        .map_err(anyhow::Error::from)?;
+    provision_mandatory_worktree_controls_impl(workspace_path)
+}
+
+#[cfg(test)]
+pub(super) fn provision_mandatory_worktree_controls(
+    workspace_path: &Path,
+) -> Result<MandatoryWorktreeControls> {
+    provision_mandatory_worktree_controls_impl(workspace_path)
 }
 
 pub(super) fn assignment_worktree_control_exceptions(

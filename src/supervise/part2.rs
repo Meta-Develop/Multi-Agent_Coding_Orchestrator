@@ -58,6 +58,7 @@ struct AssignmentExecutionContext<'a, 'writer> {
     runtime_model_catalog: &'a RuntimeModelCatalog,
     cancellation: ProcessCancellation,
     external_runner: &'a CancellableExternalRunner<'a>,
+    mutation_session: &'a SupervisorRunMutationSession,
 }
 
 #[derive(Clone)]
@@ -481,7 +482,7 @@ fn run_supervisor_plan_with_budget_catalog_and_runner(
         execution_runtime,
         worktree_creation,
         runtime_model_catalog,
-        &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
+        &|command, _cancellation, _review_runtime, _authorization| match serialized_runner.lock() {
             Ok(mut runner) => runner(command),
             Err(poisoned) => poisoned.into_inner()(command),
         },
@@ -503,7 +504,7 @@ fn run_loaded_supervisor_plan_with_runner(
         SupervisorExecutionRuntime::NonpublishableSimulation,
         SupervisorWorktreeCreation::TestOnly,
         Ok(runtime_model_catalog),
-        &|command, _cancellation, review_runtime| match serialized_runner.lock() {
+        &|command, _cancellation, review_runtime, _authorization| match serialized_runner.lock() {
             Ok(mut runner) => runner(command, review_runtime.is_some()),
             Err(poisoned) => poisoned.into_inner()(command, review_runtime.is_some()),
         },
@@ -553,7 +554,7 @@ fn run_supervisor_plan_with_budget_and_concurrent_runner(
         SupervisorExecutionRuntime::NonpublishableSimulation,
         SupervisorWorktreeCreation::TestOnly,
         Ok(runtime_model_catalog),
-        &|command, _cancellation, _review_runtime| external_runner(command),
+        &|command, _cancellation, _review_runtime, _authorization| external_runner(command),
     )
 }
 

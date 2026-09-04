@@ -283,6 +283,14 @@ pub(super) fn record_licensed_breakage_follow_up_tasks(
     let mut guard = artifacts
         .lock()
         .map_err(|_| anyhow!("supervisor artifact writer mutex was poisoned"))?;
+    guard
+        .mutation_session
+        .permit(MutationOperation::SupervisorRunArtifactWriteAppend)?
+        .verify(MutationOperation::SupervisorRunArtifactWriteAppend)?;
+    guard
+        .mutation_session
+        .permit(MutationOperation::SupervisorOrchestrationJournalLifecycle)?
+        .verify(MutationOperation::SupervisorOrchestrationJournalLifecycle)?;
     let SharedSupervisorArtifacts {
         writer,
         journal,
@@ -332,6 +340,14 @@ pub(super) fn with_supervisor_artifacts<T>(
     let mut guard = artifacts
         .lock()
         .map_err(|_| anyhow!("supervisor artifact writer mutex was poisoned"))?;
+    guard
+        .mutation_session
+        .permit(MutationOperation::SupervisorRunArtifactWriteAppend)?
+        .verify(MutationOperation::SupervisorRunArtifactWriteAppend)?;
+    guard
+        .mutation_session
+        .permit(MutationOperation::SupervisorOrchestrationJournalLifecycle)?
+        .verify(MutationOperation::SupervisorOrchestrationJournalLifecycle)?;
     let SharedSupervisorArtifacts {
         writer, journal, ..
     } = &mut *guard;
@@ -363,6 +379,14 @@ pub(super) fn record_gate_correction_event(
     let mut guard = artifacts
         .lock()
         .map_err(|_| anyhow!("supervisor artifact writer mutex was poisoned"))?;
+    guard
+        .mutation_session
+        .permit(MutationOperation::SupervisorRunArtifactWriteAppend)?
+        .verify(MutationOperation::SupervisorRunArtifactWriteAppend)?;
+    guard
+        .mutation_session
+        .permit(MutationOperation::SupervisorOrchestrationJournalLifecycle)?
+        .verify(MutationOperation::SupervisorOrchestrationJournalLifecycle)?;
     let SharedSupervisorArtifacts {
         writer,
         journal,
@@ -471,11 +495,25 @@ pub(super) fn release_concurrent_assignment(
     outcome: &mut AssignmentExecutionOutcome,
     sync_store: &SyncStore,
     semantic_store: &SemanticIntentStore,
-) {
-    let (released_claims, release_errors) =
-        release_claims(sync_store, std::mem::take(&mut outcome.claim_tokens));
-    let (released_semantic_intents, semantic_release_errors) =
-        release_semantic_intents(semantic_store, std::mem::take(&mut outcome.semantic_tokens));
+    claim_release_permit: &crate::mutation_taxonomy::SupervisorOperationPermit<'_>,
+    semantic_release_permit: &crate::mutation_taxonomy::SupervisorOperationPermit<'_>,
+) -> Result<()> {
+    claim_release_permit
+        .verify(MutationOperation::ClaimRelease)
+        .map_err(anyhow::Error::from)?;
+    semantic_release_permit
+        .verify(MutationOperation::SemanticIntentRelease)
+        .map_err(anyhow::Error::from)?;
+    let (released_claims, release_errors) = release_claims(
+        sync_store,
+        std::mem::take(&mut outcome.claim_tokens),
+        claim_release_permit,
+    );
+    let (released_semantic_intents, semantic_release_errors) = release_semantic_intents(
+        semantic_store,
+        std::mem::take(&mut outcome.semantic_tokens),
+        semantic_release_permit,
+    );
     outcome.released_claims = released_claims;
     outcome.release_errors = release_errors;
     outcome.released_semantic_intents = released_semantic_intents;
@@ -488,6 +526,7 @@ pub(super) fn release_concurrent_assignment(
                 .to_string(),
         );
     }
+    Ok(())
 }
 
 pub(super) fn assignment_outcome_succeeded(outcome: &AssignmentExecutionOutcome) -> bool {
@@ -639,6 +678,14 @@ pub(super) fn record_breaker_trip(
     let mut guard = artifacts
         .lock()
         .map_err(|_| anyhow!("supervisor artifact writer mutex was poisoned"))?;
+    guard
+        .mutation_session
+        .permit(MutationOperation::SupervisorRunArtifactWriteAppend)?
+        .verify(MutationOperation::SupervisorRunArtifactWriteAppend)?;
+    guard
+        .mutation_session
+        .permit(MutationOperation::SupervisorOrchestrationJournalLifecycle)?
+        .verify(MutationOperation::SupervisorOrchestrationJournalLifecycle)?;
     let SharedSupervisorArtifacts {
         writer,
         journal,

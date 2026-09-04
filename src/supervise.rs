@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::external_agent::load_codex_runtime_model_catalog;
 #[cfg(target_os = "linux")]
 use crate::external_agent::CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS;
 #[cfg(test)]
@@ -11,19 +13,21 @@ pub use crate::supervise_budget::{
 use crate::{
     artifacts::{
         repository_authenticator_key_only, state_auth::random_identifier, ArtifactFileDisposition,
-        ArtifactRecoveryFile, ArtifactRunReader, ArtifactRunWriter, ArtifactScratchDirectory,
-        RunArtifactFamily,
+        ArtifactRecoveryFile, ArtifactRunReader, ArtifactRunResumeBinding, ArtifactRunWriter,
+        ArtifactScratchDirectory, RunArtifactFamily,
     },
     external_agent::{
-        codex_usage_from_jsonl, collect_and_import_managed_child_git_commit,
-        load_codex_runtime_model_catalog, run_external_agent_cancellable_reviewed,
-        validate_environment_requirements, CodexRuntimeModelCatalog, EnvironmentFailure,
-        EnvironmentFailureCategory, EnvironmentPreflightResult, EnvironmentRemediation,
-        EnvironmentRemediationScope, EnvironmentRequirement, ExternalAgentCommand,
-        ExternalAgentRun, ExternalPreActionReviewRuntime, ExternalProgramTrust,
-        ManagedChildGitImport, PreActionJournalPhase, PreActionJournalRationale,
-        PreActionJournalRecord, PreActionJournalSink, SandboxDenialEvidence,
-        WorkerJournalArtifactCapture, WorkerJournalArtifactCaptureStatus,
+        codex_usage_from_jsonl, collect_and_import_managed_child_git_commit_authorized,
+        exact_external_process_launch_binding, load_codex_runtime_model_catalog_authorized,
+        materialize_managed_child_git_commit_authorized,
+        run_external_agent_cancellable_reviewed_authorized, validate_environment_requirements,
+        CodexRuntimeModelCatalog, EnvironmentFailure, EnvironmentFailureCategory,
+        EnvironmentPreflightResult, EnvironmentRemediation, EnvironmentRemediationScope,
+        EnvironmentRequirement, ExternalAgentCommand, ExternalAgentRun,
+        ExternalPreActionReviewRuntime, ExternalProgramTrust, ManagedChildCommitAuthorization,
+        ManagedChildGitImport, ManagedChildImportAuthorization, PreActionJournalPhase,
+        PreActionJournalRationale, PreActionJournalRecord, PreActionJournalSink,
+        SandboxDenialEvidence, WorkerJournalArtifactCapture, WorkerJournalArtifactCaptureStatus,
     },
     field_guide::{
         decode_canonical_prompt_entry_line, DecodedFieldGuidePromptEntry, FieldGuideDraft,
@@ -46,13 +50,15 @@ use crate::{
         ValidationEvidenceBundle, WorktreeMergeMetadata, VALIDATION_BINDING_VERSION,
     },
     mutation_taxonomy::{
-        authorize_effective_supervisor_mutation_manifest, CatalogPreflightMutationPermit,
+        authorize_effective_supervisor_mutation_manifest, CatalogPreflightMutationSession,
         EffectiveCatalogPreflightManifestInput, EffectiveResumeRecoveryManifestInput,
         EffectiveSupervisorDispatchIdentity, EffectiveSupervisorExecutionRuntime,
         EffectiveSupervisorMutationAdmissionError, EffectiveSupervisorMutationAuditEvidence,
         EffectiveSupervisorMutationIdentityInput, EffectiveSupervisorMutationManifest,
         EffectiveSupervisorRunManifestInput, EffectiveSupervisorWorktreeMode,
-        SupervisorResolutionPreflightPermit, SupervisorRunMutationPermit,
+        ExactSupervisorProcessLaunchIdentity, MutationOperation, SupervisorOperationPermit,
+        SupervisorProcessLaunchAuditEvidence, SupervisorProcessLaunchAuthorization,
+        SupervisorProcessLaunchKind, SupervisorRunMutationSession,
     },
     objective_profile::{resolve_objective_profile, ResolvedObjectiveProfile},
     orchestration_event::{
@@ -318,6 +324,39 @@ use reporting::*;
 mod schema_artifacts;
 use schema_artifacts::*;
 
+pub(crate) fn reserve_supervisor_artifact_run(
+    repo: &Path,
+    family: RunArtifactFamily,
+    run_id: RunId,
+    producer: &str,
+    permit: &crate::mutation_taxonomy::SupervisorOperationPermit<'_>,
+) -> Result<ArtifactRunWriter> {
+    permit.verify(MutationOperation::SupervisorRunArtifactReserve)?;
+    ArtifactRunWriter::reserve(repo, family, run_id, producer)
+}
+
+pub(crate) fn finalize_supervisor_artifact_run(
+    writer: ArtifactRunWriter,
+    report_path: &Path,
+    publish_requested: bool,
+    permit: &crate::mutation_taxonomy::SupervisorOperationPermit<'_>,
+) -> Result<()> {
+    permit
+        .verify(MutationOperation::SupervisorRunArtifactAuthenticatedFinalize)
+        .map_err(anyhow::Error::from)?;
+    writer.finalize(report_path, publish_requested).map(|_| ())
+}
+
+pub(crate) fn register_current_supervisor_process_authorized(
+    repo: &Path,
+    role: &str,
+    run_id: &RunId,
+    permit: &crate::mutation_taxonomy::SupervisorOperationPermit<'_>,
+) -> Result<Option<crate::run_ops::SupervisorProcessGuard>> {
+    permit.verify(MutationOperation::SupervisorProcessRegister)?;
+    crate::run_ops::register_current_supervisor_process(repo, role, run_id)
+}
+
 /// Persists the normalized plan and establishes its authenticated messaging identity set before
 /// scheduler dispatch. This local definition intentionally takes precedence over the private
 /// schema-module helper imported above.
@@ -328,7 +367,12 @@ fn write_plan_snapshot(
     consultant: &SupervisorConsultantPlan,
     assignment_metadata: &AssignmentMetadata,
     plan_metadata: &SupervisorPlanMetadata,
+    artifact_permit: &crate::mutation_taxonomy::SupervisorOperationPermit<'_>,
+    messaging_permit: &crate::mutation_taxonomy::SupervisorOperationPermit<'_>,
 ) -> Result<()> {
+    artifact_permit
+        .verify(MutationOperation::SupervisorRunArtifactWriteAppend)
+        .map_err(anyhow::Error::from)?;
     schema_artifacts::write_plan_snapshot(
         writer,
         relative,
@@ -337,8 +381,13 @@ fn write_plan_snapshot(
         assignment_metadata,
         plan_metadata,
     )?;
-    messaging_bridge::initialize_supervisor_messaging_session(writer, plan, plan_metadata)
-        .context("supervisor messaging pre-launch initialization failed")
+    messaging_bridge::initialize_supervisor_messaging_session_authorized(
+        writer,
+        plan,
+        plan_metadata,
+        messaging_permit,
+    )
+    .context("supervisor messaging pre-launch initialization failed")
 }
 
 /// Recovers a run's existing messaging journal before the authenticated supervisor finalization
@@ -466,6 +515,7 @@ type CancellableExternalRunner<'a> = dyn for<'review> Fn(
         &ExternalAgentCommand,
         &ProcessCancellation,
         Option<ExternalPreActionReviewRuntime<'review>>,
+        crate::mutation_taxonomy::SupervisorProcessLaunchAuthorization,
     ) -> ExternalAgentRun
     + Send
     + Sync
@@ -1106,6 +1156,38 @@ struct RoleModelResolution {
 }
 
 impl RuntimeModelCatalog {
+    fn for_supervisor_authorized(
+        options: &SupervisorRunOptions,
+        repo: &Path,
+        session: &CatalogPreflightMutationSession,
+    ) -> (
+        RuntimeModelCatalogAcquisition,
+        Vec<SupervisorProcessLaunchAuditEvidence>,
+    ) {
+        if options.runtime == SupervisorRuntime::Fake {
+            return (Ok(Self::LocalDeterministicFake), Vec::new());
+        }
+        let (codex_probe, codex_evidence) = load_codex_runtime_model_catalog_authorized(
+            &options.codex_bin,
+            repo,
+            CODEX_MODEL_CATALOG_TIMEOUT,
+            options.run_id.as_str(),
+            session,
+        );
+        let process_launch_evidence = codex_evidence.into_iter().collect::<Vec<_>>();
+        match (options.runtime, codex_probe) {
+            (SupervisorRuntime::Codex, Ok(catalog)) => {
+                (Ok(Self::Codex(catalog)), process_launch_evidence)
+            }
+            (SupervisorRuntime::Codex, Err(error)) => (Err(error), process_launch_evidence),
+            (_, Ok(_catalog)) => (Ok(Self::OperatorDeclared), process_launch_evidence),
+            (_, Err(_optional_codex_error)) => {
+                (Ok(Self::OperatorDeclared), process_launch_evidence)
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn for_supervisor(
         options: &SupervisorRunOptions,
         repo: &Path,
@@ -3122,7 +3204,7 @@ fn run_supervisor_plan_file_with_runner(
         SupervisorExecutionRuntime::Verified,
         SupervisorWorktreeCreation::Bound(&cleanliness),
         Ok(runtime_model_catalog),
-        &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
+        &|command, _cancellation, _review_runtime, _authorization| match serialized_runner.lock() {
             Ok(mut runner) => runner(command),
             Err(poisoned) => poisoned.into_inner()(command),
         },
@@ -3148,7 +3230,7 @@ pub(crate) fn run_supervisor_plan_file_cascade_with_runner(
             source_dispatch_started: None,
         },
         &mut permit,
-        &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
+        &|command, _cancellation, _review_runtime, _authorization| match serialized_runner.lock() {
             Ok(mut runner) => runner(command),
             Err(poisoned) => poisoned.into_inner()(command),
         },
@@ -3170,7 +3252,8 @@ pub(crate) fn run_supervisor_plan_file_cascade_with_runner_and_gate_for_autopilo
     let cancellable_runner =
         |command: &ExternalAgentCommand,
          scheduler_cancellation: &ProcessCancellation,
-         _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
+         _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>,
+         _authorization: SupervisorProcessLaunchAuthorization| {
             let run = || match serialized_runner.lock() {
                 Ok(mut runner) => runner(command, scheduler_cancellation),
                 Err(poisoned) => poisoned.into_inner()(command, scheduler_cancellation),
@@ -3257,7 +3340,8 @@ fn run_supervisor_plan_file_cascade_with_cancellable_runner_and_gate(
         worktree_creation: SupervisorWorktreeCreation::Bound(&cleanliness),
         runtime_model_catalog: Ok(runtime_model_catalog),
         preflight_evidence: None,
-        resolution_preflight_permit: None,
+        catalog_preflight_session: None,
+        preflight_process_evidence: Vec::new(),
         dispatch_started: source_dispatch_started,
         dispatch_authorized: None,
         external_runner,
@@ -3299,15 +3383,16 @@ fn run_supervisor_plan_file_cascade_with_runner_and_gate(
         }
     };
     run_supervisor_plan_file_cascade_with_cancellable_runner_and_gate(
-        options,
-        outer_entrypoint,
-        outer_command_run_id,
-        None,
-        &cancellation_observed,
-        None,
-        None,
+        InjectedSupervisorCascadeRequest {
+            options,
+            outer_entrypoint,
+            outer_command_run_id,
+            caller_cancellation: None,
+            cancellation_observed: &cancellation_observed,
+            source_dispatch_started: None,
+        },
         &mut adapt_gate,
-        &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
+        &|command, _cancellation, _review_runtime, _authorization| match serialized_runner.lock() {
             Ok(mut runner) => runner(command),
             Err(poisoned) => poisoned.into_inner()(command),
         },
@@ -3353,7 +3438,7 @@ pub(crate) fn resume_supervisor_plan_file_cascade_with_runner(
         None,
         &cancellation_observed,
         &mut permit,
-        &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
+        &|command, _cancellation, _review_runtime, _authorization| match serialized_runner.lock() {
             Ok(mut runner) => runner(command),
             Err(poisoned) => poisoned.into_inner()(command),
         },
@@ -3943,7 +4028,7 @@ enum ChildAttemptCorrection {
 enum SupervisorWorktreeCreation<'a> {
     Bound(&'a RepositoryCleanlinessCapability),
     ExistingOnly,
-    PrimaryWorktree,
+    PrimaryWorktree(&'a PrimaryWorktreeOptInCapability),
     NonpublishableSimulation,
     #[cfg(test)]
     TestOnly,
@@ -3981,7 +4066,7 @@ fn effective_supervisor_worktree_mode(
     match creation {
         SupervisorWorktreeCreation::Bound(_) => EffectiveSupervisorWorktreeMode::BoundCreateOrReuse,
         SupervisorWorktreeCreation::ExistingOnly => EffectiveSupervisorWorktreeMode::ExistingOnly,
-        SupervisorWorktreeCreation::PrimaryWorktree => {
+        SupervisorWorktreeCreation::PrimaryWorktree(_) => {
             EffectiveSupervisorWorktreeMode::PrimaryWorktree
         }
         SupervisorWorktreeCreation::NonpublishableSimulation => {
@@ -4069,7 +4154,6 @@ fn effective_supervisor_mutation_manifest(
         &loaded.assignment_metadata,
         &loaded.plan_metadata,
     )?;
-    let external_process_runtime = options.runtime != SupervisorRuntime::Fake;
     let queue_item_sha256 = effective_generated_follow_up_queue_item_sha256(loaded, options)?;
     let machine_global_retention_sha256 = options
         .machine_global_retention
@@ -4077,15 +4161,6 @@ fn effective_supervisor_mutation_manifest(
         .map(crate::follow_up_queue::GeneratedFollowUpRetentionBinding::from_machine_global)
         .transpose()?
         .map(|binding| binding.binding_sha256().to_string());
-    let managed_child_may_import = match worktree_mode {
-        EffectiveSupervisorWorktreeMode::BoundCreateOrReuse => true,
-        #[cfg(test)]
-        EffectiveSupervisorWorktreeMode::VerifiedTestOnly => true,
-        _ => false,
-    };
-    let primary_object_import = external_process_runtime
-        && execution_runtime == SupervisorExecutionRuntime::Verified
-        && managed_child_may_import;
     Ok(EffectiveSupervisorMutationManifest::supervisor_run(
         EffectiveSupervisorRunManifestInput {
             identity: EffectiveSupervisorMutationIdentityInput {
@@ -4118,13 +4193,6 @@ fn effective_supervisor_mutation_manifest(
                 outer_entrypoint: None,
                 outer_run_id: None,
             },
-            semantic_coordination: loaded.plan.semantic_coordination
-                == SemanticCoordinationMode::Block,
-            external_process_runtime,
-            machine_global_retention_bound: options.machine_global_retention.is_some(),
-            field_guide_mutation: external_process_runtime
-                && loaded.plan_metadata.evidence_only_reaudit.is_none(),
-            primary_object_import,
         },
     ))
 }
@@ -4139,7 +4207,8 @@ fn effective_repository_identity(repo: &Path) -> Result<String> {
 struct RuntimeModelCatalogPreflight {
     acquisition: RuntimeModelCatalogAcquisition,
     evidence: EffectiveSupervisorMutationAuditEvidence,
-    resolution_permit: SupervisorResolutionPreflightPermit,
+    session: CatalogPreflightMutationSession,
+    process_launch_evidence: Vec<SupervisorProcessLaunchAuditEvidence>,
 }
 
 fn acquire_runtime_model_catalog_with_permit(
@@ -4190,26 +4259,29 @@ fn acquire_runtime_model_catalog_with_permit(
                 outer_entrypoint: None,
                 outer_run_id: None,
             },
-            launches_process: options.runtime == SupervisorRuntime::Codex,
         },
     );
     let authorized = authorize_effective_supervisor_manifest(manifest)?;
-    let (evidence, catalog_permit, resolution_permit) = authorized.into_catalog_preflight()?;
-    consume_catalog_preflight_permit(evidence, catalog_permit, resolution_permit, options, repo)
+    let (evidence, session) = authorized.into_catalog_preflight()?;
+    consume_catalog_preflight_session(evidence, session, options, repo)
 }
 
-fn consume_catalog_preflight_permit(
+fn consume_catalog_preflight_session(
     evidence: EffectiveSupervisorMutationAuditEvidence,
-    permit: CatalogPreflightMutationPermit,
-    resolution_permit: SupervisorResolutionPreflightPermit,
+    session: CatalogPreflightMutationSession,
     options: &SupervisorRunOptions,
     repo: &Path,
 ) -> Result<RuntimeModelCatalogPreflight> {
-    permit.consume(evidence.canonical_manifest_sha256())?;
+    if session.canonical_manifest_sha256() != evidence.canonical_manifest_sha256() {
+        bail!("catalog preflight session is bound to different audit evidence");
+    }
+    let (acquisition, process_launch_evidence) =
+        RuntimeModelCatalog::for_supervisor_authorized(options, repo, &session);
     Ok(RuntimeModelCatalogPreflight {
-        acquisition: RuntimeModelCatalog::for_supervisor(options, repo),
+        acquisition,
         evidence,
-        resolution_permit,
+        session,
+        process_launch_evidence,
     })
 }
 
@@ -4332,7 +4404,8 @@ fn authorize_and_run_supervisor_plan_with_runner_and_creation(
         worktree_creation,
         runtime_model_catalog,
         preflight_evidence: None,
-        resolution_preflight_permit: None,
+        catalog_preflight_session: None,
+        preflight_process_evidence: Vec::new(),
         dispatch_started: None,
         dispatch_authorized: None,
         external_runner,
@@ -4352,7 +4425,8 @@ fn authorize_acquire_catalog_and_run_supervisor_plan_with_runner_and_creation(
     let RuntimeModelCatalogPreflight {
         acquisition: runtime_model_catalog,
         evidence: preflight_evidence,
-        resolution_permit,
+        session: catalog_preflight_session,
+        process_launch_evidence: preflight_process_evidence,
     } = acquire_runtime_model_catalog_with_permit(
         &loaded,
         &options,
@@ -4369,7 +4443,8 @@ fn authorize_acquire_catalog_and_run_supervisor_plan_with_runner_and_creation(
         worktree_creation,
         runtime_model_catalog,
         preflight_evidence: Some(preflight_evidence),
-        resolution_preflight_permit: Some(resolution_permit),
+        catalog_preflight_session: Some(catalog_preflight_session),
+        preflight_process_evidence,
         dispatch_started: source_dispatch_started,
         dispatch_authorized: None,
         external_runner,
@@ -4381,6 +4456,7 @@ struct SharedSupervisorArtifacts<'a> {
     journal: &'a mut Option<OrchestrationEventJournal>,
     autonomy_kpis: &'a mut AutonomyKpiCollector,
     checkpoint: Option<&'a mut SupervisorCheckpointWriter>,
+    mutation_session: &'a SupervisorRunMutationSession,
 }
 
 struct SupervisorPreActionJournalSink<'artifacts, 'writer> {
@@ -4395,6 +4471,14 @@ impl PreActionJournalSink for SupervisorPreActionJournalSink<'_, '_> {
             .artifacts
             .lock()
             .map_err(|_| anyhow!("supervisor artifact writer mutex was poisoned"))?;
+        guard
+            .mutation_session
+            .permit(MutationOperation::SupervisorRunArtifactWriteAppend)?
+            .verify(MutationOperation::SupervisorRunArtifactWriteAppend)?;
+        guard
+            .mutation_session
+            .permit(MutationOperation::SupervisorOrchestrationJournalLifecycle)?
+            .verify(MutationOperation::SupervisorOrchestrationJournalLifecycle)?;
         let SharedSupervisorArtifacts {
             writer,
             journal,

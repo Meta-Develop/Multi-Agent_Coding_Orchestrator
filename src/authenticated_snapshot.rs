@@ -19,7 +19,9 @@ use crate::{
         remove_direct_child_tree, AtomicStateWriter, BoundedRegularReader, FileIdentity, SafeRoot,
         TreeLinkPolicy,
     },
-    state_journal::{AuthenticatedStateJournal, JournalIdentity, JournalSpec},
+    state_journal::{
+        AuthenticatedStateJournal, AuthenticatedStateJournalSnapshot, JournalIdentity, JournalSpec,
+    },
     state_migration::is_legacy_retirement_metadata_name,
 };
 use anyhow::{bail, Context, Result};
@@ -1971,7 +1973,7 @@ where
 }
 
 fn exact_current_from_journal<S, T>(
-    journal: &AuthenticatedStateJournal<S>,
+    journal: &AuthenticatedStateJournalSnapshot<S>,
     locator: &SnapshotLocator,
 ) -> Result<AuthenticatedSnapshot<T>>
 where

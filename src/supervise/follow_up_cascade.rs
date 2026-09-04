@@ -380,7 +380,8 @@ pub(super) fn run_generated_follow_up_cascade(
                 )?));
             }
             let effective = validate_generated_follow_up_plan_document(&task.supervisor_plan)?;
-            let plan_file = generated_plan_file(repo, &task.supervisor_plan)?;
+            let plan_stage_permit = queue.generated_plan_stage_permit()?;
+            let plan_file = generated_plan_file(repo, &task.supervisor_plan, &plan_stage_permit)?;
             #[cfg(test)]
             run_before_generated_follow_up_plan_load_hook(plan_file.path());
             let Some(reloaded) =
@@ -499,8 +500,16 @@ pub(super) fn run_generated_follow_up_cascade(
                 |RuntimeModelCatalogPreflight {
                      acquisition,
                      evidence,
-                     resolution_permit,
-                 }| { (acquisition, Some(evidence), Some(resolution_permit)) },
+                     session,
+                     process_launch_evidence,
+                 }| {
+                    (
+                        acquisition,
+                        Some(evidence),
+                        Some(session),
+                        process_launch_evidence,
+                    )
+                },
             ),
             #[cfg(test)]
             FollowUpRuntimeCatalog::Injected => Ok((
@@ -510,30 +519,35 @@ pub(super) fn run_generated_follow_up_cascade(
                 )?),
                 None,
                 None,
+                Vec::new(),
             )),
         };
-        let (runtime_model_catalog, preflight_evidence, resolution_preflight_permit) =
-            match runtime_preflight {
-                Ok(preflight) => preflight,
-                Err(error) => {
-                    let gate_id = supervisor_mutation_admission_gate_id(&error)
-                        .unwrap_or(crate::mutation_taxonomy::TAXONOMY_REVIEW_REQUIRED_GATE_ID);
-                    let denial = GateDenial::from_approval_review(
-                        &item_id,
-                        gate_id,
-                        ApprovalReviewDenial::HumanReviewRequired,
-                        reloaded
-                            .plan
-                            .assignments
-                            .iter()
-                            .flat_map(|assignment| assignment.assigned_paths.iter().cloned()),
-                    )?;
-                    queue.release_before_dispatch(&item_id, Some(denial), Vec::new())?;
-                    return Err(error.context(
-                        "generated follow-up catalog preflight failed before durable dispatch start",
-                    ));
-                }
-            };
+        let (
+            runtime_model_catalog,
+            preflight_evidence,
+            catalog_preflight_session,
+            preflight_process_evidence,
+        ) = match runtime_preflight {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                let gate_id = supervisor_mutation_admission_gate_id(&error)
+                    .unwrap_or(crate::mutation_taxonomy::TAXONOMY_REVIEW_REQUIRED_GATE_ID);
+                let denial = GateDenial::from_approval_review(
+                    &item_id,
+                    gate_id,
+                    ApprovalReviewDenial::HumanReviewRequired,
+                    reloaded
+                        .plan
+                        .assignments
+                        .iter()
+                        .flat_map(|assignment| assignment.assigned_paths.iter().cloned()),
+                )?;
+                queue.release_before_dispatch(&item_id, Some(denial), Vec::new())?;
+                return Err(error.context(
+                    "generated follow-up catalog preflight failed before durable dispatch start",
+                ));
+            }
+        };
         let mut durable_dispatch_started = false;
         let mut mark_dispatch_authorized = || -> Result<()> {
             queue.mark_dispatch_started(&item_id)?;
@@ -565,7 +579,8 @@ pub(super) fn run_generated_follow_up_cascade(
             worktree_creation: SupervisorWorktreeCreation::Bound(&cleanliness),
             runtime_model_catalog,
             preflight_evidence,
-            resolution_preflight_permit,
+            catalog_preflight_session,
+            preflight_process_evidence,
             dispatch_started: None,
             dispatch_authorized: Some(&mut mark_dispatch_authorized),
             external_runner,
@@ -579,7 +594,7 @@ pub(super) fn run_generated_follow_up_cascade(
                 .item(&item_id)
                 .is_some_and(|item| item.phase() == GeneratedFollowUpQueuePhase::HeldAmbiguous)
         {
-            return result.context(
+            return result.map(|_| unreachable!()).context(
                 "injected interruption after admitted durable generated follow-up dispatch start",
             );
         }
@@ -596,7 +611,7 @@ pub(super) fn run_generated_follow_up_cascade(
                 std::iter::empty::<PathBuf>(),
             )?;
             queue.release_before_dispatch(&item_id, Some(denial), Vec::new())?;
-            return result.context(
+            return result.map(|_| unreachable!()).context(
                 "generated follow-up Supervisor failed before admitted durable dispatch start",
             );
         }
@@ -1273,7 +1288,11 @@ fn authenticated_subordinate_plan_matches(
 fn generated_plan_file(
     repo: &Path,
     plan: &GeneratedFollowUpSupervisorPlan,
+    permit: &crate::mutation_taxonomy::SupervisorOperationPermit<'_>,
 ) -> Result<tempfile::NamedTempFile> {
+    permit
+        .verify(crate::mutation_taxonomy::MutationOperation::GeneratedSupervisorPlanStage)
+        .map_err(anyhow::Error::from)?;
     let repository = crate::git_repository::open(repo)?;
     let mut file = tempfile::Builder::new()
         .prefix("maco-generated-follow-up-")

@@ -20,6 +20,29 @@ const PHASE_FINAL_REPORT_COMMITTED: &str = "final_report_committed";
 const PHASE_FINALIZATION_STARTED: &str = "artifact_finalization_started";
 const PHASE_FINALIZED: &str = "artifact_finalized";
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error(
+    "unsupported supervise checkpoint version {observed} (supported version: {supported}); start a new run or reconcile the retained checkpoint with a supported migration tool"
+)]
+pub(super) struct UnsupportedCheckpointVersion {
+    pub(super) observed: u32,
+    pub(super) supported: u32,
+}
+
+pub(super) fn unsupported_checkpoint_version_denial(
+    error: &anyhow::Error,
+) -> Option<ResumeCheckpointDenial> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<UnsupportedCheckpointVersion>())
+        .map(
+            |unsupported| ResumeCheckpointDenial::UnsupportedCheckpointVersion {
+                observed: unsupported.observed,
+                supported: unsupported.supported,
+            },
+        )
+}
+
 #[cfg(test)]
 #[derive(Debug)]
 struct CheckpointFailureHook {
@@ -328,9 +351,27 @@ impl<'a> SupervisorCheckpointPreparation<'a> {
 }
 
 impl SupervisorCheckpointWriter {
+    pub(super) fn create_authorized(
+        repo: &Path,
+        preparation: SupervisorCheckpointPreparation<'_>,
+        permit: &crate::mutation_taxonomy::SupervisorOperationPermit<'_>,
+    ) -> Result<Self> {
+        permit.verify(MutationOperation::SupervisorCheckpointJournalLifecycle)?;
+        Self::create_with_version(repo, preparation, SUPERVISE_CHECKPOINT_VERSION)
+    }
+
+    #[cfg(test)]
     pub(super) fn create(
         repo: &Path,
         preparation: SupervisorCheckpointPreparation<'_>,
+    ) -> Result<Self> {
+        Self::create_with_version(repo, preparation, SUPERVISE_CHECKPOINT_VERSION)
+    }
+
+    fn create_with_version(
+        repo: &Path,
+        preparation: SupervisorCheckpointPreparation<'_>,
+        version: u32,
     ) -> Result<Self> {
         let SupervisorCheckpointPreparation {
             run_id,
@@ -366,7 +407,7 @@ impl SupervisorCheckpointWriter {
             PHASE_PREPARED,
             None,
             &PreparedCheckpoint {
-                version: SUPERVISE_CHECKPOINT_VERSION,
+                version,
                 run_id: run_id.as_str().to_string(),
                 parent_node,
                 dispatch_identity,
@@ -380,6 +421,14 @@ impl SupervisorCheckpointWriter {
             },
         )?;
         Ok(writer)
+    }
+
+    #[cfg(test)]
+    pub(super) fn create_unsupported_v1_for_test(
+        repo: &Path,
+        preparation: SupervisorCheckpointPreparation<'_>,
+    ) -> Result<Self> {
+        Self::create_with_version(repo, preparation, 1)
     }
 
     pub(super) fn assignment_started(
@@ -610,6 +659,10 @@ pub(super) fn record_assignment_started_checkpoint(
     if guard.checkpoint.is_none() {
         return Ok(());
     }
+    guard
+        .mutation_session
+        .permit(MutationOperation::SupervisorCheckpointJournalLifecycle)?
+        .verify(MutationOperation::SupervisorCheckpointJournalLifecycle)?;
     let artifact = match guard.writer.resume_binding() {
         Ok(binding) => Some(binding),
         Err(error)
@@ -643,6 +696,10 @@ pub(super) fn record_assignment_completed_checkpoint(
     if guard.checkpoint.is_none() {
         return Ok(());
     }
+    guard
+        .mutation_session
+        .permit(MutationOperation::SupervisorCheckpointJournalLifecycle)?
+        .verify(MutationOperation::SupervisorCheckpointJournalLifecycle)?;
     let artifact = match guard.writer.resume_binding() {
         Ok(binding) => Some(binding),
         Err(error)
@@ -672,6 +729,10 @@ pub(super) fn record_dispatch_checkpoint(
     let mut guard = artifacts
         .lock()
         .map_err(|_| anyhow!("supervisor artifact writer mutex was poisoned"))?;
+    guard
+        .mutation_session
+        .permit(MutationOperation::SupervisorCheckpointJournalLifecycle)?
+        .verify(MutationOperation::SupervisorCheckpointJournalLifecycle)?;
     let Some(checkpoint) = guard.checkpoint.as_deref_mut() else {
         return Ok(());
     };
@@ -738,10 +799,11 @@ pub(super) fn open_supervisor_checkpoint(
 pub(super) fn open_supervisor_checkpoint_authorized(
     repo: &Path,
     run_id: &RunId,
-    manifest_sha256: &str,
-    permit: crate::mutation_taxonomy::ResumeRecoveryMutationPermit,
+    session: &crate::mutation_taxonomy::ResumeRecoveryMutationSession,
 ) -> Result<(SupervisorCheckpointWriter, SupervisorCheckpointSnapshot)> {
-    permit.consume(manifest_sha256)?;
+    session
+        .permit(MutationOperation::SupervisorCheckpointJournalLifecycle)?
+        .verify(MutationOperation::SupervisorCheckpointJournalLifecycle)?;
     open_supervisor_checkpoint_mutating(repo, run_id)
 }
 
@@ -1078,7 +1140,11 @@ fn decode_payload<T: DeserializeOwned>(record: &JournalRecord) -> Result<T> {
 
 fn validate_version(version: u32) -> Result<()> {
     if version != SUPERVISE_CHECKPOINT_VERSION {
-        bail!("unsupported supervise checkpoint version {version}");
+        return Err(UnsupportedCheckpointVersion {
+            observed: version,
+            supported: SUPERVISE_CHECKPOINT_VERSION,
+        }
+        .into());
     }
     Ok(())
 }

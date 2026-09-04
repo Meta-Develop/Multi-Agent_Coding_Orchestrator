@@ -27,7 +27,14 @@ pub(super) fn planned_claim_releases(
 pub(super) fn release_claims(
     store: &SyncStore,
     tokens: Vec<ClaimToken>,
+    permit: &SupervisorOperationPermit<'_>,
 ) -> (Vec<PathClaim>, Vec<String>) {
+    if let Err(error) = permit.verify(MutationOperation::ClaimRelease) {
+        return (
+            Vec::new(),
+            vec![format!("claim release authorization refused: {error}")],
+        );
+    }
     let mut released = Vec::new();
     let mut errors = Vec::new();
     for token in tokens {
@@ -69,7 +76,16 @@ pub(super) fn planned_semantic_intent_releases(
 pub(super) fn release_semantic_intents(
     store: &SemanticIntentStore,
     tokens: Vec<crate::semantic_coord::SemanticIntentToken>,
+    permit: &SupervisorOperationPermit<'_>,
 ) -> (Vec<SemanticIntent>, Vec<String>) {
+    if let Err(error) = permit.verify(MutationOperation::SemanticIntentRelease) {
+        return (
+            Vec::new(),
+            vec![format!(
+                "semantic intent release authorization refused: {error}"
+            )],
+        );
+    }
     let mut released = Vec::new();
     let mut errors = Vec::new();
     for token in tokens {
@@ -91,7 +107,15 @@ pub(super) fn complete_planned_scheduler_resource_release(
     sync_store: &SyncStore,
     semantic_store: &SemanticIntentStore,
     report: &SupervisorFinalReport,
+    claim_permit: &SupervisorOperationPermit<'_>,
+    semantic_permit: &SupervisorOperationPermit<'_>,
 ) -> Result<()> {
+    claim_permit
+        .verify(MutationOperation::ClaimRelease)
+        .map_err(anyhow::Error::from)?;
+    semantic_permit
+        .verify(MutationOperation::SemanticIntentRelease)
+        .map_err(anyhow::Error::from)?;
     if report.claim_tokens.iter().copied().collect::<BTreeSet<_>>()
         != report
             .released_claims

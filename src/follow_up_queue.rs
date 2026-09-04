@@ -18,7 +18,7 @@ use crate::{
     external_agent::EnvironmentFailure,
     gate_denial::{ExternalSideEffectState, GateDenial},
     machine_global::{machine_global_config_content_binding, MachineGlobalRetentionBinding},
-    mutation_taxonomy::GeneratedFollowUpQueueMutationPermit,
+    mutation_taxonomy::{GeneratedFollowUpQueueMutationSession, MutationOperation},
     safe_state::FileIdentity,
     state_journal::{AuthenticatedStateJournal, JournalRecord, JournalSpec},
     supervise::{
@@ -1012,6 +1012,7 @@ impl GeneratedFollowUpQueueSnapshot {
 pub(crate) struct GeneratedFollowUpQueue {
     journal: QueueJournal,
     snapshot: GeneratedFollowUpQueueSnapshot,
+    mutation_session: Option<GeneratedFollowUpQueueMutationSession>,
 }
 
 impl GeneratedFollowUpQueue {
@@ -1046,7 +1047,11 @@ impl GeneratedFollowUpQueue {
         if !snapshot.source.has_same_execution_basis(&source) || snapshot.bounds != bounds {
             bail!("generated follow-up queue execution basis changed across create-or-open");
         }
-        Ok(Self { journal, snapshot })
+        Ok(Self {
+            journal,
+            snapshot,
+            mutation_session: None,
+        })
     }
 
     /// Consumes queue-lifecycle authority before the journal root can be
@@ -1055,12 +1060,20 @@ impl GeneratedFollowUpQueue {
         authenticator: RepositoryAuthenticator,
         source: GeneratedFollowUpQueueSource,
         bounds: GeneratedFollowUpQueueBounds,
-        permit: GeneratedFollowUpQueueMutationPermit,
+        session: GeneratedFollowUpQueueMutationSession,
     ) -> Result<Self> {
         let manifest_sha256 = source
             .effective_mutation_manifest_sha256()
             .context("generated follow-up source has no admitted mutation manifest")?;
-        permit.consume(manifest_sha256)?;
+        if session.canonical_manifest_sha256() != manifest_sha256 {
+            bail!("generated follow-up queue session is bound to different audit evidence");
+        }
+        session
+            .permit(MutationOperation::GeneratedFollowUpQueueReserve)?
+            .verify(MutationOperation::GeneratedFollowUpQueueReserve)?;
+        session
+            .permit(MutationOperation::GeneratedFollowUpQueueWriteAppend)?
+            .verify(MutationOperation::GeneratedFollowUpQueueWriteAppend)?;
         source.validate()?;
         bounds.validate()?;
         verify_source_repository_binding(&authenticator, &source)?;
@@ -1077,7 +1090,11 @@ impl GeneratedFollowUpQueue {
         if !snapshot.source.has_same_execution_basis(&source) || snapshot.bounds != bounds {
             bail!("generated follow-up queue execution basis changed across create-or-open");
         }
-        Ok(Self { journal, snapshot })
+        Ok(Self {
+            journal,
+            snapshot,
+            mutation_session: Some(session),
+        })
     }
 
     #[cfg(test)]
@@ -1093,7 +1110,11 @@ impl GeneratedFollowUpQueue {
         if &snapshot.source != source {
             bail!("generated follow-up queue source identity changed across reopen");
         }
-        Ok(Self { journal, snapshot })
+        Ok(Self {
+            journal,
+            snapshot,
+            mutation_session: None,
+        })
     }
 
     /// Opens the queue identified by the immutable source execution identity,
@@ -1152,6 +1173,21 @@ impl GeneratedFollowUpQueue {
 
     pub(crate) fn summary(&self) -> GeneratedFollowUpQueueSummary {
         self.snapshot.summary()
+    }
+
+    /// Borrows the fixed plan-staging authority held by this exact queue.
+    /// The staging sink accepts no manifest, enum label, or serialized audit
+    /// evidence in its place.
+    pub(crate) fn generated_plan_stage_permit(
+        &self,
+    ) -> Result<crate::mutation_taxonomy::SupervisorOperationPermit<'_>> {
+        let session = self
+            .mutation_session
+            .as_ref()
+            .context("generated follow-up queue mutation session is missing")?;
+        session
+            .permit(MutationOperation::GeneratedSupervisorPlanStage)
+            .map_err(anyhow::Error::from)
     }
 
     /// Stages every immutable task before committing the complete batch. An
@@ -1574,6 +1610,66 @@ impl GeneratedFollowUpQueue {
         &mut self,
         event: QueueJournalEvent,
     ) -> Result<GeneratedFollowUpQueueEventData> {
+        if let Some(session) = &self.mutation_session {
+            session
+                .permit(MutationOperation::GeneratedFollowUpQueueWriteAppend)?
+                .verify(MutationOperation::GeneratedFollowUpQueueWriteAppend)?;
+            if matches!(
+                &event,
+                QueueJournalEvent::ReleasedBeforeDispatch { .. }
+                    | QueueJournalEvent::LeaseReleasedBeforeDispatch { .. }
+                    | QueueJournalEvent::AcknowledgedTerminal { .. }
+                    | QueueJournalEvent::LeaseTerminalAcknowledged { .. }
+            ) {
+                session
+                    .permit(MutationOperation::GeneratedFollowUpQueueRelease)?
+                    .verify(MutationOperation::GeneratedFollowUpQueueRelease)?;
+            }
+            if matches!(
+                &event,
+                QueueJournalEvent::Claimed { .. }
+                    | QueueJournalEvent::LeaseClaimed { .. }
+                    | QueueJournalEvent::LeaseReclaimed { .. }
+            ) {
+                session
+                    .permit(MutationOperation::GeneratedFollowUpQueueClaim)?
+                    .verify(MutationOperation::GeneratedFollowUpQueueClaim)?;
+            }
+            if matches!(
+                &event,
+                QueueJournalEvent::Enqueued { .. }
+                    | QueueJournalEvent::AcknowledgedTerminal { .. }
+                    | QueueJournalEvent::HeldAmbiguous { .. }
+                    | QueueJournalEvent::GraphDefinedAndBound { .. }
+                    | QueueJournalEvent::GraphTransition { .. }
+                    | QueueJournalEvent::LeaseTerminalAcknowledged { .. }
+            ) {
+                session
+                    .permit(MutationOperation::GeneratedFollowUpQueueAuthenticatedCommit)?
+                    .verify(MutationOperation::GeneratedFollowUpQueueAuthenticatedCommit)?;
+            }
+            let records_refusal = match &event {
+                QueueJournalEvent::ReleasedBeforeDispatch {
+                    gate_denial,
+                    environment_failures,
+                    ..
+                }
+                | QueueJournalEvent::LeaseReleasedBeforeDispatch {
+                    gate_denial,
+                    environment_failures,
+                    ..
+                } => gate_denial.is_some() || !environment_failures.is_empty(),
+                QueueJournalEvent::HeldAmbiguous { .. } => true,
+                _ => false,
+            };
+            if records_refusal {
+                session
+                    .permit(MutationOperation::GeneratedFollowUpRefusalEvidenceWrite)?
+                    .verify(MutationOperation::GeneratedFollowUpRefusalEvidenceWrite)?;
+            }
+        } else if !cfg!(test) {
+            bail!("generated follow-up queue mutation session is missing");
+        }
         if self.journal.records().len() >= MAX_AUTHENTICATED_QUEUE_RECORDS {
             bail!("generated follow-up queue exhausted its authenticated record bound");
         }
@@ -2950,13 +3046,13 @@ mod tests {
             authenticator(&repo),
             source(&repo, "source-invalid-permit"),
             bounds(1),
-            GeneratedFollowUpQueueMutationPermit::invalid_for_test(),
+            GeneratedFollowUpQueueMutationSession::invalid_for_test(),
         )
         .err()
         .expect("invalid queue lifecycle permit must fail at the real creation sink");
         assert!(error
             .to_string()
-            .contains("bound to a different canonical manifest"));
+            .contains("bound to different audit evidence"));
         assert!(
             !queue_root.exists(),
             "denied queue sink must not create its journal root"

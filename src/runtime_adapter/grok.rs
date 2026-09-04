@@ -758,7 +758,8 @@ pub struct GrokCatalogCommandOutput {
 /// Injectable command boundary.
 ///
 /// Unit tests inject hermetic evidence without resolving or starting `grok`.
-/// Production uses [`ScreenedGrokCatalogCommandRunner`].
+/// Tests may inject [`ScreenedGrokCatalogCommandRunner`]; Supervisor production
+/// uses the capability-bound runner in `supervise::selection_bridge`.
 pub trait GrokCatalogCommandRunner {
     fn run(&self, spec: &GrokCatalogCommandSpec) -> Result<GrokCatalogCommandOutput>;
 }
@@ -770,8 +771,10 @@ pub trait GrokCatalogCommandRunner {
 /// and returns honest confinement evidence. It does not invent Verified
 /// evidence after a failed or incomplete run.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub struct ScreenedGrokCatalogCommandRunner;
 
+#[cfg(test)]
 impl GrokCatalogCommandRunner for ScreenedGrokCatalogCommandRunner {
     fn run(&self, spec: &GrokCatalogCommandSpec) -> Result<GrokCatalogCommandOutput> {
         run_screened_grok_catalog_command(spec)
@@ -1138,6 +1141,7 @@ fn validate_grok_model_display_name(display_name: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn run_screened_grok_catalog_command(
     spec: &GrokCatalogCommandSpec,
 ) -> Result<GrokCatalogCommandOutput> {
@@ -1160,8 +1164,127 @@ fn run_screened_grok_catalog_command(
     })
 }
 
+pub(crate) fn run_screened_grok_catalog_command_authorized(
+    spec: &GrokCatalogCommandSpec,
+    session: &crate::mutation_taxonomy::CatalogPreflightMutationSession,
+    launch_evidence: &mut Option<crate::mutation_taxonomy::SupervisorProcessLaunchAuditEvidence>,
+) -> Result<GrokCatalogCommandOutput> {
+    let program = resolve_catalog_program(spec.program())?;
+    let program_for_revalidation = program.clone();
+    let metadata = std::fs::symlink_metadata(&program).with_context(|| {
+        format!(
+            "failed to inspect Grok catalog executable {}",
+            program.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("Grok catalog executable identity is not a regular file");
+    }
+    #[cfg(unix)]
+    let program_identity = {
+        use std::os::unix::fs::MetadataExt;
+        format!(
+            "{};dev={};ino={};len={};mtime_ns={}",
+            program.display(),
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|value| value.as_nanos().to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        )
+    };
+    #[cfg(not(unix))]
+    let program_identity = format!(
+        "{};len={};mtime={:?}",
+        program.display(),
+        metadata.len(),
+        metadata.modified().ok()
+    );
+    let (process_spec, credential_binding) =
+        screened_grok_catalog_process_spec_for_program_with_binding(spec, program)?;
+    let identity = crate::mutation_taxonomy::ExactSupervisorProcessLaunchIdentity {
+        run_id: session.run_id().to_string(),
+        subject_id: "catalog-grok".to_string(),
+        attempt: 1,
+        adapter: "grok".to_string(),
+        model: None,
+        reasoning_effort: None,
+        program_identity,
+        execution_mode: "verified-catalog-preflight".to_string(),
+        delivery_identity: serde_json::to_string(&(
+            spec.args(),
+            spec.current_dir(),
+            spec.environment(),
+            spec.timeout().as_millis(),
+            credential_binding,
+        ))?,
+        kind: crate::mutation_taxonomy::SupervisorProcessLaunchKind::CatalogGrokProbe,
+    };
+    let (evidence, authorization) = session.authorize_process_launch(identity.clone())?;
+    let current_metadata =
+        std::fs::symlink_metadata(&program_for_revalidation).with_context(|| {
+            format!(
+                "failed to revalidate Grok catalog executable {}",
+                program_for_revalidation.display()
+            )
+        })?;
+    if current_metadata.file_type().is_symlink()
+        || !current_metadata.is_file()
+        || current_metadata.len() != metadata.len()
+        || current_metadata.modified().ok() != metadata.modified().ok()
+    {
+        bail!("Grok catalog executable changed after exact process admission");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if current_metadata.dev() != metadata.dev() || current_metadata.ino() != metadata.ino() {
+            bail!("Grok catalog executable identity changed after exact process admission");
+        }
+    }
+    authorization.consume()?;
+    *launch_evidence = Some(evidence);
+    let output = run_process(process_spec).context(
+        "Grok runtime model catalog command failed before a verified result was available",
+    )?;
+    if output.process_error.is_some() || output.stdin_error.is_some() {
+        bail!("Grok runtime model catalog process ownership cleanup was incomplete");
+    }
+    Ok(GrokCatalogCommandOutput {
+        status: output.status.and_then(|status| status.code()),
+        stdout: output.stdout.as_bytes().to_vec(),
+        stderr: output.stderr.as_bytes().to_vec(),
+        stdout_truncated: output.stdout.is_truncated(),
+        stderr_truncated: output.stderr.is_truncated(),
+        timed_out: output.timed_out,
+        process_tree: output.process_tree,
+        side_effects: output.side_effects,
+    })
+}
+
+#[cfg(test)]
 fn screened_grok_catalog_process_spec(spec: &GrokCatalogCommandSpec) -> Result<ProcessSpec> {
     let program = resolve_catalog_program(spec.program())?;
+    screened_grok_catalog_process_spec_for_program(spec, program)
+}
+
+#[cfg(test)]
+fn screened_grok_catalog_process_spec_for_program(
+    spec: &GrokCatalogCommandSpec,
+    program: PathBuf,
+) -> Result<ProcessSpec> {
+    screened_grok_catalog_process_spec_for_program_with_binding(spec, program)
+        .map(|(process_spec, _)| process_spec)
+}
+
+fn screened_grok_catalog_process_spec_for_program_with_binding(
+    spec: &GrokCatalogCommandSpec,
+    program: PathBuf,
+) -> Result<(ProcessSpec, String)> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = program;
@@ -1170,7 +1293,9 @@ fn screened_grok_catalog_process_spec(spec: &GrokCatalogCommandSpec) -> Result<P
     #[cfg(target_os = "linux")]
     {
         let sources = GrokCredentialSource::from_ambient_environment()?;
+        let binding = sources.binding_identity();
         screened_grok_catalog_process_spec_with_credential_source(spec, program, &sources)
+            .map(|process_spec| (process_spec, binding))
     }
 }
 
@@ -1247,6 +1372,30 @@ impl GrokCredentialSource {
     /// The only environment value derived from this capability.
     pub(crate) fn grok_home_environment(&self) -> &str {
         &self.grok_home_environment
+    }
+
+    fn binding_identity(&self) -> String {
+        fn file_identity(file: &GrokCredentialFile) -> String {
+            format!(
+                "{};dev={};ino={};uid={};mode={};links={}",
+                file.path.display(),
+                file.identity.device,
+                file.identity.inode,
+                file.identity.owner,
+                file.identity.mode,
+                file.identity.links,
+            )
+        }
+        let config = self
+            .config
+            .as_ref()
+            .map(file_identity)
+            .unwrap_or_else(|| "none".to_string());
+        format!(
+            "home={};auth={};config={config}",
+            self.grok_home_environment,
+            file_identity(&self.auth),
+        )
     }
 
     /// Bind the exact held sources into a Grok confinement profile.

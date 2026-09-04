@@ -84,23 +84,24 @@ fn real_outer_autopilot_sink_rejects_invalid_permit_before_process_or_artifact()
             },
         },
     );
-    let (evidence, _valid_permit) = authorize_effective_supervisor_mutation_manifest(manifest)
+    let (evidence, _valid_session) = authorize_effective_supervisor_mutation_manifest(manifest)
         .expect("authorize outer test lifecycle")
         .into_autopilot_outer()
         .expect("convert outer test lifecycle");
 
+    let invalid_session = AutopilotOuterMutationSession::invalid_for_test();
     let error = begin_autopilot_mutations(AutopilotMutationStartRequest {
         repo: &repo,
         options: &options,
         evidence,
-        permit: AutopilotOuterMutationPermit::invalid_for_test(),
+        session: &invalid_session,
     })
     .err()
     .expect("invalid outer permit must fail at the real mutation sink");
 
     assert!(error
         .to_string()
-        .contains("bound to a different canonical manifest"));
+        .contains("bound to different audit evidence"));
     assert!(!repo
         .join(RunArtifactFamily::Autopilot.run_root())
         .join(run_id.as_str())

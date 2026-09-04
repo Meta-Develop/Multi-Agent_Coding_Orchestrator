@@ -3,7 +3,8 @@
 //! Published sequence records are immutable. Each record is MAC chained to its
 //! predecessor, while an authenticated atomic head detects a missing or
 //! truncated published tail. A single identity-bound kernel lock protects one
-//! run for its full lifecycle.
+//! run for its mutation lifecycle. Observation uses a separate lock-free,
+//! double-read authenticated snapshot that refuses transitional state.
 
 // Generic discovery helpers are staged for snapshot/effect consumers while
 // checkpoint callers continue to use the compatibility alias.
@@ -11,8 +12,8 @@
 
 use crate::{
     artifacts::state_auth::{
-        random_identifier, validate_repository_binding, AuthenticationDomain, AuthenticationTag,
-        BoundStateLock, RepositoryAuthBinding, RepositoryAuthenticator,
+        random_identifier, sha256_hex, validate_repository_binding, AuthenticationDomain,
+        AuthenticationTag, BoundStateLock, RepositoryAuthBinding, RepositoryAuthenticator,
     },
     safe_state::{identity_for_path, BoundedRegularReader, FileIdentity, SafeRoot},
 };
@@ -137,6 +138,44 @@ pub(crate) struct AuthenticatedStateJournal<S: JournalSpec> {
 }
 
 pub(crate) type StateJournal = AuthenticatedStateJournal<CheckpointJournalSpec>;
+
+/// A fully authenticated, stable journal snapshot that never acquires or
+/// creates a lock and has no mutation methods.
+pub(crate) struct AuthenticatedStateJournalSnapshot<S: JournalSpec> {
+    authenticator: RepositoryAuthenticator,
+    journal_root: SafeRoot,
+    run_root: SafeRoot,
+    identity: JournalIdentity,
+    records: Vec<JournalRecord>,
+    spec: PhantomData<S>,
+}
+
+impl<S: JournalSpec> AuthenticatedStateJournalSnapshot<S> {
+    pub(crate) fn identity(&self) -> &JournalIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn records(&self) -> &[JournalRecord] {
+        &self.records
+    }
+
+    pub(crate) fn into_authenticator(self) -> Result<RepositoryAuthenticator> {
+        self.verify_boundaries()?;
+        Ok(self.authenticator)
+    }
+
+    fn verify_boundaries(&self) -> Result<()> {
+        self.authenticator.verify_epoch()?;
+        self.authenticator
+            .verify_repository_binding(&self.identity.repository)?;
+        self.journal_root.verify()?;
+        self.run_root.verify()?;
+        if self.run_root.identity() != &self.identity.run_directory_identity {
+            bail!("checkpoint run directory identity changed");
+        }
+        Ok(())
+    }
+}
 
 impl<S: JournalSpec> AuthenticatedStateJournal<S> {
     pub(crate) fn existing_root(authenticator: &RepositoryAuthenticator) -> Result<SafeRoot> {
@@ -335,7 +374,7 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
     pub(crate) fn open_existing_read_only(
         authenticator: RepositoryAuthenticator,
         expected: &JournalIdentity,
-    ) -> Result<Self> {
+    ) -> Result<AuthenticatedStateJournalSnapshot<S>> {
         validate_spec::<S>()?;
         validate_identity::<S>(expected)?;
         authenticator.verify_epoch()?;
@@ -348,28 +387,10 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
         if run_root.identity() != &expected.run_directory_identity {
             bail!("authenticated checkpoint run directory identity changed");
         }
-        let run_lock =
-            BoundStateLock::try_acquire_existing_exclusive(&run_root, S::INSTANCE_LOCK_NAME)
-                .with_context(|| {
-                    format!(
-                        "{} instance is active, incomplete, or missing its stable lock",
-                        S::NAMESPACE
-                    )
-                })?;
-        let mut journal = Self {
-            authenticator,
-            journal_root,
-            run_root,
-            run_lock,
-            identity: expected.clone(),
-            records: Vec::new(),
-            record_bytes: 0,
-            head_dirty: false,
-            spec: PhantomData,
-        };
-        journal.load_without_recovery()?;
-        journal.verify_boundaries()?;
-        Ok(journal)
+        let snapshot =
+            read_stable_snapshot::<S>(authenticator, journal_root, run_root, expected.clone())?;
+        snapshot.verify_boundaries()?;
+        Ok(snapshot)
     }
 
     /// Opens a stable instance when its authenticated identity is not stored by
@@ -390,7 +411,7 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
     pub(crate) fn open_instance_read_only(
         authenticator: RepositoryAuthenticator,
         instance_id: &str,
-    ) -> Result<Self> {
+    ) -> Result<AuthenticatedStateJournalSnapshot<S>> {
         let identity = Self::locate_instance(&authenticator, instance_id)?;
         Self::open_existing_read_only(authenticator, &identity)
     }
@@ -761,6 +782,140 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct StableStateFile {
+    identity: FileIdentity,
+    digest: String,
+    bytes: Vec<u8>,
+}
+
+fn read_stable_state_file<S: JournalSpec>(
+    root: &SafeRoot,
+    name: &std::ffi::OsStr,
+) -> Result<StableStateFile> {
+    let path = root.direct_child(name)?;
+    let identity_before = validate_private_state_file::<S>(&path, false)?;
+    let bytes = BoundedRegularReader::read_direct(root, name, S::MAX_RECORD_BYTES)?;
+    let digest = sha256_hex(&bytes);
+    let identity_after = validate_private_state_file::<S>(&path, false)?;
+    let verification_bytes = BoundedRegularReader::read_direct(root, name, S::MAX_RECORD_BYTES)?;
+    let identity_final = validate_private_state_file::<S>(&path, false)?;
+    if identity_before != identity_after
+        || identity_after != identity_final
+        || digest != sha256_hex(&verification_bytes)
+        || bytes != verification_bytes
+    {
+        bail!("authenticated journal state changed while a read-only snapshot was captured");
+    }
+    Ok(StableStateFile {
+        identity: identity_final,
+        digest,
+        bytes,
+    })
+}
+
+fn read_stable_snapshot<S: JournalSpec>(
+    authenticator: RepositoryAuthenticator,
+    journal_root: SafeRoot,
+    run_root: SafeRoot,
+    identity: JournalIdentity,
+) -> Result<AuthenticatedStateJournalSnapshot<S>> {
+    authenticator.verify_epoch()?;
+    authenticator.verify_repository_binding(&identity.repository)?;
+    journal_root.verify()?;
+    run_root.verify()?;
+    if run_root.identity() != &identity.run_directory_identity {
+        bail!("checkpoint run directory identity changed");
+    }
+
+    let inventory_before = inventory_run_directory::<S>(&run_root)?;
+    if !inventory_before.record_temps.is_empty() || !inventory_before.head_temps.is_empty() {
+        bail!("authenticated journal has crash residue requiring recovery");
+    }
+    if !inventory_before.head_exists {
+        bail!("authenticated journal head is missing; recovery is required");
+    }
+    if inventory_before.records.len() > S::MAX_RECORDS {
+        bail!("{} journal exceeds its record-count bound", S::NAMESPACE);
+    }
+
+    let head_name = OsString::from(S::HEAD_FILE_NAME);
+    let head_before = read_stable_state_file::<S>(&run_root, &head_name)?;
+    let mut stable_records = Vec::with_capacity(inventory_before.records.len());
+    let mut records = Vec::with_capacity(inventory_before.records.len());
+    let mut total = 0_u64;
+    let mut previous = AuthenticationTag::zero();
+    for (expected_index, (sequence, name)) in inventory_before.records.iter().enumerate() {
+        let expected_sequence = u64::try_from(expected_index)
+            .context("checkpoint sequence overflowed")?
+            .checked_add(1)
+            .context("checkpoint sequence overflowed")?;
+        if *sequence != expected_sequence {
+            bail!("checkpoint journal has a missing, reordered, or duplicate sequence");
+        }
+        let stable = read_stable_state_file::<S>(&run_root, name)?;
+        total = total
+            .checked_add(u64::try_from(stable.bytes.len()).context("record length overflowed")?)
+            .context("journal byte total overflowed")?;
+        if total > S::MAX_TOTAL_BYTES {
+            bail!("{} journal exceeds its aggregate byte bound", S::NAMESPACE);
+        }
+        let record: JournalRecord = serde_json::from_slice(&stable.bytes)
+            .context("checkpoint journal contains a truncated or malformed record")?;
+        validate_record::<S>(&record, &identity, expected_sequence, &previous)?;
+        authenticator.verify_tag(S::RECORD_DOMAIN, &record_mac_payload(&record)?, &record.mac)?;
+        previous = record.mac.clone();
+        stable_records.push((name.clone(), stable));
+        records.push(record);
+    }
+
+    #[cfg(test)]
+    run_read_only_snapshot_midpoint_hook();
+
+    let inventory_after = inventory_run_directory::<S>(&run_root)?;
+    if inventory_before != inventory_after {
+        bail!("authenticated journal inventory changed while a read-only snapshot was captured");
+    }
+    for (name, before) in &stable_records {
+        let after = read_stable_state_file::<S>(&run_root, name)?;
+        if before != &after {
+            bail!("authenticated journal record changed while a read-only snapshot was captured");
+        }
+    }
+    let head_after = read_stable_state_file::<S>(&run_root, &head_name)?;
+    if head_before != head_after {
+        bail!("authenticated journal head changed while a read-only snapshot was captured");
+    }
+
+    let head: JournalHead = serde_json::from_slice(&head_after.bytes)
+        .context("checkpoint journal head is truncated or malformed")?;
+    validate_head::<S>(&head, &identity)?;
+    authenticator.verify_tag(S::HEAD_DOMAIN, &head_mac_payload(&head)?, &head.mac)?;
+    let last_sequence = u64::try_from(records.len()).context("checkpoint count overflowed")?;
+    let last_mac = records
+        .last()
+        .map(|record| record.mac.clone())
+        .context("authenticated journal has a head but no durable record")?;
+    if head.sequence != last_sequence
+        || head.last_record_mac != last_mac
+        || head.record_bytes != total
+    {
+        bail!("authenticated journal head does not exactly match its published tail; recovery is required");
+    }
+
+    let snapshot = AuthenticatedStateJournalSnapshot {
+        authenticator,
+        journal_root,
+        run_root,
+        identity,
+        records,
+        spec: PhantomData,
+    };
+    snapshot.verify_boundaries()?;
+    Ok(snapshot)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RunInventory {
     records: BTreeMap<u64, OsString>,
     record_temps: Vec<(u64, OsString)>,
@@ -1406,11 +1561,29 @@ fn validate_private_state_file<S: JournalSpec>(
 #[cfg(test)]
 thread_local! {
     static JOURNAL_HEAD_WRITE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static READ_ONLY_SNAPSHOT_MIDPOINT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
 fn set_journal_head_write_fault() {
     JOURNAL_HEAD_WRITE_FAULT.with(|slot| slot.set(true));
+}
+
+#[cfg(test)]
+fn set_read_only_snapshot_midpoint_hook(hook: impl FnOnce() + 'static) {
+    READ_ONLY_SNAPSHOT_MIDPOINT_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_read_only_snapshot_midpoint_hook() {
+    READ_ONLY_SNAPSHOT_MIDPOINT_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1423,6 +1596,7 @@ mod tests {
     use super::*;
     use crate::artifacts::repository_auth_writer;
     use git2::Repository;
+    use std::collections::BTreeSet;
     use tempfile::TempDir;
 
     fn auth_repo() -> (TempDir, PathBuf, RepositoryAuthenticator) {
@@ -1603,6 +1777,62 @@ mod tests {
             fs::read(run.join(HEAD_FILE_NAME)).expect("reread stable head"),
             head_before
         );
+    }
+
+    #[test]
+    fn read_only_snapshot_succeeds_while_writer_lock_is_held_without_mutation() {
+        let (_temp, repo_path, auth) = auth_repo();
+        let mut writer = StateJournal::create(auth, "writer-held").expect("create journal");
+        writer
+            .append("planned", None, &serde_json::json!({"v": 1}))
+            .expect("append record");
+        let run = repo_path
+            .join(".git/maco/state")
+            .join(JOURNAL_ROOT_NAME)
+            .join("writer-held");
+        let head_before = fs::read(run.join(HEAD_FILE_NAME)).expect("head before");
+        let entries_before = fs::read_dir(&run)
+            .expect("entries before")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect::<BTreeSet<_>>();
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        let auth = RepositoryAuthenticator::open_existing(repo.commondir()).expect("auth");
+
+        let snapshot = StateJournal::open_instance_read_only(auth, "writer-held")
+            .expect("read-only snapshot must not contend on the writer lock");
+
+        assert_eq!(snapshot.records().len(), 1);
+        assert_eq!(
+            fs::read(run.join(HEAD_FILE_NAME)).expect("head after"),
+            head_before
+        );
+        let entries_after = fs::read_dir(&run)
+            .expect("entries after")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(entries_after, entries_before);
+        drop(writer);
+    }
+
+    #[test]
+    fn read_only_snapshot_refuses_a_head_that_changes_during_capture() {
+        let (_temp, repo_path, identity) = journal_with_two_records();
+        let head_path = repo_path
+            .join(".git/maco/state")
+            .join(JOURNAL_ROOT_NAME)
+            .join(&identity.run_id)
+            .join(HEAD_FILE_NAME);
+        set_read_only_snapshot_midpoint_hook(move || {
+            fs::write(&head_path, b"{}\n").expect("mutate head during snapshot");
+        });
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        let auth = RepositoryAuthenticator::open_existing(repo.commondir()).expect("auth");
+
+        let error = StateJournal::open_instance_read_only(auth, &identity.run_id)
+            .err()
+            .expect("unstable snapshot must be refused");
+
+        assert!(error.to_string().contains("head changed"));
     }
 
     #[test]

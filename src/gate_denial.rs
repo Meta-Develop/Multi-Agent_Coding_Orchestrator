@@ -301,6 +301,7 @@ pub enum BudgetAdmissionDenial {
 pub enum ResumeCheckpointDenial {
     IntegrityFailure,
     UnsupportedLifecycle,
+    UnsupportedCheckpointVersion { observed: u32, supported: u32 },
 }
 
 /// A typed, non-executable description of the next safe operation.
@@ -1205,6 +1206,9 @@ fn reason_label(reason: &GateDenialReason) -> &'static str {
             }
             ResumeCheckpointDenial::UnsupportedLifecycle => {
                 "authenticated resume checkpoint lifecycle is not safely resumable"
+            }
+            ResumeCheckpointDenial::UnsupportedCheckpointVersion { .. } => {
+                "authenticated resume checkpoint version is unsupported; start a new run or reconcile the retained checkpoint with a supported migration tool"
             }
         },
         GateDenialReason::ExternalSideEffect {

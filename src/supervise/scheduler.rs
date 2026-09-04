@@ -6,6 +6,72 @@ use preclaim::{
     preclaim_assignment, PreclaimDecision, PreclaimRunEvidence,
 };
 
+fn require_supervisor_operation(
+    session: &SupervisorRunMutationSession,
+    operation: MutationOperation,
+) -> Result<()> {
+    session
+        .permit(operation)?
+        .verify(operation)
+        .map_err(anyhow::Error::from)
+}
+
+fn open_scheduler_coordination_stores_authorized(
+    repo: &Path,
+    permit: &SupervisorOperationPermit<'_>,
+) -> Result<(SyncStore, SemanticIntentStore)> {
+    permit
+        .verify(MutationOperation::SupervisorCoordinationStoreBootstrap)
+        .map_err(anyhow::Error::from)?;
+    Ok((SyncStore::open(repo)?, SemanticIntentStore::open(repo)?))
+}
+
+fn open_scheduler_field_guide_authorized(
+    repo: &Path,
+    permit: &SupervisorOperationPermit<'_>,
+) -> Result<FieldGuideStore> {
+    permit
+        .verify(MutationOperation::SupervisorFieldGuideMutation)
+        .map_err(anyhow::Error::from)?;
+    FieldGuideStore::open(repo, FieldGuideLimits::default())
+        .context("failed to open authenticated field guide for supervise run")
+}
+
+fn initialize_scheduler_orchestration_journal_authorized(
+    repo: &Path,
+    run_id: &RunId,
+    parent_node: Option<&str>,
+    permit: &SupervisorOperationPermit<'_>,
+) -> Result<Option<OrchestrationEventJournal>> {
+    permit
+        .verify(MutationOperation::SupervisorOrchestrationJournalLifecycle)
+        .map_err(anyhow::Error::from)?;
+    Ok(initialize_orchestration_event_journal(
+        repo,
+        run_id,
+        parent_node,
+    ))
+}
+
+fn release_concurrent_assignment_authorized(
+    context: &AssignmentSchedulerContext<'_, '_>,
+    outcome: &mut AssignmentExecutionOutcome,
+) -> Result<()> {
+    let claim_permit = context
+        .mutation_session
+        .permit(MutationOperation::ClaimRelease)?;
+    let semantic_permit = context
+        .mutation_session
+        .permit(MutationOperation::SemanticIntentRelease)?;
+    release_concurrent_assignment(
+        outcome,
+        context.sync_store,
+        context.semantic_store,
+        &claim_permit,
+        &semantic_permit,
+    )
+}
+
 /// Admission policy for concurrently runnable supervisor children.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SupervisorConcurrencyPolicy {
@@ -395,6 +461,7 @@ struct AssignmentSchedulerContext<'context, 'writer> {
     budget_ledger: &'context RunBudgetLedger,
     runtime_model_catalog: &'context RuntimeModelCatalog,
     external_runner: &'context CancellableExternalRunner<'context>,
+    mutation_session: &'context SupervisorRunMutationSession,
     release_per_assignment: bool,
 }
 
@@ -1674,6 +1741,10 @@ fn run_serial_assignment_schedule(
             break;
         };
         pending.remove(&index);
+        require_supervisor_operation(
+            context.mutation_session,
+            MutationOperation::SupervisorCheckpointJournalLifecycle,
+        )?;
         record_assignment_started_checkpoint(
             context.artifacts,
             assignment,
@@ -1719,12 +1790,13 @@ fn run_serial_assignment_schedule(
             runtime_model_catalog: context.runtime_model_catalog,
             cancellation: cancellation.clone(),
             external_runner: context.external_runner,
+            mutation_session: context.mutation_session,
         });
         drop(concurrency_guard);
         let mut outcome = outcome;
         record_completed_assignment_checkpoint(context, index, &outcome)?;
         if context.release_per_assignment {
-            release_concurrent_assignment(&mut outcome, context.sync_store, context.semantic_store);
+            release_concurrent_assignment_authorized(context, &mut outcome)?;
         }
         if progress.circuit_breaker_trip.is_none() {
             if let Some(trip) = observe_assignment_health(&mut progress.health_breaker, &outcome) {
@@ -1873,6 +1945,10 @@ fn run_concurrent_assignment_schedule(
                         break;
                     };
                     pending.remove(&index);
+                    require_supervisor_operation(
+                        context.mutation_session,
+                        MutationOperation::SupervisorCheckpointJournalLifecycle,
+                    )?;
                     record_assignment_started_checkpoint(
                         context.artifacts,
                         assignment,
@@ -1943,6 +2019,7 @@ fn run_concurrent_assignment_schedule(
                             runtime_model_catalog: context.runtime_model_catalog,
                             cancellation: assignment_cancellation,
                             external_runner: context.external_runner,
+                            mutation_session: context.mutation_session,
                         })
                     });
                     match spawn_result {
@@ -1963,11 +2040,10 @@ fn run_concurrent_assignment_schedule(
                                         active_index,
                                         &outcome,
                                     )?;
-                                    release_concurrent_assignment(
+                                    release_concurrent_assignment_authorized(
+                                        context,
                                         &mut outcome,
-                                        context.sync_store,
-                                        context.semantic_store,
-                                    );
+                                    )?;
                                     progress.indexed_outcomes[active_index] = Some(outcome);
                                 }
                                 progress
@@ -2028,7 +2104,7 @@ fn run_concurrent_assignment_schedule(
                 )),
             };
             record_completed_assignment_checkpoint(context, completed_index, &outcome)?;
-            release_concurrent_assignment(&mut outcome, context.sync_store, context.semantic_store);
+            release_concurrent_assignment_authorized(context, &mut outcome)?;
             if outcome.requires_scheduler_abort() {
                 cancellation.cancel();
                 stop_scheduling = true;
@@ -2073,7 +2149,7 @@ fn run_concurrent_assignment_schedule(
                 )),
             };
             record_completed_assignment_checkpoint(context, index, &outcome)?;
-            release_concurrent_assignment(&mut outcome, context.sync_store, context.semantic_store);
+            release_concurrent_assignment_authorized(context, &mut outcome)?;
             progress.indexed_outcomes[index] = Some(outcome);
             progress.commit_completed_selection_prefix(context.options.runtime)?;
         }
@@ -2086,6 +2162,10 @@ fn record_completed_assignment_checkpoint(
     index: usize,
     outcome: &AssignmentExecutionOutcome,
 ) -> Result<()> {
+    require_supervisor_operation(
+        context.mutation_session,
+        MutationOperation::SupervisorCheckpointJournalLifecycle,
+    )?;
     let assignment = context
         .plan
         .assignments
@@ -2846,9 +2926,15 @@ fn release_collected_scheduler_resources(
     sync_store: Option<&SyncStore>,
     semantic_store: Option<&SemanticIntentStore>,
     collected: &mut CollectedSchedulerResources,
+    claim_permit: &SupervisorOperationPermit<'_>,
+    semantic_permit: &SupervisorOperationPermit<'_>,
 ) -> ReleasedSchedulerResources {
     let (mut released_claims, mut release_errors) = match sync_store {
-        Some(store) => release_claims(store, std::mem::take(&mut collected.acquired_claim_tokens)),
+        Some(store) => release_claims(
+            store,
+            std::mem::take(&mut collected.acquired_claim_tokens),
+            claim_permit,
+        ),
         None => (Vec::new(), Vec::new()),
     };
     released_claims.extend(std::mem::take(&mut collected.concurrently_released_claims));
@@ -2857,6 +2943,7 @@ fn release_collected_scheduler_resources(
         Some(store) => release_semantic_intents(
             store,
             std::mem::take(&mut collected.acquired_semantic_tokens),
+            semantic_permit,
         ),
         None => (Vec::new(), Vec::new()),
     };
@@ -2929,9 +3016,22 @@ fn persist_supervisor_final_report(
     mut artifact_writer: ArtifactRunWriter,
     checkpoint_writer: Option<&mut SupervisorCheckpointWriter>,
     invocation_scratch_quiescence: Option<crate::artifacts::ArtifactScratchQuiescence>,
+    mutation_session: &SupervisorRunMutationSession,
     release_after_terminal_record: impl FnOnce() -> Result<()>,
 ) -> Result<SupervisorFinalReport> {
+    require_supervisor_operation(
+        mutation_session,
+        MutationOperation::SupervisorRunArtifactWriteAppend,
+    )?;
+    require_supervisor_operation(
+        mutation_session,
+        MutationOperation::SupervisorOrchestrationJournalLifecycle,
+    )?;
     if let Some(quiescence) = invocation_scratch_quiescence {
+        require_supervisor_operation(
+            mutation_session,
+            MutationOperation::SupervisorScratchEvidenceCleanup,
+        )?;
         // Incoming/capture trees are identity-bound reservations counted by the
         // artifact writer, even when a post-reservation admission check returns
         // before the normal import/discard path. This terminal boundary receives
@@ -2998,6 +3098,10 @@ fn persist_supervisor_final_report(
     let report_bytes = encode_final_report(&final_report)?;
     let mut checkpoint_writer = checkpoint_writer;
     if let Some(checkpoint) = checkpoint_writer.as_deref_mut() {
+        require_supervisor_operation(
+            mutation_session,
+            MutationOperation::SupervisorCheckpointJournalLifecycle,
+        )?;
         let artifact_binding = artifact_writer
             .resume_binding()
             .context("failed to establish a durable terminal supervisor report boundary")?;
@@ -3005,6 +3109,8 @@ fn persist_supervisor_final_report(
             .final_report_planned(&final_report, &report_bytes, artifact_binding)
             .context("failed to persist the terminal supervisor report plan")?;
     }
+    require_supervisor_operation(mutation_session, MutationOperation::ClaimRelease)?;
+    require_supervisor_operation(mutation_session, MutationOperation::SemanticIntentRelease)?;
     release_after_terminal_record()
         .context("failed to release scheduler resources after the durable terminal record")?;
     artifact_writer
@@ -3023,9 +3129,13 @@ fn persist_supervisor_final_report(
         )?;
         checkpoint.finalization_started(&final_report, &report_bytes)?;
     }
-    artifact_writer.finalize(
-        RunArtifactFamily::Supervise.final_report_relative_path(),
+    let finalization_permit =
+        mutation_session.permit(MutationOperation::SupervisorRunArtifactAuthenticatedFinalize)?;
+    finalize_supervisor_artifact_run(
+        artifact_writer,
+        &RunArtifactFamily::Supervise.final_report_relative_path(),
         final_report.publishable,
+        &finalization_permit,
     )?;
     if let Some(checkpoint) = checkpoint_writer {
         checkpoint.finalized(&final_report, &report_bytes)?;
@@ -3049,11 +3159,34 @@ struct SchedulerEvidenceInitialization<'context> {
     semantic_store_slot: &'context mut Option<SemanticIntentStore>,
     orchestration_journal: &'context mut Option<OrchestrationEventJournal>,
     primary_run_baseline: &'context mut Option<PrimaryWorktreeSnapshot>,
+    mutation_session: &'context SupervisorRunMutationSession,
 }
 
 fn initialize_scheduler_evidence(
     initialization: &mut SchedulerEvidenceInitialization<'_>,
 ) -> Result<()> {
+    require_supervisor_operation(
+        initialization.mutation_session,
+        MutationOperation::SupervisorRunArtifactWriteAppend,
+    )?;
+    require_supervisor_operation(
+        initialization.mutation_session,
+        MutationOperation::SupervisorCoordinationStoreBootstrap,
+    )?;
+    require_supervisor_operation(
+        initialization.mutation_session,
+        MutationOperation::SupervisorOrchestrationJournalLifecycle,
+    )?;
+    require_supervisor_operation(
+        initialization.mutation_session,
+        MutationOperation::SupervisorFieldGuideMutation,
+    )?;
+    let messaging_permit = initialization
+        .mutation_session
+        .permit(MutationOperation::SupervisorMessagingJournalLifecycle)?;
+    let artifact_write_permit = initialization
+        .mutation_session
+        .permit(MutationOperation::SupervisorRunArtifactWriteAppend)?;
     if initialization.execution_target.is_none() && !initialization.options.allow_dirty_primary {
         ensure_clean_primary(initialization.repo, initialization.execution_runtime)?;
     }
@@ -3064,6 +3197,8 @@ fn initialize_scheduler_evidence(
         initialization.consultant,
         initialization.assignment_metadata,
         initialization.plan_metadata,
+        &artifact_write_permit,
+        &messaging_permit,
     )?;
     write_orchestrator_schema(
         initialization.artifact_writer,
@@ -3093,18 +3228,30 @@ fn initialize_scheduler_evidence(
         initialization.artifact_writer,
         Path::new("schemas/supervisor-final-report.schema.json"),
     )?;
-    let field_guide_store = FieldGuideStore::open(initialization.repo, FieldGuideLimits::default())
-        .context("failed to open authenticated field guide for supervise run")?;
+    let field_guide_permit = initialization
+        .mutation_session
+        .permit(MutationOperation::SupervisorFieldGuideMutation)?;
+    let field_guide_store =
+        open_scheduler_field_guide_authorized(initialization.repo, &field_guide_permit)?;
     let field_guide_prompt = SupervisorFieldGuidePrompt::from_store(&field_guide_store)?;
     *initialization.field_guide_store_slot = Some(field_guide_store);
     *initialization.field_guide_prompt_slot = Some(field_guide_prompt);
-    *initialization.sync_store_slot = Some(SyncStore::open(initialization.repo)?);
-    *initialization.semantic_store_slot = Some(SemanticIntentStore::open(initialization.repo)?);
-    *initialization.orchestration_journal = initialize_orchestration_event_journal(
+    let coordination_permit = initialization
+        .mutation_session
+        .permit(MutationOperation::SupervisorCoordinationStoreBootstrap)?;
+    let (sync_store, semantic_store) =
+        open_scheduler_coordination_stores_authorized(initialization.repo, &coordination_permit)?;
+    *initialization.sync_store_slot = Some(sync_store);
+    *initialization.semantic_store_slot = Some(semantic_store);
+    let orchestration_permit = initialization
+        .mutation_session
+        .permit(MutationOperation::SupervisorOrchestrationJournalLifecycle)?;
+    *initialization.orchestration_journal = initialize_scheduler_orchestration_journal_authorized(
         initialization.repo,
         &initialization.options.run_id,
         initialization.options.parent_node.as_deref(),
-    );
+        &orchestration_permit,
+    )?;
     let run_id = initialization.options.run_id.as_str();
     let parent_node = initialization.options.parent_node.as_deref();
     let supervisor_spawn_payload = if let Some(parent) = parent_node {
@@ -3234,7 +3381,7 @@ fn preclaim_assessment_runtime(
     #[cfg(test)]
     if matches!(
         worktree_creation,
-        SupervisorWorktreeCreation::Bound(_) | SupervisorWorktreeCreation::PrimaryWorktree
+        SupervisorWorktreeCreation::Bound(_) | SupervisorWorktreeCreation::PrimaryWorktree(_)
     ) {
         return SupervisorExecutionRuntime::NonpublishableSimulation;
     }
@@ -3245,14 +3392,34 @@ fn preclaim_assessment_runtime(
     execution_runtime
 }
 
-fn persist_prepared_preclaim_decisions(
-    repo: &Path,
-    run_id: &RunId,
-    parent_node: Option<&str>,
-    artifact_writer: &mut ArtifactRunWriter,
-    assignments: &[OrchestratorAssignment],
-    decisions: &[PreclaimDecision],
-) -> Result<()> {
+struct PreparedPreclaimPersistence<'a> {
+    repo: &'a Path,
+    run_id: &'a RunId,
+    parent_node: Option<&'a str>,
+    artifact_writer: &'a mut ArtifactRunWriter,
+    assignments: &'a [OrchestratorAssignment],
+    decisions: &'a [PreclaimDecision],
+    mutation_session: &'a SupervisorRunMutationSession,
+}
+
+fn persist_prepared_preclaim_decisions(request: PreparedPreclaimPersistence<'_>) -> Result<()> {
+    let PreparedPreclaimPersistence {
+        repo,
+        run_id,
+        parent_node,
+        artifact_writer,
+        assignments,
+        decisions,
+        mutation_session,
+    } = request;
+    require_supervisor_operation(
+        mutation_session,
+        MutationOperation::SupervisorRunArtifactWriteAppend,
+    )?;
+    require_supervisor_operation(
+        mutation_session,
+        MutationOperation::SupervisorOrchestrationJournalLifecycle,
+    )?;
     if assignments.len() != decisions.len() {
         bail!(
             "cannot persist {} pre-claim decisions for {} assignments",
@@ -3260,13 +3427,21 @@ fn persist_prepared_preclaim_decisions(
             assignments.len()
         );
     }
-    let mut journal = initialize_orchestration_event_journal(repo, run_id, parent_node);
+    let orchestration_permit =
+        mutation_session.permit(MutationOperation::SupervisorOrchestrationJournalLifecycle)?;
+    let mut journal = initialize_scheduler_orchestration_journal_authorized(
+        repo,
+        run_id,
+        parent_node,
+        &orchestration_permit,
+    )?;
     let mut autonomy_kpis = AutonomyKpiCollector::default();
     let artifacts = Mutex::new(SharedSupervisorArtifacts {
         writer: artifact_writer,
         journal: &mut journal,
         autonomy_kpis: &mut autonomy_kpis,
         checkpoint: None,
+        mutation_session,
     });
     for (assignment, decision) in assignments.iter().zip(decisions) {
         persist_preclaim_decision(&artifacts, assignment, decision)?;
@@ -3337,21 +3512,23 @@ struct PreparedSupervisorRun {
     run_dir: PathBuf,
     dirs: RunDirs,
     manager: WorktreeManager,
+    mutation_session: SupervisorRunMutationSession,
     _process_registration: Option<crate::run_ops::SupervisorProcessGuard>,
 }
 
-struct SupervisorMutationStartRequest<'a> {
-    repo: &'a Path,
-    options: &'a SupervisorRunOptions,
+struct SupervisorMutationStartRequest<'run, 'dispatch> {
+    repo: &'run Path,
+    options: &'run SupervisorRunOptions,
     evidence: EffectiveSupervisorMutationAuditEvidence,
-    permit: SupervisorRunMutationPermit,
+    session: &'run SupervisorRunMutationSession,
     preflight_evidence: Option<EffectiveSupervisorMutationAuditEvidence>,
-    dispatch_started: Option<&'a AtomicBool>,
-    dispatch_authorized: Option<&'a mut dyn FnMut() -> Result<()>>,
+    preflight_process_evidence: Vec<SupervisorProcessLaunchAuditEvidence>,
+    dispatch_started: Option<&'dispatch AtomicBool>,
+    dispatch_authorized: Option<&'dispatch mut dyn FnMut() -> Result<()>>,
 }
 
 fn begin_supervisor_mutations(
-    request: SupervisorMutationStartRequest<'_>,
+    request: SupervisorMutationStartRequest<'_, '_>,
 ) -> Result<(
     ArtifactRunWriter,
     Option<crate::run_ops::SupervisorProcessGuard>,
@@ -3360,12 +3537,15 @@ fn begin_supervisor_mutations(
         repo,
         options,
         evidence,
-        permit,
+        session,
         preflight_evidence,
+        preflight_process_evidence,
         dispatch_started,
         mut dispatch_authorized,
     } = request;
-    permit.consume(evidence.canonical_manifest_sha256())?;
+    if session.canonical_manifest_sha256() != evidence.canonical_manifest_sha256() {
+        bail!("Supervisor mutation session is bound to different audit evidence");
+    }
     let collision = crate::run_ops::refuse_live_run_collision(
         repo,
         RunArtifactFamily::Supervise,
@@ -3378,12 +3558,18 @@ fn begin_supervisor_mutations(
     if let Some(dispatch_started) = dispatch_started {
         dispatch_started.store(true, Ordering::SeqCst);
     }
-    let mut artifact_writer = ArtifactRunWriter::reserve(
+    let artifact_reserve_permit =
+        session.permit(MutationOperation::SupervisorRunArtifactReserve)?;
+    let mut artifact_writer = reserve_supervisor_artifact_run(
         repo,
         RunArtifactFamily::Supervise,
         options.run_id.clone(),
         "maco-supervise",
+        &artifact_reserve_permit,
     )?;
+    let artifact_write_permit =
+        session.permit(MutationOperation::SupervisorRunArtifactWriteAppend)?;
+    artifact_write_permit.verify(MutationOperation::SupervisorRunArtifactWriteAppend)?;
     write_artifact_json(
         &mut artifact_writer,
         Path::new("effective-mutation-manifest.json"),
@@ -3400,10 +3586,25 @@ fn begin_supervisor_mutations(
             ArtifactFileDisposition::PrivateEvidence,
         )?;
     }
-    let process_registration =
-        crate::run_ops::register_current_supervisor_process(repo, "supervise", &options.run_id)
-            .ok()
-            .flatten();
+    for (index, process_evidence) in preflight_process_evidence.iter().enumerate() {
+        write_artifact_json(
+            &mut artifact_writer,
+            &PathBuf::from("preflight-process-launches")
+                .join(format!("catalog-probe-{index}.json")),
+            process_evidence,
+            MAX_SUPERVISOR_REPORT_BYTES,
+            ArtifactFileDisposition::PrivateEvidence,
+        )?;
+    }
+    let process_register_permit = session.permit(MutationOperation::SupervisorProcessRegister)?;
+    let process_registration = register_current_supervisor_process_authorized(
+        repo,
+        "supervise",
+        &options.run_id,
+        &process_register_permit,
+    )
+    .ok()
+    .flatten();
     let preflight_spec = crate::run_ops::LaunchPreflightSpec {
         family: RunArtifactFamily::Supervise,
         run_id: options.run_id.clone(),
@@ -3430,21 +3631,22 @@ fn begin_supervisor_mutations(
     Ok((artifact_writer, process_registration))
 }
 
-struct PrepareSupervisorRunRequest<'a> {
+struct PrepareSupervisorRunRequest<'options, 'worktree, 'dispatch> {
     loaded: LoadedSupervisorPlan,
-    options: &'a SupervisorRunOptions,
+    options: &'options SupervisorRunOptions,
     max_concurrent_children: usize,
     execution_runtime: SupervisorExecutionRuntime,
-    worktree_creation: SupervisorWorktreeCreation<'a>,
+    worktree_creation: SupervisorWorktreeCreation<'worktree>,
     runtime_model_catalog: RuntimeModelCatalogAcquisition,
     preflight_evidence: Option<EffectiveSupervisorMutationAuditEvidence>,
-    resolution_preflight_permit: Option<SupervisorResolutionPreflightPermit>,
-    dispatch_started: Option<&'a AtomicBool>,
-    dispatch_authorized: Option<&'a mut dyn FnMut() -> Result<()>>,
+    catalog_preflight_session: Option<CatalogPreflightMutationSession>,
+    preflight_process_evidence: Vec<SupervisorProcessLaunchAuditEvidence>,
+    dispatch_started: Option<&'dispatch AtomicBool>,
+    dispatch_authorized: Option<&'dispatch mut dyn FnMut() -> Result<()>>,
 }
 
 fn prepare_supervisor_run(
-    request: PrepareSupervisorRunRequest<'_>,
+    request: PrepareSupervisorRunRequest<'_, '_, '_>,
 ) -> Result<PreparedSupervisorRun> {
     let PrepareSupervisorRunRequest {
         loaded,
@@ -3454,7 +3656,8 @@ fn prepare_supervisor_run(
         worktree_creation,
         runtime_model_catalog,
         preflight_evidence,
-        resolution_preflight_permit,
+        catalog_preflight_session,
+        mut preflight_process_evidence,
         dispatch_started,
         mut dispatch_authorized,
     } = request;
@@ -3476,7 +3679,7 @@ fn prepare_supervisor_run(
         {
             bail!("existing-only worktree execution requires the verified supervisor runtime")
         }
-        SupervisorWorktreeCreation::PrimaryWorktree
+        SupervisorWorktreeCreation::PrimaryWorktree(_)
             if execution_runtime != SupervisorExecutionRuntime::Verified =>
         {
             bail!("primary-worktree execution requires the verified supervisor runtime")
@@ -3509,10 +3712,13 @@ fn prepare_supervisor_run(
     }
     match (worktree_creation, plan_metadata.execution_target.as_ref()) {
         (
-            SupervisorWorktreeCreation::PrimaryWorktree,
-            Some(SupervisorExecutionTarget::PrimaryWorktree { .. }),
-        ) => {}
-        (SupervisorWorktreeCreation::PrimaryWorktree, None) => {
+            SupervisorWorktreeCreation::PrimaryWorktree(capability),
+            Some(execution_target @ SupervisorExecutionTarget::PrimaryWorktree { .. }),
+        ) if capability.matches(execution_target) => {}
+        (SupervisorWorktreeCreation::PrimaryWorktree(_), Some(_)) => {
+            bail!("primary-worktree double opt-in capability belongs to a different target")
+        }
+        (SupervisorWorktreeCreation::PrimaryWorktree(_), None) => {
             bail!("primary-worktree execution requires its validated plan declaration")
         }
         (_, Some(SupervisorExecutionTarget::PrimaryWorktree { .. })) => {
@@ -3534,10 +3740,12 @@ fn prepare_supervisor_run(
         preclaim_assessment_runtime(runtime, execution_runtime, worktree_creation);
     let preclaim_decisions =
         evaluate_supervisor_preclaims(&plan, &requested_plan, &repo, runtime, preclaim_runtime);
-    let preflight_evidence = match (preflight_evidence, resolution_preflight_permit) {
-        (Some(evidence), Some(permit)) => {
-            permit.consume(evidence.canonical_manifest_sha256())?;
-            Some(evidence)
+    let preflight_evidence = match (&preflight_evidence, &catalog_preflight_session) {
+        (Some(evidence), Some(session)) => {
+            if session.canonical_manifest_sha256() != evidence.canonical_manifest_sha256() {
+                bail!("catalog preflight session is bound to different audit evidence");
+            }
+            preflight_evidence
         }
         (None, None) if cfg!(test) => None,
         _ => bail!("Supervisor resolution preflight authority is missing or incomplete"),
@@ -3600,6 +3808,8 @@ fn prepare_supervisor_run(
                     context: quota_context.as_ref(),
                     ledger: quota_context.as_ref().map(|_| &budget_ledger),
                 },
+                catalog_preflight_session: catalog_preflight_session.as_ref(),
+                process_launch_evidence: &mut preflight_process_evidence,
             },
         )?
     };
@@ -3670,26 +3880,30 @@ fn prepare_supervisor_run(
             max_concurrent_children,
         })?;
     let authorized = authorize_effective_supervisor_manifest(effective_mutation_manifest)?;
-    let (mutation_evidence, mutation_permit) = authorized.into_supervisor_run()?;
+    let (mutation_evidence, mutation_session) = authorized.into_supervisor_run()?;
     let (mut artifact_writer, process_registration) =
         begin_supervisor_mutations(SupervisorMutationStartRequest {
             repo: &repo,
             options,
             evidence: mutation_evidence,
-            permit: mutation_permit,
+            session: &mutation_session,
             preflight_evidence,
+            preflight_process_evidence,
             dispatch_started,
             dispatch_authorized: dispatch_authorized.take(),
         })?;
-    persist_prepared_preclaim_decisions(
-        &repo,
-        &options.run_id,
-        options.parent_node.as_deref(),
-        &mut artifact_writer,
-        &requested_plan.assignments,
-        &preclaim_decisions,
-    )?;
-    let checkpoint_writer = SupervisorCheckpointWriter::create(
+    persist_prepared_preclaim_decisions(PreparedPreclaimPersistence {
+        repo: &repo,
+        run_id: &options.run_id,
+        parent_node: options.parent_node.as_deref(),
+        artifact_writer: &mut artifact_writer,
+        assignments: &requested_plan.assignments,
+        decisions: &preclaim_decisions,
+        mutation_session: &mutation_session,
+    })?;
+    let checkpoint_permit =
+        mutation_session.permit(MutationOperation::SupervisorCheckpointJournalLifecycle)?;
+    let checkpoint_writer = SupervisorCheckpointWriter::create_authorized(
         &repo,
         SupervisorCheckpointPreparation::new(
             &options.run_id,
@@ -3702,6 +3916,7 @@ fn prepare_supervisor_run(
         )
         .with_parent_node(options.parent_node.clone())
         .with_dispatch_identity(dispatch_identity),
+        &checkpoint_permit,
     )?;
     let run_dir = artifact_writer.run_dir().to_path_buf();
     let dirs = RunDirs::for_writer(&artifact_writer);
@@ -3730,6 +3945,7 @@ fn prepare_supervisor_run(
         run_dir,
         dirs,
         manager,
+        mutation_session,
         _process_registration: process_registration,
     })
 }
@@ -3751,7 +3967,8 @@ fn prepare_supervisor_run_for_test(
         worktree_creation,
         runtime_model_catalog,
         preflight_evidence: None,
-        resolution_preflight_permit: None,
+        catalog_preflight_session: None,
+        preflight_process_evidence: Vec::new(),
         dispatch_started: None,
         dispatch_authorized: None,
     })
@@ -3764,6 +3981,8 @@ pub(super) struct PreparedSupervisorSelectionRequest<'a> {
     pub(super) runtime_model_catalog: &'a RuntimeModelCatalogAcquisition,
     pub(super) admission_policy_input: &'a SupervisorAdmissionPolicyInput,
     pub(super) quota: SupervisorQuotaSelectionInput<'a>,
+    pub(super) catalog_preflight_session: Option<&'a CatalogPreflightMutationSession>,
+    pub(super) process_launch_evidence: &'a mut Vec<SupervisorProcessLaunchAuditEvidence>,
 }
 
 pub(super) fn initialize_supervisor_selection_from_prepared_metadata(
@@ -3778,6 +3997,8 @@ pub(super) fn initialize_supervisor_selection_from_prepared_metadata(
         runtime_model_catalog,
         admission_policy_input,
         quota,
+        catalog_preflight_session,
+        process_launch_evidence,
     } = request;
     if plan_metadata.resolved_objective_profile.is_none() {
         let requested_objective_profile = plan_metadata.objective_profile.clone();
@@ -3796,7 +4017,27 @@ pub(super) fn initialize_supervisor_selection_from_prepared_metadata(
             selection_preflight_failure: None,
         }),
         Ok(catalog) => {
-            let advertised = advertised_catalogs_for_launch(repo)?;
+            let advertised = match advertised_catalogs_for_supervisor_selection(
+                repo,
+                catalog_preflight_session,
+                process_launch_evidence,
+            ) {
+                Ok(advertised) => advertised,
+                Err(error) => {
+                    return Ok(SupervisorSelectionResolution {
+                        mode: SupervisorSelectionMode::Automatic,
+                        decisions: Vec::new(),
+                        automatic_state: None,
+                        selection_preflight_failure: Some(SupervisorSelectionPreflightFailure {
+                            role: AgentRole::Worker,
+                            kind: SupervisorSelectionPreflightFailureKind::FailClosed,
+                            message: format!(
+                                "runtime catalog probe failed after exact admission: {error:#}"
+                            ),
+                        }),
+                    })
+                }
+            };
             let resolution = initialize_supervisor_selection_with_quota(
                 plan,
                 runtime,
@@ -3835,6 +4076,7 @@ struct PredispatchFailureFinalization<'context, 'checkpoint> {
     runtime_model_catalog: Option<&'context RuntimeModelCatalog>,
     selection_decisions: Vec<SupervisorSelectionEvent>,
     preclaim_parked_assignment_ids: BTreeSet<String>,
+    mutation_session: &'context SupervisorRunMutationSession,
 }
 
 enum SupervisorPredispatchFailure {
@@ -3861,7 +4103,12 @@ fn persist_supervisor_predispatch_failure(
         runtime_model_catalog,
         selection_decisions,
         preclaim_parked_assignment_ids,
+        mutation_session,
     } = finalization;
+    require_supervisor_operation(
+        mutation_session,
+        MutationOperation::SupervisorRefusalEvidenceWrite,
+    )?;
     let run_budget_report = budget_ledger.report()?;
     let (report_plan_file, report_run_dir) =
         supervisor_report_paths(repo, &options.plan_file, run_dir, &options.run_id);
@@ -3940,6 +4187,10 @@ fn persist_supervisor_predispatch_failure(
     let binding = artifact_writer
         .resume_binding()
         .context("failed to establish predispatch failure report boundary")?;
+    require_supervisor_operation(
+        mutation_session,
+        MutationOperation::SupervisorCheckpointJournalLifecycle,
+    )?;
     checkpoint_writer.scheduler_closed(binding, run_budget_report)?;
     let mut orchestration_journal = None;
     persist_supervisor_final_report(
@@ -3948,26 +4199,28 @@ fn persist_supervisor_predispatch_failure(
         artifact_writer,
         Some(checkpoint_writer),
         Some(crate::artifacts::ArtifactScratchQuiescence::Verified),
+        mutation_session,
         || Ok(()),
     )
 }
 
-pub(super) struct SupervisorRunExecution<'a> {
+pub(super) struct SupervisorRunExecution<'worktree, 'dispatch, 'runner> {
     pub(super) loaded: LoadedSupervisorPlan,
     pub(super) options: SupervisorRunOptions,
     pub(super) max_concurrent_children: usize,
     pub(super) execution_runtime: SupervisorExecutionRuntime,
-    pub(super) worktree_creation: SupervisorWorktreeCreation<'a>,
+    pub(super) worktree_creation: SupervisorWorktreeCreation<'worktree>,
     pub(super) runtime_model_catalog: RuntimeModelCatalogAcquisition,
     pub(super) preflight_evidence: Option<EffectiveSupervisorMutationAuditEvidence>,
-    pub(super) resolution_preflight_permit: Option<SupervisorResolutionPreflightPermit>,
-    pub(super) dispatch_started: Option<&'a AtomicBool>,
-    pub(super) dispatch_authorized: Option<&'a mut dyn FnMut() -> Result<()>>,
-    pub(super) external_runner: &'a CancellableExternalRunner<'a>,
+    pub(super) catalog_preflight_session: Option<CatalogPreflightMutationSession>,
+    pub(super) preflight_process_evidence: Vec<SupervisorProcessLaunchAuditEvidence>,
+    pub(super) dispatch_started: Option<&'dispatch AtomicBool>,
+    pub(super) dispatch_authorized: Option<&'dispatch mut dyn FnMut() -> Result<()>>,
+    pub(super) external_runner: &'runner CancellableExternalRunner<'runner>,
 }
 
 pub(super) fn run_supervisor_plan_with_runner_and_creation(
-    execution: SupervisorRunExecution<'_>,
+    execution: SupervisorRunExecution<'_, '_, '_>,
 ) -> Result<SupervisorFinalReport> {
     let SupervisorRunExecution {
         loaded,
@@ -3977,7 +4230,8 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         worktree_creation,
         runtime_model_catalog,
         preflight_evidence,
-        resolution_preflight_permit,
+        catalog_preflight_session,
+        preflight_process_evidence,
         dispatch_started,
         dispatch_authorized,
         external_runner,
@@ -4006,6 +4260,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         run_dir,
         dirs,
         manager,
+        mutation_session,
         _process_registration,
     } = prepare_supervisor_run(PrepareSupervisorRunRequest {
         loaded,
@@ -4015,7 +4270,8 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         worktree_creation,
         runtime_model_catalog,
         preflight_evidence,
-        resolution_preflight_permit,
+        catalog_preflight_session,
+        preflight_process_evidence,
         dispatch_started,
         dispatch_authorized,
     })?;
@@ -4050,6 +4306,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                     runtime_model_catalog: None,
                     selection_decisions,
                     preclaim_parked_assignment_ids,
+                    mutation_session: &mutation_session,
                 },
                 SupervisorPredispatchFailure::RuntimeModelCatalog(*failure),
             );
@@ -4073,6 +4330,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                 runtime_model_catalog: Some(&runtime_model_catalog),
                 selection_decisions,
                 preclaim_parked_assignment_ids,
+                mutation_session: &mutation_session,
             },
             SupervisorPredispatchFailure::Selection(failure),
         );
@@ -4124,6 +4382,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
             semantic_store_slot: &mut semantic_store_slot,
             orchestration_journal: &mut orchestration_journal,
             primary_run_baseline: &mut primary_run_baseline,
+            mutation_session: &mutation_session,
         })?;
         let sync_store = sync_store_slot
             .as_ref()
@@ -4160,6 +4419,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                 journal: &mut orchestration_journal,
                 autonomy_kpis: &mut autonomy_kpi_collector,
                 checkpoint: Some(&mut checkpoint_writer),
+                mutation_session: &mutation_session,
             });
             let semantic_block_gate = SemanticBlockGate::default();
             let serial_semantic_warn_intents = Mutex::new(Vec::<(usize, SemanticIntent)>::new());
@@ -4195,6 +4455,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                 budget_ledger: &budget_ledger,
                 runtime_model_catalog: &runtime_model_catalog,
                 external_runner,
+                mutation_session: &mutation_session,
                 release_per_assignment,
             };
             let scheduler_result = if max_concurrent_children == 1 {
@@ -4388,13 +4649,16 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
             paths: Vec::new(),
         });
     }
-    let field_guide_mutation_failed = match append_accepted_field_guide_drafts(
+    let field_guide_permit =
+        mutation_session.permit(MutationOperation::SupervisorFieldGuideMutation)?;
+    let field_guide_mutation_failed = match append_accepted_field_guide_drafts_authorized(
         &plan,
         &collected.orchestrator_reports,
         &options.run_id,
         field_guide_store_slot.as_ref(),
         &mut orchestration_journal,
         &mut artifact_writer,
+        &field_guide_permit,
     ) {
         Ok(_) => false,
         Err(error) => {
@@ -4523,6 +4787,10 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
     };
     let checkpoint_finalization = match resume_binding {
         Ok(binding) => {
+            require_supervisor_operation(
+                &mutation_session,
+                MutationOperation::SupervisorCheckpointJournalLifecycle,
+            )?;
             // Bind the same snapshot already sealed into the final report.
             // A second budget_ledger.report() can cross a 1-second boundary and
             // diverge on elapsed_seconds / remaining.max_duration_seconds,
@@ -4555,11 +4823,17 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         checkpoint_finalization.then_some(&mut checkpoint_writer),
         (!external_containment_failed)
             .then_some(crate::artifacts::ArtifactScratchQuiescence::Verified),
+        &mutation_session,
         || {
+            let claim_permit = mutation_session.permit(MutationOperation::ClaimRelease)?;
+            let semantic_permit =
+                mutation_session.permit(MutationOperation::SemanticIntentRelease)?;
             let released = release_collected_scheduler_resources(
                 sync_store_slot.as_ref(),
                 semantic_store_slot.as_ref(),
                 &mut scheduler_resources,
+                &claim_permit,
+                &semantic_permit,
             );
             if released != planned_scheduler_resources {
                 bail!(
@@ -4923,54 +5197,19 @@ mod selection_policy_tests {
         let (temporary, repo) = initialized_repository();
         let mut options = predispatch_options(&repo, temporary.path(), "supervisor-invalid-permit");
         options.runtime = SupervisorRuntime::Fake;
-        let repository_authenticator =
-            crate::artifacts::repository_auth_writer(&repo)?.into_authenticator()?;
-        let manifest = EffectiveSupervisorMutationManifest::supervisor_run(
-            EffectiveSupervisorRunManifestInput {
-                identity: EffectiveSupervisorMutationIdentityInput {
-                    run_id: options.run_id.as_str().to_string(),
-                    parent_node: None,
-                    normalized_plan_sha256: "a".repeat(64),
-                    dispatch_identity: EffectiveSupervisorDispatchIdentity::Root,
-                    execution_runtime:
-                        EffectiveSupervisorExecutionRuntime::NonpublishableSimulation,
-                    worktree_mode: EffectiveSupervisorWorktreeMode::NonpublishableSimulation,
-                    runtime_adapter: Some("fake".to_string()),
-                    repository_identity: repository_authenticator.binding().repository_id.clone(),
-                    artifact_family: "supervise".to_string(),
-                    delivery_identity: "test-plan".to_string(),
-                    machine_global_retention_sha256: None,
-                    queue_item_sha256: None,
-                    task_batch_sha256: None,
-                    primary_baseline_sha256: Some("b".repeat(64)),
-                    outer_entrypoint: None,
-                    outer_run_id: None,
-                },
-                semantic_coordination: false,
-                external_process_runtime: false,
-                machine_global_retention_bound: false,
-                field_guide_mutation: false,
-                primary_object_import: false,
-            },
-        );
-        let (evidence, _valid_permit) =
-            authorize_effective_supervisor_mutation_manifest(manifest)?.into_supervisor_run()?;
-
-        let error = begin_supervisor_mutations(SupervisorMutationStartRequest {
-            repo: &repo,
-            options: &options,
-            evidence,
-            permit: SupervisorRunMutationPermit::invalid_for_test(),
-            preflight_evidence: None,
-            dispatch_started: None,
-            dispatch_authorized: None,
-        })
+        let error = reserve_supervisor_artifact_run(
+            &repo,
+            RunArtifactFamily::Supervise,
+            options.run_id.clone(),
+            "maco-supervise",
+            &crate::mutation_taxonomy::SupervisorOperationPermit::invalid_for_test(),
+        )
         .err()
         .context("invalid Supervisor permit must fail at the real mutation sink")?;
 
         assert!(error
             .to_string()
-            .contains("bound to a different canonical manifest"));
+            .contains("permit for a different operation"));
         assert!(!repo
             .join(RunArtifactFamily::Supervise.run_root())
             .join(options.run_id.as_str())
@@ -4984,6 +5223,10 @@ mod selection_policy_tests {
         let (_temporary, repo) = initialized_repository();
         let manager = WorktreeManager::new(&repo);
         let cleanliness = manager.acquire_repository_cleanliness()?;
+        let primary_execution_target = SupervisorExecutionTarget::PrimaryWorktree {
+            claim_paths: Vec::new(),
+        };
+        let primary_worktree_opt_in = primary_worktree_opt_in_for_test(&primary_execution_target);
 
         assert_eq!(
             preclaim_assessment_runtime(
@@ -5013,7 +5256,7 @@ mod selection_policy_tests {
             preclaim_assessment_runtime(
                 SupervisorRuntime::Codex,
                 SupervisorExecutionRuntime::Verified,
-                SupervisorWorktreeCreation::PrimaryWorktree,
+                SupervisorWorktreeCreation::PrimaryWorktree(&primary_worktree_opt_in),
             ),
             SupervisorExecutionRuntime::NonpublishableSimulation
         );
@@ -5763,13 +6006,13 @@ mod selection_policy_tests {
         );
         let run_id = options.run_id.clone();
         let calls = AtomicUsize::new(0);
-        let runner =
-            |_command: &ExternalAgentCommand,
-             _cancellation: &ProcessCancellation,
-             _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
-                calls.fetch_add(1, Ordering::SeqCst);
-                panic!("selection preflight failure must prevent external dispatch")
-            };
+        let runner = |_command: &ExternalAgentCommand,
+                      _cancellation: &ProcessCancellation,
+                      _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>,
+                      _authorization: SupervisorProcessLaunchAuthorization| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            panic!("selection preflight failure must prevent external dispatch")
+        };
 
         let report = authorize_and_run_supervisor_plan_with_runner_and_creation(
             LoadedSupervisorPlan {

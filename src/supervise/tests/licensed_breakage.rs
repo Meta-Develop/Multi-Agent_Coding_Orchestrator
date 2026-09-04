@@ -798,12 +798,14 @@ fn strict_journal_failure_cannot_silently_swallow_generated_tasks() {
         },
     )
     .expect("generate follow-up task fixture");
+    let mutation_session = SupervisorRunMutationSession::local_for_test(run_id.as_str());
     {
         let artifacts = Mutex::new(SharedSupervisorArtifacts {
             writer: &mut writer,
             journal: &mut journal,
             autonomy_kpis: &mut collector,
             checkpoint: None,
+            mutation_session: &mutation_session,
         });
         let error =
             record_licensed_breakage_follow_up_tasks(&artifacts, &assignment.id, &review, &[])

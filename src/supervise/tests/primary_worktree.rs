@@ -1,4 +1,5 @@
 use super::*;
+use crate::mutation_taxonomy::ExplicitMutationGate;
 
 const PRIMARY_SCOPE: &str = "local/deploy.txt";
 
@@ -65,7 +66,8 @@ fn primary_worktree_outside_scope_mutation_fails_integrity_and_releases_claim() 
     let dispatches = AtomicUsize::new(0);
     let runner = |command: &ExternalAgentCommand,
                   _: &ProcessCancellation,
-                  _: Option<ExternalPreActionReviewRuntime<'_>>| {
+                  _: Option<ExternalPreActionReviewRuntime<'_>>,
+                  _: SupervisorProcessLaunchAuthorization| {
         dispatches.fetch_add(1, Ordering::SeqCst);
         fs::write(runner_repo.join(PRIMARY_SCOPE), "deployed\n")
             .expect("mutate declared scope in outside-scope test");
@@ -101,12 +103,19 @@ fn run_primary_with_runner(
     runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorFinalReport> {
     let runtime_model_catalog = test_runtime_model_catalog(&loaded.plan, options.runtime)?;
+    let primary_worktree_opt_in = primary_worktree_opt_in_for_test(
+        loaded
+            .plan_metadata
+            .execution_target
+            .as_ref()
+            .expect("primary fixture must declare its execution target"),
+    );
     authorize_and_run_supervisor_plan_with_runner_and_creation(
         loaded,
         options,
         1,
         SupervisorExecutionRuntime::Verified,
-        SupervisorWorktreeCreation::PrimaryWorktree,
+        SupervisorWorktreeCreation::PrimaryWorktree(&primary_worktree_opt_in),
         Ok(runtime_model_catalog),
         runner,
     )
@@ -126,7 +135,8 @@ fn primary_missing_double_opt_in_gate_is_refused_before_artifact_or_dispatch() {
     ]);
     let runner = |_command: &ExternalAgentCommand,
                   _cancellation: &ProcessCancellation,
-                  _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
+                  _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>,
+                  _authorization: SupervisorProcessLaunchAuthorization| {
         dispatches.fetch_add(1, Ordering::SeqCst);
         panic!("missing primary mutation gate must precede dispatch")
     };
@@ -208,7 +218,8 @@ fn dirty_primary_scope_refuses_before_dispatch_and_releases_claim() {
     let dispatches = AtomicUsize::new(0);
     let runner = |_: &ExternalAgentCommand,
                   _: &ProcessCancellation,
-                  _: Option<ExternalPreActionReviewRuntime<'_>>| {
+                  _: Option<ExternalPreActionReviewRuntime<'_>>,
+                  _: SupervisorProcessLaunchAuthorization| {
         dispatches.fetch_add(1, Ordering::SeqCst);
         panic!("dirty primary scope must be refused before dispatch")
     };
@@ -248,7 +259,8 @@ fn bounded_primary_command_run_mutates_scope_holds_and_releases_claim_and_marks_
     let runner_assignment = assignment.clone();
     let runner = |command: &ExternalAgentCommand,
                   _: &ProcessCancellation,
-                  _: Option<ExternalPreActionReviewRuntime<'_>>| {
+                  _: Option<ExternalPreActionReviewRuntime<'_>>,
+                  _: SupervisorProcessLaunchAuthorization| {
         dispatches.fetch_add(1, Ordering::SeqCst);
         let active_claims = SyncStore::open(&runner_repo)
             .expect("open active primary claims")

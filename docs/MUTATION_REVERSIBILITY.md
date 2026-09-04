@@ -7,29 +7,40 @@ This document defines version 5 of MACO's mutation taxonomy in
 the taxonomy maps that lifecycle and its production-derived control state to a
 complete fixed operation set. Callers cannot supply operation rows or gate
 labels. The authorizer consumes the non-Clone manifest by value and returns a
-non-Clone, non-Copy, non-serializable lifecycle permit bound to its canonical
-SHA-256. Serialized manifest evidence is produced only after authorization and
-is deliberately not an authorizable type. The appropriate real sink consumes
-the permit before artifact reservation, process/catalog launch, checkpoint or
-queue creation, dispatch marking, recovery, release, repair, finalization,
-messaging, or journal mutation.
+non-Clone, non-Copy, non-serializable lifecycle session bound to its canonical
+SHA-256. The session remains alive through the complete run, recovery, outer
+Autopilot, or queue lifecycle and lends operation-specific opaque permits to
+the corresponding real sinks. Serialized manifest evidence is produced only
+after authorization and is deliberately not an authorizable type. A serialized
+manifest cannot be replayed, and the consumed manifest object cannot be
+authorized twice.
 
 The Supervisor dispatch manifest is persisted as private authenticated run
 evidence. "Exact" means the complete mutation surface reachable in the
 selected post-override mode, not a post-hoc list of whichever success/failure
 branch happened to run. Thus `bound-create-or-reuse` includes worktree creation
 because absence of a reusable lane can select that branch, and a generated
-queue includes both release and refusal-record branches. Primary-worktree
-execution, existing-only re-audit, managed verified execution, nonpublishable
-Fake simulation, retention-bound quarantine, unbound output cleanup, and
-blocking semantic coordination remain conditional and mutually exclusive where
-the production control flow is exclusive. Supervisor does not install hooks,
-so `hook-install` is absent from every Supervisor manifest. The hook rows
-remain for the independently owned worktree-guard integration.
+queue includes both release and refusal-record branches. Every sealed lifecycle
+variant has a fixed complete set; callers cannot omit a row by choosing a
+success/failure branch. Primary-worktree, existing-only, managed, and
+nonpublishable Fake variants remain distinct where their reachable sinks
+differ. External process variants include both retained quarantine and bounded
+cleanup because the real process owner decides between them from its verified
+retention binding. Supervisor does not install hooks, so `hook-install` is
+absent from every Supervisor manifest. The hook rows remain for the
+independently owned worktree-guard integration.
 
-Catalog acquisition has a separately admitted preflight permit, consumed
-before a model-catalog subprocess or rolling-budget recovery. The common
-Scheduler later freezes budget, admission, objective, role, review, runtime,
+Catalog acquisition has a separately admitted preflight session before a
+model-catalog subprocess or rolling-budget recovery. Production selection
+admits Codex, Cursor, and configured Grok probes separately, binding each
+single-use process capability to the exact executable identity, arguments,
+working directory, screened environment or credential-source binding, timeout,
+run, adapter, and probe kind. Assignment and parent-auditor dispatch similarly
+perform fresh admission after every retry/fallback runtime, model, effort, and
+program resolution; the central launch sink revalidates that exact command and
+consumes the capability immediately before launch. Probe and attempt evidence
+is inert audit data and is persisted with run evidence. The common scheduler
+later freezes budget, admission, objective, role, review, runtime,
 schedule, and evidence-only overrides and binds the final manifest to that
 exact normalized effective plan plus runtime adapter, authenticated repository,
 parent presence, dispatch and delivery identity, retention, queue item, primary
@@ -42,10 +53,22 @@ the same final Scheduler admission as a root plan, and its dispatch-started
 marker is written only after that final permit is validated. Outer Autopilot
 process and artifact mutations use their own manifest bound to the outer
 entrypoint, run, artifact family, and effective plan; its source Supervisor has
-a distinct catalog preflight and final Scheduler permit. Resume first inspects
-the checkpoint read-only, then consumes a resume/recovery permit before opening
-any recovery-capable state. Status and evidence inspection remain strictly
-read-only.
+a distinct catalog preflight and final Scheduler session. Resume first inspects
+the checkpoint through a non-locking authenticated snapshot, then retains a
+resume/recovery session before opening any recovery-capable state. The snapshot
+reader creates or acquires no lock, removes no temporary state, performs no
+recovery or head repair, and accepts only a stable before/after inventory whose
+head and every record retain the same file identity, bytes, digest,
+authenticated chain, and exact published-tail binding. Transitional state is
+refused. Status and evidence inspection use only this strictly read-only path.
+Checkpoint payload version 2 is required; version 1 is reported as
+`unsupported_checkpoint_version` with observed/supported versions and guidance
+to start a new run or reconcile through a supported migration. It is never
+silently recovered without the missing v2 identity.
+
+The persisted effective-manifest evidence keeps the established object shape:
+`operations` is an array of `{ "operation_id": "..." }` objects. Internal
+operation ID indexes are not serialized and carry no authority.
 
 `SemanticIntentStore::claim` durably acquires blocking intent immediately
 before an assignment is admitted. As with path claims, releasing an exact token
@@ -59,6 +82,14 @@ MACO-owned, prior-hook-preserving install qualifies as `hook-install`.
 Read-only verification is `hook-verify`; removal of the captured guard binding
 is `hook-uninstall`. An arbitrary hook rewrite, deletion, or replacement is
 unlisted and therefore fails closed.
+
+Opaque lifecycle authority complements rather than replaces the existing gate
+owners: primary execution carries the exact validated plan/CLI double opt-in,
+managed commit and object import carry the held worktree write lease, process
+launch carries verified runner/confinement and retention controls, releases are
+checked against exact held claim or semantic-intent tokens, and field-guide
+mutation requires the authenticated store binding. A taxonomy permit by itself
+cannot fabricate those proofs.
 
 The registry names operation boundaries, not whole commands. A command that
 composes multiple operations inherits the most restrictive classification of

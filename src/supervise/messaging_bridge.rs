@@ -255,7 +255,28 @@ fn run_sessions() -> &'static Mutex<BTreeMap<PathBuf, SupervisorMessagingSession
 /// This is called from scheduler evidence initialization after plan normalization and before the
 /// first dispatch-capable scheduler action. An existing durable journal without the original
 /// memory-resident factory is refused instead of receiving replacement credentials.
+pub(super) fn initialize_supervisor_messaging_session_authorized(
+    writer: &mut ArtifactRunWriter,
+    plan: &SupervisorPlan,
+    metadata: &SupervisorPlanMetadata,
+    permit: &crate::mutation_taxonomy::SupervisorOperationPermit<'_>,
+) -> Result<()> {
+    permit
+        .verify(crate::mutation_taxonomy::MutationOperation::SupervisorMessagingJournalLifecycle)
+        .map_err(anyhow::Error::from)?;
+    initialize_supervisor_messaging_session_impl(writer, plan, metadata)
+}
+
+#[cfg(test)]
 pub(super) fn initialize_supervisor_messaging_session(
+    writer: &mut ArtifactRunWriter,
+    plan: &SupervisorPlan,
+    metadata: &SupervisorPlanMetadata,
+) -> Result<()> {
+    initialize_supervisor_messaging_session_impl(writer, plan, metadata)
+}
+
+fn initialize_supervisor_messaging_session_impl(
     writer: &mut ArtifactRunWriter,
     plan: &SupervisorPlan,
     metadata: &SupervisorPlanMetadata,
@@ -304,7 +325,21 @@ pub(super) fn initialize_supervisor_messaging_session(
 }
 
 /// Reopens and fully replays the existing run journal with its original process-local registry.
+pub(super) fn recover_supervisor_messaging_session_authorized(
+    run_directory: &Path,
+    permit: &crate::mutation_taxonomy::SupervisorOperationPermit<'_>,
+) -> Result<()> {
+    permit
+        .verify(crate::mutation_taxonomy::MutationOperation::SupervisorMessagingJournalLifecycle)?;
+    recover_supervisor_messaging_session_impl(run_directory)
+}
+
+#[cfg(test)]
 pub(super) fn recover_supervisor_messaging_session(run_directory: &Path) -> Result<()> {
+    recover_supervisor_messaging_session_impl(run_directory)
+}
+
+fn recover_supervisor_messaging_session_impl(run_directory: &Path) -> Result<()> {
     let store = run_directory.join(SUPERVISOR_MESSAGING_STORE_NAME);
     let anchor = run_directory.join(SUPERVISOR_MESSAGING_ANCHOR_NAME);
     if !store

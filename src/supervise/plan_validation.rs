@@ -1276,11 +1276,15 @@ pub(super) fn coordinate_semantic_assignment(
     store: &SemanticIntentStore,
     assignment: &OrchestratorAssignment,
     mode: SemanticCoordinationMode,
+    permit: &SupervisorOperationPermit<'_>,
     acquired_tokens: &mut Vec<crate::semantic_coord::SemanticIntentToken>,
     planned_preview_intents: &mut Vec<SemanticIntent>,
     findings: &mut Vec<Finding>,
     health_signals: &mut Vec<SwarmHealthSignal>,
 ) -> Result<SemanticAssignmentCoordination> {
+    permit
+        .verify(MutationOperation::SemanticIntentAcquire)
+        .map_err(anyhow::Error::from)?;
     if mode == SemanticCoordinationMode::Off {
         return Ok(SemanticAssignmentCoordination::Ready(None));
     }

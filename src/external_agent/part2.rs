@@ -567,7 +567,46 @@ pub(crate) fn load_codex_runtime_model_catalog(
     cwd: &Path,
     timeout: Duration,
 ) -> std::result::Result<CodexRuntimeModelCatalog, Box<EnvironmentFailure>> {
-    let catalog = (|| -> Result<CodexRuntimeModelCatalog> {
+    load_codex_runtime_model_catalog_inner(program, cwd, timeout, None).0
+}
+
+pub(crate) fn load_codex_runtime_model_catalog_authorized(
+    program: &Path,
+    cwd: &Path,
+    timeout: Duration,
+    run_id: &str,
+    session: &crate::mutation_taxonomy::CatalogPreflightMutationSession,
+) -> (
+    std::result::Result<CodexRuntimeModelCatalog, Box<EnvironmentFailure>>,
+    Option<crate::mutation_taxonomy::SupervisorProcessLaunchAuditEvidence>,
+) {
+    let (catalog, evidence) =
+        load_codex_runtime_model_catalog_inner(program, cwd, timeout, Some((run_id, session)));
+    let catalog = if catalog.is_ok() && evidence.is_none() {
+        Err(Box::new(EnvironmentFailure::runtime_model_catalog(
+            "authorized Codex catalog probe produced no launch evidence".to_string(),
+        )))
+    } else {
+        catalog
+    };
+    (catalog, evidence)
+}
+
+fn load_codex_runtime_model_catalog_inner(
+    program: &Path,
+    cwd: &Path,
+    timeout: Duration,
+    authorization: Option<(
+        &str,
+        &crate::mutation_taxonomy::CatalogPreflightMutationSession,
+    )>,
+) -> (
+    std::result::Result<CodexRuntimeModelCatalog, Box<EnvironmentFailure>>,
+    Option<crate::mutation_taxonomy::SupervisorProcessLaunchAuditEvidence>,
+) {
+    #[allow(unused_mut)]
+    let mut launch_evidence = None;
+    let catalog = (|| -> Result<_> {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (program, cwd, timeout);
@@ -593,6 +632,10 @@ pub(crate) fn load_codex_runtime_model_catalog(
             auth.verify_source_unchanged()
                 .context(CodexRuntimeModelCatalogFailureCause::AuthRevalidationFailed)?;
 
+            let environment = allowed_env(
+                ExternalAgentInvocation::CodexSupervisor,
+                ExternalProgramTrust::TrustedSystemCodex,
+            );
             let process_spec = ProcessSpec::direct(
                 "Codex runtime model catalog preflight",
                 &resolved_program,
@@ -600,10 +643,7 @@ pub(crate) fn load_codex_runtime_model_catalog(
                 program_parent,
                 CODEX_MODEL_CATALOG_MAX_BYTES,
             )
-            .with_environment(EnvironmentMode::ClearAndSet(allowed_env(
-                ExternalAgentInvocation::CodexSupervisor,
-                ExternalProgramTrust::TrustedSystemCodex,
-            )))
+            .with_environment(EnvironmentMode::ClearAndSet(environment.clone()))
             .with_stdin(StdinMode::Null)
             .with_timeout(Some(timeout))
             .with_private_runtime_home(true)
@@ -613,6 +653,41 @@ pub(crate) fn load_codex_runtime_model_catalog(
                 ExternalCodexProfile::read_only(program_parent),
             ));
 
+            if let Some((run_id, session)) = authorization {
+                let identity = crate::mutation_taxonomy::ExactSupervisorProcessLaunchIdentity {
+                    run_id: run_id.to_string(),
+                    subject_id: "catalog-codex".to_string(),
+                    attempt: 1,
+                    adapter: "codex".to_string(),
+                    model: None,
+                    reasoning_effort: None,
+                    program_identity: format!(
+                        "{};{}",
+                        resolved_program.display(),
+                        program_identity.display()
+                    ),
+                    execution_mode: "verified-catalog-preflight".to_string(),
+                    delivery_identity: serde_json::to_string(&(
+                        ["debug", "models"],
+                        cwd,
+                        timeout.as_millis(),
+                        &environment,
+                        auth.binding_sha256()?,
+                    ))?,
+                    kind: crate::mutation_taxonomy::SupervisorProcessLaunchKind::CatalogCodexProbe,
+                };
+                let (evidence, authorization) =
+                    session.authorize_process_launch(identity.clone())?;
+                let current_identity = external_program_identity(&resolved_program)
+                    .context(CodexRuntimeModelCatalogFailureCause::ExecutableRevalidationFailed)?;
+                if current_identity != program_identity {
+                    return Err(CodexRuntimeModelCatalogFailureCause::ExecutableChanged.into());
+                }
+                auth.verify_source_unchanged()
+                    .context(CodexRuntimeModelCatalogFailureCause::AuthRevalidationFailed)?;
+                authorization.consume()?;
+                launch_evidence = Some(evidence);
+            }
             let process_result = run_process_cancellable(process_spec, &ProcessCancellation::new());
             let current_identity = external_program_identity(&resolved_program)
                 .context(CodexRuntimeModelCatalogFailureCause::ExecutableRevalidationFailed)?;
@@ -636,7 +711,10 @@ pub(crate) fn load_codex_runtime_model_catalog(
         }
     })();
 
-    catalog.map_err(|error| codex_runtime_model_catalog_failure(&error))
+    (
+        catalog.map_err(|error| codex_runtime_model_catalog_failure(&error)),
+        launch_evidence,
+    )
 }
 
 fn codex_runtime_model_catalog_process_root(resolved_program: &Path) -> Result<&Path> {
@@ -1047,6 +1125,45 @@ fn external_program_identity(path: &Path) -> Result<ExternalProgramIdentity> {
     }
 }
 
+pub(crate) fn exact_external_process_launch_binding(
+    command: &ExternalAgentCommand,
+) -> Result<(String, String)> {
+    let (program, argv, cwd, environment) = if let Some(config) = &command.runtime_adapter {
+        let launch = config.render(&crate::runtime_adapter::LaunchContext {
+            prompt: &command.prompt,
+            model: command.model.as_deref(),
+            effort: command.reasoning_effort.as_deref(),
+            cwd: &command.cwd,
+            output: &command.output_last_message,
+        })?;
+        (launch.program, launch.argv, launch.cwd, launch.env)
+    } else {
+        (
+            command.program.clone(),
+            Vec::new(),
+            command.cwd.clone(),
+            BTreeMap::new(),
+        )
+    };
+    let resolved = resolve_external_program(&program, &cwd)?;
+    let identity = external_program_identity(&resolved)?;
+    let program_identity = format!("{};{}", resolved.display(), identity.display());
+    let delivery_identity = serde_json::to_string(&(
+        argv,
+        cwd,
+        environment,
+        &command.prompt,
+        &command.json_log,
+        &command.output_last_message,
+        &command.output_schema,
+        command.timeout.as_millis(),
+        command.workspace_access,
+        command.writable_launch_target,
+    ))
+    .context("failed to encode exact external process delivery identity")?;
+    Ok((program_identity, delivery_identity))
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ProtectedWorktreeControls {
     read_only_roots: Vec<ProtectedWorktreeControl>,
@@ -1205,7 +1322,72 @@ pub(crate) fn prepare_managed_child_git_boundary_for_test(workspace: &Path) -> R
 /// tree exactly matches the supervisor-captured tree. The ordinary Git commit
 /// path is intentional: repository-projected attribution and the validated
 /// commit-msg hook remain authoritative and are never bypassed.
+pub(crate) struct ManagedChildCommitAuthorization<'borrow, 'session> {
+    write_lease: &'borrow crate::worktree::ManagedWorktreeWriteLease,
+    permit: &'borrow crate::mutation_taxonomy::SupervisorOperationPermit<'session>,
+}
+
+impl<'borrow, 'session> ManagedChildCommitAuthorization<'borrow, 'session> {
+    pub(crate) fn new(
+        write_lease: &'borrow crate::worktree::ManagedWorktreeWriteLease,
+        permit: &'borrow crate::mutation_taxonomy::SupervisorOperationPermit<'session>,
+    ) -> Result<Self> {
+        permit
+            .verify(crate::mutation_taxonomy::MutationOperation::SandboxWorktreeCommit)
+            .map_err(anyhow::Error::from)?;
+        Ok(Self {
+            write_lease,
+            permit,
+        })
+    }
+}
+
+pub(crate) fn materialize_managed_child_git_commit_authorized(
+    primary_repo: &Path,
+    workspace: &Path,
+    captured_base: Oid,
+    claimed_paths: &[PathBuf],
+    candidate_paths: &[PathBuf],
+    candidate_tree: Oid,
+    authorization: ManagedChildCommitAuthorization<'_, '_>,
+) -> Result<Option<Oid>> {
+    authorization
+        .permit
+        .verify(crate::mutation_taxonomy::MutationOperation::SandboxWorktreeCommit)
+        .map_err(anyhow::Error::from)?;
+    if authorization.write_lease.path() != workspace {
+        bail!("managed child commit write lease does not bind the selected workspace");
+    }
+    materialize_managed_child_git_commit_impl(
+        primary_repo,
+        workspace,
+        captured_base,
+        claimed_paths,
+        candidate_paths,
+        candidate_tree,
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn materialize_managed_child_git_commit(
+    primary_repo: &Path,
+    workspace: &Path,
+    captured_base: Oid,
+    claimed_paths: &[PathBuf],
+    candidate_paths: &[PathBuf],
+    candidate_tree: Oid,
+) -> Result<Option<Oid>> {
+    materialize_managed_child_git_commit_impl(
+        primary_repo,
+        workspace,
+        captured_base,
+        claimed_paths,
+        candidate_paths,
+        candidate_tree,
+    )
+}
+
+fn materialize_managed_child_git_commit_impl(
     primary_repo: &Path,
     workspace: &Path,
     captured_base: Oid,
@@ -1637,7 +1819,68 @@ fn run_managed_child_git_command_allow_status(
 /// before the primary object database is mutated. Only missing, content-addressed
 /// objects from that verified closure are written; refs, HEAD, indexes, reflogs,
 /// and other Git metadata are never import targets.
+pub(crate) struct ManagedChildImportAuthorization<'borrow, 'session> {
+    write_lease: &'borrow crate::worktree::ManagedWorktreeWriteLease,
+    permit: &'borrow crate::mutation_taxonomy::SupervisorOperationPermit<'session>,
+}
+
+impl<'borrow, 'session> ManagedChildImportAuthorization<'borrow, 'session> {
+    pub(crate) fn new(
+        write_lease: &'borrow crate::worktree::ManagedWorktreeWriteLease,
+        permit: &'borrow crate::mutation_taxonomy::SupervisorOperationPermit<'session>,
+    ) -> Result<Self> {
+        permit
+            .verify(
+                crate::mutation_taxonomy::MutationOperation::SupervisorPrimaryObjectDatabaseImport,
+            )
+            .map_err(anyhow::Error::from)?;
+        Ok(Self {
+            write_lease,
+            permit,
+        })
+    }
+}
+
+pub(crate) fn collect_and_import_managed_child_git_commit_authorized(
+    primary_repo: &Path,
+    workspace: &Path,
+    captured_base: Oid,
+    claimed_paths: &[PathBuf],
+    authorization: ManagedChildImportAuthorization<'_, '_>,
+) -> Result<ManagedChildGitImport> {
+    authorization
+        .permit
+        .verify(
+            crate::mutation_taxonomy::MutationOperation::SupervisorPrimaryObjectDatabaseImport,
+        )
+        .map_err(anyhow::Error::from)?;
+    if authorization.write_lease.path() != workspace {
+        bail!("managed child import write lease does not bind the selected workspace");
+    }
+    collect_and_import_managed_child_git_commit_impl(
+        primary_repo,
+        workspace,
+        captured_base,
+        claimed_paths,
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn collect_and_import_managed_child_git_commit(
+    primary_repo: &Path,
+    workspace: &Path,
+    captured_base: Oid,
+    claimed_paths: &[PathBuf],
+) -> Result<ManagedChildGitImport> {
+    collect_and_import_managed_child_git_commit_impl(
+        primary_repo,
+        workspace,
+        captured_base,
+        claimed_paths,
+    )
+}
+
+fn collect_and_import_managed_child_git_commit_impl(
     primary_repo: &Path,
     workspace: &Path,
     captured_base: Oid,
@@ -4975,6 +5218,26 @@ struct ValidatedCodexAuth {
 }
 
 impl ValidatedCodexAuth {
+    fn binding_sha256(&self) -> Result<String> {
+        #[cfg(unix)]
+        let identity = serde_json::to_vec(&(
+            &self.path,
+            self.length,
+            self.modified,
+            self.device,
+            self.inode,
+            sha256_hex(&self.bytes),
+        ))?;
+        #[cfg(not(unix))]
+        let identity = serde_json::to_vec(&(
+            &self.path,
+            self.length,
+            self.modified,
+            sha256_hex(&self.bytes),
+        ))?;
+        Ok(sha256_hex(&identity))
+    }
+
     fn load() -> Result<Option<Self>> {
         let Some(home) = env::var_os("CODEX_HOME").map(PathBuf::from).or_else(|| {
             env::var_os("HOME")

@@ -648,6 +648,8 @@ fn authored_profile_reaches_verified_scheduler_selection_and_exact_score_evidenc
         SupervisorAdmissionConfig::default(),
     )
     .expect("resolve selector admission");
+    let catalog_preflight_session = CatalogPreflightMutationSession::for_test("profile-selection");
+    let mut default_process_launch_evidence = Vec::new();
 
     let default = initialize_supervisor_selection_from_prepared_metadata(
         &mut default_loaded.plan,
@@ -659,9 +661,12 @@ fn authored_profile_reaches_verified_scheduler_selection_and_exact_score_evidenc
             runtime_model_catalog: &catalog,
             admission_policy_input: &admission,
             quota: SupervisorQuotaSelectionInput::default(),
+            catalog_preflight_session: Some(&catalog_preflight_session),
+            process_launch_evidence: &mut default_process_launch_evidence,
         },
     )
     .expect("default verified scheduler selection");
+    let mut adjusted_process_launch_evidence = Vec::new();
     let adjusted = initialize_supervisor_selection_from_prepared_metadata(
         &mut authored_loaded.plan,
         &mut authored_loaded.plan_metadata,
@@ -672,6 +677,8 @@ fn authored_profile_reaches_verified_scheduler_selection_and_exact_score_evidenc
             runtime_model_catalog: &catalog,
             admission_policy_input: &admission,
             quota: SupervisorQuotaSelectionInput::default(),
+            catalog_preflight_session: Some(&catalog_preflight_session),
+            process_launch_evidence: &mut adjusted_process_launch_evidence,
         },
     )
     .expect("authored verified scheduler selection");

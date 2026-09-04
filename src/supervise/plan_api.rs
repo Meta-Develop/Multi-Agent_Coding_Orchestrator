@@ -47,11 +47,37 @@ fn apply_objective_profile_override(
 fn validate_execution_target_pre_dispatch(
     loaded: &LoadedSupervisorPlan,
     allow_primary_worktree: bool,
-) -> Result<()> {
+) -> Result<Option<PrimaryWorktreeOptInCapability>> {
     validate_execution_target_opt_in(
         loaded.plan_metadata.execution_target.as_ref(),
         allow_primary_worktree,
-    )
+    )?;
+    Ok(loaded
+        .plan_metadata
+        .execution_target
+        .as_ref()
+        .cloned()
+        .map(|execution_target| PrimaryWorktreeOptInCapability { execution_target }))
+}
+
+#[derive(Debug)]
+pub(super) struct PrimaryWorktreeOptInCapability {
+    execution_target: SupervisorExecutionTarget,
+}
+
+impl PrimaryWorktreeOptInCapability {
+    pub(super) fn matches(&self, execution_target: &SupervisorExecutionTarget) -> bool {
+        &self.execution_target == execution_target
+    }
+}
+
+#[cfg(test)]
+pub(super) fn primary_worktree_opt_in_for_test(
+    execution_target: &SupervisorExecutionTarget,
+) -> PrimaryWorktreeOptInCapability {
+    PrimaryWorktreeOptInCapability {
+        execution_target: execution_target.clone(),
+    }
 }
 
 pub fn supervisor_plan_from_task_file(
@@ -2514,7 +2540,8 @@ pub(crate) fn run_fake_supervisor_plan_file_for_test(
     let runtime_model_catalog = test_runtime_model_catalog(&loaded.plan, options.runtime)?;
     let no_external_runner = |_command: &ExternalAgentCommand,
                               _cancellation: &ProcessCancellation,
-                              _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>|
+                              _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>,
+                              _authorization: SupervisorProcessLaunchAuthorization|
      -> ExternalAgentRun {
         panic!("hermetic Fake plan-file execution must not launch an external process")
     };
@@ -2598,7 +2625,7 @@ pub fn run_supervisor_plan_file_cascade_with_concurrency_policy_and_primary_work
             objective_profile_override: objective_profile_override.as_deref(),
         },
         &mut permit,
-        &run_external_agent_cancellable_reviewed,
+        &run_external_agent_cancellable_reviewed_authorized,
     )
 }
 
@@ -2648,7 +2675,8 @@ pub fn run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_work
     let repo = discover_repo_root(&options.repo)?;
     let mut loaded = supervisor_plan_and_consultant_from_goal_spec(&repo, goal, spec, None)?;
     apply_objective_profile_override(&mut loaded, objective_profile_override.as_deref());
-    validate_execution_target_pre_dispatch(&loaded, allow_primary_worktree)?;
+    let primary_worktree_opt_in =
+        validate_execution_target_pre_dispatch(&loaded, allow_primary_worktree)?;
     let source_loaded = loaded.clone();
     let template = options.clone();
     let source_report = if template.runtime == SupervisorRuntime::Fake {
@@ -2657,7 +2685,8 @@ pub fn run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_work
         }
         let no_external_runner = |_command: &ExternalAgentCommand,
                                   _cancellation: &ProcessCancellation,
-                                  _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>|
+                                  _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>,
+                                  _authorization: SupervisorProcessLaunchAuthorization|
          -> ExternalAgentRun {
             panic!("nonpublishable Fake cascade must not launch an external process")
         };
@@ -2670,6 +2699,20 @@ pub fn run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_work
             None,
             &no_external_runner,
         )?
+    } else if source_loaded.plan_metadata.execution_target.is_some() {
+        authorize_acquire_catalog_and_run_supervisor_plan_with_runner_and_creation(
+            loaded,
+            options,
+            max_concurrent_children,
+            SupervisorExecutionRuntime::Verified,
+            SupervisorWorktreeCreation::PrimaryWorktree(
+                primary_worktree_opt_in
+                    .as_ref()
+                    .context("primary worktree dispatch lost its validated double opt-in")?,
+            ),
+            None,
+            &run_external_agent_cancellable_reviewed_authorized,
+        )?
     } else {
         let manager = WorktreeManager::new(&repo);
         let cleanliness = manager.acquire_repository_cleanliness()?;
@@ -2680,7 +2723,7 @@ pub fn run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_work
             SupervisorExecutionRuntime::Verified,
             SupervisorWorktreeCreation::Bound(&cleanliness),
             None,
-            &run_external_agent_cancellable_reviewed,
+            &run_external_agent_cancellable_reviewed_authorized,
         )?
     };
     let mut permit = |_plan: &SupervisorPlan| Ok(None);
@@ -2699,7 +2742,7 @@ pub fn run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_work
         None,
         &cancellation_observed,
         &mut permit,
-        &run_external_agent_cancellable_reviewed,
+        &run_external_agent_cancellable_reviewed_authorized,
     )
 }
 
@@ -2775,7 +2818,7 @@ fn resume_generated_follow_up_cascade(
         None,
         &cancellation_observed,
         &mut permit,
-        &run_external_agent_cancellable_reviewed,
+        &run_external_agent_cancellable_reviewed_authorized,
     )
 }
 
@@ -2805,16 +2848,18 @@ pub(crate) fn run_supervisor_plan_file_cascade_for_autopilot(
             let external_runner =
                 |command: &ExternalAgentCommand,
                  scheduler_cancellation: &ProcessCancellation,
-                 review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
+                 review_runtime: Option<ExternalPreActionReviewRuntime<'_>>,
+                 authorization: SupervisorProcessLaunchAuthorization| {
                     run_with_caller_process_cancellation(
                         caller_cancellation,
                         scheduler_cancellation,
                         cancellation_observed,
                         || {
-                            run_external_agent_cancellable_reviewed(
+                            run_external_agent_cancellable_reviewed_authorized(
                                 command,
                                 scheduler_cancellation,
                                 review_runtime,
+                                authorization,
                             )
                         },
                     )
@@ -2848,7 +2893,7 @@ pub(crate) fn run_supervisor_plan_file_cascade_for_autopilot(
                 objective_profile_override: None,
             },
             before_dispatch,
-            &run_external_agent_cancellable_reviewed,
+            &run_external_agent_cancellable_reviewed_authorized,
         ),
     }
 }
@@ -2886,7 +2931,8 @@ fn run_supervisor_plan_file_cascade_with_gate(
     let repo = discover_repo_root(&options.repo)?;
     let mut loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
     apply_objective_profile_override(&mut loaded, objective_profile_override);
-    validate_execution_target_pre_dispatch(&loaded, allow_primary_worktree)?;
+    let primary_worktree_opt_in =
+        validate_execution_target_pre_dispatch(&loaded, allow_primary_worktree)?;
     if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
         bail!("autopilot caller cancelled before exact loaded-plan dispatch");
     }
@@ -2907,7 +2953,8 @@ fn run_supervisor_plan_file_cascade_with_gate(
         }
         let no_external_runner = |_command: &ExternalAgentCommand,
                                   _cancellation: &ProcessCancellation,
-                                  _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>|
+                                  _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>,
+                                  _authorization: SupervisorProcessLaunchAuthorization|
          -> ExternalAgentRun {
             panic!("nonpublishable Fake cascade must not launch an external process")
         };
@@ -2932,7 +2979,11 @@ fn run_supervisor_plan_file_cascade_with_gate(
             options,
             max_concurrent_children,
             SupervisorExecutionRuntime::Verified,
-            SupervisorWorktreeCreation::PrimaryWorktree,
+            SupervisorWorktreeCreation::PrimaryWorktree(
+                primary_worktree_opt_in
+                    .as_ref()
+                    .context("primary worktree dispatch lost its validated double opt-in")?,
+            ),
             source_dispatch_started,
             external_runner,
         )?
@@ -2989,7 +3040,7 @@ fn run_supervisor_goal_spec_with_max_concurrent_children(
         SupervisorExecutionRuntime::Verified,
         SupervisorWorktreeCreation::Bound(&cleanliness),
         None,
-        &run_external_agent_cancellable_reviewed,
+        &run_external_agent_cancellable_reviewed_authorized,
     )
 }
 
@@ -3014,7 +3065,7 @@ pub(super) fn run_supervisor_goal_spec_with_runner_for_test(
         SupervisorExecutionRuntime::Verified,
         SupervisorWorktreeCreation::Bound(&cleanliness),
         Ok(runtime_model_catalog),
-        &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
+        &|command, _cancellation, _review_runtime, _authorization| match serialized_runner.lock() {
             Ok(mut runner) => runner(command),
             Err(poisoned) => poisoned.into_inner()(command),
         },
@@ -3025,7 +3076,7 @@ pub fn run_supervisor_plan_file_with_max_concurrent_children(
     options: SupervisorRunOptions,
     max_concurrent_children: usize,
 ) -> Result<SupervisorFinalReport> {
-    let external_runner = run_external_agent_cancellable_reviewed;
+    let external_runner = run_external_agent_cancellable_reviewed_authorized;
     run_supervisor_plan_file_with_runner_and_max_concurrent_children(
         options,
         max_concurrent_children,
@@ -3082,7 +3133,7 @@ pub fn reaudit_supervisor_assignment(
         SupervisorExecutionRuntime::Verified,
         SupervisorWorktreeCreation::ExistingOnly,
         None,
-        &run_external_agent_cancellable_reviewed,
+        &run_external_agent_cancellable_reviewed_authorized,
     )?;
     Ok(SupervisorEvidenceOnlyReauditReport {
         source_run_id: request.source_run_id,
@@ -3354,6 +3405,74 @@ fn run_supervisor_plan_file_with_runner_and_max_concurrent_children(
     )
 }
 
+fn open_resume_coordination_store_authorized(
+    repo: &Path,
+    permit: &crate::mutation_taxonomy::SupervisorOperationPermit<'_>,
+) -> Result<SyncStore> {
+    permit
+        .verify(MutationOperation::SupervisorCoordinationStoreBootstrap)
+        .map_err(anyhow::Error::from)?;
+    SyncStore::open(repo)
+}
+
+fn open_resume_semantic_store_authorized(
+    repo: &Path,
+    permit: &crate::mutation_taxonomy::SupervisorOperationPermit<'_>,
+) -> Result<SemanticIntentStore> {
+    permit
+        .verify(MutationOperation::SupervisorCoordinationStoreBootstrap)
+        .map_err(anyhow::Error::from)?;
+    SemanticIntentStore::open(repo)
+}
+
+fn complete_planned_scheduler_resource_release_authorized(
+    sync_store: &SyncStore,
+    semantic_store: &SemanticIntentStore,
+    report: &SupervisorFinalReport,
+    claim_permit: &crate::mutation_taxonomy::SupervisorOperationPermit<'_>,
+    semantic_permit: &crate::mutation_taxonomy::SupervisorOperationPermit<'_>,
+) -> Result<()> {
+    claim_permit
+        .verify(MutationOperation::ClaimRelease)
+        .map_err(anyhow::Error::from)?;
+    semantic_permit
+        .verify(MutationOperation::SemanticIntentRelease)
+        .map_err(anyhow::Error::from)?;
+    complete_planned_scheduler_resource_release(
+        sync_store,
+        semantic_store,
+        report,
+        claim_permit,
+        semantic_permit,
+    )
+}
+
+fn reopen_resume_artifacts_authorized(
+    repo: &Path,
+    binding: &ArtifactRunResumeBinding,
+    recovery: Option<&[ArtifactRecoveryFile<'_>]>,
+    permit: &crate::mutation_taxonomy::SupervisorOperationPermit<'_>,
+) -> Result<ArtifactRunWriter> {
+    permit
+        .verify(MutationOperation::SupervisorRunArtifactWriteAppend)
+        .map_err(anyhow::Error::from)?;
+    match recovery {
+        Some(recovery) => {
+            ArtifactRunWriter::reopen_unfinalized_with_recovery(repo, binding, recovery)
+        }
+        None => ArtifactRunWriter::reopen_unfinalized(repo, binding),
+    }
+}
+
+fn finalize_resume_artifacts_authorized(
+    writer: ArtifactRunWriter,
+    report_path: &Path,
+    publish_requested: bool,
+    permit: &crate::mutation_taxonomy::SupervisorOperationPermit<'_>,
+) -> Result<()> {
+    finalize_supervisor_artifact_run(writer, report_path, publish_requested, permit)
+}
+
 pub fn resume_supervisor_run(
     repo: impl AsRef<Path>,
     run_id: RunId,
@@ -3384,15 +3503,17 @@ pub fn resume_supervisor_run(
     let read_snapshot = match read_supervisor_checkpoint(&repo, &run_id) {
         Ok(snapshot) => snapshot,
         Err(error) => {
+            let denial = unsupported_checkpoint_version_denial(&error)
+                .unwrap_or(ResumeCheckpointDenial::IntegrityFailure);
             return resume_refusal(
                 &run_id,
                 SupervisorRunLifecycle::Interrupted,
-                ResumeCheckpointDenial::IntegrityFailure,
+                denial,
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 Some(format!("{error:#}")),
-            )
+            );
         }
     };
     if !read_snapshot.uncertain_assignments.is_empty() {
@@ -3517,17 +3638,15 @@ pub fn resume_supervisor_run(
                 outer_entrypoint: None,
                 outer_run_id: None,
             },
-            semantic_release: !plan.report.semantic_intent_tokens.is_empty(),
         },
     );
     let authorized_resume = authorize_effective_supervisor_manifest(resume_manifest)?;
-    let (resume_evidence, resume_permit) = authorized_resume.into_resume_recovery()?;
-    let (mut checkpoint, snapshot) = open_supervisor_checkpoint_authorized(
-        &repo,
-        &run_id,
-        resume_evidence.canonical_manifest_sha256(),
-        resume_permit,
-    )?;
+    let (resume_evidence, resume_session) = authorized_resume.into_resume_recovery()?;
+    if resume_session.canonical_manifest_sha256() != resume_evidence.canonical_manifest_sha256() {
+        bail!("resume recovery session is bound to different audit evidence");
+    }
+    let (mut checkpoint, snapshot) =
+        open_supervisor_checkpoint_authorized(&repo, &run_id, &resume_session)?;
     if snapshot.normalized_plan_sha256() != read_snapshot.normalized_plan_sha256()
         || snapshot.parent_node() != read_snapshot.parent_node()
         || snapshot.dispatch_identity() != read_snapshot.dispatch_identity()
@@ -3535,17 +3654,27 @@ pub fn resume_supervisor_run(
     {
         bail!("supervisor checkpoint identity changed during admitted recovery open");
     }
-    messaging_bridge::recover_supervisor_messaging_session(&run_dir)
+    let messaging_permit =
+        resume_session.permit(MutationOperation::SupervisorMessagingJournalLifecycle)?;
+    messaging_bridge::recover_supervisor_messaging_session_authorized(&run_dir, &messaging_permit)
         .context("supervisor messaging resume recovery failed")?;
-    let sync_store = SyncStore::open(&repo)?;
+    let coordination_permit =
+        resume_session.permit(MutationOperation::SupervisorCoordinationStoreBootstrap)?;
+    let sync_store = open_resume_coordination_store_authorized(&repo, &coordination_permit)?;
     let claim_disposition = (|| -> Result<()> {
         snapshot.verify_claim_disposition(&sync_store, &plan.report, !plan.artifact_committed)?;
         if !plan.artifact_committed {
-            let semantic_store = SemanticIntentStore::open(&repo)?;
-            complete_planned_scheduler_resource_release(
+            let claim_release_permit = resume_session.permit(MutationOperation::ClaimRelease)?;
+            let semantic_release_permit =
+                resume_session.permit(MutationOperation::SemanticIntentRelease)?;
+            let semantic_store =
+                open_resume_semantic_store_authorized(&repo, &coordination_permit)?;
+            complete_planned_scheduler_resource_release_authorized(
                 &sync_store,
                 &semantic_store,
                 &plan.report,
+                &claim_release_permit,
+                &semantic_release_permit,
             )?;
             snapshot.verify_claim_disposition(&sync_store, &plan.report, false)?;
         }
@@ -3564,15 +3693,22 @@ pub fn resume_supervisor_run(
     }
 
     let report_path = RunArtifactFamily::Supervise.final_report_relative_path();
+    let artifact_write_permit =
+        resume_session.permit(MutationOperation::SupervisorRunArtifactWriteAppend)?;
     let artifact_writer_result = if plan.artifact_committed {
-        ArtifactRunWriter::reopen_unfinalized(&repo, &plan.artifact)
+        reopen_resume_artifacts_authorized(&repo, &plan.artifact, None, &artifact_write_permit)
     } else {
         let recovery = ArtifactRecoveryFile {
             relative: &report_path,
             contents: &plan.report_bytes,
             disposition: ArtifactFileDisposition::PrivateEvidence,
         };
-        ArtifactRunWriter::reopen_unfinalized_with_recovery(&repo, &plan.artifact, &[recovery])
+        reopen_resume_artifacts_authorized(
+            &repo,
+            &plan.artifact,
+            Some(&[recovery]),
+            &artifact_write_permit,
+        )
     };
     let mut artifact_writer = match artifact_writer_result {
         Ok(writer) => writer,
@@ -3596,6 +3732,9 @@ pub fn resume_supervisor_run(
         ArtifactFileDisposition::PrivateEvidence,
     )?;
     if !plan.artifact_committed {
+        resume_session
+            .permit(MutationOperation::SupervisorCheckpointJournalLifecycle)?
+            .verify(MutationOperation::SupervisorCheckpointJournalLifecycle)?;
         checkpoint.final_report_committed(
             &plan.report,
             &plan.report_bytes,
@@ -3603,9 +3742,22 @@ pub fn resume_supervisor_run(
         )?;
     }
     if !snapshot.finalization_started {
+        resume_session
+            .permit(MutationOperation::SupervisorCheckpointJournalLifecycle)?
+            .verify(MutationOperation::SupervisorCheckpointJournalLifecycle)?;
         checkpoint.finalization_started(&plan.report, &plan.report_bytes)?;
     }
-    artifact_writer.finalize(&report_path, plan.publish_requested)?;
+    let artifact_finalize_permit =
+        resume_session.permit(MutationOperation::SupervisorRunArtifactAuthenticatedFinalize)?;
+    finalize_resume_artifacts_authorized(
+        artifact_writer,
+        &report_path,
+        plan.publish_requested,
+        &artifact_finalize_permit,
+    )?;
+    resume_session
+        .permit(MutationOperation::SupervisorCheckpointJournalLifecycle)?
+        .verify(MutationOperation::SupervisorCheckpointJournalLifecycle)?;
     checkpoint.finalized(&plan.report, &plan.report_bytes)?;
     let report = read_finalized_supervisor_report(&repo, &run_id, &run_dir)?
         .context("resumed supervise finalization did not publish a verified final report")?;
@@ -3701,17 +3853,13 @@ pub fn supervisor_status(repo: impl AsRef<Path>, run_id: RunId) -> Result<Superv
                 )?;
                 (SupervisorRunLifecycle::Interrupted, refusal.gate_denial)
             }
-            Err(error)
-                if error.to_string().contains("active elsewhere")
-                    || error.to_string().contains("instance is active") =>
-            {
-                (SupervisorRunLifecycle::Active, None)
-            }
-            Err(_) => {
+            Err(error) => {
+                let denial = unsupported_checkpoint_version_denial(&error)
+                    .unwrap_or(ResumeCheckpointDenial::IntegrityFailure);
                 let refusal = resume_refusal(
                     &run_id,
                     SupervisorRunLifecycle::Interrupted,
-                    ResumeCheckpointDenial::IntegrityFailure,
+                    denial,
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),

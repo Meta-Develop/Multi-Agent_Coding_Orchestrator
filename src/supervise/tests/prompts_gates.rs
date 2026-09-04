@@ -658,6 +658,7 @@ fn gate_terminal_append_failure_retains_active_denial_without_false_outcome() {
     let mut tracker = GateCorrectionTracker::new(1);
     let mut health_signals = Vec::new();
     let mut autonomy_kpis = AutonomyKpiCollector::default();
+    let mutation_session = SupervisorRunMutationSession::local_for_test(run_id.as_str());
 
     {
         let artifacts = Mutex::new(SharedSupervisorArtifacts {
@@ -665,6 +666,7 @@ fn gate_terminal_append_failure_retains_active_denial_without_false_outcome() {
             journal: &mut journal,
             autonomy_kpis: &mut autonomy_kpis,
             checkpoint: None,
+            mutation_session: &mutation_session,
         });
         let authorized = tracker
             .authorize(
