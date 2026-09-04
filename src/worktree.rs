@@ -60,11 +60,14 @@ use std::os::unix::fs::MetadataExt;
 
 const DEFAULT_BRANCH_PREFIX: &str = "maco";
 const WORKTREE_GUARD_ASSET: &[u8] = include_bytes!("../assets/maco-worktree-guard.sh");
+const WORKTREE_GUARD_ASSET_V3_LEGACY: &[u8] = include_bytes!("../assets/maco-worktree-guard-v3.sh");
+const WORKTREE_GUARD_MODE: u32 = 0o755;
 const WORKTREE_GUARD_STATE_DIRECTORY: &str = ".maco-worktree-guard";
 const WORKTREE_GUARD_MARKER: &str = "maco-worktree-guard-v3";
 const WORKTREE_GUARD_PREVIOUS_SUFFIX: &str = ".maco-worktree-guard-previous";
 const WORKTREE_GUARD_STAGED_SUFFIX: &str = ".maco-worktree-guard-installing";
 const WORKTREE_GUARD_PRE_PUSH_TARGET: &str = "pre-push.human-authorship-previous";
+const HUMAN_AUTHORSHIP_PRE_PUSH_DISPATCHER_V5_MODE: u32 = 0o755;
 const HUMAN_AUTHORSHIP_PRE_PUSH_DISPATCHER_V5: &[u8] = br#"#!/usr/bin/env bash
 # human-authorship-guard dispatcher v5
 set -euo pipefail
@@ -1564,8 +1567,13 @@ pub fn install_primary_worktree_guard(repo_path: impl AsRef<Path>) -> Result<Wor
                     layout.state_dir.display()
                 );
             }
+            let upgraded = upgrade_existing_primary_worktree_guard_layout(&layout)?;
             let mut report = verify_primary_worktree_guard_layout(&layout)?;
-            report.status = WorktreeGuardStatus::AlreadyInstalled;
+            report.status = if upgraded {
+                WorktreeGuardStatus::Installed
+            } else {
+                WorktreeGuardStatus::AlreadyInstalled
+            };
             return Ok(report);
         }
         Err(error) if error.kind() == ErrorKind::NotFound => {}
@@ -1656,6 +1664,7 @@ pub fn uninstall_primary_worktree_guard(
         Ok(_) => {}
     }
 
+    upgrade_existing_primary_worktree_guard_layout(&layout)?;
     let verified = verify_primary_worktree_guard_layout(&layout)?;
     let pre_push = resolve_installed_pre_push_guard(&layout)?;
     uninstall_guard_target_with_previous(&pre_push.target, &pre_push.previous)?;
@@ -1749,9 +1758,9 @@ fn require_exact_human_authorship_dispatcher_v5(path: &Path, bytes: &[u8]) -> Re
             path.display()
         )
     })?;
-    if metadata.permissions().mode() & 0o111 == 0 {
+    if metadata.permissions().mode() & 0o7777 != HUMAN_AUTHORSHIP_PRE_PUSH_DISPATCHER_V5_MODE {
         bail!(
-            "human-authorship dispatcher v5 is not executable: {}",
+            "human-authorship dispatcher v5 must have exact mode 0755: {}",
             path.display()
         );
     }
@@ -1775,7 +1784,7 @@ fn preflight_guard_target(target: &Path) -> Result<()> {
         );
     }
     if let Some(bytes) = read_guard_regular_file(target)? {
-        if bytes == WORKTREE_GUARD_ASSET {
+        if bytes == WORKTREE_GUARD_ASSET || bytes == WORKTREE_GUARD_ASSET_V3_LEGACY {
             bail!(
                 "worktree guard hook exists without owned state; refusing to adopt {}",
                 target.display()
@@ -1790,7 +1799,7 @@ fn install_guard_target(target: &Path) -> Result<()> {
     let backup = guard_previous_path(target)?;
     let staged = guard_staged_path(target)?;
     let had_previous = read_guard_regular_file(target)?.is_some();
-    publish_guard_file(&staged, WORKTREE_GUARD_ASSET, 0o755)?;
+    publish_guard_file(&staged, WORKTREE_GUARD_ASSET, WORKTREE_GUARD_MODE)?;
 
     if had_previous {
         if let Err(error) = fs::hard_link(target, &backup) {
@@ -1893,6 +1902,31 @@ fn write_guard_state(layout: &PrimaryWorktreeGuardLayout, pre_push_target: &Path
 fn verify_primary_worktree_guard_layout(
     layout: &PrimaryWorktreeGuardLayout,
 ) -> Result<WorktreeGuardReport> {
+    let pre_push = verify_guard_state_and_previous_bindings(layout)?;
+    for target in [
+        &pre_push.target,
+        &layout.pre_commit,
+        &layout.pre_merge_commit,
+    ] {
+        require_exact_guard_hook(target)?;
+        if require_exact_staged_guard_upgrade(target)? {
+            bail!(
+                "staged worktree guard upgrade requires recovery with `maco worktree guard install`: {}",
+                target.display()
+            );
+        }
+    }
+    Ok(worktree_guard_report(
+        layout,
+        pre_push.target,
+        WorktreeGuardStatus::Verified,
+    ))
+}
+
+#[cfg(unix)]
+fn verify_guard_state_and_previous_bindings(
+    layout: &PrimaryWorktreeGuardLayout,
+) -> Result<InstalledPrePushGuard> {
     let marker = read_guard_state_line(layout, "marker")?;
     if marker != WORKTREE_GUARD_MARKER {
         bail!("MACO worktree guard ownership marker is missing or changed");
@@ -1903,9 +1937,6 @@ fn verify_primary_worktree_guard_layout(
         bail!("MACO worktree guard repository binding changed");
     }
     let pre_push = resolve_installed_pre_push_guard(layout)?;
-    require_exact_guard_hook(&layout.pre_commit)?;
-    require_exact_guard_hook(&layout.pre_merge_commit)?;
-    require_exact_guard_hook(&pre_push.target)?;
     require_guard_previous_binding(layout, "pre-commit-previous", &layout.pre_commit)?;
     require_guard_previous_binding(
         layout,
@@ -1913,11 +1944,33 @@ fn verify_primary_worktree_guard_layout(
         &layout.pre_merge_commit,
     )?;
     require_guard_previous_binding(layout, "pre-push-previous", &pre_push.target)?;
-    Ok(worktree_guard_report(
-        layout,
-        pre_push.target,
-        WorktreeGuardStatus::Verified,
-    ))
+    Ok(pre_push)
+}
+
+#[cfg(unix)]
+fn upgrade_existing_primary_worktree_guard_layout(
+    layout: &PrimaryWorktreeGuardLayout,
+) -> Result<bool> {
+    let pre_push = verify_guard_state_and_previous_bindings(layout)?;
+    let targets = [
+        &pre_push.target,
+        &layout.pre_commit,
+        &layout.pre_merge_commit,
+    ];
+    let mut upgrade_required = false;
+    for target in targets {
+        upgrade_required |= require_upgradeable_guard_hook(target)?;
+        upgrade_required |= require_exact_staged_guard_upgrade(target)?;
+    }
+    if !upgrade_required {
+        return Ok(false);
+    }
+
+    let mut upgraded = false;
+    for target in targets {
+        upgraded |= upgrade_guard_target(target)?;
+    }
+    Ok(upgraded)
 }
 
 #[cfg(unix)]
@@ -1940,17 +1993,90 @@ fn resolve_installed_pre_push_guard(
 
 #[cfg(unix)]
 fn require_exact_guard_hook(path: &Path) -> Result<()> {
+    if require_upgradeable_guard_hook(path)? {
+        bail!(
+            "legacy worktree guard hook requires an in-place upgrade with `maco worktree guard install`: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn require_upgradeable_guard_hook(path: &Path) -> Result<bool> {
     let bytes = read_guard_regular_file(path)?
         .with_context(|| format!("worktree guard hook is missing: {}", path.display()))?;
-    if bytes != WORKTREE_GUARD_ASSET {
+    if bytes != WORKTREE_GUARD_ASSET && bytes != WORKTREE_GUARD_ASSET_V3_LEGACY {
         bail!("worktree guard hook changed: {}", path.display());
     }
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect worktree guard hook {}", path.display()))?;
-    if metadata.permissions().mode() & 0o111 == 0 {
-        bail!("worktree guard hook is not executable: {}", path.display());
+    if metadata.permissions().mode() & 0o7777 != WORKTREE_GUARD_MODE {
+        bail!(
+            "worktree guard hook must have exact mode 0755: {}",
+            path.display()
+        );
     }
-    Ok(())
+    Ok(bytes == WORKTREE_GUARD_ASSET_V3_LEGACY)
+}
+
+#[cfg(unix)]
+fn require_exact_staged_guard_upgrade(target: &Path) -> Result<bool> {
+    let staged = guard_staged_path(target)?;
+    let Some(bytes) = read_guard_regular_file(&staged)? else {
+        return Ok(false);
+    };
+    if bytes != WORKTREE_GUARD_ASSET {
+        bail!(
+            "worktree guard staged upgrade changed; refusing recovery: {}",
+            staged.display()
+        );
+    }
+    let metadata = fs::symlink_metadata(&staged).with_context(|| {
+        format!(
+            "failed to inspect staged guard upgrade {}",
+            staged.display()
+        )
+    })?;
+    if metadata.permissions().mode() & 0o7777 != WORKTREE_GUARD_MODE {
+        bail!(
+            "worktree guard staged upgrade must have exact mode 0755: {}",
+            staged.display()
+        );
+    }
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn upgrade_guard_target(target: &Path) -> Result<bool> {
+    let legacy = require_upgradeable_guard_hook(target)?;
+    let staged = guard_staged_path(target)?;
+    if require_exact_staged_guard_upgrade(target)? {
+        fs::rename(&staged, target).with_context(|| {
+            format!(
+                "failed to complete atomically staged worktree guard upgrade {}",
+                target.display()
+            )
+        })?;
+        sync_guard_parent_directory(target)?;
+        return Ok(true);
+    }
+    if !legacy {
+        return Ok(false);
+    }
+
+    publish_guard_file(&staged, WORKTREE_GUARD_ASSET, WORKTREE_GUARD_MODE)?;
+    if let Err(error) = fs::rename(&staged, target) {
+        let _ = fs::remove_file(&staged);
+        return Err(error).with_context(|| {
+            format!(
+                "failed to atomically upgrade worktree guard hook {}",
+                target.display()
+            )
+        });
+    }
+    sync_guard_parent_directory(target)?;
+    Ok(true)
 }
 
 #[cfg(unix)]
@@ -1979,7 +2105,10 @@ fn require_no_orphaned_guard_payload(layout: &PrimaryWorktreeGuardLayout) -> Res
         layout.pre_push.clone(),
         layout.hooks_dir.join(WORKTREE_GUARD_PRE_PUSH_TARGET),
     ] {
-        if read_guard_regular_file(&target)?.as_deref() == Some(WORKTREE_GUARD_ASSET) {
+        let payload = read_guard_regular_file(&target)?;
+        if payload.as_deref() == Some(WORKTREE_GUARD_ASSET)
+            || payload.as_deref() == Some(WORKTREE_GUARD_ASSET_V3_LEGACY)
+        {
             bail!(
                 "worktree guard payload exists without owned state; refusing uninstall: {}",
                 target.display()
@@ -2086,12 +2215,19 @@ fn publish_guard_file(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
         .create_new(true)
         .open(path)
         .with_context(|| format!("failed to create guard file {}", path.display()))?;
-    file.write_all(bytes)
-        .with_context(|| format!("failed to write guard file {}", path.display()))?;
-    file.set_permissions(fs::Permissions::from_mode(mode))
-        .with_context(|| format!("failed to set guard file mode {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("failed to sync guard file {}", path.display()))
+    let publication = (|| -> Result<()> {
+        file.write_all(bytes)
+            .with_context(|| format!("failed to write guard file {}", path.display()))?;
+        file.set_permissions(fs::Permissions::from_mode(mode))
+            .with_context(|| format!("failed to set guard file mode {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync guard file {}", path.display()))
+    })();
+    if publication.is_err() {
+        drop(file);
+        let _ = fs::remove_file(path);
+    }
+    publication
 }
 
 #[cfg(unix)]
