@@ -2586,16 +2586,17 @@ pub fn run_supervisor_plan_file_cascade_with_concurrency_policy_and_primary_work
     let mut permit = |_plan: &SupervisorPlan| Ok(None);
     let cancellation_observed = AtomicBool::new(false);
     run_supervisor_plan_file_cascade_with_gate(
-        options,
-        concurrency_policy,
-        GeneratedFollowUpQueueEntrypoint::SuperviseRun,
-        &outer_run_id,
-        None,
-        &cancellation_observed,
-        None,
-        None,
-        allow_primary_worktree,
-        objective_profile_override.as_deref(),
+        SupervisorPlanFileCascadeRequest {
+            options,
+            concurrency_policy,
+            outer_entrypoint: GeneratedFollowUpQueueEntrypoint::SuperviseRun,
+            outer_command_run_id: &outer_run_id,
+            caller_cancellation: None,
+            cancellation_observed: &cancellation_observed,
+            source_dispatch_started: None,
+            allow_primary_worktree,
+            objective_profile_override: objective_profile_override.as_deref(),
+        },
         &mut permit,
         &run_external_agent_cancellable_reviewed,
     )
@@ -2778,16 +2779,27 @@ fn resume_generated_follow_up_cascade(
     )
 }
 
+pub(crate) struct AutopilotSupervisorCascadeRequest<'a> {
+    pub(crate) options: SupervisorRunOptions,
+    pub(crate) concurrency_policy: SupervisorConcurrencyPolicy,
+    pub(crate) outer_command_run_id: &'a RunId,
+    pub(crate) caller_cancellation: Option<&'a ProcessCancellation>,
+    pub(crate) cancellation_observed: &'a AtomicBool,
+    pub(crate) source_dispatch_started: &'a AtomicBool,
+}
+
 pub(crate) fn run_supervisor_plan_file_cascade_for_autopilot(
-    options: SupervisorRunOptions,
-    concurrency_policy: SupervisorConcurrencyPolicy,
-    outer_command_run_id: &RunId,
-    caller_cancellation: Option<&ProcessCancellation>,
-    cancellation_observed: &AtomicBool,
-    source_dispatch_started: &AtomicBool,
-    source_mutation_grant: EffectiveSupervisorMutationGrant,
+    request: AutopilotSupervisorCascadeRequest<'_>,
     before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<Option<GateDenial>>,
 ) -> Result<SupervisorCascadeOutcome> {
+    let AutopilotSupervisorCascadeRequest {
+        options,
+        concurrency_policy,
+        outer_command_run_id,
+        caller_cancellation,
+        cancellation_observed,
+        source_dispatch_started,
+    } = request;
     match caller_cancellation {
         Some(caller_cancellation) => {
             let external_runner =
@@ -2808,52 +2820,67 @@ pub(crate) fn run_supervisor_plan_file_cascade_for_autopilot(
                     )
                 };
             run_supervisor_plan_file_cascade_with_gate(
-                options,
-                concurrency_policy,
-                GeneratedFollowUpQueueEntrypoint::AutopilotRun,
-                outer_command_run_id,
-                Some(caller_cancellation),
-                cancellation_observed,
-                Some(source_dispatch_started),
-                Some(source_mutation_grant),
-                false,
-                None,
+                SupervisorPlanFileCascadeRequest {
+                    options,
+                    concurrency_policy,
+                    outer_entrypoint: GeneratedFollowUpQueueEntrypoint::AutopilotRun,
+                    outer_command_run_id,
+                    caller_cancellation: Some(caller_cancellation),
+                    cancellation_observed,
+                    source_dispatch_started: Some(source_dispatch_started),
+                    allow_primary_worktree: false,
+                    objective_profile_override: None,
+                },
                 before_dispatch,
                 &external_runner,
             )
         }
         None => run_supervisor_plan_file_cascade_with_gate(
-            options,
-            concurrency_policy,
-            GeneratedFollowUpQueueEntrypoint::AutopilotRun,
-            outer_command_run_id,
-            None,
-            cancellation_observed,
-            Some(source_dispatch_started),
-            Some(source_mutation_grant),
-            false,
-            None,
+            SupervisorPlanFileCascadeRequest {
+                options,
+                concurrency_policy,
+                outer_entrypoint: GeneratedFollowUpQueueEntrypoint::AutopilotRun,
+                outer_command_run_id,
+                caller_cancellation: None,
+                cancellation_observed,
+                source_dispatch_started: Some(source_dispatch_started),
+                allow_primary_worktree: false,
+                objective_profile_override: None,
+            },
             before_dispatch,
             &run_external_agent_cancellable_reviewed,
         ),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_supervisor_plan_file_cascade_with_gate(
+struct SupervisorPlanFileCascadeRequest<'a> {
     options: SupervisorRunOptions,
     concurrency_policy: SupervisorConcurrencyPolicy,
     outer_entrypoint: GeneratedFollowUpQueueEntrypoint,
-    outer_command_run_id: &RunId,
-    caller_cancellation: Option<&ProcessCancellation>,
-    cancellation_observed: &AtomicBool,
-    source_dispatch_started: Option<&AtomicBool>,
-    mut source_mutation_grant: Option<EffectiveSupervisorMutationGrant>,
+    outer_command_run_id: &'a RunId,
+    caller_cancellation: Option<&'a ProcessCancellation>,
+    cancellation_observed: &'a AtomicBool,
+    source_dispatch_started: Option<&'a AtomicBool>,
     allow_primary_worktree: bool,
-    objective_profile_override: Option<&str>,
+    objective_profile_override: Option<&'a str>,
+}
+
+fn run_supervisor_plan_file_cascade_with_gate(
+    request: SupervisorPlanFileCascadeRequest<'_>,
     before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<Option<GateDenial>>,
     external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorCascadeOutcome> {
+    let SupervisorPlanFileCascadeRequest {
+        options,
+        concurrency_policy,
+        outer_entrypoint,
+        outer_command_run_id,
+        caller_cancellation,
+        cancellation_observed,
+        source_dispatch_started,
+        allow_primary_worktree,
+        objective_profile_override,
+    } = request;
     let max_concurrent_children = concurrency_policy.resolve(HostProcessCapacity::measured());
     validate_max_concurrent_children(max_concurrent_children)?;
     let repo = discover_repo_root(&options.repo)?;
@@ -2884,95 +2911,44 @@ fn run_supervisor_plan_file_cascade_with_gate(
          -> ExternalAgentRun {
             panic!("nonpublishable Fake cascade must not launch an external process")
         };
-        let mutation_grant = match source_mutation_grant.take() {
-            Some(grant) => grant,
-            None => {
-                let manifest = effective_supervisor_mutation_manifest(
-                    &loaded,
-                    &options,
-                    SupervisorExecutionRuntime::NonpublishableSimulation,
-                    SupervisorWorktreeCreation::NonpublishableSimulation,
-                )?;
-                authorize_effective_supervisor_manifest(manifest)?
-            }
-        };
-        let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
         if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
-            bail!("autopilot caller cancelled after runtime catalog resolution before exact loaded-plan dispatch");
+            bail!("autopilot caller cancelled before admitted runtime catalog resolution");
         }
-        if let Some(source_dispatch_started) = source_dispatch_started {
-            source_dispatch_started.store(true, Ordering::SeqCst);
-        }
-        run_supervisor_plan_with_runner_and_creation(
+        authorize_acquire_catalog_and_run_supervisor_plan_with_runner_and_creation(
             loaded,
             options,
             max_concurrent_children,
             SupervisorExecutionRuntime::NonpublishableSimulation,
             SupervisorWorktreeCreation::NonpublishableSimulation,
-            runtime_model_catalog,
-            mutation_grant,
+            source_dispatch_started,
             &no_external_runner,
         )?
     } else if source_loaded.plan_metadata.execution_target.is_some() {
-        let mutation_grant = match source_mutation_grant.take() {
-            Some(grant) => grant,
-            None => {
-                let manifest = effective_supervisor_mutation_manifest(
-                    &loaded,
-                    &options,
-                    SupervisorExecutionRuntime::Verified,
-                    SupervisorWorktreeCreation::PrimaryWorktree,
-                )?;
-                authorize_effective_supervisor_manifest(manifest)?
-            }
-        };
-        let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
         if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
-            bail!("autopilot caller cancelled after runtime catalog resolution before exact loaded-plan dispatch");
+            bail!("autopilot caller cancelled before admitted runtime catalog resolution");
         }
-        if let Some(source_dispatch_started) = source_dispatch_started {
-            source_dispatch_started.store(true, Ordering::SeqCst);
-        }
-        run_supervisor_plan_with_runner_and_creation(
+        authorize_acquire_catalog_and_run_supervisor_plan_with_runner_and_creation(
             loaded,
             options,
             max_concurrent_children,
             SupervisorExecutionRuntime::Verified,
             SupervisorWorktreeCreation::PrimaryWorktree,
-            runtime_model_catalog,
-            mutation_grant,
+            source_dispatch_started,
             external_runner,
         )?
     } else {
         let manager = WorktreeManager::new(&repo);
         let cleanliness = manager.acquire_repository_cleanliness()?;
-        let mutation_grant = match source_mutation_grant.take() {
-            Some(grant) => grant,
-            None => {
-                let manifest = effective_supervisor_mutation_manifest(
-                    &loaded,
-                    &options,
-                    SupervisorExecutionRuntime::Verified,
-                    SupervisorWorktreeCreation::Bound(&cleanliness),
-                )?;
-                authorize_effective_supervisor_manifest(manifest)?
-            }
-        };
-        let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
         if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
-            bail!("autopilot caller cancelled after runtime catalog resolution before exact loaded-plan dispatch");
+            bail!("autopilot caller cancelled before admitted runtime catalog resolution");
         }
-        if let Some(source_dispatch_started) = source_dispatch_started {
-            source_dispatch_started.store(true, Ordering::SeqCst);
-        }
-        run_supervisor_plan_with_runner_and_creation(
+        authorize_acquire_catalog_and_run_supervisor_plan_with_runner_and_creation(
             loaded,
             options,
             max_concurrent_children,
             SupervisorExecutionRuntime::Verified,
             SupervisorWorktreeCreation::Bound(&cleanliness),
-            runtime_model_catalog,
-            mutation_grant,
+            source_dispatch_started,
             external_runner,
         )?
     };
@@ -3405,8 +3381,8 @@ pub fn resume_supervisor_run(
         });
     }
 
-    let (mut checkpoint, snapshot) = match open_supervisor_checkpoint(&repo, &run_id) {
-        Ok(opened) => opened,
+    let read_snapshot = match read_supervisor_checkpoint(&repo, &run_id) {
+        Ok(snapshot) => snapshot,
         Err(error) => {
             return resume_refusal(
                 &run_id,
@@ -3419,7 +3395,7 @@ pub fn resume_supervisor_run(
             )
         }
     };
-    if !snapshot.uncertain_assignments.is_empty() {
+    if !read_snapshot.uncertain_assignments.is_empty() {
         let denial = GateDenial::new(
             run_id.as_str(),
             GateDenialReason::ExternalSideEffect {
@@ -3439,32 +3415,32 @@ pub fn resume_supervisor_run(
             resumed: false,
             budget_reconciled_from_checkpoint: false,
             run_budget: None,
-            completed_assignments: snapshot.completed_assignments,
-            pending_assignments: snapshot.pending_assignments,
-            uncertain_assignments: snapshot.uncertain_assignments,
+            completed_assignments: read_snapshot.completed_assignments,
+            pending_assignments: read_snapshot.pending_assignments,
+            uncertain_assignments: read_snapshot.uncertain_assignments,
             gate_denial: Some(denial),
             final_report: None,
         });
     }
-    let Some(plan) = snapshot.final_report.as_ref() else {
+    let Some(plan) = read_snapshot.final_report.as_ref() else {
         return resume_refusal(
             &run_id,
             SupervisorRunLifecycle::Interrupted,
             ResumeCheckpointDenial::UnsupportedLifecycle,
-            snapshot.completed_assignments,
-            snapshot.pending_assignments,
-            snapshot.uncertain_assignments,
+            read_snapshot.completed_assignments,
+            read_snapshot.pending_assignments,
+            read_snapshot.uncertain_assignments,
             None,
         );
     };
-    if snapshot.finalized {
+    if read_snapshot.finalized {
         return resume_refusal(
             &run_id,
             SupervisorRunLifecycle::Interrupted,
             ResumeCheckpointDenial::IntegrityFailure,
-            snapshot.completed_assignments,
-            snapshot.pending_assignments,
-            snapshot.uncertain_assignments,
+            read_snapshot.completed_assignments,
+            read_snapshot.pending_assignments,
+            read_snapshot.uncertain_assignments,
             Some(
                 "checkpoint claims finalization but the authenticated artifact marker is missing"
                     .to_string(),
@@ -3472,31 +3448,95 @@ pub fn resume_supervisor_run(
         );
     }
     let manager = WorktreeManager::new(&repo);
-    let _primary_cleanliness = match snapshot.verify_primary_binding(&repo, &manager) {
+    let _primary_cleanliness = match read_snapshot.verify_primary_binding(&repo, &manager) {
         Ok(cleanliness) => cleanliness,
         Err(error) => {
             return resume_refusal(
                 &run_id,
                 SupervisorRunLifecycle::Interrupted,
                 ResumeCheckpointDenial::IntegrityFailure,
-                snapshot.completed_assignments,
-                snapshot.pending_assignments,
-                snapshot.uncertain_assignments,
+                read_snapshot.completed_assignments,
+                read_snapshot.pending_assignments,
+                read_snapshot.uncertain_assignments,
                 Some(format!("{error:#}")),
             )
         }
     };
-    if let Err(error) = snapshot.verify_completed_worktrees(&manager) {
+    if let Err(error) = read_snapshot.verify_completed_worktrees(&manager) {
         return resume_refusal(
             &run_id,
             SupervisorRunLifecycle::Interrupted,
             ResumeCheckpointDenial::IntegrityFailure,
-            snapshot.completed_assignments,
-            snapshot.pending_assignments,
-            snapshot.uncertain_assignments,
+            read_snapshot.completed_assignments,
+            read_snapshot.pending_assignments,
+            read_snapshot.uncertain_assignments,
             Some(format!("{error:#}")),
         );
     }
+    let artifact_binding_sha256 = crate::artifacts::state_auth::sha256_hex(
+        &serde_json::to_vec(&plan.artifact)
+            .context("failed to encode authenticated resume artifact binding")?,
+    );
+    let primary_baseline_sha256 = if plan.report.runtime == SupervisorRuntime::Fake {
+        nonpublishable_simulation_whole_primary_snapshot_sha256(&repo)?
+    } else {
+        verified_whole_primary_snapshot_sha256(&repo)?
+    };
+    let queue_item_sha256 = matches!(
+        read_snapshot.dispatch_identity(),
+        EffectiveSupervisorDispatchIdentity::GeneratedFollowUpSubordinate { .. }
+    )
+    .then(|| generated_follow_up_item_id_from_subordinate_run_id(run_id.as_str()))
+    .transpose()?;
+    let repository_identity = effective_repository_identity(&repo)?;
+    let resume_manifest = EffectiveSupervisorMutationManifest::resume_recovery(
+        EffectiveResumeRecoveryManifestInput {
+            identity: EffectiveSupervisorMutationIdentityInput {
+                run_id: run_id.as_str().to_string(),
+                parent_node: read_snapshot.parent_node().map(str::to_string),
+                normalized_plan_sha256: read_snapshot.normalized_plan_sha256().to_string(),
+                dispatch_identity: read_snapshot.dispatch_identity().clone(),
+                execution_runtime: if plan.report.runtime == SupervisorRuntime::Fake {
+                    EffectiveSupervisorExecutionRuntime::NonpublishableSimulation
+                } else {
+                    EffectiveSupervisorExecutionRuntime::Verified
+                },
+                worktree_mode: EffectiveSupervisorWorktreeMode::NotApplicable,
+                runtime_adapter: Some(
+                    crate::runtime_adapter::AdapterId::from_runtime(plan.report.runtime)
+                        .as_str()
+                        .to_string(),
+                ),
+                repository_identity,
+                artifact_family: "supervise".to_string(),
+                delivery_identity: artifact_binding_sha256,
+                machine_global_retention_sha256: None,
+                queue_item_sha256,
+                task_batch_sha256: None,
+                primary_baseline_sha256: Some(primary_baseline_sha256),
+                outer_entrypoint: None,
+                outer_run_id: None,
+            },
+            semantic_release: !plan.report.semantic_intent_tokens.is_empty(),
+        },
+    );
+    let authorized_resume = authorize_effective_supervisor_manifest(resume_manifest)?;
+    let (resume_evidence, resume_permit) = authorized_resume.into_resume_recovery()?;
+    let (mut checkpoint, snapshot) = open_supervisor_checkpoint_authorized(
+        &repo,
+        &run_id,
+        resume_evidence.canonical_manifest_sha256(),
+        resume_permit,
+    )?;
+    if snapshot.normalized_plan_sha256() != read_snapshot.normalized_plan_sha256()
+        || snapshot.parent_node() != read_snapshot.parent_node()
+        || snapshot.dispatch_identity() != read_snapshot.dispatch_identity()
+        || snapshot.primary_base() != read_snapshot.primary_base()
+    {
+        bail!("supervisor checkpoint identity changed during admitted recovery open");
+    }
+    messaging_bridge::recover_supervisor_messaging_session(&run_dir)
+        .context("supervisor messaging resume recovery failed")?;
     let sync_store = SyncStore::open(&repo)?;
     let claim_disposition = (|| -> Result<()> {
         snapshot.verify_claim_disposition(&sync_store, &plan.report, !plan.artifact_committed)?;
@@ -3534,7 +3574,7 @@ pub fn resume_supervisor_run(
         };
         ArtifactRunWriter::reopen_unfinalized_with_recovery(&repo, &plan.artifact, &[recovery])
     };
-    let artifact_writer = match artifact_writer_result {
+    let mut artifact_writer = match artifact_writer_result {
         Ok(writer) => writer,
         Err(error) => {
             return resume_refusal(
@@ -3548,6 +3588,13 @@ pub fn resume_supervisor_run(
             )
         }
     };
+    write_artifact_json(
+        &mut artifact_writer,
+        Path::new("resume-effective-mutation-manifest.json"),
+        &resume_evidence,
+        MAX_SUPERVISOR_REPORT_BYTES,
+        ArtifactFileDisposition::PrivateEvidence,
+    )?;
     if !plan.artifact_committed {
         checkpoint.final_report_committed(
             &plan.report,
@@ -3624,8 +3671,8 @@ pub fn supervisor_status(repo: impl AsRef<Path>, run_id: RunId) -> Result<Superv
     let (lifecycle, resume_gate_denial) = if final_report.is_some() {
         (SupervisorRunLifecycle::Finalized, None)
     } else {
-        match open_supervisor_checkpoint(&repo, &run_id) {
-            Ok((_writer, snapshot)) if !snapshot.uncertain_assignments.is_empty() => {
+        match read_supervisor_checkpoint(&repo, &run_id) {
+            Ok(snapshot) if !snapshot.uncertain_assignments.is_empty() => {
                 let denial = GateDenial::new(
                     run_id.as_str(),
                     GateDenialReason::ExternalSideEffect {
@@ -3639,10 +3686,10 @@ pub fn supervisor_status(repo: impl AsRef<Path>, run_id: RunId) -> Result<Superv
                 )?;
                 (SupervisorRunLifecycle::Uncertain, Some(denial))
             }
-            Ok((_writer, snapshot)) if snapshot.final_report.is_some() => {
+            Ok(snapshot) if snapshot.final_report.is_some() => {
                 (SupervisorRunLifecycle::Resumable, None)
             }
-            Ok((_writer, _snapshot)) => {
+            Ok(_snapshot) => {
                 let refusal = resume_refusal(
                     &run_id,
                     SupervisorRunLifecycle::Interrupted,

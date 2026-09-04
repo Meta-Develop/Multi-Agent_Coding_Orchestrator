@@ -380,6 +380,25 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
         authenticator: RepositoryAuthenticator,
         instance_id: &str,
     ) -> Result<Self> {
+        let identity = Self::locate_instance(&authenticator, instance_id)?;
+        Self::open(authenticator, &identity)
+    }
+
+    /// Locates and authenticates an existing stable instance strictly through
+    /// the read-only open path. This never initializes, scavenges, repairs, or
+    /// publishes journal state.
+    pub(crate) fn open_instance_read_only(
+        authenticator: RepositoryAuthenticator,
+        instance_id: &str,
+    ) -> Result<Self> {
+        let identity = Self::locate_instance(&authenticator, instance_id)?;
+        Self::open_existing_read_only(authenticator, &identity)
+    }
+
+    fn locate_instance(
+        authenticator: &RepositoryAuthenticator,
+        instance_id: &str,
+    ) -> Result<JournalIdentity> {
         validate_spec::<S>()?;
         validate_instance_id::<S>(instance_id)?;
         authenticator.verify_epoch()?;
@@ -403,7 +422,7 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
                 S::NAMESPACE
             );
         }
-        Self::open(authenticator, &locator.identity)
+        Ok(locator.identity)
     }
 
     pub(crate) fn identity(&self) -> &JournalIdentity {
@@ -1549,6 +1568,41 @@ mod tests {
         assert_eq!(journal.records().len(), 2);
         assert!(!run.join(temp_name).exists());
         assert!(run.join(record_file_name(2)).exists());
+    }
+
+    #[test]
+    fn read_only_instance_open_refuses_crash_residue_without_recovery() {
+        let (_temp, repo_path, identity) = journal_with_two_records();
+        let run = repo_path
+            .join(".git/maco/state")
+            .join(JOURNAL_ROOT_NAME)
+            .join(&identity.run_id);
+        let temp_name = record_temp_name(3, &"a".repeat(64));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        options
+            .open(run.join(&temp_name))
+            .expect("create crash temp")
+            .write_all(b"partial")
+            .expect("write partial");
+        let head_before = fs::read(run.join(HEAD_FILE_NAME)).expect("read stable head");
+        let repo = crate::git_repository::open(&repo_path).expect("open repo");
+        let auth = RepositoryAuthenticator::open_existing(repo.commondir()).expect("auth");
+
+        let error = StateJournal::open_instance_read_only(auth, &identity.run_id)
+            .err()
+            .expect("read-only open must refuse transitional journal state");
+
+        assert!(error
+            .to_string()
+            .contains("crash residue requiring recovery"));
+        assert!(run.join(temp_name).exists());
+        assert_eq!(
+            fs::read(run.join(HEAD_FILE_NAME)).expect("reread stable head"),
+            head_before
+        );
     }
 
     #[test]

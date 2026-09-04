@@ -18,6 +18,7 @@ use crate::{
     external_agent::EnvironmentFailure,
     gate_denial::{ExternalSideEffectState, GateDenial},
     machine_global::{machine_global_config_content_binding, MachineGlobalRetentionBinding},
+    mutation_taxonomy::GeneratedFollowUpQueueMutationPermit,
     safe_state::FileIdentity,
     state_journal::{AuthenticatedStateJournal, JournalRecord, JournalSpec},
     supervise::{
@@ -250,6 +251,10 @@ impl GeneratedFollowUpQueueSource {
         &self.source_normalized_plan_sha256
     }
 
+    pub(crate) fn effective_mutation_manifest_sha256(&self) -> Option<&str> {
+        self.effective_mutation_manifest_sha256.as_deref()
+    }
+
     pub(crate) fn source_report_accepted(&self) -> bool {
         self.source_report_accepted
     }
@@ -282,10 +287,10 @@ impl GeneratedFollowUpQueueSource {
         self.machine_global_retention.root_id()
     }
 
-    /// The outer command is provenance, not execution identity. A source
-    /// supervisor run may first be entered through Autopilot and later resumed
-    /// through `supervise run`; every field that can change what is dispatched
-    /// must still match exactly before that resume reuses the durable queue.
+    /// A cross-entrypoint resume adopts the authenticated original outer
+    /// provenance before constructing its new authorization manifest. Every
+    /// field that can change what is dispatched must still match exactly before
+    /// that resume reuses the durable queue.
     fn has_same_execution_basis(&self, other: &Self) -> bool {
         self.source_supervisor_run_id == other.source_supervisor_run_id
             && self.source_normalized_plan_sha256 == other.source_normalized_plan_sha256
@@ -1010,6 +1015,7 @@ pub(crate) struct GeneratedFollowUpQueue {
 }
 
 impl GeneratedFollowUpQueue {
+    #[cfg(test)]
     pub(crate) fn create(
         authenticator: RepositoryAuthenticator,
         source: GeneratedFollowUpQueueSource,
@@ -1018,6 +1024,7 @@ impl GeneratedFollowUpQueue {
         Self::create_or_open(authenticator, source, bounds)
     }
 
+    #[cfg(test)]
     pub(crate) fn create_or_open(
         authenticator: RepositoryAuthenticator,
         source: GeneratedFollowUpQueueSource,
@@ -1042,6 +1049,38 @@ impl GeneratedFollowUpQueue {
         Ok(Self { journal, snapshot })
     }
 
+    /// Consumes queue-lifecycle authority before the journal root can be
+    /// initialized, recovered, or appended.
+    pub(crate) fn create_or_open_authorized(
+        authenticator: RepositoryAuthenticator,
+        source: GeneratedFollowUpQueueSource,
+        bounds: GeneratedFollowUpQueueBounds,
+        permit: GeneratedFollowUpQueueMutationPermit,
+    ) -> Result<Self> {
+        let manifest_sha256 = source
+            .effective_mutation_manifest_sha256()
+            .context("generated follow-up source has no admitted mutation manifest")?;
+        permit.consume(manifest_sha256)?;
+        source.validate()?;
+        bounds.validate()?;
+        verify_source_repository_binding(&authenticator, &source)?;
+        let journal_slot_id = queue_journal_slot_id(&source)?;
+        let mut journal = QueueJournal::open_or_initialize(authenticator, &journal_slot_id)?;
+        if journal.records().is_empty() {
+            let created = QueueJournalEvent::Created {
+                source: source.clone(),
+                bounds: bounds.clone(),
+            };
+            journal.append(created.phase(), None, &created)?;
+        }
+        let snapshot = replay_queue_records(&journal_slot_id, journal.records())?;
+        if !snapshot.source.has_same_execution_basis(&source) || snapshot.bounds != bounds {
+            bail!("generated follow-up queue execution basis changed across create-or-open");
+        }
+        Ok(Self { journal, snapshot })
+    }
+
+    #[cfg(test)]
     pub(crate) fn open(
         authenticator: RepositoryAuthenticator,
         source: &GeneratedFollowUpQueueSource,
@@ -1068,7 +1107,7 @@ impl GeneratedFollowUpQueue {
         authenticator: RepositoryAuthenticator,
         source_supervisor_run_id: &str,
         source_normalized_plan_sha256: &str,
-    ) -> Result<Option<Self>> {
+    ) -> Result<Option<GeneratedFollowUpQueueInspection>> {
         validate_source_run_id(source_supervisor_run_id)?;
         validate_sha256_id(
             source_normalized_plan_sha256,
@@ -1092,7 +1131,7 @@ impl GeneratedFollowUpQueue {
         if !journal_root.direct_child_exists(&journal_slot_id)? {
             return Ok(None);
         }
-        let journal = QueueJournal::open_instance(authenticator, &journal_slot_id)?;
+        let journal = QueueJournal::open_instance_read_only(authenticator, &journal_slot_id)?;
         let snapshot = replay_queue_records(&journal_slot_id, journal.records())?;
         if snapshot.source.source_supervisor_run_id() != source_supervisor_run_id
             || snapshot.source.source_normalized_plan_sha256() != source_normalized_plan_sha256
@@ -1100,7 +1139,7 @@ impl GeneratedFollowUpQueue {
         {
             bail!("generated follow-up queue source execution identity changed across reopen");
         }
-        Ok(Some(Self { journal, snapshot }))
+        Ok(Some(GeneratedFollowUpQueueInspection { snapshot }))
     }
 
     pub(crate) fn snapshot(&self) -> &GeneratedFollowUpQueueSnapshot {
@@ -1544,6 +1583,20 @@ impl GeneratedFollowUpQueue {
             .append(event.phase(), event.subject(), &event)?;
         self.snapshot = next;
         Ok(event_data)
+    }
+}
+
+pub(crate) struct GeneratedFollowUpQueueInspection {
+    snapshot: GeneratedFollowUpQueueSnapshot,
+}
+
+impl GeneratedFollowUpQueueInspection {
+    pub(crate) fn snapshot(&self) -> &GeneratedFollowUpQueueSnapshot {
+        &self.snapshot
+    }
+
+    pub(crate) fn summary(&self) -> GeneratedFollowUpQueueSummary {
+        self.snapshot.summary()
     }
 }
 
@@ -2223,6 +2276,56 @@ fn prepare_enqueue_records(
     Ok(prepared)
 }
 
+/// Computes the exact immutable item-set digest used by queue admission before
+/// any queue directory or record exists.
+pub(crate) fn generated_follow_up_task_batch_sha256(
+    tasks: &[GeneratedFollowUpTaskRecord],
+) -> Result<String> {
+    if tasks.is_empty() || tasks.len() > MAX_STORED_QUEUE_ITEMS {
+        bail!("generated follow-up authorization batch is out of bounds");
+    }
+    let canonical_tasks = tasks
+        .iter()
+        .map(canonical_validated_task_bytes)
+        .collect::<Result<Vec<_>>>()?;
+    let parts = canonical_tasks
+        .iter()
+        .map(Vec::as_slice)
+        .collect::<Vec<_>>();
+    domain_separated_sha256(
+        b"MACO\0generated-follow-up-authorization-batch\0v1\0",
+        &parts,
+    )
+}
+
+/// Computes a stable digest of the complete logical item set without using
+/// the queue instance id. Keeping this independent of the admitted manifest
+/// avoids a digest cycle while still binding every item before queue creation.
+pub(crate) fn generated_follow_up_item_set_sha256(
+    tasks: &[GeneratedFollowUpTaskRecord],
+) -> Result<String> {
+    if tasks.is_empty() || tasks.len() > MAX_STORED_QUEUE_ITEMS {
+        bail!("generated follow-up authorization item set is out of bounds");
+    }
+    let mut item_digests = tasks
+        .iter()
+        .map(|task| {
+            canonical_validated_task_bytes(task).and_then(|canonical| {
+                domain_separated_sha256(
+                    b"MACO\0generated-follow-up-logical-item\0v1\0",
+                    &[canonical.as_slice()],
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    item_digests.sort();
+    let parts = item_digests
+        .iter()
+        .map(|digest| digest.as_bytes())
+        .collect::<Vec<_>>();
+    domain_separated_sha256(b"MACO\0generated-follow-up-logical-item-set\0v1\0", &parts)
+}
+
 fn generated_follow_up_item_id(
     source: &GeneratedFollowUpQueueSource,
     task: &GeneratedFollowUpTaskRecord,
@@ -2364,6 +2467,16 @@ fn verify_source_repository_binding(
 fn subordinate_run_id(item_id: &str) -> Result<String> {
     validate_sha256_id(item_id, "generated follow-up item id")?;
     Ok(format!("follow-up-{item_id}"))
+}
+
+pub(crate) fn generated_follow_up_item_id_from_subordinate_run_id(
+    subordinate_run_id: &str,
+) -> Result<String> {
+    let item_id = subordinate_run_id
+        .strip_prefix("follow-up-")
+        .context("generated follow-up subordinate run id has no queue-item prefix")?;
+    validate_sha256_id(item_id, "generated follow-up subordinate queue item id")?;
+    Ok(item_id.to_string())
 }
 
 fn batch_sha256(item_ids: &[String]) -> Result<String> {
@@ -2825,6 +2938,29 @@ mod tests {
                 notes: None,
             }],
         }
+    }
+
+    #[test]
+    fn real_queue_creation_sink_rejects_an_invalid_lifecycle_permit_without_state() {
+        let (_temp, repo) = repository();
+        let queue_root = repo
+            .join(".git/maco/state")
+            .join(GENERATED_FOLLOW_UP_QUEUE_ROOT_NAME);
+        let error = GeneratedFollowUpQueue::create_or_open_authorized(
+            authenticator(&repo),
+            source(&repo, "source-invalid-permit"),
+            bounds(1),
+            GeneratedFollowUpQueueMutationPermit::invalid_for_test(),
+        )
+        .err()
+        .expect("invalid queue lifecycle permit must fail at the real creation sink");
+        assert!(error
+            .to_string()
+            .contains("bound to a different canonical manifest"));
+        assert!(
+            !queue_root.exists(),
+            "denied queue sink must not create its journal root"
+        );
     }
 
     #[test]

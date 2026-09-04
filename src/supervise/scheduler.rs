@@ -3314,7 +3314,7 @@ struct PreparedSupervisorRun {
     /// Selector-resolved execution plan. Only pre-claim-viable assignments may
     /// receive selector-bound assignment runtime state.
     plan: SupervisorPlan,
-    /// Original caller plan used for artifact identity and follow-up inheritance.
+    /// Original caller plan retained for selection provenance and follow-up inheritance.
     requested_plan: SupervisorPlan,
     consultant: SupervisorConsultantPlan,
     assignment_metadata: AssignmentMetadata,
@@ -3340,17 +3340,124 @@ struct PreparedSupervisorRun {
     _process_registration: Option<crate::run_ops::SupervisorProcessGuard>,
 }
 
-fn prepare_supervisor_run(
+struct SupervisorMutationStartRequest<'a> {
+    repo: &'a Path,
+    options: &'a SupervisorRunOptions,
+    evidence: EffectiveSupervisorMutationAuditEvidence,
+    permit: SupervisorRunMutationPermit,
+    preflight_evidence: Option<EffectiveSupervisorMutationAuditEvidence>,
+    dispatch_started: Option<&'a AtomicBool>,
+    dispatch_authorized: Option<&'a mut dyn FnMut() -> Result<()>>,
+}
+
+fn begin_supervisor_mutations(
+    request: SupervisorMutationStartRequest<'_>,
+) -> Result<(
+    ArtifactRunWriter,
+    Option<crate::run_ops::SupervisorProcessGuard>,
+)> {
+    let SupervisorMutationStartRequest {
+        repo,
+        options,
+        evidence,
+        permit,
+        preflight_evidence,
+        dispatch_started,
+        mut dispatch_authorized,
+    } = request;
+    permit.consume(evidence.canonical_manifest_sha256())?;
+    let collision = crate::run_ops::refuse_live_run_collision(
+        repo,
+        RunArtifactFamily::Supervise,
+        &options.run_id,
+        options.allow_live_run_collision,
+    )?;
+    if let Some(dispatch_authorized) = dispatch_authorized.as_mut() {
+        dispatch_authorized()?;
+    }
+    if let Some(dispatch_started) = dispatch_started {
+        dispatch_started.store(true, Ordering::SeqCst);
+    }
+    let mut artifact_writer = ArtifactRunWriter::reserve(
+        repo,
+        RunArtifactFamily::Supervise,
+        options.run_id.clone(),
+        "maco-supervise",
+    )?;
+    write_artifact_json(
+        &mut artifact_writer,
+        Path::new("effective-mutation-manifest.json"),
+        &evidence,
+        MAX_SUPERVISOR_REPORT_BYTES,
+        ArtifactFileDisposition::PrivateEvidence,
+    )?;
+    if let Some(preflight_evidence) = preflight_evidence {
+        write_artifact_json(
+            &mut artifact_writer,
+            Path::new("preflight-effective-mutation-manifest.json"),
+            &preflight_evidence,
+            MAX_SUPERVISOR_REPORT_BYTES,
+            ArtifactFileDisposition::PrivateEvidence,
+        )?;
+    }
+    let process_registration =
+        crate::run_ops::register_current_supervisor_process(repo, "supervise", &options.run_id)
+            .ok()
+            .flatten();
+    let preflight_spec = crate::run_ops::LaunchPreflightSpec {
+        family: RunArtifactFamily::Supervise,
+        run_id: options.run_id.clone(),
+        runtime: crate::runtime_adapter::AdapterId::from_runtime(options.runtime)
+            .as_str()
+            .to_string(),
+        runtime_bin: Some(options.codex_bin.clone()),
+        allow_dirty_primary: options.allow_dirty_primary,
+        allow_live_run_collision: options.allow_live_run_collision,
+    };
+    crate::run_ops::persist_launch_preflight(
+        &mut artifact_writer,
+        repo,
+        &preflight_spec,
+        &collision,
+    )?;
+    crate::run_ops::append_run_heartbeat_best_effort(
+        &mut artifact_writer,
+        "initialized",
+        None,
+        "ok",
+        None,
+    );
+    Ok((artifact_writer, process_registration))
+}
+
+struct PrepareSupervisorRunRequest<'a> {
     loaded: LoadedSupervisorPlan,
-    options: &SupervisorRunOptions,
+    options: &'a SupervisorRunOptions,
     max_concurrent_children: usize,
     execution_runtime: SupervisorExecutionRuntime,
-    worktree_creation: SupervisorWorktreeCreation<'_>,
+    worktree_creation: SupervisorWorktreeCreation<'a>,
     runtime_model_catalog: RuntimeModelCatalogAcquisition,
-    mutation_grant: EffectiveSupervisorMutationGrant,
-    effective_mutation_manifest: &EffectiveSupervisorMutationManifest,
+    preflight_evidence: Option<EffectiveSupervisorMutationAuditEvidence>,
+    resolution_preflight_permit: Option<SupervisorResolutionPreflightPermit>,
+    dispatch_started: Option<&'a AtomicBool>,
+    dispatch_authorized: Option<&'a mut dyn FnMut() -> Result<()>>,
+}
+
+fn prepare_supervisor_run(
+    request: PrepareSupervisorRunRequest<'_>,
 ) -> Result<PreparedSupervisorRun> {
-    mutation_grant.consume(effective_mutation_manifest)?;
+    let PrepareSupervisorRunRequest {
+        loaded,
+        options,
+        max_concurrent_children,
+        execution_runtime,
+        worktree_creation,
+        runtime_model_catalog,
+        preflight_evidence,
+        resolution_preflight_permit,
+        dispatch_started,
+        mut dispatch_authorized,
+    } = request;
     let LoadedSupervisorPlan {
         mut plan,
         consultant,
@@ -3423,68 +3530,25 @@ fn prepare_supervisor_run(
     }
     let repo = discover_repo_root(&options.repo)?;
     let requested_plan = plan.clone();
-    let collision = crate::run_ops::refuse_live_run_collision(
-        &repo,
-        RunArtifactFamily::Supervise,
-        &options.run_id,
-        options.allow_live_run_collision,
-    )?;
-    let mut artifact_writer = ArtifactRunWriter::reserve(
-        &repo,
-        RunArtifactFamily::Supervise,
-        options.run_id.clone(),
-        "maco-supervise",
-    )?;
-    write_artifact_json(
-        &mut artifact_writer,
-        Path::new("effective-mutation-manifest.json"),
-        effective_mutation_manifest,
-        MAX_SUPERVISOR_REPORT_BYTES,
-        ArtifactFileDisposition::PrivateEvidence,
-    )?;
-    let process_registration =
-        crate::run_ops::register_current_supervisor_process(&repo, "supervise", &options.run_id)
-            .ok()
-            .flatten();
-    let preflight_spec = crate::run_ops::LaunchPreflightSpec {
-        family: RunArtifactFamily::Supervise,
-        run_id: options.run_id.clone(),
-        runtime: crate::runtime_adapter::AdapterId::from_runtime(options.runtime)
-            .as_str()
-            .to_string(),
-        runtime_bin: Some(options.codex_bin.clone()),
-        allow_dirty_primary: options.allow_dirty_primary,
-        allow_live_run_collision: options.allow_live_run_collision,
-    };
-    crate::run_ops::persist_launch_preflight(
-        &mut artifact_writer,
-        &repo,
-        &preflight_spec,
-        &collision,
-    )?;
-    crate::run_ops::append_run_heartbeat_best_effort(
-        &mut artifact_writer,
-        "initialized",
-        None,
-        "ok",
-        None,
-    );
-    // The acceptance gate is evaluated from immutable assignment evidence before
-    // selector, quota-ledger attachment, or assignment admission policy state can
-    // affect the run. Persist every decision immediately after evaluation so any
-    // later preparation failure still leaves durable gate evidence.
     let preclaim_runtime =
         preclaim_assessment_runtime(runtime, execution_runtime, worktree_creation);
     let preclaim_decisions =
         evaluate_supervisor_preclaims(&plan, &requested_plan, &repo, runtime, preclaim_runtime);
-    persist_prepared_preclaim_decisions(
-        &repo,
-        &options.run_id,
-        options.parent_node.as_deref(),
-        &mut artifact_writer,
-        &requested_plan.assignments,
-        &preclaim_decisions,
-    )?;
+    let preflight_evidence = match (preflight_evidence, resolution_preflight_permit) {
+        (Some(evidence), Some(permit)) => {
+            permit.consume(evidence.canonical_manifest_sha256())?;
+            Some(evidence)
+        }
+        (None, None) if cfg!(test) => None,
+        _ => bail!("Supervisor resolution preflight authority is missing or incomplete"),
+    };
+    let effective_max_duration_seconds = match (
+        plan_metadata.run_budget_max_duration_seconds,
+        options.budget_max_duration_seconds,
+    ) {
+        (Some(plan), Some(cli)) => Some(plan.min(cli)),
+        (plan, cli) => plan.or(cli),
+    };
     let mut budget_ledger = RunBudgetLedger::new_composed(
         plan_metadata.run_budget.limits,
         options.budget_overrides,
@@ -3493,6 +3557,7 @@ fn prepare_supervisor_run(
     )
     .context("failed to initialize the supervise run budget ledger")?;
     plan_metadata.run_budget.limits = budget_ledger.effective_limits();
+    plan_metadata.run_budget_max_duration_seconds = effective_max_duration_seconds;
     let quota_context = live_quota_context_for_run(&repo)?;
     if quota_context.is_some() && runtime == SupervisorRuntime::Fake {
         bail!("operator quota config is not valid for the nonpublishable Fake supervisor runtime");
@@ -3510,6 +3575,7 @@ fn prepare_supervisor_run(
         quota_context.as_ref(),
     )?;
     let max_concurrent_children = admission_policy_input.resolved_bound;
+    plan_metadata.admission = admission_policy_input.effective;
     resolve_preselection_objective_profile(&repo, &mut plan_metadata)?;
     let mut selector_plan = plan.clone();
     selector_plan.assignments = selector_plan
@@ -3577,11 +3643,51 @@ fn prepare_supervisor_run(
         .transpose()?;
     let assignment_schedule = validated_scheduler_assignment_schedule(&plan, &plan_metadata)?;
     let primary_base = current_head_oid(&repo)?;
+    let primary_baseline_sha256 = primary_worktree_snapshot_sha256(&repo, execution_runtime)?;
     let normalized_plan_sha256 = normalized_supervisor_plan_sha256(
-        &requested_plan,
+        &plan,
         &consultant,
         &assignment_metadata,
         &plan_metadata,
+    )?;
+    let effective_loaded = LoadedSupervisorPlan {
+        plan: plan.clone(),
+        consultant: consultant.clone(),
+        assignment_metadata: assignment_metadata.clone(),
+        plan_metadata: plan_metadata.clone(),
+    };
+    let dispatch_identity = effective_supervisor_dispatch_identity(&effective_loaded, options);
+    let effective_mutation_manifest =
+        effective_supervisor_mutation_manifest(EffectiveSupervisorRunManifestContext {
+            loaded: &effective_loaded,
+            options,
+            dispatch_identity: dispatch_identity.clone(),
+            execution_runtime,
+            worktree_mode: effective_supervisor_worktree_mode(worktree_creation),
+            repository_identity: effective_repository_identity(&repo)?,
+            primary_baseline_sha256,
+            admission_policy_input: &admission_policy_input,
+            max_concurrent_children,
+        })?;
+    let authorized = authorize_effective_supervisor_manifest(effective_mutation_manifest)?;
+    let (mutation_evidence, mutation_permit) = authorized.into_supervisor_run()?;
+    let (mut artifact_writer, process_registration) =
+        begin_supervisor_mutations(SupervisorMutationStartRequest {
+            repo: &repo,
+            options,
+            evidence: mutation_evidence,
+            permit: mutation_permit,
+            preflight_evidence,
+            dispatch_started,
+            dispatch_authorized: dispatch_authorized.take(),
+        })?;
+    persist_prepared_preclaim_decisions(
+        &repo,
+        &options.run_id,
+        options.parent_node.as_deref(),
+        &mut artifact_writer,
+        &requested_plan.assignments,
+        &preclaim_decisions,
     )?;
     let checkpoint_writer = SupervisorCheckpointWriter::create(
         &repo,
@@ -3590,10 +3696,12 @@ fn prepare_supervisor_run(
             &primary_base,
             normalized_plan_sha256,
             max_concurrent_children,
-            &requested_plan,
+            &plan,
             artifact_writer.resume_binding()?,
             budget_ledger.report()?,
-        ),
+        )
+        .with_parent_node(options.parent_node.clone())
+        .with_dispatch_identity(dispatch_identity),
     )?;
     let run_dir = artifact_writer.run_dir().to_path_buf();
     let dirs = RunDirs::for_writer(&artifact_writer);
@@ -3635,24 +3743,18 @@ fn prepare_supervisor_run_for_test(
     worktree_creation: SupervisorWorktreeCreation<'_>,
     runtime_model_catalog: RuntimeModelCatalogAcquisition,
 ) -> Result<PreparedSupervisorRun> {
-    let effective_mutation_manifest = effective_supervisor_mutation_manifest(
-        &loaded,
-        options,
-        execution_runtime,
-        worktree_creation,
-    )?;
-    let mutation_grant =
-        authorize_effective_supervisor_manifest(effective_mutation_manifest.clone())?;
-    prepare_supervisor_run(
+    prepare_supervisor_run(PrepareSupervisorRunRequest {
         loaded,
         options,
         max_concurrent_children,
         execution_runtime,
         worktree_creation,
         runtime_model_catalog,
-        mutation_grant,
-        &effective_mutation_manifest,
-    )
+        preflight_evidence: None,
+        resolution_preflight_permit: None,
+        dispatch_started: None,
+        dispatch_authorized: None,
+    })
 }
 
 pub(super) struct PreparedSupervisorSelectionRequest<'a> {
@@ -3850,22 +3952,36 @@ fn persist_supervisor_predispatch_failure(
     )
 }
 
+pub(super) struct SupervisorRunExecution<'a> {
+    pub(super) loaded: LoadedSupervisorPlan,
+    pub(super) options: SupervisorRunOptions,
+    pub(super) max_concurrent_children: usize,
+    pub(super) execution_runtime: SupervisorExecutionRuntime,
+    pub(super) worktree_creation: SupervisorWorktreeCreation<'a>,
+    pub(super) runtime_model_catalog: RuntimeModelCatalogAcquisition,
+    pub(super) preflight_evidence: Option<EffectiveSupervisorMutationAuditEvidence>,
+    pub(super) resolution_preflight_permit: Option<SupervisorResolutionPreflightPermit>,
+    pub(super) dispatch_started: Option<&'a AtomicBool>,
+    pub(super) dispatch_authorized: Option<&'a mut dyn FnMut() -> Result<()>>,
+    pub(super) external_runner: &'a CancellableExternalRunner<'a>,
+}
+
 pub(super) fn run_supervisor_plan_with_runner_and_creation(
-    loaded: LoadedSupervisorPlan,
-    options: SupervisorRunOptions,
-    max_concurrent_children: usize,
-    execution_runtime: SupervisorExecutionRuntime,
-    worktree_creation: SupervisorWorktreeCreation<'_>,
-    runtime_model_catalog: RuntimeModelCatalogAcquisition,
-    mutation_grant: EffectiveSupervisorMutationGrant,
-    external_runner: &CancellableExternalRunner<'_>,
+    execution: SupervisorRunExecution<'_>,
 ) -> Result<SupervisorFinalReport> {
-    let effective_mutation_manifest = effective_supervisor_mutation_manifest(
-        &loaded,
-        &options,
+    let SupervisorRunExecution {
+        loaded,
+        options,
+        max_concurrent_children,
         execution_runtime,
         worktree_creation,
-    )?;
+        runtime_model_catalog,
+        preflight_evidence,
+        resolution_preflight_permit,
+        dispatch_started,
+        dispatch_authorized,
+        external_runner,
+    } = execution;
     let PreparedSupervisorRun {
         plan,
         requested_plan,
@@ -3891,16 +4007,18 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         dirs,
         manager,
         _process_registration,
-    } = prepare_supervisor_run(
+    } = prepare_supervisor_run(PrepareSupervisorRunRequest {
         loaded,
-        &options,
+        options: &options,
         max_concurrent_children,
         execution_runtime,
         worktree_creation,
         runtime_model_catalog,
-        mutation_grant,
-        &effective_mutation_manifest,
-    )?;
+        preflight_evidence,
+        resolution_preflight_permit,
+        dispatch_started,
+        dispatch_authorized,
+    })?;
     let preclaim_parked_assignment_ids = preclaim_decisions
         .iter()
         .filter(|decision| !decision.allows_path_claim())
@@ -4801,6 +4919,66 @@ mod selection_policy_tests {
     }
 
     #[test]
+    fn real_supervisor_sink_rejects_invalid_permit_before_process_or_artifact() -> Result<()> {
+        let (temporary, repo) = initialized_repository();
+        let mut options = predispatch_options(&repo, temporary.path(), "supervisor-invalid-permit");
+        options.runtime = SupervisorRuntime::Fake;
+        let repository_authenticator =
+            crate::artifacts::repository_auth_writer(&repo)?.into_authenticator()?;
+        let manifest = EffectiveSupervisorMutationManifest::supervisor_run(
+            EffectiveSupervisorRunManifestInput {
+                identity: EffectiveSupervisorMutationIdentityInput {
+                    run_id: options.run_id.as_str().to_string(),
+                    parent_node: None,
+                    normalized_plan_sha256: "a".repeat(64),
+                    dispatch_identity: EffectiveSupervisorDispatchIdentity::Root,
+                    execution_runtime:
+                        EffectiveSupervisorExecutionRuntime::NonpublishableSimulation,
+                    worktree_mode: EffectiveSupervisorWorktreeMode::NonpublishableSimulation,
+                    runtime_adapter: Some("fake".to_string()),
+                    repository_identity: repository_authenticator.binding().repository_id.clone(),
+                    artifact_family: "supervise".to_string(),
+                    delivery_identity: "test-plan".to_string(),
+                    machine_global_retention_sha256: None,
+                    queue_item_sha256: None,
+                    task_batch_sha256: None,
+                    primary_baseline_sha256: Some("b".repeat(64)),
+                    outer_entrypoint: None,
+                    outer_run_id: None,
+                },
+                semantic_coordination: false,
+                external_process_runtime: false,
+                machine_global_retention_bound: false,
+                field_guide_mutation: false,
+                primary_object_import: false,
+            },
+        );
+        let (evidence, _valid_permit) =
+            authorize_effective_supervisor_mutation_manifest(manifest)?.into_supervisor_run()?;
+
+        let error = begin_supervisor_mutations(SupervisorMutationStartRequest {
+            repo: &repo,
+            options: &options,
+            evidence,
+            permit: SupervisorRunMutationPermit::invalid_for_test(),
+            preflight_evidence: None,
+            dispatch_started: None,
+            dispatch_authorized: None,
+        })
+        .err()
+        .context("invalid Supervisor permit must fail at the real mutation sink")?;
+
+        assert!(error
+            .to_string()
+            .contains("bound to a different canonical manifest"));
+        assert!(!repo
+            .join(RunArtifactFamily::Supervise.run_root())
+            .join(options.run_id.as_str())
+            .exists());
+        Ok(())
+    }
+
+    #[test]
     fn preclaim_runtime_is_derived_separately_from_effect_containment() -> Result<()> {
         skip_without_containment!(ok);
         let (_temporary, repo) = initialized_repository();
@@ -5479,20 +5657,7 @@ mod selection_policy_tests {
         let options =
             predispatch_options(&repo, temporary.path(), "automatic-requested-plan-identity");
 
-        let effective_mutation_manifest = effective_supervisor_mutation_manifest(
-            &LoadedSupervisorPlan {
-                plan: plan.clone(),
-                consultant: SupervisorConsultantPlan::default(),
-                assignment_metadata: AssignmentMetadata::new(),
-                plan_metadata: SupervisorPlanMetadata::default(),
-            },
-            &options,
-            SupervisorExecutionRuntime::Verified,
-            SupervisorWorktreeCreation::ExistingOnly,
-        )?;
-        let mutation_grant =
-            authorize_effective_supervisor_manifest(effective_mutation_manifest.clone())?;
-        let prepared = prepare_supervisor_run(
+        let prepared = prepare_supervisor_run_for_test(
             LoadedSupervisorPlan {
                 plan,
                 consultant: SupervisorConsultantPlan::default(),
@@ -5504,8 +5669,6 @@ mod selection_policy_tests {
             SupervisorExecutionRuntime::Verified,
             SupervisorWorktreeCreation::ExistingOnly,
             Ok(catalog),
-            mutation_grant,
-            &effective_mutation_manifest,
         )?;
 
         assert_eq!(prepared.requested_plan, requested_plan);
@@ -5516,6 +5679,19 @@ mod selection_policy_tests {
         );
         assert_eq!(prepared.plan.role_models.len(), 5);
         assert_ne!(prepared.plan, prepared.requested_plan);
+        let effective_sha256 = normalized_supervisor_plan_sha256(
+            &prepared.plan,
+            &prepared.consultant,
+            &prepared.assignment_metadata,
+            &prepared.plan_metadata,
+        )?;
+        let mutation_evidence: Value = serde_json::from_slice(&fs::read(
+            prepared.run_dir.join("effective-mutation-manifest.json"),
+        )?)?;
+        assert_eq!(
+            mutation_evidence["normalized_plan_sha256"],
+            Value::String(effective_sha256)
+        );
         Ok(())
     }
 

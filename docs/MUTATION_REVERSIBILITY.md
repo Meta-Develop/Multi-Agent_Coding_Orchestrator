@@ -2,21 +2,17 @@
 
 ## Status and enforcement boundary
 
-This document defines version 4 of MACO's mutation taxonomy in
-`src/mutation_taxonomy.rs`. Every production Supervisor entrypoint derives one
-canonical `EffectiveSupervisorMutationManifest` from the post-override loaded
-plan, exact run and parent identity, execution runtime, worktree mode, semantic
-mode, and applicable lifecycle effects. Manifest `demonstrated_gates` are an
-auditable binding to the existing production authorities selected by that
-control flow, not authority themselves. They are supplied explicitly by the
-private common Supervisor or authenticated queue builder; they are never
-manufactured from taxonomy rows. The authorizer independently derives the
-exact required set from the registry, rejects missing or unrelated evidence,
-and consumes its non-cloneable, non-serializable authority into a
-canonical-SHA-256-bound grant. The common scheduler consumes that grant before
-`prepare_supervisor_run` can reserve an artifact, register a process, create a
-checkpoint, or write any other run state. Authority or a grant for one manifest
-cannot admit another.
+This document defines version 5 of MACO's mutation taxonomy in
+`src/mutation_taxonomy.rs`. Production callers select a sealed lifecycle; only
+the taxonomy maps that lifecycle and its production-derived control state to a
+complete fixed operation set. Callers cannot supply operation rows or gate
+labels. The authorizer consumes the non-Clone manifest by value and returns a
+non-Clone, non-Copy, non-serializable lifecycle permit bound to its canonical
+SHA-256. Serialized manifest evidence is produced only after authorization and
+is deliberately not an authorizable type. The appropriate real sink consumes
+the permit before artifact reservation, process/catalog launch, checkpoint or
+queue creation, dispatch marking, recovery, release, repair, finalization,
+messaging, or journal mutation.
 
 The Supervisor dispatch manifest is persisted as private authenticated run
 evidence. "Exact" means the complete mutation surface reachable in the
@@ -31,16 +27,25 @@ the production control flow is exclusive. Supervisor does not install hooks,
 so `hook-install` is absent from every Supervisor manifest. The hook rows
 remain for the independently owned worktree-guard integration.
 
-Generated follow-up queue reservation, enqueue/commit, claim/release, refusal
-evidence, and exact generated-plan staging use the same typed manifest and
-authorizer before queue creation or any staging write. Each generated
-subordinate then enters the same common Scheduler admission as a root plan.
-Autopilot consumes its source authority into the source grant before its own
-process registration or artifact reservation, then transfers that grant to the
-common Scheduler. A source manifest denial therefore creates no Autopilot or
-Supervisor artifact; later queue or subordinate denials can use only the
-already-admitted outer lifecycle to persist refusal evidence and never supply
-authority for another dispatch.
+Catalog acquisition has a separately admitted preflight permit, consumed
+before a model-catalog subprocess or rolling-budget recovery. The common
+Scheduler later freezes budget, admission, objective, role, review, runtime,
+schedule, and evidence-only overrides and binds the final manifest to that
+exact normalized effective plan plus runtime adapter, authenticated repository,
+parent presence, dispatch and delivery identity, retention, queue item, primary
+baseline, and resolved admission input as applicable.
+
+Generated follow-up queue authorization occurs after its authenticated source,
+repository, retention, primary baseline, exact item, and task-batch identities
+are known, but before queue creation or staging. A generated subordinate enters
+the same final Scheduler admission as a root plan, and its dispatch-started
+marker is written only after that final permit is validated. Outer Autopilot
+process and artifact mutations use their own manifest bound to the outer
+entrypoint, run, artifact family, and effective plan; its source Supervisor has
+a distinct catalog preflight and final Scheduler permit. Resume first inspects
+the checkpoint read-only, then consumes a resume/recovery permit before opening
+any recovery-capable state. Status and evidence inspection remain strictly
+read-only.
 
 `SemanticIntentStore::claim` durably acquires blocking intent immediately
 before an assignment is admitted. As with path claims, releasing an exact token
@@ -151,9 +156,9 @@ Consequences of this rule:
   its bounded role and event vocabulary.
 - `bound-supervisor-run-lifecycle-authority`: the exact canonical manifest
   binds run artifacts, authenticated finalization, checkpoint/orchestration
-  journals, coordination bootstrap, claim telemetry, process registration,
-  scratch cleanup, and refusal evidence before the common scheduler prepares
-  the run.
+  journals, coordination and budget-ledger bootstrap/recovery, claim telemetry,
+  process registration, scratch cleanup, and refusal evidence before the
+  corresponding lifecycle sink.
 - `verified-supervisor-process-lifecycle-authority`: a verified non-Fake
   Supervisor manifest binds child/auditor spawn, output evidence writes and
   unbound cleanup, and exact process termination paths. Retention-bound output
@@ -164,8 +169,9 @@ Consequences of this rule:
 - `bound-supervisor-field-guide-mutation-authority`: the exact verified run
   manifest binds field-guide append or deterministic curation to that run.
 - `bound-generated-follow-up-queue-lifecycle-authority`: the authenticated
-  source plan, source run, and generated task count bind queue
-  writes, commits, releases, and refusal evidence before queue reservation.
+  source plan, source run, exact item/task batch, repository, retention, outer
+  run, and primary baseline bind queue writes, commits, releases, and refusal
+  evidence before queue reservation.
 
 ## Registry
 
@@ -215,7 +221,9 @@ Consequences of this rule:
 | `supervisor-refusal-evidence-write` | Irreversible | Persists refusal evidence in the bound run lifecycle and no supported operation restores the exact prior audit history. | `bound-supervisor-run-lifecycle-authority` |
 | `supervisor-checkpoint-journal-lifecycle` | Irreversible | Creates and advances authenticated checkpoint history used for recovery and dispatch ordering. | `bound-supervisor-run-lifecycle-authority` |
 | `supervisor-orchestration-journal-lifecycle` | Irreversible | Creates and appends authenticated orchestration history whose removal would destroy audit evidence. | `bound-supervisor-run-lifecycle-authority` |
+| `supervisor-messaging-journal-lifecycle` | Irreversible | Creates or recovers authenticated Supervisor messaging history whose exact prior journal state cannot be restored. | `bound-supervisor-run-lifecycle-authority` |
 | `supervisor-coordination-store-bootstrap` | Irreversible | May initialize repository-bound authenticated coordination state without a supported rollback to the absent namespace. | `bound-supervisor-run-lifecycle-authority` |
+| `supervisor-budget-ledger-bootstrap-recovery` | Irreversible | May initialize or recover authenticated rolling budget state before final Supervisor plan resolution. | `bound-supervisor-run-lifecycle-authority` |
 | `supervisor-claim-acquisition-telemetry` | Irreversible | Appends authenticated claim-frequency telemetry after claim acquisition and does not rewind consumers to the prior history. | `bound-supervisor-run-lifecycle-authority` |
 | `supervisor-mandatory-control-provision` | Reversible | Creates bounded control directories only inside a disposable managed child lane and retains the lane baseline. | `none` |
 | `supervisor-primary-object-database-import` | Irreversible | Imports verified child commit objects into the primary object database without a supported exact object-pruning rollback. | `verified-supervisor-primary-object-import-authority` |

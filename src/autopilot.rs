@@ -1,5 +1,9 @@
 use crate::{
-    artifacts::{ArtifactFileDisposition, ArtifactRunReader, ArtifactRunWriter, RunArtifactFamily},
+    artifacts::{
+        repository_authenticator_key_only, ArtifactFileDisposition, ArtifactRunReader,
+        ArtifactRunWriter, RunArtifactFamily,
+    },
+    follow_up_queue::GeneratedFollowUpRetentionBinding,
     gate_denial::{
         ApprovalReviewDenial, BudgetAdmissionDenial, GateCheckSource, GateDenial, GateDenialReason,
         VerifiedGateContext,
@@ -14,6 +18,13 @@ use crate::{
         ApplyBlocker, ApplyReadinessStatus, BoundValidationEvidenceBundle,
         CandidateValidationBinding, SafetyCheckStatus, ValidationEvidenceBundle, ValidationReport,
         ValidationStatus,
+    },
+    mutation_taxonomy::{
+        authorize_effective_supervisor_mutation_manifest, AutopilotOuterMutationPermit,
+        EffectiveAutopilotOuterManifestInput, EffectiveSupervisorDispatchIdentity,
+        EffectiveSupervisorExecutionRuntime, EffectiveSupervisorMutationAuditEvidence,
+        EffectiveSupervisorMutationIdentityInput, EffectiveSupervisorMutationManifest,
+        EffectiveSupervisorWorktreeMode,
     },
     orchestrator::{RunId, SemanticCoordinationMode},
     planning,
@@ -460,6 +471,48 @@ fn persist_autopilot_launch_preflight(
     };
     crate::run_ops::persist_launch_preflight(writer, repo, &spec, collision)?;
     Ok(())
+}
+
+struct AutopilotMutationStartRequest<'a> {
+    repo: &'a Path,
+    options: &'a AutopilotRunOptions,
+    evidence: EffectiveSupervisorMutationAuditEvidence,
+    permit: AutopilotOuterMutationPermit,
+}
+
+fn begin_autopilot_mutations(
+    request: AutopilotMutationStartRequest<'_>,
+) -> Result<(
+    ArtifactRunWriter,
+    Option<crate::run_ops::SupervisorProcessGuard>,
+)> {
+    let AutopilotMutationStartRequest {
+        repo,
+        options,
+        evidence,
+        permit,
+    } = request;
+    permit.consume(evidence.canonical_manifest_sha256())?;
+    let collision = crate::run_ops::refuse_live_run_collision(
+        repo,
+        RunArtifactFamily::Autopilot,
+        &options.run_id,
+        options.allow_live_run_collision,
+    )?;
+    let process_registration =
+        crate::run_ops::register_current_supervisor_process(repo, "autopilot", &options.run_id)
+            .ok()
+            .flatten();
+    let mut writer = ArtifactRunWriter::reserve(
+        repo,
+        RunArtifactFamily::Autopilot,
+        options.run_id.clone(),
+        "autopilot",
+    )?;
+    write_private_json(&mut writer, "effective-mutation-manifest.json", &evidence)?;
+    persist_autopilot_launch_preflight(&mut writer, repo, options, &collision)?;
+    crate::run_ops::append_run_heartbeat_best_effort(&mut writer, "initialized", None, "ok", None);
+    Ok((writer, process_registration))
 }
 
 fn finalize_autopilot_run_artifacts(
@@ -1445,9 +1498,10 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     let supervisor_plan_relative = PathBuf::from("supervisor-plan.json");
     let mut supervisor_options = SupervisorRunOptions {
         repo: repo.clone(),
-        // The plan path is not part of the canonical mutation identity. It is
-        // replaced with the authenticated Autopilot artifact path below.
-        plan_file: PathBuf::from("preauthorized-autopilot-supervisor-plan.json"),
+        // This placeholder is replaced with the authenticated Autopilot
+        // artifact path before catalog or final Supervisor admission derives
+        // its canonical delivery identity.
+        plan_file: PathBuf::from("pending-autopilot-supervisor-plan.json"),
         run_id: supervisor_run_id.clone(),
         parent_node,
         codex_bin,
@@ -1457,22 +1511,8 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides,
         budget_max_duration_seconds,
-        machine_global_retention: Some(machine_global_retention),
+        machine_global_retention: Some(machine_global_retention.clone()),
     };
-    let source_mutation_grant = supervise::preauthorize_autopilot_source_supervisor_mutations(
-        &supervisor_plan,
-        &supervisor_options,
-    )?;
-    let collision = crate::run_ops::refuse_live_run_collision(
-        &repo,
-        RunArtifactFamily::Autopilot,
-        &options.run_id,
-        options.allow_live_run_collision,
-    )?;
-    let _process_registration =
-        crate::run_ops::register_current_supervisor_process(&repo, "autopilot", &options.run_id)
-            .ok()
-            .flatten();
     if let Some(source) = &plan.external_source {
         publication::revalidate_external_source(&repo, source)
             .context("autopilot source changed immediately before supervised work")?;
@@ -1494,20 +1534,80 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     verify_after_autopilot_safety(&repository_bindings)?;
 
     let artifacts = artifact_paths();
-    let mut artifact_writer = ArtifactRunWriter::reserve(
-        &repo,
-        RunArtifactFamily::Autopilot,
-        options.run_id.clone(),
-        "autopilot",
-    )?;
-    persist_autopilot_launch_preflight(&mut artifact_writer, &repo, &options, &collision)?;
-    crate::run_ops::append_run_heartbeat_best_effort(
-        &mut artifact_writer,
-        "initialized",
-        None,
-        "ok",
-        None,
+    let retention =
+        GeneratedFollowUpRetentionBinding::from_machine_global(&machine_global_retention)?;
+    let repository_authenticator = repository_authenticator_key_only(&repo)
+        .context("outer Autopilot mutation admission requires repository identity")?;
+    repository_authenticator.verify_epoch()?;
+    let primary_baseline_sha256 = match runtime {
+        SupervisorRuntime::Fake => {
+            supervise::nonpublishable_simulation_whole_primary_snapshot_sha256(&repo)?
+        }
+        _ => supervise::verified_whole_primary_snapshot_sha256(&repo)?,
+    };
+    let outer_effective_sha256 = crate::artifacts::state_auth::sha256_hex(
+        &serde_json::to_vec(&(
+            &plan,
+            &supervisor_plan,
+            &requested_profile,
+            source_is_goal_derived,
+            &options.codex_bin,
+            options.allow_dirty_primary,
+            options.allow_live_run_collision,
+            max_child_dispatches,
+            budget_overrides,
+            budget_max_duration_seconds,
+            &supervisor_options.parent_node,
+        ))
+        .context("failed to encode the exact outer Autopilot effective plan")?,
     );
+    let outer_manifest = EffectiveSupervisorMutationManifest::autopilot_outer(
+        EffectiveAutopilotOuterManifestInput {
+            identity: EffectiveSupervisorMutationIdentityInput {
+                run_id: options.run_id.as_str().to_string(),
+                parent_node: supervisor_options.parent_node.clone(),
+                normalized_plan_sha256: outer_effective_sha256,
+                dispatch_identity: EffectiveSupervisorDispatchIdentity::Root,
+                execution_runtime: if runtime == SupervisorRuntime::Fake {
+                    EffectiveSupervisorExecutionRuntime::NonpublishableSimulation
+                } else {
+                    EffectiveSupervisorExecutionRuntime::Verified
+                },
+                worktree_mode: EffectiveSupervisorWorktreeMode::NotApplicable,
+                runtime_adapter: Some(
+                    crate::runtime_adapter::AdapterId::from_runtime(runtime)
+                        .as_str()
+                        .to_string(),
+                ),
+                repository_identity: repository_authenticator.binding().repository_id.clone(),
+                artifact_family: "autopilot".to_string(),
+                delivery_identity: serde_json::to_string(&(
+                    if source_is_goal_derived {
+                        "literal-goal"
+                    } else {
+                        "plan-file"
+                    },
+                    (!source_is_goal_derived).then_some(&options.plan_file),
+                ))
+                .context("failed to encode Autopilot plan delivery identity")?,
+                machine_global_retention_sha256: Some(retention.binding_sha256().to_string()),
+                queue_item_sha256: None,
+                task_batch_sha256: None,
+                primary_baseline_sha256: Some(primary_baseline_sha256),
+                outer_entrypoint: Some("autopilot_run".to_string()),
+                outer_run_id: Some(options.run_id.as_str().to_string()),
+            },
+        },
+    );
+    let (outer_mutation_evidence, outer_mutation_permit) =
+        authorize_effective_supervisor_mutation_manifest(outer_manifest)?.into_autopilot_outer()?;
+    let (mut artifact_writer, _process_registration) =
+        begin_autopilot_mutations(AutopilotMutationStartRequest {
+            repo: &repo,
+            options: &options,
+            evidence: outer_mutation_evidence,
+            permit: outer_mutation_permit,
+        })?;
     let run_dir = artifact_writer.run_dir().to_path_buf();
     if let Some(derived_supervisor_plan) = &derived_supervisor_plan {
         write_private_json(
@@ -1781,13 +1881,14 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         match &mut cascade_dispatch {
             AutopilotCascadeDispatch::Production(_) => {
                 supervise::run_supervisor_plan_file_cascade_for_autopilot(
-                    supervisor_options,
-                    cascade_concurrency_policy,
-                    &options.run_id,
-                    caller_cancellation.as_ref(),
-                    &cancellation_observed,
-                    &source_dispatch_started,
-                    source_mutation_grant,
+                    supervise::AutopilotSupervisorCascadeRequest {
+                        options: supervisor_options,
+                        concurrency_policy: cascade_concurrency_policy,
+                        outer_command_run_id: &options.run_id,
+                        caller_cancellation: caller_cancellation.as_ref(),
+                        cancellation_observed: &cancellation_observed,
+                        source_dispatch_started: &source_dispatch_started,
+                    },
                     &mut follow_up_profile_gate,
                 )
             }
@@ -1800,7 +1901,6 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                 caller_cancellation.as_ref(),
                 &cancellation_observed,
                 &source_dispatch_started,
-                source_mutation_grant,
                 &mut follow_up_profile_gate,
                 *external_runner,
             ),

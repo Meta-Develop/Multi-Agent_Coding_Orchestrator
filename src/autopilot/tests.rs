@@ -11,10 +11,11 @@ use crate::{
     worktree::WorktreeCreateOptions,
 };
 use serde_json::json;
+use std::{cell::Cell, fs::File, rc::Rc};
+
+#[cfg(target_os = "linux")]
 use std::{
-    cell::{Cell, RefCell},
-    fs::File,
-    rc::Rc,
+    cell::RefCell,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard, OnceLock,
@@ -25,8 +26,10 @@ use std::{
 // the shared systemd slot set. Concurrent siblings only add contention; unique
 // RunIds and temp dirs still keep durable state from colliding across leftover
 // runs. Serialization is not a substitute for keeping the fixtures themselves.
+#[cfg(target_os = "linux")]
 static SNAPSHOT_HEAVY_AUTOPILOT_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+#[cfg(target_os = "linux")]
 fn lock_snapshot_heavy_autopilot_test() -> MutexGuard<'static, ()> {
     SNAPSHOT_HEAVY_AUTOPILOT_TEST_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -34,8 +37,74 @@ fn lock_snapshot_heavy_autopilot_test() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+#[cfg(target_os = "linux")]
 fn lock_prepublication_fixture_test() -> MutexGuard<'static, ()> {
     lock_snapshot_heavy_autopilot_test()
+}
+
+#[test]
+fn real_outer_autopilot_sink_rejects_invalid_permit_before_process_or_artifact() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = create_committed_autopilot_repo(temp.path());
+    let run_id = RunId::new("outer-invalid-permit").expect("valid run id");
+    let options = AutopilotRunOptions {
+        repo: repo.clone(),
+        plan_file: temp.path().join("unused-plan.json"),
+        run_id: run_id.clone(),
+        codex_bin: None,
+        reviewer_command: None,
+        allow_dirty_primary: false,
+        allow_live_run_collision: false,
+        max_child_dispatches: None,
+        budget_overrides: RunBudgetLimits::default(),
+        budget_max_duration_seconds: None,
+        cancellation: None,
+    };
+    let repository_authenticator =
+        repository_authenticator_key_only(&repo).expect("repository authenticator");
+    let manifest = EffectiveSupervisorMutationManifest::autopilot_outer(
+        EffectiveAutopilotOuterManifestInput {
+            identity: EffectiveSupervisorMutationIdentityInput {
+                run_id: run_id.as_str().to_string(),
+                parent_node: None,
+                normalized_plan_sha256: "a".repeat(64),
+                dispatch_identity: EffectiveSupervisorDispatchIdentity::Root,
+                execution_runtime: EffectiveSupervisorExecutionRuntime::NonpublishableSimulation,
+                worktree_mode: EffectiveSupervisorWorktreeMode::NotApplicable,
+                runtime_adapter: Some("fake".to_string()),
+                repository_identity: repository_authenticator.binding().repository_id.clone(),
+                artifact_family: "autopilot".to_string(),
+                delivery_identity: "test-plan".to_string(),
+                machine_global_retention_sha256: Some("b".repeat(64)),
+                queue_item_sha256: None,
+                task_batch_sha256: None,
+                primary_baseline_sha256: Some("c".repeat(64)),
+                outer_entrypoint: Some("autopilot_run".to_string()),
+                outer_run_id: Some(run_id.as_str().to_string()),
+            },
+        },
+    );
+    let (evidence, _valid_permit) = authorize_effective_supervisor_mutation_manifest(manifest)
+        .expect("authorize outer test lifecycle")
+        .into_autopilot_outer()
+        .expect("convert outer test lifecycle");
+
+    let error = begin_autopilot_mutations(AutopilotMutationStartRequest {
+        repo: &repo,
+        options: &options,
+        evidence,
+        permit: AutopilotOuterMutationPermit::invalid_for_test(),
+    })
+    .err()
+    .expect("invalid outer permit must fail at the real mutation sink");
+
+    assert!(error
+        .to_string()
+        .contains("bound to a different canonical manifest"));
+    assert!(!repo
+        .join(RunArtifactFamily::Autopilot.run_root())
+        .join(run_id.as_str())
+        .exists());
 }
 
 #[cfg(target_os = "linux")]
@@ -1276,7 +1345,7 @@ fn assert_pre_dispatch_autopilot_cleanup(
 
 #[cfg(target_os = "linux")]
 #[test]
-fn autopilot_taxonomy_refuses_source_before_any_dispatch_with_exact_gate() {
+fn autopilot_taxonomy_refuses_source_after_separate_outer_admission_before_dispatch() {
     skip_without_containment!();
     let fixture = IsolatedLicensedAutopilot::new("autopilot-taxonomy-source-refused");
     let repo = &fixture.repo;
@@ -1297,18 +1366,22 @@ fn autopilot_taxonomy_refuses_source_before_any_dispatch_with_exact_gate() {
             None,
             None,
         );
-    let error = report.expect_err("source mutation admission must fail before Autopilot artifacts");
+    let report = report.expect("outer Autopilot lifecycle must persist the source refusal");
 
     assert_eq!(source_child_dispatches, 0);
     assert_eq!(follow_up_child_dispatches, 0);
-    assert_eq!(
-        crate::supervise::supervisor_mutation_admission_gate_id(&error),
-        Some(TAXONOMY_REVIEW_REQUIRED_GATE_ID)
-    );
-    assert!(!repo
-        .join(RunArtifactFamily::Autopilot.run_root())
-        .join(run_name)
-        .exists());
+    assert_eq!(report.status, AutopilotRunStatus::Refused, "{report:#?}");
+    assert!(report.gate_denials.iter().any(|denial| {
+        denial.context.owner == TAXONOMY_REVIEW_REQUIRED_GATE_ID
+            && matches!(
+                denial.reason,
+                GateDenialReason::ApprovalReview {
+                    denial: ApprovalReviewDenial::HumanReviewRequired
+                }
+            )
+    }));
+    ArtifactRunReader::open(repo, RunArtifactFamily::Autopilot, &report.run_id)
+        .expect("separately admitted outer Autopilot artifacts must finalize");
     assert!(!repo
         .join(RunArtifactFamily::Supervise.run_root())
         .join(source_run_id.as_str())

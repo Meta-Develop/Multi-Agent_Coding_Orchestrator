@@ -6,7 +6,7 @@ use crate::{
     state_journal::{JournalRecord, StateJournal},
 };
 
-const SUPERVISE_CHECKPOINT_VERSION: u32 = 1;
+const SUPERVISE_CHECKPOINT_VERSION: u32 = 2;
 const PHASE_PREPARED: &str = "supervise_prepared";
 const PHASE_ASSIGNMENT_STARTED: &str = "assignment_started";
 const PHASE_ASSIGNMENT_COMPLETED: &str = "assignment_completed";
@@ -60,6 +60,9 @@ impl CheckpointWorktreeBinding {
 struct PreparedCheckpoint {
     version: u32,
     run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_node: Option<String>,
+    dispatch_identity: EffectiveSupervisorDispatchIdentity,
     primary_base: String,
     normalized_plan_sha256: String,
     max_concurrent_children: usize,
@@ -166,11 +169,30 @@ pub(super) struct SupervisorCheckpointSnapshot {
     pub(super) finalization_started: bool,
     pub(super) finalized: bool,
     primary_base: Oid,
+    normalized_plan_sha256: String,
+    parent_node: Option<String>,
+    dispatch_identity: EffectiveSupervisorDispatchIdentity,
     worktrees: BTreeMap<String, CheckpointWorktreeBinding>,
     claims: BTreeMap<u64, (String, Vec<PathBuf>)>,
 }
 
 impl SupervisorCheckpointSnapshot {
+    pub(super) fn primary_base(&self) -> &Oid {
+        &self.primary_base
+    }
+
+    pub(super) fn normalized_plan_sha256(&self) -> &str {
+        &self.normalized_plan_sha256
+    }
+
+    pub(super) fn parent_node(&self) -> Option<&str> {
+        self.parent_node.as_deref()
+    }
+
+    pub(super) fn dispatch_identity(&self) -> &EffectiveSupervisorDispatchIdentity {
+        &self.dispatch_identity
+    }
+
     pub(super) fn verify_primary_binding(
         &self,
         repo: &Path,
@@ -264,6 +286,8 @@ pub(super) struct SupervisorCheckpointPreparation<'a> {
     plan: &'a SupervisorPlan,
     artifact: ArtifactRunResumeBinding,
     budget: RunBudgetReport,
+    parent_node: Option<String>,
+    dispatch_identity: EffectiveSupervisorDispatchIdentity,
 }
 
 impl<'a> SupervisorCheckpointPreparation<'a> {
@@ -284,7 +308,22 @@ impl<'a> SupervisorCheckpointPreparation<'a> {
             plan,
             artifact,
             budget,
+            parent_node: None,
+            dispatch_identity: EffectiveSupervisorDispatchIdentity::Root,
         }
+    }
+
+    pub(super) fn with_parent_node(mut self, parent_node: Option<String>) -> Self {
+        self.parent_node = parent_node;
+        self
+    }
+
+    pub(super) fn with_dispatch_identity(
+        mut self,
+        dispatch_identity: EffectiveSupervisorDispatchIdentity,
+    ) -> Self {
+        self.dispatch_identity = dispatch_identity;
+        self
     }
 }
 
@@ -301,6 +340,8 @@ impl SupervisorCheckpointWriter {
             plan,
             artifact,
             budget,
+            parent_node,
+            dispatch_identity,
         } = preparation;
         let authenticator = repository_auth_writer(repo)?.into_authenticator()?;
         let assignment_ids = plan
@@ -327,6 +368,8 @@ impl SupervisorCheckpointWriter {
             &PreparedCheckpoint {
                 version: SUPERVISE_CHECKPOINT_VERSION,
                 run_id: run_id.as_str().to_string(),
+                parent_node,
+                dispatch_identity,
                 primary_base: primary_base.to_string(),
                 normalized_plan_sha256,
                 max_concurrent_children,
@@ -650,7 +693,7 @@ pub(super) fn normalized_supervisor_plan_sha256(
     Ok(crate::artifacts::state_auth::sha256_hex(&bytes))
 }
 
-pub(super) fn open_supervisor_checkpoint(
+fn open_supervisor_checkpoint_mutating(
     repo: &Path,
     run_id: &RunId,
 ) -> Result<(SupervisorCheckpointWriter, SupervisorCheckpointSnapshot)> {
@@ -684,10 +727,40 @@ pub(super) fn open_supervisor_checkpoint(
     ))
 }
 
+#[cfg(test)]
+pub(super) fn open_supervisor_checkpoint(
+    repo: &Path,
+    run_id: &RunId,
+) -> Result<(SupervisorCheckpointWriter, SupervisorCheckpointSnapshot)> {
+    open_supervisor_checkpoint_mutating(repo, run_id)
+}
+
+pub(super) fn open_supervisor_checkpoint_authorized(
+    repo: &Path,
+    run_id: &RunId,
+    manifest_sha256: &str,
+    permit: crate::mutation_taxonomy::ResumeRecoveryMutationPermit,
+) -> Result<(SupervisorCheckpointWriter, SupervisorCheckpointSnapshot)> {
+    permit.consume(manifest_sha256)?;
+    open_supervisor_checkpoint_mutating(repo, run_id)
+}
+
+/// Authenticates a stable checkpoint without invoking recovery or acquiring a
+/// mutation-capable journal. Status and evidence callers must use this path.
+pub(super) fn read_supervisor_checkpoint(
+    repo: &Path,
+    run_id: &RunId,
+) -> Result<SupervisorCheckpointSnapshot> {
+    let authenticator = repository_authenticator_key_only(repo)?;
+    validate_repository_authenticated_state(repo, &authenticator)?;
+    let journal = StateJournal::open_instance_read_only(authenticator, run_id.as_str())?;
+    analyze_checkpoint_records(journal.records(), run_id)
+}
+
 pub(super) fn authenticated_child_dispatch_started(repo: &Path, run_id: &RunId) -> Result<bool> {
     let authenticator = repository_authenticator_key_only(repo)?;
     validate_repository_authenticated_state(repo, &authenticator)?;
-    let journal = StateJournal::open_instance(authenticator, run_id.as_str())?;
+    let journal = StateJournal::open_instance_read_only(authenticator, run_id.as_str())?;
     let records = journal.records();
     // Opening authenticates the complete chain and repository/key epoch. The
     // supervise analyzer additionally proves that the authenticated records
@@ -951,6 +1024,9 @@ fn analyze_checkpoint_records(
         finalization_started,
         finalized,
         primary_base,
+        normalized_plan_sha256: prepared.normalized_plan_sha256,
+        parent_node: prepared.parent_node,
+        dispatch_identity: prepared.dispatch_identity,
         worktrees,
         claims,
     })

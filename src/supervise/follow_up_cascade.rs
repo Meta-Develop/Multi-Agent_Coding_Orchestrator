@@ -2,6 +2,7 @@ use super::*;
 use crate::{
     artifacts::repository_authenticator_key_only,
     follow_up_queue::{
+        generated_follow_up_item_set_sha256, generated_follow_up_task_batch_sha256,
         GeneratedFollowUpDispatchObservation, GeneratedFollowUpQueue, GeneratedFollowUpQueueBounds,
         GeneratedFollowUpQueueEntrypoint, GeneratedFollowUpQueuePhase,
         GeneratedFollowUpQueueRootInput, GeneratedFollowUpQueueSource,
@@ -10,45 +11,57 @@ use crate::{
     gate_denial::ApprovalReviewDenial,
     machine_global::MachineGlobalRetentionBinding,
     mutation_taxonomy::{
-        EffectiveSupervisorDispatchIdentity, EffectiveSupervisorExecutionRuntime,
-        EffectiveSupervisorMutationManifest, EffectiveSupervisorMutationManifestInput,
-        EffectiveSupervisorWorktreeMode, MutationOperation,
+        EffectiveGeneratedFollowUpQueueManifestInput, EffectiveSupervisorDispatchIdentity,
+        EffectiveSupervisorExecutionRuntime, EffectiveSupervisorMutationIdentityInput,
+        EffectiveSupervisorMutationManifest, EffectiveSupervisorWorktreeMode,
     },
 };
 use std::io::Write;
 
 const FOLLOW_UP_CASCADE_VERSION: u32 = 1;
 
+pub(super) struct GeneratedQueueManifestContext<'a> {
+    pub(super) source_run_id: &'a RunId,
+    pub(super) source_plan_sha256: &'a str,
+    pub(super) task_count: usize,
+    pub(super) repository_identity: String,
+    pub(super) primary_baseline_sha256: String,
+    pub(super) retention_binding_sha256: String,
+    pub(super) item_set_sha256: String,
+    pub(super) task_batch_sha256: String,
+    pub(super) outer_entrypoint: GeneratedFollowUpQueueEntrypoint,
+    pub(super) outer_run_id: &'a str,
+    pub(super) bounds_identity: String,
+}
+
 pub(super) fn effective_generated_follow_up_queue_mutation_manifest(
-    source_run_id: &RunId,
-    source_plan_sha256: &str,
-    task_count: usize,
+    context: GeneratedQueueManifestContext<'_>,
 ) -> EffectiveSupervisorMutationManifest {
-    EffectiveSupervisorMutationManifest::new(EffectiveSupervisorMutationManifestInput {
-        run_id: source_run_id.as_str().to_string(),
-        parent_node: None,
-        normalized_plan_sha256: source_plan_sha256.to_string(),
-        dispatch_identity: EffectiveSupervisorDispatchIdentity::GeneratedFollowUpQueue {
-            source_run_id: source_run_id.as_str().to_string(),
-            task_count,
+    EffectiveSupervisorMutationManifest::generated_follow_up_queue(
+        EffectiveGeneratedFollowUpQueueManifestInput {
+            identity: EffectiveSupervisorMutationIdentityInput {
+                run_id: context.source_run_id.as_str().to_string(),
+                parent_node: None,
+                normalized_plan_sha256: context.source_plan_sha256.to_string(),
+                dispatch_identity: EffectiveSupervisorDispatchIdentity::GeneratedFollowUpQueue {
+                    source_run_id: context.source_run_id.as_str().to_string(),
+                    task_count: context.task_count,
+                },
+                execution_runtime: EffectiveSupervisorExecutionRuntime::Verified,
+                worktree_mode: EffectiveSupervisorWorktreeMode::NotApplicable,
+                runtime_adapter: None,
+                repository_identity: context.repository_identity,
+                artifact_family: "generated-follow-up-queue".to_string(),
+                delivery_identity: context.bounds_identity,
+                machine_global_retention_sha256: Some(context.retention_binding_sha256),
+                queue_item_sha256: Some(context.item_set_sha256),
+                task_batch_sha256: Some(context.task_batch_sha256),
+                primary_baseline_sha256: Some(context.primary_baseline_sha256),
+                outer_entrypoint: Some(context.outer_entrypoint.as_str().to_string()),
+                outer_run_id: Some(context.outer_run_id.to_string()),
+            },
         },
-        execution_runtime: EffectiveSupervisorExecutionRuntime::Verified,
-        worktree_mode: EffectiveSupervisorWorktreeMode::NotApplicable,
-        operations: vec![
-            MutationOperation::GeneratedFollowUpQueueReserve,
-            MutationOperation::GeneratedFollowUpQueueWriteAppend,
-            MutationOperation::GeneratedFollowUpQueueAuthenticatedCommit,
-            MutationOperation::GeneratedFollowUpQueueClaim,
-            MutationOperation::GeneratedFollowUpQueueRelease,
-            MutationOperation::GeneratedFollowUpRefusalEvidenceWrite,
-            MutationOperation::GeneratedSupervisorPlanStage,
-        ],
-        // This builder is called only after the finalized source report and
-        // normalized source plan have authenticated the exact queue identity.
-        demonstrated_gates: vec![
-            crate::mutation_taxonomy::ExplicitMutationGate::BoundGeneratedFollowUpQueueLifecycleAuthority,
-        ],
-    })
+    )
 }
 
 pub(super) struct FollowUpCascadeInvocation<'a> {
@@ -190,14 +203,6 @@ pub(super) fn run_generated_follow_up_cascade(
     if !source_report.success || !source_report.accepted || !source_report.publishable {
         return Ok(source_only_cascade_outcome(source_report));
     }
-    let effective_queue_manifest = effective_generated_follow_up_queue_mutation_manifest(
-        &source_report.run_id,
-        &source_plan_sha256,
-        source_report.generated_follow_up_tasks.len(),
-    );
-    let queue_mutation_grant =
-        authorize_effective_supervisor_manifest(effective_queue_manifest.clone())?;
-    queue_mutation_grant.consume(&effective_queue_manifest)?;
     let primary_baseline =
         primary_worktree_snapshot_sha256(repo, SupervisorExecutionRuntime::Verified)?;
     let retention = supervisor_template
@@ -219,25 +224,73 @@ pub(super) fn run_generated_follow_up_cascade(
     };
     let authenticator = repository_authenticator_key_only(repo)?;
     let repository_id = authenticator.binding().repository_id.clone();
-    let source = GeneratedFollowUpQueueSource::root(GeneratedFollowUpQueueRootInput {
-        source_supervisor_run_id: source_report.run_id.as_str().to_string(),
-        source_normalized_plan_sha256: source_plan_sha256,
-        effective_mutation_manifest_sha256: effective_queue_manifest
-            .canonical_manifest_sha256()
-            .to_string(),
-        source_report_accepted: source_report.accepted,
-        source_report_publishable: source_report.publishable,
-        outer_entrypoint: invocation.outer_entrypoint,
-        outer_command_run_id: invocation.outer_command_run_id.as_str().to_string(),
-        repository_id,
-        whole_primary_baseline_sha256: primary_baseline.clone(),
-        machine_global_retention: retained_binding,
-    })?;
+    let existing_queue = GeneratedFollowUpQueue::open_existing_for_source_execution(
+        repository_authenticator_key_only(repo)?,
+        source_report.run_id.as_str(),
+        &source_plan_sha256,
+    )?;
+    let (outer_entrypoint, outer_run_id) = existing_queue.as_ref().map_or_else(
+        || {
+            (
+                invocation.outer_entrypoint,
+                invocation.outer_command_run_id.as_str().to_string(),
+            )
+        },
+        |inspection| {
+            let source = inspection.snapshot().source();
+            (
+                source.outer_entrypoint(),
+                source.outer_command_run_id().to_string(),
+            )
+        },
+    );
+    drop(existing_queue);
     let bounds = GeneratedFollowUpQueueBounds::from_validated_source_plan_and_tasks(
         &source_loaded.plan,
         &source_report.generated_follow_up_tasks,
     )?;
-    let mut queue = GeneratedFollowUpQueue::create_or_open(authenticator, source, bounds)?;
+    let task_batch_sha256 =
+        generated_follow_up_task_batch_sha256(&source_report.generated_follow_up_tasks)?;
+    let item_set_sha256 =
+        generated_follow_up_item_set_sha256(&source_report.generated_follow_up_tasks)?;
+    let effective_queue_manifest =
+        effective_generated_follow_up_queue_mutation_manifest(GeneratedQueueManifestContext {
+            source_run_id: &source_report.run_id,
+            source_plan_sha256: &source_plan_sha256,
+            task_count: source_report.generated_follow_up_tasks.len(),
+            repository_identity: repository_id.clone(),
+            primary_baseline_sha256: primary_baseline.clone(),
+            retention_binding_sha256: retained_binding.binding_sha256().to_string(),
+            item_set_sha256,
+            task_batch_sha256,
+            outer_entrypoint,
+            outer_run_id: &outer_run_id,
+            bounds_identity: serde_json::to_string(&bounds)
+                .context("failed to encode generated queue bounds identity")?,
+        });
+    let authorized_queue = authorize_effective_supervisor_manifest(effective_queue_manifest)?;
+    let (effective_queue_evidence, queue_mutation_permit) =
+        authorized_queue.into_generated_follow_up_queue()?;
+    let source = GeneratedFollowUpQueueSource::root(GeneratedFollowUpQueueRootInput {
+        source_supervisor_run_id: source_report.run_id.as_str().to_string(),
+        source_normalized_plan_sha256: source_plan_sha256,
+        effective_mutation_manifest_sha256: effective_queue_evidence
+            .canonical_manifest_sha256()
+            .to_string(),
+        source_report_accepted: source_report.accepted,
+        source_report_publishable: source_report.publishable,
+        outer_entrypoint,
+        outer_command_run_id: outer_run_id,
+        repository_id,
+        whole_primary_baseline_sha256: primary_baseline.clone(),
+        machine_global_retention: retained_binding,
+    })?;
+    let mut queue = GeneratedFollowUpQueue::create_or_open_authorized(
+        authenticator,
+        source,
+        bounds,
+        queue_mutation_permit,
+    )?;
     #[cfg(test)]
     record_queue_test_observation("created_or_opened", &queue, 0);
     if !queue.snapshot().enqueue_committed() {
@@ -433,81 +486,120 @@ pub(super) fn run_generated_follow_up_cascade(
         validate_max_concurrent_children(max_concurrent_children)?;
         let manager = WorktreeManager::new(repo);
         let cleanliness = manager.acquire_repository_cleanliness()?;
-        let subordinate_manifest = effective_supervisor_mutation_manifest(
-            &reloaded,
-            &subordinate_options,
-            SupervisorExecutionRuntime::Verified,
-            SupervisorWorktreeCreation::Bound(&cleanliness),
-        )?;
-        let subordinate_mutation_grant = match authorize_effective_supervisor_manifest(
-            subordinate_manifest,
-        ) {
-            Ok(authority) => authority,
-            Err(error) => {
-                let gate_id = supervisor_mutation_admission_gate_id(&error)
-                    .unwrap_or(crate::mutation_taxonomy::TAXONOMY_REVIEW_REQUIRED_GATE_ID);
-                let effective_paths = reloaded
-                    .plan
-                    .assignments
-                    .iter()
-                    .flat_map(|assignment| assignment.assigned_paths.iter().cloned())
-                    .collect::<Vec<_>>();
-                let denial = GateDenial::from_approval_review(
-                    &item_id,
-                    gate_id,
-                    ApprovalReviewDenial::HumanReviewRequired,
-                    effective_paths,
-                )?;
-                queue.release_before_dispatch(&item_id, Some(denial), Vec::new())?;
-                #[cfg(test)]
-                record_queue_test_observation(
-                    "mutation_admission_refused",
-                    &queue,
-                    authenticated_child_dispatch_started_count,
-                );
-                return Err(error.context(
-                        "generated follow-up Supervisor mutation admission failed before durable dispatch start",
-                    ));
-            }
-        };
-        let runtime_model_catalog = match invocation.runtime_catalog {
-            FollowUpRuntimeCatalog::Production => {
-                RuntimeModelCatalog::for_supervisor(&subordinate_options, repo)
-            }
+        let runtime_preflight = match invocation.runtime_catalog {
+            FollowUpRuntimeCatalog::Production => acquire_runtime_model_catalog_with_permit(
+                &reloaded,
+                &subordinate_options,
+                repo,
+                max_concurrent_children,
+                SupervisorExecutionRuntime::Verified,
+                SupervisorWorktreeCreation::Bound(&cleanliness),
+            )
+            .map(
+                |RuntimeModelCatalogPreflight {
+                     acquisition,
+                     evidence,
+                     resolution_permit,
+                 }| { (acquisition, Some(evidence), Some(resolution_permit)) },
+            ),
             #[cfg(test)]
-            FollowUpRuntimeCatalog::Injected => Ok(test_runtime_model_catalog(
-                &reloaded.plan,
-                subordinate_options.runtime,
-            )?),
+            FollowUpRuntimeCatalog::Injected => Ok((
+                Ok(test_runtime_model_catalog(
+                    &reloaded.plan,
+                    subordinate_options.runtime,
+                )?),
+                None,
+                None,
+            )),
         };
-        let _started = queue.mark_dispatch_started(&item_id)?;
-        #[cfg(test)]
-        record_queue_test_observation(
-            "dispatch_started",
-            &queue,
-            authenticated_child_dispatch_started_count,
-        );
-        #[cfg(test)]
-        if take_interrupt_after_follow_up_dispatch_started() {
-            let denial = ambiguous_dispatch_denial(&item_id)?;
-            queue.mark_held_ambiguous(&item_id, Some(denial), Vec::new())?;
+        let (runtime_model_catalog, preflight_evidence, resolution_preflight_permit) =
+            match runtime_preflight {
+                Ok(preflight) => preflight,
+                Err(error) => {
+                    let gate_id = supervisor_mutation_admission_gate_id(&error)
+                        .unwrap_or(crate::mutation_taxonomy::TAXONOMY_REVIEW_REQUIRED_GATE_ID);
+                    let denial = GateDenial::from_approval_review(
+                        &item_id,
+                        gate_id,
+                        ApprovalReviewDenial::HumanReviewRequired,
+                        reloaded
+                            .plan
+                            .assignments
+                            .iter()
+                            .flat_map(|assignment| assignment.assigned_paths.iter().cloned()),
+                    )?;
+                    queue.release_before_dispatch(&item_id, Some(denial), Vec::new())?;
+                    return Err(error.context(
+                        "generated follow-up catalog preflight failed before durable dispatch start",
+                    ));
+                }
+            };
+        let mut durable_dispatch_started = false;
+        let mut mark_dispatch_authorized = || -> Result<()> {
+            queue.mark_dispatch_started(&item_id)?;
+            durable_dispatch_started = true;
+            #[cfg(test)]
             record_queue_test_observation(
-                "held_ambiguous",
+                "dispatch_started",
                 &queue,
                 authenticated_child_dispatch_started_count,
             );
-            bail!("injected interruption after durable generated follow-up ambiguous hold");
-        }
-        let result = run_supervisor_plan_with_runner_and_creation(
-            reloaded,
-            subordinate_options,
+            #[cfg(test)]
+            if take_interrupt_after_follow_up_dispatch_started() {
+                let denial = ambiguous_dispatch_denial(&item_id)?;
+                queue.mark_held_ambiguous(&item_id, Some(denial), Vec::new())?;
+                record_queue_test_observation(
+                    "held_ambiguous",
+                    &queue,
+                    authenticated_child_dispatch_started_count,
+                );
+                bail!("injected interruption after durable generated follow-up ambiguous hold");
+            }
+            Ok(())
+        };
+        let result = run_supervisor_plan_with_runner_and_creation(SupervisorRunExecution {
+            loaded: reloaded,
+            options: subordinate_options,
             max_concurrent_children,
-            SupervisorExecutionRuntime::Verified,
-            SupervisorWorktreeCreation::Bound(&cleanliness),
+            execution_runtime: SupervisorExecutionRuntime::Verified,
+            worktree_creation: SupervisorWorktreeCreation::Bound(&cleanliness),
             runtime_model_catalog,
-            subordinate_mutation_grant,
+            preflight_evidence,
+            resolution_preflight_permit,
+            dispatch_started: None,
+            dispatch_authorized: Some(&mut mark_dispatch_authorized),
             external_runner,
-        );
+        });
+        drop(mark_dispatch_authorized);
+        #[cfg(test)]
+        if result.is_err()
+            && durable_dispatch_started
+            && queue
+                .snapshot()
+                .item(&item_id)
+                .is_some_and(|item| item.phase() == GeneratedFollowUpQueuePhase::HeldAmbiguous)
+        {
+            return result.context(
+                "injected interruption after admitted durable generated follow-up dispatch start",
+            );
+        }
+        if result.is_err() && !durable_dispatch_started {
+            let gate_id = result
+                .as_ref()
+                .err()
+                .and_then(supervisor_mutation_admission_gate_id)
+                .unwrap_or(crate::mutation_taxonomy::TAXONOMY_REVIEW_REQUIRED_GATE_ID);
+            let denial = GateDenial::from_approval_review(
+                &item_id,
+                gate_id,
+                ApprovalReviewDenial::HumanReviewRequired,
+                std::iter::empty::<PathBuf>(),
+            )?;
+            queue.release_before_dispatch(&item_id, Some(denial), Vec::new())?;
+            return result.context(
+                "generated follow-up Supervisor failed before admitted durable dispatch start",
+            );
+        }
         #[cfg(test)]
         interrupt_after_authenticated_follow_up_child_start(repo, &subordinate_run_id)?;
         // The loader no longer needs the private file once the ordinary call

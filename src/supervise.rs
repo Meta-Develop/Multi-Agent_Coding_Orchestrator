@@ -29,6 +29,7 @@ use crate::{
         decode_canonical_prompt_entry_line, DecodedFieldGuidePromptEntry, FieldGuideDraft,
         FieldGuideLimits, FieldGuideStore, ParentFieldGuideProvenance, FIELD_GUIDE_PROMPT_HEADER,
     },
+    follow_up_queue::generated_follow_up_item_id_from_subordinate_run_id,
     gate_denial::{
         AuditorRejectionKind, BudgetAdmissionDenial, ExternalSideEffectState, GateApplyBlocker,
         GateCheckSource, GateDenial, GateDenialReason, GateDenialRoute, GateRetryability,
@@ -45,11 +46,13 @@ use crate::{
         ValidationEvidenceBundle, WorktreeMergeMetadata, VALIDATION_BINDING_VERSION,
     },
     mutation_taxonomy::{
-        authorize_effective_supervisor_mutation_manifest, EffectiveSupervisorDispatchIdentity,
-        EffectiveSupervisorExecutionRuntime, EffectiveSupervisorMutationAdmissionError,
-        EffectiveSupervisorMutationGrant, EffectiveSupervisorMutationManifest,
-        EffectiveSupervisorMutationManifestInput, EffectiveSupervisorWorktreeMode,
-        ExplicitMutationGate, MutationOperation,
+        authorize_effective_supervisor_mutation_manifest, CatalogPreflightMutationPermit,
+        EffectiveCatalogPreflightManifestInput, EffectiveResumeRecoveryManifestInput,
+        EffectiveSupervisorDispatchIdentity, EffectiveSupervisorExecutionRuntime,
+        EffectiveSupervisorMutationAdmissionError, EffectiveSupervisorMutationAuditEvidence,
+        EffectiveSupervisorMutationIdentityInput, EffectiveSupervisorMutationManifest,
+        EffectiveSupervisorRunManifestInput, EffectiveSupervisorWorktreeMode,
+        SupervisorResolutionPreflightPermit, SupervisorRunMutationPermit,
     },
     objective_profile::{resolve_objective_profile, ResolvedObjectiveProfile},
     orchestration_event::{
@@ -345,13 +348,7 @@ pub fn resume_supervisor_run(
     repo: impl AsRef<Path>,
     run_id: RunId,
 ) -> Result<SupervisorResumeReport> {
-    let repo = discover_repo_root(repo.as_ref())?;
-    let status = plan_api::supervisor_status(&repo, run_id.clone())?;
-    if status.lifecycle != SupervisorRunLifecycle::Finalized {
-        messaging_bridge::recover_supervisor_messaging_session(&run_dir(&repo, &run_id))
-            .context("supervisor messaging resume preflight failed")?;
-    }
-    plan_api::resume_supervisor_run(&repo, run_id)
+    plan_api::resume_supervisor_run(repo, run_id)
 }
 
 mod primary_integrity;
@@ -3142,13 +3139,14 @@ pub(crate) fn run_supervisor_plan_file_cascade_with_runner(
     let serialized_runner = Mutex::new(external_runner);
     let cancellation_observed = AtomicBool::new(false);
     run_supervisor_plan_file_cascade_with_cancellable_runner_and_gate(
-        options,
-        GeneratedFollowUpQueueEntrypoint::SuperviseRun,
-        &outer_run_id,
-        None,
-        &cancellation_observed,
-        None,
-        None,
+        InjectedSupervisorCascadeRequest {
+            options,
+            outer_entrypoint: GeneratedFollowUpQueueEntrypoint::SuperviseRun,
+            outer_command_run_id: &outer_run_id,
+            caller_cancellation: None,
+            cancellation_observed: &cancellation_observed,
+            source_dispatch_started: None,
+        },
         &mut permit,
         &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
             Ok(mut runner) => runner(command),
@@ -3164,7 +3162,6 @@ pub(crate) fn run_supervisor_plan_file_cascade_with_runner_and_gate_for_autopilo
     caller_cancellation: Option<&ProcessCancellation>,
     cancellation_observed: &AtomicBool,
     source_dispatch_started: &AtomicBool,
-    source_mutation_grant: EffectiveSupervisorMutationGrant,
     before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<Option<GateDenial>>,
     external_runner: &mut (dyn FnMut(&ExternalAgentCommand, &ProcessCancellation) -> ExternalAgentRun
               + Send),
@@ -3189,31 +3186,43 @@ pub(crate) fn run_supervisor_plan_file_cascade_with_runner_and_gate_for_autopilo
             }
         };
     run_supervisor_plan_file_cascade_with_cancellable_runner_and_gate(
-        options,
-        GeneratedFollowUpQueueEntrypoint::AutopilotRun,
-        outer_command_run_id,
-        caller_cancellation,
-        cancellation_observed,
-        Some(source_dispatch_started),
-        Some(source_mutation_grant),
+        InjectedSupervisorCascadeRequest {
+            options,
+            outer_entrypoint: GeneratedFollowUpQueueEntrypoint::AutopilotRun,
+            outer_command_run_id,
+            caller_cancellation,
+            cancellation_observed,
+            source_dispatch_started: Some(source_dispatch_started),
+        },
         before_dispatch,
         &cancellable_runner,
     )
 }
 
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-fn run_supervisor_plan_file_cascade_with_cancellable_runner_and_gate(
+struct InjectedSupervisorCascadeRequest<'a> {
     options: SupervisorRunOptions,
     outer_entrypoint: GeneratedFollowUpQueueEntrypoint,
-    outer_command_run_id: &RunId,
-    caller_cancellation: Option<&ProcessCancellation>,
-    cancellation_observed: &AtomicBool,
-    source_dispatch_started: Option<&AtomicBool>,
-    source_mutation_grant: Option<EffectiveSupervisorMutationGrant>,
+    outer_command_run_id: &'a RunId,
+    caller_cancellation: Option<&'a ProcessCancellation>,
+    cancellation_observed: &'a AtomicBool,
+    source_dispatch_started: Option<&'a AtomicBool>,
+}
+
+#[cfg(test)]
+fn run_supervisor_plan_file_cascade_with_cancellable_runner_and_gate(
+    request: InjectedSupervisorCascadeRequest<'_>,
     before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<Option<GateDenial>>,
     external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorCascadeOutcome> {
+    let InjectedSupervisorCascadeRequest {
+        options,
+        outer_entrypoint,
+        outer_command_run_id,
+        caller_cancellation,
+        cancellation_observed,
+        source_dispatch_started,
+    } = request;
     validate_max_concurrent_children(1)?;
     if options.runtime == SupervisorRuntime::Fake {
         bail!("publishable generated follow-up cascade tests require the verified runtime path");
@@ -3240,33 +3249,19 @@ fn run_supervisor_plan_file_cascade_with_cancellable_runner_and_gate(
     if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
         bail!("autopilot caller cancelled after injected runtime catalog resolution before exact loaded-plan dispatch");
     }
-    let source_report = match source_mutation_grant {
-        Some(mutation_grant) => {
-            if let Some(source_dispatch_started) = source_dispatch_started {
-                source_dispatch_started.store(true, Ordering::SeqCst);
-            }
-            run_supervisor_plan_with_runner_and_creation(
-                loaded,
-                options,
-                1,
-                SupervisorExecutionRuntime::Verified,
-                SupervisorWorktreeCreation::Bound(&cleanliness),
-                Ok(runtime_model_catalog),
-                mutation_grant,
-                external_runner,
-            )?
-        }
-        None => authorize_mark_and_run_supervisor_plan_with_runner_and_creation(
-            loaded,
-            options,
-            1,
-            SupervisorExecutionRuntime::Verified,
-            SupervisorWorktreeCreation::Bound(&cleanliness),
-            Ok(runtime_model_catalog),
-            source_dispatch_started,
-            external_runner,
-        )?,
-    };
+    let source_report = run_supervisor_plan_with_runner_and_creation(SupervisorRunExecution {
+        loaded,
+        options,
+        max_concurrent_children: 1,
+        execution_runtime: SupervisorExecutionRuntime::Verified,
+        worktree_creation: SupervisorWorktreeCreation::Bound(&cleanliness),
+        runtime_model_catalog: Ok(runtime_model_catalog),
+        preflight_evidence: None,
+        resolution_preflight_permit: None,
+        dispatch_started: source_dispatch_started,
+        dispatch_authorized: None,
+        external_runner,
+    })?;
     drop(cleanliness);
     run_generated_follow_up_cascade(
         &repo,
@@ -4030,171 +4025,192 @@ fn effective_supervisor_dispatch_identity(
     EffectiveSupervisorDispatchIdentity::Root
 }
 
-fn effective_supervisor_mutation_manifest_for_mode(
+fn effective_generated_follow_up_queue_item_sha256(
     loaded: &LoadedSupervisorPlan,
     options: &SupervisorRunOptions,
+) -> Result<Option<String>> {
+    loaded
+        .plan_metadata
+        .generated_follow_up
+        .as_ref()
+        .map(|_| generated_follow_up_item_id_from_subordinate_run_id(options.run_id.as_str()))
+        .transpose()
+}
+
+struct EffectiveSupervisorRunManifestContext<'a> {
+    loaded: &'a LoadedSupervisorPlan,
+    options: &'a SupervisorRunOptions,
+    dispatch_identity: EffectiveSupervisorDispatchIdentity,
     execution_runtime: SupervisorExecutionRuntime,
     worktree_mode: EffectiveSupervisorWorktreeMode,
+    repository_identity: String,
+    primary_baseline_sha256: String,
+    admission_policy_input: &'a SupervisorAdmissionPolicyInput,
+    max_concurrent_children: usize,
+}
+
+fn effective_supervisor_mutation_manifest(
+    context: EffectiveSupervisorRunManifestContext<'_>,
 ) -> Result<EffectiveSupervisorMutationManifest> {
+    let EffectiveSupervisorRunManifestContext {
+        loaded,
+        options,
+        dispatch_identity,
+        execution_runtime,
+        worktree_mode,
+        repository_identity,
+        primary_baseline_sha256,
+        admission_policy_input,
+        max_concurrent_children,
+    } = context;
     let normalized_plan_sha256 = normalized_supervisor_plan_sha256(
         &loaded.plan,
         &loaded.consultant,
         &loaded.assignment_metadata,
         &loaded.plan_metadata,
     )?;
-    let mut operations = vec![
-        MutationOperation::SupervisorRunArtifactReserve,
-        MutationOperation::SupervisorRunArtifactWriteAppend,
-        MutationOperation::SupervisorRunArtifactAuthenticatedFinalize,
-        MutationOperation::SupervisorScratchEvidenceCleanup,
-        MutationOperation::SupervisorRefusalEvidenceWrite,
-        MutationOperation::SupervisorCheckpointJournalLifecycle,
-        MutationOperation::SupervisorOrchestrationJournalLifecycle,
-        MutationOperation::SupervisorCoordinationStoreBootstrap,
-        MutationOperation::ClaimAcquire,
-        MutationOperation::SupervisorClaimAcquisitionTelemetry,
-        MutationOperation::ClaimRelease,
-        MutationOperation::SupervisorProcessRegister,
-    ];
-    // These gates are not inferred from the operation rows. They record the
-    // exact production authorities already enforced by this private common
-    // control flow: a bound run lifecycle and exact held-token release paths.
-    let mut demonstrated_gates = vec![
-        ExplicitMutationGate::BoundSupervisorRunLifecycleAuthority,
-        ExplicitMutationGate::ExactClaimReleaseAuthority,
-    ];
-    if loaded.plan.semantic_coordination == SemanticCoordinationMode::Block {
-        operations.extend([
-            MutationOperation::SemanticIntentAcquire,
-            MutationOperation::SemanticIntentRelease,
-        ]);
-        demonstrated_gates.push(ExplicitMutationGate::ExactSemanticIntentReleaseAuthority);
-    }
-    match worktree_mode {
-        EffectiveSupervisorWorktreeMode::BoundCreateOrReuse
-        | EffectiveSupervisorWorktreeMode::NonpublishableSimulation => {
-            operations.extend([
-                MutationOperation::WorktreeCreate,
-                MutationOperation::SupervisorMandatoryControlProvision,
-            ]);
-        }
-        EffectiveSupervisorWorktreeMode::ExistingOnly => {
-            operations.push(MutationOperation::SupervisorMandatoryControlProvision);
-        }
-        EffectiveSupervisorWorktreeMode::PrimaryWorktree => {
-            operations.push(MutationOperation::PrimaryWorktreeMutation);
-            // This private mode is reached only after the plan declaration and
-            // caller opt-in have both passed production pre-dispatch validation.
-            demonstrated_gates.push(ExplicitMutationGate::PrimaryPlanCliDoubleOptIn);
-        }
-        EffectiveSupervisorWorktreeMode::NotApplicable => {}
-        #[cfg(test)]
-        EffectiveSupervisorWorktreeMode::TestOnly
-        | EffectiveSupervisorWorktreeMode::VerifiedTestOnly => {
-            operations.extend([
-                MutationOperation::WorktreeCreate,
-                MutationOperation::SupervisorMandatoryControlProvision,
-            ]);
-        }
-    }
     let external_process_runtime = options.runtime != SupervisorRuntime::Fake;
-    if external_process_runtime {
-        operations.extend([
-            MutationOperation::SupervisorProcessSpawn,
-            MutationOperation::SupervisorProcessOutputStage,
-            MutationOperation::SupervisorProcessOutputWrite,
-            MutationOperation::SupervisorProcessTerminate,
-        ]);
-        // Verified Supervisor execution supplies the reviewed external-agent
-        // process lifecycle; Fake execution cannot demonstrate this gate.
-        demonstrated_gates.push(ExplicitMutationGate::VerifiedSupervisorProcessLifecycleAuthority);
-        if options.machine_global_retention.is_some() {
-            operations.push(MutationOperation::MachineGlobalQuarantine);
-        } else {
-            operations.push(MutationOperation::SupervisorProcessOutputCleanup);
-        }
-        if loaded.plan_metadata.evidence_only_reaudit.is_none() {
-            operations.push(MutationOperation::SupervisorFieldGuideMutation);
-            demonstrated_gates
-                .push(ExplicitMutationGate::BoundSupervisorFieldGuideMutationAuthority);
-        }
-        let managed_child_may_import = match worktree_mode {
-            EffectiveSupervisorWorktreeMode::BoundCreateOrReuse => true,
-            #[cfg(test)]
-            EffectiveSupervisorWorktreeMode::VerifiedTestOnly => true,
-            _ => false,
-        };
-        if managed_child_may_import && execution_runtime == SupervisorExecutionRuntime::Verified {
-            operations.extend([
-                MutationOperation::SandboxWorktreeEdit,
-                MutationOperation::SandboxWorktreeCommit,
-                MutationOperation::SupervisorPrimaryObjectDatabaseImport,
-            ]);
-            demonstrated_gates
-                .push(ExplicitMutationGate::VerifiedSupervisorPrimaryObjectImportAuthority);
-        }
-    }
-    Ok(EffectiveSupervisorMutationManifest::new(
-        EffectiveSupervisorMutationManifestInput {
-            run_id: options.run_id.as_str().to_string(),
-            parent_node: options.parent_node.clone(),
-            normalized_plan_sha256,
-            dispatch_identity: effective_supervisor_dispatch_identity(loaded, options),
-            execution_runtime: effective_supervisor_execution_runtime(execution_runtime),
-            worktree_mode,
-            operations,
-            demonstrated_gates,
+    let queue_item_sha256 = effective_generated_follow_up_queue_item_sha256(loaded, options)?;
+    let machine_global_retention_sha256 = options
+        .machine_global_retention
+        .as_ref()
+        .map(crate::follow_up_queue::GeneratedFollowUpRetentionBinding::from_machine_global)
+        .transpose()?
+        .map(|binding| binding.binding_sha256().to_string());
+    let managed_child_may_import = match worktree_mode {
+        EffectiveSupervisorWorktreeMode::BoundCreateOrReuse => true,
+        #[cfg(test)]
+        EffectiveSupervisorWorktreeMode::VerifiedTestOnly => true,
+        _ => false,
+    };
+    let primary_object_import = external_process_runtime
+        && execution_runtime == SupervisorExecutionRuntime::Verified
+        && managed_child_may_import;
+    Ok(EffectiveSupervisorMutationManifest::supervisor_run(
+        EffectiveSupervisorRunManifestInput {
+            identity: EffectiveSupervisorMutationIdentityInput {
+                run_id: options.run_id.as_str().to_string(),
+                parent_node: options.parent_node.clone(),
+                normalized_plan_sha256,
+                dispatch_identity,
+                execution_runtime: effective_supervisor_execution_runtime(execution_runtime),
+                worktree_mode,
+                runtime_adapter: Some(
+                    crate::runtime_adapter::AdapterId::from_runtime(options.runtime)
+                        .as_str()
+                        .to_string(),
+                ),
+                repository_identity,
+                artifact_family: "supervise".to_string(),
+                delivery_identity: serde_json::to_string(&(
+                    &options.plan_file,
+                    &options.codex_bin,
+                    options.allow_dirty_primary,
+                    options.allow_live_run_collision,
+                    max_concurrent_children,
+                    admission_policy_input,
+                ))
+                .context("failed to encode exact Supervisor delivery identity")?,
+                machine_global_retention_sha256,
+                queue_item_sha256,
+                task_batch_sha256: None,
+                primary_baseline_sha256: Some(primary_baseline_sha256),
+                outer_entrypoint: None,
+                outer_run_id: None,
+            },
+            semantic_coordination: loaded.plan.semantic_coordination
+                == SemanticCoordinationMode::Block,
+            external_process_runtime,
+            machine_global_retention_bound: options.machine_global_retention.is_some(),
+            field_guide_mutation: external_process_runtime
+                && loaded.plan_metadata.evidence_only_reaudit.is_none(),
+            primary_object_import,
         },
     ))
 }
 
-fn effective_supervisor_mutation_manifest(
-    loaded: &LoadedSupervisorPlan,
-    options: &SupervisorRunOptions,
-    execution_runtime: SupervisorExecutionRuntime,
-    worktree_creation: SupervisorWorktreeCreation<'_>,
-) -> Result<EffectiveSupervisorMutationManifest> {
-    effective_supervisor_mutation_manifest_for_mode(
-        loaded,
-        options,
-        execution_runtime,
-        effective_supervisor_worktree_mode(worktree_creation),
-    )
+fn effective_repository_identity(repo: &Path) -> Result<String> {
+    let authenticator = repository_authenticator_key_only(repo)
+        .context("Supervisor mutation admission requires repository authentication identity")?;
+    authenticator.verify_epoch()?;
+    Ok(authenticator.binding().repository_id.clone())
 }
 
-/// Performs the exact source-Supervisor mutation admission for Autopilot from
-/// the in-memory plan document. This runs before Autopilot reserves its own
-/// artifact tree or registers its process; the returned non-serializable grant
-/// is later consumed by the common Scheduler preparation boundary.
-pub(crate) fn preauthorize_autopilot_source_supervisor_mutations(
-    document: &Value,
+struct RuntimeModelCatalogPreflight {
+    acquisition: RuntimeModelCatalogAcquisition,
+    evidence: EffectiveSupervisorMutationAuditEvidence,
+    resolution_permit: SupervisorResolutionPreflightPermit,
+}
+
+fn acquire_runtime_model_catalog_with_permit(
+    loaded: &LoadedSupervisorPlan,
     options: &SupervisorRunOptions,
-) -> Result<EffectiveSupervisorMutationGrant> {
-    let serialized = serde_json::to_string(document)
-        .context("failed to serialize the effective Autopilot Supervisor plan for admission")?;
-    let loaded = parse_supervisor_plan_with_consultant(&serialized)
-        .context("failed to validate the effective Autopilot Supervisor plan for admission")?;
-    if loaded.plan_metadata.execution_target.is_some() {
-        bail!("Autopilot source admission cannot target the primary worktree");
-    }
-    let (execution_runtime, worktree_mode) = if options.runtime == SupervisorRuntime::Fake {
-        (
-            SupervisorExecutionRuntime::NonpublishableSimulation,
-            EffectiveSupervisorWorktreeMode::NonpublishableSimulation,
-        )
-    } else {
-        (
-            SupervisorExecutionRuntime::Verified,
-            EffectiveSupervisorWorktreeMode::BoundCreateOrReuse,
-        )
-    };
-    let manifest = effective_supervisor_mutation_manifest_for_mode(
-        &loaded,
-        options,
-        execution_runtime,
-        worktree_mode,
-    )?;
-    authorize_effective_supervisor_manifest(manifest)
+    repo: &Path,
+    max_concurrent_children: usize,
+    execution_runtime: SupervisorExecutionRuntime,
+    worktree_creation: SupervisorWorktreeCreation<'_>,
+) -> Result<RuntimeModelCatalogPreflight> {
+    let queue_item_sha256 = effective_generated_follow_up_queue_item_sha256(loaded, options)?;
+    let manifest = EffectiveSupervisorMutationManifest::catalog_preflight(
+        EffectiveCatalogPreflightManifestInput {
+            identity: EffectiveSupervisorMutationIdentityInput {
+                run_id: options.run_id.as_str().to_string(),
+                parent_node: options.parent_node.clone(),
+                normalized_plan_sha256: normalized_supervisor_plan_sha256(
+                    &loaded.plan,
+                    &loaded.consultant,
+                    &loaded.assignment_metadata,
+                    &loaded.plan_metadata,
+                )?,
+                dispatch_identity: effective_supervisor_dispatch_identity(loaded, options),
+                execution_runtime: effective_supervisor_execution_runtime(execution_runtime),
+                worktree_mode: effective_supervisor_worktree_mode(worktree_creation),
+                runtime_adapter: Some(
+                    crate::runtime_adapter::AdapterId::from_runtime(options.runtime)
+                        .as_str()
+                        .to_string(),
+                ),
+                repository_identity: effective_repository_identity(repo)?,
+                artifact_family: "supervise-preflight".to_string(),
+                delivery_identity: serde_json::to_string(&(
+                    &options.plan_file,
+                    &options.codex_bin,
+                    options.allow_dirty_primary,
+                    options.allow_live_run_collision,
+                    max_concurrent_children,
+                    options.admission_overrides,
+                    options.budget_overrides,
+                    options.budget_max_duration_seconds,
+                ))
+                .context("failed to encode catalog delivery identity")?,
+                machine_global_retention_sha256: None,
+                queue_item_sha256,
+                task_batch_sha256: None,
+                primary_baseline_sha256: None,
+                outer_entrypoint: None,
+                outer_run_id: None,
+            },
+            launches_process: options.runtime == SupervisorRuntime::Codex,
+        },
+    );
+    let authorized = authorize_effective_supervisor_manifest(manifest)?;
+    let (evidence, catalog_permit, resolution_permit) = authorized.into_catalog_preflight()?;
+    consume_catalog_preflight_permit(evidence, catalog_permit, resolution_permit, options, repo)
+}
+
+fn consume_catalog_preflight_permit(
+    evidence: EffectiveSupervisorMutationAuditEvidence,
+    permit: CatalogPreflightMutationPermit,
+    resolution_permit: SupervisorResolutionPreflightPermit,
+    options: &SupervisorRunOptions,
+    repo: &Path,
+) -> Result<RuntimeModelCatalogPreflight> {
+    permit.consume(evidence.canonical_manifest_sha256())?;
+    Ok(RuntimeModelCatalogPreflight {
+        acquisition: RuntimeModelCatalog::for_supervisor(options, repo),
+        evidence,
+        resolution_permit,
+    })
 }
 
 #[cfg(test)]
@@ -4202,7 +4218,7 @@ pub(crate) fn preauthorize_autopilot_source_supervisor_mutations(
 pub(crate) enum EffectiveSupervisorManifestTestMutation {
     Unchanged,
     AppendUnknownOperation(&'static str),
-    RemoveRequiredGate(ExplicitMutationGate),
+    RemoveRequiredGate(crate::mutation_taxonomy::ExplicitMutationGate),
 }
 
 #[cfg(test)]
@@ -4256,9 +4272,8 @@ pub(crate) fn set_effective_supervisor_manifest_test_mutations(
 }
 
 #[cfg(test)]
-fn apply_effective_supervisor_manifest_test_mutation(
-    manifest: &mut EffectiveSupervisorMutationManifest,
-) {
+fn effective_supervisor_manifest_test_failure() -> Option<EffectiveSupervisorMutationAdmissionError>
+{
     let mutation = EFFECTIVE_SUPERVISOR_MANIFEST_TEST_MUTATIONS.with(|mutations| {
         mutations.borrow_mut().as_mut().map(|mutations| {
             mutations.pop_front().unwrap_or_else(|| {
@@ -4267,28 +4282,28 @@ fn apply_effective_supervisor_manifest_test_mutation(
         })
     });
     match mutation {
-        Some(EffectiveSupervisorManifestTestMutation::Unchanged) | None => {}
+        Some(EffectiveSupervisorManifestTestMutation::Unchanged) | None => None,
         Some(EffectiveSupervisorManifestTestMutation::AppendUnknownOperation(operation_id)) => {
-            manifest.append_unknown_operation_for_test(operation_id);
+            Some(
+                EffectiveSupervisorMutationAdmissionError::UnknownOperation {
+                    operation_id: operation_id.to_string(),
+                },
+            )
         }
-        Some(EffectiveSupervisorManifestTestMutation::RemoveRequiredGate(gate)) => {
-            manifest.remove_demonstrated_gate_for_test(gate);
-        }
+        Some(EffectiveSupervisorManifestTestMutation::RemoveRequiredGate(gate)) => Some(
+            EffectiveSupervisorMutationAdmissionError::MissingCapability { gate_id: gate.id() },
+        ),
     }
 }
 
 fn authorize_effective_supervisor_manifest(
     manifest: EffectiveSupervisorMutationManifest,
-) -> Result<EffectiveSupervisorMutationGrant> {
+) -> Result<crate::mutation_taxonomy::AuthorizedEffectiveSupervisorMutation> {
     #[cfg(test)]
-    let manifest = {
-        let mut manifest = manifest;
-        apply_effective_supervisor_manifest_test_mutation(&mut manifest);
-        manifest
-    };
-    authorize_effective_supervisor_mutation_manifest(&manifest)
-        .and_then(|authority| authority.consume(&manifest))
-        .map_err(anyhow::Error::from)
+    if let Some(error) = effective_supervisor_manifest_test_failure() {
+        return Err(error.into());
+    }
+    authorize_effective_supervisor_mutation_manifest(manifest).map_err(anyhow::Error::from)
 }
 
 pub(crate) fn supervisor_mutation_admission_gate_id(error: &anyhow::Error) -> Option<&'static str> {
@@ -4299,7 +4314,6 @@ pub(crate) fn supervisor_mutation_admission_gate_id(error: &anyhow::Error) -> Op
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 fn authorize_and_run_supervisor_plan_with_runner_and_creation(
     loaded: LoadedSupervisorPlan,
@@ -4310,53 +4324,21 @@ fn authorize_and_run_supervisor_plan_with_runner_and_creation(
     runtime_model_catalog: RuntimeModelCatalogAcquisition,
     external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorFinalReport> {
-    authorize_mark_and_run_supervisor_plan_with_runner_and_creation(
+    run_supervisor_plan_with_runner_and_creation(SupervisorRunExecution {
         loaded,
         options,
         max_concurrent_children,
         execution_runtime,
         worktree_creation,
         runtime_model_catalog,
-        None,
+        preflight_evidence: None,
+        resolution_preflight_permit: None,
+        dispatch_started: None,
+        dispatch_authorized: None,
         external_runner,
-    )
+    })
 }
 
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-fn authorize_mark_and_run_supervisor_plan_with_runner_and_creation(
-    loaded: LoadedSupervisorPlan,
-    options: SupervisorRunOptions,
-    max_concurrent_children: usize,
-    execution_runtime: SupervisorExecutionRuntime,
-    worktree_creation: SupervisorWorktreeCreation<'_>,
-    runtime_model_catalog: RuntimeModelCatalogAcquisition,
-    source_dispatch_started: Option<&AtomicBool>,
-    external_runner: &CancellableExternalRunner<'_>,
-) -> Result<SupervisorFinalReport> {
-    let manifest = effective_supervisor_mutation_manifest(
-        &loaded,
-        &options,
-        execution_runtime,
-        worktree_creation,
-    )?;
-    let mutation_grant = authorize_effective_supervisor_manifest(manifest)?;
-    if let Some(source_dispatch_started) = source_dispatch_started {
-        source_dispatch_started.store(true, Ordering::SeqCst);
-    }
-    run_supervisor_plan_with_runner_and_creation(
-        loaded,
-        options,
-        max_concurrent_children,
-        execution_runtime,
-        worktree_creation,
-        runtime_model_catalog,
-        mutation_grant,
-        external_runner,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
 fn authorize_acquire_catalog_and_run_supervisor_plan_with_runner_and_creation(
     loaded: LoadedSupervisorPlan,
     options: SupervisorRunOptions,
@@ -4366,28 +4348,32 @@ fn authorize_acquire_catalog_and_run_supervisor_plan_with_runner_and_creation(
     source_dispatch_started: Option<&AtomicBool>,
     external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorFinalReport> {
-    let manifest = effective_supervisor_mutation_manifest(
+    let repo = discover_repo_root(&options.repo)?;
+    let RuntimeModelCatalogPreflight {
+        acquisition: runtime_model_catalog,
+        evidence: preflight_evidence,
+        resolution_permit,
+    } = acquire_runtime_model_catalog_with_permit(
         &loaded,
         &options,
+        &repo,
+        max_concurrent_children,
         execution_runtime,
         worktree_creation,
     )?;
-    let mutation_grant = authorize_effective_supervisor_manifest(manifest)?;
-    let repo = discover_repo_root(&options.repo)?;
-    let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
-    if let Some(source_dispatch_started) = source_dispatch_started {
-        source_dispatch_started.store(true, Ordering::SeqCst);
-    }
-    run_supervisor_plan_with_runner_and_creation(
+    run_supervisor_plan_with_runner_and_creation(SupervisorRunExecution {
         loaded,
         options,
         max_concurrent_children,
         execution_runtime,
         worktree_creation,
         runtime_model_catalog,
-        mutation_grant,
+        preflight_evidence: Some(preflight_evidence),
+        resolution_preflight_permit: Some(resolution_permit),
+        dispatch_started: source_dispatch_started,
+        dispatch_authorized: None,
         external_runner,
-    )
+    })
 }
 
 struct SharedSupervisorArtifacts<'a> {

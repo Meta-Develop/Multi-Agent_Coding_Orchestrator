@@ -41,6 +41,40 @@ fn plan_file_unknown_effect_is_refused_before_run_reservation_or_dispatch() {
 }
 
 #[test]
+fn production_catalog_unknown_effect_is_refused_before_catalog_or_run_artifact() {
+    let (temp, repo_path) = injected_repository();
+    let plan = injected_plan(injected_assignment(false), 0);
+    let options = injected_options(
+        &repo_path,
+        temp.path(),
+        "catalog-unknown-mutation-admission",
+    );
+    fs::write(
+        &options.plan_file,
+        serde_json::to_vec(&plan).expect("serialize catalog-admission plan"),
+    )
+    .expect("write catalog-admission plan");
+    let run_id = options.run_id.clone();
+    let _manifest_mutation = set_effective_supervisor_manifest_test_mutations([
+        EffectiveSupervisorManifestTestMutation::AppendUnknownOperation(
+            "actual-unlisted-catalog-effect",
+        ),
+    ]);
+
+    let error = run_supervisor_plan_file(options)
+        .expect_err("unknown catalog effect must fail before catalog acquisition");
+
+    assert_eq!(
+        supervisor_mutation_admission_gate_id(&error),
+        Some(crate::mutation_taxonomy::TAXONOMY_REVIEW_REQUIRED_GATE_ID)
+    );
+    assert!(!repo_path
+        .join(RunArtifactFamily::Supervise.run_root())
+        .join(run_id.as_str())
+        .exists());
+}
+
+#[test]
 fn literal_goal_missing_irreversible_gate_is_refused_before_run_reservation_or_dispatch() {
     let (temp, repo_path) = injected_repository();
     let options = injected_options(
@@ -163,99 +197,105 @@ fn every_effective_manifest_operation_is_registered_and_modes_are_conditional() 
     fake_options.runtime = SupervisorRuntime::Fake;
     fake_options.machine_global_retention = None;
     let mut unbound_verified_options = verified_options.clone();
-    unbound_verified_options.run_id =
-        RunId::new("effective-manifest-unbound-output").expect("valid unbound manifest run id");
+    unbound_verified_options.run_id = RunId::new("effective-manifest-unbound-output-cleanup")
+        .expect("valid unbound manifest run id");
     unbound_verified_options.machine_global_retention = None;
-    let manager = WorktreeManager::new(&repo_path);
-    let cleanliness = manager
-        .acquire_repository_cleanliness()
-        .expect("acquire manifest fixture cleanliness");
+    let admission = SupervisorAdmissionPolicyInput::resolve(
+        &repo_path,
+        1,
+        SupervisorAdmissionConfig::default(),
+        SupervisorAdmissionConfig::default(),
+    )
+    .expect("resolve manifest fixture admission");
+    let repository_identity = effective_repository_identity(&repo_path)
+        .expect("authenticate manifest fixture repository");
+    let primary_baseline_sha256 = "a".repeat(64);
+    let manifest = |options: &SupervisorRunOptions,
+                    execution_runtime,
+                    worktree_mode|
+     -> Result<EffectiveSupervisorMutationManifest> {
+        effective_supervisor_mutation_manifest(EffectiveSupervisorRunManifestContext {
+            loaded: &loaded,
+            options,
+            dispatch_identity: effective_supervisor_dispatch_identity(&loaded, options),
+            execution_runtime,
+            worktree_mode,
+            repository_identity: repository_identity.clone(),
+            primary_baseline_sha256: primary_baseline_sha256.clone(),
+            admission_policy_input: &admission,
+            max_concurrent_children: admission.resolved_bound,
+        })
+    };
     let scenarios = [
-        effective_supervisor_mutation_manifest(
-            &loaded,
+        manifest(
             &verified_options,
             SupervisorExecutionRuntime::Verified,
-            SupervisorWorktreeCreation::Bound(&cleanliness),
+            EffectiveSupervisorWorktreeMode::BoundCreateOrReuse,
         )
         .expect("derive bound verified manifest"),
-        effective_supervisor_mutation_manifest(
-            &loaded,
+        manifest(
             &verified_options,
             SupervisorExecutionRuntime::Verified,
-            SupervisorWorktreeCreation::ExistingOnly,
+            EffectiveSupervisorWorktreeMode::ExistingOnly,
         )
         .expect("derive existing-only manifest"),
-        effective_supervisor_mutation_manifest(
-            &loaded,
+        manifest(
             &fake_options,
             SupervisorExecutionRuntime::NonpublishableSimulation,
-            SupervisorWorktreeCreation::NonpublishableSimulation,
+            EffectiveSupervisorWorktreeMode::NonpublishableSimulation,
         )
         .expect("derive nonpublishable Fake manifest"),
-        effective_supervisor_mutation_manifest(
-            &loaded,
+        manifest(
             &verified_options,
             SupervisorExecutionRuntime::Verified,
-            SupervisorWorktreeCreation::PrimaryWorktree,
+            EffectiveSupervisorWorktreeMode::PrimaryWorktree,
         )
         .expect("derive primary-worktree manifest"),
-        effective_supervisor_mutation_manifest(
-            &loaded,
+        manifest(
             &unbound_verified_options,
             SupervisorExecutionRuntime::Verified,
-            SupervisorWorktreeCreation::ExistingOnly,
+            EffectiveSupervisorWorktreeMode::BoundCreateOrReuse,
         )
-        .expect("derive unbound-output manifest"),
-        follow_up_cascade::effective_generated_follow_up_queue_mutation_manifest(
-            &RunId::new("effective-manifest-queue-mode").expect("valid queue manifest run id"),
-            &"a".repeat(64),
-            1,
-        ),
+        .expect("derive unbound output-cleanup manifest"),
     ];
-    for manifest in &scenarios {
-        for operation in manifest.operations() {
+    let operation_sets = scenarios
+        .iter()
+        .map(|manifest| manifest.operation_ids().to_vec())
+        .collect::<Vec<_>>();
+    for manifest in scenarios {
+        for operation_id in manifest.operation_ids() {
             assert!(
-                crate::mutation_taxonomy::classification_for(operation.operation_id()).is_some(),
+                crate::mutation_taxonomy::classification_for(operation_id).is_some(),
                 "effective manifest emitted unregistered operation {}",
-                operation.operation_id()
+                operation_id
             );
         }
         assert!(!manifest
-            .operations()
+            .operation_ids()
             .iter()
-            .any(|operation| operation.operation_id() == MutationOperation::HookInstall.id()));
-        let grant = authorize_effective_supervisor_mutation_manifest(manifest)
-            .expect("actual effective manifest must include every exact required gate")
-            .consume(manifest)
-            .expect("actual effective manifest authority must consume its exact manifest");
-        grant
-            .consume(manifest)
-            .expect("actual effective manifest grant must consume its exact manifest");
+            .any(|operation_id| operation_id == MutationOperation::HookInstall.id()));
+        authorize_effective_supervisor_mutation_manifest(manifest)
+            .expect("actual sealed lifecycle must include every required capability");
     }
-    let bound_ids = scenarios[0]
-        .operations()
+    let bound_ids = operation_sets[0]
         .iter()
-        .map(|operation| operation.operation_id())
+        .map(String::as_str)
         .collect::<BTreeSet<_>>();
-    let existing_ids = scenarios[1]
-        .operations()
+    let existing_ids = operation_sets[1]
         .iter()
-        .map(|operation| operation.operation_id())
+        .map(String::as_str)
         .collect::<BTreeSet<_>>();
-    let fake_ids = scenarios[2]
-        .operations()
+    let fake_ids = operation_sets[2]
         .iter()
-        .map(|operation| operation.operation_id())
+        .map(String::as_str)
         .collect::<BTreeSet<_>>();
-    let primary_ids = scenarios[3]
-        .operations()
+    let primary_ids = operation_sets[3]
         .iter()
-        .map(|operation| operation.operation_id())
+        .map(String::as_str)
         .collect::<BTreeSet<_>>();
-    let unbound_ids = scenarios[4]
-        .operations()
+    let unbound_ids = operation_sets[4]
         .iter()
-        .map(|operation| operation.operation_id())
+        .map(String::as_str)
         .collect::<BTreeSet<_>>();
     assert!(bound_ids.contains(MutationOperation::WorktreeCreate.id()));
     assert!(!existing_ids.contains(MutationOperation::WorktreeCreate.id()));
@@ -263,8 +303,8 @@ fn every_effective_manifest_operation_is_registered_and_modes_are_conditional() 
     assert!(bound_ids.contains(MutationOperation::SupervisorProcessSpawn.id()));
     assert!(bound_ids.contains(MutationOperation::MachineGlobalQuarantine.id()));
     assert!(!bound_ids.contains(MutationOperation::SupervisorProcessOutputCleanup.id()));
-    assert!(unbound_ids.contains(MutationOperation::SupervisorProcessOutputCleanup.id()));
     assert!(!unbound_ids.contains(MutationOperation::MachineGlobalQuarantine.id()));
+    assert!(unbound_ids.contains(MutationOperation::SupervisorProcessOutputCleanup.id()));
     assert!(!fake_ids.contains(MutationOperation::SupervisorProcessSpawn.id()));
     assert!(!fake_ids.contains(MutationOperation::SandboxWorktreeEdit.id()));
     assert!(!fake_ids.contains(MutationOperation::SupervisorPrimaryObjectDatabaseImport.id()));
@@ -2042,6 +2082,60 @@ fn supervise_status_distinguishes_absent_active_finalized_and_corrupt_runs() {
     assert!(
         error.to_string().contains("verified finalized artifact")
             || error.to_string().contains("missing")
+    );
+}
+
+#[test]
+fn status_and_resume_do_not_repair_an_incomplete_checkpoint_head() {
+    let (_temp, repo) = injected_repository();
+    let run_id = RunId::new("read-only-status-checkpoint").expect("valid run id");
+    let writer = ArtifactRunWriter::reserve(
+        &repo,
+        RunArtifactFamily::Supervise,
+        run_id.clone(),
+        "read-only-status-test",
+    )
+    .expect("reserve active run");
+    let plan = injected_plan(injected_assignment(false), 0);
+    let ledger = RunBudgetLedger::new(RunBudgetLimits::default()).expect("status budget ledger");
+    let checkpoint = SupervisorCheckpointWriter::create(
+        &repo,
+        SupervisorCheckpointPreparation::new(
+            &run_id,
+            &current_head_oid(&repo).expect("status primary base"),
+            normalized_supervisor_plan_sha256(
+                &plan,
+                &SupervisorConsultantPlan::default(),
+                &AssignmentMetadata::new(),
+                &SupervisorPlanMetadata::default(),
+            )
+            .expect("status normalized plan"),
+            1,
+            &plan,
+            writer.resume_binding().expect("status artifact binding"),
+            ledger.report().expect("status initial budget"),
+        ),
+    )
+    .expect("create status checkpoint");
+    drop(checkpoint);
+    drop(writer);
+    let head = repo
+        .join(".git/maco/state")
+        .join(crate::state_journal::JOURNAL_ROOT_NAME)
+        .join(run_id.as_str())
+        .join(".head.json");
+    fs::remove_file(&head).expect("remove checkpoint head to require recovery");
+
+    let status = supervisor_status(&repo, run_id.clone()).expect("typed read-only status");
+    assert_eq!(status.lifecycle, SupervisorRunLifecycle::Interrupted);
+    assert!(!head.exists(), "status must not repair checkpoint state");
+
+    let resume = resume_supervisor_run(&repo, run_id).expect("typed read-only resume refusal");
+    assert_eq!(resume.lifecycle, SupervisorRunLifecycle::Interrupted);
+    assert!(!resume.resumed);
+    assert!(
+        !head.exists(),
+        "resume preflight must not repair before admission"
     );
 }
 
