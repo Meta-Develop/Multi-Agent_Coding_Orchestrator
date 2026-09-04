@@ -70,110 +70,6 @@ read_unix_mode() {
     return 1
 }
 
-read_link_count() {
-    link_count_candidate=
-    if link_count_candidate=$(stat -c '%h' "$1" 2>/dev/null); then
-        case "$link_count_candidate" in
-            ''|*[!0-9]*) ;;
-            *)
-                link_count_value=$link_count_candidate
-                return 0
-                ;;
-        esac
-    fi
-    if link_count_candidate=$(stat -f '%l' "$1" 2>/dev/null); then
-        case "$link_count_candidate" in
-            ''|*[!0-9]*) ;;
-            *)
-                link_count_value=$link_count_candidate
-                return 0
-                ;;
-        esac
-    fi
-    return 1
-}
-
-canonical_human_authorship_pre_push_dispatcher_v5() {
-    cat <<'MACO_HUMAN_AUTHORSHIP_PRE_PUSH_DISPATCHER_V5'
-#!/usr/bin/env bash
-# human-authorship-guard dispatcher v5
-set -euo pipefail
-self="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
-previous="$self.human-authorship-previous"
-input="$(mktemp)"
-trap 'rm -f "$input"' EXIT
-cat > "$input"
-if [[ -x "$previous" ]]; then
-  "$previous" "$@" < "$input"
-fi
-
-resolve_guard() {
-  local name="$1"
-  local repo_root
-  local primary
-  local common_dir
-  local fallback
-
-  repo_root="$(git rev-parse --show-toplevel)"
-  primary="$repo_root/.agents/scripts/$name"
-  if [[ -x "$primary" ]]; then
-    printf '%s\n' "$primary"
-    return 0
-  fi
-
-  if ! common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
-    printf 'human-authorship-guard dispatcher: cannot resolve Git common directory for %s\n' \
-      "$name" >&2
-    return 1
-  fi
-  fallback="$(dirname "$common_dir")/.agents/scripts/$name"
-  if [[ -x "$fallback" ]]; then
-    printf '%s\n' "$fallback"
-    return 0
-  fi
-
-  printf 'human-authorship-guard dispatcher: missing executable guard %s; checked %s and %s\n' \
-    "$name" "$primary" "$fallback" >&2
-  return 1
-}
-
-authorship_guard="$(resolve_guard check-human-authorship)"
-"$authorship_guard" approved-current
-"$authorship_guard" pre-push-approved "${1:-}" < "$input"
-private_guard="$(resolve_guard check-private-agent-paths)"
-"$private_guard" pre-push "${1:-}" < "$input"
-github_actor_guard="$(resolve_guard check-approved-github-actor)"
-"$github_actor_guard"
-MACO_HUMAN_AUTHORSHIP_PRE_PUSH_DISPATCHER_V5
-}
-
-verify_active_outer_dispatcher() {
-    outer_dispatcher=$hook_dir/pre-push
-    if [ ! -f "$outer_dispatcher" ] || [ -L "$outer_dispatcher" ]; then
-        refuse_state "$action"
-    fi
-    link_count_value=
-    if ! read_link_count "$outer_dispatcher" || [ "$link_count_value" != 1 ]; then
-        refuse_state "$action"
-    fi
-    mode_value=
-    if ! read_unix_mode "$outer_dispatcher" || [ "$mode_value" != 755 ]; then
-        refuse_state "$action"
-    fi
-    if ! canonical_human_authorship_pre_push_dispatcher_v5 |
-        cmp -s - "$outer_dispatcher"; then
-        refuse_state "$action"
-    fi
-    link_count_value=
-    if ! read_link_count "$outer_dispatcher" || [ "$link_count_value" != 1 ]; then
-        refuse_state "$action"
-    fi
-    mode_value=
-    if ! read_unix_mode "$outer_dispatcher" || [ "$mode_value" != 755 ]; then
-        refuse_state "$action"
-    fi
-}
-
 case "$hook_name" in
     pre-commit)
         action=commit
@@ -191,8 +87,6 @@ case "$hook_name" in
         refuse_state "$hook_name"
         ;;
 esac
-
-verify_active_outer_dispatcher
 
 read_state marker
 if [ "$state_value" != maco-worktree-guard-v3 ]; then

@@ -12,6 +12,7 @@ use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_maco");
 const WORKTREE_GUARD_ASSET: &[u8] = include_bytes!("../assets/maco-worktree-guard.sh");
+const WORKTREE_GUARD_ASSET_V3_LEGACY: &[u8] = include_bytes!("../assets/maco-worktree-guard-v3.sh");
 const HUMAN_AUTHORSHIP_PRE_PUSH_DISPATCHER_V5: &str = r#"#!/usr/bin/env bash
 # human-authorship-guard dispatcher v5
 set -euo pipefail
@@ -297,6 +298,285 @@ fn tampered_v5_dispatcher_fails_closed_before_and_after_installation() -> Result
     assert_eq!(fs::read(&pre_push)?, tampered.as_bytes());
     assert_eq!(fs::read(&v5_previous)?, WORKTREE_GUARD_ASSET);
     assert!(fixture.hooks.join(".maco-worktree-guard").is_dir());
+    Ok(())
+}
+
+#[test]
+fn tampered_outer_dispatcher_refuses_an_ordinary_push_before_the_user_hook() -> Result<()> {
+    let fixture = GuardFixture::new("tampered-outer-runtime")?;
+    let pre_push = fixture.hooks.join("pre-push");
+    let chained = fixture.hooks.join("pre-push.human-authorship-previous");
+    let user_backup = fixture
+        .hooks
+        .join("pre-push.human-authorship-previous.maco-worktree-guard-previous");
+    write_executable(&pre_push, USER_PRE_PUSH)?;
+    install_v5_guard_bundle(&fixture)?;
+    install_canonical_v5_dispatcher(&fixture)?;
+    run_guard_json("install", &fixture.primary)?;
+    stage_file(&fixture.primary, "tampered-outer.txt", "tampered\n")?;
+    git_success(
+        &fixture.primary,
+        &["commit", "-q", "-m", "prepare tampered outer push"],
+    )?;
+
+    let tampered = format!(
+        "{}# retained nested invocation, modified outer bytes\n",
+        HUMAN_AUTHORSHIP_PRE_PUSH_DISPATCHER_V5
+    );
+    assert!(tampered.contains("\"$previous\" \"$@\" < \"$input\""));
+    write_executable(&pre_push, &tampered)?;
+    let push = git(
+        &fixture.primary,
+        &["push", "origin", "HEAD:refs/heads/main"],
+    )?;
+    assert!(
+        !push.status.success(),
+        "tampered outer dispatcher allowed push"
+    );
+    assert!(String::from_utf8_lossy(&push.stderr).contains("installation state is invalid"));
+    assert_eq!(fs::read(&chained)?, WORKTREE_GUARD_ASSET);
+    assert_eq!(fs::read(&user_backup)?, USER_PRE_PUSH.as_bytes());
+    assert!(
+        !fixture.common.join("user-hooks.log").exists(),
+        "a preserved or outer guard hook ran before the outer-integrity refusal"
+    );
+    Ok(())
+}
+
+#[test]
+fn executable_outer_mode_drift_refuses_commit_merge_and_push_before_prior_hooks() -> Result<()> {
+    let commit_fixture = GuardFixture::new("outer-mode-commit")?;
+    write_executable(
+        &commit_fixture.hooks.join("pre-commit"),
+        "#!/bin/sh\nprintf 'user-pre-commit\\n' >> \"$(git rev-parse --git-common-dir)/user-hooks.log\"\n",
+    )?;
+    install_v5_guard_bundle(&commit_fixture)?;
+    install_canonical_v5_dispatcher(&commit_fixture)?;
+    run_guard_json("install", &commit_fixture.primary)?;
+    fs::set_permissions(
+        commit_fixture.hooks.join("pre-push"),
+        fs::Permissions::from_mode(0o775),
+    )?;
+    stage_file(&commit_fixture.primary, "mode-commit.txt", "mode\n")?;
+    let commit = git(
+        &commit_fixture.primary,
+        &["commit", "-m", "outer mode commit"],
+    )?;
+    assert!(
+        !commit.status.success(),
+        "mode-drifted outer allowed commit"
+    );
+    assert!(String::from_utf8_lossy(&commit.stderr).contains("installation state is invalid"));
+    assert!(!commit_fixture.common.join("user-hooks.log").exists());
+
+    let push_fixture = GuardFixture::new("outer-mode-push")?;
+    write_executable(&push_fixture.hooks.join("pre-push"), USER_PRE_PUSH)?;
+    install_v5_guard_bundle(&push_fixture)?;
+    install_canonical_v5_dispatcher(&push_fixture)?;
+    run_guard_json("install", &push_fixture.primary)?;
+    stage_file(&push_fixture.primary, "mode-push.txt", "mode\n")?;
+    git_success(
+        &push_fixture.primary,
+        &["commit", "-q", "-m", "prepare outer mode push"],
+    )?;
+    fs::set_permissions(
+        push_fixture.hooks.join("pre-push"),
+        fs::Permissions::from_mode(0o775),
+    )?;
+    let push = git(
+        &push_fixture.primary,
+        &["push", "origin", "HEAD:refs/heads/main"],
+    )?;
+    assert!(!push.status.success(), "mode-drifted outer allowed push");
+    assert!(String::from_utf8_lossy(&push.stderr).contains("installation state is invalid"));
+    assert!(!push_fixture.common.join("user-hooks.log").exists());
+    for operation in ["install", "verify", "uninstall"] {
+        let output = run_guard(operation, &push_fixture.primary)?;
+        assert!(
+            !output.status.success(),
+            "{operation} accepted a mode-drifted outer dispatcher"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("exact mode 0755"));
+    }
+
+    let merge_fixture = GuardFixture::new("outer-mode-merge")?;
+    write_executable(
+        &merge_fixture.hooks.join("pre-merge-commit"),
+        "#!/bin/sh\nprintf 'user-pre-merge\\n' >> \"$(git rev-parse --git-common-dir)/user-hooks.log\"\n",
+    )?;
+    install_v5_guard_bundle(&merge_fixture)?;
+    install_canonical_v5_dispatcher(&merge_fixture)?;
+    run_guard_json("install", &merge_fixture.primary)?;
+    git_success(&merge_fixture.primary, &["switch", "-q", "-c", "topic"])?;
+    stage_file(&merge_fixture.primary, "topic-mode.txt", "topic\n")?;
+    git_success(
+        &merge_fixture.primary,
+        &["commit", "-q", "-m", "topic mode commit"],
+    )?;
+    git_success(&merge_fixture.primary, &["switch", "-q", "main"])?;
+    stage_file(&merge_fixture.primary, "main-mode.txt", "main\n")?;
+    git_success(
+        &merge_fixture.primary,
+        &["commit", "-q", "-m", "main mode commit"],
+    )?;
+    fs::set_permissions(
+        merge_fixture.hooks.join("pre-push"),
+        fs::Permissions::from_mode(0o775),
+    )?;
+    let merge = git(
+        &merge_fixture.primary,
+        &["merge", "--no-ff", "topic", "-m", "outer mode merge"],
+    )?;
+    assert!(!merge.status.success(), "mode-drifted outer allowed merge");
+    assert!(String::from_utf8_lossy(&merge.stderr).contains("installation state is invalid"));
+    assert!(!merge_fixture.common.join("user-hooks.log").exists());
+    Ok(())
+}
+
+#[test]
+fn non_executable_outer_is_cli_detected_but_git_skips_the_push_hook() -> Result<()> {
+    let fixture = GuardFixture::new("outer-mode-non-executable")?;
+    let pre_push = fixture.hooks.join("pre-push");
+    write_executable(&pre_push, USER_PRE_PUSH)?;
+    install_v5_guard_bundle(&fixture)?;
+    install_canonical_v5_dispatcher(&fixture)?;
+    run_guard_json("install", &fixture.primary)?;
+    stage_file(&fixture.primary, "non-executable-outer.txt", "mode\n")?;
+    git_success(
+        &fixture.primary,
+        &["commit", "-q", "-m", "prepare skipped push hook"],
+    )?;
+    fs::set_permissions(&pre_push, fs::Permissions::from_mode(0o644))?;
+
+    let verify = run_guard("verify", &fixture.primary)?;
+    assert!(!verify.status.success());
+    assert!(String::from_utf8_lossy(&verify.stderr).contains("exact mode 0755"));
+    let push = git(
+        &fixture.primary,
+        &["push", "origin", "HEAD:refs/heads/main"],
+    )?;
+    assert_success(push, "push with Git-skipped non-executable outer hook");
+    assert!(!fixture.common.join("user-hooks.log").exists());
+    Ok(())
+}
+
+#[test]
+fn exact_legacy_install_upgrades_in_place_without_changing_backups() -> Result<()> {
+    let fixture = GuardFixture::new("legacy-upgrade")?;
+    let pre_commit = fixture.hooks.join("pre-commit");
+    let pre_merge = fixture.hooks.join("pre-merge-commit");
+    let pre_push = fixture.hooks.join("pre-push");
+    write_executable(&pre_commit, "#!/bin/sh\nexit 0\n")?;
+    write_executable(&pre_merge, "#!/bin/sh\nexit 0\n")?;
+    write_executable(&pre_push, USER_PRE_PUSH)?;
+    let originals = [
+        fs::read(&pre_commit)?,
+        fs::read(&pre_merge)?,
+        fs::read(&pre_push)?,
+    ];
+    install_v5_guard_bundle(&fixture)?;
+    install_canonical_v5_dispatcher(&fixture)?;
+    run_guard_json("install", &fixture.primary)?;
+    let targets = active_guard_targets(&fixture);
+    let backups = targets.each_ref().map(|target| guard_backup_path(target));
+    let backup_snapshots = backups
+        .each_ref()
+        .map(|backup| (fs::read(backup), fs::symlink_metadata(backup)))
+        .map(|(bytes, metadata)| {
+            Ok::<_, anyhow::Error>((bytes?, metadata?.permissions().mode() & 0o7777))
+        });
+    let backup_snapshots = backup_snapshots.into_iter().collect::<Result<Vec<_>>>()?;
+    for target in &targets {
+        fs::write(target, WORKTREE_GUARD_ASSET_V3_LEGACY)?;
+        fs::set_permissions(target, fs::Permissions::from_mode(0o755))?;
+    }
+
+    let verify = run_guard("verify", &fixture.primary)?;
+    assert!(!verify.status.success());
+    assert!(String::from_utf8_lossy(&verify.stderr).contains("requires an in-place upgrade"));
+    assert_eq!(
+        run_guard_json("install", &fixture.primary)?["status"],
+        "installed"
+    );
+    for (target, (backup, snapshot)) in targets
+        .iter()
+        .zip(backups.iter().zip(backup_snapshots.iter()))
+    {
+        assert_eq!(fs::read(target)?, WORKTREE_GUARD_ASSET);
+        assert_eq!(fs::read(backup)?, snapshot.0);
+        assert_eq!(
+            fs::symlink_metadata(backup)?.permissions().mode() & 0o7777,
+            snapshot.1
+        );
+    }
+    assert_eq!(
+        run_guard_json("install", &fixture.primary)?["status"],
+        "already_installed"
+    );
+    assert_eq!(
+        run_guard_json("uninstall", &fixture.primary)?["status"],
+        "removed"
+    );
+    assert_eq!(fs::read(&pre_commit)?, originals[0]);
+    assert_eq!(fs::read(&pre_merge)?, originals[1]);
+    assert_eq!(
+        fs::read(fixture.hooks.join("pre-push.human-authorship-previous"))?,
+        originals[2]
+    );
+    assert_eq!(
+        fs::read(&pre_push)?,
+        HUMAN_AUTHORSHIP_PRE_PUSH_DISPATCHER_V5.as_bytes()
+    );
+    Ok(())
+}
+
+#[test]
+fn interrupted_legacy_upgrade_is_recovered_before_uninstall() -> Result<()> {
+    let fixture = GuardFixture::new("legacy-upgrade-interrupted")?;
+    let pre_push = fixture.hooks.join("pre-push");
+    write_executable(&pre_push, USER_PRE_PUSH)?;
+    install_v5_guard_bundle(&fixture)?;
+    install_canonical_v5_dispatcher(&fixture)?;
+    run_guard_json("install", &fixture.primary)?;
+    let targets = active_guard_targets(&fixture);
+    let nested = &targets[0];
+    let pre_commit = &targets[1];
+    let pre_merge = &targets[2];
+    fs::write(pre_commit, WORKTREE_GUARD_ASSET_V3_LEGACY)?;
+    fs::set_permissions(pre_commit, fs::Permissions::from_mode(0o755))?;
+    fs::write(pre_merge, WORKTREE_GUARD_ASSET_V3_LEGACY)?;
+    fs::set_permissions(pre_merge, fs::Permissions::from_mode(0o755))?;
+    assert_eq!(fs::read(nested)?, WORKTREE_GUARD_ASSET);
+
+    let staged_commit = guard_staged_path(pre_commit);
+    write_executable_bytes(&staged_commit, WORKTREE_GUARD_ASSET)?;
+    let staged_merge = guard_staged_path(pre_merge);
+    write_executable(&staged_merge, "#!/bin/sh\nexit 9\n")?;
+    let refused = run_guard("install", &fixture.primary)?;
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("staged upgrade changed"));
+    assert_eq!(fs::read(pre_commit)?, WORKTREE_GUARD_ASSET_V3_LEGACY);
+    assert_eq!(fs::read(pre_merge)?, WORKTREE_GUARD_ASSET_V3_LEGACY);
+
+    fs::remove_file(&staged_merge)?;
+    let interrupted_verify = run_guard("verify", &fixture.primary)?;
+    assert!(!interrupted_verify.status.success());
+    assert!(String::from_utf8_lossy(&interrupted_verify.stderr)
+        .contains("requires an in-place upgrade"));
+    assert_eq!(
+        run_guard_json("uninstall", &fixture.primary)?["status"],
+        "removed"
+    );
+    assert!(!staged_commit.exists());
+    assert!(!fixture.hooks.join(".maco-worktree-guard").exists());
+    assert_eq!(
+        fs::read(fixture.hooks.join("pre-push.human-authorship-previous"))?,
+        USER_PRE_PUSH.as_bytes()
+    );
+    assert_eq!(
+        fs::read(&pre_push)?,
+        HUMAN_AUTHORSHIP_PRE_PUSH_DISPATCHER_V5.as_bytes()
+    );
     Ok(())
 }
 
@@ -824,6 +1104,34 @@ fn write_executable(path: &Path, contents: &str) -> Result<()> {
     fs::write(path, contents)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
     Ok(())
+}
+
+fn write_executable_bytes(path: &Path, contents: &[u8]) -> Result<()> {
+    fs::write(path, contents)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
+fn active_guard_targets(fixture: &GuardFixture) -> [PathBuf; 3] {
+    [
+        fixture.hooks.join("pre-push.human-authorship-previous"),
+        fixture.hooks.join("pre-commit"),
+        fixture.hooks.join("pre-merge-commit"),
+    ]
+}
+
+fn guard_backup_path(target: &Path) -> PathBuf {
+    let name = target.file_name().expect("test hook path has a filename");
+    let mut backup = name.to_os_string();
+    backup.push(".maco-worktree-guard-previous");
+    target.with_file_name(backup)
+}
+
+fn guard_staged_path(target: &Path) -> PathBuf {
+    let name = target.file_name().expect("test hook path has a filename");
+    let mut staged = name.to_os_string();
+    staged.push(".maco-worktree-guard-installing");
+    target.with_file_name(staged)
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<Output> {
