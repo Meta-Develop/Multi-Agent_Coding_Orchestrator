@@ -1783,7 +1783,6 @@
           "timed_out",
           "stdout",
           "stderr",
-          "sandbox_denials",
           "environment_preflight_results",
           "environment_failures"
         ],
@@ -5164,7 +5163,6 @@
                       "timed_out",
                       "stdout",
                       "stderr",
-                      "sandbox_denials",
                       "environment_preflight_results",
                       "environment_failures"
                     ],
@@ -5533,6 +5531,7 @@
                 "validation_results",
                 "findings",
                 "rejection_kind",
+                "no_further_delegation",
                 "read_only",
                 "accepted",
                 "rejected",
@@ -6225,7 +6224,6 @@
                 "timed_out",
                 "stdout",
                 "stderr",
-                "sandbox_denials",
                 "environment_preflight_results",
                 "environment_failures"
               ],
@@ -9858,7 +9856,6 @@
                       "timed_out",
                       "stdout",
                       "stderr",
-                      "sandbox_denials",
                       "environment_preflight_results",
                       "environment_failures"
                     ],
@@ -10332,6 +10329,7 @@
                 "field_guide_entries",
                 "bloated_file_flags",
                 "decomposition_completion",
+                "no_further_delegation",
                 "accepted",
                 "rejected",
                 "status",

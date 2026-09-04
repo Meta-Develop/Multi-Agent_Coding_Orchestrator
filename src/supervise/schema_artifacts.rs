@@ -306,7 +306,7 @@ fn supervisor_report_properties_value(run_lifecycle: &str) -> serde_json::Value 
           },
           "decomposition_candidates": {
               "type": "array",
-              "items": decomposition_completion_object_schema_value()
+              "items": supervisor_final_decomposition_completion_object_schema_value()
           },
           "generated_follow_up_tasks": generated_follow_up_tasks_schema_value(),
           "assignment_traceability": {
@@ -317,7 +317,7 @@ fn supervisor_report_properties_value(run_lifecycle: &str) -> serde_json::Value 
           "breaker_trip": {
               "anyOf": [supervisor_breaker_trip_schema_value(), {"type": "null"}]
           },
-          "orchestrator_reports": {"type": "array", "items": orchestrator_report_schema_value()}
+          "orchestrator_reports": {"type": "array", "items": supervisor_final_orchestrator_report_schema_value()}
         }),
         json!({
           "released_claims": {"type": "array", "items": path_claim_schema_value()},
@@ -1762,6 +1762,23 @@ fn run_budget_report_schema_value() -> serde_json::Value {
 }
 
 pub(super) fn orchestrator_report_schema_value() -> serde_json::Value {
+    orchestrator_report_schema_value_with_decomposition(
+        worker_report_schema_value(),
+        decomposition_completion_object_schema_value(),
+    )
+}
+
+fn supervisor_final_orchestrator_report_schema_value() -> serde_json::Value {
+    orchestrator_report_schema_value_with_decomposition(
+        supervisor_final_worker_report_schema_value(),
+        supervisor_final_decomposition_completion_object_schema_value(),
+    )
+}
+
+fn orchestrator_report_schema_value_with_decomposition(
+    worker_report_schema: serde_json::Value,
+    decomposition_completion_schema: serde_json::Value,
+) -> serde_json::Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "OrchestratorReviewReport",
@@ -1802,13 +1819,13 @@ pub(super) fn orchestrator_report_schema_value() -> serde_json::Value {
             "validation_results": {"type": "array", "items": validation_result_schema_value()},
             "findings": {"type": "array", "items": finding_schema_value()},
             "field_guide_entries": field_guide_entries_schema_value(),
-            "worker_reports": {"type": "array", "items": worker_report_schema_value()},
+            "worker_reports": {"type": "array", "items": worker_report_schema},
             "audit_reports": {"type": "array", "items": auditor_report_schema_value()},
             "review_lens_aggregate": review_lens_aggregate_schema_value(),
             "decomposition_completions": {
                 "type": "array",
                 "uniqueItems": true,
-                "items": decomposition_completion_object_schema_value()
+                "items": decomposition_completion_schema
             },
             "licensed_breakage_review": licensed_breakage_review_schema_value(),
             "generated_follow_up_tasks": generated_follow_up_tasks_schema_value(),
@@ -3033,6 +3050,7 @@ pub(super) fn auditor_report_schema_value() -> serde_json::Value {
             "validation_results",
             "findings",
             "rejection_kind",
+            "no_further_delegation",
             "read_only",
             "accepted",
             "rejected",
@@ -3066,6 +3084,18 @@ pub(super) fn auditor_report_schema_value() -> serde_json::Value {
 }
 
 pub(super) fn worker_report_schema_value() -> serde_json::Value {
+    worker_report_schema_value_with_decomposition(decomposition_completion_schema_value())
+}
+
+fn supervisor_final_worker_report_schema_value() -> serde_json::Value {
+    worker_report_schema_value_with_decomposition(
+        supervisor_final_decomposition_completion_schema_value(),
+    )
+}
+
+fn worker_report_schema_value_with_decomposition(
+    decomposition_completion_schema: serde_json::Value,
+) -> serde_json::Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "WorkerReport",
@@ -3087,6 +3117,7 @@ pub(super) fn worker_report_schema_value() -> serde_json::Value {
             "field_guide_entries",
             "bloated_file_flags",
             "decomposition_completion",
+            "no_further_delegation",
             "accepted",
             "rejected",
             "status",
@@ -3115,7 +3146,7 @@ pub(super) fn worker_report_schema_value() -> serde_json::Value {
                 "uniqueItems": true,
                 "items": bloated_file_flag_schema_value()
             },
-            "decomposition_completion": decomposition_completion_schema_value(),
+            "decomposition_completion": decomposition_completion_schema,
             "no_further_delegation": {"type": "boolean", "const": true},
             "accepted": {"type": "boolean"},
             "rejected": {"type": "boolean"},
@@ -3170,40 +3201,50 @@ fn bloated_file_flag_schema_value() -> serde_json::Value {
 }
 
 pub(super) fn decomposition_completion_schema_value() -> serde_json::Value {
-    json!({
-        "type": ["object", "null"],
-        "additionalProperties": false,
-        "required": ["target_path", "replacement_paths"],
-        "properties": {
-            "target_path": {"type": "string", "minLength": 1},
-            "replacement_paths": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": MAX_DECOMPOSITION_REPLACEMENT_PATHS,
-                "uniqueItems": true,
-                "items": {"type": "string", "minLength": 1}
-            },
-            "supervisor_candidate_binding": candidate_validation_binding_schema_value()
-        }
-    })
+    decomposition_completion_schema_value_with_binding(json!(["object", "null"]), false)
 }
 
 fn decomposition_completion_object_schema_value() -> serde_json::Value {
+    decomposition_completion_schema_value_with_binding(json!("object"), false)
+}
+
+fn supervisor_final_decomposition_completion_schema_value() -> serde_json::Value {
+    decomposition_completion_schema_value_with_binding(json!(["object", "null"]), true)
+}
+
+fn supervisor_final_decomposition_completion_object_schema_value() -> serde_json::Value {
+    decomposition_completion_schema_value_with_binding(json!("object"), true)
+}
+
+fn decomposition_completion_schema_value_with_binding(
+    schema_type: serde_json::Value,
+    include_supervisor_binding: bool,
+) -> serde_json::Value {
+    let base_properties = json!({
+        "target_path": {"type": "string", "minLength": 1},
+        "replacement_paths": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": MAX_DECOMPOSITION_REPLACEMENT_PATHS,
+            "uniqueItems": true,
+            "items": {"type": "string", "minLength": 1}
+        }
+    });
+    let properties = if include_supervisor_binding {
+        merge_schema_property_groups([
+            base_properties,
+            json!({
+                "supervisor_candidate_binding": candidate_validation_binding_schema_value()
+            }),
+        ])
+    } else {
+        base_properties
+    };
     json!({
-        "type": "object",
+        "type": schema_type,
         "additionalProperties": false,
         "required": ["target_path", "replacement_paths"],
-        "properties": {
-            "target_path": {"type": "string", "minLength": 1},
-            "replacement_paths": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": MAX_DECOMPOSITION_REPLACEMENT_PATHS,
-                "uniqueItems": true,
-                "items": {"type": "string", "minLength": 1}
-            },
-            "supervisor_candidate_binding": candidate_validation_binding_schema_value()
-        }
+        "properties": properties
     })
 }
 
@@ -3220,7 +3261,6 @@ pub(super) fn command_run_record_schema_value() -> serde_json::Value {
             "timed_out",
             "stdout",
             "stderr",
-            "sandbox_denials",
             "environment_preflight_results",
             "environment_failures"
         ],
