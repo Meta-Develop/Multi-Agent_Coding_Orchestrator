@@ -65,7 +65,24 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 16384,
-      "pattern": "^(?![\\\\/])(?![A-Za-z]:)(?!.*(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$))[^\\u0000-\\u001F]+$",
+      "pattern": "^[^\\u0000-\\u001F]+$",
+      "allOf": [
+        {
+          "not": {
+            "pattern": "^[\\\\/]"
+          }
+        },
+        {
+          "not": {
+            "pattern": "^[A-Za-z]:"
+          }
+        },
+        {
+          "not": {
+            "pattern": "(^|[\\\\/])\\.\\.([\\\\/]|$)"
+          }
+        }
+      ],
       "description": "Producer-normalized repository-relative path; native separators remain platform-dependent."
     },
     "nullableRepositoryRelativePath": {

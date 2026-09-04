@@ -1,0 +1,133 @@
+{
+  "preview": {
+    "candidate": {
+      "metadata": {
+        "agent_id": "agent-a",
+        "worktree_path": "/workspace/repository/.worktrees/agent-a",
+        "branch": "agent/agent-a",
+        "primary_repo_root": "/workspace/repository",
+        "primary_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "agent_head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "merge_base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "base_matches_primary": true
+      },
+      "claimed_paths": [
+        "src/lib.rs"
+      ],
+      "changed_paths": [],
+      "changes": [],
+      "unclaimed_changed_paths": [],
+      "diff": {
+        "summary": {
+          "text": "",
+          "truncated": false
+        },
+        "full": ""
+      },
+      "validations": [],
+      "validation_binding": {
+        "version": 1,
+        "agent_id": "agent-a",
+        "primary_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "agent_head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "merge_base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "diff_oid": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+      }
+    },
+    "safety": {
+      "primary_state_unchanged": {
+        "status": "passed",
+        "message": null,
+        "paths": []
+      },
+      "dirty_primary": {
+        "status": "passed",
+        "message": null,
+        "paths": []
+      },
+      "stale_base": {
+        "status": "passed",
+        "message": null,
+        "paths": []
+      },
+      "apply_check": {
+        "status": "passed",
+        "message": null,
+        "paths": []
+      },
+      "unclaimed_edits": {
+        "status": "passed",
+        "message": null,
+        "paths": []
+      },
+      "validation": {
+        "status": "skipped",
+        "message": "validation was not required",
+        "paths": []
+      },
+      "validation_evidence": {
+        "status": "skipped",
+        "binding_status": "not_required",
+        "message": "validation evidence was not required",
+        "paths": []
+      },
+      "megafile": {
+        "status": "passed",
+        "message": null,
+        "paths": []
+      },
+      "megafile_warnings": [],
+      "megafile_decomposition_target": null,
+      "megafile_decomposition_evidence": null,
+      "megafile_blocking": false,
+      "validation_required": false,
+      "candidate_validation_commands": [],
+      "force_options": {
+        "allow_dirty_primary": false,
+        "allow_stale_base": false,
+        "allow_unclaimed_edits": false,
+        "allow_validation_failures": false,
+        "allow_apply_conflicts": false
+      },
+      "apply_mode": "none",
+      "semantic_conflicts": {
+        "advisory": true,
+        "status": "no_conflict",
+        "risk": "none",
+        "confidence": "high",
+        "degraded": false,
+        "conflict_paths": [],
+        "overlaps": []
+      },
+      "readiness": {
+        "status": "safe",
+        "blockers": [],
+        "forced": [],
+        "details": []
+      }
+    },
+    "review_intent": {
+      "candidate_validation_commands": [],
+      "require_validation_after_candidate": false,
+      "auto_reap_merged": false,
+      "trunk_ref": null,
+      "apply_auto_reap": false
+    }
+  },
+  "status": "nothing_to_apply",
+  "applied": false,
+  "review_bound": true,
+  "review_binding_status": "matched",
+  "gate_denials": [],
+  "stdout": {
+    "text": "Nothing to apply.",
+    "truncated": false
+  },
+  "stderr": {
+    "text": "",
+    "truncated": false
+  },
+  "error": null,
+  "recorded_collision_paths": [],
+  "accepted_decomposition": null
+}

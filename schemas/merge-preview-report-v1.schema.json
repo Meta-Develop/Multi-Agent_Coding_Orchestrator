@@ -135,7 +135,24 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 4096,
-      "pattern": "^(?![\\\\/])(?![A-Za-z]:)(?!.*(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$))[^\\u0000-\\u001F]+$",
+      "pattern": "^[^\\u0000-\\u001F]+$",
+      "allOf": [
+        {
+          "not": {
+            "pattern": "^[\\\\/]"
+          }
+        },
+        {
+          "not": {
+            "pattern": "^[A-Za-z]:"
+          }
+        },
+        {
+          "not": {
+            "pattern": "(^|[\\\\/])\\.\\.([\\\\/]|$)"
+          }
+        }
+      ],
       "description": "Canonical repository-relative path. Native path spelling and non-UTF-8 escape text remain producer-defined."
     },
     "nullableRepositoryRelativePath": {

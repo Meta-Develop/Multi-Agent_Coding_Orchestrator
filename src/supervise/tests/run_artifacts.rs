@@ -1,5 +1,168 @@
 use super::*;
 
+fn validate_supervisor_reports_with_draft_2020_12(
+    valid_reports: &[PathBuf],
+    drifted_report: &Path,
+) {
+    let schema_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("schemas/supervisor-final-report-v1.schema.json");
+    let schema: serde_json::Value = serde_json::from_slice(
+        &fs::read(&schema_path).expect("read tracked supervisor final-report schema"),
+    )
+    .expect("parse tracked supervisor final-report schema");
+    let schema_id = schema["$id"]
+        .as_str()
+        .expect("tracked supervisor final-report schema id");
+    let mut compiler = boon::Compiler::new();
+    compiler.set_default_draft(boon::Draft::V2020_12);
+    compiler
+        .add_resource(schema_id, schema.clone())
+        .expect("register tracked Draft 2020-12 supervisor schema");
+    let dependency_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("schemas/merge-preview-report-v1.schema.json");
+    let dependency: serde_json::Value = serde_json::from_slice(
+        &fs::read(&dependency_path).expect("read supervisor schema dependency"),
+    )
+    .expect("parse supervisor schema dependency");
+    let dependency_id = dependency["$id"]
+        .as_str()
+        .expect("supervisor schema dependency id");
+    compiler
+        .add_resource(dependency_id, dependency.clone())
+        .expect("register supervisor schema dependency");
+    let mut schemas = boon::Schemas::new();
+    let index = compiler
+        .compile(schema_id, &mut schemas)
+        .expect("meta-validate and compile tracked Draft 2020-12 supervisor schema");
+
+    for report in valid_reports {
+        let instance: serde_json::Value = serde_json::from_slice(
+            &fs::read(report).expect("read persisted supervisor report for schema validation"),
+        )
+        .expect("parse persisted supervisor report for schema validation");
+        schemas.validate(&instance, index).unwrap_or_else(|error| {
+            panic!(
+                "persisted supervisor report {} failed Draft 2020-12 validation: {error:#}",
+                report.display()
+            )
+        });
+    }
+
+    let drifted: serde_json::Value = serde_json::from_slice(
+        &fs::read(drifted_report).expect("read deliberately drifted supervisor report"),
+    )
+    .expect("parse deliberately drifted supervisor report");
+    let error = schemas
+        .validate(&drifted, index)
+        .expect_err("a deliberately drifted production runtime must be rejected");
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("runtime") && rendered.contains("enum"),
+        "deliberate drift was not rejected by the runtime enum: {rendered}"
+    );
+}
+
+#[test]
+fn production_persistence_emits_schema_valid_finalized_reports_for_every_runtime_and_outcome() {
+    let runtimes = [
+        SupervisorRuntime::Codex,
+        SupervisorRuntime::Fake,
+        SupervisorRuntime::Grok,
+        SupervisorRuntime::Cursor,
+        SupervisorRuntime::ClaudeCode,
+        SupervisorRuntime::GeminiCli,
+    ];
+    let tracked_schema: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/schemas/supervisor-final-report-v1.schema.json"
+    )))
+    .expect("parse tracked supervisor final-report schema");
+    let runtime_values = tracked_schema["properties"]["runtime"]["enum"]
+        .as_array()
+        .expect("tracked runtime enum");
+    let mut retained_roots = Vec::new();
+    let mut persisted_reports = Vec::new();
+    let mut drifted_report = None;
+
+    for runtime in runtimes {
+        for expected_success in [true, false] {
+            let (temp, repo_path) = injected_repository();
+            if !expected_success {
+                fs::write(repo_path.join("README.md"), "dirty\n")
+                    .expect("dirty failure-class primary worktree");
+            }
+            let mut plan = injected_plan(injected_assignment(false), 0);
+            plan.assignments.clear();
+            let outcome = if expected_success {
+                "success"
+            } else {
+                "failure"
+            };
+            let run_id = format!("schema-{}-{outcome}", runtime.as_str());
+            let mut options = injected_options(&repo_path, temp.path(), &run_id);
+            options.runtime = runtime;
+            options.allow_dirty_primary = false;
+            let mut runner = |_command: &ExternalAgentCommand| -> ExternalAgentRun {
+                panic!("an empty supervisor plan must not launch an external runtime")
+            };
+
+            let report = run_supervisor_plan_with_runner(
+                plan,
+                SupervisorConsultantPlan::default(),
+                options,
+                SupervisorExecutionRuntime::NonpublishableSimulation,
+                &mut runner,
+            )
+            .expect("persist reachable runtime final report");
+            assert_eq!(report.runtime, runtime);
+            assert_eq!(report.success, expected_success);
+            assert_eq!(report.run_lifecycle, SupervisorRunLifecycle::Finalized);
+            assert!(report.role_economics_profile.is_some());
+            assert_eq!(report.role_usage.len(), 5);
+
+            let run_id = RunId::new(&run_id).expect("valid runtime schema run id");
+            let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
+                .expect("open finalized runtime report artifact");
+            let restored =
+                read_supervisor_final_report(&reader).expect("read finalized runtime report");
+            assert_eq!(restored, report);
+            let report_path = repo_path
+                .join(RunArtifactFamily::Supervise.run_root())
+                .join(run_id.as_str())
+                .join(RunArtifactFamily::Supervise.final_report_relative_path());
+            let persisted: serde_json::Value = serde_json::from_slice(
+                &fs::read(&report_path).expect("read persisted supervisor final report"),
+            )
+            .expect("decode persisted supervisor final report");
+            assert_eq!(persisted["run_lifecycle"], "finalized");
+            assert!(runtime_values.contains(&persisted["runtime"]));
+
+            if drifted_report.is_none() {
+                let mut drifted = persisted;
+                drifted["runtime"] = json!("drifted-runtime");
+                assert!(!runtime_values.contains(&drifted["runtime"]));
+                let path = temp.path().join("drifted-supervisor-final.json");
+                fs::write(
+                    &path,
+                    serde_json::to_vec_pretty(&drifted)
+                        .expect("encode deliberately drifted production report"),
+                )
+                .expect("write deliberately drifted production report");
+                drifted_report = Some(path);
+            }
+            persisted_reports.push(report_path);
+            retained_roots.push(temp);
+        }
+    }
+
+    validate_supervisor_reports_with_draft_2020_12(
+        &persisted_reports,
+        drifted_report
+            .as_deref()
+            .expect("one production report was deliberately drifted"),
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn worker_codex_schema_artifact_is_authenticated_across_resume_and_refuses_mutation() {

@@ -1,12 +1,13 @@
 mod support;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use boon::{Compiler, Draft, SchemaIndex, Schemas};
 use git2::{Oid, Repository, Signature};
 use serde_json::Value;
 use std::{
     collections::BTreeSet,
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -17,6 +18,125 @@ use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
 const PAUSED_CANDIDATE_VALIDATION_COMMAND: &str = "printf ready > validation-ready; while [ ! -f validation-release ]; do sleep 0.05; done; rm -f validation-ready validation-release";
+const DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
+
+#[derive(Debug, PartialEq, Eq)]
+struct PrimarySnapshot {
+    primary_worktree: Vec<FileSystemSnapshotEntry>,
+    primary_head: Vec<u8>,
+    primary_index: Vec<u8>,
+    primary_status: Vec<u8>,
+    managed_registry_and_pending_operations: Vec<FileSystemSnapshotEntry>,
+    managed_execution_leases: Vec<FileSystemSnapshotEntry>,
+    candidate_worktree: Vec<FileSystemSnapshotEntry>,
+    candidate_head: Vec<u8>,
+    candidate_index: Vec<u8>,
+    candidate_status: Vec<u8>,
+    repository_mutation_lock: Option<Vec<u8>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FileSystemSnapshotEntry {
+    path: PathBuf,
+    mode: u32,
+    contents: FileSystemSnapshotContents,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FileSystemSnapshotContents {
+    Directory,
+    File(Vec<u8>),
+    Symlink(PathBuf),
+}
+
+struct MergeV2Schemas {
+    schemas: Schemas,
+    preview: SchemaIndex,
+    apply: SchemaIndex,
+}
+
+impl MergeV2Schemas {
+    fn load() -> Result<Self> {
+        let mut compiler = Compiler::new();
+        compiler.set_default_draft(Draft::V2020_12);
+        let mut preview_id = None;
+        let mut apply_id = None;
+
+        for name in [
+            "merge-preview-report-v1.schema.json",
+            "merge-apply-report-v1.schema.json",
+            "merge-preview-report-v2.schema.json",
+            "merge-apply-report-v2.schema.json",
+        ] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("schemas")
+                .join(name);
+            let schema: Value = serde_json::from_slice(
+                &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+            )
+            .with_context(|| format!("parse {}", path.display()))?;
+            if schema.get("$schema").and_then(Value::as_str) != Some(DRAFT_2020_12) {
+                bail!("{name} does not declare JSON Schema Draft 2020-12");
+            }
+            let schema_id = schema
+                .get("$id")
+                .and_then(Value::as_str)
+                .with_context(|| format!("{name} must declare a string $id"))?
+                .to_owned();
+            compiler
+                .add_resource(&schema_id, schema)
+                .map_err(|error| anyhow::anyhow!("register {name}: {error:#}"))?;
+            match name {
+                "merge-preview-report-v2.schema.json" => preview_id = Some(schema_id),
+                "merge-apply-report-v2.schema.json" => apply_id = Some(schema_id),
+                _ => {}
+            }
+        }
+
+        let mut schemas = Schemas::new();
+        let preview = compiler
+            .compile(
+                preview_id
+                    .as_deref()
+                    .context("missing merge preview v2 id")?,
+                &mut schemas,
+            )
+            .map_err(|error| anyhow::anyhow!("compile merge preview v2 schema: {error:#}"))?;
+        let apply = compiler
+            .compile(
+                apply_id.as_deref().context("missing merge apply v2 id")?,
+                &mut schemas,
+            )
+            .map_err(|error| anyhow::anyhow!("compile merge apply v2 schema: {error:#}"))?;
+        Ok(Self {
+            schemas,
+            preview,
+            apply,
+        })
+    }
+
+    fn assert_preview_valid(&self, instance: &Value) -> Result<()> {
+        self.assert_valid(instance, self.preview, "merge preview v2")
+    }
+
+    fn assert_apply_valid(&self, instance: &Value) -> Result<()> {
+        self.assert_valid(instance, self.apply, "merge apply v2")
+    }
+
+    fn assert_preview_rejected(&self, instance: &Value, drift: &str) -> Result<()> {
+        if self.schemas.validate(instance, self.preview).is_ok() {
+            bail!("merge preview v2 schema accepted deliberate live-output drift: {drift}");
+        }
+        Ok(())
+    }
+
+    fn assert_valid(&self, instance: &Value, index: SchemaIndex, label: &str) -> Result<()> {
+        if let Err(error) = self.schemas.validate(instance, index) {
+            bail!("live {label} output failed Draft 2020-12 validation: {error:#}");
+        }
+        Ok(())
+    }
+}
 
 #[test]
 fn merge_arbitrate_help_exposes_only_the_explicit_neutral_entrypoint() -> Result<()> {
@@ -84,6 +204,73 @@ fn merge_preview_and_apply_help_do_not_inherit_arbitration_options() -> Result<(
 }
 
 #[test]
+fn merge_preview_v2_schema_validates_live_dependency_spans_and_rejects_drift() -> Result<()> {
+    support::require_containment!(
+        "merge_preview_v2_schema_validates_live_dependency_spans_and_rejects_drift"
+    );
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    fs::write(
+        repo_path.join("src/lib.rs"),
+        "pub mod consumer;\npub mod shared;\n",
+    )?;
+    fs::write(
+        repo_path.join("src/shared.rs"),
+        "pub fn compute() -> i32 {\n    1\n}\n",
+    )?;
+    fs::write(
+        repo_path.join("src/consumer.rs"),
+        "use crate::shared::compute;\n\npub fn consume() -> i32 { compute() }\n",
+    )?;
+    let primary = Repository::open(&repo_path)?;
+    commit_all(&primary, "add semantic dependency fixture")?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(
+        worktree_path.join("src/shared.rs"),
+        "pub fn compute() -> i32 {\n    2\n}\n",
+    )?;
+    fs::write(
+        repo_path.join("src/shared.rs"),
+        "pub fn compute() -> i32 {\n    3\n}\n",
+    )?;
+    commit_all(&primary, "change primary function")?;
+
+    let preview = run_success_json(&[
+        "merge",
+        "preview",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "src/shared.rs",
+        "--json",
+    ])?;
+    let dependency_impacts = preview["safety"]["semantic_conflicts"]["overlaps"][0]
+        ["dependency_impacts"]
+        .as_array()
+        .context("live merge preview dependency impacts")?;
+    assert!(
+        !dependency_impacts.is_empty(),
+        "live merge preview omitted dependency spans: {preview}"
+    );
+    assert!(dependency_impacts.iter().all(|impact| {
+        impact["impact"]["dependency"]["span"]["signature_end_line"].is_number()
+    }));
+
+    let schemas = MergeV2Schemas::load()?;
+    schemas.assert_preview_valid(&preview)?;
+    let mut drifted = preview.clone();
+    drifted["safety"]["semantic_conflicts"]["overlaps"][0]["dependency_impacts"][0]["impact"]
+        ["dependency"]["span"]
+        .as_object_mut()
+        .context("live merge preview dependency span object")?
+        .remove("signature_end_line");
+    schemas.assert_preview_rejected(&drifted, "dependency span omitted signature_end_line")
+}
+
+#[test]
 fn merge_arbitrate_refuses_primary_claim_before_repository_or_runner_access() -> Result<()> {
     let output = Command::new(BIN)
         .args([
@@ -148,6 +335,730 @@ fn merge_arbitrate_refuses_duplicate_sides_before_repository_or_runner_access() 
 }
 
 #[test]
+fn merge_apply_without_reviewed_evidence_refuses_before_repository_mutation() -> Result<()> {
+    support::require_containment!(
+        "merge_apply_without_reviewed_evidence_refuses_before_repository_mutation"
+    );
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(worktree_path.join("README.md"), "# unreviewed\n").context("edit worktree")?;
+    let before_apply = capture_primary_snapshot(&repo_path, worktree_path, Path::new("README.md"))?;
+
+    let output = Command::new(BIN)
+        .args([
+            "merge",
+            "apply",
+            "agent-a",
+            "--repo",
+            repo,
+            "--claim",
+            "README.md",
+            "--json",
+        ])
+        .output()
+        .context("run unreviewed apply")?;
+    assert!(!output.status.success());
+    let refusal: Value = serde_json::from_slice(&output.stdout).context("parse refusal JSON")?;
+    MergeV2Schemas::load()?.assert_apply_valid(&refusal)?;
+    assert_eq!(refusal["version"], 2);
+    assert_eq!(refusal["status"], "refused");
+    assert_eq!(refusal["applied"], false);
+    assert_eq!(refusal["review_bound"], false);
+    assert_eq!(refusal["review_binding_status"], "missing");
+    assert_eq!(refusal["refusal"]["kind"], "reviewed_preview_evidence");
+    assert_eq!(refusal["refusal"]["axes"], serde_json::json!([]));
+    assert_eq!(
+        capture_primary_snapshot(&repo_path, worktree_path, Path::new("README.md"))?,
+        before_apply,
+        "missing reviewed evidence mutated repository state"
+    );
+    Ok(())
+}
+
+#[test]
+fn merge_apply_accepts_full_preview_and_nested_watermark_inputs() -> Result<()> {
+    support::require_containment!("merge_apply_accepts_full_preview_and_nested_watermark_inputs");
+    let schemas = MergeV2Schemas::load()?;
+    for nested in [false, true] {
+        let temp = TempDir::new().context("tempdir")?;
+        let repo_path = create_committed_repo(temp.path())?;
+        let repo = repo_path.to_str().context("repo path utf8")?;
+        let worktree =
+            run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+        let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+        let expected_primary = format!("# reviewed {nested}\n");
+        fs::write(worktree_path.join("README.md"), &expected_primary)?;
+        let preview = run_success_json(&[
+            "merge",
+            "preview",
+            "agent-a",
+            "--repo",
+            repo,
+            "--claim",
+            "README.md",
+            "--json",
+        ])?;
+        schemas.assert_preview_valid(&preview)?;
+        let evidence = if nested {
+            serde_json::json!({"freshness_watermark": preview["freshness_watermark"].clone()})
+        } else {
+            preview
+        };
+        let evidence_path = write_json_value(temp.path(), "reviewed.json", &evidence)?;
+        let report = run_success_json(&[
+            "merge",
+            "apply",
+            "agent-a",
+            "--repo",
+            repo,
+            "--claim",
+            "README.md",
+            "--reviewed-watermark",
+            evidence_path.to_str().context("evidence path utf8")?,
+            "--json",
+        ])?;
+        schemas.assert_apply_valid(&report)?;
+        assert_eq!(report["status"], "applied");
+        assert_eq!(report["review_bound"], true);
+        assert_eq!(report["review_binding_status"], "matched");
+        assert_eq!(
+            fs::read_to_string(repo_path.join("README.md"))
+                .context("read applied primary README")?,
+            expected_primary,
+            "{nested}-nested reviewed artifact did not apply its candidate contents"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn merge_apply_review_binding_reports_source_and_target_drift_axes() -> Result<()> {
+    support::require_containment!(
+        "merge_apply_review_binding_reports_source_and_target_drift_axes"
+    );
+    let schemas = MergeV2Schemas::load()?;
+    for (case, expected_status, expected_axis) in [
+        ("source_dirty", "substituted", "candidate_diff"),
+        ("source_head", "stale", "source_head"),
+        ("target_head", "stale", "primary_head"),
+        ("target_index", "stale", "primary_index"),
+        ("target_worktree", "stale", "primary_worktree"),
+    ] {
+        let temp = TempDir::new().context("tempdir")?;
+        let repo_path = create_committed_repo(temp.path())?;
+        let repo = repo_path.to_str().context("repo path utf8")?;
+        let worktree =
+            run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+        let worktree_path =
+            PathBuf::from(worktree["path"].as_str().context("worktree path string")?);
+        fs::write(worktree_path.join("README.md"), "# candidate one\n")?;
+        let preview = run_success_json(&[
+            "merge",
+            "preview",
+            "agent-a",
+            "--repo",
+            repo,
+            "--claim",
+            "README.md",
+            "--json",
+        ])?;
+        let evidence_path = write_json_value(temp.path(), "reviewed.json", &preview)?;
+
+        match case {
+            "source_dirty" => fs::write(worktree_path.join("README.md"), "# candidate two\n")?,
+            "source_head" => {
+                let source_repo = Repository::open(&worktree_path)?;
+                commit_all(&source_repo, "advance source HEAD")?;
+            }
+            "target_head" => {
+                fs::write(
+                    repo_path.join("src/lib.rs"),
+                    "pub fn ok() -> bool { false }\n",
+                )?;
+                let primary_repo = Repository::open(&repo_path)?;
+                commit_all(&primary_repo, "advance primary HEAD")?;
+            }
+            "target_index" => run_git(&[
+                "-C",
+                repo,
+                "update-index",
+                "--assume-unchanged",
+                "README.md",
+            ])?,
+            "target_worktree" => fs::write(repo_path.join("src/lib.rs"), "dirty target\n")?,
+            _ => unreachable!(),
+        }
+
+        let before_apply =
+            capture_primary_snapshot(&repo_path, &worktree_path, Path::new("README.md"))?;
+        let refusal = run_failure_json(&[
+            "merge",
+            "apply",
+            "agent-a",
+            "--repo",
+            repo,
+            "--claim",
+            "README.md",
+            "--reviewed-watermark",
+            evidence_path.to_str().context("evidence path utf8")?,
+            "--json",
+        ])?;
+        schemas.assert_apply_valid(&refusal)?;
+        assert_eq!(refusal["version"], 2, "case {case}");
+        assert_eq!(refusal["status"], "refused", "case {case}: {refusal}");
+        assert_eq!(
+            refusal["review_binding_status"], expected_status,
+            "case {case}"
+        );
+        assert_contains(&refusal["refusal"]["axes"], expected_axis)?;
+        let after_apply =
+            capture_primary_snapshot(&repo_path, &worktree_path, Path::new("README.md"))?;
+        assert_eq!(
+            after_apply, before_apply,
+            "case {case} mutated repository state"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn merge_apply_refuses_independent_nested_watermark_identity_tampering() -> Result<()> {
+    support::require_containment!(
+        "merge_apply_refuses_independent_nested_watermark_identity_tampering"
+    );
+    let schemas = MergeV2Schemas::load()?;
+    for (case, expected_axis) in [
+        ("source_agent_id", "source_identity"),
+        ("candidate_snapshot_tree", "candidate_snapshot"),
+    ] {
+        let temp = TempDir::new().context("tempdir")?;
+        let repo_path = create_committed_repo(temp.path())?;
+        let repo = repo_path.to_str().context("repo path utf8")?;
+        let worktree =
+            run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+        let worktree_path =
+            PathBuf::from(worktree["path"].as_str().context("worktree path string")?);
+        fs::write(worktree_path.join("README.md"), "# tamper candidate\n")?;
+        let preview = run_success_json(&[
+            "merge",
+            "preview",
+            "agent-a",
+            "--repo",
+            repo,
+            "--claim",
+            "README.md",
+            "--json",
+        ])?;
+        schemas.assert_preview_valid(&preview)?;
+        let mut watermark = preview["freshness_watermark"].clone();
+        match case {
+            "source_agent_id" => watermark["source"]["agent_id"] = serde_json::json!("agent-b"),
+            "candidate_snapshot_tree" => {
+                watermark["candidate"]["snapshot_tree"] =
+                    serde_json::json!("1111111111111111111111111111111111111111")
+            }
+            _ => unreachable!(),
+        }
+        let evidence_path = write_json_value(
+            temp.path(),
+            &format!("{case}.json"),
+            &serde_json::json!({"freshness_watermark": watermark}),
+        )?;
+        let before_apply =
+            capture_primary_snapshot(&repo_path, &worktree_path, Path::new("README.md"))?;
+
+        let refusal = run_failure_json(&[
+            "merge",
+            "apply",
+            "agent-a",
+            "--repo",
+            repo,
+            "--claim",
+            "README.md",
+            "--reviewed-watermark",
+            evidence_path.to_str().context("evidence path utf8")?,
+            "--json",
+        ])?;
+
+        schemas.assert_apply_valid(&refusal)?;
+        assert_eq!(refusal["version"], 2, "case {case}");
+        assert_eq!(refusal["status"], "refused", "case {case}: {refusal}");
+        assert_eq!(
+            refusal["review_binding_status"], "substituted",
+            "case {case}"
+        );
+        assert_eq!(
+            refusal["refusal"]["axes"],
+            serde_json::json!([expected_axis]),
+            "case {case}"
+        );
+        assert_eq!(
+            capture_primary_snapshot(&repo_path, &worktree_path, Path::new("README.md"))?,
+            before_apply,
+            "case {case} mutated repository state"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn merge_apply_review_intent_binds_validation_and_lifecycle_options() -> Result<()> {
+    support::require_containment!(
+        "merge_apply_review_intent_binds_validation_and_lifecycle_options"
+    );
+    let schemas = MergeV2Schemas::load()?;
+
+    {
+        let temp = TempDir::new().context("tempdir")?;
+        let repo_path = create_committed_repo(temp.path())?;
+        let repo = repo_path.to_str().context("repo path utf8")?;
+        let worktree =
+            run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+        let worktree_path =
+            PathBuf::from(worktree["path"].as_str().context("worktree path string")?);
+        fs::write(worktree_path.join("README.md"), "# reviewed intent\n")?;
+        let preview = run_success_json(&[
+            "merge",
+            "preview",
+            "agent-a",
+            "--repo",
+            repo,
+            "--claim",
+            "README.md",
+            "--validation-command",
+            "test -f README.md",
+            "--validation-command",
+            "grep -q 'reviewed intent' README.md",
+            "--require-validation",
+            "--json",
+        ])?;
+        schemas.assert_preview_valid(&preview)?;
+        assert_eq!(
+            preview["review_intent"]["candidate_validation_commands"],
+            serde_json::json!(["test -f README.md", "grep -q 'reviewed intent' README.md"])
+        );
+        assert_eq!(
+            preview["review_intent"]["require_validation_after_candidate"],
+            true
+        );
+        let evidence_path = write_json_value(temp.path(), "reviewed-intent.json", &preview)?;
+        let report = run_success_json(&[
+            "merge",
+            "apply",
+            "agent-a",
+            "--repo",
+            repo,
+            "--claim",
+            "README.md",
+            "--validation-command",
+            "test -f README.md",
+            "--validation-command",
+            "grep -q 'reviewed intent' README.md",
+            "--require-validation",
+            "--reviewed-watermark",
+            evidence_path.to_str().context("evidence path utf8")?,
+            "--json",
+        ])?;
+        schemas.assert_apply_valid(&report)?;
+        assert_eq!(report["status"], "applied");
+        assert_eq!(report["review_binding_status"], "matched");
+        assert_eq!(report["preview"]["review_intent"], preview["review_intent"]);
+    }
+
+    {
+        let temp = TempDir::new().context("tempdir")?;
+        let repo_path = create_committed_repo(temp.path())?;
+        let repo = repo_path.to_str().context("repo path utf8")?;
+        let worktree =
+            run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+        let worktree_path =
+            PathBuf::from(worktree["path"].as_str().context("worktree path string")?);
+        fs::write(worktree_path.join("README.md"), "# intent mismatch\n")?;
+        let preview = run_success_json(&[
+            "merge",
+            "preview",
+            "agent-a",
+            "--repo",
+            repo,
+            "--claim",
+            "README.md",
+            "--validation-command",
+            "test -f README.md",
+            "--validation-command",
+            "test -f src/lib.rs",
+            "--require-validation",
+            "--json",
+        ])?;
+        schemas.assert_preview_valid(&preview)?;
+        let evidence_path = write_json_value(temp.path(), "changed-intent.json", &preview)?;
+        let before_apply =
+            capture_primary_snapshot(&repo_path, &worktree_path, Path::new("README.md"))?;
+        let refusal = run_failure_json(&[
+            "merge",
+            "apply",
+            "agent-a",
+            "--repo",
+            repo,
+            "--claim",
+            "README.md",
+            "--validation-command",
+            "test -f README.md",
+            "--validation-command",
+            "test -s src/lib.rs",
+            "--require-validation",
+            "--reviewed-watermark",
+            evidence_path.to_str().context("evidence path utf8")?,
+            "--json",
+        ])?;
+        schemas.assert_apply_valid(&refusal)?;
+        assert_eq!(refusal["status"], "refused");
+        assert_eq!(refusal["review_binding_status"], "substituted");
+        assert_eq!(
+            refusal["refusal"]["axes"],
+            serde_json::json!(["base_preview"])
+        );
+        assert_eq!(
+            capture_primary_snapshot(&repo_path, &worktree_path, Path::new("README.md"))?,
+            before_apply,
+            "changed validation command mutated repository state"
+        );
+    }
+
+    {
+        let temp = TempDir::new().context("tempdir")?;
+        let repo_path = create_committed_repo(temp.path())?;
+        let repo = repo_path.to_str().context("repo path utf8")?;
+        let worktree =
+            run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+        let worktree_path =
+            PathBuf::from(worktree["path"].as_str().context("worktree path string")?);
+        fs::write(worktree_path.join("README.md"), "# lifecycle intent\n")?;
+        let preview = run_success_json(&[
+            "merge",
+            "preview",
+            "agent-a",
+            "--repo",
+            repo,
+            "--claim",
+            "README.md",
+            "--auto-reap-merged",
+            "--trunk-ref",
+            "main",
+            "--apply-auto-reap",
+            "--json",
+        ])?;
+        schemas.assert_preview_valid(&preview)?;
+        assert_eq!(preview["review_intent"]["auto_reap_merged"], true);
+        assert_eq!(preview["review_intent"]["trunk_ref"], "main");
+        assert_eq!(preview["review_intent"]["apply_auto_reap"], true);
+        let evidence_path = write_json_value(temp.path(), "reviewed-lifecycle.json", &preview)?;
+        let before_apply =
+            capture_primary_snapshot(&repo_path, &worktree_path, Path::new("README.md"))?;
+        let refusal = run_failure_json(&[
+            "merge",
+            "apply",
+            "agent-a",
+            "--repo",
+            repo,
+            "--claim",
+            "README.md",
+            "--reviewed-watermark",
+            evidence_path.to_str().context("evidence path utf8")?,
+            "--json",
+        ])?;
+        schemas.assert_apply_valid(&refusal)?;
+        assert_eq!(refusal["status"], "refused");
+        assert_eq!(refusal["review_binding_status"], "substituted");
+        assert_eq!(
+            refusal["refusal"]["axes"],
+            serde_json::json!(["base_preview"])
+        );
+        assert_eq!(
+            capture_primary_snapshot(&repo_path, &worktree_path, Path::new("README.md"))?,
+            before_apply,
+            "omitted lifecycle intent mutated or reaped reviewed state"
+        );
+        assert!(
+            worktree_path.exists(),
+            "omitted lifecycle intent reaped candidate lane"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn merge_apply_refuses_preview_substitution_stale_reuse_and_bad_evidence() -> Result<()> {
+    support::require_containment!(
+        "merge_apply_refuses_preview_substitution_stale_reuse_and_bad_evidence"
+    );
+    let temp = TempDir::new().context("tempdir")?;
+    let schemas = MergeV2Schemas::load()?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let repo = repo_path.to_str().context("repo path utf8")?;
+    let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
+    fs::write(worktree_path.join("README.md"), "# exact candidate\n")?;
+    let preview = run_success_json(&[
+        "merge",
+        "preview",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--json",
+    ])?;
+    schemas.assert_preview_valid(&preview)?;
+
+    let mut substituted = preview.clone();
+    substituted["safety"]["force_options"]["allow_dirty_primary"] = Value::Bool(true);
+    let substituted_path = write_json_value(temp.path(), "substituted.json", &substituted)?;
+    let before_substitution =
+        capture_primary_snapshot(&repo_path, worktree_path, Path::new("README.md"))?;
+    let refusal = run_failure_json(&[
+        "merge",
+        "apply",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--reviewed-watermark",
+        substituted_path.to_str().context("path utf8")?,
+        "--json",
+    ])?;
+    schemas.assert_apply_valid(&refusal)?;
+    assert_eq!(refusal["review_binding_status"], "substituted");
+    assert_eq!(
+        refusal["refusal"]["axes"],
+        serde_json::json!(["base_preview"])
+    );
+    assert_eq!(
+        capture_primary_snapshot(&repo_path, worktree_path, Path::new("README.md"))?,
+        before_substitution,
+        "substituted full preview mutated repository state"
+    );
+
+    let nested_path = write_json_value(
+        temp.path(),
+        "nested.json",
+        &serde_json::json!({
+            "freshness_watermark": preview["freshness_watermark"].clone()
+        }),
+    )?;
+    let before_force_substitution =
+        capture_primary_snapshot(&repo_path, worktree_path, Path::new("README.md"))?;
+    let force_substitution = run_failure_json(&[
+        "merge",
+        "apply",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--force-dirty-primary",
+        "--reviewed-watermark",
+        nested_path.to_str().context("nested path utf8")?,
+        "--json",
+    ])?;
+    schemas.assert_apply_valid(&force_substitution)?;
+    assert_eq!(force_substitution["review_binding_status"], "substituted");
+    assert_contains(&force_substitution["refusal"]["axes"], "base_preview")?;
+    assert_eq!(
+        capture_primary_snapshot(&repo_path, worktree_path, Path::new("README.md"))?,
+        before_force_substitution,
+        "force-option substitution mutated repository state"
+    );
+
+    let mut unsupported = preview["freshness_watermark"].clone();
+    unsupported["version"] = serde_json::json!(1);
+    let version_path = write_json_value(
+        temp.path(),
+        "version.json",
+        &serde_json::json!({"freshness_watermark": unsupported}),
+    )?;
+    let before_unsupported =
+        capture_primary_snapshot(&repo_path, worktree_path, Path::new("README.md"))?;
+    let version_refusal = run_failure_json(&[
+        "merge",
+        "apply",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--reviewed-watermark",
+        version_path.to_str().context("version path utf8")?,
+        "--json",
+    ])?;
+    schemas.assert_apply_valid(&version_refusal)?;
+    assert_eq!(
+        version_refusal["review_binding_status"],
+        "unsupported_version"
+    );
+    assert_eq!(
+        capture_primary_snapshot(&repo_path, worktree_path, Path::new("README.md"))?,
+        before_unsupported,
+        "unsupported watermark version mutated repository state"
+    );
+
+    let raw_top_level_path = write_json_value(
+        temp.path(),
+        "raw-top-level-watermark.json",
+        &preview["freshness_watermark"],
+    )?;
+    let before_raw_top_level =
+        capture_primary_snapshot(&repo_path, worktree_path, Path::new("README.md"))?;
+    let raw_top_level_refusal = run_failure_json(&[
+        "merge",
+        "apply",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--reviewed-watermark",
+        raw_top_level_path
+            .to_str()
+            .context("raw top-level path utf8")?,
+        "--json",
+    ])?;
+    schemas.assert_apply_valid(&raw_top_level_refusal)?;
+    assert_eq!(raw_top_level_refusal["review_binding_status"], "malformed");
+    assert_eq!(
+        capture_primary_snapshot(&repo_path, worktree_path, Path::new("README.md"))?,
+        before_raw_top_level,
+        "raw top-level watermark mutated repository state"
+    );
+
+    let malformed_path = temp.path().join("malformed.json");
+    fs::write(&malformed_path, b"{not-json")?;
+    let before_malformed =
+        capture_primary_snapshot(&repo_path, worktree_path, Path::new("README.md"))?;
+    let malformed_refusal = run_failure_json(&[
+        "merge",
+        "apply",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--reviewed-watermark",
+        malformed_path.to_str().context("malformed path utf8")?,
+        "--json",
+    ])?;
+    schemas.assert_apply_valid(&malformed_refusal)?;
+    assert_eq!(malformed_refusal["review_binding_status"], "malformed");
+    assert_eq!(
+        capture_primary_snapshot(&repo_path, worktree_path, Path::new("README.md"))?,
+        before_malformed,
+        "malformed review evidence mutated repository state"
+    );
+
+    let exact_path = write_json_value(temp.path(), "exact.json", &preview)?;
+    let applied = run_success_json(&[
+        "merge",
+        "apply",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--reviewed-watermark",
+        exact_path.to_str().context("exact path utf8")?,
+        "--json",
+    ])?;
+    schemas.assert_apply_valid(&applied)?;
+    assert_eq!(applied["status"], "applied");
+    let before_stale_reuse =
+        capture_primary_snapshot(&repo_path, worktree_path, Path::new("README.md"))?;
+    let stale = run_failure_json(&[
+        "merge",
+        "apply",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--reviewed-watermark",
+        exact_path.to_str().context("exact path utf8")?,
+        "--json",
+    ])?;
+    schemas.assert_apply_valid(&stale)?;
+    assert_eq!(stale["review_binding_status"], "stale");
+    assert_contains(&stale["refusal"]["axes"], "primary_worktree")?;
+    assert_eq!(
+        capture_primary_snapshot(&repo_path, worktree_path, Path::new("README.md"))?,
+        before_stale_reuse,
+        "stale reviewed preview reuse mutated repository state"
+    );
+    Ok(())
+}
+
+#[test]
+fn merge_apply_nothing_and_blocked_reports_remain_ordinary_matched_shapes() -> Result<()> {
+    support::require_containment!(
+        "merge_apply_nothing_and_blocked_reports_remain_ordinary_matched_shapes"
+    );
+    let schemas = MergeV2Schemas::load()?;
+    let empty = TempDir::new().context("empty tempdir")?;
+    let empty_repo_path = create_committed_repo(empty.path())?;
+    let empty_repo = empty_repo_path.to_str().context("empty repo utf8")?;
+    run_success_json(&[
+        "worktree", "create", "agent-a", "--repo", empty_repo, "--json",
+    ])?;
+    let nothing = run_success_json(&[
+        "merge",
+        "apply",
+        "agent-a",
+        "--repo",
+        empty_repo,
+        "--claim",
+        "README.md",
+        "--json",
+    ])?;
+    schemas.assert_apply_valid(&nothing)?;
+    assert_eq!(nothing["status"], "nothing_to_apply");
+    assert_eq!(nothing["review_bound"], true);
+    assert_eq!(nothing["review_binding_status"], "matched");
+    assert!(nothing.get("refusal").is_none());
+
+    let blocked = TempDir::new().context("blocked tempdir")?;
+    let blocked_repo_path = create_committed_repo(blocked.path())?;
+    let blocked_repo = blocked_repo_path.to_str().context("blocked repo utf8")?;
+    let worktree = run_success_json(&[
+        "worktree",
+        "create",
+        "agent-a",
+        "--repo",
+        blocked_repo,
+        "--json",
+    ])?;
+    let worktree_path = Path::new(worktree["path"].as_str().context("worktree path")?);
+    fs::write(worktree_path.join("README.md"), "# candidate\n")?;
+    fs::write(blocked_repo_path.join("src/lib.rs"), "dirty primary\n")?;
+    let blocked_report = run_failure_json(&[
+        "merge",
+        "apply",
+        "agent-a",
+        "--repo",
+        blocked_repo,
+        "--claim",
+        "README.md",
+        "--json",
+    ])?;
+    schemas.assert_apply_valid(&blocked_report)?;
+    assert_eq!(blocked_report["status"], "blocked");
+    assert_eq!(blocked_report["review_bound"], true);
+    assert_eq!(blocked_report["review_binding_status"], "matched");
+    assert!(blocked_report.get("refusal").is_none());
+    Ok(())
+}
+
+#[test]
 fn merge_apply_accepts_external_validation_report_and_applies() -> Result<()> {
     support::require_containment!("merge_apply_accepts_external_validation_report_and_applies");
     let temp = TempDir::new().context("tempdir")?;
@@ -179,6 +1090,8 @@ fn merge_apply_accepts_external_validation_report_and_applies() -> Result<()> {
 
     assert_eq!(report["status"], "applied");
     assert_eq!(report["applied"], true);
+    assert_eq!(report["review_bound"], true);
+    assert_eq!(report["review_binding_status"], "matched");
     assert_eq!(report["preview"]["safety"]["readiness"]["status"], "safe");
     assert_eq!(
         report["preview"]["candidate"]["validations"][0]["paths"][0],
@@ -369,20 +1282,21 @@ fn merge_apply_revalidates_clean_committed_primary_after_candidate_validation() 
         .context("edit worktree")?;
     let runtime_root = candidate_validation_runtime_root()?;
     let existing_runtime_entries = candidate_validation_runtime_entries(&runtime_root)?;
+    let (apply_args, _review_directory) = bind_reviewed_preview_if_needed(&[
+        "merge",
+        "apply",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--validation-command",
+        PAUSED_CANDIDATE_VALIDATION_COMMAND,
+        "--force-stale-base",
+        "--json",
+    ])?;
     let mut apply = Command::new(BIN)
-        .args([
-            "merge",
-            "apply",
-            "agent-a",
-            "--repo",
-            repo,
-            "--claim",
-            "README.md",
-            "--validation-command",
-            PAUSED_CANDIDATE_VALIDATION_COMMAND,
-            "--force-stale-base",
-            "--json",
-        ])
+        .args(apply_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -404,23 +1318,10 @@ fn merge_apply_revalidates_clean_committed_primary_after_candidate_validation() 
     assert!(!applied.status.success());
     let report: Value = serde_json::from_slice(&applied.stdout).context("parse apply report")?;
 
-    assert_eq!(report["status"], "blocked");
-    assert_eq!(
-        report["preview"]["safety"]["primary_state_unchanged"]["status"],
-        "failed"
-    );
-    assert_contains(
-        &report["preview"]["safety"]["readiness"]["blockers"],
-        "primary_state_changed",
-    )?;
-    assert_contains(
-        &report["preview"]["safety"]["readiness"]["forced"],
-        "stale_base",
-    )?;
-    assert_eq!(
-        report["preview"]["safety"]["dirty_primary"]["status"],
-        "passed"
-    );
+    assert_eq!(report["status"], "refused");
+    assert_eq!(report["review_bound"], false);
+    assert_eq!(report["review_binding_status"], "stale");
+    assert_contains(&report["refusal"]["axes"], "primary_head")?;
     assert_eq!(
         fs::read_to_string(repo_path.join("README.md")).context("read primary readme")?,
         "# Smoke\n"
@@ -439,6 +1340,16 @@ fn merge_apply_refuses_when_repo_common_lock_is_held() -> Result<()> {
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\nlocked\n").context("edit worktree")?;
+    let (apply_args, _review_directory) = bind_reviewed_preview_if_needed(&[
+        "merge",
+        "apply",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--json",
+    ])?;
     let lock_dir = repo_path.join(".git/maco/state");
     fs::create_dir_all(&lock_dir).context("create lock dir")?;
     fs::write(
@@ -476,16 +1387,7 @@ fn merge_apply_refuses_when_repo_common_lock_is_held() -> Result<()> {
     let path = path_with_prefix(&fake_bin)?;
 
     let output = Command::new(BIN)
-        .args([
-            "merge",
-            "apply",
-            "agent-a",
-            "--repo",
-            repo,
-            "--claim",
-            "README.md",
-            "--json",
-        ])
+        .args(apply_args)
         .env("PATH", path)
         .output()
         .context("run locked merge apply")?;
@@ -522,19 +1424,20 @@ fn pr_publish_cannot_run_while_merge_apply_validates_candidate() -> Result<()> {
     let runtime_root = candidate_validation_runtime_root()?;
     let existing_runtime_entries = candidate_validation_runtime_entries(&runtime_root)?;
 
+    let (apply_args, _review_directory) = bind_reviewed_preview_if_needed(&[
+        "merge",
+        "apply",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--validation-command",
+        PAUSED_CANDIDATE_VALIDATION_COMMAND,
+        "--json",
+    ])?;
     let mut apply = Command::new(BIN)
-        .args([
-            "merge",
-            "apply",
-            "agent-a",
-            "--repo",
-            repo,
-            "--claim",
-            "README.md",
-            "--validation-command",
-            PAUSED_CANDIDATE_VALIDATION_COMMAND,
-            "--json",
-        ])
+        .args(apply_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -584,6 +1487,16 @@ fn merge_apply_refuses_malformed_repo_common_lock() -> Result<()> {
     let worktree = run_success_json(&["worktree", "create", "agent-a", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\nlocked\n").context("edit worktree")?;
+    let (apply_args, _review_directory) = bind_reviewed_preview_if_needed(&[
+        "merge",
+        "apply",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--json",
+    ])?;
     let lock_dir = repo_path.join(".git/maco/state");
     fs::create_dir_all(&lock_dir).context("create lock dir")?;
     fs::write(
@@ -599,16 +1512,7 @@ fn merge_apply_refuses_malformed_repo_common_lock() -> Result<()> {
     lock_file.try_lock().context("hold malformed kernel lock")?;
 
     let output = Command::new(BIN)
-        .args([
-            "merge",
-            "apply",
-            "agent-a",
-            "--repo",
-            repo,
-            "--claim",
-            "README.md",
-            "--json",
-        ])
+        .args(apply_args)
         .output()
         .context("run locked merge apply")?;
 
@@ -631,6 +1535,16 @@ fn merge_apply_refuses_symlink_repository_lock_file() -> Result<()> {
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# Smoke\n\nsymlink lock\n")
         .context("edit worktree")?;
+    let (apply_args, _review_directory) = bind_reviewed_preview_if_needed(&[
+        "merge",
+        "apply",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--json",
+    ])?;
     let lock_dir = repo_path.join(".git/maco/state");
     fs::create_dir_all(&lock_dir).context("create lock dir")?;
     let target = temp.path().join("lock-target");
@@ -638,16 +1552,7 @@ fn merge_apply_refuses_symlink_repository_lock_file() -> Result<()> {
     symlink(&target, lock_dir.join("repository-mutation.lock")).context("create lock symlink")?;
 
     let output = Command::new(BIN)
-        .args([
-            "merge",
-            "apply",
-            "agent-a",
-            "--repo",
-            repo,
-            "--claim",
-            "README.md",
-            "--json",
-        ])
+        .args(apply_args)
         .output()
         .context("run merge with symlink lock")?;
 
@@ -673,6 +1578,16 @@ fn merge_apply_refuses_symlink_repository_state_directory() -> Result<()> {
         "# Smoke\n\nsymlink state\n",
     )
     .context("edit worktree")?;
+    let (apply_args, _review_directory) = bind_reviewed_preview_if_needed(&[
+        "merge",
+        "apply",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--json",
+    ])?;
     let maco_dir = repo_path.join(".git/maco");
     fs::create_dir_all(&maco_dir).context("create maco dir")?;
     let state_dir = maco_dir.join("state");
@@ -684,16 +1599,7 @@ fn merge_apply_refuses_symlink_repository_state_directory() -> Result<()> {
     symlink(&target, &state_dir).context("create state symlink")?;
 
     let output = Command::new(BIN)
-        .args([
-            "merge",
-            "apply",
-            "agent-a",
-            "--repo",
-            repo,
-            "--claim",
-            "README.md",
-            "--json",
-        ])
+        .args(apply_args)
         .output()
         .context("run merge with symlink state")?;
 
@@ -1703,21 +2609,22 @@ fn authenticated_megafile_read_failure_refuses_merge_before_primary_apply() -> R
     run_success_json(&["repo", "megafile", "seed", "--repo", repo, "--json"])?;
     let worktree_path = Path::new(worktree["path"].as_str().context("worktree path string")?);
     fs::write(worktree_path.join("README.md"), "# candidate\n").context("edit candidate")?;
+    let (apply_args, _review_directory) = bind_reviewed_preview_if_needed(&[
+        "merge",
+        "apply",
+        "agent-a",
+        "--repo",
+        repo,
+        "--claim",
+        "README.md",
+        "--json",
+    ])?;
     let history_root = repo_path.join(".git/maco/state/authenticated-megafile-history-v1");
     let snapshot = newest_numeric_json(&history_root)?.context("authenticated snapshot")?;
     fs::write(&snapshot, b"{\"tampered\":true}\n").context("tamper authenticated snapshot")?;
 
     let output = Command::new(BIN)
-        .args([
-            "merge",
-            "apply",
-            "agent-a",
-            "--repo",
-            repo,
-            "--claim",
-            "README.md",
-            "--json",
-        ])
+        .args(apply_args)
         .output()
         .context("run merge against tampered telemetry")?;
     assert!(!output.status.success());
@@ -1878,7 +2785,8 @@ fn wait_for_candidate_validation_ready(
 }
 
 fn run_success_json(args: &[&str]) -> Result<Value> {
-    let output = Command::new(BIN).args(args).output().context("run maco")?;
+    let (args, _review_directory) = bind_reviewed_preview_if_needed(args)?;
+    let output = Command::new(BIN).args(&args).output().context("run maco")?;
     if !output.status.success() {
         anyhow::bail!(
             "maco command failed: {}",
@@ -1890,11 +2798,248 @@ fn run_success_json(args: &[&str]) -> Result<Value> {
 }
 
 fn run_failure_json(args: &[&str]) -> Result<Value> {
-    let output = Command::new(BIN).args(args).output().context("run maco")?;
+    let (args, _review_directory) = bind_reviewed_preview_if_needed(args)?;
+    let output = Command::new(BIN).args(&args).output().context("run maco")?;
     if output.status.success() {
         anyhow::bail!("maco command unexpectedly succeeded");
     }
     serde_json::from_slice(&output.stdout).context("parse failure json")
+}
+
+fn write_json_value(root: &Path, name: &str, value: &Value) -> Result<PathBuf> {
+    let path = root.join(name);
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(value).context("serialize JSON value")?,
+    )
+    .with_context(|| format!("write {}", path.display()))?;
+    Ok(path)
+}
+
+/// Test-only synthetic review authority for legacy apply-focused fixtures.
+///
+/// Production callers must obtain and review their own preview. This helper
+/// forwards every apply option shared by preview and adds only the resulting
+/// reviewed watermark to the apply invocation.
+fn bind_reviewed_preview_if_needed(args: &[&str]) -> Result<(Vec<OsString>, Option<TempDir>)> {
+    let is_merge_apply = args.first() == Some(&"merge") && args.get(1) == Some(&"apply");
+    if !is_merge_apply || args.contains(&"--reviewed-watermark") {
+        return Ok((args.iter().map(OsString::from).collect(), None));
+    }
+
+    let mut preview_args = vec![OsString::from("merge"), OsString::from("preview")];
+    preview_args.extend(args.iter().skip(2).map(OsString::from));
+
+    let preview_output = Command::new(BIN)
+        .args(&preview_args)
+        .output()
+        .context("run mandatory reviewed merge preview")?;
+    if !preview_output.status.success() {
+        anyhow::bail!(
+            "mandatory reviewed merge preview failed: {}",
+            String::from_utf8_lossy(&preview_output.stderr)
+        );
+    }
+    let directory = TempDir::new().context("reviewed preview tempdir")?;
+    let path = directory.path().join("reviewed-preview.json");
+    fs::write(&path, preview_output.stdout).context("write reviewed preview JSON")?;
+    let mut apply_args = args.iter().map(OsString::from).collect::<Vec<_>>();
+    apply_args.push(OsString::from("--reviewed-watermark"));
+    apply_args.push(path.into_os_string());
+    Ok((apply_args, Some(directory)))
+}
+
+fn capture_primary_snapshot(
+    repo_path: &Path,
+    candidate_worktree_path: &Path,
+    _candidate_path: &Path,
+) -> Result<PrimarySnapshot> {
+    let repo = Repository::open(repo_path).context("open primary repository for snapshot")?;
+    let candidate_repo = Repository::open(candidate_worktree_path)
+        .context("open candidate repository for snapshot")?;
+    let state_root = repo.commondir().join("maco/state");
+    let lock_path = state_root.join("repository-mutation.lock");
+    Ok(PrimarySnapshot {
+        primary_worktree: capture_worktree_tree(repo_path)?,
+        primary_head: git_output_bytes(repo_path, &["rev-parse", "--verify", "HEAD"])
+            .context("capture primary HEAD")?,
+        primary_index: fs::read(repo.path().join("index"))
+            .context("capture primary index bytes")?,
+        primary_status: git_output_bytes(
+            repo_path,
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        )
+        .context("capture porcelain-v1 -z primary status")?,
+        managed_registry_and_pending_operations: capture_managed_registry_and_pending_operations(
+            &state_root,
+        )?,
+        managed_execution_leases: capture_managed_execution_leases(&state_root)?,
+        candidate_worktree: capture_worktree_tree(candidate_worktree_path)?,
+        candidate_head: git_output_bytes(
+            candidate_worktree_path,
+            &["rev-parse", "--verify", "HEAD"],
+        )
+        .context("capture candidate HEAD")?,
+        candidate_index: fs::read(candidate_repo.path().join("index"))
+            .context("capture candidate index bytes")?,
+        candidate_status: git_output_bytes(
+            candidate_worktree_path,
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        )
+        .context("capture porcelain-v1 -z candidate status")?,
+        repository_mutation_lock: read_optional_bytes(&lock_path)?,
+    })
+}
+
+fn capture_worktree_tree(root: &Path) -> Result<Vec<FileSystemSnapshotEntry>> {
+    let mut snapshot = Vec::new();
+    for entry in sorted_directory_entries(root)? {
+        if entry.file_name() == OsStr::new(".git") {
+            continue;
+        }
+        capture_file_system_entry(root, &entry.path(), &mut snapshot)?;
+    }
+    Ok(snapshot)
+}
+
+fn capture_managed_registry_and_pending_operations(
+    state_root: &Path,
+) -> Result<Vec<FileSystemSnapshotEntry>> {
+    capture_selected_state_entries(state_root, |name| {
+        matches!(
+            name.to_str(),
+            Some(
+                "authenticated-managed-worktrees-v1"
+                    | ".authenticated-managed-worktrees.lock"
+                    | "managed_worktrees.json"
+                    | "managed_worktrees.lock"
+            )
+        ) || name
+            .to_str()
+            .is_some_and(|name| name.starts_with(".managed_worktrees.json."))
+    })
+}
+
+fn capture_managed_execution_leases(state_root: &Path) -> Result<Vec<FileSystemSnapshotEntry>> {
+    capture_selected_state_entries(state_root, |name| {
+        name.to_str().is_some_and(|name| {
+            name.starts_with("managed-worktree-") && name.ends_with(".execution.lock")
+        })
+    })
+}
+
+fn capture_selected_state_entries(
+    state_root: &Path,
+    include: impl Fn(&OsStr) -> bool,
+) -> Result<Vec<FileSystemSnapshotEntry>> {
+    let mut snapshot = Vec::new();
+    let entries = match sorted_directory_entries(state_root) {
+        Ok(entries) => entries,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(snapshot)
+        }
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        if include(&entry.file_name()) {
+            capture_file_system_entry(state_root, &entry.path(), &mut snapshot)?;
+        }
+    }
+    Ok(snapshot)
+}
+
+fn capture_file_system_entry(
+    root: &Path,
+    path: &Path,
+    snapshot: &mut Vec<FileSystemSnapshotEntry>,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect snapshot entry {}", path.display()))?;
+    let contents = if metadata.file_type().is_symlink() {
+        FileSystemSnapshotContents::Symlink(
+            fs::read_link(path)
+                .with_context(|| format!("read snapshot symlink {}", path.display()))?,
+        )
+    } else if metadata.is_dir() {
+        FileSystemSnapshotContents::Directory
+    } else if metadata.is_file() {
+        FileSystemSnapshotContents::File(
+            fs::read(path).with_context(|| format!("read snapshot file {}", path.display()))?,
+        )
+    } else {
+        bail!(
+            "snapshot entry has unsupported file type: {}",
+            path.display()
+        );
+    };
+    snapshot.push(FileSystemSnapshotEntry {
+        path: path
+            .strip_prefix(root)
+            .with_context(|| format!("make snapshot path relative to {}", root.display()))?
+            .to_path_buf(),
+        mode: snapshot_mode(&metadata),
+        contents,
+    });
+    if metadata.is_dir() {
+        for entry in sorted_directory_entries(path)? {
+            capture_file_system_entry(root, &entry.path(), snapshot)?;
+        }
+    }
+    Ok(())
+}
+
+fn sorted_directory_entries(path: &Path) -> Result<Vec<fs::DirEntry>> {
+    let mut entries = fs::read_dir(path)
+        .with_context(|| format!("read snapshot directory {}", path.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("collect snapshot directory {}", path.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    Ok(entries)
+}
+
+#[cfg(unix)]
+fn snapshot_mode(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.mode()
+}
+
+#[cfg(not(unix))]
+fn snapshot_mode(metadata: &fs::Metadata) -> u32 {
+    let readable = if metadata.is_dir() { 0o555 } else { 0o444 };
+    if metadata.permissions().readonly() {
+        readable
+    } else {
+        readable | 0o222
+    }
+}
+
+fn read_optional_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read optional file {}", path.display())),
+    }
+}
+
+fn git_output_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let output = Command::new("git")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .context("run git snapshot command")?;
+    if !output.status.success() {
+        bail!(
+            "git snapshot command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(output.stdout)
 }
 
 fn newest_numeric_json(root: &Path) -> Result<Option<std::path::PathBuf>> {

@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "status": "refused",
+  "applied": false,
+  "review_bound": false,
+  "review_binding_status": "substituted",
+  "refusal": {
+    "kind": "reviewed_preview_evidence",
+    "message": "merge apply refused: the reviewed base preview payload was substituted",
+    "axes": [
+      "base_preview"
+    ],
+    "next_safe_operation": "run_merge_preview_again_with_the_same_options"
+  }
+}

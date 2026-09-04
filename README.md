@@ -18,7 +18,8 @@ reviewable and recoverable:
 - run each agent in an isolated worktree
 - prevent overlapping edits through shared path claims
 - collect diffs, summaries, validation results, and patches
-- preview and apply merge candidates with conflict reporting
+- preview merge candidates, review them under integration authority, and apply
+  them with conflict reporting
 
 ## Current Status
 
@@ -50,8 +51,22 @@ The current implementation covers a local-first command-line slice:
 - `maco orchestrate resume <checkpoint-file>` authenticates the repository-bound v3 journal, validates repository HEAD, plan snapshot, worktree metadata, path boundaries, and claims, then reruns validation/capture for completed commands without rerunning those commands.
 - `maco worktree diff` collects a registered agent worktree diff and uses active sync claims when `--claim` is omitted.
 - `maco orchestrate collect` reads a prior JSON run summary and builds merge candidates with validation reports from agent summaries.
-- `maco merge preview` and `maco merge apply` collect one stable agent snapshot and gate primary-worktree integration with dirty-primary, stale-base, unclaimed-edit, candidate-bound validation, and apply-check safety reports. Their JSON reports also include advisory semantic classification for overlapping symbols, impls, modules, imports, signatures, and dependent files. Both commands accept external validation JSON with `--validation-report`; `--require-validation` accepts passed reports only when their envelope contains the exact current `candidate.validation_binding` (or a passed `merge apply --validation-command`).
-- `maco merge apply --validation-command <command>` validates a temporary merged
+- `maco merge preview --json` captures the review artifact required before
+  primary-worktree integration. After that complete preview receives authority
+  review, `maco merge apply` accepts either the unchanged full preview JSON or an
+  extracted one-field `freshness_watermark` JSON object through
+  `--reviewed-watermark`; it otherwise refuses before primary mutation. Both
+  commands retain the dirty-primary,
+  stale-base, unclaimed-edit, candidate-bound validation, and apply-check safety
+  reports. Their JSON reports also include advisory semantic classification for
+  overlapping symbols, impls, modules, imports, signatures, and dependent files.
+  Both commands accept external validation JSON with `--validation-report`;
+  `--require-validation` accepts passed reports only when their envelope contains
+  the exact current `candidate.validation_binding` (or a passed
+  `merge apply --validation-command`).
+- After the required preview review, `maco merge apply` with
+  `--validation-command <command>` and
+  `--reviewed-watermark <unchanged-preview.json>` validates a temporary merged
   candidate before mutating the primary worktree. A command failure or a
   recursive candidate-state change, including an initialized or uninitialized
   submodule change, blocks the apply and leaves the primary worktree unchanged.
@@ -179,8 +194,11 @@ The current implementation covers a local-first command-line slice:
   providers remain refused.
 - `maco eval-harness run` completes a declared role mix through the local fake
   provider. Version 2 manifests are routed to the Issue #26 v2 operator path;
-  `maco eval-harness run-v2` always parses that v2 schema. Real network
-  providers are refused; v2 output is not production-eligible.
+  `maco eval-harness run-v2` always parses that version-2 manifest schema, and
+  the current version-2 run path emits result/schema v3. Result/schema v1 and
+  v2 remain historical; v3 was necessary because fully closing the permissive
+  v2 schema would be breaking. Real network providers are refused; current v3
+  output is not production-eligible.
 - `maco optimizer library|preference|replay` inspects the starter policy
   library, operator preference profiles, and stored decision replay snapshots.
   It does not launch supervise or change production model defaults.
@@ -195,7 +213,8 @@ The current implementation covers a local-first command-line slice:
 
 Implemented local foundations:
 
-1. Result collection, merge preview, and guarded patch apply for agent worktrees.
+1. Result collection, merge preview, and guarded application of agent-worktree
+   patches after an authorized preview review.
 2. Parser-backed Rust repository maps for modules, symbols, impls, imports, and
    dependency edges, plus semantic risk reports for changed paths.
 3. Retained local orchestration internals with dependency scheduling, path claims, timeouts,
@@ -1212,7 +1231,8 @@ case so a complete local run stays modest.
 
 **DEFERRED SCOPE:** This first issue #25 increment does not benchmark:
 
-- managed-worktree registry create/list/remove lifecycle or merge preview/apply
+- managed-worktree registry create/list/remove lifecycle or merge
+  preview/review/apply
   throughput, because successful setup requires the capability-bound managed
   worktree API tracked by issue #11;
 - semantic merge-conflict classification, because
@@ -1345,13 +1365,16 @@ cargo run -- evaluation run tests/fixtures/model_mix_evaluation/manifest-v1.json
 through the local fake provider and records mix plus per-role outcomes. Version
 1 manifests use the v1 local-fake path. Version 2 manifests are routed to the
 Issue #26 v2 operator path. `maco eval-harness run-v2 <manifest.json>` always
-parses the v2 manifest schema and refuses a v1 document. Both commands accept
-`--json`. Real network providers are refused. A v2 `provider_request` of
+parses the version-2 manifest schema and refuses a v1 document. Both commands
+accept `--json`. Their current version-2 run output uses result/schema v3;
+result/schema v1 and v2 remain historical. Version 3 was necessary because
+fully closing the permissive v2 schema would be breaking. Real network
+providers are refused. A v2 `provider_request` of
 `real_provider` fails closed: omitting the explicit opt-in is
 `RealProviderOptInRequired`, and `allow_real_provider=true` is still
-`RealProviderUnavailable`. The v2 local fake path emits machine-readable
-comparable results (`schema` such as `eval_harness_comparable_fake_results_v2`)
-with `production_eligible=false` and does not write cwd artifacts.
+`RealProviderUnavailable`. The v2 local fake path emits current machine-readable
+comparable results (`schema` `eval_harness_comparable_fake_results_v3`) with
+`production_eligible=false` and does not write cwd artifacts.
 
 ```bash
 cargo run -- eval-harness run tests/fixtures/eval_harness/manifest-v2.json --json
@@ -1998,13 +2021,15 @@ is available.
 
 Merged-lane automation requires an exact local reference such as
 `--trunk-ref refs/heads/main`. It never treats an arbitrary current or detached
-`HEAD` as trunk, and it re-resolves ancestry at the deletion boundary. A merge
-apply only applies a patch to the primary checkout and does not advance the
-trunk reference, so `merge apply --auto-reap-merged --trunk-ref ...` reports a
+`HEAD` as trunk, and it re-resolves ancestry at the deletion boundary. An apply
+backed by the required reviewed preview only applies a patch to the primary
+checkout and does not advance the trunk reference. An apply using
+`--auto-reap-merged`, `--trunk-ref ...`, and
+`--reviewed-watermark <unchanged-preview.json>` therefore reports a
 just-applied lane as unmerged. After the integration commit or fast-forward, a
 finalization rerun classifies and, with `--apply-auto-reap`, reaps the fully
-merged lane. The post-reap Git prune pass is limited to the exact selected
-lane; unrelated stale registrations are counted as protected and left intact.
+merged lane. The post-reap Git prune pass is limited to the exact selected lane;
+unrelated stale registrations are counted as protected and left intact.
 
 The `--o2-launch-retention` profile schedules only the actual O2-launch run
 store: it keeps the newest 10 runs and gives idle unfinalized artifacts a
@@ -2203,18 +2228,117 @@ cargo run -- merge preview agent-a --repo . --claim src --json
 cargo run -- merge preview agent-a --repo . --claim src --validation-report validation.json --json
 cargo run -- merge preview agent-a --repo . --claim src --require-validation --validation-report validation.json --json
 cargo run -- merge preview agent-a --repo . --claim src/large.c --block-megafiles --json
-cargo run -- merge apply agent-a --repo . --claim src --validation-report validation.json
-cargo run -- merge apply agent-a --repo . --claim src --require-validation --validation-command "cargo test" --json
-cargo run -- merge apply agent-a --repo . --claim src \
-  --auto-reap-merged --trunk-ref refs/heads/main --apply-auto-reap --json
-cargo run -- merge apply split-large-c --repo . --claim src/large.c --claim src/large/ --block-megafiles --decomposition-target src/large.c --decomposition-run-id issue19-split-large-c --json
-cargo run -- merge apply agent-a --repo . --claim src --force-dirty-primary --force-stale-base --force-unclaimed-edits
 ```
 
-Merge apply refuses dirty primary worktrees, stale agent bases, unclaimed edits,
-validation failures, and apply conflicts unless the matching explicit force flag
-is passed. Apply-check failures themselves are still blocking unless
-`--force-apply-conflicts` allows a successful three-way apply check.
+### Reviewed merge apply workflow
+
+Every CLI apply uses a mandatory three-stage workflow:
+
+1. Run `merge preview --json` with the source, target, claims, validation
+   evidence, megafile policy, decomposition evidence, and force choices intended
+   for the apply, and redirect the complete JSON output to a file outside the
+   repository.
+2. Have a reviewer with the project's integration authority inspect that entire
+   file. Do not edit, regenerate, truncate, or replace it after review.
+3. Run `merge apply` with the corresponding options and pass either that same
+   unchanged file or a one-field JSON object containing its unchanged nested
+   `freshness_watermark` through `--reviewed-watermark`. Extraction does not
+   replace or precede the authority review of the complete preview.
+
+For example, validate external evidence, review the complete captured preview,
+then apply only that reviewed candidate:
+
+```bash
+REVIEWED_PREVIEW="$(mktemp)"
+cargo run -- merge preview agent-a --repo . --claim src \
+  --validation-report validation.json --json > "$REVIEWED_PREVIEW"
+# Stop here for the required authority review of the complete file.
+cargo run -- merge apply agent-a --repo . --claim src \
+  --validation-report validation.json \
+  --reviewed-watermark "$REVIEWED_PREVIEW" --json
+```
+
+Candidate validation, merged-lane reaping, megafile decomposition, and force
+options use the same preview-review-apply sequence. Each example below requires
+the authority review at the marked stop before its apply command:
+
+```bash
+REVIEWED_PREVIEW="$(mktemp)"
+cargo run -- merge preview agent-a --repo . --claim src \
+  --require-validation --validation-command "cargo test" --json \
+  > "$REVIEWED_PREVIEW"
+# Stop here for authority review; leave the file unchanged.
+cargo run -- merge apply agent-a --repo . --claim src \
+  --require-validation --validation-command "cargo test" \
+  --reviewed-watermark "$REVIEWED_PREVIEW" --json
+
+REVIEWED_PREVIEW="$(mktemp)"
+cargo run -- merge preview agent-a --repo . --claim src \
+  --auto-reap-merged --trunk-ref refs/heads/main --apply-auto-reap --json \
+  > "$REVIEWED_PREVIEW"
+# Stop here for authority review; leave the file unchanged.
+cargo run -- merge apply agent-a --repo . --claim src \
+  --auto-reap-merged --trunk-ref refs/heads/main --apply-auto-reap \
+  --reviewed-watermark "$REVIEWED_PREVIEW" --json
+
+REVIEWED_PREVIEW="$(mktemp)"
+cargo run -- merge preview split-large-c --repo . \
+  --claim src/large.c --claim src/large/ --block-megafiles \
+  --decomposition-target src/large.c \
+  --decomposition-run-id issue19-split-large-c --json \
+  > "$REVIEWED_PREVIEW"
+# Stop here for authority review; leave the file unchanged.
+cargo run -- merge apply split-large-c --repo . \
+  --claim src/large.c --claim src/large/ --block-megafiles \
+  --decomposition-target src/large.c \
+  --decomposition-run-id issue19-split-large-c \
+  --reviewed-watermark "$REVIEWED_PREVIEW" --json
+
+REVIEWED_PREVIEW="$(mktemp)"
+cargo run -- merge preview agent-a --repo . --claim src \
+  --force-dirty-primary --force-stale-base --force-unclaimed-edits --json \
+  > "$REVIEWED_PREVIEW"
+# Stop here for authority review; leave the file unchanged.
+cargo run -- merge apply agent-a --repo . --claim src \
+  --force-dirty-primary --force-stale-base --force-unclaimed-edits \
+  --reviewed-watermark "$REVIEWED_PREVIEW" --json
+```
+
+The nested v2 freshness watermark embeds the reviewed target primary HEAD,
+index, and worktree state; source agent identity and HEAD; candidate snapshot
+and diff; and a SHA-256 identity that binds the complete base preview. The
+top-level `review_intent`, which is included in that base-preview digest, binds
+the exact ordered candidate validation commands, the
+require-validation-after-command choice, and the lifecycle/reap choices. After
+the complete preview receives authority review,
+`--reviewed-watermark` accepts either that unchanged full output or an extracted
+one-field object containing its unchanged nested watermark. Apply re-captures
+current state only to compare it with that evidence. The recapture is not an
+implicit reviewed preview. Missing, malformed, stale, or substituted evidence
+is refused before the primary worktree is mutated, including a different
+complete preview for an otherwise unchanged candidate. A raw top-level
+watermark object is not accepted.
+
+All public Rust direct-apply wrappers fail closed before repository access.
+Mutation requires guarded CLI loading of a previously emitted, reviewed full
+preview or a one-field object containing its nested `freshness_watermark`.
+
+The current `merge preview --json` and `merge apply --json` producer contracts
+are v2. Mandatory exact review binding changes both the wire shape and
+accepted behavior, so it is a breaking correction rather than a compatible v1
+extension. Review-evidence refusal envelopes carry an unambiguous top-level
+`version: 2`; ordinary matched apply reports remain disjoint and carry their
+v2 base preview instead of a top-level refusal version. The v1 merge-preview
+and merge-apply schemas remain historical contracts only. Repository-map,
+semantic, and supervisor contracts retain their existing documented versions,
+while the current evaluation producer emits v3; v1 and v2 remain historical
+contracts because closing the contract required breaking changes.
+
+After review evidence is accepted, merge apply still refuses dirty primary
+worktrees, stale agent bases, unclaimed edits, validation failures, and apply
+conflicts unless the matching explicit force flag is passed. Apply-check failures
+themselves are still blocking unless `--force-apply-conflicts` allows a
+successful three-way apply check.
 
 Megafile merge policy is also warn-only by default. `safety.megafile_warnings`
 contains the authenticated threshold assessments without changing readiness.
@@ -2228,12 +2352,14 @@ typed assessment. A future dedicated `megafile_threshold_exceeded` blocker
 would require a coordinated versioned update of all exhaustive blocker
 consumers.
 
-`merge preview` never records a collision. `merge apply` records paths when its
-direct apply check detects a collision, including the direct-check failure that
-is allowed to continue via a successful opt-in three-way check. That write uses
-the authenticated durable megafile store before a blocked merge decision is
-returned. An authenticity or persistence failure aborts the decision and never
-turns a blocked merge into an apply.
+`merge preview` never records a collision. During
+`merge apply --reviewed-watermark <unchanged-preview.json>`, after the reviewed
+preview is accepted, apply records paths when its direct check detects a
+collision, including the direct-check failure that is allowed to continue via a
+successful opt-in three-way check. That write uses the authenticated durable
+megafile store before a blocked merge decision is returned. An authenticity or
+persistence failure aborts the decision and never turns a blocked merge into an
+apply.
 
 ### Public gate-denial contract
 
@@ -2386,11 +2512,13 @@ without a bound passed report. JSON readiness details distinguish `validation_mi
 `validation_not_run`, `validation_skipped`, and `validation_failed`, include
 related paths when available, and report the next safe operation.
 
-`merge apply --validation-command <command>` creates an independent standalone
-temporary repository for each command. It materializes the reviewed base through
-a private Git directory and controlled object alternate, applies the agent diff,
-and runs the command there before applying anything to the primary worktree. A
-failed command blocks the apply. A successful command is also
+After the exact preview is authority-reviewed and supplied with
+`--reviewed-watermark`, `merge apply --validation-command <command>` creates an
+independent standalone temporary repository for each command. It materializes
+the reviewed base through a private Git directory and controlled object
+alternate, applies the agent diff, and runs the command there before applying
+anything to the primary worktree. A failed command blocks the apply. A
+successful command is also
 rejected if it changes the candidate's HEAD, index, tracked files,
 non-ignored untracked files, or recursive submodule state. For an initialized
 submodule, checking records the `.git` marker identity plus the recursive
@@ -2483,14 +2611,14 @@ inherited. Captured validation diagnostics are bounded and redact registered
 credential, authentication, cookie/session, proxy/CA, and shell-startup values
 before they enter a validation report.
 
-Merge apply and PR publication share a kernel-managed advisory lock on the
-stable repo-common file `.git/maco/state/repository-mutation.lock`. The file is
-not deleted when the operation finishes; closing or crashing the process
-releases the kernel lock. Its typed owner record contains the operation, PID,
-process-start identity when available, nonce, and creation time for diagnostics.
-The owner record does not decide whether the lock is live. A locked malformed
-record is refused, while an unlocked stale record is replaced by the next lock
-holder.
+Merge apply with the required reviewed preview evidence and PR publication share
+a kernel-managed advisory lock on the stable repo-common file
+`.git/maco/state/repository-mutation.lock`. The file is not deleted when the
+operation finishes; closing or crashing the process releases the kernel lock.
+Its typed owner record contains the operation, PID, process-start identity when
+available, nonce, and creation time for diagnostics. The owner record does not
+decide whether the lock is live. A locked malformed record is refused, while an
+unlocked stale record is replaced by the next lock holder.
 
 Validation evidence remains bound to the exact candidate snapshot described
 above. Git and GitHub publication use a unique OID-derived remote ref and push
@@ -2618,11 +2746,12 @@ durability still depends on the underlying filesystem. Managed paths reject
 pre-existing symlinks (and Windows reparse points), but path-based checks do not
 claim protection from a hostile same-user process replacing components during
 the check; this boundary coordinates non-adversarial concurrent local actors.
-`merge apply` also does
-not run project checks after a successful primary apply, so release managers
-should run final verification after accepting changes. With `--json`, a blocked
-apply emits a machine-readable report with readiness blockers, blocker details,
-and related paths before exiting with an error.
+Even with the required reviewed preview evidence,
+`merge apply --reviewed-watermark <unchanged-preview.json>` does not run project
+checks after a successful primary apply, so release managers should run final
+verification after accepting changes. With `--json`, a blocked apply emits a
+machine-readable report with readiness blockers, blocker details, and related
+paths before exiting with an error.
 
 Preview and publish agent worktree changes as a pull request:
 
@@ -2638,8 +2767,9 @@ cargo run -- pr publish --from-branch task/docs --squash-onto main --exclude .ag
 ```
 
 `maco pr preview` uses the same merge-preview gates as `merge apply` and never
-pushes or creates a pull request. `maco pr publish --forge fake|github` refuses
-dirty-primary, stale-base, unclaimed-edit, validation, and apply-check blockers.
+pushes or creates a pull request.
+`maco pr publish --forge fake|github` refuses dirty-primary, stale-base,
+unclaimed-edit, validation, and apply-check blockers.
 `maco pr preview|publish --from-branch <task-branch>` uses the same gates for a
 committed primary task branch instead of a managed agent worktree. When
 `--claim` is omitted in branch mode, all changed paths in the branch candidate
@@ -3256,9 +3386,10 @@ are rejected. The supervisor final report deduplicates flags into
 `bloated_file_flags` and merge-ready output evidence into
 `decomposition_candidates`. The latter name is deliberate: supervisor work
 remains isolated, so successful worker/report evidence is not an accepted
-decomposition. Only a later successful `merge apply --decomposition-target
-... --decomposition-run-id ...` using that same finalized run evidence writes
-the authoritative `accepted_decomposition` history record.
+decomposition. Only a later successful `merge apply` backed by the required
+reviewed preview, `--decomposition-target ...`, `--decomposition-run-id ...`,
+and `--reviewed-watermark <unchanged-preview.json>` using that same finalized
+run evidence writes the authoritative `accepted_decomposition` history record.
 
 In `auto` mode, every hierarchy-ready assignment from independent roots can run
 concurrently up to the measured host-capacity bound, but only when normalized
@@ -3521,7 +3652,7 @@ requested, but `auto_merge_performed` is always `false`.
 | Typed environment failures | Issues #31 (`5655419`) and #47 (`74369ac`) provide `EnvironmentFailure`, including `runtime_model_catalog_unavailable`. Autopilot embeds the supervisor report unchanged and performs no dispatch/publication after catalog failure. | `runtime_catalog_failure_composes_typed_environment_failure_without_dispatch` uses a missing Codex runtime and fails unless the exact typed category is nested in the Autopilot report. |
 | Economics and KPI composition | Issues #34 (`285c517`) and #35 (`60ad4f9`) provide role economics, honest usage attribution including `not_process_observable`, and supervisor KPIs. Autopilot passes those fields through without inventing cost observations or recomputing rates. | `public_json_shape_is_stable_and_sanitized` requires the nested role-economics profile and `supervisor_aggregate` KPI observation. Existing supervisor economics/KPI gate tests retain their refusal assertions. |
 | Machine-global destructive staging cleanup | Issues #44 (`0217cfb`), #48 (`5b3d8ba`), and #54 (`4491bf3`, merged by `a76a4b9`) bind both child-orchestrator and parent review-lens auditor staging cleanup through `SupervisorRunOptions`. CLI omission fails in argument parsing; programmatic omission fails before repository/plan effects; missing/partial or denied binding refuses cleanup and preserves staging. Fake creates no external staging and therefore records no fabricated cleanup. | `autopilot_run_cli_requires_machine_global_binding_before_effect_artifacts`, `autopilot_missing_retention_binding_fails_before_any_repository_or_runtime_side_effect`, and existing `supervise_dispatch_refuses_a_missing_staging_cleanup_binding` plus child/auditor binding tests fail if any reached destructive launch loses its binding. |
-| Human-only integration | Issue #17 (`9f92b3e`) exposes arbitration only as an opt-in proposal. Generated follow-ups can run only as isolated ordinary supervisor work; Autopilot never calls publication, arbitration, or merge preview/apply, and legacy `auto_merge` is recorded only. | `auto_merge_request_is_recorded_but_never_performed` asserts the false capability fields and exact primary HEAD/index/files; `legacy_reviewer_command_refuses_before_autopilot_artifacts` and the legacy validation/reviewer plan tests fail if the legacy publication loop becomes reachable. |
+| Human-only integration | Issue #17 (`9f92b3e`) exposes arbitration only as an opt-in proposal. Generated follow-ups can run only as isolated ordinary supervisor work; Autopilot never calls publication, arbitration, or the merge preview/review/apply workflow, and legacy `auto_merge` is recorded only. | `auto_merge_request_is_recorded_but_never_performed` asserts the false capability fields and exact primary HEAD/index/files; `legacy_reviewer_command_refuses_before_autopilot_artifacts` and the legacy validation/reviewer plan tests fail if the legacy publication loop becomes reachable. |
 
 The load-bearing CLI contract changed explicitly: previously every
 `AutopilotSubcommand::Run` returned one unconditional unavailable error and its

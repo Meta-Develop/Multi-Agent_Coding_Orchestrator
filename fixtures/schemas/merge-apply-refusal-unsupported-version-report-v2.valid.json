@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "status": "refused",
+  "applied": false,
+  "review_bound": false,
+  "review_binding_status": "unsupported_version",
+  "refusal": {
+    "kind": "reviewed_preview_evidence",
+    "message": "merge apply refused: reviewed preview evidence version 1 is unsupported; expected version 2",
+    "axes": [],
+    "next_safe_operation": "run_merge_preview_again_with_the_same_options"
+  }
+}

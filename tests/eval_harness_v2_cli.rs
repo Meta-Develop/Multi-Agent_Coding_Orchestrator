@@ -6,7 +6,7 @@ use tempfile::TempDir;
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
 
 #[test]
-fn eval_harness_run_v2_emits_machine_readable_local_fake_json() -> Result<()> {
+fn eval_harness_run_v2_emits_v3_machine_readable_local_fake_json() -> Result<()> {
     let working = TempDir::new().context("create empty eval-harness cwd")?;
     let manifest_path = fixture_path("manifest-v2.json");
 
@@ -29,8 +29,8 @@ fn eval_harness_run_v2_emits_machine_readable_local_fake_json() -> Result<()> {
 
         let results: Value =
             serde_json::from_slice(&output.stdout).context("parse eval harness v2 JSON")?;
-        assert_eq!(results["version"], 2);
-        assert_eq!(results["schema"], "eval_harness_comparable_fake_results_v2");
+        assert_eq!(results["version"], 3);
+        assert_eq!(results["schema"], "eval_harness_comparable_fake_results_v3");
         assert_eq!(results["experiment_id"], "issue26-cli-operator-path-v2");
         assert_eq!(results["provider"]["kind"], "local_fake");
         assert_eq!(results["provider"]["network_providers"], false);

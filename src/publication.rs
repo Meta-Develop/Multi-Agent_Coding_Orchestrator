@@ -4505,6 +4505,10 @@ fn build_branch_publication_preview(
         candidate,
         MergeForceOptions::default(),
         require_validation,
+        merge::MergeApplyReviewIntent {
+            require_validation_after_candidate: require_validation,
+            ..Default::default()
+        },
     )?;
     Ok((preview, excluded_reference))
 }
@@ -5170,6 +5174,10 @@ fn build_merge_preview(
             },
             forces: MergeForceOptions::default(),
             require_validation,
+            review_intent: merge::MergeApplyReviewIntent {
+                require_validation_after_candidate: require_validation,
+                ..merge::MergeApplyReviewIntent::default()
+            },
         },
         validation_evidence,
     )
@@ -5193,6 +5201,10 @@ fn build_merge_preview_with_write_lease(
             },
             forces: MergeForceOptions::default(),
             require_validation,
+            review_intent: merge::MergeApplyReviewIntent {
+                require_validation_after_candidate: require_validation,
+                ..merge::MergeApplyReviewIntent::default()
+            },
         },
         validation_evidence,
         write_lease,

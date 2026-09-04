@@ -802,6 +802,7 @@ fn preview_merge_from_args(
     validation_report_paths: Vec<PathBuf>,
     forces: MergeForceOptions,
     require_validation: bool,
+    review_intent: merge::MergeApplyReviewIntent,
     megafile_policy: MegafileMergePolicy,
     local_git: merge::MergeLocalGitOptions,
 ) -> Result<MergeApplyPreview> {
@@ -812,6 +813,7 @@ fn preview_merge_from_args(
             collect: collect_options_from_claims(&repo, &agent_id, claims, true, Vec::new()),
             forces,
             require_validation,
+            review_intent,
         },
         validation_evidence,
         megafile_policy,
@@ -831,6 +833,7 @@ impl MergeCommand {
             MergeSubcommand::Preview(args) => {
                 let megafile_policy = args.megafile_policy()?;
                 let local_git = args.local_git.options()?;
+                let review_intent = args.review_intent()?;
                 let preview = preview_merge_from_args(
                     args.repo,
                     args.agent_id,
@@ -838,14 +841,17 @@ impl MergeCommand {
                     args.validation_report,
                     args.forces.into_force_options(),
                     args.require_validation,
+                    review_intent,
                     megafile_policy,
                     local_git,
                 )?;
                 print_merge_preview(&preview, args.json)
             }
-            MergeSubcommand::Apply(args) => run_merge_apply_controller(args, |report, json| {
-                print_merge_apply_report(report, json)
-            }),
+            MergeSubcommand::Apply(args) => run_merge_apply_controller(
+                args,
+                print_merge_apply_report,
+                print_merge_apply_review_refusal,
+            ),
             MergeSubcommand::Arbitrate(args) => {
                 let first_side =
                     arbitration_side_from_cli(args.first_side, args.first_claim, "first")?;
@@ -877,15 +883,23 @@ impl MergeCommand {
 fn run_merge_apply_controller(
     args: MergeApplyArgs,
     mut deliver_report: impl FnMut(&MergeApplyReport, bool) -> Result<()>,
+    mut deliver_review_refusal: impl FnMut(&merge::MergeApplyReviewRefusalEnvelope, bool) -> Result<()>,
 ) -> Result<()> {
+    let review_intent = args.review_intent()?;
     let lifecycle_repo = args.repo.clone();
     let lifecycle_agent_id = args.agent_id.clone();
-    let auto_reap_merged = args.auto_reap_merged;
-    let apply_auto_reap = args.apply_auto_reap;
-    let lifecycle_trunk_ref = args.trunk_ref.clone();
+    let auto_reap_merged = review_intent.auto_reap_merged;
+    let apply_auto_reap = review_intent.apply_auto_reap;
+    let lifecycle_trunk_ref = review_intent.trunk_ref.clone();
     let json = args.json;
     let megafile_policy = args.megafile_policy()?;
     let local_git = args.local_git.options()?;
+    let reviewed_watermark = match load_reviewed_merge_preview(args.reviewed_watermark.as_deref()) {
+        Ok(reviewed) => reviewed,
+        Err(error) => {
+            return deliver_merge_review_refusal(error, json, &mut deliver_review_refusal)
+        }
+    };
     let claims = resolve_claims(&args.repo, &args.agent_id, args.claim)?;
     let validation_evidence = load_validation_evidence(&args.validation_report, &args.agent_id)?;
     let candidate_validation_commands = args
@@ -897,29 +911,31 @@ fn run_merge_apply_controller(
         collect: collect_options_from_claims(&args.repo, &args.agent_id, claims, true, Vec::new()),
         forces: args.forces.into_force_options(),
         require_validation: args.require_validation,
+        review_intent,
     };
-    let mut report = merge::merge_apply_report_with_megafile_policy_and_local_git_options(
+    let report = merge::merge_apply_report_with_megafile_policy_and_local_git_options(
         MergeApplyOptions {
             preview: preview_options,
             candidate_validation_commands,
-            reviewed_watermark: match args.reviewed_watermark {
-                Some(path) => {
-                    let bytes = std::fs::read(&path).with_context(|| {
-                        format!("failed to read reviewed watermark {}", path.display())
-                    })?;
-                    let value: serde_json::Value = serde_json::from_slice(&bytes)
-                        .context("reviewed watermark is not valid JSON")?;
-                    Some(
-                        crate::merge_freshness::reviewed_merge_preview_watermark_from_json(&value)?,
-                    )
-                }
-                None => None,
-            },
+            reviewed_watermark,
         },
         validation_evidence,
         megafile_policy,
         local_git,
-    )?;
+    );
+    let mut report = match report {
+        Ok(report) => report,
+        Err(error) => {
+            if let Some(review_error) = error.downcast_ref::<merge::MergePreviewFreshnessError>() {
+                return deliver_merge_review_refusal(
+                    review_error,
+                    json,
+                    &mut deliver_review_refusal,
+                );
+            }
+            return Err(error);
+        }
+    };
     if report.status == merge::MergeApplyReportStatus::Blocked {
         if json {
             deliver_report(&report, true)?;
@@ -962,6 +978,41 @@ fn run_merge_apply_controller(
         }
     }
     deliver_report(&report, json)
+}
+
+fn load_reviewed_merge_preview(
+    path: Option<&Path>,
+) -> std::result::Result<merge::MergePreviewFreshnessWatermark, merge::MergePreviewFreshnessError> {
+    let path = path.ok_or(merge::MergePreviewFreshnessError::MissingReviewedEvidence)?;
+    let bytes = std::fs::read(path).map_err(|source| {
+        merge::MergePreviewFreshnessError::malformed(format!(
+            "failed to read reviewed evidence {}: {source}",
+            path.display()
+        ))
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|source| {
+        merge::MergePreviewFreshnessError::malformed(format!(
+            "reviewed evidence is not valid JSON: {source}"
+        ))
+    })?;
+    crate::merge_freshness::reviewed_merge_preview_watermark_from_json(&value)
+}
+
+fn deliver_merge_review_refusal<E>(
+    error: E,
+    json: bool,
+    deliver: &mut impl FnMut(&merge::MergeApplyReviewRefusalEnvelope, bool) -> Result<()>,
+) -> Result<()>
+where
+    E: std::borrow::Borrow<merge::MergePreviewFreshnessError>,
+{
+    let error = error.borrow();
+    let message = error.to_string();
+    if json {
+        let refusal = merge::MergeApplyReviewRefusalEnvelope::from_error(error);
+        deliver(&refusal, true)?;
+    }
+    bail!(message)
 }
 
 /// Reap authenticated managed worktrees whose branches are fully contained in
@@ -1116,6 +1167,9 @@ struct MergePreviewArgs {
     /// Require passed validation evidence bound exactly to the current candidate snapshot.
     #[arg(long)]
     require_validation: bool,
+    /// Validate a temporary merged candidate; recursive candidate or submodule changes block apply.
+    #[arg(long = "validation-command")]
+    validation_command: Vec<String>,
     /// Block threshold-crossing megafiles unless this is their exact typed decomposition.
     #[arg(long)]
     block_megafiles: bool,
@@ -1131,6 +1185,15 @@ struct MergePreviewArgs {
     forces: MergeForceArgs,
     #[command(flatten)]
     local_git: MergeLocalGitTimeoutArgs,
+    /// After a non-blocked merge result, classify this lane for guarded merged-lane reaping.
+    #[arg(long, requires = "trunk_ref")]
+    auto_reap_merged: bool,
+    /// Exact local trunk reference used to verify that the lane is fully merged.
+    #[arg(long, value_name = "REF", requires = "auto_reap_merged")]
+    trunk_ref: Option<String>,
+    /// Apply an eligible merge lifecycle reap; requires --auto-reap-merged.
+    #[arg(long, requires = "auto_reap_merged")]
+    apply_auto_reap: bool,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -1257,6 +1320,16 @@ fn arbitration_side_from_cli(
 }
 
 impl MergePreviewArgs {
+    fn review_intent(&self) -> Result<merge::MergeApplyReviewIntent> {
+        merge_apply_review_intent(
+            &self.validation_command,
+            self.require_validation,
+            self.auto_reap_merged,
+            self.trunk_ref.as_deref(),
+            self.apply_auto_reap,
+        )
+    }
+
     fn megafile_policy(&self) -> Result<MegafileMergePolicy> {
         let decomposition_run_id = self
             .decomposition_run_id
@@ -1280,6 +1353,16 @@ impl MergePreviewArgs {
 }
 
 impl MergeApplyArgs {
+    fn review_intent(&self) -> Result<merge::MergeApplyReviewIntent> {
+        merge_apply_review_intent(
+            &self.validation_command,
+            self.require_validation,
+            self.auto_reap_merged,
+            self.trunk_ref.as_deref(),
+            self.apply_auto_reap,
+        )
+    }
+
     fn megafile_policy(&self) -> Result<MegafileMergePolicy> {
         let decomposition_run_id = self
             .decomposition_run_id
@@ -1300,6 +1383,24 @@ impl MergeApplyArgs {
                 .unwrap_or_else(MegafileThresholds::provisional_bootstrap),
         })
     }
+}
+
+fn merge_apply_review_intent(
+    validation_commands: &[String],
+    require_validation_after_candidate: bool,
+    auto_reap_merged: bool,
+    trunk_ref: Option<&str>,
+    apply_auto_reap: bool,
+) -> Result<merge::MergeApplyReviewIntent> {
+    let intent = merge::MergeApplyReviewIntent {
+        candidate_validation_commands: validation_commands.to_vec(),
+        require_validation_after_candidate,
+        auto_reap_merged,
+        trunk_ref: trunk_ref.map(str::to_owned),
+        apply_auto_reap,
+    };
+    intent.validate()?;
+    Ok(intent)
 }
 
 fn validate_decomposition_cli_pair(target: Option<&Path>, run_id: Option<&RunId>) -> Result<()> {
@@ -2365,9 +2466,7 @@ fn print_merge_candidate(candidate: &MergeCandidate, json: bool) -> Result<()> {
 fn print_merge_preview(preview: &MergeApplyPreview, json: bool) -> Result<()> {
     if json {
         let watermark =
-            crate::merge_freshness::MergePreviewFreshnessWatermark::capture_from_candidate(
-                &preview.candidate,
-            )?;
+            crate::merge_freshness::MergePreviewFreshnessWatermark::capture_from_preview(preview)?;
         let mut value = serde_json::to_value(preview)?;
         if let Some(object) = value.as_object_mut() {
             object.insert(
@@ -2427,6 +2526,16 @@ fn print_merge_apply_report(report: &MergeApplyReport, json: bool) -> Result<()>
         if let Some(error) = &report.error {
             println!("Error: {error}");
         }
+    }
+    Ok(())
+}
+
+fn print_merge_apply_review_refusal(
+    refusal: &merge::MergeApplyReviewRefusalEnvelope,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(refusal)?);
     }
     Ok(())
 }

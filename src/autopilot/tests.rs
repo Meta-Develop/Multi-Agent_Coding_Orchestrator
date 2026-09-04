@@ -2833,6 +2833,7 @@ fn deterministic_prepared_report(
         truncated: false,
     };
     let preview = crate::merge::MergeApplyPreview {
+        review_intent: crate::merge::MergeApplyReviewIntent::default(),
         candidate: crate::merge::MergeCandidate {
             metadata: candidate.metadata.clone(),
             claimed_paths: changed_paths.clone(),

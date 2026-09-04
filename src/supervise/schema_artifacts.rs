@@ -51,6 +51,22 @@ pub(super) fn write_worktree_writable_admission_schema(
     write_schema(writer, relative, worktree_writable_admission_schema_value())
 }
 
+const REACHABLE_SUPERVISOR_RUNTIMES: [SupervisorRuntime; 6] = [
+    SupervisorRuntime::Codex,
+    SupervisorRuntime::Fake,
+    SupervisorRuntime::Grok,
+    SupervisorRuntime::Cursor,
+    SupervisorRuntime::ClaudeCode,
+    SupervisorRuntime::GeminiCli,
+];
+
+fn supervisor_runtime_schema_value() -> serde_json::Value {
+    json!({
+        "type": "string",
+        "enum": REACHABLE_SUPERVISOR_RUNTIMES.map(SupervisorRuntime::as_str)
+    })
+}
+
 pub(super) fn worktree_writable_admission_schema_value() -> serde_json::Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -98,10 +114,7 @@ pub(super) fn worktree_writable_admission_schema_value() -> serde_json::Value {
                 "additionalProperties": false,
                 "required": ["runtime", "workspace_access", "side_effect_confinement"],
                 "properties": {
-                    "runtime": {
-                        "type": "string",
-                        "enum": ["codex", "fake", "grok", "cursor", "claude-code", "gemini-cli"]
-                    },
+                    "runtime": supervisor_runtime_schema_value(),
                     "workspace_access": {"const": "read_write"},
                     "side_effect_confinement": {"const": "verified"}
                 }
@@ -118,6 +131,7 @@ pub(super) fn supervisor_final_report_schema_value() -> serde_json::Value {
         "required": ["version", "role_economics_profile", "role_usage", "usage_complete"],
         "properties": {
             "version": {"type": "integer", "const": SUPERVISOR_SCHEMA_VERSION},
+            "runtime": supervisor_runtime_schema_value(),
             "role_economics_profile": role_economics_profile_schema_value(),
             "role_usage": complete_role_usage_schema_value(),
             "usage_complete": {"type": "boolean"},
@@ -352,6 +366,24 @@ fn resolved_objective_profile_schema_value() -> serde_json::Value {
                             "latency_percent": {"type": "integer", "minimum": 0, "maximum": 100},
                             "retry_rework_percent": {"type": "integer", "minimum": 0, "maximum": 100},
                             "human_review_percent": {"type": "integer", "minimum": 0, "maximum": 100}
+                        }
+                    },
+                    "switch_costs": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                            "model_change_same_runtime_microunits",
+                            "runtime_change_microunits"
+                        ],
+                        "properties": {
+                            "model_change_same_runtime_microunits": {
+                                "type": "integer",
+                                "minimum": 0
+                            },
+                            "runtime_change_microunits": {
+                                "type": "integer",
+                                "minimum": 0
+                            }
                         }
                     },
                     "quality_operations_balance": {
@@ -3235,6 +3267,101 @@ mod selection_schema_tests {
         Ok(())
     }
 
+    fn tracked_supervisor_schema_replacements(
+        tracked: &serde_json::Value,
+        generated: &serde_json::Value,
+    ) -> Result<Vec<(&'static [&'static str], serde_json::Value)>> {
+        const RUNTIME: &[&str] = &["properties", "runtime"];
+        const RESOLVED_OBJECTIVE_PROFILE: &[&str] = &[
+            "$defs",
+            "economicsProfile",
+            "properties",
+            "resolved_objective_profile",
+        ];
+        const SELECTION_DECISIONS: &[&str] =
+            &["$defs", "execution", "properties", "selection_decisions"];
+        const ASSIGNMENT_SELECTION_LEDGER: &[&str] = &[
+            "$defs",
+            "execution",
+            "properties",
+            "assignment_selection_ledger",
+        ];
+        const ADMISSION_POLICY_PROPERTIES: &[&str] =
+            &["$defs", "admissionPolicyInput", "properties"];
+        const ADMISSION_INPUT_SOURCE_ENUM: &[&str] = &["$defs", "admissionInputSource", "enum"];
+
+        let generated_execution =
+            &generated["properties"]["role_economics_profile"]["properties"]["execution"];
+        let generated_concurrency = &generated_execution["properties"]["concurrency"];
+        let generated_admission =
+            &generated_concurrency["properties"]["policy_input_details"]["anyOf"][0];
+        let mut admission_properties =
+            tracked["$defs"]["admissionPolicyInput"]["properties"].clone();
+        let admission_properties_object = admission_properties
+            .as_object_mut()
+            .context("tracked admissionPolicyInput properties are not an object")?;
+        for field in [
+            "quota_inflight_bound",
+            "quota_inflight_source",
+            "quota_config_path",
+        ] {
+            admission_properties_object.insert(
+                field.to_string(),
+                generated_admission["properties"][field].clone(),
+            );
+        }
+
+        Ok(vec![
+            (RUNTIME, generated["properties"]["runtime"].clone()),
+            (
+                RESOLVED_OBJECTIVE_PROFILE,
+                generated["properties"]["role_economics_profile"]["properties"]
+                    ["resolved_objective_profile"]
+                    .clone(),
+            ),
+            (
+                SELECTION_DECISIONS,
+                generated_execution["properties"]["selection_decisions"].clone(),
+            ),
+            (
+                ASSIGNMENT_SELECTION_LEDGER,
+                generated_execution["properties"]["assignment_selection_ledger"].clone(),
+            ),
+            (ADMISSION_POLICY_PROPERTIES, admission_properties),
+            (
+                ADMISSION_INPUT_SOURCE_ENUM,
+                generated_admission["properties"]["provider_inflight_source"]["enum"].clone(),
+            ),
+        ])
+    }
+
+    #[test]
+    fn generated_fragments_match_tracked_supervisor_schema() -> Result<()> {
+        let tracked: serde_json::Value = serde_json::from_str(include_str!(
+            "../../schemas/supervisor-final-report-v1.schema.json"
+        ))?;
+        let generated = supervisor_final_report_schema_value();
+
+        for (path, expected) in tracked_supervisor_schema_replacements(&tracked, &generated)? {
+            let mut actual = &tracked;
+            for segment in path {
+                actual = actual.get(segment).with_context(|| {
+                    format!(
+                        "tracked supervisor schema is missing synchronized fragment {}",
+                        path.join("/")
+                    )
+                })?;
+            }
+            assert_eq!(
+                actual,
+                &expected,
+                "tracked supervisor schema fragment {} drifted; run the ignored regeneration test",
+                path.join("/")
+            );
+        }
+        Ok(())
+    }
+
     /// Explicit maintainer action for synchronizing generated execution
     /// subcontracts into the broader published supervisor-report envelope.
     ///
@@ -3261,55 +3388,8 @@ mod selection_schema_tests {
         let published_required = tracked["required"].clone();
 
         let generated = supervisor_final_report_schema_value();
-        let generated_execution =
-            &generated["properties"]["role_economics_profile"]["properties"]["execution"];
-        let generated_concurrency = &generated_execution["properties"]["concurrency"];
-        let generated_admission =
-            &generated_concurrency["properties"]["policy_input_details"]["anyOf"][0];
-        let mut admission_properties =
-            tracked["$defs"]["admissionPolicyInput"]["properties"].clone();
-        let admission_properties_object = admission_properties
-            .as_object_mut()
-            .context("tracked admissionPolicyInput properties are not an object")?;
-        for field in [
-            "quota_inflight_bound",
-            "quota_inflight_source",
-            "quota_config_path",
-        ] {
-            admission_properties_object.insert(
-                field.to_string(),
-                generated_admission["properties"][field].clone(),
-            );
-        }
-        let replacements: &[(&[&str], serde_json::Value)] = &[
-            (
-                &["$defs", "execution", "properties", "selection_decisions"],
-                generated_execution["properties"]["selection_decisions"].clone(),
-            ),
-            (
-                &[
-                    "$defs",
-                    "execution",
-                    "properties",
-                    "assignment_selection_ledger",
-                ],
-                generated_execution["properties"]["assignment_selection_ledger"].clone(),
-            ),
-            (
-                &["$defs", "admissionPolicyInput", "properties"],
-                admission_properties,
-            ),
-            (
-                &["$defs", "admissionInputSource", "enum"],
-                json!([
-                    "configured",
-                    "operator_quota_config",
-                    "conservative_default",
-                    "measured"
-                ]),
-            ),
-        ];
-        let rendered = replace_json_values_preserving_document(&original, replacements)?;
+        let replacements = tracked_supervisor_schema_replacements(&tracked, &generated)?;
+        let rendered = replace_json_values_preserving_document(&original, &replacements)?;
         let rendered_value: serde_json::Value = serde_json::from_slice(&rendered)
             .context("parse synchronized tracked supervisor schema")?;
         if rendered_value["$id"] != published_id
@@ -3320,6 +3400,34 @@ mod selection_schema_tests {
         }
         fs::write(&path, rendered)
             .with_context(|| format!("write tracked schema {}", path.display()))?;
+        Ok(())
+    }
+
+    #[test]
+    fn reachable_runtime_schema_is_synchronized_across_generated_and_published_contracts(
+    ) -> Result<()> {
+        let runtime_schema = supervisor_runtime_schema_value();
+        let generated = supervisor_final_report_schema_value();
+        let admission = worktree_writable_admission_schema_value();
+        let tracked: serde_json::Value = serde_json::from_str(include_str!(
+            "../../schemas/supervisor-final-report-v1.schema.json"
+        ))?;
+
+        assert_eq!(generated["properties"]["runtime"], runtime_schema);
+        assert_eq!(
+            admission["properties"]["native_sandbox"]["properties"]["runtime"],
+            runtime_schema
+        );
+        assert_eq!(tracked["properties"]["runtime"], runtime_schema);
+        assert_eq!(
+            tracked["$defs"]["economicsProfile"]["properties"]["resolved_objective_profile"],
+            generated["properties"]["role_economics_profile"]["properties"]
+                ["resolved_objective_profile"]
+        );
+        assert_eq!(
+            runtime_schema["enum"],
+            json!(REACHABLE_SUPERVISOR_RUNTIMES.map(SupervisorRuntime::as_str))
+        );
         Ok(())
     }
 

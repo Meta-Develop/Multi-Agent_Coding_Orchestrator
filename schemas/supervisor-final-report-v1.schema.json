@@ -68,7 +68,11 @@
       "type": "string",
       "enum": [
         "codex",
-        "fake"
+        "fake",
+        "grok",
+        "cursor",
+        "claude-code",
+        "gemini-cli"
       ]
     },
     "publishable": {
@@ -312,14 +316,20 @@
     "safePublishedPath": {
       "type": "string",
       "minLength": 1,
-      "pattern": "^(?![\\\\/])(?![A-Za-z]:)(?!.*(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$))[^\\u0000-\\u001F]+$",
+      "pattern": "^([A-Za-z]($|[^:\\u0000-\\u001F])|[^A-Za-z\\\\/\\u0000-\\u001F])[^\\u0000-\\u001F]*$",
+      "not": {
+        "pattern": "(^|[\\\\/])\\.\\.([\\\\/]|$)"
+      },
       "description": "Repository-relative or explicit producer sentinel path; absolute, drive-prefixed, traversal, and control-character forms are forbidden while native separators remain portable."
     },
     "repositoryRelativePath": {
       "type": "string",
       "minLength": 1,
       "maxLength": 4096,
-      "pattern": "^(?![\\\\/])(?![A-Za-z]:)(?!.*(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$))[^\\u0000-\\u001F]+$"
+      "pattern": "^([A-Za-z]($|[^:\\u0000-\\u001F])|[^A-Za-z\\\\/\\u0000-\\u001F])[^\\u0000-\\u001F]*$",
+      "not": {
+        "pattern": "(^|[\\\\/])\\.\\.([\\\\/]|$)"
+      }
     },
     "pathArray": {
       "type": "array",
@@ -832,6 +842,44 @@
                       "maximum": 100
                     },
                     "human_review_percent": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 100
+                    }
+                  }
+                },
+                "switch_costs": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "model_change_same_runtime_microunits",
+                    "runtime_change_microunits"
+                  ],
+                  "properties": {
+                    "model_change_same_runtime_microunits": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "runtime_change_microunits": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  }
+                },
+                "quality_operations_balance": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "quality_percent",
+                    "operations_percent"
+                  ],
+                  "properties": {
+                    "quality_percent": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 100
+                    },
+                    "operations_percent": {
                       "type": "integer",
                       "minimum": 0,
                       "maximum": 100

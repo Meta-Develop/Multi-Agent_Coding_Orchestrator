@@ -35,6 +35,26 @@
       "auditor": {}
     },
     "model_catalog_observation": "not_consulted",
+    "resolved_objective_profile": {
+      "profile": {
+        "id": "maco-default-objective-v1",
+        "version": 1,
+        "content_hash": "64a1962f8f603c668ecb15713baf7541b3f33899a4f8159026dafa3004c092c8",
+        "quality": {
+          "held_out_percent": 50,
+          "breadth_percent": 25,
+          "anti_shortcut_percent": 25
+        },
+        "tradeoffs": {
+          "monetary_cost_percent": 100,
+          "quota_consumption_percent": 0,
+          "latency_percent": 0,
+          "retry_rework_percent": 0,
+          "human_review_percent": 0
+        }
+      },
+      "source": "built_in"
+    },
     "execution": {
       "assignment_count": 0,
       "started_assignment_count": 0,
@@ -43,35 +63,7 @@
         "configured_max_concurrent_children": 1,
         "policy_input_observation": "not_retained",
         "policy_input": null,
-        "policy_input_details": {
-          "entrypoint_bound": 1,
-          "plan": {
-            "max_concurrent_children": null
-          },
-          "cli": {},
-          "effective": {
-            "max_concurrent_children": 1
-          },
-          "provider_inflight_bound": 1,
-          "provider_inflight_source": "configured",
-          "host": {
-            "memory_available_mib": null,
-            "memory_available_source": "conservative_default",
-            "memory_per_child_mib": 1,
-            "memory_bound": null,
-            "fd_available": null,
-            "fd_available_source": "conservative_default",
-            "fds_per_child": 1,
-            "fd_bound": null,
-            "disk_available_mib": null,
-            "disk_available_source": "conservative_default",
-            "disk_per_child_mib": 1,
-            "disk_bound": null,
-            "fallback_children": 1,
-            "resolved_bound": 1
-          },
-          "resolved_bound": 1
-        },
+        "policy_input_details": 7,
         "policy_input_unavailable_reason": "synthetic fixture",
         "achieved_max_concurrent_children": 0,
         "achieved_mean_concurrent_children": 0.0,
