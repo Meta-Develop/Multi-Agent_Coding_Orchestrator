@@ -321,6 +321,73 @@ fn assert_expected_diagnostic(
     )
 }
 
+fn assert_recursively_strict_schema(value: &Value, path: &str) -> Result<()> {
+    match value {
+        Value::Object(object) => {
+            let object_type = object.get("type").is_some_and(|schema_type| {
+                schema_type == "object"
+                    || schema_type
+                        .as_array()
+                        .is_some_and(|types| types.iter().any(|value| value == "object"))
+            });
+            if object_type {
+                match object.get("additionalProperties") {
+                    Some(Value::Bool(false)) | Some(Value::Object(_)) => {}
+                    other => bail!(
+                        "{path}: object schema must deny unknown fields or type map values; got {other:?}"
+                    ),
+                }
+            }
+            if object.get("type") == Some(&Value::String("array".to_owned()))
+                && !object.contains_key("items")
+            {
+                bail!("{path}: reachable array schema must define items");
+            }
+            for (name, child) in object {
+                assert_recursively_strict_schema(child, &format!("{path}/{name}"))?;
+            }
+        }
+        Value::Array(values) => {
+            for (index, child) in values.iter().enumerate() {
+                assert_recursively_strict_schema(child, &format!("{path}/{index}"))?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn assert_unknown_nested_field_rejected(
+    schemas: &Schemas,
+    index: SchemaIndex,
+    valid: &Value,
+    object_pointer: &str,
+    expected_instance_path: &str,
+) -> Result<()> {
+    if let Err(failure) = validate_instance(schemas, index, valid) {
+        bail!(
+            "representative nested family at {object_pointer} was not valid before drift:\n{}",
+            failure.rendered
+        );
+    }
+    let mut invalid = valid.clone();
+    invalid
+        .pointer_mut(object_pointer)
+        .and_then(Value::as_object_mut)
+        .with_context(|| format!("nested strictness pointer {object_pointer}"))?
+        .insert(DRIFT_PROPERTY.to_owned(), Value::Bool(true));
+    let failure = validate_instance(schemas, index, &invalid).map_or_else(Ok, |()| {
+        Err(anyhow::anyhow!(
+            "supervisor final schema accepted nested drift at {object_pointer}"
+        ))
+    })?;
+    assert_expected_diagnostic(
+        object_pointer,
+        &format!("{expected_instance_path}.{DRIFT_PROPERTY}: additionalProperties"),
+        &failure,
+    )
+}
+
 #[test]
 fn published_schemas_and_fixtures_follow_the_manifest_contract() -> Result<()> {
     let root = repo_root();
@@ -439,6 +506,157 @@ fn published_schemas_and_fixtures_follow_the_manifest_contract() -> Result<()> {
         )?;
     }
 
+    Ok(())
+}
+
+#[test]
+fn supervisor_final_contract_is_recursive_and_rejects_representative_nested_drift() -> Result<()> {
+    let schema_name = "supervisor-final-report-v1.schema.json";
+    let schema = load_json(&repo_root().join("schemas").join(schema_name))?;
+    assert_recursively_strict_schema(&schema, "$")?;
+    let compiled =
+        compile_and_meta_validate_2020_12(&BTreeMap::from([(schema_name.to_owned(), schema)]))?;
+    let index = *compiled
+        .indices
+        .get(schema_name)
+        .context("compiled schema")?;
+    let base = load_json(
+        &repo_root()
+            .join("fixtures/schemas")
+            .join("supervisor-final-report-v1.valid.json"),
+    )?;
+
+    let binding = serde_json::json!({
+        "version": 1,
+        "agent_id": "worker-1",
+        "primary_head": null,
+        "agent_head": null,
+        "merge_base": null,
+        "diff_oid": "sha256:binding"
+    });
+
+    let mut reaudit = base.clone();
+    reaudit["evidence_only_reaudit"] = serde_json::json!({
+        "source_run_id": "source-1",
+        "assignment_id": "assignment-1",
+        "attempt": 1,
+        "preserved_candidate_binding": binding.clone(),
+        "accepted": true
+    });
+    assert_unknown_nested_field_rejected(
+        &compiled.schemas,
+        index,
+        &reaudit,
+        "/evidence_only_reaudit/preserved_candidate_binding",
+        "$.evidence_only_reaudit.preserved_candidate_binding",
+    )?;
+
+    let mut command = base.clone();
+    command["commands_run"] = serde_json::json!([{
+        "command": ["cargo", "check"],
+        "cwd": ".",
+        "exit_code": 0,
+        "status": "succeeded",
+        "timeout_seconds": 30,
+        "duration_ms": 1,
+        "timed_out": false,
+        "stdout": "",
+        "stderr": "",
+        "sandbox_denials": [],
+        "environment_preflight_results": [{
+            "requirement": {"kind": "executable", "executable": "cargo"},
+            "status": "satisfied",
+            "observation": {
+                "kind": "executable_version",
+                "executable": "cargo",
+                "version": {"major": 1, "minor": 90, "patch": 0}
+            }
+        }],
+        "environment_failures": []
+    }]);
+    assert_unknown_nested_field_rejected(
+        &compiled.schemas,
+        index,
+        &command,
+        "/commands_run/0/environment_preflight_results/0/observation",
+        "$.commands_run[0].environment_preflight_results[0].observation",
+    )?;
+
+    let mut traceability = base.clone();
+    traceability["assignment_traceability"] = serde_json::json!([{
+        "assignment_id": "assignment-1",
+        "depth": 1,
+        "flattened_index": 0,
+        "spec_fragment_ids": [],
+        "assigned_paths": ["src/lib.rs"],
+        "produced_changed_paths": [],
+        "produced_diff_binding": binding
+    }]);
+    assert_unknown_nested_field_rejected(
+        &compiled.schemas,
+        index,
+        &traceability,
+        "/assignment_traceability/0",
+        "$.assignment_traceability[0]",
+    )?;
+
+    let mut breaker = base.clone();
+    breaker["breaker_trip"] = serde_json::json!({
+        "reason": {
+            "kind": "sustained_assignment_failures",
+            "failures": 2,
+            "retries": 1,
+            "threshold": 2
+        },
+        "window": {
+            "window_len": 2,
+            "accepted_assignments": 0,
+            "repeated_rejections": 0,
+            "failed_assignments": 2,
+            "retries": 1,
+            "claim_denials": 0,
+            "claim_failures": 0,
+            "semantic_conflict_blocks": 0,
+            "semantic_conflict_warnings": 0,
+            "semantic_conflicts": 0
+        },
+        "autonomy_kpis": base["autonomy_kpis"].clone(),
+        "recovery_guidance": "inspect failures"
+    });
+    assert_unknown_nested_field_rejected(
+        &compiled.schemas,
+        index,
+        &breaker,
+        "/breaker_trip/window",
+        "$.breaker_trip.window",
+    )?;
+
+    let mut released = base;
+    released["released_semantic_intents"] = serde_json::json!([{
+        "token": 1,
+        "agent_id": "worker-1",
+        "paths": ["src/lib.rs"],
+        "symbols": [{
+            "id": "symbol-1",
+            "qualified_path": "crate::item",
+            "name": "item",
+            "kind": "function",
+            "file": "src/lib.rs"
+        }],
+        "modules": ["crate"],
+        "impacted_files": ["src/lib.rs"],
+        "task_digest": null,
+        "task_excerpt": null,
+        "notes": [],
+        "warnings": []
+    }]);
+    assert_unknown_nested_field_rejected(
+        &compiled.schemas,
+        index,
+        &released,
+        "/released_semantic_intents/0/symbols/0",
+        "$.released_semantic_intents[0].symbols[0]",
+    )?;
     Ok(())
 }
 

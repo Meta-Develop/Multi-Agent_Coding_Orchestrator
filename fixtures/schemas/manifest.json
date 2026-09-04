@@ -150,6 +150,19 @@
       ]
     },
     {
+      "schema": "supervisor-collect-report-v1.schema.json",
+      "valid": [
+        "supervisor-collect-finalized-v1.valid.json",
+        "supervisor-collect-active-v1.valid.json"
+      ],
+      "invalid": [
+        {
+          "path": "supervisor-collect-plan-file-v1.invalid.json",
+          "expected_error": "$.plan_file: const"
+        }
+      ]
+    },
+    {
       "schema": "eval-harness-comparable-fake-results-v2.schema.json",
       "valid": [
         "eval-harness-comparable-fake-results-v2.valid.json"

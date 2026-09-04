@@ -1,5 +1,5 @@
 {
-  "$id": "https://raw.githubusercontent.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/main/schemas/supervisor-final-report-v1.schema.json",
+  "$id": "https://raw.githubusercontent.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/main/schemas/supervisor-collect-report-v1.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "allOf": [
@@ -77,12 +77,349 @@
           }
         }
       }
+    },
+    {
+      "oneOf": [
+        {
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "role_economics_profile"
+                ]
+              },
+              {
+                "required": [
+                  "role_usage"
+                ]
+              }
+            ]
+          },
+          "properties": {
+            "accepted": {
+              "const": false
+            },
+            "collection_state": {
+              "const": "active"
+            },
+            "final_report_available": {
+              "const": false
+            },
+            "plan_file": {
+              "const": "<unavailable-until-finalized>"
+            },
+            "publishable": {
+              "const": false
+            },
+            "rejected": {
+              "const": true
+            },
+            "run_lifecycle": {
+              "const": "active"
+            },
+            "status": {
+              "const": "missing"
+            },
+            "success": {
+              "const": false
+            },
+            "usage_complete": {
+              "const": false
+            }
+          },
+          "required": [
+            "collection_state",
+            "final_report_available",
+            "run_lifecycle",
+            "plan_file",
+            "publishable",
+            "success",
+            "accepted",
+            "rejected",
+            "status",
+            "usage_complete"
+          ]
+        },
+        {
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "role_economics_profile"
+                ]
+              },
+              {
+                "required": [
+                  "role_usage"
+                ]
+              }
+            ]
+          },
+          "properties": {
+            "accepted": {
+              "const": false
+            },
+            "collection_state": {
+              "const": "resumable"
+            },
+            "final_report_available": {
+              "const": false
+            },
+            "plan_file": {
+              "const": "<unavailable-until-finalized>"
+            },
+            "publishable": {
+              "const": false
+            },
+            "rejected": {
+              "const": true
+            },
+            "run_lifecycle": {
+              "const": "resumable"
+            },
+            "status": {
+              "const": "missing"
+            },
+            "success": {
+              "const": false
+            },
+            "usage_complete": {
+              "const": false
+            }
+          },
+          "required": [
+            "collection_state",
+            "final_report_available",
+            "run_lifecycle",
+            "plan_file",
+            "publishable",
+            "success",
+            "accepted",
+            "rejected",
+            "status",
+            "usage_complete"
+          ]
+        },
+        {
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "role_economics_profile"
+                ]
+              },
+              {
+                "required": [
+                  "role_usage"
+                ]
+              }
+            ]
+          },
+          "properties": {
+            "accepted": {
+              "const": false
+            },
+            "collection_state": {
+              "const": "uncertain"
+            },
+            "final_report_available": {
+              "const": false
+            },
+            "plan_file": {
+              "const": "<unavailable-until-finalized>"
+            },
+            "publishable": {
+              "const": false
+            },
+            "rejected": {
+              "const": true
+            },
+            "run_lifecycle": {
+              "const": "uncertain"
+            },
+            "status": {
+              "const": "missing"
+            },
+            "success": {
+              "const": false
+            },
+            "usage_complete": {
+              "const": false
+            }
+          },
+          "required": [
+            "collection_state",
+            "final_report_available",
+            "run_lifecycle",
+            "plan_file",
+            "publishable",
+            "success",
+            "accepted",
+            "rejected",
+            "status",
+            "usage_complete"
+          ]
+        },
+        {
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "role_economics_profile"
+                ]
+              },
+              {
+                "required": [
+                  "role_usage"
+                ]
+              }
+            ]
+          },
+          "properties": {
+            "accepted": {
+              "const": false
+            },
+            "collection_state": {
+              "const": "interrupted"
+            },
+            "final_report_available": {
+              "const": false
+            },
+            "plan_file": {
+              "const": "<unavailable-until-finalized>"
+            },
+            "publishable": {
+              "const": false
+            },
+            "rejected": {
+              "const": true
+            },
+            "run_lifecycle": {
+              "const": "interrupted"
+            },
+            "status": {
+              "const": "missing"
+            },
+            "success": {
+              "const": false
+            },
+            "usage_complete": {
+              "const": false
+            }
+          },
+          "required": [
+            "collection_state",
+            "final_report_available",
+            "run_lifecycle",
+            "plan_file",
+            "publishable",
+            "success",
+            "accepted",
+            "rejected",
+            "status",
+            "usage_complete"
+          ]
+        },
+        {
+          "not": {
+            "properties": {
+              "plan_file": {
+                "const": "<unavailable-until-finalized>"
+              }
+            },
+            "required": [
+              "plan_file"
+            ]
+          },
+          "properties": {
+            "collection_state": {
+              "const": "finalized"
+            },
+            "final_report_available": {
+              "const": true
+            },
+            "run_lifecycle": {
+              "const": "finalized"
+            }
+          },
+          "required": [
+            "collection_state",
+            "final_report_available",
+            "run_lifecycle",
+            "role_economics_profile",
+            "role_usage"
+          ]
+        },
+        {
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "role_economics_profile"
+                ]
+              },
+              {
+                "required": [
+                  "role_usage"
+                ]
+              }
+            ]
+          },
+          "properties": {
+            "accepted": {
+              "const": false
+            },
+            "collection_state": {
+              "const": "inconsistent_finalized"
+            },
+            "final_report_available": {
+              "const": false
+            },
+            "plan_file": {
+              "const": "<unavailable-until-finalized>"
+            },
+            "publishable": {
+              "const": false
+            },
+            "rejected": {
+              "const": true
+            },
+            "run_lifecycle": {
+              "const": "finalized"
+            },
+            "status": {
+              "const": "missing"
+            },
+            "success": {
+              "const": false
+            },
+            "usage_complete": {
+              "const": false
+            }
+          },
+          "required": [
+            "collection_state",
+            "final_report_available",
+            "run_lifecycle",
+            "plan_file",
+            "publishable",
+            "success",
+            "accepted",
+            "rejected",
+            "status",
+            "usage_complete"
+          ]
+        }
+      ]
     }
   ],
-  "description": "Contract for newly finalized `supervisor-final.json` reports. Historical top-level version-1 reports that predate finalized economics telemetry are outside this publication contract.",
+  "description": "Lifecycle-aware public output from `maco supervise collect`. Finalized reports preserve the historical supervisor-final v1 fields; nonfinal states are explicit incomplete snapshots.",
   "properties": {
     "accepted": {
       "type": "boolean"
+    },
+    "artifact_kind": {
+      "const": "supervisor_collect_report"
     },
     "assigned_paths": {
       "items": {
@@ -1108,6 +1445,17 @@
       },
       "type": "array",
       "uniqueItems": true
+    },
+    "collection_state": {
+      "enum": [
+        "active",
+        "resumable",
+        "uncertain",
+        "interrupted",
+        "finalized",
+        "inconsistent_finalized"
+      ],
+      "type": "string"
     },
     "commands_run": {
       "items": {
@@ -2209,6 +2557,9 @@
       },
       "type": "array",
       "uniqueItems": true
+    },
+    "final_report_available": {
+      "type": "boolean"
     },
     "findings": {
       "items": {
@@ -18606,7 +18957,14 @@
       "type": "string"
     },
     "run_lifecycle": {
-      "const": "finalized"
+      "enum": [
+        "active",
+        "interrupted",
+        "uncertain",
+        "resumable",
+        "finalized"
+      ],
+      "type": "string"
     },
     "runtime": {
       "enum": [
@@ -18663,6 +19021,13 @@
       },
       "type": "array",
       "uniqueItems": true
+    },
+    "schema": {
+      "const": "https://raw.githubusercontent.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/main/schemas/supervisor-collect-report-v1.schema.json"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
     },
     "semantic_intent_tokens": {
       "items": {
@@ -18796,8 +19161,6 @@
     "semantic_modules",
     "claim_tokens",
     "semantic_intent_tokens",
-    "role_economics_profile",
-    "role_usage",
     "usage_complete",
     "commands_run",
     "environment_failures",
@@ -18814,8 +19177,13 @@
     "released_semantic_intents",
     "semantic_release_errors",
     "remaining_risk",
-    "next_safe_action"
+    "next_safe_action",
+    "artifact_kind",
+    "schema",
+    "schema_version",
+    "collection_state",
+    "final_report_available"
   ],
-  "title": "MACO Newly Finalized Supervisor Report v1",
+  "title": "MACO Supervisor Collect Report v1",
   "type": "object"
 }

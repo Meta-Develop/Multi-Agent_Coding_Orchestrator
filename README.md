@@ -135,8 +135,13 @@ The current implementation covers a local-first command-line slice:
   changes to the primary worktree automatically.
 - `maco supervise status` reports durable supervisor run artifact state without
   launching workers or applying changes.
-- `maco supervise collect` reads the structured supervisor final report and
-  preserves the same no-automatic-primary-apply boundary.
+- `maco supervise collect` emits the versioned lifecycle-aware
+  `supervisor_collect_report` contract and preserves the same
+  no-automatic-primary-apply boundary. Finalized output flattens the complete
+  supervisor-final fields for compatibility; active, resumable, uncertain,
+  interrupted, and inconsistent-finalized snapshots explicitly advertise
+  `final_report_available: false` and use
+  `<unavailable-until-finalized>` instead of an empty or invented plan path.
 - `maco supervise artifacts list/latest/prune` inspects or prunes durable
   supervisor run artifacts.
 - `maco consult ask` asks a terminal read-only cross-runtime consultant for
@@ -3048,6 +3053,15 @@ cargo run -- supervise status supervise-demo --repo . --json
 cargo run -- supervise collect supervise-demo --repo . --json
 cargo run -- supervise artifacts latest --repo . --json
 ```
+
+Machine consumers of `supervise collect` should resolve the exact Draft
+2020-12 contract from its `schema` field. Version 1 currently identifies
+`schemas/supervisor-collect-report-v1.schema.json`; the newly finalized report
+contract remains `schemas/supervisor-final-report-v1.schema.json`. Both tracked
+supervisor contracts are compared as complete JSON values against the Rust
+generator, and the final-report contract denies unknown properties recursively
+through command, gate, follow-up, traceability, breaker, review-report, claim,
+and semantic-intent records.
 
 `supervise plan` and `supervise run` each require exactly one input source. The
 positional `TASK_FILE` keeps its existing contract: valid JSON is normalized as

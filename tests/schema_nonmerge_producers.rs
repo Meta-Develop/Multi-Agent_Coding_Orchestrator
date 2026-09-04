@@ -100,6 +100,41 @@ fn repository_map_cli_output_validates_and_required_entry_drift_fails() -> Resul
     schema.assert_rejected(&drifted, "file entry omitted category")
 }
 
+#[cfg(unix)]
+#[test]
+fn supervise_collect_cli_advertises_and_validates_its_interrupted_contract() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().context("create supervise collect fixture root")?;
+    let repository = temp.path().join("repository");
+    Repository::init(&repository).context("initialize supervise collect repository")?;
+    let run_id = "schema-collect-interrupted";
+    let run_dir = repository.join(".maco/o2/runs").join(run_id);
+    fs::create_dir_all(&run_dir).context("create interrupted supervise run directory")?;
+    fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700))
+        .context("secure interrupted supervise run directory")?;
+
+    let output = run_json_refusal_in(
+        &repository,
+        [
+            "supervise",
+            "collect",
+            run_id,
+            "--repo",
+            path_text(&repository)?,
+            "--json",
+        ],
+    )?;
+    assert_eq!(output["artifact_kind"], "supervisor_collect_report");
+    assert_eq!(output["collection_state"], "interrupted");
+    assert_eq!(output["run_lifecycle"], "interrupted");
+    assert_eq!(output["final_report_available"], false);
+
+    let schema = Draft202012Schema::load("supervisor-collect-report-v1.schema.json")?;
+    assert_eq!(output["schema"], load_fixture_schema_id(&schema.name)?);
+    schema.assert_valid(&output)
+}
+
 #[test]
 fn semantic_risk_cli_output_validates_spans_and_signature_drift_fails() -> Result<()> {
     let temp = TempDir::new().context("create semantic-risk fixture root")?;
@@ -332,4 +367,30 @@ fn run_json_in<const N: usize>(working: &Path, args: [&str; N]) -> Result<Value>
         );
     }
     serde_json::from_slice(&output.stdout).context("parse production CLI JSON")
+}
+
+fn run_json_refusal_in<const N: usize>(working: &Path, args: [&str; N]) -> Result<Value> {
+    let output = Command::new(BIN)
+        .current_dir(working)
+        .args(args)
+        .output()
+        .context("run refusing production CLI")?;
+    if output.status.success() {
+        bail!("production CLI unexpectedly accepted an incomplete supervise run");
+    }
+    serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "parse refusing production CLI JSON; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
+fn load_fixture_schema_id(name: &str) -> Result<Value> {
+    let schema = serde_json::from_slice::<Value>(
+        &fs::read(repo_root().join("schemas").join(name))
+            .with_context(|| format!("read schema {name}"))?,
+    )
+    .with_context(|| format!("parse schema {name}"))?;
+    Ok(schema["$id"].clone())
 }

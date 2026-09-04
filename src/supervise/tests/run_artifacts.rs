@@ -1,5 +1,28 @@
 use super::*;
 
+fn validate_supervisor_collect_with_advertised_schema(report: &SupervisorCollectReport) {
+    let schema_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("schemas/supervisor-collect-report-v1.schema.json");
+    let schema: serde_json::Value = serde_json::from_slice(
+        &fs::read(&schema_path).expect("read tracked supervisor collect schema"),
+    )
+    .expect("parse tracked supervisor collect schema");
+    assert_eq!(schema["$id"], report.schema);
+    let mut compiler = boon::Compiler::new();
+    compiler.set_default_draft(boon::Draft::V2020_12);
+    compiler
+        .add_resource(report.schema, schema)
+        .expect("register advertised supervisor collect schema");
+    let mut schemas = boon::Schemas::new();
+    let index = compiler
+        .compile(report.schema, &mut schemas)
+        .expect("compile advertised supervisor collect schema");
+    let instance = serde_json::to_value(report).expect("serialize supervisor collect output");
+    schemas.validate(&instance, index).unwrap_or_else(|error| {
+        panic!("supervisor collect output violated its advertised schema: {error:#}")
+    });
+}
+
 fn validate_supervisor_reports_with_draft_2020_12(
     valid_reports: &[PathBuf],
     drifted_report: &Path,
@@ -136,6 +159,17 @@ fn production_persistence_emits_schema_valid_finalized_reports_for_every_runtime
             .expect("decode persisted supervisor final report");
             assert_eq!(persisted["run_lifecycle"], "finalized");
             assert!(runtime_values.contains(&persisted["runtime"]));
+
+            if persisted_reports.is_empty() {
+                let collected = collect_supervisor_run(&repo_path, run_id.clone())
+                    .expect("collect finalized production report");
+                assert_eq!(
+                    collected.collection_state,
+                    SupervisorCollectState::Finalized
+                );
+                assert!(collected.final_report_available);
+                validate_supervisor_collect_with_advertised_schema(&collected);
+            }
 
             if drifted_report.is_none() {
                 let mut drifted = persisted;
@@ -1907,6 +1941,13 @@ fn supervise_status_distinguishes_absent_active_finalized_and_corrupt_runs() {
     let active = supervisor_status(&repo_path, run_id.clone()).expect("status active run");
     assert!(!active.final_report_exists);
     assert_eq!(active.lifecycle, SupervisorRunLifecycle::Active);
+    let active_collect =
+        collect_supervisor_run(&repo_path, run_id.clone()).expect("collect active run");
+    assert_eq!(
+        active_collect.collection_state,
+        SupervisorCollectState::Active
+    );
+    validate_supervisor_collect_with_advertised_schema(&active_collect);
     drop(checkpoint);
 
     let final_report = artifact_test_final_report(&run_id);
@@ -1919,6 +1960,13 @@ fn supervise_status_distinguishes_absent_active_finalized_and_corrupt_runs() {
         .expect("finalize run");
     let finalized = supervisor_status(&repo_path, run_id.clone()).expect("status finalized");
     assert!(finalized.final_report_exists);
+    let inconsistent =
+        collect_supervisor_run(&repo_path, run_id.clone()).expect("collect inconsistent final");
+    assert_eq!(
+        inconsistent.collection_state,
+        SupervisorCollectState::InconsistentFinalized
+    );
+    validate_supervisor_collect_with_advertised_schema(&inconsistent);
 
     let report_path = repo_path
         .join(RunArtifactFamily::Supervise.run_root())
@@ -1931,6 +1979,28 @@ fn supervise_status_distinguishes_absent_active_finalized_and_corrupt_runs() {
         error.to_string().contains("verified finalized artifact")
             || error.to_string().contains("missing")
     );
+}
+
+#[test]
+fn supervise_collect_publishes_schema_valid_interrupted_snapshot() {
+    let (_temp, repo_path) = injected_repository();
+    let run_id = RunId::new("artifact-collect-interrupted").expect("valid run id");
+    let writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        run_id.clone(),
+        "supervise-test",
+    )
+    .expect("reserve interrupted run without checkpoint");
+
+    let collect = collect_supervisor_run(&repo_path, run_id).expect("collect interrupted run");
+    assert_eq!(
+        collect.collection_state,
+        SupervisorCollectState::Interrupted
+    );
+    assert_eq!(collect.run_lifecycle, SupervisorRunLifecycle::Interrupted);
+    validate_supervisor_collect_with_advertised_schema(&collect);
+    drop(writer);
 }
 
 #[test]
@@ -2102,6 +2172,18 @@ fn interrupted_final_report_checkpoint(
 }
 
 #[test]
+fn supervise_collect_publishes_schema_valid_resumable_snapshot() {
+    let (_temp, repo) = injected_repository();
+    let run_id = RunId::new("artifact-collect-resumable").expect("valid resumable run id");
+    let _ = interrupted_final_report_checkpoint(&repo, &run_id);
+
+    let collect = collect_supervisor_run(&repo, run_id).expect("collect resumable run");
+    assert_eq!(collect.collection_state, SupervisorCollectState::Resumable);
+    assert_eq!(collect.run_lifecycle, SupervisorRunLifecycle::Resumable);
+    validate_supervisor_collect_with_advertised_schema(&collect);
+}
+
+#[test]
 fn authenticated_resume_finalizes_without_reexecuting_completed_work_and_preserves_budget() {
     skip_without_containment!();
     let (_temp, repo) = injected_repository();
@@ -2113,6 +2195,7 @@ fn authenticated_resume_finalizes_without_reexecuting_completed_work_and_preserv
     let collect = collect_supervisor_run(&repo, run_id.clone()).expect("collect resumable run");
     assert_eq!(collect.run_lifecycle, SupervisorRunLifecycle::Resumable);
     assert!(!collect.success);
+    validate_supervisor_collect_with_advertised_schema(&collect);
 
     let resumed = resume_supervisor_run(&repo, run_id.clone()).expect("resume finalization");
     assert!(resumed.success);
@@ -2664,6 +2747,7 @@ fn resume_refuses_dispatch_started_without_durable_completion_as_uncertain() {
 
     let collect = collect_supervisor_run(&repo, run_id.clone()).expect("collect uncertain run");
     assert_eq!(collect.run_lifecycle, SupervisorRunLifecycle::Uncertain);
+    validate_supervisor_collect_with_advertised_schema(&collect);
     assert!(matches!(
         collect.gate_denials.as_slice(),
         [GateDenial {
