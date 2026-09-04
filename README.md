@@ -1756,6 +1756,38 @@ Rust target/toolchain and are not provided by this flake.
 
 ## CLI Examples
 
+Install the composing primary-worktree guard only after the canonical v5
+human-authorship `pre-push` dispatcher is present in Git's default hooks
+directory:
+
+```bash
+maco worktree guard install --repo .
+maco worktree guard verify --repo .
+maco worktree guard uninstall --repo .
+```
+
+Install and verify require the active outer dispatcher to match the canonical
+v5 bytes and exact `0755` mode. Every installed worktree-guard hook repeats
+that check before repository or branch decisions and before invoking a
+preserved hook. Re-running `install` safely upgrades an exactly intact guard
+installed by the previous v3 payload, preserving its recorded prior-hook
+backups; arbitrary or ambiguous payload, mode, state, or staged-file drift is
+still refused. `uninstall` completes that same exact legacy upgrade before it
+restores the recorded backups.
+
+For an ordinary push, push-time refusal exists only while Git executes an outer
+`pre-push` dispatcher that reaches the nested worktree guard. If all executable
+bits are removed from the outer hook, Git skips it. If the outer hook is
+replaced by an executable script that omits the nested invocation, Git runs
+only that replacement; the nested guard and all other checks normally reached
+through the dispatcher are bypassed for that push.
+
+`maco worktree guard verify` detects either form of outer drift. Another
+installed guard hook that Git still executes, such as `pre-commit` or
+`pre-merge-commit`, also detects it. These checks provide defense in depth
+against accidental or partial drift, not tamper-proof enforcement by local
+hooks.
+
 Inspect a repository:
 
 ```bash
