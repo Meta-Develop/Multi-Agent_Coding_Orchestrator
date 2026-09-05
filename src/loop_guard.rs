@@ -565,29 +565,10 @@ fn decide(
         });
     }
 
-    // 3. Repeated identical high-severity failures: refuse, keep the real
-    //    failure visible.
-    if repeat_threshold_reached {
-        return LoopGuardDecision::refuse(LoopGuardReason::RepeatedHighSeverityFailure {
-            consecutive: record.consecutive_repeat_failures,
-            threshold: config.consecutive_repeat_failures,
-            signature: record.failure_signature.clone().unwrap_or_default(),
-            severity_score: record.severity_score,
-        });
-    }
-
-    // 4. Consecutive low-severity non-progress: narrow (stop critique) without
-    //    spending remaining correction budget. The floor still binds.
-    if low_threshold_reached {
-        return LoopGuardDecision::narrow(
-            record.consecutive_low_severity_cycles,
-            config.consecutive_low_severity_cycles,
-            record.severity_score,
-        );
-    }
-
-    // 5. Would continue, but the correction budget is gone. If the floor is
-    //    unsatisfied, name the floor — never the loop — as the cause.
+    // 3. Correction budget is gone. Name the floor when it is unsatisfied;
+    //    otherwise name the exhausted gate-correction bound. This must precede
+    //    the scored loop exits so an exhausted budget is not reclassified as
+    //    repeated high-severity or low-severity non-progress.
     if corrections_exhausted {
         if !floor.is_satisfied() {
             return LoopGuardDecision::refuse(LoopGuardReason::ValidationFloorUnsatisfied {
@@ -599,6 +580,27 @@ fn decide(
             used: request.used_gate_corrections,
             bound: request.limits.max_gate_corrections,
         });
+    }
+
+    // 4. Repeated identical high-severity failures: refuse, keep the real
+    //    failure visible.
+    if repeat_threshold_reached {
+        return LoopGuardDecision::refuse(LoopGuardReason::RepeatedHighSeverityFailure {
+            consecutive: record.consecutive_repeat_failures,
+            threshold: config.consecutive_repeat_failures,
+            signature: record.failure_signature.clone().unwrap_or_default(),
+            severity_score: record.severity_score,
+        });
+    }
+
+    // 5. Consecutive low-severity non-progress: narrow (stop critique) without
+    //    spending remaining correction budget. The floor still binds.
+    if low_threshold_reached {
+        return LoopGuardDecision::narrow(
+            record.consecutive_low_severity_cycles,
+            config.consecutive_low_severity_cycles,
+            record.severity_score,
+        );
     }
 
     // 6. Remaining budget and no threshold: keep iterating. A failed floor
@@ -635,6 +637,42 @@ mod tests {
     fn tracker() -> LoopGuardTracker {
         LoopGuardTracker::new(LoopGuardConfig::warning_streak(2).expect("config"), caps())
             .expect("tracker")
+    }
+
+    fn exhausted_gate_limits() -> ExistingRoundLimits {
+        ExistingRoundLimits {
+            max_depth: 2,
+            max_child_retries: 2,
+            max_gate_corrections: 0,
+        }
+    }
+
+    fn exhausted_gate_request(
+        severity: Option<LoopFindingSeverity>,
+        signature: Option<&str>,
+        floor: ValidationFloor,
+    ) -> LoopGuardObserveRequest {
+        LoopGuardObserveRequest {
+            observation: LoopCycleObservation::new(severity, signature.map(str::to_owned), floor)
+                .expect("observation"),
+            limits: exhausted_gate_limits(),
+            used_gate_corrections: 0,
+            used_child_retries: 0,
+            current_depth: 2,
+            cascade_breaker: CascadeBreakerView::Closed,
+        }
+    }
+
+    fn exhausted_gate_reason(floor: ValidationFloor) -> LoopGuardReason {
+        if floor.is_satisfied() {
+            LoopGuardReason::RoundLimitExhausted {
+                limit: RoundLimitKind::MaxGateCorrections,
+                used: 0,
+                bound: 0,
+            }
+        } else {
+            LoopGuardReason::ValidationFloorUnsatisfied { floor }
+        }
     }
 
     #[test]
@@ -875,6 +913,92 @@ mod tests {
                 bound: 1
             }
         );
+    }
+
+    #[test]
+    fn exhausted_budget_precedes_low_severity_threshold_for_each_floor() {
+        for floor in [
+            ValidationFloor::Passed,
+            ValidationFloor::Failed,
+            ValidationFloor::Missing,
+        ] {
+            let mut tracker =
+                LoopGuardTracker::new(LoopGuardConfig::warning_streak(1).expect("config"), caps())
+                    .expect("tracker");
+            let decision = tracker
+                .observe(exhausted_gate_request(
+                    Some(LoopFindingSeverity::Warning),
+                    None,
+                    floor,
+                ))
+                .expect("exhausted low-threshold observe");
+            assert_eq!(
+                decision.escalation,
+                LoopGuardEscalation::Refuse,
+                "exhausted budget must refuse rather than narrow for {floor:?}"
+            );
+            assert_eq!(
+                decision.reason,
+                exhausted_gate_reason(floor),
+                "exhausted budget must keep the floor/round-limit name for {floor:?}"
+            );
+            assert!(
+                !matches!(
+                    decision.reason,
+                    LoopGuardReason::ConsecutiveLowSeverityNonProgress { .. }
+                ),
+                "exhausted correction budget must precede low-severity nonprogress for {floor:?}"
+            );
+            assert!(!decision.permits_success(floor));
+        }
+    }
+
+    #[test]
+    fn exhausted_budget_precedes_repeated_high_severity_for_each_floor() {
+        for floor in [
+            ValidationFloor::Passed,
+            ValidationFloor::Failed,
+            ValidationFloor::Missing,
+        ] {
+            let mut tracker = tracker();
+            tracker
+                .observe(exhausted_gate_request(
+                    Some(LoopFindingSeverity::Error),
+                    Some("same-bug"),
+                    floor,
+                ))
+                .expect("first exhausted high-severity observe");
+            let decision = tracker
+                .observe(exhausted_gate_request(
+                    Some(LoopFindingSeverity::Error),
+                    Some("same-bug"),
+                    floor,
+                ))
+                .expect("repeat exhausted high-severity observe");
+            assert_eq!(
+                tracker.cycles()[1].consecutive_repeat_failures,
+                2,
+                "repeat threshold must be reached for {floor:?}"
+            );
+            assert_eq!(
+                decision.escalation,
+                LoopGuardEscalation::Refuse,
+                "exhausted budget must refuse rather than reclassify as a repeat loop for {floor:?}"
+            );
+            assert_eq!(
+                decision.reason,
+                exhausted_gate_reason(floor),
+                "exhausted budget must keep the floor/round-limit name for {floor:?}"
+            );
+            assert!(
+                !matches!(
+                    decision.reason,
+                    LoopGuardReason::RepeatedHighSeverityFailure { .. }
+                ),
+                "exhausted correction budget must precede repeated high-severity for {floor:?}"
+            );
+            assert!(!decision.permits_success(floor));
+        }
     }
 
     #[test]
