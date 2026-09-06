@@ -706,7 +706,10 @@ fn run_follow_up_supervisor_loaded_plan(
     let manager = WorktreeManager::new(&repo);
     let cleanliness = manager.acquire_repository_cleanliness()?;
     let runtime_model_catalog = match runtime_catalog {
-        FollowUpRuntimeCatalog::Production => RuntimeModelCatalog::for_supervisor(&options, &repo),
+        FollowUpRuntimeCatalog::Production => {
+            admit_production_supervisor_catalog_preflight_grant(&options, &repo)
+                .and_then(|grant| RuntimeModelCatalog::for_supervisor(&options, &repo, grant))
+        }
         #[cfg(test)]
         FollowUpRuntimeCatalog::Injected => {
             Ok(test_runtime_model_catalog(&loaded.plan, options.runtime)?)

@@ -6,6 +6,9 @@ use crate::machine_global::{
     DestructiveTargetInput, GateOutcome, MachineGlobalRetentionBinding, MachineGlobalStore,
     RetentionOperation, RetentionOperationId,
 };
+use crate::mutation_taxonomy::{
+    SupervisorCatalogCodexPreflightGrant, SupervisorCatalogCodexPreflightGrantError,
+};
 use crate::pre_action_review::{
     ActionDescriptor, ApprovalReviewRequest, BlastRadius, CommandClass, CommandInvocation,
     DecisionSource, PathAccess, PathAccessMode, PermissionRequest, PreActionReviewer,
@@ -14,8 +17,8 @@ use crate::pre_action_review::{
 use crate::process_runner::{
     read_bounded_regular_file_nofollow, run_process_cancellable, run_process_interactive,
     CapturedBytes, ContainmentBackend, EnvironmentMode, ExternalCodexProfile, ExternalGrokProfile,
-    InteractiveProcessOutput, ProcessCancellation, ProcessOutput, ProcessRunError, ProcessSpec,
-    ProcessTreeEvidence, SideEffectConfinementEvidence, SideEffectConfinementProfile,
+    InteractiveProcessOutput, ProcessCancellation, ProcessCommand, ProcessOutput, ProcessRunError,
+    ProcessSpec, ProcessTreeEvidence, SideEffectConfinementEvidence, SideEffectConfinementProfile,
     SideEffectConfinementProfileKind, StdinMode, StreamCapture, StrictOfflineWorkspaceProfile,
     WorkspaceAccess,
 };
