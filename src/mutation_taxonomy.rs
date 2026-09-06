@@ -5,12 +5,21 @@
 //! of authority: every existing claim, containment, review, and effect gate
 //! remains independently required.
 
+use std::collections::HashSet;
+use std::ffi::OsStr;
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
+
 /// Current reviewed registry version.
 ///
 /// Version 3 adds the durable semantic-intent acquire/release surface used by
 /// current Supervisor dispatch while retaining the reviewed worktree-guard
 /// operations that are installed by the independently owned hook integration.
-pub const MUTATION_TAXONOMY_VERSION: u32 = 3;
+/// Version 4 adds Supervisor Codex catalog preflight as an irreversible spawn
+/// admitted only by an upstream one-shot grant bound to the final ProcessSpec.
+pub const MUTATION_TAXONOMY_VERSION: u32 = 4;
 
 /// Gate identity returned for an unlisted, empty, or internally inconsistent row.
 pub const TAXONOMY_REVIEW_REQUIRED_GATE_ID: &str = "taxonomy-review-required";
@@ -55,6 +64,7 @@ pub enum ExplicitMutationGate {
     InternalSealedPinnedExecCapability,
     ExactAgentProcessSelector,
     BoundedExternalScopeEventApi,
+    ExplicitSupervisorCatalogCodexPreflightGrant,
 }
 
 impl ExplicitMutationGate {
@@ -80,6 +90,9 @@ impl ExplicitMutationGate {
             Self::InternalSealedPinnedExecCapability => "internal-sealed-pinned-exec-capability",
             Self::ExactAgentProcessSelector => "exact-agent-process-selector",
             Self::BoundedExternalScopeEventApi => "bounded-external-scope-event-api",
+            Self::ExplicitSupervisorCatalogCodexPreflightGrant => {
+                "explicit-supervisor-catalog-codex-preflight-grant"
+            }
         }
     }
 }
@@ -124,11 +137,12 @@ pub enum MutationOperation {
     PinnedExecutableExec,
     AgentProcessStop,
     ScopeEventAppend,
+    SupervisorCatalogCodexPreflight,
 }
 
 impl MutationOperation {
     /// Complete enum inventory, kept explicit so additions cannot evade tests.
-    pub const ALL: [Self; 37] = [
+    pub const ALL: [Self; 38] = [
         Self::RepositoryInitialize,
         Self::MegafileTelemetrySeed,
         Self::StateMigrationPreview,
@@ -166,6 +180,7 @@ impl MutationOperation {
         Self::PinnedExecutableExec,
         Self::AgentProcessStop,
         Self::ScopeEventAppend,
+        Self::SupervisorCatalogCodexPreflight,
     ];
 
     /// Stable identifier used for lookup, policy rows, and gate evidence.
@@ -208,6 +223,7 @@ impl MutationOperation {
             Self::PinnedExecutableExec => "pinned-executable-exec",
             Self::AgentProcessStop => "agent-process-stop",
             Self::ScopeEventAppend => "scope-event-append",
+            Self::SupervisorCatalogCodexPreflight => "supervisor-catalog-codex-preflight",
         }
     }
 
@@ -432,6 +448,11 @@ const ENTRIES: &[MutationClassification] = &[
         "Emits durable observability history whose removal would destroy audit evidence and whose consumers cannot be rewound.",
         ExplicitMutationGate::BoundedExternalScopeEventApi,
     ),
+    irreversible(
+        MutationOperation::SupervisorCatalogCodexPreflight,
+        "Spawns a trusted Codex catalog probe whose process, network, and captured output cannot be restored from retained MACO state.",
+        ExplicitMutationGate::ExplicitSupervisorCatalogCodexPreflightGrant,
+    ),
 ];
 
 const REGISTRY: MutationTaxonomyRegistry = MutationTaxonomyRegistry {
@@ -549,6 +570,252 @@ pub(crate) fn autonomous_decision_for_supervisor_child_dispatch() -> AutonomousM
     AutonomousMutationDecision::Allow
 }
 
+/// Cwd policy sealed into a Supervisor Codex catalog-preflight grant.
+///
+/// Production issuance can only name the resolved trusted program parent.
+/// Exact paths exist solely so tests can inject the historical caller-repo
+/// mismatch; they are not a production encoding of the resolver search base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CatalogPreflightCwdPolicy {
+    ResolvedTrustedProgramParent,
+    #[cfg(test)]
+    Exact(PathBuf),
+}
+
+/// Expected executable binding sealed into a Supervisor Codex catalog-preflight
+/// grant.
+///
+/// Production issuance records only the trusted path spelling `codex`. The
+/// authorized loader must refine that intent with an independently verified
+/// canonical program (and its parent) before `ProcessSpec` construction.
+/// Consume then exact-matches the final spec against that sealed canonical
+/// binding. It does not rederive the expected parent from an arbitrary
+/// supplied final program, and it does not require the canonical filename to
+/// be `codex`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CatalogPreflightExpectedProgram {
+    TrustedSpelling,
+    IndependentlyVerifiedCanonical { program: PathBuf, parent: PathBuf },
+}
+
+/// One-shot grant that admits a Supervisor Codex catalog preflight spawn
+/// against a fully built `ProcessSpec`.
+///
+/// The issuer is the production catalog-preflight caller, not the catalog
+/// builder. `run_id` may correlate; it is not the grant. A nonce is.
+#[derive(Debug, Clone)]
+#[must_use]
+pub(crate) struct SupervisorCatalogCodexPreflightGrant {
+    nonce: u64,
+    /// Correlation only; `run_id` is not the grant. Inspected by tests.
+    #[allow(dead_code)]
+    run_id: String,
+    /// Negative context: caller repo / resolver search base, never process cwd.
+    #[allow(dead_code)]
+    resolver_search_base: PathBuf,
+    expected_program: CatalogPreflightExpectedProgram,
+    cwd_policy: CatalogPreflightCwdPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SupervisorCatalogCodexPreflightGrantError {
+    UntrustedExpectedProgram,
+    AlreadyConsumed,
+    ProgramMismatch,
+    CurrentDirMismatch,
+    ArgvMismatch,
+}
+
+impl SupervisorCatalogCodexPreflightGrantError {
+    pub(crate) const fn cause_id(self) -> &'static str {
+        match self {
+            Self::UntrustedExpectedProgram => "untrusted_catalog_preflight_program",
+            Self::AlreadyConsumed => "catalog_preflight_grant_consumed",
+            Self::ProgramMismatch | Self::CurrentDirMismatch | Self::ArgvMismatch => {
+                "catalog_preflight_grant_mismatch"
+            }
+        }
+    }
+}
+
+impl fmt::Display for SupervisorCatalogCodexPreflightGrantError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.cause_id())
+    }
+}
+
+impl std::error::Error for SupervisorCatalogCodexPreflightGrantError {}
+
+static NEXT_SUPERVISOR_CATALOG_PREFLIGHT_NONCE: AtomicU64 = AtomicU64::new(1);
+static CONSUMED_SUPERVISOR_CATALOG_PREFLIGHT_NONCES: LazyLock<Mutex<HashSet<u64>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+const TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM: &str = "codex";
+const SUPERVISOR_CATALOG_CODEX_PREFLIGHT_ARGV: [&str; 2] = ["debug", "models"];
+
+impl SupervisorCatalogCodexPreflightGrant {
+    /// Production issuer. Encodes only `ResolvedTrustedProgramParent`.
+    ///
+    /// `resolver_search_base` is negative context (the caller repo / search
+    /// base). It is never stored as process cwd.
+    pub(crate) fn admit_from_supervisor_catalog_intent(
+        run_id: &str,
+        resolver_search_base: &Path,
+        expected_program: &Path,
+    ) -> Result<Self, SupervisorCatalogCodexPreflightGrantError> {
+        if expected_program != Path::new(TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM) {
+            return Err(SupervisorCatalogCodexPreflightGrantError::UntrustedExpectedProgram);
+        }
+        Ok(Self {
+            nonce: NEXT_SUPERVISOR_CATALOG_PREFLIGHT_NONCE.fetch_add(1, Ordering::Relaxed),
+            run_id: run_id.to_string(),
+            resolver_search_base: resolver_search_base.to_path_buf(),
+            expected_program: CatalogPreflightExpectedProgram::TrustedSpelling,
+            cwd_policy: CatalogPreflightCwdPolicy::ResolvedTrustedProgramParent,
+        })
+    }
+
+    /// Test-only issuer that can encode `Exact(current_dir)` so negative tests
+    /// can inject the historical caller-repo cwd mismatch.
+    #[cfg(test)]
+    pub(crate) fn admit_exact_cwd_for_test(
+        run_id: &str,
+        resolver_search_base: &Path,
+        expected_program: &Path,
+        current_dir: &Path,
+    ) -> Result<Self, SupervisorCatalogCodexPreflightGrantError> {
+        if expected_program != Path::new(TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM) {
+            return Err(SupervisorCatalogCodexPreflightGrantError::UntrustedExpectedProgram);
+        }
+        Ok(Self {
+            nonce: NEXT_SUPERVISOR_CATALOG_PREFLIGHT_NONCE.fetch_add(1, Ordering::Relaxed),
+            run_id: run_id.to_string(),
+            resolver_search_base: resolver_search_base.to_path_buf(),
+            expected_program: CatalogPreflightExpectedProgram::TrustedSpelling,
+            cwd_policy: CatalogPreflightCwdPolicy::Exact(current_dir.to_path_buf()),
+        })
+    }
+
+    /// Refine admitted trusted spelling `codex` with an independently verified
+    /// canonical program before `ProcessSpec` construction.
+    ///
+    /// `independently_verified_canonical_program` is the result of trusted
+    /// resolution plus identity validation. This seals that canonical path and
+    /// its parent. It refuses to treat the admit spelling `codex` as if it
+    /// were already a canonical binding, and it does not require the canonical
+    /// filename to be `codex`.
+    pub(crate) fn seal_independently_verified_canonical_binding(
+        self,
+        independently_verified_canonical_program: &Path,
+    ) -> Result<Self, SupervisorCatalogCodexPreflightGrantError> {
+        if !matches!(
+            self.expected_program,
+            CatalogPreflightExpectedProgram::TrustedSpelling
+        ) {
+            return Err(SupervisorCatalogCodexPreflightGrantError::ProgramMismatch);
+        }
+        if independently_verified_canonical_program
+            == Path::new(TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM)
+        {
+            return Err(SupervisorCatalogCodexPreflightGrantError::ProgramMismatch);
+        }
+        let Some(parent) = independently_verified_canonical_program.parent() else {
+            return Err(SupervisorCatalogCodexPreflightGrantError::CurrentDirMismatch);
+        };
+        if parent.as_os_str().is_empty() {
+            return Err(SupervisorCatalogCodexPreflightGrantError::CurrentDirMismatch);
+        }
+        Ok(Self {
+            expected_program: CatalogPreflightExpectedProgram::IndependentlyVerifiedCanonical {
+                program: independently_verified_canonical_program.to_path_buf(),
+                parent: parent.to_path_buf(),
+            },
+            ..self
+        })
+    }
+
+    pub(crate) fn independently_verified_canonical_program(&self) -> Option<&Path> {
+        match &self.expected_program {
+            CatalogPreflightExpectedProgram::IndependentlyVerifiedCanonical { program, .. } => {
+                Some(program)
+            }
+            CatalogPreflightExpectedProgram::TrustedSpelling => None,
+        }
+    }
+
+    pub(crate) fn independently_verified_canonical_parent(&self) -> Option<&Path> {
+        match &self.expected_program {
+            CatalogPreflightExpectedProgram::IndependentlyVerifiedCanonical { parent, .. } => {
+                Some(parent)
+            }
+            CatalogPreflightExpectedProgram::TrustedSpelling => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resolver_search_base(&self) -> &Path {
+        &self.resolver_search_base
+    }
+
+    /// Consume this one-shot grant against the final process binding.
+    ///
+    /// Exact-matches `program` to the independently sealed canonical expected
+    /// program and `current_dir` to the independently sealed expected parent
+    /// (or a test-only `Exact` cwd). Does not accept a basename-only `codex`
+    /// match and does not rederive the expected parent from the supplied
+    /// final program. Returns the sealed expected parent so bind can compare
+    /// confinement independently of `spec.current_dir`.
+    pub(crate) fn consume_for_process_binding<A: AsRef<OsStr>>(
+        self,
+        program: &Path,
+        current_dir: &Path,
+        argv: &[A],
+    ) -> Result<PathBuf, SupervisorCatalogCodexPreflightGrantError> {
+        let mut consumed = CONSUMED_SUPERVISOR_CATALOG_PREFLIGHT_NONCES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !consumed.insert(self.nonce) {
+            return Err(SupervisorCatalogCodexPreflightGrantError::AlreadyConsumed);
+        }
+        drop(consumed);
+
+        let CatalogPreflightExpectedProgram::IndependentlyVerifiedCanonical {
+            program: expected_program,
+            parent: expected_parent,
+        } = &self.expected_program
+        else {
+            return Err(SupervisorCatalogCodexPreflightGrantError::ProgramMismatch);
+        };
+        if program != expected_program {
+            return Err(SupervisorCatalogCodexPreflightGrantError::ProgramMismatch);
+        }
+        if argv.len() != SUPERVISOR_CATALOG_CODEX_PREFLIGHT_ARGV.len()
+            || argv
+                .iter()
+                .zip(SUPERVISOR_CATALOG_CODEX_PREFLIGHT_ARGV.iter())
+                .any(|(actual, expected)| actual.as_ref() != OsStr::new(expected))
+        {
+            return Err(SupervisorCatalogCodexPreflightGrantError::ArgvMismatch);
+        }
+        let cwd_matches = match &self.cwd_policy {
+            CatalogPreflightCwdPolicy::ResolvedTrustedProgramParent => {
+                current_dir == expected_parent
+            }
+            #[cfg(test)]
+            CatalogPreflightCwdPolicy::Exact(expected_cwd) => current_dir == expected_cwd,
+        };
+        if !cwd_matches {
+            return Err(SupervisorCatalogCodexPreflightGrantError::CurrentDirMismatch);
+        }
+        Ok(expected_parent.clone())
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static AUTOPILOT_DISPATCH_DECISION_OVERRIDES: std::cell::RefCell<Option<std::collections::VecDeque<AutonomousMutationDecision>>> =
@@ -609,7 +876,7 @@ mod tests {
     #[test]
     fn registry_is_current_complete_and_unique() {
         assert_eq!(registry().version, MUTATION_TAXONOMY_VERSION);
-        assert_eq!(registry().version, 3);
+        assert_eq!(registry().version, 4);
         assert_eq!(registry().entries.len(), MutationOperation::ALL.len());
 
         let registered = registry()
@@ -671,7 +938,7 @@ mod tests {
             .filter(|entry| entry.reversibility == MutationReversibility::Reversible)
             .count();
         assert_eq!(reversible, 15);
-        assert_eq!(registry().entries.len() - reversible, 22);
+        assert_eq!(registry().entries.len() - reversible, 23);
         assert_eq!(
             SUPERVISOR_CHILD_DISPATCH_MUTATIONS,
             [
@@ -730,6 +997,297 @@ mod tests {
             AutonomousMutationDecision::Refuse {
                 gate_id: TAXONOMY_REVIEW_REQUIRED_GATE_ID
             }
+        );
+    }
+
+    #[test]
+    fn production_catalog_preflight_grant_consumes_once_against_program_parent() {
+        use crate::process_runner::{ProcessCommand, ProcessSpec};
+
+        let program = Path::new("/usr/bin/codex");
+        let program_parent = Path::new("/usr/bin");
+        let resolver_search_base = Path::new("/repos/caller-worktree");
+        assert_ne!(program_parent, resolver_search_base);
+
+        let spec = ProcessSpec::direct(
+            "catalog preflight binding",
+            program,
+            ["debug", "models"],
+            program_parent,
+            64,
+        );
+        let ProcessCommand::Direct {
+            program: spec_program,
+            args: spec_argv,
+        } = &spec.command
+        else {
+            panic!("direct catalog spec must remain a direct command");
+        };
+        assert_eq!(spec.current_dir.as_path(), program_parent);
+
+        let grant = SupervisorCatalogCodexPreflightGrant::admit_from_supervisor_catalog_intent(
+            "run-catalog-preflight-1",
+            resolver_search_base,
+            Path::new("codex"),
+        )
+        .expect("trusted codex spelling must admit")
+        .seal_independently_verified_canonical_binding(program)
+        .expect("independently verified canonical must seal");
+        assert_eq!(grant.run_id(), "run-catalog-preflight-1");
+        assert_eq!(grant.resolver_search_base(), resolver_search_base);
+        assert_eq!(
+            grant.independently_verified_canonical_program(),
+            Some(program)
+        );
+        assert_eq!(
+            grant.independently_verified_canonical_parent(),
+            Some(program_parent)
+        );
+
+        let sealed_parent = grant
+            .clone()
+            .consume_for_process_binding(spec_program, &spec.current_dir, spec_argv)
+            .expect("program-parent binding must consume once");
+        assert_eq!(sealed_parent.as_path(), program_parent);
+        let reused = grant.consume_for_process_binding(spec_program, &spec.current_dir, spec_argv);
+        assert_eq!(
+            reused,
+            Err(SupervisorCatalogCodexPreflightGrantError::AlreadyConsumed)
+        );
+    }
+
+    #[test]
+    fn production_catalog_preflight_grant_rejects_resolver_search_base_cwd() {
+        use crate::process_runner::{ProcessCommand, ProcessSpec};
+
+        let program = Path::new("/usr/bin/codex");
+        let program_parent = Path::new("/usr/bin");
+        let resolver_search_base = Path::new("/repos/caller-worktree");
+        let spec = ProcessSpec::direct(
+            "catalog preflight residual cwd",
+            program,
+            ["debug", "models"],
+            resolver_search_base,
+            64,
+        );
+        let ProcessCommand::Direct {
+            program: spec_program,
+            args: spec_argv,
+        } = &spec.command
+        else {
+            panic!("direct catalog spec must remain a direct command");
+        };
+        assert_eq!(spec.current_dir.as_path(), resolver_search_base);
+        assert_ne!(spec.current_dir.as_path(), program_parent);
+
+        let grant = SupervisorCatalogCodexPreflightGrant::admit_from_supervisor_catalog_intent(
+            "run-catalog-preflight-repo-cwd",
+            resolver_search_base,
+            Path::new("codex"),
+        )
+        .expect("trusted codex spelling must admit")
+        .seal_independently_verified_canonical_binding(program)
+        .expect("independently verified canonical must seal");
+        assert_eq!(
+            grant.consume_for_process_binding(spec_program, &spec.current_dir, spec_argv),
+            Err(SupervisorCatalogCodexPreflightGrantError::CurrentDirMismatch)
+        );
+    }
+
+    #[test]
+    fn exact_repo_grant_rejects_program_parent_spec() {
+        use crate::process_runner::{ProcessCommand, ProcessSpec};
+
+        let program = Path::new("/usr/bin/codex");
+        let program_parent = Path::new("/usr/bin");
+        let repo = Path::new("/repos/caller-worktree");
+        let spec = ProcessSpec::direct(
+            "catalog preflight program parent spec",
+            program,
+            ["debug", "models"],
+            program_parent,
+            64,
+        );
+        let ProcessCommand::Direct {
+            program: spec_program,
+            args: spec_argv,
+        } = &spec.command
+        else {
+            panic!("direct catalog spec must remain a direct command");
+        };
+
+        let grant = SupervisorCatalogCodexPreflightGrant::admit_exact_cwd_for_test(
+            "run-catalog-preflight-exact-repo",
+            repo,
+            Path::new("codex"),
+            repo,
+        )
+        .expect("test exact-cwd constructor must admit trusted program spelling")
+        .seal_independently_verified_canonical_binding(program)
+        .expect("independently verified canonical must seal");
+        assert_eq!(
+            grant.consume_for_process_binding(spec_program, &spec.current_dir, spec_argv),
+            Err(SupervisorCatalogCodexPreflightGrantError::CurrentDirMismatch)
+        );
+    }
+
+    #[test]
+    fn catalog_preflight_grant_rejects_wrong_argv() {
+        use crate::process_runner::{ProcessCommand, ProcessSpec};
+
+        let program = Path::new("/usr/bin/codex");
+        let program_parent = Path::new("/usr/bin");
+        let spec = ProcessSpec::direct(
+            "catalog preflight wrong argv",
+            program,
+            ["debug", "model"],
+            program_parent,
+            64,
+        );
+        let ProcessCommand::Direct {
+            program: spec_program,
+            args: spec_argv,
+        } = &spec.command
+        else {
+            panic!("direct catalog spec must remain a direct command");
+        };
+
+        let grant = SupervisorCatalogCodexPreflightGrant::admit_from_supervisor_catalog_intent(
+            "run-catalog-preflight-argv",
+            Path::new("/repos/caller-worktree"),
+            Path::new("codex"),
+        )
+        .expect("trusted codex spelling must admit")
+        .seal_independently_verified_canonical_binding(program)
+        .expect("independently verified canonical must seal");
+        assert_eq!(
+            grant.consume_for_process_binding(spec_program, &spec.current_dir, spec_argv),
+            Err(SupervisorCatalogCodexPreflightGrantError::ArgvMismatch)
+        );
+    }
+
+    #[test]
+    fn production_catalog_preflight_grant_consumes_sealed_canonical_with_non_codex_filename() {
+        use crate::process_runner::{ProcessCommand, ProcessSpec};
+
+        let independently_verified_canonical = Path::new("/opt/codex-lib/codex.js");
+        let sealed_parent = Path::new("/opt/codex-lib");
+        let resolver_search_base = Path::new("/repos/caller-worktree");
+        assert_ne!(
+            independently_verified_canonical.file_name(),
+            Some(OsStr::new("codex"))
+        );
+        assert_eq!(
+            independently_verified_canonical.parent(),
+            Some(sealed_parent)
+        );
+        assert_ne!(sealed_parent, resolver_search_base);
+
+        let spec = ProcessSpec::direct(
+            "catalog preflight non-codex canonical filename",
+            independently_verified_canonical,
+            ["debug", "models"],
+            sealed_parent,
+            64,
+        );
+        let ProcessCommand::Direct {
+            program: spec_program,
+            args: spec_argv,
+        } = &spec.command
+        else {
+            panic!("direct catalog spec must remain a direct command");
+        };
+        assert_eq!(spec_program, independently_verified_canonical);
+        assert_eq!(spec.current_dir.as_path(), sealed_parent);
+
+        let grant = SupervisorCatalogCodexPreflightGrant::admit_from_supervisor_catalog_intent(
+            "run-catalog-preflight-codex-js",
+            resolver_search_base,
+            Path::new("codex"),
+        )
+        .expect("trusted codex spelling must admit")
+        .seal_independently_verified_canonical_binding(independently_verified_canonical)
+        .expect("canonical target whose filename is not codex must seal");
+        let consumed_parent = grant
+            .consume_for_process_binding(spec_program, &spec.current_dir, spec_argv)
+            .expect("sealed non-codex canonical filename must consume when spec matches");
+        assert_eq!(consumed_parent.as_path(), sealed_parent);
+    }
+
+    #[test]
+    fn production_catalog_preflight_grant_rejects_same_basename_wrong_final_program() {
+        use crate::process_runner::{ProcessCommand, ProcessSpec};
+
+        let independently_verified_canonical = Path::new("/usr/bin/codex");
+        let independently_verified_parent = Path::new("/usr/bin");
+        let wrong_program = Path::new("/tmp/codex");
+        let wrong_cwd = Path::new("/tmp");
+        assert_eq!(
+            wrong_program.file_name(),
+            independently_verified_canonical.file_name()
+        );
+        assert_eq!(wrong_program.file_name(), Some(OsStr::new("codex")));
+        assert_ne!(wrong_program, independently_verified_canonical);
+        assert_ne!(wrong_cwd, independently_verified_parent);
+
+        let spec = ProcessSpec::direct(
+            "catalog preflight same-basename wrong program",
+            wrong_program,
+            ["debug", "models"],
+            wrong_cwd,
+            64,
+        );
+        let ProcessCommand::Direct {
+            program: spec_program,
+            args: spec_argv,
+        } = &spec.command
+        else {
+            panic!("direct catalog spec must remain a direct command");
+        };
+        assert_eq!(spec_program, wrong_program);
+        assert_eq!(spec.current_dir.as_path(), wrong_cwd);
+
+        let grant = SupervisorCatalogCodexPreflightGrant::admit_from_supervisor_catalog_intent(
+            "run-catalog-preflight-tmp-codex",
+            Path::new("/repos/caller-worktree"),
+            Path::new("codex"),
+        )
+        .expect("trusted codex spelling must admit")
+        .seal_independently_verified_canonical_binding(independently_verified_canonical)
+        .expect("independently verified canonical must seal");
+        assert_eq!(
+            grant.consume_for_process_binding(spec_program, &spec.current_dir, spec_argv),
+            Err(SupervisorCatalogCodexPreflightGrantError::ProgramMismatch)
+        );
+    }
+
+    #[test]
+    fn production_catalog_preflight_issuer_refuses_untrusted_program_spelling() {
+        let error = SupervisorCatalogCodexPreflightGrant::admit_from_supervisor_catalog_intent(
+            "run-catalog-preflight-untrusted",
+            Path::new("/repos/caller-worktree"),
+            Path::new("/tmp/untrusted-custom-codex"),
+        )
+        .expect_err("production issuer must refuse non-codex spelling");
+        assert_eq!(
+            error,
+            SupervisorCatalogCodexPreflightGrantError::UntrustedExpectedProgram
+        );
+    }
+
+    #[test]
+    fn supervisor_catalog_codex_preflight_is_irreversible_and_not_child_dispatch() {
+        assert!(!SUPERVISOR_CHILD_DISPATCH_MUTATIONS
+            .contains(&MutationOperation::SupervisorCatalogCodexPreflight));
+        assert_eq!(
+            autonomous_decision_for(MutationOperation::SupervisorCatalogCodexPreflight.id()),
+            AutonomousMutationDecision::RequireExplicitGate(
+                ExplicitMutationGate::ExplicitSupervisorCatalogCodexPreflightGrant
+            )
+        );
+        assert_ne!(
+            ExplicitMutationGate::ExplicitSupervisorCatalogCodexPreflightGrant,
+            ExplicitMutationGate::InternalSealedPinnedExecCapability
         );
     }
 }

@@ -16,7 +16,9 @@ use crate::{
     },
     external_agent::{
         codex_usage_from_jsonl, collect_and_import_managed_child_git_commit,
-        load_codex_runtime_model_catalog, run_external_agent_cancellable_reviewed,
+        load_codex_runtime_model_catalog_authorized,
+        missing_supervisor_catalog_preflight_grant_failure,
+        run_external_agent_cancellable_reviewed, supervisor_catalog_preflight_grant_admit_failure,
         validate_environment_requirements, CodexRuntimeModelCatalog, EnvironmentFailure,
         EnvironmentFailureCategory, EnvironmentPreflightResult, EnvironmentRemediation,
         EnvironmentRemediationScope, EnvironmentRequirement, ExternalAgentCommand,
@@ -44,6 +46,7 @@ use crate::{
         ApplyBlockerDetail, CandidateValidationBinding, MergeCollectOptions,
         ValidationEvidenceBundle, WorktreeMergeMetadata, VALIDATION_BINDING_VERSION,
     },
+    mutation_taxonomy::SupervisorCatalogCodexPreflightGrant,
     objective_profile::{resolve_objective_profile, ResolvedObjectiveProfile},
     orchestration_event::{
         FieldGuideEventKind, OrchestrationEventJournal, OrchestrationEventKind, OrchestrationRole,
@@ -1101,18 +1104,52 @@ struct RoleModelResolution {
     resolved_candidate_index: Option<usize>,
 }
 
+/// Production issuer for Supervisor Codex catalog preflight.
+///
+/// Callers invoke this **before** [`RuntimeModelCatalog::for_supervisor`].
+/// This helper must not live inside the catalog builder, and `for_supervisor`
+/// must not mint a grant from its own result.
+fn admit_production_supervisor_catalog_preflight_grant(
+    options: &SupervisorRunOptions,
+    resolver_search_base: &Path,
+) -> Result<Option<SupervisorCatalogCodexPreflightGrant>, Box<EnvironmentFailure>> {
+    match options.runtime {
+        SupervisorRuntime::Codex => {
+            SupervisorCatalogCodexPreflightGrant::admit_from_supervisor_catalog_intent(
+                options.run_id.as_str(),
+                resolver_search_base,
+                &options.codex_bin,
+            )
+            .map(Some)
+            .map_err(supervisor_catalog_preflight_grant_admit_failure)
+        }
+        SupervisorRuntime::Fake
+        | SupervisorRuntime::Grok
+        | SupervisorRuntime::Cursor
+        | SupervisorRuntime::ClaudeCode
+        | SupervisorRuntime::GeminiCli => Ok(None),
+    }
+}
+
 impl RuntimeModelCatalog {
     fn for_supervisor(
         options: &SupervisorRunOptions,
         repo: &Path,
+        grant: Option<SupervisorCatalogCodexPreflightGrant>,
     ) -> RuntimeModelCatalogAcquisition {
         match options.runtime {
-            SupervisorRuntime::Codex => load_codex_runtime_model_catalog(
-                &options.codex_bin,
-                repo,
-                CODEX_MODEL_CATALOG_TIMEOUT,
-            )
-            .map(Self::Codex),
+            SupervisorRuntime::Codex => {
+                let Some(grant) = grant else {
+                    return Err(missing_supervisor_catalog_preflight_grant_failure());
+                };
+                load_codex_runtime_model_catalog_authorized(
+                    &options.codex_bin,
+                    repo,
+                    CODEX_MODEL_CATALOG_TIMEOUT,
+                    grant,
+                )
+                .map(Self::Codex)
+            }
             SupervisorRuntime::Fake => Ok(Self::LocalDeterministicFake),
             SupervisorRuntime::Grok
             | SupervisorRuntime::Cursor
