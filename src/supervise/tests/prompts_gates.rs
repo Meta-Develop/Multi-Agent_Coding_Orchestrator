@@ -983,6 +983,718 @@ fn repeated_validation_denial_uses_one_correlation_across_prompts_and_journal() 
     assert_eq!(report.gate_correction_outcomes[0].correction_attempts, 2);
 }
 
+fn injected_failed_validation_report(
+    assignment: &OrchestratorAssignment,
+    severity: Option<FindingSeverity>,
+    message: &str,
+    validation_status: Option<ReviewStatus>,
+) -> OrchestratorReviewReport {
+    let mut child = injected_child_report(assignment);
+    child.status = ReviewStatus::Failed;
+    child.accepted = false;
+    child.rejected = true;
+    match validation_status {
+        Some(status) => {
+            child.validation_results[0].status = status;
+        }
+        None => child.validation_results.clear(),
+    }
+    if let Some(severity) = severity {
+        child.findings.push(Finding {
+            severity,
+            message: message.to_string(),
+            paths: vec![PathBuf::from("README.md")],
+        });
+    }
+    child
+}
+
+fn run_validation_repair_script(
+    temp: &tempfile::TempDir,
+    repo_path: &Path,
+    assignment: &OrchestratorAssignment,
+    max_gate_corrections: u8,
+    run_id: &str,
+    mut script: impl FnMut(usize, &OrchestratorAssignment) -> OrchestratorReviewReport + Send,
+) -> (SupervisorFinalReport, usize, usize) {
+    let mut plan = injected_plan(assignment.clone(), 0);
+    plan.max_gate_corrections = max_gate_corrections;
+    let options = injected_options(repo_path, temp.path(), run_id);
+    let mut child_invocations = 0usize;
+    let mut auditor_invocations = 0usize;
+    let mut runner = |command: &ExternalAgentCommand| {
+        let name = command
+            .output_last_message
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default();
+        if name.contains("review-auditor") {
+            auditor_invocations = auditor_invocations.saturating_add(1);
+            let child = injected_child_report(assignment);
+            write_injected_json(
+                &command.output_last_message,
+                &injected_auditor_report(assignment, &child),
+            );
+        } else {
+            child_invocations = child_invocations.saturating_add(1);
+            write_injected_json(
+                &command.output_last_message,
+                &script(child_invocations, assignment),
+            );
+        }
+        injected_verified_run(command)
+    };
+    let report = run_supervisor_plan_with_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        &mut runner,
+    )
+    .expect("run injected validation-repair script");
+    (report, child_invocations, auditor_invocations)
+}
+
+fn assert_warning_streak_stop(
+    report: &SupervisorFinalReport,
+    child_invocations: usize,
+    auditor_invocations: usize,
+    expected_child_launches: usize,
+    expected_correction_attempts: u8,
+    blocker: GateApplyBlocker,
+) {
+    assert!(
+        !report.success,
+        "warning-streak stop must not succeed: {report:#?}"
+    );
+    assert!(!report.accepted);
+    assert_eq!(child_invocations, expected_child_launches);
+    assert_eq!(auditor_invocations, 0, "parent auditor must not re-enter");
+    let child = report
+        .orchestrator_reports
+        .first()
+        .expect("child orchestrator report");
+    assert!(!child.accepted);
+    assert!(child.rejected);
+    assert_eq!(child.status, ReviewStatus::Failed);
+    match blocker {
+        GateApplyBlocker::ValidationMissing => {
+            assert!(
+                child.validation_results.is_empty(),
+                "Missing floor must retain empty validation_results"
+            );
+        }
+        GateApplyBlocker::ValidationFailed => {
+            assert!(
+                child.validation_results.iter().any(validation_failed),
+                "Failed floor must retain a non-Succeeded validation result"
+            );
+        }
+        other => panic!("unexpected validation blocker {other:?}"),
+    }
+    assert_eq!(report.gate_denials.len(), 1);
+    assert_eq!(
+        report.gate_denials[0].reason,
+        GateDenialReason::ValidationRepair { blocker }
+    );
+    assert_eq!(report.gate_correction_outcomes.len(), 1);
+    assert_eq!(
+        report.gate_correction_outcomes[0].correction_attempts,
+        expected_correction_attempts
+    );
+    assert_ne!(
+        report.gate_correction_outcomes[0].terminal_class,
+        GateCorrectionTerminalClass::SelfCorrected
+    );
+    assert_ne!(
+        report.gate_correction_outcomes[0].terminal_class,
+        GateCorrectionTerminalClass::Exhausted,
+        "unused correction budget must remain"
+    );
+}
+
+fn assert_existing_never_passing_bound(
+    report: &SupervisorFinalReport,
+    child_invocations: usize,
+    expected_child_launches: usize,
+    expected_correction_attempts: u8,
+) {
+    assert!(
+        !report.success,
+        "never-passing validation repair must not succeed: {report:#?}"
+    );
+    assert!(!report.accepted);
+    assert_eq!(child_invocations, expected_child_launches);
+    let child = report
+        .orchestrator_reports
+        .first()
+        .expect("child orchestrator report");
+    assert!(!child.accepted);
+    assert_eq!(
+        report.gate_correction_outcomes[0].correction_attempts,
+        expected_correction_attempts
+    );
+    assert_eq!(
+        report.gate_correction_outcomes[0].terminal_class,
+        GateCorrectionTerminalClass::Exhausted
+    );
+}
+
+#[test]
+fn consecutive_warning_validation_failed_stops_before_unused_correction() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(false);
+    let (report, child_invocations, auditor_invocations) = run_validation_repair_script(
+        &temp,
+        &repo_path,
+        &assignment,
+        2,
+        "warning-streak-failed-floor",
+        |_, assignment| {
+            injected_failed_validation_report(
+                assignment,
+                Some(FindingSeverity::Warning),
+                "bounded warning",
+                Some(ReviewStatus::Failed),
+            )
+        },
+    );
+    assert_warning_streak_stop(
+        &report,
+        child_invocations,
+        auditor_invocations,
+        2,
+        1,
+        GateApplyBlocker::ValidationFailed,
+    );
+}
+
+#[test]
+fn consecutive_warning_validation_missing_stops_before_unused_correction() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(false);
+    let (report, child_invocations, auditor_invocations) = run_validation_repair_script(
+        &temp,
+        &repo_path,
+        &assignment,
+        2,
+        "warning-streak-missing-floor",
+        |_, assignment| {
+            injected_failed_validation_report(
+                assignment,
+                Some(FindingSeverity::Warning),
+                "bounded warning",
+                None,
+            )
+        },
+    );
+    assert_warning_streak_stop(
+        &report,
+        child_invocations,
+        auditor_invocations,
+        2,
+        1,
+        GateApplyBlocker::ValidationMissing,
+    );
+}
+
+#[test]
+fn consecutive_warning_validation_does_not_reenter_parent_auditor() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    let (report, child_invocations, auditor_invocations) = run_validation_repair_script(
+        &temp,
+        &repo_path,
+        &assignment,
+        2,
+        "warning-streak-no-parent-auditor",
+        |_, assignment| {
+            injected_failed_validation_report(
+                assignment,
+                Some(FindingSeverity::Warning),
+                "bounded warning",
+                Some(ReviewStatus::Failed),
+            )
+        },
+    );
+    assert_warning_streak_stop(
+        &report,
+        child_invocations,
+        auditor_invocations,
+        2,
+        1,
+        GateApplyBlocker::ValidationFailed,
+    );
+    assert!(report
+        .orchestrator_reports
+        .iter()
+        .all(|child| child.audit_reports.is_empty()));
+}
+
+#[test]
+fn repeated_error_validation_keeps_existing_correction_bound() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(false);
+    let (report, child_invocations, _) = run_validation_repair_script(
+        &temp,
+        &repo_path,
+        &assignment,
+        2,
+        "error-validation-existing-bound",
+        |_, assignment| {
+            injected_failed_validation_report(
+                assignment,
+                Some(FindingSeverity::Error),
+                "bounded error",
+                Some(ReviewStatus::Failed),
+            )
+        },
+    );
+    assert_existing_never_passing_bound(&report, child_invocations, 3, 2);
+}
+
+#[test]
+fn distinct_error_messages_do_not_claim_identical_failure_narrowing() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(false);
+    let (report, child_invocations, _) = run_validation_repair_script(
+        &temp,
+        &repo_path,
+        &assignment,
+        2,
+        "distinct-error-messages-no-identical-claim",
+        |invocation, assignment| {
+            injected_failed_validation_report(
+                assignment,
+                Some(FindingSeverity::Error),
+                &format!("distinct error {invocation}"),
+                Some(ReviewStatus::Failed),
+            )
+        },
+    );
+    assert_existing_never_passing_bound(&report, child_invocations, 3, 2);
+}
+
+#[test]
+fn no_findings_validation_repair_keeps_existing_correction_bound() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(false);
+    let (report, child_invocations, _) = run_validation_repair_script(
+        &temp,
+        &repo_path,
+        &assignment,
+        2,
+        "no-findings-validation-existing-bound",
+        |_, assignment| {
+            injected_failed_validation_report(assignment, None, "", Some(ReviewStatus::Failed))
+        },
+    );
+    assert_existing_never_passing_bound(&report, child_invocations, 3, 2);
+}
+
+#[test]
+fn info_validation_repair_keeps_existing_correction_bound_and_resets_warning_streak() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(false);
+    let (report, child_invocations, _) = run_validation_repair_script(
+        &temp,
+        &repo_path,
+        &assignment,
+        2,
+        "info-validation-existing-bound",
+        |_, assignment| {
+            injected_failed_validation_report(
+                assignment,
+                Some(FindingSeverity::Info),
+                "bounded info",
+                Some(ReviewStatus::Failed),
+            )
+        },
+    );
+    assert_existing_never_passing_bound(&report, child_invocations, 3, 2);
+}
+
+#[test]
+fn warning_then_empty_findings_does_not_narrow_warning_streak() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(false);
+    let (report, child_invocations, _) = run_validation_repair_script(
+        &temp,
+        &repo_path,
+        &assignment,
+        2,
+        "warning-then-empty-findings-no-narrow",
+        |invocation, assignment| {
+            if invocation == 1 {
+                injected_failed_validation_report(
+                    assignment,
+                    Some(FindingSeverity::Warning),
+                    "bounded warning",
+                    Some(ReviewStatus::Failed),
+                )
+            } else {
+                injected_failed_validation_report(assignment, None, "", Some(ReviewStatus::Failed))
+            }
+        },
+    );
+    assert_existing_never_passing_bound(&report, child_invocations, 3, 2);
+}
+
+#[test]
+fn warning_then_info_does_not_narrow_warning_streak() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(false);
+    let (report, child_invocations, _) = run_validation_repair_script(
+        &temp,
+        &repo_path,
+        &assignment,
+        2,
+        "warning-then-info-no-narrow",
+        |invocation, assignment| {
+            let severity = if invocation == 1 {
+                FindingSeverity::Warning
+            } else {
+                FindingSeverity::Info
+            };
+            injected_failed_validation_report(
+                assignment,
+                Some(severity),
+                "mixed severity",
+                Some(ReviewStatus::Failed),
+            )
+        },
+    );
+    assert_existing_never_passing_bound(&report, child_invocations, 3, 2);
+}
+
+#[test]
+fn warning_then_error_then_warning_does_not_narrow_warning_streak() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(false);
+    let (report, child_invocations, _) = run_validation_repair_script(
+        &temp,
+        &repo_path,
+        &assignment,
+        2,
+        "warning-error-warning-no-narrow",
+        |invocation, assignment| {
+            let severity = match invocation {
+                1 => FindingSeverity::Warning,
+                2 => FindingSeverity::Error,
+                _ => FindingSeverity::Warning,
+            };
+            injected_failed_validation_report(
+                assignment,
+                Some(severity),
+                "mixed W-E-W",
+                Some(ReviewStatus::Failed),
+            )
+        },
+    );
+    assert_existing_never_passing_bound(&report, child_invocations, 3, 2);
+}
+
+#[test]
+fn warning_interrupted_then_consecutive_warnings_stop_at_last_pair() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(false);
+    let (report, child_invocations, auditor_invocations) = run_validation_repair_script(
+        &temp,
+        &repo_path,
+        &assignment,
+        4,
+        "warning-interrupted-then-consecutive-pair",
+        |invocation, assignment| {
+            let severity = match invocation {
+                1 | 3 | 4 => FindingSeverity::Warning,
+                _ => FindingSeverity::Info,
+            };
+            injected_failed_validation_report(
+                assignment,
+                Some(severity),
+                "interrupted then consecutive warnings",
+                Some(ReviewStatus::Failed),
+            )
+        },
+    );
+    assert_warning_streak_stop(
+        &report,
+        child_invocations,
+        auditor_invocations,
+        4,
+        3,
+        GateApplyBlocker::ValidationFailed,
+    );
+}
+
+#[test]
+fn zero_gate_corrections_does_not_construct_warning_streak_config() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(false);
+    let (report, child_invocations, auditor_invocations) = run_validation_repair_script(
+        &temp,
+        &repo_path,
+        &assignment,
+        0,
+        "zero-gate-corrections-warning-unchanged",
+        |_, assignment| {
+            injected_failed_validation_report(
+                assignment,
+                Some(FindingSeverity::Warning),
+                "bounded warning",
+                Some(ReviewStatus::Failed),
+            )
+        },
+    );
+    assert!(!report.success);
+    assert_eq!(child_invocations, 1);
+    assert_eq!(auditor_invocations, 0);
+    assert_eq!(
+        report.gate_correction_outcomes[0].terminal_class,
+        GateCorrectionTerminalClass::Exhausted
+    );
+    assert_eq!(report.gate_correction_outcomes[0].correction_attempts, 0);
+}
+
+#[test]
+fn nested_worker_report_warning_counts_for_consecutive_streak() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    let (report, child_invocations, auditor_invocations) = run_validation_repair_script(
+        &temp,
+        &repo_path,
+        &assignment,
+        2,
+        "nested-worker-warning-streak",
+        |_, assignment| {
+            let mut child = injected_failed_validation_report(
+                assignment,
+                Some(FindingSeverity::Info),
+                "top-level info",
+                Some(ReviewStatus::Failed),
+            );
+            child.worker_reports[0].findings.push(Finding {
+                severity: FindingSeverity::Warning,
+                message: "nested worker warning".to_string(),
+                paths: vec![PathBuf::from("README.md")],
+            });
+            child
+        },
+    );
+    assert_warning_streak_stop(
+        &report,
+        child_invocations,
+        auditor_invocations,
+        2,
+        1,
+        GateApplyBlocker::ValidationFailed,
+    );
+}
+
+#[test]
+fn distinct_warning_messages_still_count_as_consecutive_warnings() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(false);
+    let (report, child_invocations, auditor_invocations) = run_validation_repair_script(
+        &temp,
+        &repo_path,
+        &assignment,
+        2,
+        "distinct-warning-messages-still-consecutive",
+        |invocation, assignment| {
+            injected_failed_validation_report(
+                assignment,
+                Some(FindingSeverity::Warning),
+                &format!("distinct warning {invocation}"),
+                Some(ReviewStatus::Failed),
+            )
+        },
+    );
+    assert_warning_streak_stop(
+        &report,
+        child_invocations,
+        auditor_invocations,
+        2,
+        1,
+        GateApplyBlocker::ValidationFailed,
+    );
+}
+
+#[test]
+fn structural_retry_gap_resets_warning_streak_before_later_consecutive_pair() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(false);
+    let mut plan = injected_plan(assignment.clone(), 1);
+    plan.max_gate_corrections = 4;
+    let options = injected_options(
+        &repo_path,
+        temp.path(),
+        "warning-streak-structural-retry-gap",
+    );
+    let mut child_invocations = 0usize;
+    let mut auditor_invocations = 0usize;
+    let mut runner = |command: &ExternalAgentCommand| {
+        let name = command
+            .output_last_message
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default();
+        if name.contains("review-auditor") {
+            auditor_invocations = auditor_invocations.saturating_add(1);
+            let child = injected_child_report(&assignment);
+            write_injected_json(
+                &command.output_last_message,
+                &injected_auditor_report(&assignment, &child),
+            );
+        } else {
+            child_invocations = child_invocations.saturating_add(1);
+            let child = if child_invocations == 2 {
+                let mut mismatched = injected_child_report(&assignment);
+                mismatched.id = "wrong-id".to_string();
+                mismatched
+            } else {
+                injected_failed_validation_report(
+                    &assignment,
+                    Some(FindingSeverity::Warning),
+                    "bounded warning",
+                    Some(ReviewStatus::Failed),
+                )
+            };
+            write_injected_json(&command.output_last_message, &child);
+        }
+        injected_verified_run(command)
+    };
+
+    let report = run_supervisor_plan_with_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        &mut runner,
+    )
+    .expect("run structural-retry warning-streak gap");
+
+    assert_eq!(child_invocations, 4);
+    assert_eq!(auditor_invocations, 0);
+    assert!(!report.success);
+    assert!(!report.accepted);
+    let child = report
+        .orchestrator_reports
+        .first()
+        .expect("child orchestrator report");
+    assert!(!child.accepted);
+    assert!(child.rejected);
+    assert_eq!(report.gate_correction_outcomes[0].correction_attempts, 2);
+    assert_ne!(
+        report.gate_correction_outcomes[0].terminal_class,
+        GateCorrectionTerminalClass::SelfCorrected
+    );
+    assert_ne!(
+        report.gate_correction_outcomes[0].terminal_class,
+        GateCorrectionTerminalClass::Exhausted
+    );
+}
+
+#[test]
+fn parent_auditor_repair_gap_resets_warning_streak_before_later_consecutive_pair() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    let mut plan = injected_plan(assignment.clone(), 0);
+    plan.max_gate_corrections = 4;
+    let options = injected_options(&repo_path, temp.path(), "warning-streak-auditor-repair-gap");
+    let mut child_invocations = 0usize;
+    let mut auditor_invocations = 0usize;
+    let mut runner = |command: &ExternalAgentCommand| {
+        let name = command
+            .output_last_message
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default();
+        if name.contains("review-auditor") {
+            auditor_invocations = auditor_invocations.saturating_add(1);
+            let child = injected_child_report(&assignment);
+            let mut auditor = injected_auditor_report(&assignment, &child);
+            if auditor_invocations == 1 {
+                auditor.status = ReviewStatus::Rejected;
+                auditor.accepted = false;
+                auditor.rejected = true;
+                auditor.rejection_kind = Some(AuditorRejectionKind::ImplementationDefect);
+                auditor.findings.push(Finding {
+                    severity: FindingSeverity::Error,
+                    message: "bounded auditor implementation defect".to_string(),
+                    paths: vec![PathBuf::from("README.md")],
+                });
+            }
+            write_injected_json(&command.output_last_message, &auditor);
+        } else {
+            child_invocations = child_invocations.saturating_add(1);
+            let child = if child_invocations == 2 {
+                injected_child_report(&assignment)
+            } else {
+                injected_failed_validation_report(
+                    &assignment,
+                    Some(FindingSeverity::Warning),
+                    "bounded warning",
+                    Some(ReviewStatus::Failed),
+                )
+            };
+            write_injected_json(&command.output_last_message, &child);
+        }
+        injected_verified_run(command)
+    };
+
+    let result = run_supervisor_plan_with_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        &mut runner,
+    );
+
+    assert_eq!(child_invocations, 3);
+    assert_eq!(auditor_invocations, 1);
+    match result {
+        Err(error) => {
+            let text = format!("{error:#}");
+            assert!(
+                text.contains("cannot replace active gate denial"),
+                "unexpected runner Err: {text}"
+            );
+        }
+        Ok(report) => {
+            assert!(
+                report.findings.iter().any(|finding| finding
+                    .message
+                    .contains("cannot replace active gate denial")),
+                "expected typed begin-refusal, not Narrow; findings={:?} outcomes={:?}",
+                report
+                    .findings
+                    .iter()
+                    .map(|finding| finding.message.as_str())
+                    .collect::<Vec<_>>(),
+                report.gate_correction_outcomes
+            );
+            assert!(!report.success);
+        }
+    }
+}
+
 #[test]
 fn primary_integrity_failure_dominates_validation_retry() {
     let (temp, repo_path) = injected_repository();
