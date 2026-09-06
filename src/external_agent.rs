@@ -6,7 +6,9 @@ use crate::machine_global::{
     DestructiveTargetInput, GateOutcome, MachineGlobalRetentionBinding, MachineGlobalStore,
     RetentionOperation, RetentionOperationId,
 };
-use crate::mutation_taxonomy::SupervisorCatalogCodexPreflightGrant;
+use crate::mutation_taxonomy::{
+    SupervisorCatalogCodexPreflightGrant, SupervisorCatalogCodexPreflightGrantError,
+};
 use crate::pre_action_review::{
     ActionDescriptor, ApprovalReviewRequest, BlastRadius, CommandClass, CommandInvocation,
     DecisionSource, PathAccess, PathAccessMode, PermissionRequest, PreActionReviewer,
