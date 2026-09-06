@@ -568,75 +568,157 @@ pub(crate) fn load_codex_runtime_model_catalog(
     timeout: Duration,
 ) -> std::result::Result<CodexRuntimeModelCatalog, Box<EnvironmentFailure>> {
     let catalog = (|| -> Result<CodexRuntimeModelCatalog> {
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (program, cwd, timeout);
-            return Err(CodexRuntimeModelCatalogFailureCause::UnsupportedPlatform.into());
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            if program != Path::new("codex") {
-                return Err(CodexRuntimeModelCatalogFailureCause::UntrustedCustomExecutable.into());
-            }
-            if timeout.is_zero() {
-                return Err(CodexRuntimeModelCatalogFailureCause::InvalidTimeout.into());
-            }
-            let resolved_program = resolve_external_program(program, cwd)
-                .context(CodexRuntimeModelCatalogFailureCause::ExecutableResolutionFailed)?;
-            let program_parent = codex_runtime_model_catalog_process_root(&resolved_program)?;
-            let program_identity = external_program_identity(&resolved_program)
-                .context(CodexRuntimeModelCatalogFailureCause::ExecutableIdentityFailed)?;
-            let auth = ValidatedCodexAuth::load()
-                .context(CodexRuntimeModelCatalogFailureCause::AuthValidationFailed)?
-                .context(CodexAuthValidationFailureCause::AuthFileMissing)?;
-            auth.verify_source_unchanged()
-                .context(CodexRuntimeModelCatalogFailureCause::AuthRevalidationFailed)?;
-
-            let process_spec = ProcessSpec::direct(
-                "Codex runtime model catalog preflight",
-                &resolved_program,
-                ["debug", "models"],
-                program_parent,
-                CODEX_MODEL_CATALOG_MAX_BYTES,
-            )
-            .with_environment(EnvironmentMode::ClearAndSet(allowed_env(
-                ExternalAgentInvocation::CodexSupervisor,
-                ExternalProgramTrust::TrustedSystemCodex,
-            )))
-            .with_stdin(StdinMode::Null)
-            .with_timeout(Some(timeout))
-            .with_private_runtime_home(true)
-            .with_private_runtime_codex_home(true)
-            .with_private_runtime_file("auth.json", auth.bytes.clone())
-            .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(
-                ExternalCodexProfile::read_only(program_parent),
-            ));
-
-            let process_result = run_process_cancellable(process_spec, &ProcessCancellation::new());
-            let current_identity = external_program_identity(&resolved_program)
-                .context(CodexRuntimeModelCatalogFailureCause::ExecutableRevalidationFailed)?;
-            let auth_result = auth
-                .verify_source_unchanged()
-                .context(CodexRuntimeModelCatalogFailureCause::AuthRevalidationFailed);
-            if current_identity != program_identity {
-                return Err(CodexRuntimeModelCatalogFailureCause::ExecutableChanged.into());
-            }
-            auth_result?;
-            let output = process_result
-                .map_err(|error| codex_runtime_model_catalog_process_failure_cause(&error))?;
-            if !output.safety_sensitive_succeeded() {
-                return Err(CodexRuntimeModelCatalogFailureCause::UnsafeProcessResult.into());
-            }
-            if output.stdout.is_truncated() || output.stderr.is_truncated() {
-                return Err(CodexRuntimeModelCatalogFailureCause::OutputLimitExceeded.into());
-            }
-            parse_codex_runtime_model_catalog(output.stdout.as_bytes())
-                .context(CodexRuntimeModelCatalogFailureCause::InvalidOutput)
-        }
+        let prepared = prepare_codex_runtime_model_catalog_process(program, cwd, timeout)?;
+        execute_prepared_codex_runtime_model_catalog(prepared)
     })();
 
     catalog.map_err(|error| codex_runtime_model_catalog_failure(&error))
+}
+
+pub(crate) fn load_codex_runtime_model_catalog_authorized(
+    program: &Path,
+    resolver_search_base: &Path,
+    timeout: Duration,
+    grant: SupervisorCatalogCodexPreflightGrant,
+) -> std::result::Result<CodexRuntimeModelCatalog, Box<EnvironmentFailure>> {
+    let catalog = (|| -> Result<CodexRuntimeModelCatalog> {
+        let prepared =
+            prepare_codex_runtime_model_catalog_process(program, resolver_search_base, timeout)?;
+        bind_supervisor_catalog_preflight_grant(&prepared.process_spec, grant)?;
+        execute_prepared_codex_runtime_model_catalog(prepared)
+    })();
+
+    catalog.map_err(|error| codex_runtime_model_catalog_failure(&error))
+}
+
+struct PreparedCodexRuntimeModelCatalogProcess {
+    resolved_program: PathBuf,
+    program_identity: ExternalProgramIdentity,
+    auth: ValidatedCodexAuth,
+    process_spec: ProcessSpec,
+}
+
+fn prepare_codex_runtime_model_catalog_process(
+    program: &Path,
+    resolver_search_base: &Path,
+    timeout: Duration,
+) -> Result<PreparedCodexRuntimeModelCatalogProcess> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (program, resolver_search_base, timeout);
+        return Err(CodexRuntimeModelCatalogFailureCause::UnsupportedPlatform.into());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if program != Path::new("codex") {
+            return Err(CodexRuntimeModelCatalogFailureCause::UntrustedCustomExecutable.into());
+        }
+        if timeout.is_zero() {
+            return Err(CodexRuntimeModelCatalogFailureCause::InvalidTimeout.into());
+        }
+        let resolved_program = resolve_external_program(program, resolver_search_base)
+            .context(CodexRuntimeModelCatalogFailureCause::ExecutableResolutionFailed)?;
+        let program_parent = codex_runtime_model_catalog_process_root(&resolved_program)?;
+        let program_identity = external_program_identity(&resolved_program)
+            .context(CodexRuntimeModelCatalogFailureCause::ExecutableIdentityFailed)?;
+        let auth = ValidatedCodexAuth::load()
+            .context(CodexRuntimeModelCatalogFailureCause::AuthValidationFailed)?
+            .context(CodexAuthValidationFailureCause::AuthFileMissing)?;
+        auth.verify_source_unchanged()
+            .context(CodexRuntimeModelCatalogFailureCause::AuthRevalidationFailed)?;
+
+        let process_spec = ProcessSpec::direct(
+            "Codex runtime model catalog preflight",
+            &resolved_program,
+            ["debug", "models"],
+            program_parent,
+            CODEX_MODEL_CATALOG_MAX_BYTES,
+        )
+        .with_environment(EnvironmentMode::ClearAndSet(allowed_env(
+            ExternalAgentInvocation::CodexSupervisor,
+            ExternalProgramTrust::TrustedSystemCodex,
+        )))
+        .with_stdin(StdinMode::Null)
+        .with_timeout(Some(timeout))
+        .with_private_runtime_home(true)
+        .with_private_runtime_codex_home(true)
+        .with_private_runtime_file("auth.json", auth.bytes.clone())
+        .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(
+            ExternalCodexProfile::read_only(program_parent),
+        ));
+
+        Ok(PreparedCodexRuntimeModelCatalogProcess {
+            resolved_program,
+            program_identity,
+            auth,
+            process_spec,
+        })
+    }
+}
+
+fn bind_supervisor_catalog_preflight_grant(
+    process_spec: &ProcessSpec,
+    grant: SupervisorCatalogCodexPreflightGrant,
+) -> Result<()> {
+    let ProcessCommand::Direct { program, args } = &process_spec.command else {
+        return Err(CodexRuntimeModelCatalogFailureCause::CatalogPreflightGrantMismatch.into());
+    };
+    grant
+        .consume_for_process_binding(program, &process_spec.current_dir, args)
+        .map_err(|error| match error {
+            crate::mutation_taxonomy::SupervisorCatalogCodexPreflightGrantError::AlreadyConsumed => {
+                CodexRuntimeModelCatalogFailureCause::CatalogPreflightGrantConsumed
+            }
+            crate::mutation_taxonomy::SupervisorCatalogCodexPreflightGrantError::UntrustedExpectedProgram => {
+                CodexRuntimeModelCatalogFailureCause::UntrustedCatalogPreflightProgram
+            }
+            crate::mutation_taxonomy::SupervisorCatalogCodexPreflightGrantError::ProgramMismatch
+            | crate::mutation_taxonomy::SupervisorCatalogCodexPreflightGrantError::CurrentDirMismatch
+            | crate::mutation_taxonomy::SupervisorCatalogCodexPreflightGrantError::ArgvMismatch => {
+                CodexRuntimeModelCatalogFailureCause::CatalogPreflightGrantMismatch
+            }
+        })?;
+    let expected_confinement = SideEffectConfinementProfile::ExternalCodex(
+        ExternalCodexProfile::read_only(&process_spec.current_dir),
+    );
+    if process_spec.side_effects != expected_confinement {
+        return Err(
+            CodexRuntimeModelCatalogFailureCause::CatalogPreflightConfinementMismatch.into(),
+        );
+    }
+    Ok(())
+}
+
+fn execute_prepared_codex_runtime_model_catalog(
+    prepared: PreparedCodexRuntimeModelCatalogProcess,
+) -> Result<CodexRuntimeModelCatalog> {
+    let PreparedCodexRuntimeModelCatalogProcess {
+        resolved_program,
+        program_identity,
+        auth,
+        process_spec,
+    } = prepared;
+    let process_result = run_process_cancellable(process_spec, &ProcessCancellation::new());
+    let current_identity = external_program_identity(&resolved_program)
+        .context(CodexRuntimeModelCatalogFailureCause::ExecutableRevalidationFailed)?;
+    let auth_result = auth
+        .verify_source_unchanged()
+        .context(CodexRuntimeModelCatalogFailureCause::AuthRevalidationFailed);
+    if current_identity != program_identity {
+        return Err(CodexRuntimeModelCatalogFailureCause::ExecutableChanged.into());
+    }
+    auth_result?;
+    let output =
+        process_result.map_err(|error| codex_runtime_model_catalog_process_failure_cause(&error))?;
+    if !output.safety_sensitive_succeeded() {
+        return Err(CodexRuntimeModelCatalogFailureCause::UnsafeProcessResult.into());
+    }
+    if output.stdout.is_truncated() || output.stderr.is_truncated() {
+        return Err(CodexRuntimeModelCatalogFailureCause::OutputLimitExceeded.into());
+    }
+    parse_codex_runtime_model_catalog(output.stdout.as_bytes())
+        .context(CodexRuntimeModelCatalogFailureCause::InvalidOutput)
 }
 
 fn codex_runtime_model_catalog_process_root(resolved_program: &Path) -> Result<&Path> {
@@ -652,6 +734,16 @@ enum CodexRuntimeModelCatalogFailureCause {
     UnsupportedPlatform,
     #[error("untrusted_custom_executable")]
     UntrustedCustomExecutable,
+    #[error("untrusted_catalog_preflight_program")]
+    UntrustedCatalogPreflightProgram,
+    #[error("missing_catalog_preflight_grant")]
+    MissingCatalogPreflightGrant,
+    #[error("catalog_preflight_grant_mismatch")]
+    CatalogPreflightGrantMismatch,
+    #[error("catalog_preflight_grant_consumed")]
+    CatalogPreflightGrantConsumed,
+    #[error("catalog_preflight_confinement_mismatch")]
+    CatalogPreflightConfinementMismatch,
     #[error("invalid_timeout")]
     InvalidTimeout,
     #[error("trusted_executable_resolution_failed")]
@@ -725,6 +817,34 @@ fn codex_runtime_model_catalog_process_failure_cause(
             CodexRuntimeModelCatalogFailureCause::ProcessStdinTooLarge
         }
     }
+}
+
+pub(crate) fn missing_supervisor_catalog_preflight_grant_failure() -> Box<EnvironmentFailure> {
+    Box::new(EnvironmentFailure::runtime_model_catalog(format!(
+        "Codex runtime model catalog acquisition failed: cause={}",
+        CodexRuntimeModelCatalogFailureCause::MissingCatalogPreflightGrant
+    )))
+}
+
+pub(crate) fn supervisor_catalog_preflight_grant_admit_failure(
+    error: crate::mutation_taxonomy::SupervisorCatalogCodexPreflightGrantError,
+) -> Box<EnvironmentFailure> {
+    let cause = match error {
+        crate::mutation_taxonomy::SupervisorCatalogCodexPreflightGrantError::UntrustedExpectedProgram => {
+            CodexRuntimeModelCatalogFailureCause::UntrustedCatalogPreflightProgram
+        }
+        crate::mutation_taxonomy::SupervisorCatalogCodexPreflightGrantError::AlreadyConsumed => {
+            CodexRuntimeModelCatalogFailureCause::CatalogPreflightGrantConsumed
+        }
+        crate::mutation_taxonomy::SupervisorCatalogCodexPreflightGrantError::ProgramMismatch
+        | crate::mutation_taxonomy::SupervisorCatalogCodexPreflightGrantError::CurrentDirMismatch
+        | crate::mutation_taxonomy::SupervisorCatalogCodexPreflightGrantError::ArgvMismatch => {
+            CodexRuntimeModelCatalogFailureCause::CatalogPreflightGrantMismatch
+        }
+    };
+    Box::new(EnvironmentFailure::runtime_model_catalog(format!(
+        "Codex runtime model catalog acquisition failed: cause={cause}"
+    )))
 }
 
 fn codex_runtime_model_catalog_failure(error: &anyhow::Error) -> Box<EnvironmentFailure> {
