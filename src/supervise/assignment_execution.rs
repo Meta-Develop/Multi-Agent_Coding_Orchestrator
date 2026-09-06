@@ -2333,6 +2333,114 @@ fn is_child_pre_action_refusal(denial: &GateDenial) -> bool {
     )
 }
 
+fn loop_finding_severity(severity: FindingSeverity) -> crate::loop_guard::LoopFindingSeverity {
+    match severity {
+        FindingSeverity::Info => crate::loop_guard::LoopFindingSeverity::Info,
+        FindingSeverity::Warning => crate::loop_guard::LoopFindingSeverity::Warning,
+        FindingSeverity::Error => crate::loop_guard::LoopFindingSeverity::Error,
+    }
+}
+
+fn highest_loop_finding_severity(
+    report: &OrchestratorReviewReport,
+) -> Option<crate::loop_guard::LoopFindingSeverity> {
+    report
+        .findings
+        .iter()
+        .chain(
+            report
+                .worker_reports
+                .iter()
+                .flat_map(|worker| worker.findings.iter()),
+        )
+        .map(|finding| loop_finding_severity(finding.severity))
+        .max()
+}
+
+fn validation_floor_from_results(
+    results: &[ValidationResult],
+) -> crate::loop_guard::ValidationFloor {
+    if results.is_empty() {
+        crate::loop_guard::ValidationFloor::Missing
+    } else if results.iter().any(validation_failed) {
+        crate::loop_guard::ValidationFloor::Failed
+    } else {
+        crate::loop_guard::ValidationFloor::Passed
+    }
+}
+
+fn consecutive_warning_validation_repair_should_stop(
+    plan: &SupervisorPlan,
+    outcome: &AssignmentExecutionOutcome,
+    warning_streak: &mut Option<crate::loop_guard::LoopGuardTracker>,
+    attempt_report: &OrchestratorReviewReport,
+    structural_attempt: usize,
+    current_depth: u8,
+) -> bool {
+    use crate::loop_guard::{
+        CascadeBreakerView, ExistingRoundLimits, LoopCycleObservation, LoopFindingSeverity,
+        LoopGuardConfig, LoopGuardEscalation, LoopGuardObserveRequest, LoopGuardReason,
+        LoopGuardTracker, RoundLimitKind,
+    };
+
+    let limits = ExistingRoundLimits {
+        max_depth: plan.max_depth,
+        max_child_retries: plan.max_child_retries,
+        max_gate_corrections: plan.max_gate_corrections,
+    };
+    if warning_streak.is_none() {
+        match LoopGuardConfig::warning_streak(2)
+            .and_then(|config| LoopGuardTracker::new(config, limits))
+        {
+            Ok(tracker) => *warning_streak = Some(tracker),
+            Err(_) => return true,
+        }
+    }
+    let Some(tracker) = warning_streak.as_mut() else {
+        return true;
+    };
+    let used_gate_corrections = outcome
+        .gate_tracker
+        .as_ref()
+        .map(|gate_tracker| gate_tracker.used)
+        .unwrap_or(0);
+    let used_child_retries = u8::try_from(structural_attempt.saturating_sub(1)).unwrap_or(u8::MAX);
+    let Ok(observation) = LoopCycleObservation::new(
+        Some(LoopFindingSeverity::Warning),
+        None,
+        validation_floor_from_results(&attempt_report.validation_results),
+    ) else {
+        return true;
+    };
+    let remaining_corrections = limits.remaining_gate_corrections(used_gate_corrections);
+    let decision = match tracker.observe(LoopGuardObserveRequest {
+        observation,
+        limits,
+        used_gate_corrections,
+        used_child_retries,
+        current_depth,
+        cascade_breaker: CascadeBreakerView::Closed,
+    }) {
+        Ok(decision) => decision,
+        Err(_) => return true,
+    };
+    match decision.escalation {
+        LoopGuardEscalation::Continue => false,
+        LoopGuardEscalation::Narrow => true,
+        LoopGuardEscalation::Refuse => {
+            let budget_class = remaining_corrections == 0
+                || matches!(
+                    decision.reason,
+                    LoopGuardReason::RoundLimitExhausted {
+                        limit: RoundLimitKind::MaxGateCorrections,
+                        ..
+                    } | LoopGuardReason::ValidationFloorUnsatisfied { .. }
+                );
+            !budget_class
+        }
+    }
+}
+
 fn child_gate_terminal_reason(
     containment_verified: bool,
     sandbox_denied: bool,
@@ -2368,8 +2476,10 @@ fn decide_child_attempt(
     structural_attempt: &mut usize,
     retry_feedback: &mut Option<ChildAttemptCorrection>,
     attempt_history: &mut Vec<ChildAttemptHistory>,
+    warning_streak: &mut Option<crate::loop_guard::LoopGuardTracker>,
     collected: CollectedChildAttempt<'_>,
 ) -> Result<ChildAttemptDisposition> {
+    let mut warning_streak_state = warning_streak.take();
     let AssignmentExecutionContext {
         plan, artifacts, ..
     } = context;
@@ -2674,6 +2784,33 @@ fn decide_child_attempt(
     };
     if report_shape_problems.is_empty() {
         if let Some(blocker) = validation_blocker.filter(|_| report_failed(&attempt_report)) {
+            let highest = highest_loop_finding_severity(&attempt_report);
+            let eligible_warning = highest == Some(crate::loop_guard::LoopFindingSeverity::Warning)
+                && plan.max_gate_corrections > 0;
+            if eligible_warning {
+                let current_depth = context
+                    .assignment_schedule
+                    .get(context.index)
+                    .map(|entry| entry.depth)
+                    .unwrap_or(plan.max_depth);
+                if consecutive_warning_validation_repair_should_stop(
+                    plan,
+                    outcome,
+                    &mut warning_streak_state,
+                    &attempt_report,
+                    *structural_attempt,
+                    current_depth,
+                ) {
+                    attempt_report.status = ReviewStatus::Failed;
+                    attempt_report.accepted = false;
+                    attempt_report.rejected = true;
+                    return Ok(ChildAttemptDisposition::Finish {
+                        report: attempt_report,
+                        containment_verified: true,
+                        gate_terminal: true,
+                    });
+                }
+            }
             let correction_correlation_id = outcome
                 .gate_tracker
                 .as_ref()
@@ -2701,6 +2838,9 @@ fn decide_child_attempt(
                     &mut outcome.health_signals,
                 )?;
             if let Some(authorized_denial) = authorized_denial {
+                if eligible_warning {
+                    *warning_streak = warning_streak_state;
+                }
                 *retry_feedback = Some(ChildAttemptCorrection::Gate(authorized_denial));
                 return Ok(ChildAttemptDisposition::Retry);
             }
@@ -3956,6 +4096,7 @@ fn execute_supervisor_assignment_inner(
     let mut active_budget_policy = context.budget_policy.clone();
     let mut attempt_history = Vec::new();
     let mut structural_attempt = 1usize;
+    let mut warning_streak: Option<crate::loop_guard::LoopGuardTracker> = None;
     let max_attempts = usize::from(plan.max_child_retries)
         .saturating_add(usize::from(plan.max_gate_corrections))
         .saturating_add(1);
@@ -4025,6 +4166,7 @@ fn execute_supervisor_assignment_inner(
                 &mut structural_attempt,
                 &mut retry_feedback,
                 &mut attempt_history,
+                &mut warning_streak,
                 collected,
             )? {
                 ChildAttemptDisposition::Retry => continue,
@@ -4337,7 +4479,10 @@ fn execute_supervisor_assignment_inner(
             child_report,
             &mut retry_feedback,
         )? {
-            ParentAuditorGateDisposition::Retry => continue 'gate_controller,
+            ParentAuditorGateDisposition::Retry => {
+                warning_streak = None;
+                continue 'gate_controller;
+            }
             ParentAuditorGateDisposition::Complete {
                 report,
                 candidate,
@@ -4782,6 +4927,7 @@ mod decomposition_tests {
         let mut structural_attempt = 1;
         let mut retry_feedback = None;
         let mut attempt_history = Vec::new();
+        let mut warning_streak = None;
         let mut child_report = match decide_child_attempt(
             &context,
             &mut outcome,
@@ -4791,6 +4937,7 @@ mod decomposition_tests {
             &mut structural_attempt,
             &mut retry_feedback,
             &mut attempt_history,
+            &mut warning_streak,
             collected,
         )
         .expect("direct child gate invocation")
@@ -5267,6 +5414,7 @@ mod decomposition_tests {
         let mut structural_attempt = 1;
         let mut retry_feedback = None;
         let mut attempt_history = Vec::new();
+        let mut warning_streak = None;
         let mut child_report = match decide_child_attempt(
             &context,
             &mut outcome,
@@ -5276,6 +5424,7 @@ mod decomposition_tests {
             &mut structural_attempt,
             &mut retry_feedback,
             &mut attempt_history,
+            &mut warning_streak,
             collected,
         )
         .expect("direct child gate invocation")
