@@ -7,7 +7,8 @@ use crate::machine_global::{
     RetentionOperation, RetentionOperationId,
 };
 use crate::mutation_taxonomy::{
-    SupervisorCatalogCodexPreflightGrant, SupervisorCatalogCodexPreflightGrantError,
+    CatalogPreflightOrigin, SupervisorCatalogCodexPreflightGrant,
+    SupervisorCatalogCodexPreflightGrantError,
 };
 use crate::pre_action_review::{
     ActionDescriptor, ApprovalReviewRequest, BlastRadius, CommandClass, CommandInvocation,
