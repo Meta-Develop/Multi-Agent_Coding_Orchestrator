@@ -132,6 +132,74 @@ fn budget_policy_request<'a>(
     }
 }
 
+const FIXTURE_UNRANKED_CURRENT: &str = "fixture-unranked-current";
+const FIXTURE_UNRANKED_TARGET: &str = "fixture-unranked-target";
+const FIXTURE_CRITICAL_TWIN: &str = "fixture-critical-twin";
+const FIXTURE_GENERAL_TWIN: &str = "fixture-general-twin";
+const FIXTURE_WEAK_MECHANICAL: &str = "fixture-weak-mechanical";
+
+fn worker_plan_with_current_and_ladder(
+    assignments: Vec<OrchestratorAssignment>,
+    current: &str,
+    ladder: &[&str],
+) -> SupervisorPlan {
+    let mut plan = test_plan(assignments);
+    plan.role_models.insert(
+        AgentRole::Worker,
+        RoleModelSelection {
+            model: Some(current.to_string()),
+            reasoning_effort: Some("xhigh".to_string()),
+            unavailable_model_fallback: UnavailableModelFallback::OrderedCatalogChain(
+                OrderedCatalogFallback {
+                    models: Vec::new(),
+                    budget_degrade_models: ladder
+                        .iter()
+                        .map(|model| (*model).to_string())
+                        .collect(),
+                    on_exhausted: TerminalUnavailableModelFallback::FailClosed,
+                },
+            ),
+        },
+    );
+    plan
+}
+
+fn mechanical_codex_catalog(slugs: &[&str]) -> RuntimeModelCatalog {
+    RuntimeModelCatalog::Codex(
+        CodexRuntimeModelCatalog::from_slugs(slugs.iter().copied()).expect("fixture Codex catalog"),
+    )
+}
+
+fn mechanical_model_tier_policy(
+    controller: &mut BudgetDegradationController,
+    assignment: &OrchestratorAssignment,
+    plan: &SupervisorPlan,
+    requested_plan: &SupervisorPlan,
+    catalog: &RuntimeModelCatalog,
+) -> Result<Option<AssignmentBudgetPolicy>> {
+    let mut metadata = AssignmentMetadata::new();
+    insert_mechanical_metadata(&mut metadata, &assignment.id);
+    let report = degrade_report();
+    controller.assignment_policy(budget_policy_request(
+        assignment,
+        None,
+        &report,
+        plan,
+        requested_plan,
+        &metadata,
+        catalog,
+    ))
+}
+
+fn assert_model_tier_unchanged(controller: &BudgetDegradationController) {
+    assert_eq!(controller.rung, BudgetDegradationRung::ModelTier);
+    assert!(controller.records.is_empty());
+    assert!(!controller
+        .policy
+        .model_overrides
+        .contains_key(&AgentRole::Worker));
+}
+
 #[test]
 fn role_binding_telemetry_retains_catalog_fallback_resolution() {
     let mut plan = test_plan(Vec::new());
@@ -637,11 +705,356 @@ fn worker_model_rung_refuses_no_distinct_eligible_target_without_advancing() {
         .expect_err("no eligible Worker target must refuse degradation");
 
     assert!(error.to_string().contains(
-        "requested-plan budget_degrade_models ladder has no distinct runtime-advertised authority-eligible target"
+        "requested-plan budget_degrade_models ladder has no distinct runtime-advertised authority-eligible strictly-lower target"
     ));
     assert_eq!(controller.rung, BudgetDegradationRung::ModelTier);
     assert_eq!(controller.effective_fan_out, 8);
     assert!(controller.records.is_empty());
+}
+
+#[test]
+fn worker_model_rung_refuses_unknown_current_capability_without_advancing() {
+    let assignment = mechanical_assignment("unknown-current");
+    let plan = worker_plan_with_current_and_ladder(
+        vec![assignment.clone()],
+        FIXTURE_UNRANKED_CURRENT,
+        &[ECONOMY_PROFILE_MODEL],
+    );
+    let requested_plan = plan.clone();
+    let catalog = mechanical_codex_catalog(&[FIXTURE_UNRANKED_CURRENT, ECONOMY_PROFILE_MODEL]);
+    let mut controller = BudgetDegradationController::new(8);
+
+    let error = mechanical_model_tier_policy(
+        &mut controller,
+        &assignment,
+        &plan,
+        &requested_plan,
+        &catalog,
+    )
+    .expect_err("unknown current capability must refuse ModelTier");
+
+    assert!(
+        error.to_string().contains("no trusted capability class"),
+        "unknown-current refusal: {error}"
+    );
+    assert_model_tier_unchanged(&controller);
+    assert_eq!(controller.effective_fan_out, 8);
+}
+
+#[test]
+fn worker_model_rung_skips_unknown_target_and_binds_later_strictly_lower_index() {
+    let assignment = mechanical_assignment("unknown-target");
+    let plan = worker_plan_with_current_and_ladder(
+        vec![assignment.clone()],
+        FRONTIER_PROFILE_MODEL,
+        &[FIXTURE_UNRANKED_TARGET, ECONOMY_PROFILE_MODEL],
+    );
+    let requested_plan = plan.clone();
+    let catalog = mechanical_codex_catalog(&[
+        FRONTIER_PROFILE_MODEL,
+        FIXTURE_UNRANKED_TARGET,
+        ECONOMY_PROFILE_MODEL,
+    ]);
+    let mut controller = BudgetDegradationController::new(8);
+
+    let policy = mechanical_model_tier_policy(
+        &mut controller,
+        &assignment,
+        &plan,
+        &requested_plan,
+        &catalog,
+    )
+    .expect("unknown target is skipped")
+    .expect("later strictly-lower candidate is admitted");
+
+    assert_eq!(
+        policy.apply(&plan).role_models[&AgentRole::Worker]
+            .model
+            .as_deref(),
+        Some(ECONOMY_PROFILE_MODEL)
+    );
+    assert_eq!(controller.rung, BudgetDegradationRung::Effort);
+    assert_eq!(
+        controller.records[0].change,
+        BudgetDegradationChange::ModelTier {
+            role: AgentRole::Worker,
+            before: FRONTIER_PROFILE_MODEL.to_string(),
+            after: ECONOMY_PROFILE_MODEL.to_string(),
+            resolved_candidate_index: 1,
+        }
+    );
+}
+
+#[test]
+fn worker_model_rung_skips_equal_class_and_binds_later_strictly_lower_index() {
+    let _guard = install_test_fixture_models(&[(
+        FIXTURE_CRITICAL_TWIN,
+        ModelCapabilityClass::CriticalJudgment,
+    )])
+    .expect("equal-class fixture overlay is not production evidence");
+    let assignment = mechanical_assignment("equal-class");
+    let plan = worker_plan_with_current_and_ladder(
+        vec![assignment.clone()],
+        FRONTIER_PROFILE_MODEL,
+        &[FIXTURE_CRITICAL_TWIN, ECONOMY_PROFILE_MODEL],
+    );
+    let requested_plan = plan.clone();
+    let catalog = mechanical_codex_catalog(&[
+        FRONTIER_PROFILE_MODEL,
+        FIXTURE_CRITICAL_TWIN,
+        ECONOMY_PROFILE_MODEL,
+    ]);
+    let mut controller = BudgetDegradationController::new(8);
+
+    let policy = mechanical_model_tier_policy(
+        &mut controller,
+        &assignment,
+        &plan,
+        &requested_plan,
+        &catalog,
+    )
+    .expect("equal-class distinct slug is not a degrade")
+    .expect("later strictly-lower candidate is admitted");
+
+    assert_eq!(
+        policy.apply(&plan).role_models[&AgentRole::Worker]
+            .model
+            .as_deref(),
+        Some(ECONOMY_PROFILE_MODEL)
+    );
+    assert_eq!(
+        controller.records[0].change,
+        BudgetDegradationChange::ModelTier {
+            role: AgentRole::Worker,
+            before: FRONTIER_PROFILE_MODEL.to_string(),
+            after: ECONOMY_PROFILE_MODEL.to_string(),
+            resolved_candidate_index: 1,
+        }
+    );
+    assert_ne!(
+        controller.records[0].change,
+        BudgetDegradationChange::ModelTier {
+            role: AgentRole::Worker,
+            before: FRONTIER_PROFILE_MODEL.to_string(),
+            after: FIXTURE_CRITICAL_TWIN.to_string(),
+            resolved_candidate_index: 0,
+        }
+    );
+}
+
+#[test]
+fn worker_model_rung_refuses_higher_class_upgrade_without_advancing() {
+    let assignment = mechanical_assignment("higher-class-upgrade");
+    let plan = worker_plan_with_current_and_ladder(
+        vec![assignment.clone()],
+        ECONOMY_PROFILE_MODEL,
+        &[FRONTIER_PROFILE_MODEL],
+    );
+    let requested_plan = plan.clone();
+    let catalog = mechanical_codex_catalog(&[ECONOMY_PROFILE_MODEL, FRONTIER_PROFILE_MODEL]);
+    let mut controller = BudgetDegradationController::new(8);
+
+    let error = mechanical_model_tier_policy(
+        &mut controller,
+        &assignment,
+        &plan,
+        &requested_plan,
+        &catalog,
+    )
+    .expect_err("higher-class distinct slug must not upgrade");
+
+    assert!(error.to_string().contains(
+        "requested-plan budget_degrade_models ladder has no distinct runtime-advertised authority-eligible"
+    ));
+    assert_model_tier_unchanged(&controller);
+}
+
+#[test]
+fn worker_model_rung_skips_higher_class_and_binds_later_strictly_lower_index() {
+    let _guard = install_test_fixture_models(&[(
+        FIXTURE_WEAK_MECHANICAL,
+        ModelCapabilityClass::WeakMechanical,
+    )])
+    .expect("weak-mechanical fixture overlay is admission-only, not an executor claim");
+    let assignment = mechanical_assignment("higher-then-lower");
+    let plan = worker_plan_with_current_and_ladder(
+        vec![assignment.clone()],
+        ECONOMY_PROFILE_MODEL,
+        &[FRONTIER_PROFILE_MODEL, FIXTURE_WEAK_MECHANICAL],
+    );
+    let requested_plan = plan.clone();
+    let catalog = mechanical_codex_catalog(&[
+        ECONOMY_PROFILE_MODEL,
+        FRONTIER_PROFILE_MODEL,
+        FIXTURE_WEAK_MECHANICAL,
+    ]);
+    let mut controller = BudgetDegradationController::new(8);
+
+    let policy = mechanical_model_tier_policy(
+        &mut controller,
+        &assignment,
+        &plan,
+        &requested_plan,
+        &catalog,
+    )
+    .expect("higher-class slug is skipped")
+    .expect("later strictly-lower candidate is admitted");
+
+    assert_eq!(
+        policy.apply(&plan).role_models[&AgentRole::Worker]
+            .model
+            .as_deref(),
+        Some(FIXTURE_WEAK_MECHANICAL)
+    );
+    assert_eq!(
+        controller.records[0].change,
+        BudgetDegradationChange::ModelTier {
+            role: AgentRole::Worker,
+            before: ECONOMY_PROFILE_MODEL.to_string(),
+            after: FIXTURE_WEAK_MECHANICAL.to_string(),
+            resolved_candidate_index: 1,
+        }
+    );
+}
+
+#[test]
+fn worker_model_rung_reordered_higher_equal_lower_binds_first_strictly_lower_index() {
+    let _guard = install_test_fixture_models(&[
+        (FIXTURE_GENERAL_TWIN, ModelCapabilityClass::GeneralJudgment),
+        (
+            FIXTURE_WEAK_MECHANICAL,
+            ModelCapabilityClass::WeakMechanical,
+        ),
+    ])
+    .expect("reordered-ladder fixture overlay is not production evidence");
+    let assignment = mechanical_assignment("reordered-higher-equal-lower");
+    let plan = worker_plan_with_current_and_ladder(
+        vec![assignment.clone()],
+        ECONOMY_PROFILE_MODEL,
+        &[
+            FRONTIER_PROFILE_MODEL,
+            FIXTURE_GENERAL_TWIN,
+            FIXTURE_WEAK_MECHANICAL,
+        ],
+    );
+    let requested_plan = plan.clone();
+    let catalog = mechanical_codex_catalog(&[
+        ECONOMY_PROFILE_MODEL,
+        FRONTIER_PROFILE_MODEL,
+        FIXTURE_GENERAL_TWIN,
+        FIXTURE_WEAK_MECHANICAL,
+    ]);
+    let mut controller = BudgetDegradationController::new(8);
+
+    let policy = mechanical_model_tier_policy(
+        &mut controller,
+        &assignment,
+        &plan,
+        &requested_plan,
+        &catalog,
+    )
+    .expect("higher and equal classes are skipped")
+    .expect("first strictly-lower candidate is admitted");
+
+    assert_eq!(
+        policy.apply(&plan).role_models[&AgentRole::Worker]
+            .model
+            .as_deref(),
+        Some(FIXTURE_WEAK_MECHANICAL)
+    );
+    assert_eq!(
+        controller.records[0].change,
+        BudgetDegradationChange::ModelTier {
+            role: AgentRole::Worker,
+            before: ECONOMY_PROFILE_MODEL.to_string(),
+            after: FIXTURE_WEAK_MECHANICAL.to_string(),
+            resolved_candidate_index: 2,
+        }
+    );
+}
+
+#[test]
+fn worker_model_rung_binds_first_eligible_strictly_lower_not_globally_weakest() {
+    let _guard = install_test_fixture_models(&[(
+        FIXTURE_WEAK_MECHANICAL,
+        ModelCapabilityClass::WeakMechanical,
+    )])
+    .expect("even-lower fixture overlay is not production evidence");
+    let assignment = mechanical_assignment("first-lower-not-weakest");
+    let plan = worker_plan_with_current_and_ladder(
+        vec![assignment.clone()],
+        FRONTIER_PROFILE_MODEL,
+        &[ECONOMY_PROFILE_MODEL, FIXTURE_WEAK_MECHANICAL],
+    );
+    let requested_plan = plan.clone();
+    let catalog = mechanical_codex_catalog(&[
+        FRONTIER_PROFILE_MODEL,
+        ECONOMY_PROFILE_MODEL,
+        FIXTURE_WEAK_MECHANICAL,
+    ]);
+    let mut controller = BudgetDegradationController::new(8);
+
+    let policy = mechanical_model_tier_policy(
+        &mut controller,
+        &assignment,
+        &plan,
+        &requested_plan,
+        &catalog,
+    )
+    .expect("first eligible strictly-lower candidate binds")
+    .expect("assignment admitted");
+
+    assert_eq!(
+        policy.apply(&plan).role_models[&AgentRole::Worker]
+            .model
+            .as_deref(),
+        Some(ECONOMY_PROFILE_MODEL)
+    );
+    assert_eq!(
+        controller.records[0].change,
+        BudgetDegradationChange::ModelTier {
+            role: AgentRole::Worker,
+            before: FRONTIER_PROFILE_MODEL.to_string(),
+            after: ECONOMY_PROFILE_MODEL.to_string(),
+            resolved_candidate_index: 0,
+        }
+    );
+}
+
+#[test]
+fn worker_model_rung_binds_shipped_sol_to_luna_at_advertised_index() {
+    let assignment = mechanical_assignment("shipped-sol-to-luna");
+    let plan = worker_degrade_plan(vec![assignment.clone()]);
+    let requested_plan = plan.clone();
+    let catalog = mechanical_codex_catalog(&[FRONTIER_PROFILE_MODEL, ECONOMY_PROFILE_MODEL]);
+    let mut controller = BudgetDegradationController::new(8);
+
+    let policy = mechanical_model_tier_policy(
+        &mut controller,
+        &assignment,
+        &plan,
+        &requested_plan,
+        &catalog,
+    )
+    .expect("shipped sol to luna remains eligible")
+    .expect("assignment admitted");
+
+    assert_eq!(
+        policy.apply(&plan).role_models[&AgentRole::Worker]
+            .model
+            .as_deref(),
+        Some(ECONOMY_PROFILE_MODEL)
+    );
+    assert_eq!(
+        controller.records[0].change,
+        BudgetDegradationChange::ModelTier {
+            role: AgentRole::Worker,
+            before: FRONTIER_PROFILE_MODEL.to_string(),
+            after: ECONOMY_PROFILE_MODEL.to_string(),
+            resolved_candidate_index: 0,
+        }
+    );
+    assert_eq!(controller.rung, BudgetDegradationRung::Effort);
 }
 
 #[test]

@@ -2729,7 +2729,9 @@ pub fn run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_work
     validate_execution_target_pre_dispatch(&loaded, allow_primary_worktree)?;
     let source_loaded = loaded.clone();
     let template = options.clone();
-    let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
+    let runtime_model_catalog =
+        admit_production_supervisor_catalog_preflight_grant(&options, &repo)
+            .and_then(|grant| RuntimeModelCatalog::for_supervisor(&options, &repo, grant));
     let source_report = if template.runtime == SupervisorRuntime::Fake {
         if source_loaded.plan_metadata.execution_target.is_some() {
             bail!("nonpublishable Fake cascade cannot use primary-worktree execution");
@@ -2950,7 +2952,9 @@ fn run_supervisor_plan_file_cascade_with_gate(
     }
     let source_loaded = loaded.clone();
     let template = options.clone();
-    let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
+    let runtime_model_catalog =
+        admit_production_supervisor_catalog_preflight_grant(&options, &repo)
+            .and_then(|grant| RuntimeModelCatalog::for_supervisor(&options, &repo, grant));
     if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
         bail!("autopilot caller cancelled after runtime catalog resolution before exact loaded-plan dispatch");
     }
@@ -3029,7 +3033,9 @@ fn run_supervisor_goal_spec_with_max_concurrent_children(
     validate_execution_target_pre_dispatch(&loaded, false)?;
     let manager = WorktreeManager::new(&repo);
     let cleanliness = manager.acquire_repository_cleanliness()?;
-    let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
+    let runtime_model_catalog =
+        admit_production_supervisor_catalog_preflight_grant(&options, &repo)
+            .and_then(|grant| RuntimeModelCatalog::for_supervisor(&options, &repo, grant));
     run_supervisor_plan_with_runner_and_creation(
         loaded,
         options,
@@ -3095,7 +3101,9 @@ pub fn reaudit_supervisor_assignment(
         budget_max_duration_seconds: None,
         machine_global_retention: request.machine_global_retention,
     };
-    let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
+    let runtime_model_catalog =
+        admit_production_supervisor_catalog_preflight_grant(&options, &repo)
+            .and_then(|grant| RuntimeModelCatalog::for_supervisor(&options, &repo, grant));
     let final_report = run_supervisor_plan_with_runner_and_creation(
         loaded,
         options,
@@ -3364,7 +3372,9 @@ fn run_supervisor_plan_file_with_runner_and_max_concurrent_children(
     let cleanliness = manager.acquire_repository_cleanliness()?;
     let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
     validate_execution_target_pre_dispatch(&loaded, false)?;
-    let runtime_model_catalog = RuntimeModelCatalog::for_supervisor(&options, &repo);
+    let runtime_model_catalog =
+        admit_production_supervisor_catalog_preflight_grant(&options, &repo)
+            .and_then(|grant| RuntimeModelCatalog::for_supervisor(&options, &repo, grant));
     run_supervisor_plan_with_runner_and_creation(
         loaded,
         options,
