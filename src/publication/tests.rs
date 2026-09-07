@@ -4348,6 +4348,8 @@ struct ScriptedAuthenticatedMergeState {
 struct ScriptedAuthenticatedMergeTransport {
     inner: FakeForgeTransport,
     state: Mutex<ScriptedAuthenticatedMergeState>,
+    repository: Mutex<Option<PathBuf>>,
+    phase_at_execute: Mutex<Option<EffectPhase>>,
 }
 
 impl ScriptedAuthenticatedMergeTransport {
@@ -4359,7 +4361,17 @@ impl ScriptedAuthenticatedMergeTransport {
         Self {
             inner,
             state: Mutex::new(ScriptedAuthenticatedMergeState::default()),
+            repository: Mutex::new(None),
+            phase_at_execute: Mutex::new(None),
         }
+    }
+
+    fn bind_repository(&self, repo: &Path) {
+        *self.repository.lock().expect("scripted merge repository") = Some(repo.to_path_buf());
+    }
+
+    fn phase_at_execute(&self) -> Option<EffectPhase> {
+        *self.phase_at_execute.lock().expect("scripted merge phase")
     }
 
     fn override_lookup(&self, receipts: Option<Vec<PullRequestMergeReceipt>>) {
@@ -4380,9 +4392,37 @@ impl ScriptedAuthenticatedMergeTransport {
         let state = self.state.lock().expect("scripted merge state");
         (state.lookup_calls, state.execute_calls, state.verify_calls)
     }
+
+    fn record_historical_merge(&self, effect: &PullRequestMergeEffect) -> PullRequestMergeReceipt {
+        self.inner
+            .record_historical_pull_request_merge(effect)
+            .expect("record historical authenticated merge")
+    }
+
+    fn refuse_empty_binding_execute(&self, effect: &PullRequestMergeEffect) {
+        let error = self
+            .inner
+            .execute_pull_request_merge(effect)
+            .expect_err("empty default binding must not SHA-only merge");
+        assert!(
+            format!("{error:#}").contains(
+                "review, thread, or required-check snapshot changed before the compare-and-swap merge"
+            ),
+            "unexpected empty-binding execute error: {error:#}"
+        );
+        assert_eq!(
+            self.inner.pull_request_merge_count().expect("merge count"),
+            0,
+            "empty default binding executed as SHA-only success"
+        );
+    }
 }
 
 impl PullRequestMergeTransport for ScriptedAuthenticatedMergeTransport {
+    fn pull_request_merge_atomic_support(&self) -> PullRequestMergeAtomicSupport {
+        self.inner.pull_request_merge_atomic_support()
+    }
+
     fn observe_pull_request_for_merge(
         &self,
         candidate: &ForgeItem,
@@ -4414,6 +4454,21 @@ impl PullRequestMergeTransport for ScriptedAuthenticatedMergeTransport {
             state.execute_calls += 1;
             state.lose_execute_response
         };
+        if let Some(repo) = self
+            .repository
+            .lock()
+            .expect("scripted merge repository")
+            .clone()
+        {
+            let digest = effect
+                .effect_id()
+                .strip_prefix("merge:")
+                .expect("authenticated merge effect id prefix");
+            let logical_id = format!("pr-merge-{digest}");
+            observe_signed_started_merge_wal(&repo, &logical_id, effect.effect_id())?;
+            *self.phase_at_execute.lock().expect("scripted merge phase") =
+                Some(EffectPhase::Started);
+        }
         let receipt = self.inner.execute_pull_request_merge(effect)?;
         if lose_response {
             bail!("injected authenticated merge response loss");
@@ -5084,6 +5139,933 @@ fn authenticated_pull_request_merge_duplicate_retry_reconciles_one_effect() {
 
     assert_eq!(first.receipt(), retry.receipt());
     assert_eq!(fake.pull_request_merge_count().expect("merge count"), 1);
+}
+
+#[test]
+fn pull_request_merge_effect_deserializes_legacy_records_without_atomic_binding() {
+    let (snapshot, input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    let evidence = authenticated_merge_evidence(&snapshot, &input);
+    let mut fake = FakeForgeTransport::new();
+    fake.register_pull_request_merge_observation(snapshot.item(), snapshot.clone())
+        .expect("register legacy-effect ground truth");
+    let authorized = match authorize_current_pull_request_merge(snapshot.item(), &evidence, &fake)
+        .expect("authorize legacy-effect fixture")
+    {
+        PullRequestMergePreflight::Allowed(authorized) => authorized,
+        PullRequestMergePreflight::Blocked(outcome) => {
+            panic!("legacy-effect fixture was blocked: {outcome:?}")
+        }
+    };
+    let plan_digest = stable_json_digest(&(
+        "maco_authenticated_pull_request_merge_plan_v1",
+        snapshot.item(),
+        &evidence,
+    ))
+    .expect("legacy-effect plan digest");
+    let effect = pull_request_merge_effect(
+        &format!("merge:{plan_digest}"),
+        &plan_digest,
+        &evidence,
+        &authorized,
+    )
+    .expect("current effect with atomic binding");
+    let mut value = serde_json::to_value(&effect).expect("serialize current effect");
+    value
+        .as_object_mut()
+        .expect("effect object")
+        .remove("atomic_binding");
+    let legacy: PullRequestMergeEffect = serde_json::from_value(value.clone())
+        .expect("legacy effect missing atomic_binding deserializes");
+    assert_eq!(legacy.item(), effect.item());
+    assert_eq!(legacy.evidence_digest(), effect.evidence_digest());
+    assert_eq!(legacy.ground_truth_digest(), effect.ground_truth_digest());
+    assert!(
+        !legacy.atomic_binding().matches_snapshot(&snapshot),
+        "legacy records must not invent a bound snapshot"
+    );
+    let reencoded =
+        serde_json::to_value(&legacy).expect("re-serialize default-filled legacy effect");
+    assert_eq!(
+        reencoded, value,
+        "empty default binding must omit on serialize to the pre-field wire"
+    );
+    assert!(
+        reencoded.get("atomic_binding").is_none(),
+        "legacy re-serialize must not emit atomic_binding"
+    );
+    assert!(
+        serde_json::to_value(&effect)
+            .expect("serialize bound effect")
+            .get("atomic_binding")
+            .is_some(),
+        "non-empty Planned from_snapshot bind must not omit"
+    );
+    let unbound = PullRequestMergeEffect::new(
+        effect.effect_id(),
+        effect.item().clone(),
+        effect.approved_actor().clone(),
+        effect.evidence_digest(),
+        effect.ground_truth_digest(),
+        effect.completion_mode(),
+        PullRequestMergeAtomicBinding::default(),
+    )
+    .expect("construct empty-binding effect without stripping JSON");
+    assert_eq!(
+        serde_json::to_value(&unbound).expect("serialize constructed empty bind"),
+        value
+    );
+    assert_eq!(
+        super::forge_transport::pull_request_merge_effect_digest(&legacy).expect("legacy digest"),
+        super::forge_transport::pull_request_merge_effect_digest(&unbound)
+            .expect("constructed empty-bind digest")
+    );
+    assert_ne!(
+        super::forge_transport::pull_request_merge_effect_digest(&effect).expect("bound digest"),
+        super::forge_transport::pull_request_merge_effect_digest(&legacy).expect("legacy digest")
+    );
+}
+
+fn legacy_unbound_merge_effect(bound: &PullRequestMergeEffect) -> PullRequestMergeEffect {
+    PullRequestMergeEffect::new(
+        bound.effect_id(),
+        bound.item().clone(),
+        bound.approved_actor().clone(),
+        bound.evidence_digest(),
+        bound.ground_truth_digest(),
+        bound.completion_mode(),
+        PullRequestMergeAtomicBinding::default(),
+    )
+    .expect("legacy unbound merge effect")
+}
+
+#[test]
+fn authenticated_pull_request_merge_recovers_legacy_wal_without_atomic_binding_without_execute() {
+    for phase in [
+        EffectPhase::Started,
+        EffectPhase::Observed,
+        EffectPhase::Completed,
+    ] {
+        let (snapshot, input) = merge_authority_fixture(
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+        );
+        let evidence = authenticated_merge_evidence(&snapshot, &input);
+        let repository = authenticated_merge_repository();
+        let transport = ScriptedAuthenticatedMergeTransport::new(&snapshot);
+        let plan_digest = stable_json_digest(&(
+            "maco_authenticated_pull_request_merge_plan_v1",
+            snapshot.item(),
+            &evidence,
+        ))
+        .expect("legacy WAL plan digest");
+        let effect_id = format!("merge:{plan_digest}");
+        let logical_id = format!("pr-merge-{plan_digest}");
+        let planned = AuthenticatedPullRequestMergeRecord {
+            version: AUTHENTICATED_PR_MERGE_VERSION,
+            plan_digest: plan_digest.clone(),
+            candidate: snapshot.item().clone(),
+            effect: None,
+            authority: None,
+            receipt: None,
+        };
+        let auth = repository_auth_writer(repository.path())
+            .expect("legacy WAL auth writer")
+            .into_authenticator()
+            .expect("legacy WAL authenticator");
+        let mut wal: EffectWal = EffectWal::create_planned(auth, &logical_id, &effect_id, &planned)
+            .expect("seed planned legacy merge WAL");
+        let authorized =
+            match authorize_current_pull_request_merge(snapshot.item(), &evidence, &transport)
+                .expect("authorize legacy WAL fixture")
+            {
+                PullRequestMergePreflight::Allowed(authorized) => authorized,
+                PullRequestMergePreflight::Blocked(outcome) => {
+                    panic!("legacy WAL fixture was blocked: {outcome:?}")
+                }
+            };
+        let bound = pull_request_merge_effect(&effect_id, &plan_digest, &evidence, &authorized)
+            .expect("bound merge effect");
+        assert!(
+            !bound.atomic_binding().is_empty(),
+            "from_snapshot fixture must carry a non-empty bind"
+        );
+        let legacy = legacy_unbound_merge_effect(&bound);
+        assert!(
+            legacy.atomic_binding().is_empty(),
+            "legacy fixture must start from an empty default bind"
+        );
+        assert_eq!(
+            serde_json::to_value(&legacy)
+                .expect("serialize constructed legacy effect")
+                .get("atomic_binding"),
+            None,
+            "constructed empty binding must omit on serialize"
+        );
+        assert!(
+            serde_json::to_value(&bound)
+                .expect("serialize bound effect")
+                .get("atomic_binding")
+                .is_some(),
+            "non-empty from_snapshot bind must serialize"
+        );
+        transport.refuse_empty_binding_execute(&legacy);
+        let planted = transport.record_historical_merge(&legacy);
+        let started = AuthenticatedPullRequestMergeRecord {
+            version: AUTHENTICATED_PR_MERGE_VERSION,
+            plan_digest: plan_digest.clone(),
+            candidate: snapshot.item().clone(),
+            effect: Some(legacy.clone()),
+            authority: Some(authorized.authority.clone()),
+            receipt: None,
+        };
+        wal.started(&effect_id, &started)
+            .expect("seed signed legacy Started WAL");
+        if matches!(phase, EffectPhase::Observed | EffectPhase::Completed) {
+            let observed = AuthenticatedPullRequestMergeRecord {
+                receipt: Some(planted.clone()),
+                ..started
+            };
+            wal.observed(&effect_id, &observed)
+                .expect("seed signed legacy Observed WAL");
+            if phase == EffectPhase::Completed {
+                wal.completed(&effect_id, &observed)
+                    .expect("seed signed legacy Completed WAL");
+            }
+        }
+
+        let (durable_phase, durable) =
+            latest_authenticated_pull_request_merge_record(&wal, &effect_id)
+                .expect("deserialize signed legacy merge record");
+        assert_eq!(durable_phase, phase);
+        let durable_effect = durable.effect.as_ref().expect("legacy durable effect");
+        assert!(durable_effect.atomic_binding().is_empty());
+        assert_eq!(
+            super::forge_transport::pull_request_merge_effect_digest(durable_effect)
+                .expect("durable legacy digest"),
+            super::forge_transport::pull_request_merge_effect_digest(&legacy)
+                .expect("constructed legacy digest")
+        );
+        assert_ne!(
+            super::forge_transport::pull_request_merge_effect_digest(durable_effect)
+                .expect("durable legacy digest"),
+            super::forge_transport::pull_request_merge_effect_digest(&bound).expect("bound digest")
+        );
+        for event in wal.events() {
+            if let Some(effect) = event.data.get("effect") {
+                if !effect.is_null() {
+                    assert!(
+                        effect.get("atomic_binding").is_none(),
+                        "{phase:?} in-memory WAL effect must lack atomic_binding: {effect}"
+                    );
+                }
+            }
+        }
+        drop(wal);
+
+        let expected_phase = match phase {
+            EffectPhase::Started => "started",
+            EffectPhase::Observed => "observed",
+            EffectPhase::Completed => "completed",
+            EffectPhase::Planned => unreachable!("legacy recovery fixture is post-Planned"),
+        };
+        let tail = verified_merge_wal_tail(repository.path(), &logical_id)
+            .expect("verify signed legacy WAL bytes");
+        assert_eq!(
+            tail.payload["value"]["phases"][effect_id.as_str()].as_str(),
+            Some(expected_phase)
+        );
+        for event in tail.payload["value"]["events"]
+            .as_array()
+            .expect("signed WAL events")
+        {
+            if let Some(effect) = event["data"]["effect"].as_object() {
+                assert!(
+                    !effect.contains_key("atomic_binding"),
+                    "{phase:?} stored WAL effect must lack atomic_binding as stored bytes: {effect:?}"
+                );
+            }
+        }
+
+        assert_eq!(
+            transport.call_counts().1,
+            0,
+            "{phase:?} fixture must not execute before recovery"
+        );
+        let recovered = execute_authenticated_pull_request_merge(
+            repository.path(),
+            snapshot.item(),
+            Some(&evidence),
+            &transport,
+        )
+        .unwrap_or_else(|error| panic!("recover legacy {phase:?} authenticated merge: {error:#}"));
+        let retry = execute_authenticated_pull_request_merge(
+            repository.path(),
+            snapshot.item(),
+            Some(&evidence),
+            &transport,
+        )
+        .unwrap_or_else(|error| {
+            panic!("retry recovered legacy {phase:?} authenticated merge: {error:#}")
+        });
+
+        assert!(
+            recovered.is_merged(),
+            "legacy {phase:?} recovery was blocked: {recovered:?}"
+        );
+        assert_eq!(recovered.receipt(), Some(&planted));
+        assert_eq!(recovered.receipt(), retry.receipt());
+        assert_eq!(
+            transport.call_counts().1,
+            0,
+            "legacy {phase:?} recovery re-executed the provider"
+        );
+
+        let completed_tail = verified_merge_wal_tail(repository.path(), &logical_id)
+            .expect("verify post-recovery signed WAL");
+        assert_eq!(
+            completed_tail.payload["value"]["phases"][effect_id.as_str()].as_str(),
+            Some("completed")
+        );
+        for event in completed_tail.payload["value"]["events"]
+            .as_array()
+            .expect("post-recovery WAL events")
+        {
+            if let Some(effect) = event["data"]["effect"].as_object() {
+                assert!(
+                    !effect.contains_key("atomic_binding"),
+                    "recovery must not rewrite empty default bind onto the wire: {effect:?}"
+                );
+            }
+        }
+    }
+}
+
+struct CountingForwardingMergeTransport {
+    inner: FakeForgeTransport,
+    execute_calls: Mutex<usize>,
+}
+
+impl CountingForwardingMergeTransport {
+    fn new(snapshot: &PullRequestReviewSnapshot) -> Self {
+        let mut inner = FakeForgeTransport::new();
+        inner
+            .register_pull_request_merge_observation(snapshot.item(), snapshot.clone())
+            .expect("register forwarding merge ground truth");
+        Self {
+            inner,
+            execute_calls: Mutex::new(0),
+        }
+    }
+
+    fn execute_calls(&self) -> usize {
+        *self.execute_calls.lock().expect("forwarding execute count")
+    }
+}
+
+impl PullRequestMergeTransport for CountingForwardingMergeTransport {
+    fn observe_pull_request_for_merge(
+        &self,
+        candidate: &ForgeItem,
+    ) -> Result<PullRequestReviewSnapshot> {
+        self.inner.observe_pull_request_for_merge(candidate)
+    }
+
+    fn lookup_pull_request_merge(
+        &self,
+        effect: &PullRequestMergeEffect,
+    ) -> Result<Vec<PullRequestMergeReceipt>> {
+        self.inner.lookup_pull_request_merge(effect)
+    }
+
+    fn execute_pull_request_merge(
+        &self,
+        effect: &PullRequestMergeEffect,
+    ) -> Result<PullRequestMergeReceipt> {
+        *self.execute_calls.lock().expect("forwarding execute count") += 1;
+        self.inner.execute_pull_request_merge(effect)
+    }
+
+    fn verify_pull_request_merge(
+        &self,
+        effect: &PullRequestMergeEffect,
+        receipt: &PullRequestMergeReceipt,
+    ) -> Result<PullRequestMergeReceipt> {
+        self.inner.verify_pull_request_merge(effect, receipt)
+    }
+}
+
+struct GithubEquivalentHeadOnlyMergeTransport {
+    inner: CountingForwardingMergeTransport,
+}
+
+impl GithubEquivalentHeadOnlyMergeTransport {
+    fn new(snapshot: &PullRequestReviewSnapshot) -> Self {
+        Self {
+            inner: CountingForwardingMergeTransport::new(snapshot),
+        }
+    }
+
+    fn execute_calls(&self) -> usize {
+        self.inner.execute_calls()
+    }
+
+    fn merge_count(&self) -> usize {
+        self.inner
+            .inner
+            .pull_request_merge_count()
+            .expect("head-only merge count")
+    }
+}
+
+impl PullRequestMergeTransport for GithubEquivalentHeadOnlyMergeTransport {
+    fn pull_request_merge_atomic_support(&self) -> PullRequestMergeAtomicSupport {
+        PullRequestMergeAtomicSupport::github_head_oid_only()
+    }
+
+    fn observe_pull_request_for_merge(
+        &self,
+        candidate: &ForgeItem,
+    ) -> Result<PullRequestReviewSnapshot> {
+        self.inner.observe_pull_request_for_merge(candidate)
+    }
+
+    fn lookup_pull_request_merge(
+        &self,
+        effect: &PullRequestMergeEffect,
+    ) -> Result<Vec<PullRequestMergeReceipt>> {
+        self.inner.lookup_pull_request_merge(effect)
+    }
+
+    fn execute_pull_request_merge(
+        &self,
+        effect: &PullRequestMergeEffect,
+    ) -> Result<PullRequestMergeReceipt> {
+        self.inner.execute_pull_request_merge(effect)
+    }
+
+    fn verify_pull_request_merge(
+        &self,
+        effect: &PullRequestMergeEffect,
+        receipt: &PullRequestMergeReceipt,
+    ) -> Result<PullRequestMergeReceipt> {
+        self.inner.verify_pull_request_merge(effect, receipt)
+    }
+}
+
+fn verified_merge_wal_tail(
+    repository: &Path,
+    logical_id: &str,
+) -> Result<crate::state_journal::JournalRecord> {
+    use crate::artifacts::state_auth::AuthenticationTag;
+    use crate::state_journal::JournalSpec;
+    let git =
+        Repository::open(repository).context("open merge WAL repository for on-disk observe")?;
+    let root = git
+        .commondir()
+        .join("maco/state")
+        .join(crate::effect_wal::EFFECT_WAL_ROOT_NAME);
+    let mut matching_records = Vec::new();
+    for entry in fs::read_dir(&root).context("enumerate authenticated merge WAL root")? {
+        let entry = entry.context("inspect authenticated merge WAL root entry")?;
+        if !entry
+            .file_type()
+            .context("inspect authenticated merge WAL entry type")?
+            .is_dir()
+        {
+            continue;
+        }
+        let mut records = Vec::new();
+        for record in
+            fs::read_dir(entry.path()).context("enumerate authenticated merge WAL instance")?
+        {
+            let record = record.context("inspect authenticated merge WAL instance entry")?;
+            let name = record.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.len() == 25
+                && name.ends_with(".json")
+                && name.as_bytes()[..20]
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit())
+            {
+                records.push(record.path());
+            }
+        }
+        records.sort();
+        let Some(last_path) = records.last() else {
+            continue;
+        };
+        let last: crate::state_journal::JournalRecord = serde_json::from_slice(
+            &fs::read(last_path).context("read authenticated merge WAL tail")?,
+        )
+        .context("decode authenticated merge WAL tail")?;
+        if last.payload["value"]["logical_id"].as_str() == Some(logical_id) {
+            matching_records.push(records);
+        }
+    }
+    if matching_records.len() != 1 {
+        bail!(
+            "provider merge callback found {} durable WALs for its logical effect",
+            matching_records.len()
+        );
+    }
+
+    let authenticator = repository_auth_writer(repository)?
+        .into_authenticator()
+        .context("authenticated merge WAL observer authenticator")?;
+    let mut previous_mac = AuthenticationTag::zero();
+    let mut identity = None;
+    let mut tail = None;
+    let records = matching_records
+        .pop()
+        .context("one matching authenticated merge WAL")?;
+    for (index, path) in records.iter().enumerate() {
+        let record: crate::state_journal::JournalRecord =
+            serde_json::from_slice(&fs::read(path).context("read authenticated merge WAL record")?)
+                .context("decode authenticated merge WAL record")?;
+        let expected_sequence = u64::try_from(index)
+            .context("authenticated merge WAL sequence overflow")?
+            .checked_add(1)
+            .context("authenticated merge WAL sequence exhausted")?;
+        if record.sequence != expected_sequence
+            || record.previous_mac != previous_mac
+            || record.phase != "snapshot"
+            || record.subject.is_some()
+            || identity
+                .as_ref()
+                .is_some_and(|expected| expected != &record.identity)
+        {
+            bail!("provider merge callback observed a malformed durable WAL chain");
+        }
+        authenticator.verify_repository_binding(&record.identity.repository)?;
+        let mac_payload = serde_json::to_vec(&(
+            record.version,
+            &record.identity,
+            record.sequence,
+            &record.previous_mac,
+            &record.phase,
+            &record.subject,
+            &record.payload,
+        ))
+        .context("encode authenticated merge WAL record MAC payload")?;
+        let record_domain = <crate::effect_wal::DefaultEffectWalSpec as JournalSpec>::RECORD_DOMAIN;
+        authenticator.verify_tag(record_domain, &mac_payload, &record.mac)?;
+        identity.get_or_insert_with(|| record.identity.clone());
+        previous_mac = record.mac.clone();
+        tail = Some(record);
+    }
+    tail.context("provider merge callback observed no durable WAL record")
+}
+
+fn observe_signed_started_merge_wal(
+    repository: &Path,
+    logical_id: &str,
+    effect_id: &str,
+) -> Result<()> {
+    let tail = verified_merge_wal_tail(repository, logical_id)?;
+    if tail.payload["value"]["phases"][effect_id].as_str() != Some("started") {
+        bail!("provider merge callback ran before its durable WAL reached Started");
+    }
+    Ok(())
+}
+
+fn authenticated_merge_plan_ids(
+    candidate: &ForgeItem,
+    evidence: &AuthenticatedPullRequestMergeEvidence,
+) -> (String, String) {
+    let plan_digest = stable_json_digest(&(
+        "maco_authenticated_pull_request_merge_plan_v1",
+        candidate,
+        evidence,
+    ))
+    .expect("authenticated merge plan digest");
+    let effect_id = format!("merge:{plan_digest}");
+    let logical_id = format!("pr-merge-{plan_digest}");
+    (effect_id, logical_id)
+}
+
+fn authenticated_merge_wal_phase(repo: &Path, logical_id: &str, effect_id: &str) -> EffectPhase {
+    let auth = repository_auth_writer(repo)
+        .expect("inspect merge WAL auth writer")
+        .into_authenticator()
+        .expect("inspect merge WAL authenticator");
+    let wal: EffectWal =
+        EffectWal::open_instance(auth, logical_id).expect("open refused merge WAL");
+    wal.phase(effect_id)
+        .expect("refused merge WAL omitted its effect")
+}
+
+fn merge_authority_thread_comment(
+    created_at: &str,
+    body: &str,
+) -> super::forge_transport::ForgeComment {
+    super::forge_transport::ForgeComment::new(
+        merge_authority_object(ProviderObjectKind::Comment, "C_thread_1"),
+        ForgeActor::new(
+            "github",
+            merge_authority_object(ProviderObjectKind::Actor, "auditor"),
+            "auditor",
+            ReportedActorKind::Human,
+        )
+        .expect("thread comment actor"),
+        body,
+        "https://github.example/acme/repo/pull/327#discussion_r1",
+        ForgeTimestamp::new(created_at).expect("thread comment timestamp"),
+    )
+    .expect("thread comment")
+}
+
+fn merge_execution_snapshot_with_resolved_thread() -> PullRequestReviewSnapshot {
+    let snapshot = merge_execution_snapshot(
+        &"1".repeat(40),
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+        "auditor",
+        ForgeReviewState::Approved,
+    );
+    let thread = super::forge_transport::ForgeReviewThread::new(
+        merge_authority_object(ProviderObjectKind::ReviewThread, "T_1"),
+        true,
+        vec![merge_authority_thread_comment(
+            MERGE_AUTHORITY_OBSERVED_AT,
+            "resolved discussion",
+        )],
+    )
+    .expect("resolved review thread");
+    PullRequestReviewSnapshot::new(
+        snapshot.item().clone(),
+        snapshot.observed_at().clone(),
+        snapshot.reviews().to_vec(),
+        vec![thread],
+        snapshot.checks().to_vec(),
+    )
+    .expect("green snapshot with a resolved thread")
+}
+
+fn assert_provider_atomic_precondition_unsupported(
+    outcome: &AuthenticatedPullRequestMergeOutcome,
+    expected_supported: &[PullRequestMergeAtomicAxis],
+    expected_unsupported: &[PullRequestMergeAtomicAxis],
+) {
+    assert_authenticated_no_merge(outcome, |blocker| match blocker {
+        AuthenticatedPullRequestMergeBlocker::ProviderAtomicPreconditionUnsupported {
+            supported_axes,
+            unsupported_required_axes,
+        } => {
+            supported_axes.as_slice() == expected_supported
+                && unsupported_required_axes.as_slice() == expected_unsupported
+        }
+        _ => false,
+    });
+}
+
+#[test]
+fn github_pull_request_merge_transport_reports_head_oid_only_atomic_support() {
+    let transport =
+        GithubPullRequestMergeTransport::new(std::path::Path::new("/tmp"), "github.com/acme/repo")
+            .expect("construct GitHub merge transport without I/O");
+    let support = GithubPullRequestMergeTransport::pull_request_merge_atomic_support(&transport);
+    assert_eq!(
+        support.supported_axes(),
+        vec![PullRequestMergeAtomicAxis::HeadOid]
+    );
+    assert_eq!(
+        support.unsupported_required_axes(),
+        vec![
+            PullRequestMergeAtomicAxis::ReviewSetAndDecision,
+            PullRequestMergeAtomicAxis::ReviewThreadSetResolutionAndCurrency,
+            PullRequestMergeAtomicAxis::RequiredCheckSetAndState,
+        ]
+    );
+}
+
+#[test]
+fn authenticated_pull_request_merge_refuses_github_head_only_provider_before_started_or_execute() {
+    let (snapshot, input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    let evidence = authenticated_merge_evidence(&snapshot, &input);
+    let transport = GithubEquivalentHeadOnlyMergeTransport::new(&snapshot);
+    let repository = authenticated_merge_repository();
+
+    let outcome = execute_authenticated_pull_request_merge(
+        repository.path(),
+        snapshot.item(),
+        Some(&evidence),
+        &transport,
+    )
+    .expect("typed GitHub HeadOnly atomic refusal");
+
+    assert_provider_atomic_precondition_unsupported(
+        &outcome,
+        &[PullRequestMergeAtomicAxis::HeadOid],
+        &[
+            PullRequestMergeAtomicAxis::ReviewSetAndDecision,
+            PullRequestMergeAtomicAxis::ReviewThreadSetResolutionAndCurrency,
+            PullRequestMergeAtomicAxis::RequiredCheckSetAndState,
+        ],
+    );
+    let (effect_id, logical_id) = authenticated_merge_plan_ids(snapshot.item(), &evidence);
+    assert_eq!(
+        authenticated_merge_wal_phase(repository.path(), &logical_id, &effect_id),
+        EffectPhase::Planned
+    );
+    assert_eq!(transport.execute_calls(), 0);
+    assert_eq!(transport.merge_count(), 0);
+}
+
+#[test]
+fn authenticated_pull_request_merge_refuses_default_absent_atomic_support_before_started() {
+    let (snapshot, input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    let evidence = authenticated_merge_evidence(&snapshot, &input);
+    let transport = CountingForwardingMergeTransport::new(&snapshot);
+    let repository = authenticated_merge_repository();
+
+    let outcome = execute_authenticated_pull_request_merge(
+        repository.path(),
+        snapshot.item(),
+        Some(&evidence),
+        &transport,
+    )
+    .expect("typed default-absence atomic refusal");
+
+    assert_provider_atomic_precondition_unsupported(
+        &outcome,
+        &[],
+        &PullRequestMergeAtomicAxis::REQUIRED,
+    );
+    let (effect_id, logical_id) = authenticated_merge_plan_ids(snapshot.item(), &evidence);
+    assert_eq!(
+        authenticated_merge_wal_phase(repository.path(), &logical_id, &effect_id),
+        EffectPhase::Planned
+    );
+    assert_eq!(transport.execute_calls(), 0);
+    assert_eq!(
+        transport
+            .inner
+            .pull_request_merge_count()
+            .expect("default-absence merge count"),
+        0
+    );
+}
+
+#[test]
+fn authenticated_atomic_contract_starts_durable_wal_before_provider_mutation() {
+    let (snapshot, input) = merge_authority_fixture(
+        ForgeCheckStatus::Completed,
+        Some(ForgeCheckConclusion::Success),
+    );
+    let evidence = authenticated_merge_evidence(&snapshot, &input);
+    let repository = authenticated_merge_repository();
+    let transport = ScriptedAuthenticatedMergeTransport::new(&snapshot);
+    transport.bind_repository(repository.path());
+
+    let outcome = execute_authenticated_pull_request_merge(
+        repository.path(),
+        snapshot.item(),
+        Some(&evidence),
+        &transport,
+    )
+    .expect("supporting transport merge");
+
+    assert!(
+        outcome.is_merged(),
+        "full-axis supporting transport was blocked: {outcome:?}"
+    );
+    assert_eq!(
+        transport.phase_at_execute(),
+        Some(EffectPhase::Started),
+        "provider execute ran before durable WAL Started"
+    );
+    assert_eq!(transport.call_counts().1, 1);
+}
+
+#[test]
+fn authenticated_atomic_contract_refuses_unchanged_head_review_thread_and_check_tampering() {
+    for tamper in [
+        "approval_removal",
+        "approval_state_change",
+        "thread_resolution_change",
+        "thread_comment_change",
+        "thread_currency_change",
+        "required_check_removal",
+        "required_check_state_change",
+    ] {
+        let snapshot = merge_execution_snapshot_with_resolved_thread();
+        let (_, input) = merge_authority_fixture(
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+        );
+        let evidence = authenticated_merge_evidence(&snapshot, &input);
+        let changed = match tamper {
+            "approval_removal" => PullRequestReviewSnapshot::new(
+                snapshot.item().clone(),
+                snapshot.observed_at().clone(),
+                Vec::new(),
+                snapshot.threads().to_vec(),
+                snapshot.checks().to_vec(),
+            )
+            .expect("snapshot without approval review"),
+            "approval_state_change" => {
+                let prior = &snapshot.reviews()[0];
+                let changed_review = ForgeReview::new(
+                    prior.provider_review_id().clone(),
+                    prior.author().clone(),
+                    ForgeReviewState::ChangesRequested,
+                    prior.body(),
+                    prior.submitted_at().clone(),
+                    prior.commit_oid(),
+                )
+                .expect("changed approval review");
+                PullRequestReviewSnapshot::new(
+                    snapshot.item().clone(),
+                    snapshot.observed_at().clone(),
+                    vec![changed_review],
+                    snapshot.threads().to_vec(),
+                    snapshot.checks().to_vec(),
+                )
+                .expect("snapshot with changed approval review")
+            }
+            "thread_resolution_change" => {
+                let prior = &snapshot.threads()[0];
+                let thread = super::forge_transport::ForgeReviewThread::new(
+                    prior.provider_thread_id().clone(),
+                    false,
+                    prior.comments().to_vec(),
+                )
+                .expect("thread resolution drift");
+                PullRequestReviewSnapshot::new(
+                    snapshot.item().clone(),
+                    snapshot.observed_at().clone(),
+                    snapshot.reviews().to_vec(),
+                    vec![thread],
+                    snapshot.checks().to_vec(),
+                )
+                .expect("snapshot with changed thread resolution")
+            }
+            "thread_comment_change" => {
+                let prior = &snapshot.threads()[0];
+                let comment = &prior.comments()[0];
+                let changed_comment = super::forge_transport::ForgeComment::new(
+                    comment.provider_comment_id().clone(),
+                    comment.author().clone(),
+                    "changed discussion body",
+                    comment.url(),
+                    comment.created_at().clone(),
+                )
+                .expect("changed thread comment");
+                let thread = super::forge_transport::ForgeReviewThread::new(
+                    prior.provider_thread_id().clone(),
+                    prior.is_resolved(),
+                    vec![changed_comment],
+                )
+                .expect("thread with changed comment");
+                PullRequestReviewSnapshot::new(
+                    snapshot.item().clone(),
+                    snapshot.observed_at().clone(),
+                    snapshot.reviews().to_vec(),
+                    vec![thread],
+                    snapshot.checks().to_vec(),
+                )
+                .expect("snapshot with changed thread comment")
+            }
+            "thread_currency_change" => {
+                let prior = &snapshot.threads()[0];
+                let comment = &prior.comments()[0];
+                let changed_comment = super::forge_transport::ForgeComment::new(
+                    comment.provider_comment_id().clone(),
+                    comment.author().clone(),
+                    comment.body(),
+                    comment.url(),
+                    ForgeTimestamp::new("2026-08-30T08:00:00Z").expect("earlier thread currency"),
+                )
+                .expect("changed thread currency");
+                let thread = super::forge_transport::ForgeReviewThread::new(
+                    prior.provider_thread_id().clone(),
+                    prior.is_resolved(),
+                    vec![changed_comment],
+                )
+                .expect("thread with changed currency");
+                PullRequestReviewSnapshot::new(
+                    snapshot.item().clone(),
+                    snapshot.observed_at().clone(),
+                    snapshot.reviews().to_vec(),
+                    vec![thread],
+                    snapshot.checks().to_vec(),
+                )
+                .expect("snapshot with changed thread currency")
+            }
+            "required_check_removal" => PullRequestReviewSnapshot::new(
+                snapshot.item().clone(),
+                snapshot.observed_at().clone(),
+                snapshot.reviews().to_vec(),
+                snapshot.threads().to_vec(),
+                snapshot.checks()[..1].to_vec(),
+            )
+            .expect("snapshot without one required check"),
+            "required_check_state_change" => {
+                let prior = &snapshot.checks()[0];
+                let changed_check = ForgeCheck::new(
+                    prior.provider_check_id().clone(),
+                    prior.actor().clone(),
+                    prior.name(),
+                    ForgeCheckStatus::InProgress,
+                    None,
+                    prior.head_oid(),
+                    prior.updated_at().clone(),
+                )
+                .expect("changed required check state");
+                PullRequestReviewSnapshot::new(
+                    snapshot.item().clone(),
+                    snapshot.observed_at().clone(),
+                    snapshot.reviews().to_vec(),
+                    snapshot.threads().to_vec(),
+                    [vec![changed_check], snapshot.checks()[1..].to_vec()].concat(),
+                )
+                .expect("snapshot with changed required check state")
+            }
+            _ => panic!("unknown tamper fixture"),
+        };
+        assert_eq!(
+            changed.item().head_oid(),
+            snapshot.item().head_oid(),
+            "{tamper} fixture changed the head OID"
+        );
+        let mut fake = FakeForgeTransport::new();
+        fake.register_pull_request_merge_observation(snapshot.item(), snapshot.clone())
+            .expect("register tamper baseline");
+        fake.set_execute_only_observation(changed)
+            .expect("inject execute-only atomic tamper");
+        let repository = authenticated_merge_repository();
+
+        let error = execute_authenticated_pull_request_merge(
+            repository.path(),
+            snapshot.item(),
+            Some(&evidence),
+            &fake,
+        )
+        .expect_err("same-head atomic drift must refuse merge");
+
+        assert!(
+            format!("{error:#}").contains(
+                "review, thread, or required-check snapshot changed before the compare-and-swap merge"
+            ),
+            "unexpected {tamper} error: {error:#}"
+        );
+        assert_eq!(
+            fake.pull_request_merge_count().expect("tamper merge count"),
+            0,
+            "{tamper} mutated the fake provider"
+        );
+    }
 }
 
 fn sequenced_provider_review(
