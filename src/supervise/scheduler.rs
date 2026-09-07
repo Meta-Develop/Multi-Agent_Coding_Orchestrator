@@ -897,6 +897,12 @@ impl BudgetDegradationController {
                         )
                     }
                 };
+                let Some(before_capability) = trusted_model_capability(&before) else {
+                    bail!(
+                        "Worker model degradation refused for assignment '{}': the resolved Worker model has no trusted capability class, so ModelTier cannot select a strictly-lower candidate",
+                        assignment.id
+                    )
+                };
                 let Some((resolved_candidate_index, after)) = candidates
                     .iter()
                     .enumerate()
@@ -912,11 +918,14 @@ impl BudgetDegradationController {
                                 .is_ok_and(|availability| {
                                     availability == RoleModelAvailability::Available
                                 })
+                            && trusted_model_capability(model).is_some_and(|target_capability| {
+                                target_capability < before_capability
+                            })
                     })
                     .map(|(index, model)| (index, model.clone()))
                 else {
                     bail!(
-                        "Worker model degradation refused for assignment '{}': the requested-plan budget_degrade_models ladder has no distinct runtime-advertised authority-eligible target",
+                        "Worker model degradation refused for assignment '{}': the requested-plan budget_degrade_models ladder has no distinct runtime-advertised authority-eligible strictly-lower target",
                         assignment.id
                     )
                 };
