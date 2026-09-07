@@ -1,6 +1,7 @@
 mod acceptance_integrity;
 mod autonomy_kpis;
 mod budget;
+mod catalog_preflight_admission;
 mod environment_controls;
 mod licensed_breakage;
 mod plan_runtime;
