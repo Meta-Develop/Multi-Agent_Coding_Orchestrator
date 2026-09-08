@@ -4737,3 +4737,250 @@ fn heuristic_feedback_replan_lowers_remaining_work_only() {
         .iter()
         .all(|assignment| assignment.id != "assignment-001"));
 }
+
+fn empty_scope_invalid_plan_json(include_viable_sibling: bool) -> String {
+    let mut assignments = vec![json!({
+        "id": "empty-child",
+        "phase": "execution",
+        "assigned_paths": [],
+        "worker_assignments": []
+    })];
+    if include_viable_sibling {
+        assignments.push(json!({
+            "id": "viable-child",
+            "phase": "execution",
+            "assigned_paths": ["tests/preclaim_narrow.rs"],
+            "worker_assignments": []
+        }));
+    }
+    serde_json::to_string(&json!({
+        "version": 1,
+        "task": "empty-scope invalid park",
+        "max_depth": 2,
+        "max_child_assignments": 2,
+        "max_child_retries": 0,
+        "child_timeout_seconds": 60,
+        "assignments": assignments
+    }))
+    .expect("serialize empty-scope plan")
+}
+
+fn recorded_preclaim_decision_rows(repo_path: &Path, run_id: &RunId) -> Vec<Value> {
+    let reader = ArtifactRunReader::open(repo_path, RunArtifactFamily::Supervise, run_id)
+        .expect("open empty-scope preclaim artifacts");
+    let bytes = reader
+        .read("preclaim/decisions.jsonl")
+        .expect("read persisted pre-claim decisions");
+    String::from_utf8(bytes)
+        .expect("utf-8 pre-claim decisions")
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).expect("parse pre-claim decision"))
+        .collect()
+}
+
+#[test]
+fn empty_scope_invalid_loader_still_rejects_malformed_escaping_and_overlap() {
+    let loaded = parse_supervisor_plan_with_consultant(&empty_scope_invalid_plan_json(true))
+        .expect("empty assigned_paths must load so preclaim Invalid can park");
+    assert!(
+        loaded.plan.assignments.iter().any(
+            |assignment| assignment.id == "empty-child" && assignment.assigned_paths.is_empty()
+        ),
+        "empty-child must survive validation with empty assigned_paths: {:#?}",
+        loaded.plan.assignments
+    );
+    assert!(
+        loaded.plan.assignments.iter().any(|assignment| {
+            assignment.id == "viable-child"
+                && assignment.assigned_paths == [PathBuf::from("tests/preclaim_narrow.rs")]
+        }),
+        "viable sibling must still load: {:#?}",
+        loaded.plan.assignments
+    );
+
+    let escape = parse_supervisor_plan_with_consultant(
+        &serde_json::to_string(&json!({
+            "version": 1,
+            "task": "escape",
+            "assignments": [{
+                "id": "escape-child",
+                "phase": "execution",
+                "assigned_paths": ["../outside.rs"],
+                "worker_assignments": []
+            }]
+        }))
+        .expect("serialize escaping plan"),
+    )
+    .expect_err("escaping assigned_paths must still fail closed");
+    let escape_text = format!("{escape:#}").to_ascii_lowercase();
+    assert!(
+        escape_text.contains("invalid paths") || escape_text.contains("escap"),
+        "unexpected escaping-path error: {escape:#}"
+    );
+
+    let overlap = parse_supervisor_plan_with_consultant(
+        &serde_json::to_string(&json!({
+            "version": 1,
+            "task": "overlap",
+            "max_child_assignments": 2,
+            "assignments": [
+                {
+                    "id": "child-a",
+                    "phase": "execution",
+                    "assigned_paths": ["src/lib.rs"],
+                    "worker_assignments": []
+                },
+                {
+                    "id": "child-b",
+                    "phase": "execution",
+                    "assigned_paths": ["src/lib.rs"],
+                    "worker_assignments": []
+                }
+            ]
+        }))
+        .expect("serialize overlap plan"),
+    )
+    .expect_err("nonempty overlapping assigned_paths must still fail closed");
+    assert!(
+        format!("{overlap:#}").contains("overlap"),
+        "unexpected overlap error: {overlap:#}"
+    );
+
+    let duplicate = parse_supervisor_plan_with_consultant(
+        &serde_json::to_string(&json!({
+            "version": 1,
+            "task": "duplicate-id",
+            "max_child_assignments": 2,
+            "assignments": [
+                {
+                    "id": "child-a",
+                    "phase": "execution",
+                    "assigned_paths": ["README.md"],
+                    "worker_assignments": []
+                },
+                {
+                    "id": "child-a",
+                    "phase": "execution",
+                    "assigned_paths": ["src/lib.rs"],
+                    "worker_assignments": []
+                }
+            ]
+        }))
+        .expect("serialize duplicate-id plan"),
+    )
+    .expect_err("duplicate assignment ids must still fail closed");
+    assert!(
+        format!("{duplicate:#}").contains("duplicate orchestrator assignment id"),
+        "unexpected duplicate-id error: {duplicate:#}"
+    );
+}
+
+#[test]
+fn empty_scope_invalid_parks_without_worker_launch_while_sibling_still_dispatches() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    fs::create_dir_all(repo_path.join("tests")).expect("create tests directory");
+    fs::write(
+        repo_path.join("tests/preclaim_narrow.rs"),
+        "#[test] fn preclaim_narrow_fixture() {}\n",
+    )
+    .expect("write recognized mapped test path");
+    commit_injected_repository(&repo_path, "add recognized mapped test path");
+
+    let loaded = parse_supervisor_plan_with_consultant(&empty_scope_invalid_plan_json(true))
+        .expect("empty-scope mixed plan must pass production plan validation");
+    let viable = loaded
+        .plan
+        .assignments
+        .iter()
+        .find(|assignment| assignment.id == "viable-child")
+        .cloned()
+        .expect("viable-child present after validation");
+    let options = injected_options(
+        &repo_path,
+        temp.path(),
+        "empty-scope-invalid-park-with-sibling",
+    );
+    let run_id = options.run_id.clone();
+    let mut child_launches = Vec::new();
+    let mut runner = |command: &ExternalAgentCommand| {
+        let name = command
+            .output_last_message
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default();
+        if name.contains("review-auditor") {
+            let child = injected_child_report(&viable);
+            write_injected_json(
+                &command.output_last_message,
+                &injected_auditor_report(&viable, &child),
+            );
+        } else {
+            child_launches.push(injected_command_assignment_id(command));
+            write_injected_assignment_report(command, &viable);
+        }
+        injected_verified_run(command)
+    };
+
+    let report = run_supervisor_plan_with_runner(
+        loaded.plan,
+        loaded.consultant,
+        options,
+        SupervisorExecutionRuntime::Verified,
+        &mut runner,
+    )
+    .expect("run verified empty-scope Invalid park with sibling dispatch");
+
+    assert!(
+        !child_launches.iter().any(|id| id == "empty-child"),
+        "empty-scope Invalid must not launch a worker: {child_launches:?}"
+    );
+    assert_eq!(
+        child_launches
+            .iter()
+            .filter(|id| *id == "viable-child")
+            .count(),
+        1,
+        "recognized mapped sibling must still dispatch once: {child_launches:?}"
+    );
+    assert_eq!(
+        report.claim_tokens.len(),
+        1,
+        "empty-scope park must not keep a claim; sibling keeps one: {:?}",
+        report.claim_tokens
+    );
+    assert!(
+        report.findings.iter().any(|finding| {
+            finding.message.contains("pre-claim viability parked")
+                && finding.message.contains("empty-child")
+        }),
+        "missing empty-child park finding: {:#?}",
+        report.findings
+    );
+
+    let rows = recorded_preclaim_decision_rows(&repo_path, &run_id);
+    let empty_row = rows
+        .iter()
+        .find(|row| row.get("assignment_id").and_then(Value::as_str) == Some("empty-child"))
+        .unwrap_or_else(|| panic!("empty-child preclaim JSONL missing from {rows:?}"));
+    assert_eq!(
+        empty_row.get("disposition").and_then(Value::as_str),
+        Some("park"),
+        "empty-child JSONL: {empty_row}"
+    );
+    assert_eq!(
+        empty_row.get("rejection_bucket").and_then(Value::as_str),
+        Some("invalid"),
+        "empty-child must reuse deterministic_bucket Invalid: {empty_row}"
+    );
+    let viable_row = rows
+        .iter()
+        .find(|row| row.get("assignment_id").and_then(Value::as_str) == Some("viable-child"))
+        .unwrap_or_else(|| panic!("viable-child preclaim JSONL missing from {rows:?}"));
+    assert_eq!(
+        viable_row.get("disposition").and_then(Value::as_str),
+        Some("claim"),
+        "viable sibling JSONL: {viable_row}"
+    );
+}
