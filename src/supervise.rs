@@ -15,8 +15,8 @@ use crate::{
         RunArtifactFamily,
     },
     external_agent::{
-        codex_usage_from_jsonl, collect_and_import_managed_child_git_commit,
-        load_codex_runtime_model_catalog_authorized,
+        catalog_preflight_grant_origin_mismatch_failure, codex_usage_from_jsonl,
+        collect_and_import_managed_child_git_commit, load_codex_runtime_model_catalog_authorized,
         missing_supervisor_catalog_preflight_grant_failure,
         run_external_agent_cancellable_reviewed, supervisor_catalog_preflight_grant_admit_failure,
         validate_environment_requirements, CodexRuntimeModelCatalog, EnvironmentFailure,
@@ -46,7 +46,7 @@ use crate::{
         ApplyBlockerDetail, CandidateValidationBinding, MergeCollectOptions,
         ValidationEvidenceBundle, WorktreeMergeMetadata, VALIDATION_BINDING_VERSION,
     },
-    mutation_taxonomy::SupervisorCatalogCodexPreflightGrant,
+    mutation_taxonomy::{CatalogPreflightOrigin, SupervisorCatalogCodexPreflightGrant},
     objective_profile::{resolve_objective_profile, ResolvedObjectiveProfile},
     orchestration_event::{
         FieldGuideEventKind, OrchestrationEventJournal, OrchestrationEventKind, OrchestrationRole,
@@ -1142,11 +1142,15 @@ impl RuntimeModelCatalog {
                 let Some(grant) = grant else {
                     return Err(missing_supervisor_catalog_preflight_grant_failure());
                 };
+                if grant.origin() != CatalogPreflightOrigin::Supervisor {
+                    return Err(catalog_preflight_grant_origin_mismatch_failure());
+                }
                 load_codex_runtime_model_catalog_authorized(
                     &options.codex_bin,
                     repo,
                     CODEX_MODEL_CATALOG_TIMEOUT,
                     grant,
+                    CatalogPreflightOrigin::Supervisor,
                 )
                 .map(Self::Codex)
             }

@@ -11,11 +11,20 @@ use crate::{
         self, AutopilotForgeMode, AutopilotPlan, AutopilotPublishMode, AutopilotRunOptions,
         AutopilotRunStatus, AutopilotTask, AutopilotValidationCommand,
     },
-    external_agent::{load_codex_runtime_model_catalog, run_external_agent, ExternalAgentCommand},
+    external_agent::{
+        catalog_preflight_grant_origin_mismatch_failure,
+        load_codex_runtime_model_catalog_authorized,
+        missing_supervisor_catalog_preflight_grant_failure, run_external_agent,
+        supervisor_catalog_preflight_grant_admit_failure, ExternalAgentCommand,
+    },
     gate_denial::GateDenialReason,
     live_claim::{self, LiveClock},
     llm::{RedactionSummary, Redactor},
     machine_global::MachineGlobalRetentionBinding,
+    mutation_taxonomy::{
+        CatalogPreflightOrigin, SupervisorCatalogCodexPreflightGrant,
+        SupervisorCatalogCodexPreflightGrantError,
+    },
     orchestrator::RunId,
     planning,
     process_runner::{ProcessResourceLimits, StdinMode, TrustedFixedNetworkProfile},
@@ -3867,8 +3876,47 @@ fn run_independent_audit_intake_item(
         },
         None,
         before_auditor_launch,
+        InboxCatalogPreflightGrantSupply::IssueFromInboxIntent,
         verified_independent_audit_runner,
     )
+}
+
+/// How the independent-audit dispatch obtains a catalog-preflight grant.
+///
+/// Production always issues an Inbox-origin grant from caller intent before
+/// catalog load. Tests may inject a missing or foreign-origin grant onto the
+/// same dispatch path.
+#[derive(Debug)]
+enum InboxCatalogPreflightGrantSupply {
+    IssueFromInboxIntent,
+    #[cfg(test)]
+    Override(Option<SupervisorCatalogCodexPreflightGrant>),
+}
+
+/// Independent Inbox catalog-preflight issuer.
+///
+/// Lives at the independent-audit dispatch boundary, outside
+/// `impl RuntimeModelCatalog` and outside `load_codex_runtime_model_catalog*`.
+/// Must not call `admit_from_supervisor_catalog_intent` or
+/// `admit_production_supervisor_catalog_preflight_grant`.
+fn admit_inbox_catalog_preflight_grant(
+    run_id: &str,
+    resolver_search_base: &Path,
+    expected_program: &Path,
+) -> Result<SupervisorCatalogCodexPreflightGrant, SupervisorCatalogCodexPreflightGrantError> {
+    SupervisorCatalogCodexPreflightGrant::admit_from_inbox_catalog_intent(
+        run_id,
+        resolver_search_base,
+        expected_program,
+    )
+}
+
+fn inbox_skips_codex_catalog_process(
+    action_policy: InboxActionPolicy,
+    permission_mode: InboxPermissionMode,
+) -> bool {
+    matches!(action_policy, InboxActionPolicy::Fake)
+        || matches!(permission_mode, InboxPermissionMode::Fake)
 }
 
 struct IndependentAuditRunnerResult {
@@ -3910,6 +3958,7 @@ fn run_independent_audit_intake_item_with_runner<F>(
     input: IndependentAuditIntakeRunInput<'_>,
     available_models_override: Option<&BTreeSet<String>>,
     before_auditor_launch: Option<InboxBeforeAuditorLaunch<'_>>,
+    catalog_grant_supply: InboxCatalogPreflightGrantSupply,
     mut external_runner: F,
 ) -> Result<InboxItemRunOutcome>
 where
@@ -4069,11 +4118,31 @@ where
         .codex_bin
         .clone()
         .unwrap_or_else(|| PathBuf::from("codex"));
-    let available_models = match available_models_override
-        .cloned()
-        .map(Ok)
-        .unwrap_or_else(|| independent_auditor_available_models(&program, context.repo, timeout))
-    {
+    let available_models = match available_models_override.cloned().map(Ok).unwrap_or_else(|| {
+        if inbox_skips_codex_catalog_process(action_policy, permission_mode) {
+            return Err(
+                review_loop_entry::InboxIndependentAuditLaneBlocker::UnavailableEligibleAuditor {
+                    detail: "Codex runtime model catalog acquisition skipped: cause=fake_runtime_skips_codex_catalog".to_string(),
+                },
+            );
+        }
+        let grant = match catalog_grant_supply {
+            InboxCatalogPreflightGrantSupply::IssueFromInboxIntent => {
+                Some(admit_inbox_catalog_preflight_grant(
+                    run_id.as_str(),
+                    context.repo,
+                    &program,
+                ).map_err(supervisor_catalog_preflight_grant_admit_failure).map_err(|failure| {
+                    review_loop_entry::InboxIndependentAuditLaneBlocker::UnavailableEligibleAuditor {
+                        detail: failure.summary,
+                    }
+                })?)
+            }
+            #[cfg(test)]
+            InboxCatalogPreflightGrantSupply::Override(grant) => grant,
+        };
+        independent_auditor_available_models(&program, context.repo, timeout, grant)
+    }) {
         Ok(models) => models,
         Err(blocker) => {
             let lane = review_loop_entry::blocked_independent_audit_lane_result(
@@ -5293,6 +5362,7 @@ fn independent_auditor_available_models(
     program: &Path,
     repo: &Path,
     timeout: Duration,
+    grant: Option<SupervisorCatalogCodexPreflightGrant>,
 ) -> std::result::Result<BTreeSet<String>, review_loop_entry::InboxIndependentAuditLaneBlocker> {
     let priors = crate::selection::built_in_prior_dataset().map_err(|error| {
         review_loop_entry::InboxIndependentAuditLaneBlocker::SelectorRejected {
@@ -5305,7 +5375,28 @@ fn independent_auditor_available_models(
         .filter(|prior| prior.runtime == "codex")
         .map(|prior| prior.model.clone())
         .collect::<BTreeSet<_>>();
-    let catalog = load_codex_runtime_model_catalog(program, repo, timeout).map_err(|failure| {
+    let Some(grant) = grant else {
+        return Err(
+            review_loop_entry::InboxIndependentAuditLaneBlocker::UnavailableEligibleAuditor {
+                detail: missing_supervisor_catalog_preflight_grant_failure().summary,
+            },
+        );
+    };
+    if grant.origin() != CatalogPreflightOrigin::Inbox {
+        return Err(
+            review_loop_entry::InboxIndependentAuditLaneBlocker::UnavailableEligibleAuditor {
+                detail: catalog_preflight_grant_origin_mismatch_failure().summary,
+            },
+        );
+    }
+    let catalog = load_codex_runtime_model_catalog_authorized(
+        program,
+        repo,
+        timeout,
+        grant,
+        CatalogPreflightOrigin::Inbox,
+    )
+    .map_err(|failure| {
         review_loop_entry::InboxIndependentAuditLaneBlocker::UnavailableEligibleAuditor {
             detail: failure.summary,
         }
@@ -7097,6 +7188,7 @@ mod pr_intake_always_on_audit_tests {
             },
             Some(&available_models),
             Some(&mut before_launch),
+            InboxCatalogPreflightGrantSupply::IssueFromInboxIntent,
             |command| {
                 assert!(
                     callback_called.get(),
@@ -7181,6 +7273,7 @@ mod pr_intake_always_on_audit_tests {
             },
             None,
             None,
+            InboxCatalogPreflightGrantSupply::IssueFromInboxIntent,
             |_| panic!("dry run must not launch the independent auditor"),
         )
         .expect("dry-run audit plan");
@@ -7188,6 +7281,224 @@ mod pr_intake_always_on_audit_tests {
         assert_eq!(outcome.report.status, "dry_run");
         assert!(outcome.report.independent_audit_lane.is_none());
         assert!(outcome.report.github_success);
+    }
+
+    fn independent_audit_catalog_dispatch_fixture(
+        number: u64,
+        run_id: &str,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        InboxConfig,
+        InboxItem,
+        InboxPrIntakeReport,
+        RunId,
+        ArtifactRunWriter,
+        PathBuf,
+    ) {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        crate::worktree::WorktreeManager::init_repository(&repo, "main")
+            .expect("initialize repository");
+        let config = InboxConfig::default();
+        let item = pr_item(fake_pr(number), &config, &fake_source(), &BTreeMap::new())
+            .expect("clean PR item");
+        let pr_intake = pr_intake_report_for_item(&item).expect("audit intake");
+        let run_id = RunId::new(run_id).expect("run id");
+        let writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Inbox,
+            run_id.clone(),
+            "inbox-test",
+        )
+        .expect("reserve Inbox artifacts");
+        let run_dir = writer.run_dir().to_path_buf();
+        (temp, repo, config, item, pr_intake, run_id, writer, run_dir)
+    }
+
+    #[test]
+    fn independent_audit_missing_catalog_grant_fails_closed_without_execute() {
+        let (_temp, repo, config, item, pr_intake, run_id, mut writer, run_dir) =
+            independent_audit_catalog_dispatch_fixture(
+                941,
+                "independent-audit-missing-catalog-grant",
+            );
+        let context = InboxItemRunContext {
+            repo: &repo,
+            run_dir: &run_dir,
+            run_id: &run_id,
+            config: &config,
+            action_policy: InboxActionPolicy::Github,
+            permission_mode: InboxPermissionMode::GithubFull,
+            codex_bin: Some(PathBuf::from("codex")),
+            machine_global: None,
+            rolling_budget_quota: None,
+        };
+        let runner_invoked = Cell::new(false);
+        let outcome = run_independent_audit_intake_item_with_runner(
+            &mut writer,
+            IndependentAuditIntakeRunInput {
+                item_run: InboxItemRunInput {
+                    context: &context,
+                    item_index: 1,
+                    item: &item,
+                },
+                review_loop: review_loop_entry::evaluate_inbox_item_review_loop(&item),
+                pr_intake,
+                source_fresh: true,
+            },
+            None,
+            None,
+            InboxCatalogPreflightGrantSupply::Override(None),
+            |_| {
+                runner_invoked.set(true);
+                panic!("missing catalog grant must not invoke the independent-audit runner");
+            },
+        )
+        .expect("missing grant must fail closed as a typed lane block");
+
+        assert!(
+            !runner_invoked.get(),
+            "verified_independent_audit_runner must not run without an Inbox catalog grant"
+        );
+        assert_eq!(outcome.report.status, "launch_blocked");
+        let lane = outcome.report.independent_audit_lane.expect("lane result");
+        assert_eq!(
+            lane.status,
+            review_loop_entry::InboxIndependentAuditLaneStatus::Blocked
+        );
+        assert!(lane.launch.is_none());
+        assert!(
+            lane.blockers.iter().any(|blocker| matches!(
+                blocker,
+                review_loop_entry::InboxIndependentAuditLaneBlocker::UnavailableEligibleAuditor { detail }
+                    if detail.contains("cause=missing_catalog_preflight_grant")
+            )),
+            "missing grant must surface the catalog preflight cause: {:?}",
+            lane.blockers
+        );
+    }
+
+    #[test]
+    fn independent_audit_supervisor_catalog_grant_fails_closed_without_execute() {
+        let (_temp, repo, config, item, pr_intake, run_id, mut writer, run_dir) =
+            independent_audit_catalog_dispatch_fixture(
+                942,
+                "independent-audit-supervisor-catalog-grant",
+            );
+        let supervisor_grant =
+            SupervisorCatalogCodexPreflightGrant::admit_from_supervisor_catalog_intent(
+                run_id.as_str(),
+                &repo,
+                Path::new("codex"),
+            )
+            .expect("trusted Supervisor origin spelling must admit");
+        let context = InboxItemRunContext {
+            repo: &repo,
+            run_dir: &run_dir,
+            run_id: &run_id,
+            config: &config,
+            action_policy: InboxActionPolicy::Github,
+            permission_mode: InboxPermissionMode::GithubFull,
+            codex_bin: Some(PathBuf::from("codex")),
+            machine_global: None,
+            rolling_budget_quota: None,
+        };
+        let runner_invoked = Cell::new(false);
+        let outcome = run_independent_audit_intake_item_with_runner(
+            &mut writer,
+            IndependentAuditIntakeRunInput {
+                item_run: InboxItemRunInput {
+                    context: &context,
+                    item_index: 1,
+                    item: &item,
+                },
+                review_loop: review_loop_entry::evaluate_inbox_item_review_loop(&item),
+                pr_intake,
+                source_fresh: true,
+            },
+            None,
+            None,
+            InboxCatalogPreflightGrantSupply::Override(Some(supervisor_grant)),
+            |_| {
+                runner_invoked.set(true);
+                panic!("Supervisor catalog grant must not authorize Inbox catalog dispatch");
+            },
+        )
+        .expect("wrong origin must fail closed as a typed lane block");
+
+        assert!(
+            !runner_invoked.get(),
+            "runner must not run on origin mismatch"
+        );
+        assert_eq!(outcome.report.status, "launch_blocked");
+        let lane = outcome.report.independent_audit_lane.expect("lane result");
+        assert!(lane.launch.is_none());
+        assert!(
+            lane.blockers.iter().any(|blocker| matches!(
+                blocker,
+                review_loop_entry::InboxIndependentAuditLaneBlocker::UnavailableEligibleAuditor { detail }
+                    if detail.contains("cause=catalog_preflight_grant_origin_mismatch")
+            )),
+            "injected Supervisor grant must fail as origin mismatch: {:?}",
+            lane.blockers
+        );
+    }
+
+    #[test]
+    fn independent_audit_fake_path_skips_codex_catalog_without_execute() {
+        let (_temp, repo, config, item, pr_intake, run_id, mut writer, run_dir) =
+            independent_audit_catalog_dispatch_fixture(943, "independent-audit-fake-skips-catalog");
+        let context = InboxItemRunContext {
+            repo: &repo,
+            run_dir: &run_dir,
+            run_id: &run_id,
+            config: &config,
+            action_policy: InboxActionPolicy::Fake,
+            permission_mode: InboxPermissionMode::Fake,
+            codex_bin: Some(PathBuf::from("/must-not-run/codex")),
+            machine_global: None,
+            rolling_budget_quota: None,
+        };
+        let runner_invoked = Cell::new(false);
+        let outcome = run_independent_audit_intake_item_with_runner(
+            &mut writer,
+            IndependentAuditIntakeRunInput {
+                item_run: InboxItemRunInput {
+                    context: &context,
+                    item_index: 1,
+                    item: &item,
+                },
+                review_loop: review_loop_entry::evaluate_inbox_item_review_loop(&item),
+                pr_intake,
+                source_fresh: true,
+            },
+            None,
+            None,
+            InboxCatalogPreflightGrantSupply::IssueFromInboxIntent,
+            |_| {
+                runner_invoked.set(true);
+                panic!("Fake inbox must not launch the independent auditor via Codex catalog");
+            },
+        )
+        .expect("Fake catalog skip must fail closed without execute");
+
+        assert!(
+            !runner_invoked.get(),
+            "Fake action_policy/permission_mode must not invoke the independent-audit runner"
+        );
+        assert_eq!(outcome.report.status, "launch_blocked");
+        let lane = outcome.report.independent_audit_lane.expect("lane result");
+        assert!(lane.launch.is_none());
+        assert!(
+            lane.blockers.iter().any(|blocker| matches!(
+                blocker,
+                review_loop_entry::InboxIndependentAuditLaneBlocker::UnavailableEligibleAuditor { detail }
+                    if detail.contains("cause=fake_runtime_skips_codex_catalog")
+            )),
+            "Fake path must skip Codex catalog without spawn: {:?}",
+            lane.blockers
+        );
     }
 
     #[test]
