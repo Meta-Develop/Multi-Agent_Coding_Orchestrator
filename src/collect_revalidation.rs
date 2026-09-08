@@ -455,9 +455,6 @@ mod tests {
             let repo = crate::git_repository::open(&repo_path)?;
             commit_file(&repo, "README.md", "base\n")?;
             let store = SyncStore::open(&repo_path)?;
-            let claim = store
-                .claim_paths_with_timing("agent-a", ["README.md"], timing)?
-                .claim;
             let manager = WorktreeManager::new(&repo_path);
             let worktree = manager.create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-a".to_string(),
@@ -466,6 +463,9 @@ mod tests {
                 worktree_root: None,
             })?;
             let head = current_head(&worktree.path)?;
+            let claim = store
+                .claim_paths_with_timing("agent-a", ["README.md"], timing)?
+                .claim;
             Ok(Self {
                 _temp: temp,
                 repo_path,
