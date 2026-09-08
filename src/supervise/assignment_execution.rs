@@ -742,10 +742,11 @@ fn prepare_assignment_execution<'a>(
     let AssignmentExecutionContext {
         index,
         plan,
+        requested_plan,
         assignment,
         options,
         repo,
-        execution_runtime: _,
+        execution_runtime,
         worktree_creation,
         manager,
         reused,
@@ -905,6 +906,19 @@ fn prepare_assignment_execution<'a>(
                     return Ok(AssignmentExecutionDisposition::Complete);
                 }
                 effective_assignment = narrowed;
+                if let Some(parked) = recheck_narrowed_assignment_preclaim(
+                    artifacts,
+                    &effective_assignment,
+                    &requested_plan.assignments,
+                    repo,
+                    options.runtime,
+                    *execution_runtime,
+                    *worktree_creation,
+                )? {
+                    outcome.findings.extend(parked.findings);
+                    outcome.assignment_failed = true;
+                    return Ok(AssignmentExecutionDisposition::Complete);
+                }
             }
         }
     };
