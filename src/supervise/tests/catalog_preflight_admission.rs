@@ -1,5 +1,6 @@
 use super::*;
 use crate::external_agent::EnvironmentFailureCategory;
+use crate::mutation_taxonomy::{CatalogPreflightOrigin, SupervisorCatalogCodexPreflightGrant};
 
 fn catalog_options(runtime: SupervisorRuntime, codex_bin: &str) -> SupervisorRunOptions {
     SupervisorRunOptions {
@@ -42,4 +43,29 @@ fn for_supervisor_fake_without_grant_keeps_local_deterministic_catalog() {
     let catalog = RuntimeModelCatalog::for_supervisor(&options, Path::new("."), None)
         .expect("fake runtime must not require a catalog grant");
     assert_eq!(catalog, RuntimeModelCatalog::LocalDeterministicFake);
+}
+
+#[test]
+fn for_supervisor_rejects_inbox_origin_grant_without_catalog_spawn() {
+    let options = catalog_options(SupervisorRuntime::Codex, "codex");
+    let grant = SupervisorCatalogCodexPreflightGrant::admit_from_inbox_catalog_intent(
+        options.run_id.as_str(),
+        Path::new("."),
+        Path::new("codex"),
+    )
+    .expect("trusted Inbox origin spelling must admit");
+    assert_eq!(grant.origin(), CatalogPreflightOrigin::Inbox);
+    let failure = RuntimeModelCatalog::for_supervisor(&options, Path::new("."), Some(grant))
+        .expect_err("Inbox origin must not bind for_supervisor");
+    assert_eq!(
+        failure.category,
+        EnvironmentFailureCategory::RuntimeModelCatalogUnavailable
+    );
+    assert!(
+        failure
+            .summary
+            .contains("cause=catalog_preflight_grant_origin_mismatch"),
+        "cross-origin grant must fail closed before catalog spawn: {}",
+        failure.summary
+    );
 }
