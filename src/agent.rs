@@ -210,6 +210,22 @@ fn run_agent_protected_stage_hook(stage: AgentProtectedStage) {
     });
 }
 
+#[cfg(test)]
+thread_local! {
+    static AGENT_CLAIM_TIMING: std::cell::RefCell<Option<crate::sync_store::ClaimTiming>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_agent_claim_timing_for_test(timing: crate::sync_store::ClaimTiming) {
+    AGENT_CLAIM_TIMING.with(|slot| *slot.borrow_mut() = Some(timing));
+}
+
+#[cfg(test)]
+fn take_agent_claim_timing_for_test() -> Option<crate::sync_store::ClaimTiming> {
+    AGENT_CLAIM_TIMING.with(|slot| slot.borrow_mut().take())
+}
+
 #[derive(Debug, Clone)]
 struct CommandSpec {
     command: String,
@@ -273,9 +289,16 @@ where
     let manager = WorktreeManager::new(&repo);
     let selected = select_worktree(&manager, &agent_id, options.worktree_reuse)?;
     let store = SyncStore::open(&repo)?;
-    let claim = store
-        .claim_paths(&agent_id, claimed_paths.iter())
-        .with_context(|| format!("failed to claim paths for agent '{agent_id}'"))?;
+    #[cfg(test)]
+    let claim = match take_agent_claim_timing_for_test() {
+        Some(timing) => store
+            .claim_paths_with_timing(&agent_id, claimed_paths.iter(), timing)
+            .map(|outcome| outcome.claim),
+        None => store.claim_paths(&agent_id, claimed_paths.iter()),
+    };
+    #[cfg(not(test))]
+    let claim = store.claim_paths(&agent_id, claimed_paths.iter());
+    let claim = claim.with_context(|| format!("failed to claim paths for agent '{agent_id}'"))?;
     let claim_token = claim.token;
 
     let result = run_claimed_agent(ClaimedAgentRun {
@@ -380,6 +403,14 @@ where
             run.agent_id
         )
     })?;
+    _revalidation
+        .start_guard_owned_heartbeat()
+        .with_context(|| {
+            format!(
+                "failed to start guard-owned heartbeat for agent '{}'",
+                run.agent_id
+            )
+        })?;
     #[cfg(test)]
     run_agent_protected_stage_hook(AgentProtectedStage::Revalidation);
 
@@ -524,6 +555,10 @@ where
     let validation_failed = validation_results.iter().any(|result| !result.success);
     let success = execution_error.is_none() && boundary_error.is_none() && !validation_failed;
     let error = execution_error.or(boundary_error);
+
+    _revalidation
+        .stop_guard_owned_heartbeat()
+        .with_context(|| format!("guard-owned heartbeat failed for agent '{}'", run.agent_id))?;
 
     Ok(AgentRunReport {
         success,
@@ -1270,6 +1305,7 @@ mod tests {
         FakeOutcome, FakeProvider, LlmProvider, LlmRequest, LlmResponse, ProposedCommand,
         ProposedPatch, ProviderCapabilities, ProviderError, WorkProposal,
     };
+    use crate::sync_store::ClaimTiming;
     use git2::{Oid, Signature};
     use std::{io::Read, sync::mpsc, thread};
     use tempfile::TempDir;
@@ -2005,6 +2041,200 @@ diff --git a/README.md b/README.md
             .acquire_write_execution_lease("agent-a")
             .context("success must RAII-release the write lease")?;
         drop(released);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn peek_agent_liveness(
+        repo_path: &Path,
+        agent_id: &str,
+    ) -> Result<crate::sync_store::PeekedClaimLiveness> {
+        crate::sync_store::peek_liveness_without_claims_lock(repo_path)?
+            .into_iter()
+            .find(|row| row.agent_id == agent_id)
+            .with_context(|| format!("missing peeked liveness for {agent_id}"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_run_guard_owned_heartbeat_ticks_during_blocking_child() -> Result<()> {
+        skip_without_containment!(ok);
+        let temp = TempDir::new().context("tempdir")?;
+        let repo_path = create_committed_repo(temp.path())?;
+        let store = SyncStore::open(&repo_path)?;
+        let foreign = store
+            .claim_paths("foreign-agent", [PathBuf::from("src/lib.rs")])?
+            .clone();
+        let foreign_before = peek_agent_liveness(&repo_path, "foreign-agent")?;
+
+        let ready_fifo = temp.path().join("heartbeat-ready.fifo");
+        let release_fifo = temp.path().join("heartbeat-release.fifo");
+        create_fifo(&ready_fifo);
+        create_fifo(&release_fifo);
+
+        let run_repo = repo_path.clone();
+        let validation_command = format!(
+            "printf x > '{}'; cat '{}'",
+            ready_fifo.display(),
+            release_fifo.display()
+        );
+        let runner = thread::spawn(move || {
+            set_agent_claim_timing_for_test(ClaimTiming::new(1, 3).expect("timing"));
+            let mut provider = FakeProvider::new("fake", DEFAULT_MODEL);
+            provider.push_response(
+                "agent-run-agent-a",
+                WorkProposal::summary("update readme").with_command(ProposedCommand::new(
+                    "printf '# Test\\n\\nagent edit\\n' > README.md",
+                    CommandPurpose::Implement,
+                )),
+            );
+            let mut options = default_agent_options(run_repo, "agent-a");
+            options.keep_claims = true;
+            options.validation_commands =
+                vec![AgentValidationCommand::required(validation_command)];
+            options.provider_command_policy = ProviderCommandPolicy::AllowUnsafeShell;
+            run_agent_with_provider_simulation(options, &mut provider)
+        });
+
+        wait_for_fifo_byte(&ready_fifo, Duration::from_secs(30));
+        let baseline = peek_agent_liveness(&repo_path, "agent-a")?;
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let mut observed = baseline.heartbeat_unix_seconds;
+        while Instant::now() < deadline {
+            if let Ok(row) = peek_agent_liveness(&repo_path, "agent-a") {
+                observed = row.heartbeat_unix_seconds;
+                if observed >= baseline.heartbeat_unix_seconds + 2 {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            observed > baseline.heartbeat_unix_seconds,
+            "must observe disk heartbeat_unix_seconds advance while the child is blocked (baseline={}, observed={})",
+            baseline.heartbeat_unix_seconds,
+            observed
+        );
+        fs::write(&release_fifo, b"go").context("release validation fifo")?;
+
+        let report = runner.join().expect("join agent run")?;
+        assert!(report.success, "unexpected failed report: {report:?}");
+        let claim = report.claim.as_ref().context("kept claim")?;
+        assert_eq!(claim.agent_id, "agent-a");
+        assert_eq!(claim.paths, vec![PathBuf::from("README.md")]);
+        assert_eq!(claim.token, baseline.token);
+        let after = peek_agent_liveness(&repo_path, "agent-a")?;
+        assert_eq!(after.paths, vec![PathBuf::from("README.md")]);
+        assert_eq!(after.run_owner_count, 0);
+        assert!(after.takeover_eligible_since_unix_seconds.is_none());
+        let foreign_after = peek_agent_liveness(&repo_path, "foreign-agent")?;
+        assert_eq!(foreign_after.token, foreign.token);
+        assert_eq!(
+            foreign_after.heartbeat_unix_seconds,
+            foreign_before.heartbeat_unix_seconds
+        );
+        assert_eq!(foreign_after.paths, foreign.paths);
+        let sweep = store.sweep_stale()?;
+        assert!(
+            !sweep
+                .newly_takeover_eligible
+                .iter()
+                .any(|claim_id| claim_id == &after.claim_id),
+            "live ticking claim must not become takeover-eligible: {:?}",
+            sweep.newly_takeover_eligible
+        );
+        store
+            .takeover(claim.token, "other-agent", None)
+            .expect_err("takeover of a live ticking claim must fail");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_run_guard_lifetime_blocks_competing_claim_ops_during_fifo_hold() -> Result<()> {
+        skip_without_containment!(ok);
+        let temp = TempDir::new().context("tempdir")?;
+        let repo_path = create_committed_repo(temp.path())?;
+        let store = SyncStore::open(&repo_path)?;
+        let ready_fifo = temp.path().join("block-ready.fifo");
+        let release_fifo = temp.path().join("block-release.fifo");
+        create_fifo(&ready_fifo);
+        create_fifo(&release_fifo);
+        let run_repo = repo_path.clone();
+        let validation_command = format!(
+            "printf x > '{}'; cat '{}'",
+            ready_fifo.display(),
+            release_fifo.display()
+        );
+        let runner = thread::spawn(move || {
+            set_agent_claim_timing_for_test(ClaimTiming::new(1, 3).expect("timing"));
+            let mut provider = FakeProvider::new("fake", DEFAULT_MODEL);
+            provider.push_response(
+                "agent-run-agent-a",
+                WorkProposal::summary("update readme").with_command(ProposedCommand::new(
+                    "printf '# Test\\n\\nagent edit\\n' > README.md",
+                    CommandPurpose::Implement,
+                )),
+            );
+            let mut options = default_agent_options(run_repo, "agent-a");
+            options.keep_claims = true;
+            options.validation_commands =
+                vec![AgentValidationCommand::required(validation_command)];
+            options.provider_command_policy = ProviderCommandPolicy::AllowUnsafeShell;
+            run_agent_with_provider_simulation(options, &mut provider)
+        });
+
+        wait_for_fifo_byte(&ready_fifo, Duration::from_secs(30));
+        let live = peek_agent_liveness(&repo_path, "agent-a")?;
+        let token = live.token;
+        let release_store = store.clone();
+        let takeover_store = store.clone();
+        let heartbeat_store = store.clone();
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let (takeover_tx, takeover_rx) = mpsc::sync_channel(1);
+        let (heartbeat_tx, heartbeat_rx) = mpsc::sync_channel(1);
+        let release = thread::spawn(move || {
+            let result = release_store.release(token).map(|claim| claim.token);
+            let _ = release_tx.send(result);
+        });
+        let takeover = thread::spawn(move || {
+            let result = takeover_store.takeover(token, "other-agent", None);
+            let _ = takeover_tx.send(result.map(|outcome| outcome.claim.token));
+        });
+        let heartbeat = thread::spawn(move || {
+            let result = heartbeat_store.heartbeat(token, "agent-a", None);
+            let _ = heartbeat_tx.send(result.map(|report| report.claim.token));
+        });
+        assert!(
+            release_rx.recv_timeout(Duration::from_millis(150)).is_err(),
+            "competing release must not complete while the guard holds claims.lock"
+        );
+        assert!(
+            takeover_rx.try_recv().is_err(),
+            "competing takeover must not complete while the guard holds claims.lock"
+        );
+        assert!(
+            heartbeat_rx.try_recv().is_err(),
+            "ordinary heartbeat must remain the timeout path while the guard holds claims.lock"
+        );
+        fs::write(&release_fifo, b"go").context("release validation fifo")?;
+        let report = runner.join().expect("join agent run")?;
+        assert!(report.success, "unexpected failed report: {report:?}");
+        let _ = release_rx.recv_timeout(Duration::from_secs(6));
+        let _ = takeover_rx.recv_timeout(Duration::from_millis(200));
+        let _ = heartbeat_rx.recv_timeout(Duration::from_millis(200));
+        let _ = release.join();
+        let _ = takeover.join();
+        let _ = heartbeat.join();
+        let remaining = store.snapshot()?;
+        if remaining.iter().any(|claim| claim.token == token) {
+            let started = Instant::now();
+            store.release(token)?;
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "release after drop+join must proceed"
+            );
+        }
         Ok(())
     }
 
