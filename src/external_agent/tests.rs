@@ -7545,4 +7545,326 @@ fn codex_argv_and_digest_preserve_non_utf8_paths_without_collision() -> Result<(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn assignment_process_launch_fixture(
+    kind: AssignmentProcessLaunchKind,
+    grant: Option<crate::mutation_taxonomy::AssignmentProcessLaunchGrant>,
+    run_id: &str,
+    subject: &str,
+    model: Option<&str>,
+) -> Result<(tempfile::TempDir, ExternalAgentCommand, PathBuf)> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    git2::Repository::init(&workspace)?;
+    create_mandatory_control_roots(&workspace)?;
+    let marker = workspace.join("child-process-started");
+    let agent = workspace.join("fixture-agent.sh");
+    fs::write(
+        &agent,
+        format!(
+            "#!/bin/sh\nwhile IFS= read -r _line; do\n    :\ndone\ntouch '{}'\nexit 0\n",
+            marker.display()
+        ),
+    )?;
+    fs::set_permissions(&agent, fs::Permissions::from_mode(0o700))?;
+    let prompt = workspace.join("prompt.md");
+    fs::write(&prompt, "fixture prompt\n")?;
+    let incoming = workspace.join("incoming");
+    fs::create_dir(&incoming)?;
+    fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+    let mut spec = ExternalAgentCommand::codex(
+        &agent,
+        &workspace,
+        &prompt,
+        incoming.join("events.jsonl"),
+        incoming.join("last-message.txt"),
+        Duration::from_secs(5),
+    )
+    .with_workspace_access(WorkspaceAccess::ReadWrite)
+    .with_writable_launch_target(WritableLaunchTarget::ManagedChildWorktree)
+    .with_agent_lifecycle(&workspace, "worker", run_id, subject)
+    .with_model_selection(model.map(str::to_string), None);
+    match grant {
+        Some(grant) => spec = spec.with_assignment_process_launch(kind, grant),
+        None => spec.assignment_process_launch_kind = Some(kind),
+    }
+    Ok((temp, spec, marker))
+}
+
+#[cfg(target_os = "linux")]
+fn assert_assignment_process_launch_refused(
+    report: &ExternalAgentRun,
+    marker: &Path,
+    cause: crate::mutation_taxonomy::AssignmentProcessLaunchGrantError,
+) {
+    assert!(
+        !marker.exists(),
+        "assignment process launch must not spawn: {:?}",
+        report.error
+    );
+    assert!(!report.stdout.target_launch_attempted);
+    assert!(
+        report.error.as_deref().is_some_and(|error| {
+            error.contains("assignment process launch grant failed closed")
+                && error.contains(cause.cause_id())
+        }),
+        "unexpected refusal: {:?}",
+        report.error
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn assignment_child_missing_grant_fails_closed_on_verified_and_simulation() -> Result<()> {
+    let (_temp, spec, marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::AssignmentChild,
+        None,
+        "run-missing-child",
+        "assignment-missing",
+        None,
+    )?;
+    let simulated = run_external_agent_nonpublishable_simulation(&spec);
+    assert_assignment_process_launch_refused(
+        &simulated,
+        &marker,
+        crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::MissingGrant,
+    );
+    let verified = run_external_agent(&spec);
+    assert_assignment_process_launch_refused(
+        &verified,
+        &marker,
+        crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::MissingGrant,
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn parent_auditor_missing_grant_fails_closed_on_verified_and_simulation() -> Result<()> {
+    let (_temp, spec, marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::ParentAuditor,
+        None,
+        "run-missing-auditor",
+        "auditor-missing",
+        None,
+    )?;
+    let simulated = run_external_agent_nonpublishable_simulation(&spec);
+    assert_assignment_process_launch_refused(
+        &simulated,
+        &marker,
+        crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::MissingGrant,
+    );
+    let verified = run_external_agent(&spec);
+    assert_assignment_process_launch_refused(
+        &verified,
+        &marker,
+        crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::MissingGrant,
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn assignment_process_wrong_kind_identity_and_catalog_grant_fail_closed() -> Result<()> {
+    let child_grant = crate::mutation_taxonomy::admit_assignment_child_process_intent(
+        "run-wrong-kind",
+        "assignment-a",
+        1,
+        Path::new("codex"),
+        None,
+        "worker-duty",
+    )?;
+    let (_temp, spec, marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::ParentAuditor,
+        Some(child_grant),
+        "run-wrong-kind",
+        "assignment-a",
+        None,
+    )?;
+    let report = run_external_agent_nonpublishable_simulation(&spec);
+    assert_assignment_process_launch_refused(
+        &report,
+        &marker,
+        crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::KindMismatch,
+    );
+
+    let grant = crate::mutation_taxonomy::admit_assignment_child_process_intent(
+        "run-wrong-id",
+        "assignment-a",
+        1,
+        Path::new("codex"),
+        None,
+        "worker-duty",
+    )?;
+    let (_temp, spec, marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::AssignmentChild,
+        Some(grant),
+        "run-other-id",
+        "assignment-a",
+        None,
+    )?;
+    let report = run_external_agent_nonpublishable_simulation(&spec);
+    assert_assignment_process_launch_refused(
+        &report,
+        &marker,
+        crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::IdentityMismatch,
+    );
+
+    let _catalog = SupervisorCatalogCodexPreflightGrant::admit_from_supervisor_catalog_intent(
+        "run-catalog-as-worker",
+        Path::new("/repos/caller-worktree"),
+        Path::new("codex"),
+    )?;
+    let (_temp, spec, marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::AssignmentChild,
+        None,
+        "run-catalog-as-worker",
+        "assignment-a",
+        None,
+    )?;
+    let report = run_external_agent_nonpublishable_simulation(&spec);
+    assert_assignment_process_launch_refused(
+        &report,
+        &marker,
+        crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::MissingGrant,
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn assignment_process_replay_fails_closed_as_already_consumed() -> Result<()> {
+    let grant = crate::mutation_taxonomy::admit_assignment_child_process_intent(
+        "run-replay",
+        "assignment-a",
+        1,
+        Path::new("codex"),
+        Some("gpt-5.4"),
+        "worker-duty",
+    )?;
+    let replay = grant.clone();
+    let (_temp, spec, marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::AssignmentChild,
+        Some(grant),
+        "run-replay",
+        "assignment-a",
+        Some("gpt-5.4"),
+    )?;
+    let first = run_external_agent_nonpublishable_simulation(&spec);
+    assert_eq!(first.error, None, "{first:?}");
+    assert_eq!(first.exit_code, Some(0));
+    assert!(first.stdout.target_launch_attempted);
+    assert!(marker.exists());
+    let (_temp_replay, replay_spec, replay_marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::AssignmentChild,
+        Some(replay),
+        "run-replay",
+        "assignment-a",
+        Some("gpt-5.4"),
+    )?;
+    let second = run_external_agent_nonpublishable_simulation(&replay_spec);
+    assert_assignment_process_launch_refused(
+        &second,
+        &replay_marker,
+        crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::AlreadyConsumed,
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn assignment_process_tmp_codex_substitution_fails_closed() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    git2::Repository::init(&workspace)?;
+    create_mandatory_control_roots(&workspace)?;
+    let marker = workspace.join("child-process-started");
+    let agent = workspace.join("codex");
+    fs::write(
+        &agent,
+        format!(
+            "#!/bin/sh\nwhile IFS= read -r _line; do\n    :\ndone\ntouch '{}'\nexit 0\n",
+            marker.display()
+        ),
+    )?;
+    fs::set_permissions(&agent, fs::Permissions::from_mode(0o700))?;
+    let prompt = workspace.join("prompt.md");
+    fs::write(&prompt, "tmp-codex substitution\n")?;
+    let incoming = workspace.join("incoming");
+    fs::create_dir(&incoming)?;
+    fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+    let grant = crate::mutation_taxonomy::admit_assignment_child_process_intent(
+        "run-tmp-codex",
+        "assignment-a",
+        1,
+        Path::new("codex"),
+        None,
+        "worker-duty",
+    )?
+    .seal_independently_verified_canonical_program_for_test(Path::new("/tmp/codex"))?;
+    let spec = ExternalAgentCommand::codex(
+        &agent,
+        &workspace,
+        &prompt,
+        incoming.join("events.jsonl"),
+        incoming.join("last-message.txt"),
+        Duration::from_secs(5),
+    )
+    .with_agent_lifecycle(&workspace, "worker", "run-tmp-codex", "assignment-a")
+    .with_assignment_process_launch(AssignmentProcessLaunchKind::AssignmentChild, grant);
+    let report = run_external_agent_nonpublishable_simulation(&spec);
+    assert_assignment_process_launch_refused(
+        &report,
+        &marker,
+        crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::ProgramMismatch,
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn matching_assignment_process_grant_launches_local_fixture_once() -> Result<()> {
+    let grant = crate::mutation_taxonomy::admit_assignment_child_process_intent(
+        "run-genuine-fixture",
+        "assignment-fixture",
+        4,
+        Path::new("codex"),
+        Some("gpt-5.4"),
+        "worker-duty",
+    )?;
+    let replay = grant.clone();
+    let (_temp, spec, marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::AssignmentChild,
+        Some(grant),
+        "run-genuine-fixture",
+        "assignment-fixture",
+        Some("gpt-5.4"),
+    )?;
+    let report = run_external_agent_nonpublishable_simulation(&spec);
+    assert_eq!(report.error, None, "{report:?}");
+    assert_eq!(report.exit_code, Some(0));
+    assert!(report.stdout.target_launch_attempted);
+    assert!(marker.exists());
+    let (_temp_replay, replay_spec, replay_marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::AssignmentChild,
+        Some(replay),
+        "run-genuine-fixture",
+        "assignment-fixture",
+        Some("gpt-5.4"),
+    )?;
+    let reused = run_external_agent_nonpublishable_simulation(&replay_spec);
+    assert_assignment_process_launch_refused(
+        &reused,
+        &replay_marker,
+        crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::AlreadyConsumed,
+    );
+    Ok(())
+}
+
 include!("tests_part2.rs");
