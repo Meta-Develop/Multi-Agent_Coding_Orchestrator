@@ -27,6 +27,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
@@ -145,6 +146,58 @@ pub(crate) enum ExistingClaimRevalidationError {
     StateChanged,
 }
 
+/// Unique held claims writer lock plus the frozen authenticated snapshot.
+/// Not `Clone`: the `Arc<Mutex<…>>` is the share, and this type is the guard.
+#[derive(Debug)]
+pub(crate) struct HeldClaimsPersist {
+    repo_path: PathBuf,
+    state: RepositoryStateRoot,
+    lock: RepositoryStateLock,
+    frozen: AuthenticatedClaimsState,
+    requests: Vec<ExistingClaimBindingRequest>,
+}
+
+impl HeldClaimsPersist {
+    pub(crate) fn min_heartbeat_interval_seconds(&self) -> std::result::Result<u64, (String, u64)> {
+        let mut interval = None;
+        for request in &self.requests {
+            let entry = self
+                .frozen
+                .liveness
+                .iter()
+                .find(|entry| entry.token == request.token)
+                .ok_or_else(|| (request.agent_id.clone(), request.token.get()))?;
+            interval = Some(
+                interval.map_or(entry.heartbeat_interval_seconds, |current: u64| {
+                    current.min(entry.heartbeat_interval_seconds)
+                }),
+            );
+        }
+        interval.ok_or_else(|| (String::new(), 0))
+    }
+
+    pub(crate) fn next_due_unix_seconds(
+        &self,
+        interval: u64,
+    ) -> std::result::Result<u64, (String, u64)> {
+        let mut due = None;
+        for request in &self.requests {
+            let entry = self
+                .frozen
+                .liveness
+                .iter()
+                .find(|entry| entry.token == request.token)
+                .ok_or_else(|| (request.agent_id.clone(), request.token.get()))?;
+            let token_due = entry
+                .heartbeat_unix_seconds
+                .checked_add(interval)
+                .ok_or_else(|| (request.agent_id.clone(), request.token.get()))?;
+            due = Some(due.map_or(token_due, |current: u64| current.min(token_due)));
+        }
+        due.ok_or_else(|| (String::new(), 0))
+    }
+}
+
 /// Retains the already-existing claims writer lock for one bounded batch of
 /// mutation authorities. Heartbeat, sweep, takeover, and release stay
 /// serialized while the guard is alive. This is the claims lock only; it must
@@ -152,29 +205,33 @@ pub(crate) enum ExistingClaimRevalidationError {
 #[must_use = "the claims guard must be retained for the protected operation"]
 #[derive(Debug)]
 pub(crate) struct ExistingClaimsGuard {
-    repo_path: PathBuf,
-    state: RepositoryStateRoot,
-    lock: RepositoryStateLock,
-    authenticated: AuthenticatedClaimsState,
-    requests: Vec<ExistingClaimBindingRequest>,
-    // Rechecks use the acquisition instant that already passed liveness.
-    // Re-aging while this guard blocks heartbeats would manufacture staleness.
+    persist: Arc<Mutex<HeldClaimsPersist>>,
+    // Rechecks keep this acquisition instant as metadata only. Wall-clock
+    // liveness uses `current_unix_seconds` so a live worker can refresh
+    // `heartbeat_unix_seconds` without manufacturing staleness here.
+    #[allow(dead_code)]
     validated_at_unix_seconds: u64,
 }
 
 impl ExistingClaimsGuard {
     pub(crate) fn verify(&self) -> std::result::Result<(), ExistingClaimRevalidationError> {
+        let persist = self
+            .persist
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let authenticated =
-            read_existing_authenticated_claims(&self.repo_path, &self.state, &self.lock)
+            read_existing_authenticated_claims(&persist.repo_path, &persist.state, &persist.lock)
                 .map_err(|source| ExistingClaimRevalidationError::StateUnavailable { source })?;
-        if authenticated != self.authenticated {
+        if authenticated != persist.frozen {
             return Err(ExistingClaimRevalidationError::StateChanged);
         }
-        verify_existing_claim_requests(
-            &authenticated,
-            &self.requests,
-            self.validated_at_unix_seconds,
-        )
+        let now = current_unix_seconds()
+            .map_err(|source| ExistingClaimRevalidationError::StateUnavailable { source })?;
+        verify_existing_claim_requests(&authenticated, &persist.requests, now)
+    }
+
+    pub(crate) fn persist_handle(&self) -> Arc<Mutex<HeldClaimsPersist>> {
+        Arc::clone(&self.persist)
     }
 }
 
@@ -705,11 +762,13 @@ pub(crate) fn lock_existing_authenticated_claims(
         .map_err(|source| ExistingClaimRevalidationError::StateUnavailable { source })?;
     verify_existing_claim_requests(&authenticated, &requests, validated_at_unix_seconds)?;
     Ok(ExistingClaimsGuard {
-        repo_path,
-        state,
-        lock,
-        authenticated,
-        requests,
+        persist: Arc::new(Mutex::new(HeldClaimsPersist {
+            repo_path,
+            state,
+            lock,
+            frozen: authenticated,
+            requests,
+        })),
         validated_at_unix_seconds,
     })
 }
@@ -835,6 +894,235 @@ fn verify_existing_claim_requests(
         }
     }
     Ok(())
+}
+
+pub(crate) fn snapshot_lock_busy(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}");
+    text.contains("state lock is active elsewhere")
+        || text.contains("kernel state lock is already held")
+        || text.contains("active elsewhere")
+}
+
+fn apply_exact_owner_heartbeat(
+    state: &mut AuthenticatedClaimsState,
+    requests: &[ExistingClaimBindingRequest],
+    now: u64,
+) -> Result<()> {
+    for request in requests {
+        let claim = state
+            .claims
+            .iter()
+            .find(|claim| claim.token == request.token)
+            .cloned()
+            .with_context(|| format!("claim token is not active: {}", request.token.get()))?;
+        if claim.agent_id != request.agent_id {
+            bail!(
+                "claim heartbeat agent '{}' does not exactly match owner '{}'",
+                request.agent_id,
+                claim.agent_id
+            );
+        }
+        let entry = state
+            .liveness
+            .iter_mut()
+            .find(|entry| entry.token == request.token)
+            .with_context(|| {
+                format!(
+                    "claim liveness row is missing for token {}",
+                    request.token.get()
+                )
+            })?;
+        if entry.takeover_eligible_since_unix_seconds.is_some() {
+            bail!(
+                "claim '{}' is takeover-eligible and cannot be revived by heartbeat; release or take it over explicitly",
+                entry.claim_id
+            );
+        }
+        if now < entry.heartbeat_unix_seconds {
+            bail!(
+                "claim '{}' heartbeat would move backward from {} to {}; refusing ambiguous clock state",
+                entry.claim_id,
+                entry.heartbeat_unix_seconds,
+                now
+            );
+        }
+        entry.heartbeat_unix_seconds = now;
+    }
+    Ok(())
+}
+
+pub(crate) fn persist_exact_owner_heartbeat_under_held_lock(
+    persist: &Mutex<HeldClaimsPersist>,
+    now: u64,
+) -> Result<()> {
+    let mut held = persist
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    #[cfg(test)]
+    if let Some(fault) = take_heartbeat_persist_fault(&held.repo_path) {
+        match fault {
+            HeartbeatPersistFault::Busy => {
+                bail!("state lock is active elsewhere");
+            }
+            HeartbeatPersistFault::Fatal(message) => {
+                bail!("{message}");
+            }
+        }
+    }
+    persist_exact_owner_heartbeat_locked(&mut held, now)
+}
+
+fn persist_exact_owner_heartbeat_locked(held: &mut HeldClaimsPersist, now: u64) -> Result<()> {
+    held.state.verify_lock(&held.lock)?;
+    let authenticator = repository_authenticator_key_only(&held.repo_path)?;
+    let mut store =
+        AuthenticatedSnapshotStore::<ClaimsSnapshotSpec, AuthenticatedClaimsState>::open_instance(
+            authenticator,
+            CLAIMS_LOGICAL_ID,
+        )?;
+    let current = store.current().value.clone();
+    if current != held.frozen {
+        bail!("authenticated claims state changed while its existing-only guard was held");
+    }
+    let mut next = current.clone();
+    apply_exact_owner_heartbeat(&mut next, &held.requests, now)?;
+    if next == current {
+        held.state.verify_lock(&held.lock)?;
+        drop(store);
+        return Ok(());
+    }
+    let revision = next
+        .snapshot_revision
+        .checked_add(1)
+        .context("authenticated claims snapshot revision exhausted")?;
+    next.snapshot_revision = revision;
+    validate_sync_snapshot(&SyncSnapshot {
+        next_token: next.next_token,
+        claims: next.claims.clone(),
+    })?;
+    validate_claim_run_owners(&next.claims, &next.run_owners)?;
+    validate_claim_liveness(
+        next.next_token,
+        &next.claims,
+        &next.liveness,
+        &next.supersessions,
+    )?;
+    if revision % 4_096 == 0 {
+        let authenticator = repository_authenticator_key_only(&held.repo_path)?;
+        store = store.rollover(authenticator, revision, next)?;
+    } else {
+        store.commit(revision, next)?;
+    }
+    validate_existing_authenticated_claims_snapshot(store.current())?;
+    held.frozen = store.current().value.clone();
+    held.state.verify_lock(&held.lock)?;
+    drop(store);
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) enum HeartbeatPersistFault {
+    Busy,
+    Fatal(&'static str),
+}
+
+#[cfg(test)]
+static HEARTBEAT_PERSIST_FAULTS: Mutex<
+    BTreeMap<PathBuf, std::collections::VecDeque<HeartbeatPersistFault>>,
+> = Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+pub(crate) fn queue_heartbeat_persist_fault(repo_path: &Path, fault: HeartbeatPersistFault) {
+    let mut faults = HEARTBEAT_PERSIST_FAULTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    faults
+        .entry(repo_path.to_path_buf())
+        .or_default()
+        .push_back(fault);
+}
+
+#[cfg(test)]
+fn take_heartbeat_persist_fault(repo_path: &Path) -> Option<HeartbeatPersistFault> {
+    let mut faults = HEARTBEAT_PERSIST_FAULTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let queue = faults.get_mut(repo_path)?;
+    let fault = queue.pop_front();
+    if queue.is_empty() {
+        faults.remove(repo_path);
+    }
+    fault
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PeekedClaimLiveness {
+    pub token: crate::sync::ClaimToken,
+    pub agent_id: String,
+    pub claim_id: String,
+    pub paths: Vec<PathBuf>,
+    pub heartbeat_unix_seconds: u64,
+    pub heartbeat_interval_seconds: u64,
+    pub stale_after_seconds: u64,
+    pub takeover_eligible_since_unix_seconds: Option<u64>,
+    pub run_owner_count: usize,
+}
+
+#[cfg(test)]
+pub(crate) fn peek_liveness_without_claims_lock(
+    repo_path: &Path,
+) -> Result<Vec<PeekedClaimLiveness>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        match try_peek_liveness_without_claims_lock(repo_path) {
+            Ok(rows) => return Ok(rows),
+            Err(error) if snapshot_lock_busy(&error) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(error).context("timed out retrying Busy snapshot peek");
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(test)]
+fn try_peek_liveness_without_claims_lock(repo_path: &Path) -> Result<Vec<PeekedClaimLiveness>> {
+    let authenticator = repository_authenticator_key_only(repo_path)?;
+    let snapshot = AuthenticatedSnapshotStore::<
+        ClaimsSnapshotSpec,
+        AuthenticatedClaimsState,
+    >::read_existing_current(authenticator, CLAIMS_LOGICAL_ID)?;
+    let run_owner_count = snapshot.value.run_owners.len();
+    let claims = snapshot
+        .value
+        .claims
+        .iter()
+        .map(|claim| (claim.token, claim))
+        .collect::<BTreeMap<_, _>>();
+    Ok(snapshot
+        .value
+        .liveness
+        .iter()
+        .map(|entry| {
+            let claim = claims.get(&entry.token);
+            PeekedClaimLiveness {
+                token: entry.token,
+                agent_id: claim
+                    .map(|claim| claim.agent_id.clone())
+                    .unwrap_or_default(),
+                claim_id: entry.claim_id.clone(),
+                paths: claim.map(|claim| claim.paths.clone()).unwrap_or_default(),
+                heartbeat_unix_seconds: entry.heartbeat_unix_seconds,
+                heartbeat_interval_seconds: entry.heartbeat_interval_seconds,
+                stale_after_seconds: entry.stale_after_seconds,
+                takeover_eligible_since_unix_seconds: entry.takeover_eligible_since_unix_seconds,
+                run_owner_count,
+            }
+        })
+        .collect())
 }
 
 fn canonical_request_paths(
@@ -2656,6 +2944,72 @@ mod tests {
         )
         .expect_err("superseded predecessor must stop the harness");
         assert!(error.to_string().contains("superseded"));
+    }
+
+    #[test]
+    fn persist_exact_owner_heartbeat_refuses_owner_mismatch_takeover_and_clock_rollback() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open claims");
+        let claim = store
+            .claim_paths_with_timing("owner", ["src"], ClaimTiming::new(1, 3).expect("timing"))
+            .expect("claim")
+            .claim;
+        let state = authenticated_claims_state(&store);
+        let now = state.liveness[0].heartbeat_unix_seconds;
+        let owner_request = ExistingClaimBindingRequest {
+            agent_id: "owner".to_string(),
+            token: claim.token,
+            paths: claim.paths.clone(),
+        };
+
+        let mismatch = ExistingClaimBindingRequest {
+            agent_id: "other".to_string(),
+            token: claim.token,
+            paths: claim.paths.clone(),
+        };
+        let error = apply_exact_owner_heartbeat(&mut state.clone(), &[mismatch], now)
+            .expect_err("owner mismatch");
+        assert!(
+            error.to_string().contains("does not exactly match owner"),
+            "unexpected owner-mismatch error: {error:#}"
+        );
+
+        let mut eligible = state.clone();
+        eligible.liveness[0].takeover_eligible_since_unix_seconds = Some(now);
+        let error =
+            apply_exact_owner_heartbeat(&mut eligible, std::slice::from_ref(&owner_request), now)
+                .expect_err("takeover-eligible");
+        assert!(
+            error.to_string().contains("takeover-eligible"),
+            "unexpected takeover-eligible error: {error:#}"
+        );
+
+        let error = apply_exact_owner_heartbeat(
+            &mut state.clone(),
+            std::slice::from_ref(&owner_request),
+            now.saturating_sub(1),
+        )
+        .expect_err("clock rollback");
+        assert!(
+            error.to_string().contains("move backward"),
+            "unexpected clock-rollback error: {error:#}"
+        );
+
+        let mut missing = state.clone();
+        missing.liveness.clear();
+        let error =
+            apply_exact_owner_heartbeat(&mut missing, std::slice::from_ref(&owner_request), now)
+                .expect_err("missing liveness");
+        assert!(
+            error.to_string().contains("missing"),
+            "unexpected missing-row error: {error:#}"
+        );
+
+        let mut same = state.clone();
+        apply_exact_owner_heartbeat(&mut same, &[owner_request], now).expect("same-second no-op");
+        assert_eq!(same, state);
     }
 
     fn authenticated_claims_state(store: &SyncStore) -> AuthenticatedClaimsState {
