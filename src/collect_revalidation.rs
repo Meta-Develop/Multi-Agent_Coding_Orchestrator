@@ -1,13 +1,19 @@
 use crate::{
     sync::ClaimToken,
     sync_store::{
-        lock_existing_authenticated_claims, ExistingClaimBindingRequest,
-        ExistingClaimRevalidationError, ExistingClaimsGuard,
+        lock_existing_authenticated_claims, persist_exact_owner_heartbeat_under_held_lock,
+        snapshot_lock_busy, ExistingClaimBindingRequest, ExistingClaimRevalidationError,
+        ExistingClaimsGuard, HeldClaimsPersist,
     },
     worktree::{WorktreeManager, WorktreeRecord},
 };
 use git2::Oid;
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::{mpsc, Arc, Mutex},
+    thread::{self, JoinHandle},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use thiserror::Error;
 
 const MAX_REVALIDATION_REQUESTS: usize = 4_096;
@@ -54,6 +60,30 @@ pub(crate) enum RevalidationError {
     DetachedHead { agent_id: String },
     #[error("agent '{agent_id}' worktree HEAD/ref OID mismatch")]
     OidMismatch { agent_id: String },
+    #[error("guard-owned heartbeat already started")]
+    HeartbeatAlreadyStarted,
+    #[error("guard-owned heartbeat missing liveness for agent '{agent_id}' token {token}")]
+    HeartbeatMissingLiveness { agent_id: String, token: u64 },
+    #[error("guard-owned heartbeat interval must be at least 1 second")]
+    HeartbeatInvalidInterval,
+    #[error("guard-owned heartbeat persist failed: {source}")]
+    HeartbeatPersist {
+        #[source]
+        source: anyhow::Error,
+    },
+    #[error("guard-owned heartbeat worker panicked")]
+    HeartbeatJoinPanic,
+}
+
+struct HeartbeatWorker {
+    stop_tx: mpsc::Sender<()>,
+    join: JoinHandle<Result<(), RevalidationError>>,
+}
+
+impl std::fmt::Debug for HeartbeatWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeartbeatWorker").finish_non_exhaustive()
+    }
 }
 
 /// Claims-only revalidation guard plus a snapshot worktree/HEAD check.
@@ -67,7 +97,8 @@ pub(crate) enum RevalidationError {
 pub(crate) struct RevalidationGuard {
     claims: ExistingClaimsGuard,
     requests: Vec<RevalidationRequest>,
-    verification: std::sync::Mutex<()>,
+    verification: Mutex<()>,
+    heartbeat: Mutex<Option<HeartbeatWorker>>,
 }
 
 impl RevalidationGuard {
@@ -81,6 +112,53 @@ impl RevalidationGuard {
             verify_worktree_snapshot(request)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn start_guard_owned_heartbeat(&self) -> Result<(), RevalidationError> {
+        let mut slot = self
+            .heartbeat
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.is_some() {
+            return Err(RevalidationError::HeartbeatAlreadyStarted);
+        }
+        let persist = self.claims.persist_handle();
+        let interval = heartbeat_interval_seconds(&persist)?;
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let join = thread::Builder::new()
+            .name("maco-guard-heartbeat".to_string())
+            .spawn(move || run_guard_owned_heartbeat(persist, stop_rx, interval))
+            .map_err(|source| RevalidationError::HeartbeatPersist {
+                source: anyhow::Error::from(source)
+                    .context("failed to spawn guard-owned heartbeat worker"),
+            })?;
+        *slot = Some(HeartbeatWorker { stop_tx, join });
+        Ok(())
+    }
+
+    pub(crate) fn stop_guard_owned_heartbeat(&self) -> Result<(), RevalidationError> {
+        let worker = {
+            let mut slot = self
+                .heartbeat
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            slot.take()
+        };
+        let Some(worker) = worker else {
+            return Ok(());
+        };
+        let _ = worker.stop_tx.send(());
+        match worker.join.join() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(RevalidationError::HeartbeatJoinPanic),
+        }
+    }
+}
+
+impl Drop for RevalidationGuard {
+    fn drop(&mut self) {
+        let _ = self.stop_guard_owned_heartbeat();
     }
 }
 
@@ -96,7 +174,8 @@ pub(crate) fn revalidate_existing_worker_batch(
     let guard = RevalidationGuard {
         claims,
         requests,
-        verification: std::sync::Mutex::new(()),
+        verification: Mutex::new(()),
+        heartbeat: Mutex::new(None),
     };
     guard.verify()?;
     Ok(guard)
@@ -265,11 +344,88 @@ fn current_head(path: &Path) -> anyhow::Result<Oid> {
     Ok(oid)
 }
 
+fn missing_liveness(agent_id: String, token: u64) -> RevalidationError {
+    RevalidationError::HeartbeatMissingLiveness { agent_id, token }
+}
+
+fn heartbeat_interval_seconds(
+    persist: &Mutex<HeldClaimsPersist>,
+) -> Result<u64, RevalidationError> {
+    let held = persist
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let interval = held
+        .min_heartbeat_interval_seconds()
+        .map_err(|(agent_id, token)| missing_liveness(agent_id, token))?;
+    if interval == 0 {
+        return Err(RevalidationError::HeartbeatInvalidInterval);
+    }
+    Ok(interval)
+}
+
+fn due_unix_seconds(persist: &HeldClaimsPersist, interval: u64) -> Result<u64, RevalidationError> {
+    persist
+        .next_due_unix_seconds(interval)
+        .map_err(|(agent_id, token)| missing_liveness(agent_id, token))
+}
+
+fn current_unix_seconds() -> Result<u64, RevalidationError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|source| RevalidationError::HeartbeatPersist {
+            source: anyhow::Error::from(source).context("system clock is before the Unix epoch"),
+        })
+}
+
+fn run_guard_owned_heartbeat(
+    persist: Arc<Mutex<HeldClaimsPersist>>,
+    stop_rx: mpsc::Receiver<()>,
+    interval: u64,
+) -> Result<(), RevalidationError> {
+    loop {
+        let due = {
+            let held = persist
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            due_unix_seconds(&held, interval)?
+        };
+        let now = current_unix_seconds()?;
+        let wait = Duration::from_secs(due.saturating_sub(now));
+        match stop_rx.recv_timeout(wait) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        loop {
+            match stop_rx.try_recv() {
+                Ok(()) | Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            let now = current_unix_seconds()?;
+            match persist_exact_owner_heartbeat_under_held_lock(&persist, now) {
+                Ok(()) => break,
+                Err(error) if snapshot_lock_busy(&error) => {
+                    match stop_rx.recv_timeout(Duration::from_millis(50)) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    }
+                }
+                Err(error) => {
+                    return Err(RevalidationError::HeartbeatPersist { source: error });
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        sync_store::{ClaimTiming, SyncStore},
+        sync_store::{
+            peek_liveness_without_claims_lock, persist_exact_owner_heartbeat_under_held_lock,
+            queue_heartbeat_persist_fault, ClaimTiming, HeartbeatPersistFault, SyncStore,
+        },
         worktree::{WorktreeCreateOptions, WorktreeManager},
     };
     use anyhow::{Context, Result};
@@ -289,13 +445,16 @@ mod tests {
 
     impl Fixture {
         fn new() -> Result<Self> {
+            Self::new_with_timing(ClaimTiming::default())
+        }
+
+        fn new_with_timing(timing: ClaimTiming) -> Result<Self> {
             let temp = TempDir::new()?;
             let repo_path = temp.path().join("repo");
             WorktreeManager::init_repository(&repo_path, "main")?;
             let repo = crate::git_repository::open(&repo_path)?;
             commit_file(&repo, "README.md", "base\n")?;
             let store = SyncStore::open(&repo_path)?;
-            let claim = store.claim_paths("agent-a", ["README.md"])?;
             let manager = WorktreeManager::new(&repo_path);
             let worktree = manager.create_for_test(WorktreeCreateOptions {
                 agent_id: "agent-a".to_string(),
@@ -304,6 +463,9 @@ mod tests {
                 worktree_root: None,
             })?;
             let head = current_head(&worktree.path)?;
+            let claim = store
+                .claim_paths_with_timing("agent-a", ["README.md"], timing)?
+                .claim;
             Ok(Self {
                 _temp: temp,
                 repo_path,
@@ -575,6 +737,166 @@ mod tests {
             error.to_string().contains("not live"),
             "unexpected error: {error}"
         );
+        Ok(())
+    }
+
+    fn heartbeat_row_for_agent(
+        repo_path: &Path,
+        agent_id: &str,
+    ) -> Result<crate::sync_store::PeekedClaimLiveness> {
+        peek_liveness_without_claims_lock(repo_path)?
+            .into_iter()
+            .find(|row| row.agent_id == agent_id)
+            .context("missing peeked liveness row")
+    }
+
+    #[test]
+    fn revalidation_guard_stays_sync_with_heartbeat_join_behind_mutex() {
+        fn assert_sync<T: Sync>() {}
+        fn assert_send<T: Send>() {}
+        assert_sync::<RevalidationGuard>();
+        assert_send::<HeldClaimsPersist>();
+        assert_send::<RevalidationGuard>();
+    }
+
+    #[test]
+    fn guard_owned_heartbeat_second_start_fails_and_stop_is_safe_twice() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let guard = fixture.guard()?;
+        guard.start_guard_owned_heartbeat()?;
+        let error = guard
+            .start_guard_owned_heartbeat()
+            .expect_err("second start must fail");
+        assert!(
+            matches!(error, RevalidationError::HeartbeatAlreadyStarted),
+            "unexpected second-start error: {error}"
+        );
+        guard.stop_guard_owned_heartbeat()?;
+        guard.stop_guard_owned_heartbeat()?;
+        Ok(())
+    }
+
+    #[test]
+    fn guard_owned_heartbeat_absent_lets_claim_go_stale_after_hold() -> Result<()> {
+        let fixture = Fixture::new_with_timing(ClaimTiming::new(1, 3)?)?;
+        let guard = fixture.guard()?;
+        std::thread::scope(|scope| {
+            scope.spawn(|| std::thread::sleep(Duration::from_secs(4)));
+        });
+        drop(guard);
+        let report = fixture.store.sweep_stale()?;
+        assert!(
+            report
+                .newly_takeover_eligible
+                .iter()
+                .any(|claim_id| claim_id == &format!("claim-{:020}", fixture.claim.token.get())),
+            "no-start hold must make the claim takeover-eligible, got {:?}",
+            report.newly_takeover_eligible
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn guard_owned_heartbeat_verify_ok_after_ticks_and_no_tick_without_start() -> Result<()> {
+        let fixture = Fixture::new_with_timing(ClaimTiming::new(1, 3)?)?;
+        let before = heartbeat_row_for_agent(&fixture.repo_path, "agent-a")?;
+        let guard = fixture.guard()?;
+        std::thread::sleep(Duration::from_secs(2));
+        let without_start = heartbeat_row_for_agent(&fixture.repo_path, "agent-a")?;
+        assert_eq!(
+            without_start.heartbeat_unix_seconds, before.heartbeat_unix_seconds,
+            "timestamps must not advance from this unit without start"
+        );
+        guard.start_guard_owned_heartbeat()?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let row = heartbeat_row_for_agent(&fixture.repo_path, "agent-a")?;
+            if row.heartbeat_unix_seconds > before.heartbeat_unix_seconds {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "worker did not advance heartbeat_unix_seconds (before={}, after={})",
+                    before.heartbeat_unix_seconds,
+                    row.heartbeat_unix_seconds
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        guard.verify()?;
+        guard.stop_guard_owned_heartbeat()?;
+        Ok(())
+    }
+
+    #[test]
+    fn guard_owned_heartbeat_busy_retry_does_not_kill_worker() -> Result<()> {
+        let fixture = Fixture::new_with_timing(ClaimTiming::new(1, 3)?)?;
+        let before = heartbeat_row_for_agent(&fixture.repo_path, "agent-a")?;
+        queue_heartbeat_persist_fault(&fixture.repo_path, HeartbeatPersistFault::Busy);
+        queue_heartbeat_persist_fault(&fixture.repo_path, HeartbeatPersistFault::Busy);
+        let guard = fixture.guard()?;
+        guard.start_guard_owned_heartbeat()?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            let row = heartbeat_row_for_agent(&fixture.repo_path, "agent-a")?;
+            if row.heartbeat_unix_seconds > before.heartbeat_unix_seconds {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("busy retry worker never persisted a heartbeat");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        guard.stop_guard_owned_heartbeat()?;
+        Ok(())
+    }
+
+    #[test]
+    fn guard_owned_heartbeat_stop_surfaces_persist_error() -> Result<()> {
+        let fixture = Fixture::new_with_timing(ClaimTiming::new(1, 3)?)?;
+        queue_heartbeat_persist_fault(
+            &fixture.repo_path,
+            HeartbeatPersistFault::Fatal("injected exact-owner persist failure"),
+        );
+        let guard = fixture.guard()?;
+        guard.start_guard_owned_heartbeat()?;
+        std::thread::sleep(Duration::from_secs(2));
+        let error = guard
+            .stop_guard_owned_heartbeat()
+            .expect_err("persist failure must fail stop");
+        let message = error.to_string();
+        assert!(
+            message.contains("injected exact-owner persist failure"),
+            "unexpected persist error: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn persist_exact_owner_heartbeat_under_held_lock_advances_and_preserves_identity() -> Result<()>
+    {
+        let fixture = Fixture::new_with_timing(ClaimTiming::new(1, 3)?)?;
+        let before = heartbeat_row_for_agent(&fixture.repo_path, "agent-a")?;
+        let guard = fixture.guard()?;
+        std::thread::sleep(Duration::from_secs(1));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("unix time")
+            .as_secs();
+        persist_exact_owner_heartbeat_under_held_lock(&guard.claims.persist_handle(), now)?;
+        let after = heartbeat_row_for_agent(&fixture.repo_path, "agent-a")?;
+        assert!(
+            after.heartbeat_unix_seconds > before.heartbeat_unix_seconds,
+            "held-lock persist must advance heartbeat_unix_seconds"
+        );
+        assert_eq!(after.token, fixture.claim.token);
+        assert_eq!(after.agent_id, "agent-a");
+        assert_eq!(after.paths, fixture.claim.paths);
+        assert_eq!(after.heartbeat_interval_seconds, 1);
+        assert_eq!(after.stale_after_seconds, 3);
+        assert!(after.takeover_eligible_since_unix_seconds.is_none());
+        assert_eq!(after.run_owner_count, 0);
+        guard.verify()?;
         Ok(())
     }
 
