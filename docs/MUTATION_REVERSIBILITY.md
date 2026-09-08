@@ -2,7 +2,7 @@
 
 ## Status and enforcement boundary
 
-This document defines version 4 of MACO's mutation taxonomy in
+This document defines version 5 of MACO's mutation taxonomy in
 `src/mutation_taxonomy.rs`. The policy is enforced at both autonomous child
 dispatch boundaries:
 
@@ -31,6 +31,13 @@ Version 4 adds Supervisor Codex catalog preflight as an irreversible spawn.
 Production callers issue a one-shot grant before the catalog builder; the
 authorized loader consumes that grant against the final ProcessSpec and does
 not treat `run_id` plus the caller repository as authority to spawn.
+
+Version 5 adds Inbox independent-audit and PR-intake Codex catalog preflight
+as a distinct irreversible spawn. Those callers issue an origin-tagged grant
+upstream of the authorized loader. A Supervisor catalog grant cannot authorize
+Inbox or PR-intake catalog, and an Inbox or PR-intake grant cannot authorize
+`for_supervisor`. The Supervisor grant, gate, and child-dispatch set are
+unchanged.
 
 The hook rows cover the independently owned worktree-guard integration without
 coupling this taxonomy port to the guard implementation files. Only a verified
@@ -136,6 +143,10 @@ Consequences of this rule:
 - `explicit-supervisor-catalog-codex-preflight-grant`: Supervisor Codex catalog
   preflight spawn requires an upstream one-shot grant that matches the final
   ProcessSpec; the catalog builder cannot mint that grant from run identity.
+- `explicit-inbox-pr-intake-catalog-codex-preflight-grant`: Inbox and PR-intake
+  Codex catalog preflight spawn requires an upstream one-shot grant whose
+  sealed origin and final ProcessSpec match; Supervisor catalog grants cannot
+  authorize those callers.
 
 ## Registry
 
@@ -179,3 +190,4 @@ Consequences of this rule:
 | `agent-process-stop` | Irreversible | Terminates a live process; restarting cannot restore its exact in-memory execution state. | `exact-agent-process-selector` |
 | `scope-event-append` | Irreversible | Emits durable observability history whose removal would destroy audit evidence and whose consumers cannot be rewound. | `bounded-external-scope-event-api` |
 | `supervisor-catalog-codex-preflight` | Irreversible | Spawns a trusted Codex catalog probe whose process, network, and captured output cannot be restored from retained MACO state. | `explicit-supervisor-catalog-codex-preflight-grant` |
+| `inbox-pr-intake-catalog-codex-preflight` | Irreversible | Spawns a trusted Codex catalog probe for Inbox independent-audit or PR-intake whose process, network, and captured output cannot be restored from retained MACO state. | `explicit-inbox-pr-intake-catalog-codex-preflight-grant` |
