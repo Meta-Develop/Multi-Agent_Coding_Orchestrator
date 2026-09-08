@@ -6,7 +6,7 @@
 //! remains independently required.
 
 use std::collections::HashSet;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,7 +21,10 @@ use std::sync::{LazyLock, Mutex};
 /// admitted only by an upstream one-shot grant bound to the final ProcessSpec.
 /// Version 5 adds Inbox/PR-intake Codex catalog preflight as a distinct
 /// irreversible spawn with its own explicit gate and sealed origin.
-pub const MUTATION_TAXONOMY_VERSION: u32 = 5;
+/// Version 6 adds assignment-child and parent-auditor process launch as a
+/// distinct irreversible spawn admitted only by an upstream one-shot sibling
+/// grant bound to the final ProcessSpec.
+pub const MUTATION_TAXONOMY_VERSION: u32 = 6;
 
 /// Gate identity returned for an unlisted, empty, or internally inconsistent row.
 pub const TAXONOMY_REVIEW_REQUIRED_GATE_ID: &str = "taxonomy-review-required";
@@ -68,6 +71,7 @@ pub enum ExplicitMutationGate {
     BoundedExternalScopeEventApi,
     ExplicitSupervisorCatalogCodexPreflightGrant,
     ExplicitInboxPrIntakeCatalogCodexPreflightGrant,
+    ExplicitAssignmentParentAuditorProcessLaunchGrant,
 }
 
 impl ExplicitMutationGate {
@@ -98,6 +102,9 @@ impl ExplicitMutationGate {
             }
             Self::ExplicitInboxPrIntakeCatalogCodexPreflightGrant => {
                 "explicit-inbox-pr-intake-catalog-codex-preflight-grant"
+            }
+            Self::ExplicitAssignmentParentAuditorProcessLaunchGrant => {
+                "explicit-assignment-parent-auditor-process-launch-grant"
             }
         }
     }
@@ -145,11 +152,12 @@ pub enum MutationOperation {
     ScopeEventAppend,
     SupervisorCatalogCodexPreflight,
     InboxPrIntakeCatalogCodexPreflight,
+    AssignmentParentAuditorProcessLaunch,
 }
 
 impl MutationOperation {
     /// Complete enum inventory, kept explicit so additions cannot evade tests.
-    pub const ALL: [Self; 39] = [
+    pub const ALL: [Self; 40] = [
         Self::RepositoryInitialize,
         Self::MegafileTelemetrySeed,
         Self::StateMigrationPreview,
@@ -189,6 +197,7 @@ impl MutationOperation {
         Self::ScopeEventAppend,
         Self::SupervisorCatalogCodexPreflight,
         Self::InboxPrIntakeCatalogCodexPreflight,
+        Self::AssignmentParentAuditorProcessLaunch,
     ];
 
     /// Stable identifier used for lookup, policy rows, and gate evidence.
@@ -233,6 +242,9 @@ impl MutationOperation {
             Self::ScopeEventAppend => "scope-event-append",
             Self::SupervisorCatalogCodexPreflight => "supervisor-catalog-codex-preflight",
             Self::InboxPrIntakeCatalogCodexPreflight => "inbox-pr-intake-catalog-codex-preflight",
+            Self::AssignmentParentAuditorProcessLaunch => {
+                "assignment-parent-auditor-process-launch"
+            }
         }
     }
 
@@ -466,6 +478,11 @@ const ENTRIES: &[MutationClassification] = &[
         MutationOperation::InboxPrIntakeCatalogCodexPreflight,
         "Spawns a trusted Codex catalog probe for Inbox independent-audit or PR-intake whose process, network, and captured output cannot be restored from retained MACO state.",
         ExplicitMutationGate::ExplicitInboxPrIntakeCatalogCodexPreflightGrant,
+    ),
+    irreversible(
+        MutationOperation::AssignmentParentAuditorProcessLaunch,
+        "Spawns a trusted assignment-child or parent-auditor process whose process, network, and captured output cannot be restored from retained MACO state.",
+        ExplicitMutationGate::ExplicitAssignmentParentAuditorProcessLaunchGrant,
     ),
 ];
 
@@ -916,6 +933,401 @@ impl SupervisorCatalogCodexPreflightGrant {
     }
 }
 
+/// Launch kind sealed into an assignment-child / parent-auditor process grant.
+///
+/// Distinct from `CatalogPreflightOrigin`. Catalog grants cannot bind these
+/// worker or auditor argv surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AssignmentProcessLaunchKind {
+    AssignmentChild,
+    ParentAuditor,
+}
+
+/// Expected executable binding sealed into an assignment process-launch grant.
+///
+/// Production issuance records only the trusted path spelling `codex`. The
+/// runtime must refine that intent with an independently verified canonical
+/// program (and its parent) plus the final argv and output staging path before
+/// `ProcessSpec` construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AssignmentProcessExpectedProgram {
+    TrustedSpelling,
+    IndependentlyVerifiedCanonical { program: PathBuf, parent: PathBuf },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssignmentProcessSealedDelivery {
+    argv: Vec<OsString>,
+    output_staging: PathBuf,
+    cwd: PathBuf,
+}
+
+/// One-shot grant that admits an assignment-child or parent-auditor spawn
+/// against a fully built `ProcessSpec`.
+///
+/// The issuer is the trusted caller (`admit_assignment_child_process_intent` /
+/// `admit_parent_auditor_process_intent`), not the external-agent sink. The
+/// sink must not mint this grant from `run_id` plus the caller repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub(crate) struct AssignmentProcessLaunchGrant {
+    nonce: u64,
+    run_id: String,
+    subject: String,
+    attempt: usize,
+    kind: AssignmentProcessLaunchKind,
+    expected_program: AssignmentProcessExpectedProgram,
+    model: Option<String>,
+    duty: String,
+    sealed_delivery: Option<AssignmentProcessSealedDelivery>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AssignmentProcessLaunchGrantError {
+    UntrustedExpectedProgram,
+    MissingGrant,
+    AlreadyConsumed,
+    ProgramMismatch,
+    CurrentDirMismatch,
+    ArgvMismatch,
+    OutputStagingMismatch,
+    KindMismatch,
+    IdentityMismatch,
+}
+
+impl AssignmentProcessLaunchGrantError {
+    pub(crate) const fn cause_id(self) -> &'static str {
+        match self {
+            Self::UntrustedExpectedProgram => "untrusted_assignment_process_launch_program",
+            Self::MissingGrant => "assignment_process_launch_grant_missing",
+            Self::AlreadyConsumed => "assignment_process_launch_grant_consumed",
+            Self::ProgramMismatch
+            | Self::CurrentDirMismatch
+            | Self::ArgvMismatch
+            | Self::OutputStagingMismatch => "assignment_process_launch_grant_mismatch",
+            Self::KindMismatch => "assignment_process_launch_grant_kind_mismatch",
+            Self::IdentityMismatch => "assignment_process_launch_grant_identity_mismatch",
+        }
+    }
+}
+
+impl fmt::Display for AssignmentProcessLaunchGrantError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.cause_id())
+    }
+}
+
+impl std::error::Error for AssignmentProcessLaunchGrantError {}
+
+static NEXT_ASSIGNMENT_PROCESS_LAUNCH_NONCE: AtomicU64 = AtomicU64::new(1);
+static CONSUMED_ASSIGNMENT_PROCESS_LAUNCH_NONCES: LazyLock<Mutex<HashSet<u64>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+const TRUSTED_ASSIGNMENT_PROCESS_CODEX_PROGRAM: &str = "codex";
+pub(crate) const ASSIGNMENT_CHILD_PROCESS_DUTY: &str = "assignment-child";
+pub(crate) const PARENT_AUDITOR_PROCESS_DUTY: &str = "parent-auditor";
+
+impl AssignmentProcessLaunchGrant {
+    fn admit(
+        run_id: &str,
+        subject: &str,
+        attempt: usize,
+        kind: AssignmentProcessLaunchKind,
+        expected_program: &Path,
+        model: Option<&str>,
+        duty: &str,
+    ) -> Result<Self, AssignmentProcessLaunchGrantError> {
+        if expected_program != Path::new(TRUSTED_ASSIGNMENT_PROCESS_CODEX_PROGRAM) {
+            return Err(AssignmentProcessLaunchGrantError::UntrustedExpectedProgram);
+        }
+        Ok(Self {
+            nonce: NEXT_ASSIGNMENT_PROCESS_LAUNCH_NONCE.fetch_add(1, Ordering::Relaxed),
+            run_id: run_id.to_string(),
+            subject: subject.to_string(),
+            attempt,
+            kind,
+            expected_program: AssignmentProcessExpectedProgram::TrustedSpelling,
+            model: model.map(str::to_string),
+            duty: duty.to_string(),
+            sealed_delivery: None,
+        })
+    }
+
+    pub(crate) fn kind(&self) -> AssignmentProcessLaunchKind {
+        self.kind
+    }
+
+    pub(crate) fn attempt(&self) -> usize {
+        self.attempt
+    }
+
+    pub(crate) fn duty(&self) -> &str {
+        &self.duty
+    }
+
+    pub(crate) fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub(crate) fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    pub(crate) fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn independently_verified_canonical_program(&self) -> Option<&Path> {
+        match &self.expected_program {
+            AssignmentProcessExpectedProgram::IndependentlyVerifiedCanonical {
+                program, ..
+            } => Some(program),
+            AssignmentProcessExpectedProgram::TrustedSpelling => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn independently_verified_canonical_parent(&self) -> Option<&Path> {
+        match &self.expected_program {
+            AssignmentProcessExpectedProgram::IndependentlyVerifiedCanonical { parent, .. } => {
+                Some(parent)
+            }
+            AssignmentProcessExpectedProgram::TrustedSpelling => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_independently_verified_canonical_parent_for_test(
+        mut self,
+        parent: PathBuf,
+    ) -> Self {
+        if let AssignmentProcessExpectedProgram::IndependentlyVerifiedCanonical {
+            parent: expected_parent,
+            ..
+        } = &mut self.expected_program
+        {
+            *expected_parent = parent;
+        }
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seal_independently_verified_canonical_program_for_test(
+        self,
+        independently_verified_canonical_program: &Path,
+    ) -> Result<Self, AssignmentProcessLaunchGrantError> {
+        if !matches!(
+            self.expected_program,
+            AssignmentProcessExpectedProgram::TrustedSpelling
+        ) {
+            return Err(AssignmentProcessLaunchGrantError::ProgramMismatch);
+        }
+        if independently_verified_canonical_program
+            == Path::new(TRUSTED_ASSIGNMENT_PROCESS_CODEX_PROGRAM)
+        {
+            return Err(AssignmentProcessLaunchGrantError::ProgramMismatch);
+        }
+        let Some(parent) = independently_verified_canonical_program.parent() else {
+            return Err(AssignmentProcessLaunchGrantError::CurrentDirMismatch);
+        };
+        if parent.as_os_str().is_empty() {
+            return Err(AssignmentProcessLaunchGrantError::CurrentDirMismatch);
+        }
+        Ok(Self {
+            expected_program: AssignmentProcessExpectedProgram::IndependentlyVerifiedCanonical {
+                program: independently_verified_canonical_program.to_path_buf(),
+                parent: parent.to_path_buf(),
+            },
+            ..self
+        })
+    }
+
+    /// Refine admitted trusted spelling `codex` with an independently verified
+    /// canonical program, final argv, output staging path, and ProcessSpec cwd.
+    ///
+    /// Already-sealed program bindings are retained so a later substituted
+    /// program cannot overwrite the independently verified canonical. Delivery
+    /// fields are sealed once.
+    pub(crate) fn seal_independently_verified_canonical_binding<A: AsRef<OsStr>>(
+        self,
+        independently_verified_canonical_program: &Path,
+        argv: impl IntoIterator<Item = A>,
+        output_staging: &Path,
+        cwd: &Path,
+    ) -> Result<Self, AssignmentProcessLaunchGrantError> {
+        let expected_program = match &self.expected_program {
+            AssignmentProcessExpectedProgram::TrustedSpelling => {
+                if independently_verified_canonical_program
+                    == Path::new(TRUSTED_ASSIGNMENT_PROCESS_CODEX_PROGRAM)
+                {
+                    return Err(AssignmentProcessLaunchGrantError::ProgramMismatch);
+                }
+                let Some(parent) = independently_verified_canonical_program.parent() else {
+                    return Err(AssignmentProcessLaunchGrantError::CurrentDirMismatch);
+                };
+                if parent.as_os_str().is_empty() {
+                    return Err(AssignmentProcessLaunchGrantError::CurrentDirMismatch);
+                }
+                AssignmentProcessExpectedProgram::IndependentlyVerifiedCanonical {
+                    program: independently_verified_canonical_program.to_path_buf(),
+                    parent: parent.to_path_buf(),
+                }
+            }
+            AssignmentProcessExpectedProgram::IndependentlyVerifiedCanonical {
+                program, ..
+            } => {
+                if independently_verified_canonical_program != program {
+                    return Err(AssignmentProcessLaunchGrantError::ProgramMismatch);
+                }
+                self.expected_program.clone()
+            }
+        };
+        if let Some(delivery) = self.sealed_delivery.clone() {
+            // Delivery is sealed once. Retain it so consume exact-matches the
+            // independently verified staging/argv/cwd against the final spec.
+            return Ok(Self {
+                expected_program,
+                sealed_delivery: Some(delivery),
+                ..self
+            });
+        }
+        if cwd.as_os_str().is_empty() || output_staging.as_os_str().is_empty() {
+            return Err(AssignmentProcessLaunchGrantError::CurrentDirMismatch);
+        }
+        Ok(Self {
+            expected_program,
+            sealed_delivery: Some(AssignmentProcessSealedDelivery {
+                argv: argv
+                    .into_iter()
+                    .map(|argument| argument.as_ref().to_os_string())
+                    .collect(),
+                output_staging: output_staging.to_path_buf(),
+                cwd: cwd.to_path_buf(),
+            }),
+            ..self
+        })
+    }
+
+    /// Consume this one-shot grant against the final process binding.
+    ///
+    /// Exact-matches sealed canonical program, ProcessSpec cwd, argv, output
+    /// staging, launch kind, run_id, subject, attempt, model, and duty. Does
+    /// not accept a basename-only `codex` match and does not rederive the
+    /// expected program from the supplied final program.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn consume_for_process_binding<A: AsRef<OsStr>>(
+        self,
+        program: &Path,
+        current_dir: &Path,
+        argv: &[A],
+        output_staging: &Path,
+        run_id: &str,
+        subject: &str,
+        attempt: usize,
+        kind: AssignmentProcessLaunchKind,
+        model: Option<&str>,
+        duty: &str,
+    ) -> Result<(), AssignmentProcessLaunchGrantError> {
+        let mut consumed = CONSUMED_ASSIGNMENT_PROCESS_LAUNCH_NONCES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !consumed.insert(self.nonce) {
+            return Err(AssignmentProcessLaunchGrantError::AlreadyConsumed);
+        }
+        drop(consumed);
+
+        if self.kind != kind {
+            return Err(AssignmentProcessLaunchGrantError::KindMismatch);
+        }
+        if self.run_id != run_id
+            || self.subject != subject
+            || self.attempt != attempt
+            || self.model.as_deref() != model
+            || self.duty != duty
+        {
+            return Err(AssignmentProcessLaunchGrantError::IdentityMismatch);
+        }
+
+        let AssignmentProcessExpectedProgram::IndependentlyVerifiedCanonical {
+            program: expected_program,
+            parent: expected_parent,
+        } = &self.expected_program
+        else {
+            return Err(AssignmentProcessLaunchGrantError::ProgramMismatch);
+        };
+        let Some(delivery) = &self.sealed_delivery else {
+            return Err(AssignmentProcessLaunchGrantError::ProgramMismatch);
+        };
+        if program != expected_program {
+            return Err(AssignmentProcessLaunchGrantError::ProgramMismatch);
+        }
+        // Parent is a component of the independently verified canonical program
+        // path. ProcessSpec cwd is sealed delivery.cwd, not this parent field.
+        if program.parent() != Some(expected_parent.as_path()) {
+            return Err(AssignmentProcessLaunchGrantError::ProgramMismatch);
+        }
+        if current_dir != delivery.cwd.as_path() {
+            return Err(AssignmentProcessLaunchGrantError::CurrentDirMismatch);
+        }
+        if output_staging != delivery.output_staging.as_path() {
+            return Err(AssignmentProcessLaunchGrantError::OutputStagingMismatch);
+        }
+        if argv.len() != delivery.argv.len()
+            || argv
+                .iter()
+                .zip(delivery.argv.iter())
+                .any(|(actual, expected)| actual.as_ref() != expected.as_os_str())
+        {
+            return Err(AssignmentProcessLaunchGrantError::ArgvMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Trusted assignment-child issuer. Encodes run identity, subject, attempt,
+/// kind, trusted program spelling `codex`, model, and duty. Does not mint a
+/// grant from `run_id` plus a repository path.
+pub(crate) fn admit_assignment_child_process_intent(
+    run_id: &str,
+    subject: &str,
+    attempt: usize,
+    expected_program: &Path,
+    model: Option<&str>,
+    duty: &str,
+) -> Result<AssignmentProcessLaunchGrant, AssignmentProcessLaunchGrantError> {
+    AssignmentProcessLaunchGrant::admit(
+        run_id,
+        subject,
+        attempt,
+        AssignmentProcessLaunchKind::AssignmentChild,
+        expected_program,
+        model,
+        duty,
+    )
+}
+
+/// Trusted parent-auditor issuer. Distinct kind from assignment-child; shares
+/// the assignment process-launch nonce ledger, not the catalog ledger.
+pub(crate) fn admit_parent_auditor_process_intent(
+    run_id: &str,
+    subject: &str,
+    attempt: usize,
+    expected_program: &Path,
+    model: Option<&str>,
+    duty: &str,
+) -> Result<AssignmentProcessLaunchGrant, AssignmentProcessLaunchGrantError> {
+    AssignmentProcessLaunchGrant::admit(
+        run_id,
+        subject,
+        attempt,
+        AssignmentProcessLaunchKind::ParentAuditor,
+        expected_program,
+        model,
+        duty,
+    )
+}
+
 #[cfg(test)]
 thread_local! {
     static AUTOPILOT_DISPATCH_DECISION_OVERRIDES: std::cell::RefCell<Option<std::collections::VecDeque<AutonomousMutationDecision>>> =
@@ -976,7 +1388,7 @@ mod tests {
     #[test]
     fn registry_is_current_complete_and_unique() {
         assert_eq!(registry().version, MUTATION_TAXONOMY_VERSION);
-        assert_eq!(registry().version, 5);
+        assert_eq!(registry().version, 6);
         assert_eq!(registry().entries.len(), MutationOperation::ALL.len());
 
         let registered = registry()
@@ -1038,7 +1450,7 @@ mod tests {
             .filter(|entry| entry.reversibility == MutationReversibility::Reversible)
             .count();
         assert_eq!(reversible, 15);
-        assert_eq!(registry().entries.len() - reversible, 24);
+        assert_eq!(registry().entries.len() - reversible, 25);
         assert_eq!(
             SUPERVISOR_CHILD_DISPATCH_MUTATIONS,
             [
@@ -1768,6 +2180,563 @@ mod tests {
         assert_eq!(
             pr_intake_error,
             SupervisorCatalogCodexPreflightGrantError::UntrustedExpectedProgram
+        );
+    }
+
+    struct AssignmentProcessGrantFixture<'a> {
+        run_id: &'a str,
+        subject: &'a str,
+        attempt: usize,
+        model: Option<&'a str>,
+        duty: &'a str,
+        program: &'a Path,
+        argv: &'a [&'a str],
+        output_staging: &'a Path,
+        cwd: &'a Path,
+    }
+
+    impl AssignmentProcessGrantFixture<'_> {
+        fn admit_child(self) -> AssignmentProcessLaunchGrant {
+            admit_assignment_child_process_intent(
+                self.run_id,
+                self.subject,
+                self.attempt,
+                Path::new("codex"),
+                self.model,
+                self.duty,
+            )
+            .expect("trusted codex spelling must admit")
+            .seal_independently_verified_canonical_binding(
+                self.program,
+                self.argv.iter().copied(),
+                self.output_staging,
+                self.cwd,
+            )
+            .expect("independently verified canonical must seal")
+        }
+
+        fn admit_auditor(self) -> AssignmentProcessLaunchGrant {
+            admit_parent_auditor_process_intent(
+                self.run_id,
+                self.subject,
+                self.attempt,
+                Path::new("codex"),
+                self.model,
+                self.duty,
+            )
+            .expect("trusted codex spelling must admit")
+            .seal_independently_verified_canonical_binding(
+                self.program,
+                self.argv.iter().copied(),
+                self.output_staging,
+                self.cwd,
+            )
+            .expect("independently verified canonical must seal")
+        }
+    }
+
+    #[test]
+    fn assignment_parent_auditor_process_launch_is_irreversible_and_not_child_dispatch() {
+        assert!(!SUPERVISOR_CHILD_DISPATCH_MUTATIONS
+            .contains(&MutationOperation::AssignmentParentAuditorProcessLaunch));
+        assert_eq!(
+            autonomous_decision_for(MutationOperation::AssignmentParentAuditorProcessLaunch.id()),
+            AutonomousMutationDecision::RequireExplicitGate(
+                ExplicitMutationGate::ExplicitAssignmentParentAuditorProcessLaunchGrant
+            )
+        );
+        assert_ne!(
+            ExplicitMutationGate::ExplicitAssignmentParentAuditorProcessLaunchGrant,
+            ExplicitMutationGate::InternalSealedPinnedExecCapability
+        );
+        assert_ne!(
+            ExplicitMutationGate::ExplicitAssignmentParentAuditorProcessLaunchGrant,
+            ExplicitMutationGate::ExplicitSupervisorCatalogCodexPreflightGrant
+        );
+        assert_ne!(
+            ExplicitMutationGate::ExplicitAssignmentParentAuditorProcessLaunchGrant,
+            ExplicitMutationGate::ExplicitInboxPrIntakeCatalogCodexPreflightGrant
+        );
+        assert_ne!(
+            MutationOperation::AssignmentParentAuditorProcessLaunch,
+            MutationOperation::SupervisorCatalogCodexPreflight
+        );
+        assert_ne!(
+            MutationOperation::AssignmentParentAuditorProcessLaunch,
+            MutationOperation::InboxPrIntakeCatalogCodexPreflight
+        );
+    }
+
+    #[test]
+    fn assignment_process_grant_consumes_once_against_final_spec_identity() {
+        use crate::process_runner::{ProcessCommand, ProcessSpec};
+
+        let program = Path::new("/usr/bin/codex");
+        let cwd = Path::new("/worktrees/assignment-child");
+        let staging = Path::new("/run/maco/output/last-message.raw");
+        let argv = ["exec", "--sandbox", "workspace-write"];
+        let spec = ProcessSpec::direct("assignment child binding", program, argv, cwd, 64);
+        let ProcessCommand::Direct {
+            program: spec_program,
+            args: spec_argv,
+        } = &spec.command
+        else {
+            panic!("direct assignment spec must remain a direct command");
+        };
+
+        let grant = AssignmentProcessGrantFixture {
+            run_id: "run-assignment-1",
+            subject: "assignment-a",
+            attempt: 1,
+            model: Some("gpt-5.4"),
+            duty: "worker-duty",
+            program,
+            argv: &argv,
+            output_staging: staging,
+            cwd,
+        }
+        .admit_child();
+        assert_eq!(grant.run_id(), "run-assignment-1");
+        assert_eq!(grant.subject(), "assignment-a");
+        assert_eq!(grant.attempt(), 1);
+        assert_eq!(grant.kind(), AssignmentProcessLaunchKind::AssignmentChild);
+        assert_eq!(
+            grant.independently_verified_canonical_program(),
+            Some(program)
+        );
+        grant
+            .clone()
+            .consume_for_process_binding(
+                spec_program,
+                &spec.current_dir,
+                spec_argv,
+                staging,
+                "run-assignment-1",
+                "assignment-a",
+                1,
+                AssignmentProcessLaunchKind::AssignmentChild,
+                Some("gpt-5.4"),
+                "worker-duty",
+            )
+            .expect("matching assignment-child grant must consume once");
+        assert_eq!(
+            grant.consume_for_process_binding(
+                spec_program,
+                &spec.current_dir,
+                spec_argv,
+                staging,
+                "run-assignment-1",
+                "assignment-a",
+                1,
+                AssignmentProcessLaunchKind::AssignmentChild,
+                Some("gpt-5.4"),
+                "worker-duty",
+            ),
+            Err(AssignmentProcessLaunchGrantError::AlreadyConsumed)
+        );
+    }
+
+    #[test]
+    fn assignment_process_grant_rejects_wrong_kind_and_identity() {
+        use crate::process_runner::{ProcessCommand, ProcessSpec};
+
+        let program = Path::new("/usr/bin/codex");
+        let cwd = Path::new("/worktrees/assignment-child");
+        let staging = Path::new("/run/maco/output/last-message.raw");
+        let argv = ["exec"];
+        let spec = ProcessSpec::direct("assignment identity", program, argv, cwd, 64);
+        let ProcessCommand::Direct {
+            program: spec_program,
+            args: spec_argv,
+        } = &spec.command
+        else {
+            panic!("direct assignment spec must remain a direct command");
+        };
+        let bind =
+            |run_id: &str, subject: &str, attempt: usize, model: Option<&str>, duty: &str| {
+                AssignmentProcessGrantFixture {
+                    run_id,
+                    subject,
+                    attempt,
+                    model,
+                    duty,
+                    program,
+                    argv: &argv,
+                    output_staging: staging,
+                    cwd,
+                }
+                .admit_child()
+            };
+        assert_eq!(
+            bind(
+                "run-assignment-kind",
+                "assignment-a",
+                2,
+                Some("gpt-5.4"),
+                "worker-duty"
+            )
+            .consume_for_process_binding(
+                spec_program,
+                &spec.current_dir,
+                spec_argv,
+                staging,
+                "run-assignment-kind",
+                "assignment-a",
+                2,
+                AssignmentProcessLaunchKind::ParentAuditor,
+                Some("gpt-5.4"),
+                "worker-duty",
+            ),
+            Err(AssignmentProcessLaunchGrantError::KindMismatch)
+        );
+        assert_eq!(
+            bind(
+                "run-assignment-kind",
+                "assignment-a",
+                2,
+                Some("gpt-5.4"),
+                "worker-duty"
+            )
+            .consume_for_process_binding(
+                spec_program,
+                &spec.current_dir,
+                spec_argv,
+                staging,
+                "run-other",
+                "assignment-a",
+                2,
+                AssignmentProcessLaunchKind::AssignmentChild,
+                Some("gpt-5.4"),
+                "worker-duty",
+            ),
+            Err(AssignmentProcessLaunchGrantError::IdentityMismatch)
+        );
+        assert_eq!(
+            bind(
+                "run-assignment-kind",
+                "assignment-a",
+                2,
+                Some("gpt-5.4"),
+                "worker-duty"
+            )
+            .consume_for_process_binding(
+                spec_program,
+                &spec.current_dir,
+                spec_argv,
+                staging,
+                "run-assignment-kind",
+                "assignment-b",
+                2,
+                AssignmentProcessLaunchKind::AssignmentChild,
+                Some("gpt-5.4"),
+                "worker-duty",
+            ),
+            Err(AssignmentProcessLaunchGrantError::IdentityMismatch)
+        );
+        assert_eq!(
+            bind(
+                "run-assignment-kind",
+                "assignment-a",
+                2,
+                Some("gpt-5.4"),
+                "worker-duty"
+            )
+            .consume_for_process_binding(
+                spec_program,
+                &spec.current_dir,
+                spec_argv,
+                staging,
+                "run-assignment-kind",
+                "assignment-a",
+                9,
+                AssignmentProcessLaunchKind::AssignmentChild,
+                Some("gpt-5.4"),
+                "worker-duty",
+            ),
+            Err(AssignmentProcessLaunchGrantError::IdentityMismatch)
+        );
+        assert_eq!(
+            bind(
+                "run-assignment-kind",
+                "assignment-a",
+                2,
+                Some("gpt-5.4"),
+                "worker-duty"
+            )
+            .consume_for_process_binding(
+                spec_program,
+                &spec.current_dir,
+                spec_argv,
+                staging,
+                "run-assignment-kind",
+                "assignment-a",
+                2,
+                AssignmentProcessLaunchKind::AssignmentChild,
+                Some("other-model"),
+                "worker-duty",
+            ),
+            Err(AssignmentProcessLaunchGrantError::IdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn catalog_preflight_grant_cannot_consume_as_assignment_process_worker() {
+        use crate::process_runner::{ProcessCommand, ProcessSpec};
+
+        let program = Path::new("/usr/bin/codex");
+        let worker_argv = ["exec", "--sandbox", "workspace-write"];
+        let spec = ProcessSpec::direct(
+            "catalog grant cannot bind worker argv",
+            program,
+            worker_argv,
+            Path::new("/worktrees/assignment-child"),
+            64,
+        );
+        let ProcessCommand::Direct {
+            program: spec_program,
+            args: spec_argv,
+        } = &spec.command
+        else {
+            panic!("direct spec must remain a direct command");
+        };
+        let grant = SupervisorCatalogCodexPreflightGrant::admit_from_supervisor_catalog_intent(
+            "run-catalog-as-worker",
+            Path::new("/repos/caller-worktree"),
+            Path::new("codex"),
+        )
+        .expect("trusted codex spelling must admit")
+        .seal_independently_verified_canonical_binding(program)
+        .expect("independently verified canonical must seal");
+        assert_eq!(
+            grant.consume_for_process_binding(
+                spec_program,
+                &spec.current_dir,
+                spec_argv,
+                CatalogPreflightOrigin::Supervisor,
+            ),
+            Err(SupervisorCatalogCodexPreflightGrantError::ArgvMismatch)
+        );
+    }
+
+    #[test]
+    fn assignment_process_grant_rejects_same_basename_tmp_codex_and_untrusted_spelling() {
+        use crate::process_runner::{ProcessCommand, ProcessSpec};
+
+        let independently_verified_canonical = Path::new("/usr/bin/codex");
+        let wrong_program = Path::new("/tmp/codex");
+        let cwd = Path::new("/worktrees/assignment-child");
+        let staging = Path::new("/run/maco/output/last-message.raw");
+        let argv = ["exec"];
+        assert_eq!(
+            wrong_program.file_name(),
+            independently_verified_canonical.file_name()
+        );
+        assert_ne!(wrong_program, independently_verified_canonical);
+        let spec = ProcessSpec::direct(
+            "assignment process same-basename wrong program",
+            wrong_program,
+            argv,
+            cwd,
+            64,
+        );
+        let ProcessCommand::Direct {
+            program: spec_program,
+            args: spec_argv,
+        } = &spec.command
+        else {
+            panic!("direct assignment spec must remain a direct command");
+        };
+        let grant = AssignmentProcessGrantFixture {
+            run_id: "run-assignment-tmp-codex",
+            subject: "assignment-a",
+            attempt: 1,
+            model: None,
+            duty: "worker-duty",
+            program: independently_verified_canonical,
+            argv: &argv,
+            output_staging: staging,
+            cwd,
+        }
+        .admit_child();
+        assert_eq!(
+            grant.consume_for_process_binding(
+                spec_program,
+                &spec.current_dir,
+                spec_argv,
+                staging,
+                "run-assignment-tmp-codex",
+                "assignment-a",
+                1,
+                AssignmentProcessLaunchKind::AssignmentChild,
+                None,
+                "worker-duty",
+            ),
+            Err(AssignmentProcessLaunchGrantError::ProgramMismatch)
+        );
+        assert_eq!(
+            admit_assignment_child_process_intent(
+                "run-assignment-untrusted",
+                "assignment-a",
+                1,
+                Path::new("/tmp/untrusted-custom-codex"),
+                None,
+                "worker-duty",
+            )
+            .expect_err("production issuer must refuse non-codex spelling"),
+            AssignmentProcessLaunchGrantError::UntrustedExpectedProgram
+        );
+        assert_eq!(
+            admit_parent_auditor_process_intent(
+                "run-auditor-untrusted",
+                "auditor-a",
+                1,
+                Path::new("/tmp/untrusted-custom-codex"),
+                None,
+                "auditor-duty",
+            )
+            .expect_err("parent-auditor issuer must refuse non-codex spelling"),
+            AssignmentProcessLaunchGrantError::UntrustedExpectedProgram
+        );
+    }
+
+    #[test]
+    fn assignment_process_grant_consumes_sealed_canonical_with_non_codex_filename() {
+        use crate::process_runner::{ProcessCommand, ProcessSpec};
+
+        let independently_verified_canonical = Path::new("/opt/codex-lib/codex.js");
+        let sealed_parent = Path::new("/opt/codex-lib");
+        let cwd = Path::new("/worktrees/assignment-child");
+        let staging = Path::new("/run/maco/output/last-message.raw");
+        let argv = ["exec", "--json"];
+        assert_ne!(
+            independently_verified_canonical.file_name(),
+            Some(OsStr::new("codex"))
+        );
+        assert_eq!(
+            independently_verified_canonical.parent(),
+            Some(sealed_parent)
+        );
+        let spec = ProcessSpec::direct(
+            "assignment process non-codex canonical filename",
+            independently_verified_canonical,
+            argv,
+            cwd,
+            64,
+        );
+        let ProcessCommand::Direct {
+            program: spec_program,
+            args: spec_argv,
+        } = &spec.command
+        else {
+            panic!("direct assignment spec must remain a direct command");
+        };
+        let grant = AssignmentProcessGrantFixture {
+            run_id: "run-auditor-codex-js",
+            subject: "auditor-a",
+            attempt: 3,
+            model: Some("o4-mini"),
+            duty: "parent-auditor-duty",
+            program: independently_verified_canonical,
+            argv: &argv,
+            output_staging: staging,
+            cwd,
+        }
+        .admit_auditor();
+        assert_eq!(
+            grant.independently_verified_canonical_parent(),
+            Some(sealed_parent)
+        );
+        grant
+            .consume_for_process_binding(
+                spec_program,
+                &spec.current_dir,
+                spec_argv,
+                staging,
+                "run-auditor-codex-js",
+                "auditor-a",
+                3,
+                AssignmentProcessLaunchKind::ParentAuditor,
+                Some("o4-mini"),
+                "parent-auditor-duty",
+            )
+            .expect("sealed non-codex canonical filename must consume when spec matches");
+    }
+
+    #[test]
+    fn assignment_process_grant_rejects_staging_and_canonical_parent_mismatch() {
+        use crate::process_runner::{ProcessCommand, ProcessSpec};
+
+        let program = Path::new("/usr/bin/codex");
+        let cwd = Path::new("/worktrees/assignment-child");
+        let staging = Path::new("/run/maco/output/last-message.raw");
+        let argv = ["exec"];
+        let spec = ProcessSpec::direct("assignment staging parent", program, argv, cwd, 64);
+        let ProcessCommand::Direct {
+            program: spec_program,
+            args: spec_argv,
+        } = &spec.command
+        else {
+            panic!("direct assignment spec must remain a direct command");
+        };
+        let grant = AssignmentProcessGrantFixture {
+            run_id: "run-assignment-staging",
+            subject: "assignment-a",
+            attempt: 1,
+            model: None,
+            duty: "worker-duty",
+            program,
+            argv: &argv,
+            output_staging: staging,
+            cwd,
+        }
+        .admit_child();
+        assert_eq!(
+            grant.consume_for_process_binding(
+                spec_program,
+                &spec.current_dir,
+                spec_argv,
+                Path::new("/run/maco/output/other-staging.raw"),
+                "run-assignment-staging",
+                "assignment-a",
+                1,
+                AssignmentProcessLaunchKind::AssignmentChild,
+                None,
+                "worker-duty",
+            ),
+            Err(AssignmentProcessLaunchGrantError::OutputStagingMismatch)
+        );
+
+        let grant = AssignmentProcessGrantFixture {
+            run_id: "run-assignment-parent",
+            subject: "assignment-a",
+            attempt: 1,
+            model: None,
+            duty: "worker-duty",
+            program,
+            argv: &argv,
+            output_staging: staging,
+            cwd,
+        }
+        .admit_child()
+        .with_independently_verified_canonical_parent_for_test(PathBuf::from("/tmp"));
+        assert_eq!(
+            grant.independently_verified_canonical_parent(),
+            Some(Path::new("/tmp"))
+        );
+        assert_eq!(
+            grant.consume_for_process_binding(
+                spec_program,
+                &spec.current_dir,
+                spec_argv,
+                staging,
+                "run-assignment-parent",
+                "assignment-a",
+                1,
+                AssignmentProcessLaunchKind::AssignmentChild,
+                None,
+                "worker-duty",
+            ),
+            Err(AssignmentProcessLaunchGrantError::ProgramMismatch)
         );
     }
 }

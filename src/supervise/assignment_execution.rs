@@ -1,4 +1,8 @@
 use super::*;
+use crate::mutation_taxonomy::{
+    admit_assignment_child_process_intent, admit_parent_auditor_process_intent,
+    AssignmentProcessLaunchKind, ASSIGNMENT_CHILD_PROCESS_DUTY, PARENT_AUDITOR_PROCESS_DUTY,
+};
 
 fn live_invocation_started_millis(duration_ms: u64) -> u64 {
     let now = SystemTime::now()
@@ -1727,6 +1731,16 @@ fn prepare_child_attempt<'a>(
     if let Some(signal) = &context.admission_commit {
         signal.notify();
     }
+    let grant = admit_assignment_child_process_intent(
+        options.run_id.as_str(),
+        assignment.id.as_str(),
+        attempt,
+        Path::new("codex"),
+        command.model.as_deref(),
+        ASSIGNMENT_CHILD_PROCESS_DUTY,
+    )?;
+    command =
+        command.with_assignment_process_launch(AssignmentProcessLaunchKind::AssignmentChild, grant);
     Ok(AssignmentExecutionDisposition::Continue(
         PreparedChildAttempt {
             attempt_artifacts,
@@ -3307,6 +3321,16 @@ fn prepare_parent_auditor<'a>(
             return Ok(ParentAuditorPreparation::GateComplete { verdict });
         }
     };
+    let grant = admit_parent_auditor_process_intent(
+        options.run_id.as_str(),
+        auditor_id.as_str(),
+        *auditor_attempt,
+        Path::new("codex"),
+        auditor_command.model.as_deref(),
+        PARENT_AUDITOR_PROCESS_DUTY,
+    )?;
+    auditor_command = auditor_command
+        .with_assignment_process_launch(AssignmentProcessLaunchKind::ParentAuditor, grant);
     Ok(ParentAuditorPreparation::Ready(PreparedParentAuditor {
         lens: lens.clone(),
         expected_request: expected_request.clone(),
@@ -4596,6 +4620,59 @@ mod decomposition_tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn bind_local_assignment_sink_fixture(
+        command: &mut ExternalAgentCommand,
+        program_name: &str,
+    ) -> Result<(tempfile::TempDir, PathBuf)> {
+        let temp = tempfile::tempdir()?;
+        let marker = temp.path().join("child-process-started");
+        let agent = temp.path().join(program_name);
+        fs::write(
+            &agent,
+            format!(
+                "#!/bin/sh\nwhile IFS= read -r _line; do\n    :\ndone\ntouch '{}'\nexit 0\n",
+                marker.display()
+            ),
+        )?;
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o700))?;
+        let incoming = temp.path().join("incoming");
+        fs::create_dir(&incoming)?;
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+        let program = fs::canonicalize(&agent)?;
+        command.program = program;
+        command.json_log = incoming.join("events.jsonl");
+        command.output_last_message = incoming.join("last-message.txt");
+        command.machine_global_retention = None;
+        command.output_schema = None;
+        command.read_only_input_files.clear();
+        command.worker_journal_artifacts.clear();
+        command.environment_requirements.clear();
+        Ok((temp, marker))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_assignment_sink_refused(
+        report: &ExternalAgentRun,
+        marker: &Path,
+        cause: crate::mutation_taxonomy::AssignmentProcessLaunchGrantError,
+    ) {
+        assert!(
+            !marker.exists(),
+            "assignment process launch must not spawn: {:?}",
+            report.error
+        );
+        assert!(!report.stdout.target_launch_attempted);
+        assert!(
+            report.error.as_deref().is_some_and(|error| {
+                error.contains("assignment process launch grant failed closed")
+                    && error.contains(cause.cause_id())
+            }),
+            "unexpected refusal: {:?}",
+            report.error
+        );
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn review_lens_execution_boundary_hides_primary_and_child_roots_from_hostile_process(
     ) -> Result<()> {
@@ -5082,6 +5159,539 @@ mod decomposition_tests {
         assert!(outcome.report.is_some());
         assert_eq!(outcome.command_records.len(), 2);
         assert!(!outcome.external_containment_failed);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_child_and_parent_auditor_issuers_reach_production_sink() -> Result<()> {
+        use crate::mutation_taxonomy::{
+            AssignmentProcessLaunchGrantError, AssignmentProcessLaunchKind,
+            ASSIGNMENT_CHILD_PROCESS_DUTY, PARENT_AUDITOR_PROCESS_DUTY,
+        };
+
+        let temp = tempfile::tempdir().expect("temporary issuer fixture");
+        let repo = temp.path().join("repo");
+        Repository::init(&repo).expect("initialize issuer fixture repository");
+        fs::write(repo.join("README.md"), "baseline\n").expect("write fixture file");
+        commit_fixture_repository(&repo);
+
+        let assignment = OrchestratorAssignment {
+            id: "phase-child".to_string(),
+            phase: AssignmentPhase::Execution,
+            runtime: None,
+            role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        };
+        let plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "issuer sink exercise".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: 10,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+            assignments: vec![assignment.clone()],
+        };
+        let budget_config = SupervisorBudgetConfig::default();
+        let consultant = SupervisorConsultantPlan::default();
+        let assignment_metadata = AssignmentMetadata::new();
+        let options = SupervisorRunOptions {
+            repo: repo.clone(),
+            plan_file: temp.path().join("plan.json"),
+            run_id: RunId::new("issuer-sink-admission").expect("valid fixture run id"),
+            parent_node: None,
+            codex_bin: PathBuf::from("unused-codex"),
+            runtime: SupervisorRuntime::Fake,
+            allow_dirty_primary: false,
+            allow_live_run_collision: false,
+            admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+            budget_overrides: crate::supervise::RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
+            machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
+                config: temp.path().join("unused-machine-global.json"),
+                root_id: "runtime".to_string(),
+                owner: "maco-supervise".to_string(),
+                correction_correlation_id: "issuer-sink-admission".to_string(),
+            }),
+        };
+        let mut artifact_writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            options.run_id.clone(),
+            "issuer-sink-test",
+        )
+        .expect("reserve issuer artifacts");
+        let run_dir = artifact_writer.run_dir().to_path_buf();
+        let dirs = RunDirs::for_writer(&artifact_writer);
+        let manager = WorktreeManager::new(&repo);
+        let sync_store = SyncStore::open(&repo).expect("open fixture sync store");
+        let semantic_store = SemanticIntentStore::open(&repo).expect("open fixture semantic store");
+        let assignment_schedule = vec![AssignmentScheduleEntry {
+            assignment_id: assignment.id.clone(),
+            parent_assignment_id: None,
+            depth: 1,
+            flattened_index: 0,
+        }];
+        let field_guide = SupervisorFieldGuidePrompt::empty().expect("empty fixture field guide");
+        let budget_ledger =
+            RunBudgetLedger::new(RunBudgetLimits::default()).expect("fixture budget ledger");
+        let runtime_model_catalog = RuntimeModelCatalog::LocalDeterministicFake;
+        let cancellation = ProcessCancellation::new();
+        let mut journal = initialize_orchestration_event_journal(
+            &repo,
+            &options.run_id,
+            options.parent_node.as_deref(),
+        );
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut artifact_writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let runner = unused_external_runner;
+        let context = AssignmentExecutionContext {
+            index: 0,
+            concurrent_mode: false,
+            plan: &plan,
+            requested_plan: &plan,
+            execution_target: None,
+            budget_config: &budget_config,
+            consultant: &consultant,
+            assignment_metadata: &assignment_metadata,
+            assignment: &assignment,
+            evidence_only_reaudit: None,
+            options: &options,
+            repo: &repo,
+            run_dir: &run_dir,
+            dirs: &dirs,
+            execution_runtime: SupervisorExecutionRuntime::NonpublishableSimulation,
+            worktree_creation: SupervisorWorktreeCreation::TestOnly,
+            manager: &manager,
+            reused: false,
+            sync_store: &sync_store,
+            semantic_store: &semantic_store,
+            prepared_semantic_token: None,
+            prepared_semantic_findings: &[],
+            prepared_semantic_signals: &[],
+            prepared_semantic_failed: false,
+            assignment_schedule: &assignment_schedule,
+            field_guide: &field_guide,
+            serial_semantic_warn_intents: None,
+            semantic_block_order: None,
+            semantic_block_gate: None,
+            artifacts: &artifacts,
+            budget_ledger: &budget_ledger,
+            budget_policy: AssignmentBudgetPolicy::default(),
+            admission_commit: None,
+            runtime_model_catalog: &runtime_model_catalog,
+            cancellation,
+            external_runner: &runner,
+        };
+        let mut outcome = AssignmentExecutionOutcome {
+            gate_tracker: Some(GateCorrectionTracker::new(plan.max_gate_corrections)),
+            ..AssignmentExecutionOutcome::default()
+        };
+        let preflight = match prepare_assignment_execution(&context, &mut outcome)
+            .expect("issuer preflight invocation")
+        {
+            AssignmentExecutionDisposition::Continue(preflight) => preflight,
+            AssignmentExecutionDisposition::Complete => panic!("preflight unexpectedly completed"),
+        };
+
+        let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
+        let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
+        let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
+        fs::create_dir_all(&dirs.schemas).expect("create issuer schema directory");
+        fs::write(&auditor_schema_path, "{\"type\":\"object\"}\n")
+            .expect("materialize issuer auditor schema");
+        let prepared = match prepare_child_attempt(
+            &context,
+            &mut outcome,
+            &context.budget_policy,
+            &preflight,
+            options.run_id.as_str(),
+            1,
+            1,
+            &None,
+            &schema_path,
+            &worker_schema_path,
+            &auditor_schema_path,
+        )
+        .expect("issuer child preparation")
+        {
+            AssignmentExecutionDisposition::Continue(prepared) => prepared,
+            AssignmentExecutionDisposition::Complete => {
+                panic!("child preparation unexpectedly completed")
+            }
+        };
+        assert_eq!(
+            prepared.command.assignment_process_launch_kind,
+            Some(AssignmentProcessLaunchKind::AssignmentChild)
+        );
+        let child_grant = prepared
+            .command
+            .assignment_process_launch_grant
+            .clone()
+            .expect("prepare_child_attempt must attach an issuer grant");
+        assert_eq!(
+            child_grant.kind(),
+            AssignmentProcessLaunchKind::AssignmentChild
+        );
+        assert_eq!(child_grant.subject(), assignment.id);
+        assert_eq!(child_grant.attempt(), 1);
+        assert_eq!(child_grant.run_id(), options.run_id.as_str());
+        assert_eq!(child_grant.duty(), ASSIGNMENT_CHILD_PROCESS_DUTY);
+        assert_eq!(
+            prepared
+                .command
+                .agent_lifecycle
+                .as_ref()
+                .map(|id| id.task_id.as_str()),
+            Some(assignment.id.as_str())
+        );
+
+        let mut missing = prepared.command.clone();
+        let (_missing_temp, missing_marker) =
+            bind_local_assignment_sink_fixture(&mut missing, "fixture-agent.sh")?;
+        missing.assignment_process_launch_grant = None;
+        assert_eq!(
+            missing.assignment_process_launch_kind,
+            Some(AssignmentProcessLaunchKind::AssignmentChild)
+        );
+        let missing_report = run_external_agent_nonpublishable_simulation(&missing);
+        assert_assignment_sink_refused(
+            &missing_report,
+            &missing_marker,
+            AssignmentProcessLaunchGrantError::MissingGrant,
+        );
+
+        let mut wrong_kind = prepared.command.clone();
+        let (_kind_temp, kind_marker) =
+            bind_local_assignment_sink_fixture(&mut wrong_kind, "fixture-agent.sh")?;
+        wrong_kind.assignment_process_launch_kind =
+            Some(AssignmentProcessLaunchKind::ParentAuditor);
+        let kind_report = run_external_agent_nonpublishable_simulation(&wrong_kind);
+        assert_assignment_sink_refused(
+            &kind_report,
+            &kind_marker,
+            AssignmentProcessLaunchGrantError::KindMismatch,
+        );
+
+        let mut wrong_subject = prepared.command.clone();
+        let (_subject_temp, subject_marker) =
+            bind_local_assignment_sink_fixture(&mut wrong_subject, "fixture-agent.sh")?;
+        if let Some(identity) = &mut wrong_subject.agent_lifecycle {
+            identity.task_id = "assignment-other".to_string();
+        }
+        let subject_report = run_external_agent_nonpublishable_simulation(&wrong_subject);
+        assert_assignment_sink_refused(
+            &subject_report,
+            &subject_marker,
+            AssignmentProcessLaunchGrantError::IdentityMismatch,
+        );
+
+        let mut wrong_attempt = prepared.command.clone();
+        let (_attempt_temp, attempt_marker) =
+            bind_local_assignment_sink_fixture(&mut wrong_attempt, "fixture-agent.sh")?;
+        wrong_attempt.assignment_process_launch_attempt = Some(9);
+        let attempt_report = run_external_agent_nonpublishable_simulation(&wrong_attempt);
+        assert_assignment_sink_refused(
+            &attempt_report,
+            &attempt_marker,
+            AssignmentProcessLaunchGrantError::IdentityMismatch,
+        );
+
+        let mut tmp_codex = prepared.command.clone();
+        let (_tmp_temp, tmp_marker) = bind_local_assignment_sink_fixture(&mut tmp_codex, "codex")?;
+        tmp_codex.assignment_process_launch_grant = Some(
+            child_grant
+                .clone()
+                .seal_independently_verified_canonical_program_for_test(Path::new("/tmp/codex"))?,
+        );
+        let tmp_report = run_external_agent_nonpublishable_simulation(&tmp_codex);
+        assert_assignment_sink_refused(
+            &tmp_report,
+            &tmp_marker,
+            AssignmentProcessLaunchGrantError::ProgramMismatch,
+        );
+
+        let mut matching = prepared.command.clone();
+        let (_match_temp, match_marker) =
+            bind_local_assignment_sink_fixture(&mut matching, "fixture-agent.sh")?;
+        let matching_report = run_external_agent_nonpublishable_simulation(&matching);
+        assert_eq!(matching_report.error, None, "{matching_report:?}");
+        assert_eq!(matching_report.exit_code, Some(0));
+        assert!(matching_report.stdout.target_launch_attempted);
+        assert!(match_marker.exists());
+
+        let mut replay = prepared.command.clone();
+        let (_replay_temp, replay_marker) =
+            bind_local_assignment_sink_fixture(&mut replay, "fixture-agent.sh")?;
+        replay.assignment_process_launch_grant = Some(child_grant.clone());
+        let replay_report = run_external_agent_nonpublishable_simulation(&replay);
+        assert_assignment_sink_refused(
+            &replay_report,
+            &replay_marker,
+            AssignmentProcessLaunchGrantError::AlreadyConsumed,
+        );
+
+        // Sequential supervise names `incoming`/`capture` stay outstanding until
+        // production discard. This fixture drives the sink via command clones
+        // instead of dispatch, so it must release the first attempt with that
+        // same API before a later prepare can reserve the names.
+        let PreparedChildAttempt {
+            incoming_scratch,
+            capture_scratch,
+            incoming_output_root,
+            capture_output_root,
+            ..
+        } = prepared;
+        drop(incoming_output_root);
+        drop(capture_output_root);
+        with_supervisor_artifacts(&artifacts, |writer, _| {
+            discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
+        })
+        .expect("release first-attempt invocation scratches before attempt 2");
+
+        let prepared_staging = match prepare_child_attempt(
+            &context,
+            &mut outcome,
+            &context.budget_policy,
+            &preflight,
+            options.run_id.as_str(),
+            2,
+            2,
+            &None,
+            &schema_path,
+            &worker_schema_path,
+            &auditor_schema_path,
+        )
+        .expect("issuer child staging preparation")
+        {
+            AssignmentExecutionDisposition::Continue(prepared) => prepared,
+            AssignmentExecutionDisposition::Complete => {
+                panic!("staging child preparation unexpectedly completed")
+            }
+        };
+        let staging_grant = prepared_staging
+            .command
+            .assignment_process_launch_grant
+            .clone()
+            .expect("attempt 2 must attach a distinct issuer grant");
+        assert_eq!(staging_grant.attempt(), 2);
+        let mut staging = prepared_staging.command.clone();
+        let (_staging_temp, staging_marker) =
+            bind_local_assignment_sink_fixture(&mut staging, "fixture-agent.sh")?;
+        staging.assignment_process_launch_grant =
+            Some(staging_grant.seal_independently_verified_canonical_binding(
+                &staging.program,
+                [] as [&str; 0],
+                Path::new("/no-such-assignment-output-staging"),
+                &staging.cwd,
+            )?);
+        let staging_report = run_external_agent_nonpublishable_simulation(&staging);
+        assert_assignment_sink_refused(
+            &staging_report,
+            &staging_marker,
+            AssignmentProcessLaunchGrantError::OutputStagingMismatch,
+        );
+
+        let PreparedChildAttempt {
+            incoming_scratch: staging_incoming_scratch,
+            capture_scratch: staging_capture_scratch,
+            incoming_output_root: staging_incoming_output_root,
+            capture_output_root: staging_capture_output_root,
+            ..
+        } = prepared_staging;
+        drop(staging_incoming_output_root);
+        drop(staging_capture_output_root);
+        with_supervisor_artifacts(&artifacts, |writer, _| {
+            discard_invocation_scratches(
+                writer,
+                &staging_incoming_scratch,
+                &staging_capture_scratch,
+            )
+        })
+        .expect("release attempt-2 invocation scratches before parent auditor");
+
+        let mut child_report = OrchestratorReviewReport {
+            id: assignment.id.clone(),
+            role: assignment.role,
+            assigned_paths: assignment.assigned_paths.clone(),
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            claim_token: None,
+            semantic_intent_token: None,
+            commands_run: Vec::new(),
+            environment_failures: Vec::new(),
+            files_changed: Vec::new(),
+            validation_results: Vec::new(),
+            findings: Vec::new(),
+            field_guide_entries: Vec::new(),
+            worker_reports: Vec::new(),
+            audit_reports: Vec::new(),
+            review_lens_aggregate: None,
+            decomposition_completions: Vec::new(),
+            licensed_breakage_review: None,
+            generated_follow_up_tasks: Vec::new(),
+            gate_denials: Vec::new(),
+            gate_correction_outcomes: Vec::new(),
+            accepted: true,
+            rejected: false,
+            status: ReviewStatus::Succeeded,
+            remaining_risk: String::new(),
+            next_safe_action: String::new(),
+        };
+        let mut auditor_attempt = 0;
+        let lens = plan.review_lenses[0].clone();
+        let output_report = serde_json::to_string(&child_report).expect("serialize child report");
+        let expected_request = build_review_lens_request(
+            &lens,
+            ReviewLensRequestSources {
+                child_transcript: "issuer sink transcript",
+                diff: "issuer sink diff",
+                output_report: &output_report,
+            },
+        )
+        .expect("build issuer review request");
+        let required_coverage = ReviewCoverageRequirement {
+            worker_ids: assignment
+                .worker_assignments
+                .iter()
+                .map(|worker| worker.id.clone())
+                .collect(),
+            paths: assignment.assigned_paths.clone(),
+        };
+        let prepared_auditor = match prepare_parent_auditor(
+            &context,
+            &mut outcome,
+            &preflight,
+            options.run_id.as_str(),
+            &mut child_report,
+            &mut auditor_attempt,
+            ParentAuditorLensExecution {
+                budget_policy: &context.budget_policy,
+                lens: &lens,
+                lens_index: 0,
+                expected_request: &expected_request,
+                required_coverage: &required_coverage,
+            },
+        )
+        .expect("issuer auditor preparation")
+        {
+            ParentAuditorPreparation::Ready(prepared) => prepared,
+            ParentAuditorPreparation::AssignmentComplete => {
+                panic!("auditor preparation unexpectedly completed assignment")
+            }
+            ParentAuditorPreparation::GateComplete { .. } => {
+                panic!("auditor preparation unexpectedly terminalized gate")
+            }
+        };
+        assert_eq!(auditor_attempt, 1);
+        assert_eq!(
+            prepared_auditor
+                .auditor_command
+                .assignment_process_launch_kind,
+            Some(AssignmentProcessLaunchKind::ParentAuditor)
+        );
+        let auditor_grant = prepared_auditor
+            .auditor_command
+            .assignment_process_launch_grant
+            .clone()
+            .expect("prepare_parent_auditor must attach an issuer grant");
+        assert_eq!(
+            auditor_grant.kind(),
+            AssignmentProcessLaunchKind::ParentAuditor
+        );
+        assert_eq!(auditor_grant.subject(), prepared_auditor.auditor_id);
+        assert_eq!(auditor_grant.attempt(), 1);
+        assert_eq!(auditor_grant.duty(), PARENT_AUDITOR_PROCESS_DUTY);
+        assert_eq!(
+            prepared_auditor
+                .auditor_command
+                .agent_lifecycle
+                .as_ref()
+                .map(|id| id.task_id.as_str()),
+            Some(prepared_auditor.auditor_id.as_str())
+        );
+
+        let mut auditor_missing = prepared_auditor.auditor_command.clone();
+        let (_auditor_missing_temp, auditor_missing_marker) =
+            bind_local_assignment_sink_fixture(&mut auditor_missing, "fixture-agent.sh")?;
+        auditor_missing.assignment_process_launch_grant = None;
+        let auditor_missing_report = run_external_agent_nonpublishable_simulation(&auditor_missing);
+        assert_assignment_sink_refused(
+            &auditor_missing_report,
+            &auditor_missing_marker,
+            AssignmentProcessLaunchGrantError::MissingGrant,
+        );
+
+        let mut auditor_wrong_kind = prepared_auditor.auditor_command.clone();
+        let (_auditor_kind_temp, auditor_kind_marker) =
+            bind_local_assignment_sink_fixture(&mut auditor_wrong_kind, "fixture-agent.sh")?;
+        auditor_wrong_kind.assignment_process_launch_kind =
+            Some(AssignmentProcessLaunchKind::AssignmentChild);
+        let auditor_kind_report = run_external_agent_nonpublishable_simulation(&auditor_wrong_kind);
+        assert_assignment_sink_refused(
+            &auditor_kind_report,
+            &auditor_kind_marker,
+            AssignmentProcessLaunchGrantError::KindMismatch,
+        );
+
+        let mut auditor_wrong_subject = prepared_auditor.auditor_command.clone();
+        let (_auditor_subject_temp, auditor_subject_marker) =
+            bind_local_assignment_sink_fixture(&mut auditor_wrong_subject, "fixture-agent.sh")?;
+        if let Some(identity) = &mut auditor_wrong_subject.agent_lifecycle {
+            identity.task_id = "auditor-other".to_string();
+        }
+        let auditor_subject_report =
+            run_external_agent_nonpublishable_simulation(&auditor_wrong_subject);
+        assert_assignment_sink_refused(
+            &auditor_subject_report,
+            &auditor_subject_marker,
+            AssignmentProcessLaunchGrantError::IdentityMismatch,
+        );
+
+        let mut auditor_matching = prepared_auditor.auditor_command.clone();
+        let (_auditor_match_temp, auditor_match_marker) =
+            bind_local_assignment_sink_fixture(&mut auditor_matching, "fixture-agent.sh")?;
+        let auditor_matching_report =
+            run_external_agent_nonpublishable_simulation(&auditor_matching);
+        assert_eq!(
+            auditor_matching_report.error, None,
+            "{auditor_matching_report:?}"
+        );
+        assert_eq!(auditor_matching_report.exit_code, Some(0));
+        assert!(auditor_matching_report.stdout.target_launch_attempted);
+        assert!(auditor_match_marker.exists());
+
+        let mut auditor_replay = prepared_auditor.auditor_command.clone();
+        let (_auditor_replay_temp, auditor_replay_marker) =
+            bind_local_assignment_sink_fixture(&mut auditor_replay, "fixture-agent.sh")?;
+        auditor_replay.assignment_process_launch_grant = Some(auditor_grant);
+        let auditor_replay_report = run_external_agent_nonpublishable_simulation(&auditor_replay);
+        assert_assignment_sink_refused(
+            &auditor_replay_report,
+            &auditor_replay_marker,
+            AssignmentProcessLaunchGrantError::AlreadyConsumed,
+        );
+        Ok(())
     }
 
     #[test]
