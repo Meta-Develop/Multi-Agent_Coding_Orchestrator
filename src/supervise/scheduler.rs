@@ -1590,6 +1590,28 @@ fn scheduler_preclaim_evidence(
     )
 }
 
+pub(super) fn recheck_narrowed_assignment_preclaim(
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    assignment: &OrchestratorAssignment,
+    requested_assignments: &[OrchestratorAssignment],
+    repo: &Path,
+    runtime: SupervisorRuntime,
+    execution_runtime: SupervisorExecutionRuntime,
+    worktree_creation: SupervisorWorktreeCreation<'_>,
+) -> Result<Option<AssignmentExecutionOutcome>> {
+    let evidence = PreclaimRunEvidence::acquire(
+        repo,
+        runtime,
+        preclaim_assessment_runtime(runtime, execution_runtime, worktree_creation),
+    );
+    let decision = preclaim_assignment(artifacts, assignment, requested_assignments, &evidence)?;
+    if decision.allows_path_claim() {
+        Ok(None)
+    } else {
+        Ok(Some(parked_preclaim_outcome(assignment, &decision)))
+    }
+}
+
 fn run_serial_assignment_schedule(
     context: &AssignmentSchedulerContext<'_, '_>,
     progress: &mut SchedulerProgress,
