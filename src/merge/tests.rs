@@ -3337,3 +3337,492 @@ fn validation_check_uses_explicit_paths_for_failures() {
     assert_eq!(validation.status, SafetyCheckStatus::Failed);
     assert_eq!(validation.paths, vec![PathBuf::from("src/lib.rs")]);
 }
+
+#[test]
+fn static_arbitration_runner_is_test_only_nongrant_and_does_not_spawn() {
+    let digest = "2".repeat(64);
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "input_sha256": digest,
+        "disposition": "escalated",
+        "rationale": "static fake does not spawn",
+        "candidate_patch": null,
+    }))
+    .expect("proposal JSON");
+    let runner = StaticArbitrationRunner::from_bytes(bytes).expect("static runner");
+    let result = runner
+        .run(&ArbitrationRunnerRequest {
+            prompt_path: PathBuf::from("prompt"),
+            output_schema_path: PathBuf::from("schema"),
+            output_last_message_path: PathBuf::from("output"),
+            json_log_path: PathBuf::from("log"),
+            neutral_worktree_path: PathBuf::from("neutral"),
+            hidden_primary_root: PathBuf::from("primary"),
+            run_id: "run-static-nongrant".to_string(),
+            arbiter_id: "neutral-arbiter".to_string(),
+        })
+        .expect("static result");
+    assert_eq!(result.execution.kind, "static_fake");
+    assert!(!result.execution.trusted_local_boundary);
+    assert!(result.execution.command.is_empty());
+    assert_eq!(result.execution.exit_code, Some(0));
+}
+
+#[cfg(target_os = "linux")]
+fn chmod_merge_control_roots(workspace: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    for control_root in [".git", ".maco", ".maco-cache", ".codex", ".agents"] {
+        let path = workspace.join(control_root);
+        fs::create_dir_all(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn write_merge_arbiter_fixture_agent(dir: &Path, marker: &Path, hold: bool) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let agent = dir.join("fixture-agent.sh");
+    let body = if hold {
+        format!(
+            "#!/bin/sh\ntouch '{}'\nprintf '%s\\n%s\\n' \"$MACO_RUN_ID\" \"$MACO_TASK_ID\" > '{}/lifecycle-env'\nwhile [ ! -f '{}/provider-release' ]; do sleep 0.01; done\nexit 0\n",
+            marker.display(),
+            dir.display(),
+            dir.display()
+        )
+    } else {
+        format!(
+            "#!/bin/sh\nwhile IFS= read -r _line; do\n    :\ndone\ntouch '{}'\nexit 0\n",
+            marker.display()
+        )
+    };
+    fs::write(&agent, body)?;
+    fs::set_permissions(&agent, fs::Permissions::from_mode(0o700))?;
+    Ok(fs::canonicalize(&agent)?)
+}
+
+#[cfg(target_os = "linux")]
+fn prepared_merge_arbiter_command(
+    run_id: &str,
+    arbiter_id: &str,
+    hold: bool,
+) -> Result<(
+    tempfile::TempDir,
+    ExternalAgentCommand,
+    PathBuf,
+    PathBuf,
+    PathBuf,
+)> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let hidden_primary = temp.path().join("primary");
+    let neutral = temp.path().join("neutral");
+    git2::Repository::init(&hidden_primary)?;
+    git2::Repository::init(&neutral)?;
+    chmod_merge_control_roots(&hidden_primary)?;
+    chmod_merge_control_roots(&neutral)?;
+    let incoming = neutral.join("incoming");
+    fs::create_dir(&incoming)?;
+    fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+    let marker = neutral.join("child-process-started");
+    let agent = write_merge_arbiter_fixture_agent(&neutral, &marker, hold)?;
+    let prompt = hidden_primary.join("prompt.md");
+    fs::write(&prompt, "fixture merge arbiter prompt\n")?;
+    let schema = hidden_primary.join("arbitration-output.schema.json");
+    fs::write(&schema, "{}\n")?;
+    let request = ArbitrationRunnerRequest {
+        prompt_path: prompt,
+        output_schema_path: schema,
+        output_last_message_path: incoming.join("proposal.json"),
+        json_log_path: incoming.join("arbiter.jsonl"),
+        neutral_worktree_path: neutral.clone(),
+        hidden_primary_root: hidden_primary.clone(),
+        run_id: run_id.to_string(),
+        arbiter_id: arbiter_id.to_string(),
+    };
+    let runner = ExternalArbitrationRunner {
+        codex_bin: agent,
+        timeout: Duration::from_secs(5),
+        machine_global_config: hidden_primary.join("unused-machine-global.json"),
+        machine_global_runtime_root_id: "runtime".to_string(),
+    };
+    let mut command = prepare_merge_arbiter_command(&runner, &request)?;
+    command.machine_global_retention = None;
+    command.output_schema = None;
+    Ok((temp, command, marker, hidden_primary, neutral))
+}
+
+#[cfg(target_os = "linux")]
+fn assert_merge_arbiter_sink_refused(
+    report: &crate::external_agent::ExternalAgentRun,
+    marker: &Path,
+    cause: AssignmentProcessLaunchGrantError,
+) {
+    assert!(
+        !marker.exists(),
+        "merge arbiter process must not spawn: {:?}",
+        report.error
+    );
+    assert!(!report.stdout.target_launch_attempted);
+    assert!(
+        report.error.as_deref().is_some_and(|error| {
+            error.contains("assignment process launch grant failed closed")
+                && error.contains(cause.cause_id())
+        }),
+        "unexpected merge arbiter process refusal: {:?}",
+        report.error
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn matching_merge_arbiter_process_grant_launches_local_fixture_once_and_lists_canonical_auditor(
+) -> Result<()> {
+    use crate::agent_lifecycle::{AgentListFilter, AgentRegistry};
+    use crate::external_agent::run_external_agent_nonpublishable_simulation;
+    use std::time::Instant;
+
+    let run_id = "run-merge-arbiter-fixture";
+    let arbiter_id = "neutral-arbiter";
+    let (temp, command, marker, hidden_primary, neutral) =
+        prepared_merge_arbiter_command(run_id, arbiter_id, true)?;
+    let _temp = temp;
+    assert_eq!(
+        command.assignment_process_launch_kind,
+        Some(AssignmentProcessLaunchKind::MergeArbiter)
+    );
+    assert_eq!(
+        command
+            .agent_lifecycle
+            .as_ref()
+            .map(|identity| identity.role.as_str()),
+        Some(AgentRole::Auditor.as_str())
+    );
+    assert_eq!(command.model, None);
+    assert_eq!(command.workspace_access, WorkspaceAccess::ReadOnly);
+    assert_eq!(
+        command.assignment_process_launch_duty.as_deref(),
+        Some(MERGE_ARBITER_PROCESS_DUTY)
+    );
+    assert_eq!(
+        command.program.file_name().and_then(|name| name.to_str()),
+        Some("fixture-agent.sh")
+    );
+    let replay = command
+        .assignment_process_launch_grant
+        .clone()
+        .expect("production helper must attach a merge-arbiter grant");
+    assert_eq!(replay.kind(), AssignmentProcessLaunchKind::MergeArbiter);
+    assert_eq!(replay.run_id(), run_id);
+    assert_eq!(replay.subject(), arbiter_id);
+    assert_eq!(replay.duty(), MERGE_ARBITER_PROCESS_DUTY);
+    assert_eq!(replay.model(), None);
+
+    let registry = AgentRegistry::open(&hidden_primary)?;
+    let runner = std::thread::spawn({
+        let command = command.clone();
+        move || run_external_agent_nonpublishable_simulation(&command)
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let observed = (|| -> Result<Option<_>> {
+        loop {
+            if let Some(record) = registry
+                .list(&AgentListFilter::default())?
+                .into_iter()
+                .next()
+            {
+                return Ok(Some(record));
+            }
+            if runner.is_finished() || Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    })();
+    fs::write(neutral.join("provider-release"), b"")?;
+    let report = runner
+        .join()
+        .map_err(|_| anyhow!("merge arbiter fixture runner thread panicked"))?;
+    let record = observed?.context("merge arbiter auditor lifecycle was not observable")?;
+    assert!(
+        report.simulation_succeeded(),
+        "unexpected merge arbiter fixture report: {report:#?}"
+    );
+    assert_eq!(report.exit_code, Some(0));
+    assert!(report.stdout.target_launch_attempted);
+    assert!(marker.exists());
+    assert_eq!(record.role, AgentRole::Auditor.as_str());
+    assert_eq!(record.run_id, run_id);
+    assert_eq!(record.task_id, arbiter_id);
+    assert_eq!(record.repo, hidden_primary);
+    assert_eq!(
+        fs::read_to_string(neutral.join("lifecycle-env"))?,
+        format!("{run_id}\n{arbiter_id}\n")
+    );
+    assert!(registry.list(&AgentListFilter::default())?.is_empty());
+
+    let (temp_replay, mut replay_command, replay_marker, _, _) =
+        prepared_merge_arbiter_command(run_id, arbiter_id, false)?;
+    let _temp_replay = temp_replay;
+    replay_command.assignment_process_launch_grant = Some(replay);
+    let replay_report = run_external_agent_nonpublishable_simulation(&replay_command);
+    assert_merge_arbiter_sink_refused(
+        &replay_report,
+        &replay_marker,
+        AssignmentProcessLaunchGrantError::AlreadyConsumed,
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn merge_arbiter_process_grant_missing_wrong_kind_identity_duty_model_replay_fail_closed(
+) -> Result<()> {
+    use crate::external_agent::run_external_agent_nonpublishable_simulation;
+    use crate::mutation_taxonomy::CONSULTANT_PROCESS_DUTY;
+
+    let (temp, command, marker, _hidden_primary, _neutral) =
+        prepared_merge_arbiter_command("run-merge-arbiter-refuse", "neutral-arbiter", false)?;
+    let _temp = temp;
+    let grant = command
+        .assignment_process_launch_grant
+        .clone()
+        .expect("production helper must attach a merge-arbiter grant");
+
+    let mut missing = command.clone();
+    missing.assignment_process_launch_grant = None;
+    assert_merge_arbiter_sink_refused(
+        &run_external_agent_nonpublishable_simulation(&missing),
+        &marker,
+        AssignmentProcessLaunchGrantError::MissingGrant,
+    );
+
+    let mut missing_kind = command.clone();
+    missing_kind.assignment_process_launch_kind = None;
+    missing_kind.assignment_process_launch_grant = None;
+    assert!(missing_kind.assignment_process_launch_kind.is_none());
+    assert!(missing_kind.assignment_process_launch_grant.is_none());
+    assert_eq!(
+        missing_kind.invocation,
+        ExternalAgentInvocation::CodexSupervisor
+    );
+
+    let mut wrong_kind = command.clone();
+    wrong_kind.assignment_process_launch_kind = Some(AssignmentProcessLaunchKind::ConsultCodex);
+    assert_merge_arbiter_sink_refused(
+        &run_external_agent_nonpublishable_simulation(&wrong_kind),
+        &marker,
+        AssignmentProcessLaunchGrantError::KindMismatch,
+    );
+
+    let mut inbox_kind = command.clone();
+    inbox_kind.assignment_process_launch_kind =
+        Some(AssignmentProcessLaunchKind::InboxIndependentAuditor);
+    assert_merge_arbiter_sink_refused(
+        &run_external_agent_nonpublishable_simulation(&inbox_kind),
+        &marker,
+        AssignmentProcessLaunchGrantError::KindMismatch,
+    );
+
+    let mut parent_kind = command.clone();
+    parent_kind.assignment_process_launch_kind = Some(AssignmentProcessLaunchKind::ParentAuditor);
+    assert_merge_arbiter_sink_refused(
+        &run_external_agent_nonpublishable_simulation(&parent_kind),
+        &marker,
+        AssignmentProcessLaunchGrantError::KindMismatch,
+    );
+
+    let mut child_kind = command.clone();
+    child_kind.assignment_process_launch_kind = Some(AssignmentProcessLaunchKind::AssignmentChild);
+    assert_merge_arbiter_sink_refused(
+        &run_external_agent_nonpublishable_simulation(&child_kind),
+        &marker,
+        AssignmentProcessLaunchGrantError::KindMismatch,
+    );
+
+    let mut wrong_identity = command.clone();
+    if let Some(identity) = &mut wrong_identity.agent_lifecycle {
+        identity.task_id = "other-arbiter".to_string();
+    }
+    assert_merge_arbiter_sink_refused(
+        &run_external_agent_nonpublishable_simulation(&wrong_identity),
+        &marker,
+        AssignmentProcessLaunchGrantError::IdentityMismatch,
+    );
+
+    let mut wrong_duty = command.clone();
+    wrong_duty.assignment_process_launch_duty = Some(CONSULTANT_PROCESS_DUTY.to_string());
+    assert_merge_arbiter_sink_refused(
+        &run_external_agent_nonpublishable_simulation(&wrong_duty),
+        &marker,
+        AssignmentProcessLaunchGrantError::IdentityMismatch,
+    );
+
+    let mut wrong_model = command.clone();
+    wrong_model.model = Some("gpt-5.6-sol".to_string());
+    assert_merge_arbiter_sink_refused(
+        &run_external_agent_nonpublishable_simulation(&wrong_model),
+        &marker,
+        AssignmentProcessLaunchGrantError::IdentityMismatch,
+    );
+
+    let matching = run_external_agent_nonpublishable_simulation(&command);
+    assert_eq!(matching.error, None, "{matching:?}");
+    assert_eq!(matching.exit_code, Some(0));
+    assert!(matching.stdout.target_launch_attempted);
+    assert!(marker.exists());
+
+    let (temp_replay, mut replay_command, replay_marker, _, _) =
+        prepared_merge_arbiter_command("run-merge-arbiter-refuse", "neutral-arbiter", false)?;
+    let _temp_replay = temp_replay;
+    replay_command.assignment_process_launch_grant = Some(grant);
+    assert_merge_arbiter_sink_refused(
+        &run_external_agent_nonpublishable_simulation(&replay_command),
+        &replay_marker,
+        AssignmentProcessLaunchGrantError::AlreadyConsumed,
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn merge_arbiter_generic_writable_worker_masquerade_and_consultant_invocation_refuse() -> Result<()>
+{
+    use crate::external_agent::run_external_agent_nonpublishable_simulation;
+    use crate::mutation_taxonomy::{
+        admit_consult_codex_process_intent, admit_merge_arbiter_process_intent,
+        CONSULTANT_PROCESS_DUTY,
+    };
+    use std::os::unix::fs::PermissionsExt;
+
+    let run_id = "run-merge-arbiter-masquerade";
+    let arbiter_id = "neutral-arbiter";
+    let (temp, merge_command, _marker, hidden_primary, neutral) =
+        prepared_merge_arbiter_command(run_id, arbiter_id, false)?;
+    let _temp = temp;
+    let merge_grant = admit_merge_arbiter_process_intent(
+        run_id,
+        arbiter_id,
+        MERGE_ARBITER_PROCESS_LAUNCH_ATTEMPT,
+        Path::new("codex"),
+        None,
+        MERGE_ARBITER_PROCESS_DUTY,
+    )?;
+
+    let worker_incoming = neutral.join("worker-incoming");
+    fs::create_dir_all(&worker_incoming)?;
+    fs::set_permissions(&worker_incoming, fs::Permissions::from_mode(0o700))?;
+    let worker_marker = neutral.join("worker-started");
+    let worker = ExternalAgentCommand::codex(
+        &merge_command.program,
+        &neutral,
+        hidden_primary.join("prompt.md"),
+        worker_incoming.join("events.jsonl"),
+        worker_incoming.join("last-message.txt"),
+        Duration::from_secs(5),
+    )
+    .with_workspace_access(WorkspaceAccess::ReadWrite)
+    .with_agent_lifecycle(
+        &hidden_primary,
+        AgentRole::Worker.as_str(),
+        run_id,
+        arbiter_id,
+    )
+    .with_assignment_process_launch(AssignmentProcessLaunchKind::MergeArbiter, merge_grant);
+    assert_eq!(worker.invocation, ExternalAgentInvocation::CodexSupervisor);
+    assert_eq!(worker.workspace_access, WorkspaceAccess::ReadWrite);
+    assert_eq!(
+        worker
+            .agent_lifecycle
+            .as_ref()
+            .map(|identity| identity.role.as_str()),
+        Some(AgentRole::Worker.as_str())
+    );
+    assert!(worker.hidden_roots.is_empty());
+    assert_eq!(
+        worker
+            .agent_lifecycle
+            .as_ref()
+            .map(|identity| identity.run_id.as_str()),
+        Some(run_id)
+    );
+    assert_eq!(
+        worker
+            .agent_lifecycle
+            .as_ref()
+            .map(|identity| identity.task_id.as_str()),
+        Some(arbiter_id)
+    );
+    assert_eq!(
+        worker.assignment_process_launch_duty.as_deref(),
+        Some(MERGE_ARBITER_PROCESS_DUTY)
+    );
+    assert_eq!(worker.model, None);
+    assert_merge_arbiter_sink_refused(
+        &run_external_agent_nonpublishable_simulation(&worker),
+        &worker_marker,
+        AssignmentProcessLaunchGrantError::KindMismatch,
+    );
+
+    let consultant_grant = admit_merge_arbiter_process_intent(
+        run_id,
+        arbiter_id,
+        MERGE_ARBITER_PROCESS_LAUNCH_ATTEMPT,
+        Path::new("codex"),
+        None,
+        MERGE_ARBITER_PROCESS_DUTY,
+    )?;
+    let consultant_incoming = neutral.join("consultant-incoming");
+    fs::create_dir_all(&consultant_incoming)?;
+    fs::set_permissions(&consultant_incoming, fs::Permissions::from_mode(0o700))?;
+    let consultant_marker = neutral.join("consultant-started");
+    let consultant = ExternalAgentCommand::codex_read_only_consultant(
+        &merge_command.program,
+        &neutral,
+        hidden_primary.join("prompt.md"),
+        consultant_incoming.join("events.jsonl"),
+        consultant_incoming.join("last-message.txt"),
+        Duration::from_secs(5),
+    )
+    .with_hidden_root(&hidden_primary)
+    .with_agent_lifecycle(
+        &hidden_primary,
+        AgentRole::Auditor.as_str(),
+        run_id,
+        arbiter_id,
+    )
+    .with_assignment_process_launch(AssignmentProcessLaunchKind::MergeArbiter, consultant_grant);
+    assert_eq!(
+        consultant.invocation,
+        ExternalAgentInvocation::CodexConsultant
+    );
+    assert_eq!(consultant.workspace_access, WorkspaceAccess::ReadOnly);
+    assert_merge_arbiter_sink_refused(
+        &run_external_agent_nonpublishable_simulation(&consultant),
+        &consultant_marker,
+        AssignmentProcessLaunchGrantError::KindMismatch,
+    );
+
+    let consult_kind_grant = admit_consult_codex_process_intent(
+        run_id,
+        arbiter_id,
+        MERGE_ARBITER_PROCESS_LAUNCH_ATTEMPT,
+        Path::new("codex"),
+        None,
+        CONSULTANT_PROCESS_DUTY,
+    )?;
+    let mut consult_kind_on_merge = merge_command.clone();
+    consult_kind_on_merge = consult_kind_on_merge.with_assignment_process_launch(
+        AssignmentProcessLaunchKind::ConsultCodex,
+        consult_kind_grant,
+    );
+    assert_merge_arbiter_sink_refused(
+        &run_external_agent_nonpublishable_simulation(&consult_kind_on_merge),
+        &worker_marker,
+        AssignmentProcessLaunchGrantError::KindMismatch,
+    );
+    Ok(())
+}

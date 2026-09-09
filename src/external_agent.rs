@@ -33,6 +33,7 @@ use crate::runtime_adapter::{
 };
 use crate::safe_state::{unsigned_to_u32, ReservedDirectory};
 use crate::secure_output::{ReservedOutputFile, SecureOutputRoot};
+use crate::supervise::AgentRole;
 use crate::worktree::normalize_agent_id;
 use anyhow::{bail, Context, Result};
 use git2::Oid;
@@ -244,8 +245,11 @@ pub struct ExternalAgentCommand {
     /// Opaque MACO-owned proof that the selected command, held claims, disposable worktree, and
     /// verified native confinement were authenticated together immediately before launch.
     worktree_writable_confinement: Option<WorktreeWritableConfinementProof>,
-    /// Assignment-child / parent-auditor launch kind. Absence leaves consult, inbox,
-    /// merge, and catalog callers ungated by this grant.
+    /// Assignment-child / parent-auditor / Inbox-independent-auditor / consult /
+    /// merge-arbiter launch kind. CodexConsultant accepts ConsultCodex or
+    /// InboxIndependentAuditor; ClaudeConsultant accepts ConsultClaude only.
+    /// MergeArbiter accepts only a merge-shaped CodexSupervisor command.
+    /// Generic CodexSupervisor constructors still leave kind absent.
     pub(crate) assignment_process_launch_kind: Option<AssignmentProcessLaunchKind>,
     /// One-shot sibling grant consumed against the final ProcessSpec when kind is set.
     pub(crate) assignment_process_launch_grant: Option<AssignmentProcessLaunchGrant>,
@@ -1407,10 +1411,13 @@ impl ExternalAgentCommand {
         self
     }
 
-    /// Attach a caller-issued assignment-child or parent-auditor process grant.
+    /// Attach a caller-issued assignment-child, parent-auditor, Inbox
+    /// independent-auditor, consult, or merge-arbiter process grant.
     ///
-    /// Consult, inbox, merge, and catalog constructors leave kind and grant
-    /// absent so those callers stay outside this unit.
+    /// Catalog constructors leave kind and grant absent. Consult Codex binds
+    /// only CodexConsultant; consult Claude binds only ClaudeConsultant.
+    /// MergeArbiter binds only a merge-shaped CodexSupervisor command. Generic
+    /// CodexSupervisor constructors still leave kind absent.
     pub(crate) fn with_assignment_process_launch(
         mut self,
         kind: AssignmentProcessLaunchKind,
@@ -2027,12 +2034,75 @@ fn assignment_process_launch_refusal(error: AssignmentProcessLaunchGrantError) -
     format!("assignment process launch grant failed closed: {error}")
 }
 
+fn consult_consultant_invocation_requires_process_grant(
+    invocation: ExternalAgentInvocation,
+) -> bool {
+    matches!(
+        invocation,
+        ExternalAgentInvocation::CodexConsultant | ExternalAgentInvocation::ClaudeConsultant
+    )
+}
+
+fn assignment_process_launch_kind_allowed_for_invocation(
+    kind: AssignmentProcessLaunchKind,
+    spec: &ExternalAgentCommand,
+) -> bool {
+    match kind {
+        AssignmentProcessLaunchKind::ConsultCodex => {
+            matches!(spec.invocation, ExternalAgentInvocation::CodexConsultant)
+        }
+        AssignmentProcessLaunchKind::ConsultClaude => {
+            matches!(spec.invocation, ExternalAgentInvocation::ClaudeConsultant)
+        }
+        AssignmentProcessLaunchKind::InboxIndependentAuditor => matches!(
+            spec.invocation,
+            ExternalAgentInvocation::CodexConsultant | ExternalAgentInvocation::CodexSupervisor
+        ),
+        AssignmentProcessLaunchKind::AssignmentChild
+        | AssignmentProcessLaunchKind::ParentAuditor => match spec.invocation {
+            ExternalAgentInvocation::CodexSupervisor
+            | ExternalAgentInvocation::Grok
+            | ExternalAgentInvocation::Cursor
+            | ExternalAgentInvocation::ClaudeCode
+            | ExternalAgentInvocation::GeminiCli => true,
+            ExternalAgentInvocation::CodexConsultant
+            | ExternalAgentInvocation::ClaudeConsultant => false,
+        },
+        AssignmentProcessLaunchKind::MergeArbiter => {
+            matches!(spec.invocation, ExternalAgentInvocation::CodexSupervisor)
+                && merge_arbiter_command_is_merge_shaped(spec)
+        }
+    }
+}
+
+fn merge_arbiter_command_is_merge_shaped(spec: &ExternalAgentCommand) -> bool {
+    spec.workspace_access == WorkspaceAccess::ReadOnly
+        && spec
+            .hidden_roots
+            .iter()
+            .any(|root| !root.as_os_str().is_empty())
+        && spec.agent_lifecycle.as_ref().is_some_and(|identity| {
+            identity.role == AgentRole::Auditor.as_str()
+                && !identity.run_id.is_empty()
+                && !identity.task_id.is_empty()
+        })
+}
+
 fn refuse_assignment_process_launch_before_preflight(
     spec: &ExternalAgentCommand,
 ) -> Result<(), AssignmentProcessLaunchGrantError> {
-    let Some(kind) = spec.assignment_process_launch_kind else {
-        return Ok(());
+    let kind = match spec.assignment_process_launch_kind {
+        Some(kind) => kind,
+        None => {
+            if consult_consultant_invocation_requires_process_grant(spec.invocation) {
+                return Err(AssignmentProcessLaunchGrantError::MissingGrant);
+            }
+            return Ok(());
+        }
     };
+    if !assignment_process_launch_kind_allowed_for_invocation(kind, spec) {
+        return Err(AssignmentProcessLaunchGrantError::KindMismatch);
+    }
     let Some(grant) = spec.assignment_process_launch_grant.as_ref() else {
         return Err(AssignmentProcessLaunchGrantError::MissingGrant);
     };
@@ -3013,7 +3083,7 @@ fn run_external_agent_runtime(
         ExternalExecutionRuntime::NonpublishableSimulation => {
             let process_spec = process_spec
                 .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort);
-            match &agent_lifecycle {
+            match agent_lifecycle.as_ref() {
                 Some(metadata) => process_spec.with_agent_lifecycle(metadata.clone()),
                 None => process_spec,
             }
