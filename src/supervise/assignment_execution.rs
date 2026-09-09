@@ -8895,4 +8895,343 @@ done
         }
         Ok(())
     }
+
+    fn weak_mechanical_executor_injected_deterministic_run(
+        command: &ExternalAgentCommand,
+        assignment: &OrchestratorAssignment,
+        assignment_metadata: &AssignmentMetadata,
+    ) -> ExternalAgentRun {
+        let mut report_command = command.clone();
+        report_command.model = None;
+        let mut run =
+            deterministic_fake_child_run(&report_command, assignment, assignment_metadata, 1, None)
+                .expect("local deterministic injected child run");
+        run.process_tree = Some(ProcessTreeEvidence::VerifiedEmpty(
+            crate::process_runner::ContainmentBackend::SystemdUserService,
+        ));
+        run.side_effects = Some(SideEffectConfinementEvidence::Verified(
+            crate::process_runner::SideEffectConfinementProfileKind::ExternalCodex,
+        ));
+        run.publishable = true;
+        run.program_trust = ExternalProgramTrust::TrustedSystemCodex;
+        run.codex_permissions = Some(crate::external_agent::CodexPermissionEvidence {
+            codex_version: "0.142.3".to_string(),
+            minimum_version: "0.138.0".to_string(),
+            permission_profile: "maco_external_codex".to_string(),
+            workspace_access: command.workspace_access,
+            network_enabled: false,
+            argv_digest: "fixture-digest".to_string(),
+            executable_identity: "fixture-identity".to_string(),
+        });
+        run
+    }
+
+    #[test]
+    fn weak_mechanical_executor_dispatch_spawn_journal_matches_runner_command() -> Result<()> {
+        // Dispatch-to-injected-runner + durable Spawn journal. Not live provider spawn/inference.
+        const ASSIGNMENT_ID: &str = "weak-dispatch-spawn";
+        const DUTY: &str = "run_preselected_command";
+        let overlay = install_test_fixture_models(&[(
+            WEAK_MECHANICAL_EXECUTOR_FIXTURE,
+            ModelCapabilityClass::WeakMechanical,
+        )])?;
+        let loaded = parse_supervisor_plan_with_consultant(&serde_json::to_string(
+            &weak_mechanical_executor_plan_json(ASSIGNMENT_ID, Some(DUTY)),
+        )?)?;
+        let assignment = loaded
+            .plan
+            .assignments
+            .first()
+            .cloned()
+            .context("parsed plan omitted the direct worker assignment")?;
+        assert_eq!(assignment.role, AgentRole::Worker);
+        assert!(assignment.worker_assignments.is_empty());
+        assert_eq!(
+            loaded
+                .assignment_metadata
+                .direct_mechanical_duty(&assignment.id),
+            Some(MechanicalTerminalDuty::RunPreselectedCommand)
+        );
+        let expected_duty = loaded
+            .assignment_metadata
+            .direct_mechanical_duty(&assignment.id);
+        let temp = tempfile::tempdir().context("temporary dispatch-spawn fixture")?;
+        let repo = temp.path().join("repo");
+        Repository::init(&repo).context("initialize dispatch-spawn fixture repository")?;
+        fs::write(repo.join("README.md"), "baseline\n").context("write fixture file")?;
+        commit_fixture_repository(&repo);
+        let plan = loaded.plan.clone();
+        let budget_config = SupervisorBudgetConfig::default();
+        let consultant = loaded.consultant.clone();
+        let assignment_metadata = loaded.assignment_metadata.clone();
+        let options = SupervisorRunOptions {
+            repo: repo.clone(),
+            plan_file: temp.path().join("plan.json"),
+            run_id: RunId::new("weak-mechanical-dispatch-spawn").context("valid fixture run id")?,
+            parent_node: None,
+            codex_bin: PathBuf::from("unused-codex"),
+            runtime: SupervisorRuntime::Codex,
+            allow_dirty_primary: false,
+            allow_live_run_collision: false,
+            admission_overrides: SupervisorAdmissionConfig::default(),
+            budget_overrides: RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
+            machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
+                config: temp.path().join("unused-machine-global.json"),
+                root_id: "runtime".to_string(),
+                owner: "maco-supervise".to_string(),
+                correction_correlation_id: "weak-mechanical-dispatch-spawn".to_string(),
+            }),
+        };
+        let mut artifact_writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            options.run_id.clone(),
+            "weak-mechanical-dispatch-spawn",
+        )
+        .context("reserve dispatch-spawn artifacts")?;
+        let run_dir = artifact_writer.run_dir().to_path_buf();
+        let dirs = RunDirs::for_writer(&artifact_writer);
+        let manager = WorktreeManager::new(&repo);
+        let sync_store = SyncStore::open(&repo).context("open fixture sync store")?;
+        let semantic_store =
+            SemanticIntentStore::open(&repo).context("open fixture semantic store")?;
+        let assignment_schedule = vec![AssignmentScheduleEntry {
+            assignment_id: assignment.id.clone(),
+            parent_assignment_id: None,
+            depth: 1,
+            flattened_index: 0,
+        }];
+        let field_guide =
+            SupervisorFieldGuidePrompt::empty().context("empty fixture field guide")?;
+        let budget_ledger =
+            RunBudgetLedger::new(RunBudgetLimits::default()).context("fixture budget ledger")?;
+        let runtime_model_catalog =
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs([
+                WEAK_MECHANICAL_EXECUTOR_FIXTURE,
+            ])?);
+        let cancellation = ProcessCancellation::new();
+        let mut journal = initialize_orchestration_event_journal(
+            &repo,
+            &options.run_id,
+            options.parent_node.as_deref(),
+        );
+        assert!(
+            journal.is_some(),
+            "artifact reserve must enable the production orchestration journal"
+        );
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut artifact_writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let captured: Mutex<Option<ExternalAgentCommand>> = Mutex::new(None);
+        let runner = |command: &ExternalAgentCommand,
+                      _cancellation: &ProcessCancellation,
+                      _review: Option<ExternalPreActionReviewRuntime<'_>>| {
+            let grant = command
+                .assignment_process_launch_grant
+                .as_ref()
+                .expect("prepared U2 grant must ride the dispatched command");
+            assert_eq!(
+                command.assignment_process_launch_kind,
+                Some(AssignmentProcessLaunchKind::AssignmentChild)
+            );
+            assert_eq!(grant.kind(), AssignmentProcessLaunchKind::AssignmentChild);
+            assert_eq!(grant.model(), command.model.as_deref());
+            assert_eq!(grant.duty(), ASSIGNMENT_CHILD_PROCESS_DUTY);
+            assert_eq!(
+                command
+                    .agent_lifecycle
+                    .as_ref()
+                    .map(|identity| identity.task_id.as_str()),
+                Some(ASSIGNMENT_ID)
+            );
+            *captured.lock().expect("capture mutex") = Some(command.clone());
+            weak_mechanical_executor_injected_deterministic_run(
+                command,
+                &assignment,
+                &assignment_metadata,
+            )
+        };
+        let context = AssignmentExecutionContext {
+            index: 0,
+            concurrent_mode: false,
+            plan: &plan,
+            requested_plan: &plan,
+            execution_target: None,
+            budget_config: &budget_config,
+            consultant: &consultant,
+            assignment_metadata: &assignment_metadata,
+            assignment: &assignment,
+            evidence_only_reaudit: None,
+            options: &options,
+            repo: &repo,
+            run_dir: &run_dir,
+            dirs: &dirs,
+            execution_runtime: SupervisorExecutionRuntime::NonpublishableSimulation,
+            worktree_creation: SupervisorWorktreeCreation::TestOnly,
+            manager: &manager,
+            reused: false,
+            sync_store: &sync_store,
+            semantic_store: &semantic_store,
+            prepared_semantic_token: None,
+            prepared_semantic_findings: &[],
+            prepared_semantic_signals: &[],
+            prepared_semantic_failed: false,
+            assignment_schedule: &assignment_schedule,
+            field_guide: &field_guide,
+            serial_semantic_warn_intents: None,
+            semantic_block_order: None,
+            semantic_block_gate: None,
+            artifacts: &artifacts,
+            budget_ledger: &budget_ledger,
+            budget_policy: AssignmentBudgetPolicy::default(),
+            admission_commit: None,
+            runtime_model_catalog: &runtime_model_catalog,
+            cancellation,
+            external_runner: &runner,
+        };
+        let mut outcome = AssignmentExecutionOutcome {
+            gate_tracker: Some(GateCorrectionTracker::new(plan.max_gate_corrections)),
+            ..AssignmentExecutionOutcome::default()
+        };
+        let preflight = match prepare_assignment_execution(&context, &mut outcome)? {
+            AssignmentExecutionDisposition::Continue(preflight) => preflight,
+            AssignmentExecutionDisposition::Complete => {
+                bail!("dispatch-spawn preflight unexpectedly completed")
+            }
+        };
+        let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
+        let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
+        let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
+        fs::create_dir_all(&dirs.schemas).context("create dispatch-spawn schema directory")?;
+        fs::write(&auditor_schema_path, "{\"type\":\"object\"}\n")
+            .context("materialize dispatch-spawn auditor schema")?;
+        fs::write(&worker_schema_path, "{\"type\":\"object\"}\n")
+            .context("materialize dispatch-spawn worker schema")?;
+        let prepared = match prepare_child_attempt(
+            &context,
+            &mut outcome,
+            &context.budget_policy,
+            &preflight,
+            options.run_id.as_str(),
+            1,
+            1,
+            &None,
+            &schema_path,
+            &worker_schema_path,
+            &auditor_schema_path,
+        )? {
+            AssignmentExecutionDisposition::Continue(prepared) => prepared,
+            AssignmentExecutionDisposition::Complete => {
+                bail!("dispatch-spawn child preparation unexpectedly completed")
+            }
+        };
+        assert_eq!(
+            prepared.command.model.as_deref(),
+            Some(WEAK_MECHANICAL_EXECUTOR_FIXTURE)
+        );
+        let collected = dispatch_and_collect_child_attempt(
+            &context,
+            &mut outcome,
+            &preflight,
+            options.run_id.as_str(),
+            1,
+            prepared,
+        )
+        .context("production dispatch_and_collect_child_attempt")?;
+        drop(collected);
+        let command = captured
+            .lock()
+            .expect("capture mutex")
+            .clone()
+            .context("injected runner must receive the production-bound command")?;
+        drop(context);
+        drop(artifacts);
+        artifact_writer.write_bytes(
+            RunArtifactFamily::Supervise.final_report_relative_path(),
+            b"{}\n",
+            ArtifactFileDisposition::PrivateEvidence,
+        )?;
+        artifact_writer.finalize(
+            RunArtifactFamily::Supervise.final_report_relative_path(),
+            false,
+        )?;
+        let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &options.run_id)
+            .context("open finalized dispatch-spawn artifacts")?;
+        let journal_bytes = reader.read(crate::orchestration_event::ORCHESTRATION_EVENT_PATH)?;
+        let events: Vec<crate::orchestration_event::OrchestrationEvent> =
+            std::str::from_utf8(&journal_bytes)
+                .context("UTF-8 orchestration journal")?
+                .lines()
+                .map(|line| {
+                    serde_json::from_str(line).context("schema-conforming orchestration event")
+                })
+                .collect::<Result<Vec<_>>>()?;
+        let spawn = events
+            .iter()
+            .find(|event| {
+                event.node == ASSIGNMENT_ID
+                    && event.kind == OrchestrationEventKind::Spawn
+                    && event.role == OrchestrationRole::Worker
+            })
+            .context("production dispatch must persist Worker Spawn at the assignment node")?;
+        let grant = command
+            .assignment_process_launch_grant
+            .as_ref()
+            .expect("captured command must retain the prepared U2 grant");
+        assert_eq!(spawn.parent.as_deref(), Some(options.run_id.as_str()));
+        assert_eq!(
+            command.model.as_deref(),
+            Some(WEAK_MECHANICAL_EXECUTOR_FIXTURE)
+        );
+        assert_eq!(grant.model(), Some(WEAK_MECHANICAL_EXECUTOR_FIXTURE));
+        assert_eq!(grant.subject(), ASSIGNMENT_ID);
+        assert_eq!(grant.attempt(), 1);
+        assert_eq!(grant.duty(), ASSIGNMENT_CHILD_PROCESS_DUTY);
+        assert_ne!(grant.duty(), DUTY);
+        assert_eq!(
+            command.assignment_process_launch_duty.as_deref(),
+            Some(ASSIGNMENT_CHILD_PROCESS_DUTY)
+        );
+        assert_eq!(
+            command
+                .agent_lifecycle
+                .as_ref()
+                .map(|identity| identity.role.as_str()),
+            Some("worker")
+        );
+        assert_eq!(spawn.payload["model"].as_str(), command.model.as_deref());
+        assert_eq!(
+            spawn.payload["mechanical_duty"].as_str(),
+            expected_duty.map(MechanicalTerminalDuty::as_str)
+        );
+        assert_eq!(spawn.payload["mechanical_duty"].as_str(), Some(DUTY));
+        assert_eq!(spawn.payload["attempt"], 1);
+        assert_eq!(spawn.payload["runtime"], "codex");
+        assert_eq!(
+            spawn.payload[crate::hierarchy_ledger::SUPERVISION_EDGE_FIELD]["child_agent_id"],
+            ASSIGNMENT_ID
+        );
+        assert_eq!(
+            spawn.payload[crate::hierarchy_ledger::SUPERVISION_EDGE_FIELD]["parent_agent_id"],
+            options.run_id.as_str()
+        );
+        let argv = argv_strings(&command);
+        let bound = argv
+            .iter()
+            .position(|argument| argument == "-m")
+            .map(|index| argv[index + 1].as_str());
+        assert_eq!(bound, Some(WEAK_MECHANICAL_EXECUTOR_FIXTURE));
+        for forbidden in ["gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra", "grok-4.6"] {
+            assert_ne!(command.model.as_deref(), Some(forbidden));
+            assert_ne!(spawn.payload["model"].as_str(), Some(forbidden));
+            assert!(!argv.iter().any(|argument| argument.contains(forbidden)));
+        }
+        drop(overlay);
+        Ok(())
+    }
 }
