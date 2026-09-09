@@ -2,7 +2,7 @@
 
 ## Status and enforcement boundary
 
-This document defines version 6 of MACO's mutation taxonomy in
+This document defines version 7 of MACO's mutation taxonomy in
 `src/mutation_taxonomy.rs`. The policy is enforced at both autonomous child
 dispatch boundaries:
 
@@ -45,6 +45,13 @@ external-agent sink; the sink seals independently verified canonical program
 and parent plus final argv and output staging, then consumes that grant against
 the final ProcessSpec. Catalog grants cannot bind worker or auditor argv, and
 the callee cannot mint the grant from run identity plus the caller repository.
+
+Version 7 adds Inbox independent-auditor process launch as a distinct
+irreversible sibling spawn. The trusted Inbox `with_runner` caller issues that
+one-shot grant after the final prepared consultant command and before
+`external_runner`. Catalog grants and parent-auditor grants cannot authorize
+that spawn, and the callee cannot mint the grant from run identity plus the
+caller repository.
 
 The hook rows cover the independently owned worktree-guard integration without
 coupling this taxonomy port to the guard implementation files. Only a verified
@@ -158,6 +165,11 @@ Consequences of this rule:
   and parent-auditor process spawn requires an upstream one-shot grant that
   matches the final ProcessSpec; the callee cannot mint that grant from run
   identity.
+- `explicit-inbox-independent-auditor-process-launch-grant`: Inbox
+  independent-auditor process spawn requires an upstream one-shot grant that
+  matches the final ProcessSpec; catalog grants and parent-auditor grants
+  cannot authorize that spawn, and the callee cannot mint that grant from run
+  identity.
 
 ## Registry
 
@@ -203,3 +215,4 @@ Consequences of this rule:
 | `supervisor-catalog-codex-preflight` | Irreversible | Spawns a trusted Codex catalog probe whose process, network, and captured output cannot be restored from retained MACO state. | `explicit-supervisor-catalog-codex-preflight-grant` |
 | `inbox-pr-intake-catalog-codex-preflight` | Irreversible | Spawns a trusted Codex catalog probe for Inbox independent-audit or PR-intake whose process, network, and captured output cannot be restored from retained MACO state. | `explicit-inbox-pr-intake-catalog-codex-preflight-grant` |
 | `assignment-parent-auditor-process-launch` | Irreversible | Spawns a trusted assignment-child or parent-auditor process whose process, network, and captured output cannot be restored from retained MACO state. | `explicit-assignment-parent-auditor-process-launch-grant` |
+| `inbox-independent-auditor-process-launch` | Irreversible | Spawns a trusted Inbox independent-auditor process whose process, network, and captured output cannot be restored from retained MACO state. | `explicit-inbox-independent-auditor-process-launch-grant` |

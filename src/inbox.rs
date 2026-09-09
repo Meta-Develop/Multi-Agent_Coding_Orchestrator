@@ -22,8 +22,9 @@ use crate::{
     llm::{RedactionSummary, Redactor},
     machine_global::MachineGlobalRetentionBinding,
     mutation_taxonomy::{
+        admit_inbox_independent_auditor_process_intent, AssignmentProcessLaunchKind,
         CatalogPreflightOrigin, SupervisorCatalogCodexPreflightGrant,
-        SupervisorCatalogCodexPreflightGrantError,
+        SupervisorCatalogCodexPreflightGrantError, INBOX_INDEPENDENT_AUDITOR_PROCESS_DUTY,
     },
     orchestrator::RunId,
     planning,
@@ -32,6 +33,7 @@ use crate::{
     review::{ReviewerConfig, ReviewerMode},
     safe_state::{stable_checksum, BoundedRegularReader, SafeRoot},
     semantic_coord::SemanticIntentStore,
+    supervise::AgentRole,
     sync::normalize_repo_relative_path,
     sync_store::SyncStore,
 };
@@ -4241,6 +4243,43 @@ where
             machine_global.retention_binding_for_run(&autopilot_run_id),
         );
     }
+    command = command.with_agent_lifecycle(
+        context.repo,
+        AgentRole::Auditor.as_str(),
+        run_id.as_str(),
+        &auditor_session_id,
+    );
+    let grant = match admit_inbox_independent_auditor_process_intent(
+        run_id.as_str(),
+        &auditor_session_id,
+        item_index,
+        Path::new("codex"),
+        command.model.as_deref(),
+        INBOX_INDEPENDENT_AUDITOR_PROCESS_DUTY,
+    ) {
+        Ok(grant) => grant,
+        Err(error) => {
+            let lane = review_loop_entry::blocked_independent_audit_lane_result(
+                item,
+                &task.head_oid,
+                vec![
+                    review_loop_entry::InboxIndependentAuditLaneBlocker::UnavailableEligibleAuditor {
+                        detail: format!(
+                            "Inbox independent-auditor process launch grant failed closed: cause={}",
+                            error.cause_id()
+                        ),
+                    },
+                ],
+                Some(selection),
+                None,
+            );
+            return finish_independent_audit_lane_item(writer, input, review_loop, pr_intake, lane);
+        }
+    };
+    command = command.with_assignment_process_launch(
+        AssignmentProcessLaunchKind::InboxIndependentAuditor,
+        grant,
+    );
     if let Some(hook) = before_auditor_launch {
         hook(&auditor_session_id, &selection).context(
             "persist authenticated PR intake start immediately before independent-auditor launch",
@@ -6961,6 +7000,11 @@ include!("inbox/part2.rs");
 #[cfg(test)]
 mod pr_intake_always_on_audit_tests {
     use super::*;
+    use crate::hierarchy_ledger::RoleCategory;
+    use crate::mutation_taxonomy::{
+        AssignmentProcessLaunchGrantError, AssignmentProcessLaunchKind,
+        INBOX_INDEPENDENT_AUDITOR_PROCESS_DUTY,
+    };
     use std::cell::Cell;
 
     #[test]
@@ -7200,6 +7244,40 @@ mod pr_intake_always_on_audit_tests {
                 );
                 assert_eq!(command.model.as_deref(), Some("gpt-5.6-sol"));
                 assert_eq!(command.reasoning_effort.as_deref(), Some("xhigh"));
+                assert_eq!(
+                    command.assignment_process_launch_kind,
+                    Some(AssignmentProcessLaunchKind::InboxIndependentAuditor)
+                );
+                let grant = command
+                    .assignment_process_launch_grant
+                    .as_ref()
+                    .expect("fake-command path must still attach the Inbox process grant");
+                assert_eq!(
+                    grant.kind(),
+                    AssignmentProcessLaunchKind::InboxIndependentAuditor
+                );
+                assert_eq!(grant.run_id(), run_id.as_str());
+                assert_eq!(
+                    grant.subject(),
+                    "independent-audit-fake-command-item-1-auditor"
+                );
+                assert_eq!(grant.attempt(), 1);
+                assert_eq!(grant.duty(), INBOX_INDEPENDENT_AUDITOR_PROCESS_DUTY);
+                assert_eq!(grant.model(), Some("gpt-5.6-sol"));
+                assert_eq!(
+                    command
+                        .agent_lifecycle
+                        .as_ref()
+                        .map(|identity| identity.run_id.as_str()),
+                    Some(run_id.as_str())
+                );
+                assert_eq!(
+                    command
+                        .agent_lifecycle
+                        .as_ref()
+                        .map(|identity| identity.task_id.as_str()),
+                    Some("independent-audit-fake-command-item-1-auditor")
+                );
                 IndependentAuditRunnerResult {
                     raw_output: Some(raw_output.clone()),
                     report_sha256: Some(report_sha256.clone()),
@@ -7259,6 +7337,7 @@ mod pr_intake_always_on_audit_tests {
             machine_global: None,
             rolling_budget_quota: None,
         };
+        let launches = Cell::new(0usize);
         let outcome = run_independent_audit_intake_item_with_runner(
             &mut writer,
             IndependentAuditIntakeRunInput {
@@ -7274,10 +7353,18 @@ mod pr_intake_always_on_audit_tests {
             None,
             None,
             InboxCatalogPreflightGrantSupply::IssueFromInboxIntent,
-            |_| panic!("dry run must not launch the independent auditor"),
+            |_| {
+                launches.set(launches.get() + 1);
+                panic!("dry run must not launch the independent auditor");
+            },
         )
         .expect("dry-run audit plan");
 
+        assert_eq!(
+            launches.get(),
+            0,
+            "dry-run must exit before issuer, loader, spawn, and network"
+        );
         assert_eq!(outcome.report.status, "dry_run");
         assert!(outcome.report.independent_audit_lane.is_none());
         assert!(outcome.report.github_success);
@@ -7498,6 +7585,269 @@ mod pr_intake_always_on_audit_tests {
             )),
             "Fake path must skip Codex catalog without spawn: {:?}",
             lane.blockers
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn bind_local_inbox_sink_fixture(
+        command: &mut ExternalAgentCommand,
+        program_name: &str,
+    ) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("inbox sink fixture temp");
+        let marker = temp.path().join("child-process-started");
+        let agent = temp.path().join(program_name);
+        fs::write(
+            &agent,
+            format!(
+                "#!/bin/sh\nwhile IFS= read -r _line; do\n    :\ndone\ntouch '{}'\nexit 0\n",
+                marker.display()
+            ),
+        )
+        .expect("write inbox sink fixture agent");
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o700))
+            .expect("chmod inbox sink fixture agent");
+        let incoming = temp.path().join("incoming");
+        fs::create_dir(&incoming).expect("create inbox sink incoming");
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))
+            .expect("chmod inbox sink incoming");
+        command.program = fs::canonicalize(&agent).expect("canonicalize inbox sink fixture");
+        command.json_log = incoming.join("events.jsonl");
+        command.output_last_message = incoming.join("last-message.txt");
+        command.machine_global_retention = None;
+        command.output_schema = None;
+        command.read_only_input_files.clear();
+        command.worker_journal_artifacts.clear();
+        command.environment_requirements.clear();
+        // Same mandatory control roots as create_mandatory_control_roots.
+        fs::create_dir_all(&command.cwd).expect("inbox sink workspace");
+        fs::create_dir_all(command.cwd.join(".git")).expect("inbox sink git control");
+        for protected_root in [".maco", ".maco-cache", ".codex", ".agents"] {
+            let path = command.cwd.join(protected_root);
+            fs::create_dir_all(&path).expect("create inbox sink protected worktree control");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .expect("chmod inbox sink protected worktree control");
+        }
+        (temp, marker)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_inbox_sink_refused(
+        report: &crate::external_agent::ExternalAgentRun,
+        marker: &Path,
+        cause: AssignmentProcessLaunchGrantError,
+    ) {
+        assert!(
+            !marker.exists(),
+            "Inbox independent-auditor process must not spawn: {:?}",
+            report.error
+        );
+        assert!(!report.stdout.target_launch_attempted);
+        assert!(
+            report.error.as_deref().is_some_and(|error| {
+                error.contains("assignment process launch grant failed closed")
+                    && error.contains(cause.cause_id())
+            }),
+            "unexpected Inbox process refusal: {:?}",
+            report.error
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn independent_audit_inbox_process_grant_reaches_shared_sink_with_counts() {
+        use crate::external_agent::{
+            run_external_agent, run_external_agent_nonpublishable_simulation,
+        };
+
+        let (_temp, repo, config, item, pr_intake, run_id, mut writer, run_dir) =
+            independent_audit_catalog_dispatch_fixture(
+                944,
+                "independent-audit-inbox-process-grant",
+            );
+        let context = InboxItemRunContext {
+            repo: &repo,
+            run_dir: &run_dir,
+            run_id: &run_id,
+            config: &config,
+            action_policy: InboxActionPolicy::Github,
+            permission_mode: InboxPermissionMode::GithubFull,
+            codex_bin: Some(PathBuf::from("codex")),
+            machine_global: None,
+            rolling_budget_quota: None,
+        };
+        let available_models = ["gpt-5.6-sol".to_string()].into_iter().collect();
+        let expected_session = format!("{}-item-1-auditor", run_id.as_str());
+        let runner_calls = Cell::new(0usize);
+        let spawn_attempted = Cell::new(0usize);
+        let spawn_refused = Cell::new(0usize);
+        let consume_ok = Cell::new(0usize);
+        let consume_replay_fail = Cell::new(0usize);
+        let outcome = run_independent_audit_intake_item_with_runner(
+            &mut writer,
+            IndependentAuditIntakeRunInput {
+                item_run: InboxItemRunInput {
+                    context: &context,
+                    item_index: 1,
+                    item: &item,
+                },
+                review_loop: review_loop_entry::evaluate_inbox_item_review_loop(&item),
+                pr_intake,
+                source_fresh: true,
+            },
+            Some(&available_models),
+            None,
+            InboxCatalogPreflightGrantSupply::IssueFromInboxIntent,
+            |command| {
+                runner_calls.set(runner_calls.get() + 1);
+                assert_eq!(command.program, PathBuf::from("codex"));
+                assert_eq!(command.cwd, repo);
+                assert_eq!(
+                    command.assignment_process_launch_kind,
+                    Some(AssignmentProcessLaunchKind::InboxIndependentAuditor)
+                );
+                let grant = command
+                    .assignment_process_launch_grant
+                    .clone()
+                    .expect("with_runner must attach the Inbox process grant before the runner");
+                assert_eq!(
+                    grant.kind(),
+                    AssignmentProcessLaunchKind::InboxIndependentAuditor
+                );
+                assert_eq!(grant.run_id(), run_id.as_str());
+                assert_eq!(grant.subject(), expected_session.as_str());
+                assert_eq!(grant.attempt(), 1);
+                assert_eq!(grant.duty(), INBOX_INDEPENDENT_AUDITOR_PROCESS_DUTY);
+                assert_eq!(grant.model(), Some("gpt-5.6-sol"));
+                let lifecycle_role = command
+                    .agent_lifecycle
+                    .as_ref()
+                    .map(|identity| identity.role.as_str())
+                    .expect("Inbox independent-auditor command must carry lifecycle role");
+                assert_eq!(lifecycle_role, AgentRole::Auditor.as_str());
+                assert_eq!(
+                    RoleCategory::from_legacy_role(lifecycle_role)
+                        .expect("canonical auditor role maps to hierarchy ledger category"),
+                    RoleCategory::ReadOnlyReviewAuditor
+                );
+                assert_eq!(
+                    command
+                        .agent_lifecycle
+                        .as_ref()
+                        .map(|identity| identity.run_id.as_str()),
+                    Some(run_id.as_str())
+                );
+                assert_eq!(
+                    command
+                        .agent_lifecycle
+                        .as_ref()
+                        .map(|identity| identity.task_id.as_str()),
+                    Some(expected_session.as_str())
+                );
+
+                let mut missing = command.clone();
+                let (_missing_temp, missing_marker) =
+                    bind_local_inbox_sink_fixture(&mut missing, "fixture-agent.sh");
+                missing.assignment_process_launch_grant = None;
+                let missing_sim = run_external_agent_nonpublishable_simulation(&missing);
+                assert_inbox_sink_refused(
+                    &missing_sim,
+                    &missing_marker,
+                    AssignmentProcessLaunchGrantError::MissingGrant,
+                );
+                spawn_refused.set(spawn_refused.get() + 1);
+                let missing_verified = run_external_agent(&missing);
+                assert_inbox_sink_refused(
+                    &missing_verified,
+                    &missing_marker,
+                    AssignmentProcessLaunchGrantError::MissingGrant,
+                );
+                spawn_refused.set(spawn_refused.get() + 1);
+
+                let mut wrong_kind = command.clone();
+                let (_kind_temp, kind_marker) =
+                    bind_local_inbox_sink_fixture(&mut wrong_kind, "fixture-agent.sh");
+                wrong_kind.assignment_process_launch_kind =
+                    Some(AssignmentProcessLaunchKind::ParentAuditor);
+                let kind_report = run_external_agent_nonpublishable_simulation(&wrong_kind);
+                assert_inbox_sink_refused(
+                    &kind_report,
+                    &kind_marker,
+                    AssignmentProcessLaunchGrantError::KindMismatch,
+                );
+                spawn_refused.set(spawn_refused.get() + 1);
+
+                let mut wrong_identity = command.clone();
+                let (_id_temp, id_marker) =
+                    bind_local_inbox_sink_fixture(&mut wrong_identity, "fixture-agent.sh");
+                if let Some(identity) = &mut wrong_identity.agent_lifecycle {
+                    identity.task_id = "other-auditor-session".to_string();
+                }
+                let identity_report = run_external_agent_nonpublishable_simulation(&wrong_identity);
+                assert_inbox_sink_refused(
+                    &identity_report,
+                    &id_marker,
+                    AssignmentProcessLaunchGrantError::IdentityMismatch,
+                );
+                spawn_refused.set(spawn_refused.get() + 1);
+
+                let mut matching = command.clone();
+                let (_match_temp, match_marker) =
+                    bind_local_inbox_sink_fixture(&mut matching, "fixture-agent.sh");
+                let matching_report = run_external_agent_nonpublishable_simulation(&matching);
+                assert_eq!(matching_report.error, None, "{matching_report:?}");
+                assert_eq!(matching_report.exit_code, Some(0));
+                assert!(matching_report.stdout.target_launch_attempted);
+                assert!(match_marker.exists());
+                spawn_attempted.set(spawn_attempted.get() + 1);
+                consume_ok.set(consume_ok.get() + 1);
+
+                let mut replay = command.clone();
+                let (_replay_temp, replay_marker) =
+                    bind_local_inbox_sink_fixture(&mut replay, "fixture-agent.sh");
+                replay.assignment_process_launch_grant = Some(grant);
+                let replay_report = run_external_agent_nonpublishable_simulation(&replay);
+                assert_inbox_sink_refused(
+                    &replay_report,
+                    &replay_marker,
+                    AssignmentProcessLaunchGrantError::AlreadyConsumed,
+                );
+                spawn_refused.set(spawn_refused.get() + 1);
+                consume_replay_fail.set(consume_replay_fail.get() + 1);
+
+                IndependentAuditRunnerResult {
+                    raw_output: None,
+                    report_sha256: None,
+                    exit_code: matching_report.exit_code,
+                    duration_ms: matching_report.duration_ms,
+                    timed_out: matching_report.timed_out,
+                    safely_executed: matching_report.safely_executed(),
+                    publishable: matching_report.publishable,
+                    succeeded: false,
+                    scratch_quiescence_verified: true,
+                    error: matching_report.error.clone(),
+                }
+            },
+        )
+        .expect("Inbox process-grant fixture must finish without a second same-path prepare");
+
+        assert_eq!(runner_calls.get(), 1);
+        assert_eq!(spawn_attempted.get(), 1);
+        assert_eq!(spawn_refused.get(), 5);
+        assert_eq!(consume_ok.get(), 1);
+        assert_eq!(consume_replay_fail.get(), 1);
+        assert_eq!(outcome.report.status, "launch_blocked");
+        let lane = outcome
+            .report
+            .independent_audit_lane
+            .as_ref()
+            .expect("Inbox process-grant fixture records a lane");
+        assert_eq!(
+            lane.launch
+                .as_ref()
+                .map(|launch| launch.auditor_identity.as_str()),
+            Some(review_loop_entry::independent_auditor_stable_id())
         );
     }
 

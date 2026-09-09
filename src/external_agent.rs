@@ -244,8 +244,8 @@ pub struct ExternalAgentCommand {
     /// Opaque MACO-owned proof that the selected command, held claims, disposable worktree, and
     /// verified native confinement were authenticated together immediately before launch.
     worktree_writable_confinement: Option<WorktreeWritableConfinementProof>,
-    /// Assignment-child / parent-auditor launch kind. Absence leaves consult, inbox,
-    /// merge, and catalog callers ungated by this grant.
+    /// Assignment-child / parent-auditor / Inbox-independent-auditor launch kind.
+    /// Absence leaves consult, merge, and catalog callers ungated by this grant.
     pub(crate) assignment_process_launch_kind: Option<AssignmentProcessLaunchKind>,
     /// One-shot sibling grant consumed against the final ProcessSpec when kind is set.
     pub(crate) assignment_process_launch_grant: Option<AssignmentProcessLaunchGrant>,
@@ -1403,10 +1403,11 @@ impl ExternalAgentCommand {
         self
     }
 
-    /// Attach a caller-issued assignment-child or parent-auditor process grant.
+    /// Attach a caller-issued assignment-child, parent-auditor, or Inbox
+    /// independent-auditor process grant.
     ///
-    /// Consult, inbox, merge, and catalog constructors leave kind and grant
-    /// absent so those callers stay outside this unit.
+    /// Consult, merge, and catalog constructors leave kind and grant absent so
+    /// those callers stay outside this grant family.
     pub(crate) fn with_assignment_process_launch(
         mut self,
         kind: AssignmentProcessLaunchKind,

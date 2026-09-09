@@ -7867,4 +7867,140 @@ fn matching_assignment_process_grant_launches_local_fixture_once() -> Result<()>
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn inbox_independent_auditor_missing_grant_fails_closed_on_verified_and_simulation() -> Result<()> {
+    let (_temp, spec, marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::InboxIndependentAuditor,
+        None,
+        "run-missing-inbox-auditor",
+        "run-missing-inbox-auditor-item-1-auditor",
+        Some("gpt-5.6-sol"),
+    )?;
+    let simulated = run_external_agent_nonpublishable_simulation(&spec);
+    assert_assignment_process_launch_refused(
+        &simulated,
+        &marker,
+        crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::MissingGrant,
+    );
+    assert!(!simulated.stdout.target_launch_attempted);
+    let verified = run_external_agent(&spec);
+    assert_assignment_process_launch_refused(
+        &verified,
+        &marker,
+        crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::MissingGrant,
+    );
+    assert!(!verified.stdout.target_launch_attempted);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn inbox_independent_auditor_wrong_kind_identity_catalog_and_replay_fail_closed() -> Result<()> {
+    let inbox_grant = crate::mutation_taxonomy::admit_inbox_independent_auditor_process_intent(
+        "run-inbox-wrong-kind",
+        "run-inbox-wrong-kind-item-1-auditor",
+        1,
+        Path::new("codex"),
+        Some("gpt-5.6-sol"),
+        crate::mutation_taxonomy::INBOX_INDEPENDENT_AUDITOR_PROCESS_DUTY,
+    )?;
+    let (_temp, spec, marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::ParentAuditor,
+        Some(inbox_grant),
+        "run-inbox-wrong-kind",
+        "run-inbox-wrong-kind-item-1-auditor",
+        Some("gpt-5.6-sol"),
+    )?;
+    let report = run_external_agent_nonpublishable_simulation(&spec);
+    assert_assignment_process_launch_refused(
+        &report,
+        &marker,
+        crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::KindMismatch,
+    );
+
+    let grant = crate::mutation_taxonomy::admit_inbox_independent_auditor_process_intent(
+        "run-inbox-wrong-id",
+        "run-inbox-wrong-id-item-1-auditor",
+        1,
+        Path::new("codex"),
+        Some("gpt-5.6-sol"),
+        crate::mutation_taxonomy::INBOX_INDEPENDENT_AUDITOR_PROCESS_DUTY,
+    )?;
+    let (_temp, spec, marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::InboxIndependentAuditor,
+        Some(grant),
+        "run-other-inbox-id",
+        "run-inbox-wrong-id-item-1-auditor",
+        Some("gpt-5.6-sol"),
+    )?;
+    let report = run_external_agent_nonpublishable_simulation(&spec);
+    assert_assignment_process_launch_refused(
+        &report,
+        &marker,
+        crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::IdentityMismatch,
+    );
+
+    let _catalog = SupervisorCatalogCodexPreflightGrant::admit_from_supervisor_catalog_intent(
+        "run-catalog-as-inbox-auditor",
+        Path::new("/repos/caller-worktree"),
+        Path::new("codex"),
+    )?;
+    let (_temp, spec, marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::InboxIndependentAuditor,
+        None,
+        "run-catalog-as-inbox-auditor",
+        "run-catalog-as-inbox-auditor-item-1-auditor",
+        Some("gpt-5.6-sol"),
+    )?;
+    let report = run_external_agent_nonpublishable_simulation(&spec);
+    assert_assignment_process_launch_refused(
+        &report,
+        &marker,
+        crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::MissingGrant,
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn matching_inbox_independent_auditor_grant_launches_local_fixture_once() -> Result<()> {
+    let grant = crate::mutation_taxonomy::admit_inbox_independent_auditor_process_intent(
+        "run-inbox-genuine-fixture",
+        "run-inbox-genuine-fixture-item-1-auditor",
+        1,
+        Path::new("codex"),
+        Some("gpt-5.6-sol"),
+        crate::mutation_taxonomy::INBOX_INDEPENDENT_AUDITOR_PROCESS_DUTY,
+    )?;
+    let replay = grant.clone();
+    let (_temp, spec, marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::InboxIndependentAuditor,
+        Some(grant),
+        "run-inbox-genuine-fixture",
+        "run-inbox-genuine-fixture-item-1-auditor",
+        Some("gpt-5.6-sol"),
+    )?;
+    let report = run_external_agent_nonpublishable_simulation(&spec);
+    assert_eq!(report.error, None, "{report:?}");
+    assert_eq!(report.exit_code, Some(0));
+    assert!(report.stdout.target_launch_attempted);
+    assert!(marker.exists());
+    let (_temp_replay, replay_spec, replay_marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::InboxIndependentAuditor,
+        Some(replay),
+        "run-inbox-genuine-fixture",
+        "run-inbox-genuine-fixture-item-1-auditor",
+        Some("gpt-5.6-sol"),
+    )?;
+    let reused = run_external_agent_nonpublishable_simulation(&replay_spec);
+    assert_assignment_process_launch_refused(
+        &reused,
+        &replay_marker,
+        crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::AlreadyConsumed,
+    );
+    assert!(!replay_marker.exists());
+    Ok(())
+}
+
 include!("tests_part2.rs");

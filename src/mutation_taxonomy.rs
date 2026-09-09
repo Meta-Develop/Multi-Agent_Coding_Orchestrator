@@ -24,7 +24,10 @@ use std::sync::{LazyLock, Mutex};
 /// Version 6 adds assignment-child and parent-auditor process launch as a
 /// distinct irreversible spawn admitted only by an upstream one-shot sibling
 /// grant bound to the final ProcessSpec.
-pub const MUTATION_TAXONOMY_VERSION: u32 = 6;
+/// Version 7 adds Inbox independent-auditor process launch as a distinct
+/// irreversible sibling spawn with its own explicit gate. Catalog grants and
+/// parent-auditor grants cannot authorize that spawn.
+pub const MUTATION_TAXONOMY_VERSION: u32 = 7;
 
 /// Gate identity returned for an unlisted, empty, or internally inconsistent row.
 pub const TAXONOMY_REVIEW_REQUIRED_GATE_ID: &str = "taxonomy-review-required";
@@ -72,6 +75,7 @@ pub enum ExplicitMutationGate {
     ExplicitSupervisorCatalogCodexPreflightGrant,
     ExplicitInboxPrIntakeCatalogCodexPreflightGrant,
     ExplicitAssignmentParentAuditorProcessLaunchGrant,
+    ExplicitInboxIndependentAuditorProcessLaunchGrant,
 }
 
 impl ExplicitMutationGate {
@@ -105,6 +109,9 @@ impl ExplicitMutationGate {
             }
             Self::ExplicitAssignmentParentAuditorProcessLaunchGrant => {
                 "explicit-assignment-parent-auditor-process-launch-grant"
+            }
+            Self::ExplicitInboxIndependentAuditorProcessLaunchGrant => {
+                "explicit-inbox-independent-auditor-process-launch-grant"
             }
         }
     }
@@ -153,11 +160,12 @@ pub enum MutationOperation {
     SupervisorCatalogCodexPreflight,
     InboxPrIntakeCatalogCodexPreflight,
     AssignmentParentAuditorProcessLaunch,
+    InboxIndependentAuditorProcessLaunch,
 }
 
 impl MutationOperation {
     /// Complete enum inventory, kept explicit so additions cannot evade tests.
-    pub const ALL: [Self; 40] = [
+    pub const ALL: [Self; 41] = [
         Self::RepositoryInitialize,
         Self::MegafileTelemetrySeed,
         Self::StateMigrationPreview,
@@ -198,6 +206,7 @@ impl MutationOperation {
         Self::SupervisorCatalogCodexPreflight,
         Self::InboxPrIntakeCatalogCodexPreflight,
         Self::AssignmentParentAuditorProcessLaunch,
+        Self::InboxIndependentAuditorProcessLaunch,
     ];
 
     /// Stable identifier used for lookup, policy rows, and gate evidence.
@@ -244,6 +253,9 @@ impl MutationOperation {
             Self::InboxPrIntakeCatalogCodexPreflight => "inbox-pr-intake-catalog-codex-preflight",
             Self::AssignmentParentAuditorProcessLaunch => {
                 "assignment-parent-auditor-process-launch"
+            }
+            Self::InboxIndependentAuditorProcessLaunch => {
+                "inbox-independent-auditor-process-launch"
             }
         }
     }
@@ -483,6 +495,11 @@ const ENTRIES: &[MutationClassification] = &[
         MutationOperation::AssignmentParentAuditorProcessLaunch,
         "Spawns a trusted assignment-child or parent-auditor process whose process, network, and captured output cannot be restored from retained MACO state.",
         ExplicitMutationGate::ExplicitAssignmentParentAuditorProcessLaunchGrant,
+    ),
+    irreversible(
+        MutationOperation::InboxIndependentAuditorProcessLaunch,
+        "Spawns a trusted Inbox independent-auditor process whose process, network, and captured output cannot be restored from retained MACO state.",
+        ExplicitMutationGate::ExplicitInboxIndependentAuditorProcessLaunchGrant,
     ),
 ];
 
@@ -933,14 +950,17 @@ impl SupervisorCatalogCodexPreflightGrant {
     }
 }
 
-/// Launch kind sealed into an assignment-child / parent-auditor process grant.
+/// Launch kind sealed into an assignment-child / parent-auditor /
+/// Inbox-independent-auditor process grant.
 ///
 /// Distinct from `CatalogPreflightOrigin`. Catalog grants cannot bind these
-/// worker or auditor argv surfaces.
+/// worker or auditor argv surfaces. Inbox independent-auditor is a sibling
+/// kind, not a parent-auditor alias.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AssignmentProcessLaunchKind {
     AssignmentChild,
     ParentAuditor,
+    InboxIndependentAuditor,
 }
 
 /// Expected executable binding sealed into an assignment process-launch grant.
@@ -962,12 +982,14 @@ struct AssignmentProcessSealedDelivery {
     cwd: PathBuf,
 }
 
-/// One-shot grant that admits an assignment-child or parent-auditor spawn
-/// against a fully built `ProcessSpec`.
+/// One-shot grant that admits an assignment-child, parent-auditor, or Inbox
+/// independent-auditor spawn against a fully built `ProcessSpec`.
 ///
 /// The issuer is the trusted caller (`admit_assignment_child_process_intent` /
-/// `admit_parent_auditor_process_intent`), not the external-agent sink. The
-/// sink must not mint this grant from `run_id` plus the caller repository.
+/// `admit_parent_auditor_process_intent` /
+/// `admit_inbox_independent_auditor_process_intent`), not the external-agent
+/// sink. The sink must not mint this grant from `run_id` plus the caller
+/// repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use]
 pub(crate) struct AssignmentProcessLaunchGrant {
@@ -1026,6 +1048,7 @@ static CONSUMED_ASSIGNMENT_PROCESS_LAUNCH_NONCES: LazyLock<Mutex<HashSet<u64>>> 
 const TRUSTED_ASSIGNMENT_PROCESS_CODEX_PROGRAM: &str = "codex";
 pub(crate) const ASSIGNMENT_CHILD_PROCESS_DUTY: &str = "assignment-child";
 pub(crate) const PARENT_AUDITOR_PROCESS_DUTY: &str = "parent-auditor";
+pub(crate) const INBOX_INDEPENDENT_AUDITOR_PROCESS_DUTY: &str = "inbox-independent-auditor";
 
 impl AssignmentProcessLaunchGrant {
     fn admit(
@@ -1328,6 +1351,28 @@ pub(crate) fn admit_parent_auditor_process_intent(
     )
 }
 
+/// Trusted Inbox independent-auditor issuer. Distinct kind from assignment
+/// child and parent-auditor; shares the process-launch nonce ledger, not the
+/// catalog ledger. Does not mint a grant from `run_id` plus a repository path.
+pub(crate) fn admit_inbox_independent_auditor_process_intent(
+    run_id: &str,
+    subject: &str,
+    attempt: usize,
+    expected_program: &Path,
+    model: Option<&str>,
+    duty: &str,
+) -> Result<AssignmentProcessLaunchGrant, AssignmentProcessLaunchGrantError> {
+    AssignmentProcessLaunchGrant::admit(
+        run_id,
+        subject,
+        attempt,
+        AssignmentProcessLaunchKind::InboxIndependentAuditor,
+        expected_program,
+        model,
+        duty,
+    )
+}
+
 #[cfg(test)]
 thread_local! {
     static AUTOPILOT_DISPATCH_DECISION_OVERRIDES: std::cell::RefCell<Option<std::collections::VecDeque<AutonomousMutationDecision>>> =
@@ -1388,7 +1433,7 @@ mod tests {
     #[test]
     fn registry_is_current_complete_and_unique() {
         assert_eq!(registry().version, MUTATION_TAXONOMY_VERSION);
-        assert_eq!(registry().version, 6);
+        assert_eq!(registry().version, 7);
         assert_eq!(registry().entries.len(), MutationOperation::ALL.len());
 
         let registered = registry()
@@ -1450,7 +1495,7 @@ mod tests {
             .filter(|entry| entry.reversibility == MutationReversibility::Reversible)
             .count();
         assert_eq!(reversible, 15);
-        assert_eq!(registry().entries.len() - reversible, 25);
+        assert_eq!(registry().entries.len() - reversible, 26);
         assert_eq!(
             SUPERVISOR_CHILD_DISPATCH_MUTATIONS,
             [
@@ -2233,6 +2278,25 @@ mod tests {
             )
             .expect("independently verified canonical must seal")
         }
+
+        fn admit_inbox(self) -> AssignmentProcessLaunchGrant {
+            admit_inbox_independent_auditor_process_intent(
+                self.run_id,
+                self.subject,
+                self.attempt,
+                Path::new("codex"),
+                self.model,
+                self.duty,
+            )
+            .expect("trusted codex spelling must admit")
+            .seal_independently_verified_canonical_binding(
+                self.program,
+                self.argv.iter().copied(),
+                self.output_staging,
+                self.cwd,
+            )
+            .expect("independently verified canonical must seal")
+        }
     }
 
     #[test]
@@ -2264,6 +2328,224 @@ mod tests {
         assert_ne!(
             MutationOperation::AssignmentParentAuditorProcessLaunch,
             MutationOperation::InboxPrIntakeCatalogCodexPreflight
+        );
+        assert_ne!(
+            MutationOperation::AssignmentParentAuditorProcessLaunch,
+            MutationOperation::InboxIndependentAuditorProcessLaunch
+        );
+        assert_ne!(
+            ExplicitMutationGate::ExplicitAssignmentParentAuditorProcessLaunchGrant,
+            ExplicitMutationGate::ExplicitInboxIndependentAuditorProcessLaunchGrant
+        );
+    }
+
+    #[test]
+    fn inbox_independent_auditor_process_launch_is_irreversible_distinct_gate_and_not_child_dispatch(
+    ) {
+        assert!(!SUPERVISOR_CHILD_DISPATCH_MUTATIONS
+            .contains(&MutationOperation::InboxIndependentAuditorProcessLaunch));
+        assert_eq!(
+            autonomous_decision_for(MutationOperation::InboxIndependentAuditorProcessLaunch.id()),
+            AutonomousMutationDecision::RequireExplicitGate(
+                ExplicitMutationGate::ExplicitInboxIndependentAuditorProcessLaunchGrant
+            )
+        );
+        assert_ne!(
+            ExplicitMutationGate::ExplicitInboxIndependentAuditorProcessLaunchGrant,
+            ExplicitMutationGate::InternalSealedPinnedExecCapability
+        );
+        assert_ne!(
+            ExplicitMutationGate::ExplicitInboxIndependentAuditorProcessLaunchGrant,
+            ExplicitMutationGate::ExplicitSupervisorCatalogCodexPreflightGrant
+        );
+        assert_ne!(
+            ExplicitMutationGate::ExplicitInboxIndependentAuditorProcessLaunchGrant,
+            ExplicitMutationGate::ExplicitInboxPrIntakeCatalogCodexPreflightGrant
+        );
+        assert_ne!(
+            ExplicitMutationGate::ExplicitInboxIndependentAuditorProcessLaunchGrant,
+            ExplicitMutationGate::ExplicitAssignmentParentAuditorProcessLaunchGrant
+        );
+        assert_ne!(
+            MutationOperation::InboxIndependentAuditorProcessLaunch,
+            MutationOperation::SupervisorCatalogCodexPreflight
+        );
+        assert_ne!(
+            MutationOperation::InboxIndependentAuditorProcessLaunch,
+            MutationOperation::InboxPrIntakeCatalogCodexPreflight
+        );
+        assert_ne!(
+            MutationOperation::InboxIndependentAuditorProcessLaunch,
+            MutationOperation::AssignmentParentAuditorProcessLaunch
+        );
+        assert_ne!(
+            AssignmentProcessLaunchKind::InboxIndependentAuditor,
+            AssignmentProcessLaunchKind::ParentAuditor
+        );
+        assert_ne!(
+            AssignmentProcessLaunchKind::InboxIndependentAuditor,
+            AssignmentProcessLaunchKind::AssignmentChild
+        );
+    }
+
+    #[test]
+    fn inbox_independent_auditor_process_grant_consumes_once_against_final_spec_identity() {
+        use crate::process_runner::{ProcessCommand, ProcessSpec};
+
+        let program = Path::new("/usr/bin/codex");
+        let cwd = Path::new("/repos/inbox-audit");
+        let staging = Path::new("/run/maco/output/auditor-output.json");
+        let argv = ["exec", "--sandbox", "read-only"];
+        let spec = ProcessSpec::direct("inbox independent auditor binding", program, argv, cwd, 64);
+        let ProcessCommand::Direct {
+            program: spec_program,
+            args: spec_argv,
+        } = &spec.command
+        else {
+            panic!("direct inbox auditor spec must remain a direct command");
+        };
+
+        let grant = AssignmentProcessGrantFixture {
+            run_id: "run-inbox-audit-1",
+            subject: "run-inbox-audit-1-item-1-auditor",
+            attempt: 1,
+            model: Some("gpt-5.6-sol"),
+            duty: INBOX_INDEPENDENT_AUDITOR_PROCESS_DUTY,
+            program,
+            argv: &argv,
+            output_staging: staging,
+            cwd,
+        }
+        .admit_inbox();
+        assert_eq!(grant.run_id(), "run-inbox-audit-1");
+        assert_eq!(grant.subject(), "run-inbox-audit-1-item-1-auditor");
+        assert_eq!(grant.attempt(), 1);
+        assert_eq!(
+            grant.kind(),
+            AssignmentProcessLaunchKind::InboxIndependentAuditor
+        );
+        assert_eq!(grant.duty(), INBOX_INDEPENDENT_AUDITOR_PROCESS_DUTY);
+        assert_eq!(
+            grant.independently_verified_canonical_program(),
+            Some(program)
+        );
+        grant
+            .clone()
+            .consume_for_process_binding(
+                spec_program,
+                &spec.current_dir,
+                spec_argv,
+                staging,
+                "run-inbox-audit-1",
+                "run-inbox-audit-1-item-1-auditor",
+                1,
+                AssignmentProcessLaunchKind::InboxIndependentAuditor,
+                Some("gpt-5.6-sol"),
+                INBOX_INDEPENDENT_AUDITOR_PROCESS_DUTY,
+            )
+            .expect("matching Inbox independent-auditor grant must consume once");
+        assert_eq!(
+            grant.consume_for_process_binding(
+                spec_program,
+                &spec.current_dir,
+                spec_argv,
+                staging,
+                "run-inbox-audit-1",
+                "run-inbox-audit-1-item-1-auditor",
+                1,
+                AssignmentProcessLaunchKind::InboxIndependentAuditor,
+                Some("gpt-5.6-sol"),
+                INBOX_INDEPENDENT_AUDITOR_PROCESS_DUTY,
+            ),
+            Err(AssignmentProcessLaunchGrantError::AlreadyConsumed)
+        );
+    }
+
+    #[test]
+    fn inbox_independent_auditor_process_grant_rejects_parent_auditor_kind_and_catalog_argv() {
+        use crate::process_runner::{ProcessCommand, ProcessSpec};
+
+        let program = Path::new("/usr/bin/codex");
+        let cwd = Path::new("/repos/inbox-audit");
+        let staging = Path::new("/run/maco/output/auditor-output.json");
+        let argv = ["exec"];
+        let spec = ProcessSpec::direct("inbox kind mismatch", program, argv, cwd, 64);
+        let ProcessCommand::Direct {
+            program: spec_program,
+            args: spec_argv,
+        } = &spec.command
+        else {
+            panic!("direct inbox auditor spec must remain a direct command");
+        };
+        let inbox_grant = AssignmentProcessGrantFixture {
+            run_id: "run-inbox-kind",
+            subject: "run-inbox-kind-item-1-auditor",
+            attempt: 1,
+            model: Some("gpt-5.6-sol"),
+            duty: INBOX_INDEPENDENT_AUDITOR_PROCESS_DUTY,
+            program,
+            argv: &argv,
+            output_staging: staging,
+            cwd,
+        }
+        .admit_inbox();
+        assert_eq!(
+            inbox_grant.consume_for_process_binding(
+                spec_program,
+                &spec.current_dir,
+                spec_argv,
+                staging,
+                "run-inbox-kind",
+                "run-inbox-kind-item-1-auditor",
+                1,
+                AssignmentProcessLaunchKind::ParentAuditor,
+                Some("gpt-5.6-sol"),
+                INBOX_INDEPENDENT_AUDITOR_PROCESS_DUTY,
+            ),
+            Err(AssignmentProcessLaunchGrantError::KindMismatch)
+        );
+
+        let catalog_argv = ["debug", "models"];
+        let catalog_spec = ProcessSpec::direct(
+            "catalog argv cannot bind inbox auditor",
+            program,
+            catalog_argv,
+            cwd,
+            64,
+        );
+        let ProcessCommand::Direct {
+            program: catalog_program,
+            args: catalog_args,
+        } = &catalog_spec.command
+        else {
+            panic!("direct catalog spec must remain a direct command");
+        };
+        let catalog_shaped = AssignmentProcessGrantFixture {
+            run_id: "run-inbox-catalog-argv",
+            subject: "run-inbox-catalog-argv-item-1-auditor",
+            attempt: 1,
+            model: Some("gpt-5.6-sol"),
+            duty: INBOX_INDEPENDENT_AUDITOR_PROCESS_DUTY,
+            program,
+            argv: &argv,
+            output_staging: staging,
+            cwd,
+        }
+        .admit_inbox();
+        assert_eq!(
+            catalog_shaped.consume_for_process_binding(
+                catalog_program,
+                &catalog_spec.current_dir,
+                catalog_args,
+                staging,
+                "run-inbox-catalog-argv",
+                "run-inbox-catalog-argv-item-1-auditor",
+                1,
+                AssignmentProcessLaunchKind::InboxIndependentAuditor,
+                Some("gpt-5.6-sol"),
+                INBOX_INDEPENDENT_AUDITOR_PROCESS_DUTY,
+            ),
+            Err(AssignmentProcessLaunchGrantError::ArgvMismatch)
         );
     }
 
