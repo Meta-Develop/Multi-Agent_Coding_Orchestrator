@@ -19,8 +19,12 @@ use std::{
 use thiserror::Error;
 
 use crate::{
-    agent_lifecycle::{AgentLaunchMetadata, AgentRegistry, MACO_RUN_ID_ENV, MACO_TASK_ID_ENV},
+    agent_lifecycle::{
+        authorize_process_launch_before_spawn, AgentLaunchMetadata, AgentRegistry, MACO_RUN_ID_ENV,
+        MACO_TASK_ID_ENV,
+    },
     external_agent::EnvironmentFailure,
+    mutation_taxonomy::ConsumedMechanicalExecutorProof,
     pinned_exec::{
         self, PinnedDirectExecutable, HIDDEN_PINNED_EXEC_ARGUMENT, PINNED_EXEC_DESCRIPTOR_NAME,
     },
@@ -1661,6 +1665,9 @@ pub struct ProcessSpec {
     /// runner stamps [`MACO_NESTED_USAGE_JOURNAL_ENV`] and [`MACO_PARENT_SPAN_ID_ENV`] so a nested
     /// Fake or CLI worker can emit role-tagged usage across the process boundary.
     pub nested_usage: Option<NestedUsageRequest>,
+    /// Opaque consumed mechanical-executor proof. Public constructors cannot set
+    /// this. Clone shares the consume slot so a second spawn cannot reuse it.
+    mechanical_executor_proof: Option<ConsumedMechanicalExecutorProof>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1739,6 +1746,7 @@ impl ProcessSpec {
             stdout: StreamCapture::bounded(capture_limit_bytes),
             stderr: StreamCapture::bounded(capture_limit_bytes),
             nested_usage: None,
+            mechanical_executor_proof: None,
         }
     }
 
@@ -1775,6 +1783,7 @@ impl ProcessSpec {
             stdout: StreamCapture::bounded(capture_limit_bytes),
             stderr: StreamCapture::bounded(capture_limit_bytes),
             nested_usage: None,
+            mechanical_executor_proof: None,
         }
     }
 
@@ -1787,10 +1796,30 @@ impl ProcessSpec {
     ///
     /// Environment stamping is applied both here for inspectable built-spec evidence and again at
     /// [`run_process`] entry so later builder calls cannot accidentally discard the identifiers.
+    /// This does not copy, clear, or invent a mechanical-executor proof.
     pub fn with_agent_lifecycle(mut self, metadata: AgentLaunchMetadata) -> Self {
         stamp_agent_lifecycle_environment(&mut self.environment, &metadata);
         self.agent_lifecycle = Some(metadata);
         self
+    }
+
+    pub(crate) fn with_consumed_mechanical_executor_proof(
+        mut self,
+        proof: ConsumedMechanicalExecutorProof,
+    ) -> Self {
+        self.mechanical_executor_proof = Some(proof);
+        self
+    }
+
+    pub(crate) fn attach_consumed_mechanical_executor_proof(
+        &mut self,
+        proof: ConsumedMechanicalExecutorProof,
+    ) {
+        self.mechanical_executor_proof = Some(proof);
+    }
+
+    fn take_mechanical_executor_proof(&mut self) -> Option<ConsumedMechanicalExecutorProof> {
+        self.mechanical_executor_proof.take()
     }
 
     // This capability is intentionally crate-internal and is consumed only by callers that opt
@@ -2213,6 +2242,53 @@ fn run_process_cancellable_with_interaction(
             });
         }
     }
+    let reserved_mechanical_executor = match spec.take_mechanical_executor_proof() {
+        Some(proof) => {
+            Some(
+                proof
+                    .reserve_for_execution()
+                    .map_err(|error| ProcessRunError::Spawn {
+                        label: spec.label.clone(),
+                        command: command_display.clone(),
+                        current_dir: spec.current_dir.clone(),
+                        source: std::io::Error::other(format!(
+                            "mechanical executor proof reservation failed closed: {error}"
+                        )),
+                    })?,
+            )
+        }
+        None => None,
+    };
+    if spec.agent_lifecycle.is_some() || reserved_mechanical_executor.is_some() {
+        match spec.agent_lifecycle.as_ref() {
+            Some(metadata) => {
+                authorize_process_launch_before_spawn(
+                    metadata,
+                    &spec.command.lifecycle_argv(),
+                    &spec.current_dir,
+                    reserved_mechanical_executor.as_ref(),
+                )
+                .map_err(|error| ProcessRunError::Spawn {
+                    label: spec.label.clone(),
+                    command: command_display.clone(),
+                    current_dir: spec.current_dir.clone(),
+                    source: std::io::Error::other(format!(
+                        "agent lifecycle launch refused before spawn: {error:#}"
+                    )),
+                })?;
+            }
+            None => {
+                return Err(ProcessRunError::Spawn {
+                    label: spec.label.clone(),
+                    command: command_display.clone(),
+                    current_dir: spec.current_dir.clone(),
+                    source: std::io::Error::other(
+                        "mechanical executor proof requires agent lifecycle identity",
+                    ),
+                });
+            }
+        }
+    }
     ensure_not_cancelled(cancellation, &spec.label, &command_display, "initial setup")?;
     let operation_deadline = spec
         .timeout
@@ -2422,8 +2498,18 @@ fn run_process_cancellable_with_interaction(
                 return Err(append_process_run_error_cleanup(error, cleanup_error));
             }
         };
-        let registration = AgentRegistry::open(metadata.repo())
-            .and_then(|registry| registry.register(metadata, pid, spec.command.lifecycle_argv()));
+        let registration = AgentRegistry::open(metadata.repo()).and_then(|registry| {
+            match reserved_mechanical_executor {
+                Some(reserved) => registry.register_reserved_mechanical_executor(
+                    metadata,
+                    pid,
+                    spec.command.lifecycle_argv(),
+                    &spec.current_dir,
+                    reserved,
+                ),
+                None => registry.register(metadata, pid, spec.command.lifecycle_argv()),
+            }
+        });
         if let Err(error) = registration {
             let cleanup = attached_process_tree.cleanup(
                 &mut child,
@@ -4107,3 +4193,222 @@ pub(crate) fn private_runtime_environment_for_test(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod mechanical_executor_lifecycle_tests {
+    use super::*;
+    use crate::mutation_taxonomy::{
+        admit_assignment_child_process_intent, AssignmentProcessLaunchKind,
+        AssignmentProcessMechanicalBinding, SealedMechanicalExecutorDuty,
+        SealedMechanicalExecutorPhase, SealedMechanicalExecutorRole, ASSIGNMENT_CHILD_PROCESS_DUTY,
+    };
+    use std::os::unix::fs::PermissionsExt;
+
+    fn named_codex_counter_fixture(root: &Path) -> (PathBuf, PathBuf) {
+        let program = root.join("codex");
+        let counter = root.join("spawn-count");
+        fs::write(
+            &program,
+            format!("#!/bin/sh\nprintf x >> '{}'\nexit 0\n", counter.display()),
+        )
+        .expect("write named codex fixture");
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).expect("chmod fixture");
+        (
+            fs::canonicalize(&program).expect("canonical fixture"),
+            counter,
+        )
+    }
+
+    #[test]
+    fn generic_process_spec_weak_mechanical_without_proof_is_refused_before_spawn() {
+        let overlay = crate::supervise::install_test_fixture_models(&[(
+            "fixture-weak-mechanical",
+            crate::supervise::ModelCapabilityClass::WeakMechanical,
+        )])
+        .expect("overlay");
+        let temp = tempfile::tempdir().expect("tempdir");
+        git2::Repository::init(temp.path()).expect("init repository");
+        let (program, counter) = named_codex_counter_fixture(temp.path());
+        let metadata =
+            AgentLaunchMetadata::new(temp.path(), "worker", "run-generic", "task-generic")
+                .expect("lifecycle metadata");
+        let spec = ProcessSpec::direct(
+            "generic weak without proof",
+            program,
+            ["exec", "-m", "fixture-weak-mechanical"],
+            temp.path(),
+            128,
+        )
+        .with_stdin(StdinMode::Null)
+        .with_timeout(Some(Duration::from_secs(10)))
+        .with_containment(ContainmentPolicy::TrustedBestEffort)
+        .with_agent_lifecycle(metadata);
+        let error = run_process(spec).expect_err("weak mechanical without proof must refuse");
+        assert!(
+            format!("{error:#}").contains("weak_mechanical launch requires consumed"),
+            "{error:#}"
+        );
+        assert!(
+            !counter.exists(),
+            "generic ProcessSpec without proof must not spawn"
+        );
+        drop(overlay);
+    }
+
+    #[test]
+    fn cloned_process_spec_mechanical_proof_cannot_spawn_twice() {
+        let overlay = crate::supervise::install_test_fixture_models(&[(
+            "fixture-weak-mechanical",
+            crate::supervise::ModelCapabilityClass::WeakMechanical,
+        )])
+        .expect("overlay");
+        let temp = tempfile::tempdir().expect("tempdir");
+        git2::Repository::init(temp.path()).expect("init repository");
+        let (program, counter) = named_codex_counter_fixture(temp.path());
+        let cwd = temp.path();
+        let staging = temp.path().join("last-message.raw");
+        fs::write(&staging, b"").expect("staging");
+        let args = ["exec", "-m", "fixture-weak-mechanical"];
+        let grant = admit_assignment_child_process_intent(
+            "run-clone-proof",
+            "assignment-clone",
+            1,
+            Path::new("codex"),
+            Some("fixture-weak-mechanical"),
+            ASSIGNMENT_CHILD_PROCESS_DUTY,
+        )
+        .expect("admit")
+        .seal_mechanical_executor(
+            SealedMechanicalExecutorRole::Worker,
+            SealedMechanicalExecutorPhase::MechanicalTerminal,
+            SealedMechanicalExecutorDuty::RunPreselectedCommand,
+        )
+        .expect("seal mechanical")
+        .seal_independently_verified_canonical_binding(&program, args, &staging, cwd)
+        .expect("seal canonical");
+        let proof = grant
+            .consume_for_process_binding(
+                &program,
+                cwd,
+                &args,
+                &staging,
+                "run-clone-proof",
+                "assignment-clone",
+                1,
+                AssignmentProcessLaunchKind::AssignmentChild,
+                Some("fixture-weak-mechanical"),
+                ASSIGNMENT_CHILD_PROCESS_DUTY,
+                Some(AssignmentProcessMechanicalBinding::worker(
+                    SealedMechanicalExecutorDuty::RunPreselectedCommand,
+                    SealedMechanicalExecutorRole::Worker.as_str(),
+                )),
+            )
+            .expect("consume")
+            .expect("proof");
+        let metadata =
+            AgentLaunchMetadata::new(temp.path(), "worker", "run-clone-proof", "assignment-clone")
+                .expect("lifecycle metadata");
+        let spec = ProcessSpec::direct("cloned mechanical proof", &program, args, cwd, 128)
+            .with_stdin(StdinMode::Null)
+            .with_timeout(Some(Duration::from_secs(10)))
+            .with_containment(ContainmentPolicy::TrustedBestEffort)
+            .with_agent_lifecycle(metadata)
+            .with_consumed_mechanical_executor_proof(proof);
+        let cloned = spec.clone();
+        run_process(spec).expect("first execution must spawn");
+        assert_eq!(fs::read_to_string(&counter).expect("count"), "x");
+        let error = run_process(cloned).expect_err("cloned proof must refuse before second spawn");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("mechanical executor proof reservation failed closed")
+                || rendered.contains("assignment_process_launch_grant_consumed"),
+            "{rendered}"
+        );
+        assert_eq!(
+            fs::read_to_string(&counter).expect("count after replay"),
+            "x",
+            "cloned ProcessSpec must not spawn a second target"
+        );
+        drop(overlay);
+    }
+
+    #[test]
+    fn mechanical_proof_changed_cwd_is_refused_before_spawn() {
+        let overlay = crate::supervise::install_test_fixture_models(&[(
+            "fixture-weak-mechanical",
+            crate::supervise::ModelCapabilityClass::WeakMechanical,
+        )])
+        .expect("overlay");
+        let temp = tempfile::tempdir().expect("tempdir");
+        git2::Repository::init(temp.path()).expect("init repository");
+        let (program, counter) = named_codex_counter_fixture(temp.path());
+        let cwd = temp.path();
+        let changed_cwd = temp.path().join("other-cwd");
+        fs::create_dir(&changed_cwd).expect("changed cwd");
+        let staging = temp.path().join("last-message.raw");
+        fs::write(&staging, b"").expect("staging");
+        let args = ["exec", "-m", "fixture-weak-mechanical"];
+        let grant = admit_assignment_child_process_intent(
+            "run-cwd-proof",
+            "assignment-cwd",
+            1,
+            Path::new("codex"),
+            Some("fixture-weak-mechanical"),
+            ASSIGNMENT_CHILD_PROCESS_DUTY,
+        )
+        .expect("admit")
+        .seal_mechanical_executor(
+            SealedMechanicalExecutorRole::Worker,
+            SealedMechanicalExecutorPhase::MechanicalTerminal,
+            SealedMechanicalExecutorDuty::RunPreselectedCommand,
+        )
+        .expect("seal mechanical")
+        .seal_independently_verified_canonical_binding(&program, args, &staging, cwd)
+        .expect("seal canonical");
+        let proof = grant
+            .consume_for_process_binding(
+                &program,
+                cwd,
+                &args,
+                &staging,
+                "run-cwd-proof",
+                "assignment-cwd",
+                1,
+                AssignmentProcessLaunchKind::AssignmentChild,
+                Some("fixture-weak-mechanical"),
+                ASSIGNMENT_CHILD_PROCESS_DUTY,
+                Some(AssignmentProcessMechanicalBinding::worker(
+                    SealedMechanicalExecutorDuty::RunPreselectedCommand,
+                    SealedMechanicalExecutorRole::Worker.as_str(),
+                )),
+            )
+            .expect("consume")
+            .expect("proof");
+        let metadata =
+            AgentLaunchMetadata::new(temp.path(), "worker", "run-cwd-proof", "assignment-cwd")
+                .expect("lifecycle metadata");
+        let spec = ProcessSpec::direct(
+            "changed cwd mechanical proof",
+            &program,
+            args,
+            &changed_cwd,
+            128,
+        )
+        .with_stdin(StdinMode::Null)
+        .with_timeout(Some(Duration::from_secs(10)))
+        .with_containment(ContainmentPolicy::TrustedBestEffort)
+        .with_agent_lifecycle(metadata)
+        .with_consumed_mechanical_executor_proof(proof);
+        let error = run_process(spec).expect_err("changed cwd must refuse before spawn");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("mechanical executor proof does not match launched cwd"),
+            "{rendered}"
+        );
+        assert!(
+            !counter.exists(),
+            "changed cwd must not execute the named-codex fixture"
+        );
+        drop(overlay);
+    }
+}

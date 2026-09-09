@@ -8,8 +8,8 @@ use crate::machine_global::{
 };
 use crate::mutation_taxonomy::{
     AssignmentProcessLaunchGrant, AssignmentProcessLaunchGrantError, AssignmentProcessLaunchKind,
-    CatalogPreflightOrigin, SupervisorCatalogCodexPreflightGrant,
-    SupervisorCatalogCodexPreflightGrantError,
+    AssignmentProcessMechanicalBinding, CatalogPreflightOrigin, SealedMechanicalExecutorDuty,
+    SupervisorCatalogCodexPreflightGrant, SupervisorCatalogCodexPreflightGrantError,
 };
 use crate::pre_action_review::{
     ActionDescriptor, ApprovalReviewRequest, BlastRadius, CommandClass, CommandInvocation,
@@ -251,6 +251,7 @@ pub struct ExternalAgentCommand {
     pub(crate) assignment_process_launch_grant: Option<AssignmentProcessLaunchGrant>,
     pub(crate) assignment_process_launch_attempt: Option<usize>,
     pub(crate) assignment_process_launch_duty: Option<String>,
+    pub(crate) assignment_mechanical_executor_duty: Option<SealedMechanicalExecutorDuty>,
 }
 
 pub(crate) const WRITABLE_GROK_TERMINAL_WORKER_REQUIRED: &str =
@@ -1015,6 +1016,7 @@ impl ExternalAgentCommand {
             assignment_process_launch_grant: None,
             assignment_process_launch_attempt: None,
             assignment_process_launch_duty: None,
+            assignment_mechanical_executor_duty: None,
         }
     }
 
@@ -1054,6 +1056,7 @@ impl ExternalAgentCommand {
             assignment_process_launch_grant: None,
             assignment_process_launch_attempt: None,
             assignment_process_launch_duty: None,
+            assignment_mechanical_executor_duty: None,
         }
     }
 
@@ -1093,6 +1096,7 @@ impl ExternalAgentCommand {
             assignment_process_launch_grant: None,
             assignment_process_launch_attempt: None,
             assignment_process_launch_duty: None,
+            assignment_mechanical_executor_duty: None,
         }
     }
 
@@ -1414,6 +1418,7 @@ impl ExternalAgentCommand {
     ) -> Self {
         self.assignment_process_launch_attempt = Some(grant.attempt());
         self.assignment_process_launch_duty = Some(grant.duty().to_string());
+        self.assignment_mechanical_executor_duty = grant.mechanical_duty();
         self.assignment_process_launch_kind = Some(kind);
         self.assignment_process_launch_grant = Some(grant);
         self
@@ -2081,7 +2086,7 @@ fn seal_assignment_process_launch_grant(
 fn consume_assignment_process_launch_grant(
     spec: &ExternalAgentCommand,
     grant: AssignmentProcessLaunchGrant,
-    process_spec: &ProcessSpec,
+    process_spec: &mut ProcessSpec,
     output_staging: &Path,
 ) -> Result<(), AssignmentProcessLaunchGrantError> {
     let Some(kind) = spec.assignment_process_launch_kind else {
@@ -2090,6 +2095,9 @@ fn consume_assignment_process_launch_grant(
     let ProcessCommand::Direct { program, args } = &process_spec.command else {
         return Err(AssignmentProcessLaunchGrantError::ProgramMismatch);
     };
+    let program = program.clone();
+    let args = args.clone();
+    let current_dir = process_spec.current_dir.clone();
     let run_id = spec
         .agent_lifecycle
         .as_ref()
@@ -2102,10 +2110,36 @@ fn consume_assignment_process_launch_grant(
         .unwrap_or("");
     let attempt = spec.assignment_process_launch_attempt.unwrap_or(usize::MAX);
     let duty = spec.assignment_process_launch_duty.as_deref().unwrap_or("");
-    grant.consume_for_process_binding(
-        program,
-        &process_spec.current_dir,
-        args,
+    let lifecycle_role = spec
+        .agent_lifecycle
+        .as_ref()
+        .map(|identity| identity.role.as_str())
+        .unwrap_or("");
+    if spec
+        .model
+        .as_deref()
+        .is_some_and(crate::agent_lifecycle::model_requires_mechanical_executor_proof)
+        && grant.mechanical_executor().is_none()
+    {
+        return Err(AssignmentProcessLaunchGrantError::MechanicalExecutorMissing);
+    }
+    if grant.mechanical_executor().is_some() {
+        if lifecycle_role != "worker" {
+            return Err(AssignmentProcessLaunchGrantError::MechanicalExecutorMismatch);
+        }
+        if grant.mechanical_duty() != spec.assignment_mechanical_executor_duty {
+            return Err(AssignmentProcessLaunchGrantError::MechanicalExecutorMismatch);
+        }
+    }
+    let actual_mechanical = spec
+        .assignment_mechanical_executor_duty
+        .map(|mechanical_duty| {
+            AssignmentProcessMechanicalBinding::worker(mechanical_duty, lifecycle_role)
+        });
+    let proof = grant.consume_for_process_binding(
+        &program,
+        &current_dir,
+        &args,
         output_staging,
         run_id,
         subject,
@@ -2113,7 +2147,12 @@ fn consume_assignment_process_launch_grant(
         kind,
         spec.model.as_deref(),
         duty,
-    )
+        actual_mechanical,
+    )?;
+    if let Some(proof) = proof {
+        process_spec.attach_consumed_mechanical_executor_proof(proof);
+    }
+    Ok(())
 }
 
 fn run_external_agent_runtime(
@@ -2948,7 +2987,7 @@ fn run_external_agent_runtime(
     .with_stdin_limit(MAX_PROMPT_BYTES)
     .with_timeout(Some(timeout))
     .with_stdout(StreamCapture::bounded(OUTPUT_TEE_LIMIT_BYTES));
-    let process_spec = match runtime {
+    let mut process_spec = match runtime {
         ExternalExecutionRuntime::Verified => {
             let Some(side_effect_profile) = side_effect_profile else {
                 report.duration_ms = duration_millis(started.elapsed());
@@ -2992,7 +3031,7 @@ fn run_external_agent_runtime(
 
     if let Some(grant) = sealed_assignment_process_grant {
         if let Err(error) =
-            consume_assignment_process_launch_grant(spec, grant, &process_spec, &staging_path)
+            consume_assignment_process_launch_grant(spec, grant, &mut process_spec, &staging_path)
         {
             report.duration_ms = duration_millis(started.elapsed());
             record_external_error(&mut report, assignment_process_launch_refusal(error));

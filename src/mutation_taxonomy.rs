@@ -10,7 +10,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 /// Current reviewed registry version.
 ///
@@ -943,6 +943,244 @@ pub(crate) enum AssignmentProcessLaunchKind {
     ParentAuditor,
 }
 
+impl AssignmentProcessLaunchKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::AssignmentChild => "assignment_child",
+            Self::ParentAuditor => "parent_auditor",
+        }
+    }
+}
+
+/// Role sealed onto an assignment-child mechanical-executor sibling.
+///
+/// Distinct from process `duty` (`assignment-child`). Only Worker is
+/// representable so a parent-auditor or other role cannot be named here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SealedMechanicalExecutorRole {
+    Worker,
+}
+
+impl SealedMechanicalExecutorRole {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Worker => "worker",
+        }
+    }
+}
+
+/// Phase sealed onto an assignment-child mechanical-executor sibling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SealedMechanicalExecutorPhase {
+    MechanicalTerminal,
+}
+
+impl SealedMechanicalExecutorPhase {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::MechanicalTerminal => "mechanical_terminal",
+        }
+    }
+}
+
+/// Enumerated mechanical-terminal duty sealed onto the assignment-child grant.
+///
+/// This is not the process-launch duty string and is not a Codex argv flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SealedMechanicalExecutorDuty {
+    ApplyExplicitTextReplacement,
+    RunPreselectedCommand,
+    FormatPreselectedFiles,
+    EnumerateDeclaredArtifacts,
+    ValidateAgainstFixedSchema,
+}
+
+impl SealedMechanicalExecutorDuty {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ApplyExplicitTextReplacement => "apply_explicit_text_replacement",
+            Self::RunPreselectedCommand => "run_preselected_command",
+            Self::FormatPreselectedFiles => "format_preselected_files",
+            Self::EnumerateDeclaredArtifacts => "enumerate_declared_artifacts",
+            Self::ValidateAgainstFixedSchema => "validate_against_fixed_schema",
+        }
+    }
+}
+
+/// Typed Worker + MechanicalTerminal + enumerated duty bound to an assignment-child grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SealedMechanicalExecutor {
+    role: SealedMechanicalExecutorRole,
+    phase: SealedMechanicalExecutorPhase,
+    duty: SealedMechanicalExecutorDuty,
+    model: String,
+}
+
+impl SealedMechanicalExecutor {
+    pub(crate) fn role(&self) -> SealedMechanicalExecutorRole {
+        self.role
+    }
+
+    pub(crate) fn phase(&self) -> SealedMechanicalExecutorPhase {
+        self.phase
+    }
+
+    pub(crate) fn duty(&self) -> SealedMechanicalExecutorDuty {
+        self.duty
+    }
+
+    pub(crate) fn model(&self) -> &str {
+        &self.model
+    }
+}
+
+/// Live mechanical-executor binding presented by the caller at consume.
+///
+/// Distinct from process duty (`assignment-child`) and from the grant's sealed
+/// sibling. Nonmechanical consume passes `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AssignmentProcessMechanicalBinding<'a> {
+    duty: SealedMechanicalExecutorDuty,
+    worker_role: &'a str,
+}
+
+impl<'a> AssignmentProcessMechanicalBinding<'a> {
+    pub(crate) const fn worker(duty: SealedMechanicalExecutorDuty, role: &'a str) -> Self {
+        Self {
+            duty,
+            worker_role: role,
+        }
+    }
+
+    pub(crate) const fn duty(self) -> SealedMechanicalExecutorDuty {
+        self.duty
+    }
+
+    pub(crate) const fn worker_role(self) -> &'a str {
+        self.worker_role
+    }
+}
+
+/// One-shot execution reservation produced by consuming a mechanical sibling.
+///
+/// Clone of a `ProcessSpec` shares the consume slot; only one `run_process`
+/// can reserve it before `command.spawn`. Not constructible from durable JSON.
+#[derive(Clone)]
+pub(crate) struct ConsumedMechanicalExecutorProof {
+    nonce: u64,
+    slot: Arc<Mutex<Option<ReservedMechanicalExecutorExecution>>>,
+}
+
+impl fmt::Debug for ConsumedMechanicalExecutorProof {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConsumedMechanicalExecutorProof")
+            .field("nonce", &"<redacted>")
+            .field("slot", &"<redacted reservation>")
+            .finish()
+    }
+}
+
+impl PartialEq for ConsumedMechanicalExecutorProof {
+    fn eq(&self, other: &Self) -> bool {
+        self.nonce == other.nonce
+    }
+}
+
+impl Eq for ConsumedMechanicalExecutorProof {}
+
+impl ConsumedMechanicalExecutorProof {
+    pub(crate) fn nonce(&self) -> u64 {
+        self.nonce
+    }
+
+    /// Bind this proof to exactly one ProcessSpec execution before spawn.
+    ///
+    /// Registration consumes the returned reservation by value. A cloned
+    /// `ProcessSpec` cannot reserve the same nonce again.
+    pub(crate) fn reserve_for_execution(
+        self,
+    ) -> Result<ReservedMechanicalExecutorExecution, AssignmentProcessLaunchGrantError> {
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.take()
+            .ok_or(AssignmentProcessLaunchGrantError::AlreadyConsumed)
+    }
+}
+
+/// Non-reusable execution capability created by reserving a consumed proof.
+///
+/// This is the only value that may mint durable mechanical-executor evidence.
+/// Fields are private so other modules cannot construct a reservation.
+/// `reserve_for_execution` is the only producer. No `Copy`/`Clone`/`Deserialize`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ReservedMechanicalExecutorExecution {
+    nonce: u64,
+    role: SealedMechanicalExecutorRole,
+    phase: SealedMechanicalExecutorPhase,
+    duty: SealedMechanicalExecutorDuty,
+    model: String,
+    canonical_program: PathBuf,
+    cwd: PathBuf,
+    argv: Vec<OsString>,
+    kind: AssignmentProcessLaunchKind,
+    run_id: String,
+    subject: String,
+    attempt: usize,
+}
+
+impl ReservedMechanicalExecutorExecution {
+    pub(crate) fn nonce(&self) -> u64 {
+        self.nonce
+    }
+
+    pub(crate) fn role(&self) -> SealedMechanicalExecutorRole {
+        self.role
+    }
+
+    pub(crate) fn phase(&self) -> SealedMechanicalExecutorPhase {
+        self.phase
+    }
+
+    pub(crate) fn duty(&self) -> SealedMechanicalExecutorDuty {
+        self.duty
+    }
+
+    pub(crate) fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub(crate) fn canonical_program(&self) -> &Path {
+        &self.canonical_program
+    }
+
+    pub(crate) fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    pub(crate) fn argv(&self) -> &[OsString] {
+        &self.argv
+    }
+
+    pub(crate) fn kind(&self) -> AssignmentProcessLaunchKind {
+        self.kind
+    }
+
+    pub(crate) fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub(crate) fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    pub(crate) fn attempt(&self) -> usize {
+        self.attempt
+    }
+}
+
 /// Expected executable binding sealed into an assignment process-launch grant.
 ///
 /// Production issuance records only the trusted path spelling `codex`. The
@@ -980,6 +1218,7 @@ pub(crate) struct AssignmentProcessLaunchGrant {
     model: Option<String>,
     duty: String,
     sealed_delivery: Option<AssignmentProcessSealedDelivery>,
+    mechanical_executor: Option<SealedMechanicalExecutor>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -993,6 +1232,8 @@ pub(crate) enum AssignmentProcessLaunchGrantError {
     OutputStagingMismatch,
     KindMismatch,
     IdentityMismatch,
+    MechanicalExecutorMissing,
+    MechanicalExecutorMismatch,
 }
 
 impl AssignmentProcessLaunchGrantError {
@@ -1007,6 +1248,8 @@ impl AssignmentProcessLaunchGrantError {
             | Self::OutputStagingMismatch => "assignment_process_launch_grant_mismatch",
             Self::KindMismatch => "assignment_process_launch_grant_kind_mismatch",
             Self::IdentityMismatch => "assignment_process_launch_grant_identity_mismatch",
+            Self::MechanicalExecutorMissing => "assignment_process_mechanical_executor_missing",
+            Self::MechanicalExecutorMismatch => "assignment_process_mechanical_executor_mismatch",
         }
     }
 }
@@ -1050,6 +1293,7 @@ impl AssignmentProcessLaunchGrant {
             model: model.map(str::to_string),
             duty: duty.to_string(),
             sealed_delivery: None,
+            mechanical_executor: None,
         })
     }
 
@@ -1075,6 +1319,86 @@ impl AssignmentProcessLaunchGrant {
 
     pub(crate) fn model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    pub(crate) fn nonce(&self) -> u64 {
+        self.nonce
+    }
+
+    pub(crate) fn mechanical_executor(&self) -> Option<&SealedMechanicalExecutor> {
+        self.mechanical_executor.as_ref()
+    }
+
+    pub(crate) fn mechanical_duty(&self) -> Option<SealedMechanicalExecutorDuty> {
+        self.mechanical_executor
+            .as_ref()
+            .map(SealedMechanicalExecutor::duty)
+    }
+
+    /// Seal typed Worker + MechanicalTerminal + enumerated duty onto an
+    /// assignment-child grant. Process `duty` stays `assignment-child`.
+    ///
+    /// The trusted issuer must already have admitted the grant and authorized
+    /// the executor triple. Parent-auditor kind, a second seal, a missing
+    /// model, or a non-Worker/non-mechanical-terminal triple fail closed.
+    pub(crate) fn seal_mechanical_executor(
+        self,
+        role: SealedMechanicalExecutorRole,
+        phase: SealedMechanicalExecutorPhase,
+        duty: SealedMechanicalExecutorDuty,
+    ) -> Result<Self, AssignmentProcessLaunchGrantError> {
+        if self.kind != AssignmentProcessLaunchKind::AssignmentChild {
+            return Err(AssignmentProcessLaunchGrantError::KindMismatch);
+        }
+        if self.mechanical_executor.is_some() {
+            return Err(AssignmentProcessLaunchGrantError::MechanicalExecutorMismatch);
+        }
+        let Some(model) = self.model.clone() else {
+            return Err(AssignmentProcessLaunchGrantError::IdentityMismatch);
+        };
+        if role != SealedMechanicalExecutorRole::Worker
+            || phase != SealedMechanicalExecutorPhase::MechanicalTerminal
+        {
+            return Err(AssignmentProcessLaunchGrantError::MechanicalExecutorMismatch);
+        }
+        Ok(Self {
+            mechanical_executor: Some(SealedMechanicalExecutor {
+                role,
+                phase,
+                duty,
+                model,
+            }),
+            ..self
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn without_mechanical_executor_for_test(mut self) -> Self {
+        self.mechanical_executor = None;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tamper_mechanical_executor_for_test(
+        mut self,
+        duty: SealedMechanicalExecutorDuty,
+        model: impl Into<String>,
+    ) -> Self {
+        match &mut self.mechanical_executor {
+            Some(mechanical) => {
+                mechanical.duty = duty;
+                mechanical.model = model.into();
+            }
+            None => {
+                self.mechanical_executor = Some(SealedMechanicalExecutor {
+                    role: SealedMechanicalExecutorRole::Worker,
+                    phase: SealedMechanicalExecutorPhase::MechanicalTerminal,
+                    duty,
+                    model: model.into(),
+                });
+            }
+        }
+        self
     }
 
     #[cfg(test)]
@@ -1214,7 +1538,11 @@ impl AssignmentProcessLaunchGrant {
     /// Exact-matches sealed canonical program, ProcessSpec cwd, argv, output
     /// staging, launch kind, run_id, subject, attempt, model, and duty. Does
     /// not accept a basename-only `codex` match and does not rederive the
-    /// expected program from the supplied final program.
+    /// expected program from the supplied final program. When a mechanical
+    /// sibling is present it is exact-matched against the live caller
+    /// mechanical duty and worker role before the nonce is burned, then
+    /// returned as a private one-shot proof bound to this grant nonce.
+    /// Nonmechanical callers pass `actual_mechanical = None`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn consume_for_process_binding<A: AsRef<OsStr>>(
         self,
@@ -1228,14 +1556,22 @@ impl AssignmentProcessLaunchGrant {
         kind: AssignmentProcessLaunchKind,
         model: Option<&str>,
         duty: &str,
-    ) -> Result<(), AssignmentProcessLaunchGrantError> {
-        let mut consumed = CONSUMED_ASSIGNMENT_PROCESS_LAUNCH_NONCES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !consumed.insert(self.nonce) {
-            return Err(AssignmentProcessLaunchGrantError::AlreadyConsumed);
+        actual_mechanical: Option<AssignmentProcessMechanicalBinding<'_>>,
+    ) -> Result<Option<ConsumedMechanicalExecutorProof>, AssignmentProcessLaunchGrantError> {
+        match (self.mechanical_executor.as_ref(), actual_mechanical) {
+            (None, None) => {}
+            (Some(mechanical), Some(actual)) => {
+                if mechanical.duty() != actual.duty()
+                    || actual.worker_role() != SealedMechanicalExecutorRole::Worker.as_str()
+                    || mechanical.role() != SealedMechanicalExecutorRole::Worker
+                {
+                    return Err(AssignmentProcessLaunchGrantError::MechanicalExecutorMismatch);
+                }
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(AssignmentProcessLaunchGrantError::MechanicalExecutorMismatch);
+            }
         }
-        drop(consumed);
 
         if self.kind != kind {
             return Err(AssignmentProcessLaunchGrantError::KindMismatch);
@@ -1281,7 +1617,46 @@ impl AssignmentProcessLaunchGrant {
         {
             return Err(AssignmentProcessLaunchGrantError::ArgvMismatch);
         }
-        Ok(())
+
+        if let Some(mechanical) = self.mechanical_executor.as_ref() {
+            if mechanical.role != SealedMechanicalExecutorRole::Worker
+                || mechanical.phase != SealedMechanicalExecutorPhase::MechanicalTerminal
+                || Some(mechanical.model.as_str()) != self.model.as_deref()
+                || Some(mechanical.model.as_str()) != model
+                || self.kind != AssignmentProcessLaunchKind::AssignmentChild
+            {
+                return Err(AssignmentProcessLaunchGrantError::MechanicalExecutorMismatch);
+            }
+        }
+
+        let mut consumed = CONSUMED_ASSIGNMENT_PROCESS_LAUNCH_NONCES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !consumed.insert(self.nonce) {
+            return Err(AssignmentProcessLaunchGrantError::AlreadyConsumed);
+        }
+        drop(consumed);
+
+        let Some(mechanical) = self.mechanical_executor.as_ref() else {
+            return Ok(None);
+        };
+        Ok(Some(ConsumedMechanicalExecutorProof {
+            nonce: self.nonce,
+            slot: Arc::new(Mutex::new(Some(ReservedMechanicalExecutorExecution {
+                nonce: self.nonce,
+                role: mechanical.role,
+                phase: mechanical.phase,
+                duty: mechanical.duty,
+                model: mechanical.model.clone(),
+                canonical_program: expected_program.clone(),
+                cwd: delivery.cwd.clone(),
+                argv: delivery.argv.clone(),
+                kind: self.kind,
+                run_id: self.run_id.clone(),
+                subject: self.subject.clone(),
+                attempt: self.attempt,
+            }))),
+        }))
     }
 }
 
@@ -2317,6 +2692,7 @@ mod tests {
                 AssignmentProcessLaunchKind::AssignmentChild,
                 Some("gpt-5.4"),
                 "worker-duty",
+                None,
             )
             .expect("matching assignment-child grant must consume once");
         assert_eq!(
@@ -2331,6 +2707,7 @@ mod tests {
                 AssignmentProcessLaunchKind::AssignmentChild,
                 Some("gpt-5.4"),
                 "worker-duty",
+                None,
             ),
             Err(AssignmentProcessLaunchGrantError::AlreadyConsumed)
         );
@@ -2386,6 +2763,7 @@ mod tests {
                 AssignmentProcessLaunchKind::ParentAuditor,
                 Some("gpt-5.4"),
                 "worker-duty",
+                None,
             ),
             Err(AssignmentProcessLaunchGrantError::KindMismatch)
         );
@@ -2408,6 +2786,7 @@ mod tests {
                 AssignmentProcessLaunchKind::AssignmentChild,
                 Some("gpt-5.4"),
                 "worker-duty",
+                None,
             ),
             Err(AssignmentProcessLaunchGrantError::IdentityMismatch)
         );
@@ -2430,6 +2809,7 @@ mod tests {
                 AssignmentProcessLaunchKind::AssignmentChild,
                 Some("gpt-5.4"),
                 "worker-duty",
+                None,
             ),
             Err(AssignmentProcessLaunchGrantError::IdentityMismatch)
         );
@@ -2452,6 +2832,7 @@ mod tests {
                 AssignmentProcessLaunchKind::AssignmentChild,
                 Some("gpt-5.4"),
                 "worker-duty",
+                None,
             ),
             Err(AssignmentProcessLaunchGrantError::IdentityMismatch)
         );
@@ -2474,6 +2855,7 @@ mod tests {
                 AssignmentProcessLaunchKind::AssignmentChild,
                 Some("other-model"),
                 "worker-duty",
+                None,
             ),
             Err(AssignmentProcessLaunchGrantError::IdentityMismatch)
         );
@@ -2570,6 +2952,7 @@ mod tests {
                 AssignmentProcessLaunchKind::AssignmentChild,
                 None,
                 "worker-duty",
+                None,
             ),
             Err(AssignmentProcessLaunchGrantError::ProgramMismatch)
         );
@@ -2581,6 +2964,7 @@ mod tests {
                 Path::new("/tmp/untrusted-custom-codex"),
                 None,
                 "worker-duty",
+                None,
             )
             .expect_err("production issuer must refuse non-codex spelling"),
             AssignmentProcessLaunchGrantError::UntrustedExpectedProgram
@@ -2658,6 +3042,7 @@ mod tests {
                 AssignmentProcessLaunchKind::ParentAuditor,
                 Some("o4-mini"),
                 "parent-auditor-duty",
+                None,
             )
             .expect("sealed non-codex canonical filename must consume when spec matches");
     }
@@ -2702,6 +3087,7 @@ mod tests {
                 AssignmentProcessLaunchKind::AssignmentChild,
                 None,
                 "worker-duty",
+                None,
             ),
             Err(AssignmentProcessLaunchGrantError::OutputStagingMismatch)
         );
@@ -2735,8 +3121,343 @@ mod tests {
                 AssignmentProcessLaunchKind::AssignmentChild,
                 None,
                 "worker-duty",
+                None,
             ),
             Err(AssignmentProcessLaunchGrantError::ProgramMismatch)
+        );
+    }
+
+    #[test]
+    fn assignment_process_grant_seals_mechanical_executor_once_and_returns_proof() {
+        use crate::process_runner::{ProcessCommand, ProcessSpec};
+
+        let program = Path::new("/usr/bin/codex");
+        let cwd = Path::new("/worktrees/assignment-child");
+        let staging = Path::new("/run/maco/output/last-message.raw");
+        let argv = ["exec", "-m", "fixture-weak-mechanical"];
+        let spec = ProcessSpec::direct("mechanical child binding", program, argv, cwd, 64);
+        let ProcessCommand::Direct {
+            program: spec_program,
+            args: spec_argv,
+        } = &spec.command
+        else {
+            panic!("direct assignment spec must remain a direct command");
+        };
+
+        let grant = AssignmentProcessGrantFixture {
+            run_id: "run-mechanical-1",
+            subject: "assignment-weak",
+            attempt: 1,
+            model: Some("fixture-weak-mechanical"),
+            duty: ASSIGNMENT_CHILD_PROCESS_DUTY,
+            program,
+            argv: &argv,
+            output_staging: staging,
+            cwd,
+        }
+        .admit_child()
+        .seal_mechanical_executor(
+            SealedMechanicalExecutorRole::Worker,
+            SealedMechanicalExecutorPhase::MechanicalTerminal,
+            SealedMechanicalExecutorDuty::RunPreselectedCommand,
+        )
+        .expect("assignment-child grant must seal mechanical executor");
+        assert_eq!(grant.duty(), ASSIGNMENT_CHILD_PROCESS_DUTY);
+        assert_ne!(
+            grant.duty(),
+            SealedMechanicalExecutorDuty::RunPreselectedCommand.as_str()
+        );
+        assert_eq!(
+            grant.mechanical_duty(),
+            Some(SealedMechanicalExecutorDuty::RunPreselectedCommand)
+        );
+        let second_seal = grant.clone().seal_mechanical_executor(
+            SealedMechanicalExecutorRole::Worker,
+            SealedMechanicalExecutorPhase::MechanicalTerminal,
+            SealedMechanicalExecutorDuty::ValidateAgainstFixedSchema,
+        );
+        assert_eq!(
+            second_seal.err(),
+            Some(AssignmentProcessLaunchGrantError::MechanicalExecutorMismatch)
+        );
+
+        let proof = grant
+            .clone()
+            .consume_for_process_binding(
+                spec_program,
+                &spec.current_dir,
+                spec_argv,
+                staging,
+                "run-mechanical-1",
+                "assignment-weak",
+                1,
+                AssignmentProcessLaunchKind::AssignmentChild,
+                Some("fixture-weak-mechanical"),
+                ASSIGNMENT_CHILD_PROCESS_DUTY,
+                Some(AssignmentProcessMechanicalBinding::worker(
+                    SealedMechanicalExecutorDuty::RunPreselectedCommand,
+                    SealedMechanicalExecutorRole::Worker.as_str(),
+                )),
+            )
+            .expect("matching mechanical grant must consume once")
+            .expect("mechanical sibling must yield a consumed proof");
+        let reserved = proof
+            .reserve_for_execution()
+            .expect("consumed proof must reserve once");
+        assert_eq!(reserved.model(), "fixture-weak-mechanical");
+        assert_eq!(
+            reserved.duty(),
+            SealedMechanicalExecutorDuty::RunPreselectedCommand
+        );
+        assert_eq!(reserved.canonical_program(), program);
+        assert_eq!(
+            grant.consume_for_process_binding(
+                spec_program,
+                &spec.current_dir,
+                spec_argv,
+                staging,
+                "run-mechanical-1",
+                "assignment-weak",
+                1,
+                AssignmentProcessLaunchKind::AssignmentChild,
+                Some("fixture-weak-mechanical"),
+                ASSIGNMENT_CHILD_PROCESS_DUTY,
+                Some(AssignmentProcessMechanicalBinding::worker(
+                    SealedMechanicalExecutorDuty::RunPreselectedCommand,
+                    SealedMechanicalExecutorRole::Worker.as_str(),
+                )),
+            ),
+            Err(AssignmentProcessLaunchGrantError::AlreadyConsumed)
+        );
+    }
+
+    #[test]
+    fn parent_auditor_grant_refuses_mechanical_executor_seal() {
+        let program = Path::new("/usr/bin/codex");
+        let cwd = Path::new("/worktrees/parent-auditor");
+        let staging = Path::new("/run/maco/output/last-message.raw");
+        let argv = ["exec"];
+        let error = AssignmentProcessGrantFixture {
+            run_id: "run-auditor-mechanical",
+            subject: "auditor-a",
+            attempt: 1,
+            model: Some("fixture-weak-mechanical"),
+            duty: PARENT_AUDITOR_PROCESS_DUTY,
+            program,
+            argv: &argv,
+            output_staging: staging,
+            cwd,
+        }
+        .admit_auditor()
+        .seal_mechanical_executor(
+            SealedMechanicalExecutorRole::Worker,
+            SealedMechanicalExecutorPhase::MechanicalTerminal,
+            SealedMechanicalExecutorDuty::RunPreselectedCommand,
+        )
+        .expect_err("parent-auditor must not seal mechanical executor");
+        assert_eq!(error, AssignmentProcessLaunchGrantError::KindMismatch);
+    }
+
+    #[test]
+    fn consumed_mechanical_executor_proof_reservation_is_one_shot() {
+        use crate::process_runner::{ProcessCommand, ProcessSpec};
+
+        let program = Path::new("/usr/bin/codex");
+        let cwd = Path::new("/worktrees/assignment-child");
+        let staging = Path::new("/run/maco/output/last-message.raw");
+        let argv = ["exec", "-m", "fixture-weak-mechanical"];
+        let spec = ProcessSpec::direct("mechanical reservation", program, argv, cwd, 64);
+        let ProcessCommand::Direct {
+            program: spec_program,
+            args: spec_argv,
+        } = &spec.command
+        else {
+            panic!("direct assignment spec must remain a direct command");
+        };
+        let proof = AssignmentProcessGrantFixture {
+            run_id: "run-mechanical-reserve",
+            subject: "assignment-weak",
+            attempt: 1,
+            model: Some("fixture-weak-mechanical"),
+            duty: ASSIGNMENT_CHILD_PROCESS_DUTY,
+            program,
+            argv: &argv,
+            output_staging: staging,
+            cwd,
+        }
+        .admit_child()
+        .seal_mechanical_executor(
+            SealedMechanicalExecutorRole::Worker,
+            SealedMechanicalExecutorPhase::MechanicalTerminal,
+            SealedMechanicalExecutorDuty::RunPreselectedCommand,
+        )
+        .expect("seal mechanical")
+        .consume_for_process_binding(
+            spec_program,
+            &spec.current_dir,
+            spec_argv,
+            staging,
+            "run-mechanical-reserve",
+            "assignment-weak",
+            1,
+            AssignmentProcessLaunchKind::AssignmentChild,
+            Some("fixture-weak-mechanical"),
+            ASSIGNMENT_CHILD_PROCESS_DUTY,
+            Some(AssignmentProcessMechanicalBinding::worker(
+                SealedMechanicalExecutorDuty::RunPreselectedCommand,
+                SealedMechanicalExecutorRole::Worker.as_str(),
+            )),
+        )
+        .expect("consume mechanical")
+        .expect("proof");
+        let rendered = format!("{proof:?}");
+        assert!(rendered.contains("<redacted reservation>"), "{rendered}");
+        assert!(
+            !rendered.contains("ReservedMechanicalExecutorExecution"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("fixture-weak-mechanical"), "{rendered}");
+        let cloned = proof.clone();
+        cloned
+            .reserve_for_execution()
+            .expect("first reservation must succeed");
+        assert_eq!(
+            proof.reserve_for_execution().err(),
+            Some(AssignmentProcessLaunchGrantError::AlreadyConsumed)
+        );
+    }
+
+    #[test]
+    fn assignment_process_consume_rejects_omitted_or_mismatched_live_mechanical_binding() {
+        use crate::process_runner::{ProcessCommand, ProcessSpec};
+
+        let program = Path::new("/usr/bin/codex");
+        let cwd = Path::new("/worktrees/assignment-child");
+        let staging = Path::new("/run/maco/output/last-message.raw");
+        let argv = ["exec", "-m", "fixture-weak-mechanical"];
+        let spec = ProcessSpec::direct("mechanical live binding", program, argv, cwd, 64);
+        let ProcessCommand::Direct {
+            program: spec_program,
+            args: spec_argv,
+        } = &spec.command
+        else {
+            panic!("direct assignment spec must remain a direct command");
+        };
+        let grant = AssignmentProcessGrantFixture {
+            run_id: "run-mechanical-live-binding",
+            subject: "assignment-weak",
+            attempt: 1,
+            model: Some("fixture-weak-mechanical"),
+            duty: ASSIGNMENT_CHILD_PROCESS_DUTY,
+            program,
+            argv: &argv,
+            output_staging: staging,
+            cwd,
+        }
+        .admit_child()
+        .seal_mechanical_executor(
+            SealedMechanicalExecutorRole::Worker,
+            SealedMechanicalExecutorPhase::MechanicalTerminal,
+            SealedMechanicalExecutorDuty::RunPreselectedCommand,
+        )
+        .expect("seal mechanical");
+
+        assert_eq!(
+            grant.clone().consume_for_process_binding(
+                spec_program,
+                &spec.current_dir,
+                spec_argv,
+                staging,
+                "run-mechanical-live-binding",
+                "assignment-weak",
+                1,
+                AssignmentProcessLaunchKind::AssignmentChild,
+                Some("fixture-weak-mechanical"),
+                ASSIGNMENT_CHILD_PROCESS_DUTY,
+                None,
+            ),
+            Err(AssignmentProcessLaunchGrantError::MechanicalExecutorMismatch)
+        );
+        assert_eq!(
+            grant.clone().consume_for_process_binding(
+                spec_program,
+                &spec.current_dir,
+                spec_argv,
+                staging,
+                "run-mechanical-live-binding",
+                "assignment-weak",
+                1,
+                AssignmentProcessLaunchKind::AssignmentChild,
+                Some("fixture-weak-mechanical"),
+                ASSIGNMENT_CHILD_PROCESS_DUTY,
+                Some(AssignmentProcessMechanicalBinding::worker(
+                    SealedMechanicalExecutorDuty::ValidateAgainstFixedSchema,
+                    SealedMechanicalExecutorRole::Worker.as_str(),
+                )),
+            ),
+            Err(AssignmentProcessLaunchGrantError::MechanicalExecutorMismatch)
+        );
+        assert_eq!(
+            grant.clone().consume_for_process_binding(
+                spec_program,
+                &spec.current_dir,
+                spec_argv,
+                staging,
+                "run-mechanical-live-binding",
+                "assignment-weak",
+                1,
+                AssignmentProcessLaunchKind::AssignmentChild,
+                Some("fixture-weak-mechanical"),
+                ASSIGNMENT_CHILD_PROCESS_DUTY,
+                Some(AssignmentProcessMechanicalBinding::worker(
+                    SealedMechanicalExecutorDuty::RunPreselectedCommand,
+                    "auditor",
+                )),
+            ),
+            Err(AssignmentProcessLaunchGrantError::MechanicalExecutorMismatch)
+        );
+
+        let proof = grant
+            .clone()
+            .consume_for_process_binding(
+                spec_program,
+                &spec.current_dir,
+                spec_argv,
+                staging,
+                "run-mechanical-live-binding",
+                "assignment-weak",
+                1,
+                AssignmentProcessLaunchKind::AssignmentChild,
+                Some("fixture-weak-mechanical"),
+                ASSIGNMENT_CHILD_PROCESS_DUTY,
+                Some(AssignmentProcessMechanicalBinding::worker(
+                    SealedMechanicalExecutorDuty::RunPreselectedCommand,
+                    SealedMechanicalExecutorRole::Worker.as_str(),
+                )),
+            )
+            .expect("matching live mechanical binding must consume")
+            .expect("matching live mechanical binding must yield a proof");
+        proof
+            .reserve_for_execution()
+            .expect("matching live mechanical binding must reserve");
+        assert_eq!(
+            grant.consume_for_process_binding(
+                spec_program,
+                &spec.current_dir,
+                spec_argv,
+                staging,
+                "run-mechanical-live-binding",
+                "assignment-weak",
+                1,
+                AssignmentProcessLaunchKind::AssignmentChild,
+                Some("fixture-weak-mechanical"),
+                ASSIGNMENT_CHILD_PROCESS_DUTY,
+                Some(AssignmentProcessMechanicalBinding::worker(
+                    SealedMechanicalExecutorDuty::RunPreselectedCommand,
+                    SealedMechanicalExecutorRole::Worker.as_str(),
+                )),
+            ),
+            Err(AssignmentProcessLaunchGrantError::AlreadyConsumed)
         );
     }
 }
