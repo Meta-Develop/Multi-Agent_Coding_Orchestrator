@@ -943,15 +943,6 @@ pub(crate) enum AssignmentProcessLaunchKind {
     ParentAuditor,
 }
 
-impl AssignmentProcessLaunchKind {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::AssignmentChild => "assignment_child",
-            Self::ParentAuditor => "parent_auditor",
-        }
-    }
-}
-
 /// Role sealed onto an assignment-child mechanical-executor sibling.
 ///
 /// Distinct from process `duty` (`assignment-child`). Only Worker is
@@ -975,14 +966,6 @@ pub(crate) enum SealedMechanicalExecutorPhase {
     MechanicalTerminal,
 }
 
-impl SealedMechanicalExecutorPhase {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::MechanicalTerminal => "mechanical_terminal",
-        }
-    }
-}
-
 /// Enumerated mechanical-terminal duty sealed onto the assignment-child grant.
 ///
 /// This is not the process-launch duty string and is not a Codex argv flag.
@@ -995,6 +978,7 @@ pub(crate) enum SealedMechanicalExecutorDuty {
     ValidateAgainstFixedSchema,
 }
 
+#[cfg(test)]
 impl SealedMechanicalExecutorDuty {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -1021,16 +1005,8 @@ impl SealedMechanicalExecutor {
         self.role
     }
 
-    pub(crate) fn phase(&self) -> SealedMechanicalExecutorPhase {
-        self.phase
-    }
-
     pub(crate) fn duty(&self) -> SealedMechanicalExecutorDuty {
         self.duty
-    }
-
-    pub(crate) fn model(&self) -> &str {
-        &self.model
     }
 }
 
@@ -1090,10 +1066,6 @@ impl PartialEq for ConsumedMechanicalExecutorProof {
 impl Eq for ConsumedMechanicalExecutorProof {}
 
 impl ConsumedMechanicalExecutorProof {
-    pub(crate) fn nonce(&self) -> u64 {
-        self.nonce
-    }
-
     /// Bind this proof to exactly one ProcessSpec execution before spawn.
     ///
     /// Registration consumes the returned reservation by value. A cloned
@@ -1321,6 +1293,7 @@ impl AssignmentProcessLaunchGrant {
         self.model.as_deref()
     }
 
+    #[cfg(test)]
     pub(crate) fn nonce(&self) -> u64 {
         self.nonce
     }
@@ -2964,7 +2937,6 @@ mod tests {
                 Path::new("/tmp/untrusted-custom-codex"),
                 None,
                 "worker-duty",
-                None,
             )
             .expect_err("production issuer must refuse non-codex spelling"),
             AssignmentProcessLaunchGrantError::UntrustedExpectedProgram

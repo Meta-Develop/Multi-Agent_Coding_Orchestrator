@@ -73,6 +73,53 @@ fn insert_mechanical_metadata(metadata: &mut AssignmentMetadata, assignment_id: 
     );
 }
 
+fn direct_mechanical_assignment(id: &str) -> OrchestratorAssignment {
+    OrchestratorAssignment {
+        id: id.to_string(),
+        phase: AssignmentPhase::Execution,
+        runtime: None,
+        role: AgentRole::Worker,
+        role_category: Some(RoleCategory::NonDelegatingTerminalWorker),
+        selection_source: None,
+        assigned_paths: vec![PathBuf::from("mechanical.txt")],
+        semantic_symbols: Vec::new(),
+        semantic_modules: Vec::new(),
+        task: None,
+        worker_assignments: Vec::new(),
+        environment_requirements: Vec::new(),
+        licensed_breakage: None,
+        notes: None,
+    }
+}
+
+fn insert_direct_mechanical_duty_metadata(metadata: &mut AssignmentMetadata, assignment_id: &str) {
+    metadata.insert_direct_mechanical_duty(
+        assignment_id.to_string(),
+        MechanicalTerminalDuty::RunPreselectedCommand,
+    );
+}
+
+fn direct_mechanical_model_tier_policy(
+    controller: &mut BudgetDegradationController,
+    assignment: &OrchestratorAssignment,
+    plan: &SupervisorPlan,
+    requested_plan: &SupervisorPlan,
+    catalog: &RuntimeModelCatalog,
+) -> Result<Option<AssignmentBudgetPolicy>> {
+    let mut metadata = AssignmentMetadata::new();
+    insert_direct_mechanical_duty_metadata(&mut metadata, &assignment.id);
+    let report = degrade_report();
+    controller.assignment_policy(budget_policy_request(
+        assignment,
+        None,
+        &report,
+        plan,
+        requested_plan,
+        &metadata,
+        catalog,
+    ))
+}
+
 fn worker_degrade_plan(assignments: Vec<OrchestratorAssignment>) -> SupervisorPlan {
     let mut plan = test_plan(assignments);
     plan.role_models.insert(
@@ -576,6 +623,375 @@ fn low_difficulty_mechanical_trigger_consumes_only_worker_requested_ladder() {
         inherited.selected_model.as_deref(),
         Some(ECONOMY_PROFILE_MODEL)
     );
+}
+
+#[test]
+fn direct_typed_mechanical_low_difficulty_consumes_only_worker_requested_ladder() {
+    let assignment = direct_mechanical_assignment("direct-low-difficulty");
+    let inherited_assignment = direct_mechanical_assignment("direct-inherited");
+    let plan = worker_degrade_plan(vec![assignment.clone(), inherited_assignment.clone()]);
+    let requested_plan = plan.clone();
+    let mut metadata = AssignmentMetadata::new();
+    insert_direct_mechanical_duty_metadata(&mut metadata, &assignment.id);
+    insert_direct_mechanical_duty_metadata(&mut metadata, &inherited_assignment.id);
+    let catalog = RuntimeModelCatalog::Codex(
+        CodexRuntimeModelCatalog::from_slugs([FRONTIER_PROFILE_MODEL, ECONOMY_PROFILE_MODEL])
+            .expect("direct mechanical catalog"),
+    );
+    let report = RunBudgetLedger::new(RunBudgetLimits::default())
+        .expect("unbounded budget")
+        .report()
+        .expect("unbounded report");
+    let mut controller = BudgetDegradationController::new(4);
+
+    let policy = controller
+        .assignment_policy(budget_policy_request(
+            &assignment,
+            None,
+            &report,
+            &plan,
+            &requested_plan,
+            &metadata,
+            &catalog,
+        ))
+        .expect("direct low-difficulty model degradation")
+        .expect("direct assignment admitted");
+
+    assert_eq!(report.action, BudgetAction::Continue);
+    assert_eq!(
+        policy.apply(&plan).role_models[&AgentRole::Worker]
+            .model
+            .as_deref(),
+        Some(ECONOMY_PROFILE_MODEL)
+    );
+    assert_eq!(controller.records.len(), 1);
+    assert_eq!(
+        controller.records[0].trigger,
+        BudgetDegradationTrigger::LowDifficultyMechanical
+    );
+    assert_eq!(
+        controller.records[0].change,
+        BudgetDegradationChange::ModelTier {
+            role: AgentRole::Worker,
+            before: FRONTIER_PROFILE_MODEL.to_string(),
+            after: ECONOMY_PROFILE_MODEL.to_string(),
+            resolved_candidate_index: 0,
+        }
+    );
+    assert!(controller.records[0].budget_reasons.is_empty());
+    assert_eq!(controller.effective_fan_out, 4);
+
+    let inherited_policy = controller
+        .assignment_policy(budget_policy_request(
+            &inherited_assignment,
+            None,
+            &report,
+            &plan,
+            &requested_plan,
+            &metadata,
+            &catalog,
+        ))
+        .expect("inherited direct mechanical binding evidence")
+        .expect("inherited direct assignment admitted");
+    assert_eq!(controller.rung, BudgetDegradationRung::Effort);
+    assert_eq!(controller.effective_fan_out, 4);
+    assert_eq!(controller.records.len(), 2);
+    assert_eq!(
+        controller.records[1].change,
+        BudgetDegradationChange::RoleBindingApplied {
+            role: AgentRole::Worker
+        }
+    );
+    assert_eq!(
+        inherited_policy.apply(&plan).role_models[&AgentRole::Worker]
+            .model
+            .as_deref(),
+        Some(ECONOMY_PROFILE_MODEL)
+    );
+    let mut ledger = build_assignment_selection_ledger(&plan, &[], SupervisorRuntime::Codex);
+    apply_budget_degradations_to_selection_ledger(&mut ledger, &controller.records);
+    let inherited = ledger
+        .iter()
+        .find(|entry| {
+            entry.assignment_id == inherited_assignment.id && entry.role == AgentRole::Worker
+        })
+        .expect("inherited direct Worker ledger row");
+    assert_eq!(
+        inherited.selection_source,
+        AssignmentSelectionSource::LowDifficultyMechanical
+    );
+    assert_eq!(
+        inherited.selected_model.as_deref(),
+        Some(ECONOMY_PROFILE_MODEL)
+    );
+}
+
+#[test]
+fn direct_typed_mechanical_budget_pressure_binds_explicit_eligible_lower_worker() {
+    let assignment = direct_mechanical_assignment("direct-budget-pressure");
+    let plan = worker_degrade_plan(vec![assignment.clone()]);
+    let requested_plan = plan.clone();
+    let catalog = mechanical_codex_catalog(&[FRONTIER_PROFILE_MODEL, ECONOMY_PROFILE_MODEL]);
+    let mut controller = BudgetDegradationController::new(8);
+
+    let policy = direct_mechanical_model_tier_policy(
+        &mut controller,
+        &assignment,
+        &plan,
+        &requested_plan,
+        &catalog,
+    )
+    .expect("direct budget-pressure ModelTier")
+    .expect("direct assignment admitted");
+
+    assert_eq!(
+        policy.apply(&plan).role_models[&AgentRole::Worker]
+            .model
+            .as_deref(),
+        Some(ECONOMY_PROFILE_MODEL)
+    );
+    assert_eq!(controller.rung, BudgetDegradationRung::Effort);
+    assert_eq!(
+        controller.records[0].trigger,
+        BudgetDegradationTrigger::BudgetPressure
+    );
+    assert_eq!(
+        controller.records[0].change,
+        BudgetDegradationChange::ModelTier {
+            role: AgentRole::Worker,
+            before: FRONTIER_PROFILE_MODEL.to_string(),
+            after: ECONOMY_PROFILE_MODEL.to_string(),
+            resolved_candidate_index: 0,
+        }
+    );
+}
+
+#[test]
+fn direct_untyped_planning_and_auditor_do_not_bind_weak_or_degrade() {
+    let _guard = install_test_fixture_models(&[(
+        FIXTURE_WEAK_MECHANICAL,
+        ModelCapabilityClass::WeakMechanical,
+    )])
+    .expect("weak-mechanical fixture overlay is admission-only, not an executor claim");
+    let catalog = mechanical_codex_catalog(&[
+        FRONTIER_PROFILE_MODEL,
+        ECONOMY_PROFILE_MODEL,
+        FIXTURE_WEAK_MECHANICAL,
+    ]);
+    let report = degrade_report();
+
+    let untyped = direct_mechanical_assignment("direct-untyped");
+    let untyped_plan = worker_plan_with_current_and_ladder(
+        vec![untyped.clone()],
+        FRONTIER_PROFILE_MODEL,
+        &[FIXTURE_WEAK_MECHANICAL],
+    );
+    let untyped_requested = untyped_plan.clone();
+    let untyped_metadata = AssignmentMetadata::new();
+    let mut untyped_controller = BudgetDegradationController::new(8);
+    let untyped_policy = untyped_controller
+        .assignment_policy(budget_policy_request(
+            &untyped,
+            None,
+            &report,
+            &untyped_plan,
+            &untyped_requested,
+            &untyped_metadata,
+            &catalog,
+        ))
+        .expect("untyped direct Worker remains admitted")
+        .expect("untyped direct Worker is not halted");
+    assert_eq!(
+        untyped_policy.apply(&untyped_plan).role_models[&AgentRole::Worker]
+            .model
+            .as_deref(),
+        Some(FRONTIER_PROFILE_MODEL)
+    );
+    assert_ne!(
+        untyped_policy.apply(&untyped_plan).role_models[&AgentRole::Worker]
+            .model
+            .as_deref(),
+        Some(FIXTURE_WEAK_MECHANICAL)
+    );
+    assert_model_tier_unchanged(&untyped_controller);
+
+    let mut planning = direct_mechanical_assignment("direct-planning");
+    planning.phase = AssignmentPhase::Planning;
+    let planning_plan = worker_plan_with_current_and_ladder(
+        vec![planning.clone()],
+        FRONTIER_PROFILE_MODEL,
+        &[FIXTURE_WEAK_MECHANICAL],
+    );
+    let planning_requested = planning_plan.clone();
+    let mut planning_metadata = AssignmentMetadata::new();
+    insert_direct_mechanical_duty_metadata(&mut planning_metadata, &planning.id);
+    let mut planning_controller = BudgetDegradationController::new(8);
+    let planning_policy = planning_controller
+        .assignment_policy(budget_policy_request(
+            &planning,
+            None,
+            &report,
+            &planning_plan,
+            &planning_requested,
+            &planning_metadata,
+            &catalog,
+        ))
+        .expect("planning Worker with duty remains admitted")
+        .expect("planning Worker is not halted");
+    assert_eq!(
+        planning_policy.apply(&planning_plan).role_models[&AgentRole::Worker]
+            .model
+            .as_deref(),
+        Some(FRONTIER_PROFILE_MODEL)
+    );
+    assert_ne!(
+        planning_policy.apply(&planning_plan).role_models[&AgentRole::Worker]
+            .model
+            .as_deref(),
+        Some(FIXTURE_WEAK_MECHANICAL)
+    );
+    assert_model_tier_unchanged(&planning_controller);
+
+    let mut auditor = test_assignment("auditor-assignment", "auditor.txt");
+    auditor.role = AgentRole::Auditor;
+    let auditor_plan = worker_plan_with_current_and_ladder(
+        vec![auditor.clone()],
+        FRONTIER_PROFILE_MODEL,
+        &[FIXTURE_WEAK_MECHANICAL],
+    );
+    let auditor_requested = auditor_plan.clone();
+    let mut auditor_metadata = AssignmentMetadata::new();
+    insert_direct_mechanical_duty_metadata(&mut auditor_metadata, &auditor.id);
+    let mut auditor_controller = BudgetDegradationController::new(8);
+    let auditor_policy = auditor_controller
+        .assignment_policy(budget_policy_request(
+            &auditor,
+            None,
+            &report,
+            &auditor_plan,
+            &auditor_requested,
+            &auditor_metadata,
+            &catalog,
+        ))
+        .expect("auditor assignment remains admitted")
+        .expect("auditor assignment is not halted");
+    assert_eq!(
+        auditor_policy.apply(&auditor_plan).role_models[&AgentRole::Worker]
+            .model
+            .as_deref(),
+        Some(FRONTIER_PROFILE_MODEL)
+    );
+    assert_ne!(
+        auditor_policy.apply(&auditor_plan).role_models[&AgentRole::Worker]
+            .model
+            .as_deref(),
+        Some(FIXTURE_WEAK_MECHANICAL)
+    );
+    assert_model_tier_unchanged(&auditor_controller);
+}
+
+#[test]
+fn direct_typed_mechanical_absent_unavailable_ineligible_or_non_lower_target_refuses() {
+    let assignment = direct_mechanical_assignment("direct-fail-closed");
+
+    let mut absent_plan = worker_degrade_plan(vec![assignment.clone()]);
+    absent_plan
+        .role_models
+        .get_mut(&AgentRole::Worker)
+        .expect("Worker selection")
+        .unavailable_model_fallback = UnavailableModelFallback::FailClosed;
+    let absent_requested = absent_plan.clone();
+    let absent_catalog = mechanical_codex_catalog(&[FRONTIER_PROFILE_MODEL, ECONOMY_PROFILE_MODEL]);
+    let mut absent_controller = BudgetDegradationController::new(8);
+    let absent_error = direct_mechanical_model_tier_policy(
+        &mut absent_controller,
+        &assignment,
+        &absent_plan,
+        &absent_requested,
+        &absent_catalog,
+    )
+    .expect_err("absent budget_degrade_models ladder must refuse");
+    assert!(
+        absent_error
+            .to_string()
+            .contains("requested-plan Worker role has no budget_degrade_models ladder"),
+        "absent-ladder refusal: {absent_error}"
+    );
+    assert_model_tier_unchanged(&absent_controller);
+
+    let unavailable_plan = worker_plan_with_current_and_ladder(
+        vec![assignment.clone()],
+        FRONTIER_PROFILE_MODEL,
+        &[ECONOMY_PROFILE_MODEL],
+    );
+    let unavailable_requested = unavailable_plan.clone();
+    let unavailable_catalog = mechanical_codex_catalog(&[FRONTIER_PROFILE_MODEL]);
+    let mut unavailable_controller = BudgetDegradationController::new(8);
+    let unavailable_error = direct_mechanical_model_tier_policy(
+        &mut unavailable_controller,
+        &assignment,
+        &unavailable_plan,
+        &unavailable_requested,
+        &unavailable_catalog,
+    )
+    .expect_err("catalog-unavailable ladder target must refuse");
+    assert!(
+        unavailable_error.to_string().contains(
+            "requested-plan budget_degrade_models ladder has no distinct runtime-advertised authority-eligible strictly-lower target"
+        ),
+        "unavailable-target refusal: {unavailable_error}"
+    );
+    assert_model_tier_unchanged(&unavailable_controller);
+
+    let ineligible_plan = worker_plan_with_current_and_ladder(
+        vec![assignment.clone()],
+        FRONTIER_PROFILE_MODEL,
+        &[BALANCED_PROFILE_MODEL],
+    );
+    let ineligible_requested = ineligible_plan.clone();
+    let ineligible_catalog =
+        mechanical_codex_catalog(&[FRONTIER_PROFILE_MODEL, BALANCED_PROFILE_MODEL]);
+    let mut ineligible_controller = BudgetDegradationController::new(8);
+    let ineligible_error = direct_mechanical_model_tier_policy(
+        &mut ineligible_controller,
+        &assignment,
+        &ineligible_plan,
+        &ineligible_requested,
+        &ineligible_catalog,
+    )
+    .expect_err("ineligible terra ladder target must refuse");
+    assert!(
+        ineligible_error.to_string().contains(
+            "requested-plan budget_degrade_models ladder has no distinct runtime-advertised authority-eligible strictly-lower target"
+        ),
+        "ineligible-target refusal: {ineligible_error}"
+    );
+    assert_model_tier_unchanged(&ineligible_controller);
+
+    let non_lower_plan = worker_plan_with_current_and_ladder(
+        vec![assignment.clone()],
+        ECONOMY_PROFILE_MODEL,
+        &[FRONTIER_PROFILE_MODEL],
+    );
+    let non_lower_requested = non_lower_plan.clone();
+    let non_lower_catalog =
+        mechanical_codex_catalog(&[ECONOMY_PROFILE_MODEL, FRONTIER_PROFILE_MODEL]);
+    let mut non_lower_controller = BudgetDegradationController::new(8);
+    let non_lower_error = direct_mechanical_model_tier_policy(
+        &mut non_lower_controller,
+        &assignment,
+        &non_lower_plan,
+        &non_lower_requested,
+        &non_lower_catalog,
+    )
+    .expect_err("non-lower ladder target must refuse");
+    assert!(
+        non_lower_error.to_string().contains(
+            "requested-plan budget_degrade_models ladder has no distinct runtime-advertised authority-eligible strictly-lower target"
+        ),
+        "non-lower-target refusal: {non_lower_error}"
+    );
+    assert_model_tier_unchanged(&non_lower_controller);
 }
 
 #[test]

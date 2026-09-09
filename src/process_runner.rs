@@ -1803,6 +1803,7 @@ impl ProcessSpec {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_consumed_mechanical_executor_proof(
         mut self,
         proof: ConsumedMechanicalExecutorProof,
