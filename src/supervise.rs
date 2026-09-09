@@ -2351,7 +2351,7 @@ fn enforce_role_reasoning_effort_floor(
 }
 
 impl AgentRole {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Supervisor => "supervisor",
             Self::ChildOrchestrator => "child_orchestrator",
