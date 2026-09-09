@@ -7575,18 +7575,44 @@ fn assignment_process_launch_fixture(
     let incoming = workspace.join("incoming");
     fs::create_dir(&incoming)?;
     fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
-    let mut spec = ExternalAgentCommand::codex(
-        &agent,
-        &workspace,
-        &prompt,
-        incoming.join("events.jsonl"),
-        incoming.join("last-message.txt"),
-        Duration::from_secs(5),
-    )
-    .with_workspace_access(WorkspaceAccess::ReadWrite)
-    .with_writable_launch_target(WritableLaunchTarget::ManagedChildWorktree)
-    .with_agent_lifecycle(&workspace, "worker", run_id, subject)
-    .with_model_selection(model.map(str::to_string), None);
+    let mut spec = match kind {
+        AssignmentProcessLaunchKind::ConsultCodex => {
+            ExternalAgentCommand::codex_read_only_consultant(
+                &agent,
+                &workspace,
+                &prompt,
+                incoming.join("events.jsonl"),
+                incoming.join("last-message.txt"),
+                Duration::from_secs(5),
+            )
+            .with_agent_lifecycle(&workspace, "researcher", run_id, subject)
+            .with_model_selection(model.map(str::to_string), None)
+        }
+        AssignmentProcessLaunchKind::ConsultClaude => ExternalAgentCommand::claude_consultant(
+            &agent,
+            &workspace,
+            &prompt,
+            incoming.join("events.jsonl"),
+            incoming.join("last-message.txt"),
+            Duration::from_secs(5),
+        )
+        .with_agent_lifecycle(&workspace, "researcher", run_id, subject)
+        .with_model_selection(model.map(str::to_string), None),
+        AssignmentProcessLaunchKind::AssignmentChild
+        | AssignmentProcessLaunchKind::ParentAuditor
+        | AssignmentProcessLaunchKind::InboxIndependentAuditor => ExternalAgentCommand::codex(
+            &agent,
+            &workspace,
+            &prompt,
+            incoming.join("events.jsonl"),
+            incoming.join("last-message.txt"),
+            Duration::from_secs(5),
+        )
+        .with_workspace_access(WorkspaceAccess::ReadWrite)
+        .with_writable_launch_target(WritableLaunchTarget::ManagedChildWorktree)
+        .with_agent_lifecycle(&workspace, "worker", run_id, subject)
+        .with_model_selection(model.map(str::to_string), None),
+    };
     match grant {
         Some(grant) => spec = spec.with_assignment_process_launch(kind, grant),
         None => spec.assignment_process_launch_kind = Some(kind),
@@ -7612,6 +7638,27 @@ fn assert_assignment_process_launch_refused(
                 && error.contains(cause.cause_id())
         }),
         "unexpected refusal: {:?}",
+        report.error
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn assert_claude_consultant_inner_contract_refused_after_grant(
+    report: &ExternalAgentRun,
+    marker: &Path,
+) {
+    assert!(
+        !marker.exists(),
+        "Claude consultant must not spawn without an inner read-only contract: {:?}",
+        report.error
+    );
+    assert!(!report.stdout.target_launch_attempted);
+    assert!(
+        report.error.as_deref().is_some_and(|error| {
+            error.contains("no enforceable inner read-only permission contract")
+                && !error.contains("assignment process launch grant failed closed")
+        }),
+        "matching ConsultClaude must pass the process-grant gate then hit the existing inner-contract refusal: {:?}",
         report.error
     );
 }
@@ -8000,6 +8047,498 @@ fn matching_inbox_independent_auditor_grant_launches_local_fixture_once() -> Res
         crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::AlreadyConsumed,
     );
     assert!(!replay_marker.exists());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn chmod_fixture_control_roots(workspace: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    for control_root in [".git", ".maco", ".maco-cache", ".codex", ".agents"] {
+        let path = workspace.join(control_root);
+        fs::create_dir_all(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn consult_process_missing_grant_fails_closed_on_verified_and_simulation() -> Result<()> {
+    for kind in [
+        AssignmentProcessLaunchKind::ConsultCodex,
+        AssignmentProcessLaunchKind::ConsultClaude,
+    ] {
+        let (_temp, spec, marker) = assignment_process_launch_fixture(
+            kind,
+            None,
+            "run-missing-consult",
+            "run-missing-consult",
+            None,
+        )?;
+        chmod_fixture_control_roots(&spec.cwd)?;
+        let simulated = run_external_agent_nonpublishable_simulation(&spec);
+        assert_assignment_process_launch_refused(
+            &simulated,
+            &marker,
+            crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::MissingGrant,
+        );
+        let verified = run_external_agent(&spec);
+        assert_assignment_process_launch_refused(
+            &verified,
+            &marker,
+            crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::MissingGrant,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn consult_process_wrong_kind_identity_catalog_and_replay_fail_closed() -> Result<()> {
+    let consult_grant = crate::mutation_taxonomy::admit_consult_codex_process_intent(
+        "run-consult-wrong-kind",
+        "run-consult-wrong-kind",
+        1,
+        Path::new("codex"),
+        None,
+        crate::mutation_taxonomy::CONSULTANT_PROCESS_DUTY,
+    )?;
+    let (_temp, spec, marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::InboxIndependentAuditor,
+        Some(consult_grant),
+        "run-consult-wrong-kind",
+        "run-consult-wrong-kind",
+        None,
+    )?;
+    chmod_fixture_control_roots(&spec.cwd)?;
+    let report = run_external_agent_nonpublishable_simulation(&spec);
+    assert_assignment_process_launch_refused(
+        &report,
+        &marker,
+        crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::KindMismatch,
+    );
+
+    let grant = crate::mutation_taxonomy::admit_consult_codex_process_intent(
+        "run-consult-wrong-id",
+        "run-consult-wrong-id",
+        1,
+        Path::new("codex"),
+        None,
+        crate::mutation_taxonomy::CONSULTANT_PROCESS_DUTY,
+    )?;
+    let (_temp, spec, marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::ConsultCodex,
+        Some(grant),
+        "run-other-consult-id",
+        "run-consult-wrong-id",
+        None,
+    )?;
+    chmod_fixture_control_roots(&spec.cwd)?;
+    let report = run_external_agent_nonpublishable_simulation(&spec);
+    assert_assignment_process_launch_refused(
+        &report,
+        &marker,
+        crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::IdentityMismatch,
+    );
+
+    let _catalog = SupervisorCatalogCodexPreflightGrant::admit_from_supervisor_catalog_intent(
+        "run-catalog-as-consult",
+        Path::new("/repos/caller-worktree"),
+        Path::new("codex"),
+    )?;
+    let (_temp, spec, marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::ConsultCodex,
+        None,
+        "run-catalog-as-consult",
+        "run-catalog-as-consult",
+        None,
+    )?;
+    chmod_fixture_control_roots(&spec.cwd)?;
+    let report = run_external_agent_nonpublishable_simulation(&spec);
+    assert_assignment_process_launch_refused(
+        &report,
+        &marker,
+        crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::MissingGrant,
+    );
+
+    let grant = crate::mutation_taxonomy::admit_consult_codex_process_intent(
+        "run-consult-replay",
+        "run-consult-replay",
+        1,
+        Path::new("codex"),
+        None,
+        crate::mutation_taxonomy::CONSULTANT_PROCESS_DUTY,
+    )?;
+    let replay = grant.clone();
+    let (_temp, spec, marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::ConsultCodex,
+        Some(grant),
+        "run-consult-replay",
+        "run-consult-replay",
+        None,
+    )?;
+    chmod_fixture_control_roots(&spec.cwd)?;
+    let first = run_external_agent_nonpublishable_simulation(&spec);
+    assert_eq!(first.error, None, "{first:?}");
+    assert!(marker.exists());
+    let (_temp_replay, replay_spec, replay_marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::ConsultCodex,
+        Some(replay),
+        "run-consult-replay",
+        "run-consult-replay",
+        None,
+    )?;
+    chmod_fixture_control_roots(&replay_spec.cwd)?;
+    let second = run_external_agent_nonpublishable_simulation(&replay_spec);
+    assert_assignment_process_launch_refused(
+        &second,
+        &replay_marker,
+        crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::AlreadyConsumed,
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn matching_consult_process_grant_launches_local_fixture_once() -> Result<()> {
+    let grant = crate::mutation_taxonomy::admit_consult_codex_process_intent(
+        "run-consult-genuine-fixture",
+        "run-consult-genuine-fixture",
+        1,
+        Path::new("codex"),
+        None,
+        crate::mutation_taxonomy::CONSULTANT_PROCESS_DUTY,
+    )?;
+    let replay = grant.clone();
+    let (_temp, spec, marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::ConsultCodex,
+        Some(grant),
+        "run-consult-genuine-fixture",
+        "run-consult-genuine-fixture",
+        None,
+    )?;
+    chmod_fixture_control_roots(&spec.cwd)?;
+    assert_eq!(spec.invocation, ExternalAgentInvocation::CodexConsultant);
+    assert_eq!(
+        spec.agent_lifecycle
+            .as_ref()
+            .map(|identity| identity.role.as_str()),
+        Some("researcher")
+    );
+    assert_eq!(
+        spec.assignment_process_launch_duty.as_deref(),
+        Some(crate::mutation_taxonomy::CONSULTANT_PROCESS_DUTY)
+    );
+    let report = run_external_agent_nonpublishable_simulation(&spec);
+    assert_eq!(report.error, None, "{report:?}");
+    assert_eq!(report.exit_code, Some(0));
+    assert!(report.stdout.target_launch_attempted);
+    assert!(marker.exists());
+    let (_temp_replay, replay_spec, replay_marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::ConsultCodex,
+        Some(replay),
+        "run-consult-genuine-fixture",
+        "run-consult-genuine-fixture",
+        None,
+    )?;
+    chmod_fixture_control_roots(&replay_spec.cwd)?;
+    let reused = run_external_agent_nonpublishable_simulation(&replay_spec);
+    assert_assignment_process_launch_refused(
+        &reused,
+        &replay_marker,
+        crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::AlreadyConsumed,
+    );
+
+    let claude_grant = crate::mutation_taxonomy::admit_consult_claude_process_intent(
+        "run-consult-claude-genuine-fixture",
+        "run-consult-claude-genuine-fixture",
+        1,
+        Path::new("claude"),
+        None,
+        crate::mutation_taxonomy::CONSULTANT_PROCESS_DUTY,
+    )?;
+    let claude_replay = claude_grant.clone();
+    let (_temp, spec, marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::ConsultClaude,
+        Some(claude_grant),
+        "run-consult-claude-genuine-fixture",
+        "run-consult-claude-genuine-fixture",
+        None,
+    )?;
+    chmod_fixture_control_roots(&spec.cwd)?;
+    assert_eq!(spec.invocation, ExternalAgentInvocation::ClaudeConsultant);
+    assert_eq!(
+        spec.agent_lifecycle
+            .as_ref()
+            .map(|identity| identity.role.as_str()),
+        Some("researcher")
+    );
+    let report = run_external_agent_nonpublishable_simulation(&spec);
+    assert_claude_consultant_inner_contract_refused_after_grant(&report, &marker);
+    let (_temp_replay, replay_spec, replay_marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::ConsultClaude,
+        Some(claude_replay),
+        "run-consult-claude-genuine-fixture",
+        "run-consult-claude-genuine-fixture",
+        None,
+    )?;
+    chmod_fixture_control_roots(&replay_spec.cwd)?;
+    let reused = run_external_agent_nonpublishable_simulation(&replay_spec);
+    assert_claude_consultant_inner_contract_refused_after_grant(&reused, &replay_marker);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn consultant_invocation_missing_kind_cannot_bypass_process_grant() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    git2::Repository::init(&workspace)?;
+    create_mandatory_control_roots(&workspace)?;
+    chmod_fixture_control_roots(&workspace)?;
+    let marker = workspace.join("child-process-started");
+    let agent = workspace.join("fixture-agent.sh");
+    fs::write(
+        &agent,
+        format!(
+            "#!/bin/sh\nwhile IFS= read -r _line; do\n    :\ndone\ntouch '{}'\nexit 0\n",
+            marker.display()
+        ),
+    )?;
+    fs::set_permissions(&agent, fs::Permissions::from_mode(0o700))?;
+    let prompt = workspace.join("prompt.md");
+    fs::write(&prompt, "fixture prompt\n")?;
+    let incoming = workspace.join("incoming");
+    fs::create_dir(&incoming)?;
+    fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+
+    let codex = ExternalAgentCommand::codex_read_only_consultant(
+        &agent,
+        &workspace,
+        &prompt,
+        incoming.join("events.jsonl"),
+        incoming.join("last-message.txt"),
+        Duration::from_secs(5),
+    );
+    let report = run_external_agent_nonpublishable_simulation(&codex);
+    assert_assignment_process_launch_refused(
+        &report,
+        &marker,
+        crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::MissingGrant,
+    );
+
+    let claude = ExternalAgentCommand::claude_consultant(
+        &agent,
+        &workspace,
+        &prompt,
+        incoming.join("events.jsonl"),
+        incoming.join("last-message.txt"),
+        Duration::from_secs(5),
+    );
+    let report = run_external_agent_nonpublishable_simulation(&claude);
+    assert_assignment_process_launch_refused(
+        &report,
+        &marker,
+        crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::MissingGrant,
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn consult_process_grant_rejects_generic_codex_and_adapter_invocations() -> Result<()> {
+    let grant = crate::mutation_taxonomy::admit_consult_codex_process_intent(
+        "run-consult-wrong-invocation",
+        "run-consult-wrong-invocation",
+        1,
+        Path::new("codex"),
+        None,
+        crate::mutation_taxonomy::CONSULTANT_PROCESS_DUTY,
+    )?;
+    let (_temp, spec, marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::ConsultCodex,
+        Some(grant),
+        "run-consult-wrong-invocation",
+        "run-consult-wrong-invocation",
+        None,
+    )?;
+    chmod_fixture_control_roots(&spec.cwd)?;
+    assert_eq!(spec.invocation, ExternalAgentInvocation::CodexConsultant);
+
+    for invocation in [
+        ExternalAgentInvocation::CodexSupervisor,
+        ExternalAgentInvocation::Grok,
+        ExternalAgentInvocation::ClaudeCode,
+    ] {
+        let mut mutated = spec.clone();
+        mutated.invocation = invocation;
+        let report = run_external_agent_nonpublishable_simulation(&mutated);
+        assert_assignment_process_launch_refused(
+            &report,
+            &marker,
+            crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::KindMismatch,
+        );
+    }
+
+    let generic_grant = crate::mutation_taxonomy::admit_consult_codex_process_intent(
+        "run-consult-generic-codex",
+        "run-consult-generic-codex",
+        1,
+        Path::new("codex"),
+        None,
+        crate::mutation_taxonomy::CONSULTANT_PROCESS_DUTY,
+    )?;
+    let (_generic_temp, mut generic, generic_marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::AssignmentChild,
+        None,
+        "run-consult-generic-codex",
+        "run-consult-generic-codex",
+        None,
+    )?;
+    chmod_fixture_control_roots(&generic.cwd)?;
+    generic.assignment_process_launch_kind = Some(AssignmentProcessLaunchKind::ConsultCodex);
+    generic = generic
+        .with_assignment_process_launch(AssignmentProcessLaunchKind::ConsultCodex, generic_grant);
+    assert_eq!(generic.invocation, ExternalAgentInvocation::CodexSupervisor);
+    let generic_report = run_external_agent_nonpublishable_simulation(&generic);
+    assert_assignment_process_launch_refused(
+        &generic_report,
+        &generic_marker,
+        crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::KindMismatch,
+    );
+
+    let claude_grant = crate::mutation_taxonomy::admit_consult_claude_process_intent(
+        "run-consult-claude-wrong-invocation",
+        "run-consult-claude-wrong-invocation",
+        1,
+        Path::new("claude"),
+        None,
+        crate::mutation_taxonomy::CONSULTANT_PROCESS_DUTY,
+    )?;
+    let (_claude_temp, mut claude, claude_marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::ConsultClaude,
+        Some(claude_grant),
+        "run-consult-claude-wrong-invocation",
+        "run-consult-claude-wrong-invocation",
+        None,
+    )?;
+    chmod_fixture_control_roots(&claude.cwd)?;
+    assert_eq!(claude.invocation, ExternalAgentInvocation::ClaudeConsultant);
+    claude.invocation = ExternalAgentInvocation::ClaudeCode;
+    let claude_report = run_external_agent_nonpublishable_simulation(&claude);
+    assert_assignment_process_launch_refused(
+        &claude_report,
+        &claude_marker,
+        crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::KindMismatch,
+    );
+
+    let matching = run_external_agent_nonpublishable_simulation(&spec);
+    assert_eq!(matching.error, None, "{matching:?}");
+    assert_eq!(matching.exit_code, Some(0));
+    assert!(matching.stdout.target_launch_attempted);
+    assert!(marker.exists());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn consult_codex_consultant_lifecycle_is_listed_as_researcher_in_supervisor_repo_and_gc_after_exit(
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let supervisor_repo = temp.path().join("supervisor-repo");
+    let child_repo = temp.path().join("child-worktree");
+    git2::Repository::init(&supervisor_repo)?;
+    git2::Repository::init(&child_repo)?;
+    create_mandatory_control_roots(&supervisor_repo)?;
+    create_mandatory_control_roots(&child_repo)?;
+    chmod_fixture_control_roots(&supervisor_repo)?;
+    chmod_fixture_control_roots(&child_repo)?;
+
+    let provider = child_repo.join("fake-provider.sh");
+    fs::write(
+        &provider,
+        "#!/bin/sh\nroot=${0%/*}\nprintf '%s\\n%s\\n' \"$MACO_RUN_ID\" \"$MACO_TASK_ID\" > \"$root/lifecycle-env\"\n: > \"$root/provider-started\"\nwhile [ ! -f \"$root/provider-release\" ]; do sleep 0.01; done\n",
+    )?;
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o700))?;
+    let prompt = child_repo.join("prompt.md");
+    fs::write(&prompt, "offline fake consult lifecycle test\n")?;
+    let incoming = child_repo.join("incoming");
+    fs::create_dir(&incoming)?;
+    fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+
+    let grant = crate::mutation_taxonomy::admit_consult_codex_process_intent(
+        "consult-run",
+        "consult-run",
+        1,
+        Path::new("codex"),
+        None,
+        crate::mutation_taxonomy::CONSULTANT_PROCESS_DUTY,
+    )?;
+    let command = ExternalAgentCommand::codex_read_only_consultant(
+        &provider,
+        &child_repo,
+        &prompt,
+        incoming.join("events.jsonl"),
+        incoming.join("last-message.txt"),
+        Duration::from_secs(10),
+    )
+    .with_agent_lifecycle(&supervisor_repo, "researcher", "consult-run", "consult-run")
+    .with_assignment_process_launch(AssignmentProcessLaunchKind::ConsultCodex, grant);
+    assert_eq!(command.invocation, ExternalAgentInvocation::CodexConsultant);
+    assert_eq!(command.model, None);
+    assert_eq!(
+        command.assignment_process_launch_duty.as_deref(),
+        Some(crate::mutation_taxonomy::CONSULTANT_PROCESS_DUTY)
+    );
+
+    let registry = AgentRegistry::open(&supervisor_repo)?;
+    let runner = std::thread::spawn(move || run_external_agent_nonpublishable_simulation(&command));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let observed = (|| -> Result<Option<_>> {
+        loop {
+            if let Some(record) = registry
+                .list(&AgentListFilter::default())?
+                .into_iter()
+                .next()
+            {
+                return Ok(Some(record));
+            }
+            if runner.is_finished() || Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    })();
+
+    fs::write(child_repo.join("provider-release"), b"")?;
+    let report = runner
+        .join()
+        .map_err(|_| anyhow::anyhow!("consult fake provider runner thread panicked"))?;
+    let record = observed?
+        .context("consult researcher lifecycle registration was not observable before exit")?;
+
+    assert!(
+        report.simulation_succeeded(),
+        "unexpected report: {report:#?}"
+    );
+    assert_eq!(record.role, "researcher");
+    assert_eq!(record.run_id, "consult-run");
+    assert_eq!(record.task_id, "consult-run");
+    assert_eq!(record.repo, supervisor_repo);
+    assert_eq!(
+        fs::read_to_string(child_repo.join("lifecycle-env"))?,
+        "consult-run\nconsult-run\n"
+    );
+    assert!(registry.list(&AgentListFilter::default())?.is_empty());
+    assert!(registry.registry_path().is_file());
+    assert!(!child_repo.join(".maco/agents/registry.json").exists());
     Ok(())
 }
 

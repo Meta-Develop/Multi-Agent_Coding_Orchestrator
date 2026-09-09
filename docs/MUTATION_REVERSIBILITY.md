@@ -2,7 +2,7 @@
 
 ## Status and enforcement boundary
 
-This document defines version 7 of MACO's mutation taxonomy in
+This document defines version 8 of MACO's mutation taxonomy in
 `src/mutation_taxonomy.rs`. The policy is enforced at both autonomous child
 dispatch boundaries:
 
@@ -52,6 +52,25 @@ one-shot grant after the final prepared consultant command and before
 `external_runner`. Catalog grants and parent-auditor grants cannot authorize
 that spawn, and the callee cannot mint the grant from run identity plus the
 caller repository.
+
+Version 8 adds consult Codex and Claude process launch as a distinct
+irreversible sibling spawn. The trusted consult caller issues that one-shot
+grant after the final prepared command identity, model, and duty are bound and
+before `external_runner`. ConsultCodex binds only the CodexConsultant
+invocation; ConsultClaude binds only ClaudeConsultant. Inbox independent-auditor
+keeps CodexConsultant plus the existing U3 CodexSupervisor fixture;
+assignment-child and parent-auditor keep CodexSupervisor plus Grok, Cursor,
+ClaudeCode, and Gemini adapters. Process registration uses the canonical
+lifecycle role `researcher` (`ReadOnlyResearcher`); grant duty remains
+`consultant`. The sink does not skip lifecycle metadata. The sink seals
+independently verified canonical program and parent plus final argv, cwd, and
+output staging, then consumes the same grant against the final ProcessSpec.
+Trusted program spelling is kind-scoped: child, parent-auditor, Inbox
+independent-auditor, and consult-Codex remain `codex`; consult-Claude is
+`claude` without broadening those kinds. Catalog grants and assignment-family
+grants cannot authorize consult spawn, a missing kind cannot bypass the newly
+covered consult paths, and the callee cannot mint the grant from run identity
+plus the caller repository.
 
 The hook rows cover the independently owned worktree-guard integration without
 coupling this taxonomy port to the guard implementation files. Only a verified
@@ -170,6 +189,11 @@ Consequences of this rule:
   matches the final ProcessSpec; catalog grants and parent-auditor grants
   cannot authorize that spawn, and the callee cannot mint that grant from run
   identity.
+- `explicit-consult-process-launch-grant`: consult Codex or Claude process
+  spawn requires an upstream one-shot grant that matches the final ProcessSpec;
+  catalog grants and assignment-family grants cannot authorize that spawn, a
+  missing kind cannot bypass those consult paths, and the callee cannot mint
+  that grant from run identity.
 
 ## Registry
 
@@ -216,3 +240,4 @@ Consequences of this rule:
 | `inbox-pr-intake-catalog-codex-preflight` | Irreversible | Spawns a trusted Codex catalog probe for Inbox independent-audit or PR-intake whose process, network, and captured output cannot be restored from retained MACO state. | `explicit-inbox-pr-intake-catalog-codex-preflight-grant` |
 | `assignment-parent-auditor-process-launch` | Irreversible | Spawns a trusted assignment-child or parent-auditor process whose process, network, and captured output cannot be restored from retained MACO state. | `explicit-assignment-parent-auditor-process-launch-grant` |
 | `inbox-independent-auditor-process-launch` | Irreversible | Spawns a trusted Inbox independent-auditor process whose process, network, and captured output cannot be restored from retained MACO state. | `explicit-inbox-independent-auditor-process-launch-grant` |
+| `consult-process-launch` | Irreversible | Spawns a trusted consult Codex or Claude consultant process whose process, network, and captured output cannot be restored from retained MACO state. | `explicit-consult-process-launch-grant` |
