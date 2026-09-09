@@ -9021,6 +9021,16 @@ done
             "artifact reserve must enable the production orchestration journal"
         );
         let mut autonomy_kpis = AutonomyKpiCollector::default();
+        artifact_writer.write_bytes(
+            "schemas/auditor-report.schema.json",
+            b"{\"type\":\"object\"}\n",
+            ArtifactFileDisposition::PrivateEvidence,
+        )?;
+        artifact_writer.write_bytes(
+            "schemas/worker-report.schema.json",
+            b"{\"type\":\"object\"}\n",
+            ArtifactFileDisposition::PrivateEvidence,
+        )?;
         let command = {
             let artifacts = Mutex::new(SharedSupervisorArtifacts {
                 writer: &mut artifact_writer,
@@ -9109,11 +9119,6 @@ done
             let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
             let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
             let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
-            fs::create_dir_all(&dirs.schemas).context("create dispatch-spawn schema directory")?;
-            fs::write(&auditor_schema_path, "{\"type\":\"object\"}\n")
-                .context("materialize dispatch-spawn auditor schema")?;
-            fs::write(&worker_schema_path, "{\"type\":\"object\"}\n")
-                .context("materialize dispatch-spawn worker schema")?;
             let prepared = match prepare_child_attempt(
                 &context,
                 &mut outcome,
