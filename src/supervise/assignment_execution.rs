@@ -9021,136 +9021,137 @@ done
             "artifact reserve must enable the production orchestration journal"
         );
         let mut autonomy_kpis = AutonomyKpiCollector::default();
-        let artifacts = Mutex::new(SharedSupervisorArtifacts {
-            writer: &mut artifact_writer,
-            journal: &mut journal,
-            autonomy_kpis: &mut autonomy_kpis,
-            checkpoint: None,
-        });
-        let captured: Mutex<Option<ExternalAgentCommand>> = Mutex::new(None);
-        let runner = |command: &ExternalAgentCommand,
-                      _cancellation: &ProcessCancellation,
-                      _review: Option<ExternalPreActionReviewRuntime<'_>>| {
-            let grant = command
-                .assignment_process_launch_grant
-                .as_ref()
-                .expect("prepared U2 grant must ride the dispatched command");
+        let command = {
+            let artifacts = Mutex::new(SharedSupervisorArtifacts {
+                writer: &mut artifact_writer,
+                journal: &mut journal,
+                autonomy_kpis: &mut autonomy_kpis,
+                checkpoint: None,
+            });
+            let captured: Mutex<Option<ExternalAgentCommand>> = Mutex::new(None);
+            let runner =
+                |command: &ExternalAgentCommand,
+                 _cancellation: &ProcessCancellation,
+                 _review: Option<ExternalPreActionReviewRuntime<'_>>| {
+                    let grant = command
+                        .assignment_process_launch_grant
+                        .as_ref()
+                        .expect("prepared U2 grant must ride the dispatched command");
+                    assert_eq!(
+                        command.assignment_process_launch_kind,
+                        Some(AssignmentProcessLaunchKind::AssignmentChild)
+                    );
+                    assert_eq!(grant.kind(), AssignmentProcessLaunchKind::AssignmentChild);
+                    assert_eq!(grant.model(), command.model.as_deref());
+                    assert_eq!(grant.duty(), ASSIGNMENT_CHILD_PROCESS_DUTY);
+                    assert_eq!(
+                        command
+                            .agent_lifecycle
+                            .as_ref()
+                            .map(|identity| identity.task_id.as_str()),
+                        Some(ASSIGNMENT_ID)
+                    );
+                    *captured.lock().expect("capture mutex") = Some(command.clone());
+                    weak_mechanical_executor_injected_deterministic_run(
+                        command,
+                        &assignment,
+                        &assignment_metadata,
+                    )
+                };
+            let context = AssignmentExecutionContext {
+                index: 0,
+                concurrent_mode: false,
+                plan: &plan,
+                requested_plan: &plan,
+                execution_target: None,
+                budget_config: &budget_config,
+                consultant: &consultant,
+                assignment_metadata: &assignment_metadata,
+                assignment: &assignment,
+                evidence_only_reaudit: None,
+                options: &options,
+                repo: &repo,
+                run_dir: &run_dir,
+                dirs: &dirs,
+                execution_runtime: SupervisorExecutionRuntime::NonpublishableSimulation,
+                worktree_creation: SupervisorWorktreeCreation::TestOnly,
+                manager: &manager,
+                reused: false,
+                sync_store: &sync_store,
+                semantic_store: &semantic_store,
+                prepared_semantic_token: None,
+                prepared_semantic_findings: &[],
+                prepared_semantic_signals: &[],
+                prepared_semantic_failed: false,
+                assignment_schedule: &assignment_schedule,
+                field_guide: &field_guide,
+                serial_semantic_warn_intents: None,
+                semantic_block_order: None,
+                semantic_block_gate: None,
+                artifacts: &artifacts,
+                budget_ledger: &budget_ledger,
+                budget_policy: AssignmentBudgetPolicy::default(),
+                admission_commit: None,
+                runtime_model_catalog: &runtime_model_catalog,
+                cancellation,
+                external_runner: &runner,
+            };
+            let mut outcome = AssignmentExecutionOutcome {
+                gate_tracker: Some(GateCorrectionTracker::new(plan.max_gate_corrections)),
+                ..AssignmentExecutionOutcome::default()
+            };
+            let preflight = match prepare_assignment_execution(&context, &mut outcome)? {
+                AssignmentExecutionDisposition::Continue(preflight) => preflight,
+                AssignmentExecutionDisposition::Complete => {
+                    bail!("dispatch-spawn preflight unexpectedly completed")
+                }
+            };
+            let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
+            let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
+            let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
+            fs::create_dir_all(&dirs.schemas).context("create dispatch-spawn schema directory")?;
+            fs::write(&auditor_schema_path, "{\"type\":\"object\"}\n")
+                .context("materialize dispatch-spawn auditor schema")?;
+            fs::write(&worker_schema_path, "{\"type\":\"object\"}\n")
+                .context("materialize dispatch-spawn worker schema")?;
+            let prepared = match prepare_child_attempt(
+                &context,
+                &mut outcome,
+                &context.budget_policy,
+                &preflight,
+                options.run_id.as_str(),
+                1,
+                1,
+                &None,
+                &schema_path,
+                &worker_schema_path,
+                &auditor_schema_path,
+            )? {
+                AssignmentExecutionDisposition::Continue(prepared) => prepared,
+                AssignmentExecutionDisposition::Complete => {
+                    bail!("dispatch-spawn child preparation unexpectedly completed")
+                }
+            };
             assert_eq!(
-                command.assignment_process_launch_kind,
-                Some(AssignmentProcessLaunchKind::AssignmentChild)
+                prepared.command.model.as_deref(),
+                Some(WEAK_MECHANICAL_EXECUTOR_FIXTURE)
             );
-            assert_eq!(grant.kind(), AssignmentProcessLaunchKind::AssignmentChild);
-            assert_eq!(grant.model(), command.model.as_deref());
-            assert_eq!(grant.duty(), ASSIGNMENT_CHILD_PROCESS_DUTY);
-            assert_eq!(
-                command
-                    .agent_lifecycle
-                    .as_ref()
-                    .map(|identity| identity.task_id.as_str()),
-                Some(ASSIGNMENT_ID)
-            );
-            *captured.lock().expect("capture mutex") = Some(command.clone());
-            weak_mechanical_executor_injected_deterministic_run(
-                command,
-                &assignment,
-                &assignment_metadata,
+            let collected = dispatch_and_collect_child_attempt(
+                &context,
+                &mut outcome,
+                &preflight,
+                options.run_id.as_str(),
+                1,
+                prepared,
             )
+            .context("production dispatch_and_collect_child_attempt")?;
+            drop(collected);
+            captured
+                .lock()
+                .expect("capture mutex")
+                .clone()
+                .context("injected runner must receive the production-bound command")?;
         };
-        let context = AssignmentExecutionContext {
-            index: 0,
-            concurrent_mode: false,
-            plan: &plan,
-            requested_plan: &plan,
-            execution_target: None,
-            budget_config: &budget_config,
-            consultant: &consultant,
-            assignment_metadata: &assignment_metadata,
-            assignment: &assignment,
-            evidence_only_reaudit: None,
-            options: &options,
-            repo: &repo,
-            run_dir: &run_dir,
-            dirs: &dirs,
-            execution_runtime: SupervisorExecutionRuntime::NonpublishableSimulation,
-            worktree_creation: SupervisorWorktreeCreation::TestOnly,
-            manager: &manager,
-            reused: false,
-            sync_store: &sync_store,
-            semantic_store: &semantic_store,
-            prepared_semantic_token: None,
-            prepared_semantic_findings: &[],
-            prepared_semantic_signals: &[],
-            prepared_semantic_failed: false,
-            assignment_schedule: &assignment_schedule,
-            field_guide: &field_guide,
-            serial_semantic_warn_intents: None,
-            semantic_block_order: None,
-            semantic_block_gate: None,
-            artifacts: &artifacts,
-            budget_ledger: &budget_ledger,
-            budget_policy: AssignmentBudgetPolicy::default(),
-            admission_commit: None,
-            runtime_model_catalog: &runtime_model_catalog,
-            cancellation,
-            external_runner: &runner,
-        };
-        let mut outcome = AssignmentExecutionOutcome {
-            gate_tracker: Some(GateCorrectionTracker::new(plan.max_gate_corrections)),
-            ..AssignmentExecutionOutcome::default()
-        };
-        let preflight = match prepare_assignment_execution(&context, &mut outcome)? {
-            AssignmentExecutionDisposition::Continue(preflight) => preflight,
-            AssignmentExecutionDisposition::Complete => {
-                bail!("dispatch-spawn preflight unexpectedly completed")
-            }
-        };
-        let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
-        let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
-        let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
-        fs::create_dir_all(&dirs.schemas).context("create dispatch-spawn schema directory")?;
-        fs::write(&auditor_schema_path, "{\"type\":\"object\"}\n")
-            .context("materialize dispatch-spawn auditor schema")?;
-        fs::write(&worker_schema_path, "{\"type\":\"object\"}\n")
-            .context("materialize dispatch-spawn worker schema")?;
-        let prepared = match prepare_child_attempt(
-            &context,
-            &mut outcome,
-            &context.budget_policy,
-            &preflight,
-            options.run_id.as_str(),
-            1,
-            1,
-            &None,
-            &schema_path,
-            &worker_schema_path,
-            &auditor_schema_path,
-        )? {
-            AssignmentExecutionDisposition::Continue(prepared) => prepared,
-            AssignmentExecutionDisposition::Complete => {
-                bail!("dispatch-spawn child preparation unexpectedly completed")
-            }
-        };
-        assert_eq!(
-            prepared.command.model.as_deref(),
-            Some(WEAK_MECHANICAL_EXECUTOR_FIXTURE)
-        );
-        let collected = dispatch_and_collect_child_attempt(
-            &context,
-            &mut outcome,
-            &preflight,
-            options.run_id.as_str(),
-            1,
-            prepared,
-        )
-        .context("production dispatch_and_collect_child_attempt")?;
-        drop(collected);
-        let command = captured
-            .lock()
-            .expect("capture mutex")
-            .clone()
-            .context("injected runner must receive the production-bound command")?;
-        drop(context);
-        drop(artifacts);
         artifact_writer.write_bytes(
             RunArtifactFamily::Supervise.final_report_relative_path(),
             b"{}\n",
