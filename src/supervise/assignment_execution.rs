@@ -9146,11 +9146,12 @@ done
             )
             .context("production dispatch_and_collect_child_attempt")?;
             drop(collected);
-            captured
+            let captured_command = captured
                 .lock()
                 .expect("capture mutex")
                 .clone()
                 .context("injected runner must receive the production-bound command")?;
+            captured_command
         };
         artifact_writer.write_bytes(
             RunArtifactFamily::Supervise.final_report_relative_path(),
