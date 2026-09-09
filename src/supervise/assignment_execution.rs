@@ -1,7 +1,8 @@
 use super::*;
 use crate::mutation_taxonomy::{
     admit_assignment_child_process_intent, admit_parent_auditor_process_intent,
-    AssignmentProcessLaunchKind, ASSIGNMENT_CHILD_PROCESS_DUTY, PARENT_AUDITOR_PROCESS_DUTY,
+    AssignmentProcessLaunchKind, SealedMechanicalExecutorDuty, SealedMechanicalExecutorPhase,
+    SealedMechanicalExecutorRole, ASSIGNMENT_CHILD_PROCESS_DUTY, PARENT_AUDITOR_PROCESS_DUTY,
 };
 
 fn live_invocation_started_millis(duration_ms: u64) -> u64 {
@@ -479,6 +480,26 @@ fn direct_worker_mechanical_duty(
         return None;
     }
     assignment_metadata.direct_mechanical_duty(&assignment.id)
+}
+
+fn sealed_mechanical_executor_duty(duty: MechanicalTerminalDuty) -> SealedMechanicalExecutorDuty {
+    match duty {
+        MechanicalTerminalDuty::ApplyExplicitTextReplacement => {
+            SealedMechanicalExecutorDuty::ApplyExplicitTextReplacement
+        }
+        MechanicalTerminalDuty::RunPreselectedCommand => {
+            SealedMechanicalExecutorDuty::RunPreselectedCommand
+        }
+        MechanicalTerminalDuty::FormatPreselectedFiles => {
+            SealedMechanicalExecutorDuty::FormatPreselectedFiles
+        }
+        MechanicalTerminalDuty::EnumerateDeclaredArtifacts => {
+            SealedMechanicalExecutorDuty::EnumerateDeclaredArtifacts
+        }
+        MechanicalTerminalDuty::ValidateAgainstFixedSchema => {
+            SealedMechanicalExecutorDuty::ValidateAgainstFixedSchema
+        }
+    }
 }
 
 fn bind_selected_runtime_launch(
@@ -1774,7 +1795,7 @@ fn prepare_child_attempt<'a>(
     if let Some(signal) = &context.admission_commit {
         signal.notify();
     }
-    let grant = admit_assignment_child_process_intent(
+    let mut grant = admit_assignment_child_process_intent(
         options.run_id.as_str(),
         assignment.id.as_str(),
         attempt,
@@ -1782,6 +1803,24 @@ fn prepare_child_attempt<'a>(
         command.model.as_deref(),
         ASSIGNMENT_CHILD_PROCESS_DUTY,
     )?;
+    if let Some(duty) = mechanical_duty {
+        if command
+            .model
+            .as_deref()
+            .is_some_and(recorded_model_is_weak_mechanical)
+        {
+            authorize_known_executor_role_model(
+                AgentRole::Worker,
+                command.model.as_deref(),
+                Some(duty),
+            )?;
+            grant = grant.seal_mechanical_executor(
+                SealedMechanicalExecutorRole::Worker,
+                SealedMechanicalExecutorPhase::MechanicalTerminal,
+                sealed_mechanical_executor_duty(duty),
+            )?;
+        }
+    }
     command =
         command.with_assignment_process_launch(AssignmentProcessLaunchKind::AssignmentChild, grant);
     Ok(AssignmentExecutionDisposition::Continue(
@@ -4597,6 +4636,9 @@ fn execute_supervisor_assignment_inner(
 
 #[cfg(test)]
 mod decomposition_tests {
+    use super::super::scheduler::{
+        assignment_budget_policy_for_test, AssignmentBudgetPolicyRequest,
+    };
     use super::*;
     #[cfg(target_os = "linux")]
     use crate::external_agent::run_external_agent_nonpublishable_simulation;
@@ -8896,6 +8938,626 @@ done
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    fn chmod_control_dirs(repo: &Path) -> Result<()> {
+        for name in [".git", ".maco", ".maco-cache", ".codex", ".agents"] {
+            let path = repo.join(name);
+            if !path.exists() {
+                fs::create_dir(&path)?;
+            }
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn named_codex_weak_mechanical_worker_registers_typed_executor_evidence() -> Result<()> {
+        use crate::agent_lifecycle::AgentRegistry;
+        use crate::mutation_taxonomy::{
+            AssignmentProcessLaunchGrantError, AssignmentProcessLaunchKind,
+            SealedMechanicalExecutorDuty, ASSIGNMENT_CHILD_PROCESS_DUTY,
+        };
+
+        const ASSIGNMENT_ID: &str = "weak-named-codex";
+        const DUTY: &str = "run_preselected_command";
+        let overlay = install_test_fixture_models(&[(
+            WEAK_MECHANICAL_EXECUTOR_FIXTURE,
+            ModelCapabilityClass::WeakMechanical,
+        )])?;
+        let loaded = parse_supervisor_plan_with_consultant(&serde_json::to_string(
+            &weak_mechanical_executor_plan_json(ASSIGNMENT_ID, Some(DUTY)),
+        )?)?;
+        let assignment = loaded
+            .plan
+            .assignments
+            .first()
+            .cloned()
+            .context("parsed plan omitted the direct worker assignment")?;
+        let temp = tempfile::tempdir().context("temporary named-codex fixture")?;
+        let repo = temp.path().join("repo");
+        Repository::init(&repo).context("initialize named-codex fixture repository")?;
+        fs::write(repo.join("README.md"), "baseline\n").context("write fixture file")?;
+        commit_fixture_repository(&repo);
+        chmod_control_dirs(&repo)?;
+        let plan = loaded.plan.clone();
+        let budget_config = SupervisorBudgetConfig::default();
+        let consultant = loaded.consultant.clone();
+        let assignment_metadata = loaded.assignment_metadata.clone();
+        let options = SupervisorRunOptions {
+            repo: repo.clone(),
+            plan_file: temp.path().join("plan.json"),
+            run_id: RunId::new("weak-mechanical-named-codex").context("valid fixture run id")?,
+            parent_node: None,
+            codex_bin: PathBuf::from("unused-codex"),
+            runtime: SupervisorRuntime::Codex,
+            allow_dirty_primary: false,
+            allow_live_run_collision: false,
+            admission_overrides: SupervisorAdmissionConfig::default(),
+            budget_overrides: RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
+            machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
+                config: temp.path().join("unused-machine-global.json"),
+                root_id: "runtime".to_string(),
+                owner: "maco-supervise".to_string(),
+                correction_correlation_id: "weak-mechanical-named-codex".to_string(),
+            }),
+        };
+        let mut artifact_writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            options.run_id.clone(),
+            "weak-mechanical-named-codex",
+        )
+        .context("reserve named-codex artifacts")?;
+        let run_dir = artifact_writer.run_dir().to_path_buf();
+        let dirs = RunDirs::for_writer(&artifact_writer);
+        let manager = WorktreeManager::new(&repo);
+        let sync_store = SyncStore::open(&repo).context("open fixture sync store")?;
+        let semantic_store =
+            SemanticIntentStore::open(&repo).context("open fixture semantic store")?;
+        let assignment_schedule = vec![AssignmentScheduleEntry {
+            assignment_id: assignment.id.clone(),
+            parent_assignment_id: None,
+            depth: 1,
+            flattened_index: 0,
+        }];
+        let field_guide =
+            SupervisorFieldGuidePrompt::empty().context("empty fixture field guide")?;
+        let budget_ledger =
+            RunBudgetLedger::new(RunBudgetLimits::default()).context("fixture budget ledger")?;
+        let runtime_model_catalog =
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs([
+                WEAK_MECHANICAL_EXECUTOR_FIXTURE,
+            ])?);
+        let cancellation = ProcessCancellation::new();
+        let mut journal = initialize_orchestration_event_journal(
+            &repo,
+            &options.run_id,
+            options.parent_node.as_deref(),
+        );
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut artifact_writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let runner = unused_external_runner;
+        let context = AssignmentExecutionContext {
+            index: 0,
+            concurrent_mode: false,
+            plan: &plan,
+            requested_plan: &plan,
+            execution_target: None,
+            budget_config: &budget_config,
+            consultant: &consultant,
+            assignment_metadata: &assignment_metadata,
+            assignment: &assignment,
+            evidence_only_reaudit: None,
+            options: &options,
+            repo: &repo,
+            run_dir: &run_dir,
+            dirs: &dirs,
+            execution_runtime: SupervisorExecutionRuntime::NonpublishableSimulation,
+            worktree_creation: SupervisorWorktreeCreation::TestOnly,
+            manager: &manager,
+            reused: false,
+            sync_store: &sync_store,
+            semantic_store: &semantic_store,
+            prepared_semantic_token: None,
+            prepared_semantic_findings: &[],
+            prepared_semantic_signals: &[],
+            prepared_semantic_failed: false,
+            assignment_schedule: &assignment_schedule,
+            field_guide: &field_guide,
+            serial_semantic_warn_intents: None,
+            semantic_block_order: None,
+            semantic_block_gate: None,
+            artifacts: &artifacts,
+            budget_ledger: &budget_ledger,
+            budget_policy: AssignmentBudgetPolicy::default(),
+            admission_commit: None,
+            runtime_model_catalog: &runtime_model_catalog,
+            cancellation,
+            external_runner: &runner,
+        };
+        let mut outcome = AssignmentExecutionOutcome {
+            gate_tracker: Some(GateCorrectionTracker::new(plan.max_gate_corrections)),
+            ..AssignmentExecutionOutcome::default()
+        };
+        let preflight = match prepare_assignment_execution(&context, &mut outcome)? {
+            AssignmentExecutionDisposition::Continue(preflight) => preflight,
+            AssignmentExecutionDisposition::Complete => {
+                bail!("named-codex preflight unexpectedly completed")
+            }
+        };
+        let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
+        let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
+        let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
+        fs::create_dir_all(&dirs.schemas).context("create named-codex schema directory")?;
+        fs::write(&auditor_schema_path, "{\"type\":\"object\"}\n")?;
+        fs::write(&worker_schema_path, "{\"type\":\"object\"}\n")?;
+        let prepared = match prepare_child_attempt(
+            &context,
+            &mut outcome,
+            &context.budget_policy,
+            &preflight,
+            options.run_id.as_str(),
+            1,
+            1,
+            &None,
+            &schema_path,
+            &worker_schema_path,
+            &auditor_schema_path,
+        )? {
+            AssignmentExecutionDisposition::Continue(prepared) => prepared,
+            AssignmentExecutionDisposition::Complete => {
+                bail!("named-codex child preparation unexpectedly completed")
+            }
+        };
+        let child_grant = prepared
+            .command
+            .assignment_process_launch_grant
+            .clone()
+            .expect("prepare_child_attempt must attach an issuer grant");
+        assert_eq!(
+            child_grant.kind(),
+            AssignmentProcessLaunchKind::AssignmentChild
+        );
+        assert_eq!(child_grant.duty(), ASSIGNMENT_CHILD_PROCESS_DUTY);
+        assert_ne!(child_grant.duty(), DUTY);
+        assert_eq!(
+            child_grant.mechanical_duty(),
+            Some(SealedMechanicalExecutorDuty::RunPreselectedCommand)
+        );
+        assert_eq!(
+            prepared.command.assignment_mechanical_executor_duty,
+            Some(SealedMechanicalExecutorDuty::RunPreselectedCommand)
+        );
+
+        // Identity and delivery negatives run before matching so a failed
+        // consume cannot burn the prepare grant nonce. Same fixture markers;
+        // target_launch_attempted stays false. Replay stays after matching.
+        let mut missing = prepared.command.clone();
+        let (_missing_temp, missing_marker) =
+            bind_local_assignment_sink_fixture(&mut missing, "codex")?;
+        missing.assignment_process_launch_grant =
+            Some(child_grant.clone().without_mechanical_executor_for_test());
+        missing.assignment_mechanical_executor_duty = None;
+        assert_assignment_sink_refused(
+            &run_external_agent_nonpublishable_simulation(&missing),
+            &missing_marker,
+            AssignmentProcessLaunchGrantError::MechanicalExecutorMissing,
+        );
+
+        let mut wrong_role = prepared.command.clone();
+        let (_role_temp, role_marker) =
+            bind_local_assignment_sink_fixture(&mut wrong_role, "codex")?;
+        if let Some(identity) = &mut wrong_role.agent_lifecycle {
+            identity.role = "auditor".to_string();
+        }
+        assert_assignment_sink_refused(
+            &run_external_agent_nonpublishable_simulation(&wrong_role),
+            &role_marker,
+            AssignmentProcessLaunchGrantError::MechanicalExecutorMismatch,
+        );
+
+        let mut wrong_kind = prepared.command.clone();
+        let (_kind_temp, kind_marker) =
+            bind_local_assignment_sink_fixture(&mut wrong_kind, "codex")?;
+        wrong_kind.assignment_process_launch_kind =
+            Some(AssignmentProcessLaunchKind::ParentAuditor);
+        assert_assignment_sink_refused(
+            &run_external_agent_nonpublishable_simulation(&wrong_kind),
+            &kind_marker,
+            AssignmentProcessLaunchGrantError::KindMismatch,
+        );
+
+        let mut wrong_model = prepared.command.clone();
+        let (_model_temp, model_marker) =
+            bind_local_assignment_sink_fixture(&mut wrong_model, "codex")?;
+        wrong_model.model = Some("gpt-5.6-luna".to_string());
+        assert_assignment_sink_refused(
+            &run_external_agent_nonpublishable_simulation(&wrong_model),
+            &model_marker,
+            AssignmentProcessLaunchGrantError::IdentityMismatch,
+        );
+
+        let mut wrong_duty = prepared.command.clone();
+        let (_duty_temp, duty_marker) =
+            bind_local_assignment_sink_fixture(&mut wrong_duty, "codex")?;
+        wrong_duty.assignment_process_launch_grant =
+            Some(child_grant.clone().tamper_mechanical_executor_for_test(
+                SealedMechanicalExecutorDuty::ValidateAgainstFixedSchema,
+                WEAK_MECHANICAL_EXECUTOR_FIXTURE,
+            ));
+        assert_assignment_sink_refused(
+            &run_external_agent_nonpublishable_simulation(&wrong_duty),
+            &duty_marker,
+            AssignmentProcessLaunchGrantError::MechanicalExecutorMismatch,
+        );
+
+        let mut wrong_program = prepared.command.clone();
+        let (_program_temp, program_marker) =
+            bind_local_assignment_sink_fixture(&mut wrong_program, "codex")?;
+        wrong_program.assignment_process_launch_grant = Some(
+            child_grant
+                .clone()
+                .seal_independently_verified_canonical_program_for_test(Path::new("/tmp/codex"))?,
+        );
+        assert_assignment_sink_refused(
+            &run_external_agent_nonpublishable_simulation(&wrong_program),
+            &program_marker,
+            AssignmentProcessLaunchGrantError::ProgramMismatch,
+        );
+
+        let mut wrong_cwd = prepared.command.clone();
+        let (_cwd_temp, cwd_marker) = bind_local_assignment_sink_fixture(&mut wrong_cwd, "codex")?;
+        wrong_cwd.assignment_process_launch_grant = Some(
+            child_grant
+                .clone()
+                .seal_independently_verified_canonical_binding(
+                    &wrong_cwd.program,
+                    ["exec"],
+                    Path::new("/run/maco/output/named-codex.raw"),
+                    Path::new("/wrong-mechanical-cwd"),
+                )?,
+        );
+        assert_assignment_sink_refused(
+            &run_external_agent_nonpublishable_simulation(&wrong_cwd),
+            &cwd_marker,
+            AssignmentProcessLaunchGrantError::CurrentDirMismatch,
+        );
+
+        let mut wrong_argv = prepared.command.clone();
+        let (_argv_temp, argv_marker) =
+            bind_local_assignment_sink_fixture(&mut wrong_argv, "codex")?;
+        wrong_argv.assignment_process_launch_grant = Some(
+            child_grant
+                .clone()
+                .seal_independently_verified_canonical_binding(
+                    &wrong_argv.program,
+                    ["--version"],
+                    Path::new("/run/maco/output/named-codex.raw"),
+                    &wrong_argv.cwd,
+                )?,
+        );
+        assert_assignment_sink_refused(
+            &run_external_agent_nonpublishable_simulation(&wrong_argv),
+            &argv_marker,
+            AssignmentProcessLaunchGrantError::ArgvMismatch,
+        );
+
+        let mut matching = prepared.command.clone();
+        let (_match_temp, match_marker) =
+            bind_local_assignment_sink_fixture(&mut matching, "codex")?;
+        chmod_control_dirs(&repo)?;
+        let canonical = matching.program.clone();
+        assert_eq!(
+            canonical.file_name().and_then(|name| name.to_str()),
+            Some("codex")
+        );
+        assert_ne!(canonical, Path::new("codex"));
+        assert_ne!(canonical, Path::new("/tmp/codex"));
+        let matching_report = run_external_agent_nonpublishable_simulation(&matching);
+        assert_eq!(matching_report.error, None, "{matching_report:?}");
+        assert_eq!(matching_report.exit_code, Some(0));
+        assert!(matching_report.stdout.target_launch_attempted);
+        assert!(match_marker.exists());
+        let argv = argv_strings(&matching);
+        assert!(argv.iter().any(|argument| argument == "exec"));
+        assert!(!argv
+            .iter()
+            .any(|argument| { matches!(argument.as_str(), "--version" | "-V" | "version") }));
+        let bound = argv
+            .iter()
+            .position(|argument| argument == "-m")
+            .map(|index| argv[index + 1].as_str());
+        assert_eq!(bound, Some(WEAK_MECHANICAL_EXECUTOR_FIXTURE));
+        for forbidden in ["gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra", "grok-4.6"] {
+            assert_ne!(matching.model.as_deref(), Some(forbidden));
+            assert!(!argv.iter().any(|argument| argument.contains(forbidden)));
+        }
+        assert!(recorded_model_is_weak_mechanical("gpt-5.6-terra"));
+
+        let registry = AgentRegistry::open(&repo)?;
+        let inspections = registry.inspect()?;
+        let live = inspections
+            .iter()
+            .find(|inspection| inspection.process.task_id == ASSIGNMENT_ID)
+            .context("named-codex worker must register")?;
+        assert_eq!(live.process.role, "worker");
+        let authority = live.process.launch_authority()?;
+        assert_eq!(
+            authority.source,
+            "role_argv_and_consumed_assignment_child_mechanical_executor"
+        );
+        assert_eq!(
+            authority.model_capability,
+            Some(ModelCapabilityClass::WeakMechanical)
+        );
+        assert_eq!(
+            authority.requested_model.as_deref(),
+            Some(WEAK_MECHANICAL_EXECUTOR_FIXTURE)
+        );
+        let evidence = live
+            .process
+            .mechanical_executor
+            .as_ref()
+            .context("consumed proof must mint durable mechanical evidence")?;
+        assert_eq!(evidence.role, "worker");
+        assert_eq!(
+            evidence.phase,
+            crate::supervise::OrchestrationPhase::MechanicalTerminal
+        );
+        assert_eq!(evidence.duty, MechanicalTerminalDuty::RunPreselectedCommand);
+        assert_eq!(evidence.model, WEAK_MECHANICAL_EXECUTOR_FIXTURE);
+        assert_eq!(evidence.canonical_program, canonical);
+        assert_eq!(evidence.run_id, options.run_id.as_str());
+        assert_eq!(evidence.subject, ASSIGNMENT_ID);
+        assert_eq!(evidence.grant_nonce, child_grant.nonce());
+        assert_eq!(evidence.argv, live.process.argv);
+        let reloaded = AgentRegistry::open(&repo)?.inspect()?;
+        assert_eq!(
+            reloaded
+                .iter()
+                .find(|inspection| inspection.process.task_id == ASSIGNMENT_ID)
+                .and_then(|inspection| inspection.process.mechanical_executor.as_ref())
+                .map(|evidence| evidence.grant_nonce),
+            Some(evidence.grant_nonce)
+        );
+
+        let mut replay = prepared.command.clone();
+        let (_replay_temp, replay_marker) =
+            bind_local_assignment_sink_fixture(&mut replay, "codex")?;
+        replay.assignment_process_launch_grant = Some(child_grant.clone());
+        assert_assignment_sink_refused(
+            &run_external_agent_nonpublishable_simulation(&replay),
+            &replay_marker,
+            AssignmentProcessLaunchGrantError::AlreadyConsumed,
+        );
+        assert_eq!(
+            AgentRegistry::open(&repo)?
+                .inspect()?
+                .iter()
+                .filter(|inspection| inspection.process.run_id == options.run_id.as_str())
+                .count(),
+            1,
+            "grant replay must not register a second process"
+        );
+
+        let PreparedChildAttempt {
+            incoming_scratch,
+            capture_scratch,
+            incoming_output_root,
+            capture_output_root,
+            ..
+        } = prepared;
+        drop(incoming_output_root);
+        drop(capture_output_root);
+        with_supervisor_artifacts(&artifacts, |writer, _| {
+            discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
+        })
+        .expect("release named-codex invocation scratches");
+
+        drop(overlay);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn named_codex_luna_worker_registers_without_mechanical_evidence() -> Result<()> {
+        use crate::agent_lifecycle::AgentRegistry;
+
+        let temp = tempfile::tempdir().expect("temporary luna fixture");
+        let repo = temp.path().join("repo");
+        Repository::init(&repo).expect("initialize luna fixture repository");
+        fs::write(repo.join("README.md"), "baseline\n").expect("write fixture file");
+        commit_fixture_repository(&repo);
+        chmod_control_dirs(&repo)?;
+        let assignment = OrchestratorAssignment {
+            id: "luna-named-codex".to_string(),
+            phase: AssignmentPhase::Execution,
+            runtime: None,
+            role: AgentRole::Worker,
+            role_category: Some(RoleCategory::NonDelegatingTerminalWorker),
+            selection_source: Some(AssignmentSelectionSource::Automatic),
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        };
+        let mut plan = worker_plan(ECONOMY_PROFILE_MODEL);
+        plan.assignments = vec![assignment.clone()];
+        let loaded_metadata = AssignmentMetadata::new();
+        let budget_config = SupervisorBudgetConfig::default();
+        let consultant = SupervisorConsultantPlan::default();
+        let options = SupervisorRunOptions {
+            repo: repo.clone(),
+            plan_file: temp.path().join("plan.json"),
+            run_id: RunId::new("luna-named-codex").expect("valid fixture run id"),
+            parent_node: None,
+            codex_bin: PathBuf::from("unused-codex"),
+            runtime: SupervisorRuntime::Codex,
+            allow_dirty_primary: false,
+            allow_live_run_collision: false,
+            admission_overrides: SupervisorAdmissionConfig::default(),
+            budget_overrides: RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
+            machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
+                config: temp.path().join("unused-machine-global.json"),
+                root_id: "runtime".to_string(),
+                owner: "maco-supervise".to_string(),
+                correction_correlation_id: "luna-named-codex".to_string(),
+            }),
+        };
+        let mut artifact_writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            options.run_id.clone(),
+            "luna-named-codex",
+        )?;
+        let run_dir = artifact_writer.run_dir().to_path_buf();
+        let dirs = RunDirs::for_writer(&artifact_writer);
+        let manager = WorktreeManager::new(&repo);
+        let sync_store = SyncStore::open(&repo)?;
+        let semantic_store = SemanticIntentStore::open(&repo)?;
+        let assignment_schedule = vec![AssignmentScheduleEntry {
+            assignment_id: assignment.id.clone(),
+            parent_assignment_id: None,
+            depth: 1,
+            flattened_index: 0,
+        }];
+        let field_guide = SupervisorFieldGuidePrompt::empty()?;
+        let budget_ledger = RunBudgetLedger::new(RunBudgetLimits::default())?;
+        let runtime_model_catalog =
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs([
+                ECONOMY_PROFILE_MODEL,
+            ])?);
+        let cancellation = ProcessCancellation::new();
+        let mut journal = initialize_orchestration_event_journal(
+            &repo,
+            &options.run_id,
+            options.parent_node.as_deref(),
+        );
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut artifact_writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let runner = unused_external_runner;
+        let context = AssignmentExecutionContext {
+            index: 0,
+            concurrent_mode: false,
+            plan: &plan,
+            requested_plan: &plan,
+            execution_target: None,
+            budget_config: &budget_config,
+            consultant: &consultant,
+            assignment_metadata: &loaded_metadata,
+            assignment: &assignment,
+            evidence_only_reaudit: None,
+            options: &options,
+            repo: &repo,
+            run_dir: &run_dir,
+            dirs: &dirs,
+            execution_runtime: SupervisorExecutionRuntime::NonpublishableSimulation,
+            worktree_creation: SupervisorWorktreeCreation::TestOnly,
+            manager: &manager,
+            reused: false,
+            sync_store: &sync_store,
+            semantic_store: &semantic_store,
+            prepared_semantic_token: None,
+            prepared_semantic_findings: &[],
+            prepared_semantic_signals: &[],
+            prepared_semantic_failed: false,
+            assignment_schedule: &assignment_schedule,
+            field_guide: &field_guide,
+            serial_semantic_warn_intents: None,
+            semantic_block_order: None,
+            semantic_block_gate: None,
+            artifacts: &artifacts,
+            budget_ledger: &budget_ledger,
+            budget_policy: AssignmentBudgetPolicy::default(),
+            admission_commit: None,
+            runtime_model_catalog: &runtime_model_catalog,
+            cancellation,
+            external_runner: &runner,
+        };
+        let mut outcome = AssignmentExecutionOutcome {
+            gate_tracker: Some(GateCorrectionTracker::new(plan.max_gate_corrections)),
+            ..AssignmentExecutionOutcome::default()
+        };
+        let preflight = match prepare_assignment_execution(&context, &mut outcome)? {
+            AssignmentExecutionDisposition::Continue(preflight) => preflight,
+            AssignmentExecutionDisposition::Complete => {
+                bail!("luna preflight unexpectedly completed")
+            }
+        };
+        let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
+        let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
+        let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
+        fs::create_dir_all(&dirs.schemas)?;
+        fs::write(&auditor_schema_path, "{\"type\":\"object\"}\n")?;
+        fs::write(&worker_schema_path, "{\"type\":\"object\"}\n")?;
+        let prepared = match prepare_child_attempt(
+            &context,
+            &mut outcome,
+            &context.budget_policy,
+            &preflight,
+            options.run_id.as_str(),
+            1,
+            1,
+            &None,
+            &schema_path,
+            &worker_schema_path,
+            &auditor_schema_path,
+        )? {
+            AssignmentExecutionDisposition::Continue(prepared) => prepared,
+            AssignmentExecutionDisposition::Complete => {
+                bail!("luna child preparation unexpectedly completed")
+            }
+        };
+        assert_eq!(
+            prepared.command.model.as_deref(),
+            Some(ECONOMY_PROFILE_MODEL)
+        );
+        assert!(prepared
+            .command
+            .assignment_mechanical_executor_duty
+            .is_none());
+        assert!(prepared
+            .command
+            .assignment_process_launch_grant
+            .as_ref()
+            .and_then(|grant| grant.mechanical_executor())
+            .is_none());
+        let mut matching = prepared.command.clone();
+        let (_match_temp, match_marker) =
+            bind_local_assignment_sink_fixture(&mut matching, "codex")?;
+        let matching_report = run_external_agent_nonpublishable_simulation(&matching);
+        assert_eq!(matching_report.error, None, "{matching_report:?}");
+        assert!(match_marker.exists());
+        let inspections = AgentRegistry::open(&repo)?.inspect()?;
+        let live = inspections
+            .iter()
+            .find(|inspection| inspection.process.task_id == "luna-named-codex")
+            .context("luna worker must register")?;
+        assert!(live.process.mechanical_executor.is_none());
+        assert_eq!(
+            live.process.launch_authority()?.source,
+            "role_and_exact_requested_argv"
+        );
+        Ok(())
+    }
+
     fn weak_mechanical_executor_injected_deterministic_run(
         command: &ExternalAgentCommand,
         assignment: &OrchestratorAssignment,
@@ -9227,6 +9889,346 @@ done
             spawn.payload[crate::hierarchy_ledger::SUPERVISION_EDGE_FIELD]["parent_agent_id"],
             options.run_id.as_str()
         );
+        let argv = argv_strings(&command);
+        let bound = argv
+            .iter()
+            .position(|argument| argument == "-m")
+            .map(|index| argv[index + 1].as_str());
+        assert_eq!(bound, Some(WEAK_MECHANICAL_EXECUTOR_FIXTURE));
+        for forbidden in ["gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra", "grok-4.6"] {
+            assert_ne!(command.model.as_deref(), Some(forbidden));
+            assert_ne!(spawn.payload["model"].as_str(), Some(forbidden));
+            assert!(!argv.iter().any(|argument| argument.contains(forbidden)));
+        }
+        drop(overlay);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_typed_mechanical_scheduler_selection_reaches_prepare_command_and_spawn_journal(
+    ) -> Result<()> {
+        // Scheduler ModelTier must select the advertised lower Worker candidate.
+        // prepare_child_attempt / dispatch then carry that slug; this is not a
+        // test-forced command.model and not a live provider spawn.
+        const ASSIGNMENT_ID: &str = "direct-degrade-spawn";
+        let overlay = install_test_fixture_models(&[(
+            WEAK_MECHANICAL_EXECUTOR_FIXTURE,
+            ModelCapabilityClass::WeakMechanical,
+        )])?;
+        let assignment = weak_mechanical_executor_worker(ASSIGNMENT_ID);
+        let mut assignment_metadata = AssignmentMetadata::new();
+        assignment_metadata.insert_direct_mechanical_duty(
+            assignment.id.clone(),
+            MechanicalTerminalDuty::RunPreselectedCommand,
+        );
+        let mut plan = worker_plan(ECONOMY_PROFILE_MODEL);
+        plan.assignments.push(assignment.clone());
+        plan.max_child_assignments = 1;
+        plan.role_models.insert(
+            AgentRole::Worker,
+            RoleModelSelection {
+                model: Some(ECONOMY_PROFILE_MODEL.to_string()),
+                reasoning_effort: Some("high".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::OrderedCatalogChain(
+                    OrderedCatalogFallback {
+                        models: Vec::new(),
+                        budget_degrade_models: vec![WEAK_MECHANICAL_EXECUTOR_FIXTURE.to_string()],
+                        on_exhausted: TerminalUnavailableModelFallback::FailClosed,
+                    },
+                ),
+            },
+        );
+        let requested_plan = plan.clone();
+        let runtime_model_catalog =
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs([
+                ECONOMY_PROFILE_MODEL,
+                WEAK_MECHANICAL_EXECUTOR_FIXTURE,
+            ])?);
+        let budget_ledger =
+            RunBudgetLedger::new(RunBudgetLimits::default()).context("fixture budget ledger")?;
+        let report = budget_ledger
+            .report()
+            .context("unbounded budget report")?
+            .clone();
+        let (budget_policy, records) = assignment_budget_policy_for_test(
+            AssignmentBudgetPolicyRequest {
+                assignment: &assignment,
+                requested_reasoning_effort: assignment_metadata.reasoning_effort(&assignment.id),
+                report: &report,
+                plan: &plan,
+                requested_plan: &requested_plan,
+                assignment_metadata: &assignment_metadata,
+                catalog: &runtime_model_catalog,
+                runtime: SupervisorRuntime::Codex,
+            },
+            4,
+        )?
+        .context("typed direct Worker LowDifficulty admission")?;
+        assert_eq!(
+            budget_policy.apply(&plan).role_models[&AgentRole::Worker]
+                .model
+                .as_deref(),
+            Some(WEAK_MECHANICAL_EXECUTOR_FIXTURE)
+        );
+        assert_eq!(
+            records.first().map(|record| &record.change),
+            Some(&BudgetDegradationChange::ModelTier {
+                role: AgentRole::Worker,
+                before: ECONOMY_PROFILE_MODEL.to_string(),
+                after: WEAK_MECHANICAL_EXECUTOR_FIXTURE.to_string(),
+                resolved_candidate_index: 0,
+            })
+        );
+        assert_eq!(
+            records.first().map(|record| record.trigger),
+            Some(BudgetDegradationTrigger::LowDifficultyMechanical)
+        );
+
+        let temp = tempfile::tempdir().context("temporary direct-degrade fixture")?;
+        let repo = temp.path().join("repo");
+        Repository::init(&repo).context("initialize direct-degrade fixture repository")?;
+        fs::write(repo.join("README.md"), "baseline\n").context("write fixture file")?;
+        commit_fixture_repository(&repo);
+        let budget_config = SupervisorBudgetConfig::default();
+        let consultant = SupervisorConsultantPlan::default();
+        let options = SupervisorRunOptions {
+            repo: repo.clone(),
+            plan_file: temp.path().join("plan.json"),
+            run_id: RunId::new("direct-mechanical-degrade-spawn")
+                .context("valid fixture run id")?,
+            parent_node: None,
+            codex_bin: PathBuf::from("unused-codex"),
+            runtime: SupervisorRuntime::Codex,
+            allow_dirty_primary: false,
+            allow_live_run_collision: false,
+            admission_overrides: SupervisorAdmissionConfig::default(),
+            budget_overrides: RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
+            machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
+                config: temp.path().join("unused-machine-global.json"),
+                root_id: "runtime".to_string(),
+                owner: "maco-supervise".to_string(),
+                correction_correlation_id: "direct-mechanical-degrade-spawn".to_string(),
+            }),
+        };
+        let mut artifact_writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            options.run_id.clone(),
+            "direct-mechanical-degrade-spawn",
+        )
+        .context("reserve direct-degrade artifacts")?;
+        let run_dir = artifact_writer.run_dir().to_path_buf();
+        let dirs = RunDirs::for_writer(&artifact_writer);
+        let manager = WorktreeManager::new(&repo);
+        let sync_store = SyncStore::open(&repo).context("open fixture sync store")?;
+        let semantic_store =
+            SemanticIntentStore::open(&repo).context("open fixture semantic store")?;
+        let assignment_schedule = vec![AssignmentScheduleEntry {
+            assignment_id: assignment.id.clone(),
+            parent_assignment_id: None,
+            depth: 1,
+            flattened_index: 0,
+        }];
+        let field_guide =
+            SupervisorFieldGuidePrompt::empty().context("empty fixture field guide")?;
+        let cancellation = ProcessCancellation::new();
+        let mut journal = initialize_orchestration_event_journal(
+            &repo,
+            &options.run_id,
+            options.parent_node.as_deref(),
+        );
+        assert!(
+            journal.is_some(),
+            "artifact reserve must enable the production orchestration journal"
+        );
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        artifact_writer.write_bytes(
+            "schemas/auditor-report.schema.json",
+            b"{\"type\":\"object\"}\n",
+            ArtifactFileDisposition::PrivateEvidence,
+        )?;
+        artifact_writer.write_bytes(
+            "schemas/worker-report.schema.json",
+            b"{\"type\":\"object\"}\n",
+            ArtifactFileDisposition::PrivateEvidence,
+        )?;
+        let command = {
+            let artifacts = Mutex::new(SharedSupervisorArtifacts {
+                writer: &mut artifact_writer,
+                journal: &mut journal,
+                autonomy_kpis: &mut autonomy_kpis,
+                checkpoint: None,
+            });
+            let captured: Mutex<Option<ExternalAgentCommand>> = Mutex::new(None);
+            let runner =
+                |command: &ExternalAgentCommand,
+                 _cancellation: &ProcessCancellation,
+                 _review: Option<ExternalPreActionReviewRuntime<'_>>| {
+                    *captured.lock().expect("capture mutex") = Some(command.clone());
+                    weak_mechanical_executor_injected_deterministic_run(
+                        command,
+                        &assignment,
+                        &assignment_metadata,
+                    )
+                };
+            let context = AssignmentExecutionContext {
+                index: 0,
+                concurrent_mode: false,
+                plan: &plan,
+                requested_plan: &requested_plan,
+                execution_target: None,
+                budget_config: &budget_config,
+                consultant: &consultant,
+                assignment_metadata: &assignment_metadata,
+                assignment: &assignment,
+                evidence_only_reaudit: None,
+                options: &options,
+                repo: &repo,
+                run_dir: &run_dir,
+                dirs: &dirs,
+                execution_runtime: SupervisorExecutionRuntime::NonpublishableSimulation,
+                worktree_creation: SupervisorWorktreeCreation::TestOnly,
+                manager: &manager,
+                reused: false,
+                sync_store: &sync_store,
+                semantic_store: &semantic_store,
+                prepared_semantic_token: None,
+                prepared_semantic_findings: &[],
+                prepared_semantic_signals: &[],
+                prepared_semantic_failed: false,
+                assignment_schedule: &assignment_schedule,
+                field_guide: &field_guide,
+                serial_semantic_warn_intents: None,
+                semantic_block_order: None,
+                semantic_block_gate: None,
+                artifacts: &artifacts,
+                budget_ledger: &budget_ledger,
+                budget_policy,
+                admission_commit: None,
+                runtime_model_catalog: &runtime_model_catalog,
+                cancellation,
+                external_runner: &runner,
+            };
+            let mut outcome = AssignmentExecutionOutcome {
+                gate_tracker: Some(GateCorrectionTracker::new(plan.max_gate_corrections)),
+                ..AssignmentExecutionOutcome::default()
+            };
+            let preflight = match prepare_assignment_execution(&context, &mut outcome)? {
+                AssignmentExecutionDisposition::Continue(preflight) => preflight,
+                AssignmentExecutionDisposition::Complete => {
+                    bail!("direct-degrade preflight unexpectedly completed")
+                }
+            };
+            let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
+            let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
+            let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
+            let prepared = match prepare_child_attempt(
+                &context,
+                &mut outcome,
+                &context.budget_policy,
+                &preflight,
+                options.run_id.as_str(),
+                1,
+                1,
+                &None,
+                &schema_path,
+                &worker_schema_path,
+                &auditor_schema_path,
+            )? {
+                AssignmentExecutionDisposition::Continue(prepared) => prepared,
+                AssignmentExecutionDisposition::Complete => {
+                    bail!("direct-degrade child preparation unexpectedly completed")
+                }
+            };
+            assert_eq!(
+                prepared.command.model.as_deref(),
+                Some(WEAK_MECHANICAL_EXECUTOR_FIXTURE)
+            );
+            let child_grant = prepared
+                .command
+                .assignment_process_launch_grant
+                .as_ref()
+                .expect("prepare_child_attempt must attach an issuer grant");
+            assert_eq!(
+                child_grant.kind(),
+                AssignmentProcessLaunchKind::AssignmentChild
+            );
+            assert_eq!(child_grant.duty(), ASSIGNMENT_CHILD_PROCESS_DUTY);
+            assert_eq!(child_grant.model(), Some(WEAK_MECHANICAL_EXECUTOR_FIXTURE));
+            assert_eq!(
+                child_grant.mechanical_duty(),
+                Some(SealedMechanicalExecutorDuty::RunPreselectedCommand)
+            );
+            assert_eq!(
+                prepared.command.assignment_mechanical_executor_duty,
+                Some(SealedMechanicalExecutorDuty::RunPreselectedCommand)
+            );
+            let collected = dispatch_and_collect_child_attempt(
+                &context,
+                &mut outcome,
+                &preflight,
+                options.run_id.as_str(),
+                1,
+                prepared,
+            )
+            .context("production dispatch_and_collect_child_attempt")?;
+            drop(collected);
+            let captured_command = captured
+                .lock()
+                .expect("capture mutex")
+                .clone()
+                .context("injected runner must receive the production-bound command")?;
+            captured_command
+        };
+        artifact_writer.write_bytes(
+            RunArtifactFamily::Supervise.final_report_relative_path(),
+            b"{}\n",
+            ArtifactFileDisposition::PrivateEvidence,
+        )?;
+        artifact_writer.finalize(
+            RunArtifactFamily::Supervise.final_report_relative_path(),
+            false,
+        )?;
+        let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &options.run_id)
+            .context("open finalized direct-degrade artifacts")?;
+        let journal_bytes = reader.read(crate::orchestration_event::ORCHESTRATION_EVENT_PATH)?;
+        let events: Vec<crate::orchestration_event::OrchestrationEvent> =
+            std::str::from_utf8(&journal_bytes)
+                .context("UTF-8 orchestration journal")?
+                .lines()
+                .map(|line| {
+                    serde_json::from_str(line).context("schema-conforming orchestration event")
+                })
+                .collect::<Result<Vec<_>>>()?;
+        let spawn = events
+            .iter()
+            .find(|event| {
+                event.node == ASSIGNMENT_ID
+                    && event.kind == OrchestrationEventKind::Spawn
+                    && event.role == OrchestrationRole::Worker
+            })
+            .context("production dispatch must persist Worker Spawn at the assignment node")?;
+        let grant = command
+            .assignment_process_launch_grant
+            .as_ref()
+            .expect("captured command must retain the prepared U2 grant");
+        assert_eq!(
+            command.model.as_deref(),
+            Some(WEAK_MECHANICAL_EXECUTOR_FIXTURE)
+        );
+        assert_eq!(grant.model(), Some(WEAK_MECHANICAL_EXECUTOR_FIXTURE));
+        assert_eq!(grant.duty(), ASSIGNMENT_CHILD_PROCESS_DUTY);
+        assert_eq!(
+            grant.mechanical_duty(),
+            Some(SealedMechanicalExecutorDuty::RunPreselectedCommand)
+        );
+        assert_eq!(spawn.payload["model"].as_str(), command.model.as_deref());
+        assert_eq!(
+            spawn.payload["mechanical_duty"].as_str(),
+            Some(MechanicalTerminalDuty::RunPreselectedCommand.as_str())
+        );
+        assert_eq!(spawn.payload["runtime"], "codex");
         let argv = argv_strings(&command);
         let bound = argv
             .iter()
