@@ -1768,6 +1768,9 @@ struct LoadedSupervisorPlan {
 struct AssignmentMetadata {
     workers: BTreeMap<(String, String), WorkerAssignmentMetadata>,
     reasoning_efforts: BTreeMap<String, ReasoningEffort>,
+    /// Assignment-level mechanical duty for a direct Worker (empty nested list).
+    /// Nested `worker_assignments` keep [`WorkerAssignmentMetadata::mechanical_duty`].
+    direct_mechanical_duties: BTreeMap<String, MechanicalTerminalDuty>,
 }
 
 impl AssignmentMetadata {
@@ -1799,9 +1802,23 @@ impl AssignmentMetadata {
         self.reasoning_efforts.get(assignment_id).copied()
     }
 
+    fn insert_direct_mechanical_duty(
+        &mut self,
+        assignment_id: String,
+        duty: MechanicalTerminalDuty,
+    ) -> Option<MechanicalTerminalDuty> {
+        self.direct_mechanical_duties.insert(assignment_id, duty)
+    }
+
+    fn direct_mechanical_duty(&self, assignment_id: &str) -> Option<MechanicalTerminalDuty> {
+        self.direct_mechanical_duties.get(assignment_id).copied()
+    }
+
     fn retain_assignment(&mut self, assignment_id: &str) {
         self.workers.retain(|(owner, _), _| owner == assignment_id);
         self.reasoning_efforts
+            .retain(|owner, _| owner == assignment_id);
+        self.direct_mechanical_duties
             .retain(|owner, _| owner == assignment_id);
     }
 }
@@ -1811,6 +1828,7 @@ impl From<BTreeMap<(String, String), WorkerAssignmentMetadata>> for AssignmentMe
         Self {
             workers,
             reasoning_efforts: BTreeMap::new(),
+            direct_mechanical_duties: BTreeMap::new(),
         }
     }
 }
