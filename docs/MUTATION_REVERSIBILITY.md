@@ -2,7 +2,7 @@
 
 ## Status and enforcement boundary
 
-This document defines version 8 of MACO's mutation taxonomy in
+This document defines version 9 of MACO's mutation taxonomy in
 `src/mutation_taxonomy.rs`. The policy is enforced at both autonomous child
 dispatch boundaries:
 
@@ -71,6 +71,21 @@ independent-auditor, and consult-Codex remain `codex`; consult-Claude is
 grants cannot authorize consult spawn, a missing kind cannot bypass the newly
 covered consult paths, and the callee cannot mint the grant from run identity
 plus the caller repository.
+
+Version 9 adds merge-arbiter process launch as a distinct irreversible sibling
+spawn. The trusted merge runner issues that one-shot grant after the final
+prepared CodexSupervisor command, ReadOnly workspace, canonical auditor
+lifecycle, hidden primary, retention, and output schema are bound and before
+`run_external_agent`. MergeArbiter binds only a merge-shaped CodexSupervisor
+command; a generic writable worker command cannot become the arbiter by
+pasting the merge grant or kind. Consult, Inbox, parent-auditor, and
+assignment-child kinds cannot authorize that spawn. Process registration uses
+the canonical lifecycle role `auditor` (`ReadOnlyReviewAuditor`); grant duty
+is `merge-arbiter`; model remains omitted. The sink seals independently
+verified canonical program and parent plus final argv, cwd, and output
+staging, then consumes the same grant against the final ProcessSpec. Catalog
+grants and assignment-family grants cannot authorize merge-arbiter spawn, and
+the callee cannot mint the grant from run identity plus the caller repository.
 
 The hook rows cover the independently owned worktree-guard integration without
 coupling this taxonomy port to the guard implementation files. Only a verified
@@ -194,6 +209,12 @@ Consequences of this rule:
   catalog grants and assignment-family grants cannot authorize that spawn, a
   missing kind cannot bypass those consult paths, and the callee cannot mint
   that grant from run identity.
+- `explicit-merge-arbiter-process-launch-grant`: merge-arbiter process spawn
+  requires an upstream one-shot grant that matches the final ProcessSpec and a
+  merge-shaped ReadOnly CodexSupervisor command; catalog grants and
+  assignment-family grants cannot authorize that spawn, a generic writable
+  worker cannot masquerade as the arbiter, and the callee cannot mint that
+  grant from run identity.
 
 ## Registry
 
@@ -241,3 +262,4 @@ Consequences of this rule:
 | `assignment-parent-auditor-process-launch` | Irreversible | Spawns a trusted assignment-child or parent-auditor process whose process, network, and captured output cannot be restored from retained MACO state. | `explicit-assignment-parent-auditor-process-launch-grant` |
 | `inbox-independent-auditor-process-launch` | Irreversible | Spawns a trusted Inbox independent-auditor process whose process, network, and captured output cannot be restored from retained MACO state. | `explicit-inbox-independent-auditor-process-launch-grant` |
 | `consult-process-launch` | Irreversible | Spawns a trusted consult Codex or Claude consultant process whose process, network, and captured output cannot be restored from retained MACO state. | `explicit-consult-process-launch-grant` |
+| `merge-arbiter-process-launch` | Irreversible | Spawns a trusted merge-arbiter process whose process, network, and captured output cannot be restored from retained MACO state. | `explicit-merge-arbiter-process-launch-grant` |

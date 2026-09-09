@@ -7612,6 +7612,23 @@ fn assignment_process_launch_fixture(
         .with_writable_launch_target(WritableLaunchTarget::ManagedChildWorktree)
         .with_agent_lifecycle(&workspace, "worker", run_id, subject)
         .with_model_selection(model.map(str::to_string), None),
+        AssignmentProcessLaunchKind::MergeArbiter => ExternalAgentCommand::codex(
+            &agent,
+            &workspace,
+            &prompt,
+            incoming.join("events.jsonl"),
+            incoming.join("last-message.txt"),
+            Duration::from_secs(5),
+        )
+        .with_workspace_access(WorkspaceAccess::ReadOnly)
+        .with_hidden_root(&workspace)
+        .with_agent_lifecycle(
+            &workspace,
+            crate::supervise::AgentRole::Auditor.as_str(),
+            run_id,
+            subject,
+        )
+        .with_model_selection(model.map(str::to_string), None),
     };
     match grant {
         Some(grant) => spec = spec.with_assignment_process_launch(kind, grant),

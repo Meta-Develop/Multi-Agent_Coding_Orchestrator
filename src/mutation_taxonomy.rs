@@ -31,7 +31,13 @@ use std::sync::{LazyLock, Mutex};
 /// irreversible sibling spawn with its own explicit gate. Trusted program
 /// spelling is kind-scoped: existing child/parent/Inbox kinds still require
 /// `codex`; consult-Claude requires `claude` without broadening those kinds.
-pub const MUTATION_TAXONOMY_VERSION: u32 = 8;
+/// Version 9 adds merge-arbiter process launch as a distinct irreversible
+/// sibling spawn with its own explicit gate. MergeArbiter binds only a
+/// merge-shaped CodexSupervisor command (ReadOnly, canonical auditor
+/// lifecycle, hidden primary, neutral worktree). It does not reuse consult,
+/// Inbox, parent-auditor, or assignment-child kinds, and it does not require
+/// a grant on every generic CodexSupervisor constructor.
+pub const MUTATION_TAXONOMY_VERSION: u32 = 9;
 
 /// Gate identity returned for an unlisted, empty, or internally inconsistent row.
 pub const TAXONOMY_REVIEW_REQUIRED_GATE_ID: &str = "taxonomy-review-required";
@@ -81,6 +87,7 @@ pub enum ExplicitMutationGate {
     ExplicitAssignmentParentAuditorProcessLaunchGrant,
     ExplicitInboxIndependentAuditorProcessLaunchGrant,
     ExplicitConsultProcessLaunchGrant,
+    ExplicitMergeArbiterProcessLaunchGrant,
 }
 
 impl ExplicitMutationGate {
@@ -119,6 +126,9 @@ impl ExplicitMutationGate {
                 "explicit-inbox-independent-auditor-process-launch-grant"
             }
             Self::ExplicitConsultProcessLaunchGrant => "explicit-consult-process-launch-grant",
+            Self::ExplicitMergeArbiterProcessLaunchGrant => {
+                "explicit-merge-arbiter-process-launch-grant"
+            }
         }
     }
 }
@@ -168,11 +178,12 @@ pub enum MutationOperation {
     AssignmentParentAuditorProcessLaunch,
     InboxIndependentAuditorProcessLaunch,
     ConsultProcessLaunch,
+    MergeArbiterProcessLaunch,
 }
 
 impl MutationOperation {
     /// Complete enum inventory, kept explicit so additions cannot evade tests.
-    pub const ALL: [Self; 42] = [
+    pub const ALL: [Self; 43] = [
         Self::RepositoryInitialize,
         Self::MegafileTelemetrySeed,
         Self::StateMigrationPreview,
@@ -215,6 +226,7 @@ impl MutationOperation {
         Self::AssignmentParentAuditorProcessLaunch,
         Self::InboxIndependentAuditorProcessLaunch,
         Self::ConsultProcessLaunch,
+        Self::MergeArbiterProcessLaunch,
     ];
 
     /// Stable identifier used for lookup, policy rows, and gate evidence.
@@ -266,6 +278,7 @@ impl MutationOperation {
                 "inbox-independent-auditor-process-launch"
             }
             Self::ConsultProcessLaunch => "consult-process-launch",
+            Self::MergeArbiterProcessLaunch => "merge-arbiter-process-launch",
         }
     }
 
@@ -514,6 +527,11 @@ const ENTRIES: &[MutationClassification] = &[
         MutationOperation::ConsultProcessLaunch,
         "Spawns a trusted consult Codex or Claude consultant process whose process, network, and captured output cannot be restored from retained MACO state.",
         ExplicitMutationGate::ExplicitConsultProcessLaunchGrant,
+    ),
+    irreversible(
+        MutationOperation::MergeArbiterProcessLaunch,
+        "Spawns a trusted merge-arbiter process whose process, network, and captured output cannot be restored from retained MACO state.",
+        ExplicitMutationGate::ExplicitMergeArbiterProcessLaunchGrant,
     ),
 ];
 
@@ -965,12 +983,15 @@ impl SupervisorCatalogCodexPreflightGrant {
 }
 
 /// Launch kind sealed into an assignment-child / parent-auditor /
-/// Inbox-independent-auditor / consult process grant.
+/// Inbox-independent-auditor / consult / merge-arbiter process grant.
 ///
 /// Distinct from `CatalogPreflightOrigin`. Catalog grants cannot bind these
-/// worker, auditor, or consult argv surfaces. Inbox independent-auditor is a
-/// sibling kind, not a parent-auditor alias. Consult Codex and consult Claude
-/// are sibling kinds with kind-scoped trusted program spellings.
+/// worker, auditor, consult, or merge-arbiter argv surfaces. Inbox
+/// independent-auditor is a sibling kind, not a parent-auditor alias. Consult
+/// Codex and consult Claude are sibling kinds with kind-scoped trusted program
+/// spellings. MergeArbiter is a sibling kind for a merge-shaped CodexSupervisor
+/// command and is not a consult, Inbox, parent-auditor, or assignment-child
+/// alias.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AssignmentProcessLaunchKind {
     AssignmentChild,
@@ -978,19 +999,22 @@ pub(crate) enum AssignmentProcessLaunchKind {
     InboxIndependentAuditor,
     ConsultCodex,
     ConsultClaude,
+    MergeArbiter,
 }
 
 impl AssignmentProcessLaunchKind {
     /// Trusted basename spelling admitted for this kind.
     ///
-    /// Child, parent-auditor, Inbox independent-auditor, and consult-Codex
-    /// remain `codex`. Consult-Claude is `claude` only for that kind.
+    /// Child, parent-auditor, Inbox independent-auditor, consult-Codex, and
+    /// merge-arbiter remain `codex`. Consult-Claude is `claude` only for that
+    /// kind.
     pub(crate) const fn trusted_program_spelling(self) -> &'static str {
         match self {
             Self::AssignmentChild
             | Self::ParentAuditor
             | Self::InboxIndependentAuditor
-            | Self::ConsultCodex => TRUSTED_ASSIGNMENT_PROCESS_CODEX_PROGRAM,
+            | Self::ConsultCodex
+            | Self::MergeArbiter => TRUSTED_ASSIGNMENT_PROCESS_CODEX_PROGRAM,
             Self::ConsultClaude => TRUSTED_CONSULT_CLAUDE_PROGRAM,
         }
     }
@@ -999,10 +1023,10 @@ impl AssignmentProcessLaunchKind {
 /// Expected executable binding sealed into an assignment process-launch grant.
 ///
 /// Production issuance records only the kind's trusted path spelling (`codex`
-/// for child/parent/Inbox/consult-Codex, `claude` for consult-Claude). The
-/// runtime must refine that intent with an independently verified canonical
-/// program (and its parent) plus the final argv and output staging path before
-/// `ProcessSpec` construction.
+/// for child/parent/Inbox/consult-Codex/merge-arbiter, `claude` for
+/// consult-Claude). The runtime must refine that intent with an independently
+/// verified canonical program (and its parent) plus the final argv and output
+/// staging path before `ProcessSpec` construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AssignmentProcessExpectedProgram {
     TrustedSpelling,
@@ -1017,13 +1041,15 @@ struct AssignmentProcessSealedDelivery {
 }
 
 /// One-shot grant that admits an assignment-child, parent-auditor, Inbox
-/// independent-auditor, or consult spawn against a fully built `ProcessSpec`.
+/// independent-auditor, consult, or merge-arbiter spawn against a fully built
+/// `ProcessSpec`.
 ///
 /// The issuer is the trusted caller (`admit_assignment_child_process_intent` /
 /// `admit_parent_auditor_process_intent` /
 /// `admit_inbox_independent_auditor_process_intent` /
 /// `admit_consult_codex_process_intent` /
-/// `admit_consult_claude_process_intent`), not the external-agent sink. The
+/// `admit_consult_claude_process_intent` /
+/// `admit_merge_arbiter_process_intent`), not the external-agent sink. The
 /// sink must not mint this grant from `run_id` plus the caller repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use]
@@ -1086,6 +1112,7 @@ pub(crate) const ASSIGNMENT_CHILD_PROCESS_DUTY: &str = "assignment-child";
 pub(crate) const PARENT_AUDITOR_PROCESS_DUTY: &str = "parent-auditor";
 pub(crate) const INBOX_INDEPENDENT_AUDITOR_PROCESS_DUTY: &str = "inbox-independent-auditor";
 pub(crate) const CONSULTANT_PROCESS_DUTY: &str = "consultant";
+pub(crate) const MERGE_ARBITER_PROCESS_DUTY: &str = "merge-arbiter";
 
 impl AssignmentProcessLaunchGrant {
     fn admit(
@@ -1456,6 +1483,29 @@ pub(crate) fn admit_consult_claude_process_intent(
     )
 }
 
+/// Trusted merge-arbiter issuer. Distinct kind from assignment child, parent
+/// auditor, Inbox independent-auditor, and consult. Shares the process-launch
+/// nonce ledger, not the catalog ledger. Trusted spelling is `codex`. Does not
+/// mint a grant from `run_id` plus a repository path.
+pub(crate) fn admit_merge_arbiter_process_intent(
+    run_id: &str,
+    subject: &str,
+    attempt: usize,
+    expected_program: &Path,
+    model: Option<&str>,
+    duty: &str,
+) -> Result<AssignmentProcessLaunchGrant, AssignmentProcessLaunchGrantError> {
+    AssignmentProcessLaunchGrant::admit(
+        run_id,
+        subject,
+        attempt,
+        AssignmentProcessLaunchKind::MergeArbiter,
+        expected_program,
+        model,
+        duty,
+    )
+}
+
 #[cfg(test)]
 thread_local! {
     static AUTOPILOT_DISPATCH_DECISION_OVERRIDES: std::cell::RefCell<Option<std::collections::VecDeque<AutonomousMutationDecision>>> =
@@ -1516,7 +1566,7 @@ mod tests {
     #[test]
     fn registry_is_current_complete_and_unique() {
         assert_eq!(registry().version, MUTATION_TAXONOMY_VERSION);
-        assert_eq!(registry().version, 8);
+        assert_eq!(registry().version, 9);
         assert_eq!(registry().entries.len(), MutationOperation::ALL.len());
 
         let registered = registry()
@@ -1578,7 +1628,7 @@ mod tests {
             .filter(|entry| entry.reversibility == MutationReversibility::Reversible)
             .count();
         assert_eq!(reversible, 15);
-        assert_eq!(registry().entries.len() - reversible, 27);
+        assert_eq!(registry().entries.len() - reversible, 28);
         assert_eq!(
             SUPERVISOR_CHILD_DISPATCH_MUTATIONS,
             [
@@ -2418,6 +2468,25 @@ mod tests {
             )
             .expect("independently verified canonical must seal")
         }
+
+        fn admit_merge_arbiter(self) -> AssignmentProcessLaunchGrant {
+            admit_merge_arbiter_process_intent(
+                self.run_id,
+                self.subject,
+                self.attempt,
+                Path::new("codex"),
+                self.model,
+                self.duty,
+            )
+            .expect("trusted merge-arbiter spelling must admit")
+            .seal_independently_verified_canonical_binding(
+                self.program,
+                self.argv.iter().copied(),
+                self.output_staging,
+                self.cwd,
+            )
+            .expect("independently verified canonical must seal")
+        }
     }
 
     #[test]
@@ -2887,6 +2956,153 @@ mod tests {
                 AssignmentProcessLaunchKind::ConsultClaude,
                 None,
                 CONSULTANT_PROCESS_DUTY,
+            ),
+            Err(AssignmentProcessLaunchGrantError::AlreadyConsumed)
+        );
+    }
+
+    #[test]
+    fn merge_arbiter_process_launch_is_irreversible_distinct_gate_and_not_child_dispatch() {
+        assert!(!SUPERVISOR_CHILD_DISPATCH_MUTATIONS
+            .contains(&MutationOperation::MergeArbiterProcessLaunch));
+        assert_eq!(
+            autonomous_decision_for(MutationOperation::MergeArbiterProcessLaunch.id()),
+            AutonomousMutationDecision::RequireExplicitGate(
+                ExplicitMutationGate::ExplicitMergeArbiterProcessLaunchGrant
+            )
+        );
+        assert_ne!(
+            ExplicitMutationGate::ExplicitMergeArbiterProcessLaunchGrant,
+            ExplicitMutationGate::ExplicitConsultProcessLaunchGrant
+        );
+        assert_ne!(
+            ExplicitMutationGate::ExplicitMergeArbiterProcessLaunchGrant,
+            ExplicitMutationGate::ExplicitMergeArbitrateCli
+        );
+        assert_ne!(
+            ExplicitMutationGate::ExplicitMergeArbiterProcessLaunchGrant,
+            ExplicitMutationGate::ExplicitAssignmentParentAuditorProcessLaunchGrant
+        );
+        assert_ne!(
+            ExplicitMutationGate::ExplicitMergeArbiterProcessLaunchGrant,
+            ExplicitMutationGate::ExplicitInboxIndependentAuditorProcessLaunchGrant
+        );
+        assert_ne!(
+            MutationOperation::MergeArbiterProcessLaunch,
+            MutationOperation::ConsultProcessLaunch
+        );
+        assert_ne!(
+            MutationOperation::MergeArbiterProcessLaunch,
+            MutationOperation::MergeArbitrationProposal
+        );
+        assert_ne!(
+            MutationOperation::MergeArbiterProcessLaunch,
+            MutationOperation::AssignmentParentAuditorProcessLaunch
+        );
+        assert_ne!(
+            MutationOperation::MergeArbiterProcessLaunch,
+            MutationOperation::InboxIndependentAuditorProcessLaunch
+        );
+        assert_ne!(
+            AssignmentProcessLaunchKind::MergeArbiter,
+            AssignmentProcessLaunchKind::ConsultCodex
+        );
+        assert_ne!(
+            AssignmentProcessLaunchKind::MergeArbiter,
+            AssignmentProcessLaunchKind::ConsultClaude
+        );
+        assert_ne!(
+            AssignmentProcessLaunchKind::MergeArbiter,
+            AssignmentProcessLaunchKind::AssignmentChild
+        );
+        assert_ne!(
+            AssignmentProcessLaunchKind::MergeArbiter,
+            AssignmentProcessLaunchKind::ParentAuditor
+        );
+        assert_ne!(
+            AssignmentProcessLaunchKind::MergeArbiter,
+            AssignmentProcessLaunchKind::InboxIndependentAuditor
+        );
+        assert_eq!(
+            AssignmentProcessLaunchKind::MergeArbiter.trusted_program_spelling(),
+            "codex"
+        );
+        assert_eq!(MERGE_ARBITER_PROCESS_DUTY, "merge-arbiter");
+        assert_ne!(MERGE_ARBITER_PROCESS_DUTY, CONSULTANT_PROCESS_DUTY);
+        assert_ne!(MERGE_ARBITER_PROCESS_DUTY, PARENT_AUDITOR_PROCESS_DUTY);
+        assert_ne!(
+            MERGE_ARBITER_PROCESS_DUTY,
+            INBOX_INDEPENDENT_AUDITOR_PROCESS_DUTY
+        );
+        assert_ne!(MERGE_ARBITER_PROCESS_DUTY, ASSIGNMENT_CHILD_PROCESS_DUTY);
+    }
+
+    #[test]
+    fn merge_arbiter_process_grant_consumes_once_against_final_spec_identity() {
+        use crate::process_runner::{ProcessCommand, ProcessSpec};
+
+        let program = Path::new("/usr/bin/codex");
+        let cwd = Path::new("/worktrees/neutral-arbiter");
+        let staging = Path::new("/run/maco/output/proposal.json");
+        let argv = ["exec", "--sandbox", "read-only"];
+        let spec = ProcessSpec::direct("merge arbiter binding", program, argv, cwd, 64);
+        let ProcessCommand::Direct {
+            program: spec_program,
+            args: spec_argv,
+        } = &spec.command
+        else {
+            panic!("direct merge-arbiter spec must remain a direct command");
+        };
+
+        let grant = AssignmentProcessGrantFixture {
+            run_id: "run-merge-arbiter-1",
+            subject: "neutral-arbiter",
+            attempt: 1,
+            model: None,
+            duty: MERGE_ARBITER_PROCESS_DUTY,
+            program,
+            argv: &argv,
+            output_staging: staging,
+            cwd,
+        }
+        .admit_merge_arbiter();
+        assert_eq!(grant.run_id(), "run-merge-arbiter-1");
+        assert_eq!(grant.subject(), "neutral-arbiter");
+        assert_eq!(grant.attempt(), 1);
+        assert_eq!(grant.kind(), AssignmentProcessLaunchKind::MergeArbiter);
+        assert_eq!(grant.duty(), MERGE_ARBITER_PROCESS_DUTY);
+        assert_eq!(grant.model(), None);
+        assert_eq!(
+            grant.independently_verified_canonical_program(),
+            Some(program)
+        );
+        grant
+            .clone()
+            .consume_for_process_binding(
+                spec_program,
+                &spec.current_dir,
+                spec_argv,
+                staging,
+                "run-merge-arbiter-1",
+                "neutral-arbiter",
+                1,
+                AssignmentProcessLaunchKind::MergeArbiter,
+                None,
+                MERGE_ARBITER_PROCESS_DUTY,
+            )
+            .expect("matching merge-arbiter grant must consume once");
+        assert_eq!(
+            grant.consume_for_process_binding(
+                spec_program,
+                &spec.current_dir,
+                spec_argv,
+                staging,
+                "run-merge-arbiter-1",
+                "neutral-arbiter",
+                1,
+                AssignmentProcessLaunchKind::MergeArbiter,
+                None,
+                MERGE_ARBITER_PROCESS_DUTY,
             ),
             Err(AssignmentProcessLaunchGrantError::AlreadyConsumed)
         );

@@ -33,6 +33,7 @@ use crate::runtime_adapter::{
 };
 use crate::safe_state::{unsigned_to_u32, ReservedDirectory};
 use crate::secure_output::{ReservedOutputFile, SecureOutputRoot};
+use crate::supervise::AgentRole;
 use crate::worktree::normalize_agent_id;
 use anyhow::{bail, Context, Result};
 use git2::Oid;
@@ -244,10 +245,11 @@ pub struct ExternalAgentCommand {
     /// Opaque MACO-owned proof that the selected command, held claims, disposable worktree, and
     /// verified native confinement were authenticated together immediately before launch.
     worktree_writable_confinement: Option<WorktreeWritableConfinementProof>,
-    /// Assignment-child / parent-auditor / Inbox-independent-auditor / consult
-    /// launch kind. CodexConsultant accepts ConsultCodex or InboxIndependentAuditor;
-    /// ClaudeConsultant accepts ConsultClaude only. Merge and catalog constructors
-    /// still leave kind absent.
+    /// Assignment-child / parent-auditor / Inbox-independent-auditor / consult /
+    /// merge-arbiter launch kind. CodexConsultant accepts ConsultCodex or
+    /// InboxIndependentAuditor; ClaudeConsultant accepts ConsultClaude only.
+    /// MergeArbiter accepts only a merge-shaped CodexSupervisor command.
+    /// Generic CodexSupervisor constructors still leave kind absent.
     pub(crate) assignment_process_launch_kind: Option<AssignmentProcessLaunchKind>,
     /// One-shot sibling grant consumed against the final ProcessSpec when kind is set.
     pub(crate) assignment_process_launch_grant: Option<AssignmentProcessLaunchGrant>,
@@ -1406,10 +1408,12 @@ impl ExternalAgentCommand {
     }
 
     /// Attach a caller-issued assignment-child, parent-auditor, Inbox
-    /// independent-auditor, or consult process grant.
+    /// independent-auditor, consult, or merge-arbiter process grant.
     ///
-    /// Merge and catalog constructors leave kind and grant absent. Consult
-    /// Codex binds only CodexConsultant; consult Claude binds only ClaudeConsultant.
+    /// Catalog constructors leave kind and grant absent. Consult Codex binds
+    /// only CodexConsultant; consult Claude binds only ClaudeConsultant.
+    /// MergeArbiter binds only a merge-shaped CodexSupervisor command. Generic
+    /// CodexSupervisor constructors still leave kind absent.
     pub(crate) fn with_assignment_process_launch(
         mut self,
         kind: AssignmentProcessLaunchKind,
@@ -2036,21 +2040,21 @@ fn consult_consultant_invocation_requires_process_grant(
 
 fn assignment_process_launch_kind_allowed_for_invocation(
     kind: AssignmentProcessLaunchKind,
-    invocation: ExternalAgentInvocation,
+    spec: &ExternalAgentCommand,
 ) -> bool {
     match kind {
         AssignmentProcessLaunchKind::ConsultCodex => {
-            matches!(invocation, ExternalAgentInvocation::CodexConsultant)
+            matches!(spec.invocation, ExternalAgentInvocation::CodexConsultant)
         }
         AssignmentProcessLaunchKind::ConsultClaude => {
-            matches!(invocation, ExternalAgentInvocation::ClaudeConsultant)
+            matches!(spec.invocation, ExternalAgentInvocation::ClaudeConsultant)
         }
         AssignmentProcessLaunchKind::InboxIndependentAuditor => matches!(
-            invocation,
+            spec.invocation,
             ExternalAgentInvocation::CodexConsultant | ExternalAgentInvocation::CodexSupervisor
         ),
         AssignmentProcessLaunchKind::AssignmentChild
-        | AssignmentProcessLaunchKind::ParentAuditor => match invocation {
+        | AssignmentProcessLaunchKind::ParentAuditor => match spec.invocation {
             ExternalAgentInvocation::CodexSupervisor
             | ExternalAgentInvocation::Grok
             | ExternalAgentInvocation::Cursor
@@ -2059,7 +2063,24 @@ fn assignment_process_launch_kind_allowed_for_invocation(
             ExternalAgentInvocation::CodexConsultant
             | ExternalAgentInvocation::ClaudeConsultant => false,
         },
+        AssignmentProcessLaunchKind::MergeArbiter => {
+            matches!(spec.invocation, ExternalAgentInvocation::CodexSupervisor)
+                && merge_arbiter_command_is_merge_shaped(spec)
+        }
     }
+}
+
+fn merge_arbiter_command_is_merge_shaped(spec: &ExternalAgentCommand) -> bool {
+    spec.workspace_access == WorkspaceAccess::ReadOnly
+        && spec
+            .hidden_roots
+            .iter()
+            .any(|root| !root.as_os_str().is_empty())
+        && spec.agent_lifecycle.as_ref().is_some_and(|identity| {
+            identity.role == AgentRole::Auditor.as_str()
+                && !identity.run_id.is_empty()
+                && !identity.task_id.is_empty()
+        })
 }
 
 fn refuse_assignment_process_launch_before_preflight(
@@ -2074,7 +2095,7 @@ fn refuse_assignment_process_launch_before_preflight(
             return Ok(());
         }
     };
-    if !assignment_process_launch_kind_allowed_for_invocation(kind, spec.invocation) {
+    if !assignment_process_launch_kind_allowed_for_invocation(kind, spec) {
         return Err(AssignmentProcessLaunchGrantError::KindMismatch);
     }
     let Some(grant) = spec.assignment_process_launch_grant.as_ref() else {

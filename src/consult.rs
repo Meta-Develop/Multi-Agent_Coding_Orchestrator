@@ -575,7 +575,8 @@ fn attach_consult_process_launch(
         ),
         AssignmentProcessLaunchKind::AssignmentChild
         | AssignmentProcessLaunchKind::ParentAuditor
-        | AssignmentProcessLaunchKind::InboxIndependentAuditor => {
+        | AssignmentProcessLaunchKind::InboxIndependentAuditor
+        | AssignmentProcessLaunchKind::MergeArbiter => {
             bail!("consult process launch requires a consult caller kind")
         }
     }
