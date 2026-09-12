@@ -294,6 +294,7 @@ impl Cli {
             .context("failed to configure supported Git repository extensions")?;
 
         match self.command {
+            Command::Accounts(command) => command.run(),
             Command::Init(args) => {
                 let info = WorktreeManager::init_repository(args.repo, &args.initial_branch)?;
                 print_repository_info(&info, args.json)
@@ -328,6 +329,8 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Inspect account metadata and preview policies for one manual account pin.
+    Accounts(crate::accounts::cli::AccountsCommand),
     /// Initialize a Git repository for orchestrated agent work.
     Init(InitArgs),
     /// Inspect repository structure.

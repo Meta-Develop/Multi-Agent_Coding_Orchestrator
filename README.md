@@ -25,6 +25,10 @@ reviewable and recoverable:
 
 The current implementation covers a local-first command-line slice:
 
+- `maco accounts list/discover/preview` reads registered account metadata through
+  a trusted Linux capability socket and evaluates supplied complete-policy
+  evidence for one exact manual account pin. It never authorizes execution;
+  see [account capabilities](docs/accounts.md).
 - `maco init` initializes a Git repository.
 - `maco worktree create <agent-id>` derives the capability-bound repository cleanliness input at command start: creation proceeds only when the primary repository is observed clean, and a dirty primary fails with the required remedy.
 - `maco worktree list` lists verified registered agent worktrees. `maco worktree pending` is a strict existing-only authenticated reader: absent state returns an empty list, while transitional or invalid state is refused without creating locks, migrating, scavenging, recovering, or writing.
