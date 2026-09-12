@@ -61,6 +61,46 @@ impl PreferenceProfileId {
         if value.trim().is_empty() || value != value.trim() {
             return Err(OptimizerError::EmptyIdentifier);
         }
+        let stem = value
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .trim_end()
+            .to_ascii_uppercase();
+        let reserved = matches!(
+            stem.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+        ) || stem
+            .strip_prefix("COM")
+            .or_else(|| stem.strip_prefix("LPT"))
+            .is_some_and(|suffix| {
+                matches!(
+                    suffix,
+                    "1" | "2"
+                        | "3"
+                        | "4"
+                        | "5"
+                        | "6"
+                        | "7"
+                        | "8"
+                        | "9"
+                        | "\u{00b9}"
+                        | "\u{00b2}"
+                        | "\u{00b3}"
+                )
+            });
+        if value == "."
+            || value == ".."
+            || value.ends_with('.')
+            || reserved
+            || value
+                .chars()
+                .any(|ch| ch.is_control() || "/\\:<>\"|?*".contains(ch))
+        {
+            return Err(OptimizerError::invalid(
+                "preference profile id must be a portable filename component",
+            ));
+        }
         Ok(Self(value))
     }
 
@@ -222,6 +262,7 @@ impl PreferenceProfile {
     }
 
     pub fn validate(&self) -> Result<(), OptimizerError> {
+        PreferenceProfileId::new(self.id.as_str())?;
         if self.schema_version != PREFERENCE_SCHEMA_VERSION {
             return Err(OptimizerError::invalid(format!(
                 "unsupported preference schema version {}",
@@ -233,10 +274,55 @@ impl PreferenceProfile {
                 "preference profile version must be at least 1",
             ));
         }
-        if self.cost_weight_bp < 0 || self.latency_weight_bp < 0 {
+        if [
+            self.cost_weight_bp,
+            self.latency_weight_bp,
+            self.reserve_margin_native,
+            self.human_intervention_aversion_bp,
+            self.uncertainty_aversion_bp,
+        ]
+        .iter()
+        .any(|value| *value < 0)
+        {
             return Err(OptimizerError::invalid(
-                "preference cost and latency weights must be non-negative",
+                "preference weights and reserves must be non-negative",
             ));
+        }
+        for preference in self.provider_weights.values().chain(
+            self.task_class_overrides
+                .values()
+                .flat_map(|item| item.provider_weights.values()),
+        ) {
+            if [
+                preference.prior_weight_bp,
+                preference.target_usage_bp,
+                preference.interactive_reserve_bp,
+                preference.external_consumption_margin_bp,
+            ]
+            .iter()
+            .any(|value| *value < 0)
+            {
+                return Err(OptimizerError::invalid(
+                    "provider preference weights must be non-negative",
+                ));
+            }
+        }
+        for override_set in self.task_class_overrides.values() {
+            if [
+                override_set.cost_weight_bp,
+                override_set.latency_weight_bp,
+                override_set.reserve_margin_native,
+                override_set.human_intervention_aversion_bp,
+                override_set.uncertainty_aversion_bp,
+            ]
+            .iter()
+            .flatten()
+            .any(|value| *value < 0)
+            {
+                return Err(OptimizerError::invalid(
+                    "task preference weights must be non-negative",
+                ));
+            }
         }
         if self.hedge.min_delay_seconds > self.hedge.max_delay_seconds {
             return Err(OptimizerError::invalid(
@@ -674,28 +760,71 @@ impl PreferenceSelection {
 }
 
 /// Integer soft score. Lower is better. Quality is never a term.
-pub fn score_candidate(candidate: &PreferenceCandidate, profile: &PreferenceProfile) -> i64 {
+pub fn score_candidate(
+    candidate: &PreferenceCandidate,
+    profile: &PreferenceProfile,
+) -> Result<i64, OptimizerError> {
+    profile.validate()?;
+    validate_candidate_measurements(candidate)?;
     let provider = profile.provider_preference(&candidate.provider);
-    let cost_term = scale_bp(candidate.expected_cost_micros, profile.cost_weight_bp);
-    let latency_term = scale_bp(candidate.expected_latency_micros, profile.latency_weight_bp);
+    let cost_term = scale_bp(candidate.expected_cost_micros, profile.cost_weight_bp)?;
+    let latency_term = scale_bp(candidate.expected_latency_micros, profile.latency_weight_bp)?;
     let human_term = scale_bp(
         candidate.human_minutes_micros,
         profile.human_intervention_aversion_bp,
-    );
+    )?;
     let uncertainty_term = scale_bp(
         i64::from(candidate.uncertainty_bp),
         profile.uncertainty_aversion_bp,
-    );
-    let avoidance_term = scale_bp(1_000_000, provider.avoidance_penalty_bp());
-    cost_term
-        .saturating_add(latency_term)
-        .saturating_add(human_term)
-        .saturating_add(uncertainty_term)
-        .saturating_add(avoidance_term)
+    )?;
+    let avoidance = provider
+        .interactive_reserve_bp
+        .checked_add(provider.external_consumption_margin_bp)
+        .ok_or_else(|| OptimizerError::invalid("provider avoidance weight overflow"))?;
+    let avoidance_term = scale_bp(1_000_000, avoidance)?;
+    checked_score_sum(&[
+        cost_term,
+        latency_term,
+        human_term,
+        uncertainty_term,
+        avoidance_term,
+    ])
 }
 
-fn scale_bp(value: i64, weight_bp: i64) -> i64 {
-    value.saturating_mul(weight_bp) / 10_000
+fn scale_bp(value: i64, weight_bp: i64) -> Result<i64, OptimizerError> {
+    if value < 0 || weight_bp < 0 {
+        return Err(OptimizerError::invalid(
+            "objective measurements and weights must be non-negative",
+        ));
+    }
+    i64::try_from(i128::from(value) * i128::from(weight_bp) / 10_000)
+        .map_err(|_| OptimizerError::invalid("weighted objective score overflow"))
+}
+
+fn checked_score_sum(terms: &[i64]) -> Result<i64, OptimizerError> {
+    terms.iter().try_fold(0_i64, |total, term| {
+        total
+            .checked_add(*term)
+            .ok_or_else(|| OptimizerError::invalid("total objective score overflow"))
+    })
+}
+
+fn validate_candidate_measurements(candidate: &PreferenceCandidate) -> Result<(), OptimizerError> {
+    if candidate.quality_lower_confidence_bp > 10_000
+        || candidate.uncertainty_bp > 10_000
+        || [
+            candidate.expected_cost_micros,
+            candidate.expected_latency_micros,
+            candidate.human_minutes_micros,
+        ]
+        .iter()
+        .any(|value| *value < 0)
+    {
+        return Err(OptimizerError::invalid(
+            "invalid preference candidate measurement",
+        ));
+    }
+    Ok(())
 }
 
 pub fn select_with_profile(
@@ -711,6 +840,11 @@ pub fn decide_with_profile(
     profile: &PreferenceProfile,
     quality_threshold_bp: u16,
 ) -> Result<PreferenceDecision, OptimizerError> {
+    if quality_threshold_bp > 10_000 {
+        return Err(OptimizerError::invalid(
+            "quality threshold must be at most 10000 basis points",
+        ));
+    }
     profile.validate()?;
     let objective_profile_hash = profile.content_hash()?;
     let attribution = profile.attribution();
@@ -749,7 +883,7 @@ pub fn decide_with_profile(
         }
         candidate_scores.push(PreferenceCandidateScore {
             identity,
-            score_micros: score_candidate(candidate, profile),
+            score_micros: score_candidate(candidate, profile)?,
             admitted: candidate.admitted,
             effective_admission,
             eligible: rejection_reasons.is_empty(),
@@ -865,14 +999,14 @@ impl ObjectiveEvaluator for PreferenceObjectiveEvaluator {
         let cost = scale_bp(
             distribution.expected_cost_micros,
             self.profile.cost_weight_bp,
-        );
+        )?;
         let latency = scale_bp(
             distribution.expected_latency_micros,
             self.profile.latency_weight_bp,
-        );
+        )?;
         Ok(ObjectiveValue {
             policy_id: distribution.policy_id.clone(),
-            risk_adjusted_cost_micros: cost.saturating_add(latency),
+            risk_adjusted_cost_micros: checked_score_sum(&[cost, latency])?,
             tail_latency_micros: distribution.expected_latency_micros,
         })
     }
@@ -1051,11 +1185,11 @@ impl PreferenceStore {
             "id": profile.id.as_str(),
             "version": profile.version,
         });
-        fs::write(
-            &path,
-            serde_json::to_vec_pretty(&body).expect("default json"),
-        )
-        .map_err(|error| OptimizerError::invalid(format!("write {}: {error}", path.display())))
+        let body = serde_json::to_vec_pretty(&body).map_err(|error| {
+            OptimizerError::invalid(format!("serialize default preference pointer: {error}"))
+        })?;
+        fs::write(&path, body)
+            .map_err(|error| OptimizerError::invalid(format!("write {}: {error}", path.display())))
     }
 
     pub fn project_default(&self) -> Result<Option<PreferenceProfile>, OptimizerError> {
@@ -1073,7 +1207,29 @@ impl PreferenceStore {
             .get("id")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| OptimizerError::invalid("default.json is missing id"))?;
-        Ok(Some(self.load(id)?))
+        let id = PreferenceProfileId::new(id)?;
+        let version = value
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|version| u32::try_from(version).ok())
+            .filter(|version| *version > 0)
+            .ok_or_else(|| {
+                OptimizerError::invalid("default.json is missing a valid pinned version")
+            })?;
+        let selected = self.profile_path(&id, version);
+        let bytes = fs::read(&selected).map_err(|error| {
+            OptimizerError::invalid(format!(
+                "read pinned preference {}: {error}",
+                selected.display()
+            ))
+        })?;
+        let profile = parse_preference_profile(&bytes)?;
+        if profile.id != id || profile.version != version {
+            return Err(OptimizerError::invalid(
+                "default preference identity does not match its pinned version",
+            ));
+        }
+        Ok(Some(profile))
     }
 
     fn profile_path(&self, id: &PreferenceProfileId, version: u32) -> PathBuf {
@@ -1424,5 +1580,220 @@ mod tests {
             .expect("evaluate");
         assert_eq!(value.risk_adjusted_cost_micros, 6_000);
         assert_eq!(value.tail_latency_micros, 2_000);
+    }
+
+    #[test]
+    fn readiness_regression_large_scores_preserve_candidate_order() {
+        let mut profile = PreferenceProfile::shipped_default();
+        profile.cost_weight_bp = 10_000;
+        profile.latency_weight_bp = 0;
+        let outcome = decide_with_profile(
+            &[
+                certified("a-expensive", "test", i64::MAX / 2, 0),
+                certified("b-cheaper", "test", i64::MAX / 4, 0),
+            ],
+            &profile,
+            8_000,
+        )
+        .expect("representable scores");
+        assert_eq!(
+            outcome
+                .selected
+                .as_ref()
+                .map(|value| value.policy_id.as_str()),
+            Some("b-cheaper")
+        );
+        assert_eq!(outcome.candidate_scores[1].score_micros, i64::MAX / 4);
+    }
+
+    #[test]
+    fn readiness_regression_invalid_preference_measurements_and_overflow_refuse() {
+        let mut profile = PreferenceProfile::shipped_default();
+        profile.cost_weight_bp = 10_000;
+        profile.latency_weight_bp = 10_000;
+        let mut candidates = vec![
+            certified("negative", "test", -1, 0),
+            certified("overflow", "test", i64::MAX, i64::MAX),
+        ];
+        let mut invalid_quality = certified("quality", "test", 0, 0);
+        invalid_quality.quality_lower_confidence_bp = 10_001;
+        candidates.push(invalid_quality);
+        let mut invalid_uncertainty = certified("uncertainty", "test", 0, 0);
+        invalid_uncertainty.uncertainty_bp = 10_001;
+        candidates.push(invalid_uncertainty);
+        let mut invalid_human = certified("human", "test", 0, 0);
+        invalid_human.human_minutes_micros = -1;
+        candidates.push(invalid_human);
+        candidates.push(certified("negative-latency", "test", 0, -1));
+        for candidate in candidates {
+            assert!(decide_with_profile(&[candidate], &profile, 8_000).is_err());
+        }
+        assert!(decide_with_profile(&[], &profile, 10_001).is_err());
+        profile.cost_weight_bp = 20_000;
+        assert!(
+            score_candidate(&certified("term-overflow", "test", i64::MAX, 0), &profile).is_err()
+        );
+        profile.provider_weights.insert(
+            provider("test"),
+            ProviderPreference {
+                interactive_reserve_bp: i64::MAX,
+                external_consumption_margin_bp: 1,
+                ..ProviderPreference::default()
+            },
+        );
+        assert!(score_candidate(&certified("avoidance-overflow", "test", 0, 0), &profile).is_err());
+    }
+
+    #[test]
+    fn readiness_regression_preference_store_rejects_escaping_profile_id() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = PreferenceStore::open(temp.path().join("profiles"));
+        let mut value =
+            serde_json::to_value(PreferenceProfile::shipped_default()).expect("profile");
+        value["id"] = serde_json::json!("../escaped");
+        let profile: PreferenceProfile =
+            serde_json::from_value(value.clone()).expect("deserialize");
+        assert!(store.save(&profile).is_err());
+        assert!(!temp.path().join("escaped.v1.json").exists());
+        assert!(parse_preference_profile(&serde_json::to_vec(&value).expect("json")).is_err());
+        for id in [
+            "..",
+            ".",
+            "nested/profile",
+            r"nested\profile",
+            "name:stream",
+            "trailing.",
+            "CON",
+            "nul.json",
+            "COM1",
+            "lpt9.txt",
+            "COM\u{00b9}",
+            "LPT\u{00b2}",
+            "CONIN$",
+            "CON .txt",
+        ] {
+            assert!(
+                PreferenceProfileId::new(id).is_err(),
+                "accepted unsafe id: {id}"
+            );
+        }
+        for id in ["default", "cost-first", "profile.v2", "COM10", "console"] {
+            assert!(
+                PreferenceProfileId::new(id).is_ok(),
+                "rejected portable id: {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn readiness_regression_default_preference_keeps_selected_version() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = PreferenceStore::open(temp.path());
+        let first = PreferenceProfile::shipped_default();
+        let first_path = store.save(&first).expect("save first");
+        store
+            .set_project_default(first.id.as_str())
+            .expect("select first");
+        let mut second = first.clone();
+        second.version += 1;
+        second.cost_weight_bp += 1;
+        store.save(&second).expect("save second");
+        assert_eq!(store.project_default().expect("default"), Some(first));
+        fs::remove_file(first_path).expect("remove pinned version");
+        assert!(store.project_default().is_err());
+    }
+
+    #[test]
+    fn readiness_regression_typed_profile_rejects_negative_soft_weights() {
+        let value = serde_json::to_value(PreferenceProfile::shipped_default()).expect("profile");
+        for field in [
+            "cost_weight_bp",
+            "latency_weight_bp",
+            "reserve_margin_native",
+            "human_intervention_aversion_bp",
+            "uncertainty_aversion_bp",
+        ] {
+            let mut invalid = value.clone();
+            invalid[field] = serde_json::json!(-1);
+            let profile: PreferenceProfile =
+                serde_json::from_value(invalid).expect("typed profile");
+            assert!(profile.validate().is_err(), "accepted negative {field}");
+        }
+        let mut profile = PreferenceProfile::shipped_default();
+        profile.task_class_overrides.insert(
+            "repair".into(),
+            PreferenceOverride {
+                reserve_margin_native: Some(-1),
+                ..PreferenceOverride::default()
+            },
+        );
+        assert!(profile.validate().is_err());
+        profile.task_class_overrides.clear();
+        profile.provider_weights.insert(
+            provider("test"),
+            ProviderPreference {
+                external_consumption_margin_bp: -1,
+                ..ProviderPreference::default()
+            },
+        );
+        assert!(profile.validate().is_err());
+    }
+
+    #[test]
+    fn readiness_regression_default_pointer_rejects_invalid_or_mismatched_version() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = PreferenceStore::open(temp.path());
+        let profile = PreferenceProfile::shipped_default();
+        let profile_path = store.save(&profile).expect("save");
+        let default_path = temp.path().join("default.json");
+        for version in [
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(u64::MAX),
+            serde_json::json!("1"),
+        ] {
+            fs::write(
+                &default_path,
+                serde_json::to_vec(&serde_json::json!({
+                    "id": "default", "version": version,
+                }))
+                .expect("pointer"),
+            )
+            .expect("write pointer");
+            assert!(store.project_default().is_err());
+        }
+        store.set_project_default("default").expect("valid pointer");
+        let mut mismatched = profile;
+        mismatched.version = 2;
+        fs::write(
+            profile_path,
+            serde_json::to_vec(&mismatched).expect("profile"),
+        )
+        .expect("write mismatch");
+        assert!(store.project_default().is_err());
+    }
+
+    #[test]
+    fn readiness_regression_preference_evaluator_preserves_large_values_and_refuses_overflow() {
+        let evaluator = PreferenceObjectiveEvaluator {
+            profile: PreferenceProfile::shipped_default(),
+        };
+        let mut distribution =
+            PolicyOutcomeDistribution::new(policy("large"), i64::MAX, 0, 9_000, 9_000);
+        assert_eq!(
+            evaluator
+                .evaluate(&distribution)
+                .expect("representable score")
+                .risk_adjusted_cost_micros,
+            i64::MAX / 2
+        );
+        distribution.expected_cost_micros = -1;
+        assert!(evaluator.evaluate(&distribution).is_err());
+        let mut evaluator = evaluator;
+        evaluator.profile.cost_weight_bp = 20_000;
+        distribution.expected_cost_micros = i64::MAX;
+        assert!(evaluator.evaluate(&distribution).is_err());
     }
 }

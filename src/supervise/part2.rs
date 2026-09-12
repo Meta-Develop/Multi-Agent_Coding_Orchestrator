@@ -192,7 +192,7 @@ impl DispatchBudgetReservation<'_> {
                 Some(usage)
                     if external_process_completed(run, launch_runtime)
                         && external_safety_verified(run, launch_runtime)
-                        && !run.stdout.truncated =>
+                        && !run.stdout.raw_capture_truncated() =>
                 {
                     (
                         UsageMeasurement::Reliable {

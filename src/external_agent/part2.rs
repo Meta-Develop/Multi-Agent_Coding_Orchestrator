@@ -4751,6 +4751,18 @@ fn external_side_effect_profile(
             for input in &protected_controls.exact_read_only_input_files {
                 profile = profile.with_visible_read_only_file(input);
             }
+            #[cfg(target_os = "linux")]
+            if let Some(artifact) = protected_controls.exact_writable_artifact_files.first() {
+                // All declared journals share the enumerated private carrier. It
+                // must exist in the isolated root before systemd can make the
+                // parent read-only and mount the exact held files read-write.
+                // Expose only that validated carrier, not the incoming root.
+                let carrier = artifact
+                    .path
+                    .parent()
+                    .context("validated worker journal has no carrier directory")?;
+                profile = profile.with_visible_read_only_root(carrier);
+            }
             for artifact in &protected_controls.exact_writable_artifact_files {
                 #[cfg(target_os = "linux")]
                 {
@@ -6138,6 +6150,7 @@ fn summarize_redacted_output(
         text: value,
         truncated: output.is_truncated() || chars.next().is_some(),
         bytes,
+        raw_truncated: Some(output.is_truncated()),
         target_launch_attempted: false,
         run_metadata: ExternalAgentRunMetadata::default(),
     }

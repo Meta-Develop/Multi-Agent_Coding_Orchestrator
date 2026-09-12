@@ -1965,6 +1965,7 @@ fn nested_codex_profile_appends_exact_journal_while_outer_keeps_parent_nonwritab
     let profile = ExternalCodexProfile::read_write(&workspace)
         .with_visible_read_write_file_capability(&journal, held_journal)
         .expect("outer exact-file capability")
+        .with_visible_read_only_file(&test_binary)
         .with_writable_artifact_root(&incoming);
     let output = run_process(
         ProcessSpec::direct(

@@ -2850,6 +2850,10 @@ fn exact_writable_journal_uses_outer_file_and_inner_private_carrier_boundaries()
     };
     assert_eq!(profile.visible_read_write_files(), &[canonical_journal]);
     assert!(!profile.visible_read_write_roots().contains(&journal_parent));
+    #[cfg(target_os = "linux")]
+    assert!(profile.visible_read_only_roots().contains(&journal_parent));
+    assert!(!profile.visible_read_only_roots().contains(&incoming));
+    assert!(!profile.visible_read_write_roots().contains(&incoming));
     assert_eq!(profile.writable_artifact_roots(), &[output_staging]);
     Ok(())
 }
@@ -7436,6 +7440,25 @@ fn external_profile_exposes_only_incoming_output_root_as_writable() -> Result<()
         .writable_artifact_roots()
         .iter()
         .all(|root| !root.starts_with(&trusted)));
+    Ok(())
+}
+
+#[test]
+fn captured_output_raw_truncation_provenance_cannot_be_deserialized() -> Result<()> {
+    let capture = CapturedOutput {
+        text: "shortened display".to_string(),
+        truncated: true,
+        raw_truncated: Some(false),
+        ..CapturedOutput::default()
+    };
+    assert!(!capture.raw_capture_truncated());
+    let mut value = serde_json::to_value(&capture)?;
+    assert!(value.get("raw_truncated").is_none());
+    let decoded: CapturedOutput = serde_json::from_value(value.clone())?;
+    assert!(decoded.raw_capture_truncated());
+    value["raw_truncated"] = serde_json::json!(false);
+    let forged: CapturedOutput = serde_json::from_value(value)?;
+    assert!(forged.raw_capture_truncated());
     Ok(())
 }
 

@@ -38,6 +38,7 @@
         root = ./.;
         fileset = lib.fileset.unions [
           ./.cargo
+          ./assets
           ./benches
           ./Cargo.lock
           ./Cargo.toml
