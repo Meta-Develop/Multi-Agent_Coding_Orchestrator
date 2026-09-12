@@ -1105,6 +1105,12 @@ from repository maps, semantic maps, and task-path proposal helpers.
 
 ## Install
 
+Agent execution and repository mapping currently require Linux with a delegated
+systemd user manager. Native Windows and macOS builds are compile-portability
+targets, not full runtime support. On Windows, use a configured WSL2 Linux
+environment for coding workflows; the native `maco scope serve` command can
+serve the local monitoring UI at `http://127.0.0.1:7878`.
+
 Install `maco` once as a machine-global binary. Do not invoke it through a
 per-repository `cargo run` wrapper around a pinned checkout. See
 [`docs/PACKAGING.md`](docs/PACKAGING.md) for the install, update, and version

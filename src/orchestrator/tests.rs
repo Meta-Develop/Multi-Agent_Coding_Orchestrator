@@ -608,6 +608,111 @@ fn scheduler_accepts_successful_checkpoint_summary_as_dependency() {
 }
 
 #[test]
+fn ready_wave_keeps_claims_alive_for_queued_and_recovered_assignments() {
+    let mut summaries = (0..5)
+        .map(|index| {
+            let agent = schedule_test_agent(&format!("agent-{index}"), &[]);
+            let mut summary = AgentRunSummary::pending(&agent);
+            summary.claim = Some(PathClaim {
+                token: ClaimToken::from_u64(index + 1),
+                agent_id: agent.id,
+                paths: agent.paths,
+            });
+            summary
+        })
+        .collect::<Vec<_>>();
+    summaries[2].status = AgentRunStatus::Succeeded;
+    summaries[3].status = AgentRunStatus::Failed;
+    summaries[4].claim = None;
+    assert_eq!(protected_wave_indices(&summaries, &[0]), vec![0, 1, 2]);
+    assert_eq!(
+        protected_wave_indices(&summaries, &[4]),
+        vec![0, 1, 2, 4],
+        "an unclaimed ready assignment must still reach revalidation and fail"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn schedule_heartbeat_preserves_claims_across_long_dependency_waves_and_recovery() -> Result<()> {
+    let temp = TempDir::new()?;
+    let repo_path = temp.path().join("repo");
+    WorktreeManager::init_repository(&repo_path, "main")?;
+    let repository = crate::git_repository::open(&repo_path)?;
+    fs::write(repo_path.join("agent-a.txt"), "a\n")?;
+    fs::write(repo_path.join("agent-b.txt"), "b\n")?;
+    commit_all(&repository, "baseline")?;
+    let base_oid = current_head_oid(&repo_path)?;
+    let manager = WorktreeManager::new(&repo_path);
+    let store = SyncStore::open(&repo_path)?;
+    let mut first = schedule_test_agent("agent-a", &[]);
+    first.command = "sleep 4".to_string();
+    let mut plan = schedule_test_plan(vec![first, schedule_test_agent("agent-b", &["agent-a"])]);
+    let mut summaries = Vec::new();
+    let mut worktrees = Vec::new();
+    for agent in &plan.agents {
+        manager.create_for_test(WorktreeCreateOptions {
+            agent_id: agent.id.clone(),
+            branch: None,
+            base: None,
+            worktree_root: None,
+        })?;
+        let selected = SelectedWorktree {
+            lease: manager.acquire_write_execution_lease(&agent.id)?,
+            reused: false,
+        };
+        let mut summary = AgentRunSummary::pending(agent);
+        summary.worktree = Some(selected.record().clone());
+        summary.claim = Some(store.claim_paths_with_timing(
+            &agent.id,
+            &agent.paths,
+            crate::sync_store::ClaimTiming::new(1, 3)?,
+        )?);
+        summaries.push(summary);
+        worktrees.push(selected);
+    }
+    let candidates = run_agent_schedule_with_patch_dir(
+        &AgentScheduleContext {
+            repo: &repo_path,
+            manager: &manager,
+            plan: &plan,
+            worktrees: &worktrees,
+            jobs: 1,
+            base_oid: &base_oid,
+            runtime: OrchestrationExecutionRuntime::NonpublishableSimulation,
+        },
+        &mut summaries,
+        None,
+        None,
+    )?;
+    assert!(summaries
+        .iter()
+        .all(|summary| summary.status == AgentRunStatus::Succeeded));
+    assert!(candidates.iter().all(Option::is_some));
+    assert!(store.sweep_stale()?.newly_takeover_eligible.is_empty());
+    // Recovery must refresh every retained claim without rerunning commands.
+    plan.agents[0].command = "exit 99".to_string();
+    plan.agents[0].validation_commands = vec!["sleep 4".to_string()];
+    let recovered = run_agent_schedule_with_patch_dir(
+        &AgentScheduleContext {
+            repo: &repo_path,
+            manager: &manager,
+            plan: &plan,
+            worktrees: &worktrees,
+            jobs: 1,
+            base_oid: &base_oid,
+            runtime: OrchestrationExecutionRuntime::NonpublishableSimulation,
+        },
+        &mut summaries,
+        None,
+        None,
+    )?;
+    assert!(recovered.iter().all(Option::is_some));
+    assert!(store.sweep_stale()?.newly_takeover_eligible.is_empty());
+    Ok(())
+}
+
+#[test]
 fn resume_claim_failure_isolated_to_its_dependency_branch() {
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo");

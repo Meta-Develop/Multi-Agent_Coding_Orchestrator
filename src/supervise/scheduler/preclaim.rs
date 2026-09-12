@@ -1099,9 +1099,7 @@ fn resolve_preclaim_policy(
     if requested.licensed_breakage != assignment.licensed_breakage {
         mismatches.push("licensed_breakage");
     }
-    if requested.environment_requirements.is_empty()
-        != assignment.environment_requirements.is_empty()
-    {
+    if requested.environment_requirements != assignment.environment_requirements {
         mismatches.push("environment_requirements");
     }
     if !nested_worker_identities_are_one_to_one(assignment, requested) {
@@ -1208,6 +1206,19 @@ fn nested_worker_identities_are_one_to_one(
     assignment_ids.len() == assignment.worker_assignments.len()
         && requested_ids.len() == requested.worker_assignments.len()
         && assignment_ids == requested_ids
+        && assignment.worker_assignments.iter().all(|worker| {
+            requested.worker_assignments.iter().any(|declared| {
+                worker.id == declared.id
+                    && worker.role == declared.role
+                    && worker.task == declared.task
+                    && worker.environment_requirements == declared.environment_requirements
+                    && !worker.assigned_paths.is_empty()
+                    && worker
+                        .assigned_paths
+                        .iter()
+                        .all(|path| declared.assigned_paths.contains(path))
+            })
+        })
 }
 
 fn effective_scope_is_requested_narrowing(
@@ -2425,6 +2436,53 @@ mod tests {
             &[requested_nested],
             "worker_assignments binding",
         );
+    }
+
+    #[test]
+    fn requested_plan_binding_rejects_nested_task_role_and_scope_drift() {
+        let mut requested = assignment();
+        requested.worker_assignments.push(WorkerAssignment {
+            id: "worker-a".to_string(),
+            role: AgentRole::Worker,
+            role_category: None,
+            selection_source: None,
+            assigned_paths: requested.assigned_paths.clone(),
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: Some("verify the assigned test".to_string()),
+            environment_requirements: Vec::new(),
+            report_path: None,
+        });
+        for mutation in 0..3 {
+            let mut current = requested.clone();
+            match mutation {
+                0 => current.worker_assignments[0].task = Some("a different task".to_string()),
+                1 => current.worker_assignments[0].role = AgentRole::ChildOrchestrator,
+                _ => {
+                    current.worker_assignments[0]
+                        .assigned_paths
+                        .push(PathBuf::from("src/unrequested.rs"));
+                }
+            }
+            assert_policy_binding_failure(
+                &current,
+                std::slice::from_ref(&requested),
+                "worker_assignments binding",
+            );
+        }
+    }
+
+    #[test]
+    fn requested_plan_binding_rejects_replaced_environment_requirements() {
+        let mut requested = assignment();
+        requested.environment_requirements = vec![EnvironmentRequirement::network(
+            EnvironmentNetworkAccess::Disabled,
+        )];
+        let mut current = requested.clone();
+        current.environment_requirements = vec![EnvironmentRequirement::network(
+            EnvironmentNetworkAccess::Enabled,
+        )];
+        assert_policy_binding_failure(&current, &[requested], "environment_requirements binding");
     }
 
     #[test]

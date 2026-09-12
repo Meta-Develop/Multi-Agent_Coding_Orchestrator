@@ -3222,6 +3222,19 @@ fn run_agent_schedule(
         if summaries[index].status != AgentRunStatus::Succeeded {
             continue;
         }
+        // Recovery reruns validation and captures artifacts, so it needs the
+        // same claim lifetime as a newly dispatched command.
+        let recovery_guard = revalidate_ready_wave(
+            context.manager,
+            context.plan,
+            summaries,
+            context.worktrees,
+            &[index],
+            context.repo,
+        )?;
+        recovery_guard
+            .start_guard_owned_heartbeat()
+            .context("failed to start recovered-agent claim heartbeat")?;
         let expected = capture_selected_candidate_state(
             context.manager,
             &context.plan.agents[index],
@@ -3319,6 +3332,9 @@ fn run_agent_schedule(
             )?;
         }
         captured_candidates[index] = Some(captured);
+        recovery_guard
+            .stop_guard_owned_heartbeat()
+            .context("recovered-agent claim heartbeat failed")?;
     }
 
     while !remaining.is_empty() {
@@ -3365,8 +3381,8 @@ fn run_agent_schedule(
         // One batch claims-writer lock for this ready wave. Retain through
         // command join, capture, validation, and patch-byte publication, then
         // drop before the next wave and before ClaimCleanupGuard / keep_claims.
-        // A later in-process heartbeat join must happen after this guard drops.
-        let _wave_guard = revalidate_ready_wave(
+        // The heartbeat writes through the held lock and joins before release.
+        let wave_guard = revalidate_ready_wave(
             context.manager,
             context.plan,
             summaries,
@@ -3374,6 +3390,9 @@ fn run_agent_schedule(
             &ready,
             context.repo,
         )?;
+        wave_guard
+            .start_guard_owned_heartbeat()
+            .context("failed to start ready-wave claim heartbeat")?;
         let outcomes = run_ready_agents(
             context.manager,
             context.plan,
@@ -3515,6 +3534,9 @@ fn run_agent_schedule(
             }
             remaining.remove(&index);
         }
+        wave_guard
+            .stop_guard_owned_heartbeat()
+            .context("ready-wave claim heartbeat failed")?;
     }
 
     Ok(())
@@ -3549,13 +3571,16 @@ fn verify_selected_worktree_binding(
 }
 
 /// Acquire one all-or-none batch `RevalidationGuard` for the current ready wave.
+/// Include the other live assignments so their eagerly acquired claims do not
+/// expire while they wait for dependencies or for resumed candidate capture.
 ///
 /// Production waves must not loop `revalidate_claimed_worker` / hold N
 /// `RevalidationGuard`s: a second `claims.lock` would deadlock or serialize
 /// children. The caller retains the returned guard through
 /// `join_ready_agent_handles`, candidate capture, validation, bound-candidate
 /// capture, and patch-byte publication, then drops it before the next wave.
-/// Future in-process claim-heartbeat join must happen after that drop.
+/// The guard-owned heartbeat uses the already-held claims lock; stop and join
+/// it before dropping the guard, including on an error path.
 fn revalidate_ready_wave(
     manager: &WorktreeManager,
     plan: &OrchestrationPlan,
@@ -3564,8 +3589,9 @@ fn revalidate_ready_wave(
     ready: &[usize],
     repo: &Path,
 ) -> Result<crate::collect_revalidation::RevalidationGuard> {
-    let mut requests = Vec::with_capacity(ready.len());
-    for index in ready {
+    let protected = protected_wave_indices(summaries, ready);
+    let mut requests = Vec::with_capacity(protected.len());
+    for index in &protected {
         verify_selected_worktree_binding(
             manager,
             &plan.agents[*index],
@@ -3602,6 +3628,21 @@ fn revalidate_ready_wave(
             )
         },
     )
+}
+
+fn protected_wave_indices(summaries: &[AgentRunSummary], ready: &[usize]) -> Vec<usize> {
+    let mut protected = ready.iter().copied().collect::<BTreeSet<_>>();
+    for (index, summary) in summaries.iter().enumerate() {
+        if summary.claim.is_some()
+            && matches!(
+                summary.status,
+                AgentRunStatus::Pending | AgentRunStatus::Succeeded
+            )
+        {
+            protected.insert(index);
+        }
+    }
+    protected.into_iter().collect()
 }
 
 /// Thin single-agent wrapper around `revalidate_claimed_worker`.
