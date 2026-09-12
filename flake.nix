@@ -168,6 +168,7 @@
             packages = [
               rustToolchain
               pkgs.python3
+              pkgs.git
               cargo-audit
               cargo-deny
             ];

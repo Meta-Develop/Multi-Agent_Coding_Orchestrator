@@ -4780,6 +4780,10 @@ fn run_writable_grok_production_helper_subprocess() -> Result<()> {
     let receipt = temp.path().join("helper-completed");
     fs::create_dir(&grok_home)?;
     fs::write(grok_home.join("auth.json"), "hermetic-grok-auth-fixture\n")?;
+    fs::write(
+        grok_home.join("ambient-secret"),
+        "must stay outside the child\n",
+    )?;
     if receipt.try_exists()? {
         bail!("writable Grok helper receipt must start absent");
     }
@@ -4947,12 +4951,25 @@ set -eu
 [ "${16}" = "--disable-web-search" ]
 [ "${17}" = "--no-memory" ]
 [ "${18}" = "--no-subagents" ]
+[ "$HOME" = "$GROK_HOME" ]
+[ -r "$GROK_HOME/auth.json" ]
+[ ! -e "$GROK_HOME/ambient-secret" ]
 printf '%s\n' 'request-begin' "$@" 'request-end' >&2
 printf '%s\n' 'approval-contract:sandbox=strict;headless=always-approve;web-search=disabled;memory=disabled;subagents=disabled' >&2
 printf '%s\n' 'bounded managed child write' > bounded-result.txt
 printf '%s\n' '{"type":"text","data":"claimed path written"}'
 printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-session","requestId":"fixture-request","structuredOutput":{"accepted":true,"path":"bounded-result.txt"},"usage":{"input_tokens":12,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":4,"reasoning_tokens":0,"total_tokens":16}}'
 "#,
+    )?;
+    let hidden_auth = grok_home
+        .join("auth.json")
+        .to_str()
+        .context("UTF-8 ambient Grok auth path")?
+        .replace('\'', "'\\''");
+    let script = fs::read_to_string(&program)?;
+    fs::write(
+        &program,
+        format!("#!/bin/sh\nset -eu\n[ ! -r '{hidden_auth}' ]\n{script}"),
     )?;
     fs::set_permissions(&program, fs::Permissions::from_mode(0o755))?;
 

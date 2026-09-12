@@ -4845,7 +4845,9 @@ mod decomposition_tests {
         assert!(!output_schema.starts_with(&primary_root));
 
         let mut profile = crate::process_runner::ExternalCodexProfile::read_only(&command.cwd);
-        profile = profile.with_visible_read_only_file(output_schema);
+        profile = profile
+            .with_visible_read_only_file(output_schema)
+            .with_visible_read_only_file(&test_binary);
         for input in &command.read_only_input_files {
             profile = profile.with_visible_read_only_file(input);
         }
@@ -7488,11 +7490,14 @@ done
             let read_write_child = format!("--property=ReadWritePaths={}", managed_child.display());
             let read_only_child =
                 format!("--property=BindReadOnlyPaths={}", managed_child.display());
-            let hidden_primary = format!("--property=InaccessiblePaths={}", primary.display());
+            let hidden_primary = format!("--property=InaccessiblePaths=-{}", primary.display());
             assert!(projection.systemd_properties.contains(&writable_child));
             assert!(projection.systemd_properties.contains(&read_write_child));
             assert!(!projection.systemd_properties.contains(&read_only_child));
             assert!(projection.systemd_properties.contains(&hidden_primary));
+            assert!(projection
+                .systemd_properties
+                .contains(&"--property=PrivateTmp=yes".to_string()));
 
             let mut replaced = command.clone();
             replaced.cwd = primary.clone();
