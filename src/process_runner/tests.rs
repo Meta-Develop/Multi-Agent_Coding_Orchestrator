@@ -2228,6 +2228,10 @@ fn external_grok_unix_stream_initialization_preserves_codex_and_write_boundaries
             .parent()
             .expect("managed worktree parent")
             .join(PROTECTED_FILE);
+        assert_eq!(
+            fs::read_to_string(&protected).expect("read bound host fixture"),
+            "protected\n"
+        );
         assert!(
             fs::write(&protected, "forbidden\n").is_err(),
             "{mode} profile wrote outside its managed worktree"
@@ -2302,7 +2306,8 @@ fn external_grok_unix_stream_initialization_preserves_codex_and_write_boundaries
         &codex_worktree,
         SideEffectConfinementProfile::ExternalCodex(
             ExternalCodexProfile::read_write(&codex_worktree)
-                .with_visible_read_only_file(&test_binary),
+                .with_visible_read_only_file(&test_binary)
+                .with_visible_read_only_file(&protected),
         ),
     );
     assert_eq!(
@@ -2320,7 +2325,8 @@ fn external_grok_unix_stream_initialization_preserves_codex_and_write_boundaries
         &grok_worktree,
         SideEffectConfinementProfile::ExternalGrok(
             ExternalGrokProfile::read_write(&grok_worktree)
-                .with_visible_read_only_file(&test_binary),
+                .with_visible_read_only_file(&test_binary)
+                .with_visible_read_only_file(&protected),
         ),
     );
     assert_eq!(
@@ -2339,7 +2345,8 @@ fn external_grok_unix_stream_initialization_preserves_codex_and_write_boundaries
         &offline_worktree,
         SideEffectConfinementProfile::StrictOfflineWorkspace(
             StrictOfflineWorkspaceProfile::read_write(&offline_worktree)
-                .with_visible_read_only_file(&test_binary),
+                .with_visible_read_only_file(&test_binary)
+                .with_visible_read_only_file(&protected),
         ),
     );
     assert_eq!(
