@@ -2575,6 +2575,7 @@ pub(super) fn codex_response_format_schema(
             .and_then(serde_json::Value::as_object_mut)
             .context("authoritative orchestrator schema omitted properties")?;
         for supervisor_owned in [
+            "review_lens_aggregate",
             "licensed_breakage_review",
             "generated_follow_up_tasks",
             "gate_denials",
@@ -3954,6 +3955,14 @@ mod selection_schema_tests {
         assert!(codex["properties"]
             .get("gate_correction_outcomes")
             .is_none());
+        // Strict response formats require every exposed property. Exposing the
+        // parent aggregate would force a child to manufacture review authority
+        // that the acceptance boundary must reject.
+        assert!(authoritative["properties"]
+            .get("review_lens_aggregate")
+            .is_some());
+        assert!(codex["properties"].get("review_lens_aggregate").is_none());
+        assert!(!required_contains(&codex, "review_lens_aggregate"));
         let worker = &codex["properties"]["worker_reports"]["items"];
         let command = &worker["properties"]["commands_run"]["items"];
         for field in [
