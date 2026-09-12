@@ -25,7 +25,8 @@ reviewable and recoverable:
 
 The current implementation covers a local-first command-line slice:
 
-- `maco accounts list/discover/preview` reads registered account metadata through
+- `maco accounts manage` provides a local device-login screen and saved manual
+  selection. `maco accounts list/discover/preview` reads registered account metadata through
   a trusted Linux capability socket and evaluates supplied complete-policy
   evidence for one exact manual account pin. It never authorizes execution;
   see [account capabilities](docs/accounts.md).

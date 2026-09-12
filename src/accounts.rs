@@ -3,7 +3,10 @@
 //! Discovery supplies metadata, never execution authority or quality evidence.
 
 pub mod evaluation;
+pub mod login_protocol;
+pub mod management;
 pub mod protocol;
+mod state;
 mod transport;
 
 pub(crate) mod cli;
@@ -30,4 +33,8 @@ pub enum AccountError {
     Refused,
     #[error("account capability input is invalid")]
     InvalidInput,
+    #[error("account management state is unsafe or belongs to another endpoint")]
+    UnsafeState,
+    #[error("account selection changed; reload before trying again")]
+    SelectionConflict,
 }

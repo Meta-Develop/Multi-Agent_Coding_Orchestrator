@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>アカウント管理 · MACO</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <header><div><p class="eyebrow">MACO</p><h1>アカウント管理</h1></div><button id="reload" type="button">一覧を更新</button></header>
+    <p class="intro">使うアカウントを自分で選び、ログインと利用状況を確認できます。</p>
+    <p id="message" role="status" aria-live="polite"></p>
+    <section class="selection" aria-labelledby="selection-title">
+      <div><p id="selection-title" class="eyebrow">選択中</p><h2 id="selected-name">未選択</h2></div>
+      <button id="refresh" type="button" disabled>このアカウントの情報を更新</button>
+    </section>
+    <p class="note">選択は保存されます。現在のタスクは切り替わりません。この画面からモデルを実行することはありません。</p>
+    <section aria-labelledby="accounts-title"><h2 id="accounts-title">登録アカウント</h2><div id="accounts" class="cards"></div></section>
+    <section id="login" class="panel" aria-labelledby="login-title" hidden>
+      <h2 id="login-title">ログイン</h2><p id="login-status" role="status" aria-live="polite"></p>
+      <div id="device" hidden><p>認証ページを開き、このコードを入力してください。</p><div class="code-row"><code id="device-code"></code><button id="copy" type="button">コピー</button></div><a id="open-device" class="button" href="https://auth.openai.com/codex/device" target="_blank" rel="noopener noreferrer">認証ページを開く ↗</a></div>
+      <p id="login-deadline" class="note"></p><button id="cancel" class="secondary" type="button" hidden>ログインをキャンセル</button>
+    </section>
+    <section class="panel" aria-labelledby="details-title"><div class="section-title"><h2 id="details-title">選択中の利用状況</h2><span id="observed" class="note">まだ取得していません</span></div><p id="auth-state">情報を更新するとログイン状態と利用枠を確認できます。</p><div id="quota" class="quota-grid"></div><h3>モデルと推論の強さ</h3><p class="note">表示は取得時点のカタログです。実行の可否や品質を保証するものではありません。</p><div id="models"></div></section>
+    <footer>OpenAI / Codex 対応 · ログイン完了後も、使うアカウントは手動で選択します。</footer>
+  </main>
+</body>
+</html>
