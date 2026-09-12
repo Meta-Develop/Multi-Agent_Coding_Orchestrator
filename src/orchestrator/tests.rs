@@ -632,7 +632,10 @@ fn ready_wave_keeps_claims_alive_for_queued_and_recovered_assignments() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "requires Linux authenticated worktrees and claim state"
+)]
 #[test]
 fn schedule_heartbeat_preserves_claims_across_long_dependency_waves_and_recovery() -> Result<()> {
     let temp = TempDir::new()?;
@@ -663,11 +666,15 @@ fn schedule_heartbeat_preserves_claims_across_long_dependency_waves_and_recovery
         };
         let mut summary = AgentRunSummary::pending(agent);
         summary.worktree = Some(selected.record().clone());
-        summary.claim = Some(store.claim_paths_with_timing(
-            &agent.id,
-            &agent.paths,
-            crate::sync_store::ClaimTiming::new(1, 3)?,
-        )?);
+        summary.claim = Some(
+            store
+                .claim_paths_with_timing(
+                    &agent.id,
+                    &agent.paths,
+                    crate::sync_store::ClaimTiming::new(1, 3)?,
+                )?
+                .claim,
+        );
         summaries.push(summary);
         worktrees.push(selected);
     }
@@ -692,7 +699,13 @@ fn schedule_heartbeat_preserves_claims_across_long_dependency_waves_and_recovery
     assert!(store.sweep_stale()?.newly_takeover_eligible.is_empty());
     // Recovery must refresh every retained claim without rerunning commands.
     plan.agents[0].command = "exit 99".to_string();
-    plan.agents[0].validation_commands = vec!["sleep 4".to_string()];
+    plan.agents[0].validation_commands = vec![ValidationCommandPlan {
+        name: None,
+        command: "sleep 4".to_string(),
+        env: BTreeMap::new(),
+        timeout: None,
+        working_directory: None,
+    }];
     let recovered = run_agent_schedule_with_patch_dir(
         &AgentScheduleContext {
             repo: &repo_path,
