@@ -6,6 +6,7 @@ mod test_containment;
 #[cfg(all(test, unix))]
 mod test_support;
 
+pub mod accounts;
 pub mod agent;
 pub mod agent_lifecycle;
 pub mod artifacts;
