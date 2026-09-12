@@ -33,6 +33,36 @@ pub(super) struct SelectionStore {
 }
 
 impl SelectionStore {
+    pub(super) fn open_existing(
+        path: &Path,
+        endpoint_binding: String,
+    ) -> Result<Self, AccountError> {
+        let root = SafeRoot::open_existing_private(path).map_err(|_| AccountError::UnsafeState)?;
+        let store = Self {
+            root,
+            endpoint_binding,
+        };
+        store.read()?;
+        Ok(store)
+    }
+
+    /// Commit an intent while selection is locked. Later UI changes affect future intents.
+    pub(super) fn freeze<T>(
+        &self,
+        alias: &str,
+        commit: impl FnOnce(&ManualSelection) -> Result<T, AccountError>,
+    ) -> Result<T, AccountError> {
+        let lock = self.lock()?;
+        let selection = self.read_locked(&lock)?;
+        if selection.revision == 0 || selection.selected_alias.as_deref() != Some(alias) {
+            return Err(AccountError::SelectionConflict);
+        }
+        let result = commit(&selection)?;
+        lock.verify_direct_binding(&self.root)
+            .map_err(|_| AccountError::UnsafeState)?;
+        Ok(result)
+    }
+
     pub(super) fn open(path: &Path, endpoint_binding: String) -> Result<Self, AccountError> {
         let root = SafeRoot::open_or_create(path).map_err(|_| AccountError::UnsafeState)?;
         let store = Self {

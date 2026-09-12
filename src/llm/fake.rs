@@ -184,6 +184,7 @@ impl LlmProvider for FakeProvider {
                     usage,
                     transcript,
                     redactions,
+                    broker_attempt: None,
                 })
             }
             FakeOutcome::Failure(error) => Err(error),

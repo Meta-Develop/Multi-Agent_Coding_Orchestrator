@@ -2782,7 +2782,7 @@ impl AgentCommand {
                                 }
                             }
                             Err(error) => {
-                                let report = failure_context.into_report(error.to_string());
+                                let report = failure_context.into_report(&error);
                                 print_agent_run_failure_report(&report)?;
                                 bail!("{}", report.error);
                             }
@@ -2818,13 +2818,15 @@ struct RunAgentArgs {
     /// Repository-relative path to claim. Repeat for multiple paths.
     #[arg(long = "path", required = true)]
     paths: Vec<PathBuf>,
-    /// Provider id. Only `fake` is available without explicit real-provider support.
+    /// Provider id: fake or explicitly selected account-broker (Linux).
     #[arg(long, default_value = "fake")]
     provider: String,
+    #[command(flatten)]
+    broker: BrokerAgentArgs,
     /// Deterministic fake provider proposal JSON file.
     #[arg(long)]
     fake_proposal: Option<PathBuf>,
-    /// Request id used to select the fake provider response.
+    /// Task request identity. A recorded Broker identity cannot be run again automatically.
     #[arg(long)]
     request_id: Option<String>,
     /// Model label recorded in the provider-neutral request.
@@ -2853,6 +2855,37 @@ struct RunAgentArgs {
     json: bool,
 }
 
+#[derive(Debug, Clone, Args)]
+struct BrokerAgentArgs {
+    /// Trusted Unix socket required by account-broker.
+    #[arg(long)]
+    broker_socket: Option<PathBuf>,
+    /// Expected Broker directory/socket/peer UID.
+    #[arg(long)]
+    broker_uid: Option<u32>,
+    /// Existing private account-management selection directory.
+    #[arg(long)]
+    account_state_dir: Option<PathBuf>,
+    /// Exact alias; must match the saved manual selection.
+    #[arg(long)]
+    account_alias: Option<String>,
+    /// Exact approved reasoning effort required by account-broker.
+    #[arg(long, value_parser = parse_broker_effort)]
+    reasoning_effort: Option<crate::accounts::protocol::ModelEffort>,
+    /// Local rolling admission tokens; required for Broker, never a remote spend cap.
+    #[arg(long, value_parser = parse_positive_usize)]
+    broker_admission_tokens: Option<usize>,
+    /// Local accounting horizon, not a provider quota/reset window.
+    #[arg(long, default_value_t = crate::budget_ledger::DEFAULT_ROLLING_WINDOW_SECONDS, value_parser = parse_positive_seconds)]
+    broker_admission_window_seconds: u64,
+    /// Broker IPC deadline; the protected service config sets the separate turn deadline.
+    #[arg(long, default_value_t = crate::accounts::protocol::MAX_REQUEST_SECONDS, value_parser = clap::value_parser!(u64).range(1..=crate::accounts::protocol::MAX_REQUEST_SECONDS))]
+    broker_request_timeout_seconds: u64,
+    /// Require an enforced remote spend cap; account-broker refuses this unsupported requirement.
+    #[arg(long)]
+    require_provider_spend_cap: bool,
+}
+
 #[derive(Debug, Clone)]
 struct AgentRunFailureContext {
     repo: PathBuf,
@@ -2874,7 +2907,16 @@ impl AgentRunFailureContext {
         }
     }
 
-    fn into_report(self, error: String) -> AgentRunFailureReport {
+    fn into_report(self, error: &anyhow::Error) -> AgentRunFailureReport {
+        let broker_attempt = error
+            .downcast_ref::<crate::accounts::provider::BrokerAttemptMetadata>()
+            .cloned()
+            .or_else(|| match error.downcast_ref::<crate::llm::ProviderError>() {
+                Some(crate::llm::ProviderError::AccountBroker(failure)) => {
+                    Some(failure.attempt.clone())
+                }
+                _ => None,
+            });
         AgentRunFailureReport {
             success: false,
             status: "failed",
@@ -2882,7 +2924,8 @@ impl AgentRunFailureContext {
             agent_id: self.agent_id,
             provider_id: self.provider_id,
             request_id: self.request_id,
-            error,
+            error: format!("{error:#}"),
+            broker_attempt,
         }
     }
 }
@@ -2896,6 +2939,8 @@ struct AgentRunFailureReport {
     provider_id: String,
     request_id: String,
     error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    broker_attempt: Option<crate::accounts::provider::BrokerAttemptMetadata>,
 }
 
 #[derive(Debug, Args)]

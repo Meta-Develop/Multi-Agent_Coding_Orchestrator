@@ -29,7 +29,9 @@ The current implementation covers a local-first command-line slice:
   selection. `maco accounts list/discover/preview` reads registered account metadata through
   a trusted Linux capability socket and evaluates supplied complete-policy
   evidence for one exact manual account pin. It never authorizes execution;
-  see [account capabilities](docs/accounts.md).
+  see [account capabilities](docs/accounts.md). The separate explicit
+  `agent run --provider account-broker` path obtains a durable account binding and
+  accounts for one guarded proposal; see [account invocation](docs/account-invocation.md).
 - `maco init` initializes a Git repository.
 - `maco worktree create <agent-id>` derives the capability-bound repository cleanliness input at command start: creation proceeds only when the primary repository is observed clean, and a dirty primary fails with the required remedy.
 - `maco worktree list` lists verified registered agent worktrees. `maco worktree pending` is a strict existing-only authenticated reader: absent state returns an empty list, while transitional or invalid state is refused without creating locks, migrating, scavenging, recovering, or writing.
@@ -231,9 +233,9 @@ Implemented local foundations:
    per-agent validation, repo-level validation, run ids, checkpoint writes,
    safe checkpoint resume, and guarded `reuse=reset`.
 4. Provider-neutral LLM adapter boundaries with deterministic fake-provider
-   tests; public `maco agent run` executes the local `fake` provider in an
-   isolated managed worktree. Real network providers remain planned and are
-   refused until configured.
+   tests; public `maco agent run` uses `fake` by default or an explicitly
+   configured `account-broker` binding, with proposal application in an isolated
+   managed worktree. Other provider IDs remain refused.
 
 Known limitations and roadmap for 0.3.0:
 
@@ -2969,9 +2971,11 @@ Run a deterministic local fake-provider proposal in an isolated worktree:
 cargo run -- agent run task.md --agent-id agent-a --path README.md --fake-proposal proposal.json --validation "cargo test" --repo . --json
 ```
 
-The retained agent runner accepts only the local `fake` provider and executes
+The retained agent runner defaults to the local `fake` provider and executes
 in an isolated managed worktree after deriving the capability-bound
-repository-cleanliness input. Other provider names are refused. It renders
+repository-cleanliness input. It also supports explicitly configured
+[`account-broker` proposals](docs/account-invocation.md); other provider names
+are refused. It renders
 the same provider-neutral prompt boundary used by `llm prompt-preview`.
 Provider-proposed shell commands are disabled by default: the command above
 reports a refusal for the proposed `printf` command and tells you to rerun with

@@ -2094,36 +2094,29 @@ fn build_prompt_preview(args: LlmPromptPreviewArgs) -> Result<LlmPromptPreviewRe
 }
 
 fn run_agent_from_args(args: RunAgentArgs) -> Result<AgentRunReport> {
-    if args.provider != "fake" {
-        bail!(
-            "provider '{}' is not configured for agent run; only local fake is available",
-            args.provider
-        );
+    if args.provider != "fake" && args.provider != "account-broker" {
+        bail!("provider '{}' is not configured for agent run; available providers: fake, account-broker", args.provider);
     }
-
-    let proposal_path = args
-        .fake_proposal
-        .context("fake provider agent run requires --fake-proposal <proposal.json>")?;
-    let proposal = load_fake_proposal(&proposal_path)?;
+    if args.provider == "account-broker" && args.fake_proposal.is_some() {
+        bail!("account-broker cannot use --fake-proposal");
+    }
     let task =
         BoundedRegularReader::read_tree_no_follow_utf8(&args.task_file, MAX_AGENT_TASK_BYTES)
             .with_context(|| format!("failed to read task file {}", args.task_file.display()))?;
     let request_id = args
         .request_id
         .unwrap_or_else(|| agent::default_request_id(&args.agent_id));
-    let model = args
-        .model
-        .unwrap_or_else(|| agent::default_model().to_string());
-    let mut provider = FakeProvider::new("fake", model.clone());
-    provider.push_response(request_id.clone(), proposal);
-
-    agent::run_agent_with_provider(
-        AgentRunOptions {
+    let model = if args.provider == "account-broker" {
+        args.model.context("account-broker requires --model <exact-model>")?
+    } else {
+        args.model.unwrap_or_else(|| agent::default_model().to_string())
+    };
+    let options = AgentRunOptions {
             repo: args.repo,
             agent_id: args.agent_id,
             task,
-            request_id: Some(request_id),
-            model: Some(model),
+            request_id: Some(request_id.clone()),
+            model: Some(model.clone()),
             claimed_paths: args.paths,
             validation_commands: args
                 .validation_commands
@@ -2138,9 +2131,44 @@ fn run_agent_from_args(args: RunAgentArgs) -> Result<AgentRunReport> {
                 ProviderCommandPolicy::Disabled
             },
             command_timeout: Duration::from_secs(args.command_timeout_seconds),
-        },
-        &mut provider,
-    )
+        };
+    if args.provider == "fake" {
+        let proposal_path = args.fake_proposal.context("fake provider agent run requires --fake-proposal <proposal.json>")?;
+        let proposal = load_fake_proposal(&proposal_path)?;
+        let mut provider = FakeProvider::new("fake", model);
+        provider.push_response(request_id, proposal);
+        return agent::run_agent_with_provider(options, &mut provider);
+    }
+    let mut provider = crate::accounts::provider::AccountBrokerProvider::new(
+        crate::accounts::provider::AccountBrokerProviderConfig {
+            client: crate::accounts::AccountClientConfig {
+                socket: args.broker.broker_socket.context("account-broker requires --broker-socket")?,
+                expected_uid: args.broker.broker_uid.context("account-broker requires --broker-uid")?,
+                timeout: Duration::from_secs(args.broker.broker_request_timeout_seconds),
+            },
+            repo: discover_repo_root(&options.repo)?,
+            selection_state: args.broker.account_state_dir.context("account-broker requires --account-state-dir")?,
+            alias: args.broker.account_alias.context("account-broker requires --account-alias")?,
+            model,
+            reasoning_effort: args.broker.reasoning_effort.context("account-broker requires --reasoning-effort")?,
+            admission: crate::accounts::provider::BrokerAdmissionPolicy {
+                max_tokens: args.broker.broker_admission_tokens.context("account-broker requires --broker-admission-tokens (local admission, not a remote ceiling)")?,
+                window_seconds: args.broker.broker_admission_window_seconds,
+                require_hard_spend_cap: args.broker.require_provider_spend_cap,
+            },
+        }
+    )?;
+    agent::run_agent_with_provider(options, &mut provider).map_err(|error| {
+        match provider.last_attempt() {
+            Some(metadata) => error.context(metadata.clone()),
+            None => error,
+        }
+    })
+}
+
+fn parse_broker_effort(value: &str) -> std::result::Result<crate::accounts::protocol::ModelEffort, String> {
+    serde_json::from_value(serde_json::Value::String(value.to_string()))
+        .map_err(|_| "expected none, minimal, low, medium, high, xhigh, max, or ultra".to_string())
 }
 
 fn load_fake_proposal(path: &Path) -> Result<WorkProposal> {

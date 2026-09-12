@@ -317,13 +317,22 @@ impl SafeRoot {
 
     /// Opens an existing directory and verifies it without changing it.
     pub fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
-        let path = absolute_normalized(path.as_ref())?;
+        Self::open_existing_with_policy(path.as_ref(), RootPolicy::Managed)
+    }
+
+    /// Opens existing owner-private state without creating or widening it.
+    pub fn open_existing_private(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_existing_with_policy(path.as_ref(), RootPolicy::OwnerPrivate)
+    }
+
+    fn open_existing_with_policy(path: &Path, policy: RootPolicy) -> Result<Self> {
+        let path = absolute_normalized(path)?;
         let directory = open_existing_directory(&path)?;
         let metadata = directory
             .metadata()
             .with_context(|| format!("failed to inspect safe root handle {}", path.display()))?;
         ensure_directory_metadata(&path, &metadata)?;
-        ensure_root_policy(&path, &metadata, RootPolicy::Managed)?;
+        ensure_root_policy(&path, &metadata, policy)?;
         #[cfg(windows)]
         let identity = identity_from_open_handle(&directory, &path)?;
         #[cfg(not(windows))]
@@ -332,7 +341,7 @@ impl SafeRoot {
             path,
             identity,
             directory: Arc::new(directory),
-            policy: RootPolicy::Managed,
+            policy,
         })
     }
 

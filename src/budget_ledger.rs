@@ -59,7 +59,8 @@ thread_local! {
 }
 
 /// Operator-configured rolling window and hard ceilings for one workspace.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RollingBudgetQuota {
     pub max_tokens: Option<usize>,
     pub max_cost_usd: Option<f64>,
@@ -200,6 +201,12 @@ enum BudgetLedgerEvent {
         #[serde(default, skip_serializing_if = "is_false")]
         recovered_after_process_death: bool,
     },
+    ReservationObservedFloor {
+        version: u32,
+        reservation_id: String,
+        tokens: usize,
+        unix_seconds: u64,
+    },
     Consume {
         version: u32,
         run_id: String,
@@ -232,6 +239,7 @@ impl BudgetLedgerEvent {
         match self {
             Self::Reservation { .. } => "reservation",
             Self::ReservationReconciled { .. } => "reservation_reconciled",
+            Self::ReservationObservedFloor { .. } => "reservation_observed_floor",
             Self::Consume { .. } => "consume",
             Self::PoolConsume { .. } => "pool_consume",
             Self::RateLimited { .. } => "rate_limited",
@@ -242,6 +250,7 @@ impl BudgetLedgerEvent {
         match self {
             Self::Reservation { reservation_id, .. }
             | Self::ReservationReconciled { reservation_id, .. }
+            | Self::ReservationObservedFloor { reservation_id, .. }
                 if journal_subject_ok(reservation_id) =>
             {
                 Some(reservation_id.as_str())
@@ -259,6 +268,7 @@ impl BudgetLedgerEvent {
         match self {
             Self::Reservation { unix_seconds, .. }
             | Self::ReservationReconciled { unix_seconds, .. }
+            | Self::ReservationObservedFloor { unix_seconds, .. }
             | Self::Consume { unix_seconds, .. }
             | Self::PoolConsume { unix_seconds, .. }
             | Self::RateLimited { unix_seconds, .. } => *unix_seconds,
@@ -408,6 +418,47 @@ impl WorkspaceBudgetLedger {
         self.reconcile_reservation_inner(reconciliation, false)
     }
 
+    /// Retain an observed token lower bound before continuing an effectful attempt.
+    /// This adjusts recovery of the original reservation, never its pool or request count.
+    pub fn record_observed_floor(
+        &mut self,
+        reservation_id: &str,
+        tokens: usize,
+        unix_seconds: u64,
+    ) -> Result<DurableReservationRecordOutcome> {
+        let reservation = self
+            .reservation(reservation_id)
+            .context("observed usage references an unknown reservation")?;
+        if self.reservation_is_terminal(reservation_id) {
+            bail!("observed usage cannot change a terminal reservation");
+        }
+        if tokens <= self.observed_floor(reservation_id).unwrap_or(0) {
+            return Ok(DurableReservationRecordOutcome::AlreadyRecorded);
+        }
+        self.ensure_append_capacity(self.unsettled_reservations().len())?;
+        self.publish(BudgetLedgerEvent::ReservationObservedFloor {
+            version: LEDGER_FORMAT_VERSION,
+            reservation_id: reservation_id.to_string(),
+            tokens,
+            unix_seconds: unix_seconds.max(reservation.unix_seconds),
+        })?;
+        Ok(DurableReservationRecordOutcome::Recorded)
+    }
+
+    fn observed_floor(&self, reservation_id: &str) -> Option<usize> {
+        self.events
+            .iter()
+            .filter_map(|event| match event {
+                BudgetLedgerEvent::ReservationObservedFloor {
+                    reservation_id: id,
+                    tokens,
+                    ..
+                } if id == reservation_id => Some(*tokens),
+                _ => None,
+            })
+            .max()
+    }
+
     fn reconcile_reservation_inner(
         &mut self,
         reconciliation: DurableBudgetReconciliation,
@@ -422,6 +473,14 @@ impl WorkspaceBudgetLedger {
                     reconciliation.reservation_id
                 )
             })?;
+        if let Some(floor) = self.observed_floor(&reconciliation.reservation_id) {
+            if reconciliation.tokens < floor
+                || reconciliation.pool != reservation.pool
+                || reconciliation.requests != reservation.requests
+            {
+                bail!("reconciliation cannot discard observed usage or change its attribution");
+            }
+        }
         if let Some(terminal) = self.reservation_terminal(&reconciliation.reservation_id) {
             if matches!(
                 terminal,
@@ -551,6 +610,17 @@ impl WorkspaceBudgetLedger {
                 }
                 BudgetLedgerEvent::ReservationReconciled { reservation_id, .. } => {
                     pending.remove(reservation_id);
+                }
+                BudgetLedgerEvent::ReservationObservedFloor {
+                    reservation_id,
+                    tokens,
+                    unix_seconds,
+                    ..
+                } => {
+                    if let Some(reservation) = pending.get_mut(reservation_id) {
+                        reservation.tokens = reservation.tokens.max(*tokens);
+                        reservation.unix_seconds = reservation.unix_seconds.max(*unix_seconds);
+                    }
                 }
                 BudgetLedgerEvent::Consume { .. }
                 | BudgetLedgerEvent::PoolConsume { .. }
@@ -760,7 +830,9 @@ impl WorkspaceBudgetLedger {
                     && !excluded_reservation_ids.contains(reservation_id) =>
                 {
                     tokens = tokens
-                        .checked_add(*reserved)
+                        .checked_add(
+                            (*reserved).max(self.observed_floor(reservation_id).unwrap_or(0)),
+                        )
                         .context("rolling reserved token consumption overflowed")?;
                     match estimated {
                         Some(cost) => cost_usd = checked_cost_add(cost_usd, *cost)?,
@@ -768,7 +840,8 @@ impl WorkspaceBudgetLedger {
                         None => {}
                     }
                 }
-                BudgetLedgerEvent::Reservation { .. } => {}
+                BudgetLedgerEvent::Reservation { .. }
+                | BudgetLedgerEvent::ReservationObservedFloor { .. } => {}
                 BudgetLedgerEvent::ReservationReconciled {
                     tokens: consumed,
                     cost_usd: observed,
@@ -983,6 +1056,7 @@ fn replay_events(records: &[JournalRecord]) -> Result<Vec<BudgetLedgerEvent>> {
     let mut pool_completion_ids = BTreeSet::new();
     let mut reservations = BTreeMap::new();
     let mut reservation_terminals = BTreeSet::new();
+    let mut observed_floors = BTreeMap::new();
     for record in records {
         let event = serde_json::from_value::<BudgetLedgerEvent>(record.payload.clone())
             .context("workspace rolling budget journal contains an unknown or corrupt event")?;
@@ -1054,10 +1128,18 @@ fn replay_events(records: &[JournalRecord]) -> Result<Vec<BudgetLedgerEvent>> {
                         reservation_id
                     );
                 }
+                let floor = observed_floors.get(reservation_id).copied();
+                if floor.is_some_and(|floor| {
+                    *tokens < floor
+                        || *pool != reservation.pool
+                        || *requests != reservation.requests
+                }) {
+                    bail!("replayed reconciliation discards observed usage or changes its attribution");
+                }
                 if *recovered_after_process_death
                     && (*pool != reservation.pool
                         || *requests != reservation.requests
-                        || *tokens != reservation.tokens
+                        || *tokens != reservation.tokens.max(floor.unwrap_or(0))
                         || *cost_usd != reservation.cost_usd)
                 {
                     bail!(
@@ -1071,6 +1153,25 @@ fn replay_events(records: &[JournalRecord]) -> Result<Vec<BudgetLedgerEvent>> {
                         reservation_id
                     );
                 }
+            }
+            BudgetLedgerEvent::ReservationObservedFloor {
+                version,
+                reservation_id,
+                tokens,
+                unix_seconds,
+            } => {
+                let reservation = reservations
+                    .get(reservation_id)
+                    .context("observed usage references an unknown reservation")?;
+                if *version != LEDGER_FORMAT_VERSION
+                    || *tokens == 0
+                    || *tokens <= observed_floors.get(reservation_id).copied().unwrap_or(0)
+                    || reservation_terminals.contains(reservation_id)
+                    || *unix_seconds < reservation.unix_seconds
+                {
+                    bail!("invalid or regressive observed reservation usage");
+                }
+                observed_floors.insert(reservation_id.clone(), *tokens);
             }
             BudgetLedgerEvent::Consume {
                 version,
@@ -1472,6 +1573,81 @@ mod tests {
             pool,
             unix_seconds: now,
         }
+    }
+
+    #[test]
+    fn observed_floor_survives_reopen_in_the_original_pool_once() {
+        let (_temp, repo) = repository();
+        let now = unix_now().unwrap();
+        let attribution = pool("codex", ResetWindow::None);
+        {
+            let mut ledger = WorkspaceBudgetLedger::open_or_create(&repo).unwrap();
+            ledger
+                .record_reservation(reservation_for_pool(
+                    "observed",
+                    100,
+                    attribution.clone(),
+                    now,
+                ))
+                .unwrap();
+            ledger.record_observed_floor("observed", 150, now).unwrap();
+            assert_eq!(
+                ledger.record_observed_floor("observed", 120, now).unwrap(),
+                DurableReservationRecordOutcome::AlreadyRecorded
+            );
+            assert_eq!(ledger.usage_in_window(86400, now).unwrap().tokens, 150);
+        }
+        for _ in 0..2 {
+            let ledger = WorkspaceBudgetLedger::open_or_create(&repo).unwrap();
+            assert_eq!(ledger.usage_in_window(86400, now).unwrap().tokens, 150);
+            let usage = ledger.pool_usage(&attribution, now).unwrap();
+            assert_eq!(usage.tokens, 150);
+            assert_eq!(usage.requests, 1);
+        }
+    }
+
+    #[test]
+    fn observed_floor_rejects_undercharge_or_reattribution_and_final_is_idempotent() {
+        let (_temp, repo) = repository();
+        let now = unix_now().unwrap();
+        let attribution = pool("codex", ResetWindow::None);
+        let mut ledger = WorkspaceBudgetLedger::open_or_create(&repo).unwrap();
+        ledger
+            .record_reservation(reservation_for_pool(
+                "observed",
+                100,
+                attribution.clone(),
+                now,
+            ))
+            .unwrap();
+        ledger.record_observed_floor("observed", 150, now).unwrap();
+        assert!(ledger
+            .reconcile_reservation(reconciliation(
+                "observed",
+                149,
+                Some(attribution.clone()),
+                now
+            ))
+            .is_err());
+        assert!(ledger
+            .reconcile_reservation(reconciliation(
+                "observed",
+                150,
+                Some(pool("other", ResetWindow::None)),
+                now
+            ))
+            .is_err());
+        let final_charge = reconciliation("observed", 160, Some(attribution.clone()), now);
+        ledger.reconcile_reservation(final_charge.clone()).unwrap();
+        assert_eq!(
+            ledger.reconcile_reservation(final_charge).unwrap(),
+            DurableReservationRecordOutcome::AlreadyRecorded
+        );
+        assert!(ledger.record_observed_floor("observed", 170, now).is_err());
+        drop(ledger);
+        let ledger = WorkspaceBudgetLedger::open_or_create(&repo).unwrap();
+        assert_eq!(ledger.usage_in_window(86400, now).unwrap().tokens, 160);
+        assert_eq!(ledger.pool_usage(&attribution, now).unwrap().requests, 1);
     }
 
     #[test]

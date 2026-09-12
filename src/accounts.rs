@@ -1,11 +1,14 @@
-//! Account-scoped capability observations and a non-executing policy preview.
+//! Account observations, manual management, and explicitly bound agent proposals.
 //!
 //! Discovery supplies metadata, never execution authority or quality evidence.
 
 pub mod evaluation;
+pub mod invocation_protocol;
+mod invocation_state;
 pub mod login_protocol;
 pub mod management;
 pub mod protocol;
+pub mod provider;
 mod state;
 mod transport;
 

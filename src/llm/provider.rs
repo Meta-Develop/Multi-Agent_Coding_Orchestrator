@@ -56,6 +56,8 @@ pub struct LlmResponse {
     pub usage: Usage,
     pub transcript: Transcript,
     pub redactions: RedactionSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker_attempt: Option<crate::accounts::provider::BrokerAttemptMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -206,8 +208,10 @@ impl Default for RequestBudget {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ProviderCapabilities {
-    pub max_context_tokens: usize,
-    pub max_output_tokens: usize,
+    /// Provider-published capacity, absent when this source does not establish it.
+    pub max_context_tokens: Option<usize>,
+    /// Provider-published capacity, not a caller budget or enforced spend ceiling.
+    pub max_output_tokens: Option<usize>,
     pub supports_command_proposals: bool,
     pub supports_patch_proposals: bool,
     pub supports_transcripts: bool,
@@ -216,8 +220,8 @@ pub struct ProviderCapabilities {
 impl ProviderCapabilities {
     pub fn local_fake() -> Self {
         Self {
-            max_context_tokens: usize::MAX,
-            max_output_tokens: usize::MAX,
+            max_context_tokens: Some(usize::MAX),
+            max_output_tokens: Some(usize::MAX),
             supports_command_proposals: true,
             supports_patch_proposals: true,
             supports_transcripts: true,
@@ -376,6 +380,8 @@ fn estimate_tokens(chars: usize) -> usize {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ProviderError {
+    #[error(transparent)]
+    AccountBroker(Box<crate::accounts::provider::BrokerProviderError>),
     #[error("request id cannot be empty")]
     EmptyRequestId,
     #[error("model cannot be empty")]

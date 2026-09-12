@@ -76,7 +76,7 @@ pub enum ProviderCommandPolicy {
     AllowUnsafeShell,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentValidationCommand {
     pub name: Option<String>,
     pub command: String,
@@ -378,8 +378,22 @@ where
         &run.validation_commands,
         capabilities,
     )?;
-    let request = LlmRequest::new(run.request_id.clone(), run.model.clone(), prompt)
+    let mut request = LlmRequest::new(run.request_id.clone(), run.model.clone(), prompt)
         .with_budget(RequestBudget::default());
+    // Bind the complete concrete guardian policy, not merely the selected model.
+    request.metadata.insert(
+        "maco_agent_policy".into(),
+        serde_json::to_string(&serde_json::json!({
+            "schema_version": 1,
+            "agent_id": run.agent_id,
+            "claimed_paths": run.claimed_paths,
+            "validation_commands": run.validation_commands,
+            "provider_command_policy": run.provider_command_policy,
+            "command_timeout_seconds": run.command_timeout.as_secs(),
+            "execution": format!("{:?}", run.runtime),
+            "request_budget": request.budget,
+        }))?,
+    );
     let response = run.provider.complete(request).map_err(|error| {
         crate::budget_ledger::record_bound_provider_error_preserving_source(error)
             .context(format!("provider '{}' failed", run.provider.provider_id()))
