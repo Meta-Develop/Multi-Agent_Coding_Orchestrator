@@ -2639,14 +2639,18 @@ fn resolve_hidden_root(path: &Path, label: &str) -> std::io::Result<(PathBuf, bo
 
 #[cfg(target_os = "linux")]
 fn hidden_root_mask_is_optional(root: &Path, host_path_exists: bool) -> bool {
-    // systemd mounts ProtectHome=tmpfs before applying InaccessiblePaths=. A required child
-    // path would therefore fail namespace setup because its ProtectHome-covered host path has
-    // already disappeared, even though the enclosing tmpfs already provides the intended mask.
+    // systemd mounts ProtectHome=tmpfs and PrivateTmp=yes before applying
+    // InaccessiblePaths=. A required child path would fail namespace setup when
+    // its host path has already disappeared behind one of those private mounts.
+    // If a visible ancestor binding makes it present again, systemd must still
+    // mask it and the guardian verifies that mask before releasing the child.
     !host_path_exists
         || [
             Path::new("/home"),
             Path::new("/root"),
             Path::new("/run/user"),
+            Path::new("/tmp"),
+            Path::new("/var/tmp"),
         ]
         .into_iter()
         .any(|protected_home| root.starts_with(protected_home))

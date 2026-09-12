@@ -137,8 +137,9 @@ fn delta_bp(before: Option<i64>, after: Option<i64>) -> Option<i64> {
 }
 
 /// One durable invocation record. New fields are optional so older fixtures
-/// remain readable; [`InvocationRecord::validate`] enforces the complete
-/// attribution contract for newly written records.
+/// remain readable. [`InvocationRecord::validate_observation`] permits unknown
+/// runtime attribution in observations; [`InvocationRecord::validate`] enforces
+/// the complete attribution contract before use as attributed evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InvocationRecord {
     pub policy_id: PolicyId,
@@ -288,14 +289,21 @@ impl InvocationRecord {
 
     /// Complete-attribution contract for newly written records.
     pub fn validate(&self) -> Result<(), OptimizerError> {
-        require_present(self.optimization_run_id.is_some(), "optimization_run_id")?;
-        require_present(self.policy_execution_id.is_some(), "policy_execution_id")?;
-        require_present(self.invocation_id.is_some(), "invocation_id")?;
-        require_present(self.root_decision_id.is_some(), "root_decision_id")?;
+        self.validate_observation()?;
         require_present(self.requested_model.is_some(), "requested_model")?;
         require_present(self.resolved_model.is_some(), "resolved_model")?;
         require_present(self.requested_effort.is_some(), "requested_effort")?;
         require_present(self.resolved_effort.is_some(), "resolved_effort")?;
+        Ok(())
+    }
+
+    /// Validate an observation without inventing unobserved runtime resolution.
+    /// This does not establish the complete-attribution contract of `validate`.
+    pub fn validate_observation(&self) -> Result<(), OptimizerError> {
+        require_present(self.optimization_run_id.is_some(), "optimization_run_id")?;
+        require_present(self.policy_execution_id.is_some(), "policy_execution_id")?;
+        require_present(self.invocation_id.is_some(), "invocation_id")?;
+        require_present(self.root_decision_id.is_some(), "root_decision_id")?;
         if let Some(finished) = self.finished_at {
             if finished.as_millis() < self.started_at.as_millis() {
                 return Err(OptimizerError::invalid("finished_at precedes started_at"));
@@ -824,6 +832,21 @@ mod tests {
         assert_eq!(inferred.delta_bp, None);
         assert_eq!(inferred.observation.kind, ObservationKind::Inferred);
         assert_eq!(inferred.after_bp, None);
+    }
+
+    #[test]
+    fn unresolved_observation_keeps_identity_checks_and_cannot_enter_attributed_sink() {
+        let mut record = complete_record("unresolved", 1, 2);
+        record.resolved_model = None;
+        record.resolved_effort = None;
+        record
+            .validate_observation()
+            .expect("valid partial observation");
+        assert!(record.validate().is_err());
+        let sink = AttributedTelemetrySink::in_memory();
+        assert!(sink.record(&record).is_err());
+        record.invocation_id = None;
+        assert!(record.validate_observation().is_err());
     }
 
     #[test]
