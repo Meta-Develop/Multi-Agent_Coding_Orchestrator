@@ -19,6 +19,7 @@
 //! owners and must not be edited by this slice.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 use super::action::CanonicalEffort;
 use super::ids::PolicyId;
@@ -33,6 +34,7 @@ pub const DEFAULT_QUALITY_THRESHOLD_BP: u16 = 8_000;
 /// certification. Cost-to-certification is the sole ranking key among
 /// feasible candidates.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluationFunction {
     quality_threshold_bp: u16,
 }
@@ -55,11 +57,29 @@ impl EvaluationFunction {
     /// Evaluate complete execution policies. Quality and provider-resource
     /// constraints define the feasible set; only then is cost minimized.
     pub fn evaluate(&self, candidates: &[EvaluatedPolicy]) -> EvaluationOutcome {
+        if self.quality_threshold_bp > 10_000 {
+            return EvaluationOutcome::Infeasible {
+                reason: "quality confidence threshold must be at most 10000 basis points".into(),
+                rejected: Vec::new(),
+            };
+        }
+        let mut seen = BTreeSet::new();
+        let mut duplicates = BTreeSet::new();
+        for candidate in candidates {
+            if !seen.insert(&candidate.policy_id) {
+                duplicates.insert(&candidate.policy_id);
+            }
+        }
         let mut rejected = Vec::new();
         let mut eligible: Vec<&EvaluatedPolicy> = Vec::new();
 
         for candidate in candidates {
-            if let Some(reason) = self.rejection_reason(candidate) {
+            let reason = if duplicates.contains(&candidate.policy_id) {
+                Some(RejectionReason::DuplicatePolicyIdentity)
+            } else {
+                self.rejection_reason(candidate)
+            };
+            if let Some(reason) = reason {
                 rejected.push(PolicyRejection {
                     policy_id: candidate.policy_id.clone(),
                     reason,
@@ -91,6 +111,12 @@ impl EvaluationFunction {
     }
 
     fn rejection_reason(&self, candidate: &EvaluatedPolicy) -> Option<RejectionReason> {
+        if candidate.cost_to_certification_micros < 0 {
+            return Some(RejectionReason::InvalidCost);
+        }
+        if candidate.quality_lower_confidence_bp > 10_000 {
+            return Some(RejectionReason::InvalidQualityConfidence);
+        }
         if !candidate.certified_quality {
             return Some(RejectionReason::Uncertified);
         }
@@ -125,6 +151,9 @@ pub struct EvaluatedPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RejectionReason {
+    InvalidCost,
+    InvalidQualityConfidence,
+    DuplicatePolicyIdentity,
     Uncertified,
     QualityConfidenceBelowThreshold { observed_bp: u16, threshold_bp: u16 },
     ProviderResourceConstraint,
@@ -336,5 +365,70 @@ mod tests {
         assert!(!object.contains_key("quality_weight_bp"));
         assert!(!object.contains_key("quality_floor"));
         assert!(!object.contains_key("cost_weight_bp"));
+    }
+
+    #[test]
+    fn readiness_regression_invalid_measurements_cannot_win() {
+        for (cost, quality, reason) in [
+            (-1, 9_000, RejectionReason::InvalidCost),
+            (0, 10_001, RejectionReason::InvalidQualityConfidence),
+        ] {
+            let mut invalid = certified("invalid", cost, CanonicalEffort::Low);
+            invalid.quality_lower_confidence_bp = quality;
+            let outcome = EvaluationFunction::shipped_default()
+                .evaluate(&[invalid, certified("valid", 100, CanonicalEffort::Medium)]);
+            assert_eq!(
+                outcome.selected_policy().map(PolicyId::as_str),
+                Some("valid")
+            );
+            let EvaluationOutcome::Selected { rejected, .. } = outcome else {
+                panic!("valid evidence must remain eligible");
+            };
+            assert_eq!(
+                rejected,
+                vec![PolicyRejection {
+                    policy_id: policy("invalid"),
+                    reason
+                }]
+            );
+        }
+        let mut impossible = certified("impossible", 0, CanonicalEffort::Low);
+        impossible.quality_lower_confidence_bp = u16::MAX;
+        assert!(!EvaluationFunction::new(10_001)
+            .evaluate(&[impossible])
+            .may_publish());
+    }
+
+    #[test]
+    fn readiness_regression_duplicate_policy_evidence_is_ambiguous() {
+        let outcome = EvaluationFunction::shipped_default().evaluate(&[
+            certified("duplicate", 1, CanonicalEffort::Low),
+            certified("duplicate", 1_000, CanonicalEffort::High),
+            certified("unambiguous", 10, CanonicalEffort::Medium),
+        ]);
+        assert_eq!(
+            outcome.selected_policy().map(PolicyId::as_str),
+            Some("unambiguous")
+        );
+        let EvaluationOutcome::Selected { rejected, .. } = outcome else {
+            panic!("unique evidence must remain eligible");
+        };
+        assert_eq!(rejected.len(), 2);
+        assert!(rejected
+            .iter()
+            .all(|entry| entry.reason == RejectionReason::DuplicatePolicyIdentity));
+    }
+
+    #[test]
+    fn readiness_regression_quality_boundaries_and_unknown_configuration() {
+        let mut perfect = certified("perfect", 0, CanonicalEffort::Low);
+        perfect.quality_lower_confidence_bp = 10_000;
+        assert!(EvaluationFunction::new(10_000)
+            .evaluate(&[perfect])
+            .may_publish());
+        assert!(serde_json::from_str::<EvaluationFunction>(
+            r#"{"quality_threshold_bp":8000,"quality_weight":1}"#,
+        )
+        .is_err());
     }
 }

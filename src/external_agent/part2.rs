@@ -6150,6 +6150,7 @@ fn summarize_redacted_output(
         text: value,
         truncated: output.is_truncated() || chars.next().is_some(),
         bytes,
+        raw_truncated: Some(output.is_truncated()),
         target_launch_attempted: false,
         run_metadata: ExternalAgentRunMetadata::default(),
     }

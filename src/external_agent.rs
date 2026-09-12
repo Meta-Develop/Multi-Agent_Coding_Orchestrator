@@ -1866,6 +1866,10 @@ pub struct CapturedOutput {
     pub truncated: bool,
     #[serde(skip, default)]
     bytes: Vec<u8>,
+    /// Process-capture loss, independent of the shorter public display text.
+    /// Only the live capture path can attest to this private provenance.
+    #[serde(skip, default)]
+    raw_truncated: Option<bool>,
     #[serde(
         skip_serializing,
         skip_deserializing,
@@ -1876,6 +1880,19 @@ pub struct CapturedOutput {
     /// `ExternalAgentRun` as the top-level `sandbox_denials` wire field.
     #[serde(skip, default)]
     run_metadata: ExternalAgentRunMetadata,
+}
+
+impl CapturedOutput {
+    pub(crate) fn raw_capture_truncated(&self) -> bool {
+        // Deserialized and legacy captures lack private provenance. Preserve
+        // their conservative interpretation of the public truncation flag.
+        self.raw_truncated.unwrap_or(self.truncated)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn from_captured_bytes_for_test(output: &CapturedBytes) -> Self {
+        summarize_redacted_output(output, &CredentialRedactor::default())
+    }
 }
 
 impl std::fmt::Debug for CapturedOutput {

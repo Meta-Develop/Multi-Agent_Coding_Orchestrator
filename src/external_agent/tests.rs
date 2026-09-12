@@ -7444,6 +7444,25 @@ fn external_profile_exposes_only_incoming_output_root_as_writable() -> Result<()
 }
 
 #[test]
+fn captured_output_raw_truncation_provenance_cannot_be_deserialized() -> Result<()> {
+    let capture = CapturedOutput {
+        text: "shortened display".to_string(),
+        truncated: true,
+        raw_truncated: Some(false),
+        ..CapturedOutput::default()
+    };
+    assert!(!capture.raw_capture_truncated());
+    let mut value = serde_json::to_value(&capture)?;
+    assert!(value.get("raw_truncated").is_none());
+    let decoded: CapturedOutput = serde_json::from_value(value.clone())?;
+    assert!(decoded.raw_capture_truncated());
+    value["raw_truncated"] = serde_json::json!(false);
+    let forged: CapturedOutput = serde_json::from_value(value)?;
+    assert!(forged.raw_capture_truncated());
+    Ok(())
+}
+
+#[test]
 fn descriptor_captured_output_is_never_serialized() -> Result<()> {
     let mut report = failed_external_run(
         &ExternalAgentCommand::codex(

@@ -1942,7 +1942,10 @@ pub(super) fn complete_external_codex_usage(
             codex_usage_from_jsonl(&bytes).ok().flatten()
         }
         Ok(_) => None,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !run.stdout.truncated => {
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && !run.stdout.raw_capture_truncated() =>
+        {
             codex_usage_from_jsonl(run.stdout_bytes()).ok().flatten()
         }
         Err(_) => None,
