@@ -3932,6 +3932,21 @@ mod selection_schema_tests {
     }
 
     #[test]
+    fn codex_child_schema_omits_parent_review_authority() -> Result<()> {
+        let authoritative = orchestrator_report_schema_value();
+        let codex = codex_response_format_schema(authoritative.clone())?;
+        // Strict response formats require every exposed property. Exposing the
+        // parent aggregate would force a child to manufacture review authority
+        // that the acceptance boundary must reject.
+        assert!(authoritative["properties"]
+            .get("review_lens_aggregate")
+            .is_some());
+        assert!(codex["properties"].get("review_lens_aggregate").is_none());
+        assert!(!required_contains(&codex, "review_lens_aggregate"));
+        Ok(())
+    }
+
+    #[test]
     fn codex_report_schemas_are_strict_shape_only_derivatives() -> Result<()> {
         let authoritative = orchestrator_report_schema_value();
         assert!(authoritative.get("allOf").is_some());
@@ -3955,14 +3970,6 @@ mod selection_schema_tests {
         assert!(codex["properties"]
             .get("gate_correction_outcomes")
             .is_none());
-        // Strict response formats require every exposed property. Exposing the
-        // parent aggregate would force a child to manufacture review authority
-        // that the acceptance boundary must reject.
-        assert!(authoritative["properties"]
-            .get("review_lens_aggregate")
-            .is_some());
-        assert!(codex["properties"].get("review_lens_aggregate").is_none());
-        assert!(!required_contains(&codex, "review_lens_aggregate"));
         let worker = &codex["properties"]["worker_reports"]["items"];
         let command = &worker["properties"]["commands_run"]["items"];
         for field in [
