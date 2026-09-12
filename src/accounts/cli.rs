@@ -7,7 +7,12 @@ use crate::safe_state::BoundedRegularReader;
 use anyhow::Result;
 use clap::{Args, Subcommand};
 use serde::Serialize;
-use std::{path::PathBuf, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{atomic::AtomicBool, Arc},
+    time::Duration,
+};
 
 #[derive(Debug, Args)]
 pub(crate) struct AccountsCommand {
@@ -37,6 +42,15 @@ enum AccountsSubcommand {
         #[arg(long)]
         policies: PathBuf,
     },
+    /// Open a local account screen for device login and saved manual selection.
+    Manage {
+        /// Owner-private directory for the endpoint-bound selection preference.
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// Exact loopback address; port zero chooses an available port.
+        #[arg(long, default_value = "127.0.0.1:0")]
+        bind: SocketAddr,
+    },
 }
 
 #[derive(Serialize)]
@@ -49,7 +63,8 @@ impl AccountsCommand {
     pub(crate) fn run(self) -> Result<()> {
         let result = self.execute();
         match result {
-            Ok(value) => println!("{}", serde_json::to_string_pretty(&value)?),
+            Ok(Some(value)) => println!("{}", serde_json::to_string_pretty(&value)?),
+            Ok(None) => {}
             Err(error) => {
                 println!(
                     "{}",
@@ -64,18 +79,20 @@ impl AccountsCommand {
         Ok(())
     }
 
-    fn execute(self) -> Result<serde_json::Value, AccountError> {
+    fn execute(self) -> Result<Option<serde_json::Value>, AccountError> {
         let client = AccountClient::new(AccountClientConfig {
             socket: self.broker_socket,
             expected_uid: self.broker_uid,
             timeout: Duration::from_secs(self.timeout_seconds),
         })?;
         match self.command {
-            AccountsSubcommand::List => {
-                serde_json::to_value(client.list()?).map_err(|_| AccountError::Protocol)
-            }
+            AccountsSubcommand::List => serde_json::to_value(client.list()?)
+                .map(Some)
+                .map_err(|_| AccountError::Protocol),
             AccountsSubcommand::Discover { alias } => {
-                serde_json::to_value(client.discover(&alias)?).map_err(|_| AccountError::Protocol)
+                serde_json::to_value(client.discover(&alias)?)
+                    .map(Some)
+                    .map_err(|_| AccountError::Protocol)
             }
             AccountsSubcommand::Preview { alias, policies } => {
                 if !valid_alias(&alias) {
@@ -91,7 +108,14 @@ impl AccountsCommand {
                     return Err(AccountError::InvalidInput);
                 }
                 serde_json::to_value(evaluation::preview(&client, &input)?)
+                    .map(Some)
                     .map_err(|_| AccountError::Protocol)
+            }
+            AccountsSubcommand::Manage { state_dir, bind } => {
+                let server = super::management::ManagementServer::bind(client, &state_dir, bind)?;
+                println!("{}", server.launch_url());
+                server.serve(Arc::new(AtomicBool::new(false)))?;
+                Ok(None)
             }
         }
     }

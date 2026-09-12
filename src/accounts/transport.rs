@@ -10,6 +10,7 @@ pub struct AccountClientConfig {
     pub timeout: Duration,
 }
 
+#[derive(Clone)]
 pub struct AccountClient {
     config: AccountClientConfig,
 }
@@ -46,7 +47,24 @@ impl AccountClient {
         Ok(result)
     }
 
-    fn request<A: Serialize, T: serde::de::DeserializeOwned>(
+    pub(super) fn endpoint_binding(&self) -> Result<String, AccountError> {
+        if !self.config.socket.is_absolute()
+            || self.config.socket.components().any(|component| {
+                !matches!(
+                    component,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                )
+            })
+        {
+            return Err(AccountError::UnsafeEndpoint);
+        }
+        let mut bytes = b"MACO-account-management-endpoint-v1\0".to_vec();
+        bytes.extend_from_slice(&self.config.expected_uid.to_be_bytes());
+        bytes.extend_from_slice(self.config.socket.as_os_str().as_encoded_bytes());
+        Ok(crate::artifacts::state_auth::sha256_hex(&bytes))
+    }
+
+    pub(super) fn request<A: Serialize, T: serde::de::DeserializeOwned>(
         &self,
         capability: &'static str,
         arguments: A,

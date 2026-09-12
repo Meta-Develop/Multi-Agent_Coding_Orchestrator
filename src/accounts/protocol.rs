@@ -155,7 +155,7 @@ pub struct AccountDiscovery {
     pub failure: Option<DiscoveryFailure>,
 }
 
-fn required_option<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+pub(super) fn required_option<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
 ) -> Result<Option<T>, D::Error> {
     Option::deserialize(deserializer)
@@ -177,7 +177,7 @@ pub fn valid_identifier(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || b"_.:/-".contains(&c))
 }
 
-fn valid_observation_id(value: &str) -> bool {
+pub(super) fn valid_observation_id(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == 36
         && bytes[14] == b'4'
