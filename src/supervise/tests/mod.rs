@@ -280,7 +280,7 @@ fn assert_final_decision_event<T: ReportStatus>(
     );
 }
 
-fn injected_repository() -> (tempfile::TempDir, PathBuf) {
+pub(super) fn injected_repository() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().expect("temporary repository root");
     let path = temp.path().join("repo");
     Repository::init(&path).expect("initialize injected repository");
@@ -532,7 +532,7 @@ fn injected_options(repo: &Path, root: &Path, run_id: &str) -> SupervisorRunOpti
     }
 }
 
-fn artifact_test_final_report(run_id: &RunId) -> SupervisorFinalReport {
+pub(super) fn artifact_test_final_report(run_id: &RunId) -> SupervisorFinalReport {
     SupervisorFinalReport {
         version: SUPERVISOR_SCHEMA_VERSION,
         run_id: run_id.clone(),
@@ -1247,7 +1247,7 @@ fn assert_parseable_partial_usage_is_conservative(
     assert_injected_dispatch_cleanup(&report, &repo_path, run_id, "child-a", &["child-b"], true);
 }
 
-fn sample_child_report_json(id: &str) -> String {
+pub(super) fn sample_child_report_json(id: &str) -> String {
     format!(
         r#"{{
   "id": "{id}",

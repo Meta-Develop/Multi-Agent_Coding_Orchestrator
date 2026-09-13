@@ -26,6 +26,88 @@ pub fn built_in_prior_dataset() -> Result<PriorDataset, SelectionError> {
     serde_json::from_str(BUILT_IN_PRIORS).map_err(|error| SelectionError::Data(error.to_string()))
 }
 
+/// Validate an operator-provided prior snapshot before it can enter a run.
+/// The selector validates the same fields again on each normalized decision.
+pub fn validate_prior_dataset(priors: &PriorDataset) -> Result<(), SelectionError> {
+    validate_identifier("priors.dataset_id", &priors.dataset_id)?;
+    validate_identifier("priors.revision", &priors.revision)?;
+    validate_calendar_date("priors.published_on", &priors.published_on)?;
+    if priors.schema_version != PRIOR_DATASET_SCHEMA_VERSION {
+        return invalid("operator prior dataset has an unsupported schema version");
+    }
+    if duplicate_pair(&priors.models, |prior| {
+        (prior.runtime.as_str(), prior.model.as_str())
+    }) {
+        return invalid("prior dataset contains a duplicate runtime/model entry");
+    }
+    if duplicate_semantic_key(&priors.objective_profiles, |profile| {
+        (profile.name.clone(), profile.version)
+    }) {
+        return invalid("prior dataset contains a duplicate selector calibration name/version");
+    }
+    for profile in &priors.objective_profiles {
+        validate_identifier("objective_profile.name", &profile.name)?;
+        if profile.version != SELECTOR_CALIBRATION_VERSION {
+            return invalid("operator prior dataset has an incompatible calibration version");
+        }
+        validate_calendar_date("objective_profile.effective_date", &profile.effective_date)?;
+        if profile.minimum_quality_basis_points > 10_000
+            || profile.minimum_class_fit_samples == 0
+            || profile.minimum_authority_samples == 0
+        {
+            return invalid("operator prior dataset has invalid calibration evidence floors");
+        }
+    }
+    for prior in &priors.models {
+        validate_identifier("prior.runtime", &prior.runtime)?;
+        validate_identifier("prior.model", &prior.model)?;
+        validate_calendar_date("prior.observed_on", &prior.observed_on)?;
+        validate_identifier("prior.source_id", &prior.source_id)?;
+        validate_identifier("prior.prior_scope", &prior.prior_scope)?;
+        if let Some(reason) = &prior.prohibition_reason {
+            validate_identifier("prior.prohibition_reason", reason)?;
+        }
+        if duplicate_semantic_key(&prior.class_fit, |fit| (fit.task_class.clone(), fit.effort))
+            || duplicate_semantic_key(&prior.authority_evidence, |evidence| {
+                (evidence.task_class.clone(), evidence.role, evidence.effort)
+            })
+            || duplicate_semantic_key(&prior.one_shot_environment_fallbacks, |fallback| {
+                fallback.rejection_code.clone()
+            })
+        {
+            return invalid("operator prior dataset has duplicate model evidence keys");
+        }
+        for fit in &prior.class_fit {
+            validate_identifier("class_fit.task_class", &fit.task_class)?;
+            if fit.quality_basis_points > 10_000 || fit.sample_size == 0 {
+                return invalid("operator class-fit prior has invalid quality or sample size");
+            }
+        }
+        for evidence in &prior.authority_evidence {
+            validate_identifier("authority_evidence.task_class", &evidence.task_class)?;
+            if evidence.quality_basis_points > 10_000 || evidence.sample_size == 0 {
+                return invalid("operator authority prior has invalid quality or sample size");
+            }
+        }
+        for fallback in &prior.one_shot_environment_fallbacks {
+            validate_identifier(
+                "environment_fallback.rejection_code",
+                &fallback.rejection_code,
+            )?;
+            validate_identifier(
+                "environment_fallback.target_runtime",
+                &fallback.target_runtime,
+            )?;
+            validate_identifier("environment_fallback.target_model", &fallback.target_model)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_prior_date(name: &str, date: &str) -> Result<(), SelectionError> {
+    validate_calendar_date(name, date)
+}
+
 /// Dated catalog/evidence eligibility for `model` under `authority`.
 ///
 /// Unknown slugs return [`MeasuredAuthorityEligibility::NoDatedEvidence`] so a
@@ -265,6 +347,8 @@ pub fn select_with_switch_cost_estimates(
         debug_override,
         environment_fallback,
         quota,
+        outcome_history: None,
+        operator_prior_data: None,
     })
 }
 

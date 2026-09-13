@@ -303,6 +303,9 @@ fn merge_capability_overlay(base: &mut ModelCapabilityPolicy, overlay: &ModelCap
 }
 
 pub fn current_model_capability_policy() -> ModelCapabilityPolicy {
+    if let Some(policy) = super::prior_input::current_capability_policy() {
+        return policy;
+    }
     let mut policy = default_model_capability_policy();
     if let Ok(guard) = installed_policy().lock() {
         for overlay in guard.overlays.values() {
@@ -620,7 +623,7 @@ fn authority_role_for(role: AgentRole) -> crate::selection::AuthorityRole {
 }
 
 fn reject_static_tier_override_of_measured(role: AgentRole, model: &str) -> Result<()> {
-    let eligibility = crate::selection::measured_authority_eligibility(model, authority_role_for(role))
+    let eligibility = super::prior_input::current_measured_authority_eligibility(model, authority_role_for(role))
         .map_err(|error| {
             anyhow!(
                 "measured catalog/evidence eligibility could not be loaded for model '{model}': {error}"

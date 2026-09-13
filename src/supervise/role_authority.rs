@@ -7,9 +7,7 @@
 
 use super::{AgentRole, ModelCapabilityClass};
 use crate::orchestration_event::OrchestrationEvent;
-use crate::selection::{
-    measured_authority_eligibility, AuthorityRole, MeasuredAuthorityEligibility,
-};
+use crate::selection::{AuthorityRole, MeasuredAuthorityEligibility};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -306,7 +304,10 @@ pub fn admit_role_category(category: RoleCategory, model: Option<&str>) -> Resul
         return Ok(());
     };
 
-    match measured_authority_eligibility(model, category.measured_authority_role()) {
+    match super::prior_input::current_measured_authority_eligibility(
+        model,
+        category.measured_authority_role(),
+    ) {
         Ok(MeasuredAuthorityEligibility::Ineligible { reason }) => {
             bail!(
                 "model '{model}' is ineligible by measured catalog/evidence for category '{}': {reason}",

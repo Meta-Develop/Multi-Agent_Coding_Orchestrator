@@ -1470,6 +1470,16 @@ ID, version, built-in or repository-override source, content hash, quality
 weights, and every effective tradeoff weight. Older reports remain readable;
 the generated schema requires this evidence for newly finalized reports.
 
+Verified supervisor runs also write parent-owned child-attempt records under
+`selection-attempts/` in the existing authenticated run artifact. Initial
+selection freezes eligible finalized same-repository history and records its
+source digests and exclusions in each selector decision; retries reuse that
+snapshot. Only exact-bound real attempts with observed execution identity,
+parent-reviewed result, and complete attributable attempt costs can affect
+numeric selector outcomes. Current live invocation telemetry does not establish
+provider-resolved model identity or per-attempt cost, so those fields remain
+unknown and current attempt records do not change numeric scores.
+
 Supervisor routing interprets the default 100%-monetary profile as the exact
 legacy selector baseline. Nonzero retry/rework and human-review weights are
 supported as explicit monetary cost-proxy adjustments, proportional to their
@@ -1705,6 +1715,33 @@ selection refuses. Debug overrides cannot bypass quota exhaustion. The selected
 pool state and exhaustion decision are retained as typed selection provenance
 and assignment-ledger evidence. `max_concurrent_sessions` also tightens the
 resolved scheduler fan-out.
+
+### Operator prior data for a supervise run
+
+`maco supervise run --prior-data REPO_RELATIVE_FILE` accepts one bounded,
+strict JSON snapshot owned by the operator. Its top-level fields are
+`schema_version: 1`, `dataset_id`, `revision`, `published_on`, `models`, and
+`capability_policy`. Each `models` entry uses the `ModelPrior` shape shown in
+[`src/selection/data/priors-2026-08-07.json`](src/selection/data/priors-2026-08-07.json);
+`capability_policy` uses the existing `ModelCapabilityPolicy` shape with `id`,
+`version`, `source`, and dated model evidence rows. The path must be inside
+`--repo`; symlinks, traversal, hard-linked leaves, oversized files, unknown
+fields, duplicate models, and malformed dates or evidence are refused.
+This feature requires Unix component-wise path confinement (including WSL);
+native Windows refuses `--prior-data` and continuation of a run containing
+prior data. Legacy runs without prior data retain their existing behavior.
+
+The snapshot may add or update dated model priors. Bundled objective
+calibration, model prohibitions, role and long-context vetoes, and judgment
+effort floors remain binding. A newly advertised model needs both a dated
+prior and an eligible operator capability row before execution admission;
+unknown models receive no inferred quality, cost, or authority. This source is
+operator-declared prior evidence, distinct from MACO's authenticated
+parent-reviewed attempt outcomes. MACO archives the exact source and effective
+policy with each run, records their digests in selector provenance, and uses
+that same policy in selection and dispatch. A finalized continuation reuses
+its authenticated snapshot and refuses changed `--prior-data`; an unfinalized
+run with prior data must first be finalized before continuation.
 
 On the production Codex path, the no-override child-orchestrator and auditor
 commands are constructed with the profile's explicit model and resolved

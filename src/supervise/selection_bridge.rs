@@ -806,6 +806,7 @@ pub(super) struct SupervisorQuotaSelectionInput<'a> {
     pub(super) ledger: Option<&'a RunBudgetLedger>,
 }
 
+#[cfg(test)]
 pub(super) fn initialize_supervisor_selection_with_quota(
     plan: &mut SupervisorPlan,
     runtime: SupervisorRuntime,
@@ -814,6 +815,29 @@ pub(super) fn initialize_supervisor_selection_with_quota(
     advertised: &AdvertisedCatalogSet,
     resolved_objective_profile: Option<&ResolvedObjectiveProfile>,
     quota: SupervisorQuotaSelectionInput<'_>,
+) -> Result<SupervisorSelectionResolution> {
+    initialize_supervisor_selection_with_history(
+        plan,
+        runtime,
+        catalog,
+        admission,
+        advertised,
+        resolved_objective_profile,
+        quota,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn initialize_supervisor_selection_with_history(
+    plan: &mut SupervisorPlan,
+    runtime: SupervisorRuntime,
+    catalog: &RuntimeModelCatalog,
+    admission: &SupervisorAdmissionPolicyInput,
+    advertised: &AdvertisedCatalogSet,
+    resolved_objective_profile: Option<&ResolvedObjectiveProfile>,
+    quota: SupervisorQuotaSelectionInput<'_>,
+    history: Option<&FrozenOutcomeHistory>,
 ) -> Result<SupervisorSelectionResolution> {
     if runtime == SupervisorRuntime::Fake {
         return Ok(SupervisorSelectionResolution {
@@ -891,13 +915,16 @@ pub(super) fn initialize_supervisor_selection_with_quota(
                 environment_rejections: Vec::new(),
             },
             debug_override,
+            history,
         })?;
-        let decision = select_with_live_switch_cost(&input).map_err(|error| {
+        let mut decision = select_with_live_switch_cost(&input).map_err(|error| {
             anyhow!(
                 "automatic selector rejected role '{}': {error}",
                 role.as_str()
             )
         })?;
+        decision.outcome_history = history.map(|snapshot| snapshot.provenance.clone());
+        decision.operator_prior_data = super::prior_input::current_provenance();
         let primary_cause = if configured.is_some() {
             SupervisorSelectionEventCause::DebugOverride
         } else {
@@ -1236,12 +1263,14 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
             )?;
         }
 
-        let decision = select_with_live_switch_cost(&input).map_err(|error| {
+        let mut decision = select_with_live_switch_cost(&input).map_err(|error| {
             anyhow!(
                 "automatic selector replay rejected role '{}': {error}",
                 role.as_str()
             )
         })?;
+        decision.outcome_history = previous.outcome_history.clone();
+        decision.operator_prior_data = previous.operator_prior_data.clone();
         let choice = match executable_choice(&decision, runtime, role)? {
             ExecutableChoiceResolution::Executable(choice) => choice,
             ExecutableChoiceResolution::PreflightFailure(failure) => {
@@ -1409,6 +1438,7 @@ struct SelectionInputForRoleArgs<'a> {
     quota_ledger: Option<&'a RunBudgetLedger>,
     signals: DynamicSignals,
     debug_override: Option<DebugOverride>,
+    history: Option<&'a FrozenOutcomeHistory>,
 }
 
 fn live_switch_cost_evidence(input: &SelectionInput) -> Vec<CandidateSwitchCostEvidence> {
@@ -1428,7 +1458,15 @@ fn select_with_live_switch_cost(
     Ok(provenance)
 }
 
-fn selector_priors_with_terminal_worker_economics() -> Result<selection::PriorDataset> {
+pub(super) fn selector_priors_with_terminal_worker_economics() -> Result<selection::PriorDataset> {
+    if let Some(priors) = super::prior_input::current_priors() {
+        return Ok(priors);
+    }
+    base_selector_priors_with_terminal_worker_economics()
+}
+
+pub(super) fn base_selector_priors_with_terminal_worker_economics(
+) -> Result<selection::PriorDataset> {
     let mut priors = selection::built_in_prior_dataset()?;
     #[cfg(test)]
     if TEST_SELECTOR_TRIPLE_RUNNER_UP_ENABLED.with(Cell::get) {
@@ -1557,9 +1595,13 @@ fn selection_input_for_role(args: SelectionInputForRoleArgs<'_>) -> Result<Selec
         quota_ledger,
         signals,
         debug_override,
+        history,
     } = args;
     let priors = selector_priors_with_terminal_worker_economics()?;
     let task = task_profile_for_role(role);
+    let outcomes = history
+        .map(|snapshot| snapshot.outcomes_for(&task))
+        .unwrap_or_default();
     let runtime_name = runtime_name(runtime);
     let catalogs = constructed_selection_catalogs(runtime, catalog, advertised, &task, &priors)?;
     let profile = priors
@@ -1623,7 +1665,7 @@ fn selection_input_for_role(args: SelectionInputForRoleArgs<'_>) -> Result<Selec
             expected_digest: None,
         },
         resolved_objective_profile: resolved_objective_profile.clone(),
-        outcomes: Vec::new(),
+        outcomes,
         signals,
         debug_override,
         operational_observations: None,
@@ -1957,7 +1999,7 @@ fn catalog_model_from_prior(
     })
 }
 
-fn runtime_catalog_from_priors(
+pub(super) fn runtime_catalog_from_priors(
     runtime_name: &str,
     catalog: &RuntimeModelCatalog,
     task: &TaskProfile,
@@ -3885,6 +3927,7 @@ mod tests {
                 environment_rejections: Vec::new(),
             },
             debug_override: None,
+            history: None,
         })?)?;
         let selected = decision.choice.as_ref().context("degraded choice")?;
         assert_eq!(selected.candidate.runtime, "cursor");
@@ -5768,6 +5811,7 @@ mod tests {
                 environment_rejections: Vec::new(),
             },
             debug_override: None,
+            history: None,
         })?;
         input.catalogs.push(input.catalogs[0].clone());
 

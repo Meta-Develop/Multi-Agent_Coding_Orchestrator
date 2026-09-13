@@ -481,6 +481,7 @@ pub(super) struct AssignmentBudgetPolicy {
     selector_overrides: BTreeMap<AgentRole, RoleModelSelection>,
     selector_runtime_overrides: BTreeMap<AgentRole, SupervisorRuntime>,
     pub(super) selector_decisions: Vec<SupervisorSelectionEvent>,
+    pub(super) initial_selector_decisions: Vec<SupervisorSelectionEvent>,
 }
 
 impl AssignmentBudgetPolicy {
@@ -1343,7 +1344,7 @@ fn mechanical_worker_model_is_eligible(model: &str, duties: &[MechanicalTerminal
     let Some(capability) = trusted_model_capability(model) else {
         return false;
     };
-    let measured_eligible = crate::selection::measured_authority_eligibility(
+    let measured_eligible = super::prior_input::current_measured_authority_eligibility(
         model,
         crate::selection::AuthorityRole::TerminalLeaf,
     )
@@ -1954,7 +1955,10 @@ fn run_concurrent_assignment_schedule(
                     let assignment_cancellation = cancellation.clone();
                     let concurrency = progress.concurrency.clone();
                     let (admission_commit, admission_receiver) = AdmissionCommitSignal::new();
+                    let prior_binding = super::prior_input::captured_binding();
                     let spawn_result = thread::Builder::new().spawn_scoped(scope, move || {
+                        let _prior_binding_guard =
+                            super::prior_input::install_captured(prior_binding);
                         let _completion = CompletionSignal {
                             index,
                             sender: completion_sender,
@@ -3483,6 +3487,7 @@ fn prepare_supervisor_run(
         bail!("nonpublishable-simulation worktree creation requires the Fake supervisor runtime");
     }
     let repo = discover_repo_root(&options.repo)?;
+    super::prior_input::require_binding_repo(&repo)?;
     let requested_plan = plan.clone();
     let collision = crate::run_ops::refuse_live_run_collision(
         &repo,
@@ -3539,6 +3544,7 @@ fn prepare_supervisor_run(
         &requested_plan.assignments,
         &preclaim_decisions,
     )?;
+    super::prior_input::archive_current(&mut artifact_writer, &repo)?;
     let mut budget_ledger = RunBudgetLedger::new_composed(
         plan_metadata.run_budget.limits,
         options.budget_overrides,
@@ -3580,6 +3586,7 @@ fn prepare_supervisor_run(
             &mut plan_metadata,
             PreparedSupervisorSelectionRequest {
                 repo: &repo,
+                current_run: Some(&options.run_id),
                 runtime,
                 execution_runtime,
                 runtime_model_catalog: &runtime_model_catalog,
@@ -3682,6 +3689,7 @@ fn prepare_supervisor_run(
 
 pub(super) struct PreparedSupervisorSelectionRequest<'a> {
     pub(super) repo: &'a Path,
+    pub(super) current_run: Option<&'a RunId>,
     pub(super) runtime: SupervisorRuntime,
     pub(super) execution_runtime: SupervisorExecutionRuntime,
     pub(super) runtime_model_catalog: &'a RuntimeModelCatalogAcquisition,
@@ -3696,6 +3704,7 @@ pub(super) fn initialize_supervisor_selection_from_prepared_metadata(
 ) -> Result<SupervisorSelectionResolution> {
     let PreparedSupervisorSelectionRequest {
         repo,
+        current_run,
         runtime,
         execution_runtime,
         runtime_model_catalog,
@@ -3720,7 +3729,10 @@ pub(super) fn initialize_supervisor_selection_from_prepared_metadata(
         }),
         Ok(catalog) => {
             let advertised = advertised_catalogs_for_launch(repo)?;
-            let resolution = initialize_supervisor_selection_with_quota(
+            let frozen_history = current_run
+                .map(|run| load_frozen_outcome_history(repo, run))
+                .transpose()?;
+            let resolution = initialize_supervisor_selection_with_history(
                 plan,
                 runtime,
                 catalog,
@@ -3728,6 +3740,7 @@ pub(super) fn initialize_supervisor_selection_from_prepared_metadata(
                 &advertised,
                 plan_metadata.resolved_objective_profile.as_ref(),
                 quota,
+                frozen_history.as_ref(),
             )?;
             if resolution.selection_preflight_failure.is_none() {
                 bind_selected_assignment_runtimes(plan, &resolution.decisions)?;
@@ -4067,6 +4080,10 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                 automatic_selection_state,
                 options.runtime,
             )?;
+            progress
+                .budget_degradation
+                .policy
+                .initial_selector_decisions = collected.selection_decisions.clone();
             progress.install_preclaim_decisions(preclaim_decisions)?;
             let scheduler_context = AssignmentSchedulerContext {
                 plan: &plan,
