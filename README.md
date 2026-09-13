@@ -3862,6 +3862,15 @@ and Fake behavior. Review readiness never authorizes fix dispatch, comments,
 or merge. Authenticated GitHub review threads carry `isOutdated` separately
 from `isResolved`. A current thread follows the existing comment triage;
 an outdated thread or legacy thread without currency evidence blocks readiness.
+For a real GitHub PR repair with an explicitly bound policy, each attempted
+Autopilot invocation first consumes one repository-authenticated slot under
+that policy's `max_attempts`. The durable key is the GitHub repository ID and
+PR number, so changing the PR head or supplying a new policy file does not
+reset prior consumption. Failed, refused, and interrupted reservations remain
+spent; exhaustion refuses new repair dispatch before model budget reservation.
+These slots do not establish that feedback was addressed, grant readiness, or
+authorize a comment, publication, or merge. Fake, issue, and no-policy paths
+retain their existing behavior.
 
 `maco-inbox.json` is optional. Without it, `maco inbox scan` uses deterministic
 fake local data: one safe issue candidate, one PR candidate with requested review
