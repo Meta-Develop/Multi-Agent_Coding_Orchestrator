@@ -4942,6 +4942,7 @@ mod decomposition_tests {
 
     #[test]
     fn leased_child_head_change_after_preparation_refuses_before_model_invocation() {
+        skip_without_containment!();
         let temp = tempfile::tempdir().expect("temporary source-base fixture");
         let repo = temp.path().join("repo");
         Repository::init(&repo).expect("initialize source-base fixture repository");
