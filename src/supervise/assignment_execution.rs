@@ -4271,16 +4271,37 @@ fn execute_supervisor_assignment_inner(
                 AssignmentExecutionDisposition::Continue(prepared) => prepared,
                 AssignmentExecutionDisposition::Complete => return Ok(()),
             };
-            let collected = dispatch_and_collect_child_attempt(
+            let attempted_launch_model_provenance = prepared.model_provenance.clone();
+            let requested_effort = prepared.command.reasoning_effort.clone();
+            let collected = match dispatch_and_collect_child_attempt(
                 context,
                 outcome,
                 &preflight,
                 journal_parent_id,
                 attempt,
                 prepared,
-            )?;
+            ) {
+                Ok(collected) => collected,
+                Err(error) => {
+                    record_child_attempt_outcome(
+                        artifacts,
+                        &options.run_id,
+                        &assignment.id,
+                        attempt,
+                        assignment.role,
+                        &outcome.selection_decisions,
+                        &active_budget_policy.initial_selector_decisions,
+                        runtime_name(attempted_launch_model_provenance.launch_runtime),
+                        attempted_launch_model_provenance.launched_model.as_deref(),
+                        requested_effort.as_deref(),
+                        context.execution_runtime == SupervisorExecutionRuntime::Verified,
+                        false,
+                    )?;
+                    return Err(error);
+                }
+            };
             let attempted_launch_model_provenance = collected.model_provenance.clone();
-            match decide_child_attempt(
+            let disposition = match decide_child_attempt(
                 context,
                 outcome,
                 &preflight,
@@ -4291,14 +4312,49 @@ fn execute_supervisor_assignment_inner(
                 &mut attempt_history,
                 &mut warning_streak,
                 collected,
-            )? {
+            ) {
+                Ok(disposition) => disposition,
+                Err(error) => {
+                    record_child_attempt_outcome(
+                        artifacts,
+                        &options.run_id,
+                        &assignment.id,
+                        attempt,
+                        assignment.role,
+                        &outcome.selection_decisions,
+                        &active_budget_policy.initial_selector_decisions,
+                        runtime_name(attempted_launch_model_provenance.launch_runtime),
+                        attempted_launch_model_provenance.launched_model.as_deref(),
+                        requested_effort.as_deref(),
+                        context.execution_runtime == SupervisorExecutionRuntime::Verified,
+                        false,
+                    )?;
+                    return Err(error);
+                }
+            };
+            let recorded_attempt = record_child_attempt_outcome(
+                artifacts,
+                &options.run_id,
+                &assignment.id,
+                attempt,
+                assignment.role,
+                &outcome.selection_decisions,
+                &active_budget_policy.initial_selector_decisions,
+                runtime_name(attempted_launch_model_provenance.launch_runtime),
+                attempted_launch_model_provenance.launched_model.as_deref(),
+                requested_effort.as_deref(),
+                context.execution_runtime == SupervisorExecutionRuntime::Verified,
+                matches!(&disposition, ChildAttemptDisposition::Retry),
+            )?;
+            match disposition {
                 ChildAttemptDisposition::Retry => continue,
                 ChildAttemptDisposition::Finish {
                     report,
                     containment_verified,
                     gate_terminal,
                 } => {
-                    child_result = Some((report, attempted_launch_model_provenance));
+                    child_result =
+                        Some((report, attempted_launch_model_provenance, recorded_attempt));
                     child_containment_verified = containment_verified;
                     child_gate_terminal = gate_terminal;
                     break;
@@ -4306,7 +4362,9 @@ fn execute_supervisor_assignment_inner(
             }
         }
 
-        let Some((mut child_report, child_launch_model_provenance)) = child_result else {
+        let Some((mut child_report, child_launch_model_provenance, terminal_attempt_outcome)) =
+            child_result
+        else {
             let error = anyhow!(
                 "child orchestrator '{}' did not produce a collected report after retries",
                 assignment.id
@@ -4603,6 +4661,7 @@ fn execute_supervisor_assignment_inner(
             &mut retry_feedback,
         )? {
             ParentAuditorGateDisposition::Retry => {
+                record_parent_auditor_retry(artifacts, &terminal_attempt_outcome)?;
                 warning_streak = None;
                 continue 'gate_controller;
             }

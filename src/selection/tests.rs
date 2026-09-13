@@ -128,7 +128,7 @@ fn configure_exhausted_quota(
     input.quota_source = Some(source);
 }
 
-fn base_input() -> SelectionInput {
+pub(crate) fn base_input() -> SelectionInput {
     SelectionInput {
         task: leaf_task(),
         catalogs: vec![
@@ -1357,6 +1357,24 @@ fn judgment_fallback_below_xhigh_remains_ineligible_despite_prior_declaration() 
         &[(model.as_str(), &[ReasoningEffort::Low], long_context)],
     )];
     input.pools = vec![pool(&runtime, 0)];
+    input.outcomes.push(OutcomeRecord {
+        attempt_id: "verified-low-gate-outcome-fixture".to_string(),
+        task: input.task.clone(),
+        candidate: CandidateKey {
+            runtime: runtime.clone(),
+            model,
+            effort: ReasoningEffort::Low,
+        },
+        result: OutcomeResult::Accepted,
+        failure_class: None,
+        execution_cost_microunits: 1,
+        review_cost_microunits: 0,
+        rework_cost_microunits: 0,
+        rereview_cost_microunits: 0,
+        environment_cost_microunits: 0,
+        environment_failures: Vec::new(),
+        fixed_cause_relaunch: None,
+    });
 
     let decision = select(&input).expect("low judgment fallback decision");
 

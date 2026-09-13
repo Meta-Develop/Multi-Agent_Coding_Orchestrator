@@ -654,6 +654,7 @@ fn authored_profile_reaches_verified_scheduler_selection_and_exact_score_evidenc
         &mut default_loaded.plan_metadata,
         PreparedSupervisorSelectionRequest {
             repo: &repo_path,
+            current_run: None,
             runtime: SupervisorRuntime::Codex,
             execution_runtime: SupervisorExecutionRuntime::Verified,
             runtime_model_catalog: &catalog,
@@ -667,6 +668,7 @@ fn authored_profile_reaches_verified_scheduler_selection_and_exact_score_evidenc
         &mut authored_loaded.plan_metadata,
         PreparedSupervisorSelectionRequest {
             repo: &repo_path,
+            current_run: None,
             runtime: SupervisorRuntime::Codex,
             execution_runtime: SupervisorExecutionRuntime::Verified,
             runtime_model_catalog: &catalog,

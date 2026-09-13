@@ -15855,6 +15855,40 @@
                         ],
                         "type": "object"
                       },
+                      "outcome_history": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "exclusions": {
+                            "items": {
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "projected_attempt_count": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "snapshot_sha256": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "source_digests": {
+                            "items": {
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "type": "array"
+                          }
+                        },
+                        "required": [
+                          "snapshot_sha256",
+                          "source_digests",
+                          "exclusions",
+                          "projected_attempt_count"
+                        ],
+                        "type": "object"
+                      },
                       "provided_switch_cost_evidence": {
                         "items": {
                           "additionalProperties": false,

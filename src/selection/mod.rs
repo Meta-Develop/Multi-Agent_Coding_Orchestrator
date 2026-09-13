@@ -22,3 +22,6 @@ pub use types::*;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use tests::base_input as selection_test_base_input;

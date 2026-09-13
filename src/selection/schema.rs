@@ -718,7 +718,7 @@ fn ranked_score() -> Value {
 }
 
 pub(crate) fn selection_provenance_schema_value() -> Value {
-    strict_object!(
+    let mut schema = strict_object!(
         "schema_version" => json!({"type": "integer", "const": 4}),
         "status" => enum_schema(&["selected", "fail_closed"]),
         "normalized_input" => selection_input(),
@@ -740,7 +740,14 @@ pub(crate) fn selection_provenance_schema_value() -> Value {
         "debug_override" => nullable(debug_override_provenance()),
         "environment_fallback" => nullable(environment_fallback_transition()),
         "quota" => nullable(quota_decision_provenance()),
-    )
+    );
+    schema["properties"]["outcome_history"] = strict_object!(
+        "snapshot_sha256" => nonempty_string(),
+        "source_digests" => array(nonempty_string()),
+        "exclusions" => array(nonempty_string()),
+        "projected_attempt_count" => nonnegative_integer(),
+    );
+    schema
 }
 
 pub(crate) fn selection_event_schema_value() -> Value {

@@ -897,4 +897,17 @@ pub struct SelectionProvenance {
     pub environment_fallback: Option<EnvironmentFallbackTransition>,
     #[serde(default)]
     pub quota: Option<QuotaDecisionProvenance>,
+    /// Frozen authenticated supervisor-run sources consulted for this decision.
+    /// Older selector artifacts omit this additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_history: Option<AuthenticatedOutcomeHistoryProvenance>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticatedOutcomeHistoryProvenance {
+    pub snapshot_sha256: String,
+    pub source_digests: Vec<String>,
+    pub exclusions: Vec<String>,
+    pub projected_attempt_count: usize,
 }
