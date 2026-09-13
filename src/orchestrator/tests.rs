@@ -666,6 +666,11 @@ fn schedule_heartbeat_preserves_claims_across_long_dependency_waves_and_recovery
         };
         let mut summary = AgentRunSummary::pending(agent);
         summary.worktree = Some(selected.record().clone());
+        summaries.push(summary);
+        worktrees.push(selected);
+    }
+    // Acquire short-lived fixture claims after both worktrees are prepared.
+    for (agent, summary) in plan.agents.iter().zip(&mut summaries) {
         summary.claim = Some(
             store
                 .claim_paths_with_timing(
@@ -675,8 +680,6 @@ fn schedule_heartbeat_preserves_claims_across_long_dependency_waves_and_recovery
                 )?
                 .claim,
         );
-        summaries.push(summary);
-        worktrees.push(selected);
     }
     let candidates = run_agent_schedule_with_patch_dir(
         &AgentScheduleContext {
