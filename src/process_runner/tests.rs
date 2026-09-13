@@ -4934,6 +4934,8 @@ fn stuck_owned_io_thread_aborts_instead_of_detaching() {
     let temp = tempfile::tempdir().expect("tempdir");
     let deadline_observed = temp.path().join("deadline-observed");
     let unexpected_return = temp.path().join("unexpected-return");
+    let stderr_path = temp.path().join("stderr");
+    let stderr = fs::File::create(&stderr_path).expect("create child stderr capture");
     let mut child = Command::new(std::env::current_exe().expect("current test executable"))
         .args([
             "--exact",
@@ -4943,6 +4945,7 @@ fn stuck_owned_io_thread_aborts_instead_of_detaching() {
         .env("MACO_TEST_STUCK_IO_DEADLINE_OBSERVED", &deadline_observed)
         .env("MACO_TEST_STUCK_IO_UNEXPECTED_RETURN", &unexpected_return)
         .current_dir(temp.path())
+        .stderr(stderr)
         .spawn()
         .expect("spawn stuck-owner child test");
     // This is only a harness liveness fuse, not the cleanup-deadline assertion. Its 60-second
@@ -4968,6 +4971,14 @@ fn stuck_owned_io_thread_aborts_instead_of_detaching() {
     assert!(
         !unexpected_return.exists(),
         "stuck I/O owner was detached instead of failing closed"
+    );
+    assert!(
+        fs::read_to_string(stderr_path)
+            .expect("read child stderr capture")
+            .contains(
+                "fatal: synthetic stuck I/O owner remained live past its bounded cleanup deadline"
+            ),
+        "fatal owner diagnostic must survive ordinary libtest capture"
     );
 }
 
