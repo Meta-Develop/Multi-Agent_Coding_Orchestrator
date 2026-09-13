@@ -2898,10 +2898,10 @@ fn validate_publication_git_operation(operation: &[OsString]) -> Result<()> {
             validate_publication_ref(remote_ref)
         }
         ["push", "--no-verify", lease, "maco-publication", refspec] => {
-            let leased_ref = lease
+            let (leased_ref, old_oid) = lease
                 .strip_prefix("--force-with-lease=")
-                .and_then(|value| value.strip_suffix(':'))
-                .context("publication Git push omitted its create-only lease")?;
+                .and_then(|value| value.split_once(':'))
+                .context("publication Git push omitted its exact ref lease")?;
             validate_publication_ref(leased_ref)?;
             let (oid, remote_ref) = refspec
                 .split_once(':')
@@ -2912,8 +2912,15 @@ fn validate_publication_git_operation(operation: &[OsString]) -> Result<()> {
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
                 || Oid::from_str(oid).is_err()
+                || (!old_oid.is_empty()
+                    && (old_oid == oid
+                        || old_oid.len() != 40
+                        || !old_oid
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+                        || Oid::from_str(old_oid).is_err()))
             {
-                bail!("publication Git push refspec did not match its exact create-only lease");
+                bail!("publication Git push refspec did not match its exact ref lease");
             }
             Ok(())
         }

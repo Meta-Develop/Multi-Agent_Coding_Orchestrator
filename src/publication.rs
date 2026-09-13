@@ -1,6 +1,7 @@
 pub mod forge_coordination;
 pub mod forge_transport;
 mod github_review_observation;
+pub mod pr_original_update;
 
 use self::forge_transport::{
     decide_pull_request_merge, AuthenticatedPullRequestMergeEvidence, ForgeActor, ForgeCheck,
@@ -3478,6 +3479,11 @@ enum PublicationGitOperation {
         expected_oid: String,
         remote_ref: String,
     },
+    PushUpdateExact {
+        old_oid: String,
+        new_oid: String,
+        remote_ref: String,
+    },
 }
 
 impl PublicationGitOperation {
@@ -3500,10 +3506,30 @@ impl PublicationGitOperation {
         })
     }
 
+    fn push_update_exact(old_oid: &str, new_oid: &str, remote_ref: &str) -> Result<Self> {
+        validate_publication_ref(remote_ref)?;
+        if old_oid.len() != 40
+            || new_oid.len() != 40
+            || Oid::from_str(old_oid)?.to_string() != old_oid
+            || Oid::from_str(new_oid)?.to_string() != new_oid
+        {
+            bail!("original PR update requires canonical 40-character old and new OIDs");
+        }
+        if old_oid == new_oid {
+            bail!("original PR update requires a new commit");
+        }
+        Ok(Self::PushUpdateExact {
+            old_oid: old_oid.to_string(),
+            new_oid: new_oid.to_string(),
+            remote_ref: remote_ref.to_string(),
+        })
+    }
+
     fn requires_object_closure(&self) -> Option<&str> {
         match self {
             Self::ObserveRemoteRef { .. } => None,
             Self::PushCreateOnly { expected_oid, .. } => Some(expected_oid),
+            Self::PushUpdateExact { new_oid, .. } => Some(new_oid),
         }
     }
 
@@ -3511,6 +3537,7 @@ impl PublicationGitOperation {
         match self {
             Self::ObserveRemoteRef { .. } => "observe publication remote ref",
             Self::PushCreateOnly { .. } => "create publication remote ref",
+            Self::PushUpdateExact { .. } => "update exact original PR remote ref",
         }
     }
 
@@ -3531,6 +3558,17 @@ impl PublicationGitOperation {
                 OsString::from(format!("--force-with-lease={remote_ref}:")),
                 OsString::from("maco-publication"),
                 OsString::from(format!("{expected_oid}:{remote_ref}")),
+            ],
+            Self::PushUpdateExact {
+                old_oid,
+                new_oid,
+                remote_ref,
+            } => vec![
+                OsString::from("push"),
+                OsString::from("--no-verify"),
+                OsString::from(format!("--force-with-lease={remote_ref}:{old_oid}")),
+                OsString::from("maco-publication"),
+                OsString::from(format!("{new_oid}:{remote_ref}")),
             ],
         }
     }
