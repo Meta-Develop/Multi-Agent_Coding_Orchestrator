@@ -3812,6 +3812,57 @@ cargo run -- inbox watch --repo . --poll-seconds 60 --once --json
 cargo run -- inbox artifacts list --repo . --json
 ```
 
+For authenticated GitHub review triage, direct `inbox scan`, `run`, and
+`watch` accept `--review-policy-file /absolute/operator/policy.json`. The
+operator file must be outside the source repository in an owned,
+non-group-writable directory; it must be a regular single-link UTF-8 JSON
+file opened without following links. This input is supported on Unix. Its
+closed version-1 shape is `{ "version": 1, "repository": <ForgeRepository>,
+"policy": <ReviewLoopPolicy> }`: `repository` binds the exact canonical
+GitHub locator and provider repository ID; `policy` names independently
+trusted actor IDs, roles, required checks, approval count, and attempt limit.
+For every repository or actor `stable_id`, use MACO's canonical
+`node:sha256:<lowercase SHA-256 of the raw GitHub node ID UTF-8 bytes>` form.
+The raw `node_id` from GitHub is not itself a matching `stable_id`. Bind actor
+handles in lowercase and kinds to the provider's `User` (human) or `Bot`
+identity; a required check must name its independently approved actor in the
+same form. The following sample values are hashes of the illustrative raw IDs
+`R_APPROVED`, `U_REVIEWER`, and `B_CI`; replace them with independently
+approved real identities before use, rather than copying a PR's participants:
+
+```json
+{
+  "version": 1,
+  "repository": {
+    "provider_id": "github",
+    "canonical_locator": "github.com/example/project",
+    "provider_repository_id": {"provider_id": "github", "kind": "repository", "stable_id": "node:sha256:1eddabd711a92eac167e58e26a2832c006eceefefd8d560eb442f60712be0ee6"}
+  },
+  "policy": {
+    "trusted_feedback_actors": [
+      {"identity": {"provider_actor_id": {"provider_id": "github", "kind": "actor", "stable_id": "node:sha256:77a2a0fbff42dabcdd5e048c636e2eb956bc02178ba79863929c5f31ebb46540"}, "canonical_handle": "reviewer", "expected_kind": "human"}, "role": "human_blocking"},
+      {"identity": {"provider_actor_id": {"provider_id": "github", "kind": "actor", "stable_id": "node:sha256:2ad315ab7dc36665b9b36c1464907bddb43a7e9c5ed28001179de28ea3da9ac6"}, "canonical_handle": "ci-bot", "expected_kind": "bot"}, "role": "bot_advisory"}
+    ],
+    "required_checks": [
+      {"name": "ci", "trusted_actors": [
+        {"provider_actor_id": {"provider_id": "github", "kind": "actor", "stable_id": "node:sha256:2ad315ab7dc36665b9b36c1464907bddb43a7e9c5ed28001179de28ea3da9ac6"}, "canonical_handle": "ci-bot", "expected_kind": "bot"}
+      ]}
+    ],
+    "minimum_approvals": 1,
+    "max_attempts": 2
+  }
+}
+```
+
+The policy is frozen once per command invocation. A run archives its raw
+bytes and canonical binding in private finalized Inbox artifacts, alongside
+an initial current-head review state for every successfully observed PR.
+Omitting the flag preserves the existing `policy_unavailable` GitHub report
+and Fake behavior. Review readiness never authorizes fix dispatch, comments,
+or merge. Authenticated GitHub review threads carry `isOutdated` separately
+from `isResolved`. A current thread follows the existing comment triage;
+an outdated thread or legacy thread without currency evidence blocks readiness.
+
 `maco-inbox.json` is optional. Without it, `maco inbox scan` uses deterministic
 fake local data: one safe issue candidate, one PR candidate with requested review
 changes and failing CI context, one unsafe item that is skipped, and duplicate

@@ -100,6 +100,7 @@ struct GraphqlThreadParent {
 struct GraphqlThreadNode {
     id: String,
     is_resolved: bool,
+    is_outdated: bool,
     #[serde(default)]
     pull_request: Option<GraphqlThreadParent>,
     comments: GraphqlConnection<GraphqlReviewComment>,
@@ -212,6 +213,20 @@ fn repository_from_rest(
         expected.selector(),
         github_node_object_id(ProviderObjectKind::Repository, &rest.node_id)?,
     )
+}
+
+fn resolve_repository_with(
+    transport: &GithubPullRequestMergeTransport,
+    mut fetch: impl FnMut(&str, AuthenticatedGithubOperation) -> Result<String>,
+) -> Result<ForgeRepository> {
+    let rest: RestRepository = parse_authenticated_github_json(
+        &fetch(
+            "gh review repository identity",
+            AuthenticatedGithubOperation::Repository,
+        )?,
+        "GitHub review repository identity",
+    )?;
+    repository_from_rest(&rest, &transport.repository)
 }
 
 fn repository_from_pull(
@@ -508,6 +523,7 @@ fn collect_thread_comments(
     item: &ForgeItem,
     thread_id: &str,
     expected_resolved: bool,
+    expected_outdated: bool,
     first: GraphqlConnection<GraphqlReviewComment>,
     mut fetch: impl FnMut(&str, AuthenticatedGithubOperation) -> Result<String>,
 ) -> Result<Vec<ForgeComment>> {
@@ -551,8 +567,13 @@ fn collect_thread_comments(
         let node = data
             .node
             .context("GitHub review thread node disappeared during pagination")?;
-        if node.id != thread_id || node.is_resolved != expected_resolved {
-            bail!("GitHub review thread identity or resolution changed during pagination");
+        if node.id != thread_id
+            || node.is_resolved != expected_resolved
+            || node.is_outdated != expected_outdated
+        {
+            bail!(
+                "GitHub review thread identity, resolution, or currency changed during pagination"
+            );
         }
         let parent = node
             .pull_request
@@ -632,6 +653,7 @@ fn collect_review_threads(
                 item,
                 &thread.id,
                 thread.is_resolved,
+                thread.is_outdated,
                 thread.comments,
                 &mut fetch,
             )?;
@@ -641,9 +663,10 @@ fn collect_review_threads(
             if total_comments > MAX_REVIEW_COMMENTS {
                 bail!("GitHub review comments exceeded their aggregate bound");
             }
-            threads.push(ForgeReviewThread::new(
+            threads.push(ForgeReviewThread::new_with_currency(
                 github_node_object_id(ProviderObjectKind::ReviewThread, &thread.id)?,
                 thread.is_resolved,
+                Some(thread.is_outdated),
                 comments,
             )?);
             if threads.len() > MAX_REVIEW_THREADS {
@@ -702,6 +725,16 @@ pub(super) fn resolve_item(
     .item;
     verify_bound_origin(repo, &transport.repository)?;
     Ok(item)
+}
+
+pub(super) fn resolve_repository(repo: &Path, selector: &str) -> Result<ForgeRepository> {
+    let transport = GithubPullRequestMergeTransport::new(repo, selector)?;
+    verify_bound_origin(repo, &transport.repository)?;
+    let repository = resolve_repository_with(&transport, |label, operation| {
+        transport.json(label, operation)
+    })?;
+    verify_bound_origin(repo, &transport.repository)?;
+    Ok(repository)
 }
 
 pub(super) fn observe(
@@ -838,6 +871,41 @@ mod tests {
             "html_url":"https://github.com/meta-develop/maco"})
     }
 
+    #[test]
+    fn repository_identity_read_is_fixed_and_distinguishes_provider_ids() {
+        let mut operations = 0;
+        let observed = resolve_repository_with(&transport(), |_, operation| {
+            assert!(matches!(
+                operation,
+                AuthenticatedGithubOperation::Repository
+            ));
+            operations += 1;
+            Ok(rest_repository().to_string())
+        })
+        .unwrap();
+        assert_eq!(observed, repository());
+        assert_eq!(operations, 1);
+
+        let mut foreign = rest_repository();
+        foreign["node_id"] = json!("R_other");
+        let foreign_observed = resolve_repository_with(&transport(), |_, operation| {
+            assert!(matches!(
+                operation,
+                AuthenticatedGithubOperation::Repository
+            ));
+            Ok(foreign.to_string())
+        })
+        .unwrap();
+        assert_ne!(
+            foreign_observed.provider_repository_id(),
+            repository().provider_repository_id()
+        );
+
+        let mut wrong_name = rest_repository();
+        wrong_name["full_name"] = json!("foreign/project");
+        assert!(resolve_repository_with(&transport(), |_, _| Ok(wrong_name.to_string())).is_err());
+    }
+
     fn rest_issue() -> Value {
         json!({"node_id":"I_issue", "number":89,
             "html_url":"https://github.com/meta-develop/maco/issues/89",
@@ -873,7 +941,7 @@ mod tests {
     }
 
     fn thread(id: &str, resolved: bool, comments: Vec<Value>, next: Option<&str>) -> Value {
-        json!({"id":id, "isResolved":resolved,
+        json!({"id":id, "isResolved":resolved, "isOutdated":false,
             "comments":{"nodes":comments, "pageInfo":page(next)}})
     }
 
@@ -942,6 +1010,7 @@ mod tests {
             GITHUB_REVIEW_THREAD_COMMENTS_QUERY,
         ] {
             assert!(query.contains("author{login __typename ... on Node{id}}"));
+            assert!(query.contains("isResolved isOutdated"));
             assert!(!query.contains("author{id"));
         }
         assert!(args.iter().any(|arg| arg == "after=cursor-safe"));
@@ -1104,8 +1173,47 @@ mod tests {
         assert_eq!(operations.len(), 3);
         assert_eq!(threads.len(), 2);
         assert!(!threads[0].is_resolved());
+        assert_eq!(threads[0].is_outdated(), Some(false));
         assert_eq!(threads[0].comments().len(), 2);
         assert!(threads[1].is_resolved());
+        assert_eq!(threads[1].is_outdated(), Some(false));
+    }
+
+    #[test]
+    fn authenticated_outdated_thread_keeps_currency_across_nested_pages() {
+        let threads = collect_review_threads(&pr(), |_, operation| {
+            let mut response = match &operation {
+                AuthenticatedGithubOperation::ReviewThreads { .. } => thread_page(
+                    vec![thread(
+                        "T_outdated",
+                        true,
+                        vec![graphql_comment(201)],
+                        Some("next-comments"),
+                    )],
+                    None,
+                ),
+                AuthenticatedGithubOperation::ReviewThreadComments { .. } => {
+                    thread_comment_page("T_outdated", true, vec![graphql_comment(202)], None)
+                }
+                _ => panic!("unexpected GitHub operation"),
+            };
+            match operation {
+                AuthenticatedGithubOperation::ReviewThreads { .. } => {
+                    response["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][0]
+                        ["isOutdated"] = json!(true);
+                }
+                AuthenticatedGithubOperation::ReviewThreadComments { .. } => {
+                    response["data"]["node"]["isOutdated"] = json!(true);
+                }
+                _ => unreachable!(),
+            }
+            Ok(response.to_string())
+        })
+        .expect("complete outdated thread observation");
+        assert_eq!(threads.len(), 1);
+        assert!(threads[0].is_resolved());
+        assert_eq!(threads[0].is_outdated(), Some(true));
+        assert_eq!(threads[0].comments().len(), 2);
     }
 
     #[test]
@@ -1149,6 +1257,12 @@ mod tests {
         let mut wrong_head = valid.clone();
         wrong_head["data"]["repository"]["pullRequest"]["headRefOid"] = json!(BASE);
         cases.push_back(wrong_head);
+        let mut missing_currency = valid.clone();
+        missing_currency["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][0]
+            .as_object_mut()
+            .expect("thread")
+            .remove("isOutdated");
+        cases.push_back(missing_currency);
         let mut missing_actor = valid.clone();
         missing_actor["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][0]
             ["comments"]["nodes"][0]["author"] = Value::Null;
@@ -1185,27 +1299,65 @@ mod tests {
             );
         }
 
-        let wrong_parent = collect_review_threads(&pr(), |_, operation| {
-            Ok(match operation {
-                AuthenticatedGithubOperation::ReviewThreads { .. } => thread_page(
-                    vec![thread(
-                        "T_one",
-                        false,
-                        vec![graphql_comment(201)],
-                        Some("next"),
-                    )],
-                    None,
-                ),
-                AuthenticatedGithubOperation::ReviewThreadComments { .. } => {
-                    let mut page =
-                        thread_comment_page("T_one", false, vec![graphql_comment(202)], None);
-                    page["data"]["node"]["pullRequest"]["number"] = json!(91);
-                    page
+        for wrong_head in [false, true] {
+            let wrong_parent = collect_review_threads(&pr(), |_, operation| {
+                Ok(match operation {
+                    AuthenticatedGithubOperation::ReviewThreads { .. } => thread_page(
+                        vec![thread(
+                            "T_one",
+                            false,
+                            vec![graphql_comment(201)],
+                            Some("next"),
+                        )],
+                        None,
+                    ),
+                    AuthenticatedGithubOperation::ReviewThreadComments { .. } => {
+                        let mut page =
+                            thread_comment_page("T_one", false, vec![graphql_comment(202)], None);
+                        if wrong_head {
+                            page["data"]["node"]["pullRequest"]["headRefOid"] = json!(BASE);
+                        } else {
+                            page["data"]["node"]["pullRequest"]["number"] = json!(91);
+                        }
+                        page
+                    }
+                    _ => panic!("unexpected GitHub operation"),
                 }
-                _ => panic!("unexpected GitHub operation"),
-            }
-            .to_string())
-        });
-        assert!(wrong_parent.is_err());
+                .to_string())
+            });
+            assert!(wrong_parent.is_err());
+        }
+
+        for omit_currency in [false, true] {
+            let inconsistent_nested = collect_review_threads(&pr(), |_, operation| {
+                Ok(match operation {
+                    AuthenticatedGithubOperation::ReviewThreads { .. } => thread_page(
+                        vec![thread(
+                            "T_one",
+                            false,
+                            vec![graphql_comment(201)],
+                            Some("next"),
+                        )],
+                        None,
+                    ),
+                    AuthenticatedGithubOperation::ReviewThreadComments { .. } => {
+                        let mut page =
+                            thread_comment_page("T_one", false, vec![graphql_comment(202)], None);
+                        if omit_currency {
+                            page["data"]["node"]
+                                .as_object_mut()
+                                .expect("thread node")
+                                .remove("isOutdated");
+                        } else {
+                            page["data"]["node"]["isOutdated"] = json!(true);
+                        }
+                        page
+                    }
+                    _ => panic!("unexpected GitHub operation"),
+                }
+                .to_string())
+            });
+            assert!(inconsistent_nested.is_err());
+        }
     }
 }

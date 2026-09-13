@@ -1,5 +1,8 @@
 pub mod review_loop;
 pub mod review_loop_entry;
+mod review_policy_input;
+
+use self::review_policy_input::BoundReviewPolicy;
 
 use self::review_loop_entry::InboxIndependentAuditorSelectionEvidence;
 
@@ -139,6 +142,7 @@ pub struct InboxScanOptions {
     pub permission_mode: Option<InboxPermissionMode>,
     pub max_items: Option<usize>,
     pub action_policy_override: Option<InboxActionPolicy>,
+    pub review_policy_file: Option<PathBuf>,
 }
 
 /// Operator-reviewed machine-global cleanup authority forwarded to each
@@ -170,6 +174,7 @@ pub struct InboxRunOptions {
     pub max_items: Option<usize>,
     pub codex_bin: Option<PathBuf>,
     pub machine_global: Option<InboxMachineGlobalInput>,
+    pub review_policy_file: Option<PathBuf>,
 }
 
 /// Operator-configured aggregate quota shared by sequential inbox autopilot runs.
@@ -206,6 +211,7 @@ pub struct InboxWatchOptions {
     pub max_items: Option<usize>,
     pub codex_bin: Option<PathBuf>,
     pub machine_global: Option<InboxMachineGlobalInput>,
+    pub review_policy_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -1540,7 +1546,32 @@ pub fn scan_inbox(options: InboxScanOptions) -> Result<InboxScanReport> {
 
 fn scan_inbox_with_overrides(
     options: InboxScanOptions,
+    overrides: InboxConfigOverrides,
+) -> Result<InboxScanReport> {
+    scan_inbox_with_bound_policy(options, overrides, None)
+}
+
+fn scan_inbox_with_bound_policy(
+    options: InboxScanOptions,
+    overrides: InboxConfigOverrides,
+    prebound_policy: Option<&BoundReviewPolicy>,
+) -> Result<InboxScanReport> {
+    scan_inbox_with_bound_policy_and_resolver(
+        options,
+        overrides,
+        prebound_policy,
+        publication::resolve_github_forge_repository,
+    )
+}
+
+fn scan_inbox_with_bound_policy_and_resolver(
+    options: InboxScanOptions,
     mut overrides: InboxConfigOverrides,
+    prebound_policy: Option<&BoundReviewPolicy>,
+    resolve_repository: impl FnOnce(
+        &Path,
+        &str,
+    ) -> Result<crate::publication::forge_transport::ForgeRepository>,
 ) -> Result<InboxScanReport> {
     validate_cli_source_options(
         options.github,
@@ -1560,6 +1591,20 @@ fn scan_inbox_with_overrides(
         effective_permission_mode(&loaded.config, options.github, options.permission_mode);
     let action_policy = effective_action_policy(loaded.config.action_policy, permission_mode);
     let github_enabled = permission_mode.uses_github_intake();
+    if options.review_policy_file.is_some() && !github_enabled {
+        bail!("operator review-policy input requires GitHub inbox observation");
+    }
+    let loaded_policy = options
+        .review_policy_file
+        .as_deref()
+        .filter(|_| prebound_policy.is_none())
+        .map(|path| BoundReviewPolicy::load(&repo, &loaded.config, path))
+        .transpose()?;
+    let bound_policy = prebound_policy.or(loaded_policy.as_ref());
+    if let Some(policy) = bound_policy {
+        let observed = resolve_repository(&repo, policy.repository().canonical_locator())?;
+        policy.verify_repository(&observed)?;
+    }
     let duplicate_keys = load_duplicate_keys(&repo)?;
     let duplicate_pr_snapshots = load_duplicate_pr_snapshots(&repo)?;
     let source_repository =
@@ -1663,7 +1708,8 @@ fn scan_inbox_with_overrides(
         .filter(|item| item.selected)
         .filter_map(pr_intake_report_for_item)
         .collect::<Vec<_>>();
-    let review_loops = review_loop_entry::evaluate_inbox_scan_review_loops_in_repo(&repo, &items);
+    let review_loops =
+        review_loop_entry::evaluate_inbox_scan_review_loops_in_repo(&repo, &items, bound_policy)?;
 
     let selected_count = items.iter().filter(|item| item.selected).count();
     let candidate_count = items.len();
@@ -2274,6 +2320,7 @@ pub(crate) fn preflight_inbox_pr_event(
             permission_mode: options.permission_mode,
             max_items: None,
             action_policy_override: None,
+            review_policy_file: None,
         },
         InboxConfigOverrides {
             max_items: Some(1),
@@ -2308,6 +2355,9 @@ pub(crate) fn run_inbox_for_pr_event(
     before_auditor_launch: Option<InboxBeforeAuditorLaunch<'_>>,
 ) -> Result<InboxRunReport> {
     options.max_items = None;
+    // External review triage policy is not an input to authenticated PR intake
+    // or its independent merge authority.
+    options.review_policy_file = None;
     run_inbox_with_overrides(
         options,
         None,
@@ -2342,8 +2392,45 @@ pub fn run_inbox_with_rolling_budget(
 fn run_inbox_with_overrides(
     options: InboxRunOptions,
     rolling_budget_quota: Option<InboxRollingBudgetQuota>,
+    overrides: InboxConfigOverrides,
+    before_auditor_launch: Option<InboxBeforeAuditorLaunch<'_>>,
+) -> Result<InboxRunReport> {
+    run_inbox_with_bound_policy(
+        options,
+        rolling_budget_quota,
+        overrides,
+        before_auditor_launch,
+        None,
+    )
+}
+
+fn run_inbox_with_bound_policy(
+    options: InboxRunOptions,
+    rolling_budget_quota: Option<InboxRollingBudgetQuota>,
+    overrides: InboxConfigOverrides,
+    before_auditor_launch: Option<InboxBeforeAuditorLaunch<'_>>,
+    prebound_policy: Option<&BoundReviewPolicy>,
+) -> Result<InboxRunReport> {
+    run_inbox_with_bound_policy_and_resolver(
+        options,
+        rolling_budget_quota,
+        overrides,
+        before_auditor_launch,
+        prebound_policy,
+        publication::resolve_github_forge_repository,
+    )
+}
+
+fn run_inbox_with_bound_policy_and_resolver(
+    options: InboxRunOptions,
+    rolling_budget_quota: Option<InboxRollingBudgetQuota>,
     mut overrides: InboxConfigOverrides,
     mut before_auditor_launch: Option<InboxBeforeAuditorLaunch<'_>>,
+    prebound_policy: Option<&BoundReviewPolicy>,
+    resolve_repository: impl FnOnce(
+        &Path,
+        &str,
+    ) -> Result<crate::publication::forge_transport::ForgeRepository>,
 ) -> Result<InboxRunReport> {
     validate_cli_source_options(
         options.github,
@@ -2366,6 +2453,16 @@ fn run_inbox_with_overrides(
         effective_permission_mode(&loaded.config, options.github, options.permission_mode);
     let preflight_action_policy =
         effective_action_policy(loaded.config.action_policy, preflight_permission_mode);
+    if options.review_policy_file.is_some() && !preflight_permission_mode.uses_github_intake() {
+        bail!("operator review-policy input requires GitHub inbox observation");
+    }
+    let loaded_policy = options
+        .review_policy_file
+        .as_deref()
+        .filter(|_| prebound_policy.is_none())
+        .map(|path| BoundReviewPolicy::load(&repo, &loaded.config, path))
+        .transpose()?;
+    let bound_policy = prebound_policy.or(loaded_policy.as_ref());
     let event_reviewer_bound = overrides.authenticated_pr_event
         && (options.codex_bin.is_some() || loaded.config.codex_bin.is_some());
     if preflight_permission_mode.publishes_real_branch_or_pr()
@@ -2376,6 +2473,27 @@ fn run_inbox_with_overrides(
             "real Inbox publication requires an explicitly bound external reviewer; the deterministic fake reviewer is not publication authority"
         );
     }
+    let scan_options = InboxScanOptions {
+        repo: repo.clone(),
+        github: options.github,
+        permission_mode: options.permission_mode,
+        max_items: None,
+        action_policy_override: None,
+        review_policy_file: options.review_policy_file.clone(),
+    };
+    // A provider repository ID can only be checked through an authenticated
+    // identity read. Policy-enabled runs complete that check before reserving
+    // artifacts; the legacy no-policy run retains its original ordering.
+    let policy_scan = if let Some(policy) = bound_policy {
+        Some(scan_inbox_with_bound_policy_and_resolver(
+            scan_options.clone(),
+            overrides.clone(),
+            Some(policy),
+            resolve_repository,
+        )?)
+    } else {
+        None
+    };
     let artifacts = run_artifacts(&options.run_id);
     let mut artifact_writer = ArtifactRunWriter::reserve(
         &repo,
@@ -2384,16 +2502,21 @@ fn run_inbox_with_overrides(
         "inbox",
     )?;
     let run_dir = artifact_writer.run_dir().to_path_buf();
-    let scan = match scan_inbox_with_overrides(
-        InboxScanOptions {
-            repo: repo.clone(),
-            github: options.github,
-            permission_mode: options.permission_mode,
-            max_items: None,
-            action_policy_override: None,
-        },
-        overrides.clone(),
-    ) {
+    if let Some(policy) = bound_policy {
+        artifact_writer.write_bytes(
+            "review-policy-input.json",
+            policy.raw(),
+            ArtifactFileDisposition::PrivateEvidence,
+        )?;
+        write_private_artifact_json(
+            &mut artifact_writer,
+            "review-policy-binding.json",
+            policy.binding(),
+        )?;
+    }
+    let scan = match policy_scan.map(Ok).unwrap_or_else(|| {
+        scan_inbox_with_bound_policy(scan_options, overrides.clone(), bound_policy)
+    }) {
         Ok(scan) => scan,
         Err(error) => {
             let message =
@@ -2500,6 +2623,7 @@ fn run_inbox_with_overrides(
         run_dir: &run_dir,
         run_id: &options.run_id,
         config: &loaded.config,
+        review_policy: bound_policy,
         action_policy,
         permission_mode,
         codex_bin: options
@@ -2809,6 +2933,7 @@ fn run_github_watch_iteration_with<L, P, R>(
     list: L,
     produce: P,
     run_ordinary: R,
+    policy: Option<&BoundReviewPolicy>,
 ) -> Result<InboxRunReport>
 where
     L: FnOnce(
@@ -2820,10 +2945,33 @@ where
     P: FnMut(InboxRunOptions, u64) -> crate::pr_intake::PrIntakeProducerReport,
     R: FnOnce(InboxRunOptions, InboxConfigOverrides) -> Result<InboxRunReport>,
 {
-    let producer_options = options.clone();
+    let mut producer_options = options.clone();
+    // Review policy only admits read-only review triage in the ordinary Inbox
+    // lane. It is never an input to the independent PR-intake producer.
+    producer_options.review_policy_file = None;
     let mut produce = produce;
+    let listed = list(
+        &producer_options,
+        ExternalSourceObjectKind::PullRequest,
+        GITHUB_WATCH_PR_DISCOVERY_SENTINEL,
+        &[],
+    );
+    if let (Some(policy), Ok((selector, value))) = (policy, &listed) {
+        if let Ok(numbers) = parse_github_watch_pr_numbers(value) {
+            if let Some(number) = numbers.first() {
+                let repo = discover_repo_root(&options.repo)?;
+                let observed = publication::resolve_github_forge_item(
+                    &repo,
+                    selector,
+                    crate::publication::forge_transport::ForgeItemKind::PullRequest,
+                    *number,
+                )?;
+                policy.verify_repository(observed.repository())?;
+            }
+        }
+    }
     let producer_report = produce_github_watch_pr_intakes_with(
-        |kind, limit, labels| list(&producer_options, kind, limit, labels),
+        |_, _, _| listed,
         |number| produce(producer_options.clone(), number),
     );
     run_ordinary(
@@ -2842,6 +2990,7 @@ fn run_github_watch_iteration(options: InboxRunOptions) -> Result<InboxRunReport
         github_watch_pr_list,
         crate::pr_intake::produce_repository_pr_intake,
         |options, overrides| run_inbox_with_overrides(options, None, overrides, None),
+        None,
     )
 }
 
@@ -2861,6 +3010,24 @@ pub fn watch_inbox(options: InboxWatchOptions) -> Result<InboxWatchReport> {
         options.codex_bin.as_deref(),
     )?;
     let repo = discover_repo_root(&options.repo)?;
+    let loaded = load_config(&repo)?;
+    let watch_permission =
+        effective_permission_mode(&loaded.config, options.github, options.permission_mode);
+    if options.review_policy_file.is_some() && !watch_permission.uses_github_intake() {
+        bail!("operator review-policy input requires GitHub inbox observation");
+    }
+    let bound_policy = options
+        .review_policy_file
+        .as_deref()
+        .map(|path| BoundReviewPolicy::load(&repo, &loaded.config, path))
+        .transpose()?;
+    if let Some(policy) = bound_policy.as_ref() {
+        let observed = publication::resolve_github_forge_repository(
+            &repo,
+            policy.repository().canonical_locator(),
+        )?;
+        policy.verify_repository(&observed)?;
+    }
     let mut runs = VecDeque::with_capacity(MAX_WATCH_RETAINED_ITERATIONS);
     let mut iteration = 0usize;
     loop {
@@ -2880,11 +3047,30 @@ pub fn watch_inbox(options: InboxWatchOptions) -> Result<InboxWatchReport> {
             max_items: options.max_items,
             codex_bin: options.codex_bin.clone(),
             machine_global: options.machine_global.clone(),
+            review_policy_file: options.review_policy_file.clone(),
         };
         let report = if watch_iteration_uses_github(&run_options)? {
-            run_github_watch_iteration(run_options)?
+            if let Some(policy) = bound_policy.as_ref() {
+                run_github_watch_iteration_with(
+                    run_options,
+                    github_watch_pr_list,
+                    crate::pr_intake::produce_repository_pr_intake,
+                    |options, overrides| {
+                        run_inbox_with_bound_policy(options, None, overrides, None, Some(policy))
+                    },
+                    Some(policy),
+                )?
+            } else {
+                run_github_watch_iteration(run_options)?
+            }
         } else {
-            run_inbox(run_options)?
+            run_inbox_with_bound_policy(
+                run_options,
+                None,
+                InboxConfigOverrides::default(),
+                None,
+                bound_policy.as_ref(),
+            )?
         };
         retain_watch_run(&mut runs, report);
         if options.once {
@@ -2980,6 +3166,7 @@ pub fn run_workspace_inbox(options: InboxWorkspaceRunOptions) -> Result<InboxWor
                 max_items: None,
                 codex_bin: options.codex_bin.clone(),
                 machine_global: options.machine_global.clone(),
+                review_policy_file: None,
             },
             None,
             workspace_overrides_for_repo(&spec),
@@ -3130,6 +3317,7 @@ fn scan_workspace_specs(
                 permission_mode: Some(spec.permission_mode),
                 max_items: None,
                 action_policy_override: None,
+                review_policy_file: None,
             },
             workspace_overrides_for_repo(spec),
         );
@@ -3600,6 +3788,7 @@ struct InboxItemRunContext<'a> {
     run_dir: &'a Path,
     run_id: &'a RunId,
     config: &'a InboxConfig,
+    review_policy: Option<&'a BoundReviewPolicy>,
     action_policy: InboxActionPolicy,
     permission_mode: InboxPermissionMode,
     codex_bin: Option<PathBuf>,
@@ -3644,7 +3833,11 @@ fn run_inbox_item(
         revalidate_inbox_item_source(repo, item)
             .context("inbox source changed before item processing started")?;
     }
-    let review_observation = review_loop_entry::evaluate_inbox_item_review_loop_in_repo(repo, item);
+    let review_observation = review_loop_entry::evaluate_inbox_item_review_loop_in_repo(
+        repo,
+        item,
+        context.review_policy,
+    )?;
     if let Some(observation) = &review_observation {
         write_private_artifact_json(
             writer,
@@ -3656,6 +3849,13 @@ fn run_inbox_item(
                 writer,
                 format!("item-{item_index}-review-snapshot.json"),
                 snapshot,
+            )?;
+        }
+        if let Some(state) = &observation.state {
+            write_private_artifact_json(
+                writer,
+                format!("item-{item_index}-review-state.json"),
+                state,
             )?;
         }
         if let Some(thread) = &observation.item_thread {
@@ -7216,6 +7416,7 @@ mod pr_intake_always_on_audit_tests {
             run_dir: &run_dir,
             run_id: &run_id,
             config: &config,
+            review_policy: None,
             action_policy: InboxActionPolicy::Fake,
             permission_mode: InboxPermissionMode::Fake,
             codex_bin: Some(PathBuf::from("/fake/codex")),
@@ -7346,6 +7547,7 @@ mod pr_intake_always_on_audit_tests {
             run_dir: &run_dir,
             run_id: &run_id,
             config: &config,
+            review_policy: None,
             action_policy: InboxActionPolicy::DryRun,
             permission_mode: InboxPermissionMode::Fake,
             codex_bin: Some(PathBuf::from("/must-not-run/codex")),
@@ -7430,6 +7632,7 @@ mod pr_intake_always_on_audit_tests {
             run_dir: &run_dir,
             run_id: &run_id,
             config: &config,
+            review_policy: None,
             action_policy: InboxActionPolicy::Github,
             permission_mode: InboxPermissionMode::GithubFull,
             codex_bin: Some(PathBuf::from("codex")),
@@ -7500,6 +7703,7 @@ mod pr_intake_always_on_audit_tests {
             run_dir: &run_dir,
             run_id: &run_id,
             config: &config,
+            review_policy: None,
             action_policy: InboxActionPolicy::Github,
             permission_mode: InboxPermissionMode::GithubFull,
             codex_bin: Some(PathBuf::from("codex")),
@@ -7556,6 +7760,7 @@ mod pr_intake_always_on_audit_tests {
             run_dir: &run_dir,
             run_id: &run_id,
             config: &config,
+            review_policy: None,
             action_policy: InboxActionPolicy::Fake,
             permission_mode: InboxPermissionMode::Fake,
             codex_bin: Some(PathBuf::from("/must-not-run/codex")),
@@ -7686,6 +7891,7 @@ mod pr_intake_always_on_audit_tests {
             run_dir: &run_dir,
             run_id: &run_id,
             config: &config,
+            review_policy: None,
             action_policy: InboxActionPolicy::Github,
             permission_mode: InboxPermissionMode::GithubFull,
             codex_bin: Some(PathBuf::from("codex")),
@@ -8343,6 +8549,7 @@ mod pr_intake_observation_seam_tests {
             max_items: None,
             codex_bin: None,
             machine_global: None,
+            review_policy_file: None,
         };
         (temp, options)
     }
@@ -8767,6 +8974,7 @@ mod github_watch_pr_producer_tests {
             max_items: Some(DEFAULT_MAX_ITEMS),
             codex_bin: None,
             machine_global: None,
+            review_policy_file: None,
         };
         let fixed_scan_items = vec![
             test_pr_item(1, false),
@@ -8814,6 +9022,7 @@ mod github_watch_pr_producer_tests {
                     };
                 run_inbox_with_overrides(options, None, overrides, Some(&mut before_auditor_launch))
             },
+            None,
         )
         .expect("watch iteration");
 
@@ -8892,6 +9101,7 @@ mod github_watch_pr_producer_tests {
             max_items: Some(1),
             codex_bin: None,
             machine_global: None,
+            review_policy_file: None,
         })
         .expect("fake watch once");
 
@@ -8933,6 +9143,7 @@ mod github_watch_pr_producer_tests {
                 max_items: Some(1),
                 codex_bin: None,
                 machine_global: None,
+                review_policy_file: None,
             },
             None,
             InboxConfigOverrides {
