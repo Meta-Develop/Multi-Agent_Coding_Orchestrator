@@ -6,6 +6,7 @@ use self::forge_transport::{
     ForgeCheckConclusion, ForgeCheckStatus, ForgeItem, ForgeItemKind, ForgeRepository, ForgeReview,
     ForgeReviewState, ForgeTimestamp, ProviderObjectId, ProviderObjectKind,
     PullRequestAuditorEvidence, PullRequestFreshnessEvidence, PullRequestFreshnessStatus,
+    PullRequestMergeAtomicAxis, PullRequestMergeAtomicBinding, PullRequestMergeAtomicSupport,
     PullRequestMergeAuthorityBlocker, PullRequestMergeAuthorityDecision,
     PullRequestMergeAuthorityInput, PullRequestMergeEffect, PullRequestMergeReceipt,
     PullRequestMergeSimulationEvidence, PullRequestMergeTransport, PullRequestReviewSnapshot,
@@ -795,6 +796,10 @@ pub enum AuthenticatedPullRequestMergeBlocker {
         expected_actor_id: String,
         observed_actor_id: String,
     },
+    ProviderAtomicPreconditionUnsupported {
+        supported_axes: Vec<PullRequestMergeAtomicAxis>,
+        unsupported_required_axes: Vec<PullRequestMergeAtomicAxis>,
+    },
     Authority(PullRequestMergeAuthorityBlocker),
 }
 
@@ -1016,6 +1021,19 @@ fn execute_authenticated_pull_request_merge_with_wal(
                     PullRequestMergePreflight::Blocked(outcome) => return Ok(*outcome),
                 };
             let effect = pull_request_merge_effect(effect_id, plan_digest, evidence, &authorized)?;
+            let support = transport.pull_request_merge_atomic_support();
+            let unsupported_required_axes = support.unsupported_required_axes();
+            if !unsupported_required_axes.is_empty() {
+                return Ok(AuthenticatedPullRequestMergeOutcome::NotMerged {
+                    blockers: vec![
+                        AuthenticatedPullRequestMergeBlocker::ProviderAtomicPreconditionUnsupported {
+                            supported_axes: support.supported_axes(),
+                            unsupported_required_axes,
+                        },
+                    ],
+                    authority: Some(authorized.authority),
+                });
+            }
             let started = AuthenticatedPullRequestMergeRecord {
                 version: AUTHENTICATED_PR_MERGE_VERSION,
                 plan_digest: plan_digest.to_string(),
@@ -1223,6 +1241,7 @@ fn pull_request_merge_effect(
         format!("sha256:{plan_digest}"),
         format!("sha256:{ground_truth_digest}"),
         evidence.completion_mode,
+        PullRequestMergeAtomicBinding::from_snapshot(&authorized.snapshot),
     )
 }
 
@@ -1791,6 +1810,14 @@ impl GithubPullRequestMergeTransport {
         })
     }
 
+    /// Static GitHub merge-mutation capability. The compare-and-swap body binds
+    /// HEAD only; review, thread, and required-check sets cannot join that
+    /// mutation. This method performs no I/O.
+    fn pull_request_merge_atomic_support(&self) -> PullRequestMergeAtomicSupport {
+        let _host = self.repository.host.as_str();
+        PullRequestMergeAtomicSupport::github_head_oid_only()
+    }
+
     fn json(&self, label: &str, operation: AuthenticatedGithubOperation) -> Result<String> {
         let context = GhCommandContext::create(&self.repo, &self.repository)?;
         let output = context.run_authenticated_pull_request_operation(label, operation)?;
@@ -2298,6 +2325,10 @@ impl GithubPullRequestMergeTransport {
 }
 
 impl PullRequestMergeTransport for GithubPullRequestMergeTransport {
+    fn pull_request_merge_atomic_support(&self) -> PullRequestMergeAtomicSupport {
+        GithubPullRequestMergeTransport::pull_request_merge_atomic_support(self)
+    }
+
     fn observe_pull_request_for_merge(
         &self,
         candidate: &ForgeItem,
