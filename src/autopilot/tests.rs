@@ -1822,6 +1822,21 @@ fn bound_inbox_pr_gate_refuses_generated_follow_up_in_same_cascade() {
         .peel_to_commit()
         .expect("source commit")
         .id();
+    let source_guard = publication::ExternalSourceGuard::new(
+        "github",
+        "github.com",
+        "github.com/acme/repo",
+        publication::external_source_repository_identity(7, 11),
+        publication::ExternalSourceObjectKind::PullRequest,
+        7,
+        "2026-09-14T00:00:00Z",
+        "OPEN",
+        Some(expected_head.to_string()),
+        Some(expected_head.to_string()),
+        "1".repeat(64),
+        "2".repeat(64),
+    )
+    .expect("test source guard");
     let source_dispatch_started = AtomicBool::new(false);
     let cancellation_observed = AtomicBool::new(false);
     let source_child_dispatches = Arc::new(AtomicUsize::new(0));
@@ -1837,12 +1852,14 @@ fn bound_inbox_pr_gate_refuses_generated_follow_up_in_same_cascade() {
             .iter()
             .flat_map(|assignment| assignment.assigned_paths.iter().cloned())
             .collect::<Vec<_>>();
-        bound_inbox_pr_source_gate(
+        bound_inbox_pr_source_gate_with(
             repo,
             &outer_run_id,
             Some(expected_head),
+            Some(&source_guard),
             source_dispatch_started.load(Ordering::SeqCst),
             &paths,
+            |_, _| Ok(()),
         )
     };
     let cascade = supervise::run_supervisor_plan_file_cascade_with_runner_and_gate_for_autopilot(
@@ -1891,6 +1908,115 @@ fn bound_inbox_pr_gate_refuses_generated_follow_up_in_same_cascade() {
             .as_ref()
             .expect("authenticated refused follow-up queue"),
     );
+}
+
+#[test]
+fn bound_inbox_pr_gate_accepts_local_b_when_primary_is_a_and_refuses_missing_b() {
+    let temp = tempfile::tempdir().expect("source gate tempdir");
+    let repo_path = temp.path().join("repo");
+    let repo = git2::Repository::init(&repo_path).expect("initialize source gate repo");
+    fs::write(repo_path.join("README.md"), "primary A\n").expect("write primary A");
+    let mut index = repo.index().expect("primary index");
+    index
+        .add_path(Path::new("README.md"))
+        .expect("stage primary A");
+    index.write().expect("write primary index");
+    let tree = repo
+        .find_tree(index.write_tree().expect("primary tree"))
+        .unwrap();
+    let signature =
+        git2::Signature::now("maco test", "maco-test@example.invalid").expect("fixture signature");
+    let primary_a = repo
+        .commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "primary A",
+            &tree,
+            &[],
+        )
+        .expect("commit primary A");
+    let parent = repo.find_commit(primary_a).expect("primary parent");
+    let mut builder = repo.treebuilder(Some(&tree)).expect("source tree builder");
+    let source_blob = repo.blob(b"original PR change\n").expect("source blob");
+    builder.insert("PR_ONLY.md", source_blob, 0o100644).unwrap();
+    let source_tree = repo
+        .find_tree(builder.write().expect("source tree"))
+        .unwrap();
+    let source_b = repo
+        .commit(
+            None,
+            &signature,
+            &signature,
+            "source PR B",
+            &source_tree,
+            &[&parent],
+        )
+        .expect("create B without moving A");
+    let guard = publication::ExternalSourceGuard::new(
+        "github",
+        "github.com",
+        "github.com/acme/repo",
+        publication::external_source_repository_identity(7, 11),
+        publication::ExternalSourceObjectKind::PullRequest,
+        7,
+        "2026-09-14T00:00:00Z",
+        "OPEN",
+        Some(source_b.to_string()),
+        Some(primary_a.to_string()),
+        "1".repeat(64),
+        "2".repeat(64),
+    )
+    .expect("bound source guard");
+    let run_id = RunId::new("source-rooted-gate").expect("gate run id");
+    let paths = [PathBuf::from("README.md")];
+    let revalidations = Cell::new(0usize);
+    let source_head_text = source_b.to_string();
+    let revalidate = |_: &Path, source: &publication::ExternalSourceGuard| {
+        assert_eq!(source.head_oid.as_deref(), Some(source_head_text.as_str()));
+        revalidations.set(revalidations.get() + 1);
+        Ok(())
+    };
+    assert!(bound_inbox_pr_source_gate_with(
+        &repo_path,
+        &run_id,
+        Some(source_b),
+        Some(&guard),
+        false,
+        &paths,
+        revalidate,
+    )
+    .expect("B source gate")
+    .is_none());
+    assert_eq!(repo.head().unwrap().target(), Some(primary_a));
+    assert_eq!(revalidations.get(), 1);
+
+    let missing =
+        git2::Oid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").expect("missing B OID");
+    let denial = bound_inbox_pr_source_gate_with(
+        &repo_path,
+        &run_id,
+        Some(missing),
+        Some(&guard),
+        false,
+        &paths,
+        |_, _| Ok(()),
+    )
+    .expect("missing B gate")
+    .expect("missing B denial");
+    assert_eq!(denial.context.owner, "source_head_not_execution_base");
+    let denial = bound_inbox_pr_source_gate_with(
+        &repo_path,
+        &run_id,
+        Some(source_b),
+        None,
+        true,
+        &paths,
+        |_, _| panic!("generated follow-up must not gain source authority"),
+    )
+    .expect("follow-up gate")
+    .expect("follow-up denial");
+    assert_eq!(denial.context.owner, "source_head_follow_up_unbound");
 }
 
 #[test]

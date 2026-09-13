@@ -5,7 +5,11 @@ use super::*;
 #[test]
 fn authenticated_source_head_binds_real_child_base_at_admission() {
     skip_without_containment!();
-    for scenario in ["different_primary", "equal_head", "changed_after_gate"] {
+    for scenario in [
+        "different_primary",
+        "equal_head",
+        "primary_moves_before_admission",
+    ] {
         let (temp, repo) = injected_repository();
         let primary_a = current_head_oid(&repo).expect("initial primary head");
         fs::write(repo.join("README.md"), "authenticated PR head B\n")
@@ -42,12 +46,16 @@ fn authenticated_source_head_binds_real_child_base_at_admission() {
         };
         let source_dispatch_started = AtomicBool::new(false);
         let cancellation_observed = AtomicBool::new(false);
+        let primary_at_admission = std::cell::Cell::new(None);
         let mut before_dispatch = |_plan: &SupervisorPlan| {
-            if scenario == "changed_after_gate" {
+            if scenario == "primary_moves_before_admission" {
                 fs::write(repo.join("README.md"), "primary head C\n")
                     .expect("write concurrent primary change");
                 commit_injected_repository(&repo, "primary head C after admission");
             }
+            primary_at_admission.set(Some(
+                current_head_oid(&repo).expect("admitted primary HEAD"),
+            ));
             Ok(None)
         };
         let mut invocations = 0_usize;
@@ -90,31 +98,28 @@ fn authenticated_source_head_binds_real_child_base_at_admission() {
             &mut runner,
         )
         .expect("finalize bound source supervisor run");
-        if scenario == "equal_head" {
-            assert!(
-                invocations > 0,
-                "equal source/base must reach supervised runner"
+        assert!(
+            invocations > 0,
+            "authenticated source B must reach supervised runner for {scenario}"
+        );
+        assert!(cascade
+            .source_report
+            .gate_denials
+            .iter()
+            .all(|denial| denial.context.owner != "source_head_not_execution_base"));
+        assert_eq!(
+            current_head_oid(&repo).expect("primary after source-rooted dispatch"),
+            primary_at_admission
+                .get()
+                .expect("captured admitted primary"),
+            "source-rooted dispatch must preserve the admitted primary for {scenario}"
+        );
+        if scenario == "different_primary" {
+            assert_eq!(
+                primary_at_admission.get(),
+                Some(primary_a),
+                "A and B differ at supervisor admission"
             );
-            assert!(cascade
-                .source_report
-                .gate_denials
-                .iter()
-                .all(|denial| denial.context.owner != "source_head_not_execution_base"));
-        } else {
-            assert_eq!(invocations, 0, "{scenario} dispatched a model");
-            assert!(!cascade.source_report.success);
-            assert!(cascade.source_report.commands_run.is_empty());
-            assert!(cascade.source_report.gate_denials.iter().any(|denial| {
-                denial.context.owner == "source_head_not_execution_base"
-                    && denial.context.source == GateCheckSource::ValidationBinding
-                    && matches!(
-                        denial.reason,
-                        GateDenialReason::MergeRemediation {
-                            blocker: GateApplyBlocker::StaleBase
-                        }
-                    )
-            }));
-            assert!(!cascade.generated_follow_up_dispatch_performed());
         }
     }
 }

@@ -1003,7 +1003,7 @@ fn supervisor_injects_binding_from_stable_candidate_and_detects_later_bytes() {
         .acquire_write_execution_lease(&assignment.id)
         .expect("acquire supervisor candidate lease");
     let before =
-        bind_supervisor_decomposition_candidate(&repo_path, &assignment, &mut child, &lease)
+        bind_supervisor_decomposition_candidate(&repo_path, &assignment, &mut child, &lease, None)
             .expect("bind supervisor candidate")
             .expect("typed decomposition inspection");
     assert_eq!(
@@ -1020,7 +1020,7 @@ fn supervisor_injects_binding_from_stable_candidate_and_detects_later_bytes() {
 
     fs::write(agent.path.join("src/readme_part.md"), "substituted\n")
         .expect("substitute inspected replacement bytes");
-    let after = inspect_supervisor_candidate(&repo_path, &assignment, &lease)
+    let after = inspect_supervisor_candidate(&repo_path, &assignment, &lease, None)
         .expect("recapture substituted candidate");
     assert_eq!(after.changed_paths, before.changed_paths);
     assert_ne!(after.binding, before.binding);

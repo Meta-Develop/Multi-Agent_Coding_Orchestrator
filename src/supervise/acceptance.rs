@@ -1102,7 +1102,32 @@ pub(super) fn inspect_supervisor_candidate(
     repo: &Path,
     assignment: &OrchestratorAssignment,
     worktree_write_lease: &ManagedWorktreeWriteLease,
+    source_base: Option<Oid>,
 ) -> Result<SupervisorCandidateInspection> {
+    if let Some(base) = source_base {
+        // This is source-bound supervisor evidence over B -> C, never an
+        // ordinary merge candidate or permission to apply against primary A.
+        let candidate = crate::merge::capture_exact_base_worktree_with_write_lease(
+            repo,
+            &assignment.id,
+            &assignment.assigned_paths,
+            worktree_write_lease,
+            base,
+        )?;
+        let binding = CandidateValidationBinding {
+            version: VALIDATION_BINDING_VERSION,
+            agent_id: assignment.id.clone(),
+            primary_head: Some(candidate.primary_head.to_string()),
+            agent_head: Some(candidate.agent_head.to_string()),
+            merge_base: candidate.merge_base.map(|oid| oid.to_string()),
+            diff_oid: Oid::hash_object(ObjectType::Blob, &candidate.raw_diff)?.to_string(),
+        }
+        .canonicalized()?;
+        return Ok(SupervisorCandidateInspection {
+            binding,
+            changed_paths: normalize_paths(candidate.changed_paths)?,
+        });
+    }
     let candidate = collect_agent_result_with_evidence_and_write_lease(
         MergeCollectOptions {
             repo: repo.to_path_buf(),
@@ -1159,6 +1184,7 @@ pub(super) fn bind_supervisor_decomposition_candidate(
     assignment: &OrchestratorAssignment,
     report: &mut OrchestratorReviewReport,
     worktree_write_lease: &ManagedWorktreeWriteLease,
+    source_base: Option<Oid>,
 ) -> Result<Option<SupervisorCandidateInspection>> {
     if report_failed(report) || report.decomposition_completions.is_empty() {
         return Ok(None);
@@ -1179,7 +1205,8 @@ pub(super) fn bind_supervisor_decomposition_candidate(
         );
     }
 
-    let inspection = inspect_supervisor_candidate(repo, assignment, worktree_write_lease)?;
+    let inspection =
+        inspect_supervisor_candidate(repo, assignment, worktree_write_lease, source_base)?;
     let report_paths =
         normalize_paths(report.files_changed.clone()).context("child files_changed invalid")?;
     if inspection.changed_paths != report_paths {

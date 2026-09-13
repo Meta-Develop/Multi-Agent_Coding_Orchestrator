@@ -1402,20 +1402,46 @@ fn bound_inbox_pr_source_gate(
     repo: &Path,
     run_id: &RunId,
     expected_source_head: Option<Oid>,
+    source: Option<&publication::ExternalSourceGuard>,
     source_dispatch_started: bool,
     effective_paths: &[PathBuf],
 ) -> Result<Option<GateDenial>> {
+    bound_inbox_pr_source_gate_with(
+        repo,
+        run_id,
+        expected_source_head,
+        source,
+        source_dispatch_started,
+        effective_paths,
+        publication::revalidate_same_repository_pr_source,
+    )
+}
+
+fn bound_inbox_pr_source_gate_with<R>(
+    repo: &Path,
+    run_id: &RunId,
+    expected_source_head: Option<Oid>,
+    source: Option<&publication::ExternalSourceGuard>,
+    source_dispatch_started: bool,
+    effective_paths: &[PathBuf],
+    mut revalidate: R,
+) -> Result<Option<GateDenial>>
+where
+    R: FnMut(&Path, &publication::ExternalSourceGuard) -> Result<()>,
+{
     let Some(expected) = expected_source_head else {
         return Ok(None);
     };
     let owner = if source_dispatch_started {
         "source_head_follow_up_unbound"
     } else {
-        let observed = crate::git_repository::open(repo)?
-            .head()?
-            .peel_to_commit()?
-            .id();
-        if observed == expected {
+        let source = source.context("bound Inbox PR repair omitted its source guard")?;
+        revalidate(repo, source)
+            .context("bound Inbox PR source changed before supervisor admission")?;
+        if crate::git_repository::open(repo)?
+            .find_commit(expected)
+            .is_ok()
+        {
             return Ok(None);
         }
         "source_head_not_execution_base"
@@ -1849,6 +1875,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                 &repo,
                 &options.run_id,
                 expected_source_head,
+                plan.external_source.as_ref(),
                 source_dispatch_started.load(Ordering::SeqCst),
                 &effective_paths,
             )? {
@@ -2079,7 +2106,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                 } else if admission_refused_before_source_dispatch {
                     "review the configured child-dispatch maximum and start a new run with an adequate bound; no supervisor dispatch was attempted"
                 } else if source_base_refused_before_source_dispatch {
-                    "source_head_not_execution_base: authenticated PR head differs from the primary execution base; no model dispatch or publication was attempted"
+                    "source_head_not_execution_base: the authenticated PR head was unavailable as the supervised execution base; no model dispatch or publication was attempted"
                 } else if profile_refused_before_source_dispatch {
                     "correct the requested/effective profile mismatch; no supervisor, publication, merge, or follow-up dispatch was attempted"
                 } else if generated_follow_up_dispatch_performed {

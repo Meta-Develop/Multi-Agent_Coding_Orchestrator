@@ -3959,9 +3959,22 @@ fn run_inbox_item(
         });
     }
 
-    revalidate_inbox_item_source(repo, item)
-        .context("inbox source changed immediately before local work started")?;
     let expected_source_head = inbox_pr_repair_execution_head(item, context.codex_bin.is_some())?;
+    if let Some(expected) = expected_source_head {
+        let prepared = prepare_github_pr_repair_source_with(
+            repo,
+            item,
+            materialize_trusted_github_pull_request_objects,
+            revalidate_github_pr_repair_source,
+        )
+        .context("authenticated PR repair source could not be prepared")?;
+        if prepared != expected {
+            bail!("prepared PR repair head differs from the parent-owned source binding");
+        }
+    } else {
+        revalidate_inbox_item_source(repo, item)
+            .context("inbox source changed immediately before local work started")?;
+    }
     match repair_attempts::reserve_if_applicable(
         repo,
         item,
@@ -4767,6 +4780,47 @@ where
     verify_local_independent_audit_candidate(repo_path, task)
 }
 
+fn revalidate_github_pr_repair_source(repo: &Path, item: &InboxItem) -> Result<()> {
+    let guard = item
+        .source_snapshot
+        .external_source_guard()?
+        .context("GitHub PR repair omitted its authenticated source guard")?;
+    publication::revalidate_same_repository_pr_source(repo, &guard)
+}
+
+fn prepare_github_pr_repair_source_with<M, R>(
+    repo_path: &Path,
+    item: &InboxItem,
+    mut materialize: M,
+    mut revalidate: R,
+) -> Result<Oid>
+where
+    M: FnMut(&Path, &TrustedGithubPullRequestObjectRequest) -> Result<()>,
+    R: FnMut(&Path, &InboxItem) -> Result<()>,
+{
+    let request = trusted_github_pull_request_source_object_request(repo_path, item)?;
+    revalidate(repo_path, item)
+        .context("GitHub PR repair source changed before object preparation")?;
+    let repository = crate::git_repository::open(repo_path)?;
+    let has_exact_commits = repository.find_commit(request.expected_base_oid).is_ok()
+        && repository.find_commit(request.expected_head_oid).is_ok();
+    drop(repository);
+    if !has_exact_commits {
+        materialize(repo_path, &request)
+            .context("bounded exact pull-request object transport failed")?;
+        revalidate(repo_path, item)
+            .context("GitHub PR repair source changed during object preparation")?;
+    }
+    let repository = crate::git_repository::open(repo_path)?;
+    repository
+        .find_commit(request.expected_base_oid)
+        .context("PR repair omitted its exact base commit")?;
+    repository
+        .find_commit(request.expected_head_oid)
+        .context("PR repair omitted its exact head commit")?;
+    Ok(request.expected_head_oid)
+}
+
 fn trusted_github_pull_request_object_request(
     repo_path: &Path,
     item: &InboxItem,
@@ -4803,6 +4857,29 @@ fn trusted_github_pull_request_object_request(
             "pull-request object materialization requires a trusted non-draft same-repository head"
         );
     }
+    trusted_github_pull_request_source_object_request(repo_path, item)
+}
+
+fn trusted_github_pull_request_source_object_request(
+    repo_path: &Path,
+    item: &InboxItem,
+) -> Result<TrustedGithubPullRequestObjectRequest> {
+    item.source_snapshot.validate()?;
+    if item.kind != InboxItemKind::PullRequest
+        || item.source_snapshot.kind() != InboxItemKind::PullRequest
+        || item.source_snapshot.provider() != InboxSourceProvider::Github
+    {
+        bail!("exact pull-request object materialization requires a GitHub PR snapshot");
+    }
+    let pull_request = item
+        .pull_request
+        .as_ref()
+        .context("GitHub PR snapshot omitted its pull-request candidate")?;
+    if pull_request.number != item.source_snapshot.number()
+        || pull_request.source_trust != GithubPrSourceTrust::TrustedTargetRepository
+    {
+        bail!("PR repair source is not a trusted same-repository head");
+    }
     let target_owner_name = item
         .source_snapshot
         .repository_selector()
@@ -4822,13 +4899,17 @@ fn trusted_github_pull_request_object_request(
         .as_deref()
         .context("GitHub PR snapshot omitted its base branch")?;
     validate_github_materialization_branch(base_ref)?;
-    let expected_head_oid =
-        Oid::from_str(&task.head_oid).context("parse source-bound pull-request head OID")?;
-    let expected_base_oid =
-        Oid::from_str(&task.base_oid).context("parse source-bound pull-request base OID")?;
-    if expected_head_oid.to_string() != task.head_oid
-        || expected_base_oid.to_string() != task.base_oid
-    {
+    let head_oid = item
+        .source_snapshot
+        .head_oid()
+        .context("authenticated PR source omitted its head OID")?;
+    let base_oid = item
+        .source_snapshot
+        .base_oid()
+        .context("authenticated PR source omitted its base OID")?;
+    let expected_head_oid = Oid::from_str(head_oid).context("parse source-bound PR head OID")?;
+    let expected_base_oid = Oid::from_str(base_oid).context("parse source-bound PR base OID")?;
+    if expected_head_oid.to_string() != head_oid || expected_base_oid.to_string() != base_oid {
         bail!("source-bound pull-request OIDs were not canonical SHA-1 identities");
     }
 
@@ -8564,6 +8645,95 @@ mod pr_intake_always_on_audit_tests {
         .expect("valid exact materialized objects");
         assert!(transported.get());
         assert!(revalidated.get());
+    }
+
+    #[test]
+    fn github_pr_repair_fetches_missing_exact_head_before_attempt_and_revalidates() {
+        let source_temp = tempfile::TempDir::new().expect("source tempdir");
+        let source_path = source_temp.path().join("source");
+        crate::worktree::WorktreeManager::init_repository(&source_path, "main")
+            .expect("initialize source repository");
+        let (base, head) = create_materialization_test_commits(&source_path);
+        let source = Repository::open(&source_path).expect("open source repository");
+
+        let target_temp = tempfile::TempDir::new().expect("target tempdir");
+        let target_path = target_temp.path().join("target");
+        crate::worktree::WorktreeManager::init_repository(&target_path, "main")
+            .expect("initialize target repository");
+        let target = Repository::open(&target_path).expect("open target repository");
+        let (item, _) = github_materialization_test_item(&target_path, base, head);
+        let observations = std::cell::Cell::new(0usize);
+        let fetched = std::cell::Cell::new(false);
+        let prepared = prepare_github_pr_repair_source_with(
+            &target_path,
+            &item,
+            |_, request| {
+                assert_eq!(observations.get(), 1, "fresh source precedes transport");
+                assert_eq!(request.expected_head_oid, head);
+                assert_eq!(request.expected_base_oid, base);
+                assert_eq!(request.head_remote_ref, "refs/pull/909/head");
+                copy_pull_request_object_closure(&source, &target, base, head)?;
+                fetched.set(true);
+                Ok(())
+            },
+            |_, _| {
+                observations.set(observations.get() + 1);
+                Ok(())
+            },
+        )
+        .expect("source-rooted repair preparation");
+        assert_eq!(prepared, head);
+        assert!(fetched.get());
+        assert_eq!(observations.get(), 2, "source revalidated after transport");
+        assert!(target.find_commit(base).is_ok());
+        assert!(target.find_commit(head).is_ok());
+    }
+
+    #[test]
+    fn github_pr_repair_existing_objects_still_require_trusted_current_source() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        crate::worktree::WorktreeManager::init_repository(&repo, "main")
+            .expect("initialize repository");
+        let (base, head) = create_materialization_test_commits(&repo);
+        let (item, _) = github_materialization_test_item(&repo, base, head);
+        let observations = std::cell::Cell::new(0usize);
+        let prepared = prepare_github_pr_repair_source_with(
+            &repo,
+            &item,
+            |_, _| panic!("present commits must not trigger transport"),
+            |_, _| {
+                observations.set(observations.get() + 1);
+                Ok(())
+            },
+        )
+        .expect("present exact source");
+        assert_eq!(prepared, head);
+        assert_eq!(
+            observations.get(),
+            1,
+            "present commits still require fresh source"
+        );
+
+        let mut fork = item.clone();
+        fork.pull_request.as_mut().unwrap().source_trust = GithubPrSourceTrust::Fork;
+        let error = prepare_github_pr_repair_source_with(
+            &repo,
+            &fork,
+            |_, _| panic!("fork must not fetch"),
+            |_, _| panic!("fork must refuse before provider observation"),
+        )
+        .expect_err("fork candidate must refuse even with present objects");
+        assert!(error.to_string().contains("trusted same-repository"));
+
+        let error = prepare_github_pr_repair_source_with(
+            &repo,
+            &item,
+            |_, _| panic!("present commits must not fetch"),
+            |_, _| bail!("provider PR source moved"),
+        )
+        .expect_err("moved source refuses despite present objects");
+        assert!(format!("{error:#}").contains("provider PR source moved"));
     }
 
     #[test]

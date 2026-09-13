@@ -624,6 +624,8 @@ fn external_source_guard_separates_full_freshness_from_action_revision_and_accep
         &original,
     )
     .expect("original guard");
+    require_same_repository_pr_observation(&original, "acme/repo")
+        .expect("same-repository source evidence");
     let mut volatile = original.clone();
     volatile["updatedAt"] = serde_json::json!("2026-07-13T00:01:00Z");
     volatile["statusCheckRollup"] = serde_json::json!([{"name": "maco", "status": "SUCCESS"}]);
@@ -657,6 +659,15 @@ fn external_source_guard_separates_full_freshness_from_action_revision_and_accep
         expected.action_revision_digest,
         forked_guard.action_revision_digest
     );
+    assert!(require_same_repository_pr_observation(&forked, "acme/repo").is_err());
+    let mut candidate_claimed_trusted = forked.clone();
+    candidate_claimed_trusted["headRepository"] = serde_json::json!({"nameWithOwner": "acme/repo"});
+    assert!(
+        require_same_repository_pr_observation(&candidate_claimed_trusted, "acme/repo").is_err()
+    );
+    let mut unbound_head = original.clone();
+    unbound_head["headRepository"] = serde_json::json!({"nameWithOwner": "other/repo"});
+    assert!(require_same_repository_pr_observation(&unbound_head, "acme/repo").is_err());
 
     let mut changed = volatile;
     changed["title"] = serde_json::json!("changed title");

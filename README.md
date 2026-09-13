@@ -3931,6 +3931,15 @@ spent; exhaustion refuses new repair dispatch before model budget reservation.
 These slots do not establish that feedback was addressed, grant readiness, or
 authorize a comment, publication, or merge. Fake, issue, and no-policy paths
 retain their existing behavior.
+For a trusted same-repository GitHub PR, repair starts its isolated managed
+child at the authenticated PR head even when the primary checkout has a
+different HEAD. Missing exact PR commits use the existing bounded, fixed-ref
+object transport and a fresh source check. The primary checkout stays at its
+own HEAD; repair candidate evidence and any verified child commit cover only
+changes after the PR head. A fork or source drift detected by those checks
+refuses model dispatch.
+This repair path still does not update the original PR branch or grant comment
+or merge permission.
 
 `maco-inbox.json` is optional. Without it, `maco inbox scan` uses deterministic
 fake local data: one safe issue candidate, one PR candidate with requested review
