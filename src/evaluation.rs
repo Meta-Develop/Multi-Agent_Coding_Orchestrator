@@ -3720,7 +3720,15 @@ impl fmt::Display for EvaluationEvidenceKind {
     }
 }
 
+mod executed_experiment;
 mod experiment;
+pub use crate::merge::held_out::{CommandObservation, CommandObservationStatus};
+pub use crate::supervise::held_out::{
+    HeldOutCandidateEvidence, HeldOutCommandEvidence, HeldOutRunBinding,
+};
+pub use executed_experiment::{
+    run_experiment_with_held_out, ExecutedExperimentResults, ObservedExperimentRun,
+};
 pub mod rescore;
 pub use experiment::{
     parse_experiment_manifest, run_fake_supervise_experiment, ExperimentEvidence,
