@@ -924,6 +924,7 @@ pub(super) fn initialize_supervisor_selection_with_history(
             )
         })?;
         decision.outcome_history = history.map(|snapshot| snapshot.provenance.clone());
+        decision.operator_prior_data = super::prior_input::current_provenance();
         let primary_cause = if configured.is_some() {
             SupervisorSelectionEventCause::DebugOverride
         } else {
@@ -1269,6 +1270,7 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
             )
         })?;
         decision.outcome_history = previous.outcome_history.clone();
+        decision.operator_prior_data = previous.operator_prior_data.clone();
         let choice = match executable_choice(&decision, runtime, role)? {
             ExecutableChoiceResolution::Executable(choice) => choice,
             ExecutableChoiceResolution::PreflightFailure(failure) => {
@@ -1456,7 +1458,15 @@ fn select_with_live_switch_cost(
     Ok(provenance)
 }
 
-fn selector_priors_with_terminal_worker_economics() -> Result<selection::PriorDataset> {
+pub(super) fn selector_priors_with_terminal_worker_economics() -> Result<selection::PriorDataset> {
+    if let Some(priors) = super::prior_input::current_priors() {
+        return Ok(priors);
+    }
+    base_selector_priors_with_terminal_worker_economics()
+}
+
+pub(super) fn base_selector_priors_with_terminal_worker_economics(
+) -> Result<selection::PriorDataset> {
     let mut priors = selection::built_in_prior_dataset()?;
     #[cfg(test)]
     if TEST_SELECTOR_TRIPLE_RUNNER_UP_ENABLED.with(Cell::get) {
@@ -1989,7 +1999,7 @@ fn catalog_model_from_prior(
     })
 }
 
-fn runtime_catalog_from_priors(
+pub(super) fn runtime_catalog_from_priors(
     runtime_name: &str,
     catalog: &RuntimeModelCatalog,
     task: &TaskProfile,

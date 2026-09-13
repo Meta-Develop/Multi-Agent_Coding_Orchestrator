@@ -281,7 +281,9 @@ mod selection_bridge;
 use selection_bridge::*;
 
 mod outcome_history;
+mod prior_input;
 use outcome_history::*;
+pub use prior_input::{bind_frozen_operator_prior_data_for_run, bind_operator_prior_data};
 
 mod messaging_bridge;
 
@@ -487,14 +489,20 @@ fn run_with_caller_process_cancellation<T>(
 
     thread::scope(|scope| {
         let (finished_sender, finished_receiver) = mpsc::channel::<()>();
-        scope.spawn(move || loop {
-            match finished_receiver.recv_timeout(Duration::from_millis(10)) {
-                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if observe_caller_cancellation(Some(caller_cancellation), cancellation_observed)
-                    {
-                        scheduler_cancellation.cancel();
-                        break;
+        let prior_binding = prior_input::captured_binding();
+        scope.spawn(move || {
+            let _prior_binding_guard = prior_input::install_captured(prior_binding);
+            loop {
+                match finished_receiver.recv_timeout(Duration::from_millis(10)) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if observe_caller_cancellation(
+                            Some(caller_cancellation),
+                            cancellation_observed,
+                        ) {
+                            scheduler_cancellation.cancel();
+                            break;
+                        }
                     }
                 }
             }

@@ -747,6 +747,11 @@ pub(crate) fn selection_provenance_schema_value() -> Value {
         "exclusions" => array(nonempty_string()),
         "projected_attempt_count" => nonnegative_integer(),
     );
+    schema["properties"]["operator_prior_data"] = strict_object!(
+        "relative_path" => nonempty_string(),
+        "raw_sha256" => json!({"type": "string", "pattern": "^[0-9a-f]{64}$"}),
+        "effective_sha256" => json!({"type": "string", "pattern": "^[0-9a-f]{64}$"}),
+    );
     schema
 }
 
@@ -766,7 +771,7 @@ pub(crate) fn selection_event_schema_value() -> Value {
 mod tests {
     use super::*;
 
-    fn assert_every_object_is_closed(schema: &Value) {
+    fn assert_every_object_is_closed(schema: &Value, path: &str) {
         match schema {
             Value::Object(object) => {
                 if object.get("type") == Some(&Value::String("object".to_string())) {
@@ -776,18 +781,27 @@ mod tests {
                     );
                     let properties = object["properties"].as_object().expect("object properties");
                     let required = object["required"].as_array().expect("object required");
-                    assert_eq!(required.len(), properties.len());
+                    let optional = if path == "$/properties/provenance" {
+                        &["outcome_history", "operator_prior_data"][..]
+                    } else {
+                        &[][..]
+                    };
+                    assert_eq!(required.len() + optional.len(), properties.len(), "{path}");
                     for field in properties.keys() {
-                        assert!(required.iter().any(|required| required == field));
+                        assert_eq!(
+                            required.iter().any(|required| required == field),
+                            !optional.contains(&field.as_str()),
+                            "{path}/{field}"
+                        );
                     }
                 }
-                for value in object.values() {
-                    assert_every_object_is_closed(value);
+                for (key, value) in object {
+                    assert_every_object_is_closed(value, &format!("{path}/{key}"));
                 }
             }
             Value::Array(values) => {
-                for value in values {
-                    assert_every_object_is_closed(value);
+                for (index, value) in values.iter().enumerate() {
+                    assert_every_object_is_closed(value, &format!("{path}/{index}"));
                 }
             }
             _ => {}
@@ -797,9 +811,16 @@ mod tests {
     #[test]
     fn event_and_every_nested_selector_object_are_closed_and_exhaustively_required() {
         let event = selection_event_schema_value();
-        assert_every_object_is_closed(&event);
+        assert_every_object_is_closed(&event, "$");
 
         let provenance = &event["properties"]["provenance"];
+        let required = provenance["required"]
+            .as_array()
+            .expect("provenance required");
+        for optional in ["outcome_history", "operator_prior_data"] {
+            assert!(provenance["properties"].get(optional).is_some());
+            assert!(!required.iter().any(|field| field == optional));
+        }
         assert_eq!(provenance["properties"]["schema_version"]["const"], 4);
         assert_eq!(
             provenance["properties"]["normalized_input"]["properties"]["priors"]["properties"]

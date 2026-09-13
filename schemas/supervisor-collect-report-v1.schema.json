@@ -16240,6 +16240,29 @@
                         ],
                         "type": "object"
                       },
+                      "operator_prior_data": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "effective_sha256": {
+                            "pattern": "^[0-9a-f]{64}$",
+                            "type": "string"
+                          },
+                          "raw_sha256": {
+                            "pattern": "^[0-9a-f]{64}$",
+                            "type": "string"
+                          },
+                          "relative_path": {
+                            "minLength": 1,
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "relative_path",
+                          "raw_sha256",
+                          "effective_sha256"
+                        ],
+                        "type": "object"
+                      },
                       "provided_switch_cost_evidence": {
                         "items": {
                           "additionalProperties": false,

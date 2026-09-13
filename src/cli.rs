@@ -1044,6 +1044,7 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     args.machine_global_runtime_root_id.clone(),
                 )?;
             let quota_config = args.quota_config.clone();
+            let prior_data = args.prior_data.clone();
             let rolling_quota = args.budget.rolling_quota();
             let budget_overrides = args.budget.limits();
             let budget_max_duration_seconds = args.budget.max_duration_seconds();
@@ -1142,6 +1143,18 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                 .as_deref()
                 .map(|path| supervise::bind_operator_quota_config(&resolved_repo, path))
                 .transpose()?;
+            let _prior_data_guard = if resume_existing {
+                supervise::bind_frozen_operator_prior_data_for_run(
+                    &resolved_repo,
+                    &resolved_run_id,
+                    prior_data.as_deref(),
+                )?
+            } else {
+                prior_data
+                    .as_deref()
+                    .map(|path| supervise::bind_operator_prior_data(&resolved_repo, path))
+                    .transpose()?
+            };
             let options = SupervisorRunOptions {
                 repo: resolved_repo,
                 plan_file,
@@ -1635,6 +1648,9 @@ struct RunSuperviseArgs {
     /// Repository-relative strict versioned quota entitlement config. No provider is probed.
     #[arg(long, value_name = "REPO_RELATIVE_FILE")]
     quota_config: Option<PathBuf>,
+    /// Repository-relative strict versioned operator prior/capability snapshot.
+    #[arg(long, value_name = "REPO_RELATIVE_FILE")]
+    prior_data: Option<PathBuf>,
     /// Explicit host memory available to supervised children, in MiB.
     #[arg(long, value_parser = parse_positive_usize)]
     host_memory_available_mib: Option<usize>,
