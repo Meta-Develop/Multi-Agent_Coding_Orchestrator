@@ -280,6 +280,9 @@ pub use scheduler::*;
 mod selection_bridge;
 use selection_bridge::*;
 
+mod outcome_history;
+use outcome_history::*;
+
 mod messaging_bridge;
 
 mod assignment_execution;

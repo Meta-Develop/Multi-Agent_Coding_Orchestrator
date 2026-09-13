@@ -265,6 +265,7 @@ pub fn select_with_switch_cost_estimates(
         debug_override,
         environment_fallback,
         quota,
+        outcome_history: None,
     })
 }
 

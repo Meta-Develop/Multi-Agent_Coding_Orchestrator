@@ -718,7 +718,7 @@ fn ranked_score() -> Value {
 }
 
 pub(crate) fn selection_provenance_schema_value() -> Value {
-    strict_object!(
+    let mut schema = strict_object!(
         "schema_version" => json!({"type": "integer", "const": 4}),
         "status" => enum_schema(&["selected", "fail_closed"]),
         "normalized_input" => selection_input(),
@@ -740,7 +740,14 @@ pub(crate) fn selection_provenance_schema_value() -> Value {
         "debug_override" => nullable(debug_override_provenance()),
         "environment_fallback" => nullable(environment_fallback_transition()),
         "quota" => nullable(quota_decision_provenance()),
-    )
+    );
+    schema["properties"]["outcome_history"] = strict_object!(
+        "snapshot_sha256" => nonempty_string(),
+        "source_digests" => array(nonempty_string()),
+        "exclusions" => array(nonempty_string()),
+        "projected_attempt_count" => nonnegative_integer(),
+    );
+    schema
 }
 
 pub(crate) fn selection_event_schema_value() -> Value {
@@ -759,7 +766,7 @@ pub(crate) fn selection_event_schema_value() -> Value {
 mod tests {
     use super::*;
 
-    fn assert_every_object_is_closed(schema: &Value) {
+    fn assert_every_object_is_closed(schema: &Value, path: &str) {
         match schema {
             Value::Object(object) => {
                 if object.get("type") == Some(&Value::String("object".to_string())) {
@@ -769,18 +776,31 @@ mod tests {
                     );
                     let properties = object["properties"].as_object().expect("object properties");
                     let required = object["required"].as_array().expect("object required");
-                    assert_eq!(required.len(), properties.len());
+                    let optional = if path == "$/properties/provenance" {
+                        Some("outcome_history")
+                    } else {
+                        None
+                    };
+                    assert_eq!(
+                        required.len() + usize::from(optional.is_some()),
+                        properties.len(),
+                        "{path}"
+                    );
                     for field in properties.keys() {
-                        assert!(required.iter().any(|required| required == field));
+                        assert_eq!(
+                            required.iter().any(|required| required == field),
+                            optional != Some(field.as_str()),
+                            "{path}/{field}"
+                        );
                     }
                 }
-                for value in object.values() {
-                    assert_every_object_is_closed(value);
+                for (key, value) in object {
+                    assert_every_object_is_closed(value, &format!("{path}/{key}"));
                 }
             }
             Value::Array(values) => {
-                for value in values {
-                    assert_every_object_is_closed(value);
+                for (index, value) in values.iter().enumerate() {
+                    assert_every_object_is_closed(value, &format!("{path}/{index}"));
                 }
             }
             _ => {}
@@ -790,9 +810,26 @@ mod tests {
     #[test]
     fn event_and_every_nested_selector_object_are_closed_and_exhaustively_required() {
         let event = selection_event_schema_value();
-        assert_every_object_is_closed(&event);
+        assert_every_object_is_closed(&event, "$");
 
         let provenance = &event["properties"]["provenance"];
+        let required = provenance["required"]
+            .as_array()
+            .expect("provenance required");
+        assert!(provenance["properties"].get("outcome_history").is_some());
+        assert!(!required.iter().any(|field| field == "outcome_history"));
+        let history = &provenance["properties"]["outcome_history"];
+        assert_eq!(history["additionalProperties"], false);
+        for field in [
+            "snapshot_sha256",
+            "source_digests",
+            "exclusions",
+            "projected_attempt_count",
+        ] {
+            assert!(history["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|value| value == field)));
+        }
         assert_eq!(provenance["properties"]["schema_version"]["const"], 4);
         assert_eq!(
             provenance["properties"]["normalized_input"]["properties"]["priors"]["properties"]
@@ -826,5 +863,28 @@ mod tests {
                 .as_array()
                 .is_some_and(|required| required.iter().any(|value| value == field)));
         }
+    }
+
+    #[test]
+    fn optional_outcome_history_preserves_legacy_and_present_wire_forms() {
+        let mut decision = crate::selection::select(&crate::selection::selection_test_base_input())
+            .expect("valid selector fixture");
+        let legacy = serde_json::to_value(&decision).expect("legacy selector JSON");
+        assert!(legacy.get("outcome_history").is_none());
+        let decoded: crate::selection::SelectionProvenance =
+            serde_json::from_value(legacy).expect("legacy provenance remains readable");
+        assert!(decoded.outcome_history.is_none());
+
+        decision.outcome_history = Some(crate::selection::AuthenticatedOutcomeHistoryProvenance {
+            snapshot_sha256: "a".repeat(64),
+            source_digests: vec!["b".repeat(64)],
+            exclusions: vec!["unfinalized".to_string()],
+            projected_attempt_count: 1,
+        });
+        let present = serde_json::to_value(&decision).expect("history selector JSON");
+        assert!(present.get("outcome_history").is_some());
+        let decoded: crate::selection::SelectionProvenance =
+            serde_json::from_value(present).expect("history provenance remains readable");
+        assert_eq!(decoded.outcome_history, decision.outcome_history);
     }
 }

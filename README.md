@@ -1470,6 +1470,16 @@ ID, version, built-in or repository-override source, content hash, quality
 weights, and every effective tradeoff weight. Older reports remain readable;
 the generated schema requires this evidence for newly finalized reports.
 
+Verified supervisor runs also write parent-owned child-attempt records under
+`selection-attempts/` in the existing authenticated run artifact. Initial
+selection freezes eligible finalized same-repository history and records its
+source digests and exclusions in each selector decision; retries reuse that
+snapshot. Only exact-bound real attempts with observed execution identity,
+parent-reviewed result, and complete attributable attempt costs can affect
+numeric selector outcomes. Current live invocation telemetry does not establish
+provider-resolved model identity or per-attempt cost, so those fields remain
+unknown and current attempt records do not change numeric scores.
+
 Supervisor routing interprets the default 100%-monetary profile as the exact
 legacy selector baseline. Nonzero retry/rework and human-review weights are
 supported as explicit monetary cost-proxy adjustments, proportional to their
