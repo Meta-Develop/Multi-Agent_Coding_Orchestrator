@@ -15,8 +15,8 @@ use crate::{
         RunArtifactFamily,
     },
     external_agent::{
-        codex_usage_from_jsonl, collect_and_import_managed_child_git_commit,
-        load_codex_runtime_model_catalog_authorized,
+        catalog_preflight_grant_origin_mismatch_failure, codex_usage_from_jsonl,
+        collect_and_import_managed_child_git_commit, load_codex_runtime_model_catalog_authorized,
         missing_supervisor_catalog_preflight_grant_failure,
         run_external_agent_cancellable_reviewed, supervisor_catalog_preflight_grant_admit_failure,
         validate_environment_requirements, CodexRuntimeModelCatalog, EnvironmentFailure,
@@ -46,7 +46,7 @@ use crate::{
         ApplyBlockerDetail, CandidateValidationBinding, MergeCollectOptions,
         ValidationEvidenceBundle, WorktreeMergeMetadata, VALIDATION_BINDING_VERSION,
     },
-    mutation_taxonomy::SupervisorCatalogCodexPreflightGrant,
+    mutation_taxonomy::{CatalogPreflightOrigin, SupervisorCatalogCodexPreflightGrant},
     objective_profile::{resolve_objective_profile, ResolvedObjectiveProfile},
     orchestration_event::{
         FieldGuideEventKind, OrchestrationEventJournal, OrchestrationEventKind, OrchestrationRole,
@@ -1142,11 +1142,15 @@ impl RuntimeModelCatalog {
                 let Some(grant) = grant else {
                     return Err(missing_supervisor_catalog_preflight_grant_failure());
                 };
+                if grant.origin() != CatalogPreflightOrigin::Supervisor {
+                    return Err(catalog_preflight_grant_origin_mismatch_failure());
+                }
                 load_codex_runtime_model_catalog_authorized(
                     &options.codex_bin,
                     repo,
                     CODEX_MODEL_CATALOG_TIMEOUT,
                     grant,
+                    CatalogPreflightOrigin::Supervisor,
                 )
                 .map(Self::Codex)
             }
@@ -1764,6 +1768,9 @@ struct LoadedSupervisorPlan {
 struct AssignmentMetadata {
     workers: BTreeMap<(String, String), WorkerAssignmentMetadata>,
     reasoning_efforts: BTreeMap<String, ReasoningEffort>,
+    /// Assignment-level mechanical duty for a direct Worker (empty nested list).
+    /// Nested `worker_assignments` keep [`WorkerAssignmentMetadata::mechanical_duty`].
+    direct_mechanical_duties: BTreeMap<String, MechanicalTerminalDuty>,
 }
 
 impl AssignmentMetadata {
@@ -1795,9 +1802,23 @@ impl AssignmentMetadata {
         self.reasoning_efforts.get(assignment_id).copied()
     }
 
+    fn insert_direct_mechanical_duty(
+        &mut self,
+        assignment_id: String,
+        duty: MechanicalTerminalDuty,
+    ) -> Option<MechanicalTerminalDuty> {
+        self.direct_mechanical_duties.insert(assignment_id, duty)
+    }
+
+    fn direct_mechanical_duty(&self, assignment_id: &str) -> Option<MechanicalTerminalDuty> {
+        self.direct_mechanical_duties.get(assignment_id).copied()
+    }
+
     fn retain_assignment(&mut self, assignment_id: &str) {
         self.workers.retain(|(owner, _), _| owner == assignment_id);
         self.reasoning_efforts
+            .retain(|owner, _| owner == assignment_id);
+        self.direct_mechanical_duties
             .retain(|owner, _| owner == assignment_id);
     }
 }
@@ -1807,6 +1828,7 @@ impl From<BTreeMap<(String, String), WorkerAssignmentMetadata>> for AssignmentMe
         Self {
             workers,
             reasoning_efforts: BTreeMap::new(),
+            direct_mechanical_duties: BTreeMap::new(),
         }
     }
 }
@@ -2329,7 +2351,7 @@ fn enforce_role_reasoning_effort_floor(
 }
 
 impl AgentRole {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Supervisor => "supervisor",
             Self::ChildOrchestrator => "child_orchestrator",

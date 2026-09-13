@@ -684,15 +684,15 @@ struct BudgetDegradationController {
     next_selection_commit_index: usize,
 }
 
-struct AssignmentBudgetPolicyRequest<'a> {
-    assignment: &'a OrchestratorAssignment,
-    requested_reasoning_effort: Option<ReasoningEffort>,
-    report: &'a RunBudgetReport,
-    plan: &'a SupervisorPlan,
-    requested_plan: &'a SupervisorPlan,
-    assignment_metadata: &'a AssignmentMetadata,
-    catalog: &'a RuntimeModelCatalog,
-    runtime: SupervisorRuntime,
+pub(super) struct AssignmentBudgetPolicyRequest<'a> {
+    pub(super) assignment: &'a OrchestratorAssignment,
+    pub(super) requested_reasoning_effort: Option<ReasoningEffort>,
+    pub(super) report: &'a RunBudgetReport,
+    pub(super) plan: &'a SupervisorPlan,
+    pub(super) requested_plan: &'a SupervisorPlan,
+    pub(super) assignment_metadata: &'a AssignmentMetadata,
+    pub(super) catalog: &'a RuntimeModelCatalog,
+    pub(super) runtime: SupervisorRuntime,
 }
 
 impl BudgetDegradationController {
@@ -1287,12 +1287,45 @@ pub(super) fn assignment_policy_after_completed_settlement_for_test(
     .context("completed settlement unexpectedly stopped the next assignment admission")
 }
 
+#[cfg(test)]
+pub(super) fn assignment_budget_policy_for_test(
+    request: AssignmentBudgetPolicyRequest<'_>,
+    max_concurrent_children: usize,
+) -> Result<Option<(AssignmentBudgetPolicy, Vec<BudgetDegradationRecord>)>> {
+    let mut controller = BudgetDegradationController::new_with_selection_state(
+        max_concurrent_children,
+        None,
+        request.runtime,
+    )?;
+    let policy = controller.assignment_policy(request)?;
+    Ok(policy.map(|policy| (policy, controller.records.clone())))
+}
+
+fn typed_direct_mechanical_worker_duty(
+    assignment: &OrchestratorAssignment,
+    assignment_metadata: &AssignmentMetadata,
+) -> Option<MechanicalTerminalDuty> {
+    // Direct Worker ModelTier is opt-in on the assignment itself. Nested
+    // `worker_assignments` keep the existing all-or-nothing collect below.
+    // `direct_worker_mechanical_duty` is role-only; do not copy that helper
+    // here and grant planning, judgment, or delegating roles.
+    if assignment.role != AgentRole::Worker
+        || assignment.phase != AssignmentPhase::Execution
+        || assignment.role_category != Some(RoleCategory::NonDelegatingTerminalWorker)
+        || !assignment.worker_assignments.is_empty()
+    {
+        return None;
+    }
+    assignment_metadata.direct_mechanical_duty(&assignment.id)
+}
+
 fn assignment_mechanical_duties(
     assignment: &OrchestratorAssignment,
     assignment_metadata: &AssignmentMetadata,
 ) -> Option<Vec<MechanicalTerminalDuty>> {
     if assignment.worker_assignments.is_empty() {
-        return None;
+        return typed_direct_mechanical_worker_duty(assignment, assignment_metadata)
+            .map(|duty| vec![duty]);
     }
     assignment
         .worker_assignments
@@ -1588,6 +1621,28 @@ fn scheduler_preclaim_evidence(
             context.worktree_creation,
         ),
     )
+}
+
+pub(super) fn recheck_narrowed_assignment_preclaim(
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    assignment: &OrchestratorAssignment,
+    requested_assignments: &[OrchestratorAssignment],
+    repo: &Path,
+    runtime: SupervisorRuntime,
+    execution_runtime: SupervisorExecutionRuntime,
+    worktree_creation: SupervisorWorktreeCreation<'_>,
+) -> Result<Option<AssignmentExecutionOutcome>> {
+    let evidence = PreclaimRunEvidence::acquire(
+        repo,
+        runtime,
+        preclaim_assessment_runtime(runtime, execution_runtime, worktree_creation),
+    );
+    let decision = preclaim_assignment(artifacts, assignment, requested_assignments, &evidence)?;
+    if decision.allows_path_claim() {
+        Ok(None)
+    } else {
+        Ok(Some(parked_preclaim_outcome(assignment, &decision)))
+    }
 }
 
 fn run_serial_assignment_schedule(

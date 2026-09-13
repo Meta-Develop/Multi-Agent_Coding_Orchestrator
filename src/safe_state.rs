@@ -1059,7 +1059,9 @@ impl DirectoryBindingGuard {
         {
             let mut file =
                 open_repository_relative_linux_fd(self.directory.as_raw_fd(), &relative)?;
-            read_bounded_file(&mut file, &self.path.join(&relative), max_bytes)
+            read_bounded_file_with_reopen(&mut file, &self.path.join(&relative), max_bytes, || {
+                open_repository_relative_linux_fd(self.directory.as_raw_fd(), &relative)
+            })
         }
         #[cfg(not(target_os = "linux"))]
         BoundedRegularReader::read_relative(&self.path, relative, max_bytes)
@@ -1092,7 +1094,10 @@ impl DirectoryBindingGuard {
             }
             ensure_regular_single_link_metadata(&self.path.join(&relative), &metadata)?;
             let mut file = file;
-            read_bounded_file(&mut file, &self.path.join(&relative), max_bytes).map(Some)
+            read_bounded_file_with_reopen(&mut file, &self.path.join(&relative), max_bytes, || {
+                open_repository_relative_linux_fd(self.directory.as_raw_fd(), &relative)
+            })
+            .map(Some)
         }
         #[cfg(not(target_os = "linux"))]
         BoundedRegularReader::read_relative_optional(&self.path, relative, max_bytes)
@@ -1545,7 +1550,9 @@ impl BoundedRegularReader {
                 format!("failed to make path root-relative: {}", absolute.display())
             })?;
             let mut file = open_relative_regular_unix_allow_mounts(root, relative)?;
-            read_bounded_file(&mut file, &absolute, max_bytes)
+            read_bounded_file_with_reopen(&mut file, &absolute, max_bytes, || {
+                open_relative_regular_unix_allow_mounts(root, relative)
+            })
         }
         #[cfg(not(unix))]
         {
@@ -1581,6 +1588,7 @@ impl BoundedRegularReader {
                 max_bytes,
                 &mut validate,
                 || {},
+                || open_relative_regular_unix_allow_mounts(root, relative),
             )
         }
         #[cfg(not(unix))]
@@ -1609,7 +1617,9 @@ impl BoundedRegularReader {
         root.verify()?;
         let path = root.direct_child(file_name)?;
         let mut file = open_regular_file_at(root, file_name, false)?;
-        let contents = read_bounded_file(&mut file, &path, max_bytes)?;
+        let contents = read_bounded_file_with_reopen(&mut file, &path, max_bytes, || {
+            open_regular_file_at(root, file_name, false)
+        })?;
         root.verify()?;
         Ok(contents)
     }
@@ -1627,13 +1637,17 @@ impl BoundedRegularReader {
         #[cfg(target_os = "linux")]
         {
             let mut file = open_repository_relative_regular_linux(&root, &relative)?;
-            read_bounded_file(&mut file, &root.join(&relative), max_bytes)
+            read_bounded_file_with_reopen(&mut file, &root.join(&relative), max_bytes, || {
+                open_repository_relative_regular_linux(&root, &relative)
+            })
         }
 
         #[cfg(all(unix, not(target_os = "linux")))]
         {
             let mut file = open_relative_regular_unix_allow_mounts(&root, &relative)?;
-            read_bounded_file(&mut file, &root.join(&relative), max_bytes)
+            read_bounded_file_with_reopen(&mut file, &root.join(&relative), max_bytes, || {
+                open_relative_regular_unix_allow_mounts(&root, &relative)
+            })
         }
 
         #[cfg(not(unix))]
@@ -1693,7 +1707,10 @@ impl BoundedRegularReader {
             else {
                 return Ok(None);
             };
-            read_bounded_file(&mut file, &root.join(&relative), max_bytes).map(Some)
+            read_bounded_file_with_reopen(&mut file, &root.join(&relative), max_bytes, || {
+                open_repository_relative_regular_linux(&root, &relative)
+            })
+            .map(Some)
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -3268,9 +3285,22 @@ fn open_regular_no_follow(path: &Path, _writable: bool) -> Result<File> {
 }
 
 fn read_bounded_file(file: &mut File, path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
-    read_bounded_file_with_hook(file, path, max_bytes, || {})
+    read_bounded_file_with_reopen(file, path, max_bytes, || {
+        open_regular_no_follow(path, false)
+    })
 }
 
+fn read_bounded_file_with_reopen(
+    file: &mut File,
+    path: &Path,
+    max_bytes: u64,
+    reopen: impl FnOnce() -> Result<File>,
+) -> Result<Vec<u8>> {
+    let mut validate = |_: &fs::Metadata| Ok(());
+    read_bounded_file_with_validator_and_hook(file, path, max_bytes, &mut validate, || {}, reopen)
+}
+
+#[cfg(all(test, unix))]
 fn read_bounded_file_with_hook(
     file: &mut File,
     path: &Path,
@@ -3284,6 +3314,7 @@ fn read_bounded_file_with_hook(
         max_bytes,
         &mut validate,
         after_initial_metadata,
+        || open_regular_no_follow(path, false),
     )
 }
 
@@ -3293,6 +3324,7 @@ fn read_bounded_file_with_validator_and_hook(
     max_bytes: u64,
     validate: &mut impl FnMut(&fs::Metadata) -> Result<()>,
     after_initial_metadata: impl FnOnce(),
+    reopen: impl FnOnce() -> Result<File>,
 ) -> Result<Vec<u8>> {
     let before = file
         .metadata()
@@ -3349,6 +3381,22 @@ fn read_bounded_file_with_validator_and_hook(
     #[cfg(not(windows))]
     let same_generation = same_file_generation(&before, &after);
     if !same_generation {
+        bail!(
+            "file identity changed during bounded read: {}",
+            path.display()
+        );
+    }
+    // Reopen through the caller's original authority: a diagnostic pathname is
+    // not necessarily the path of a retained directory handle after a rename.
+    let rebound = reopen().with_context(|| {
+        format!(
+            "file identity changed during bounded read: {}",
+            path.display()
+        )
+    })?;
+    if identity_from_file(&rebound, path)? != identity_from_file(file, path)?
+        || !same_file_generation(&after, &rebound.metadata()?)
+    {
         bail!(
             "file identity changed during bounded read: {}",
             path.display()

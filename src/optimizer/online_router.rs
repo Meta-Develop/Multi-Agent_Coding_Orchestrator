@@ -157,22 +157,40 @@ impl ObjectiveEvaluator for TailRiskObjective {
                 )
             };
             let lambda = self.shadow_prices.get(dimension).copied().unwrap_or(0);
-            total = total.saturating_add(lambda.saturating_mul(expected));
+            total = checked_priced_objective_term(total, lambda, expected)?;
         }
-        total = total.saturating_add(
-            self.human_price
-                .saturating_mul(distribution.details.expected_human_micros),
-        );
-        total = total.saturating_add(
-            self.uncertainty_price
-                .saturating_mul(distribution.details.uncertainty_micros),
-        );
+        total = checked_priced_objective_term(
+            total,
+            self.human_price,
+            distribution.details.expected_human_micros,
+        )?;
+        total = checked_priced_objective_term(
+            total,
+            self.uncertainty_price,
+            distribution.details.uncertainty_micros,
+        )?;
         Ok(ObjectiveValue {
             policy_id: distribution.policy_id.clone(),
             risk_adjusted_cost_micros: total,
             tail_latency_micros: cvar,
         })
     }
+}
+
+fn checked_priced_objective_term(
+    total: i64,
+    price: i64,
+    amount: i64,
+) -> Result<i64, OptimizerError> {
+    if total < 0 || price < 0 || amount < 0 {
+        return Err(OptimizerError::invalid(
+            "tail-risk objective measurements and prices must be non-negative",
+        ));
+    }
+    price
+        .checked_mul(amount)
+        .and_then(|term| total.checked_add(term))
+        .ok_or_else(|| OptimizerError::invalid("tail-risk objective score overflow"))
 }
 
 #[derive(Debug, Clone)]
@@ -1289,6 +1307,30 @@ mod tests {
                 oscillation_alarm_threshold: DEFAULT_OSCILLATION_ALARM,
             },
         )
+    }
+
+    #[test]
+    fn readiness_regression_tail_risk_objective_refuses_overflow() {
+        let mut objective = TailRiskObjective::new();
+        let mut distribution = dist("large", 9_500, 1, 1, 0, 0);
+        distribution.details.uncertainty_micros = 0;
+        distribution.details.expected_human_micros = i64::MAX - 1;
+        assert_eq!(
+            objective
+                .evaluate(&distribution)
+                .expect("representable objective")
+                .risk_adjusted_cost_micros,
+            i64::MAX
+        );
+        distribution.details.expected_human_micros = i64::MAX;
+        assert!(objective.evaluate(&distribution).is_err());
+        objective.set_human_price(2);
+        assert!(objective.evaluate(&distribution).is_err());
+        distribution.details.expected_human_micros = -1;
+        assert!(objective.evaluate(&distribution).is_err());
+        distribution.details.expected_human_micros = 0;
+        distribution.details.uncertainty_micros = i64::MAX;
+        assert!(objective.evaluate(&distribution).is_err());
     }
 
     #[test]

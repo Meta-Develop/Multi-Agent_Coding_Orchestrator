@@ -1105,6 +1105,12 @@ from repository maps, semantic maps, and task-path proposal helpers.
 
 ## Install
 
+Agent execution and repository mapping currently require Linux with a delegated
+systemd user manager. Native Windows and macOS builds are compile-portability
+targets, not full runtime support. On Windows, use a configured WSL2 Linux
+environment for coding workflows; the native `maco scope serve` command can
+serve the local monitoring UI at `http://127.0.0.1:7878`.
+
 Install `maco` once as a machine-global binary. Do not invoke it through a
 per-repository `cargo run` wrapper around a pinned checkout. See
 [`docs/PACKAGING.md`](docs/PACKAGING.md) for the install, update, and version
@@ -3247,12 +3253,12 @@ and the private final-message staging root beneath the reviewed machine-global
 runtime root. Neither is source-workspace authority. Release must fail closed
 unless both exact capabilities are verified; the parent retains descriptors
 for bounded reads and atomic final writes.
-The full local report schemas remain the authoritative acceptance gate. Current
-external providers, including Codex, reject their draft-2020-12 conditional
-forms, so child and parent-auditor launches omit the provider `--output-schema`
-hint instead of staging a hidden primary-artifact path or weakening the schema.
-The parent still parses and validates every collected final message before it
-can enter accepted evidence.
+The full local report schemas remain the authoritative acceptance gate. Codex
+receives a derived, provider-compatible output schema that omits unsupported
+conditional keywords and supervisor-owned authority fields, including the
+review-lens aggregate. The parent still validates every collected final message
+against the full local contract and computes its own review evidence before
+acceptance.
 Worker prompts also include a structured execution journal path under
 `incoming/worker-journals/<worker-id>.jsonl`. Terminal workers append JSONL
 records with `command`, `cwd`, `start_timestamp`, `end_timestamp`, and

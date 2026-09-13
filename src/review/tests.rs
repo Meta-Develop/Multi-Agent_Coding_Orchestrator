@@ -2284,12 +2284,13 @@ fn exact_snapshot_detects_tracked_untracked_ignored_mode_symlink_and_head_change
     let mut permissions = std::fs::metadata(temp.path().join("tracked.txt"))?.permissions();
     permissions.set_mode(0o700);
     std::fs::set_permissions(temp.path().join("tracked.txt"), permissions)?;
-    assert_ne!(restored_content, binding.snapshot()?);
+    let changed_mode = binding.snapshot()?;
+    assert_ne!(restored_content, changed_mode);
     let mut permissions = std::fs::metadata(temp.path().join("tracked.txt"))?.permissions();
     permissions.set_mode(0o644);
     std::fs::set_permissions(temp.path().join("tracked.txt"), permissions)?;
     let restored_mode = binding.snapshot()?;
-    assert_ne!(restored_content, restored_mode);
+    assert_ne!(changed_mode, restored_mode);
 
     std::fs::write(temp.path().join("untracked.txt"), "untracked-b")?;
     assert_ne!(restored_mode, binding.snapshot()?);

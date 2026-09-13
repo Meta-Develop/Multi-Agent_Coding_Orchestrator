@@ -693,6 +693,14 @@ impl SwitchCostModel {
         previous: Option<&InvocationRecord>,
         next: &InvocationRecord,
     ) {
+        // Requested model labels cannot establish a measured transition. Keep
+        // unresolved rows in the history as boundaries, so fitting never joins
+        // two known invocations across an unobserved runtime resolution.
+        if next.resolved_model.is_none()
+            || previous.is_some_and(|record| record.resolved_model.is_none())
+        {
+            return;
+        }
         let Some(class) = classify_invocation_transition(previous, next) else {
             return;
         };
@@ -1715,6 +1723,33 @@ mod tests {
         record.input_tokens = input;
         record.cached_input_tokens = cached;
         record
+    }
+
+    #[test]
+    fn unresolved_invocation_is_not_a_measured_switch_or_a_bridge_between_models() {
+        let first = invocation("first", "adapter-a", "model-a", 1, Some(1_000), Some(800));
+        let mut unresolved =
+            invocation("unknown", "adapter-a", "unconfirmed", 2, Some(900), Some(0));
+        unresolved.resolved_model = None;
+        unresolved.runtime_startup_micros = Some(5_000);
+        let mut last = invocation("last", "adapter-a", "model-b", 3, Some(800), Some(0));
+        last.runtime_startup_micros = Some(6_000);
+        let mut model = SwitchCostModel::new();
+        model.observe_invocations(std::slice::from_ref(&unresolved));
+        assert_eq!(
+            model
+                .estimate(TransitionClass::FreshSessionOrWorktree)
+                .sample_count,
+            0
+        );
+        let mut baseline = SwitchCostModel::new();
+        baseline.observe_invocations(std::slice::from_ref(&first));
+        model.observe_invocations(&[first, unresolved, last]);
+        assert_eq!(
+            model.estimate(TransitionClass::ModelChangeSameRuntime),
+            baseline.estimate(TransitionClass::ModelChangeSameRuntime),
+            "the unresolved row must prevent fitting the subsequent transition"
+        );
     }
 
     #[test]

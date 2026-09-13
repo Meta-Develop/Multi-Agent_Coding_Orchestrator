@@ -1090,16 +1090,20 @@ fn resolve_preclaim_policy(
     if requested.role != assignment.role {
         mismatches.push("role");
     }
-    if requested.assigned_paths != assignment.assigned_paths {
+    if requested.task != assignment.task {
+        mismatches.push("task");
+    }
+    if !effective_scope_is_requested_narrowing(assignment, requested) {
         mismatches.push("assigned_paths");
     }
     if requested.licensed_breakage != assignment.licensed_breakage {
         mismatches.push("licensed_breakage");
     }
-    if requested.environment_requirements.is_empty()
-        != assignment.environment_requirements.is_empty()
-    {
+    if requested.environment_requirements != assignment.environment_requirements {
         mismatches.push("environment_requirements");
+    }
+    if !nested_worker_identities_are_one_to_one(assignment, requested) {
+        mismatches.push("worker_assignments");
     }
     let requested_worker_requires_environment = requested
         .worker_assignments
@@ -1183,6 +1187,51 @@ fn resolve_preclaim_policy(
     }
 
     parse_requested_preclaim_directive(assignment, requested_notes)
+}
+
+fn nested_worker_identities_are_one_to_one(
+    assignment: &OrchestratorAssignment,
+    requested: &OrchestratorAssignment,
+) -> bool {
+    let assignment_ids = assignment
+        .worker_assignments
+        .iter()
+        .map(|worker| worker.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let requested_ids = requested
+        .worker_assignments
+        .iter()
+        .map(|worker| worker.id.as_str())
+        .collect::<BTreeSet<_>>();
+    assignment_ids.len() == assignment.worker_assignments.len()
+        && requested_ids.len() == requested.worker_assignments.len()
+        && assignment_ids == requested_ids
+        && assignment.worker_assignments.iter().all(|worker| {
+            requested.worker_assignments.iter().any(|declared| {
+                worker.id == declared.id
+                    && worker.role == declared.role
+                    && worker.task == declared.task
+                    && worker.environment_requirements == declared.environment_requirements
+                    && !worker.assigned_paths.is_empty()
+                    && worker
+                        .assigned_paths
+                        .iter()
+                        .all(|path| declared.assigned_paths.contains(path))
+            })
+        })
+}
+
+fn effective_scope_is_requested_narrowing(
+    assignment: &OrchestratorAssignment,
+    requested: &OrchestratorAssignment,
+) -> bool {
+    !assignment.assigned_paths.is_empty()
+        && assignment.assigned_paths.iter().all(|effective| {
+            requested
+                .assigned_paths
+                .iter()
+                .any(|declared| declared == effective)
+        })
 }
 
 fn parse_requested_preclaim_directive(
@@ -2361,6 +2410,169 @@ mod tests {
             &candidate,
             &[requested_worker_environment],
             "worker_environment_requirements binding",
+        );
+
+        let mut wrong_task = candidate.clone();
+        wrong_task.task = Some("a different trusted task".to_string());
+        assert_policy_binding_failure(&candidate, &[wrong_task], "task binding");
+
+        let mut requested_nested = candidate.clone();
+        requested_nested.worker_assignments.push(WorkerAssignment {
+            id: "worker-a".to_string(),
+            role: AgentRole::Worker,
+            role_category: None,
+            selection_source: None,
+            assigned_paths: candidate.assigned_paths.clone(),
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            environment_requirements: Vec::new(),
+            report_path: None,
+        });
+        let mut swapped_nested = requested_nested.clone();
+        swapped_nested.worker_assignments[0].id = "worker-b".to_string();
+        assert_policy_binding_failure(
+            &swapped_nested,
+            &[requested_nested],
+            "worker_assignments binding",
+        );
+    }
+
+    #[test]
+    fn requested_plan_binding_rejects_nested_task_role_and_scope_drift() {
+        let mut requested = assignment();
+        requested.worker_assignments.push(WorkerAssignment {
+            id: "worker-a".to_string(),
+            role: AgentRole::Worker,
+            role_category: None,
+            selection_source: None,
+            assigned_paths: requested.assigned_paths.clone(),
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: Some("verify the assigned test".to_string()),
+            environment_requirements: Vec::new(),
+            report_path: None,
+        });
+        for mutation in 0..3 {
+            let mut current = requested.clone();
+            match mutation {
+                0 => current.worker_assignments[0].task = Some("a different task".to_string()),
+                1 => current.worker_assignments[0].role = AgentRole::ChildOrchestrator,
+                _ => {
+                    current.worker_assignments[0]
+                        .assigned_paths
+                        .push(PathBuf::from("src/unrequested.rs"));
+                }
+            }
+            assert_policy_binding_failure(
+                &current,
+                std::slice::from_ref(&requested),
+                "worker_assignments binding",
+            );
+        }
+    }
+
+    #[test]
+    fn requested_plan_binding_rejects_replaced_environment_requirements() {
+        let mut requested = assignment();
+        requested.environment_requirements = vec![EnvironmentRequirement::network(
+            EnvironmentNetworkAccess::Disabled,
+        )];
+        let mut current = requested.clone();
+        current.environment_requirements = vec![EnvironmentRequirement::network(
+            EnvironmentNetworkAccess::Enabled,
+        )];
+        assert_policy_binding_failure(&current, &[requested], "environment_requirements binding");
+    }
+
+    #[test]
+    fn requested_plan_binding_accepts_strict_subset_assigned_paths() {
+        let mut requested = assignment();
+        requested.assigned_paths = vec![
+            PathBuf::from("tests/preclaim.rs"),
+            PathBuf::from("README.md"),
+        ];
+        let mut effective = requested.clone();
+        effective.assigned_paths = vec![PathBuf::from("tests/preclaim.rs")];
+        let decision = evaluate_with_requested(&effective, &[requested]);
+        assert_eq!(decision.disposition, PreclaimDisposition::Claim);
+        assert_eq!(
+            decision.authority,
+            PreclaimDecisionAuthority::DeterministicPolicy
+        );
+        assert_eq!(
+            decision.dimensions.clear_verification_path,
+            ViabilityFinding::Yes
+        );
+    }
+
+    #[test]
+    fn requested_plan_binding_rejects_widened_or_foreign_assigned_paths() {
+        let mut requested = assignment();
+        requested.assigned_paths = vec![
+            PathBuf::from("tests/preclaim.rs"),
+            PathBuf::from("README.md"),
+        ];
+
+        let mut widened = requested.clone();
+        widened.assigned_paths.push(PathBuf::from("Cargo.toml"));
+        assert_policy_binding_failure(&widened, &[requested.clone()], "assigned_paths binding");
+
+        let mut foreign = requested.clone();
+        foreign.assigned_paths = vec![PathBuf::from("tests/related.rs")];
+        assert_policy_binding_failure(&foreign, &[requested], "assigned_paths binding");
+    }
+
+    #[test]
+    fn lost_mapped_test_path_parks_without_credit_from_dropped_scope() {
+        let mut requested = assignment();
+        requested.assigned_paths = vec![
+            PathBuf::from("tests/preclaim.rs"),
+            PathBuf::from("README.md"),
+        ];
+        let mut remainder = requested.clone();
+        remainder.assigned_paths = vec![PathBuf::from("README.md")];
+        let decision = evaluate_preclaim_viability(
+            &remainder,
+            &[requested],
+            Some(&present_map()),
+            Some(&risk_for_path("tests/preclaim.rs")),
+            Some(SupervisorRuntime::Codex),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(decision.disposition, PreclaimDisposition::Park);
+        assert_ne!(
+            decision.authority,
+            PreclaimDecisionAuthority::UntrustedAssignmentInput,
+            "{}",
+            decision.reason
+        );
+        assert_eq!(
+            decision.dimensions.clear_verification_path,
+            ViabilityFinding::Unknown
+        );
+    }
+
+    #[test]
+    fn literal_one_path_typed_contract_does_not_admit_two_path_assignment() {
+        let task = "In README.md, replace scheduler fixture with exactly: verified replacement. Verify the result with git diff --check and confirm README.md contains exactly that line.";
+        let mut assignments = existing_file_edit_assignments("README.md", task);
+        assignments[1].assigned_paths =
+            vec![PathBuf::from("README.md"), PathBuf::from("Cargo.toml")];
+        let decision = evaluate_preclaim_viability(
+            &assignments[1],
+            &assignments,
+            Some(&present_map()),
+            Some(&risk_for_path("README.md")),
+            Some(SupervisorRuntime::Codex),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(decision.disposition, PreclaimDisposition::Park);
+        assert_eq!(
+            decision.dimensions.clear_verification_path,
+            ViabilityFinding::Unknown,
+            "{}",
+            decision.reason
         );
     }
 

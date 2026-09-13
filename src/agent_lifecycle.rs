@@ -1,10 +1,15 @@
 use crate::{
     artifacts::discover_repo_root,
     hierarchy_ledger::RoleCategory,
+    mutation_taxonomy::{
+        AssignmentProcessLaunchKind, ReservedMechanicalExecutorExecution,
+        SealedMechanicalExecutorDuty, SealedMechanicalExecutorPhase, SealedMechanicalExecutorRole,
+    },
     safe_state::{AtomicStateWriter, BoundedRegularReader, KernelStateLock, SafeRoot},
     supervise::{
+        authorize_known_executor_role_model, recorded_model_is_weak_mechanical,
         trusted_model_capability, validate_known_judgment_role_model, AgentRole,
-        ModelCapabilityClass,
+        MechanicalTerminalDuty, ModelCapabilityClass, OrchestrationPhase,
     },
 };
 use anyhow::{bail, Context, Result};
@@ -98,6 +103,31 @@ impl AgentLaunchMetadata {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MechanicalExecutorGrantKind {
+    AssignmentChild,
+}
+
+/// Durable inspectable mechanical-executor evidence captured only from a
+/// reserved consumed proof. This is not a live spawn capability.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MechanicalExecutorLaunchEvidence {
+    pub grant_nonce: u64,
+    pub kind: MechanicalExecutorGrantKind,
+    pub role: String,
+    pub phase: OrchestrationPhase,
+    pub duty: MechanicalTerminalDuty,
+    pub model: String,
+    pub canonical_program: PathBuf,
+    pub cwd: PathBuf,
+    pub argv: Vec<String>,
+    pub run_id: String,
+    pub subject: String,
+    pub attempt: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentProcessRecord {
     pub pid: u32,
@@ -109,6 +139,7 @@ pub struct AgentProcessRecord {
     pub repo: PathBuf,
     pub argv: Vec<String>,
     pub launch_timestamp_ms: u64,
+    pub mechanical_executor: Option<MechanicalExecutorLaunchEvidence>,
 }
 
 /// Authority MACO derived from the declared lifecycle role and the exact
@@ -144,6 +175,8 @@ struct AgentProcessRecordWire {
     launch_timestamp_ms: u64,
     #[serde(default)]
     launch_authority: Option<LaunchAuthorityBinding>,
+    #[serde(default)]
+    mechanical_executor: Option<MechanicalExecutorLaunchEvidence>,
 }
 
 impl AgentProcessRecord {
@@ -186,8 +219,10 @@ impl AgentProcessRecord {
     /// Version probes carry no authority. Actual coordinator and acceptance
     /// judge launches require an explicit model accepted by the model policy.
     /// Git mutation is never granted by lifecycle registration alone.
+    /// Durable mechanical-executor evidence is historical inspect data: it
+    /// cannot mint a reusable live proof.
     pub fn launch_authority(&self) -> Result<LaunchAuthorityBinding> {
-        derive_launch_authority(&self.role, &self.argv)
+        derive_launch_authority(&self.role, &self.argv, self.mechanical_executor.as_ref())
     }
 
     fn summary(&self) -> String {
@@ -208,7 +243,14 @@ impl Serialize for AgentProcessRecord {
         S: Serializer,
     {
         let launch_authority = self.launch_authority().map_err(serde::ser::Error::custom)?;
-        let mut state = serializer.serialize_struct("AgentProcessRecord", 10)?;
+        let mut field_count = 9;
+        if self.parent.is_some() {
+            field_count += 1;
+        }
+        if self.mechanical_executor.is_some() {
+            field_count += 1;
+        }
+        let mut state = serializer.serialize_struct("AgentProcessRecord", field_count)?;
         state.serialize_field("pid", &self.pid)?;
         state.serialize_field("process_start_time", &self.process_start_time)?;
         state.serialize_field("role", &self.role)?;
@@ -221,6 +263,9 @@ impl Serialize for AgentProcessRecord {
         state.serialize_field("argv", &self.argv)?;
         state.serialize_field("launch_timestamp_ms", &self.launch_timestamp_ms)?;
         state.serialize_field("launch_authority", &launch_authority)?;
+        if let Some(evidence) = &self.mechanical_executor {
+            state.serialize_field("mechanical_executor", evidence)?;
+        }
         state.end()
     }
 }
@@ -242,6 +287,7 @@ impl<'de> Deserialize<'de> for AgentProcessRecord {
             repo: wire.repo,
             argv: wire.argv,
             launch_timestamp_ms: wire.launch_timestamp_ms,
+            mechanical_executor: wire.mechanical_executor,
         };
         if let Some(supplied_authority) = supplied_authority {
             let reconstructed = record
@@ -257,7 +303,14 @@ impl<'de> Deserialize<'de> for AgentProcessRecord {
     }
 }
 
-fn derive_launch_authority(role: &str, argv: &[String]) -> Result<LaunchAuthorityBinding> {
+fn derive_launch_authority(
+    role: &str,
+    argv: &[String],
+    mechanical_executor: Option<&MechanicalExecutorLaunchEvidence>,
+) -> Result<LaunchAuthorityBinding> {
+    if let Some(evidence) = mechanical_executor {
+        return derive_mechanical_executor_launch_authority(role, argv, evidence);
+    }
     let category = lifecycle_role_category(role)?;
     if is_version_probe(argv) {
         return Ok(LaunchAuthorityBinding {
@@ -326,6 +379,174 @@ fn derive_launch_authority(role: &str, argv: &[String]) -> Result<LaunchAuthorit
         may_mutate_git_history: false,
         probe_only: false,
         source: "role_and_exact_requested_argv".to_string(),
+    })
+}
+
+fn derive_mechanical_executor_launch_authority(
+    role: &str,
+    argv: &[String],
+    evidence: &MechanicalExecutorLaunchEvidence,
+) -> Result<LaunchAuthorityBinding> {
+    if role != "worker" || evidence.role != "worker" {
+        bail!("mechanical executor evidence requires worker role");
+    }
+    if evidence.kind != MechanicalExecutorGrantKind::AssignmentChild {
+        bail!("mechanical executor evidence requires assignment-child kind");
+    }
+    if evidence.phase != OrchestrationPhase::MechanicalTerminal {
+        bail!("mechanical executor evidence requires mechanical_terminal phase");
+    }
+    if argv != evidence.argv.as_slice() {
+        bail!("mechanical executor evidence does not match launched argv");
+    }
+    let Some(program) = argv.first() else {
+        bail!("mechanical executor evidence requires a non-empty argv");
+    };
+    if Path::new(program) != evidence.canonical_program.as_path() {
+        bail!("mechanical executor evidence does not match canonical program");
+    }
+    let model = configured_model_from_argv(argv)?;
+    if model.as_deref() != Some(evidence.model.as_str()) {
+        bail!("mechanical executor evidence does not match launched model");
+    }
+    authorize_known_executor_role_model(
+        AgentRole::Worker,
+        Some(evidence.model.as_str()),
+        Some(evidence.duty),
+    )?;
+    let category = lifecycle_role_category(role)?;
+    let model_capability = trusted_model_capability(&evidence.model);
+    Ok(LaunchAuthorityBinding {
+        category,
+        requested_model: Some(evidence.model.clone()),
+        model_capability,
+        may_delegate: false,
+        may_write: matches!(
+            category,
+            RoleCategory::DelegatingCoordinator | RoleCategory::NonDelegatingTerminalWorker
+        ),
+        may_judge_acceptance: false,
+        may_mutate_git_history: false,
+        probe_only: false,
+        source: "role_argv_and_consumed_assignment_child_mechanical_executor".to_string(),
+    })
+}
+
+pub(crate) fn model_requires_mechanical_executor_proof(model: &str) -> bool {
+    recorded_model_is_weak_mechanical(model)
+}
+
+pub(crate) fn authorize_process_launch_before_spawn(
+    metadata: &AgentLaunchMetadata,
+    argv: &[String],
+    current_dir: &Path,
+    reserved: Option<&ReservedMechanicalExecutorExecution>,
+) -> Result<()> {
+    metadata.validate()?;
+    if argv.is_empty() {
+        bail!("agent lifecycle launch requires a non-empty argv");
+    }
+    if let Some(reserved) = reserved {
+        verify_reserved_mechanical_executor(metadata, argv, current_dir, reserved)?;
+        let evidence = evidence_from_reserved(reserved)?;
+        derive_mechanical_executor_launch_authority(&metadata.role, argv, &evidence)?;
+        return Ok(());
+    }
+    if !is_version_probe(argv) && is_agent_runtime_program(&argv[0]) {
+        if let Some(model) = configured_model_from_argv(argv)? {
+            if recorded_model_is_weak_mechanical(&model) {
+                bail!(
+                    "weak_mechanical launch requires consumed assignment-child mechanical executor proof"
+                );
+            }
+        }
+    }
+    derive_launch_authority(&metadata.role, argv, None).map(|_| ())
+}
+
+fn verify_reserved_mechanical_executor(
+    metadata: &AgentLaunchMetadata,
+    argv: &[String],
+    current_dir: &Path,
+    reserved: &ReservedMechanicalExecutorExecution,
+) -> Result<()> {
+    if metadata.role != SealedMechanicalExecutorRole::Worker.as_str()
+        || reserved.role() != SealedMechanicalExecutorRole::Worker
+    {
+        bail!("mechanical executor proof requires worker lifecycle role");
+    }
+    if metadata.run_id != reserved.run_id() || metadata.task_id != reserved.subject() {
+        bail!("mechanical executor proof does not match lifecycle run identity");
+    }
+    if reserved.kind() != AssignmentProcessLaunchKind::AssignmentChild {
+        bail!("mechanical executor proof requires assignment-child kind");
+    }
+    if reserved.phase() != SealedMechanicalExecutorPhase::MechanicalTerminal {
+        bail!("mechanical executor proof requires mechanical_terminal phase");
+    }
+    if current_dir != reserved.cwd() {
+        bail!("mechanical executor proof does not match launched cwd");
+    }
+    let expected = reserved_lifecycle_argv(reserved);
+    if argv != expected.as_slice() {
+        bail!("mechanical executor proof does not match launched argv");
+    }
+    Ok(())
+}
+
+fn reserved_lifecycle_argv(reserved: &ReservedMechanicalExecutorExecution) -> Vec<String> {
+    let mut argv = Vec::with_capacity(reserved.argv().len().saturating_add(1));
+    argv.push(reserved.canonical_program().to_string_lossy().into_owned());
+    argv.extend(
+        reserved
+            .argv()
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned()),
+    );
+    argv
+}
+
+fn mechanical_terminal_duty_from_sealed(
+    duty: SealedMechanicalExecutorDuty,
+) -> MechanicalTerminalDuty {
+    match duty {
+        SealedMechanicalExecutorDuty::ApplyExplicitTextReplacement => {
+            MechanicalTerminalDuty::ApplyExplicitTextReplacement
+        }
+        SealedMechanicalExecutorDuty::RunPreselectedCommand => {
+            MechanicalTerminalDuty::RunPreselectedCommand
+        }
+        SealedMechanicalExecutorDuty::FormatPreselectedFiles => {
+            MechanicalTerminalDuty::FormatPreselectedFiles
+        }
+        SealedMechanicalExecutorDuty::EnumerateDeclaredArtifacts => {
+            MechanicalTerminalDuty::EnumerateDeclaredArtifacts
+        }
+        SealedMechanicalExecutorDuty::ValidateAgainstFixedSchema => {
+            MechanicalTerminalDuty::ValidateAgainstFixedSchema
+        }
+    }
+}
+
+fn evidence_from_reserved(
+    reserved: &ReservedMechanicalExecutorExecution,
+) -> Result<MechanicalExecutorLaunchEvidence> {
+    if reserved.kind() != AssignmentProcessLaunchKind::AssignmentChild {
+        bail!("mechanical executor evidence requires assignment-child kind");
+    }
+    Ok(MechanicalExecutorLaunchEvidence {
+        grant_nonce: reserved.nonce(),
+        kind: MechanicalExecutorGrantKind::AssignmentChild,
+        role: reserved.role().as_str().to_string(),
+        phase: OrchestrationPhase::MechanicalTerminal,
+        duty: mechanical_terminal_duty_from_sealed(reserved.duty()),
+        model: reserved.model().to_string(),
+        canonical_program: reserved.canonical_program().to_path_buf(),
+        cwd: reserved.cwd().to_path_buf(),
+        argv: reserved_lifecycle_argv(reserved),
+        run_id: reserved.run_id().to_string(),
+        subject: reserved.subject().to_string(),
+        attempt: reserved.attempt(),
     })
 }
 
@@ -545,6 +766,62 @@ impl AgentRegistry {
             repo: self.repo.clone(),
             argv,
             launch_timestamp_ms: unix_timestamp_ms()?,
+            mechanical_executor: None,
+        };
+        record.validate(&self.repo)?;
+        self.update_state(|state| {
+            state.processes.retain(|existing| existing.pid != pid);
+            if state.processes.len() >= MAX_REGISTRY_RECORDS {
+                bail!("agent registry is full");
+            }
+            state.processes.push(record.clone());
+            state.processes.sort_by_key(|process| {
+                (
+                    process.launch_timestamp_ms,
+                    process.pid,
+                    process.process_start_time.clone(),
+                )
+            });
+            Ok(())
+        })?;
+        Ok(record)
+    }
+
+    /// Register a launch whose mechanical-executor evidence comes only from a
+    /// reserved consumed proof. Callers cannot pass deserialized evidence.
+    pub(crate) fn register_reserved_mechanical_executor(
+        &self,
+        metadata: &AgentLaunchMetadata,
+        pid: u32,
+        argv: Vec<String>,
+        current_dir: &Path,
+        reserved: ReservedMechanicalExecutorExecution,
+    ) -> Result<AgentProcessRecord> {
+        metadata.validate()?;
+        if metadata.repo != self.repo {
+            bail!(
+                "agent launch repository {} does not match registry repository {}",
+                metadata.repo.display(),
+                self.repo.display()
+            );
+        }
+        if argv.is_empty() {
+            bail!("agent lifecycle registration requires a non-empty argv");
+        }
+        authorize_process_launch_before_spawn(metadata, &argv, current_dir, Some(&reserved))?;
+        let mechanical_executor = Some(evidence_from_reserved(&reserved)?);
+        let record = AgentProcessRecord {
+            pid,
+            process_start_time: process_start_time(pid)
+                .with_context(|| format!("failed to identify launched agent PID {pid}"))?,
+            role: metadata.role.clone(),
+            run_id: metadata.run_id.clone(),
+            task_id: metadata.task_id.clone(),
+            parent: metadata.parent.clone(),
+            repo: self.repo.clone(),
+            argv,
+            launch_timestamp_ms: unix_timestamp_ms()?,
+            mechanical_executor,
         };
         record.validate(&self.repo)?;
         self.update_state(|state| {
@@ -1150,6 +1427,7 @@ mod tests {
             repo: registry.repo().to_path_buf(),
             argv: vec!["test".to_string()],
             launch_timestamp_ms: unix_timestamp_ms()?,
+            mechanical_executor: None,
         };
         reused.process_start_time.push('0');
         registry.replace_records(vec![dead_record, reused])?;
@@ -1308,6 +1586,7 @@ mod tests {
             repo: PathBuf::from("/tmp/maco-agent-lifecycle-reused"),
             argv: vec!["test".to_string()],
             launch_timestamp_ms: unix_timestamp_ms()?,
+            mechanical_executor: None,
         };
         let outcome = terminate_process(&record, Duration::from_millis(10))?;
         assert_eq!(outcome, AgentStopOutcome::AlreadyExited);
@@ -1328,9 +1607,113 @@ mod tests {
             repo: PathBuf::from("/tmp/maco-agent-lifecycle-pidfd"),
             argv: vec!["sleep".to_string()],
             launch_timestamp_ms: unix_timestamp_ms()?,
+            mechanical_executor: None,
         };
         let target = bind_linux_signal_target(&record)?.context("live process must bind")?;
         assert!(matches!(target, LinuxSignalTarget::Pidfd(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_record_json_without_mechanical_executor_still_loads() -> Result<()> {
+        let json = r#"{
+            "pid": 4242,
+            "process_start_time": "1:2",
+            "role": "worker",
+            "run_id": "run-legacy",
+            "task_id": "task-legacy",
+            "repo": "/tmp/maco-agent-lifecycle-legacy",
+            "argv": ["sleep", "60"],
+            "launch_timestamp_ms": 1
+        }"#;
+        let record: AgentProcessRecord = serde_json::from_str(json)?;
+        assert!(record.mechanical_executor.is_none());
+        assert_eq!(record.launch_authority()?.source, "non_agent_simulation");
+        Ok(())
+    }
+
+    #[test]
+    fn worker_luna_argv_without_mechanical_evidence_keeps_legacy_authority() -> Result<()> {
+        let record = AgentProcessRecord {
+            pid: 4242,
+            process_start_time: "1:2".to_string(),
+            role: "worker".to_string(),
+            run_id: "run-luna".to_string(),
+            task_id: "task-luna".to_string(),
+            parent: None,
+            repo: PathBuf::from("/tmp/maco-agent-lifecycle-luna"),
+            argv: vec![
+                "/usr/bin/codex".to_string(),
+                "exec".to_string(),
+                "-m".to_string(),
+                "gpt-5.6-luna".to_string(),
+            ],
+            launch_timestamp_ms: 1,
+            mechanical_executor: None,
+        };
+        let authority = record.launch_authority()?;
+        assert_eq!(authority.source, "role_and_exact_requested_argv");
+        assert_eq!(authority.requested_model.as_deref(), Some("gpt-5.6-luna"));
+        assert!(record.mechanical_executor.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn mechanical_executor_evidence_must_match_argv_and_cannot_mint_live_proof() -> Result<()> {
+        let overlay = crate::supervise::install_test_fixture_models(&[(
+            "fixture-weak-mechanical",
+            crate::supervise::ModelCapabilityClass::WeakMechanical,
+        )])?;
+        let evidence = MechanicalExecutorLaunchEvidence {
+            grant_nonce: 7,
+            kind: MechanicalExecutorGrantKind::AssignmentChild,
+            role: "worker".to_string(),
+            phase: crate::supervise::OrchestrationPhase::MechanicalTerminal,
+            duty: crate::supervise::MechanicalTerminalDuty::RunPreselectedCommand,
+            model: "fixture-weak-mechanical".to_string(),
+            canonical_program: PathBuf::from("/usr/bin/codex"),
+            cwd: PathBuf::from("/work"),
+            argv: vec![
+                "/usr/bin/codex".to_string(),
+                "exec".to_string(),
+                "-m".to_string(),
+                "fixture-weak-mechanical".to_string(),
+            ],
+            run_id: "run-evidence".to_string(),
+            subject: "assignment-a".to_string(),
+            attempt: 1,
+        };
+        let matching = AgentProcessRecord {
+            pid: 4242,
+            process_start_time: "1:2".to_string(),
+            role: "worker".to_string(),
+            run_id: "run-evidence".to_string(),
+            task_id: "assignment-a".to_string(),
+            parent: None,
+            repo: PathBuf::from("/tmp/maco-agent-lifecycle-evidence"),
+            argv: evidence.argv.clone(),
+            launch_timestamp_ms: 1,
+            mechanical_executor: Some(evidence.clone()),
+        };
+        let authority = matching.launch_authority()?;
+        assert_eq!(
+            authority.source,
+            "role_argv_and_consumed_assignment_child_mechanical_executor"
+        );
+        assert_eq!(
+            authority.model_capability,
+            Some(crate::supervise::ModelCapabilityClass::WeakMechanical)
+        );
+        let encoded = serde_json::to_value(&matching)?;
+        assert!(encoded.get("mechanical_executor").is_some());
+        assert!(encoded.get("mechanical_executor_proof").is_none());
+        let round_trip: AgentProcessRecord = serde_json::from_value(encoded)?;
+        assert_eq!(round_trip.mechanical_executor, Some(evidence));
+
+        let mut mismatched = matching;
+        mismatched.argv.push("--tampered".to_string());
+        assert!(mismatched.launch_authority().is_err());
+        drop(overlay);
         Ok(())
     }
 }

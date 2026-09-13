@@ -38,6 +38,7 @@
         root = ./.;
         fileset = lib.fileset.unions [
           ./.cargo
+          ./assets
           ./benches
           ./Cargo.lock
           ./Cargo.toml
@@ -167,6 +168,7 @@
             packages = [
               rustToolchain
               pkgs.python3
+              pkgs.git
               cargo-audit
               cargo-deny
             ];

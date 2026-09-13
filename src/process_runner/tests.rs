@@ -791,7 +791,7 @@ fn external_grok_network_properties_require_unix_without_netlink() {
 #[cfg(target_os = "linux")]
 #[test]
 fn external_grok_profile_projects_exact_systemd_properties() {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = tempfile::tempdir_in("/tmp").expect("PrivateTmp fixture");
     let workspace = temp.path().join("worktree");
     let read_only_root = workspace.join(".maco");
     let prompt = temp.path().join("prompt.md");
@@ -901,7 +901,7 @@ fn external_grok_profile_projects_exact_systemd_properties() {
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut expected_path_properties = BTreeSet::from([
-        systemd_path_property("InaccessiblePaths=", &hidden_root, false)
+        systemd_path_property("InaccessiblePaths=", &hidden_root, true)
             .to_string_lossy()
             .into_owned(),
         systemd_path_property("BindReadOnlyPaths=", &read_only_root, false)
@@ -992,15 +992,15 @@ fn existing_hidden_root_under_home_is_optional_because_protect_home_masks_it_fir
 
 #[cfg(target_os = "linux")]
 #[test]
-fn existing_hidden_root_outside_home_remains_required() {
-    let temp = tempfile::tempdir().expect("tempdir");
+fn existing_hidden_root_under_private_tmp_is_optional_and_still_masked() {
+    let temp = tempfile::tempdir_in("/tmp").expect("private-tmp fixture");
     let workspace = temp.path().join("worktree");
     let present = temp.path().join("present-hidden");
     fs::create_dir(&workspace).expect("workspace");
     fs::create_dir(&present).expect("present hidden root");
     let profile = ExternalGrokProfile::read_only(&workspace).with_hidden_root(&present);
     let spec = ProcessSpec::direct(
-        "required non-home hidden root",
+        "PrivateTmp-covered hidden root",
         PathBuf::from("/bin/true"),
         Vec::<OsString>::new(),
         &workspace,
@@ -1008,7 +1008,7 @@ fn existing_hidden_root_outside_home_remains_required() {
     )
     .with_side_effect_confinement(SideEffectConfinementProfile::ExternalGrok(profile));
     let sandbox = resolve_systemd_sandbox(&spec)
-        .expect("resolve sandbox with an existing non-home hidden root")
+        .expect("resolve sandbox with a PrivateTmp-covered hidden root")
         .expect("workspace sandbox");
 
     let present_check = sandbox
@@ -1016,16 +1016,38 @@ fn existing_hidden_root_outside_home_remains_required() {
         .iter()
         .find(|check| check.path == present && check.access == SandboxMountAccess::Inaccessible)
         .expect("present hidden-root guardian check");
-    assert!(!present_check.optional);
-    assert!(sandbox
+    assert!(present_check.optional);
+    assert!(!sandbox
         .path_identities
         .iter()
         .any(|identity| identity.path == present));
     let mut command = Command::new("systemd-run");
     apply_systemd_sandbox_properties(&mut command, &sandbox, Path::new("/run/maco-test-runtime"));
     assert!(command.get_args().any(|argument| {
-        argument == systemd_path_property("InaccessiblePaths=", &present, false)
+        argument == systemd_path_property("InaccessiblePaths=", &present, true)
     }));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn existing_hidden_roots_outside_private_mounts_remain_required() {
+    for path in [
+        "/srv/maco/secrets",
+        "/opt/maco/private",
+        "/tmp-other",
+        "/var/tmp-other",
+    ] {
+        assert!(
+            !hidden_root_mask_is_optional(Path::new(path), true),
+            "{path}"
+        );
+    }
+    for path in ["/tmp/grok-home", "/var/tmp/grok-home"] {
+        assert!(
+            hidden_root_mask_is_optional(Path::new(path), true),
+            "{path}"
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1075,8 +1097,8 @@ fn absent_hidden_roots_are_optional_and_remain_masked_if_created() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn grok_profile_accepts_missing_ambient_home_without_relaxing_required_roots() {
-    let temp = tempfile::tempdir().expect("tempdir");
+fn grok_profile_accepts_private_ambient_home_without_relaxing_visible_roots() {
+    let temp = tempfile::tempdir_in("/tmp").expect("PrivateTmp fixture");
     let workspace = temp.path().join("worktree");
     let ambient_grok_home = temp.path().join("home").join(".grok");
     let required_root = temp.path().join("required-hidden");
@@ -1097,7 +1119,7 @@ fn grok_profile_accepts_missing_ambient_home_without_relaxing_required_roots() {
             .into_owned()
     ));
     assert!(arguments.contains(
-        &systemd_path_property("InaccessiblePaths=", &required_root, false)
+        &systemd_path_property("InaccessiblePaths=", &required_root, true)
             .to_string_lossy()
             .into_owned()
     ));
@@ -1965,6 +1987,7 @@ fn nested_codex_profile_appends_exact_journal_while_outer_keeps_parent_nonwritab
     let profile = ExternalCodexProfile::read_write(&workspace)
         .with_visible_read_write_file_capability(&journal, held_journal)
         .expect("outer exact-file capability")
+        .with_visible_read_only_file(&test_binary)
         .with_writable_artifact_root(&incoming);
     let output = run_process(
         ProcessSpec::direct(
@@ -2105,6 +2128,7 @@ fn external_codex_outer_sandbox_enforces_control_and_report_write_boundaries() {
     );
     environment.insert(REPORT_PATH_ENV.to_string(), report.display().to_string());
     let profile = ExternalCodexProfile::read_write(&workspace)
+        .with_visible_read_only_file(&test_binary)
         .with_visible_read_only_root(workspace.join(".maco"))
         .with_visible_read_only_root(workspace.join(".maco-cache"))
         .with_visible_read_only_root(workspace.join(".codex"))
@@ -2135,7 +2159,11 @@ fn external_codex_outer_sandbox_enforces_control_and_report_write_boundaries() {
     let unit_names = unit_capture.finish();
     let output = output.expect("run ExternalCodex live write-boundary probe");
 
-    assert!(output.status.is_some_and(|status| status.success()));
+    assert!(
+        output.status.is_some_and(|status| status.success()),
+        "ExternalCodex write-boundary child failed: {}",
+        String::from_utf8_lossy(output.stderr.as_bytes())
+    );
     assert!(output.safety_evidence_verified());
     assert_eq!(
         output.side_effects,
@@ -2200,6 +2228,10 @@ fn external_grok_unix_stream_initialization_preserves_codex_and_write_boundaries
             .parent()
             .expect("managed worktree parent")
             .join(PROTECTED_FILE);
+        assert_eq!(
+            fs::read_to_string(&protected).expect("read bound host fixture"),
+            "protected\n"
+        );
         assert!(
             fs::write(&protected, "forbidden\n").is_err(),
             "{mode} profile wrote outside its managed worktree"
@@ -2272,9 +2304,11 @@ fn external_grok_unix_stream_initialization_preserves_codex_and_write_boundaries
     let codex_output = run_case(
         "codex",
         &codex_worktree,
-        SideEffectConfinementProfile::ExternalCodex(ExternalCodexProfile::read_write(
-            &codex_worktree,
-        )),
+        SideEffectConfinementProfile::ExternalCodex(
+            ExternalCodexProfile::read_write(&codex_worktree)
+                .with_visible_read_only_file(&test_binary)
+                .with_visible_read_only_file(&protected),
+        ),
     );
     assert_eq!(
         codex_output.side_effects,
@@ -2289,7 +2323,11 @@ fn external_grok_unix_stream_initialization_preserves_codex_and_write_boundaries
     let grok_output = run_case(
         "grok",
         &grok_worktree,
-        SideEffectConfinementProfile::ExternalGrok(ExternalGrokProfile::read_write(&grok_worktree)),
+        SideEffectConfinementProfile::ExternalGrok(
+            ExternalGrokProfile::read_write(&grok_worktree)
+                .with_visible_read_only_file(&test_binary)
+                .with_visible_read_only_file(&protected),
+        ),
     );
     assert_eq!(
         grok_output.side_effects,
@@ -2306,7 +2344,9 @@ fn external_grok_unix_stream_initialization_preserves_codex_and_write_boundaries
         "offline",
         &offline_worktree,
         SideEffectConfinementProfile::StrictOfflineWorkspace(
-            StrictOfflineWorkspaceProfile::read_write(&offline_worktree),
+            StrictOfflineWorkspaceProfile::read_write(&offline_worktree)
+                .with_visible_read_only_file(&test_binary)
+                .with_visible_read_only_file(&protected),
         ),
     );
     assert_eq!(
@@ -2561,11 +2601,15 @@ fn isolated_host_view_resolves_disjoint_required_mounts_and_root_tmpfs() {
     let mut sandbox = resolve_systemd_sandbox(&spec)
         .expect("resolve isolated sandbox")
         .expect("sandbox config");
-    let env_helper = trusted_system_executable(
-        "env",
-        &["/usr/bin/env", "/bin/env", "/run/current-system/sw/bin/env"],
-    )
-    .expect("trusted env helper");
+    // Ubuntu's /usr/bin/env remains a host executable even inside nix develop.
+    // Exercise an alias to the immutable helper supplied by the Nix shell.
+    let nix_env = env::split_paths(&env::var_os("PATH").unwrap_or_default())
+        .map(|directory| directory.join("env"))
+        .filter_map(|candidate| fs::canonicalize(candidate).ok())
+        .find(|candidate| candidate.starts_with("/nix/store") && candidate.is_file())
+        .expect("run this test in the repository Nix development shell");
+    let env_helper = temp.path().join("env-helper");
+    std::os::unix::fs::symlink(&nix_env, &env_helper).expect("Nix helper alias");
     sandbox
         .add_isolated_runtime_file(&env_helper)
         .expect("bind exact helper alias");
@@ -2594,7 +2638,7 @@ fn isolated_host_view_resolves_disjoint_required_mounts_and_root_tmpfs() {
         check.path == runtime && check.access == SandboxMountAccess::PrivateRuntime
     }));
     assert!(sandbox.mount_checks.iter().any(|check| {
-        check.path == source && check.access == SandboxMountAccess::Inaccessible && !check.optional
+        check.path == source && check.access == SandboxMountAccess::Inaccessible && check.optional
     }));
     assert!(sandbox.mount_checks.iter().any(|check| {
         check.path == materialized

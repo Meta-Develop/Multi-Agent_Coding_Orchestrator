@@ -5020,8 +5020,6 @@ fn complete_pr_publication_effects(
             report.publication_receipt = Some(transaction.receipt());
         }
         ForgeKind::Github => {
-            merge::resolve_trusted_executable("gh")
-                .context("GitHub publication requires a trusted gh executable")?;
             let expected_head = report
                 .head_id
                 .as_deref()
@@ -5030,6 +5028,9 @@ fn complete_pr_publication_effects(
             let remote_url = raw_remote_url
                 .as_deref()
                 .context("GitHub publication report has no origin URL")?;
+            publication_remote_transport(remote_url)?;
+            merge::resolve_trusted_executable("gh")
+                .context("GitHub publication requires a trusted gh executable")?;
             let mut transaction = PublicationTransaction::open(
                 repo_root,
                 &report,

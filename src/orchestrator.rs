@@ -115,12 +115,54 @@ static CHECKPOINT_EVENT_FAILURE_HOOK: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 #[cfg(test)]
+struct ReadyWaveIdentityDriftHook {
+    installation_id: u64,
+    owner_repo: PathBuf,
+    reached: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static READY_WAVE_IDENTITY_DRIFT_HOOKS: std::sync::OnceLock<
+    std::sync::Mutex<Vec<ReadyWaveIdentityDriftHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+struct ReadyWavePatchWriteHook {
+    installation_id: u64,
+    owner_repo: PathBuf,
+    agent_id: String,
+    reached: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static READY_WAVE_PATCH_WRITE_HOOKS: std::sync::OnceLock<
+    std::sync::Mutex<Vec<ReadyWavePatchWriteHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
 thread_local! {
     static READY_AGENT_SETUP_FAULT: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
     static READY_AGENT_POST_SPAWN_FAULT: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
 }
+
+#[cfg(test)]
+struct ReadyAgentSpawnPanicHook {
+    installation_id: u64,
+    owner_repo: PathBuf,
+    agent_id: String,
+}
+
+#[cfg(test)]
+static READY_AGENT_SPAWN_PANIC_HOOKS: std::sync::OnceLock<
+    std::sync::Mutex<Vec<ReadyAgentSpawnPanicHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static READY_WAVE_HOOK_INSTALLATION_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
 fn set_ready_agent_setup_fault(agent_id: impl Into<String>) {
@@ -158,6 +200,102 @@ fn fail_after_ready_agent_spawn(agent_id: &str) -> Result<()> {
         bail!("injected ready-agent post-spawn setup failure for '{agent_id}'");
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn ready_wave_hook_owner_key(path: &Path) -> PathBuf {
+    // Canonicalize only. Do not git-discover here: an unrelated consume path
+    // would walk parents and could match a different owner repo.
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(test)]
+fn ready_wave_hook_owner_matches(installed_key: &Path, consumer: &Path) -> bool {
+    if installed_key == consumer {
+        return true;
+    }
+    let consumer_key = ready_wave_hook_owner_key(consumer);
+    installed_key == consumer_key.as_path()
+        || ready_wave_hook_owner_key(installed_key) == consumer_key
+}
+
+#[cfg(test)]
+fn next_ready_wave_hook_installation_id() -> u64 {
+    READY_WAVE_HOOK_INSTALLATION_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+fn lock_ready_wave_hooks<T>(
+    slot: &std::sync::OnceLock<std::sync::Mutex<Vec<T>>>,
+) -> std::sync::MutexGuard<'_, Vec<T>> {
+    slot.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+fn set_ready_agent_spawn_panic(owner_repo: &Path, agent_id: impl Into<String>) -> u64 {
+    let agent_id = agent_id.into();
+    let owner_repo = ready_wave_hook_owner_key(owner_repo);
+    let installation_id = next_ready_wave_hook_installation_id();
+    let mut hooks = lock_ready_wave_hooks(&READY_AGENT_SPAWN_PANIC_HOOKS);
+    assert!(
+        !hooks.iter().any(|hook| {
+            ready_wave_hook_owner_matches(&hook.owner_repo, &owner_repo)
+                && hook.agent_id == agent_id
+        }),
+        "ready-agent spawn panic already installed for this owner"
+    );
+    hooks.push(ReadyAgentSpawnPanicHook {
+        installation_id,
+        owner_repo,
+        agent_id,
+    });
+    installation_id
+}
+
+#[cfg(test)]
+fn panic_if_ready_agent_spawn_injected(owner_repo: &Path, agent_id: &str) {
+    let triggered = {
+        let mut hooks = lock_ready_wave_hooks(&READY_AGENT_SPAWN_PANIC_HOOKS);
+        match hooks.iter().position(|hook| {
+            ready_wave_hook_owner_matches(&hook.owner_repo, owner_repo) && hook.agent_id == agent_id
+        }) {
+            Some(index) => {
+                hooks.remove(index);
+                true
+            }
+            None => false,
+        }
+    };
+    if triggered {
+        panic!("injected ready-agent spawn panic for '{agent_id}'");
+    }
+}
+
+#[cfg(test)]
+fn uninstall_ready_wave_test_hooks(installation_ids: &[u64]) {
+    if installation_ids.is_empty() {
+        return;
+    }
+    if let Some(hooks) = READY_WAVE_IDENTITY_DRIFT_HOOKS.get() {
+        hooks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|hook| !installation_ids.contains(&hook.installation_id));
+    }
+    if let Some(hooks) = READY_WAVE_PATCH_WRITE_HOOKS.get() {
+        hooks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|hook| !installation_ids.contains(&hook.installation_id));
+    }
+    if let Some(hooks) = READY_AGENT_SPAWN_PANIC_HOOKS.get() {
+        hooks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|hook| !installation_ids.contains(&hook.installation_id));
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1119,6 +1257,7 @@ fn run_plan_with_controls_runtime(
 
         let captured_candidates = run_agent_schedule_with_patch_dir(
             &AgentScheduleContext {
+                repo: &repo,
                 manager: &manager,
                 plan: &plan,
                 worktrees: &worktrees,
@@ -1407,6 +1546,7 @@ fn resume_plan_file_runtime(
 
         let captured_candidates = run_agent_schedule_with_patch_dir(
             &AgentScheduleContext {
+                repo: &repo,
                 manager: &manager,
                 plan: &plan,
                 worktrees: &worktrees,
@@ -3011,6 +3151,7 @@ impl Drop for PatchOutputGuard {
 }
 
 struct AgentScheduleContext<'a> {
+    repo: &'a Path,
     manager: &'a WorktreeManager,
     plan: &'a OrchestrationPlan,
     worktrees: &'a [SelectedWorktree],
@@ -3081,6 +3222,19 @@ fn run_agent_schedule(
         if summaries[index].status != AgentRunStatus::Succeeded {
             continue;
         }
+        // Recovery reruns validation and captures artifacts, so it needs the
+        // same claim lifetime as a newly dispatched command.
+        let recovery_guard = revalidate_ready_wave(
+            context.manager,
+            context.plan,
+            summaries,
+            context.worktrees,
+            &[index],
+            context.repo,
+        )?;
+        recovery_guard
+            .start_guard_owned_heartbeat()
+            .context("failed to start recovered-agent claim heartbeat")?;
         let expected = capture_selected_candidate_state(
             context.manager,
             &context.plan.agents[index],
@@ -3178,6 +3332,9 @@ fn run_agent_schedule(
             )?;
         }
         captured_candidates[index] = Some(captured);
+        recovery_guard
+            .stop_guard_owned_heartbeat()
+            .context("recovered-agent claim heartbeat failed")?;
     }
 
     while !remaining.is_empty() {
@@ -3221,6 +3378,21 @@ fn run_agent_schedule(
                 )?;
             }
         }
+        // One batch claims-writer lock for this ready wave. Retain through
+        // command join, capture, validation, and patch-byte publication, then
+        // drop before the next wave and before ClaimCleanupGuard / keep_claims.
+        // The heartbeat writes through the held lock and joins before release.
+        let wave_guard = revalidate_ready_wave(
+            context.manager,
+            context.plan,
+            summaries,
+            context.worktrees,
+            &ready,
+            context.repo,
+        )?;
+        wave_guard
+            .start_guard_owned_heartbeat()
+            .context("failed to start ready-wave claim heartbeat")?;
         let outcomes = run_ready_agents(
             context.manager,
             context.plan,
@@ -3228,6 +3400,8 @@ fn run_agent_schedule(
             context.worktrees,
             &ready,
             context.runtime,
+            #[cfg(test)]
+            context.repo,
         )?;
 
         for (index, run_result) in outcomes {
@@ -3335,6 +3509,8 @@ fn run_agent_schedule(
                     &mut summaries[index],
                     &captured,
                     patch_output,
+                    #[cfg(test)]
+                    context.repo,
                 );
                 if let Some(writer) = checkpoint_writer.as_deref_mut() {
                     writer.agent_event(
@@ -3358,6 +3534,9 @@ fn run_agent_schedule(
             }
             remaining.remove(&index);
         }
+        wave_guard
+            .stop_guard_owned_heartbeat()
+            .context("ready-wave claim heartbeat failed")?;
     }
 
     Ok(())
@@ -3391,6 +3570,87 @@ fn verify_selected_worktree_binding(
     Ok(())
 }
 
+/// Acquire one all-or-none batch `RevalidationGuard` for the current ready wave.
+/// Include the other live assignments so their eagerly acquired claims do not
+/// expire while they wait for dependencies or for resumed candidate capture.
+///
+/// Production waves must not loop `revalidate_claimed_worker` / hold N
+/// `RevalidationGuard`s: a second `claims.lock` would deadlock or serialize
+/// children. The caller retains the returned guard through
+/// `join_ready_agent_handles`, candidate capture, validation, bound-candidate
+/// capture, and patch-byte publication, then drops it before the next wave.
+/// The guard-owned heartbeat uses the already-held claims lock; stop and join
+/// it before dropping the guard, including on an error path.
+fn revalidate_ready_wave(
+    manager: &WorktreeManager,
+    plan: &OrchestrationPlan,
+    summaries: &[AgentRunSummary],
+    worktrees: &[SelectedWorktree],
+    ready: &[usize],
+    repo: &Path,
+) -> Result<crate::collect_revalidation::RevalidationGuard> {
+    let protected = protected_wave_indices(summaries, ready);
+    let mut requests = Vec::with_capacity(protected.len());
+    for index in &protected {
+        verify_selected_worktree_binding(
+            manager,
+            &plan.agents[*index],
+            &summaries[*index],
+            &worktrees[*index],
+        )?;
+        let claim = summaries[*index].claim.as_ref().with_context(|| {
+            format!(
+                "agent '{}' has no durable path claim for pre-mutation revalidation",
+                plan.agents[*index].id
+            )
+        })?;
+        let expected_head_oid = current_head_oid(worktrees[*index].path())?;
+        requests.push(crate::collect_revalidation::RevalidationRequest {
+            repo_path: repo.to_path_buf(),
+            agent_id: plan.agents[*index].id.clone(),
+            claim_token: claim.token,
+            claimed_paths: claim.paths.clone(),
+            expected_worktree: worktrees[*index].record().clone(),
+            expected_head_oid,
+        });
+    }
+    #[cfg(test)]
+    fire_ready_wave_identity_drift_hook(repo);
+    crate::collect_revalidation::revalidate_existing_worker_batch(repo, requests).with_context(
+        || {
+            format!(
+                "pre-mutation ready-wave revalidation failed for agents [{}]",
+                ready
+                    .iter()
+                    .map(|index| plan.agents[*index].id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        },
+    )
+}
+
+fn protected_wave_indices(summaries: &[AgentRunSummary], ready: &[usize]) -> Vec<usize> {
+    let mut protected = ready.iter().copied().collect::<BTreeSet<_>>();
+    for (index, summary) in summaries.iter().enumerate() {
+        if summary.claim.is_some()
+            && matches!(
+                summary.status,
+                AgentRunStatus::Pending | AgentRunStatus::Succeeded
+            )
+        {
+            protected.insert(index);
+        }
+    }
+    protected.into_iter().collect()
+}
+
+/// Thin single-agent wrapper around `revalidate_claimed_worker`.
+///
+/// Production ready waves use `revalidate_ready_wave`. This helper stays
+/// test-valid so the isolated negative control can execute the old
+/// drop-before-spawn lifetime.
+#[cfg(test)]
 fn revalidate_ready_agent(
     agent: &AgentPlan,
     summary: &AgentRunSummary,
@@ -3410,6 +3670,126 @@ fn revalidate_ready_agent(
         worktree.record(),
     )
     .with_context(|| format!("pre-mutation revalidation failed for agent '{}'", agent.id))
+}
+
+#[cfg(test)]
+fn install_ready_wave_identity_drift_hook(
+    owner_repo: &Path,
+) -> (
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::SyncSender<()>,
+    u64,
+) {
+    let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let owner_repo = ready_wave_hook_owner_key(owner_repo);
+    let installation_id = next_ready_wave_hook_installation_id();
+    let mut hooks = lock_ready_wave_hooks(&READY_WAVE_IDENTITY_DRIFT_HOOKS);
+    assert!(
+        !hooks
+            .iter()
+            .any(|hook| ready_wave_hook_owner_matches(&hook.owner_repo, &owner_repo)),
+        "ready-wave identity drift hook already installed for this owner"
+    );
+    hooks.push(ReadyWaveIdentityDriftHook {
+        installation_id,
+        owner_repo,
+        reached: reached_tx,
+        release: release_rx,
+    });
+    (reached_rx, release_tx, installation_id)
+}
+
+#[cfg(test)]
+fn fire_ready_wave_identity_drift_hook(repo: &Path) {
+    let selected = {
+        let mut hooks = lock_ready_wave_hooks(&READY_WAVE_IDENTITY_DRIFT_HOOKS);
+        hooks
+            .iter()
+            .position(|hook| ready_wave_hook_owner_matches(&hook.owner_repo, repo))
+            .map(|index| hooks.remove(index))
+    };
+    if let Some(selected) = selected {
+        let _ = selected.reached.send(());
+        let _ = selected.release.recv_timeout(Duration::from_secs(15));
+    }
+}
+
+#[cfg(test)]
+fn install_ready_wave_patch_write_hook(
+    owner_repo: &Path,
+    agent_id: &str,
+) -> (
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::SyncSender<()>,
+    u64,
+) {
+    let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let owner_repo = ready_wave_hook_owner_key(owner_repo);
+    let installation_id = next_ready_wave_hook_installation_id();
+    let mut hooks = lock_ready_wave_hooks(&READY_WAVE_PATCH_WRITE_HOOKS);
+    assert!(
+        !hooks.iter().any(|hook| {
+            ready_wave_hook_owner_matches(&hook.owner_repo, &owner_repo)
+                && hook.agent_id == agent_id
+        }),
+        "ready-wave patch-write hook already installed for this owner"
+    );
+    hooks.push(ReadyWavePatchWriteHook {
+        installation_id,
+        owner_repo,
+        agent_id: agent_id.to_string(),
+        reached: reached_tx,
+        release: release_rx,
+    });
+    (reached_rx, release_tx, installation_id)
+}
+
+#[cfg(test)]
+struct ReadyWavePatchWriteBarrier {
+    release: Option<std::sync::mpsc::Receiver<()>>,
+}
+
+#[cfg(test)]
+impl ReadyWavePatchWriteBarrier {
+    fn arm(owner_repo: &Path, agent_id: &str, writing_bytes: bool) -> Self {
+        if !writing_bytes {
+            return Self { release: None };
+        }
+        let selected = {
+            let mut hooks = lock_ready_wave_hooks(&READY_WAVE_PATCH_WRITE_HOOKS);
+            hooks
+                .iter()
+                .position(|hook| {
+                    ready_wave_hook_owner_matches(&hook.owner_repo, owner_repo)
+                        && hook.agent_id == agent_id
+                })
+                .map(|index| hooks.remove(index))
+        };
+        match selected {
+            Some(selected) => {
+                let _ = selected.reached.send(());
+                Self {
+                    release: Some(selected.release),
+                }
+            }
+            None => Self { release: None },
+        }
+    }
+
+    fn wait(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.recv_timeout(Duration::from_secs(15));
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ReadyWavePatchWriteBarrier {
+    fn drop(&mut self) {
+        self.wait();
+    }
 }
 
 #[cfg(test)]
