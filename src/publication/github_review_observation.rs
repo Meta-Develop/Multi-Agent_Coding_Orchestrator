@@ -308,23 +308,27 @@ fn resolve_item_with(
     }
 }
 
+struct GithubCommentIdentity<'a> {
+    node_id: &'a str,
+    database_id: u64,
+}
+
 fn make_comment(
     item: &ForgeItem,
-    node_id: &str,
-    database_id: u64,
+    identity: GithubCommentIdentity<'_>,
     url: String,
     body: String,
     created_at: ForgeTimestamp,
     author: ForgeActor,
     review: bool,
 ) -> Result<ForgeComment> {
-    if database_id == 0 {
+    if identity.database_id == 0 {
         bail!("GitHub comment omitted a positive database id");
     }
     let fragment = if review {
-        format!("discussion_r{database_id}")
+        format!("discussion_r{}", identity.database_id)
     } else {
-        format!("issuecomment-{database_id}")
+        format!("issuecomment-{}", identity.database_id)
     };
     let (base_url, actual_fragment) = url
         .split_once('#')
@@ -344,7 +348,7 @@ fn make_comment(
         ForgeItemKind::Issue => bail!("GitHub review comment did not belong to a pull request"),
     }
     ForgeComment::new(
-        github_node_object_id(ProviderObjectKind::Comment, node_id)?,
+        github_node_object_id(ProviderObjectKind::Comment, identity.node_id)?,
         author,
         body,
         url,
@@ -382,8 +386,10 @@ fn collect_item_comments(
             )?;
             result.push(make_comment(
                 item,
-                &comment.node_id,
-                comment.id,
+                GithubCommentIdentity {
+                    node_id: &comment.node_id,
+                    database_id: comment.id,
+                },
                 comment.html_url,
                 comment.body.context("GitHub issue comment omitted body")?,
                 ForgeTimestamp::new(comment.created_at)?,
@@ -429,8 +435,10 @@ fn graphql_comment(item: &ForgeItem, comment: GraphqlReviewComment) -> Result<Fo
     )?;
     make_comment(
         item,
-        &comment.id,
-        database_id,
+        GithubCommentIdentity {
+            node_id: &comment.id,
+            database_id,
+        },
         comment.url,
         comment.body,
         ForgeTimestamp::new(comment.created_at)?,
