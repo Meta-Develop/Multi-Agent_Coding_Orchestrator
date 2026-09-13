@@ -1905,22 +1905,279 @@ diff --git a/README.md b/README.md
 
     #[cfg(unix)]
     fn wait_for_fifo_byte(path: &Path, timeout: Duration) {
+        let mut ready = open_fixture_fifo(path).expect("open fixture ready fifo");
+        assert!(
+            poll_fixture_fifo(&mut ready, path, timeout, None).expect("wait for fixture readiness"),
+            "fixture readiness requires an actual byte"
+        );
+    }
+
+    #[cfg(unix)]
+    fn open_fixture_fifo(path: &Path) -> Result<fs::File> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .with_context(|| format!("open fixture fifo {}", path.display()))
+    }
+
+    #[cfg(unix)]
+    fn poll_fixture_fifo(
+        ready: &mut fs::File,
+        path: &Path,
+        timeout: Duration,
+        completed: Option<&std::os::unix::net::UnixStream>,
+    ) -> Result<bool> {
+        use std::os::fd::AsRawFd;
+
+        let deadline = Instant::now() + timeout;
+        let mut byte = [0u8; 1];
+        loop {
+            if Instant::now() >= deadline {
+                bail!("timed out waiting for fifo {}", path.display());
+            }
+            match ready.read(&mut byte) {
+                Ok(1) => return Ok(true),
+                Ok(_) => bail!("fixture fifo closed without a ready byte"),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error).context("read fixture ready byte"),
+            }
+            let mut fds = [
+                libc::pollfd {
+                    fd: ready.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: completed.map_or(-1, AsRawFd::as_raw_fd),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let timeout_ms = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+            // SAFETY: both descriptors are borrowed from live owned fixture endpoints, and
+            // poll receives the exact length of the writable array.
+            let polled = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout_ms) };
+            if polled < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error).context("poll fixture readiness");
+            }
+            if fds[1].revents != 0 {
+                return Ok(false);
+            }
+            if fds[0].revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                bail!("fixture ready fifo poll failed");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    struct NotifyAgentFixtureCompletion(std::os::unix::net::UnixStream);
+
+    #[cfg(unix)]
+    impl Drop for NotifyAgentFixtureCompletion {
+        fn drop(&mut self) {
+            use std::io::Write;
+            let _ = self.0.write_all(b"x");
+        }
+    }
+
+    #[cfg(unix)]
+    struct OwnedAgentFifoRun {
+        runner: Option<thread::JoinHandle<Result<AgentRunReport>>>,
+        competitors: Vec<thread::JoinHandle<()>>,
+        ready: fs::File,
+        release: fs::File,
+        released: bool,
+        completed: std::os::unix::net::UnixStream,
+    }
+
+    #[cfg(unix)]
+    impl OwnedAgentFifoRun {
+        fn spawn(
+            ready_fifo: &Path,
+            release_fifo: &Path,
+            run: impl FnOnce() -> Result<AgentRunReport> + Send + 'static,
+        ) -> Result<Self> {
+            let ready = open_fixture_fifo(ready_fifo)?;
+            let release = open_fixture_fifo(release_fifo)?;
+            let (completed, notify) = std::os::unix::net::UnixStream::pair()?;
+            let runner = thread::spawn(move || {
+                let _notify = NotifyAgentFixtureCompletion(notify);
+                run()
+            });
+            Ok(Self {
+                runner: Some(runner),
+                competitors: Vec::new(),
+                ready,
+                release,
+                released: false,
+                completed,
+            })
+        }
+
+        fn wait_ready(&mut self, path: &Path, timeout: Duration) -> Result<()> {
+            match poll_fixture_fifo(&mut self.ready, path, timeout, Some(&self.completed)) {
+                Ok(true) => Ok(()),
+                readiness => {
+                    let result = self.finish();
+                    bail!("fixture did not reach its FIFO hold: {readiness:?}; agent result: {result:#?}");
+                }
+            }
+        }
+
+        fn release(&mut self) -> Result<()> {
+            use std::io::Write;
+            if !self.released {
+                self.release.write_all(b"go\n")?;
+                self.released = true;
+            }
+            Ok(())
+        }
+
+        fn finish(&mut self) -> Result<AgentRunReport> {
+            let release = self.release();
+            let runner = self
+                .runner
+                .take()
+                .context("fixture runner already joined")?;
+            let result = runner
+                .join()
+                .map_err(|_| anyhow::anyhow!("agent fixture runner panicked"));
+            for competitor in self.competitors.drain(..) {
+                let _ = competitor.join();
+            }
+            release.context("release fixture validation FIFO")?;
+            result?
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for OwnedAgentFifoRun {
+        fn drop(&mut self) {
+            // Keep both FIFO endpoints alive through joins, including when readiness
+            // failed before the child opened either its ready writer or release reader.
+            let _ = self.release();
+            if let Some(runner) = self.runner.take() {
+                let _ = runner.join();
+            }
+            for competitor in self.competitors.drain(..) {
+                let _ = competitor.join();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_fifo_fixture_reports_early_runner_failure() -> Result<()> {
+        let temp = TempDir::new()?;
+        let ready = temp.path().join("ready.fifo");
+        let release = temp.path().join("release.fifo");
+        create_fifo(&ready);
+        create_fifo(&release);
+        let mut runner = OwnedAgentFifoRun::spawn(&ready, &release, || {
+            bail!("synthetic agent failure before validation")
+        })?;
+        let error = runner
+            .wait_ready(&ready, Duration::from_secs(30))
+            .expect_err("early failure cannot report FIFO readiness");
+        assert!(
+            format!("{error:#}").contains("synthetic agent failure before validation"),
+            "the joined runner error must survive: {error:#}"
+        );
+        assert!(runner.runner.is_none(), "failed runner must be joined");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_fifo_fixture_unwind_releases_and_joins_owned_threads() -> Result<()> {
+        use std::io::Write;
+        use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let temp = TempDir::new()?;
+        let ready = temp.path().join("ready.fifo");
+        let release = temp.path().join("release.fifo");
+        create_fifo(&ready);
+        create_fifo(&release);
+        let run_ready = ready.clone();
+        let run_release = release.clone();
+        let runner_done = Arc::new(AtomicBool::new(false));
+        let competitor_done = Arc::new(AtomicBool::new(false));
+        let observed_runner = Arc::clone(&runner_done);
+        let observed_competitor = Arc::clone(&competitor_done);
         let (tx, rx) = mpsc::channel();
-        let opened = path.to_path_buf();
-        let display = path.display().to_string();
-        thread::spawn(move || match fs::File::open(&opened) {
-            Ok(mut file) => {
-                let mut buf = [0u8; 1];
-                let _ = file.read(&mut buf);
-                let _ = tx.send(Ok(()));
-            }
-            Err(error) => {
-                let _ = tx.send(Err(error));
-            }
+        let unwind = std::panic::catch_unwind(move || {
+            let mut runner = OwnedAgentFifoRun::spawn(&ready, &release, move || {
+                let mut release = open_fixture_fifo(&run_release)?;
+                let mut pollfd = libc::pollfd {
+                    fd: release.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // Observe cleanup's release without consuming it. Only then attempt the
+                // late ready write, in the same write-before-read order as the shell.
+                // The existing 10-second FIFO bound also bounds a missing cleanup signal.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let timeout = i32::try_from(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .as_millis(),
+                    )?;
+                    // SAFETY: pollfd borrows the live release file, with an exact array length.
+                    let polled = unsafe { libc::poll(&mut pollfd, 1, timeout) };
+                    if polled < 0
+                        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                    {
+                        continue;
+                    }
+                    assert_eq!(polled, 1);
+                    break;
+                }
+                assert_ne!(pollfd.revents & libc::POLLIN, 0);
+                let mut ready = fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(&run_ready)?;
+                ready.write_all(b"x")?;
+                let mut line = [0; 3];
+                release.read_exact(&mut line)?;
+                assert_eq!(&line, b"go\n");
+                observed_runner.store(true, Ordering::SeqCst);
+                tx.send(())?;
+                bail!("synthetic completed runner")
+            })
+            .expect("spawn owned fixture");
+            runner.competitors.push(thread::spawn(move || {
+                if rx.recv_timeout(Duration::from_secs(10)).is_ok() {
+                    observed_competitor.store(true, Ordering::SeqCst);
+                }
+            }));
+            panic!("synthetic assertion failure while validation is held");
         });
-        rx.recv_timeout(timeout)
-            .unwrap_or_else(|_| panic!("timed out waiting for fifo {display}"))
-            .unwrap_or_else(|error| panic!("failed to open fifo {display}: {error}"));
+        assert!(unwind.is_err());
+        assert!(
+            runner_done.load(Ordering::SeqCst),
+            "runner was not released"
+        );
+        assert!(
+            competitor_done.load(Ordering::SeqCst),
+            "competing claim fixture was not drained before unwind returned"
+        );
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -2074,11 +2331,11 @@ diff --git a/README.md b/README.md
 
         let run_repo = repo_path.clone();
         let validation_command = format!(
-            "printf x > '{}'; cat '{}'",
+            "printf x > '{}'; read -r release < '{}'",
             ready_fifo.display(),
             release_fifo.display()
         );
-        let runner = thread::spawn(move || {
+        let mut runner = OwnedAgentFifoRun::spawn(&ready_fifo, &release_fifo, move || {
             set_agent_claim_timing_for_test(ClaimTiming::new(1, 3).expect("timing"));
             let mut provider = FakeProvider::new("fake", DEFAULT_MODEL);
             provider.push_response(
@@ -2094,9 +2351,9 @@ diff --git a/README.md b/README.md
                 vec![AgentValidationCommand::required(validation_command)];
             options.provider_command_policy = ProviderCommandPolicy::AllowUnsafeShell;
             run_agent_with_provider_simulation(options, &mut provider)
-        });
+        })?;
 
-        wait_for_fifo_byte(&ready_fifo, Duration::from_secs(30));
+        runner.wait_ready(&ready_fifo, Duration::from_secs(30))?;
         let baseline = peek_agent_liveness(&repo_path, "agent-a")?;
         let deadline = Instant::now() + Duration::from_secs(12);
         let mut observed = baseline.heartbeat_unix_seconds;
@@ -2115,9 +2372,7 @@ diff --git a/README.md b/README.md
             baseline.heartbeat_unix_seconds,
             observed
         );
-        fs::write(&release_fifo, b"go").context("release validation fifo")?;
-
-        let report = runner.join().expect("join agent run")?;
+        let report = runner.finish()?;
         assert!(report.success, "unexpected failed report: {report:?}");
         let claim = report.claim.as_ref().context("kept claim")?;
         assert_eq!(claim.agent_id, "agent-a");
@@ -2162,11 +2417,11 @@ diff --git a/README.md b/README.md
         create_fifo(&release_fifo);
         let run_repo = repo_path.clone();
         let validation_command = format!(
-            "printf x > '{}'; cat '{}'",
+            "printf x > '{}'; read -r release < '{}'",
             ready_fifo.display(),
             release_fifo.display()
         );
-        let runner = thread::spawn(move || {
+        let mut runner = OwnedAgentFifoRun::spawn(&ready_fifo, &release_fifo, move || {
             set_agent_claim_timing_for_test(ClaimTiming::new(1, 3).expect("timing"));
             let mut provider = FakeProvider::new("fake", DEFAULT_MODEL);
             provider.push_response(
@@ -2182,9 +2437,9 @@ diff --git a/README.md b/README.md
                 vec![AgentValidationCommand::required(validation_command)];
             options.provider_command_policy = ProviderCommandPolicy::AllowUnsafeShell;
             run_agent_with_provider_simulation(options, &mut provider)
-        });
+        })?;
 
-        wait_for_fifo_byte(&ready_fifo, Duration::from_secs(30));
+        runner.wait_ready(&ready_fifo, Duration::from_secs(30))?;
         let live = peek_agent_liveness(&repo_path, "agent-a")?;
         let token = live.token;
         let release_store = store.clone();
@@ -2193,18 +2448,18 @@ diff --git a/README.md b/README.md
         let (release_tx, release_rx) = mpsc::sync_channel(1);
         let (takeover_tx, takeover_rx) = mpsc::sync_channel(1);
         let (heartbeat_tx, heartbeat_rx) = mpsc::sync_channel(1);
-        let release = thread::spawn(move || {
+        runner.competitors.push(thread::spawn(move || {
             let result = release_store.release(token).map(|claim| claim.token);
             let _ = release_tx.send(result);
-        });
-        let takeover = thread::spawn(move || {
+        }));
+        runner.competitors.push(thread::spawn(move || {
             let result = takeover_store.takeover(token, "other-agent", None);
             let _ = takeover_tx.send(result.map(|outcome| outcome.claim.token));
-        });
-        let heartbeat = thread::spawn(move || {
+        }));
+        runner.competitors.push(thread::spawn(move || {
             let result = heartbeat_store.heartbeat(token, "agent-a", None);
             let _ = heartbeat_tx.send(result.map(|report| report.claim.token));
-        });
+        }));
         assert!(
             release_rx.recv_timeout(Duration::from_millis(150)).is_err(),
             "competing release must not complete while the guard holds claims.lock"
@@ -2217,15 +2472,11 @@ diff --git a/README.md b/README.md
             heartbeat_rx.try_recv().is_err(),
             "ordinary heartbeat must remain the timeout path while the guard holds claims.lock"
         );
-        fs::write(&release_fifo, b"go").context("release validation fifo")?;
-        let report = runner.join().expect("join agent run")?;
+        let report = runner.finish()?;
         assert!(report.success, "unexpected failed report: {report:?}");
         let _ = release_rx.recv_timeout(Duration::from_secs(6));
         let _ = takeover_rx.recv_timeout(Duration::from_millis(200));
         let _ = heartbeat_rx.recv_timeout(Duration::from_millis(200));
-        let _ = release.join();
-        let _ = takeover.join();
-        let _ = heartbeat.join();
         let remaining = store.snapshot()?;
         if remaining.iter().any(|claim| claim.token == token) {
             let started = Instant::now();
