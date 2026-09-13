@@ -550,7 +550,10 @@ mod tests {
         let mut stream_response = Vec::new();
         let mut buffer = [0_u8; 4096];
         while !has_complete_sse_event(&stream_response) {
-            let count = event_stream.read(&mut buffer).expect("read SSE response");
+            let count = match event_stream.read(&mut buffer) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result.expect("read SSE response"),
+            };
             if count == 0 {
                 break;
             }
