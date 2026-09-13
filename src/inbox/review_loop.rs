@@ -26,7 +26,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
 };
 
-const MAX_REVIEW_LOOP_ATTEMPTS: usize = 8;
+pub(super) const MAX_REVIEW_LOOP_ATTEMPTS: usize = 8;
 const MAX_CHECK_NAME_BYTES: usize = 256;
 const MAX_ATTEMPT_ID_BYTES: usize = 128;
 const MAX_DISPOSITION_SUMMARY_BYTES: usize = 8 * 1024;

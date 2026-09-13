@@ -283,6 +283,135 @@ mod tests {
     }
 
     #[test]
+    fn frozen_operator_limit_gates_only_real_github_pr_repair() {
+        use super::super::{
+            repair_attempts::{reserve_if_applicable, RepairAttemptAdmission},
+            source_repository_binding_context, GithubCheckSummary, GithubPrSourceTrust,
+            GithubReviewFeedbackSummary, InboxItemKind, InboxSourceProvider,
+            InboxSourceSnapshotBinding, RawPrCandidate,
+        };
+        let (_temp, repo, path) = fixture();
+        fs::write(
+            &path,
+            serde_json::to_vec(&input(repository("R_actual"))).unwrap(),
+        )
+        .unwrap();
+        let config = InboxConfig::default();
+        let policy = BoundReviewPolicy::load(&repo, &config, &path).unwrap();
+        let source = source_repository_binding_context(&repo, &config, true).unwrap();
+        let head = "a".repeat(40);
+        let base = "b".repeat(40);
+        let raw = RawPrCandidate {
+            provider: InboxSourceProvider::Github,
+            number: 73,
+            title: "Repair requested".to_string(),
+            body: "CI failed".to_string(),
+            url: Some("https://github.com/example/project/pull/73".to_string()),
+            author: Some("author".to_string()),
+            labels: Vec::new(),
+            updated_at: "2026-09-14T00:00:00Z".to_string(),
+            state: "OPEN".to_string(),
+            content_digest: sha256_hex(b"content"),
+            action_revision_digest: sha256_hex(b"action"),
+            head_ref: Some("repair".to_string()),
+            base_ref: Some("main".to_string()),
+            head_oid: head.clone(),
+            base_oid: base.clone(),
+            is_draft: false,
+            source_trust: GithubPrSourceTrust::TrustedTargetRepository,
+            head_repository: Some("example/project".to_string()),
+            changed_files: vec![std::path::PathBuf::from("src/lib.rs")],
+            checks: vec![GithubCheckSummary {
+                name: "ci".to_string(),
+                status: Some("completed".to_string()),
+                conclusion: Some("failure".to_string()),
+                details_url: None,
+                summary: "failed".to_string(),
+            }],
+            review_feedback: GithubReviewFeedbackSummary {
+                review_decision: Some("CHANGES_REQUESTED".to_string()),
+                requested_changes: true,
+                unresolved_thread_count: None,
+                reviewer_logins: Vec::new(),
+                summaries: Vec::new(),
+            },
+        };
+        let item = super::super::pr_item(raw, &config, &source, &Default::default()).unwrap();
+        let head_oid = git2::Oid::from_str(&head).unwrap();
+        let first_run = RunId::new("real-repair-one").unwrap();
+        assert_eq!(
+            reserve_if_applicable(&repo, &item, None, &first_run, 1, Some(head_oid)).unwrap(),
+            RepairAttemptAdmission::NotApplicable
+        );
+        let mut fake = item.clone();
+        fake.source_snapshot = InboxSourceSnapshotBinding::for_pull_request(
+            InboxSourceProvider::Fake,
+            "fake",
+            ".",
+            source.identity.clone(),
+            73,
+            "2026-09-14T00:00:00Z",
+            "OPEN",
+            head.clone(),
+            base,
+            sha256_hex(b"content"),
+            sha256_hex(b"action"),
+        )
+        .unwrap();
+        assert_eq!(
+            reserve_if_applicable(&repo, &fake, Some(&policy), &first_run, 1, Some(head_oid))
+                .unwrap(),
+            RepairAttemptAdmission::NotApplicable
+        );
+        let mut issue = item.clone();
+        issue.kind = InboxItemKind::Issue;
+        assert_eq!(
+            reserve_if_applicable(&repo, &issue, Some(&policy), &first_run, 1, Some(head_oid))
+                .unwrap(),
+            RepairAttemptAdmission::NotApplicable
+        );
+        assert!(reserve_if_applicable(
+            &repo,
+            &item,
+            Some(&policy),
+            &first_run,
+            1,
+            Some(git2::Oid::from_str(&"c".repeat(40)).unwrap()),
+        )
+        .is_err());
+        let source_snapshot_sha256 =
+            sha256_hex(&serde_json::to_vec(&item.source_snapshot).unwrap());
+        assert!(matches!(
+            reserve_if_applicable(&repo, &item, Some(&policy), &first_run, 1, Some(head_oid))
+                .unwrap(),
+            RepairAttemptAdmission::Reserved(ref receipt)
+                if receipt.attempt_number == 1
+                    && receipt.source_snapshot_sha256 == source_snapshot_sha256
+        ));
+        let second_run = RunId::new("real-repair-two").unwrap();
+        assert!(matches!(
+            reserve_if_applicable(&repo, &item, Some(&policy), &second_run, 1, Some(head_oid))
+                .unwrap(),
+            RepairAttemptAdmission::Reserved(ref receipt) if receipt.attempt_number == 2
+        ));
+        assert_eq!(
+            reserve_if_applicable(
+                &repo,
+                &item,
+                Some(&policy),
+                &RunId::new("real-repair-three").unwrap(),
+                1,
+                Some(head_oid),
+            )
+            .unwrap(),
+            RepairAttemptAdmission::Exhausted {
+                spent: 2,
+                max_attempts: 2,
+            }
+        );
+    }
+
+    #[test]
     fn exact_operator_policy_freezes_raw_and_effective_binding() {
         let (_temp, repo, path) = fixture();
         let document = input(repository("R_actual"));

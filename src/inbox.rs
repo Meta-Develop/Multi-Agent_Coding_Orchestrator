@@ -1,3 +1,4 @@
+mod repair_attempts;
 pub mod review_loop;
 pub mod review_loop_entry;
 mod review_policy_input;
@@ -2670,6 +2671,9 @@ fn run_inbox_with_bound_policy_and_resolver(
             .as_ref()
             .is_some_and(|lane| lane.auto_merge_performed && lane.merge_receipt.is_some())
     });
+    let repair_attempt_limit_refused = refusals
+        .iter()
+        .any(|refusal| refusal.kind == "review_repair_attempt_limit_exhausted");
     let report = InboxRunReport {
         version: INBOX_SCHEMA_VERSION,
         run_id: options.run_id,
@@ -2685,7 +2689,10 @@ fn run_inbox_with_bound_policy_and_resolver(
         item_reports,
         pr_intake_producer: overrides.pr_intake_producer,
         auto_merge_performed,
-        next_action: if status == InboxRunStatus::Refused {
+        next_action: if repair_attempt_limit_refused {
+            "inspect the authenticated PR repair attempt history before authorizing more work"
+                .to_string()
+        } else if status == InboxRunStatus::Refused {
             "increase or wait for the rolling inbox quota before starting another run".to_string()
         } else if success && auto_merge_performed {
             "review the verified authenticated pull-request merge receipt".to_string()
@@ -3954,11 +3961,80 @@ fn run_inbox_item(
 
     revalidate_inbox_item_source(repo, item)
         .context("inbox source changed immediately before local work started")?;
+    let expected_source_head = inbox_pr_repair_execution_head(item, context.codex_bin.is_some())?;
+    match repair_attempts::reserve_if_applicable(
+        repo,
+        item,
+        context.review_policy,
+        run_id,
+        item_index,
+        expected_source_head,
+    )? {
+        repair_attempts::RepairAttemptAdmission::NotApplicable => {}
+        repair_attempts::RepairAttemptAdmission::Reserved(receipt) => {
+            write_private_artifact_json(
+                writer,
+                format!("item-{item_index}-repair-attempt.json"),
+                &receipt,
+            )?;
+        }
+        repair_attempts::RepairAttemptAdmission::Exhausted {
+            spent,
+            max_attempts,
+        } => {
+            let message = format!(
+                "operator review policy permits {max_attempts} PR repair attempts; {spent} authenticated reservations are already spent"
+            );
+            write_private_artifact_json(
+                writer,
+                &autopilot_report_relative,
+                &json!({"status": "refused", "success": false, "reason": "review_repair_attempt_limit_exhausted", "message": message.clone()}),
+            )?;
+            let github_report = InboxGithubActionReport {
+                mode: action_policy,
+                permission_mode,
+                status: "skipped".to_string(),
+                success: false,
+                target: item_target(item),
+                comment_url: None,
+                message: Some(
+                    "PR repair attempt limit refused dispatch and downstream GitHub action"
+                        .to_string(),
+                ),
+            };
+            write_private_artifact_json(writer, &github_report_relative, &github_report)?;
+            return Ok(InboxItemRunOutcome {
+                report: InboxItemRunReport {
+                    item_index,
+                    item_id: item.item_id.clone(),
+                    kind: item.kind,
+                    title: item.title.clone(),
+                    success: false,
+                    status: "refused".to_string(),
+                    plan_path: public_item_path(run_id, &format!("item-{item_index}-plan.json")),
+                    autopilot_run_id: autopilot_run_id.as_str().to_string(),
+                    autopilot_report_path: public_item_path(run_id, &format!("item-{item_index}-autopilot-report.json")),
+                    github_report_path: public_item_path(run_id, &format!("item-{item_index}-github-report.json")),
+                    autopilot_success: None,
+                    github_success: false,
+                    review_loop,
+                    pr_intake: None,
+                    independent_audit_lane: None,
+                    next_action: "inspect the authenticated PR repair attempt history before authorizing more work".to_string(),
+                },
+                refusal: Some(InboxRefusal {
+                    kind: "review_repair_attempt_limit_exhausted".to_string(),
+                    message,
+                    paths: Vec::new(),
+                    lock_details: Vec::new(),
+                }),
+            });
+        }
+    }
     let machine_global_retention = context
         .machine_global
         .as_ref()
         .map(|input| input.retention_binding_for_run(&autopilot_run_id));
-    let expected_source_head = inbox_pr_repair_execution_head(item, context.codex_bin.is_some())?;
     let autopilot_result = {
         let _rolling_guard = context
             .rolling_budget_quota
