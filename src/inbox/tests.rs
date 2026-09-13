@@ -44,6 +44,7 @@ fn effectful_inbox_library_entries_fail_closed_before_input_or_artifact_access()
         max_items: None,
         codex_bin: Some(temp.path().join("worker-must-not-run")),
         machine_global: None,
+        review_policy_file: None,
     })
     .expect_err("inbox run must fail closed");
     watch_inbox(InboxWatchOptions {
@@ -56,6 +57,7 @@ fn effectful_inbox_library_entries_fail_closed_before_input_or_artifact_access()
         max_items: None,
         codex_bin: None,
         machine_global: None,
+        review_policy_file: None,
     })
     .expect_err("inbox watch must fail closed");
     run_workspace_inbox(InboxWorkspaceRunOptions {
@@ -680,6 +682,7 @@ fn real_publication_mode_fails_closed_before_intake_or_artifacts() {
         max_items: Some(1),
         codex_bin: None,
         machine_global: None,
+        review_policy_file: None,
     })
     .expect_err("real publication must fail closed before effectful intake");
     let error = format!("{error:#}");
@@ -1018,6 +1021,7 @@ fn scan_report_public_json_uses_placeholder_repo_and_omits_absolute_paths() {
         permission_mode: None,
         max_items: Some(1),
         action_policy_override: None,
+        review_policy_file: None,
     })
     .expect("scan inbox");
     let public_json = serde_json::to_string(&report).expect("serialize report");

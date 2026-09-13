@@ -1872,6 +1872,7 @@ impl InboxCommand {
                     permission_mode: args.permission,
                     max_items: args.max_items,
                     action_policy_override: None,
+                    review_policy_file: args.review_policy_file,
                 })?;
                 print_query_report(&report, args.json)?;
                 if !report.success {
@@ -1900,6 +1901,7 @@ impl InboxCommand {
                             args.machine_global_config,
                             args.machine_global_runtime_root_id,
                         ),
+                        review_policy_file: args.review_policy_file,
                     },
                     args.rolling_budget.quota(),
                 )?;
@@ -1944,6 +1946,7 @@ impl InboxCommand {
                         args.machine_global_config,
                         args.machine_global_runtime_root_id,
                     ),
+                    review_policy_file: args.review_policy_file,
                 })?;
                 print_query_report(&report, args.json)?;
                 if report.runs.iter().any(|run| !run.success) {
@@ -1968,6 +1971,7 @@ fn inbox_intake_options(args: &IntakeInboxArgs) -> Result<InboxRunOptions> {
         max_items: None,
         codex_bin: args.codex_bin.clone(),
         machine_global: None,
+        review_policy_file: None,
     })
 }
 
@@ -2299,6 +2303,9 @@ struct ScanInboxArgs {
     /// Select inbox capabilities: fake, github_read, github_local, github_git, github_pr, or github_full.
     #[arg(long, value_parser = parse_inbox_permission_mode)]
     permission: Option<InboxPermissionMode>,
+    /// Absolute operator-owned GitHub review policy file outside the source repository.
+    #[arg(long)]
+    review_policy_file: Option<PathBuf>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -2324,6 +2331,9 @@ struct RunInboxArgs {
     /// Select inbox capabilities: fake, github_read, github_local, github_git, github_pr, or github_full.
     #[arg(long, value_parser = parse_inbox_permission_mode)]
     permission: Option<InboxPermissionMode>,
+    /// Absolute operator-owned GitHub review policy file outside the source repository.
+    #[arg(long)]
+    review_policy_file: Option<PathBuf>,
     /// Codex-compatible executable to invoke. Omit for deterministic local fake mode.
     #[arg(long)]
     codex_bin: Option<PathBuf>,
@@ -2440,6 +2450,9 @@ struct WatchInboxArgs {
     /// Select inbox capabilities: fake, github_read, github_local, github_git, github_pr, or github_full.
     #[arg(long, value_parser = parse_inbox_permission_mode)]
     permission: Option<InboxPermissionMode>,
+    /// Absolute operator-owned GitHub review policy file outside the source repository.
+    #[arg(long)]
+    review_policy_file: Option<PathBuf>,
     /// Codex-compatible executable to invoke. Omit for deterministic local fake mode.
     #[arg(long)]
     codex_bin: Option<PathBuf>,

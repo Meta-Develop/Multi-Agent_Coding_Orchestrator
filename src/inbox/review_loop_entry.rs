@@ -10,6 +10,7 @@ use super::review_loop::{
     ReviewLoopPolicy, ReviewLoopReadinessEvaluation, ReviewLoopState, TrustedActorBinding,
     TrustedActorIdentity, TrustedActorRole,
 };
+use super::review_policy_input::{BoundReviewPolicy, ReviewPolicyRepositoryMismatch};
 use super::{
     revalidate_inbox_item_source, GithubCheckSummary, GithubPrCandidate, GithubPrSourceTrust,
     InboxIndependentAuditMergeLaneTask, InboxItem, InboxItemKind, InboxSourceProvider,
@@ -781,45 +782,60 @@ pub fn evaluate_inbox_scan_review_loops(items: &[InboxItem]) -> Vec<InboxReviewL
         .collect()
 }
 
-pub(crate) fn evaluate_inbox_scan_review_loops_in_repo(
+pub(super) fn evaluate_inbox_scan_review_loops_in_repo(
     repo: &Path,
     items: &[InboxItem],
-) -> Vec<InboxReviewLoopReport> {
-    items
-        .iter()
-        .filter_map(|item| evaluate_inbox_item_review_loop_in_repo(repo, item))
-        .map(|observation| observation.report)
-        .collect()
+    policy: Option<&BoundReviewPolicy>,
+) -> Result<Vec<InboxReviewLoopReport>> {
+    let mut reports = Vec::new();
+    for item in items {
+        if let Some(observation) = evaluate_inbox_item_review_loop_in_repo(repo, item, policy)? {
+            reports.push(observation.report);
+        }
+    }
+    Ok(reports)
 }
 
 pub(crate) struct InboxReviewObservation {
     pub(crate) report: InboxReviewLoopReport,
     pub(crate) snapshot: Option<FrozenReviewSnapshot>,
     pub(crate) item_thread: Option<ItemThreadObservation>,
+    pub(crate) state: Option<ReviewLoopState>,
 }
 
-pub(crate) fn evaluate_inbox_item_review_loop_in_repo(
+pub(super) fn evaluate_inbox_item_review_loop_in_repo(
     repo: &Path,
     item: &InboxItem,
-) -> Option<InboxReviewObservation> {
+    policy: Option<&BoundReviewPolicy>,
+) -> Result<Option<InboxReviewObservation>> {
     if item.kind != InboxItemKind::PullRequest || item.pull_request.is_none() {
-        return None;
+        return Ok(None);
     }
     if item.source_snapshot.provider() == InboxSourceProvider::Fake {
-        return Some(InboxReviewObservation {
+        return Ok(Some(InboxReviewObservation {
             report: evaluate_pull_request_review_loop(item),
             snapshot: None,
             item_thread: None,
-        });
+            state: None,
+        }));
     }
-    Some(match observe_github_review_loop(repo, item) {
+    Ok(Some(match observe_github_review_loop(repo, item, policy) {
         Ok(observation) => observation,
+        Err(error) if error.is::<ReviewPolicyRepositoryMismatch>() => return Err(error),
         Err(_) => InboxReviewObservation {
-            report: blocked_review_report(item, &["observation_failed", "policy_unavailable"]),
+            report: blocked_review_report(
+                item,
+                if policy.is_some() {
+                    &["observation_failed"]
+                } else {
+                    &["observation_failed", "policy_unavailable"]
+                },
+            ),
             snapshot: None,
             item_thread: None,
+            state: None,
         },
-    })
+    }))
 }
 
 /// Open the review loop for one inbox item when it is a pull request.
@@ -873,7 +889,11 @@ fn authenticated_observation_without_policy(
     }
 }
 
-fn observe_github_review_loop(repo: &Path, item: &InboxItem) -> Result<InboxReviewObservation> {
+fn observe_github_review_loop(
+    repo: &Path,
+    item: &InboxItem,
+    policy: Option<&BoundReviewPolicy>,
+) -> Result<InboxReviewObservation> {
     revalidate_inbox_item_source(repo, item)
         .context("GitHub review observation source changed before collection")?;
     let source = &item.source_snapshot;
@@ -883,6 +903,9 @@ fn observe_github_review_loop(repo: &Path, item: &InboxItem) -> Result<InboxRevi
         ForgeItemKind::PullRequest,
         source.number(),
     )?;
+    if let Some(policy) = policy {
+        policy.verify_repository(forge_item.repository())?;
+    }
     if forge_item.head_oid() != source.head_oid() || forge_item.base_oid() != source.base_oid() {
         bail!("authenticated GitHub PR identity does not bind the inbox source head and base");
     }
@@ -906,13 +929,40 @@ fn observe_github_review_loop(repo: &Path, item: &InboxItem) -> Result<InboxRevi
     if snapshot.item() != &forge_item || item_thread.item() != &forge_item {
         bail!("GitHub review observations changed exact item identity");
     }
+    complete_authenticated_review_observation(item, snapshot, item_thread, policy, &cutoff)
+}
+
+fn complete_authenticated_review_observation(
+    item: &InboxItem,
+    snapshot: FrozenReviewSnapshot,
+    item_thread: ItemThreadObservation,
+    policy: Option<&BoundReviewPolicy>,
+    cutoff: &ForgeTimestamp,
+) -> Result<InboxReviewObservation> {
+    if snapshot.item() != item_thread.item()
+        || snapshot.item().number() != item.source_snapshot.number()
+        || snapshot.item().head_oid() != item.source_snapshot.head_oid()
+        || snapshot.item().base_oid() != item.source_snapshot.base_oid()
+    {
+        bail!("authenticated review evidence changed its exact inbox PR binding");
+    }
+    if let Some(policy) = policy {
+        policy.verify_repository(snapshot.item().repository())?;
+    }
+    let state = policy
+        .map(|policy| ReviewLoopState::new(policy.policy().clone(), snapshot.clone(), cutoff))
+        .transpose()?;
+    let report = match &state {
+        Some(state) => report_from_state(item, state),
+        None => {
+            authenticated_observation_without_policy(item, snapshot.canonical_sha256().to_string())
+        }
+    };
     Ok(InboxReviewObservation {
-        report: authenticated_observation_without_policy(
-            item,
-            snapshot.canonical_sha256().to_string(),
-        ),
+        report,
         snapshot: Some(snapshot),
         item_thread: Some(item_thread),
+        state,
     })
 }
 
@@ -1430,6 +1480,7 @@ mod tests {
             permission_mode: None,
             max_items: Some(4),
             action_policy_override: None,
+            review_policy_file: None,
         })
         .expect("scan inbox");
 
@@ -1467,6 +1518,7 @@ mod tests {
             max_items: Some(4),
             codex_bin: None,
             machine_global: None,
+            review_policy_file: None,
         })
         .expect("run inbox");
 
@@ -1765,6 +1817,347 @@ mod tests {
             selected: true,
             skip_reason: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_operator_policy_yields_restorable_current_head_state_without_merge() {
+        use crate::artifacts::{
+            ArtifactFileDisposition, ArtifactRunReader, ArtifactRunWriter, RunArtifactFamily,
+        };
+        use crate::publication::forge_transport::ForgeReviewThread;
+
+        let (temp, repo) = temp_repo();
+        git2::Repository::open(&repo)
+            .unwrap()
+            .remote("origin", "https://github.com/example/project.git")
+            .unwrap();
+        let repository = ForgeRepository::new(
+            "github",
+            "github.com/example/project",
+            object_id(
+                "github",
+                ProviderObjectKind::Repository,
+                format!(
+                    "node:sha256:{}",
+                    crate::artifacts::state_auth::sha256_hex(b"R_actual")
+                ),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let human = ForgeActor::new(
+            "github",
+            object_id(
+                "github",
+                ProviderObjectKind::Actor,
+                format!(
+                    "node:sha256:{}",
+                    crate::artifacts::state_auth::sha256_hex(b"U_reviewer")
+                ),
+            )
+            .unwrap(),
+            "reviewer",
+            ReportedActorKind::Human,
+        )
+        .unwrap();
+        let bot = ForgeActor::new(
+            "github",
+            object_id(
+                "github",
+                ProviderObjectKind::Actor,
+                format!(
+                    "node:sha256:{}",
+                    crate::artifacts::state_auth::sha256_hex(b"B_ci")
+                ),
+            )
+            .unwrap(),
+            "ci-bot",
+            ReportedActorKind::Bot,
+        )
+        .unwrap();
+        let policy = ReviewLoopPolicy::new(
+            vec![
+                TrustedActorBinding::new(
+                    identity_from_actor(&human).unwrap(),
+                    TrustedActorRole::HumanBlocking,
+                )
+                .unwrap(),
+                TrustedActorBinding::new(
+                    identity_from_actor(&bot).unwrap(),
+                    TrustedActorRole::BotAdvisory,
+                )
+                .unwrap(),
+            ],
+            vec![RequiredCheck::new("ci", vec![identity_from_actor(&bot).unwrap()]).unwrap()],
+            1,
+            2,
+        )
+        .unwrap();
+        let path = std::fs::canonicalize(temp.path())
+            .unwrap()
+            .join("review-policy.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "repository": repository.clone(),
+                "policy": policy,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let bound =
+            BoundReviewPolicy::load(&repo, &crate::inbox::InboxConfig::default(), &path).unwrap();
+
+        let mut item = ready_pr_item();
+        let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let base = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        item.source_snapshot = InboxSourceSnapshotBinding::for_pull_request(
+            InboxSourceProvider::Github,
+            "github.com",
+            "github.com/example/project",
+            publication::stable_external_digest(b"authenticated-review-repo"),
+            9,
+            "2026-08-16T01:02:03Z",
+            "OPEN",
+            head.to_string(),
+            base.to_string(),
+            "3".repeat(64),
+            "4".repeat(64),
+        )
+        .unwrap();
+        item.pull_request.as_mut().unwrap().updated_at = Some("2026-08-16T01:02:03Z".to_string());
+        let forge_item = ForgeItem::new(
+            repository.clone(),
+            ForgeItemKind::PullRequest,
+            9,
+            object_id("github", ProviderObjectKind::Item, "PR_actual").unwrap(),
+            item.source_snapshot.action_revision_digest(),
+            Some(head.to_string()),
+            Some(base.to_string()),
+        )
+        .unwrap();
+        let observed_at = ForgeTimestamp::new("2026-08-16T01:02:03Z").unwrap();
+        let review = ForgeReview::new(
+            object_id("github", ProviderObjectKind::Review, "REV_actual").unwrap(),
+            human,
+            ForgeReviewState::Approved,
+            "approved",
+            observed_at.clone(),
+            head,
+        )
+        .unwrap();
+        let check = ForgeCheck::new(
+            object_id("github", ProviderObjectKind::Check, "CHECK_actual").unwrap(),
+            bot,
+            "ci",
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+            head,
+            observed_at.clone(),
+        )
+        .unwrap();
+        let snapshot = PullRequestReviewSnapshot::new(
+            forge_item.clone(),
+            observed_at.clone(),
+            vec![review.clone()],
+            Vec::new(),
+            vec![check.clone()],
+        )
+        .unwrap();
+        let mut transport = FakeForgeTransport::new();
+        transport
+            .register_observation(
+                ForgeObservationRequest::pull_request_review_snapshot(forge_item.clone()).unwrap(),
+                ForgeObservation::PullRequestReviewSnapshot(snapshot),
+            )
+            .unwrap();
+        let frozen = FrozenReviewSnapshot::observe(&transport, &forge_item, &observed_at).unwrap();
+        let thread =
+            ItemThreadObservation::new(forge_item.clone(), observed_at.clone(), Vec::new())
+                .unwrap();
+        let result = complete_authenticated_review_observation(
+            &item,
+            frozen.clone(),
+            thread.clone(),
+            Some(&bound),
+            &observed_at,
+        )
+        .unwrap();
+        assert!(result.report.ready);
+        assert!(!result.report.grants_merge_permission);
+        assert!(!result.report.auto_merge_performed);
+        let state = result.state.unwrap();
+        assert_eq!(
+            result.report.state_sha256.as_deref(),
+            Some(state.state_sha256())
+        );
+
+        let run_id = RunId::new("authenticated-review-state").unwrap();
+        let mut writer =
+            ArtifactRunWriter::reserve(&repo, RunArtifactFamily::Inbox, run_id.clone(), "inbox")
+                .unwrap();
+        writer
+            .write_bytes(
+                "review-policy-input.json",
+                bound.raw(),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .unwrap();
+        writer
+            .write_json(
+                "review-policy-binding.json",
+                bound.binding(),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .unwrap();
+        writer
+            .write_json(
+                "item-1-review-state.json",
+                &state,
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .unwrap();
+        writer
+            .write_json(
+                "final-report.json",
+                &serde_json::json!({"success": true}),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .unwrap();
+        let run_dir = writer.run_dir().to_path_buf();
+        writer.finalize("final-report.json", false).unwrap();
+        let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Inbox, &run_id).unwrap();
+        assert_eq!(
+            reader.read("review-policy-input.json").unwrap(),
+            bound.raw()
+        );
+        let archived_binding: serde_json::Value =
+            serde_json::from_slice(&reader.read("review-policy-binding.json").unwrap()).unwrap();
+        assert_eq!(
+            archived_binding["raw_sha256"],
+            crate::artifacts::state_auth::sha256_hex(bound.raw())
+        );
+        assert_eq!(
+            archived_binding["policy_sha256"],
+            bound.policy().canonical_sha256().unwrap()
+        );
+        let restored = ReviewLoopState::restore_json(
+            &reader.read("item-1-review-state.json").unwrap(),
+            &observed_at,
+        )
+        .unwrap();
+        assert_eq!(restored, state);
+        drop(reader);
+        let pending_id = RunId::new("unfinalized-review-state").unwrap();
+        let mut pending = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Inbox,
+            pending_id.clone(),
+            "inbox",
+        )
+        .unwrap();
+        pending
+            .write_json(
+                "item-1-review-state.json",
+                &state,
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .unwrap();
+        assert!(ArtifactRunReader::open(&repo, RunArtifactFamily::Inbox, &pending_id).is_err());
+        drop(pending);
+        std::fs::write(run_dir.join("item-1-review-state.json"), b"{}").unwrap();
+        assert!(ArtifactRunReader::open(&repo, RunArtifactFamily::Inbox, &run_id).is_err());
+
+        let wrong_repository = ForgeRepository::new(
+            "github",
+            "github.com/example/project",
+            object_id(
+                "github",
+                ProviderObjectKind::Repository,
+                format!(
+                    "node:sha256:{}",
+                    crate::artifacts::state_auth::sha256_hex(b"R_other")
+                ),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "repository": wrong_repository,
+                "policy": policy.clone(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let foreign_binding =
+            BoundReviewPolicy::load(&repo, &crate::inbox::InboxConfig::default(), &path).unwrap();
+        let wrong_repository_error = complete_authenticated_review_observation(
+            &item,
+            frozen.clone(),
+            thread.clone(),
+            Some(&foreign_binding),
+            &observed_at,
+        )
+        .err()
+        .expect("provider repository ID mismatch cannot admit review state");
+        assert!(wrong_repository_error.is::<ReviewPolicyRepositoryMismatch>());
+
+        let mut moved_head = item.clone();
+        moved_head.source_snapshot = InboxSourceSnapshotBinding::for_pull_request(
+            InboxSourceProvider::Github,
+            "github.com",
+            "github.com/example/project",
+            publication::stable_external_digest(b"authenticated-review-repo"),
+            9,
+            "2026-08-16T01:02:03Z",
+            "OPEN",
+            "c".repeat(40),
+            base.to_string(),
+            "3".repeat(64),
+            "4".repeat(64),
+        )
+        .unwrap();
+        assert!(complete_authenticated_review_observation(
+            &moved_head,
+            frozen.clone(),
+            thread,
+            Some(&bound),
+            &observed_at
+        )
+        .is_err());
+
+        let with_thread = PullRequestReviewSnapshot::new(
+            forge_item.clone(),
+            observed_at.clone(),
+            vec![review],
+            vec![ForgeReviewThread::new(
+                object_id("github", ProviderObjectKind::ReviewThread, "THREAD_actual").unwrap(),
+                true,
+                Vec::new(),
+            )
+            .unwrap()],
+            vec![check],
+        )
+        .unwrap();
+        let mut threaded_transport = FakeForgeTransport::new();
+        threaded_transport
+            .register_observation(
+                ForgeObservationRequest::pull_request_review_snapshot(forge_item.clone()).unwrap(),
+                ForgeObservation::PullRequestReviewSnapshot(with_thread),
+            )
+            .unwrap();
+        let threaded =
+            FrozenReviewSnapshot::observe(&threaded_transport, &forge_item, &observed_at).unwrap();
+        let blocked = ReviewLoopState::new(bound.policy().clone(), threaded, &observed_at).unwrap();
+        assert!(matches!(
+            blocked.readiness().unwrap(),
+            ReviewLoopReadinessEvaluation::Blocked(_)
+        ));
     }
 
     fn safe_privacy() -> PrivacyScanResult {

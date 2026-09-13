@@ -2753,6 +2753,13 @@ pub(crate) fn resolve_github_forge_item(
     github_review_observation::resolve_item(repo, repository_selector, kind, number)
 }
 
+pub(crate) fn resolve_github_forge_repository(
+    repo: &Path,
+    repository_selector: &str,
+) -> Result<ForgeRepository> {
+    github_review_observation::resolve_repository(repo, repository_selector)
+}
+
 pub(crate) fn execute_authenticated_github_pull_request_merge(
     repo: &Path,
     repository_selector: &str,

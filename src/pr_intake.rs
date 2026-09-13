@@ -3442,6 +3442,7 @@ mod tests {
             max_items: None,
             codex_bin: None,
             machine_global: None,
+            review_policy_file: None,
         };
 
         let report = handle_inbox_intake_event(&envelope, sol_catalog(), &authenticator, options);
