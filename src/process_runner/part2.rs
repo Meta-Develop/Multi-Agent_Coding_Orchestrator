@@ -582,7 +582,9 @@ impl Drop for TeeHelper {
 }
 
 fn fail_closed_stuck_owner(label: &str) -> ! {
-    eprintln!(
+    // Write directly so a process abort cannot discard libtest's captured fatal diagnostic.
+    let _ = writeln!(
+        std::io::stderr().lock(),
         "fatal: {label} remained live past its bounded cleanup deadline; aborting rather than detaching owned execution"
     );
     std::process::abort()
