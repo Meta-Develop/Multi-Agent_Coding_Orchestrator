@@ -821,6 +821,18 @@ mod tests {
             assert!(provenance["properties"].get(optional).is_some());
             assert!(!required.iter().any(|field| field == optional));
         }
+        let history = &provenance["properties"]["outcome_history"];
+        assert_eq!(history["additionalProperties"], false);
+        for field in [
+            "snapshot_sha256",
+            "source_digests",
+            "exclusions",
+            "projected_attempt_count",
+        ] {
+            assert!(history["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|value| value == field)));
+        }
         assert_eq!(provenance["properties"]["schema_version"]["const"], 4);
         assert_eq!(
             provenance["properties"]["normalized_input"]["properties"]["priors"]["properties"]
@@ -854,5 +866,28 @@ mod tests {
                 .as_array()
                 .is_some_and(|required| required.iter().any(|value| value == field)));
         }
+    }
+
+    #[test]
+    fn optional_outcome_history_preserves_legacy_and_present_wire_forms() {
+        let mut decision = crate::selection::select(&crate::selection::selection_test_base_input())
+            .expect("valid selector fixture");
+        let legacy = serde_json::to_value(&decision).expect("legacy selector JSON");
+        assert!(legacy.get("outcome_history").is_none());
+        let decoded: crate::selection::SelectionProvenance =
+            serde_json::from_value(legacy).expect("legacy provenance remains readable");
+        assert!(decoded.outcome_history.is_none());
+
+        decision.outcome_history = Some(crate::selection::AuthenticatedOutcomeHistoryProvenance {
+            snapshot_sha256: "a".repeat(64),
+            source_digests: vec!["b".repeat(64)],
+            exclusions: vec!["unfinalized".to_string()],
+            projected_attempt_count: 1,
+        });
+        let present = serde_json::to_value(&decision).expect("history selector JSON");
+        assert!(present.get("outcome_history").is_some());
+        let decoded: crate::selection::SelectionProvenance =
+            serde_json::from_value(present).expect("history provenance remains readable");
+        assert_eq!(decoded.outcome_history, decision.outcome_history);
     }
 }
