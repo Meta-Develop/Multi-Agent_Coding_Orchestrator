@@ -878,11 +878,11 @@ fn experiment_pareto_conclusion(summaries: &[ExperimentProfileSummary]) -> Paret
     }
 }
 
-struct IsolatedSuperviseState {
+pub(super) struct IsolatedSuperviseState {
     _workspace: tempfile::TempDir,
-    repo: PathBuf,
+    pub(super) repo: PathBuf,
     plan_file: PathBuf,
-    run_id: RunId,
+    pub(super) run_id: RunId,
 }
 
 impl IsolatedSuperviseState {
@@ -890,6 +890,15 @@ impl IsolatedSuperviseState {
         manifest: &ExperimentManifest,
         profile: &EvaluationProfile,
         repetition: u32,
+    ) -> Result<Self, EvaluationError> {
+        Self::create_with_baseline_time(manifest, profile, repetition, None)
+    }
+
+    pub(super) fn create_with_baseline_time(
+        manifest: &ExperimentManifest,
+        profile: &EvaluationProfile,
+        repetition: u32,
+        baseline_time: Option<git2::Time>,
     ) -> Result<Self, EvaluationError> {
         let workspace =
             tempfile::TempDir::new().map_err(|error| EvaluationError::FakeSuperviseExperiment {
@@ -907,7 +916,7 @@ impl IsolatedSuperviseState {
         .map_err(|error| EvaluationError::FakeSuperviseExperiment {
             message: format!("failed to write isolated goal/spec: {error}"),
         })?;
-        commit_isolated(&git, "isolated fake supervise baseline")?;
+        commit_isolated(&git, "isolated fake supervise baseline", baseline_time)?;
 
         let run_id = isolated_run_id(manifest, profile, repetition)?;
         let plan_file = workspace.path().join(format!("{}.json", run_id.as_str()));
@@ -929,7 +938,7 @@ impl IsolatedSuperviseState {
         })
     }
 
-    fn options(&self) -> SupervisorRunOptions {
+    pub(super) fn options(&self) -> SupervisorRunOptions {
         SupervisorRunOptions {
             repo: self.repo.clone(),
             plan_file: self.plan_file.clone(),
@@ -1008,7 +1017,11 @@ fn experiment_plan(manifest: &ExperimentManifest, profile: &EvaluationProfile) -
     }
 }
 
-fn commit_isolated(repo: &Repository, message: &str) -> Result<(), EvaluationError> {
+fn commit_isolated(
+    repo: &Repository,
+    message: &str,
+    baseline_time: Option<git2::Time>,
+) -> Result<(), EvaluationError> {
     let mut index = repo
         .index()
         .map_err(|error| EvaluationError::FakeSuperviseExperiment {
@@ -1034,10 +1047,12 @@ fn commit_isolated(repo: &Repository, message: &str) -> Result<(), EvaluationErr
             .map_err(|error| EvaluationError::FakeSuperviseExperiment {
                 message: format!("failed to load isolated tree: {error}"),
             })?;
-    let signature = Signature::now("maco-eval", "maco-eval@example.invalid").map_err(|error| {
-        EvaluationError::FakeSuperviseExperiment {
-            message: format!("failed to create isolated git signature: {error}"),
-        }
+    let signature = match baseline_time {
+        Some(time) => Signature::new("maco-eval", "maco-eval@example.invalid", &time),
+        None => Signature::now("maco-eval", "maco-eval@example.invalid"),
+    }
+    .map_err(|error| EvaluationError::FakeSuperviseExperiment {
+        message: format!("failed to create isolated git signature: {error}"),
     })?;
     let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
     let parents = parent.iter().collect::<Vec<_>>();

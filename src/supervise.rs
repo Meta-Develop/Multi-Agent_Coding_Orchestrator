@@ -283,6 +283,7 @@ use selection_bridge::*;
 mod messaging_bridge;
 
 mod assignment_execution;
+pub(crate) mod held_out;
 #[cfg(test)]
 pub(crate) use assignment_execution::configure_assignment_phase_command_for_test;
 use assignment_execution::*;
@@ -1766,6 +1767,8 @@ struct LoadedSupervisorPlan {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct AssignmentMetadata {
+    /// Constructed only by the parent experiment entrypoint, never parsed from a plan.
+    parent_validation: Option<held_out::ParentValidationAuthority>,
     workers: BTreeMap<(String, String), WorkerAssignmentMetadata>,
     reasoning_efforts: BTreeMap<String, ReasoningEffort>,
     /// Assignment-level mechanical duty for a direct Worker (empty nested list).
@@ -1827,6 +1830,7 @@ impl From<BTreeMap<(String, String), WorkerAssignmentMetadata>> for AssignmentMe
     fn from(workers: BTreeMap<(String, String), WorkerAssignmentMetadata>) -> Self {
         Self {
             workers,
+            parent_validation: None,
             reasoning_efforts: BTreeMap::new(),
             direct_mechanical_duties: BTreeMap::new(),
         }
