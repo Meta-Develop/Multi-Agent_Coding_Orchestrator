@@ -1699,6 +1699,7 @@ fn selected_writable_grok_prepares_private_git_and_retains_it_through_collection
         &primary,
         &child,
         base,
+        base,
         &[PathBuf::from("RELEASE_NOTES.md")],
     )?;
     assert_eq!(imported.head_oid, private_head);
@@ -1767,13 +1768,19 @@ fn grok_style_uncommitted_candidate_materializes_exact_tree_and_imports() -> Res
         &primary,
         &child,
         base,
+        base,
         &candidate_paths,
         &candidate_paths,
         candidate_tree,
     )?
     .context("uncommitted candidate did not materialize")?;
-    let imported =
-        collect_and_import_managed_child_git_commit(&primary, &child, base, &candidate_paths)?;
+    let imported = collect_and_import_managed_child_git_commit(
+        &primary,
+        &child,
+        base,
+        base,
+        &candidate_paths,
+    )?;
 
     assert_eq!(imported.head_oid, materialized);
     assert_eq!(imported.head_tree_oid, candidate_tree);
@@ -1790,6 +1797,102 @@ fn grok_style_uncommitted_candidate_materializes_exact_tree_and_imports() -> Res
         snapshot_managed_git_tree(&common.join("refs"))?,
         shared_refs_before
     );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn source_rooted_child_materializes_only_repair_commit_on_pr_head() -> Result<()> {
+    skip_without_containment!(ok);
+    let temp = tempfile::tempdir()?;
+    let (primary, child, _common, _child_git_dir) =
+        create_linked_git_metadata_fixture(temp.path())?;
+    let primary_repo = crate::git_repository::open(&primary)?;
+    let primary_head = primary_repo.head()?.target().context("primary A")?;
+    let linked = crate::git_repository::open(&child)?;
+    let mut config = linked.config()?;
+    config.set_str("user.name", "Fixture Owner")?;
+    config.set_str("user.email", "fixture@example.invalid")?;
+    drop(config);
+    fs::remove_file(child.join("fixture-codex"))?;
+    fs::write(child.join("PR_ONLY.md"), "original PR change\n")?;
+    let mut index = linked.index()?;
+    index.add_path(Path::new("PR_ONLY.md"))?;
+    index.write()?;
+    let tree = linked.find_tree(index.write_tree()?)?;
+    let signature = git2::Signature::now("Fixture Owner", "fixture@example.invalid")?;
+    let parent = linked.find_commit(primary_head)?;
+    let source_head = linked.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        "original PR head",
+        &tree,
+        &[&parent],
+    )?;
+    assert_ne!(source_head, primary_head);
+    assert_eq!(primary_repo.head()?.target(), Some(primary_head));
+    let git = managed_worktree_git_metadata(&child)?.context("managed Git metadata")?;
+    fs::write(child.join("RELEASE_NOTES.md"), "initial\nrepair only\n")?;
+    let repair_paths = vec![PathBuf::from("RELEASE_NOTES.md")];
+    let candidate_tree = expected_managed_candidate_tree(
+        &git,
+        source_head,
+        &[(
+            "RELEASE_NOTES.md",
+            Some(b"initial\nrepair only\n"),
+            0o100644,
+        )],
+    )?;
+    let materialized = materialize_managed_child_git_commit(
+        &primary,
+        &child,
+        primary_head,
+        source_head,
+        &repair_paths,
+        &repair_paths,
+        candidate_tree,
+    )?
+    .context("source-rooted repair commit was not materialized")?;
+    let imported = collect_and_import_managed_child_git_commit(
+        &primary,
+        &child,
+        primary_head,
+        source_head,
+        &repair_paths,
+    )?;
+    assert_eq!(imported.head_oid, materialized);
+    assert_eq!(imported.base_oid, source_head);
+    assert_eq!(imported.final_changed_paths, repair_paths);
+    assert_eq!(
+        primary_repo.find_commit(materialized)?.parent_id(0)?,
+        source_head
+    );
+    assert_eq!(primary_repo.head()?.target(), Some(primary_head));
+
+    fs::write(primary.join("RELEASE_NOTES.md"), "primary moved\n")?;
+    let mut index = primary_repo.index()?;
+    index.add_path(Path::new("RELEASE_NOTES.md"))?;
+    index.write()?;
+    let tree = primary_repo.find_tree(index.write_tree()?)?;
+    let parent = primary_repo.find_commit(primary_head)?;
+    primary_repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        "move primary after capture",
+        &tree,
+        &[&parent],
+    )?;
+    let error = collect_and_import_managed_child_git_commit(
+        &primary,
+        &child,
+        primary_head,
+        source_head,
+        &repair_paths,
+    )
+    .expect_err("a moved primary must refuse an old captured head");
+    assert!(error.to_string().contains("primary HEAD changed"));
     Ok(())
 }
 
@@ -1839,6 +1942,7 @@ fn managed_child_materialization_refuses_unclaimed_and_symlink_candidates_before
         let error = materialize_managed_child_git_commit(
             &primary,
             &child,
+            base,
             base,
             &claims,
             std::slice::from_ref(&candidate_path),
@@ -2373,6 +2477,7 @@ exit 0
         &primary,
         &child,
         child_head_before,
+        child_head_before,
         &[PathBuf::from("RELEASE_NOTES.md")],
     )?;
     assert_eq!(imported.base_oid, child_head_before);
@@ -2426,6 +2531,7 @@ fn managed_child_import_rejects_unclaimed_commit_without_primary_git_mutation() 
         &primary,
         &child,
         base,
+        base,
         &[PathBuf::from("RELEASE_NOTES.md")],
     )
     .expect_err("unclaimed private commit must fail closed");
@@ -2467,6 +2573,7 @@ fn managed_child_import_rejects_tampered_non_descendant_ref_without_import() -> 
     let error = collect_and_import_managed_child_git_commit(
         &primary,
         &child,
+        base,
         base,
         &[PathBuf::from("RELEASE_NOTES.md")],
     )
@@ -2515,6 +2622,7 @@ fn managed_child_import_rejects_merge_commit_without_import() -> Result<()> {
     let error = collect_and_import_managed_child_git_commit(
         &primary,
         &child,
+        base,
         base,
         &[PathBuf::from("RELEASE_NOTES.md")],
     )
@@ -2587,6 +2695,7 @@ fn managed_child_import_rejects_extra_private_ref_surface_without_import() -> Re
             &primary,
             &child,
             base,
+            base,
             &[PathBuf::from("RELEASE_NOTES.md")],
         )
         .expect_err("unexpected private ref surface must fail closed");
@@ -2643,6 +2752,7 @@ fn managed_child_import_fsck_rejects_corrupt_reachable_object_without_import() -
     let error = collect_and_import_managed_child_git_commit(
         &primary,
         &child,
+        base,
         base,
         &[PathBuf::from("RELEASE_NOTES.md")],
     )

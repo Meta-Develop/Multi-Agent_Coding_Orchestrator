@@ -2379,6 +2379,72 @@ pub(crate) fn collect_agent_result_with_evidence_and_write_lease(
     )
 }
 
+pub(crate) struct ExactBaseWorktreeSnapshot {
+    pub changed_paths: Vec<PathBuf>,
+    pub snapshot_tree: Oid,
+    pub raw_diff: Vec<u8>,
+    pub primary_head: Oid,
+    pub agent_head: Oid,
+    pub merge_base: Option<Oid>,
+}
+
+/// Captures only the child's changes after an authenticated non-primary base.
+/// The ordinary merge collector continues to use the actual merge base with
+/// the primary branch; this collector never creates merge or apply authority.
+pub(crate) fn capture_exact_base_worktree_with_write_lease(
+    repo: &Path,
+    agent_id: &str,
+    claimed_paths: &[PathBuf],
+    write_lease: &ManagedWorktreeWriteLease,
+    base: Oid,
+) -> Result<ExactBaseWorktreeSnapshot> {
+    let repo_root = discover_primary_repo_root(repo)?;
+    let manager = WorktreeManager::new(&repo_root);
+    manager.verify_write_execution_lease(agent_id, write_lease)?;
+    let record = write_lease.record();
+    let primary = crate::git_repository::open(&repo_root)?;
+    let agent = crate::git_repository::open(&record.path)?;
+    let (boundary, captured) = capture_two_matching(|| {
+        let before = capture_candidate_boundary(&primary, &agent)?;
+        if before.agent_head != Some(base) {
+            bail!("source-rooted candidate child HEAD differs from its exact execution base");
+        }
+        let captured =
+            snapshot_worktree_candidate_from_base(&agent, &record.path, Some(base), Some(base))?;
+        let after = capture_candidate_boundary(&primary, &agent)?;
+        Ok((before == after).then_some((before, captured)))
+    })?;
+    manager.verify_write_execution_lease(agent_id, write_lease)?;
+    let changed_paths = captured
+        .changes
+        .into_iter()
+        .map(|change| change.path)
+        .collect::<Vec<_>>();
+    let claimed = normalize_claim_paths(claimed_paths.to_vec())?;
+    let unclaimed = unclaimed_paths(&changed_paths, &claimed);
+    if !unclaimed.is_empty() {
+        bail!(
+            "source-rooted candidate contains unclaimed paths: {}",
+            unclaimed
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let primary_head = boundary
+        .primary_head
+        .context("source-rooted candidate omitted the primary HEAD")?;
+    Ok(ExactBaseWorktreeSnapshot {
+        changed_paths,
+        snapshot_tree: captured.oid,
+        raw_diff: captured.raw_diff,
+        primary_head,
+        agent_head: base,
+        merge_base: merge_base_oid(&primary, primary_head, base)?,
+    })
+}
+
 fn collect_agent_result_from_verified_record(
     options: MergeCollectOptions,
     validation_evidence: ValidationEvidenceBundle,

@@ -3129,20 +3129,31 @@ pub(crate) fn revalidate_external_source(
     repo: &Path,
     expected: &ExternalSourceGuard,
 ) -> Result<()> {
-    revalidate_external_source_with(repo, expected, true)
+    revalidate_external_source_with(repo, expected, true, false)
+}
+
+pub(crate) fn revalidate_same_repository_pr_source(
+    repo: &Path,
+    expected: &ExternalSourceGuard,
+) -> Result<()> {
+    if expected.object_kind != ExternalSourceObjectKind::PullRequest {
+        bail!("same-repository PR source admission requires a pull request");
+    }
+    revalidate_external_source_with(repo, expected, true, true)
 }
 
 fn revalidate_external_source_action_revision(
     repo: &Path,
     expected: &ExternalSourceGuard,
 ) -> Result<()> {
-    revalidate_external_source_with(repo, expected, false)
+    revalidate_external_source_with(repo, expected, false, false)
 }
 
 fn revalidate_external_source_with(
     repo: &Path,
     expected: &ExternalSourceGuard,
     require_full_freshness: bool,
+    require_same_repository_pr: bool,
 ) -> Result<()> {
     expected.validate()?;
     let repository =
@@ -3176,6 +3187,12 @@ fn revalidate_external_source_with(
         expected.object_kind,
         &value,
     )?;
+    if require_same_repository_pr {
+        require_same_repository_pr_observation(
+            &value,
+            &format!("{}/{}", github_repository.owner, github_repository.name),
+        )?;
+    }
     if require_full_freshness {
         if &observed != expected {
             bail!("external source changed from its exact freshness snapshot");
@@ -3191,6 +3208,26 @@ fn revalidate_external_source_with(
         bail!("external source action revision changed during effect reconciliation");
     }
     common.verify()
+}
+
+fn require_same_repository_pr_observation(
+    value: &serde_json::Value,
+    expected_owner_name: &str,
+) -> Result<()> {
+    let object = value
+        .as_object()
+        .context("GitHub PR source observation was not an object")?;
+    if object.get("isCrossRepository") != Some(&serde_json::Value::Bool(false))
+        || object
+            .get("headRepository")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|repository| repository.get("nameWithOwner"))
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|name| !name.eq_ignore_ascii_case(expected_owner_name))
+    {
+        bail!("authenticated GitHub PR source is a fork or has an unbound head repository");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

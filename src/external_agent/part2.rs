@@ -1380,6 +1380,7 @@ pub(crate) fn prepare_managed_child_git_boundary_for_test(workspace: &Path) -> R
 pub(crate) fn materialize_managed_child_git_commit(
     primary_repo: &Path,
     workspace: &Path,
+    captured_primary_head: Oid,
     captured_base: Oid,
     claimed_paths: &[PathBuf],
     candidate_paths: &[PathBuf],
@@ -1396,9 +1397,9 @@ pub(crate) fn materialize_managed_child_git_commit(
         .peel_to_commit()
         .context("managed child materialization primary HEAD is not a commit")?
         .id();
-    if primary_head != captured_base {
+    if primary_head != captured_primary_head {
         bail!(
-            "managed child materialization captured base changed: expected {captured_base}, observed {primary_head}"
+            "managed child materialization primary HEAD changed: expected {captured_primary_head}, observed {primary_head}"
         );
     }
     let linked = crate::git_repository::open(workspace)
@@ -1539,6 +1540,7 @@ pub(crate) fn materialize_managed_child_git_commit(
     require_managed_child_repository_bases(
         &primary,
         &linked,
+        captured_primary_head,
         captured_base,
         "before private commit",
     )?;
@@ -1572,6 +1574,7 @@ pub(crate) fn materialize_managed_child_git_commit(
     require_managed_child_repository_bases(
         &primary,
         &linked,
+        captured_primary_head,
         captured_base,
         "after private commit",
     )?;
@@ -1595,6 +1598,7 @@ fn require_managed_child_private_base(
 fn require_managed_child_repository_bases(
     primary: &git2::Repository,
     linked: &git2::Repository,
+    captured_primary_head: Oid,
     captured_base: Oid,
     phase: &str,
 ) -> Result<()> {
@@ -1610,9 +1614,9 @@ fn require_managed_child_repository_bases(
         .peel_to_commit()
         .with_context(|| format!("managed child linked HEAD is not a commit {phase}"))?
         .id();
-    if primary_head != captured_base || linked_head != captured_base {
+    if primary_head != captured_primary_head || linked_head != captured_base {
         bail!(
-            "managed child repository base changed {phase}: expected {captured_base}, primary {primary_head}, linked {linked_head}"
+            "managed child repository base changed {phase}: expected primary {captured_primary_head} and child {captured_base}, observed primary {primary_head} and child {linked_head}"
         );
     }
     Ok(())
@@ -1812,6 +1816,7 @@ fn run_managed_child_git_command_allow_status(
 pub(crate) fn collect_and_import_managed_child_git_commit(
     primary_repo: &Path,
     workspace: &Path,
+    captured_primary_head: Oid,
     captured_base: Oid,
     claimed_paths: &[PathBuf],
 ) -> Result<ManagedChildGitImport> {
@@ -1827,9 +1832,9 @@ pub(crate) fn collect_and_import_managed_child_git_commit(
         .peel_to_commit()
         .context("managed child import primary HEAD is not a commit")?
         .id();
-    if primary_head != captured_base {
+    if primary_head != captured_primary_head {
         bail!(
-            "managed child import captured base changed: expected {captured_base}, observed {primary_head}"
+            "managed child import primary HEAD changed: expected {captured_primary_head}, observed {primary_head}"
         );
     }
     let linked = crate::git_repository::open(workspace)
@@ -1939,9 +1944,9 @@ pub(crate) fn collect_and_import_managed_child_git_commit(
         .peel_to_commit()
         .context("managed child import primary HEAD stopped resolving to a commit")?
         .id();
-    if final_primary_head != captured_base {
+    if final_primary_head != captured_primary_head {
         bail!(
-            "managed child import primary HEAD changed during import: expected {captured_base}, observed {final_primary_head}"
+            "managed child import primary HEAD changed during import: expected {captured_primary_head}, observed {final_primary_head}"
         );
     }
     primary

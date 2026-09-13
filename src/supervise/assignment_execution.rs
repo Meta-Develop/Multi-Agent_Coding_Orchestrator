@@ -1088,7 +1088,9 @@ fn prepare_assignment_execution<'a>(
         let create_options = WorktreeCreateOptions {
             agent_id: effective_assignment.id.clone(),
             branch: None,
-            base: None,
+            base: worktree_creation
+                .expected_source_head()
+                .map(|head| head.to_string()),
             worktree_root: None,
         };
         let create_result = match worktree_creation {
@@ -1164,20 +1166,29 @@ fn prepare_assignment_execution<'a>(
             .as_ref()
             .context("managed child worktree lease disappeared")?;
         let reusable = if let Some(source) = evidence_only_reaudit {
-            inspect_supervisor_candidate(repo, &effective_assignment, lease).and_then(
-                |inspection| {
-                    if inspection.binding != source.operation.preserved_candidate_binding {
-                        bail!(
-                            "preserved candidate binding changed: expected {:?}, observed {:?}",
-                            source.operation.preserved_candidate_binding,
-                            inspection.binding
-                        );
-                    }
-                    Ok(())
-                },
+            inspect_supervisor_candidate(
+                repo,
+                &effective_assignment,
+                lease,
+                worktree_creation.expected_source_head(),
             )
+            .and_then(|inspection| {
+                if inspection.binding != source.operation.preserved_candidate_binding {
+                    bail!(
+                        "preserved candidate binding changed: expected {:?}, observed {:?}",
+                        source.operation.preserved_candidate_binding,
+                        inspection.binding
+                    );
+                }
+                Ok(())
+            })
         } else {
-            ensure_reusable_child_worktree(&worktree, &current_primary_head)
+            ensure_reusable_child_worktree(
+                &worktree,
+                &worktree_creation
+                    .expected_source_head()
+                    .unwrap_or(current_primary_head),
+            )
         };
         if let Err(error) = reusable {
             if evidence_only_reaudit.is_some() {
@@ -1958,8 +1969,22 @@ fn capture_managed_child_candidate(
     repo: &Path,
     assignment: &OrchestratorAssignment,
     write_lease: &ManagedWorktreeWriteLease,
+    source_base: Option<Oid>,
     context: &str,
 ) -> Result<(Vec<PathBuf>, Oid)> {
+    if let Some(base) = source_base {
+        let candidate = crate::merge::capture_exact_base_worktree_with_write_lease(
+            repo,
+            &assignment.id,
+            &assignment.assigned_paths,
+            write_lease,
+            base,
+        )
+        .with_context(|| format!("failed to capture {context}"))?;
+        let paths = normalize_paths(candidate.changed_paths)
+            .with_context(|| format!("{context} paths are invalid"))?;
+        return Ok((paths, candidate.snapshot_tree));
+    }
     let candidate = collect_agent_result_with_evidence_and_write_lease(
         MergeCollectOptions {
             repo: repo.to_path_buf(),
@@ -1988,12 +2013,14 @@ fn verify_imported_managed_child_candidate(
     repo: &Path,
     assignment: &OrchestratorAssignment,
     write_lease: &ManagedWorktreeWriteLease,
+    source_base: Option<Oid>,
     imported: &ManagedChildGitImport,
 ) -> Result<()> {
     let (candidate_paths, candidate_tree) = capture_managed_child_candidate(
         repo,
         assignment,
         write_lease,
+        source_base,
         "the imported managed child candidate",
     )?;
     if candidate_paths != imported.final_changed_paths {
@@ -2439,6 +2466,16 @@ fn dispatch_and_collect_child_attempt<'a>(
         external_side_effect_absent: external_side_effect_state.is_none(),
     };
     let managed_child_git_import = if materialization_gate.eligible() {
+        let captured_primary_head = if context.worktree_creation.expected_source_head().is_some() {
+            primary_before
+                .head
+                .target
+                .context("source-rooted child omitted its pre-invocation primary HEAD")?
+        } else {
+            // Preserve ordinary managed-child admission: its primary and
+            // child must still share the captured execution base.
+            preflight.child_base_head
+        };
         let write_lease = preflight
             .worktree_write_lease
             .as_ref()
@@ -2448,11 +2485,13 @@ fn dispatch_and_collect_child_attempt<'a>(
                 repo,
                 assignment,
                 write_lease,
+                context.worktree_creation.expected_source_head(),
                 "the pre-materialization managed child candidate",
             )?;
             crate::external_agent::materialize_managed_child_git_commit(
                 repo,
                 &worktree.path,
+                captured_primary_head,
                 preflight.child_base_head,
                 &assignment.assigned_paths,
                 &candidate_paths,
@@ -2461,10 +2500,17 @@ fn dispatch_and_collect_child_attempt<'a>(
             let imported = collect_and_import_managed_child_git_commit(
                 repo,
                 &worktree.path,
+                captured_primary_head,
                 preflight.child_base_head,
                 &assignment.assigned_paths,
             )?;
-            verify_imported_managed_child_candidate(repo, assignment, write_lease, &imported)?;
+            verify_imported_managed_child_candidate(
+                repo,
+                assignment,
+                write_lease,
+                context.worktree_creation.expected_source_head(),
+                &imported,
+            )?;
             Ok::<_, anyhow::Error>(imported)
         })())
     } else {
@@ -3949,7 +3995,12 @@ pub(super) fn inspect_assignment_candidate(
     {
         return inspect_fake_simulation_candidate(context.repo, &preflight.assignment, lease);
     }
-    inspect_supervisor_candidate(context.repo, &preflight.assignment, lease)
+    inspect_supervisor_candidate(
+        context.repo,
+        &preflight.assignment,
+        lease,
+        context.worktree_creation.expected_source_head(),
+    )
 }
 
 fn parent_auditor_repair_eligible(
@@ -4547,6 +4598,7 @@ fn execute_supervisor_assignment_inner(
                     assignment,
                     &mut child_report,
                     lease,
+                    context.worktree_creation.expected_source_head(),
                 ) {
                     Ok(Some(inspection)) => Some(inspection),
                     Ok(None) if !report_failed(&child_report) => {
@@ -4949,6 +5001,30 @@ mod decomposition_tests {
         fs::write(repo.join("README.md"), "source PR head\n").expect("write fixture file");
         commit_fixture_repository(&repo);
         let expected = current_head_oid(&repo).expect("authenticated source head");
+        fs::write(repo.join("README.md"), "primary head after PR branched\n")
+            .expect("move primary fixture content");
+        let primary_repo = crate::git_repository::open(&repo).expect("open primary fixture");
+        let mut index = primary_repo.index().expect("primary index");
+        index
+            .add_path(Path::new("README.md"))
+            .expect("stage primary change");
+        index.write().expect("write primary index");
+        let tree_id = index.write_tree().expect("primary tree");
+        let tree = primary_repo.find_tree(tree_id).expect("find primary tree");
+        let signature =
+            Signature::now("maco test", "maco-test@example.invalid").expect("primary signature");
+        let source_parent = primary_repo.find_commit(expected).expect("source parent");
+        let primary_head = primary_repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "primary moved",
+                &tree,
+                &[&source_parent],
+            )
+            .expect("commit different primary head");
+        assert_ne!(primary_head, expected);
         let manager = WorktreeManager::new(&repo);
         let cleanliness = manager
             .acquire_repository_cleanliness()
@@ -5100,6 +5176,8 @@ mod decomposition_tests {
             current_head_oid(&preflight.worktree.path).unwrap(),
             expected
         );
+        assert_eq!(preflight.child_base_head, expected);
+        assert_eq!(current_head_oid(&repo).unwrap(), primary_head);
         let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
         let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
         let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
@@ -5158,6 +5236,7 @@ mod decomposition_tests {
             current_head_oid(&preflight.worktree.path).unwrap(),
             expected
         );
+        assert_eq!(current_head_oid(&repo).unwrap(), primary_head);
         let error = match dispatch_and_collect_child_attempt(
             &context,
             &mut outcome,

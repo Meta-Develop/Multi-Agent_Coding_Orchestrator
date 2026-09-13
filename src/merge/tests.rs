@@ -1656,6 +1656,93 @@ fn candidate_collection_holds_read_lease_until_snapshot_finishes() {
 }
 
 #[test]
+fn exact_pr_base_candidate_excludes_original_pr_change_from_repair_claim() {
+    skip_without_containment!();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (repo_path, manager, _agent_a, _agent_b) = create_managed_merge_fixture(temp.path());
+    let repository = crate::git_repository::open(&repo_path).expect("open primary");
+    let primary_head = repository.head().unwrap().target().expect("primary A");
+    let parent = repository
+        .find_commit(primary_head)
+        .expect("primary commit");
+    let parent_tree = parent.tree().expect("primary tree");
+    let mut builder = repository
+        .treebuilder(Some(&parent_tree))
+        .expect("PR tree builder");
+    let pr_blob = repository
+        .blob(b"original PR-only change\n")
+        .expect("PR blob");
+    builder
+        .insert("PR_ONLY.md", pr_blob, 0o100644)
+        .expect("insert PR path");
+    let pr_tree = repository
+        .find_tree(builder.write().expect("write PR tree"))
+        .expect("find PR tree");
+    let signature =
+        Signature::now("maco test", "maco-test@example.invalid").expect("fixture signature");
+    let source_head = repository
+        .commit(
+            None,
+            &signature,
+            &signature,
+            "source PR",
+            &pr_tree,
+            &[&parent],
+        )
+        .expect("create B without moving primary A");
+    assert_eq!(repository.head().unwrap().target(), Some(primary_head));
+    let child = manager
+        .create_for_test(WorktreeCreateOptions {
+            agent_id: "source-repair".to_string(),
+            branch: None,
+            base: Some(source_head.to_string()),
+            worktree_root: None,
+        })
+        .expect("create child at B");
+    fs::write(child.path.join("REPAIR.md"), "repair-only change\n")
+        .expect("write repair candidate");
+    let lease = manager
+        .acquire_write_execution_lease("source-repair")
+        .expect("lease source child");
+    let snapshot = capture_exact_base_worktree_with_write_lease(
+        &repo_path,
+        "source-repair",
+        &[PathBuf::from("REPAIR.md")],
+        &lease,
+        source_head,
+    )
+    .expect("capture only B to C");
+    assert_eq!(snapshot.changed_paths, vec![PathBuf::from("REPAIR.md")]);
+    assert_eq!(snapshot.primary_head, primary_head);
+    assert_eq!(snapshot.agent_head, source_head);
+    assert_eq!(snapshot.merge_base, Some(primary_head));
+    let diff = String::from_utf8(snapshot.raw_diff).expect("UTF-8 fixture diff");
+    assert!(diff.contains("REPAIR.md"));
+    assert!(!diff.contains("PR_ONLY.md"));
+    // Candidate capture writes new objects in a disposable private Git store.
+    // Independently construct the exact expected B + repair tree in this fixture.
+    let repair_blob = repository
+        .blob(b"repair-only change\n")
+        .expect("repair blob");
+    let mut expected_builder = repository
+        .treebuilder(Some(&pr_tree))
+        .expect("expected repair tree builder");
+    expected_builder
+        .insert("REPAIR.md", repair_blob, 0o100644)
+        .expect("insert repair path");
+    let expected_tree = expected_builder
+        .write()
+        .expect("write expected repair tree");
+    assert_eq!(snapshot.snapshot_tree, expected_tree);
+    let tree = repository
+        .find_tree(expected_tree)
+        .expect("expected repair tree");
+    assert!(tree.get_name("PR_ONLY.md").is_some());
+    assert!(tree.get_name("REPAIR.md").is_some());
+    assert_eq!(repository.head().unwrap().target(), Some(primary_head));
+}
+
+#[test]
 fn required_process_output_rejects_unverified_side_effect_evidence() {
     let output = ProcessOutput {
         status: None,
