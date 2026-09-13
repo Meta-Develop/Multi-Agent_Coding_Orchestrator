@@ -901,6 +901,18 @@ pub struct SelectionProvenance {
     /// Older selector artifacts omit this additive field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome_history: Option<AuthenticatedOutcomeHistoryProvenance>,
+    /// Exact operator-owned source and effective policy frozen before dispatch.
+    /// Absent on legacy and built-in-only selector artifacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_prior_data: Option<OperatorPriorDataProvenance>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorPriorDataProvenance {
+    pub relative_path: String,
+    pub raw_sha256: String,
+    pub effective_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

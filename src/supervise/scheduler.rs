@@ -1344,7 +1344,7 @@ fn mechanical_worker_model_is_eligible(model: &str, duties: &[MechanicalTerminal
     let Some(capability) = trusted_model_capability(model) else {
         return false;
     };
-    let measured_eligible = crate::selection::measured_authority_eligibility(
+    let measured_eligible = super::prior_input::current_measured_authority_eligibility(
         model,
         crate::selection::AuthorityRole::TerminalLeaf,
     )
@@ -1955,7 +1955,10 @@ fn run_concurrent_assignment_schedule(
                     let assignment_cancellation = cancellation.clone();
                     let concurrency = progress.concurrency.clone();
                     let (admission_commit, admission_receiver) = AdmissionCommitSignal::new();
+                    let prior_binding = super::prior_input::captured_binding();
                     let spawn_result = thread::Builder::new().spawn_scoped(scope, move || {
+                        let _prior_binding_guard =
+                            super::prior_input::install_captured(prior_binding);
                         let _completion = CompletionSignal {
                             index,
                             sender: completion_sender,
@@ -3484,6 +3487,7 @@ fn prepare_supervisor_run(
         bail!("nonpublishable-simulation worktree creation requires the Fake supervisor runtime");
     }
     let repo = discover_repo_root(&options.repo)?;
+    super::prior_input::require_binding_repo(&repo)?;
     let requested_plan = plan.clone();
     let collision = crate::run_ops::refuse_live_run_collision(
         &repo,
@@ -3540,6 +3544,7 @@ fn prepare_supervisor_run(
         &requested_plan.assignments,
         &preclaim_decisions,
     )?;
+    super::prior_input::archive_current(&mut artifact_writer, &repo)?;
     let mut budget_ledger = RunBudgetLedger::new_composed(
         plan_metadata.run_budget.limits,
         options.budget_overrides,

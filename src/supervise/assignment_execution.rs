@@ -560,7 +560,20 @@ fn bind_selected_runtime_launch(
                 assignment.id
             )
         })?;
-        if recorded_model_is_weak_mechanical(&model) {
+        let bound_priors = super::prior_input::current_priors();
+        if let Some(priors) = &bound_priors {
+            let runtime = crate::runtime_adapter::AdapterId::from_runtime(launch_runtime).as_str();
+            if !priors
+                .models
+                .iter()
+                .any(|prior| prior.runtime == runtime && prior.model == model)
+            {
+                bail!(
+                    "operator prior data has no dated prior for selected adapter model '{runtime}:{model}'"
+                );
+            }
+        }
+        if bound_priors.is_some() || recorded_model_is_weak_mechanical(&model) {
             authorize_known_executor_role_model(
                 assignment.role,
                 Some(model.as_str()),
@@ -8888,6 +8901,119 @@ done
             || argument.contains("gpt-5.6-sol")
             || argument.contains("gpt-5.6-luna")));
         drop(overlay);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_operator_cursor_adapter_requires_exact_prior_and_eligible_capability() -> Result<()> {
+        use super::super::{
+            model_policy::{ModelCapabilityEvidence, ModelCapabilityPolicy},
+            prior_input::{bind_operator_prior_data, OperatorPriorSnapshot},
+            selection_bridge::base_selector_priors_with_terminal_worker_economics,
+        };
+
+        const MODEL: &str = "operator-cursor-fixture";
+        let (_temp, repo) = super::super::tests::injected_repository();
+        let mut prior = base_selector_priors_with_terminal_worker_economics()?
+            .models
+            .into_iter()
+            .find(|row| row.model == "gpt-5.6-sol")
+            .context("bundled Sol prior")?;
+        prior.runtime = "cursor".to_string();
+        prior.model = MODEL.to_string();
+        prior.source_id = "operator-cursor-fixture".to_string();
+        prior.prior_scope = "operator dated adapter admission fixture".to_string();
+        let mut snapshot = OperatorPriorSnapshot {
+            schema_version: 1,
+            dataset_id: "operator-cursor-test".to_string(),
+            revision: "2026-09-13.1".to_string(),
+            published_on: "2026-09-13".to_string(),
+            models: Vec::new(),
+            capability_policy: ModelCapabilityPolicy {
+                id: "operator-cursor-capability-test".to_string(),
+                version: 1,
+                source: "operator-owned adapter admission fixture".to_string(),
+                models: Vec::new(),
+            },
+        };
+        let assignment = weak_mechanical_executor_worker("operator-cursor-worker");
+        let mut policy = AssignmentBudgetPolicy::default();
+        policy.set_selector_binding_for_test(
+            AgentRole::Worker,
+            SupervisorRuntime::Cursor,
+            RoleModelSelection {
+                model: Some(MODEL.to_string()),
+                reasoning_effort: Some("high".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        let plan = policy.apply(&worker_plan(MODEL));
+        let catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs([MODEL])?);
+        let launch = || {
+            bind_selected_assignment_launch_for_test(
+                launch_fixture_command(),
+                &assignment,
+                &policy,
+                &plan,
+                &launch_fixture_options(SupervisorRuntime::Codex),
+                &catalog,
+            )
+        };
+        let prior_path = repo.join("prior.json");
+        let write_snapshot = |snapshot: &OperatorPriorSnapshot| -> Result<()> {
+            fs::write(&prior_path, serde_json::to_vec(snapshot)?)?;
+            Ok(())
+        };
+
+        write_snapshot(&snapshot)?;
+        {
+            let _guard = bind_operator_prior_data(&repo, Path::new("prior.json"))?;
+            let error = launch().expect_err("adapter model without exact dated prior must refuse");
+            assert!(
+                error
+                    .to_string()
+                    .contains("no dated prior for selected adapter model"),
+                "{error:#}"
+            );
+        }
+        snapshot.models.push(prior);
+        write_snapshot(&snapshot)?;
+        {
+            let _guard = bind_operator_prior_data(&repo, Path::new("prior.json"))?;
+            let error = launch().expect_err("dated adapter model without capability must refuse");
+            assert!(
+                error.to_string().contains("no trusted capability policy"),
+                "{error:#}"
+            );
+        }
+        snapshot
+            .capability_policy
+            .models
+            .push(ModelCapabilityEvidence {
+                model: MODEL.to_string(),
+                capability: ModelCapabilityClass::GeneralJudgment,
+                eligible: false,
+                evidence: "operator-declared ineligible adapter fixture".to_string(),
+                as_of: "2026-09-13".to_string(),
+            });
+        write_snapshot(&snapshot)?;
+        {
+            let _guard = bind_operator_prior_data(&repo, Path::new("prior.json"))?;
+            let error = launch().expect_err("ineligible adapter capability must refuse");
+            assert!(
+                error.to_string().contains("no trusted capability policy"),
+                "{error:#}"
+            );
+        }
+        snapshot.capability_policy.models[0].eligible = true;
+        write_snapshot(&snapshot)?;
+        {
+            let _guard = bind_operator_prior_data(&repo, Path::new("prior.json"))?;
+            let (runtime, command) = launch()?;
+            assert_eq!(runtime, SupervisorRuntime::Cursor);
+            assert_eq!(command.model.as_deref(), Some(MODEL));
+        }
         Ok(())
     }
 

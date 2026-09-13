@@ -747,6 +747,11 @@ pub(crate) fn selection_provenance_schema_value() -> Value {
         "exclusions" => array(nonempty_string()),
         "projected_attempt_count" => nonnegative_integer(),
     );
+    schema["properties"]["operator_prior_data"] = strict_object!(
+        "relative_path" => nonempty_string(),
+        "raw_sha256" => json!({"type": "string", "pattern": "^[0-9a-f]{64}$"}),
+        "effective_sha256" => json!({"type": "string", "pattern": "^[0-9a-f]{64}$"}),
+    );
     schema
 }
 
@@ -777,19 +782,15 @@ mod tests {
                     let properties = object["properties"].as_object().expect("object properties");
                     let required = object["required"].as_array().expect("object required");
                     let optional = if path == "$/properties/provenance" {
-                        Some("outcome_history")
+                        &["outcome_history", "operator_prior_data"][..]
                     } else {
-                        None
+                        &[][..]
                     };
-                    assert_eq!(
-                        required.len() + usize::from(optional.is_some()),
-                        properties.len(),
-                        "{path}"
-                    );
+                    assert_eq!(required.len() + optional.len(), properties.len(), "{path}");
                     for field in properties.keys() {
                         assert_eq!(
                             required.iter().any(|required| required == field),
-                            optional != Some(field.as_str()),
+                            !optional.contains(&field.as_str()),
                             "{path}/{field}"
                         );
                     }
@@ -816,8 +817,10 @@ mod tests {
         let required = provenance["required"]
             .as_array()
             .expect("provenance required");
-        assert!(provenance["properties"].get("outcome_history").is_some());
-        assert!(!required.iter().any(|field| field == "outcome_history"));
+        for optional in ["outcome_history", "operator_prior_data"] {
+            assert!(provenance["properties"].get(optional).is_some());
+            assert!(!required.iter().any(|field| field == optional));
+        }
         let history = &provenance["properties"]["outcome_history"];
         assert_eq!(history["additionalProperties"], false);
         for field in [

@@ -4214,6 +4214,44 @@ mod selection_schema_tests {
     }
 
     #[test]
+    fn published_supervisor_schemas_accept_legacy_and_frozen_operator_prior_events() -> Result<()> {
+        let decision = crate::selection::select(&crate::selection::selection_test_base_input())?;
+        let legacy = json!({
+            "assignment_id": null,
+            "attempt": 0,
+            "role": "worker",
+            "primary_cause": "initial",
+            "provenance": decision,
+        });
+        let mut present = legacy.clone();
+        present["provenance"]["operator_prior_data"] = json!({
+            "relative_path": "config/operator-priors.json",
+            "raw_sha256": "a".repeat(64),
+            "effective_sha256": "b".repeat(64),
+        });
+        for tracked in [
+            include_str!("../../schemas/supervisor-final-report-v1.schema.json"),
+            include_str!("../../schemas/supervisor-collect-report-v1.schema.json"),
+        ] {
+            let tracked: serde_json::Value = serde_json::from_str(tracked)?;
+            let event_schema = &tracked["properties"]["role_economics_profile"]["properties"]
+                ["execution"]["properties"]["selection_decisions"]["items"];
+            assert!(schema_accepts_instance(event_schema, &legacy));
+            assert!(schema_accepts_instance(event_schema, &present));
+            let mut invalid = present.clone();
+            invalid["provenance"]["operator_prior_data"]
+                .as_object_mut()
+                .context("operator provenance object")?
+                .remove("raw_sha256");
+            assert!(!schema_accepts_instance(event_schema, &invalid));
+            let mut invalid = present.clone();
+            invalid["provenance"]["operator_prior_data"]["extra_grant"] = json!(true);
+            assert!(!schema_accepts_instance(event_schema, &invalid));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn generated_complete_contracts_match_tracked_schemas() -> Result<()> {
         let tracked: serde_json::Value = serde_json::from_str(include_str!(
             "../../schemas/supervisor-final-report-v1.schema.json"
