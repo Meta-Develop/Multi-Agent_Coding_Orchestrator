@@ -2246,6 +2246,167 @@ impl<'de> Deserialize<'de> for ForgeMutationReceipt {
     }
 }
 
+/// Provider state components that must be bound in the same mutation as HEAD.
+/// Absence of a capability declaration is unsupported, not SHA-only success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PullRequestMergeAtomicAxis {
+    HeadOid,
+    ReviewSetAndDecision,
+    ReviewThreadSetResolutionAndCurrency,
+    RequiredCheckSetAndState,
+}
+
+impl PullRequestMergeAtomicAxis {
+    pub(crate) const REQUIRED: [Self; 4] = [
+        Self::HeadOid,
+        Self::ReviewSetAndDecision,
+        Self::ReviewThreadSetResolutionAndCurrency,
+        Self::RequiredCheckSetAndState,
+    ];
+}
+
+/// Axes the transport can bind in the same mutating compare as HEAD.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PullRequestMergeAtomicSupport {
+    supported: BTreeSet<PullRequestMergeAtomicAxis>,
+}
+
+impl PullRequestMergeAtomicSupport {
+    pub(crate) fn unsupported() -> Self {
+        Self {
+            supported: BTreeSet::new(),
+        }
+    }
+
+    pub(crate) fn from_supported(
+        axes: impl IntoIterator<Item = PullRequestMergeAtomicAxis>,
+    ) -> Self {
+        Self {
+            supported: axes.into_iter().collect(),
+        }
+    }
+
+    pub(crate) fn github_head_oid_only() -> Self {
+        Self::from_supported([PullRequestMergeAtomicAxis::HeadOid])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn full_required() -> Self {
+        Self::from_supported(PullRequestMergeAtomicAxis::REQUIRED)
+    }
+
+    pub(crate) fn supported_axes(&self) -> Vec<PullRequestMergeAtomicAxis> {
+        PullRequestMergeAtomicAxis::REQUIRED
+            .into_iter()
+            .filter(|axis| self.supported.contains(axis))
+            .collect()
+    }
+
+    pub(crate) fn unsupported_required_axes(&self) -> Vec<PullRequestMergeAtomicAxis> {
+        PullRequestMergeAtomicAxis::REQUIRED
+            .into_iter()
+            .filter(|axis| !self.supported.contains(axis))
+            .collect()
+    }
+}
+
+/// Expected review / thread / required-check snapshot carried into the merge
+/// mutation. Head OID is already bound on [`PullRequestMergeEffect::item`].
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PullRequestMergeAtomicBinding {
+    reviews: Vec<ForgeReview>,
+    threads: Vec<ForgeReviewThread>,
+    checks: Vec<ForgeCheck>,
+}
+
+impl PullRequestMergeAtomicBinding {
+    pub(crate) fn from_snapshot(snapshot: &PullRequestReviewSnapshot) -> Self {
+        Self {
+            reviews: snapshot.reviews().to_vec(),
+            threads: snapshot.threads().to_vec(),
+            checks: snapshot.checks().to_vec(),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.reviews.is_empty() && self.threads.is_empty() && self.checks.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn matches_snapshot(&self, snapshot: &PullRequestReviewSnapshot) -> bool {
+        snapshot.reviews() == self.reviews.as_slice()
+            && snapshot.threads() == self.threads.as_slice()
+            && snapshot.checks() == self.checks.as_slice()
+    }
+
+    fn validate_for_item(&self, item: &ForgeItem) -> Result<()> {
+        item.validate()?;
+        if item.kind() != ForgeItemKind::PullRequest {
+            bail!("forge merge atomic binding requires a pull-request item");
+        }
+        if self.reviews.len() > MAX_REVIEWS
+            || self.threads.len() > MAX_THREADS
+            || self.checks.len() > MAX_CHECKS
+        {
+            bail!("forge merge atomic binding exceeds a collection count limit");
+        }
+        let total_comments = self.threads.iter().try_fold(0_usize, |total, thread| {
+            total
+                .checked_add(thread.comments().len())
+                .context("forge merge atomic binding comment count overflowed")
+        })?;
+        if total_comments > MAX_TOTAL_REVIEW_COMMENTS {
+            bail!("forge merge atomic binding exceeds its aggregate comment count limit");
+        }
+        let provider = item.repository().provider_id();
+        let head = item
+            .head_oid()
+            .context("forge merge atomic binding omitted its expected head")?;
+        let mut review_ids = BTreeSet::new();
+        let mut thread_ids = BTreeSet::new();
+        let mut comment_ids = BTreeSet::new();
+        let mut check_ids = BTreeSet::new();
+        let mut actors = Vec::new();
+        for review in &self.reviews {
+            review.validate()?;
+            if review.author().provider_id() != provider
+                || review.commit_oid() != head
+                || !review_ids.insert(review.provider_review_id().clone())
+            {
+                bail!("forge merge atomic binding contains an unbound or duplicate review");
+            }
+            actors.push(review.author());
+        }
+        for thread in &self.threads {
+            thread.validate()?;
+            if thread.provider_thread_id().provider_id() != provider
+                || !thread_ids.insert(thread.provider_thread_id().clone())
+            {
+                bail!("forge merge atomic binding contains an unbound or duplicate review thread");
+            }
+            for comment in thread.comments() {
+                if !comment_ids.insert(comment.provider_comment_id().clone()) {
+                    bail!("forge merge atomic binding contains a duplicate review comment");
+                }
+                actors.push(comment.author());
+            }
+        }
+        for check in &self.checks {
+            check.validate()?;
+            if check.actor().provider_id() != provider
+                || check.head_oid() != head
+                || !check_ids.insert(check.provider_check_id().clone())
+            {
+                bail!("forge merge atomic binding contains an unbound or duplicate check");
+            }
+            actors.push(check.actor());
+        }
+        validate_actor_identity(actors.into_iter())
+    }
+}
+
 /// Exact compare-and-swap merge request created only after merge authority has
 /// been recomputed from a current forge observation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2256,6 +2417,8 @@ pub(crate) struct PullRequestMergeEffect {
     evidence_digest: String,
     ground_truth_digest: String,
     completion_mode: CompletionMode,
+    #[serde(skip_serializing_if = "PullRequestMergeAtomicBinding::is_empty")]
+    atomic_binding: PullRequestMergeAtomicBinding,
 }
 
 #[derive(Deserialize)]
@@ -2267,6 +2430,8 @@ struct PullRequestMergeEffectWire {
     evidence_digest: String,
     ground_truth_digest: String,
     completion_mode: CompletionMode,
+    #[serde(default)]
+    atomic_binding: PullRequestMergeAtomicBinding,
 }
 
 impl PullRequestMergeEffect {
@@ -2278,6 +2443,7 @@ impl PullRequestMergeEffect {
         evidence_digest: impl Into<String>,
         ground_truth_digest: impl Into<String>,
         completion_mode: CompletionMode,
+        atomic_binding: PullRequestMergeAtomicBinding,
     ) -> Result<Self> {
         let effect = Self {
             effect_id: effect_id.into(),
@@ -2286,6 +2452,7 @@ impl PullRequestMergeEffect {
             evidence_digest: evidence_digest.into(),
             ground_truth_digest: ground_truth_digest.into(),
             completion_mode,
+            atomic_binding,
         };
         effect.validate()?;
         Ok(effect)
@@ -2315,6 +2482,11 @@ impl PullRequestMergeEffect {
         self.completion_mode
     }
 
+    #[cfg(test)]
+    pub(crate) fn atomic_binding(&self) -> &PullRequestMergeAtomicBinding {
+        &self.atomic_binding
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         validate_stable_id(&self.effect_id, "forge merge effect id")?;
         self.item.validate()?;
@@ -2330,6 +2502,7 @@ impl PullRequestMergeEffect {
         if self.completion_mode.history_flattening() {
             bail!("forge merge effect refuses a history-flattening completion mode");
         }
+        self.atomic_binding.validate_for_item(&self.item)?;
         validate_serialized(self, MAX_REQUEST_BYTES, "forge pull-request merge effect")
     }
 }
@@ -2347,6 +2520,7 @@ impl<'de> Deserialize<'de> for PullRequestMergeEffect {
             wire.evidence_digest,
             wire.ground_truth_digest,
             wire.completion_mode,
+            wire.atomic_binding,
         )
         .map_err(serde::de::Error::custom)
     }
@@ -2545,6 +2719,14 @@ pub(crate) trait PullRequestMergeTransport {
         effect: &PullRequestMergeEffect,
         receipt: &PullRequestMergeReceipt,
     ) -> Result<PullRequestMergeReceipt>;
+
+    /// Axes this transport can bind in the same mutation as HEAD.
+    ///
+    /// The default is empty: missing a capability declaration is unsupported,
+    /// not SHA-only success.
+    fn pull_request_merge_atomic_support(&self) -> PullRequestMergeAtomicSupport {
+        PullRequestMergeAtomicSupport::unsupported()
+    }
 }
 
 /// Object-safe provider-neutral boundary. It contains no trust or reducer policy.
@@ -2566,14 +2748,20 @@ struct FakeMergeRecord {
     receipt: PullRequestMergeReceipt,
 }
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct FakeMergeRuntime {
+    observations: BTreeMap<String, PullRequestReviewSnapshot>,
+    execute_observation: Option<PullRequestReviewSnapshot>,
+    merges: BTreeMap<String, FakeMergeRecord>,
+}
+
 #[derive(Debug, Default)]
 pub struct FakeForgeTransport {
     observations: BTreeMap<String, ForgeObservation>,
     effects: Mutex<BTreeMap<String, FakeEffectRecord>>,
     #[cfg(test)]
-    merge_observations: BTreeMap<String, PullRequestReviewSnapshot>,
-    #[cfg(test)]
-    merges: Mutex<BTreeMap<String, FakeMergeRecord>>,
+    merge_runtime: Mutex<FakeMergeRuntime>,
 }
 
 impl FakeForgeTransport {
@@ -2617,7 +2805,11 @@ impl FakeForgeTransport {
             bail!("fake merge observation does not match the stable pull-request identity");
         }
         let key = pull_request_identity_digest(candidate)?;
-        match self.merge_observations.entry(key) {
+        let mut runtime = self
+            .merge_runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fake forge merge runtime lock was poisoned"))?;
+        match runtime.observations.entry(key) {
             Entry::Vacant(entry) => {
                 entry.insert(snapshot);
                 Ok(())
@@ -2631,10 +2823,59 @@ impl FakeForgeTransport {
     #[cfg(test)]
     pub(crate) fn pull_request_merge_count(&self) -> Result<usize> {
         Ok(self
-            .merges
+            .merge_runtime
             .lock()
-            .map_err(|_| anyhow::anyhow!("fake forge merge ledger lock was poisoned"))?
+            .map_err(|_| anyhow::anyhow!("fake forge merge runtime lock was poisoned"))?
+            .merges
             .len())
+    }
+
+    /// Observation used only at `execute_pull_request_merge`. Authorize still
+    /// sees the registered snapshot so unchanged-HEAD tampers exercise CAS
+    /// rather than earlier preflight blockers. The setter shares the execute
+    /// CAS mutex, so a replacement cannot sneak in between compare and insert.
+    #[cfg(test)]
+    pub(crate) fn set_execute_only_observation(
+        &self,
+        snapshot: PullRequestReviewSnapshot,
+    ) -> Result<()> {
+        snapshot.validate()?;
+        self.merge_runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fake forge merge runtime lock was poisoned"))?
+            .execute_observation = Some(snapshot);
+        Ok(())
+    }
+
+    /// Record a provider merge that already happened, without CAS.
+    ///
+    /// Used to recover pre-`atomic_binding` Started/Observed/Completed WAL
+    /// fixtures. New Planned executes still compare the bound snapshot.
+    #[cfg(test)]
+    pub(crate) fn record_historical_pull_request_merge(
+        &self,
+        effect: &PullRequestMergeEffect,
+    ) -> Result<PullRequestMergeReceipt> {
+        effect.validate()?;
+        let effect_digest = pull_request_merge_effect_digest(effect)?;
+        let receipt = mint_fake_pull_request_merge_receipt(effect, &effect_digest)?;
+        receipt.validate_for_effect(effect)?;
+        let mut runtime = self
+            .merge_runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fake forge merge runtime lock was poisoned"))?;
+        match runtime.merges.entry(effect.effect_id().to_string()) {
+            Entry::Vacant(entry) => {
+                entry.insert(FakeMergeRecord {
+                    effect_digest,
+                    receipt: receipt.clone(),
+                });
+                Ok(receipt)
+            }
+            Entry::Occupied(_) => {
+                bail!("fake forge merge effect id was reused with a historical receipt")
+            }
+        }
     }
 }
 
@@ -2707,6 +2948,10 @@ impl ForgeTransport for FakeForgeTransport {
 
 #[cfg(test)]
 impl PullRequestMergeTransport for FakeForgeTransport {
+    fn pull_request_merge_atomic_support(&self) -> PullRequestMergeAtomicSupport {
+        PullRequestMergeAtomicSupport::full_required()
+    }
+
     fn observe_pull_request_for_merge(
         &self,
         candidate: &ForgeItem,
@@ -2716,10 +2961,13 @@ impl PullRequestMergeTransport for FakeForgeTransport {
             bail!("fake forge merge observation requires a pull-request candidate");
         }
         let snapshot = self
-            .merge_observations
+            .merge_runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fake forge merge runtime lock was poisoned"))?
+            .observations
             .get(&pull_request_identity_digest(candidate)?)
-            .context("fake forge has no current merge observation for the pull request")?
-            .clone();
+            .cloned()
+            .context("fake forge has no current merge observation for the pull request")?;
         snapshot.validate()?;
         if !same_pull_request_identity(candidate, snapshot.item()) {
             bail!("fake forge returned a different pull-request identity");
@@ -2733,11 +2981,11 @@ impl PullRequestMergeTransport for FakeForgeTransport {
     ) -> Result<Vec<PullRequestMergeReceipt>> {
         effect.validate()?;
         let digest = pull_request_merge_effect_digest(effect)?;
-        let merges = self
-            .merges
+        let runtime = self
+            .merge_runtime
             .lock()
-            .map_err(|_| anyhow::anyhow!("fake forge merge ledger lock was poisoned"))?;
-        let Some(record) = merges.get(effect.effect_id()) else {
+            .map_err(|_| anyhow::anyhow!("fake forge merge runtime lock was poisoned"))?;
+        let Some(record) = runtime.merges.get(effect.effect_id()) else {
             return Ok(Vec::new());
         };
         if record.effect_digest != digest {
@@ -2752,20 +3000,30 @@ impl PullRequestMergeTransport for FakeForgeTransport {
         effect: &PullRequestMergeEffect,
     ) -> Result<PullRequestMergeReceipt> {
         effect.validate()?;
-        let current = self
-            .merge_observations
-            .get(&pull_request_identity_digest(effect.item())?)
-            .context("fake forge lost the current pull-request state before merge")?;
+        let mut runtime = self
+            .merge_runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fake forge merge runtime lock was poisoned"))?;
+        let current = if let Some(snapshot) = runtime.execute_observation.as_ref() {
+            snapshot.clone()
+        } else {
+            runtime
+                .observations
+                .get(&pull_request_identity_digest(effect.item())?)
+                .context("fake forge lost the current pull-request state before merge")?
+                .clone()
+        };
         if current.item() != effect.item() {
             bail!("fake forge pull-request head changed before the compare-and-swap merge");
         }
+        if !effect.atomic_binding().matches_snapshot(&current) {
+            bail!(
+                "fake forge review, thread, or required-check snapshot changed before the compare-and-swap merge"
+            );
+        }
 
         let effect_digest = pull_request_merge_effect_digest(effect)?;
-        let mut merges = self
-            .merges
-            .lock()
-            .map_err(|_| anyhow::anyhow!("fake forge merge ledger lock was poisoned"))?;
-        if let Some(record) = merges.get(effect.effect_id()) {
+        if let Some(record) = runtime.merges.get(effect.effect_id()) {
             if record.effect_digest != effect_digest {
                 bail!("fake forge merge effect id was reused with different authority");
             }
@@ -2773,40 +3031,9 @@ impl PullRequestMergeTransport for FakeForgeTransport {
             return Ok(record.receipt.clone());
         }
 
-        let raw_digest = crate::artifacts::state_auth::sha256_hex(
-            format!("forge-fake-merge-v1\0{effect_digest}").as_bytes(),
-        );
-        let head_width = effect
-            .item()
-            .head_oid()
-            .expect("validated merge effects contain a head OID")
-            .len();
-        let merged_oid = raw_digest[..head_width].to_string();
-        let provider_merge_id = ProviderObjectId::new(
-            effect.item().repository().provider_id(),
-            ProviderObjectKind::Merge,
-            format!("merge:{raw_digest}"),
-        )?;
-        let url = format!(
-            "https://{}/pull/{}/merge/{}",
-            effect.item().repository().canonical_locator(),
-            effect.item().number(),
-            provider_merge_id.stable_id()
-        );
-        let receipt = PullRequestMergeReceipt::new(
-            effect.effect_id().to_string(),
-            effect.item().clone(),
-            effect.approved_actor().clone(),
-            effect.evidence_digest().to_string(),
-            effect.ground_truth_digest().to_string(),
-            effect.completion_mode(),
-            provider_merge_id,
-            merged_oid,
-            url,
-            ForgeTimestamp::new("2000-01-01T00:00:00Z")?,
-        )?;
+        let receipt = mint_fake_pull_request_merge_receipt(effect, &effect_digest)?;
         receipt.validate_for_effect(effect)?;
-        merges.insert(
+        runtime.merges.insert(
             effect.effect_id().to_string(),
             FakeMergeRecord {
                 effect_digest,
@@ -2928,7 +3155,46 @@ fn pull_request_identity_digest(item: &ForgeItem) -> Result<String> {
 }
 
 #[cfg(test)]
-fn pull_request_merge_effect_digest(effect: &PullRequestMergeEffect) -> Result<String> {
+fn mint_fake_pull_request_merge_receipt(
+    effect: &PullRequestMergeEffect,
+    effect_digest: &str,
+) -> Result<PullRequestMergeReceipt> {
+    let raw_digest = crate::artifacts::state_auth::sha256_hex(
+        format!("forge-fake-merge-v1\0{effect_digest}").as_bytes(),
+    );
+    let head_width = effect
+        .item()
+        .head_oid()
+        .expect("validated merge effects contain a head OID")
+        .len();
+    let merged_oid = raw_digest[..head_width].to_string();
+    let provider_merge_id = ProviderObjectId::new(
+        effect.item().repository().provider_id(),
+        ProviderObjectKind::Merge,
+        format!("merge:{raw_digest}"),
+    )?;
+    let url = format!(
+        "https://{}/pull/{}/merge/{}",
+        effect.item().repository().canonical_locator(),
+        effect.item().number(),
+        provider_merge_id.stable_id()
+    );
+    PullRequestMergeReceipt::new(
+        effect.effect_id().to_string(),
+        effect.item().clone(),
+        effect.approved_actor().clone(),
+        effect.evidence_digest().to_string(),
+        effect.ground_truth_digest().to_string(),
+        effect.completion_mode(),
+        provider_merge_id,
+        merged_oid,
+        url,
+        ForgeTimestamp::new("2000-01-01T00:00:00Z")?,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn pull_request_merge_effect_digest(effect: &PullRequestMergeEffect) -> Result<String> {
     effect.validate()?;
     let encoded = serde_json::to_vec(effect).context("failed to bind forge merge effect")?;
     Ok(sha256_identity(
