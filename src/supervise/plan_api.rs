@@ -2734,6 +2734,7 @@ pub fn run_supervisor_plan_file_cascade_with_concurrency_policy_and_primary_work
         None,
         allow_primary_worktree,
         objective_profile_override.as_deref(),
+        None,
         &mut permit,
         &run_external_agent_cancellable_reviewed,
     )
@@ -2865,6 +2866,49 @@ pub fn resume_supervisor_goal_spec_cascade_with_concurrency_policy(
     resume_generated_follow_up_cascade(repo, loaded, options, concurrency_policy)
 }
 
+fn refuse_inbox_pr_repair_generic_resume(
+    repo: &Path,
+    run_id: &RunId,
+    finalized: bool,
+) -> Result<()> {
+    let checkpoint_head = match open_supervisor_checkpoint(repo, run_id) {
+        Ok((_writer, snapshot)) => snapshot.inbox_pr_source_head_oid,
+        Err(_) if finalized => None,
+        Err(error) => {
+            return Err(error).context("failed to authenticate source checkpoint before resume");
+        }
+    };
+    let artifact_head = if finalized {
+        let reader = ArtifactRunReader::open(repo, RunArtifactFamily::Supervise, run_id)?;
+        if reader
+            .finalization()
+            .files
+            .iter()
+            .any(|record| record.path == Path::new(INBOX_PR_SOURCE_HEAD_MARKER))
+        {
+            let marker: InboxPrSourceHeadMarker =
+                serde_json::from_slice(&reader.read(INBOX_PR_SOURCE_HEAD_MARKER)?)
+                    .context("failed to decode authenticated Inbox PR source head marker")?;
+            Some(marker.validated_head(run_id)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let (Some(checkpoint), Some(artifact)) = (checkpoint_head, artifact_head) {
+        if checkpoint != artifact {
+            bail!("authenticated Inbox PR source head marker and checkpoint disagree");
+        }
+    }
+    if checkpoint_head.is_some() || artifact_head.is_some() {
+        bail!(
+            "source_head_not_execution_base: generic generated follow-up resume cannot dispatch an Inbox PR repair source without its parent-owned execution-head binding"
+        );
+    }
+    Ok(())
+}
+
 fn resume_generated_follow_up_cascade(
     repo: PathBuf,
     loaded: LoadedSupervisorPlan,
@@ -2873,6 +2917,16 @@ fn resume_generated_follow_up_cascade(
 ) -> Result<SupervisorCascadeOutcome> {
     let run_id = options.run_id.clone();
     let status = supervisor_status(&repo, run_id.clone())?;
+    if matches!(
+        status.lifecycle,
+        SupervisorRunLifecycle::Finalized | SupervisorRunLifecycle::Resumable
+    ) {
+        refuse_inbox_pr_repair_generic_resume(
+            &repo,
+            &run_id,
+            status.lifecycle == SupervisorRunLifecycle::Finalized,
+        )?;
+    }
     let (source_report, source_was_finalized) = match status.lifecycle {
         SupervisorRunLifecycle::Finalized => (
             status
@@ -2925,7 +2979,7 @@ pub(crate) fn run_supervisor_plan_file_cascade_for_autopilot(
     outer_command_run_id: &RunId,
     caller_cancellation: Option<&ProcessCancellation>,
     cancellation_observed: &AtomicBool,
-    source_dispatch_started: &AtomicBool,
+    source_dispatch: AutopilotSourceDispatchBinding<'_>,
     before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<Option<GateDenial>>,
 ) -> Result<SupervisorCascadeOutcome> {
     match caller_cancellation {
@@ -2954,9 +3008,10 @@ pub(crate) fn run_supervisor_plan_file_cascade_for_autopilot(
                 outer_command_run_id,
                 Some(caller_cancellation),
                 cancellation_observed,
-                Some(source_dispatch_started),
+                Some(source_dispatch.started),
                 false,
                 None,
+                source_dispatch.expected_head,
                 before_dispatch,
                 &external_runner,
             )
@@ -2968,9 +3023,10 @@ pub(crate) fn run_supervisor_plan_file_cascade_for_autopilot(
             outer_command_run_id,
             None,
             cancellation_observed,
-            Some(source_dispatch_started),
+            Some(source_dispatch.started),
             false,
             None,
+            source_dispatch.expected_head,
             before_dispatch,
             &run_external_agent_cancellable_reviewed,
         ),
@@ -2988,6 +3044,7 @@ fn run_supervisor_plan_file_cascade_with_gate(
     source_dispatch_started: Option<&AtomicBool>,
     allow_primary_worktree: bool,
     objective_profile_override: Option<&str>,
+    expected_source_head: Option<Oid>,
     before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<Option<GateDenial>>,
     external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorCascadeOutcome> {
@@ -3021,6 +3078,9 @@ fn run_supervisor_plan_file_cascade_with_gate(
         source_dispatch_started.store(true, Ordering::SeqCst);
     }
     let source_report = if template.runtime == SupervisorRuntime::Fake {
+        if expected_source_head.is_some() {
+            bail!("source-head execution binding requires a verified supervisor runtime");
+        }
         if source_loaded.plan_metadata.execution_target.is_some() {
             bail!("nonpublishable Fake cascade cannot use primary-worktree execution");
         }
@@ -3040,6 +3100,9 @@ fn run_supervisor_plan_file_cascade_with_gate(
             &no_external_runner,
         )?
     } else if source_loaded.plan_metadata.execution_target.is_some() {
+        if expected_source_head.is_some() {
+            bail!("source-head execution binding cannot use primary-worktree execution");
+        }
         run_supervisor_plan_with_runner_and_creation(
             loaded,
             options,
@@ -3057,7 +3120,10 @@ fn run_supervisor_plan_file_cascade_with_gate(
             options,
             max_concurrent_children,
             SupervisorExecutionRuntime::Verified,
-            SupervisorWorktreeCreation::Bound(&cleanliness),
+            match expected_source_head {
+                Some(head) => SupervisorWorktreeCreation::BoundSourceHead(&cleanliness, head),
+                None => SupervisorWorktreeCreation::Bound(&cleanliness),
+            },
             runtime_model_catalog,
             external_runner,
         )?

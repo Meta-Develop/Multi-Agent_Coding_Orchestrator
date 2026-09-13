@@ -11,6 +11,7 @@ mod reaudit;
 mod role_transition;
 mod run_artifacts;
 mod scheduler;
+mod source_base;
 use super::*;
 use crate::{
     external_agent::{

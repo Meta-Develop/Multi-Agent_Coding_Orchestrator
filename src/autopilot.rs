@@ -1,8 +1,8 @@
 use crate::{
     artifacts::{ArtifactFileDisposition, ArtifactRunReader, ArtifactRunWriter, RunArtifactFamily},
     gate_denial::{
-        ApprovalReviewDenial, BudgetAdmissionDenial, GateCheckSource, GateDenial, GateDenialReason,
-        VerifiedGateContext,
+        ApprovalReviewDenial, BudgetAdmissionDenial, GateApplyBlocker, GateCheckSource, GateDenial,
+        GateDenialReason, VerifiedGateContext,
     },
     hierarchy_ledger::{
         observe_hierarchy, ObservedHierarchyNode, RoleCategory as AuthorityRoleCategory,
@@ -51,6 +51,7 @@ use crate::{
     worktree::{ManagedWorktreeWriteLease, WorktreeManager},
 };
 use anyhow::{bail, Context, Result};
+use git2::Oid;
 #[cfg(test)]
 use git2::Repository;
 use serde::{Deserialize, Serialize};
@@ -1135,6 +1136,24 @@ pub fn run_autopilot_plan_file_with_retention(
     run_autopilot_plan_file_with_profile_and_retention(options, None, machine_global_retention)
 }
 
+/// Parent-only admission for an authenticated Inbox PR repair. The expected
+/// revision is never taken from a child-authored supervisor plan.
+pub(crate) fn run_inbox_pr_repair_plan_file_with_retention(
+    options: AutopilotRunOptions,
+    machine_global_retention: Option<MachineGlobalRetentionBinding>,
+    expected_source_head: Oid,
+) -> Result<AutopilotFinalReport> {
+    run_autopilot_with_profile_and_retention(
+        options,
+        None,
+        machine_global_retention,
+        AutopilotRunSource::InboxPrRepair {
+            expected_source_head,
+        },
+        None,
+    )
+}
+
 pub fn autopilot_profile_from_file(profile_file: impl AsRef<Path>) -> Result<AutopilotProfile> {
     let profile_file = profile_file.as_ref();
     let contents =
@@ -1255,7 +1274,19 @@ pub fn run_autopilot_goal_spec_with_profile_retention_and_parent(
 
 enum AutopilotRunSource<'a> {
     PlanFile,
+    InboxPrRepair { expected_source_head: Oid },
     GoalSpec { goal: &'a str, spec: &'a str },
+}
+
+fn source_head_execution_base_denial(denial: &GateDenial) -> bool {
+    denial.context.owner == "source_head_not_execution_base"
+        && denial.context.source == GateCheckSource::ValidationBinding
+        && matches!(
+            denial.reason,
+            GateDenialReason::MergeRemediation {
+                blocker: GateApplyBlocker::StaleBase
+            }
+        )
 }
 
 enum AutopilotCascadeDispatch<'a> {
@@ -1367,6 +1398,37 @@ fn find_generated_follow_up_taxonomy_gate_id(
     })
 }
 
+fn bound_inbox_pr_source_gate(
+    repo: &Path,
+    run_id: &RunId,
+    expected_source_head: Option<Oid>,
+    source_dispatch_started: bool,
+    effective_paths: &[PathBuf],
+) -> Result<Option<GateDenial>> {
+    let Some(expected) = expected_source_head else {
+        return Ok(None);
+    };
+    let owner = if source_dispatch_started {
+        "source_head_follow_up_unbound"
+    } else {
+        let observed = crate::git_repository::open(repo)?
+            .head()?
+            .peel_to_commit()?
+            .id();
+        if observed == expected {
+            return Ok(None);
+        }
+        "source_head_not_execution_base"
+    };
+    Ok(Some(GateDenial::new(
+        run_id.as_str(),
+        GateDenialReason::MergeRemediation {
+            blocker: GateApplyBlocker::StaleBase,
+        },
+        VerifiedGateContext::new(owner, GateCheckSource::ValidationBinding, effective_paths)?,
+    )?))
+}
+
 #[cfg(test)]
 fn run_autopilot_plan_file_with_injected_supervisor_and_runner(
     options: AutopilotRunOptions,
@@ -1435,12 +1497,18 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         SupervisorRuntime::Fake
     };
     let source_is_goal_derived = matches!(&source, AutopilotRunSource::GoalSpec { .. });
+    let expected_source_head = match &source {
+        AutopilotRunSource::InboxPrRepair {
+            expected_source_head,
+        } => Some(*expected_source_head),
+        _ => None,
+    };
     let LoadedAutopilotPlan {
         plan,
         input_shape,
         mut derived_supervisor_plan,
     } = match source {
-        AutopilotRunSource::PlanFile => {
+        AutopilotRunSource::PlanFile | AutopilotRunSource::InboxPrRepair { .. } => {
             load_autopilot_plan_from_task_file(&repo, &options.plan_file)?
         }
         AutopilotRunSource::GoalSpec { goal, spec } => {
@@ -1461,6 +1529,21 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     if let Some(source) = &plan.external_source {
         publication::revalidate_external_source(&repo, source)
             .context("autopilot source changed immediately before supervised work")?;
+    }
+    if let Some(expected) = expected_source_head {
+        let source = plan
+            .external_source
+            .as_ref()
+            .context("inbox PR repair requires an authenticated external source")?;
+        if source.object_kind != publication::ExternalSourceObjectKind::PullRequest
+            || source
+                .head_oid
+                .as_deref()
+                .and_then(|head| Oid::from_str(head).ok())
+                != Some(expected)
+        {
+            bail!("inbox PR repair source head did not match its parent-owned binding");
+        }
     }
     let mut safety = safety_report(
         &repo,
@@ -1762,6 +1845,16 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                 .iter()
                 .flat_map(|assignment| assignment.assigned_paths.iter().cloned())
                 .collect::<Vec<_>>();
+            if let Some(denial) = bound_inbox_pr_source_gate(
+                &repo,
+                &options.run_id,
+                expected_source_head,
+                source_dispatch_started.load(Ordering::SeqCst),
+                &effective_paths,
+            )? {
+                before_dispatch_denial = Some(denial.clone());
+                return Ok(Some(denial));
+            }
             // Generated plans are checked at the central queue boundary after
             // authenticated reload. Only the initial source reaches this
             // admission check, so one dispatch consumes one decision.
@@ -1823,7 +1916,10 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                     &options.run_id,
                     caller_cancellation.as_ref(),
                     &cancellation_observed,
-                    &source_dispatch_started,
+                    supervise::AutopilotSourceDispatchBinding {
+                        started: &source_dispatch_started,
+                        expected_head: expected_source_head,
+                    },
                     &mut follow_up_profile_gate,
                 )
             }
@@ -1835,7 +1931,10 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                 &options.run_id,
                 caller_cancellation.as_ref(),
                 &cancellation_observed,
-                &source_dispatch_started,
+                supervise::AutopilotSourceDispatchBinding {
+                    started: &source_dispatch_started,
+                    expected_head: expected_source_head,
+                },
                 &mut follow_up_profile_gate,
                 *external_runner,
             ),
@@ -1872,6 +1971,10 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                 });
             let taxonomy_refused_before_source_dispatch =
                 !source_dispatch_started && taxonomy_gate_id.is_some();
+            let source_base_refused_before_source_dispatch = !source_dispatch_started
+                && before_dispatch_denial
+                    .as_ref()
+                    .is_some_and(source_head_execution_base_denial);
             let taxonomy_refusal_next_action = taxonomy_gate_id.as_deref().map(|gate_id| {
                 format!(
                     "the mutation taxonomy requires gate `{gate_id}`; the named gate, including taxonomy review for `taxonomy-review-required`, is required before retrying; no supervisor or generated follow-up dispatch occurred"
@@ -1941,6 +2044,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                     AutopilotRunStatus::Cancelled
                 } else if taxonomy_refused_before_source_dispatch
                     || admission_refused_before_source_dispatch
+                    || source_base_refused_before_source_dispatch
                 {
                     AutopilotRunStatus::Refused
                 } else {
@@ -1974,6 +2078,8 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                     next_action
                 } else if admission_refused_before_source_dispatch {
                     "review the configured child-dispatch maximum and start a new run with an adequate bound; no supervisor dispatch was attempted"
+                } else if source_base_refused_before_source_dispatch {
+                    "source_head_not_execution_base: authenticated PR head differs from the primary execution base; no model dispatch or publication was attempted"
                 } else if profile_refused_before_source_dispatch {
                     "correct the requested/effective profile mismatch; no supervisor, publication, merge, or follow-up dispatch was attempted"
                 } else if generated_follow_up_dispatch_performed {
@@ -2038,11 +2144,21 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     let child_dispatch_admission_refused = before_dispatch_denial
         .as_ref()
         .is_some_and(|denial| matches!(denial.reason, GateDenialReason::BudgetAdmission { .. }));
+    let source_base_refused = supervisor
+        .gate_denials
+        .iter()
+        .any(source_head_execution_base_denial)
+        || before_dispatch_denial
+            .as_ref()
+            .is_some_and(source_head_execution_base_denial);
     let status = if cancellation_cleanup_completed {
         AutopilotRunStatus::Cancelled
     } else if cancellation_was_observed {
         AutopilotRunStatus::Failed
-    } else if taxonomy_refusal_gate_id.is_some() || child_dispatch_admission_refused {
+    } else if taxonomy_refusal_gate_id.is_some()
+        || child_dispatch_admission_refused
+        || source_base_refused
+    {
         AutopilotRunStatus::Refused
     } else if supervisor.success && follow_up_cascade_success && !execution_profile_mismatch {
         AutopilotRunStatus::Succeeded
@@ -2062,6 +2178,8 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         next_action
     } else if child_dispatch_admission_refused {
         "review the configured child-dispatch maximum and start a new run with an adequate bound; the refused generated follow-up was not dispatched"
+    } else if source_base_refused {
+        "source_head_not_execution_base: authenticated PR head differs from the supervised execution base; no publication or merge was performed"
     } else if execution_profile_mismatch {
         "inspect the typed requested/observed profile mismatch; autopilot performed no publication, merge, or follow-up dispatch"
     } else if !follow_up_cascade_success {

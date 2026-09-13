@@ -20,7 +20,7 @@ use crate::{
         missing_supervisor_catalog_preflight_grant_failure, run_external_agent,
         supervisor_catalog_preflight_grant_admit_failure, ExternalAgentCommand,
     },
-    gate_denial::GateDenialReason,
+    gate_denial::{GateApplyBlocker, GateCheckSource, GateDenialReason},
     live_claim::{self, LiveClock},
     llm::{RedactionSummary, Redactor},
     machine_global::MachineGlobalRetentionBinding,
@@ -3958,6 +3958,7 @@ fn run_inbox_item(
         .machine_global
         .as_ref()
         .map(|input| input.retention_binding_for_run(&autopilot_run_id));
+    let expected_source_head = inbox_pr_repair_execution_head(item, context.codex_bin.is_some())?;
     let autopilot_result = {
         let _rolling_guard = context
             .rolling_budget_quota
@@ -3965,29 +3966,36 @@ fn run_inbox_item(
                 crate::budget_ledger::bind_rolling_budget(repo, quota, autopilot_run_id.as_str())
             })
             .transpose()?;
-        autopilot::run_autopilot_plan_file_with_retention(
-            AutopilotRunOptions {
-                repo: repo.to_path_buf(),
-                plan_file: plan_path.clone(),
-                run_id: autopilot_run_id.clone(),
-                codex_bin: context.codex_bin.clone(),
-                reviewer_command: None,
-                allow_dirty_primary: false,
-                allow_live_run_collision: false,
-                max_child_dispatches: None,
-                budget_overrides: crate::supervise::RunBudgetLimits::default(),
-                budget_max_duration_seconds: None,
-                cancellation: None,
-            },
-            machine_global_retention,
-        )
+        let options = AutopilotRunOptions {
+            repo: repo.to_path_buf(),
+            plan_file: plan_path.clone(),
+            run_id: autopilot_run_id.clone(),
+            codex_bin: context.codex_bin.clone(),
+            reviewer_command: None,
+            allow_dirty_primary: false,
+            allow_live_run_collision: false,
+            max_child_dispatches: None,
+            budget_overrides: crate::supervise::RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
+            cancellation: None,
+        };
+        match expected_source_head {
+            Some(head) => autopilot::run_inbox_pr_repair_plan_file_with_retention(
+                options,
+                machine_global_retention,
+                head,
+            ),
+            None => {
+                autopilot::run_autopilot_plan_file_with_retention(options, machine_global_retention)
+            }
+        }
     };
     let mut refusal = None;
     let (autopilot_success, autopilot_message) = match autopilot_result {
         Ok(report) => {
             let success = report.success;
             let message = report.next_action.clone();
-            refusal = inbox_budget_refusal(&report);
+            refusal = inbox_source_base_refusal(&report).or_else(|| inbox_budget_refusal(&report));
             write_private_artifact_json(writer, &autopilot_report_relative, &report)?;
             (success, Some(message))
         }
@@ -4018,7 +4026,7 @@ fn run_inbox_item(
             target: item_target(item),
             comment_url: None,
             message: Some(
-                "autopilot budget refusal stopped the downstream GitHub action".to_string(),
+                "autopilot gate refusal stopped the downstream GitHub action".to_string(),
             ),
         }
     } else {
@@ -5786,6 +5794,53 @@ fn inbox_budget_refusal(report: &autopilot::AutopilotFinalReport) -> Option<Inbo
     })
 }
 
+fn inbox_source_base_refusal(report: &autopilot::AutopilotFinalReport) -> Option<InboxRefusal> {
+    if !matches!(
+        report.status,
+        AutopilotRunStatus::Failed | AutopilotRunStatus::Refused
+    ) {
+        return None;
+    }
+    report
+        .gate_denials
+        .iter()
+        .any(|denial| {
+            denial.context.owner == "source_head_not_execution_base"
+                && denial.context.source == GateCheckSource::ValidationBinding
+                && matches!(
+                    denial.reason,
+                    GateDenialReason::MergeRemediation {
+                        blocker: GateApplyBlocker::StaleBase
+                    }
+                )
+        })
+        .then(|| InboxRefusal {
+            kind: "source_head_not_execution_base".to_string(),
+            message: "authenticated PR head differs from the supervised execution base; this refused attempt authorized no model dispatch or success comment".to_string(),
+            paths: Vec::new(),
+            lock_details: Vec::new(),
+        })
+}
+
+fn inbox_pr_repair_execution_head(
+    item: &InboxItem,
+    real_model_launch: bool,
+) -> Result<Option<Oid>> {
+    if !real_model_launch
+        || item.kind != InboxItemKind::PullRequest
+        || item.source_snapshot.provider() != InboxSourceProvider::Github
+        || !item.pull_request.as_ref().is_some_and(pr_needs_repair)
+    {
+        return Ok(None);
+    }
+    item.source_snapshot.validate()?;
+    Ok(Some(Oid::from_str(
+        item.source_snapshot
+            .head_oid()
+            .context("authenticated PR repair source has no head OID")?,
+    )?))
+}
+
 fn autopilot_plan_for_item(
     item: &InboxItem,
     config: &InboxConfig,
@@ -7284,6 +7339,81 @@ mod pr_intake_always_on_audit_tests {
         let body = task_body_for_item(&item);
         assert!(body.contains("Repair failing checks or requested changes"));
         assert!(body.contains("failing checks: ci"));
+    }
+
+    #[test]
+    fn only_real_github_pr_repair_binds_authenticated_execution_head() {
+        let temp = tempfile::TempDir::new().expect("source-base tempdir");
+        let repo = temp.path().join("repo");
+        crate::worktree::WorktreeManager::init_repository(&repo, "main")
+            .expect("initialize source-base repository");
+        let (base, head) = create_materialization_test_commits(&repo);
+        let (mut github_pr, _) = github_materialization_test_item(&repo, base, head);
+        github_pr
+            .pull_request
+            .as_mut()
+            .expect("GitHub PR")
+            .review_feedback
+            .requested_changes = true;
+        assert_eq!(
+            inbox_pr_repair_execution_head(&github_pr, true).expect("bound GitHub repair"),
+            Some(head)
+        );
+        assert_eq!(
+            inbox_pr_repair_execution_head(&github_pr, false).expect("Fake does not launch"),
+            None
+        );
+        let mut fake = fake_pr(913);
+        fake.review_feedback.requested_changes = true;
+        let fake = pr_item(
+            fake,
+            &InboxConfig::default(),
+            &fake_source(),
+            &BTreeMap::new(),
+        )
+        .expect("legacy Fake PR");
+        assert_eq!(
+            inbox_pr_repair_execution_head(&fake, true).expect("Fake source stays legacy"),
+            None
+        );
+        let issue = issue_item(
+            fake_issue_candidates(&InboxConfig::default())
+                .into_iter()
+                .next()
+                .expect("Fake issue fixture"),
+            &InboxConfig::default(),
+            &fake_source(),
+            &BTreeMap::new(),
+        )
+        .expect("legacy issue");
+        assert_eq!(
+            inbox_pr_repair_execution_head(&issue, true).expect("issue stays legacy"),
+            None
+        );
+    }
+
+    #[test]
+    fn failed_pr_repair_never_builds_a_success_comment_even_in_github_full_mode() {
+        let config = InboxConfig::default();
+        let item = pr_item(fake_pr(914), &config, &fake_source(), &BTreeMap::new())
+            .expect("closed fixture PR item");
+        let report = github_action_for_item(
+            Path::new("unused-repository"),
+            &config,
+            InboxActionPolicy::Github,
+            InboxPermissionMode::GithubFull,
+            &item,
+            false,
+            Some("source_head_not_execution_base".to_string()),
+        );
+        assert_eq!(report.status, "skipped");
+        assert!(report.success);
+        assert!(report.comment_url.is_none());
+        assert!(report
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("skipped"));
     }
 
     #[test]

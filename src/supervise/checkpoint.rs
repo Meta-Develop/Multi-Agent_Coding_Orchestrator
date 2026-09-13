@@ -61,6 +61,8 @@ struct PreparedCheckpoint {
     version: u32,
     run_id: String,
     primary_base: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inbox_pr_source_head_oid: Option<String>,
     normalized_plan_sha256: String,
     max_concurrent_children: usize,
     assignment_ids: Vec<String>,
@@ -166,6 +168,7 @@ pub(super) struct SupervisorCheckpointSnapshot {
     pub(super) finalization_started: bool,
     pub(super) finalized: bool,
     primary_base: Oid,
+    pub(super) inbox_pr_source_head_oid: Option<Oid>,
     worktrees: BTreeMap<String, CheckpointWorktreeBinding>,
     claims: BTreeMap<u64, (String, Vec<PathBuf>)>,
 }
@@ -259,6 +262,7 @@ pub(super) struct SupervisorCheckpointWriter {
 pub(super) struct SupervisorCheckpointPreparation<'a> {
     run_id: &'a RunId,
     primary_base: &'a Oid,
+    inbox_pr_source_head_oid: Option<Oid>,
     normalized_plan_sha256: String,
     max_concurrent_children: usize,
     plan: &'a SupervisorPlan,
@@ -279,12 +283,18 @@ impl<'a> SupervisorCheckpointPreparation<'a> {
         Self {
             run_id,
             primary_base,
+            inbox_pr_source_head_oid: None,
             normalized_plan_sha256,
             max_concurrent_children,
             plan,
             artifact,
             budget,
         }
+    }
+
+    pub(super) fn with_inbox_pr_source_head(mut self, head: Option<Oid>) -> Self {
+        self.inbox_pr_source_head_oid = head;
+        self
     }
 }
 
@@ -296,6 +306,7 @@ impl SupervisorCheckpointWriter {
         let SupervisorCheckpointPreparation {
             run_id,
             primary_base,
+            inbox_pr_source_head_oid,
             normalized_plan_sha256,
             max_concurrent_children,
             plan,
@@ -328,6 +339,7 @@ impl SupervisorCheckpointWriter {
                 version: SUPERVISE_CHECKPOINT_VERSION,
                 run_id: run_id.as_str().to_string(),
                 primary_base: primary_base.to_string(),
+                inbox_pr_source_head_oid: inbox_pr_source_head_oid.map(|head| head.to_string()),
                 normalized_plan_sha256,
                 max_concurrent_children,
                 assignment_ids,
@@ -718,6 +730,18 @@ fn analyze_checkpoint_records(
     validate_version(prepared.version)?;
     let primary_base = Oid::from_str(&prepared.primary_base)
         .context("authenticated supervise primary base is malformed")?;
+    let inbox_pr_source_head_oid = prepared
+        .inbox_pr_source_head_oid
+        .as_deref()
+        .map(|value| {
+            let head = Oid::from_str(value)
+                .context("authenticated Inbox PR source checkpoint head is malformed")?;
+            if value != head.to_string() {
+                bail!("authenticated Inbox PR source checkpoint head is not canonical");
+            }
+            Ok(head)
+        })
+        .transpose()?;
     if prepared.run_id != run_id.as_str()
         || prepared.assignment_ids.len() != prepared.assignment_claim_paths.len()
         || !is_canonical_lower_hex_64(&prepared.normalized_plan_sha256)
@@ -951,6 +975,7 @@ fn analyze_checkpoint_records(
         finalization_started,
         finalized,
         primary_base,
+        inbox_pr_source_head_oid,
         worktrees,
         claims,
     })

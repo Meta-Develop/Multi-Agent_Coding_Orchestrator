@@ -1798,6 +1798,101 @@ fn autopilot_taxonomy_refuses_generated_follow_up_as_typed_outcome() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn bound_inbox_pr_gate_refuses_generated_follow_up_in_same_cascade() {
+    skip_without_containment!();
+    let fixture = IsolatedLicensedAutopilot::new("inbox-pr-generated-refused");
+    let repo = &fixture.repo;
+    let run_name = fixture.run_name.as_str();
+    let source_run_id =
+        RunId::new(format!("{run_name}-supervise")).expect("source supervisor run id");
+    let outer_run_id = RunId::new(run_name).expect("outer inbox run id");
+    let plan_file = fixture.temp_path().join("bound-source-supervisor.json");
+    let (plan, _declaration, declaration_sha256) = licensed_autopilot_supervisor_plan();
+    fs::write(
+        &plan_file,
+        serde_json::to_vec_pretty(&plan).expect("serialize source supervisor plan"),
+    )
+    .expect("write source supervisor plan");
+    let expected_head = crate::git_repository::open(repo)
+        .expect("open source repository")
+        .head()
+        .expect("source HEAD")
+        .peel_to_commit()
+        .expect("source commit")
+        .id();
+    let source_dispatch_started = AtomicBool::new(false);
+    let cancellation_observed = AtomicBool::new(false);
+    let source_child_dispatches = Arc::new(AtomicUsize::new(0));
+    let follow_up_child_dispatches = Arc::new(AtomicUsize::new(0));
+    let mut runner = injected_licensed_autopilot_runner(
+        declaration_sha256,
+        Arc::clone(&source_child_dispatches),
+        Arc::clone(&follow_up_child_dispatches),
+    );
+    let mut before_dispatch = |effective: &SupervisorPlan| {
+        let paths = effective
+            .assignments
+            .iter()
+            .flat_map(|assignment| assignment.assigned_paths.iter().cloned())
+            .collect::<Vec<_>>();
+        bound_inbox_pr_source_gate(
+            repo,
+            &outer_run_id,
+            Some(expected_head),
+            source_dispatch_started.load(Ordering::SeqCst),
+            &paths,
+        )
+    };
+    let cascade = supervise::run_supervisor_plan_file_cascade_with_runner_and_gate_for_autopilot(
+        SupervisorRunOptions {
+            repo: repo.clone(),
+            plan_file,
+            run_id: source_run_id,
+            parent_node: None,
+            codex_bin: PathBuf::from("unused-injected-codex"),
+            runtime: SupervisorRuntime::Codex,
+            allow_dirty_primary: false,
+            allow_live_run_collision: false,
+            admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+            budget_overrides: crate::supervise::RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
+            machine_global_retention: Some(secure_autopilot_machine_global_retention(
+                fixture.temp_path(),
+                run_name,
+            )),
+        },
+        &outer_run_id,
+        None,
+        &cancellation_observed,
+        supervise::AutopilotSourceDispatchBinding {
+            started: &source_dispatch_started,
+            expected_head: Some(expected_head),
+        },
+        &mut before_dispatch,
+        &mut runner,
+    )
+    .expect("return denied generated follow-up cascade");
+    assert!(cascade.source_report.success && cascade.source_report.publishable);
+    assert_eq!(cascade.source_report.generated_follow_up_tasks.len(), 1);
+    assert_eq!(source_child_dispatches.load(Ordering::SeqCst), 1);
+    assert_eq!(follow_up_child_dispatches.load(Ordering::SeqCst), 0);
+    assert!(!cascade.follow_up_cascade_success);
+    assert!(!cascade.generated_follow_up_dispatch_performed());
+    assert!(cascade.follow_up_reports.is_empty());
+    assert!(cascade.follow_up_gate_denials.iter().any(|denial| {
+        denial.context.owner == "source_head_follow_up_unbound"
+            && denial.context.source == GateCheckSource::ValidationBinding
+    }));
+    assert_undispatched_generated_follow_up_queue(
+        cascade
+            .follow_up_queue
+            .as_ref()
+            .expect("authenticated refused follow-up queue"),
+    );
+}
+
 #[test]
 fn dispatched_subordinate_denial_cannot_impersonate_taxonomy_refusal() {
     let denial = GateDenial::from_approval_review(
