@@ -1,5 +1,6 @@
 pub mod forge_coordination;
 pub mod forge_transport;
+mod github_review_observation;
 
 use self::forge_transport::{
     decide_pull_request_merge, AuthenticatedPullRequestMergeEvidence, ForgeActor, ForgeCheck,
@@ -1361,12 +1362,15 @@ fn current_timestamp_millis() -> Result<TimestampMillis> {
 
 const AUTHENTICATED_GITHUB_PAGE_SIZE: usize = 100;
 const AUTHENTICATED_GITHUB_MAX_PAGES: usize = 64;
+const GITHUB_REVIEW_THREADS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){id nameWithOwner url pullRequest(number:$number){id number headRefOid baseRefOid reviewThreads(first:100,after:$after){nodes{id isResolved comments(first:100){nodes{id fullDatabaseId url body createdAt author{login __typename ... on Node{id}}} pageInfo{hasNextPage endCursor}}} pageInfo{hasNextPage endCursor}}}}}";
+const GITHUB_REVIEW_THREAD_COMMENTS_QUERY: &str = "query($threadId:ID!,$after:String){node(id:$threadId){... on PullRequestReviewThread{id isResolved pullRequest{id number headRefOid baseRefOid repository{id nameWithOwner url}} comments(first:100,after:$after){nodes{id fullDatabaseId url body createdAt author{login __typename ... on Node{id}}} pageInfo{hasNextPage endCursor}}}}}";
 
 /// Exact provider observation used by the inbox to mint the private merge
 /// evidence capability. Every field comes from authenticated GitHub API
 /// responses collected after the independent audit completed.
 pub(crate) struct GithubPullRequestMergeGroundTruth {
     pub(crate) snapshot: PullRequestReviewSnapshot,
+    pub(crate) source_updated_at: String,
     pub(crate) producer: ProducerFingerprint,
     pub(crate) producer_login: String,
     pub(crate) changed_paths: Vec<PathBuf>,
@@ -1499,8 +1503,24 @@ struct GithubApiMergeResponse {
 
 enum AuthenticatedGithubOperation {
     AuthenticatedActor,
+    Repository,
+    Issue {
+        number: u64,
+    },
     PullRequest {
         number: u64,
+    },
+    ItemComments {
+        number: u64,
+        page: usize,
+    },
+    ReviewThreads {
+        number: u64,
+        after: Option<String>,
+    },
+    ReviewThreadComments {
+        thread_id: String,
+        after: Option<String>,
     },
     Reviews {
         number: u64,
@@ -1552,9 +1572,41 @@ impl AuthenticatedGithubOperation {
         };
         Ok(match self {
             Self::AuthenticatedActor => get("user".to_string()),
+            Self::Repository => get(base),
+            Self::Issue { number } => {
+                validate_authenticated_github_number(*number)?;
+                get(format!("{base}/issues/{number}"))
+            }
             Self::PullRequest { number } => {
                 validate_authenticated_github_number(*number)?;
                 get(format!("{base}/pulls/{number}"))
+            }
+            Self::ItemComments { number, page } => {
+                validate_authenticated_github_number(*number)?;
+                validate_authenticated_github_page(*page)?;
+                get(format!(
+                    "{base}/issues/{number}/comments?per_page={AUTHENTICATED_GITHUB_PAGE_SIZE}&page={page}"
+                ))
+            }
+            Self::ReviewThreads { number, after } => {
+                validate_authenticated_github_number(*number)?;
+                authenticated_github_graphql_command(
+                    repository,
+                    GITHUB_REVIEW_THREADS_QUERY,
+                    Some(*number),
+                    None,
+                    after.as_deref(),
+                )?
+            }
+            Self::ReviewThreadComments { thread_id, after } => {
+                validate_authenticated_github_graphql_value(thread_id, "review thread id")?;
+                authenticated_github_graphql_command(
+                    repository,
+                    GITHUB_REVIEW_THREAD_COMMENTS_QUERY,
+                    None,
+                    Some(thread_id),
+                    after.as_deref(),
+                )?
             }
             Self::Reviews { number, page } => {
                 validate_authenticated_github_number(*number)?;
@@ -1648,6 +1700,66 @@ impl AuthenticatedGithubOperation {
             }
         })
     }
+}
+
+fn validate_authenticated_github_graphql_value(value: &str, label: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 1024
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'/' | b'+' | b'=')
+        })
+    {
+        bail!("{label} was not a bounded GitHub GraphQL identity or cursor");
+    }
+    Ok(())
+}
+
+fn authenticated_github_graphql_command(
+    repository: &GithubRepositoryIdentity,
+    query: &'static str,
+    number: Option<u64>,
+    thread_id: Option<&str>,
+    after: Option<&str>,
+) -> Result<(Vec<OsString>, StdinMode)> {
+    if query != GITHUB_REVIEW_THREADS_QUERY && query != GITHUB_REVIEW_THREAD_COMMENTS_QUERY {
+        bail!("GitHub GraphQL document was outside the fixed observation set");
+    }
+    let mut args = vec![
+        OsString::from("api"),
+        OsString::from("graphql"),
+        OsString::from("-f"),
+        OsString::from(format!("query={query}")),
+    ];
+    if let Some(number) = number {
+        validate_authenticated_github_number(number)?;
+        args.extend([
+            OsString::from("-f"),
+            OsString::from(format!("owner={}", repository.owner)),
+        ]);
+        args.extend([
+            OsString::from("-f"),
+            OsString::from(format!("name={}", repository.name)),
+        ]);
+        args.extend([
+            OsString::from("-F"),
+            OsString::from(format!("number={number}")),
+        ]);
+    }
+    if let Some(thread_id) = thread_id {
+        validate_authenticated_github_graphql_value(thread_id, "review thread id")?;
+        args.extend([
+            OsString::from("-f"),
+            OsString::from(format!("threadId={thread_id}")),
+        ]);
+    }
+    if let Some(after) = after {
+        validate_authenticated_github_graphql_value(after, "review cursor")?;
+        args.extend([
+            OsString::from("-f"),
+            OsString::from(format!("after={after}")),
+        ]);
+    }
+    Ok((args, StdinMode::Null))
 }
 
 fn validate_authenticated_github_number(number: u64) -> Result<()> {
@@ -2218,6 +2330,7 @@ impl GithubPullRequestMergeTransport {
         );
         Ok(GithubPullRequestMergeGroundTruth {
             snapshot,
+            source_updated_at: pull.updated_at,
             producer,
             producer_login: pull.user.login.to_ascii_lowercase(),
             changed_paths,
@@ -2629,6 +2742,15 @@ pub(crate) fn observe_github_pull_request_merge_ground_truth(
     number: u64,
 ) -> Result<GithubPullRequestMergeGroundTruth> {
     GithubPullRequestMergeTransport::new(repo, repository_selector)?.observe_number(number)
+}
+
+pub(crate) fn resolve_github_forge_item(
+    repo: &Path,
+    repository_selector: &str,
+    kind: ForgeItemKind,
+    number: u64,
+) -> Result<ForgeItem> {
+    github_review_observation::resolve_item(repo, repository_selector, kind, number)
 }
 
 pub(crate) fn execute_authenticated_github_pull_request_merge(
