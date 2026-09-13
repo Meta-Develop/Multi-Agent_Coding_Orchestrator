@@ -333,12 +333,8 @@ pub(super) fn validate_supervisor_plan(
         }
         assignment.assigned_paths = normalize_paths(std::mem::take(&mut assignment.assigned_paths))
             .with_context(|| format!("assignment '{}' has invalid paths", assignment.id))?;
-        if assignment.assigned_paths.is_empty() {
-            bail!(
-                "assignment '{}' must claim at least one path",
-                assignment.id
-            );
-        }
+        // Empty assigned_paths is a pre-claim Invalid park, not a loader refusal.
+        // normalize_paths still rejects malformed, empty-segment, absolute, and escaping paths.
         assignment.semantic_symbols = normalize_semantic_symbols(&assignment.semantic_symbols);
         assignment.semantic_modules = normalize_semantic_modules(&assignment.semantic_modules);
         validate_environment_requirements(&assignment.environment_requirements).with_context(

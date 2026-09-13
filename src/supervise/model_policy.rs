@@ -528,6 +528,87 @@ pub fn authorize_resolved_judgment_model(
     }
 }
 
+/// Whether the capability table records `model` as [`ModelCapabilityClass::WeakMechanical`].
+///
+/// This includes ineligible shipped rows such as terra. Executor bind uses it to
+/// close the adapter skip without treating unclassified adapter slugs (Grok
+/// `grok-4.6`) as mechanical.
+pub fn recorded_model_is_weak_mechanical(model: &str) -> bool {
+    matches!(
+        recorded_model_capability_class(model),
+        Some(ModelCapabilityClass::WeakMechanical)
+    )
+}
+
+/// Authorize a catalog-resolved slug at an actual executor bind.
+///
+/// [`ModelCapabilityClass::WeakMechanical`] requires Worker + MechanicalTerminal
+/// + an enumerated [`MechanicalTerminalDuty`]. Missing duty stays fail-closed.
+///
+/// Non-weak models keep [`validate_known_judgment_role_model`].
+pub fn authorize_resolved_executor_model(
+    role: AgentRole,
+    configured_model: Option<&str>,
+    resolved_model: Option<&str>,
+    observation: super::ModelResolutionObservation,
+    runtime: super::SupervisorRuntime,
+    mechanical_duty: Option<MechanicalTerminalDuty>,
+) -> Result<()> {
+    if let Some(model) = resolved_model {
+        return authorize_known_executor_role_model(role, Some(model), mechanical_duty);
+    }
+    match (runtime, observation) {
+        (
+            super::SupervisorRuntime::Fake,
+            super::ModelResolutionObservation::LocalDeterministicFake,
+        ) => Ok(()),
+        (super::SupervisorRuntime::Fake, _) => {
+            authorize_known_executor_role_model(role, configured_model, mechanical_duty)
+        }
+        _ => authorize_known_executor_role_model(role, None, mechanical_duty),
+    }
+}
+
+/// Fail-closed executor authority for a concrete role/model/duty triple.
+pub fn authorize_known_executor_role_model(
+    role: AgentRole,
+    model: Option<&str>,
+    mechanical_duty: Option<MechanicalTerminalDuty>,
+) -> Result<()> {
+    let Some(model) = model else {
+        bail!(
+            "role '{}' resolved without an authoritative trusted model identity; runtime-default model selection is not capability evidence",
+            role.as_str()
+        );
+    };
+    reject_static_tier_override_of_measured(role, model)?;
+    let Some(capability) = trusted_model_capability(model) else {
+        bail!("model '{model}' has no trusted capability policy");
+    };
+    if capability == ModelCapabilityClass::WeakMechanical {
+        let Some(duty) = mechanical_duty else {
+            bail!(
+                "real-runtime weak_mechanical Worker model '{model}' is unavailable: no trusted typed planner/runtime authority or exact-operation executor exists"
+            );
+        };
+        validate_phase_model_binding(
+            role,
+            OrchestrationPhase::MechanicalTerminal,
+            Some(duty),
+            capability,
+        )
+        .map(|_| ())
+        .with_context(|| {
+            format!(
+                "policy model '{model}' does not satisfy role '{}' mechanical-terminal executor binding",
+                role.as_str()
+            )
+        })?;
+        return Ok(());
+    }
+    validate_known_judgment_role_model(role, Some(model))
+}
+
 fn authority_role_for(role: AgentRole) -> crate::selection::AuthorityRole {
     match role {
         AgentRole::Supervisor => crate::selection::AuthorityRole::AcceptanceGate,
@@ -563,7 +644,8 @@ fn reject_static_tier_override_of_measured(role: AgentRole, model: &str) -> Resu
 /// authority. Measured catalog/evidence ineligibility wins over a static tier
 /// row. The static table remains fallback only when no dated prior exists.
 /// Workers are not granted weak-mechanical authority here; that requires a
-/// future typed executor.
+/// typed mechanical-terminal executor bind
+/// ([`authorize_known_executor_role_model`]) with an enumerated duty.
 pub fn validate_known_judgment_role_model(role: AgentRole, model: Option<&str>) -> Result<()> {
     let Some(model) = model else {
         bail!(
@@ -923,5 +1005,84 @@ mod tests {
             SupervisorRuntime::Codex,
         )
         .expect_err("unknown resolved slugs stay fail-closed");
+    }
+
+    #[test]
+    fn weak_mechanical_executor_requires_typed_duty_and_restores_overlay() {
+        assert_eq!(role_default_phase(AgentRole::Worker), None);
+        assert!(
+            default_model_capability_policy()
+                .lookup(BALANCED_PROFILE_MODEL)
+                .is_some_and(|entry| {
+                    entry.capability == ModelCapabilityClass::WeakMechanical && !entry.eligible
+                }),
+            "shipped terra row must stay ineligible WeakMechanical"
+        );
+        assert_eq!(
+            default_model_capability_policy()
+                .models
+                .iter()
+                .filter(|entry| entry.model.starts_with("fixture-"))
+                .count(),
+            0,
+            "no shipped fixture WeakMechanical row"
+        );
+
+        let fixture = "fixture-weak-mechanical-executor";
+        let overlay =
+            install_test_fixture_models(&[(fixture, ModelCapabilityClass::WeakMechanical)])
+                .expect("install fixture");
+        assert!(recorded_model_is_weak_mechanical(fixture));
+        let missing_duty =
+            authorize_known_executor_role_model(AgentRole::Worker, Some(fixture), None)
+                .expect_err("missing duty");
+        assert!(
+            missing_duty.to_string().contains(
+                "no trusted typed planner/runtime authority or exact-operation executor exists"
+            ),
+            "{missing_duty:#}"
+        );
+        authorize_known_executor_role_model(
+            AgentRole::Worker,
+            Some(fixture),
+            Some(MechanicalTerminalDuty::RunPreselectedCommand),
+        )
+        .expect("typed duty authorizes the overlay executor");
+        let auditor = authorize_known_executor_role_model(
+            AgentRole::Auditor,
+            Some(fixture),
+            Some(MechanicalTerminalDuty::RunPreselectedCommand),
+        )
+        .expect_err("judgment role cannot take WeakMechanical");
+        assert!(
+            auditor
+                .to_string()
+                .contains("weak-model binding is forbidden")
+                || auditor.to_string().contains("mechanical-terminal executor"),
+            "{auditor:#}"
+        );
+        authorize_known_executor_role_model(AgentRole::Worker, Some("gpt-5.6-luna"), None)
+            .expect("general Worker luna remains unchanged");
+        let terra = authorize_known_executor_role_model(
+            AgentRole::Worker,
+            Some(BALANCED_PROFILE_MODEL),
+            Some(MechanicalTerminalDuty::RunPreselectedCommand),
+        )
+        .expect_err("terra stays ineligible");
+        let terra_message = terra.to_string();
+        assert!(
+            terra_message.contains("static capability tier cannot override measured eligibility")
+                || terra_message.contains("has no trusted capability policy"),
+            "{terra_message}"
+        );
+        drop(overlay);
+        authorize_known_executor_role_model(
+            AgentRole::Worker,
+            Some(fixture),
+            Some(MechanicalTerminalDuty::RunPreselectedCommand),
+        )
+        .expect_err("overlay Drop must restore");
+        assert!(!recorded_model_is_weak_mechanical(fixture));
+        assert_eq!(role_default_phase(AgentRole::Worker), None);
     }
 }

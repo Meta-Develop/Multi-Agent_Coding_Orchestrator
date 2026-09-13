@@ -337,12 +337,18 @@ fn bounded_reader_metadata_validator_is_bound_to_the_open_descriptor_generation(
         }
         Ok(())
     };
-    let changed =
-        read_bounded_file_with_validator_and_hook(&mut opened, &path, 32, &mut validator, || {
+    let changed = read_bounded_file_with_validator_and_hook(
+        &mut opened,
+        &path,
+        32,
+        &mut validator,
+        || {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o622))
                 .expect("make descriptor unsafe");
-        })
-        .expect_err("permission change on the opened descriptor must fail");
+        },
+        || open_regular_no_follow(&path, false),
+    )
+    .expect_err("permission change on the opened descriptor must fail");
     assert!(changed.to_string().contains("metadata policy"));
 }
 
@@ -363,6 +369,52 @@ fn bounded_reader_rejects_path_replacement_during_read() {
 
     assert!(replaced.to_string().contains("identity changed"));
     assert_eq!(fs::read(&path).expect("read replacement"), b"attacker");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bounded_reader_revalidates_relative_to_a_retained_directory_handle() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("bound");
+    let moved = temp.path().join("moved");
+    fs::create_dir(&root).expect("create root");
+    fs::write(root.join("input"), b"original").expect("write original input");
+    let binding = DirectoryBindingGuard::bind(&root).expect("bind root");
+    fs::rename(&root, &moved).expect("move root");
+    fs::create_dir(&root).expect("create substitute root");
+    fs::write(root.join("input"), b"attacker").expect("write substitute input");
+
+    let relative = Path::new("input");
+    assert_eq!(
+        binding.read_relative(relative, 32).expect("bound read"),
+        b"original"
+    );
+    assert_eq!(
+        binding
+            .read_relative_optional(relative, 32)
+            .expect("optional bound read"),
+        Some(b"original".to_vec())
+    );
+    assert!(
+        binding.verify().is_err(),
+        "pathname verification remains separate"
+    );
+
+    let reopen = || open_repository_relative_linux_fd(binding.directory.as_raw_fd(), relative);
+    let mut opened = reopen().expect("open bound input");
+    let error = read_bounded_file_with_validator_and_hook(
+        &mut opened,
+        &root.join(relative),
+        32,
+        &mut |_| Ok(()),
+        || {
+            fs::rename(moved.join(relative), moved.join("displaced")).expect("move bound input");
+            fs::write(moved.join(relative), b"replacement").expect("replace bound input");
+        },
+        reopen,
+    )
+    .expect_err("replacement under the retained handle must fail");
+    assert!(error.to_string().contains("identity changed"));
 }
 
 #[cfg(unix)]

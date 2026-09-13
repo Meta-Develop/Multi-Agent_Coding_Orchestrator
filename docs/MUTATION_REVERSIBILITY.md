@@ -2,7 +2,7 @@
 
 ## Status and enforcement boundary
 
-This document defines version 4 of MACO's mutation taxonomy in
+This document defines version 9 of MACO's mutation taxonomy in
 `src/mutation_taxonomy.rs`. The policy is enforced at both autonomous child
 dispatch boundaries:
 
@@ -31,6 +31,61 @@ Version 4 adds Supervisor Codex catalog preflight as an irreversible spawn.
 Production callers issue a one-shot grant before the catalog builder; the
 authorized loader consumes that grant against the final ProcessSpec and does
 not treat `run_id` plus the caller repository as authority to spawn.
+
+Version 5 adds Inbox independent-audit and PR-intake Codex catalog preflight
+as a distinct irreversible spawn. Those callers issue an origin-tagged grant
+upstream of the authorized loader. A Supervisor catalog grant cannot authorize
+Inbox or PR-intake catalog, and an Inbox or PR-intake grant cannot authorize
+`for_supervisor`. The Supervisor grant, gate, and child-dispatch set are
+unchanged.
+
+Version 6 adds assignment-child and parent-auditor process launch as a distinct
+irreversible spawn. Trusted callers issue a one-shot sibling grant before the
+external-agent sink; the sink seals independently verified canonical program
+and parent plus final argv and output staging, then consumes that grant against
+the final ProcessSpec. Catalog grants cannot bind worker or auditor argv, and
+the callee cannot mint the grant from run identity plus the caller repository.
+
+Version 7 adds Inbox independent-auditor process launch as a distinct
+irreversible sibling spawn. The trusted Inbox `with_runner` caller issues that
+one-shot grant after the final prepared consultant command and before
+`external_runner`. Catalog grants and parent-auditor grants cannot authorize
+that spawn, and the callee cannot mint the grant from run identity plus the
+caller repository.
+
+Version 8 adds consult Codex and Claude process launch as a distinct
+irreversible sibling spawn. The trusted consult caller issues that one-shot
+grant after the final prepared command identity, model, and duty are bound and
+before `external_runner`. ConsultCodex binds only the CodexConsultant
+invocation; ConsultClaude binds only ClaudeConsultant. Inbox independent-auditor
+keeps CodexConsultant plus the existing U3 CodexSupervisor fixture;
+assignment-child and parent-auditor keep CodexSupervisor plus Grok, Cursor,
+ClaudeCode, and Gemini adapters. Process registration uses the canonical
+lifecycle role `researcher` (`ReadOnlyResearcher`); grant duty remains
+`consultant`. The sink does not skip lifecycle metadata. The sink seals
+independently verified canonical program and parent plus final argv, cwd, and
+output staging, then consumes the same grant against the final ProcessSpec.
+Trusted program spelling is kind-scoped: child, parent-auditor, Inbox
+independent-auditor, and consult-Codex remain `codex`; consult-Claude is
+`claude` without broadening those kinds. Catalog grants and assignment-family
+grants cannot authorize consult spawn, a missing kind cannot bypass the newly
+covered consult paths, and the callee cannot mint the grant from run identity
+plus the caller repository.
+
+Version 9 adds merge-arbiter process launch as a distinct irreversible sibling
+spawn. The trusted merge runner issues that one-shot grant after the final
+prepared CodexSupervisor command, ReadOnly workspace, canonical auditor
+lifecycle, hidden primary, retention, and output schema are bound and before
+`run_external_agent`. MergeArbiter binds only a merge-shaped CodexSupervisor
+command; a generic writable worker command cannot become the arbiter by
+pasting the merge grant or kind. Consult, Inbox, parent-auditor, and
+assignment-child kinds cannot authorize that spawn. Process registration uses
+the canonical lifecycle role `auditor` (`ReadOnlyReviewAuditor`); grant duty
+is `merge-arbiter`; model remains omitted. The sink seals independently
+verified canonical program and parent plus final argv, cwd, and output
+staging, then consumes the same grant against the final ProcessSpec. Catalog
+grants and assignment-family grants cannot authorize merge-arbiter spawn, and
+the callee cannot mint the grant from run identity plus the caller repository.
 
 The hook rows cover the independently owned worktree-guard integration without
 coupling this taxonomy port to the guard implementation files. Only a verified
@@ -136,6 +191,30 @@ Consequences of this rule:
 - `explicit-supervisor-catalog-codex-preflight-grant`: Supervisor Codex catalog
   preflight spawn requires an upstream one-shot grant that matches the final
   ProcessSpec; the catalog builder cannot mint that grant from run identity.
+- `explicit-inbox-pr-intake-catalog-codex-preflight-grant`: Inbox and PR-intake
+  Codex catalog preflight spawn requires an upstream one-shot grant whose
+  sealed origin and final ProcessSpec match; Supervisor catalog grants cannot
+  authorize those callers.
+- `explicit-assignment-parent-auditor-process-launch-grant`: assignment-child
+  and parent-auditor process spawn requires an upstream one-shot grant that
+  matches the final ProcessSpec; the callee cannot mint that grant from run
+  identity.
+- `explicit-inbox-independent-auditor-process-launch-grant`: Inbox
+  independent-auditor process spawn requires an upstream one-shot grant that
+  matches the final ProcessSpec; catalog grants and parent-auditor grants
+  cannot authorize that spawn, and the callee cannot mint that grant from run
+  identity.
+- `explicit-consult-process-launch-grant`: consult Codex or Claude process
+  spawn requires an upstream one-shot grant that matches the final ProcessSpec;
+  catalog grants and assignment-family grants cannot authorize that spawn, a
+  missing kind cannot bypass those consult paths, and the callee cannot mint
+  that grant from run identity.
+- `explicit-merge-arbiter-process-launch-grant`: merge-arbiter process spawn
+  requires an upstream one-shot grant that matches the final ProcessSpec and a
+  merge-shaped ReadOnly CodexSupervisor command; catalog grants and
+  assignment-family grants cannot authorize that spawn, a generic writable
+  worker cannot masquerade as the arbiter, and the callee cannot mint that
+  grant from run identity.
 
 ## Registry
 
@@ -179,3 +258,8 @@ Consequences of this rule:
 | `agent-process-stop` | Irreversible | Terminates a live process; restarting cannot restore its exact in-memory execution state. | `exact-agent-process-selector` |
 | `scope-event-append` | Irreversible | Emits durable observability history whose removal would destroy audit evidence and whose consumers cannot be rewound. | `bounded-external-scope-event-api` |
 | `supervisor-catalog-codex-preflight` | Irreversible | Spawns a trusted Codex catalog probe whose process, network, and captured output cannot be restored from retained MACO state. | `explicit-supervisor-catalog-codex-preflight-grant` |
+| `inbox-pr-intake-catalog-codex-preflight` | Irreversible | Spawns a trusted Codex catalog probe for Inbox independent-audit or PR-intake whose process, network, and captured output cannot be restored from retained MACO state. | `explicit-inbox-pr-intake-catalog-codex-preflight-grant` |
+| `assignment-parent-auditor-process-launch` | Irreversible | Spawns a trusted assignment-child or parent-auditor process whose process, network, and captured output cannot be restored from retained MACO state. | `explicit-assignment-parent-auditor-process-launch-grant` |
+| `inbox-independent-auditor-process-launch` | Irreversible | Spawns a trusted Inbox independent-auditor process whose process, network, and captured output cannot be restored from retained MACO state. | `explicit-inbox-independent-auditor-process-launch-grant` |
+| `consult-process-launch` | Irreversible | Spawns a trusted consult Codex or Claude consultant process whose process, network, and captured output cannot be restored from retained MACO state. | `explicit-consult-process-launch-grant` |
+| `merge-arbiter-process-launch` | Irreversible | Spawns a trusted merge-arbiter process whose process, network, and captured output cannot be restored from retained MACO state. | `explicit-merge-arbiter-process-launch-grant` |

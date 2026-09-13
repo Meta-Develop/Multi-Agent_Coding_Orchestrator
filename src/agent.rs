@@ -14,7 +14,10 @@ use crate::{
     },
     sync::{normalize_repo_relative_path, PathClaim},
     sync_store::SyncStore,
-    worktree::{normalize_agent_id, WorktreeCreateOptions, WorktreeManager, WorktreeRecord},
+    worktree::{
+        normalize_agent_id, ManagedWorktreeWriteLease, WorktreeCreateOptions, WorktreeManager,
+        WorktreeRecord,
+    },
 };
 use anyhow::{bail, Context, Result};
 #[cfg(test)]
@@ -154,10 +157,73 @@ pub struct OutputSummary {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct SelectedWorktree {
-    record: WorktreeRecord,
+    lease: ManagedWorktreeWriteLease,
     reused: bool,
+}
+
+impl SelectedWorktree {
+    fn record(&self) -> &WorktreeRecord {
+        self.lease.record()
+    }
+
+    fn path(&self) -> &Path {
+        self.lease.path()
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentProtectedStage {
+    Revalidation,
+    Validation,
+    Collect,
+    Preview,
+}
+
+#[cfg(test)]
+type AgentProtectedStageHook = Box<dyn FnMut(AgentProtectedStage)>;
+
+#[cfg(test)]
+thread_local! {
+    static AGENT_PROTECTED_STAGE_HOOK: std::cell::RefCell<Option<AgentProtectedStageHook>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_agent_protected_stage_hook(hook: impl FnMut(AgentProtectedStage) + 'static) {
+    AGENT_PROTECTED_STAGE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn clear_agent_protected_stage_hook() {
+    AGENT_PROTECTED_STAGE_HOOK.with(|slot| *slot.borrow_mut() = None);
+}
+
+#[cfg(test)]
+fn run_agent_protected_stage_hook(stage: AgentProtectedStage) {
+    AGENT_PROTECTED_STAGE_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(stage);
+        }
+    });
+}
+
+#[cfg(test)]
+thread_local! {
+    static AGENT_CLAIM_TIMING: std::cell::RefCell<Option<crate::sync_store::ClaimTiming>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_agent_claim_timing_for_test(timing: crate::sync_store::ClaimTiming) {
+    AGENT_CLAIM_TIMING.with(|slot| *slot.borrow_mut() = Some(timing));
+}
+
+#[cfg(test)]
+fn take_agent_claim_timing_for_test() -> Option<crate::sync_store::ClaimTiming> {
+    AGENT_CLAIM_TIMING.with(|slot| slot.borrow_mut().take())
 }
 
 #[derive(Debug, Clone)]
@@ -223,9 +289,16 @@ where
     let manager = WorktreeManager::new(&repo);
     let selected = select_worktree(&manager, &agent_id, options.worktree_reuse)?;
     let store = SyncStore::open(&repo)?;
-    let claim = store
-        .claim_paths(&agent_id, claimed_paths.iter())
-        .with_context(|| format!("failed to claim paths for agent '{agent_id}'"))?;
+    #[cfg(test)]
+    let claim = match take_agent_claim_timing_for_test() {
+        Some(timing) => store
+            .claim_paths_with_timing(&agent_id, claimed_paths.iter(), timing)
+            .map(|outcome| outcome.claim),
+        None => store.claim_paths(&agent_id, claimed_paths.iter()),
+    };
+    #[cfg(not(test))]
+    let claim = store.claim_paths(&agent_id, claimed_paths.iter());
+    let claim = claim.with_context(|| format!("failed to claim paths for agent '{agent_id}'"))?;
     let claim_token = claim.token;
 
     let result = run_claimed_agent(ClaimedAgentRun {
@@ -296,8 +369,9 @@ where
     P: LlmProvider,
 {
     let capabilities = run.provider.capabilities();
+    let worktree_path = run.selected.path().to_path_buf();
     let prompt = build_prompt(
-        &run.selected.record.path,
+        &worktree_path,
         &run.agent_id,
         &run.task,
         &run.claimed_paths,
@@ -321,7 +395,7 @@ where
         &run.agent_id,
         run.claim.token,
         &run.claimed_paths,
-        &run.selected.record,
+        run.selected.record(),
     )
     .with_context(|| {
         format!(
@@ -329,10 +403,20 @@ where
             run.agent_id
         )
     })?;
+    _revalidation
+        .start_guard_owned_heartbeat()
+        .with_context(|| {
+            format!(
+                "failed to start guard-owned heartbeat for agent '{}'",
+                run.agent_id
+            )
+        })?;
+    #[cfg(test)]
+    run_agent_protected_stage_hook(AgentProtectedStage::Revalidation);
 
     for patch in &response.proposal.patches {
         let result = apply_proposed_patch(
-            &run.selected.record.path,
+            &worktree_path,
             patch,
             &run.claimed_paths,
             run.command_timeout,
@@ -370,12 +454,8 @@ where
             .iter()
             .filter(|command| command.purpose != CommandPurpose::Validate)
         {
-            let result = run_proposed_command(
-                &run.selected.record.path,
-                command,
-                run.command_timeout,
-                run.runtime,
-            );
+            let result =
+                run_proposed_command(&worktree_path, command, run.command_timeout, run.runtime);
             if !result.success && execution_error.is_none() {
                 execution_error = result.error.clone();
             }
@@ -394,12 +474,8 @@ where
             .iter()
             .filter(|command| command.purpose == CommandPurpose::Validate)
         {
-            let result = run_proposed_command(
-                &run.selected.record.path,
-                command,
-                run.command_timeout,
-                run.runtime,
-            );
+            let result =
+                run_proposed_command(&worktree_path, command, run.command_timeout, run.runtime);
             validations.push(validation_report_for_command(&result));
             if !result.success && execution_error.is_none() {
                 execution_error = result.error.clone();
@@ -414,7 +490,7 @@ where
     if execution_error.is_none() {
         for validation in &run.validation_commands {
             let result = run_validation_command(
-                &run.selected.record.path,
+                &worktree_path,
                 validation,
                 run.command_timeout,
                 run.runtime,
@@ -430,27 +506,43 @@ where
         }
     }
 
-    let candidate = merge::collect_agent_result(MergeCollectOptions {
-        repo: run.repo.clone(),
-        agent_id: run.agent_id.clone(),
-        claimed_paths: run.claimed_paths.clone(),
-        include_full_diff: false,
-        diff_summary_char_limit: merge::DEFAULT_DIFF_SUMMARY_CHAR_LIMIT,
-        validations: validations.clone(),
-    })?;
-    let merge_preview = merge::preview_merge_apply(MergePreviewOptions {
-        collect: MergeCollectOptions {
+    #[cfg(test)]
+    run_agent_protected_stage_hook(AgentProtectedStage::Validation);
+    let collect_validations = validations.clone();
+    let candidate = merge::collect_agent_result_with_evidence_and_write_lease(
+        MergeCollectOptions {
             repo: run.repo.clone(),
             agent_id: run.agent_id.clone(),
             claimed_paths: run.claimed_paths.clone(),
-            include_full_diff: true,
+            include_full_diff: false,
             diff_summary_char_limit: merge::DEFAULT_DIFF_SUMMARY_CHAR_LIMIT,
-            validations,
+            validations: collect_validations.clone(),
         },
-        forces: MergeForceOptions::default(),
-        require_validation: false,
-        review_intent: merge::MergeApplyReviewIntent::default(),
-    })?;
+        merge::ValidationEvidenceBundle::legacy(collect_validations),
+        &run.selected.lease,
+    )?;
+    #[cfg(test)]
+    run_agent_protected_stage_hook(AgentProtectedStage::Collect);
+    let preview_validations = validations;
+    let merge_preview = merge::preview_merge_apply_with_evidence_and_write_lease(
+        MergePreviewOptions {
+            collect: MergeCollectOptions {
+                repo: run.repo.clone(),
+                agent_id: run.agent_id.clone(),
+                claimed_paths: run.claimed_paths.clone(),
+                include_full_diff: true,
+                diff_summary_char_limit: merge::DEFAULT_DIFF_SUMMARY_CHAR_LIMIT,
+                validations: preview_validations.clone(),
+            },
+            forces: MergeForceOptions::default(),
+            require_validation: false,
+            review_intent: merge::MergeApplyReviewIntent::default(),
+        },
+        merge::ValidationEvidenceBundle::legacy(preview_validations),
+        &run.selected.lease,
+    )?;
+    #[cfg(test)]
+    run_agent_protected_stage_hook(AgentProtectedStage::Preview);
 
     let boundary_error = if candidate.unclaimed_changed_paths.is_empty() {
         None
@@ -464,6 +556,10 @@ where
     let success = execution_error.is_none() && boundary_error.is_none() && !validation_failed;
     let error = execution_error.or(boundary_error);
 
+    _revalidation
+        .stop_guard_owned_heartbeat()
+        .with_context(|| format!("guard-owned heartbeat failed for agent '{}'", run.agent_id))?;
+
     Ok(AgentRunReport {
         success,
         repo: run.repo,
@@ -471,7 +567,7 @@ where
         request_id: response.request_id.clone(),
         provider_id: response.provider_id.clone(),
         model: response.model.clone(),
-        worktree: run.selected.record,
+        worktree: run.selected.record().clone(),
         worktree_reused: run.selected.reused,
         claim: Some(run.claim),
         released_claims: Vec::new(),
@@ -549,8 +645,19 @@ fn select_worktree(
             );
         }
         ensure_clean_worktree(&record)?;
+        let lease = manager
+            .acquire_write_execution_lease(agent_id)
+            .with_context(|| {
+                format!("failed to acquire exclusive write lease for worktree '{agent_id}'")
+            })?;
+        if lease.record() != &record {
+            bail!(
+                "acquired write lease for agent '{agent_id}' no longer matches the selected worktree identity"
+            );
+        }
+        ensure_clean_worktree(lease.record())?;
         return Ok(SelectedWorktree {
-            record,
+            lease,
             reused: true,
         });
     }
@@ -578,8 +685,20 @@ fn select_worktree(
         )?;
         manager.create_with_repository_cleanliness(create_options, &cleanliness)?
     };
+    let lease = manager
+        .acquire_write_execution_lease(agent_id)
+        .with_context(|| {
+            format!(
+                "failed to acquire exclusive write lease for newly created worktree '{agent_id}'"
+            )
+        })?;
+    if lease.record() != &record {
+        bail!(
+            "acquired write lease for newly created worktree '{agent_id}' no longer matches the created record"
+        );
+    }
     Ok(SelectedWorktree {
-        record,
+        lease,
         reused: false,
     })
 }
@@ -1183,9 +1302,12 @@ fn display_paths(paths: &[PathBuf]) -> String {
 mod tests {
     use super::*;
     use crate::llm::{
-        FakeOutcome, FakeProvider, ProposedCommand, ProposedPatch, ProviderError, WorkProposal,
+        FakeOutcome, FakeProvider, LlmProvider, LlmRequest, LlmResponse, ProposedCommand,
+        ProposedPatch, ProviderCapabilities, ProviderError, WorkProposal,
     };
+    use crate::sync_store::ClaimTiming;
     use git2::{Oid, Signature};
+    use std::{io::Read, sync::mpsc, thread};
     use tempfile::TempDir;
 
     #[test]
@@ -1672,6 +1794,870 @@ diff --git a/README.md b/README.md
             );
         }
 
+        Ok(())
+    }
+
+    struct PanicOnCompleteProvider;
+
+    impl LlmProvider for PanicOnCompleteProvider {
+        fn provider_id(&self) -> &str {
+            "panic-provider"
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::local_fake()
+        }
+
+        fn complete(
+            &mut self,
+            _request: LlmRequest,
+        ) -> std::result::Result<LlmResponse, ProviderError> {
+            panic!("injected provider panic for write-lease RAII");
+        }
+    }
+
+    struct DetachHeadOnComplete {
+        inner: FakeProvider,
+        worktree_path: PathBuf,
+    }
+
+    impl LlmProvider for DetachHeadOnComplete {
+        fn provider_id(&self) -> &str {
+            self.inner.provider_id()
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.inner.capabilities()
+        }
+
+        fn complete(
+            &mut self,
+            request: LlmRequest,
+        ) -> std::result::Result<LlmResponse, ProviderError> {
+            let repo = crate::git_repository::open(&self.worktree_path)
+                .expect("open selected worktree before mutation");
+            let oid = repo
+                .head()
+                .expect("read HEAD")
+                .peel_to_commit()
+                .expect("peel HEAD")
+                .id();
+            repo.set_head_detached(oid)
+                .expect("detach HEAD to drift identity before mutation");
+            self.inner.complete(request)
+        }
+    }
+
+    fn default_agent_options(repo: PathBuf, agent_id: &str) -> AgentRunOptions {
+        AgentRunOptions {
+            repo,
+            agent_id: agent_id.to_string(),
+            task: "Update README".to_string(),
+            request_id: None,
+            model: None,
+            claimed_paths: vec![PathBuf::from("README.md")],
+            validation_commands: Vec::new(),
+            keep_claims: false,
+            worktree_reuse: AgentWorktreeReusePolicy::Clean,
+            provider_command_policy: ProviderCommandPolicy::Disabled,
+            command_timeout: DEFAULT_COMMAND_TIMEOUT,
+        }
+    }
+
+    fn exclusive_same_worktree_ops_refused(manager: &WorktreeManager, agent_id: &str) {
+        let write_err = manager
+            .acquire_write_execution_lease(agent_id)
+            .expect_err("competing writer must be refused");
+        let write_msg = format!("{write_err:#}");
+        assert!(
+            write_msg.contains("kernel state lock is already held")
+                || write_msg.contains("exclusive"),
+            "competing writer must fail on the kernel/exclusive lease, got {write_msg}"
+        );
+
+        let read_err = manager
+            .acquire_read_execution_lease(agent_id)
+            .expect_err("competing reader must be refused");
+        let read_msg = format!("{read_err:#}");
+        assert!(
+            read_msg.contains("kernel state lock is already held")
+                || read_msg.contains("exclusive"),
+            "competing reader must fail on the kernel/exclusive lease, got {read_msg}"
+        );
+
+        let remove_err = manager
+            .remove(agent_id, true, false)
+            .expect_err("competing removal must be refused");
+        let remove_msg = format!("{remove_err:#}");
+        assert!(
+            remove_msg.contains("active cooperative execution lease")
+                || remove_msg.contains("kernel state lock is already held"),
+            "competing removal/rebind must fail on the cooperative/kernel lease, got {remove_msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn create_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let cstr = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path");
+        assert_eq!(unsafe { libc::mkfifo(cstr.as_ptr(), 0o600) }, 0);
+    }
+
+    #[cfg(unix)]
+    fn wait_for_fifo_byte(path: &Path, timeout: Duration) {
+        let mut ready = open_fixture_fifo(path).expect("open fixture ready fifo");
+        assert!(
+            poll_fixture_fifo(&mut ready, path, timeout, None).expect("wait for fixture readiness"),
+            "fixture readiness requires an actual byte"
+        );
+    }
+
+    #[cfg(unix)]
+    fn open_fixture_fifo(path: &Path) -> Result<fs::File> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .with_context(|| format!("open fixture fifo {}", path.display()))
+    }
+
+    #[cfg(unix)]
+    fn poll_fixture_fifo(
+        ready: &mut fs::File,
+        path: &Path,
+        timeout: Duration,
+        completed: Option<&std::os::unix::net::UnixStream>,
+    ) -> Result<bool> {
+        use std::os::fd::AsRawFd;
+
+        let deadline = Instant::now() + timeout;
+        let mut byte = [0u8; 1];
+        loop {
+            if Instant::now() >= deadline {
+                bail!("timed out waiting for fifo {}", path.display());
+            }
+            match ready.read(&mut byte) {
+                Ok(1) => return Ok(true),
+                Ok(_) => bail!("fixture fifo closed without a ready byte"),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error).context("read fixture ready byte"),
+            }
+            let mut fds = [
+                libc::pollfd {
+                    fd: ready.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: completed.map_or(-1, AsRawFd::as_raw_fd),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let timeout_ms = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+            // SAFETY: both descriptors are borrowed from live owned fixture endpoints, and
+            // poll receives the exact length of the writable array.
+            let polled = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout_ms) };
+            if polled < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error).context("poll fixture readiness");
+            }
+            if fds[1].revents != 0 {
+                return Ok(false);
+            }
+            if fds[0].revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                bail!("fixture ready fifo poll failed");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    struct NotifyAgentFixtureCompletion(std::os::unix::net::UnixStream);
+
+    #[cfg(unix)]
+    impl Drop for NotifyAgentFixtureCompletion {
+        fn drop(&mut self) {
+            use std::io::Write;
+            let _ = self.0.write_all(b"x");
+        }
+    }
+
+    #[cfg(unix)]
+    struct OwnedAgentFifoRun {
+        runner: Option<thread::JoinHandle<Result<AgentRunReport>>>,
+        competitors: Vec<thread::JoinHandle<()>>,
+        ready: fs::File,
+        release: fs::File,
+        released: bool,
+        completed: std::os::unix::net::UnixStream,
+    }
+
+    #[cfg(unix)]
+    impl OwnedAgentFifoRun {
+        fn spawn(
+            ready_fifo: &Path,
+            release_fifo: &Path,
+            run: impl FnOnce() -> Result<AgentRunReport> + Send + 'static,
+        ) -> Result<Self> {
+            let ready = open_fixture_fifo(ready_fifo)?;
+            let release = open_fixture_fifo(release_fifo)?;
+            let (completed, notify) = std::os::unix::net::UnixStream::pair()?;
+            let runner = thread::spawn(move || {
+                let _notify = NotifyAgentFixtureCompletion(notify);
+                run()
+            });
+            Ok(Self {
+                runner: Some(runner),
+                competitors: Vec::new(),
+                ready,
+                release,
+                released: false,
+                completed,
+            })
+        }
+
+        fn wait_ready(&mut self, path: &Path, timeout: Duration) -> Result<()> {
+            match poll_fixture_fifo(&mut self.ready, path, timeout, Some(&self.completed)) {
+                Ok(true) => Ok(()),
+                readiness => {
+                    let result = self.finish();
+                    bail!("fixture did not reach its FIFO hold: {readiness:?}; agent result: {result:#?}");
+                }
+            }
+        }
+
+        fn release(&mut self) -> Result<()> {
+            use std::io::Write;
+            if !self.released {
+                self.release.write_all(b"go\n")?;
+                self.released = true;
+            }
+            Ok(())
+        }
+
+        fn finish(&mut self) -> Result<AgentRunReport> {
+            let release = self.release();
+            let runner = self
+                .runner
+                .take()
+                .context("fixture runner already joined")?;
+            let result = runner
+                .join()
+                .map_err(|_| anyhow::anyhow!("agent fixture runner panicked"));
+            for competitor in self.competitors.drain(..) {
+                let _ = competitor.join();
+            }
+            release.context("release fixture validation FIFO")?;
+            result?
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for OwnedAgentFifoRun {
+        fn drop(&mut self) {
+            // Keep both FIFO endpoints alive through joins, including when readiness
+            // failed before the child opened either its ready writer or release reader.
+            let _ = self.release();
+            if let Some(runner) = self.runner.take() {
+                let _ = runner.join();
+            }
+            for competitor in self.competitors.drain(..) {
+                let _ = competitor.join();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_fifo_fixture_reports_early_runner_failure() -> Result<()> {
+        let temp = TempDir::new()?;
+        let ready = temp.path().join("ready.fifo");
+        let release = temp.path().join("release.fifo");
+        create_fifo(&ready);
+        create_fifo(&release);
+        let mut runner = OwnedAgentFifoRun::spawn(&ready, &release, || {
+            bail!("synthetic agent failure before validation")
+        })?;
+        let error = runner
+            .wait_ready(&ready, Duration::from_secs(30))
+            .expect_err("early failure cannot report FIFO readiness");
+        assert!(
+            format!("{error:#}").contains("synthetic agent failure before validation"),
+            "the joined runner error must survive: {error:#}"
+        );
+        assert!(runner.runner.is_none(), "failed runner must be joined");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_fifo_fixture_unwind_releases_and_joins_owned_threads() -> Result<()> {
+        use std::io::Write;
+        use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let temp = TempDir::new()?;
+        let ready = temp.path().join("ready.fifo");
+        let release = temp.path().join("release.fifo");
+        create_fifo(&ready);
+        create_fifo(&release);
+        let run_ready = ready.clone();
+        let run_release = release.clone();
+        let runner_done = Arc::new(AtomicBool::new(false));
+        let competitor_done = Arc::new(AtomicBool::new(false));
+        let observed_runner = Arc::clone(&runner_done);
+        let observed_competitor = Arc::clone(&competitor_done);
+        let (tx, rx) = mpsc::channel();
+        let unwind = std::panic::catch_unwind(move || {
+            let mut runner = OwnedAgentFifoRun::spawn(&ready, &release, move || {
+                let mut release = open_fixture_fifo(&run_release)?;
+                let mut pollfd = libc::pollfd {
+                    fd: release.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // Observe cleanup's release without consuming it. Only then attempt the
+                // late ready write, in the same write-before-read order as the shell.
+                // The existing 10-second FIFO bound also bounds a missing cleanup signal.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let timeout = i32::try_from(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .as_millis(),
+                    )?;
+                    // SAFETY: pollfd borrows the live release file, with an exact array length.
+                    let polled = unsafe { libc::poll(&mut pollfd, 1, timeout) };
+                    if polled < 0
+                        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                    {
+                        continue;
+                    }
+                    assert_eq!(polled, 1);
+                    break;
+                }
+                assert_ne!(pollfd.revents & libc::POLLIN, 0);
+                let mut ready = fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(&run_ready)?;
+                ready.write_all(b"x")?;
+                let mut line = [0; 3];
+                release.read_exact(&mut line)?;
+                assert_eq!(&line, b"go\n");
+                observed_runner.store(true, Ordering::SeqCst);
+                tx.send(())?;
+                bail!("synthetic completed runner")
+            })
+            .expect("spawn owned fixture");
+            runner.competitors.push(thread::spawn(move || {
+                if rx.recv_timeout(Duration::from_secs(10)).is_ok() {
+                    observed_competitor.store(true, Ordering::SeqCst);
+                }
+            }));
+            panic!("synthetic assertion failure while validation is held");
+        });
+        assert!(unwind.is_err());
+        assert!(
+            runner_done.load(Ordering::SeqCst),
+            "runner was not released"
+        );
+        assert!(
+            competitor_done.load(Ordering::SeqCst),
+            "competing claim fixture was not drained before unwind returned"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_run_write_lease_blocks_same_worktree_through_validation_collect_and_preview(
+    ) -> Result<()> {
+        skip_without_containment!(ok);
+        let temp = TempDir::new().context("tempdir")?;
+        let repo_path = create_committed_repo(temp.path())?;
+        let manager = WorktreeManager::new(&repo_path);
+        let unrelated = manager
+            .create_for_test(WorktreeCreateOptions {
+                agent_id: "agent-b".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .context("create unrelated worktree")?;
+
+        let ready_fifo = temp.path().join("validation-ready.fifo");
+        let release_fifo = temp.path().join("validation-release.fifo");
+        create_fifo(&ready_fifo);
+        create_fifo(&release_fifo);
+
+        let (stage_ready_tx, stage_ready_rx) = mpsc::channel();
+        let (stage_release_tx, stage_release_rx) = mpsc::channel();
+        let run_repo = repo_path.clone();
+        let validation_command = format!(
+            "printf x > '{}'; cat '{}'",
+            ready_fifo.display(),
+            release_fifo.display()
+        );
+        let runner = thread::spawn(move || {
+            set_agent_protected_stage_hook(move |stage| {
+                stage_ready_tx.send(stage).expect("publish protected stage");
+                stage_release_rx
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("release protected stage");
+            });
+            let mut provider = FakeProvider::new("fake", DEFAULT_MODEL);
+            provider.push_response(
+                "agent-run-agent-a",
+                WorkProposal::summary("update readme").with_command(ProposedCommand::new(
+                    "printf '# Test\\n\\nagent edit\\n' > README.md",
+                    CommandPurpose::Implement,
+                )),
+            );
+            let mut options = default_agent_options(run_repo, "agent-a");
+            options.validation_commands =
+                vec![AgentValidationCommand::required(validation_command)];
+            options.provider_command_policy = ProviderCommandPolicy::AllowUnsafeShell;
+            let result = run_agent_with_provider_simulation(options, &mut provider);
+            clear_agent_protected_stage_hook();
+            result
+        });
+
+        let after_revalidation = stage_ready_rx
+            .recv_timeout(Duration::from_secs(60))
+            .context("timed out waiting for after-revalidation")?;
+        assert_eq!(after_revalidation, AgentProtectedStage::Revalidation);
+        exclusive_same_worktree_ops_refused(&manager, "agent-a");
+        let unrelated_before_mutation = manager
+            .acquire_write_execution_lease("agent-b")
+            .context("unrelated writer must remain available before mutation")?;
+        assert_eq!(unrelated_before_mutation.path(), unrelated.path.as_path());
+        drop(unrelated_before_mutation);
+        stage_release_tx
+            .send(())
+            .context("release after-revalidation")?;
+
+        wait_for_fifo_byte(&ready_fifo, Duration::from_secs(10));
+        exclusive_same_worktree_ops_refused(&manager, "agent-a");
+        let unrelated_during_validation = manager
+            .acquire_write_execution_lease("agent-b")
+            .context("unrelated writer must remain available during validation")?;
+        assert_eq!(unrelated_during_validation.path(), unrelated.path.as_path());
+        drop(unrelated_during_validation);
+        fs::write(&release_fifo, b"go").context("release validation fifo")?;
+
+        for expected in [
+            AgentProtectedStage::Validation,
+            AgentProtectedStage::Collect,
+            AgentProtectedStage::Preview,
+        ] {
+            let stage = stage_ready_rx
+                .recv_timeout(Duration::from_secs(60))
+                .with_context(|| format!("timed out waiting for {expected:?}"))?;
+            assert_eq!(stage, expected);
+            exclusive_same_worktree_ops_refused(&manager, "agent-a");
+            let unrelated_lease = manager
+                .acquire_write_execution_lease("agent-b")
+                .with_context(|| {
+                    format!("unrelated writer must remain available at {expected:?}")
+                })?;
+            assert_eq!(unrelated_lease.path(), unrelated.path.as_path());
+            drop(unrelated_lease);
+            stage_release_tx
+                .send(())
+                .with_context(|| format!("release {expected:?}"))?;
+        }
+
+        let report = runner.join().expect("join agent run")?;
+        assert!(report.success, "unexpected failed report: {report:?}");
+        assert_eq!(
+            report.candidate.changed_paths,
+            vec![PathBuf::from("README.md")]
+        );
+        assert_eq!(
+            report.merge_preview.candidate.changed_paths,
+            vec![PathBuf::from("README.md")]
+        );
+        assert_eq!(
+            fs::read_to_string(report.worktree.path.join("README.md"))?,
+            "# Test\n\nagent edit\n"
+        );
+
+        let released = manager
+            .acquire_write_execution_lease("agent-a")
+            .context("success must RAII-release the write lease")?;
+        drop(released);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn peek_agent_liveness(
+        repo_path: &Path,
+        agent_id: &str,
+    ) -> Result<crate::sync_store::PeekedClaimLiveness> {
+        crate::sync_store::peek_liveness_without_claims_lock(repo_path)?
+            .into_iter()
+            .find(|row| row.agent_id == agent_id)
+            .with_context(|| format!("missing peeked liveness for {agent_id}"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_run_guard_owned_heartbeat_ticks_during_blocking_child() -> Result<()> {
+        skip_without_containment!(ok);
+        let temp = TempDir::new().context("tempdir")?;
+        let repo_path = create_committed_repo(temp.path())?;
+        let store = SyncStore::open(&repo_path)?;
+        let foreign = store
+            .claim_paths("foreign-agent", [PathBuf::from("src/lib.rs")])?
+            .clone();
+        let foreign_before = peek_agent_liveness(&repo_path, "foreign-agent")?;
+
+        let ready_fifo = temp.path().join("heartbeat-ready.fifo");
+        let release_fifo = temp.path().join("heartbeat-release.fifo");
+        create_fifo(&ready_fifo);
+        create_fifo(&release_fifo);
+
+        let run_repo = repo_path.clone();
+        let validation_command = format!(
+            "printf x > '{}'; read -r release < '{}'",
+            ready_fifo.display(),
+            release_fifo.display()
+        );
+        let mut runner = OwnedAgentFifoRun::spawn(&ready_fifo, &release_fifo, move || {
+            set_agent_claim_timing_for_test(ClaimTiming::new(1, 3).expect("timing"));
+            let mut provider = FakeProvider::new("fake", DEFAULT_MODEL);
+            provider.push_response(
+                "agent-run-agent-a",
+                WorkProposal::summary("update readme").with_command(ProposedCommand::new(
+                    "printf '# Test\\n\\nagent edit\\n' > README.md",
+                    CommandPurpose::Implement,
+                )),
+            );
+            let mut options = default_agent_options(run_repo, "agent-a");
+            options.keep_claims = true;
+            options.validation_commands =
+                vec![AgentValidationCommand::required(validation_command)];
+            options.provider_command_policy = ProviderCommandPolicy::AllowUnsafeShell;
+            run_agent_with_provider_simulation(options, &mut provider)
+        })?;
+
+        runner.wait_ready(&ready_fifo, Duration::from_secs(30))?;
+        let baseline = peek_agent_liveness(&repo_path, "agent-a")?;
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let mut observed = baseline.heartbeat_unix_seconds;
+        while Instant::now() < deadline {
+            if let Ok(row) = peek_agent_liveness(&repo_path, "agent-a") {
+                observed = row.heartbeat_unix_seconds;
+                if observed >= baseline.heartbeat_unix_seconds + 2 {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            observed > baseline.heartbeat_unix_seconds,
+            "must observe disk heartbeat_unix_seconds advance while the child is blocked (baseline={}, observed={})",
+            baseline.heartbeat_unix_seconds,
+            observed
+        );
+        let report = runner.finish()?;
+        assert!(report.success, "unexpected failed report: {report:?}");
+        let claim = report.claim.as_ref().context("kept claim")?;
+        assert_eq!(claim.agent_id, "agent-a");
+        assert_eq!(claim.paths, vec![PathBuf::from("README.md")]);
+        assert_eq!(claim.token, baseline.token);
+        let after = peek_agent_liveness(&repo_path, "agent-a")?;
+        assert_eq!(after.paths, vec![PathBuf::from("README.md")]);
+        assert_eq!(after.run_owner_count, 0);
+        assert!(after.takeover_eligible_since_unix_seconds.is_none());
+        let foreign_after = peek_agent_liveness(&repo_path, "foreign-agent")?;
+        assert_eq!(foreign_after.token, foreign.token);
+        assert_eq!(
+            foreign_after.heartbeat_unix_seconds,
+            foreign_before.heartbeat_unix_seconds
+        );
+        assert_eq!(foreign_after.paths, foreign.paths);
+        let sweep = store.sweep_stale()?;
+        assert!(
+            !sweep
+                .newly_takeover_eligible
+                .iter()
+                .any(|claim_id| claim_id == &after.claim_id),
+            "live ticking claim must not become takeover-eligible: {:?}",
+            sweep.newly_takeover_eligible
+        );
+        store
+            .takeover(claim.token, "other-agent", None)
+            .expect_err("takeover of a live ticking claim must fail");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_run_guard_lifetime_blocks_competing_claim_ops_during_fifo_hold() -> Result<()> {
+        skip_without_containment!(ok);
+        let temp = TempDir::new().context("tempdir")?;
+        let repo_path = create_committed_repo(temp.path())?;
+        let store = SyncStore::open(&repo_path)?;
+        let ready_fifo = temp.path().join("block-ready.fifo");
+        let release_fifo = temp.path().join("block-release.fifo");
+        create_fifo(&ready_fifo);
+        create_fifo(&release_fifo);
+        let run_repo = repo_path.clone();
+        let validation_command = format!(
+            "printf x > '{}'; read -r release < '{}'",
+            ready_fifo.display(),
+            release_fifo.display()
+        );
+        let mut runner = OwnedAgentFifoRun::spawn(&ready_fifo, &release_fifo, move || {
+            set_agent_claim_timing_for_test(ClaimTiming::new(1, 3).expect("timing"));
+            let mut provider = FakeProvider::new("fake", DEFAULT_MODEL);
+            provider.push_response(
+                "agent-run-agent-a",
+                WorkProposal::summary("update readme").with_command(ProposedCommand::new(
+                    "printf '# Test\\n\\nagent edit\\n' > README.md",
+                    CommandPurpose::Implement,
+                )),
+            );
+            let mut options = default_agent_options(run_repo, "agent-a");
+            options.keep_claims = true;
+            options.validation_commands =
+                vec![AgentValidationCommand::required(validation_command)];
+            options.provider_command_policy = ProviderCommandPolicy::AllowUnsafeShell;
+            run_agent_with_provider_simulation(options, &mut provider)
+        })?;
+
+        runner.wait_ready(&ready_fifo, Duration::from_secs(30))?;
+        let live = peek_agent_liveness(&repo_path, "agent-a")?;
+        let token = live.token;
+        let release_store = store.clone();
+        let takeover_store = store.clone();
+        let heartbeat_store = store.clone();
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let (takeover_tx, takeover_rx) = mpsc::sync_channel(1);
+        let (heartbeat_tx, heartbeat_rx) = mpsc::sync_channel(1);
+        runner.competitors.push(thread::spawn(move || {
+            let result = release_store.release(token).map(|claim| claim.token);
+            let _ = release_tx.send(result);
+        }));
+        runner.competitors.push(thread::spawn(move || {
+            let result = takeover_store.takeover(token, "other-agent", None);
+            let _ = takeover_tx.send(result.map(|outcome| outcome.claim.token));
+        }));
+        runner.competitors.push(thread::spawn(move || {
+            let result = heartbeat_store.heartbeat(token, "agent-a", None);
+            let _ = heartbeat_tx.send(result.map(|report| report.claim.token));
+        }));
+        assert!(
+            release_rx.recv_timeout(Duration::from_millis(150)).is_err(),
+            "competing release must not complete while the guard holds claims.lock"
+        );
+        assert!(
+            takeover_rx.try_recv().is_err(),
+            "competing takeover must not complete while the guard holds claims.lock"
+        );
+        assert!(
+            heartbeat_rx.try_recv().is_err(),
+            "ordinary heartbeat must remain the timeout path while the guard holds claims.lock"
+        );
+        let report = runner.finish()?;
+        assert!(report.success, "unexpected failed report: {report:?}");
+        let _ = release_rx.recv_timeout(Duration::from_secs(6));
+        let _ = takeover_rx.recv_timeout(Duration::from_millis(200));
+        let _ = heartbeat_rx.recv_timeout(Duration::from_millis(200));
+        let remaining = store.snapshot()?;
+        if remaining.iter().any(|claim| claim.token == token) {
+            let started = Instant::now();
+            store.release(token)?;
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "release after drop+join must proceed"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_run_releases_write_lease_after_provider_error() -> Result<()> {
+        let temp = TempDir::new().context("tempdir")?;
+        let repo_path = create_committed_repo(temp.path())?;
+        let manager = WorktreeManager::new(&repo_path);
+        let mut provider = FakeProvider::new("fake", DEFAULT_MODEL);
+        provider.push_failure("agent-run-error-agent", "injected provider failure");
+        let error = run_agent_with_provider(
+            default_agent_options(repo_path.clone(), "error-agent"),
+            &mut provider,
+        )
+        .expect_err("injected provider failure must fail the agent run");
+        assert!(
+            error.to_string().contains("injected provider failure")
+                || format!("{error:#}").contains("injected provider failure"),
+            "unexpected provider error: {error:#}"
+        );
+        let released = manager
+            .acquire_write_execution_lease("error-agent")
+            .context("provider error must RAII-release the write lease")?;
+        drop(released);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_run_releases_write_lease_after_provider_panic() -> Result<()> {
+        let temp = TempDir::new().context("tempdir")?;
+        let repo_path = create_committed_repo(temp.path())?;
+        let manager = WorktreeManager::new(&repo_path);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut provider = PanicOnCompleteProvider;
+            run_agent_with_provider(
+                default_agent_options(repo_path.clone(), "panic-agent"),
+                &mut provider,
+            )
+        }));
+        assert!(panicked.is_err(), "provider panic must unwind");
+        let released = manager
+            .acquire_write_execution_lease("panic-agent")
+            .context("provider panic must RAII-release the write lease")?;
+        drop(released);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_run_releases_write_lease_after_timeout_and_keep_claims() -> Result<()> {
+        skip_without_containment!(ok);
+        let temp = TempDir::new().context("tempdir")?;
+        let repo_path = create_committed_repo(temp.path())?;
+        let manager = WorktreeManager::new(&repo_path);
+        let block_fifo = temp.path().join("timeout-block.fifo");
+        create_fifo(&block_fifo);
+        let mut provider = FakeProvider::new("fake", DEFAULT_MODEL);
+        provider.push_response(
+            "agent-run-timeout-agent",
+            WorkProposal::summary("block until timeout").with_command(ProposedCommand::new(
+                format!("cat '{}'", block_fifo.display()),
+                CommandPurpose::Implement,
+            )),
+        );
+        let mut options = default_agent_options(repo_path.clone(), "timeout-agent");
+        options.keep_claims = true;
+        options.provider_command_policy = ProviderCommandPolicy::AllowUnsafeShell;
+        options.command_timeout = Duration::from_secs(1);
+        let report = run_agent_with_provider_simulation(options, &mut provider)?;
+        assert!(!report.success);
+        assert_eq!(report.command_results.len(), 1);
+        assert!(report.command_results[0].timed_out);
+        let active_claims = SyncStore::open(&repo_path)?.snapshot()?;
+        assert_eq!(active_claims.len(), 1);
+        assert_eq!(active_claims[0].agent_id, "timeout-agent");
+        assert!(report.released_claims.is_empty());
+        let released = manager
+            .acquire_write_execution_lease("timeout-agent")
+            .context("timeout/keep_claims must RAII-release the write lease")?;
+        drop(released);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_run_identity_drift_before_mutation_refuses_before_artifact_publication() -> Result<()>
+    {
+        let temp = TempDir::new().context("tempdir")?;
+        let repo_path = create_committed_repo(temp.path())?;
+        let manager = WorktreeManager::new(&repo_path);
+        let worktree = manager
+            .create_for_test(WorktreeCreateOptions {
+                agent_id: "drift-agent".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .context("pre-create worktree")?;
+        let original = fs::read_to_string(worktree.path.join("README.md"))?;
+        let mut inner = FakeProvider::new("fake", DEFAULT_MODEL);
+        inner.push_response(
+            "agent-run-drift-agent",
+            WorkProposal::summary("mutate after drift").with_patch(ProposedPatch::new(
+                "README.md",
+                "\
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1 +1,3 @@
+ # Test
++
++should not be published
+",
+            )),
+        );
+        let mut provider = DetachHeadOnComplete {
+            inner,
+            worktree_path: worktree.path.clone(),
+        };
+        let mut options = default_agent_options(repo_path.clone(), "drift-agent");
+        options.worktree_reuse = AgentWorktreeReusePolicy::Required;
+        let error = run_agent_with_provider(options, &mut provider)
+            .expect_err("identity drift must fail closed before mutation");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("pre-mutation revalidation failed")
+                || message.contains("detached")
+                || message.contains("OID mismatch")
+                || message.contains("branch"),
+            "unexpected identity-drift error: {message}"
+        );
+        assert_eq!(
+            fs::read_to_string(worktree.path.join("README.md"))?,
+            original,
+            "drift must refuse before publishing worktree artifacts"
+        );
+        assert_eq!(fs::read_to_string(repo_path.join("README.md"))?, "# Test\n");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_claim_and_revalidation_guard_without_write_lease_allow_competing_writer() -> Result<()>
+    {
+        let temp = TempDir::new().context("tempdir")?;
+        let repo_path = create_committed_repo(temp.path())?;
+        let manager = WorktreeManager::new(&repo_path);
+        let worktree = manager
+            .create_for_test(WorktreeCreateOptions {
+                agent_id: "agent-a".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .context("create worktree")?;
+        let store = SyncStore::open(&repo_path)?;
+        let claim = store.claim_paths("agent-a", [PathBuf::from("README.md")])?;
+        let guard = crate::collect_revalidation::revalidate_claimed_worker(
+            &repo_path,
+            "agent-a",
+            claim.token,
+            &claim.paths,
+            &worktree,
+        )
+        .context("claims-only revalidation guard")?;
+        let competing = manager.acquire_write_execution_lease("agent-a").context(
+            "negative control: claim+guard without write lease must still allow a competing writer",
+        )?;
+        drop(competing);
+        drop(guard);
         Ok(())
     }
 

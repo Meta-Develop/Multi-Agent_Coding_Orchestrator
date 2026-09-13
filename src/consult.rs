@@ -5,6 +5,10 @@ use crate::{
     },
     external_agent::{run_external_agent, ExternalAgentCommand, ExternalAgentRun},
     llm::Redactor,
+    mutation_taxonomy::{
+        admit_consult_claude_process_intent, admit_consult_codex_process_intent,
+        AssignmentProcessLaunchKind, CONSULTANT_PROCESS_DUTY,
+    },
     orchestrator::RunId,
     process_runner::resolve_existing_path_without_symlinks,
     sync::normalize_repo_relative_path,
@@ -29,6 +33,10 @@ const CAVEAT_LIMIT: usize = 1024;
 const CONSULTANT_THREAD_DEPTH: u8 = 2;
 const MAX_CONSULT_RAW_BYTES: usize = 8 * 1024 * 1024;
 const CONSULT_PRODUCER: &str = "consult";
+/// Canonical ledger role (`RoleCategory::ReadOnlyResearcher`). Semantic consult
+/// identity stays on grant kind/duty `consultant`; `AgentRole` has no Researcher variant.
+const CONSULTANT_LIFECYCLE_ROLE: &str = "researcher";
+const CONSULT_PROCESS_LAUNCH_ATTEMPT: usize = 1;
 const QUESTION_ARTIFACT: &str = "trusted/question.md";
 const RAW_LOG_ARTIFACT: &str = "trusted/raw.log";
 const SCHEMA_ARTIFACT: &str = "trusted/schemas/consultant-report.schema.json";
@@ -402,14 +410,19 @@ where
     let (incoming, capture) = create_external_scratches(writer)?;
     let raw_log_path = capture.path().join("raw.log");
     let incoming_report_path = incoming.path().join("consultant-report.json");
-    let command = ExternalAgentCommand::codex_read_only_consultant(
-        consultant_bin,
+    let command = attach_consult_process_launch(
+        ExternalAgentCommand::codex_read_only_consultant(
+            consultant_bin,
+            repo,
+            writer.run_dir().join(QUESTION_ARTIFACT),
+            &raw_log_path,
+            &incoming_report_path,
+            timeout,
+        ),
         repo,
-        writer.run_dir().join(QUESTION_ARTIFACT),
-        &raw_log_path,
-        &incoming_report_path,
-        timeout,
-    );
+        run_id,
+        AssignmentProcessLaunchKind::ConsultCodex,
+    )?;
     let external_run = external_runner(&command);
     let report = match external_run.output_last_message() {
         Some(contents) => match std::str::from_utf8(contents) {
@@ -471,14 +484,19 @@ where
     let (incoming, capture) = create_external_scratches(writer)?;
     let raw_log_path = capture.path().join("raw.log");
     let incoming_report_path = incoming.path().join("consultant-report.json");
-    let command = ExternalAgentCommand::claude_consultant(
-        consultant_bin,
+    let command = attach_consult_process_launch(
+        ExternalAgentCommand::claude_consultant(
+            consultant_bin,
+            repo,
+            writer.run_dir().join(QUESTION_ARTIFACT),
+            &raw_log_path,
+            &incoming_report_path,
+            timeout,
+        ),
         repo,
-        writer.run_dir().join(QUESTION_ARTIFACT),
-        &raw_log_path,
-        &incoming_report_path,
-        timeout,
-    );
+        run_id,
+        AssignmentProcessLaunchKind::ConsultClaude,
+    )?;
     let external_run = external_runner(&command);
     let raw_evidence = external_run.stdout_bytes().to_vec();
     let report = match std::str::from_utf8(&raw_evidence) {
@@ -523,6 +541,52 @@ where
         report,
         raw_evidence,
     })
+}
+
+fn attach_consult_process_launch(
+    command: ExternalAgentCommand,
+    repo: &Path,
+    run_id: &RunId,
+    kind: AssignmentProcessLaunchKind,
+) -> Result<ExternalAgentCommand> {
+    let command = command.with_agent_lifecycle(
+        repo,
+        CONSULTANT_LIFECYCLE_ROLE,
+        run_id.as_str(),
+        run_id.as_str(),
+    );
+    let expected_program = Path::new(kind.trusted_program_spelling());
+    let grant = match kind {
+        AssignmentProcessLaunchKind::ConsultCodex => admit_consult_codex_process_intent(
+            run_id.as_str(),
+            run_id.as_str(),
+            CONSULT_PROCESS_LAUNCH_ATTEMPT,
+            expected_program,
+            command.model.as_deref(),
+            CONSULTANT_PROCESS_DUTY,
+        ),
+        AssignmentProcessLaunchKind::ConsultClaude => admit_consult_claude_process_intent(
+            run_id.as_str(),
+            run_id.as_str(),
+            CONSULT_PROCESS_LAUNCH_ATTEMPT,
+            expected_program,
+            command.model.as_deref(),
+            CONSULTANT_PROCESS_DUTY,
+        ),
+        AssignmentProcessLaunchKind::AssignmentChild
+        | AssignmentProcessLaunchKind::ParentAuditor
+        | AssignmentProcessLaunchKind::InboxIndependentAuditor
+        | AssignmentProcessLaunchKind::MergeArbiter => {
+            bail!("consult process launch requires a consult caller kind")
+        }
+    }
+    .map_err(|error| {
+        anyhow!(
+            "consult process launch grant failed closed: cause={}",
+            error.cause_id()
+        )
+    })?;
+    Ok(command.with_assignment_process_launch(kind, grant))
 }
 
 fn create_external_scratches(
@@ -1070,12 +1134,16 @@ fn default_true() -> bool {
 mod tests {
     use super::*;
     use crate::external_agent::{
-        run_external_agent_nonpublishable_simulation, CapturedOutput, ExternalProgramTrust,
+        run_external_agent_nonpublishable_simulation, CapturedOutput, ExternalAgentInvocation,
+        ExternalProgramTrust,
     };
+    #[cfg(target_os = "linux")]
+    use crate::mutation_taxonomy::AssignmentProcessLaunchGrantError;
     use crate::process_runner::{
         ContainmentBackend, ProcessTreeEvidence, SideEffectConfinementEvidence,
         SideEffectConfinementProfileKind,
     };
+    use std::cell::Cell;
     use std::fs;
 
     #[test]
@@ -1357,6 +1425,359 @@ mod tests {
         assert!(!run_dir.join(EXTERNAL_CAPTURE_SCRATCH).exists());
         assert!(!run_dir.join(".maco-artifact-final.json").exists());
         Ok(())
+    }
+
+    #[test]
+    fn fake_consult_skips_process_grant_issuer_and_spawn() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = create_test_repo(temp.path())?;
+        let run_id = RunId::new("consult-fake-skip-grant")?;
+        let options = ConsultAskOptions {
+            repo,
+            run_id,
+            runtime: ConsultantRuntime::Fake,
+            consultant_bin: None,
+            question: "What should be inspected?".to_string(),
+            context_paths: Vec::new(),
+            timeout_seconds: 1,
+        };
+        let runner_called = Cell::new(false);
+        let report = ask_consultant_with_runner(options, |_| {
+            runner_called.set(true);
+            panic!("fake consult must not issue a process grant or spawn");
+        })?;
+        assert!(
+            !runner_called.get(),
+            "fake consult must not invoke the external runner"
+        );
+        assert_eq!(report.runtime, ConsultantRuntime::Fake);
+        assert!(report.success);
+        Ok(())
+    }
+
+    #[test]
+    fn consult_codex_and_claude_process_grants_reach_injected_sink() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = create_test_repo(temp.path())?;
+        let run_id = RunId::new("consult-grant-reaches-sink")?;
+        let options = ConsultAskOptions {
+            repo: repo.clone(),
+            run_id: run_id.clone(),
+            runtime: ConsultantRuntime::Codex,
+            consultant_bin: Some(PathBuf::from("/test-only/codex")),
+            question: "What should be inspected?".to_string(),
+            context_paths: Vec::new(),
+            timeout_seconds: 1,
+        };
+        let seen_codex = Cell::new(false);
+        let _ = ask_consultant_with_runner(options, |command| {
+            assert_eq!(
+                command.assignment_process_launch_kind,
+                Some(AssignmentProcessLaunchKind::ConsultCodex)
+            );
+            let grant = command
+                .assignment_process_launch_grant
+                .as_ref()
+                .expect("Codex consult must attach the process grant before the runner");
+            assert_eq!(grant.kind(), AssignmentProcessLaunchKind::ConsultCodex);
+            assert_eq!(grant.run_id(), run_id.as_str());
+            assert_eq!(grant.subject(), run_id.as_str());
+            assert_eq!(grant.attempt(), CONSULT_PROCESS_LAUNCH_ATTEMPT);
+            assert_eq!(grant.duty(), CONSULTANT_PROCESS_DUTY);
+            assert_eq!(grant.model(), None);
+            assert_eq!(
+                command
+                    .agent_lifecycle
+                    .as_ref()
+                    .map(|identity| identity.role.as_str()),
+                Some(CONSULTANT_LIFECYCLE_ROLE)
+            );
+            seen_codex.set(true);
+            failed_test_external_run(command, "synthetic sink observation")
+        })?;
+        assert!(seen_codex.get());
+
+        let claude_id = RunId::new("consult-claude-grant-reaches-sink")?;
+        let claude_options = ConsultAskOptions {
+            repo,
+            run_id: claude_id.clone(),
+            runtime: ConsultantRuntime::Claude,
+            consultant_bin: Some(PathBuf::from("/test-only/claude")),
+            question: "What should be inspected?".to_string(),
+            context_paths: Vec::new(),
+            timeout_seconds: 1,
+        };
+        let seen_claude = Cell::new(false);
+        let _ = ask_consultant_with_runner(claude_options, |command| {
+            assert_eq!(
+                command.assignment_process_launch_kind,
+                Some(AssignmentProcessLaunchKind::ConsultClaude)
+            );
+            let grant = command
+                .assignment_process_launch_grant
+                .as_ref()
+                .expect("Claude consult must attach the process grant before the runner");
+            assert_eq!(grant.kind(), AssignmentProcessLaunchKind::ConsultClaude);
+            assert_eq!(grant.run_id(), claude_id.as_str());
+            assert_eq!(grant.duty(), CONSULTANT_PROCESS_DUTY);
+            assert_eq!(
+                command
+                    .agent_lifecycle
+                    .as_ref()
+                    .map(|identity| identity.role.as_str()),
+                Some(CONSULTANT_LIFECYCLE_ROLE)
+            );
+            seen_claude.set(true);
+            failed_test_external_run(command, "synthetic sink observation")
+        })?;
+        assert!(seen_claude.get());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn consult_process_grant_missing_wrong_kind_identity_runtime_model_duty_replay_fail_closed(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = create_test_repo(temp.path())?;
+        chmod_consult_control_roots(&repo)?;
+        let run_id = RunId::new("consult-grant-fail-closed")?;
+        let options = ConsultAskOptions {
+            repo: repo.clone(),
+            run_id: run_id.clone(),
+            runtime: ConsultantRuntime::Codex,
+            consultant_bin: Some(PathBuf::from("/test-only/codex")),
+            question: "What should be inspected?".to_string(),
+            context_paths: Vec::new(),
+            timeout_seconds: 1,
+        };
+        let spawn_attempted = Cell::new(0usize);
+        let spawn_refused = Cell::new(0usize);
+        let consume_ok = Cell::new(0usize);
+        let consume_replay_fail = Cell::new(0usize);
+        let _ = ask_consultant_with_runner(options, |command| {
+            let grant = command
+                .assignment_process_launch_grant
+                .clone()
+                .expect("Codex consult must attach the process grant");
+            assert_eq!(grant.kind(), AssignmentProcessLaunchKind::ConsultCodex);
+
+            let mut missing = command.clone();
+            let (_missing_temp, missing_marker) =
+                bind_local_consult_sink_fixture(&mut missing, "fixture-agent.sh");
+            missing.assignment_process_launch_grant = None;
+            let missing_sim = run_external_agent_nonpublishable_simulation(&missing);
+            assert_consult_sink_refused(
+                &missing_sim,
+                &missing_marker,
+                AssignmentProcessLaunchGrantError::MissingGrant,
+            );
+            spawn_refused.set(spawn_refused.get() + 1);
+
+            let mut missing_kind = command.clone();
+            let (_kind_missing_temp, kind_missing_marker) =
+                bind_local_consult_sink_fixture(&mut missing_kind, "fixture-agent.sh");
+            missing_kind.assignment_process_launch_kind = None;
+            missing_kind.assignment_process_launch_grant = None;
+            let missing_kind_sim = run_external_agent_nonpublishable_simulation(&missing_kind);
+            assert_consult_sink_refused(
+                &missing_kind_sim,
+                &kind_missing_marker,
+                AssignmentProcessLaunchGrantError::MissingGrant,
+            );
+            spawn_refused.set(spawn_refused.get() + 1);
+
+            let mut wrong_kind = command.clone();
+            let (_kind_temp, kind_marker) =
+                bind_local_consult_sink_fixture(&mut wrong_kind, "fixture-agent.sh");
+            wrong_kind.assignment_process_launch_kind =
+                Some(AssignmentProcessLaunchKind::InboxIndependentAuditor);
+            let kind_report = run_external_agent_nonpublishable_simulation(&wrong_kind);
+            assert_consult_sink_refused(
+                &kind_report,
+                &kind_marker,
+                AssignmentProcessLaunchGrantError::KindMismatch,
+            );
+            spawn_refused.set(spawn_refused.get() + 1);
+
+            let mut wrong_runtime = command.clone();
+            let (_runtime_temp, runtime_marker) =
+                bind_local_consult_sink_fixture(&mut wrong_runtime, "fixture-agent.sh");
+            wrong_runtime.assignment_process_launch_kind =
+                Some(AssignmentProcessLaunchKind::ConsultClaude);
+            let runtime_report = run_external_agent_nonpublishable_simulation(&wrong_runtime);
+            assert_consult_sink_refused(
+                &runtime_report,
+                &runtime_marker,
+                AssignmentProcessLaunchGrantError::KindMismatch,
+            );
+            spawn_refused.set(spawn_refused.get() + 1);
+
+            let mut wrong_identity = command.clone();
+            let (_id_temp, id_marker) =
+                bind_local_consult_sink_fixture(&mut wrong_identity, "fixture-agent.sh");
+            if let Some(identity) = &mut wrong_identity.agent_lifecycle {
+                identity.task_id = "other-consult-subject".to_string();
+            }
+            let identity_report = run_external_agent_nonpublishable_simulation(&wrong_identity);
+            assert_consult_sink_refused(
+                &identity_report,
+                &id_marker,
+                AssignmentProcessLaunchGrantError::IdentityMismatch,
+            );
+            spawn_refused.set(spawn_refused.get() + 1);
+
+            let mut wrong_model = command.clone();
+            let (_model_temp, model_marker) =
+                bind_local_consult_sink_fixture(&mut wrong_model, "fixture-agent.sh");
+            wrong_model.model = Some("gpt-5.6-sol".to_string());
+            let model_report = run_external_agent_nonpublishable_simulation(&wrong_model);
+            assert_consult_sink_refused(
+                &model_report,
+                &model_marker,
+                AssignmentProcessLaunchGrantError::IdentityMismatch,
+            );
+            spawn_refused.set(spawn_refused.get() + 1);
+
+            let mut wrong_duty = command.clone();
+            let (_duty_temp, duty_marker) =
+                bind_local_consult_sink_fixture(&mut wrong_duty, "fixture-agent.sh");
+            wrong_duty.assignment_process_launch_duty =
+                Some(crate::mutation_taxonomy::INBOX_INDEPENDENT_AUDITOR_PROCESS_DUTY.to_string());
+            let duty_report = run_external_agent_nonpublishable_simulation(&wrong_duty);
+            assert_consult_sink_refused(
+                &duty_report,
+                &duty_marker,
+                AssignmentProcessLaunchGrantError::IdentityMismatch,
+            );
+            spawn_refused.set(spawn_refused.get() + 1);
+
+            for invocation in [
+                ExternalAgentInvocation::CodexSupervisor,
+                ExternalAgentInvocation::Grok,
+                ExternalAgentInvocation::ClaudeCode,
+            ] {
+                let mut wrong_invocation = command.clone();
+                let (_invocation_temp, invocation_marker) =
+                    bind_local_consult_sink_fixture(&mut wrong_invocation, "fixture-agent.sh");
+                wrong_invocation.invocation = invocation;
+                let invocation_report =
+                    run_external_agent_nonpublishable_simulation(&wrong_invocation);
+                assert_consult_sink_refused(
+                    &invocation_report,
+                    &invocation_marker,
+                    AssignmentProcessLaunchGrantError::KindMismatch,
+                );
+                spawn_refused.set(spawn_refused.get() + 1);
+            }
+
+            let mut matching = command.clone();
+            let (_match_temp, match_marker) =
+                bind_local_consult_sink_fixture(&mut matching, "fixture-agent.sh");
+            let matching_report = run_external_agent_nonpublishable_simulation(&matching);
+            assert_eq!(matching_report.error, None, "{matching_report:?}");
+            assert_eq!(matching_report.exit_code, Some(0));
+            assert!(matching_report.stdout.target_launch_attempted);
+            assert!(match_marker.exists());
+            spawn_attempted.set(spawn_attempted.get() + 1);
+            consume_ok.set(consume_ok.get() + 1);
+
+            let mut replay = command.clone();
+            let (_replay_temp, replay_marker) =
+                bind_local_consult_sink_fixture(&mut replay, "fixture-agent.sh");
+            replay.assignment_process_launch_grant = Some(grant);
+            let replay_report = run_external_agent_nonpublishable_simulation(&replay);
+            assert_consult_sink_refused(
+                &replay_report,
+                &replay_marker,
+                AssignmentProcessLaunchGrantError::AlreadyConsumed,
+            );
+            spawn_refused.set(spawn_refused.get() + 1);
+            consume_replay_fail.set(consume_replay_fail.get() + 1);
+
+            failed_test_external_run(command, "synthetic after grant sink checks")
+        })?;
+        assert_eq!(spawn_attempted.get(), 1);
+        assert_eq!(spawn_refused.get(), 11);
+        assert_eq!(consume_ok.get(), 1);
+        assert_eq!(consume_replay_fail.get(), 1);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn chmod_consult_control_roots(repo: &Path) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        for control_root in [".git", ".maco", ".maco-cache", ".codex", ".agents"] {
+            let path = repo.join(control_root);
+            fs::create_dir_all(&path)?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn bind_local_consult_sink_fixture(
+        command: &mut ExternalAgentCommand,
+        program_name: &str,
+    ) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("consult sink fixture temp");
+        let marker = temp.path().join("child-process-started");
+        let agent = temp.path().join(program_name);
+        fs::write(
+            &agent,
+            format!(
+                "#!/bin/sh\nwhile IFS= read -r _line; do\n    :\ndone\ntouch '{}'\nexit 0\n",
+                marker.display()
+            ),
+        )
+        .expect("write consult sink fixture agent");
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o700))
+            .expect("chmod consult sink fixture agent");
+        let incoming = temp.path().join("incoming");
+        fs::create_dir(&incoming).expect("create consult sink incoming");
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))
+            .expect("chmod consult sink incoming");
+        command.program = fs::canonicalize(&agent).expect("canonicalize consult sink fixture");
+        command.json_log = incoming.join("events.jsonl");
+        command.output_last_message = incoming.join("last-message.txt");
+        command.machine_global_retention = None;
+        command.output_schema = None;
+        command.read_only_input_files.clear();
+        command.worker_journal_artifacts.clear();
+        command.environment_requirements.clear();
+        fs::create_dir_all(&command.cwd).expect("consult sink workspace");
+        for protected_root in [".git", ".maco", ".maco-cache", ".codex", ".agents"] {
+            let path = command.cwd.join(protected_root);
+            fs::create_dir_all(&path).expect("create consult sink protected worktree control");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                .expect("chmod consult sink protected worktree control");
+        }
+        (temp, marker)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_consult_sink_refused(
+        report: &ExternalAgentRun,
+        marker: &Path,
+        cause: AssignmentProcessLaunchGrantError,
+    ) {
+        assert!(
+            !marker.exists(),
+            "consult process must not spawn: {:?}",
+            report.error
+        );
+        assert!(!report.stdout.target_launch_attempted);
+        assert!(
+            report.error.as_deref().is_some_and(|error| {
+                error.contains("assignment process launch grant failed closed")
+                    && error.contains(cause.cause_id())
+            }),
+            "unexpected consult process refusal: {:?}",
+            report.error
+        );
     }
 
     fn failed_test_external_run(command: &ExternalAgentCommand, error: &str) -> ExternalAgentRun {

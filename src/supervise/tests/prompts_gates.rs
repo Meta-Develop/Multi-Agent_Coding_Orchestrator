@@ -817,6 +817,210 @@ fn safe_claim_conflict_narrows_scope_before_child_launch() {
     );
 }
 
+fn commit_recognized_mapped_test_path(repo_path: &Path) {
+    fs::create_dir_all(repo_path.join("tests")).expect("create tests directory");
+    fs::write(
+        repo_path.join("tests/preclaim_narrow.rs"),
+        "#[test] fn preclaim_narrow_fixture() {}\n",
+    )
+    .expect("write recognized mapped test path");
+    commit_injected_repository(repo_path, "add recognized mapped test path");
+}
+
+fn recorded_preclaim_rows(repo_path: &Path, run_id: &RunId) -> Vec<(String, String)> {
+    let reader = ArtifactRunReader::open(repo_path, RunArtifactFamily::Supervise, run_id)
+        .expect("open verified narrowing artifact run");
+    let bytes = reader
+        .read("preclaim/decisions.jsonl")
+        .expect("read persisted pre-claim decisions");
+    String::from_utf8(bytes)
+        .expect("utf-8 pre-claim decisions")
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let value: Value = serde_json::from_str(line).expect("parse pre-claim decision");
+            let disposition = value
+                .get("disposition")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let verification = value
+                .get("dimensions")
+                .and_then(|dimensions| dimensions.get("clear_verification_path"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            (disposition, verification)
+        })
+        .collect()
+}
+
+fn verified_two_path_narrowing_plan(
+    repo_path: &Path,
+    temp: &tempfile::TempDir,
+    run_label: &str,
+) -> (
+    OrchestratorAssignment,
+    SupervisorPlan,
+    SupervisorRunOptions,
+    RunId,
+) {
+    let mut assignment = injected_assignment(false);
+    assignment.assigned_paths = vec![
+        PathBuf::from("tests/preclaim_narrow.rs"),
+        PathBuf::from("README.md"),
+    ];
+    let mut plan = injected_plan(assignment.clone(), 0);
+    plan.max_gate_corrections = 1;
+    let run_id = RunId::new(run_label).expect("valid verified narrowing run id");
+    let options = SupervisorRunOptions {
+        repo: repo_path.to_path_buf(),
+        plan_file: temp.path().join(format!("{run_label}.json")),
+        run_id: run_id.clone(),
+        parent_node: None,
+        codex_bin: PathBuf::from("unused-injected-codex"),
+        runtime: SupervisorRuntime::Codex,
+        allow_dirty_primary: true,
+        allow_live_run_collision: false,
+        admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+        budget_overrides: crate::supervise::RunBudgetLimits::default(),
+        budget_max_duration_seconds: None,
+        machine_global_retention: Some(injected_machine_global_retention(temp.path())),
+    };
+    (assignment, plan, options, run_id)
+}
+
+#[test]
+fn verified_claim_conflict_parks_when_narrowing_drops_the_mapped_test_path() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    commit_recognized_mapped_test_path(&repo_path);
+
+    let (assignment, plan, options, run_id) = verified_two_path_narrowing_plan(
+        &repo_path,
+        &temp,
+        "verified-claim-conflict-lost-test-path",
+    );
+    let store = SyncStore::open(&repo_path).expect("open injected sync store");
+    let conflicting_claim = store
+        .claim_paths(
+            "other-owner",
+            [PathBuf::from("tests/preclaim_narrow.rs")].iter(),
+        )
+        .expect("create conflicting claim on the mapped test path");
+    let mut launches = 0usize;
+    let mut runner = |command: &ExternalAgentCommand| {
+        launches = launches.saturating_add(1);
+        let child = injected_child_report(&assignment);
+        write_injected_json(&command.output_last_message, &child);
+        injected_verified_run(command)
+    };
+
+    let report = run_supervisor_plan_with_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        SupervisorExecutionRuntime::Verified,
+        &mut runner,
+    )
+    .expect("run verified claim-conflict lost-test-path park");
+    store
+        .release(conflicting_claim.token)
+        .expect("release injected conflicting claim");
+
+    assert!(!report.success, "unexpected parked report: {report:#?}");
+    assert_eq!(launches, 0, "parked remainder must not launch a runner");
+    assert!(
+        report.claim_tokens.is_empty(),
+        "parked remainder must not keep a successful retry claim: {:?}",
+        report.claim_tokens
+    );
+    assert!(
+        report.orchestrator_reports.is_empty(),
+        "parked remainder must not produce a child report"
+    );
+    assert!(
+        report.findings.iter().any(|finding| {
+            finding.message.contains("pre-claim viability parked")
+                && finding.message.contains("clear_verification_path=unknown")
+        }),
+        "missing durable park finding: {:#?}",
+        report.findings
+    );
+    let rows = recorded_preclaim_rows(&repo_path, &run_id);
+    assert!(
+        rows.iter()
+            .any(|(disposition, verification)| disposition == "claim" && verification == "yes"),
+        "initial verified claim missing from {rows:?}"
+    );
+    assert_eq!(
+        rows.last()
+            .map(|(disposition, verification)| (disposition.as_str(), verification.as_str())),
+        Some(("park", "unknown")),
+        "effective lost-test-path park missing from {rows:?}"
+    );
+}
+
+#[test]
+fn verified_claim_conflict_claims_when_narrowing_keeps_the_mapped_test_path() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    commit_recognized_mapped_test_path(&repo_path);
+
+    let (assignment, plan, options, run_id) = verified_two_path_narrowing_plan(
+        &repo_path,
+        &temp,
+        "verified-claim-conflict-kept-test-path",
+    );
+    let store = SyncStore::open(&repo_path).expect("open injected sync store");
+    let conflicting_claim = store
+        .claim_paths("other-owner", [PathBuf::from("README.md")].iter())
+        .expect("create conflicting claim on the non-test path");
+    let narrowed = OrchestratorAssignment {
+        assigned_paths: vec![PathBuf::from("tests/preclaim_narrow.rs")],
+        ..assignment.clone()
+    };
+    let mut launches = 0usize;
+    let mut runner = |command: &ExternalAgentCommand| {
+        launches = launches.saturating_add(1);
+        let child = injected_child_report(&narrowed);
+        write_injected_json(&command.output_last_message, &child);
+        injected_verified_run(command)
+    };
+
+    let report = run_supervisor_plan_with_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        SupervisorExecutionRuntime::Verified,
+        &mut runner,
+    )
+    .expect("run verified claim-conflict kept-test-path claim");
+    store
+        .release(conflicting_claim.token)
+        .expect("release injected conflicting claim");
+
+    assert!(
+        report.success,
+        "unexpected kept-test-path report: {report:#?}"
+    );
+    assert_eq!(launches, 1);
+    assert_eq!(
+        report.orchestrator_reports[0].assigned_paths,
+        vec![PathBuf::from("tests/preclaim_narrow.rs")]
+    );
+    let rows = recorded_preclaim_rows(&repo_path, &run_id);
+    assert!(
+        rows.iter()
+            .any(|(disposition, verification)| disposition == "claim" && verification == "yes"),
+        "verified claim for retained mapped test path missing from {rows:?}"
+    );
+    assert!(
+        rows.iter().all(|(disposition, _)| disposition != "park"),
+        "retained mapped test path must not park: {rows:?}"
+    );
+}
+
 #[test]
 fn validation_gate_reenters_child_with_injection_safe_prompt_and_journal() {
     skip_without_containment!();

@@ -21,7 +21,14 @@ fn run_ready_agents(
     worktrees: &[SelectedWorktree],
     ready: &[usize],
     runtime: OrchestrationExecutionRuntime,
+    #[cfg(test)] repo: &Path,
 ) -> Result<Vec<(usize, Result<CommandRunResult, ProcessRunError>)>> {
+    // Claim authority for this wave is the caller's one batch
+    // RevalidationGuard. Do not acquire per-agent RevalidationGuard /
+    // ExistingClaimsGuard here: a second claims.lock would deadlock or
+    // serialize children. join_ready_agent_handles still joins every
+    // handle (no deadline, no early-return detach). Future heartbeat
+    // join belongs after the caller drops the wave guard.
     if ready.len() == 1 {
         let index = ready[0];
         verify_selected_worktree_binding(
@@ -30,8 +37,6 @@ fn run_ready_agents(
             &summaries[index],
             &worktrees[index],
         )?;
-        let _revalidation =
-            revalidate_ready_agent(&plan.agents[index], &summaries[index], &worktrees[index])?;
         let spec = command_spec(
             &plan.agents[index],
             &summaries[index],
@@ -49,8 +54,6 @@ fn run_ready_agents(
             &summaries[*index],
             &worktrees[*index],
         )?;
-        let _revalidation =
-            revalidate_ready_agent(&plan.agents[*index], &summaries[*index], &worktrees[*index])?;
         let spec = command_spec(
             &plan.agents[*index],
             &summaries[*index],
@@ -62,9 +65,15 @@ fn run_ready_agents(
 
     let mut handles = Vec::with_capacity(prepared.len());
     for (index, spec) in prepared {
+        #[cfg(test)]
+        let spawn_panic = (repo.to_path_buf(), plan.agents[index].id.clone());
         handles.push((
             index,
-            thread::spawn(move || (index, run_agent_command(spec))),
+            thread::spawn(move || {
+                #[cfg(test)]
+                panic_if_ready_agent_spawn_injected(&spawn_panic.0, &spawn_panic.1);
+                (index, run_agent_command(spec))
+            }),
         ));
         #[cfg(test)]
         if let Err(error) = fail_after_ready_agent_spawn(&plan.agents[index].id) {
@@ -110,6 +119,7 @@ fn inspect_captured_agent_changes(
     summary: &mut AgentRunSummary,
     captured: &CapturedCandidate,
     patch_output: Option<ReservedOutputFile>,
+    #[cfg(test)] repo: &Path,
 ) {
     let mut patch_output = patch_output.map(PatchOutputGuard::new);
     if summary.worktree.is_none() {
@@ -143,6 +153,11 @@ fn inspect_captured_agent_changes(
     }
 
     if let Some(patch_output) = patch_output.as_mut().and_then(PatchOutputGuard::take) {
+        #[cfg(test)]
+        let mut patch_write_barrier =
+            ReadyWavePatchWriteBarrier::arm(repo, &agent.id, !captured.patch.is_empty());
+        #[cfg(test)]
+        patch_write_barrier.wait();
         match write_captured_agent_patch(patch_output, &captured.patch) {
             Ok(Some(path)) => summary.patch_path = Some(path),
             Ok(None) => {}
@@ -1829,10 +1844,12 @@ fn strict_command_profile(spec: &CommandRunSpec) -> StrictOfflineWorkspaceProfil
         StrictOfflineWorkspaceProfile::read_write(&spec.workspace_root),
         |profile, visible| profile.with_visible_read_only_root(visible),
     );
-    let profile = spec.visible_read_write_roots.iter().fold(
-        profile,
-        |profile, visible| profile.with_visible_read_write_root(visible),
-    );
+    let profile = spec
+        .visible_read_write_roots
+        .iter()
+        .fold(profile, |profile, visible| {
+            profile.with_visible_read_write_root(visible)
+        });
     spec.hidden_roots
         .iter()
         .fold(profile, |profile, hidden| profile.with_hidden_root(hidden))

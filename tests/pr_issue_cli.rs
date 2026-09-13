@@ -633,7 +633,11 @@ fi
         .context("run rejected GitHub publication")?;
 
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("local/file publication is disabled"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("local/file publication is disabled"),
+        "unexpected publication refusal: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(!gh_env_path.exists());
     assert!(!gh_state_path.exists());
     assert!(!git_trace_path.exists());
@@ -742,7 +746,11 @@ fi
         .context("run publication with attacking gh shadow")?;
 
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("local/file publication is disabled"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("local/file publication is disabled"),
+        "unexpected publication refusal: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(!state.exists());
     assert!(!git_ref_exists(
         &origin_path,
@@ -852,7 +860,11 @@ fi
         .output()
         .context("run publication with lost-response shim")?;
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("local/file publication is disabled"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("local/file publication is disabled"),
+        "unexpected publication refusal: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(!pr_state.exists());
     assert!(!list_count.exists());
     assert!(!create_count.exists());

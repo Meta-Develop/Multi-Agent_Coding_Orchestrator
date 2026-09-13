@@ -167,6 +167,188 @@ fn wait_for_test_marker(path: &Path) {
     }
 }
 
+#[cfg(unix)]
+fn blocking_marker_command(ready: &Path, release: &Path) -> String {
+    format!(
+        "printf ready > '{}'; while [ ! -f '{}' ]; do sleep 0.02; done",
+        ready.display(),
+        release.display()
+    )
+}
+
+#[cfg(unix)]
+fn blocking_claimed_edit_command(
+    relative_file: &str,
+    contents: &str,
+    ready: &Path,
+    release: &Path,
+) -> String {
+    format!(
+        "printf '{contents}' > '{relative_file}'; {}",
+        blocking_marker_command(ready, release)
+    )
+}
+
+#[cfg(unix)]
+struct ChannelRelease(Option<mpsc::SyncSender<()>>);
+
+#[cfg(unix)]
+impl ChannelRelease {
+    fn send(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ChannelRelease {
+    fn drop(&mut self) {
+        self.send();
+    }
+}
+
+#[cfg(unix)]
+struct ReadyWaveTestCleanup {
+    release_files: Vec<PathBuf>,
+    channel_releases: Vec<mpsc::SyncSender<()>>,
+    runner: Option<thread::JoinHandle<Result<OrchestrationSummary>>>,
+    extra_joins: Vec<thread::JoinHandle<()>>,
+    hook_installation_ids: Vec<u64>,
+}
+
+#[cfg(unix)]
+impl ReadyWaveTestCleanup {
+    fn new() -> Self {
+        Self {
+            release_files: Vec::new(),
+            channel_releases: Vec::new(),
+            runner: None,
+            extra_joins: Vec::new(),
+            hook_installation_ids: Vec::new(),
+        }
+    }
+
+    fn track_hook_installation(&mut self, id: u64) {
+        self.hook_installation_ids.push(id);
+    }
+
+    fn release_barriers(&mut self) {
+        for path in &self.release_files {
+            let _ = fs::write(path, "release\n");
+        }
+        for tx in self.channel_releases.drain(..) {
+            let _ = tx.send(());
+        }
+    }
+
+    fn join_runner(&mut self) -> thread::Result<Result<OrchestrationSummary>> {
+        self.release_barriers();
+        self.runner.take().expect("ready-wave runner").join()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReadyWaveTestCleanup {
+    fn drop(&mut self) {
+        self.release_barriers();
+        uninstall_ready_wave_test_hooks(&self.hook_installation_ids);
+        self.hook_installation_ids.clear();
+        if let Some(runner) = self.runner.take() {
+            let _ = runner.join();
+        }
+        for handle in self.extra_joins.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[cfg(unix)]
+struct ReadyWaveHookOwnerCleanup {
+    ids: Vec<u64>,
+}
+
+#[cfg(unix)]
+impl ReadyWaveHookOwnerCleanup {
+    fn track(&mut self, id: u64) {
+        self.ids.push(id);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReadyWaveHookOwnerCleanup {
+    fn drop(&mut self) {
+        uninstall_ready_wave_test_hooks(&self.ids);
+        self.ids.clear();
+    }
+}
+
+#[cfg(unix)]
+fn spawn_exact_token_release(
+    store: SyncStore,
+    token: crate::sync::ClaimToken,
+) -> (
+    mpsc::Receiver<Result<crate::sync::PathClaim>>,
+    thread::JoinHandle<()>,
+) {
+    let (tx, rx) = mpsc::sync_channel(1);
+    let handle = thread::spawn(move || {
+        let result = store.release(token);
+        let _ = tx.send(result);
+    });
+    (rx, handle)
+}
+
+#[cfg(unix)]
+fn assert_exact_token_release_blocked(receiver: &mpsc::Receiver<Result<crate::sync::PathClaim>>) {
+    assert!(
+        receiver.recv_timeout(Duration::from_millis(150)).is_err(),
+        "exact-token release must not complete while the ready-wave guard is held"
+    );
+}
+
+#[cfg(unix)]
+fn assert_exact_token_release_still_blocked(
+    receiver: &mpsc::Receiver<Result<crate::sync::PathClaim>>,
+) {
+    match receiver.try_recv() {
+        Err(mpsc::TryRecvError::Empty) => {}
+        other => panic!(
+            "exact-token release completed while the ready-wave guard should still be held: {other:?}"
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn claim_token_for_agent(store: &SyncStore, agent_id: &str) -> crate::sync::ClaimToken {
+    store
+        .snapshot()
+        .expect("snapshot claims")
+        .into_iter()
+        .find(|claim| claim.agent_id == agent_id)
+        .map(|claim| claim.token)
+        .unwrap_or_else(|| panic!("missing claim for {agent_id}"))
+}
+
+#[cfg(unix)]
+fn assert_no_nonempty_patch_bytes(patch_dir: &Path) {
+    if !patch_dir.exists() {
+        return;
+    }
+    for entry in fs::read_dir(patch_dir).expect("read patch dir") {
+        let entry = entry.expect("patch dir entry");
+        let path = entry.path();
+        if path.is_file() {
+            let bytes = fs::read(&path).expect("read patch artifact");
+            assert!(
+                bytes.is_empty(),
+                "pre-spawn identity drift must not publish patch bytes at {}",
+                path.display()
+            );
+        }
+    }
+}
+
 #[test]
 fn load_plan_normalizes_agent_ids_and_paths() {
     let temp = TempDir::new().expect("tempdir");
@@ -423,6 +605,124 @@ fn scheduler_accepts_successful_checkpoint_summary_as_dependency() {
         ready_agent_indices(&plan, &summaries, &remaining, 1),
         vec![1]
     );
+}
+
+#[test]
+fn ready_wave_keeps_claims_alive_for_queued_and_recovered_assignments() {
+    let mut summaries = (0..5)
+        .map(|index| {
+            let agent = schedule_test_agent(&format!("agent-{index}"), &[]);
+            let mut summary = AgentRunSummary::pending(&agent);
+            summary.claim = Some(PathClaim {
+                token: ClaimToken::from_u64(index + 1),
+                agent_id: agent.id,
+                paths: agent.paths,
+            });
+            summary
+        })
+        .collect::<Vec<_>>();
+    summaries[2].status = AgentRunStatus::Succeeded;
+    summaries[3].status = AgentRunStatus::Failed;
+    summaries[4].claim = None;
+    assert_eq!(protected_wave_indices(&summaries, &[0]), vec![0, 1, 2]);
+    assert_eq!(
+        protected_wave_indices(&summaries, &[4]),
+        vec![0, 1, 2, 4],
+        "an unclaimed ready assignment must still reach revalidation and fail"
+    );
+}
+
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "requires Linux authenticated worktrees and claim state"
+)]
+#[test]
+fn schedule_heartbeat_preserves_claims_across_long_dependency_waves_and_recovery() -> Result<()> {
+    let temp = TempDir::new()?;
+    let repo_path = temp.path().join("repo");
+    WorktreeManager::init_repository(&repo_path, "main")?;
+    let repository = crate::git_repository::open(&repo_path)?;
+    fs::write(repo_path.join("agent-a.txt"), "a\n")?;
+    fs::write(repo_path.join("agent-b.txt"), "b\n")?;
+    commit_all(&repository, "baseline")?;
+    let base_oid = current_head_oid(&repo_path)?;
+    let manager = WorktreeManager::new(&repo_path);
+    let store = SyncStore::open(&repo_path)?;
+    let mut first = schedule_test_agent("agent-a", &[]);
+    first.command = "sleep 4".to_string();
+    let mut plan = schedule_test_plan(vec![first, schedule_test_agent("agent-b", &["agent-a"])]);
+    let mut summaries = Vec::new();
+    let mut worktrees = Vec::new();
+    for agent in &plan.agents {
+        manager.create_for_test(WorktreeCreateOptions {
+            agent_id: agent.id.clone(),
+            branch: None,
+            base: None,
+            worktree_root: None,
+        })?;
+        let selected = SelectedWorktree {
+            lease: manager.acquire_write_execution_lease(&agent.id)?,
+            reused: false,
+        };
+        let mut summary = AgentRunSummary::pending(agent);
+        summary.worktree = Some(selected.record().clone());
+        summary.claim = Some(
+            store
+                .claim_paths_with_timing(
+                    &agent.id,
+                    &agent.paths,
+                    crate::sync_store::ClaimTiming::new(1, 3)?,
+                )?
+                .claim,
+        );
+        summaries.push(summary);
+        worktrees.push(selected);
+    }
+    let candidates = run_agent_schedule_with_patch_dir(
+        &AgentScheduleContext {
+            repo: &repo_path,
+            manager: &manager,
+            plan: &plan,
+            worktrees: &worktrees,
+            jobs: 1,
+            base_oid: &base_oid,
+            runtime: OrchestrationExecutionRuntime::NonpublishableSimulation,
+        },
+        &mut summaries,
+        None,
+        None,
+    )?;
+    assert!(summaries
+        .iter()
+        .all(|summary| summary.status == AgentRunStatus::Succeeded));
+    assert!(candidates.iter().all(Option::is_some));
+    assert!(store.sweep_stale()?.newly_takeover_eligible.is_empty());
+    // Recovery must refresh every retained claim without rerunning commands.
+    plan.agents[0].command = "exit 99".to_string();
+    plan.agents[0].validation_commands = vec![ValidationCommandPlan {
+        name: None,
+        command: "sleep 4".to_string(),
+        env: BTreeMap::new(),
+        timeout: None,
+        working_directory: None,
+    }];
+    let recovered = run_agent_schedule_with_patch_dir(
+        &AgentScheduleContext {
+            repo: &repo_path,
+            manager: &manager,
+            plan: &plan,
+            worktrees: &worktrees,
+            jobs: 1,
+            base_oid: &base_oid,
+            runtime: OrchestrationExecutionRuntime::NonpublishableSimulation,
+        },
+        &mut summaries,
+        None,
+        None,
+    )?;
+    assert!(recovered.iter().all(Option::is_some));
+    assert!(store.sweep_stale()?.newly_takeover_eligible.is_empty());
+    Ok(())
 }
 
 #[test]
@@ -3945,6 +4245,1232 @@ fn retained_checkpoint_writer_rejects_leaf_rebinding_without_clobbering_sentinel
         fs::read_to_string(&sentinel).expect("read sentinel"),
         "untouched"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn parallel_orchestration_holds_batched_claim_authority_through_validation_and_patch_publication() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    let patch_dir = temp.path().join("patches");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    fs::write(repo_path.join("a.txt"), "a\n").expect("write a");
+    fs::write(repo_path.join("b.txt"), "b\n").expect("write b");
+    commit_all(&repo, "initial commit").expect("commit");
+    let manager = WorktreeManager::new(&repo_path);
+    for agent_id in ["agent-a", "agent-b", "agent-c"] {
+        manager
+            .create_for_test(WorktreeCreateOptions {
+                agent_id: agent_id.to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("create worktree");
+    }
+    let unrelated = manager
+        .list()
+        .expect("list worktrees")
+        .into_iter()
+        .find(|record| record.name == "agent-c")
+        .expect("agent-c worktree");
+
+    let child_a_ready = temp.path().join("child-a-ready");
+    let child_a_release = temp.path().join("child-a-release");
+    let child_b_ready = temp.path().join("child-b-ready");
+    let child_b_release = temp.path().join("child-b-release");
+    let validation_ready = temp.path().join("validation-a-ready");
+    let validation_release = temp.path().join("validation-a-release");
+    let plan_file = temp.path().join("plan.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "worktree_reuse_policy": "required",
+            "agents": [
+                {
+                    "id": "agent-a",
+                    "paths": ["a.txt"],
+                    "command": blocking_claimed_edit_command(
+                        "a.txt",
+                        "changed-a\\n",
+                        &child_a_ready,
+                        &child_a_release,
+                    ),
+                    "validation_commands": [blocking_marker_command(
+                        &validation_ready,
+                        &validation_release,
+                    )]
+                },
+                {
+                    "id": "agent-b",
+                    "paths": ["b.txt"],
+                    "command": blocking_claimed_edit_command(
+                        "b.txt",
+                        "changed-b\\n",
+                        &child_b_ready,
+                        &child_b_release,
+                    )
+                }
+            ]
+        }))
+        .expect("encode plan"),
+    )
+    .expect("write plan");
+
+    let (pre_revalidate_reached, pre_revalidate_release, drift_id) =
+        install_ready_wave_identity_drift_hook(&repo_path);
+    let (patch_reached, patch_release, patch_id) =
+        install_ready_wave_patch_write_hook(&repo_path, "agent-a");
+    let mut cleanup = ReadyWaveTestCleanup::new();
+    cleanup.track_hook_installation(drift_id);
+    cleanup.track_hook_installation(patch_id);
+    cleanup.release_files.extend([
+        child_a_release.clone(),
+        child_b_release.clone(),
+        validation_release.clone(),
+    ]);
+    cleanup
+        .channel_releases
+        .push(pre_revalidate_release.clone());
+    cleanup.channel_releases.push(patch_release);
+    let mut pre_release = ChannelRelease(Some(pre_revalidate_release));
+    let run_repo = repo_path.clone();
+    let run_patch_dir = patch_dir.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+    cleanup.runner = Some(thread::spawn(move || {
+        let result = run_plan_file(OrchestrationRunOptions {
+            repo: run_repo,
+            plan_file,
+            keep_claims: false,
+            jobs: 2,
+            patch_dir: Some(run_patch_dir),
+        });
+        let _ = done_tx.send(());
+        result
+    }));
+
+    pre_revalidate_reached
+        .recv_timeout(Duration::from_secs(10))
+        .expect("pre-revalidate barrier");
+    let store = SyncStore::open(&repo_path).expect("open store");
+    let token_a = claim_token_for_agent(&store, "agent-a");
+    pre_release.send();
+
+    wait_for_test_marker(&child_a_ready);
+    wait_for_test_marker(&child_b_ready);
+    let (release_rx, release_handle) = spawn_exact_token_release(store.clone(), token_a);
+    cleanup.extra_joins.push(release_handle);
+    assert_exact_token_release_blocked(&release_rx);
+    assert!(manager.acquire_write_execution_lease("agent-a").is_err());
+    assert!(manager.remove("agent-a", true, false).is_err());
+    let unrelated_during_child = manager
+        .acquire_write_execution_lease("agent-c")
+        .map(|lease| lease.path().to_path_buf());
+    fs::write(&child_a_release, "release\n").expect("release child a");
+    fs::write(&child_b_release, "release\n").expect("release child b");
+
+    wait_for_test_marker(&validation_ready);
+    assert_exact_token_release_still_blocked(&release_rx);
+    assert!(manager.acquire_write_execution_lease("agent-a").is_err());
+    assert!(manager.remove("agent-a", true, false).is_err());
+    let unrelated_during_validation = manager
+        .acquire_write_execution_lease("agent-c")
+        .map(|lease| lease.path().to_path_buf());
+    fs::write(&validation_release, "release\n").expect("release validation");
+
+    patch_reached
+        .recv_timeout(Duration::from_secs(10))
+        .expect("patch-write barrier");
+    assert_exact_token_release_still_blocked(&release_rx);
+    assert!(manager.acquire_write_execution_lease("agent-a").is_err());
+    assert!(
+        done_rx.try_recv().is_err(),
+        "run returned before patch publication"
+    );
+
+    let summary = cleanup
+        .join_runner()
+        .expect("join runner")
+        .expect("run plan");
+    assert_eq!(summary.agents[0].status, AgentRunStatus::Succeeded);
+    assert_eq!(summary.agents[1].status, AgentRunStatus::Succeeded);
+    assert_eq!(
+        summary.agents[0].patch_path.as_ref(),
+        Some(&patch_dir.join("agent-a.patch"))
+    );
+    assert_eq!(
+        summary.agents[1].patch_path.as_ref(),
+        Some(&patch_dir.join("agent-b.patch"))
+    );
+    assert!(fs::read_to_string(patch_dir.join("agent-a.patch"))
+        .expect("read agent-a patch")
+        .contains("changed-a"));
+    assert_eq!(
+        unrelated_during_child
+            .expect("unrelated writer during child")
+            .as_path(),
+        unrelated.path.as_path()
+    );
+    assert_eq!(
+        unrelated_during_validation
+            .expect("unrelated writer during validation")
+            .as_path(),
+        unrelated.path.as_path()
+    );
+    let _ = release_rx.recv_timeout(Duration::from_secs(5));
+    assert_eq!(
+        store.snapshot().expect("snapshot after run"),
+        Vec::<PathClaim>::new()
+    );
+    drop(
+        manager
+            .acquire_write_execution_lease("agent-a")
+            .expect("write lease re-acquirable after wave"),
+    );
+    drop(
+        manager
+            .acquire_write_execution_lease("agent-b")
+            .expect("write lease re-acquirable after wave"),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn serial_orchestration_holds_batched_claim_authority_through_validation_and_patch_publication() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    let patch_dir = temp.path().join("patches");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    fs::write(repo_path.join("a.txt"), "a\n").expect("write a");
+    commit_all(&repo, "initial commit").expect("commit");
+    let manager = WorktreeManager::new(&repo_path);
+    manager
+        .create_for_test(WorktreeCreateOptions {
+            agent_id: "agent-a".to_string(),
+            branch: None,
+            base: None,
+            worktree_root: None,
+        })
+        .expect("create agent-a worktree");
+    manager
+        .create_for_test(WorktreeCreateOptions {
+            agent_id: "agent-c".to_string(),
+            branch: None,
+            base: None,
+            worktree_root: None,
+        })
+        .expect("create agent-c worktree");
+
+    let child_ready = temp.path().join("child-ready");
+    let child_release = temp.path().join("child-release");
+    let validation_ready = temp.path().join("validation-ready");
+    let validation_release = temp.path().join("validation-release");
+    let plan_file = temp.path().join("plan.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "worktree_reuse_policy": "required",
+            "agents": [{
+                "id": "agent-a",
+                "paths": ["a.txt"],
+                "command": blocking_claimed_edit_command(
+                    "a.txt",
+                    "changed-a\\n",
+                    &child_ready,
+                    &child_release,
+                ),
+                "validation_commands": [blocking_marker_command(
+                    &validation_ready,
+                    &validation_release,
+                )]
+            }]
+        }))
+        .expect("encode plan"),
+    )
+    .expect("write plan");
+
+    let (pre_revalidate_reached, pre_revalidate_release, drift_id) =
+        install_ready_wave_identity_drift_hook(&repo_path);
+    let (patch_reached, patch_release, patch_id) =
+        install_ready_wave_patch_write_hook(&repo_path, "agent-a");
+    let mut cleanup = ReadyWaveTestCleanup::new();
+    cleanup.track_hook_installation(drift_id);
+    cleanup.track_hook_installation(patch_id);
+    cleanup
+        .release_files
+        .extend([child_release.clone(), validation_release.clone()]);
+    cleanup
+        .channel_releases
+        .push(pre_revalidate_release.clone());
+    cleanup.channel_releases.push(patch_release);
+    let mut pre_release = ChannelRelease(Some(pre_revalidate_release));
+    let run_repo = repo_path.clone();
+    let run_patch_dir = patch_dir.clone();
+    cleanup.runner = Some(thread::spawn(move || {
+        run_plan_file(OrchestrationRunOptions {
+            repo: run_repo,
+            plan_file,
+            keep_claims: false,
+            jobs: 1,
+            patch_dir: Some(run_patch_dir),
+        })
+    }));
+
+    pre_revalidate_reached
+        .recv_timeout(Duration::from_secs(10))
+        .expect("pre-revalidate barrier");
+    let store = SyncStore::open(&repo_path).expect("open store");
+    let token_a = claim_token_for_agent(&store, "agent-a");
+    pre_release.send();
+
+    wait_for_test_marker(&child_ready);
+    let (release_rx, release_handle) = spawn_exact_token_release(store.clone(), token_a);
+    cleanup.extra_joins.push(release_handle);
+    assert_exact_token_release_blocked(&release_rx);
+    assert!(manager.acquire_write_execution_lease("agent-a").is_err());
+    assert!(manager.acquire_write_execution_lease("agent-c").is_ok());
+    fs::write(&child_release, "release\n").expect("release child");
+
+    wait_for_test_marker(&validation_ready);
+    assert_exact_token_release_still_blocked(&release_rx);
+    fs::write(&validation_release, "release\n").expect("release validation");
+
+    patch_reached
+        .recv_timeout(Duration::from_secs(10))
+        .expect("patch-write barrier");
+    assert_exact_token_release_still_blocked(&release_rx);
+
+    let summary = cleanup
+        .join_runner()
+        .expect("join runner")
+        .expect("run plan");
+    assert_eq!(summary.agents[0].status, AgentRunStatus::Succeeded);
+    assert_eq!(
+        summary.agents[0].patch_path.as_ref(),
+        Some(&patch_dir.join("agent-a.patch"))
+    );
+    assert!(fs::read_to_string(patch_dir.join("agent-a.patch"))
+        .expect("read agent-a patch")
+        .contains("changed-a"));
+    let _ = release_rx.recv_timeout(Duration::from_secs(5));
+    assert_eq!(
+        store.snapshot().expect("snapshot after run"),
+        Vec::<PathClaim>::new()
+    );
+    drop(
+        manager
+            .acquire_write_execution_lease("agent-a")
+            .expect("write lease re-acquirable after serial wave"),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn parallel_orchestration_pre_spawn_identity_drift_starts_neither_child_nor_patch_write() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    let patch_dir = temp.path().join("patches");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    fs::write(repo_path.join("a.txt"), "a\n").expect("write a");
+    fs::write(repo_path.join("b.txt"), "b\n").expect("write b");
+    commit_all(&repo, "initial commit").expect("commit");
+    let manager = WorktreeManager::new(&repo_path);
+    let agent_a = manager
+        .create_for_test(WorktreeCreateOptions {
+            agent_id: "agent-a".to_string(),
+            branch: None,
+            base: None,
+            worktree_root: None,
+        })
+        .expect("create agent-a");
+    manager
+        .create_for_test(WorktreeCreateOptions {
+            agent_id: "agent-b".to_string(),
+            branch: None,
+            base: None,
+            worktree_root: None,
+        })
+        .expect("create agent-b");
+
+    let child_a_ready = temp.path().join("child-a-ready");
+    let child_a_release = temp.path().join("child-a-release");
+    let child_b_ready = temp.path().join("child-b-ready");
+    let child_b_release = temp.path().join("child-b-release");
+    let plan_file = temp.path().join("plan.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "worktree_reuse_policy": "required",
+            "agents": [
+                {
+                    "id": "agent-a",
+                    "paths": ["a.txt"],
+                    "command": blocking_claimed_edit_command(
+                        "a.txt",
+                        "changed-a\\n",
+                        &child_a_ready,
+                        &child_a_release,
+                    )
+                },
+                {
+                    "id": "agent-b",
+                    "paths": ["b.txt"],
+                    "command": blocking_claimed_edit_command(
+                        "b.txt",
+                        "changed-b\\n",
+                        &child_b_ready,
+                        &child_b_release,
+                    )
+                }
+            ]
+        }))
+        .expect("encode plan"),
+    )
+    .expect("write plan");
+
+    let (drift_reached, drift_release, drift_id) =
+        install_ready_wave_identity_drift_hook(&repo_path);
+    let mut cleanup = ReadyWaveTestCleanup::new();
+    cleanup.track_hook_installation(drift_id);
+    cleanup
+        .release_files
+        .extend([child_a_release.clone(), child_b_release.clone()]);
+    cleanup.channel_releases.push(drift_release);
+    let run_repo = repo_path.clone();
+    let run_patch_dir = patch_dir.clone();
+    cleanup.runner = Some(thread::spawn(move || {
+        run_plan_file(OrchestrationRunOptions {
+            repo: run_repo,
+            plan_file,
+            keep_claims: false,
+            jobs: 2,
+            patch_dir: Some(run_patch_dir),
+        })
+    }));
+
+    drift_reached
+        .recv_timeout(Duration::from_secs(10))
+        .expect("identity drift hook");
+    let worktree_repo = crate::git_repository::open(&agent_a.path).expect("open agent-a worktree");
+    fs::write(agent_a.path.join("a.txt"), "drift\n").expect("inject HEAD drift");
+    commit_all(&worktree_repo, "identity drift").expect("commit drift");
+    let error = cleanup
+        .join_runner()
+        .expect("join runner")
+        .expect_err("identity drift must fail closed before spawn");
+    assert!(
+        error.to_string().contains("revalidation")
+            || error.to_string().contains("OID")
+            || error.to_string().contains("mismatch")
+            || error.to_string().contains("detached")
+            || error.to_string().contains("branch"),
+        "unexpected drift error: {error:#}"
+    );
+    assert!(
+        !child_a_ready.exists(),
+        "drifted wave must not start agent-a"
+    );
+    assert!(
+        !child_b_ready.exists(),
+        "drifted wave must not start agent-b"
+    );
+    assert_no_nonempty_patch_bytes(&patch_dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn parallel_orchestration_does_not_take_per_path_claims_guards() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    fs::write(repo_path.join("a.txt"), "a\n").expect("write a");
+    fs::write(repo_path.join("b.txt"), "b\n").expect("write b");
+    commit_all(&repo, "initial commit").expect("commit");
+    let manager = WorktreeManager::new(&repo_path);
+    manager
+        .create_for_test(WorktreeCreateOptions {
+            agent_id: "agent-a".to_string(),
+            branch: None,
+            base: None,
+            worktree_root: None,
+        })
+        .expect("create agent-a");
+    manager
+        .create_for_test(WorktreeCreateOptions {
+            agent_id: "agent-b".to_string(),
+            branch: None,
+            base: None,
+            worktree_root: None,
+        })
+        .expect("create agent-b");
+
+    let child_a_ready = temp.path().join("child-a-ready");
+    let child_a_release = temp.path().join("child-a-release");
+    let child_b_ready = temp.path().join("child-b-ready");
+    let child_b_release = temp.path().join("child-b-release");
+    let plan_file = temp.path().join("plan.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "worktree_reuse_policy": "required",
+            "agents": [
+                {
+                    "id": "agent-a",
+                    "paths": ["a.txt"],
+                    "command": blocking_marker_command(&child_a_ready, &child_a_release)
+                },
+                {
+                    "id": "agent-b",
+                    "paths": ["b.txt"],
+                    "command": blocking_marker_command(&child_b_ready, &child_b_release)
+                }
+            ]
+        }))
+        .expect("encode plan"),
+    )
+    .expect("write plan");
+
+    let mut cleanup = ReadyWaveTestCleanup::new();
+    cleanup
+        .release_files
+        .extend([child_a_release.clone(), child_b_release.clone()]);
+    let run_repo = repo_path.clone();
+    cleanup.runner = Some(thread::spawn(move || {
+        run_plan_file(OrchestrationRunOptions {
+            repo: run_repo,
+            plan_file,
+            keep_claims: false,
+            jobs: 2,
+            patch_dir: None,
+        })
+    }));
+
+    wait_for_test_marker(&child_a_ready);
+    wait_for_test_marker(&child_b_ready);
+    let summary = cleanup
+        .join_runner()
+        .expect("join runner")
+        .expect("run plan");
+    assert!(summary.success);
+}
+
+#[cfg(unix)]
+#[test]
+fn old_per_agent_revalidation_drop_before_spawn_allows_exact_token_release_during_child() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    fs::write(repo_path.join("a.txt"), "a\n").expect("write a");
+    commit_all(&repo, "initial commit").expect("commit");
+    let manager = WorktreeManager::new(&repo_path);
+    manager
+        .create_for_test(WorktreeCreateOptions {
+            agent_id: "agent-a".to_string(),
+            branch: None,
+            base: None,
+            worktree_root: None,
+        })
+        .expect("create agent-a");
+    let store = SyncStore::open(&repo_path).expect("open store");
+    let claim = store
+        .claim_paths("agent-a", ["a.txt"])
+        .expect("claim agent-a");
+    let worktree = SelectedWorktree {
+        lease: manager
+            .acquire_write_execution_lease("agent-a")
+            .expect("write lease"),
+        reused: true,
+    };
+    let child_ready = temp.path().join("old-lifetime-ready");
+    let child_release = temp.path().join("old-lifetime-release");
+    let mut agent = schedule_test_agent("agent-a", &[]);
+    agent.paths = vec![PathBuf::from("a.txt")];
+    agent.command = blocking_marker_command(&child_ready, &child_release);
+    let mut summary = AgentRunSummary::pending(&agent);
+    summary.worktree = Some(worktree.record().clone());
+    summary.claim = Some(claim.clone());
+    let guard = revalidate_ready_agent(&agent, &summary, &worktree)
+        .expect("old per-agent revalidation must remain test-valid");
+    let spec = command_spec(
+        &agent,
+        &summary,
+        &worktree,
+        OrchestrationExecutionRuntime::NonpublishableSimulation,
+    )
+    .expect("old-path command spec");
+    drop(guard);
+
+    struct ReleaseFile(PathBuf);
+    impl Drop for ReleaseFile {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, "release\n");
+        }
+    }
+    let _release_on_drop = ReleaseFile(child_release.clone());
+    let runner = thread::spawn(move || run_agent_command(spec));
+    struct JoinOnDrop<T>(Option<thread::JoinHandle<T>>);
+    impl<T> Drop for JoinOnDrop<T> {
+        fn drop(&mut self) {
+            if let Some(handle) = self.0.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+    let mut runner = JoinOnDrop(Some(runner));
+
+    wait_for_test_marker(&child_ready);
+    let (release_rx, release_handle) = spawn_exact_token_release(store.clone(), claim.token);
+    let released = release_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("old drop-before-spawn lifetime must allow exact-token release during the child")
+        .expect("release old-lifetime token");
+    assert_eq!(released.token, claim.token);
+    fs::write(&child_release, "release\n").expect("release old-lifetime child");
+    let _ = release_handle.join();
+    let outcome = runner.0.take().expect("old-lifetime runner").join();
+    assert!(outcome.is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestration_keep_claims_drops_wave_guard_without_releasing_tokens() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    fs::write(repo_path.join("a.txt"), "a\n").expect("write a");
+    fs::write(repo_path.join("b.txt"), "b\n").expect("write b");
+    commit_all(&repo, "initial commit").expect("commit");
+    let plan_file = temp.path().join("plan.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "agents": [
+                {"id": "agent-a", "paths": ["a.txt"], "command": "true"},
+                {"id": "agent-b", "paths": ["b.txt"], "command": "true"}
+            ]
+        }))
+        .expect("encode plan"),
+    )
+    .expect("write plan");
+
+    let summary = run_plan_file(OrchestrationRunOptions {
+        repo: repo_path.clone(),
+        plan_file,
+        keep_claims: true,
+        jobs: 2,
+        patch_dir: None,
+    })
+    .expect("run keep_claims plan");
+    assert!(summary.success);
+    let store = SyncStore::open(&repo_path).expect("open store");
+    let snapshot = store
+        .snapshot()
+        .expect("snapshot must complete after wave guard drop");
+    assert_eq!(snapshot.len(), 2);
+    let token_a = snapshot
+        .iter()
+        .find(|claim| claim.agent_id == "agent-a")
+        .expect("kept agent-a")
+        .token;
+    store
+        .release(token_a)
+        .expect("exact token still releasable");
+    drop(
+        WorktreeManager::new(&repo_path)
+            .acquire_write_execution_lease("agent-a")
+            .expect("keep_claims still drops worktree leases"),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestration_command_error_drops_wave_guard_and_releases_claims() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    fs::write(repo_path.join("a.txt"), "a\n").expect("write a");
+    fs::write(repo_path.join("b.txt"), "b\n").expect("write b");
+    commit_all(&repo, "initial commit").expect("commit");
+    let plan_file = temp.path().join("plan.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "agents": [
+                {"id": "agent-a", "paths": ["a.txt"], "command": "false"},
+                {"id": "agent-b", "paths": ["b.txt"], "command": "true"}
+            ]
+        }))
+        .expect("encode plan"),
+    )
+    .expect("write plan");
+
+    let summary = run_plan_file(OrchestrationRunOptions {
+        repo: repo_path.clone(),
+        plan_file,
+        keep_claims: false,
+        jobs: 2,
+        patch_dir: None,
+    })
+    .expect("run error plan");
+    assert!(!summary.success);
+    assert_eq!(summary.agents[0].status, AgentRunStatus::Failed);
+    let store = SyncStore::open(&repo_path).expect("open store");
+    assert_eq!(
+        store.snapshot().expect("snapshot after error"),
+        Vec::<PathClaim>::new()
+    );
+    store
+        .claim_paths("agent-a", ["a.txt"])
+        .expect("claims.lock must not leak after command error");
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestration_timeout_drops_wave_guard_and_releases_claims() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    fs::write(repo_path.join("a.txt"), "a\n").expect("write a");
+    fs::write(repo_path.join("b.txt"), "b\n").expect("write b");
+    commit_all(&repo, "initial commit").expect("commit");
+    let plan_file = temp.path().join("plan.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "agents": [
+                {
+                    "id": "agent-a",
+                    "paths": ["a.txt"],
+                    "command": "sleep 5",
+                    "timeout_seconds": 1
+                },
+                {"id": "agent-b", "paths": ["b.txt"], "command": "true"}
+            ]
+        }))
+        .expect("encode plan"),
+    )
+    .expect("write plan");
+
+    let summary = run_plan_file(OrchestrationRunOptions {
+        repo: repo_path.clone(),
+        plan_file,
+        keep_claims: false,
+        jobs: 2,
+        patch_dir: None,
+    })
+    .expect("run timeout plan");
+    assert!(!summary.success);
+    assert!(summary.agents[0].timed_out);
+    let store = SyncStore::open(&repo_path).expect("open store");
+    assert_eq!(
+        store.snapshot().expect("snapshot after timeout"),
+        Vec::<PathClaim>::new()
+    );
+    store
+        .claim_paths("agent-probe", ["a.txt"])
+        .expect("claims.lock must not leak after timeout");
+}
+
+#[cfg(unix)]
+#[test]
+fn parallel_orchestration_spawn_panic_still_joins_and_drops_wave_guard() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    fs::write(repo_path.join("a.txt"), "a\n").expect("write a");
+    fs::write(repo_path.join("b.txt"), "b\n").expect("write b");
+    commit_all(&repo, "initial commit").expect("commit");
+    let manager = WorktreeManager::new(&repo_path);
+    manager
+        .create_for_test(WorktreeCreateOptions {
+            agent_id: "agent-a".to_string(),
+            branch: None,
+            base: None,
+            worktree_root: None,
+        })
+        .expect("create agent-a");
+    manager
+        .create_for_test(WorktreeCreateOptions {
+            agent_id: "agent-b".to_string(),
+            branch: None,
+            base: None,
+            worktree_root: None,
+        })
+        .expect("create agent-b");
+
+    let child_b_ready = temp.path().join("child-b-ready");
+    let child_b_release = temp.path().join("child-b-release");
+    let plan_file = temp.path().join("plan.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "worktree_reuse_policy": "required",
+            "agents": [
+                {"id": "agent-a", "paths": ["a.txt"], "command": "true"},
+                {
+                    "id": "agent-b",
+                    "paths": ["b.txt"],
+                    "command": blocking_marker_command(&child_b_ready, &child_b_release)
+                }
+            ]
+        }))
+        .expect("encode plan"),
+    )
+    .expect("write plan");
+
+    let panic_id = set_ready_agent_spawn_panic(&repo_path, "agent-a");
+    let mut cleanup = ReadyWaveTestCleanup::new();
+    cleanup.track_hook_installation(panic_id);
+    cleanup.release_files.push(child_b_release.clone());
+    let run_repo = repo_path.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+    cleanup.runner = Some(thread::spawn(move || {
+        let result = run_plan_file(OrchestrationRunOptions {
+            repo: run_repo,
+            plan_file,
+            keep_claims: false,
+            jobs: 2,
+            patch_dir: None,
+        });
+        let _ = done_tx.send(());
+        result
+    }));
+
+    wait_for_test_marker(&child_b_ready);
+    assert!(
+        done_rx.try_recv().is_err(),
+        "join_ready_agent_handles must still join the non-panicking agent"
+    );
+    let summary = cleanup
+        .join_runner()
+        .expect("join runner")
+        .expect("run plan after spawn panic");
+    assert_eq!(summary.agents[0].status, AgentRunStatus::Failed);
+    assert!(summary.agents[0]
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("panicked")));
+    assert_eq!(summary.agents[1].status, AgentRunStatus::Succeeded);
+    let store = SyncStore::open(&repo_path).expect("open store");
+    assert_eq!(
+        store.snapshot().expect("snapshot after panic"),
+        Vec::<PathClaim>::new()
+    );
+    store
+        .claim_paths("agent-probe", ["a.txt"])
+        .expect("claims.lock must not leak after spawn panic");
+}
+
+#[cfg(unix)]
+struct IsolatedOwnerRepo {
+    _temp: TempDir,
+    repo_path: PathBuf,
+    patch_dir: PathBuf,
+    child_ready: PathBuf,
+    child_release: PathBuf,
+    plan_file: PathBuf,
+}
+
+#[cfg(unix)]
+fn isolated_owner_repo_with_blocking_agent_a() -> IsolatedOwnerRepo {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    let patch_dir = temp.path().join("patches");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    fs::write(repo_path.join("a.txt"), "a\n").expect("write a");
+    commit_all(&repo, "initial commit").expect("commit");
+    WorktreeManager::new(&repo_path)
+        .create_for_test(WorktreeCreateOptions {
+            agent_id: "agent-a".to_string(),
+            branch: None,
+            base: None,
+            worktree_root: None,
+        })
+        .expect("create agent-a");
+    let child_ready = temp.path().join("child-ready");
+    let child_release = temp.path().join("child-release");
+    let plan_file = temp.path().join("plan.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "worktree_reuse_policy": "required",
+            "agents": [{
+                "id": "agent-a",
+                "paths": ["a.txt"],
+                "command": blocking_claimed_edit_command(
+                    "a.txt",
+                    "changed-a\\n",
+                    &child_ready,
+                    &child_release,
+                ),
+            }]
+        }))
+        .expect("encode plan"),
+    )
+    .expect("write plan");
+    IsolatedOwnerRepo {
+        _temp: temp,
+        repo_path,
+        patch_dir,
+        child_ready,
+        child_release,
+        plan_file,
+    }
+}
+
+#[cfg(unix)]
+struct IsolatedPanicOwnerRepo {
+    _temp: TempDir,
+    repo_path: PathBuf,
+    child_b_ready: PathBuf,
+    child_b_release: PathBuf,
+    plan_file: PathBuf,
+}
+
+#[cfg(unix)]
+fn isolated_panic_owner_repo() -> IsolatedPanicOwnerRepo {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    fs::write(repo_path.join("a.txt"), "a\n").expect("write a");
+    fs::write(repo_path.join("b.txt"), "b\n").expect("write b");
+    commit_all(&repo, "initial commit").expect("commit");
+    let manager = WorktreeManager::new(&repo_path);
+    manager
+        .create_for_test(WorktreeCreateOptions {
+            agent_id: "agent-a".to_string(),
+            branch: None,
+            base: None,
+            worktree_root: None,
+        })
+        .expect("create agent-a");
+    manager
+        .create_for_test(WorktreeCreateOptions {
+            agent_id: "agent-b".to_string(),
+            branch: None,
+            base: None,
+            worktree_root: None,
+        })
+        .expect("create agent-b");
+    let child_b_ready = temp.path().join("child-b-ready");
+    let child_b_release = temp.path().join("child-b-release");
+    let plan_file = temp.path().join("plan.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "worktree_reuse_policy": "required",
+            "agents": [
+                {"id": "agent-a", "paths": ["a.txt"], "command": "true"},
+                {
+                    "id": "agent-b",
+                    "paths": ["b.txt"],
+                    "command": blocking_marker_command(&child_b_ready, &child_b_release)
+                }
+            ]
+        }))
+        .expect("encode plan"),
+    )
+    .expect("write plan");
+    IsolatedPanicOwnerRepo {
+        _temp: temp,
+        repo_path,
+        child_b_ready,
+        child_b_release,
+        plan_file,
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn ready_wave_hooks_isolate_concurrent_repos_sharing_agent_a() {
+    let owner_a = isolated_owner_repo_with_blocking_agent_a();
+    let owner_b = isolated_owner_repo_with_blocking_agent_a();
+    let owner_c = isolated_owner_repo_with_blocking_agent_a();
+    let unrelated = PathBuf::from("/tmp/maco-ready-wave-unrelated-owner");
+
+    let (a_drift_rx, a_drift_rel, a_drift_id) =
+        install_ready_wave_identity_drift_hook(&owner_a.repo_path);
+    let (b_drift_rx, b_drift_rel, b_drift_id) =
+        install_ready_wave_identity_drift_hook(&owner_b.repo_path);
+    let (c_drift_rx, _c_drift_rel, c_drift_id) =
+        install_ready_wave_identity_drift_hook(&owner_c.repo_path);
+    let (a_patch_rx, a_patch_rel, a_patch_id) =
+        install_ready_wave_patch_write_hook(&owner_a.repo_path, "agent-a");
+    let (b_patch_rx, b_patch_rel, b_patch_id) =
+        install_ready_wave_patch_write_hook(&owner_b.repo_path, "agent-a");
+    let (c_patch_rx, _c_patch_rel, c_patch_id) =
+        install_ready_wave_patch_write_hook(&owner_c.repo_path, "agent-a");
+
+    let mut live_hooks = ReadyWaveHookOwnerCleanup { ids: Vec::new() };
+    live_hooks.track(a_drift_id);
+    live_hooks.track(b_drift_id);
+    live_hooks.track(a_patch_id);
+    live_hooks.track(b_patch_id);
+    drop(ReadyWaveHookOwnerCleanup {
+        ids: vec![c_drift_id, c_patch_id],
+    });
+    fire_ready_wave_identity_drift_hook(&owner_c.repo_path);
+    assert!(
+        c_drift_rx.try_recv().is_err(),
+        "dropping owner C must not leave a consumable drift hook"
+    );
+    let mut dropped_c_patch = ReadyWavePatchWriteBarrier::arm(&owner_c.repo_path, "agent-a", true);
+    dropped_c_patch.wait();
+    assert!(
+        c_patch_rx.try_recv().is_err(),
+        "dropping owner C must not leave a consumable patch hook"
+    );
+
+    fire_ready_wave_identity_drift_hook(&unrelated);
+    assert!(
+        a_drift_rx.try_recv().is_err(),
+        "non-owner drift consume must not steal owner A"
+    );
+    assert!(
+        b_drift_rx.try_recv().is_err(),
+        "non-owner drift consume must not steal owner B"
+    );
+    let mut stolen_patch = ReadyWavePatchWriteBarrier::arm(&unrelated, "agent-a", true);
+    stolen_patch.wait();
+    assert!(
+        a_patch_rx.try_recv().is_err(),
+        "non-owner patch consume must not steal owner A"
+    );
+    assert!(
+        b_patch_rx.try_recv().is_err(),
+        "non-owner patch consume must not steal owner B"
+    );
+
+    let sibling_repo = owner_b.repo_path.clone();
+    let sibling_fire = thread::spawn(move || fire_ready_wave_identity_drift_hook(&sibling_repo));
+    b_drift_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("sibling owner B still consumes its own drift");
+    assert!(
+        a_drift_rx.try_recv().is_err(),
+        "sibling B drift consume must not steal owner A"
+    );
+    b_drift_rel
+        .send(())
+        .expect("release sibling B drift consume");
+    sibling_fire.join().expect("join sibling B drift consume");
+
+    let mut sibling_patch = ReadyWavePatchWriteBarrier::arm(&owner_b.repo_path, "agent-a", true);
+    b_patch_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("sibling owner B still consumes its own patch");
+    assert!(
+        a_patch_rx.try_recv().is_err(),
+        "sibling B patch consume must not steal owner A"
+    );
+    b_patch_rel
+        .send(())
+        .expect("release sibling B patch consume");
+    sibling_patch.wait();
+
+    let (b_drift_rx, b_drift_rel, new_b_drift_id) =
+        install_ready_wave_identity_drift_hook(&owner_b.repo_path);
+    let (b_patch_rx, b_patch_rel, new_b_patch_id) =
+        install_ready_wave_patch_write_hook(&owner_b.repo_path, "agent-a");
+    live_hooks.track(new_b_drift_id);
+    live_hooks.track(new_b_patch_id);
+
+    let mut cleanup_a = ReadyWaveTestCleanup::new();
+    cleanup_a.track_hook_installation(a_drift_id);
+    cleanup_a.track_hook_installation(a_patch_id);
+    cleanup_a.release_files.push(owner_a.child_release.clone());
+    cleanup_a.channel_releases.push(a_drift_rel.clone());
+    cleanup_a.channel_releases.push(a_patch_rel);
+    let mut a_pre = ChannelRelease(Some(a_drift_rel));
+
+    let mut cleanup_b = ReadyWaveTestCleanup::new();
+    cleanup_b.track_hook_installation(new_b_drift_id);
+    cleanup_b.track_hook_installation(new_b_patch_id);
+    cleanup_b.release_files.push(owner_b.child_release.clone());
+    cleanup_b.channel_releases.push(b_drift_rel.clone());
+    cleanup_b.channel_releases.push(b_patch_rel);
+    let mut b_pre = ChannelRelease(Some(b_drift_rel));
+
+    let a_repo = owner_a.repo_path.clone();
+    let a_plan = owner_a.plan_file.clone();
+    let a_patch_dir = owner_a.patch_dir.clone();
+    cleanup_a.runner = Some(thread::spawn(move || {
+        run_plan_file(OrchestrationRunOptions {
+            repo: a_repo,
+            plan_file: a_plan,
+            keep_claims: false,
+            jobs: 1,
+            patch_dir: Some(a_patch_dir),
+        })
+    }));
+    let b_repo = owner_b.repo_path.clone();
+    let b_plan = owner_b.plan_file.clone();
+    let b_patch_dir = owner_b.patch_dir.clone();
+    cleanup_b.runner = Some(thread::spawn(move || {
+        run_plan_file(OrchestrationRunOptions {
+            repo: b_repo,
+            plan_file: b_plan,
+            keep_claims: false,
+            jobs: 1,
+            patch_dir: Some(b_patch_dir),
+        })
+    }));
+
+    a_drift_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("intended owner A drift");
+    b_drift_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("intended owner B drift");
+    a_pre.send();
+    b_pre.send();
+
+    wait_for_test_marker(&owner_a.child_ready);
+    wait_for_test_marker(&owner_b.child_ready);
+    fs::write(&owner_a.child_release, "release\n").expect("release A child");
+    fs::write(&owner_b.child_release, "release\n").expect("release B child");
+
+    a_patch_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("intended owner A patch");
+    b_patch_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("intended owner B patch");
+
+    let summary_a = cleanup_a.join_runner().expect("join A").expect("run A");
+    let summary_b = cleanup_b.join_runner().expect("join B").expect("run B");
+    assert_eq!(summary_a.agents[0].status, AgentRunStatus::Succeeded);
+    assert_eq!(summary_b.agents[0].status, AgentRunStatus::Succeeded);
+    assert!(fs::read_to_string(owner_a.patch_dir.join("agent-a.patch"))
+        .expect("read A patch")
+        .contains("changed-a"));
+    assert!(fs::read_to_string(owner_b.patch_dir.join("agent-a.patch"))
+        .expect("read B patch")
+        .contains("changed-a"));
+    drop(live_hooks);
+}
+
+#[cfg(unix)]
+#[test]
+fn ready_wave_spawn_panic_hook_isolates_owner_repo_from_same_agent_id() {
+    let owner_a = isolated_panic_owner_repo();
+    let owner_b = isolated_panic_owner_repo();
+    let owner_c = isolated_panic_owner_repo();
+    let unrelated = PathBuf::from("/tmp/maco-ready-wave-unrelated-panic-owner");
+
+    let a_panic_id = set_ready_agent_spawn_panic(&owner_a.repo_path, "agent-a");
+    let b_panic_id = set_ready_agent_spawn_panic(&owner_b.repo_path, "agent-a");
+    let c_panic_id = set_ready_agent_spawn_panic(&owner_c.repo_path, "agent-a");
+
+    let mut live_hooks = ReadyWaveHookOwnerCleanup { ids: Vec::new() };
+    live_hooks.track(a_panic_id);
+    live_hooks.track(b_panic_id);
+    drop(ReadyWaveHookOwnerCleanup {
+        ids: vec![c_panic_id],
+    });
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        panic_if_ready_agent_spawn_injected(&owner_c.repo_path, "agent-a");
+    }))
+    .expect("dropped owner C must not panic an unrelated consume");
+
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        panic_if_ready_agent_spawn_injected(&unrelated, "agent-a");
+    }))
+    .expect("non-owner panic consume must not panic");
+
+    let sibling = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        panic_if_ready_agent_spawn_injected(&owner_b.repo_path, "agent-a");
+    }));
+    assert!(
+        sibling.is_err(),
+        "sibling owner B must still observe its own spawn-panic consume"
+    );
+
+    let b_panic_reinstall_id = set_ready_agent_spawn_panic(&owner_b.repo_path, "agent-a");
+    live_hooks.track(b_panic_reinstall_id);
+
+    let mut cleanup_a = ReadyWaveTestCleanup::new();
+    cleanup_a.track_hook_installation(a_panic_id);
+    cleanup_a
+        .release_files
+        .push(owner_a.child_b_release.clone());
+    let (a_done_tx, a_done_rx) = mpsc::channel();
+    let a_repo = owner_a.repo_path.clone();
+    let a_plan = owner_a.plan_file.clone();
+    cleanup_a.runner = Some(thread::spawn(move || {
+        let result = run_plan_file(OrchestrationRunOptions {
+            repo: a_repo,
+            plan_file: a_plan,
+            keep_claims: false,
+            jobs: 2,
+            patch_dir: None,
+        });
+        let _ = a_done_tx.send(());
+        result
+    }));
+
+    let mut cleanup_b = ReadyWaveTestCleanup::new();
+    cleanup_b.track_hook_installation(b_panic_reinstall_id);
+    cleanup_b
+        .release_files
+        .push(owner_b.child_b_release.clone());
+    let (b_done_tx, b_done_rx) = mpsc::channel();
+    let b_repo = owner_b.repo_path.clone();
+    let b_plan = owner_b.plan_file.clone();
+    cleanup_b.runner = Some(thread::spawn(move || {
+        let result = run_plan_file(OrchestrationRunOptions {
+            repo: b_repo,
+            plan_file: b_plan,
+            keep_claims: false,
+            jobs: 2,
+            patch_dir: None,
+        });
+        let _ = b_done_tx.send(());
+        result
+    }));
+
+    wait_for_test_marker(&owner_a.child_b_ready);
+    wait_for_test_marker(&owner_b.child_b_ready);
+    assert!(
+        a_done_rx.try_recv().is_err(),
+        "owner A join_ready_agent_handles must still join the non-panicking agent"
+    );
+    assert!(
+        b_done_rx.try_recv().is_err(),
+        "owner B join_ready_agent_handles must still join the non-panicking agent"
+    );
+    let summary_a = cleanup_a
+        .join_runner()
+        .expect("join A")
+        .expect("run plan after owner A spawn panic");
+    let summary_b = cleanup_b
+        .join_runner()
+        .expect("join B")
+        .expect("run plan after owner B spawn panic");
+    assert_eq!(summary_a.agents[0].status, AgentRunStatus::Failed);
+    assert!(summary_a.agents[0]
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("panicked")));
+    assert_eq!(summary_a.agents[1].status, AgentRunStatus::Succeeded);
+    assert_eq!(summary_b.agents[0].status, AgentRunStatus::Failed);
+    assert!(summary_b.agents[0]
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("panicked")));
+    assert_eq!(summary_b.agents[1].status, AgentRunStatus::Succeeded);
+    drop(live_hooks);
 }
 
 fn commit_all(repo: &Repository, message: &str) -> Result<Oid> {

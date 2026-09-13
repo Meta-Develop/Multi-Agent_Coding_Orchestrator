@@ -2300,6 +2300,15 @@ fn collect_assignment_metadata(
                 })?;
             metadata_by_worker.insert_reasoning_effort(assignment.id.clone(), effort);
         }
+        if assignment.role == AgentRole::Worker {
+            if let Some(raw_duty) = raw_assignment.get("mechanical_duty") {
+                let duty = serde_json::from_value::<MechanicalTerminalDuty>(raw_duty.clone())
+                    .with_context(|| {
+                        format!("assignment '{}' mechanical_duty is invalid", assignment.id)
+                    })?;
+                metadata_by_worker.insert_direct_mechanical_duty(assignment.id.clone(), duty);
+            }
+        }
         let workers_by_id = assignment
             .worker_assignments
             .iter()
@@ -2403,6 +2412,16 @@ pub(super) fn supervisor_plan_value(
                     "reasoning_effort".to_string(),
                     serde_json::to_value(effort)
                         .context("failed to serialize assignment reasoning effort")?,
+                );
+        }
+        if let Some(duty) = assignment_metadata.direct_mechanical_duty(&assignment.id) {
+            assignment_value
+                .as_object_mut()
+                .context("normalized assignment did not serialize to an object")?
+                .insert(
+                    "mechanical_duty".to_string(),
+                    serde_json::to_value(duty)
+                        .context("failed to serialize assignment mechanical duty")?,
                 );
         }
         let workers = assignment_value

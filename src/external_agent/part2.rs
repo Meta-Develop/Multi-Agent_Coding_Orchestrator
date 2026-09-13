@@ -562,6 +562,7 @@ fn parse_version_candidate(text: &str) -> Option<EnvironmentVersion> {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn load_codex_runtime_model_catalog(
     program: &Path,
     cwd: &Path,
@@ -581,7 +582,11 @@ pub(crate) fn load_codex_runtime_model_catalog_authorized(
     resolver_search_base: &Path,
     timeout: Duration,
     grant: SupervisorCatalogCodexPreflightGrant,
+    expected_origin: CatalogPreflightOrigin,
 ) -> std::result::Result<CodexRuntimeModelCatalog, Box<EnvironmentFailure>> {
+    if grant.origin() != expected_origin {
+        return Err(catalog_preflight_grant_origin_mismatch_failure());
+    }
     let catalog = (|| -> Result<CodexRuntimeModelCatalog> {
         let (prepared, grant) = prepare_codex_runtime_model_catalog_process(
             program,
@@ -592,7 +597,7 @@ pub(crate) fn load_codex_runtime_model_catalog_authorized(
         let Some(grant) = grant else {
             return Err(CodexRuntimeModelCatalogFailureCause::MissingCatalogPreflightGrant.into());
         };
-        bind_supervisor_catalog_preflight_grant(&prepared.process_spec, grant)?;
+        bind_catalog_preflight_grant(&prepared.process_spec, grant, expected_origin)?;
         execute_prepared_codex_runtime_model_catalog(prepared)
     })();
 
@@ -695,15 +700,16 @@ fn prepare_codex_runtime_model_catalog_process(
     }
 }
 
-fn bind_supervisor_catalog_preflight_grant(
+fn bind_catalog_preflight_grant(
     process_spec: &ProcessSpec,
     grant: SupervisorCatalogCodexPreflightGrant,
+    expected_origin: CatalogPreflightOrigin,
 ) -> Result<()> {
     let ProcessCommand::Direct { program, args } = &process_spec.command else {
         return Err(CodexRuntimeModelCatalogFailureCause::CatalogPreflightGrantMismatch.into());
     };
     let sealed_expected_parent = grant
-        .consume_for_process_binding(program, &process_spec.current_dir, args)
+        .consume_for_process_binding(program, &process_spec.current_dir, args, expected_origin)
         .map_err(|error| {
             anyhow::Error::from(CodexRuntimeModelCatalogFailureCause::from(error))
         })?;
@@ -768,6 +774,8 @@ enum CodexRuntimeModelCatalogFailureCause {
     MissingCatalogPreflightGrant,
     #[error("catalog_preflight_grant_mismatch")]
     CatalogPreflightGrantMismatch,
+    #[error("catalog_preflight_grant_origin_mismatch")]
+    CatalogPreflightGrantOriginMismatch,
     #[error("catalog_preflight_grant_consumed")]
     CatalogPreflightGrantConsumed,
     #[error("catalog_preflight_confinement_mismatch")]
@@ -854,6 +862,13 @@ pub(crate) fn missing_supervisor_catalog_preflight_grant_failure() -> Box<Enviro
     )))
 }
 
+pub(crate) fn catalog_preflight_grant_origin_mismatch_failure() -> Box<EnvironmentFailure> {
+    Box::new(EnvironmentFailure::runtime_model_catalog(format!(
+        "Codex runtime model catalog acquisition failed: cause={}",
+        CodexRuntimeModelCatalogFailureCause::CatalogPreflightGrantOriginMismatch
+    )))
+}
+
 impl From<SupervisorCatalogCodexPreflightGrantError> for CodexRuntimeModelCatalogFailureCause {
     fn from(error: SupervisorCatalogCodexPreflightGrantError) -> Self {
         match error {
@@ -867,6 +882,9 @@ impl From<SupervisorCatalogCodexPreflightGrantError> for CodexRuntimeModelCatalo
             | SupervisorCatalogCodexPreflightGrantError::CurrentDirMismatch
             | SupervisorCatalogCodexPreflightGrantError::ArgvMismatch => {
                 Self::CatalogPreflightGrantMismatch
+            }
+            SupervisorCatalogCodexPreflightGrantError::OriginMismatch => {
+                Self::CatalogPreflightGrantOriginMismatch
             }
         }
     }
@@ -4733,6 +4751,18 @@ fn external_side_effect_profile(
             for input in &protected_controls.exact_read_only_input_files {
                 profile = profile.with_visible_read_only_file(input);
             }
+            #[cfg(target_os = "linux")]
+            if let Some(artifact) = protected_controls.exact_writable_artifact_files.first() {
+                // All declared journals share the enumerated private carrier. It
+                // must exist in the isolated root before systemd can make the
+                // parent read-only and mount the exact held files read-write.
+                // Expose only that validated carrier, not the incoming root.
+                let carrier = artifact
+                    .path
+                    .parent()
+                    .context("validated worker journal has no carrier directory")?;
+                profile = profile.with_visible_read_only_root(carrier);
+            }
             for artifact in &protected_controls.exact_writable_artifact_files {
                 #[cfg(target_os = "linux")]
                 {
@@ -6120,6 +6150,7 @@ fn summarize_redacted_output(
         text: value,
         truncated: output.is_truncated() || chars.next().is_some(),
         bytes,
+        raw_truncated: Some(output.is_truncated()),
         target_launch_attempted: false,
         run_metadata: ExternalAgentRunMetadata::default(),
     }

@@ -1324,6 +1324,101 @@ fn budget_integration_parseable_usage_from_truncated_capture_is_estimated() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn budget_integration_large_capture_distinguishes_display_shortening_from_raw_loss() {
+    use crate::process_runner::{run_process, ContainmentPolicy, ProcessSpec};
+
+    let _capability = install_budget_fixture_models();
+    for (capture_limit, retain_log, expected) in [
+        (8 * 1024 * 1024, true, DispatchUsageReliability::Reliable),
+        (8 * 1024 * 1024, false, DispatchUsageReliability::Reliable),
+        (256, true, DispatchUsageReliability::Estimated),
+        (256, false, DispatchUsageReliability::Missing),
+    ] {
+        let mut plan = injected_plan(injected_assignment(false), 0);
+        inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+        let budget = injected_run_budget(None, Some(100), None, Some(1.0), 50, 50);
+        let ledger = RunBudgetLedger::new(budget.limits).expect("budget ledger");
+        let temp = tempfile::tempdir().expect("large capture command root");
+        let mut command = ExternalAgentCommand::codex(
+            "codex",
+            temp.path(),
+            temp.path().join("prompt.md"),
+            temp.path().join("capture.jsonl"),
+            temp.path().join("report.json"),
+            Duration::from_secs(1),
+        );
+        command.model = Some("priced-model".to_string());
+        let transcript = format!(
+            "{}\n{}\n",
+            json!({"type": "item.completed", "item": {"text": "x".repeat(40 * 1024)}}),
+            json!({"type": "turn.completed", "usage": {"input_tokens": 7, "output_tokens": 3}}),
+        );
+        fs::write(&command.json_log, &transcript).expect("write full large transcript");
+        let capture = run_process(
+            ProcessSpec::direct(
+                "capture large usage fixture",
+                "/bin/cat",
+                [command.json_log.as_os_str()],
+                temp.path(),
+                capture_limit,
+            )
+            .with_containment(ContainmentPolicy::TrustedBestEffort)
+            .with_timeout(Some(Duration::from_secs(5))),
+        )
+        .expect("capture fixture through real bounded pipe");
+        assert!(capture.status.is_some_and(|status| status.success()));
+        let mut run = injected_verified_run_without_journals(&command);
+        run.stdout = CapturedOutput::from_captured_bytes_for_test(&capture.stdout);
+        assert!(run.stdout.truncated, "public display must remain shortened");
+        assert_eq!(run.stdout.raw_capture_truncated(), capture_limit == 256);
+        if capture_limit > transcript.len() {
+            assert_eq!(run.stdout.text.chars().count(), 32 * 1024);
+            assert_eq!(run.stdout_bytes(), transcript.as_bytes());
+        }
+        if !retain_log {
+            fs::remove_file(&command.json_log).expect("exercise held stdout fallback");
+        }
+        let mut reservation = match reserve_dispatch_budget(
+            &plan,
+            &budget,
+            &ledger,
+            AgentRole::ChildOrchestrator,
+            &command,
+        )
+        .expect("reserve large-capture dispatch")
+        {
+            DispatchBudgetAdmission::Admitted(reservation) => reservation,
+            DispatchBudgetAdmission::Refused(refusal) => {
+                panic!("unexpected budget refusal: {refusal:?}")
+            }
+        };
+        reservation
+            .mark_invoked()
+            .expect("mark capture dispatch invoked");
+        let settlement = reservation
+            .settle(&run, SupervisorRuntime::Codex, &command)
+            .expect("settle large capture");
+        assert_eq!(settlement.reliability, expected);
+        let report = ledger.report().expect("large capture budget report");
+        let reliable = expected == DispatchUsageReliability::Reliable;
+        assert_eq!(report.consumed.tokens, if reliable { 10 } else { 50 });
+        assert_eq!(report.usage_complete, reliable);
+        assert_eq!(report.new_dispatch_allowed, reliable);
+        assert_eq!(report.reserved.tokens, 0);
+        assert_eq!(report.active_reservations, 0);
+        assert_eq!(
+            settlement.observed_usage.map(|usage| usage.total_tokens),
+            if expected == DispatchUsageReliability::Missing {
+                None
+            } else {
+                Some(10)
+            },
+        );
+    }
+}
+
 #[test]
 fn runtime_aware_external_completion_accepts_only_verified_publishable_adapter_runs() {
     let temp = tempfile::tempdir().expect("runtime completion command root");

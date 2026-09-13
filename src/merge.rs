@@ -14,12 +14,17 @@ use crate::{
         state_auth::sha256_hex, ArtifactFileDisposition, ArtifactRunWriter, RunArtifactFamily,
     },
     external_agent::{
-        run_external_agent, ExternalAgentCommand, ExternalMachineGlobalRetentionBinding,
+        run_external_agent, ExternalAgentCommand, ExternalAgentInvocation,
+        ExternalMachineGlobalRetentionBinding,
     },
     gate_denial::{GateCheckSource, GateDenial},
     llm::Redactor,
     megafile::{MegafileAssessment, MegafileStore, MegafileThresholds},
     merge_semantic::{classify_semantic_candidate_pair, classify_semantic_conflicts},
+    mutation_taxonomy::{
+        admit_merge_arbiter_process_intent, AssignmentProcessLaunchGrantError,
+        AssignmentProcessLaunchKind, MERGE_ARBITER_PROCESS_DUTY,
+    },
     orchestration_event::{
         ArbitrationOutcome, ArbitrationOutcomeDetails, ArbitrationSide, OrchestrationEventJournal,
         OrchestrationRole,
@@ -32,7 +37,9 @@ use crate::{
         TrustedFixedNetworkProfile, WorkspaceAccess,
     },
     semantic_coord::{SemanticIntent, SemanticIntentStore},
-    supervise::{verified_megafile_decomposition_evidence, VerifiedMegafileDecompositionEvidence},
+    supervise::{
+        verified_megafile_decomposition_evidence, AgentRole, VerifiedMegafileDecompositionEvidence,
+    },
     sync::{normalize_repo_relative_path, PathClaim},
     sync_store::SyncStore,
     worktree::{
@@ -40,7 +47,7 @@ use crate::{
         NeutralWorktreeCreateOptions, WorktreeLifecycleReport, WorktreeManager, WorktreeRecord,
     },
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use git2::{ErrorCode, ObjectType, Oid, Repository, Status, StatusOptions};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
@@ -76,6 +83,7 @@ const ARBITRATION_RATIONALE_PATH: &str = "reports/arbitration-rationale.json";
 const ARBITRATION_CANDIDATE_PATH: &str = "reports/arbitration-candidate.patch";
 const ARBITRATION_FINAL_REPORT_PATH: &str = "reports/supervisor-final.json";
 const ARBITRATION_INCOMING_DIR: &str = "arbiter-incoming";
+const MERGE_ARBITER_PROCESS_LAUNCH_ATTEMPT: usize = 1;
 const LOCK_RECORD_VERSION: u32 = 3;
 const REPOSITORY_MUTATION_LOCK_FILE: &str = "repository-mutation.lock";
 const MAX_LOCK_RECORD_BYTES: u64 = 4 * 1024;
@@ -476,29 +484,7 @@ struct ProductionArbitrationEnvironment;
 
 impl ArbitrationRunner for ExternalArbitrationRunner {
     fn run(&self, request: &ArbitrationRunnerRequest) -> Result<ArbitrationRunnerResult> {
-        let mut command = ExternalAgentCommand::codex(
-            &self.codex_bin,
-            &request.neutral_worktree_path,
-            &request.prompt_path,
-            &request.json_log_path,
-            &request.output_last_message_path,
-            self.timeout,
-        )
-        .with_workspace_access(WorkspaceAccess::ReadOnly)
-        .with_hidden_root(&request.hidden_primary_root)
-        .with_agent_lifecycle(
-            &request.hidden_primary_root,
-            "arbiter",
-            &request.run_id,
-            &request.arbiter_id,
-        )
-        .with_machine_global_retention(ExternalMachineGlobalRetentionBinding {
-            config: self.machine_global_config.clone(),
-            root_id: self.machine_global_runtime_root_id.clone(),
-            owner: request.arbiter_id.clone(),
-            correction_correlation_id: request.run_id.clone(),
-        });
-        command.output_schema = Some(request.output_schema_path.clone());
+        let command = prepare_merge_arbiter_command(self, request)?;
         let run = run_external_agent(&command);
         let execution = ArbitrationRunnerExecution {
             kind: "external_local_agent".to_string(),
@@ -525,6 +511,86 @@ impl ArbitrationRunner for ExternalArbitrationRunner {
             execution,
         })
     }
+}
+
+fn prepare_merge_arbiter_command(
+    runner: &ExternalArbitrationRunner,
+    request: &ArbitrationRunnerRequest,
+) -> Result<ExternalAgentCommand> {
+    let mut command = ExternalAgentCommand::codex(
+        &runner.codex_bin,
+        &request.neutral_worktree_path,
+        &request.prompt_path,
+        &request.json_log_path,
+        &request.output_last_message_path,
+        runner.timeout,
+    )
+    .with_workspace_access(WorkspaceAccess::ReadOnly)
+    .with_hidden_root(&request.hidden_primary_root)
+    .with_agent_lifecycle(
+        &request.hidden_primary_root,
+        AgentRole::Auditor.as_str(),
+        &request.run_id,
+        &request.arbiter_id,
+    )
+    .with_machine_global_retention(ExternalMachineGlobalRetentionBinding {
+        config: runner.machine_global_config.clone(),
+        root_id: runner.machine_global_runtime_root_id.clone(),
+        owner: request.arbiter_id.clone(),
+        correction_correlation_id: request.run_id.clone(),
+    });
+    command.output_schema = Some(request.output_schema_path.clone());
+    attach_merge_arbiter_process_launch(command, request)
+}
+
+fn merge_arbiter_command_matches_request(
+    command: &ExternalAgentCommand,
+    request: &ArbitrationRunnerRequest,
+) -> bool {
+    command.invocation == ExternalAgentInvocation::CodexSupervisor
+        && command.workspace_access == WorkspaceAccess::ReadOnly
+        && command.cwd == request.neutral_worktree_path
+        && command
+            .hidden_roots
+            .iter()
+            .any(|root| root == &request.hidden_primary_root)
+        && command.output_schema.as_ref() == Some(&request.output_schema_path)
+        && command.machine_global_retention.is_some()
+        && command.model.is_none()
+        && command.agent_lifecycle.as_ref().is_some_and(|identity| {
+            identity.role == AgentRole::Auditor.as_str()
+                && identity.run_id == request.run_id
+                && identity.task_id == request.arbiter_id
+                && identity.registry_repo == request.hidden_primary_root
+        })
+}
+
+fn attach_merge_arbiter_process_launch(
+    command: ExternalAgentCommand,
+    request: &ArbitrationRunnerRequest,
+) -> Result<ExternalAgentCommand> {
+    if !merge_arbiter_command_matches_request(&command, request) {
+        bail!(
+            "merge arbiter process launch grant failed closed: cause={}",
+            AssignmentProcessLaunchGrantError::KindMismatch.cause_id()
+        );
+    }
+    let kind = AssignmentProcessLaunchKind::MergeArbiter;
+    let grant = admit_merge_arbiter_process_intent(
+        &request.run_id,
+        &request.arbiter_id,
+        MERGE_ARBITER_PROCESS_LAUNCH_ATTEMPT,
+        Path::new(kind.trusted_program_spelling()),
+        command.model.as_deref(),
+        MERGE_ARBITER_PROCESS_DUTY,
+    )
+    .map_err(|error| {
+        anyhow!(
+            "merge arbiter process launch grant failed closed: cause={}",
+            error.cause_id()
+        )
+    })?;
+    Ok(command.with_assignment_process_launch(kind, grant))
 }
 
 #[cfg(test)]

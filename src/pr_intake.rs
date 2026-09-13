@@ -9,7 +9,11 @@ use crate::artifacts::{
     state_auth::{AuthenticationDomain, AuthenticationTag, RepositoryAuthenticator},
 };
 use crate::effect_wal::{EffectPhase, EffectWal};
-use crate::external_agent::{load_codex_runtime_model_catalog, CodexRuntimeModelCatalog};
+use crate::external_agent::{
+    catalog_preflight_grant_origin_mismatch_failure, load_codex_runtime_model_catalog_authorized,
+    missing_supervisor_catalog_preflight_grant_failure,
+    supervisor_catalog_preflight_grant_admit_failure, CodexRuntimeModelCatalog,
+};
 use crate::inbox::review_loop_entry::{
     compact_independent_auditor_selection, independent_auditor_actor,
     independent_auditor_stable_id, producer_auditor_separation_blocker,
@@ -22,6 +26,10 @@ use crate::inbox::{
     InboxApprovedGithubActorFailure, InboxIndependentAuditMergeLaneTask, InboxItem, InboxItemKind,
     InboxPrIntakeTaskKind, InboxPrObservationError, InboxPrObservationFailureClass,
     InboxRunOptions, InboxSourceProvider,
+};
+use crate::mutation_taxonomy::{
+    CatalogPreflightOrigin, SupervisorCatalogCodexPreflightGrant,
+    SupervisorCatalogCodexPreflightGrantError,
 };
 use crate::selection::ReasoningEffort;
 use crate::supervise::PhaseModelPolicyDecision;
@@ -1122,6 +1130,62 @@ struct PreparedRepositoryPrIntake {
     trusted_head_repository: String,
 }
 
+/// How the production PR-intake catalog path obtains a preflight grant.
+enum PrIntakeCatalogGrantSupply {
+    IssueFromPrIntakeIntent,
+    #[cfg(test)]
+    Override(Option<SupervisorCatalogCodexPreflightGrant>),
+}
+
+/// Independent PR-intake catalog-preflight issuer.
+///
+/// Lives at `produce_repository_pr_intake` before catalog load, outside
+/// `impl RuntimeModelCatalog` and outside `load_codex_runtime_model_catalog*`.
+/// Must not call `admit_from_supervisor_catalog_intent` or
+/// `admit_production_supervisor_catalog_preflight_grant`.
+fn admit_pr_intake_catalog_preflight_grant(
+    run_id: &str,
+    resolver_search_base: &Path,
+    expected_program: &Path,
+) -> Result<SupervisorCatalogCodexPreflightGrant, SupervisorCatalogCodexPreflightGrantError> {
+    SupervisorCatalogCodexPreflightGrant::admit_from_pr_intake_catalog_intent(
+        run_id,
+        resolver_search_base,
+        expected_program,
+    )
+}
+
+fn load_pr_intake_codex_runtime_model_catalog(
+    program: &Path,
+    repo: &Path,
+    run_id: &str,
+    grant_supply: PrIntakeCatalogGrantSupply,
+) -> Result<CodexRuntimeModelCatalog, String> {
+    let grant = match grant_supply {
+        PrIntakeCatalogGrantSupply::IssueFromPrIntakeIntent => Some(
+            admit_pr_intake_catalog_preflight_grant(run_id, repo, program)
+                .map_err(supervisor_catalog_preflight_grant_admit_failure)
+                .map_err(|failure| failure.summary)?,
+        ),
+        #[cfg(test)]
+        PrIntakeCatalogGrantSupply::Override(grant) => grant,
+    };
+    let Some(grant) = grant else {
+        return Err(missing_supervisor_catalog_preflight_grant_failure().summary);
+    };
+    if grant.origin() != CatalogPreflightOrigin::PrIntake {
+        return Err(catalog_preflight_grant_origin_mismatch_failure().summary);
+    }
+    load_codex_runtime_model_catalog_authorized(
+        program,
+        repo,
+        PRODUCTION_CATALOG_TIMEOUT,
+        grant,
+        CatalogPreflightOrigin::PrIntake,
+    )
+    .map_err(|failure| failure.summary)
+}
+
 /// Produce one durable repository-authenticated event from an exact
 /// provider-observed GitHub PR number. The provider fields and model catalog
 /// are both loaded internally through trusted production boundaries.
@@ -1134,6 +1198,7 @@ pub fn produce_repository_pr_intake(
         .codex_bin
         .clone()
         .unwrap_or_else(|| PathBuf::from("codex"));
+    let run_id = options.run_id.as_str().to_string();
     let mut observer = InboxGithubPrObservationProvider {
         options: options.clone(),
     };
@@ -1145,8 +1210,12 @@ pub fn produce_repository_pr_intake(
         &mut observer,
         &mut actor_preflight,
         || {
-            load_codex_runtime_model_catalog(&program, &repo, PRODUCTION_CATALOG_TIMEOUT)
-                .map_err(|failure| failure.summary)
+            load_pr_intake_codex_runtime_model_catalog(
+                &program,
+                &repo,
+                &run_id,
+                PrIntakeCatalogGrantSupply::IssueFromPrIntakeIntent,
+            )
         },
         &mut provider,
     )
@@ -3557,5 +3626,78 @@ mod tests {
             Some(PrIntakeRefusalCause::IndependenceConflict { .. })
         ));
         assert!(provider.requests.is_empty());
+    }
+
+    #[test]
+    fn production_catalog_path_missing_grant_is_catalog_unavailable_without_spawn() {
+        let (_temp, repo) = repository();
+        let mut observer = FakeObservationProvider::returning(provider_pr_item());
+        let mut provider = FakeProvider::default();
+        let report = produce_repository_pr_intake_with(
+            &repo,
+            17,
+            &mut observer,
+            || {
+                load_pr_intake_codex_runtime_model_catalog(
+                    Path::new("codex"),
+                    &repo,
+                    "pr-intake-missing-catalog-grant",
+                    PrIntakeCatalogGrantSupply::Override(None),
+                )
+            },
+            &mut provider,
+        );
+        assert!(
+            matches!(
+                report.refusal,
+                Some(PrIntakeProducerRefusalCause::CatalogUnavailable { ref detail })
+                    if detail.contains("cause=missing_catalog_preflight_grant")
+            ),
+            "production catalog path must fail closed on missing grant: {report:#?}"
+        );
+        assert!(
+            provider.requests.is_empty(),
+            "missing catalog grant must not launch the merge auditor"
+        );
+    }
+
+    #[test]
+    fn production_catalog_path_supervisor_grant_is_catalog_unavailable_without_spawn() {
+        let (_temp, repo) = repository();
+        let mut observer = FakeObservationProvider::returning(provider_pr_item());
+        let mut provider = FakeProvider::default();
+        let supervisor_grant =
+            SupervisorCatalogCodexPreflightGrant::admit_from_supervisor_catalog_intent(
+                "pr-intake-supervisor-catalog-grant",
+                &repo,
+                Path::new("codex"),
+            )
+            .expect("trusted Supervisor origin spelling must admit");
+        let report = produce_repository_pr_intake_with(
+            &repo,
+            17,
+            &mut observer,
+            || {
+                load_pr_intake_codex_runtime_model_catalog(
+                    Path::new("codex"),
+                    &repo,
+                    "pr-intake-supervisor-catalog-grant",
+                    PrIntakeCatalogGrantSupply::Override(Some(supervisor_grant)),
+                )
+            },
+            &mut provider,
+        );
+        assert!(
+            matches!(
+                report.refusal,
+                Some(PrIntakeProducerRefusalCause::CatalogUnavailable { ref detail })
+                    if detail.contains("cause=catalog_preflight_grant_origin_mismatch")
+            ),
+            "Supervisor grant must not authorize PR-intake catalog: {report:#?}"
+        );
+        assert!(
+            provider.requests.is_empty(),
+            "wrong-origin catalog grant must not launch the merge auditor"
+        );
     }
 }

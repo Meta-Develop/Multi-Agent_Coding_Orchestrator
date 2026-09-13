@@ -2292,10 +2292,15 @@ impl LiveSwitchCostSession {
     }
 
     fn observe_record(&mut self, record: InvocationRecord) -> Result<()> {
-        record.validate().map_err(|error| {
-            anyhow!("live invocation record failed attribution validation: {error}")
+        record.validate_observation().map_err(|error| {
+            anyhow!("live invocation record failed observation validation: {error}")
         })?;
         self.invocations.push(record);
+        // Refit the full history once; appending a row must not count every
+        // previous observation again.
+        self.model = SwitchCostModel::new().with_hysteresis(SwitchHysteresis {
+            margin_bp: self.config.hysteresis_margin_bp,
+        });
         self.model.observe_invocations(&self.invocations);
         Ok(())
     }
@@ -2467,13 +2472,10 @@ pub(super) fn record_supervisor_invocation_observation(
         started,
         ResourceVector::new().snapshot(started),
     );
-    let finished_millis = observation
+    record.finished_at = observation
         .duration_ms
         .and_then(|duration| observation.started_at_unix_millis.checked_add(duration))
-        .unwrap_or(observation.started_at_unix_millis.max(1));
-    record.finished_at = Some(TimestampMillis::from_millis(
-        finished_millis.max(started.as_millis()),
-    ));
+        .map(|finished| TimestampMillis::from_millis(finished.max(started.as_millis())));
     record.optimization_run_id = Some(
         OptimizationRunId::new(observation.run_id)
             .map_err(|error| anyhow!("live invocation optimization run id: {error}"))?,
@@ -2496,25 +2498,17 @@ pub(super) fn record_supervisor_invocation_observation(
     let backend = backend_id_for_runtime(observation.runtime)?;
     record.backend = Some(backend.clone());
     record.provider = Some(provider_id_for_runtime(observation.runtime)?);
-    let model = observation
+    record.requested_model = observation
         .model
         .filter(|model| !model.trim().is_empty())
-        .unwrap_or("unresolved-live-model");
-    let slug =
-        RuntimeSlug::new(model).map_err(|error| anyhow!("live invocation model slug: {error}"))?;
-    record.requested_model = Some(slug.clone());
-    record.resolved_model = Some(slug);
-    record.session_id = Some(observation.run_id.to_string());
+        .map(RuntimeSlug::new)
+        .transpose()
+        .map_err(|error| anyhow!("live invocation model slug: {error}"))?;
+    // Command configuration identifies the request, not provider resolution or
+    // runtime session identity. Duration measures the whole invocation, not
+    // adapter startup. Leave those unobserved fields absent.
     record.worktree_id = Some(observation.worktree_id.to_string());
-    if let Some(duration_ms) = observation.duration_ms {
-        let micros = i64::try_from(duration_ms.saturating_mul(1_000)).unwrap_or(i64::MAX);
-        if micros >= 0 {
-            record.runtime_startup_micros = Some(micros);
-        }
-    }
-    let effort = canonical_effort_from_label(observation.effort.unwrap_or("high"));
-    record.requested_effort = Some(effort.clone());
-    record.resolved_effort = Some(effort);
+    record.requested_effort = observation.effort.and_then(canonical_effort_from_label);
     record.role = Some(optimizer_role(observation.role));
     if let Some(usage) = observation.usage {
         record.input_tokens = u64::try_from(usage.input_tokens).ok();
@@ -2776,16 +2770,16 @@ fn selector_effort_to_canonical(effort: SelectorEffort) -> CanonicalEffort {
     }
 }
 
-fn canonical_effort_from_label(label: &str) -> CanonicalEffort {
-    match label {
+fn canonical_effort_from_label(label: &str) -> Option<CanonicalEffort> {
+    Some(match label {
         "minimal" => CanonicalEffort::Minimal,
         "low" => CanonicalEffort::Low,
         "medium" => CanonicalEffort::Medium,
         "high" => CanonicalEffort::High,
         "xhigh" => CanonicalEffort::XHigh,
         "max" => CanonicalEffort::Max,
-        _ => CanonicalEffort::High,
-    }
+        _ => return None,
+    })
 }
 
 fn optimizer_role(role: AgentRole) -> OptimizerRole {
@@ -6540,6 +6534,86 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn live_observation_preserves_requested_and_unknown_runtime_attribution() -> Result<()> {
+        reset_live_switch_cost_session();
+        let record = record_supervisor_invocation_observation(LiveInvocationObservation {
+            run_id: "observed-run",
+            assignment_id: "worker-a",
+            attempt: 1,
+            role: AgentRole::Worker,
+            runtime: SupervisorRuntime::Codex,
+            model: Some("gpt-5.6-luna"),
+            effort: Some("xhigh"),
+            worktree_id: "worker-a",
+            usage: None,
+            duration_ms: Some(12_345),
+            started_at_unix_millis: 1_000,
+        })?;
+        assert_eq!(
+            record.requested_model.as_ref().map(RuntimeSlug::as_str),
+            Some("gpt-5.6-luna")
+        );
+        assert_eq!(record.requested_effort, Some(CanonicalEffort::XHigh));
+        assert_eq!(
+            record.finished_at,
+            Some(TimestampMillis::from_millis(13_345))
+        );
+        let json = serde_json::to_value(&record)?;
+        for field in [
+            "resolved_model",
+            "resolved_effort",
+            "session_id",
+            "runtime_startup_micros",
+        ] {
+            assert!(json[field].is_null(), "{field} must remain unobserved");
+        }
+        record.validate_observation()?;
+        assert!(
+            record.validate().is_err(),
+            "request is not complete attribution"
+        );
+        assert_eq!(live_switch_cost_artifact().invocations, vec![record]);
+        let fitted = live_fitted_switch_estimate(TransitionClass::FreshSessionOrWorktree);
+        assert_eq!(fitted.sample_count, 0);
+        assert_eq!(
+            fitted.provenance.runtime_startup.observation,
+            crate::optimizer::resources::ObservationKind::Inferred
+        );
+        reset_live_switch_cost_session();
+        Ok(())
+    }
+
+    #[test]
+    fn live_observation_does_not_fill_missing_model_effort_or_duration() -> Result<()> {
+        reset_live_switch_cost_session();
+        for (model, effort, duration_ms) in [
+            (None, None, None),
+            (Some(" "), Some("future-effort"), Some(u64::MAX)),
+        ] {
+            let record = record_supervisor_invocation_observation(LiveInvocationObservation {
+                run_id: "missing-run",
+                assignment_id: "worker-a",
+                attempt: 1,
+                role: AgentRole::Worker,
+                runtime: SupervisorRuntime::Codex,
+                model,
+                effort,
+                worktree_id: "worker-a",
+                usage: None,
+                duration_ms,
+                started_at_unix_millis: 1_000,
+            })?;
+            assert!(record.requested_model.is_none());
+            assert!(record.requested_effort.is_none());
+            assert!(record.finished_at.is_none());
+            assert!(record.runtime_startup_micros.is_none());
+            record.validate_observation()?;
+        }
+        reset_live_switch_cost_session();
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn complete_live_invocation(
         id: &str,
@@ -6579,6 +6653,56 @@ mod tests {
         record.runtime_startup_micros = Some(1_200);
         record.lost_checkpoint_cost_micros = Some(400);
         Ok(record)
+    }
+
+    #[test]
+    fn live_invocation_refit_counts_each_observation_once() -> Result<()> {
+        reset_live_switch_cost_session();
+        let records = vec![
+            complete_live_invocation(
+                "first",
+                "adapter-a",
+                "model-a",
+                1,
+                Some(1_000),
+                Some(800),
+                "session-a",
+                "worktree-a",
+            )?,
+            complete_live_invocation(
+                "second",
+                "adapter-a",
+                "model-b",
+                2,
+                Some(900),
+                Some(0),
+                "session-a",
+                "worktree-a",
+            )?,
+            complete_live_invocation(
+                "third",
+                "adapter-a",
+                "model-c",
+                3,
+                Some(800),
+                Some(0),
+                "session-a",
+                "worktree-a",
+            )?,
+        ];
+        let mut once = SwitchCostModel::new();
+        once.observe_invocations(&records);
+        for record in records {
+            record_live_invocation(record)?;
+        }
+        for class in [
+            TransitionClass::FreshSessionOrWorktree,
+            TransitionClass::ModelChangeSameRuntime,
+        ] {
+            assert_eq!(live_fitted_switch_estimate(class), once.estimate(class));
+        }
+        reset_live_switch_cost_session();
+        Ok(())
     }
 
     #[test]

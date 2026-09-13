@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -104,6 +105,8 @@ pub struct RunSummary {
     pub events: Vec<NormalizedEvent>,
     #[serde(skip)]
     journal: Option<JournalPosition>,
+    #[serde(skip)]
+    pending_fingerprint: Option<DirectoryFingerprint>,
 }
 
 pub type NormalizedEvent = OrchestrationEvent;
@@ -167,7 +170,7 @@ struct RunRootWatch {
     repository_root: PathBuf,
     family_directory: &'static str,
     path: PathBuf,
-    fingerprint: Option<FileFingerprint>,
+    fingerprint: Option<DirectoryFingerprint>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -190,8 +193,14 @@ struct PendingRunWatch {
     repository_root: PathBuf,
     family_directory: &'static str,
     path: PathBuf,
-    fingerprint: Option<FileFingerprint>,
+    fingerprint: Option<DirectoryFingerprint>,
     journal_fingerprint: Option<FileFingerprint>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DirectoryFingerprint {
+    metadata: FileFingerprint,
+    entries: BTreeMap<OsString, FileFingerprint>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -342,7 +351,6 @@ impl CachedScope {
             changed = true;
         }
 
-        self.refresh_run_root_fingerprints();
         Ok(changed)
     }
 
@@ -413,11 +421,12 @@ impl CachedScope {
     }
 
     fn rebuild_all(&mut self) -> io::Result<()> {
+        let run_roots = run_root_watches(&self.repositories)?;
         let snapshot = scan_repositories(&self.repositories)?;
         let events = snapshot.all_events();
         self.snapshot = Some(snapshot);
         self.rebuild_journal_watches();
-        self.run_roots = run_root_watches(&self.repositories)?;
+        self.run_roots = run_roots;
         self.current_stream.clear();
         self.stream_history.clear();
         self.next_event_id = 1;
@@ -438,6 +447,7 @@ impl CachedScope {
                 "Scope cache lost repository target '{repo_id}'"
             )));
         };
+        let run_roots = run_root_watches(std::slice::from_ref(&target))?;
         let project = scan_repository(&target)?;
         let project_events = project_events(&project);
         self.reconcile_repository_stream(repo_id, project_events)?;
@@ -462,6 +472,8 @@ impl CachedScope {
         self.journals.retain(|key, _| key.repo != repo_id);
         self.pending_runs.retain(|key, _| key.repo != repo_id);
         self.extend_journal_watches_for(repo_id);
+        self.run_roots.retain(|watch| watch.repo != repo_id);
+        self.run_roots.extend(run_roots);
         Ok(())
     }
 
@@ -675,41 +687,26 @@ impl CachedScope {
                 );
                 continue;
             }
-            let pending = PendingRunWatch {
-                repository_root: target.path.clone(),
-                family_directory,
-                path: run.run_dir.clone(),
-                fingerprint: None,
-                journal_fingerprint: None,
-            };
-            let (fingerprint, journal_fingerprint) =
-                pending.current_state().unwrap_or((None, None));
             self.pending_runs.insert(
                 key,
                 PendingRunWatch {
-                    fingerprint,
-                    journal_fingerprint,
-                    ..pending
+                    repository_root: target.path.clone(),
+                    family_directory,
+                    path: run.run_dir.clone(),
+                    fingerprint: run.pending_fingerprint.clone(),
+                    journal_fingerprint: None,
                 },
             );
-        }
-    }
-
-    fn refresh_run_root_fingerprints(&mut self) {
-        for watch in &mut self.run_roots {
-            if let Ok(fingerprint) = watch.current_fingerprint() {
-                watch.fingerprint = fingerprint;
-            }
         }
     }
 }
 
 impl PendingRunWatch {
-    fn current_state(&self) -> io::Result<(Option<FileFingerprint>, Option<FileFingerprint>)> {
+    fn current_state(&self) -> io::Result<(Option<DirectoryFingerprint>, Option<FileFingerprint>)> {
         Ok((self.directory_fingerprint()?, self.journal_fingerprint()?))
     }
 
-    fn directory_fingerprint(&self) -> io::Result<Option<FileFingerprint>> {
+    fn directory_fingerprint(&self) -> io::Result<Option<DirectoryFingerprint>> {
         let Some(run_name) = self.path.file_name().and_then(|name| name.to_str()) else {
             return Err(invalid_data("Scope pending run path is missing a name"));
         };
@@ -740,7 +737,7 @@ impl PendingRunWatch {
 }
 
 impl RunRootWatch {
-    fn current_fingerprint(&self) -> io::Result<Option<FileFingerprint>> {
+    fn current_fingerprint(&self) -> io::Result<Option<DirectoryFingerprint>> {
         let components = [".maco", self.family_directory, "runs"];
         let Some(path) = validate_directory_chain(&self.repository_root, &components)? else {
             return Ok(None);
@@ -815,7 +812,7 @@ fn run_root_watches(repositories: &[RepositoryTarget]) -> io::Result<Vec<RunRoot
     Ok(watches)
 }
 
-fn directory_fingerprint(path: &Path) -> io::Result<Option<FileFingerprint>> {
+fn directory_fingerprint(path: &Path) -> io::Result<Option<DirectoryFingerprint>> {
     let metadata = match no_follow_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -833,7 +830,27 @@ fn directory_fingerprint(path: &Path) -> io::Result<Option<FileFingerprint>> {
             path.display()
         )));
     }
-    Ok(Some(fingerprint(&metadata)))
+    // Directory timestamps and sizes can remain unchanged when entries are
+    // created in the same filesystem clock tick. Retain the bounded entries as
+    // well, and only advance this observation when its repository is scanned.
+    let mut entries = BTreeMap::new();
+    for (index, entry) in fs::read_dir(path)?.enumerate() {
+        if index >= MAX_DIRECTORY_ENTRIES {
+            return Err(invalid_data(format!(
+                "Scope directory exceeds the {MAX_DIRECTORY_ENTRIES} entry limit: {}",
+                path.display()
+            )));
+        }
+        let entry = entry?;
+        entries.insert(
+            entry.file_name(),
+            fingerprint(&no_follow_metadata(&entry.path())?),
+        );
+    }
+    Ok(Some(DirectoryFingerprint {
+        metadata: fingerprint(&metadata),
+        entries,
+    }))
 }
 
 fn journal_fingerprint(path: &Path) -> io::Result<Option<FileFingerprint>> {
@@ -972,7 +989,11 @@ fn scan_repository(target: &RepositoryTarget) -> io::Result<ProjectSnapshot> {
             let modified = no_follow_metadata(&run_dir)
                 .and_then(|metadata| metadata.modified())
                 .unwrap_or(UNIX_EPOCH);
-            let (mut events, journal) = match scan_run_events(target, family, run_name, &run_dir) {
+            let scanned = directory_fingerprint(&run_dir).and_then(|pending_fingerprint| {
+                scan_run_events(target, family, run_name, &run_dir)
+                    .map(|(events, journal)| (events, journal, pending_fingerprint))
+            });
+            let (mut events, journal, pending_fingerprint) = match scanned {
                 Ok(scanned) => scanned,
                 Err(error) => {
                     scan_errors.push(format!("skipped run {family}/{run_name}: {error}"));
@@ -997,6 +1018,11 @@ fn scan_repository(target: &RepositoryTarget) -> io::Result<ProjectSnapshot> {
                     event_count: events.len(),
                     observed_coordination_depth: observed_coordination_depth_from_events(&events),
                     events,
+                    pending_fingerprint: if journal.is_none() {
+                        pending_fingerprint
+                    } else {
+                        None
+                    },
                     journal,
                 },
                 modified,
@@ -2787,6 +2813,15 @@ mod tests {
             &run_dir.join("STATE.tsv"),
             "key\tvalue\nupdated_at\t2026-07-20T01:00:00Z\ncurrent_phase\trunning\n",
         );
+        // Model a directory update within one filesystem timestamp tick.
+        let observed = fingerprint(&fs::metadata(&run_dir).expect("run metadata"));
+        for pending in cache.pending_runs.values_mut() {
+            pending
+                .fingerprint
+                .as_mut()
+                .expect("pending fingerprint")
+                .metadata = observed.clone();
+        }
         assert!(cache.refresh().expect("late state refresh"));
         let events = cache
             .snapshot()
@@ -2796,6 +2831,44 @@ mod tests {
         assert!(events.iter().any(|event| {
             event.kind == OrchestrationEventKind::Status && event.payload["source"] == "STATE.tsv"
         }));
+        assert!(!cache.refresh().expect("unchanged state refresh"));
+    }
+
+    #[test]
+    fn cached_scope_discovers_new_run_when_directory_metadata_is_unchanged() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let run_root = temp.path().join(".maco/o2/runs");
+        write(
+            &run_root.join("first/events/orchestration.jsonl"),
+            &journal_event("first"),
+        );
+        let mut cache = CachedScope::new(vec![target(temp.path())]);
+        assert!(cache.refresh().expect("initial scan"));
+        write(
+            &run_root.join("second/events/orchestration.jsonl"),
+            &journal_event("second"),
+        );
+        let observed = fingerprint(&fs::metadata(&run_root).expect("run root metadata"));
+        for watch in &mut cache.run_roots {
+            if watch.path == run_root {
+                watch
+                    .fingerprint
+                    .as_mut()
+                    .expect("run root fingerprint")
+                    .metadata = observed.clone();
+            }
+        }
+        assert!(cache.refresh().expect("new run refresh"));
+        assert_eq!(
+            cache
+                .snapshot()
+                .expect("snapshot")
+                .events_for_run("repo-one", "o2", "second")
+                .expect("new run")
+                .len(),
+            1
+        );
+        assert!(!cache.refresh().expect("unchanged run refresh"));
     }
 
     #[test]

@@ -7,6 +7,8 @@ use crate::machine_global::{
     RetentionOperation, RetentionOperationId,
 };
 use crate::mutation_taxonomy::{
+    AssignmentProcessLaunchGrant, AssignmentProcessLaunchGrantError, AssignmentProcessLaunchKind,
+    AssignmentProcessMechanicalBinding, CatalogPreflightOrigin, SealedMechanicalExecutorDuty,
     SupervisorCatalogCodexPreflightGrant, SupervisorCatalogCodexPreflightGrantError,
 };
 use crate::pre_action_review::{
@@ -31,6 +33,7 @@ use crate::runtime_adapter::{
 };
 use crate::safe_state::{unsigned_to_u32, ReservedDirectory};
 use crate::secure_output::{ReservedOutputFile, SecureOutputRoot};
+use crate::supervise::AgentRole;
 use crate::worktree::normalize_agent_id;
 use anyhow::{bail, Context, Result};
 use git2::Oid;
@@ -242,6 +245,17 @@ pub struct ExternalAgentCommand {
     /// Opaque MACO-owned proof that the selected command, held claims, disposable worktree, and
     /// verified native confinement were authenticated together immediately before launch.
     worktree_writable_confinement: Option<WorktreeWritableConfinementProof>,
+    /// Assignment-child / parent-auditor / Inbox-independent-auditor / consult /
+    /// merge-arbiter launch kind. CodexConsultant accepts ConsultCodex or
+    /// InboxIndependentAuditor; ClaudeConsultant accepts ConsultClaude only.
+    /// MergeArbiter accepts only a merge-shaped CodexSupervisor command.
+    /// Generic CodexSupervisor constructors still leave kind absent.
+    pub(crate) assignment_process_launch_kind: Option<AssignmentProcessLaunchKind>,
+    /// One-shot sibling grant consumed against the final ProcessSpec when kind is set.
+    pub(crate) assignment_process_launch_grant: Option<AssignmentProcessLaunchGrant>,
+    pub(crate) assignment_process_launch_attempt: Option<usize>,
+    pub(crate) assignment_process_launch_duty: Option<String>,
+    pub(crate) assignment_mechanical_executor_duty: Option<SealedMechanicalExecutorDuty>,
 }
 
 pub(crate) const WRITABLE_GROK_TERMINAL_WORKER_REQUIRED: &str =
@@ -1002,6 +1016,11 @@ impl ExternalAgentCommand {
             writable_launch_target: WritableLaunchTarget::ManagedChildWorktree,
             writable_runtime_selection: None,
             worktree_writable_confinement: None,
+            assignment_process_launch_kind: None,
+            assignment_process_launch_grant: None,
+            assignment_process_launch_attempt: None,
+            assignment_process_launch_duty: None,
+            assignment_mechanical_executor_duty: None,
         }
     }
 
@@ -1037,6 +1056,11 @@ impl ExternalAgentCommand {
             writable_launch_target: WritableLaunchTarget::ManagedChildWorktree,
             writable_runtime_selection: None,
             worktree_writable_confinement: None,
+            assignment_process_launch_kind: None,
+            assignment_process_launch_grant: None,
+            assignment_process_launch_attempt: None,
+            assignment_process_launch_duty: None,
+            assignment_mechanical_executor_duty: None,
         }
     }
 
@@ -1072,6 +1096,11 @@ impl ExternalAgentCommand {
             writable_launch_target: WritableLaunchTarget::ManagedChildWorktree,
             writable_runtime_selection: None,
             worktree_writable_confinement: None,
+            assignment_process_launch_kind: None,
+            assignment_process_launch_grant: None,
+            assignment_process_launch_attempt: None,
+            assignment_process_launch_duty: None,
+            assignment_mechanical_executor_duty: None,
         }
     }
 
@@ -1379,6 +1408,26 @@ impl ExternalAgentCommand {
 
     pub fn with_writable_launch_target(mut self, target: WritableLaunchTarget) -> Self {
         self.writable_launch_target = target;
+        self
+    }
+
+    /// Attach a caller-issued assignment-child, parent-auditor, Inbox
+    /// independent-auditor, consult, or merge-arbiter process grant.
+    ///
+    /// Catalog constructors leave kind and grant absent. Consult Codex binds
+    /// only CodexConsultant; consult Claude binds only ClaudeConsultant.
+    /// MergeArbiter binds only a merge-shaped CodexSupervisor command. Generic
+    /// CodexSupervisor constructors still leave kind absent.
+    pub(crate) fn with_assignment_process_launch(
+        mut self,
+        kind: AssignmentProcessLaunchKind,
+        grant: AssignmentProcessLaunchGrant,
+    ) -> Self {
+        self.assignment_process_launch_attempt = Some(grant.attempt());
+        self.assignment_process_launch_duty = Some(grant.duty().to_string());
+        self.assignment_mechanical_executor_duty = grant.mechanical_duty();
+        self.assignment_process_launch_kind = Some(kind);
+        self.assignment_process_launch_grant = Some(grant);
         self
     }
 }
@@ -1817,16 +1866,33 @@ pub struct CapturedOutput {
     pub truncated: bool,
     #[serde(skip, default)]
     bytes: Vec<u8>,
+    /// Process-capture loss, independent of the shorter public display text.
+    /// Only the live capture path can attest to this private provenance.
+    #[serde(skip, default)]
+    raw_truncated: Option<bool>,
     #[serde(
         skip_serializing,
         skip_deserializing,
         default = "default_target_launch_attempted"
     )]
-    target_launch_attempted: bool,
+    pub(crate) target_launch_attempted: bool,
     /// Private held metadata for the enclosing run. It is serialized only by
     /// `ExternalAgentRun` as the top-level `sandbox_denials` wire field.
     #[serde(skip, default)]
     run_metadata: ExternalAgentRunMetadata,
+}
+
+impl CapturedOutput {
+    pub(crate) fn raw_capture_truncated(&self) -> bool {
+        // Deserialized and legacy captures lack private provenance. Preserve
+        // their conservative interpretation of the public truncation flag.
+        self.raw_truncated.unwrap_or(self.truncated)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn from_captured_bytes_for_test(output: &CapturedBytes) -> Self {
+        summarize_redacted_output(output, &CredentialRedactor::default())
+    }
 }
 
 impl std::fmt::Debug for CapturedOutput {
@@ -1981,6 +2047,201 @@ fn run_external_agent_nonpublishable_simulation_cancellable(
     )
 }
 
+fn assignment_process_launch_refusal(error: AssignmentProcessLaunchGrantError) -> String {
+    format!("assignment process launch grant failed closed: {error}")
+}
+
+fn consult_consultant_invocation_requires_process_grant(
+    invocation: ExternalAgentInvocation,
+) -> bool {
+    matches!(
+        invocation,
+        ExternalAgentInvocation::CodexConsultant | ExternalAgentInvocation::ClaudeConsultant
+    )
+}
+
+fn assignment_process_launch_kind_allowed_for_invocation(
+    kind: AssignmentProcessLaunchKind,
+    spec: &ExternalAgentCommand,
+) -> bool {
+    match kind {
+        AssignmentProcessLaunchKind::ConsultCodex => {
+            matches!(spec.invocation, ExternalAgentInvocation::CodexConsultant)
+        }
+        AssignmentProcessLaunchKind::ConsultClaude => {
+            matches!(spec.invocation, ExternalAgentInvocation::ClaudeConsultant)
+        }
+        AssignmentProcessLaunchKind::InboxIndependentAuditor => matches!(
+            spec.invocation,
+            ExternalAgentInvocation::CodexConsultant | ExternalAgentInvocation::CodexSupervisor
+        ),
+        AssignmentProcessLaunchKind::AssignmentChild
+        | AssignmentProcessLaunchKind::ParentAuditor => match spec.invocation {
+            ExternalAgentInvocation::CodexSupervisor
+            | ExternalAgentInvocation::Grok
+            | ExternalAgentInvocation::Cursor
+            | ExternalAgentInvocation::ClaudeCode
+            | ExternalAgentInvocation::GeminiCli => true,
+            ExternalAgentInvocation::CodexConsultant
+            | ExternalAgentInvocation::ClaudeConsultant => false,
+        },
+        AssignmentProcessLaunchKind::MergeArbiter => {
+            matches!(spec.invocation, ExternalAgentInvocation::CodexSupervisor)
+                && merge_arbiter_command_is_merge_shaped(spec)
+        }
+    }
+}
+
+fn merge_arbiter_command_is_merge_shaped(spec: &ExternalAgentCommand) -> bool {
+    spec.workspace_access == WorkspaceAccess::ReadOnly
+        && spec
+            .hidden_roots
+            .iter()
+            .any(|root| !root.as_os_str().is_empty())
+        && spec.agent_lifecycle.as_ref().is_some_and(|identity| {
+            identity.role == AgentRole::Auditor.as_str()
+                && !identity.run_id.is_empty()
+                && !identity.task_id.is_empty()
+        })
+}
+
+fn refuse_assignment_process_launch_before_preflight(
+    spec: &ExternalAgentCommand,
+) -> Result<(), AssignmentProcessLaunchGrantError> {
+    let kind = match spec.assignment_process_launch_kind {
+        Some(kind) => kind,
+        None => {
+            if consult_consultant_invocation_requires_process_grant(spec.invocation) {
+                return Err(AssignmentProcessLaunchGrantError::MissingGrant);
+            }
+            return Ok(());
+        }
+    };
+    if !assignment_process_launch_kind_allowed_for_invocation(kind, spec) {
+        return Err(AssignmentProcessLaunchGrantError::KindMismatch);
+    }
+    let Some(grant) = spec.assignment_process_launch_grant.as_ref() else {
+        return Err(AssignmentProcessLaunchGrantError::MissingGrant);
+    };
+    if grant.kind() != kind {
+        return Err(AssignmentProcessLaunchGrantError::KindMismatch);
+    }
+    let run_id = spec
+        .agent_lifecycle
+        .as_ref()
+        .map(|identity| identity.run_id.as_str())
+        .unwrap_or("");
+    let subject = spec
+        .agent_lifecycle
+        .as_ref()
+        .map(|identity| identity.task_id.as_str())
+        .unwrap_or("");
+    let attempt = spec.assignment_process_launch_attempt.unwrap_or(usize::MAX);
+    let duty = spec.assignment_process_launch_duty.as_deref().unwrap_or("");
+    if grant.run_id() != run_id
+        || grant.subject() != subject
+        || grant.attempt() != attempt
+        || grant.model() != spec.model.as_deref()
+        || grant.duty() != duty
+    {
+        return Err(AssignmentProcessLaunchGrantError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+fn seal_assignment_process_launch_grant(
+    spec: &ExternalAgentCommand,
+    resolved_program: &Path,
+    argv: &[OsString],
+    output_staging: &Path,
+    cwd: &Path,
+) -> Result<Option<AssignmentProcessLaunchGrant>, AssignmentProcessLaunchGrantError> {
+    if spec.assignment_process_launch_kind.is_none() {
+        return Ok(None);
+    }
+    let Some(grant) = spec.assignment_process_launch_grant.clone() else {
+        return Err(AssignmentProcessLaunchGrantError::MissingGrant);
+    };
+    Ok(Some(grant.seal_independently_verified_canonical_binding(
+        resolved_program,
+        argv.iter(),
+        output_staging,
+        cwd,
+    )?))
+}
+
+fn consume_assignment_process_launch_grant(
+    spec: &ExternalAgentCommand,
+    grant: AssignmentProcessLaunchGrant,
+    process_spec: &mut ProcessSpec,
+    output_staging: &Path,
+) -> Result<(), AssignmentProcessLaunchGrantError> {
+    let Some(kind) = spec.assignment_process_launch_kind else {
+        return Ok(());
+    };
+    let ProcessCommand::Direct { program, args } = &process_spec.command else {
+        return Err(AssignmentProcessLaunchGrantError::ProgramMismatch);
+    };
+    let program = program.clone();
+    let args = args.clone();
+    let current_dir = process_spec.current_dir.clone();
+    let run_id = spec
+        .agent_lifecycle
+        .as_ref()
+        .map(|identity| identity.run_id.as_str())
+        .unwrap_or("");
+    let subject = spec
+        .agent_lifecycle
+        .as_ref()
+        .map(|identity| identity.task_id.as_str())
+        .unwrap_or("");
+    let attempt = spec.assignment_process_launch_attempt.unwrap_or(usize::MAX);
+    let duty = spec.assignment_process_launch_duty.as_deref().unwrap_or("");
+    let lifecycle_role = spec
+        .agent_lifecycle
+        .as_ref()
+        .map(|identity| identity.role.as_str())
+        .unwrap_or("");
+    if spec
+        .model
+        .as_deref()
+        .is_some_and(crate::agent_lifecycle::model_requires_mechanical_executor_proof)
+        && grant.mechanical_executor().is_none()
+    {
+        return Err(AssignmentProcessLaunchGrantError::MechanicalExecutorMissing);
+    }
+    if grant.mechanical_executor().is_some() {
+        if lifecycle_role != "worker" {
+            return Err(AssignmentProcessLaunchGrantError::MechanicalExecutorMismatch);
+        }
+        if grant.mechanical_duty() != spec.assignment_mechanical_executor_duty {
+            return Err(AssignmentProcessLaunchGrantError::MechanicalExecutorMismatch);
+        }
+    }
+    let actual_mechanical = spec
+        .assignment_mechanical_executor_duty
+        .map(|mechanical_duty| {
+            AssignmentProcessMechanicalBinding::worker(mechanical_duty, lifecycle_role)
+        });
+    let proof = grant.consume_for_process_binding(
+        &program,
+        &current_dir,
+        &args,
+        output_staging,
+        run_id,
+        subject,
+        attempt,
+        kind,
+        spec.model.as_deref(),
+        duty,
+        actual_mechanical,
+    )?;
+    if let Some(proof) = proof {
+        process_spec.attach_consumed_mechanical_executor_proof(proof);
+    }
+    Ok(())
+}
+
 fn run_external_agent_runtime(
     spec: &ExternalAgentCommand,
     runtime: ExternalExecutionRuntime,
@@ -1995,6 +2256,15 @@ fn run_external_agent_runtime(
             command_display(&spec.program, &[]),
             false,
             "external agent was cancelled before executable preflight".to_string(),
+        );
+    }
+    if let Err(error) = refuse_assignment_process_launch_before_preflight(spec) {
+        return failed_external_run(
+            spec,
+            started,
+            command_display(&spec.program, &[]),
+            false,
+            assignment_process_launch_refusal(error),
         );
     }
     if spec.workspace_access == WorkspaceAccess::ReadWrite {
@@ -2764,6 +3034,31 @@ fn run_external_agent_runtime(
     };
 
     let timeout = spec.timeout.saturating_sub(started.elapsed());
+    let staging_path = match output_staging.path() {
+        Ok(path) => path.to_path_buf(),
+        Err(error) => {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_external_error(
+                &mut report,
+                format!("private external-agent output staging became unavailable: {error:#}"),
+            );
+            return report;
+        }
+    };
+    let sealed_assignment_process_grant = match seal_assignment_process_launch_grant(
+        spec,
+        &resolved_program,
+        &argv,
+        &staging_path,
+        &target_spec.cwd,
+    ) {
+        Ok(grant) => grant,
+        Err(error) => {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_external_error(&mut report, assignment_process_launch_refusal(error));
+            return report;
+        }
+    };
     let process_spec = ProcessSpec::direct(
         "external agent",
         &resolved_program,
@@ -2779,7 +3074,7 @@ fn run_external_agent_runtime(
     .with_stdin_limit(MAX_PROMPT_BYTES)
     .with_timeout(Some(timeout))
     .with_stdout(StreamCapture::bounded(OUTPUT_TEE_LIMIT_BYTES));
-    let process_spec = match runtime {
+    let mut process_spec = match runtime {
         ExternalExecutionRuntime::Verified => {
             let Some(side_effect_profile) = side_effect_profile else {
                 report.duration_ms = duration_millis(started.elapsed());
@@ -2805,7 +3100,7 @@ fn run_external_agent_runtime(
         ExternalExecutionRuntime::NonpublishableSimulation => {
             let process_spec = process_spec
                 .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort);
-            match &agent_lifecycle {
+            match agent_lifecycle.as_ref() {
                 Some(metadata) => process_spec.with_agent_lifecycle(metadata.clone()),
                 None => process_spec,
             }
@@ -2819,6 +3114,16 @@ fn run_external_agent_runtime(
             "external agent was cancelled before target start".to_string(),
         );
         return report;
+    }
+
+    if let Some(grant) = sealed_assignment_process_grant {
+        if let Err(error) =
+            consume_assignment_process_launch_grant(spec, grant, &mut process_spec, &staging_path)
+        {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_external_error(&mut report, assignment_process_launch_refusal(error));
+            return report;
+        }
     }
 
     // Preflight evidence describes only the bounded probes. Once the main target is released it

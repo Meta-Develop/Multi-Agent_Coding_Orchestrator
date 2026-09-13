@@ -327,7 +327,12 @@ impl ManagedWorktreeRegistryStore {
         let state_root = repository.common_dir.join("maco").join("state");
         Ok(Self {
             repo_path: repo.workdir().unwrap_or_else(|| repo.path()).to_path_buf(),
-            state_root: SafeRoot::open_or_create(state_root)?,
+            state_root: SafeRoot::open_or_create(&state_root).with_context(|| {
+                format!(
+                    "cannot safely open managed worktree state directory {}; refusing symbolic links and non-directory paths",
+                    state_root.display()
+                )
+            })?,
             repository,
         })
     }

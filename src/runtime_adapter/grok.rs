@@ -2484,9 +2484,10 @@ mod tests {
             dir.path(),
         )?;
         assert!(properties.contains(&format!(
-            "--property=InaccessiblePaths={}",
+            "--property=InaccessiblePaths=-{}",
             grok_home.display()
         )));
+        assert!(properties.contains(&"--property=PrivateTmp=yes".to_string()));
         for (source, name) in [(&auth, GROK_AUTH_FILE), (&config, GROK_CONFIG_FILE)] {
             let target = private_home.join(name);
             assert!(properties.contains(&format!(

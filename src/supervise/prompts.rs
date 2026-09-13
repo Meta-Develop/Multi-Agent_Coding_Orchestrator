@@ -554,7 +554,8 @@ Evidence-only operation:
 
 Report contract:
 - Preserve every reported value and all evidence in assigned_paths, semantic_symbols, semantic_modules, files_changed, field_guide_entries, worker_reports, and decomposition_completions from the authenticated source report. When the response schema requires a property absent from the authenticated report, represent optional evidence as null and genuinely empty evidence arrays as []; do not invent or discard evidence. The immutable assignment JSON still carries any licensed_breakage declaration into this re-audit.
-- Set audit_reports=[], review_lens_aggregate=null, gate_denials=[], and gate_correction_outcomes=[]; these are supervisor-owned.
+- Set audit_reports=[]; the supervisor collects the parent review evidence.
+- Omit review_lens_aggregate, gate_denials, and gate_correction_outcomes; these are supervisor-owned and absent from the Codex response schema.
 - Do not emit licensed_breakage_review or generated_follow_up_tasks; the supervisor reconstructs those fields from the immutable declaration and current evidence.
 - Update only commands_run, validation_results, findings, environment_failures, accepted/rejected/status, remaining_risk, next_safe_action, and current claim/semantic tokens as supported by evidence you actually observe.
 - Do not claim timings, counts, versions, disk state, lock history, or side effects unless the evidence in this operation establishes them.
@@ -727,6 +728,7 @@ Workerless planning gate:
 - Stay read-only: do not edit files, apply patches, mutate repository state, or delegate implementation.
 - Do not launch terminal workers or child-side review auditors. No child-side WorkerReport or AuditorReport evidence is required or permitted for this gate.
 - Return worker_reports=[] and audit_reports=[] in the OrchestratorReviewReport.
+- Omit review_lens_aggregate; only MACO/O2 may construct that parent review evidence.
 - MACO/O2 applies the parent-enforced review lens after this report; rely on that parent review for acceptance instead of attempting a child-side audit.
 "#
     } else if assignment.worker_assignments.is_empty() {

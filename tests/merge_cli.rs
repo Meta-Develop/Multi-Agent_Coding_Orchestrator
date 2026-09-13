@@ -1555,10 +1555,28 @@ fn merge_apply_refuses_symlink_repository_lock_file() -> Result<()> {
         .args(apply_args)
         .output()
         .context("run merge with symlink lock")?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lock_path = lock_dir.join("repository-mutation.lock");
+    let diag = format!(
+        "status={status:?} lock_path={path} stderr={stderr:?} stdout={stdout:?}",
+        status = output.status,
+        path = lock_path.display()
+    );
 
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("not a regular file"));
-    assert_eq!(fs::read_to_string(&target)?, "do not touch\n");
+    assert!(
+        !output.status.success(),
+        "expected lock-file refusal; {diag}"
+    );
+    assert!(
+        stderr.contains("not a regular file"),
+        "expected lock-file gate 'not a regular file'; {diag}"
+    );
+    assert_eq!(
+        fs::read_to_string(&target)?,
+        "do not touch\n",
+        "lock symlink target must be unchanged; {diag}"
+    );
     Ok(())
 }
 
@@ -1602,10 +1620,36 @@ fn merge_apply_refuses_symlink_repository_state_directory() -> Result<()> {
         .args(apply_args)
         .output()
         .context("run merge with symlink state")?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let diag = format!(
+        "status={status:?} state_path={state} target={target} stderr={stderr:?} stdout={stdout:?}",
+        status = output.status,
+        state = state_dir.display(),
+        target = target.display()
+    );
 
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("refusing symbolic links"));
-    assert_eq!(fs::read_dir(&target)?.count(), 0);
+    assert!(
+        !output.status.success(),
+        "expected merge apply to refuse symlink state directory; {diag}"
+    );
+    assert!(
+        stderr.contains("refusing symbolic links"),
+        "expected original policy substring 'refusing symbolic links'; {diag}"
+    );
+    assert!(
+        stderr.contains("cannot safely open managed worktree state directory"),
+        "expected early ManagedWorktreeRegistryStore::open context; {diag}"
+    );
+    assert!(
+        stderr.contains("failed to open safe directory component"),
+        "expected underlying SafeRoot component failure, not later RepoCommonLock phrase; {diag}"
+    );
+    assert_eq!(
+        fs::read_dir(&target)?.count(),
+        0,
+        "symlink target must stay empty; {diag}"
+    );
     Ok(())
 }
 
