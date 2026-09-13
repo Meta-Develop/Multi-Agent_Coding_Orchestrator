@@ -1365,6 +1365,60 @@
         skip_without_containment!();
         use std::os::unix::fs::PermissionsExt;
 
+        const CHILD_ENV: &str = "MACO_TEST_BOUNDED_STATUS_HELPERS_CHILD";
+        const RECEIPT_ENV: &str = "MACO_TEST_BOUNDED_STATUS_HELPERS_RECEIPT";
+        const COMPLETED: &[u8] = b"bounded status helper assertions completed\n";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let temp = TempDir::new().expect("isolated test tempdir");
+            let receipt = temp.path().join("completed");
+            let environment = std::collections::BTreeMap::from([
+                (CHILD_ENV.to_string(), "1".to_string()),
+                (
+                    RECEIPT_ENV.to_string(),
+                    receipt.to_str().expect("UTF-8 receipt path").to_string(),
+                ),
+            ]);
+            // Reuse the bounded exact-test wrapper from the external-agent tests.
+            // Only the child may mutate process-global Git environment variables.
+            let output = run_process(
+                ProcessSpec::direct(
+                    "isolated bounded status helper test",
+                    std::env::current_exe().expect("current test executable"),
+                    [
+                        "--exact",
+                        "worktree::tests::bounded_status_ignores_ambient_and_repository_process_helpers",
+                        "--nocapture",
+                    ],
+                    std::env::current_dir().expect("current test directory"),
+                    64 * 1024,
+                )
+                .with_environment(EnvironmentMode::InheritAndSet(environment))
+                .with_containment(ContainmentPolicy::TrustedBestEffort)
+                .with_stdin(StdinMode::Null)
+                .with_timeout(Some(Duration::from_secs(90))),
+            )
+            .expect("run isolated bounded status helper test");
+            assert!(
+                output.status.is_some_and(|status| status.success())
+                    && !output.timed_out
+                    && output.process_error.is_none()
+                    && output.stdin_error.is_none(),
+                "isolated helper test failed: status={:?}, timed_out={}, process_error={:?}, stdin_error={:?}, stdout={}, stderr={}",
+                output.status,
+                output.timed_out,
+                output.process_error,
+                output.stdin_error,
+                String::from_utf8_lossy(output.stdout.as_bytes()),
+                String::from_utf8_lossy(output.stderr.as_bytes()),
+            );
+            assert_eq!(
+                fs::read(receipt).expect("child must complete both helper assertions"),
+                COMPLETED,
+            );
+            return;
+        }
+
         struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
 
         impl EnvGuard {
@@ -1450,6 +1504,11 @@
             !marker.exists(),
             "ambient or repository-configured helper executed"
         );
+        fs::write(
+            std::env::var_os(RECEIPT_ENV).expect("child completion receipt path"),
+            COMPLETED,
+        )
+        .expect("write completed helper assertions receipt");
     }
 
     #[cfg(target_os = "linux")]
