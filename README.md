@@ -1365,6 +1365,35 @@ provider path and is still refused by the current runner.
 `maco evaluation experiment` runs the same goal/spec under multiple profiles
 through isolated Fake supervise and likewise refuses real-provider execution.
 
+`maco evaluation experiment <manifest.json> --execute-held-out --repo <artifact-owner> --json`
+explicitly opts into executing each declared held-out argv against a separate
+contained copy of each candidate. The parent holds the existing candidate write
+lease, checks the captured candidate before and after validation, and binds the
+observations into the independent parent review request. Nonzero exits and
+candidate mutations fail validation; unavailable containment/executables,
+cancellation, deadlines and unexecuted commands are unknown. Every required
+command must pass before the held-out validation can pass.
+
+This mode emits `evaluation_experiment_observations_v3`; legacy experiment result
+versions and the default command behavior are unchanged. Its candidates still
+come from Fake generation over a synthetic README containing the goal/spec,
+with the same baseline commit/tree for every profile and repetition. `--repo`
+owns evidence storage and is not the evaluated source. The existing owner-private
+`.maco/o2/runs/<unique-run-id>` artifact store retains the full manifest, exact
+profile/repetition/run/baseline/candidate/argv bindings, dispatch admissions,
+observations and authenticated review/report copies before temporary repositories
+are removed. Existing artifact size/file limits apply. Finalization authenticates
+the retained run; interrupted runs remain unfinalized, unknown and nonpublishable.
+This mode never resumes or replays their commands.
+
+Manifest `max_dispatches` counts admitted child/auditor invocations and held-out
+commands per profile/repetition. The declared wall-time limit is checked before
+each dispatch and bounds the command timeout; candidate preparation and cleanup
+retain the existing bounded local-Git/guardian behavior. These observations do
+not fabricate assertion counts, tokens, prices, confidence or quality scores.
+Production and named-default eligibility remain false. Evaluating an actual
+repository through a real account-bound runtime remains a separate prerequisite.
+
 ```bash
 cargo run -- evaluation run tests/fixtures/model_mix_evaluation/manifest-v1.json \
   --plan-file tests/fixtures/model_mix_evaluation/hand-authored-plan-v1.json --json

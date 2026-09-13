@@ -2597,6 +2597,46 @@ pub fn run_supervisor_plan_file(options: SupervisorRunOptions) -> Result<Supervi
     )
 }
 
+/// Fixed nonpublishable experiment entrypoint. Only the parent supplies local
+/// validation authority; ordinary plan JSON cannot enable this capability.
+pub(crate) fn run_held_out_fake_experiment(
+    options: SupervisorRunOptions,
+    authority: held_out::ParentValidationAuthority,
+) -> Result<SupervisorFinalReport> {
+    if options.runtime != SupervisorRuntime::Fake {
+        bail!("the held-out experiment entrypoint supports only nonpublishable Fake generation");
+    }
+    let repo = discover_repo_root(&options.repo)?;
+    let mut loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    validate_execution_target_pre_dispatch(&loaded, false)?;
+    if loaded.plan_metadata.execution_target.is_some()
+        || loaded.plan.assignments.len() != 1
+        || loaded.plan.assignments[0].id != authority.binding.assignment_id
+        || options.run_id.as_str() != authority.binding.supervisor_run_id
+    {
+        bail!("experiment validation authority does not match the isolated assignment");
+    }
+    loaded.assignment_metadata.parent_validation = Some(authority);
+    let runtime_model_catalog =
+        admit_production_supervisor_catalog_preflight_grant(&options, &repo)
+            .and_then(|grant| RuntimeModelCatalog::for_supervisor(&options, &repo, grant));
+    let no_external_runner = |_command: &ExternalAgentCommand,
+                              _cancellation: &ProcessCancellation,
+                              _review: Option<ExternalPreActionReviewRuntime<'_>>|
+     -> ExternalAgentRun {
+        panic!("held-out Fake experiment cannot launch a provider")
+    };
+    run_supervisor_plan_with_runner_and_creation(
+        loaded,
+        options,
+        1,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        SupervisorWorktreeCreation::NonpublishableSimulation,
+        runtime_model_catalog,
+        &no_external_runner,
+    )
+}
+
 /// Runs a Fake plan-file experiment through the nonpublishable-simulation
 /// worktree path. This test wrapper verifies the same production seam used by
 /// Fake autopilot while keeping direct Fake plan-file execution unavailable.

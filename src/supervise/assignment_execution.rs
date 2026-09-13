@@ -211,10 +211,11 @@ pub(super) fn read_authenticated_review_transcript(
     String::from_utf8(bytes).context("child transcript evidence is not valid UTF-8")
 }
 
-fn supervisor_review_lens_binding_material(
+pub(super) fn supervisor_review_lens_binding_material(
     assignment: &OrchestratorAssignment,
     child_report: &OrchestratorReviewReport,
     candidate: Option<&SupervisorCandidateInspection>,
+    held_out: Option<&held_out::HeldOutCandidateEvidence>,
 ) -> Result<crate::review::ReviewLensBindingMaterial> {
     if !report_failed(child_report) && candidate.is_none() {
         bail!("accepted child report has no authenticated supervisor candidate binding");
@@ -239,6 +240,14 @@ fn supervisor_review_lens_binding_material(
             })
         })
         .collect::<Vec<_>>();
+    let mut validation_bindings = json!({
+        "orchestrator_validation_results": child_report.validation_results,
+        "worker_validation_results": worker_validations,
+        "child_auditor_validation_results": auditor_validations,
+    });
+    if let Some(held_out) = held_out {
+        validation_bindings["parent_held_out_validation"] = serde_json::to_value(held_out)?;
+    }
     Ok(crate::review::ReviewLensBindingMaterial {
         candidate_binding: json!({
             "supervisor_inspected": candidate.map(|inspection| &inspection.binding),
@@ -248,11 +257,7 @@ fn supervisor_review_lens_binding_material(
             "child_reported_paths": child_report.files_changed,
             "supervisor_observed_paths": candidate.map(|inspection| &inspection.changed_paths),
         }),
-        validation_bindings: json!({
-            "orchestrator_validation_results": child_report.validation_results,
-            "worker_validation_results": worker_validations,
-            "child_auditor_validation_results": auditor_validations,
-        }),
+        validation_bindings,
     })
 }
 
@@ -787,17 +792,17 @@ enum AssignmentExecutionDisposition<T> {
     Complete,
 }
 
-struct AssignmentExecutionPreflight<'a> {
+pub(super) struct AssignmentExecutionPreflight<'a> {
     journal_parent_id: &'a str,
     environment_requirements: Vec<EnvironmentRequirement>,
     semantic_token: Option<u64>,
     child_base_head: Oid,
     mandatory_worktree_controls: MandatoryWorktreeControls,
     worktree: WorktreeRecord,
-    worktree_write_lease: Option<ManagedWorktreeWriteLease>,
+    pub(super) worktree_write_lease: Option<ManagedWorktreeWriteLease>,
     primary_scope_baseline: Option<PrimaryScopeSnapshot>,
     claim: PathClaim,
-    assignment: OrchestratorAssignment,
+    pub(super) assignment: OrchestratorAssignment,
     _semantic_block_turn: Option<SemanticBlockTurn<'a>>,
 }
 
@@ -1982,7 +1987,7 @@ fn dispatch_and_collect_child_attempt<'a>(
     let worktree = &preflight.worktree;
     let attempt_artifacts = prepared.attempt_artifacts;
     let corrective_retry_used = prepared.corrective_retry_used;
-    let command = prepared.command;
+    let mut command = prepared.command;
     let model_provenance = prepared.model_provenance;
     let primary_before = prepared.primary_before;
     let primary_scope_before = prepared.primary_scope_before;
@@ -2048,6 +2053,19 @@ fn dispatch_and_collect_child_attempt<'a>(
         lifecycle_event_payload("running", Some(attempt), None),
     )?;
 
+    if let Some(authority) = &assignment_metadata.parent_validation {
+        match authority.admit(&assignment.id, cancellation) {
+            Ok(remaining) => command.timeout = command.timeout.min(remaining),
+            Err(error) => {
+                drop(incoming_output_root);
+                drop(capture_output_root);
+                with_supervisor_artifacts(artifacts, |writer, _| {
+                    discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
+                })?;
+                return Err(error);
+            }
+        }
+    }
     let external_run_result = match launch_runtime {
         SupervisorRuntime::Codex => {
             let review_context = if requires_hosted_pre_action_review(&command) {
@@ -3465,7 +3483,7 @@ fn dispatch_and_collect_parent_auditor(
         expected_request,
         auditor_id,
         auditor_artifacts,
-        auditor_command,
+        mut auditor_command,
         primary_before_auditor,
         auditor_incoming_scratch,
         auditor_capture_scratch,
@@ -3500,6 +3518,23 @@ fn dispatch_and_collect_parent_auditor(
         lifecycle_event_payload("running", Some(auditor_attempt), None),
     )?;
 
+    if let Some(authority) = &context.assignment_metadata.parent_validation {
+        match authority.admit(&auditor_id, cancellation) {
+            Ok(remaining) => auditor_command.timeout = auditor_command.timeout.min(remaining),
+            Err(error) => {
+                drop(auditor_incoming_root);
+                drop(auditor_capture_root);
+                with_supervisor_artifacts(artifacts, |writer, _| {
+                    discard_invocation_scratches(
+                        writer,
+                        &auditor_incoming_scratch,
+                        &auditor_capture_scratch,
+                    )
+                })?;
+                return Err(error);
+            }
+        }
+    }
     let auditor_run_result = match launch_runtime {
         SupervisorRuntime::Codex => {
             // All fallible pre-dispatch preparation is complete. Mark
@@ -3785,7 +3820,7 @@ enum ParentAuditorGateDisposition {
     },
 }
 
-fn inspect_assignment_candidate(
+pub(super) fn inspect_assignment_candidate(
     context: &AssignmentExecutionContext<'_, '_>,
     preflight: &AssignmentExecutionPreflight<'_>,
 ) -> Result<SupervisorCandidateInspection> {
@@ -4426,6 +4461,47 @@ fn execute_supervisor_assignment_inner(
         } else {
             None
         };
+        let parent_held_out =
+            if let Some(authority) = &context.assignment_metadata.parent_validation {
+                let evidence = authority.validate_candidate(
+                    context,
+                    &preflight,
+                    pre_auditor_candidate.as_ref(),
+                )?;
+                with_supervisor_artifacts(artifacts, |writer, _| {
+                    writer.write_json(
+                        Path::new("reports").join(format!("{}-held-out.json", assignment.id)),
+                        &evidence,
+                        ArtifactFileDisposition::PrivateEvidence,
+                    )?;
+                    Ok(())
+                })?;
+                for command in &evidence.commands {
+                    child_report.validation_results.push(ValidationResult {
+                        name: format!("parent held-out: {}", command.id),
+                        status: if command.observation.status
+                            == crate::merge::held_out::CommandObservationStatus::Passed
+                        {
+                            ReviewStatus::Succeeded
+                        } else {
+                            ReviewStatus::Failed
+                        },
+                        command: command.argv.clone(),
+                        message: Some(format!(
+                            "parent-bound observation {}: {:?}",
+                            command.command_sha256, command.observation.status
+                        )),
+                    });
+                }
+                if !evidence.passed() {
+                    child_report.status = ReviewStatus::Failed;
+                    child_report.accepted = false;
+                    child_report.rejected = true;
+                }
+                Some(evidence)
+            } else {
+                None
+            };
         if let Some(source) = context.evidence_only_reaudit {
             let binding_matches = pre_auditor_candidate.as_ref().is_some_and(|inspection| {
                 inspection.binding == source.operation.preserved_candidate_binding
@@ -4516,6 +4592,7 @@ fn execute_supervisor_assignment_inner(
                 assignment,
                 &child_report,
                 pre_auditor_candidate.as_ref(),
+                parent_held_out.as_ref(),
             )?;
             let sources = crate::review::BoundedReviewLensRequestSources {
                 child_transcript: &child_transcript,

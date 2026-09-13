@@ -3975,5 +3975,7 @@ fn snapshot_worktree_candidate_from_base_with_index_and_local_git_options(
 include!("merge/part2.rs");
 include!("merge/part3.rs");
 
+pub(crate) mod held_out;
+
 #[cfg(test)]
 mod tests;

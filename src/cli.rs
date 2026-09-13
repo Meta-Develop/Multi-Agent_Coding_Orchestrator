@@ -4211,7 +4211,7 @@ struct RescoreEvaluationArgs {
 struct RunExperimentArgs {
     /// Versioned experiment manifest binding goal/spec, profiles, and repetitions.
     manifest: PathBuf,
-    /// Reserved source-repository path; unused because each profile uses isolated Fake state.
+    /// Owns retained artifacts with --execute-held-out; never the evaluated source repository.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
     /// Requested mode; this command supports deterministic-fake and refuses real-provider.
@@ -4224,6 +4224,9 @@ struct RunExperimentArgs {
     /// Acknowledge future real-provider execution; the current runner still refuses it.
     #[arg(long)]
     allow_real_provider: bool,
+    /// Explicitly execute declared local argv in contained candidate copies and retain bound observations.
+    #[arg(long)]
+    execute_held_out: bool,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -4245,7 +4248,17 @@ fn run_evaluation_experiment_command(args: RunExperimentArgs) -> Result<()> {
                 args.manifest.display()
             )
         })?;
-    let _repo = args.repo;
+    if args.execute_held_out {
+        let results = crate::evaluation::run_experiment_with_held_out(
+            &manifest,
+            crate::evaluation::ExperimentRunRequest {
+                execution: args.execution,
+                allow_real_provider: args.allow_real_provider,
+            },
+            &args.repo,
+        )?;
+        return print_query_report(&results, args.json);
+    }
     let results = crate::evaluation::run_fake_supervise_experiment(
         &manifest,
         crate::evaluation::ExperimentRunRequest {
