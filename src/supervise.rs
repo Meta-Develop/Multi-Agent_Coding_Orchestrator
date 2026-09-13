@@ -3215,6 +3215,7 @@ pub(crate) fn run_supervisor_plan_file_cascade_with_runner(
         None,
         &cancellation_observed,
         None,
+        None,
         &mut permit,
         &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
             Ok(mut runner) => runner(command),
@@ -3223,13 +3224,19 @@ pub(crate) fn run_supervisor_plan_file_cascade_with_runner(
     )
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct AutopilotSourceDispatchBinding<'a> {
+    pub(crate) started: &'a AtomicBool,
+    pub(crate) expected_head: Option<Oid>,
+}
+
 #[cfg(test)]
 pub(crate) fn run_supervisor_plan_file_cascade_with_runner_and_gate_for_autopilot(
     options: SupervisorRunOptions,
     outer_command_run_id: &RunId,
     caller_cancellation: Option<&ProcessCancellation>,
     cancellation_observed: &AtomicBool,
-    source_dispatch_started: &AtomicBool,
+    source_dispatch: AutopilotSourceDispatchBinding<'_>,
     before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<Option<GateDenial>>,
     external_runner: &mut (dyn FnMut(&ExternalAgentCommand, &ProcessCancellation) -> ExternalAgentRun
               + Send),
@@ -3259,7 +3266,8 @@ pub(crate) fn run_supervisor_plan_file_cascade_with_runner_and_gate_for_autopilo
         outer_command_run_id,
         caller_cancellation,
         cancellation_observed,
-        Some(source_dispatch_started),
+        Some(source_dispatch.started),
+        source_dispatch.expected_head,
         before_dispatch,
         &cancellable_runner,
     )
@@ -3274,6 +3282,7 @@ fn run_supervisor_plan_file_cascade_with_cancellable_runner_and_gate(
     caller_cancellation: Option<&ProcessCancellation>,
     cancellation_observed: &AtomicBool,
     source_dispatch_started: Option<&AtomicBool>,
+    expected_source_head: Option<Oid>,
     before_dispatch: &mut dyn FnMut(&SupervisorPlan) -> Result<Option<GateDenial>>,
     external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorCascadeOutcome> {
@@ -3283,7 +3292,6 @@ fn run_supervisor_plan_file_cascade_with_cancellable_runner_and_gate(
     }
     let repo = discover_repo_root(&options.repo)?;
     let manager = WorktreeManager::new(&repo);
-    let cleanliness = manager.acquire_repository_cleanliness()?;
     let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
     if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
         bail!("autopilot caller cancelled before exact injected loaded-plan dispatch");
@@ -3306,12 +3314,16 @@ fn run_supervisor_plan_file_cascade_with_cancellable_runner_and_gate(
     if let Some(source_dispatch_started) = source_dispatch_started {
         source_dispatch_started.store(true, Ordering::SeqCst);
     }
+    let cleanliness = manager.acquire_repository_cleanliness()?;
     let source_report = run_supervisor_plan_with_runner_and_creation(
         loaded,
         options,
         1,
         SupervisorExecutionRuntime::Verified,
-        SupervisorWorktreeCreation::Bound(&cleanliness),
+        match expected_source_head {
+            Some(head) => SupervisorWorktreeCreation::BoundSourceHead(&cleanliness, head),
+            None => SupervisorWorktreeCreation::Bound(&cleanliness),
+        },
         Ok(runtime_model_catalog),
         external_runner,
     )?;
@@ -3357,6 +3369,7 @@ fn run_supervisor_plan_file_cascade_with_runner_and_gate(
         outer_command_run_id,
         None,
         &cancellation_observed,
+        None,
         None,
         &mut adapt_gate,
         &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
@@ -3994,6 +4007,7 @@ enum ChildAttemptCorrection {
 #[derive(Debug, Clone, Copy)]
 enum SupervisorWorktreeCreation<'a> {
     Bound(&'a RepositoryCleanlinessCapability),
+    BoundSourceHead(&'a RepositoryCleanlinessCapability, Oid),
     ExistingOnly,
     PrimaryWorktree,
     NonpublishableSimulation,
@@ -4003,7 +4017,43 @@ enum SupervisorWorktreeCreation<'a> {
     VerifiedTestOnly,
 }
 
+const INBOX_PR_SOURCE_HEAD_MARKER: &str = "inbox-pr-source-head.json";
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct InboxPrSourceHeadMarker {
+    version: u32,
+    run_id: String,
+    head_oid: String,
+}
+
+impl InboxPrSourceHeadMarker {
+    fn new(run_id: &RunId, head: Oid) -> Self {
+        Self {
+            version: 1,
+            run_id: run_id.as_str().to_string(),
+            head_oid: head.to_string(),
+        }
+    }
+
+    fn validated_head(&self, run_id: &RunId) -> Result<Oid> {
+        let head = Oid::from_str(&self.head_oid)
+            .context("authenticated Inbox PR source head marker has an invalid OID")?;
+        if self.version != 1 || self.run_id != run_id.as_str() || self.head_oid != head.to_string()
+        {
+            bail!("authenticated Inbox PR source head marker has an invalid run binding");
+        }
+        Ok(head)
+    }
+}
+
 impl SupervisorWorktreeCreation<'_> {
+    fn expected_source_head(self) -> Option<Oid> {
+        match self {
+            Self::BoundSourceHead(_, head) => Some(head),
+            _ => None,
+        }
+    }
     fn is_nonpublishable_simulation(self) -> bool {
         if matches!(self, Self::NonpublishableSimulation) {
             return true;

@@ -3302,7 +3302,9 @@ fn preclaim_assessment_runtime(
     #[cfg(test)]
     if matches!(
         worktree_creation,
-        SupervisorWorktreeCreation::Bound(_) | SupervisorWorktreeCreation::PrimaryWorktree
+        SupervisorWorktreeCreation::Bound(_)
+            | SupervisorWorktreeCreation::BoundSourceHead(_, _)
+            | SupervisorWorktreeCreation::PrimaryWorktree
     ) {
         return SupervisorExecutionRuntime::NonpublishableSimulation;
     }
@@ -3425,6 +3427,7 @@ fn prepare_supervisor_run(
     validate_max_concurrent_children(max_concurrent_children)?;
     match worktree_creation {
         SupervisorWorktreeCreation::Bound(_)
+        | SupervisorWorktreeCreation::BoundSourceHead(_, _)
             if execution_runtime != SupervisorExecutionRuntime::Verified =>
         {
             bail!("verified worktree creation capability requires the verified supervisor runtime")
@@ -3521,6 +3524,13 @@ fn prepare_supervisor_run(
         &preflight_spec,
         &collision,
     )?;
+    if let Some(head) = worktree_creation.expected_source_head() {
+        artifact_writer.write_json(
+            INBOX_PR_SOURCE_HEAD_MARKER,
+            &InboxPrSourceHeadMarker::new(&options.run_id, head),
+            ArtifactFileDisposition::PrivateEvidence,
+        )?;
+    }
     crate::run_ops::append_run_heartbeat_best_effort(
         &mut artifact_writer,
         "initialized",
@@ -3654,7 +3664,8 @@ fn prepare_supervisor_run(
             &requested_plan,
             artifact_writer.resume_binding()?,
             budget_ledger.report()?,
-        ),
+        )
+        .with_inbox_pr_source_head(worktree_creation.expected_source_head()),
     )?;
     let run_dir = artifact_writer.run_dir().to_path_buf();
     let dirs = RunDirs::for_writer(&artifact_writer);

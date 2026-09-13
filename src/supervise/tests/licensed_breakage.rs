@@ -4,6 +4,133 @@ const LICENSED_INTERFACE: &str = "crate::api::new_name";
 const LICENSED_SIGNATURE: &str =
     "error[E0425]: cannot find function crate::api::new_name in dependent client";
 
+#[cfg(target_os = "linux")]
+#[test]
+fn inbox_pr_source_marker_refuses_generic_resume_before_follow_up_queue_or_dispatch() {
+    skip_without_containment!();
+    let (temp, repo) = injected_repository();
+    let assignment = licensed_assignment();
+    let plan = injected_plan(assignment.clone(), 0);
+    let run_id = RunId::new("inbox-pr-source-generic-resume").expect("bound source run id");
+    let plan_file = temp.path().join("inbox-pr-source-plan.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_vec_pretty(&plan).expect("serialize licensed source plan"),
+    )
+    .expect("write licensed source plan");
+    let options = SupervisorRunOptions {
+        repo: repo.clone(),
+        plan_file: plan_file.clone(),
+        run_id: run_id.clone(),
+        parent_node: None,
+        codex_bin: PathBuf::from("unused-injected-codex"),
+        runtime: SupervisorRuntime::Codex,
+        allow_dirty_primary: false,
+        allow_live_run_collision: false,
+        admission_overrides: SupervisorAdmissionConfig::default(),
+        budget_overrides: RunBudgetLimits::default(),
+        budget_max_duration_seconds: None,
+        machine_global_retention: Some(injected_machine_global_retention(temp.path())),
+    };
+    let declaration_sha256 = licensed_breakage_declaration_sha256(
+        assignment
+            .licensed_breakage
+            .as_ref()
+            .expect("licensed declaration"),
+    )
+    .expect("hash licensed declaration");
+    let source_head = current_head_oid(&repo).expect("authenticated source execution head");
+    let manager = WorktreeManager::new(&repo);
+    let cleanliness = manager
+        .acquire_repository_cleanliness()
+        .expect("source cleanliness capability");
+    let source_invocations = std::sync::atomic::AtomicUsize::new(0);
+    let runner = |command: &ExternalAgentCommand,
+                  _cancellation: &ProcessCancellation,
+                  _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
+        if command
+            .output_last_message
+            .to_string_lossy()
+            .contains("review-auditor")
+        {
+            write_injected_json(
+                &command.output_last_message,
+                &licensed_auditor_report(&assignment, Some(&declaration_sha256)),
+            );
+        } else {
+            source_invocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                current_head_oid(&command.cwd).expect("actual source child base"),
+                source_head
+            );
+            fs::write(command.cwd.join("README.md"), "licensed breaking change\n")
+                .expect("write licensed source candidate");
+            write_injected_json(
+                &command.output_last_message,
+                &dependent_failure_child(&assignment, "src/client.rs"),
+            );
+        }
+        write_injected_usage(command, 0, 1);
+        injected_verified_run(command)
+    };
+    let loaded = load_supervisor_plan_file_with_consultant(&plan_file)
+        .expect("load parent-owned source plan");
+    let catalog = test_runtime_model_catalog(&loaded.plan, SupervisorRuntime::Codex)
+        .expect("fixture runtime catalog");
+    let report = run_supervisor_plan_with_runner_and_creation(
+        loaded,
+        options.clone(),
+        1,
+        SupervisorExecutionRuntime::Verified,
+        SupervisorWorktreeCreation::BoundSourceHead(&cleanliness, source_head),
+        Ok(catalog),
+        &runner,
+    )
+    .expect("finalize authenticated source before queue creation");
+    drop(cleanliness);
+    assert!(
+        report.success && report.accepted && report.publishable,
+        "{report:#?}"
+    );
+    assert_eq!(report.generated_follow_up_tasks.len(), 1);
+    assert_eq!(
+        source_invocations.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)
+        .expect("authenticate source artifact envelope");
+    let marker: InboxPrSourceHeadMarker = serde_json::from_slice(
+        &reader
+            .read(INBOX_PR_SOURCE_HEAD_MARKER)
+            .expect("read authenticated parent source marker"),
+    )
+    .expect("decode parent source marker");
+    assert_eq!(
+        marker
+            .validated_head(&run_id)
+            .expect("exact marker binding"),
+        source_head
+    );
+    let queue_root = repo
+        .join(".git/maco/state")
+        .join(crate::follow_up_queue::GENERATED_FOLLOW_UP_QUEUE_ROOT_NAME);
+    assert!(
+        !queue_root.exists(),
+        "source-only run must not create a queue"
+    );
+    let error = resume_supervisor_plan_file_cascade_with_concurrency_policy(
+        options,
+        SupervisorConcurrencyPolicy::Fixed(NonZeroUsize::MIN),
+    )
+    .expect_err("generic resume must refuse parent-bound Inbox PR source");
+    assert!(format!("{error:#}").contains("source_head_not_execution_base"));
+    assert!(!queue_root.exists(), "refusal must precede queue creation");
+    assert_eq!(
+        source_invocations.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
 struct LicensedScenario {
     _temp: tempfile::TempDir,
     repo: PathBuf,

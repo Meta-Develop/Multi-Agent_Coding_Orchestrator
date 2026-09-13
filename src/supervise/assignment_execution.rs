@@ -805,6 +805,48 @@ enum AssignmentExecutionDisposition<T> {
     Complete,
 }
 
+fn refuse_source_head_execution_base(
+    outcome: &mut AssignmentExecutionOutcome,
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    assignment: &OrchestratorAssignment,
+    journal_parent_id: &str,
+    expected: Oid,
+    observed: Oid,
+) -> Result<()> {
+    let ordinal = outcome
+        .gate_tracker
+        .as_ref()
+        .context("gate correction tracker was not initialized")?
+        .denials
+        .len()
+        .saturating_add(1);
+    let denial = GateDenial::new(
+        gate_correlation_id(&assignment.id, ordinal),
+        GateDenialReason::MergeRemediation {
+            blocker: GateApplyBlocker::StaleBase,
+        },
+        VerifiedGateContext::new(
+            "source_head_not_execution_base",
+            GateCheckSource::ValidationBinding,
+            &assignment.assigned_paths,
+        )?,
+    )?;
+    outcome
+        .gate_tracker
+        .as_mut()
+        .context("gate correction tracker was not initialized")?
+        .escalate(denial, artifacts, &assignment.id, journal_parent_id)?;
+    outcome.assignment_failed = true;
+    outcome.findings.push(Finding {
+        severity: FindingSeverity::Error,
+        message: format!(
+            "source_head_not_execution_base: authenticated PR head {expected} differs from managed child execution base {observed}; no model dispatch occurred for this refused attempt"
+        ),
+        paths: assignment.assigned_paths.clone(),
+    });
+    Ok(())
+}
+
 pub(super) struct AssignmentExecutionPreflight<'a> {
     journal_parent_id: &'a str,
     environment_requirements: Vec<EnvironmentRequirement>,
@@ -1050,7 +1092,8 @@ fn prepare_assignment_execution<'a>(
             worktree_root: None,
         };
         let create_result = match worktree_creation {
-            SupervisorWorktreeCreation::Bound(cleanliness) => manager
+            SupervisorWorktreeCreation::Bound(cleanliness)
+            | SupervisorWorktreeCreation::BoundSourceHead(cleanliness, _) => manager
                 .create_with_repository_cleanliness(create_options, cleanliness)
                 .with_context(|| {
                     format!(
@@ -1218,6 +1261,19 @@ fn prepare_assignment_execution<'a>(
             return Ok(AssignmentExecutionDisposition::Complete);
         }
     };
+    if let Some(expected) = worktree_creation.expected_source_head() {
+        if child_base_head != expected {
+            refuse_source_head_execution_base(
+                outcome,
+                artifacts,
+                &effective_assignment,
+                journal_parent_id,
+                expected,
+                child_base_head,
+            )?;
+            return Ok(AssignmentExecutionDisposition::Complete);
+        }
+    }
     let semantic_token = if plan.semantic_coordination == SemanticCoordinationMode::Warn {
         if let Some(planned_intents) = serial_semantic_warn_intents {
             let coordination_result = {
@@ -1413,6 +1469,20 @@ fn prepare_child_attempt<'a>(
         ..
     } = context;
     let assignment = &preflight.assignment;
+    if let Some(expected) = context.worktree_creation.expected_source_head() {
+        let observed = current_head_oid(&preflight.worktree.path)?;
+        if observed != expected {
+            refuse_source_head_execution_base(
+                outcome,
+                artifacts,
+                assignment,
+                journal_parent_id,
+                expected,
+                observed,
+            )?;
+            return Ok(AssignmentExecutionDisposition::Complete);
+        }
+    }
     let launch_runtime = assignment_launch_runtime(assignment, options, budget_policy);
     let launch_catalog =
         runtime_model_catalog_for_launch(runtime_model_catalog, options.runtime, launch_runtime)?;
@@ -2012,6 +2082,28 @@ fn dispatch_and_collect_child_attempt<'a>(
     let mut budget_reservation = prepared.budget_reservation;
     let pre_action_review_context = prepared.pre_action_review_context;
     let assignment_journal_role = direct_assignment_orchestration_role(assignment.role)?;
+    if let Some(expected) = context.worktree_creation.expected_source_head() {
+        let observed = current_head_oid(&worktree.path)?;
+        if observed != expected {
+            budget_reservation.settle_not_started()?;
+            drop(incoming_output_root);
+            drop(capture_output_root);
+            with_supervisor_artifacts(artifacts, |writer, _| {
+                discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
+            })?;
+            refuse_source_head_execution_base(
+                outcome,
+                artifacts,
+                assignment,
+                journal_parent_id,
+                expected,
+                observed,
+            )?;
+            bail!(
+                "source_head_not_execution_base: authenticated PR head differs from the leased child HEAD immediately before invocation"
+            );
+        }
+    }
 
     record_shared_orchestration_event(
         artifacts,
@@ -4846,6 +4938,253 @@ mod decomposition_tests {
             Signature::now("maco test", "maco-test@example.invalid").expect("fixture signature");
         repo.commit(Some("HEAD"), &signature, &signature, "baseline", &tree, &[])
             .expect("commit fixture baseline");
+    }
+
+    #[test]
+    fn leased_child_head_change_after_preparation_refuses_before_model_invocation() {
+        let temp = tempfile::tempdir().expect("temporary source-base fixture");
+        let repo = temp.path().join("repo");
+        Repository::init(&repo).expect("initialize source-base fixture repository");
+        fs::write(repo.join("README.md"), "source PR head\n").expect("write fixture file");
+        commit_fixture_repository(&repo);
+        let expected = current_head_oid(&repo).expect("authenticated source head");
+        let manager = WorktreeManager::new(&repo);
+        let cleanliness = manager
+            .acquire_repository_cleanliness()
+            .expect("source cleanliness capability");
+        let assignment = OrchestratorAssignment {
+            id: "leased-source-child".to_string(),
+            phase: AssignmentPhase::Execution,
+            runtime: None,
+            role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        };
+        let plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "source-base late lease check".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: 10,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+            assignments: vec![assignment.clone()],
+        };
+        let budget_config = SupervisorBudgetConfig::default();
+        let consultant = SupervisorConsultantPlan::default();
+        let assignment_metadata = AssignmentMetadata::new();
+        let options = SupervisorRunOptions {
+            repo: repo.clone(),
+            plan_file: temp.path().join("plan.json"),
+            run_id: RunId::new("late-source-base-refusal").expect("fixture run id"),
+            parent_node: None,
+            codex_bin: PathBuf::from("unused-codex"),
+            runtime: SupervisorRuntime::Fake,
+            allow_dirty_primary: false,
+            allow_live_run_collision: false,
+            admission_overrides: SupervisorAdmissionConfig::default(),
+            budget_overrides: RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
+            machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
+                config: temp.path().join("unused-machine-global.json"),
+                root_id: "runtime".to_string(),
+                owner: "maco-supervise".to_string(),
+                correction_correlation_id: "late-source-base-refusal".to_string(),
+            }),
+        };
+        let mut artifact_writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            options.run_id.clone(),
+            "late-source-base-test",
+        )
+        .expect("reserve source-base artifacts");
+        let run_dir = artifact_writer.run_dir().to_path_buf();
+        let dirs = RunDirs::for_writer(&artifact_writer);
+        let sync_store = SyncStore::open(&repo).expect("open fixture sync store");
+        let semantic_store = SemanticIntentStore::open(&repo).expect("open fixture semantic store");
+        let assignment_schedule = vec![AssignmentScheduleEntry {
+            assignment_id: assignment.id.clone(),
+            parent_assignment_id: None,
+            depth: 1,
+            flattened_index: 0,
+        }];
+        let field_guide = SupervisorFieldGuidePrompt::empty().expect("fixture field guide");
+        let budget_ledger =
+            RunBudgetLedger::new(RunBudgetLimits::default()).expect("fixture budget ledger");
+        let runtime_model_catalog = RuntimeModelCatalog::LocalDeterministicFake;
+        let cancellation = ProcessCancellation::new();
+        let mut journal = initialize_orchestration_event_journal(
+            &repo,
+            &options.run_id,
+            options.parent_node.as_deref(),
+        );
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut artifact_writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let runner_calls = std::sync::atomic::AtomicUsize::new(0);
+        let runner = |_command: &ExternalAgentCommand,
+                      _cancellation: &ProcessCancellation,
+                      _review: Option<ExternalPreActionReviewRuntime<'_>>| {
+            runner_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("source-base refusal must occur before the external runner")
+        };
+        let context = AssignmentExecutionContext {
+            index: 0,
+            concurrent_mode: false,
+            plan: &plan,
+            requested_plan: &plan,
+            execution_target: None,
+            budget_config: &budget_config,
+            consultant: &consultant,
+            assignment_metadata: &assignment_metadata,
+            assignment: &assignment,
+            evidence_only_reaudit: None,
+            options: &options,
+            repo: &repo,
+            run_dir: &run_dir,
+            dirs: &dirs,
+            execution_runtime: SupervisorExecutionRuntime::NonpublishableSimulation,
+            worktree_creation: SupervisorWorktreeCreation::BoundSourceHead(&cleanliness, expected),
+            manager: &manager,
+            reused: false,
+            sync_store: &sync_store,
+            semantic_store: &semantic_store,
+            prepared_semantic_token: None,
+            prepared_semantic_findings: &[],
+            prepared_semantic_signals: &[],
+            prepared_semantic_failed: false,
+            assignment_schedule: &assignment_schedule,
+            field_guide: &field_guide,
+            serial_semantic_warn_intents: None,
+            semantic_block_order: None,
+            semantic_block_gate: None,
+            artifacts: &artifacts,
+            budget_ledger: &budget_ledger,
+            budget_policy: AssignmentBudgetPolicy::default(),
+            admission_commit: None,
+            runtime_model_catalog: &runtime_model_catalog,
+            cancellation,
+            external_runner: &runner,
+        };
+        let mut outcome = AssignmentExecutionOutcome {
+            gate_tracker: Some(GateCorrectionTracker::new(plan.max_gate_corrections)),
+            ..AssignmentExecutionOutcome::default()
+        };
+        let preflight = match prepare_assignment_execution(&context, &mut outcome)
+            .expect("prepare managed source-bound child")
+        {
+            AssignmentExecutionDisposition::Continue(preflight) => preflight,
+            AssignmentExecutionDisposition::Complete => panic!("preflight refused equal head"),
+        };
+        assert_eq!(
+            current_head_oid(&preflight.worktree.path).unwrap(),
+            expected
+        );
+        let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
+        let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
+        let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
+        fs::create_dir_all(&dirs.schemas).expect("create schema directory");
+        fs::write(&auditor_schema_path, "{\"type\":\"object\"}\n")
+            .expect("materialize auditor schema");
+        let prepared = match prepare_child_attempt(
+            &context,
+            &mut outcome,
+            &context.budget_policy,
+            &preflight,
+            options.run_id.as_str(),
+            1,
+            1,
+            &None,
+            &schema_path,
+            &worker_schema_path,
+            &auditor_schema_path,
+        )
+        .expect("prepare child and reserve budget")
+        {
+            AssignmentExecutionDisposition::Continue(prepared) => prepared,
+            AssignmentExecutionDisposition::Complete => panic!("equal head refused preparation"),
+        };
+        assert_eq!(budget_ledger.report().unwrap().active_reservations, 1);
+        let child_repo = crate::git_repository::open(&preflight.worktree.path)
+            .expect("open leased child repository");
+        fs::write(
+            preflight.worktree.path.join("README.md"),
+            "changed after preparation\n",
+        )
+        .expect("change leased child after preparation");
+        let mut index = child_repo.index().expect("child index");
+        index
+            .add_path(Path::new("README.md"))
+            .expect("stage child change");
+        index.write().expect("write child index");
+        let tree_id = index.write_tree().expect("write child tree");
+        let tree = child_repo.find_tree(tree_id).expect("read child tree");
+        let parent = child_repo
+            .find_commit(expected)
+            .expect("source head commit");
+        let signature =
+            Signature::now("maco test", "maco-test@example.invalid").expect("fixture signature");
+        child_repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "late child change",
+                &tree,
+                &[&parent],
+            )
+            .expect("move leased child head");
+        assert_ne!(
+            current_head_oid(&preflight.worktree.path).unwrap(),
+            expected
+        );
+        let error = match dispatch_and_collect_child_attempt(
+            &context,
+            &mut outcome,
+            &preflight,
+            options.run_id.as_str(),
+            1,
+            prepared,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("late leased child HEAD mismatch must refuse invocation"),
+        };
+        assert!(format!("{error:#}").contains("source_head_not_execution_base"));
+        assert_eq!(runner_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(outcome.command_records.is_empty());
+        assert!(outcome.assignment_failed);
+        assert!(outcome
+            .gate_tracker
+            .as_ref()
+            .unwrap()
+            .denials
+            .iter()
+            .any(|denial| { denial.context.owner == "source_head_not_execution_base" }));
+        let budget = budget_ledger
+            .report()
+            .expect("settled unstarted reservation");
+        assert_eq!(budget.active_reservations, 0);
+        assert_eq!(budget.consumed.tokens, 0);
+        assert_eq!(budget.reserved.tokens, 0);
     }
 
     fn unused_external_runner(
