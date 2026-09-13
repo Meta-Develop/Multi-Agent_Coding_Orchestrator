@@ -3859,8 +3859,9 @@ bytes and canonical binding in private finalized Inbox artifacts, alongside
 an initial current-head review state for every successfully observed PR.
 Omitting the flag preserves the existing `policy_unavailable` GitHub report
 and Fake behavior. Review readiness never authorizes fix dispatch, comments,
-or merge. Existing review-thread currency remains unsupported and blocks
-readiness when threads are present.
+or merge. Authenticated GitHub review threads carry `isOutdated` separately
+from `isResolved`. A current thread follows the existing comment triage;
+an outdated thread or legacy thread without currency evidence blocks readiness.
 
 `maco-inbox.json` is optional. Without it, `maco inbox scan` uses deterministic
 fake local data: one safe issue candidate, one PR candidate with requested review

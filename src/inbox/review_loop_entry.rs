@@ -1448,6 +1448,7 @@ fn blocker_kind(blocker: &ReadinessBlocker) -> &'static str {
         ReadinessBlocker::UnsupportedThreadCurrencyMetadata => {
             "unsupported_thread_currency_metadata"
         }
+        ReadinessBlocker::OutdatedReviewThread(_) => "outdated_review_thread",
         ReadinessBlocker::AmbiguousHumanReviewCurrency(_) => "ambiguous_human_review_currency",
         ReadinessBlocker::UntrustedActor(_) => "untrusted_actor",
         ReadinessBlocker::BlockingHumanFeedback(_) => "blocking_human_feedback",

@@ -1362,8 +1362,8 @@ fn current_timestamp_millis() -> Result<TimestampMillis> {
 
 const AUTHENTICATED_GITHUB_PAGE_SIZE: usize = 100;
 const AUTHENTICATED_GITHUB_MAX_PAGES: usize = 64;
-const GITHUB_REVIEW_THREADS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){id nameWithOwner url pullRequest(number:$number){id number headRefOid baseRefOid reviewThreads(first:100,after:$after){nodes{id isResolved comments(first:100){nodes{id fullDatabaseId url body createdAt author{login __typename ... on Node{id}}} pageInfo{hasNextPage endCursor}}} pageInfo{hasNextPage endCursor}}}}}";
-const GITHUB_REVIEW_THREAD_COMMENTS_QUERY: &str = "query($threadId:ID!,$after:String){node(id:$threadId){... on PullRequestReviewThread{id isResolved pullRequest{id number headRefOid baseRefOid repository{id nameWithOwner url}} comments(first:100,after:$after){nodes{id fullDatabaseId url body createdAt author{login __typename ... on Node{id}}} pageInfo{hasNextPage endCursor}}}}}";
+const GITHUB_REVIEW_THREADS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){id nameWithOwner url pullRequest(number:$number){id number headRefOid baseRefOid reviewThreads(first:100,after:$after){nodes{id isResolved isOutdated comments(first:100){nodes{id fullDatabaseId url body createdAt author{login __typename ... on Node{id}}} pageInfo{hasNextPage endCursor}}} pageInfo{hasNextPage endCursor}}}}}";
+const GITHUB_REVIEW_THREAD_COMMENTS_QUERY: &str = "query($threadId:ID!,$after:String){node(id:$threadId){... on PullRequestReviewThread{id isResolved isOutdated pullRequest{id number headRefOid baseRefOid repository{id nameWithOwner url}} comments(first:100,after:$after){nodes{id fullDatabaseId url body createdAt author{login __typename ... on Node{id}}} pageInfo{hasNextPage endCursor}}}}}";
 
 /// Exact provider observation used by the inbox to mint the private merge
 /// evidence capability. Every field comes from authenticated GitHub API

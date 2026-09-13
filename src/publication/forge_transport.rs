@@ -809,6 +809,8 @@ impl<'de> Deserialize<'de> for ForgeReview {
 pub struct ForgeReviewThread {
     provider_thread_id: ProviderObjectId,
     is_resolved: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    is_outdated: Option<bool>,
     comments: Vec<ForgeComment>,
 }
 
@@ -817,6 +819,8 @@ pub struct ForgeReviewThread {
 struct ForgeReviewThreadWire {
     provider_thread_id: ProviderObjectId,
     is_resolved: bool,
+    #[serde(default)]
+    is_outdated: Option<bool>,
     comments: Vec<ForgeComment>,
 }
 
@@ -826,9 +830,19 @@ impl ForgeReviewThread {
         is_resolved: bool,
         comments: Vec<ForgeComment>,
     ) -> Result<Self> {
+        Self::new_with_currency(provider_thread_id, is_resolved, None, comments)
+    }
+
+    pub fn new_with_currency(
+        provider_thread_id: ProviderObjectId,
+        is_resolved: bool,
+        is_outdated: Option<bool>,
+        comments: Vec<ForgeComment>,
+    ) -> Result<Self> {
         let value = Self {
             provider_thread_id,
             is_resolved,
+            is_outdated,
             comments,
         };
         value.validate()?;
@@ -841,6 +855,10 @@ impl ForgeReviewThread {
 
     pub fn is_resolved(&self) -> bool {
         self.is_resolved
+    }
+
+    pub fn is_outdated(&self) -> Option<bool> {
+        self.is_outdated
     }
 
     pub fn comments(&self) -> &[ForgeComment] {
@@ -877,8 +895,13 @@ impl<'de> Deserialize<'de> for ForgeReviewThread {
         D: Deserializer<'de>,
     {
         let wire = ForgeReviewThreadWire::deserialize(deserializer)?;
-        Self::new(wire.provider_thread_id, wire.is_resolved, wire.comments)
-            .map_err(serde::de::Error::custom)
+        Self::new_with_currency(
+            wire.provider_thread_id,
+            wire.is_resolved,
+            wire.is_outdated,
+            wire.comments,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 

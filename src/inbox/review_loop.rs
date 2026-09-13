@@ -518,8 +518,20 @@ impl FrozenReviewSnapshot {
         let mut approval_review_ids = BTreeSet::new();
         let mut trusted_human_reviews = BTreeMap::<TrustedActorIdentity, Vec<&ForgeReview>>::new();
 
-        if !self.snapshot.threads().is_empty() {
+        if self
+            .snapshot
+            .threads()
+            .iter()
+            .any(|thread| thread.is_outdated().is_none())
+        {
             blockers.push(ReadinessBlocker::UnsupportedThreadCurrencyMetadata);
+        }
+        for thread in self.snapshot.threads() {
+            if thread.is_outdated() == Some(true) {
+                blockers.push(ReadinessBlocker::OutdatedReviewThread(
+                    thread.provider_thread_id().clone(),
+                ));
+            }
         }
 
         for review in self.snapshot.reviews() {
@@ -666,9 +678,10 @@ fn canonicalize_snapshot(snapshot: PullRequestReviewSnapshot) -> Result<PullRequ
     for thread in snapshot.threads() {
         let mut comments = thread.comments().to_vec();
         comments.sort_by(|left, right| left.provider_comment_id().cmp(right.provider_comment_id()));
-        threads.push(ForgeReviewThread::new(
+        threads.push(ForgeReviewThread::new_with_currency(
             thread.provider_thread_id().clone(),
             thread.is_resolved(),
+            thread.is_outdated(),
             comments,
         )?);
     }
@@ -1026,6 +1039,7 @@ impl ApprovalShortfall {
 pub enum ReadinessBlocker {
     AttemptLimitExhausted { max_attempts: usize },
     UnsupportedThreadCurrencyMetadata,
+    OutdatedReviewThread(ProviderObjectId),
     AmbiguousHumanReviewCurrency(AmbiguousHumanReviewCurrency),
     UntrustedActor(UntrustedActorBlocker),
     BlockingHumanFeedback(ReviewFeedbackIdentity),
@@ -2990,16 +3004,150 @@ mod tests {
                 human.clone(),
                 ForgeReviewState::Approved,
             )],
-            vec![thread],
+            vec![
+                thread,
+                ForgeReviewThread::new(
+                    object(ProviderObjectKind::ReviewThread, "thread:2"),
+                    false,
+                    Vec::new(),
+                )
+                .expect("second legacy thread"),
+            ],
             vec![check("check:1", check_actor.clone())],
         )
         .expect("valid snapshot");
 
-        let triage = policy(&human, &bot, &check_actor).triage(&observe(snapshot));
-        assert!(triage
+        let legacy = observe(snapshot);
+        let triage = policy(&human, &bot, &check_actor).triage(&legacy);
+        assert_eq!(
+            triage
+                .blockers()
+                .iter()
+                .filter(|blocker| matches!(
+                    blocker,
+                    ReadinessBlocker::UnsupportedThreadCurrencyMetadata
+                ))
+                .count(),
+            1
+        );
+
+        let encoded = serde_json::to_vec(&legacy).expect("legacy snapshot JSON");
+        let json: serde_json::Value = serde_json::from_slice(&encoded).expect("legacy snapshot");
+        for thread in json["snapshot"]["threads"]
+            .as_array()
+            .expect("legacy threads")
+        {
+            assert!(thread
+                .as_object()
+                .expect("legacy thread")
+                .get("is_outdated")
+                .is_none());
+        }
+        let restored = FrozenReviewSnapshot::restore_json(&encoded, &timestamp())
+            .expect("legacy snapshot remains restorable");
+        assert_eq!(restored.canonical_sha256(), legacy.canonical_sha256());
+        let state = ReviewLoopState::new(policy(&human, &bot, &check_actor), legacy, &timestamp())
+            .expect("legacy multi-thread state");
+        let restored_state = ReviewLoopState::restore_json(
+            &serde_json::to_vec(&state).expect("legacy state JSON"),
+            &timestamp(),
+        )
+        .expect("legacy multi-thread state remains restorable");
+        assert_eq!(restored_state.state_sha256(), state.state_sha256());
+    }
+
+    #[test]
+    fn explicit_thread_currency_controls_readiness_and_survives_durable_restore() {
+        let human = actor("actor:human", "alice", ReportedActorKind::Human);
+        let bot = actor("actor:bot", "review-bot", ReportedActorKind::Bot);
+        let check_actor = actor("actor:checks", "checks-bot", ReportedActorKind::Bot);
+        let policy = policy(&human, &bot, &check_actor);
+        let snapshot_with_thread = |resolved, outdated, comments| {
+            observe(
+                PullRequestReviewSnapshot::new(
+                    item(),
+                    timestamp(),
+                    vec![review(
+                        "review:approved",
+                        human.clone(),
+                        ForgeReviewState::Approved,
+                    )],
+                    vec![ForgeReviewThread::new_with_currency(
+                        object(ProviderObjectKind::ReviewThread, "thread:currency"),
+                        resolved,
+                        Some(outdated),
+                        comments,
+                    )
+                    .expect("explicit thread currency")],
+                    vec![check("check:currency", check_actor.clone())],
+                )
+                .expect("thread snapshot"),
+            )
+        };
+
+        let current_resolved = snapshot_with_thread(
+            true,
+            false,
+            vec![comment("comment:resolved-current", human.clone())],
+        );
+        assert!(current_resolved.triage(&policy).is_ready());
+        let state = ReviewLoopState::new(policy.clone(), current_resolved.clone(), &timestamp())
+            .expect("current resolved state");
+        assert!(matches!(
+            state.readiness().expect("current readiness"),
+            ReviewLoopReadinessEvaluation::Ready(_)
+        ));
+        let encoded = serde_json::to_vec(&state).expect("durable current state");
+        let restored = ReviewLoopState::restore_json(&encoded, &timestamp())
+            .expect("restore current state with bound currency");
+        assert_eq!(restored.state_sha256(), state.state_sha256());
+        assert_eq!(
+            restored.current_snapshot().snapshot().threads()[0].is_outdated(),
+            Some(false)
+        );
+
+        let mut tampered: serde_json::Value = serde_json::from_slice(&encoded).expect("state JSON");
+        assert_eq!(
+            tampered["current_snapshot"]["snapshot"]["threads"][0]["is_outdated"],
+            serde_json::json!(false)
+        );
+        tampered["current_snapshot"]["snapshot"]["threads"][0]["is_outdated"] =
+            serde_json::json!(true);
+        assert!(ReviewLoopState::restore_json(
+            &serde_json::to_vec(&tampered).expect("tampered state JSON"),
+            &timestamp()
+        )
+        .is_err());
+
+        let current_unresolved = snapshot_with_thread(
+            false,
+            false,
+            vec![comment("comment:currency", human.clone())],
+        );
+        let unresolved_triage = current_unresolved.triage(&policy);
+        assert!(unresolved_triage
+            .blockers()
+            .iter()
+            .any(|blocker| matches!(blocker, ReadinessBlocker::BlockingHumanFeedback(_))));
+        assert!(!unresolved_triage
             .blockers()
             .iter()
             .any(|blocker| matches!(blocker, ReadinessBlocker::UnsupportedThreadCurrencyMetadata)));
+
+        let outdated = snapshot_with_thread(true, true, Vec::new());
+        assert!(outdated
+            .triage(&policy)
+            .blockers()
+            .iter()
+            .any(|blocker| matches!(
+                blocker,
+                ReadinessBlocker::OutdatedReviewThread(id)
+                    if id.stable_id() == "thread:currency"
+            )));
+        assert_ne!(
+            current_resolved.canonical_sha256(),
+            outdated.canonical_sha256()
+        );
     }
 
     #[test]
