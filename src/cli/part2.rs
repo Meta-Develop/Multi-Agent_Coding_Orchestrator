@@ -1480,6 +1480,36 @@ impl PrCommand {
                 }
                 Ok(())
             }
+            PrSubcommand::PreviewUpdate(args) => {
+                let json = args.json;
+                let report = publication::pr_original_update::preview_update(args.options())?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", report.next_action);
+                    println!(
+                        "validation binding: {}",
+                        serde_json::to_string(&report.candidate_validation_binding)?
+                    );
+                }
+                Ok(())
+            }
+            PrSubcommand::UpdateExisting(args) => {
+                let agent_id = publication::branch_publication_agent_id(&args.from_branch)?;
+                let evidence = load_validation_evidence(&args.validation_report, &agent_id)?;
+                let json = args.json;
+                let receipt =
+                    publication::pr_original_update::update_existing(args.options(), evidence)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&receipt)?);
+                } else {
+                    println!(
+                        "original PR #{} head verified at {}",
+                        receipt.pull_request_number, receipt.updated_oid
+                    );
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -1490,6 +1520,39 @@ enum PrSubcommand {
     Preview(PrPreviewArgs),
     /// Publish an exact reviewed commit through an explicit forge with retry reconciliation.
     Publish(PrPublishArgs),
+    /// Preview an exact committed B-to-C update of an existing same-repository GitHub PR without a provider request.
+    PreviewUpdate(PrOriginalUpdateArgs),
+    /// Update the original PR head with an explicit operator grant and passed candidate-bound validation.
+    UpdateExisting(PrOriginalUpdateArgs),
+}
+
+#[derive(Debug, Args)]
+struct PrOriginalUpdateArgs {
+    /// Repository containing the committed task branch and original PR head commit.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Local committed task branch whose exact OID appears in the grant.
+    #[arg(long)]
+    from_branch: String,
+    /// Absolute operator-owned grant JSON outside the repository.
+    #[arg(long)]
+    grant_file: PathBuf,
+    /// Passed validation envelope bound to the preview's exact candidate_validation_binding.
+    #[arg(long)]
+    validation_report: Vec<PathBuf>,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+impl PrOriginalUpdateArgs {
+    fn options(self) -> publication::pr_original_update::PrOriginalUpdateOptions {
+        publication::pr_original_update::PrOriginalUpdateOptions {
+            repo: self.repo,
+            from_branch: self.from_branch,
+            grant_file: self.grant_file,
+        }
+    }
 }
 
 #[derive(Debug, Args)]

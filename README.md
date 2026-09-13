@@ -2885,6 +2885,66 @@ committed primary task branch instead of a managed agent worktree. When
 are treated as the reviewed publication scope; pass `--claim` to keep the
 unclaimed-edit gate narrow.
 
+An existing same-repository GitHub PR can instead receive an explicit update
+from a committed task branch. This path does not run from Inbox, create another
+PR, merge, or post a comment. The task branch commit `C` must descend from the
+exact observed PR head `B`; the primary checkout may be at a different commit.
+Candidates changing private `.agents` or `.agent` context, managed-worktree
+stores, or repository runtime paths anywhere in their new commit history are
+refused because this command updates the remote branch without an exclusion step.
+Place a version-1 operator grant in an owned, non-symlink regular file outside
+the repository (Unix only). Its complete JSON shape is:
+
+```json
+{
+  "version": 1,
+  "repository": {
+    "provider_id": "github",
+    "canonical_locator": "github.com/owner/repo",
+    "provider_repository_id": {"provider_id": "github", "kind": "repository", "stable_id": "node:sha256:<sha256 of raw repository node_id>"}
+  },
+  "pull_request_number": 123,
+  "pull_request_id": {"provider_id": "github", "kind": "item", "stable_id": "node:sha256:<sha256 of raw PR node_id>"},
+  "head_ref": "refs/heads/original-pr-branch",
+  "expected_head_oid": "<40-character lowercase B>",
+  "base_ref": "refs/heads/main",
+  "expected_base_oid": "<40-character lowercase observed base>",
+  "candidate_oid": "<40-character lowercase C>",
+  "approved_actor_id": {"provider_id": "github", "kind": "actor", "stable_id": "node:sha256:<sha256 of raw user node_id>"},
+  "approved_actor_login": "approved-login"
+}
+```
+
+The `node:sha256:` values are the lowercase SHA-256 of the **raw GitHub node
+ID bytes**, not the node ID itself or a Git commit ID. Obtain the repository,
+PR, and authenticated user `node_id` fields through independently authorized
+GitHub observation; the grant must not be generated from child plans or Inbox
+feedback. The operator also pins `agentFiles.approvedGitHubLogin` in the
+repository's Git config, and the authenticated account must match both pins.
+Supply current base/head refs and OIDs from that same PR. The grant is exact
+per candidate and per invocation; changing it requires a fresh preview and
+validation.
+
+```text
+maco pr preview-update --repo . --from-branch task/fix --grant-file /private/pr-update.json --json
+maco pr update-existing --repo . --from-branch task/fix --grant-file /private/pr-update.json --validation-report /private/validation.json --json
+```
+
+`preview-update` is local and read-only. Copy its
+`candidate_validation_binding` into the validation envelope's
+`validation_binding` field, with at least one independently passed report in
+`reports` as shown above. `update-existing` rechecks that exact B-to-C binding,
+the full grant bytes, canonical origin, approved actor, PR/node/ref/base/head,
+and remote ref before an authenticated write-ahead record permits one
+nonempty-old-OID compare-and-swap push. It reports success only after both the
+same PR and remote ref independently read back at `C`. A lost response or crash
+is reconciled from the authenticated record; an ambiguous started update never
+blindly retries the push. A changed PR, ref, actor, base, or remote head is a
+refusal requiring a new operator decision. A corrected explicit grant or
+validation can follow a pre-start refusal while every earlier authenticated
+effect remains Planned; any earlier Started effect at the same original head
+must first reconcile its exact plan and cannot be replaced by a new plan.
+
 `--squash-onto <base>` builds a deterministic import commit whose parent is the
 named local base branch and whose tree is the task branch snapshot, so PR
 publication works even when the task branch and base branch have disjoint
@@ -3862,6 +3922,15 @@ and Fake behavior. Review readiness never authorizes fix dispatch, comments,
 or merge. Authenticated GitHub review threads carry `isOutdated` separately
 from `isResolved`. A current thread follows the existing comment triage;
 an outdated thread or legacy thread without currency evidence blocks readiness.
+For a real GitHub PR repair with an explicitly bound policy, each attempted
+Autopilot invocation first consumes one repository-authenticated slot under
+that policy's `max_attempts`. The durable key is the GitHub repository ID and
+PR number, so changing the PR head or supplying a new policy file does not
+reset prior consumption. Failed, refused, and interrupted reservations remain
+spent; exhaustion refuses new repair dispatch before model budget reservation.
+These slots do not establish that feedback was addressed, grant readiness, or
+authorize a comment, publication, or merge. Fake, issue, and no-policy paths
+retain their existing behavior.
 
 `maco-inbox.json` is optional. Without it, `maco inbox scan` uses deterministic
 fake local data: one safe issue candidate, one PR candidate with requested review
