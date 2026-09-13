@@ -1,0 +1,12 @@
+{
+  "model": "gpt-4o",
+  "max_tokens": 256,
+  "tools": [
+    {
+      "name": "ping",
+      "description": "Check liveness.",
+      "input_schema": {}
+    }
+  ],
+  "messages": [{ "role": "user", "content": "Ping" }]
+}

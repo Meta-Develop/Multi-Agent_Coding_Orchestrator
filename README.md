@@ -2,6 +2,12 @@
 
 Rust CLI and runtime foundation for a local-first multi-agent coding orchestrator.
 
+The owned [Coding Agent Manager source](account-manager/) is included with its
+desktop application and a native core build. Its separate lockfiles and
+[build instructions](account-manager/docs/MACO_SOURCE.md) keep it independent of
+the orchestrator's Cargo package. Account-backed MACO execution and a shared
+account authority are still being integrated.
+
 ## Project Purpose
 
 This project is a local-first control plane for coordinating multiple coding

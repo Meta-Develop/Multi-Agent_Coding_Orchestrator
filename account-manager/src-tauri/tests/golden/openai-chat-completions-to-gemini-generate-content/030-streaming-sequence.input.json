@@ -1,0 +1,40 @@
+{
+  "$events": [
+    {
+      "data": {
+        "id": "FAKE-stream-chat-gemini",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "FAKE-openai-model",
+        "choices": [
+          {
+            "index": 0,
+            "delta": { "role": "assistant", "content": "" },
+            "finish_reason": null
+          }
+        ]
+      }
+    },
+    {
+      "data": {
+        "id": "FAKE-stream-chat-gemini",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "FAKE-openai-model",
+        "choices": [
+          { "index": 0, "delta": { "content": "Hello" }, "finish_reason": null }
+        ]
+      }
+    },
+    {
+      "data": {
+        "id": "FAKE-stream-chat-gemini",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "FAKE-openai-model",
+        "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+      }
+    },
+    { "data": "[DONE]", "terminal": true }
+  ]
+}

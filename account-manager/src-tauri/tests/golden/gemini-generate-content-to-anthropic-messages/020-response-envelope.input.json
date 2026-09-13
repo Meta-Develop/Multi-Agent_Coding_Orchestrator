@@ -1,0 +1,18 @@
+{
+  "$response": {
+    "responseId": "FAKE-response-gemini-0002",
+    "modelVersion": "FAKE-gemini-model",
+    "candidates": [
+      {
+        "index": 0,
+        "content": { "role": "model", "parts": [{ "text": "Hello" }] },
+        "finishReason": "STOP"
+      }
+    ],
+    "usageMetadata": {
+      "promptTokenCount": 2,
+      "candidatesTokenCount": 3,
+      "totalTokenCount": 5
+    }
+  }
+}

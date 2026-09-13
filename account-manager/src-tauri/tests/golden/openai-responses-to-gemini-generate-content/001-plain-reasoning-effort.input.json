@@ -1,0 +1,9 @@
+{
+  "$context": { "target_model": "gemini-target" },
+  "$body": {
+    "model": "response-source",
+    "max_output_tokens": 256,
+    "reasoning": { "effort": "low" },
+    "input": "Hello"
+  }
+}

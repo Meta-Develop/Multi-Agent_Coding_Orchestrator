@@ -1,0 +1,16 @@
+{
+  "$response": {
+    "responseId": "FAKE-response-gemini-thought",
+    "modelVersion": "FAKE-gemini-model",
+    "candidates": [
+      {
+        "index": 0,
+        "content": {
+          "role": "model",
+          "parts": [{ "text": "internal reasoning", "thought": true }]
+        },
+        "finishReason": "STOP"
+      }
+    ]
+  }
+}

@@ -1,0 +1,24 @@
+[
+  {
+    "id": "grok-cli-8e1568d21efb0cb6",
+    "providerId": "grok-cli",
+    "label": "",
+    "maskedIdentity": "F***@example.invalid",
+    "authKind": "oauth",
+    "isActive": false,
+    "isStored": false,
+    "isIncomplete": false,
+    "expiresAt": "2027-01-01T00:00:00Z"
+  },
+  {
+    "id": "grok-cli-ec0f5a9827956527",
+    "providerId": "grok-cli",
+    "label": "",
+    "maskedIdentity": "F***@example.invalid",
+    "authKind": "oauth",
+    "isActive": false,
+    "isStored": false,
+    "isIncomplete": false,
+    "expiresAt": "2027-06-15T12:00:00Z"
+  }
+]

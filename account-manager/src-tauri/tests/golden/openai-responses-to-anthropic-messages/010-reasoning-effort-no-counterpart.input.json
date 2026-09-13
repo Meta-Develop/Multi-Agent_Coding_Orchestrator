@@ -1,0 +1,9 @@
+{
+  "$context": { "target_model": "FAKE-anthropic-target" },
+  "$body": {
+    "model": "FAKE-responses-source",
+    "max_output_tokens": 4096,
+    "reasoning": { "effort": "high" },
+    "input": "Think"
+  }
+}

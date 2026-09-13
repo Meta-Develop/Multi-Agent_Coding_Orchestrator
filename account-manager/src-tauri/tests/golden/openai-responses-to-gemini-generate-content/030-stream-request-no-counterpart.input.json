@@ -1,0 +1,8 @@
+{
+  "$context": { "target_model": "FAKE-gemini-target" },
+  "$body": {
+    "model": "FAKE-responses-source",
+    "stream": true,
+    "input": "Hello"
+  }
+}

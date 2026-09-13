@@ -1,0 +1,8 @@
+{
+  "$context": { "target_model": "FAKE-anthropic-target" },
+  "$body": {
+    "model": "FAKE-image-source",
+    "prompt": "A blue square",
+    "size": "1024x1024"
+  }
+}
