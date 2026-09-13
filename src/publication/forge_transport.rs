@@ -3239,7 +3239,8 @@ enum GithubRunnerResponseKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GithubRunnerResponse {
     kind: GithubRunnerResponseKind,
-    json: String,
+    json: Option<String>,
+    observation: Option<ForgeObservation>,
 }
 
 impl GithubRunnerResponse {
@@ -3262,14 +3263,53 @@ impl GithubRunnerResponse {
         if json.len() > MAX_RESPONSE_BYTES || json.as_bytes().contains(&0) {
             bail!("GitHub runner response is malformed or exceeds its byte limit");
         }
-        Ok(Self { kind, json })
+        Ok(Self {
+            kind,
+            json: Some(json),
+            observation: None,
+        })
     }
 
     fn require(self, expected: GithubRunnerResponseKind) -> Result<String> {
         if self.kind != expected {
             bail!("GitHub runner returned a response for a different finite operation");
         }
-        Ok(self.json)
+        self.json
+            .context("GitHub runner omitted its JSON mutation response")
+    }
+
+    fn production_observation(observation: ForgeObservation) -> Result<Self> {
+        let kind = match observation {
+            ForgeObservation::ItemThread(_) => GithubRunnerResponseKind::ItemThread,
+            ForgeObservation::PullRequestReviewSnapshot(_) => {
+                GithubRunnerResponseKind::PullRequestReviewSnapshot
+            }
+        };
+        validate_serialized(
+            &observation,
+            MAX_RESPONSE_BYTES,
+            "GitHub production observation",
+        )?;
+        Ok(Self {
+            kind,
+            json: None,
+            observation: Some(observation),
+        })
+    }
+
+    fn observation_or_json(
+        self,
+        expected: GithubRunnerResponseKind,
+        parse: impl FnOnce(String) -> Result<ForgeObservation>,
+    ) -> Result<ForgeObservation> {
+        if self.kind != expected {
+            bail!("GitHub runner returned a response for a different finite operation");
+        }
+        match (self.observation, self.json) {
+            (Some(observation), None) => Ok(observation),
+            (None, Some(json)) => parse(json),
+            _ => bail!("GitHub runner response had ambiguous observation content"),
+        }
     }
 }
 
@@ -3279,22 +3319,41 @@ pub trait GithubRunner {
     fn run(&self, request: &GithubRunnerRequest) -> Result<GithubRunnerResponse>;
 }
 
-/// Production wiring remains fail-closed until the existing private gh
-/// boundary exposes matching finite review/thread operations.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct GithubProductionRunner;
+/// Production observations are bound to one local repository and its exact
+/// GitHub selector. An unbound runner retains the legacy fail-closed behavior.
+#[derive(Debug, Default, Clone)]
+pub struct GithubProductionRunner {
+    binding: Option<(PathBuf, String)>,
+}
 
 impl GithubProductionRunner {
     pub fn new() -> Self {
-        Self
+        Self { binding: None }
+    }
+
+    pub fn for_repository(repo: &std::path::Path, selector: &str) -> Result<Self> {
+        super::github_repository_identity_from_selector(selector)?;
+        Ok(Self {
+            binding: Some((repo.to_path_buf(), selector.to_string())),
+        })
     }
 }
 
 impl GithubRunner for GithubProductionRunner {
-    fn run(&self, _request: &GithubRunnerRequest) -> Result<GithubRunnerResponse> {
-        bail!(
-            "production GitHub forge transport is fail-closed: no finite GhCommandContext review/thread hook is registered"
-        )
+    fn run(&self, request: &GithubRunnerRequest) -> Result<GithubRunnerResponse> {
+        let (repo, selector) = self.binding.as_ref().context(
+            "production GitHub forge transport is fail-closed without a bound repository",
+        )?;
+        let observation = match request {
+            GithubRunnerRequest::ObserveItemThread(request)
+            | GithubRunnerRequest::ObservePullRequestReviewSnapshot(request) => {
+                super::github_review_observation::observe(repo, selector, request)?
+            }
+            GithubRunnerRequest::AppendComment(_) => {
+                bail!("production GitHub forge transport refuses comment mutation")
+            }
+        };
+        GithubRunnerResponse::production_observation(observation)
     }
 }
 
@@ -3319,31 +3378,35 @@ impl<R: GithubRunner> ForgeTransport for GithubForge<R> {
         require_github_item(request.item())?;
         match request {
             ForgeObservationRequest::ItemThread(_) => {
-                let response = self
+                let observation = self
                     .runner
                     .run(&GithubRunnerRequest::ObserveItemThread(request.clone()))?
-                    .require(GithubRunnerResponseKind::ItemThread)?;
-                let wire: GithubItemThreadWire =
-                    parse_bounded_json(&response, "GitHub item-thread response")?;
-                let observation = ForgeObservation::ItemThread(github_item_thread_observation(
-                    wire,
-                    request.item(),
-                )?);
+                    .observation_or_json(GithubRunnerResponseKind::ItemThread, |response| {
+                        let wire: GithubItemThreadWire =
+                            parse_bounded_json(&response, "GitHub item-thread response")?;
+                        Ok(ForgeObservation::ItemThread(
+                            github_item_thread_observation(wire, request.item())?,
+                        ))
+                    })?;
                 observation.validate_for_request(request)?;
                 Ok(observation)
             }
             ForgeObservationRequest::PullRequestReviewSnapshot(_) => {
-                let response = self
+                let observation = self
                     .runner
                     .run(&GithubRunnerRequest::ObservePullRequestReviewSnapshot(
                         request.clone(),
                     ))?
-                    .require(GithubRunnerResponseKind::PullRequestReviewSnapshot)?;
-                let wire: GithubPrReviewSnapshotWire =
-                    parse_bounded_json(&response, "GitHub PR-review response")?;
-                let observation = ForgeObservation::PullRequestReviewSnapshot(
-                    github_pr_review_snapshot(wire, request.item())?,
-                );
+                    .observation_or_json(
+                        GithubRunnerResponseKind::PullRequestReviewSnapshot,
+                        |response| {
+                            let wire: GithubPrReviewSnapshotWire =
+                                parse_bounded_json(&response, "GitHub PR-review response")?;
+                            Ok(ForgeObservation::PullRequestReviewSnapshot(
+                                github_pr_review_snapshot(wire, request.item())?,
+                            ))
+                        },
+                    )?;
                 observation.validate_for_request(request)?;
                 Ok(observation)
             }
@@ -5000,5 +5063,42 @@ mod tests {
         let production = GithubForge::new(GithubProductionRunner::new());
         let error = production.observe(&request).expect_err("must fail closed");
         assert!(error.to_string().contains("fail-closed"));
+    }
+
+    #[test]
+    fn production_observation_keeps_exact_request_binding_and_comment_mutations_closed() {
+        let item = issue();
+        let request = ForgeObservationRequest::item_thread(item.clone()).expect("request");
+        let observed_at = ForgeTimestamp::new(OBSERVED_AT).expect("timestamp");
+        let response = GithubRunnerResponse::production_observation(ForgeObservation::ItemThread(
+            ItemThreadObservation::new(item.clone(), observed_at.clone(), Vec::new())
+                .expect("item thread"),
+        ))
+        .expect("bounded typed response");
+        let forge = GithubForge::new(ScriptedGithubRunner::new([response]));
+        assert!(matches!(
+            forge.observe(&request),
+            Ok(ForgeObservation::ItemThread(_))
+        ));
+
+        let wrong = GithubRunnerResponse::production_observation(ForgeObservation::ItemThread(
+            ItemThreadObservation::new(pr(), observed_at, Vec::new()).expect("wrong item thread"),
+        ))
+        .expect("bounded wrong response");
+        let forge = GithubForge::new(ScriptedGithubRunner::new([wrong]));
+        assert!(forge.observe(&request).is_err());
+
+        let production = GithubProductionRunner::for_repository(
+            std::path::Path::new("."),
+            "github.com/meta-develop/maco",
+        )
+        .expect("bound production runner");
+        let error = production
+            .run(&GithubRunnerRequest::AppendComment(append_effect(
+                "mutation-closed",
+                "do not publish",
+            )))
+            .expect_err("production comment mutation must remain closed");
+        assert!(error.to_string().contains("refuses comment mutation"));
     }
 }

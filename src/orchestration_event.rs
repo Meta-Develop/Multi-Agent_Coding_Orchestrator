@@ -649,7 +649,7 @@ pub fn encode_event_line(event: &OrchestrationEvent) -> Result<Vec<u8>, serde_js
     Ok(line)
 }
 
-fn format_rfc3339_utc(timestamp: SystemTime) -> Result<String, OrchestrationEventError> {
+pub(crate) fn format_rfc3339_utc(timestamp: SystemTime) -> Result<String, OrchestrationEventError> {
     let elapsed = timestamp.duration_since(UNIX_EPOCH)?;
     let total_seconds = elapsed.as_secs();
     let days = i64::try_from(total_seconds / 86_400)

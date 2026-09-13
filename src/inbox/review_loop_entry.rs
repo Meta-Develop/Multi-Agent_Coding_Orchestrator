@@ -6,24 +6,26 @@
 //! freshly observed provider evidence to the distinct authenticated executor.
 
 use super::review_loop::{
-    open_review_loop, ReadinessBlocker, RequiredCheck, ReviewLoopPhase, ReviewLoopPolicy,
-    ReviewLoopReadinessEvaluation, ReviewLoopState, TrustedActorBinding, TrustedActorIdentity,
-    TrustedActorRole,
+    open_review_loop, FrozenReviewSnapshot, ReadinessBlocker, RequiredCheck, ReviewLoopPhase,
+    ReviewLoopPolicy, ReviewLoopReadinessEvaluation, ReviewLoopState, TrustedActorBinding,
+    TrustedActorIdentity, TrustedActorRole,
 };
 use super::{
-    GithubCheckSummary, GithubPrCandidate, GithubPrSourceTrust, InboxIndependentAuditMergeLaneTask,
-    InboxItem, InboxItemKind, InboxSourceProvider,
+    revalidate_inbox_item_source, GithubCheckSummary, GithubPrCandidate, GithubPrSourceTrust,
+    InboxIndependentAuditMergeLaneTask, InboxItem, InboxItemKind, InboxSourceProvider,
 };
 use crate::objective_profile::default_resolved_objective_profile;
 use crate::optimizer::merge_authority::{
     aggregate_lenses, assess_independence, AgentIdentity, LensDecision, LensVerdict, MergeActor,
     ProducerFingerprint, SessionId,
 };
+use crate::publication;
 use crate::publication::forge_transport::{
     FakeForgeTransport, ForgeActor, ForgeCheck, ForgeCheckConclusion, ForgeCheckStatus, ForgeItem,
     ForgeItemKind, ForgeObservation, ForgeObservationRequest, ForgeRepository, ForgeReview,
-    ForgeReviewState, ForgeTimestamp, ProviderObjectId, ProviderObjectKind,
-    PullRequestAuditorEvidence, PullRequestReviewSnapshot, ReportedActorKind,
+    ForgeReviewState, ForgeTimestamp, ForgeTransport, GithubForge, GithubProductionRunner,
+    ItemThreadObservation, ProviderObjectId, ProviderObjectKind, PullRequestAuditorEvidence,
+    PullRequestReviewSnapshot, ReportedActorKind,
 };
 use crate::publication::AuthenticatedPullRequestMergeBlocker;
 use crate::selection::{
@@ -35,6 +37,7 @@ use crate::selection::{
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::{path::Path, time::SystemTime};
 
 const INDEPENDENT_AUDIT_LANE_VERSION: u32 = 1;
 const INDEPENDENT_AUDITOR_STABLE_ID: &str = "maco-independent-pr-auditor";
@@ -778,12 +781,139 @@ pub fn evaluate_inbox_scan_review_loops(items: &[InboxItem]) -> Vec<InboxReviewL
         .collect()
 }
 
+pub(crate) fn evaluate_inbox_scan_review_loops_in_repo(
+    repo: &Path,
+    items: &[InboxItem],
+) -> Vec<InboxReviewLoopReport> {
+    items
+        .iter()
+        .filter_map(|item| evaluate_inbox_item_review_loop_in_repo(repo, item))
+        .map(|observation| observation.report)
+        .collect()
+}
+
+pub(crate) struct InboxReviewObservation {
+    pub(crate) report: InboxReviewLoopReport,
+    pub(crate) snapshot: Option<FrozenReviewSnapshot>,
+    pub(crate) item_thread: Option<ItemThreadObservation>,
+}
+
+pub(crate) fn evaluate_inbox_item_review_loop_in_repo(
+    repo: &Path,
+    item: &InboxItem,
+) -> Option<InboxReviewObservation> {
+    if item.kind != InboxItemKind::PullRequest || item.pull_request.is_none() {
+        return None;
+    }
+    if item.source_snapshot.provider() == InboxSourceProvider::Fake {
+        return Some(InboxReviewObservation {
+            report: evaluate_pull_request_review_loop(item),
+            snapshot: None,
+            item_thread: None,
+        });
+    }
+    Some(match observe_github_review_loop(repo, item) {
+        Ok(observation) => observation,
+        Err(_) => InboxReviewObservation {
+            report: blocked_review_report(item, &["observation_failed", "policy_unavailable"]),
+            snapshot: None,
+            item_thread: None,
+        },
+    })
+}
+
 /// Open the review loop for one inbox item when it is a pull request.
 pub fn evaluate_inbox_item_review_loop(item: &InboxItem) -> Option<InboxReviewLoopReport> {
     if item.kind != InboxItemKind::PullRequest || item.pull_request.is_none() {
         return None;
     }
+    if item.source_snapshot.provider() == InboxSourceProvider::Github {
+        return Some(blocked_review_report(
+            item,
+            &["repository_unbound", "policy_unavailable"],
+        ));
+    }
     Some(evaluate_pull_request_review_loop(item))
+}
+
+fn blocked_review_report(item: &InboxItem, blockers: &[&str]) -> InboxReviewLoopReport {
+    InboxReviewLoopReport {
+        item_id: item.item_id.clone(),
+        source_key: item.source_key.clone(),
+        number: item.source_snapshot.number(),
+        phase: None,
+        ready: false,
+        grants_merge_permission: false,
+        auto_merge_performed: false,
+        state_sha256: None,
+        snapshot_sha256: None,
+        policy_sha256: None,
+        blocker_kinds: blockers.iter().map(|blocker| (*blocker).to_string()).collect(),
+        next_action: "obtain fresh authenticated GitHub observation and independent reviewer/check policy before readiness can be evaluated".to_string(),
+    }
+}
+
+fn authenticated_observation_without_policy(
+    item: &InboxItem,
+    snapshot_sha256: String,
+) -> InboxReviewLoopReport {
+    InboxReviewLoopReport {
+        item_id: item.item_id.clone(),
+        source_key: item.source_key.clone(),
+        number: item.source_snapshot.number(),
+        phase: None,
+        ready: false,
+        grants_merge_permission: false,
+        auto_merge_performed: false,
+        state_sha256: None,
+        snapshot_sha256: Some(snapshot_sha256),
+        policy_sha256: None,
+        blocker_kinds: vec!["policy_unavailable".to_string()],
+        next_action: "supply an independently authorized reviewer/check policy before evaluating readiness; no merge or fix dispatch was authorized".to_string(),
+    }
+}
+
+fn observe_github_review_loop(repo: &Path, item: &InboxItem) -> Result<InboxReviewObservation> {
+    revalidate_inbox_item_source(repo, item)
+        .context("GitHub review observation source changed before collection")?;
+    let source = &item.source_snapshot;
+    let forge_item = publication::resolve_github_forge_item(
+        repo,
+        source.repository_selector(),
+        ForgeItemKind::PullRequest,
+        source.number(),
+    )?;
+    if forge_item.head_oid() != source.head_oid() || forge_item.base_oid() != source.base_oid() {
+        bail!("authenticated GitHub PR identity does not bind the inbox source head and base");
+    }
+    let transport = GithubForge::new(GithubProductionRunner::for_repository(
+        repo,
+        source.repository_selector(),
+    )?);
+    let cutoff = ForgeTimestamp::new(crate::orchestration_event::format_rfc3339_utc(
+        SystemTime::now(),
+    )?)?;
+    let snapshot = FrozenReviewSnapshot::observe(&transport, &forge_item, &cutoff)?;
+    let request = ForgeObservationRequest::item_thread(forge_item.clone())?;
+    let item_thread = match transport.observe(&request)? {
+        ForgeObservation::ItemThread(thread) => thread,
+        ForgeObservation::PullRequestReviewSnapshot(_) => {
+            bail!("GitHub item-thread observation returned a PR snapshot")
+        }
+    };
+    revalidate_inbox_item_source(repo, item)
+        .context("GitHub review observation source changed after collection")?;
+    if snapshot.item() != &forge_item || item_thread.item() != &forge_item {
+        bail!("GitHub review observations changed exact item identity");
+    }
+    Ok(InboxReviewObservation {
+        report: authenticated_observation_without_policy(
+            item,
+            snapshot.canonical_sha256().to_string(),
+        ),
+        snapshot: Some(snapshot),
+        item_thread: Some(item_thread),
+    })
 }
 
 fn evaluate_pull_request_review_loop(item: &InboxItem) -> InboxReviewLoopReport {
@@ -835,6 +965,9 @@ pub(crate) struct SynthesizedReviewObservation {
 pub(crate) fn synthesize_inbox_review_observation(
     item: &InboxItem,
 ) -> Result<SynthesizedReviewObservation> {
+    if item.source_snapshot.provider() != InboxSourceProvider::Fake {
+        bail!("GitHub inbox review observations require authenticated provider data");
+    }
     let pull_request = item
         .pull_request
         .as_ref()
@@ -1396,6 +1529,50 @@ mod tests {
         assert_eq!(
             report.next_action,
             "review-loop readiness evidence is available; it is not merge permission"
+        );
+    }
+
+    #[test]
+    fn github_inbox_review_never_synthesizes_identity_or_observed_policy() {
+        let mut item = ready_pr_item();
+        item.source_snapshot = InboxSourceSnapshotBinding::for_pull_request(
+            InboxSourceProvider::Github,
+            "github.com",
+            "github.com/meta-develop/maco",
+            publication::stable_external_digest(b"github-review-repository"),
+            9,
+            "2026-08-16T01:02:03Z",
+            "OPEN",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            "3".repeat(64),
+            "4".repeat(64),
+        )
+        .expect("GitHub PR source binding");
+        assert!(synthesize_inbox_review_observation(&item).is_err());
+        let unbound = evaluate_inbox_item_review_loop(&item).expect("blocked GitHub review");
+        assert!(!unbound.ready);
+        assert!(unbound.snapshot_sha256.is_none());
+        assert!(unbound.policy_sha256.is_none());
+        assert!(unbound
+            .blocker_kinds
+            .contains(&"repository_unbound".to_string()));
+        assert!(unbound
+            .blocker_kinds
+            .contains(&"policy_unavailable".to_string()));
+
+        let authenticated = authenticated_observation_without_policy(
+            &item,
+            publication::stable_external_digest(b"authenticated-snapshot"),
+        );
+        assert!(!authenticated.ready);
+        assert!(!authenticated.grants_merge_permission);
+        assert!(!authenticated.auto_merge_performed);
+        assert!(authenticated.snapshot_sha256.is_some());
+        assert!(authenticated.policy_sha256.is_none());
+        assert_eq!(
+            authenticated.blocker_kinds,
+            vec!["policy_unavailable".to_string()]
         );
     }
 

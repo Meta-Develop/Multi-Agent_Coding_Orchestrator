@@ -1663,7 +1663,7 @@ fn scan_inbox_with_overrides(
         .filter(|item| item.selected)
         .filter_map(pr_intake_report_for_item)
         .collect::<Vec<_>>();
-    let review_loops = review_loop_entry::evaluate_inbox_scan_review_loops(&items);
+    let review_loops = review_loop_entry::evaluate_inbox_scan_review_loops_in_repo(&repo, &items);
 
     let selected_count = items.iter().filter(|item| item.selected).count();
     let candidate_count = items.len();
@@ -3644,14 +3644,29 @@ fn run_inbox_item(
         revalidate_inbox_item_source(repo, item)
             .context("inbox source changed before item processing started")?;
     }
-    let review_loop = review_loop_entry::evaluate_inbox_item_review_loop(item);
-    if let Some(report) = &review_loop {
+    let review_observation = review_loop_entry::evaluate_inbox_item_review_loop_in_repo(repo, item);
+    if let Some(observation) = &review_observation {
         write_private_artifact_json(
             writer,
             format!("item-{item_index}-review-loop.json"),
-            report,
+            &observation.report,
         )?;
+        if let Some(snapshot) = &observation.snapshot {
+            write_private_artifact_json(
+                writer,
+                format!("item-{item_index}-review-snapshot.json"),
+                snapshot,
+            )?;
+        }
+        if let Some(thread) = &observation.item_thread {
+            write_private_artifact_json(
+                writer,
+                format!("item-{item_index}-item-thread.json"),
+                thread,
+            )?;
+        }
     }
+    let review_loop = review_observation.map(|observation| observation.report);
     if let Some(pr_intake) = pr_intake {
         return run_independent_audit_intake_item(
             writer,
