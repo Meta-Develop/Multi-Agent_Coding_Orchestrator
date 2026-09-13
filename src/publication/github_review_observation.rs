@@ -214,6 +214,20 @@ fn repository_from_rest(
     )
 }
 
+fn resolve_repository_with(
+    transport: &GithubPullRequestMergeTransport,
+    mut fetch: impl FnMut(&str, AuthenticatedGithubOperation) -> Result<String>,
+) -> Result<ForgeRepository> {
+    let rest: RestRepository = parse_authenticated_github_json(
+        &fetch(
+            "gh review repository identity",
+            AuthenticatedGithubOperation::Repository,
+        )?,
+        "GitHub review repository identity",
+    )?;
+    repository_from_rest(&rest, &transport.repository)
+}
+
 fn repository_from_pull(
     pull: &GithubApiPullRequest,
     expected: &GithubRepositoryIdentity,
@@ -704,6 +718,16 @@ pub(super) fn resolve_item(
     Ok(item)
 }
 
+pub(super) fn resolve_repository(repo: &Path, selector: &str) -> Result<ForgeRepository> {
+    let transport = GithubPullRequestMergeTransport::new(repo, selector)?;
+    verify_bound_origin(repo, &transport.repository)?;
+    let repository = resolve_repository_with(&transport, |label, operation| {
+        transport.json(label, operation)
+    })?;
+    verify_bound_origin(repo, &transport.repository)?;
+    Ok(repository)
+}
+
 pub(super) fn observe(
     repo: &Path,
     selector: &str,
@@ -836,6 +860,41 @@ mod tests {
     fn rest_repository() -> Value {
         json!({"node_id":"R_repo", "full_name":"meta-develop/maco",
             "html_url":"https://github.com/meta-develop/maco"})
+    }
+
+    #[test]
+    fn repository_identity_read_is_fixed_and_distinguishes_provider_ids() {
+        let mut operations = 0;
+        let observed = resolve_repository_with(&transport(), |_, operation| {
+            assert!(matches!(
+                operation,
+                AuthenticatedGithubOperation::Repository
+            ));
+            operations += 1;
+            Ok(rest_repository().to_string())
+        })
+        .unwrap();
+        assert_eq!(observed, repository());
+        assert_eq!(operations, 1);
+
+        let mut foreign = rest_repository();
+        foreign["node_id"] = json!("R_other");
+        let foreign_observed = resolve_repository_with(&transport(), |_, operation| {
+            assert!(matches!(
+                operation,
+                AuthenticatedGithubOperation::Repository
+            ));
+            Ok(foreign.to_string())
+        })
+        .unwrap();
+        assert_ne!(
+            foreign_observed.provider_repository_id(),
+            repository().provider_repository_id()
+        );
+
+        let mut wrong_name = rest_repository();
+        wrong_name["full_name"] = json!("foreign/project");
+        assert!(resolve_repository_with(&transport(), |_, _| Ok(wrong_name.to_string())).is_err());
     }
 
     fn rest_issue() -> Value {
