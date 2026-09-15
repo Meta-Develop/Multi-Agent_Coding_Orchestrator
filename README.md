@@ -1375,10 +1375,14 @@ cancellation, deadlines and unexecuted commands are unknown. Every required
 command must pass before the held-out validation can pass.
 
 This mode emits `evaluation_experiment_observations_v3`; legacy experiment result
-versions and the default command behavior are unchanged. Its candidates still
-come from Fake generation over a synthetic README containing the goal/spec,
-with the same baseline commit/tree for every profile and repetition. `--repo`
-owns evidence storage and is not the evaluated source. The existing owner-private
+versions and the default command behavior are unchanged. By default its candidates
+still come from Fake generation over a synthetic README containing the goal/spec,
+with the same baseline commit/tree for every profile and repetition. With
+`--execute-held-out`, paired `--source-repo PATH` and `--base-commit FULL_OID`
+materialize each profile/repetition from that exact commit/tree in a private
+temporary repository; the flags are refused without `--execute-held-out` and
+never infer evaluated source from `--repo`. `--repo` owns evidence storage and
+is not the evaluated source. The existing owner-private
 `.maco/o2/runs/<unique-run-id>` artifact store retains the full manifest, exact
 profile/repetition/run/baseline/candidate/argv bindings, dispatch admissions,
 observations and authenticated review/report copies before temporary repositories

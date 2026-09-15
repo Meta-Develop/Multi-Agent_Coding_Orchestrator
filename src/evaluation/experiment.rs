@@ -29,7 +29,7 @@ use crate::{
         SupervisorRunOptions, SupervisorRuntime, UnavailableModelFallback, WorkerAssignment,
     },
 };
-use git2::{IndexAddOption, Repository, Signature};
+use git2::{IndexAddOption, ObjectType, Oid, Repository, Signature};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -37,6 +37,46 @@ use std::{
     path::PathBuf,
     time::Instant,
 };
+
+// Match publication source-closure bounds (`src/publication.rs` `MAX_PUBLICATION_CLOSURE_*`).
+// The same ceilings bound distinct ODB closure totals and expanded evaluated-tree checkout totals.
+const HELD_OUT_SOURCE_BASELINE_MAX_OBJECTS: usize = 262_144;
+const HELD_OUT_SOURCE_BASELINE_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Publication-derived limits reused for distinct object-database closure and checkout expansion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HeldOutSourceBaselineBounds {
+    pub(crate) max_distinct_objects: usize,
+    pub(crate) max_bytes: u64,
+}
+
+impl Default for HeldOutSourceBaselineBounds {
+    fn default() -> Self {
+        Self {
+            max_distinct_objects: HELD_OUT_SOURCE_BASELINE_MAX_OBJECTS,
+            max_bytes: HELD_OUT_SOURCE_BASELINE_MAX_BYTES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CheckoutExpansionTotals {
+    entries: u64,
+    bytes: u64,
+}
+
+struct EvaluatedTreeFrame<'repo> {
+    oid: Oid,
+    tree: git2::Tree<'repo>,
+    next_entry: usize,
+    totals: CheckoutExpansionTotals,
+}
+
+enum CheckoutWalkStep {
+    Complete,
+    Directory { child: Oid },
+    Blob { size: u64 },
+}
 
 pub const EXPERIMENT_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const LEGACY_EXPERIMENT_RESULTS_SCHEMA_VERSION: u32 = 1;
@@ -149,6 +189,15 @@ impl ExperimentManifest {
     }
 }
 
+/// Explicit evaluated source for held-out Fake experiments. Omitted callers keep the legacy
+/// synthetic README baseline. Never inferred from the artifact-owner `--repo`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeldOutExplicitSourceBaseline {
+    pub source_repo: PathBuf,
+    pub base_commit: String,
+}
+
 /// Execution request. Real-provider execution stays fail-closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -164,6 +213,464 @@ impl Default for ExperimentRunRequest {
             allow_real_provider: false,
         }
     }
+}
+
+/// Requires a canonical 40-character commit object name; refuses refs and abbreviated SHAs.
+pub fn parse_canonical_full_commit_oid(text: &str) -> Result<Oid, EvaluationError> {
+    if text.len() != 40 {
+        return Err(invalid_experiment(
+            "base_commit",
+            "must be a full 40-character commit object name",
+        ));
+    }
+    if !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid_experiment(
+            "base_commit",
+            "must be a full 40-character commit object name",
+        ));
+    }
+    let oid = Oid::from_str(text).map_err(|error| {
+        invalid_experiment(
+            "base_commit",
+            format!("must be a full 40-character commit object name: {error}"),
+        )
+    })?;
+    if oid.to_string() != text {
+        return Err(invalid_experiment(
+            "base_commit",
+            "must be a canonical full commit object name",
+        ));
+    }
+    Ok(oid)
+}
+
+/// Read-only source validation before held-out artifact reservation.
+pub fn resolve_held_out_explicit_source_baseline(
+    source: &HeldOutExplicitSourceBaseline,
+) -> Result<Oid, EvaluationError> {
+    if source.source_repo.as_os_str().is_empty() {
+        return Err(invalid_experiment(
+            "source_repo",
+            "must name an existing Git repository",
+        ));
+    }
+    let commit_oid = parse_canonical_full_commit_oid(&source.base_commit)?;
+    crate::git_repository::configure_libgit2_repository_extensions().map_err(|error| {
+        EvaluationError::FakeSuperviseExperiment {
+            message: format!("failed to configure Git repository extensions: {error}"),
+        }
+    })?;
+    let repository = crate::git_repository::open(&source.source_repo).map_err(|error| {
+        EvaluationError::FakeSuperviseExperiment {
+            message: format!(
+                "failed to open held-out source repository {}: {error}",
+                source.source_repo.display()
+            ),
+        }
+    })?;
+    let commit = repository.find_commit(commit_oid).map_err(|_| {
+        invalid_experiment(
+            "base_commit",
+            "must name an existing commit object in the source repository object database",
+        )
+    })?;
+    preflight_held_out_explicit_source_commit(
+        &repository,
+        commit_oid,
+        commit.tree_id(),
+        HeldOutSourceBaselineBounds::default(),
+    )?;
+    Ok(commit_oid)
+}
+
+/// Read-only validation of checkout expansion and object closure before artifact reservation.
+pub(crate) fn preflight_held_out_explicit_source_commit(
+    repository: &Repository,
+    root_commit: Oid,
+    root_tree: Oid,
+    bounds: HeldOutSourceBaselineBounds,
+) -> Result<(), EvaluationError> {
+    let checkout = preflight_evaluated_tree_checkout(repository, root_tree, bounds)?;
+    enforce_checkout_expansion_bounds(checkout, bounds)?;
+    preflight_commit_object_closure(repository, root_commit, bounds)?;
+    Ok(())
+}
+
+fn enforce_checkout_expansion_bounds(
+    totals: CheckoutExpansionTotals,
+    bounds: HeldOutSourceBaselineBounds,
+) -> Result<(), EvaluationError> {
+    if totals.entries > u64::try_from(bounds.max_distinct_objects).unwrap_or(u64::MAX)
+        || totals.bytes > bounds.max_bytes
+    {
+        return Err(EvaluationError::FakeSuperviseExperiment {
+            message: "held-out source baseline checkout expansion exceeded publication-derived entry or byte bounds".into(),
+        });
+    }
+    Ok(())
+}
+
+fn add_checked_u64(left: u64, right: u64, context: &str) -> Result<u64, EvaluationError> {
+    left.checked_add(right)
+        .ok_or_else(|| EvaluationError::FakeSuperviseExperiment {
+            message: format!("held-out source baseline {context} overflowed its byte bound"),
+        })
+}
+
+fn add_checkout_entries(
+    totals: &mut CheckoutExpansionTotals,
+    extra: u64,
+    bounds: HeldOutSourceBaselineBounds,
+) -> Result<(), EvaluationError> {
+    totals.entries = add_checked_u64(totals.entries, extra, "checkout entry count")?;
+    enforce_checkout_expansion_bounds(*totals, bounds)
+}
+
+fn add_checkout_bytes(
+    totals: &mut CheckoutExpansionTotals,
+    extra: u64,
+    bounds: HeldOutSourceBaselineBounds,
+) -> Result<(), EvaluationError> {
+    totals.bytes = add_checked_u64(totals.bytes, extra, "checkout byte count")?;
+    enforce_checkout_expansion_bounds(*totals, bounds)
+}
+
+fn object_count_bound_error() -> EvaluationError {
+    EvaluationError::FakeSuperviseExperiment {
+        message: "held-out source baseline object graph exceeded its object-count bound".into(),
+    }
+}
+
+fn tree_graph_cycle_error(oid: Oid) -> EvaluationError {
+    EvaluationError::FakeSuperviseExperiment {
+        message: format!("held-out source baseline tree graph contained a cycle at {oid}"),
+    }
+}
+
+fn checkout_frame_missing() -> EvaluationError {
+    EvaluationError::FakeSuperviseExperiment {
+        message: "held-out source checkout preflight lost its active tree frame".into(),
+    }
+}
+
+fn admit_evaluated_tree<'repo>(
+    repository: &'repo Repository,
+    odb: &git2::Odb<'_>,
+    oid: Oid,
+    distinct_trees: usize,
+    tree_bytes: &mut u64,
+    bounds: HeldOutSourceBaselineBounds,
+) -> Result<git2::Tree<'repo>, EvaluationError> {
+    let (size, kind) =
+        odb.read_header(oid)
+            .map_err(|error| EvaluationError::FakeSuperviseExperiment {
+                message: format!("held-out source checkout omitted tree header {oid}: {error}"),
+            })?;
+    if kind != ObjectType::Tree {
+        return Err(EvaluationError::FakeSuperviseExperiment {
+            message: format!("held-out source baseline object {oid} had an unexpected kind"),
+        });
+    }
+    if distinct_trees >= bounds.max_distinct_objects {
+        return Err(object_count_bound_error());
+    }
+    let size = u64::try_from(size).map_err(|_| EvaluationError::FakeSuperviseExperiment {
+        message: format!("held-out source baseline object {oid} exceeded its byte bound"),
+    })?;
+    *tree_bytes = add_checked_u64(*tree_bytes, size, "object closure byte count")?;
+    if *tree_bytes > bounds.max_bytes {
+        return Err(EvaluationError::FakeSuperviseExperiment {
+            message: "held-out source baseline object graph exceeded its aggregate byte bound"
+                .into(),
+        });
+    }
+    repository
+        .find_tree(oid)
+        .map_err(|error| EvaluationError::FakeSuperviseExperiment {
+            message: format!("failed to read held-out source tree {oid}: {error}"),
+        })
+}
+
+fn push_admitted_tree_frame<'repo>(
+    stack: &mut Vec<EvaluatedTreeFrame<'repo>>,
+    active: &mut BTreeSet<Oid>,
+    oid: Oid,
+    tree: git2::Tree<'repo>,
+    bounds: HeldOutSourceBaselineBounds,
+) -> Result<(), EvaluationError> {
+    if active.contains(&oid) {
+        return Err(tree_graph_cycle_error(oid));
+    }
+    if stack.len() >= bounds.max_distinct_objects || active.len() >= bounds.max_distinct_objects {
+        return Err(object_count_bound_error());
+    }
+    active.insert(oid);
+    stack.push(EvaluatedTreeFrame {
+        oid,
+        tree,
+        next_entry: 0,
+        totals: CheckoutExpansionTotals {
+            entries: 0,
+            bytes: 0,
+        },
+    });
+    Ok(())
+}
+
+fn preflight_evaluated_tree_checkout(
+    repository: &Repository,
+    root_tree: Oid,
+    bounds: HeldOutSourceBaselineBounds,
+) -> Result<CheckoutExpansionTotals, EvaluationError> {
+    let odb = repository
+        .odb()
+        .map_err(|error| EvaluationError::FakeSuperviseExperiment {
+            message: format!("failed to open held-out source object database: {error}"),
+        })?;
+    let mut memo = BTreeMap::<Oid, CheckoutExpansionTotals>::new();
+    let mut active = BTreeSet::new();
+    let mut stack = Vec::new();
+    let mut tree_bytes = 0_u64;
+    let root = admit_evaluated_tree(repository, &odb, root_tree, 0, &mut tree_bytes, bounds)?;
+    push_admitted_tree_frame(&mut stack, &mut active, root_tree, root, bounds)?;
+    while !stack.is_empty() {
+        let step = {
+            let frame = stack.last().ok_or_else(checkout_frame_missing)?;
+            if frame.next_entry >= frame.tree.len() {
+                CheckoutWalkStep::Complete
+            } else {
+                let entry = frame.tree.get(frame.next_entry).ok_or_else(|| {
+                    EvaluationError::FakeSuperviseExperiment {
+                        message: format!(
+                            "held-out source tree {} omitted checkout entry {}",
+                            frame.oid, frame.next_entry
+                        ),
+                    }
+                })?;
+                if entry.filemode() == 0o160000 {
+                    return Err(invalid_experiment(
+                        "base_commit",
+                        "evaluated baseline tree contains a git submodule link; explicit held-out source baselines do not materialize external repositories",
+                    ));
+                }
+                match entry.kind() {
+                    Some(ObjectType::Tree) => CheckoutWalkStep::Directory { child: entry.id() },
+                    Some(ObjectType::Blob) => {
+                        let blob = entry.id();
+                        let (size, kind) = odb.read_header(blob).map_err(|error| {
+                            EvaluationError::FakeSuperviseExperiment {
+                                message: format!(
+                                    "held-out source checkout omitted blob header {blob}: {error}"
+                                ),
+                            }
+                        })?;
+                        if kind != ObjectType::Blob {
+                            return Err(EvaluationError::FakeSuperviseExperiment {
+                                message: format!(
+                                    "held-out source checkout entry {blob} had an unexpected object kind"
+                                ),
+                            });
+                        }
+                        let size = u64::try_from(size).map_err(|_| {
+                            EvaluationError::FakeSuperviseExperiment {
+                                message: format!(
+                                    "held-out source checkout blob {blob} exceeded its byte bound"
+                                ),
+                            }
+                        })?;
+                        CheckoutWalkStep::Blob { size }
+                    }
+                    _ => {
+                        return Err(EvaluationError::FakeSuperviseExperiment {
+                            message: format!(
+                                "held-out source tree {} contained an unsupported checkout entry",
+                                frame.oid
+                            ),
+                        });
+                    }
+                }
+            }
+        };
+        match step {
+            CheckoutWalkStep::Complete => {
+                let frame = stack.pop().ok_or_else(checkout_frame_missing)?;
+                active.remove(&frame.oid);
+                if memo.len() >= bounds.max_distinct_objects && !memo.contains_key(&frame.oid) {
+                    return Err(object_count_bound_error());
+                }
+                memo.insert(frame.oid, frame.totals);
+            }
+            CheckoutWalkStep::Directory { child } => {
+                if active.contains(&child) {
+                    return Err(tree_graph_cycle_error(child));
+                }
+                if let Some(child_totals) = memo.get(&child).copied() {
+                    let frame = stack.last_mut().ok_or_else(checkout_frame_missing)?;
+                    add_checkout_entries(&mut frame.totals, 1, bounds)?;
+                    add_checkout_entries(&mut frame.totals, child_totals.entries, bounds)?;
+                    add_checkout_bytes(&mut frame.totals, child_totals.bytes, bounds)?;
+                    frame.next_entry += 1;
+                    continue;
+                }
+                let distinct_trees = memo.len() + active.len();
+                let child_tree = admit_evaluated_tree(
+                    repository,
+                    &odb,
+                    child,
+                    distinct_trees,
+                    &mut tree_bytes,
+                    bounds,
+                )?;
+                push_admitted_tree_frame(&mut stack, &mut active, child, child_tree, bounds)?;
+            }
+            CheckoutWalkStep::Blob { size } => {
+                let frame = stack.last_mut().ok_or_else(checkout_frame_missing)?;
+                add_checkout_entries(&mut frame.totals, 1, bounds)?;
+                add_checkout_bytes(&mut frame.totals, size, bounds)?;
+                frame.next_entry += 1;
+            }
+        }
+    }
+    let totals =
+        memo.get(&root_tree)
+            .copied()
+            .ok_or_else(|| EvaluationError::FakeSuperviseExperiment {
+                message: "held-out source checkout preflight did not resolve the evaluated tree"
+                    .into(),
+            })?;
+    enforce_checkout_expansion_bounds(totals, bounds)?;
+    Ok(totals)
+}
+
+fn preflight_commit_object_closure(
+    source: &Repository,
+    root_commit: Oid,
+    bounds: HeldOutSourceBaselineBounds,
+) -> Result<(), EvaluationError> {
+    let source_odb = source
+        .odb()
+        .map_err(|error| EvaluationError::FakeSuperviseExperiment {
+            message: format!("failed to open held-out source object database: {error}"),
+        })?;
+    let mut pending = Vec::new();
+    let mut scheduled = BTreeSet::new();
+    schedule_closure_object(
+        &mut pending,
+        &mut scheduled,
+        root_commit,
+        ObjectType::Commit,
+        bounds.max_distinct_objects,
+    )?;
+    let mut objects = BTreeMap::<Oid, ObjectType>::new();
+    let mut total_bytes = 0_u64;
+    while let Some((oid, expected_kind)) = pending.pop() {
+        if let Some(prior) = objects.get(&oid) {
+            if *prior != expected_kind {
+                return Err(EvaluationError::FakeSuperviseExperiment {
+                    message: format!(
+                        "held-out source baseline reused object {oid} with contradictory kinds"
+                    ),
+                });
+            }
+            continue;
+        }
+        if objects.len() >= bounds.max_distinct_objects {
+            return Err(EvaluationError::FakeSuperviseExperiment {
+                message: "held-out source baseline object graph exceeded its object-count bound"
+                    .into(),
+            });
+        }
+        let (size, kind) = source_odb.read_header(oid).map_err(|error| {
+            EvaluationError::FakeSuperviseExperiment {
+                message: format!("held-out source baseline omitted object {oid}: {error}"),
+            }
+        })?;
+        if kind != expected_kind {
+            return Err(EvaluationError::FakeSuperviseExperiment {
+                message: format!("held-out source baseline object {oid} had an unexpected kind"),
+            });
+        }
+        let size = u64::try_from(size).map_err(|_| EvaluationError::FakeSuperviseExperiment {
+            message: format!("held-out source baseline object {oid} exceeded its byte bound"),
+        })?;
+        total_bytes = add_checked_u64(total_bytes, size, "object closure byte count")?;
+        if total_bytes > bounds.max_bytes {
+            return Err(EvaluationError::FakeSuperviseExperiment {
+                message: "held-out source baseline object graph exceeded its aggregate byte bound"
+                    .into(),
+            });
+        }
+        objects.insert(oid, expected_kind);
+        match expected_kind {
+            ObjectType::Commit => {
+                let commit = source.find_commit(oid).map_err(|error| {
+                    EvaluationError::FakeSuperviseExperiment {
+                        message: format!("failed to parse held-out source commit {oid}: {error}"),
+                    }
+                })?;
+                schedule_closure_object(
+                    &mut pending,
+                    &mut scheduled,
+                    commit.tree_id(),
+                    ObjectType::Tree,
+                    bounds.max_distinct_objects,
+                )?;
+                for parent in commit.parent_ids() {
+                    schedule_closure_object(
+                        &mut pending,
+                        &mut scheduled,
+                        parent,
+                        ObjectType::Commit,
+                        bounds.max_distinct_objects,
+                    )?;
+                }
+            }
+            ObjectType::Tree => {
+                let tree = source.find_tree(oid).map_err(|error| {
+                    EvaluationError::FakeSuperviseExperiment {
+                        message: format!("failed to parse held-out source tree {oid}: {error}"),
+                    }
+                })?;
+                for entry in tree.iter() {
+                    match entry.kind() {
+                        Some(ObjectType::Tree) => schedule_closure_object(
+                            &mut pending,
+                            &mut scheduled,
+                            entry.id(),
+                            ObjectType::Tree,
+                            bounds.max_distinct_objects,
+                        )?,
+                        Some(ObjectType::Blob) => schedule_closure_object(
+                            &mut pending,
+                            &mut scheduled,
+                            entry.id(),
+                            ObjectType::Blob,
+                            bounds.max_distinct_objects,
+                        )?,
+                        Some(ObjectType::Commit) if entry.filemode() == 0o160000 => {
+                            // Ancestor-tree gitlinks are metadata only and are not traversed.
+                        }
+                        _ => {
+                            return Err(EvaluationError::FakeSuperviseExperiment {
+                                message: format!(
+                                    "held-out source tree {oid} contained an unsupported entry"
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+            ObjectType::Blob => {}
+            _ => {
+                return Err(EvaluationError::FakeSuperviseExperiment {
+                    message: format!(
+                        "held-out source baseline object {oid} used an unsupported kind"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -938,6 +1445,53 @@ impl IsolatedSuperviseState {
         })
     }
 
+    pub(super) fn create_with_explicit_source_baseline(
+        manifest: &ExperimentManifest,
+        profile: &EvaluationProfile,
+        repetition: u32,
+        source: &HeldOutExplicitSourceBaseline,
+        commit_oid: Oid,
+    ) -> Result<Self, EvaluationError> {
+        let workspace =
+            tempfile::TempDir::new().map_err(|error| EvaluationError::FakeSuperviseExperiment {
+                message: format!("failed to create isolated Fake supervise workspace: {error}"),
+            })?;
+        let repo = workspace.path().join("repo");
+        let git =
+            Repository::init(&repo).map_err(|error| EvaluationError::FakeSuperviseExperiment {
+                message: format!("failed to initialize isolated Fake supervise repo: {error}"),
+            })?;
+        let source_repo = crate::git_repository::open(&source.source_repo).map_err(|error| {
+            EvaluationError::FakeSuperviseExperiment {
+                message: format!(
+                    "failed to reopen held-out source repository {}: {error}",
+                    source.source_repo.display()
+                ),
+            }
+        })?;
+        materialize_commit_object_closure(&source_repo, &git, commit_oid)?;
+        checkout_materialized_commit(&git, commit_oid)?;
+
+        let run_id = isolated_run_id(manifest, profile, repetition)?;
+        let plan_file = workspace.path().join(format!("{}.json", run_id.as_str()));
+        let plan = experiment_plan(manifest, profile);
+        let bytes = serde_json::to_vec_pretty(&plan).map_err(|error| {
+            EvaluationError::FakeSuperviseExperiment {
+                message: format!("failed to serialize isolated Fake supervise plan: {error}"),
+            }
+        })?;
+        fs::write(&plan_file, bytes).map_err(|error| EvaluationError::FakeSuperviseExperiment {
+            message: format!("failed to write isolated Fake supervise plan: {error}"),
+        })?;
+
+        Ok(Self {
+            _workspace: workspace,
+            repo,
+            plan_file,
+            run_id,
+        })
+    }
+
     pub(super) fn options(&self) -> SupervisorRunOptions {
         SupervisorRunOptions {
             repo: self.repo.clone(),
@@ -1015,6 +1569,221 @@ fn experiment_plan(manifest: &ExperimentManifest, profile: &EvaluationProfile) -
             notes: None,
         }],
     }
+}
+
+fn checkout_materialized_commit(
+    repository: &Repository,
+    commit_oid: Oid,
+) -> Result<(), EvaluationError> {
+    let target = repository
+        .find_object(commit_oid, Some(ObjectType::Commit))
+        .map_err(|error| EvaluationError::FakeSuperviseExperiment {
+            message: format!("failed to load materialized baseline commit {commit_oid}: {error}"),
+        })?;
+    repository
+        .reset(&target, git2::ResetType::Hard, None)
+        .map_err(|error| EvaluationError::FakeSuperviseExperiment {
+            message: format!(
+                "failed to check out materialized baseline commit {commit_oid}: {error}"
+            ),
+        })?;
+    Ok(())
+}
+
+fn schedule_closure_object(
+    pending: &mut Vec<(Oid, ObjectType)>,
+    scheduled: &mut BTreeSet<Oid>,
+    oid: Oid,
+    kind: ObjectType,
+    max_distinct_objects: usize,
+) -> Result<(), EvaluationError> {
+    if scheduled.contains(&oid) {
+        return Ok(());
+    }
+    if scheduled.len() >= max_distinct_objects {
+        return Err(object_count_bound_error());
+    }
+    scheduled.insert(oid);
+    pending.push((oid, kind));
+    Ok(())
+}
+
+fn materialize_commit_object_closure(
+    source: &Repository,
+    target: &Repository,
+    root_commit: Oid,
+) -> Result<(), EvaluationError> {
+    let root_tree = source
+        .find_commit(root_commit)
+        .map_err(|error| EvaluationError::FakeSuperviseExperiment {
+            message: format!(
+                "failed to load held-out source commit {root_commit} before materialization: {error}"
+            ),
+        })?
+        .tree_id();
+    let bounds = HeldOutSourceBaselineBounds::default();
+    preflight_held_out_explicit_source_commit(source, root_commit, root_tree, bounds)?;
+    let source_odb = source
+        .odb()
+        .map_err(|error| EvaluationError::FakeSuperviseExperiment {
+            message: format!("failed to open held-out source object database: {error}"),
+        })?;
+    let target_odb = target
+        .odb()
+        .map_err(|error| EvaluationError::FakeSuperviseExperiment {
+            message: format!("failed to open isolated held-out object database: {error}"),
+        })?;
+    let mut pending = Vec::new();
+    let mut scheduled = BTreeSet::new();
+    schedule_closure_object(
+        &mut pending,
+        &mut scheduled,
+        root_commit,
+        ObjectType::Commit,
+        bounds.max_distinct_objects,
+    )?;
+    let mut objects = BTreeMap::<Oid, ObjectType>::new();
+    let mut total_bytes = 0_u64;
+    while let Some((oid, expected_kind)) = pending.pop() {
+        if let Some(prior) = objects.get(&oid) {
+            if *prior != expected_kind {
+                return Err(EvaluationError::FakeSuperviseExperiment {
+                    message: format!(
+                        "held-out source baseline reused object {oid} with contradictory kinds"
+                    ),
+                });
+            }
+            continue;
+        }
+        if objects.len() >= bounds.max_distinct_objects {
+            return Err(EvaluationError::FakeSuperviseExperiment {
+                message: "held-out source baseline object graph exceeded its object-count bound"
+                    .into(),
+            });
+        }
+        let (size, kind) = source_odb.read_header(oid).map_err(|error| {
+            EvaluationError::FakeSuperviseExperiment {
+                message: format!("held-out source baseline omitted object {oid}: {error}"),
+            }
+        })?;
+        if kind != expected_kind {
+            return Err(EvaluationError::FakeSuperviseExperiment {
+                message: format!("held-out source baseline object {oid} had an unexpected kind"),
+            });
+        }
+        let size = u64::try_from(size).map_err(|_| EvaluationError::FakeSuperviseExperiment {
+            message: format!("held-out source baseline object {oid} exceeded its byte bound"),
+        })?;
+        total_bytes = add_checked_u64(total_bytes, size, "object closure byte count")?;
+        if total_bytes > bounds.max_bytes {
+            return Err(EvaluationError::FakeSuperviseExperiment {
+                message: "held-out source baseline object graph exceeded its aggregate byte bound"
+                    .into(),
+            });
+        }
+        objects.insert(oid, expected_kind);
+        match expected_kind {
+            ObjectType::Commit => {
+                let commit = source.find_commit(oid).map_err(|error| {
+                    EvaluationError::FakeSuperviseExperiment {
+                        message: format!("failed to parse held-out source commit {oid}: {error}"),
+                    }
+                })?;
+                schedule_closure_object(
+                    &mut pending,
+                    &mut scheduled,
+                    commit.tree_id(),
+                    ObjectType::Tree,
+                    bounds.max_distinct_objects,
+                )?;
+                for parent in commit.parent_ids() {
+                    schedule_closure_object(
+                        &mut pending,
+                        &mut scheduled,
+                        parent,
+                        ObjectType::Commit,
+                        bounds.max_distinct_objects,
+                    )?;
+                }
+            }
+            ObjectType::Tree => {
+                let tree = source.find_tree(oid).map_err(|error| {
+                    EvaluationError::FakeSuperviseExperiment {
+                        message: format!("failed to parse held-out source tree {oid}: {error}"),
+                    }
+                })?;
+                for entry in tree.iter() {
+                    match entry.kind() {
+                        Some(ObjectType::Tree) => schedule_closure_object(
+                            &mut pending,
+                            &mut scheduled,
+                            entry.id(),
+                            ObjectType::Tree,
+                            bounds.max_distinct_objects,
+                        )?,
+                        Some(ObjectType::Blob) => schedule_closure_object(
+                            &mut pending,
+                            &mut scheduled,
+                            entry.id(),
+                            ObjectType::Blob,
+                            bounds.max_distinct_objects,
+                        )?,
+                        Some(ObjectType::Commit) if entry.filemode() == 0o160000 => {
+                            // Ancestor-tree gitlinks are metadata only and are not traversed.
+                        }
+                        _ => {
+                            return Err(EvaluationError::FakeSuperviseExperiment {
+                                message: format!(
+                                    "held-out source tree {oid} contained an unsupported entry"
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+            ObjectType::Blob => {}
+            _ => {
+                return Err(EvaluationError::FakeSuperviseExperiment {
+                    message: format!(
+                        "held-out source baseline object {oid} used an unsupported kind"
+                    ),
+                });
+            }
+        }
+    }
+    for (oid, kind) in objects {
+        let object =
+            source_odb
+                .read(oid)
+                .map_err(|error| EvaluationError::FakeSuperviseExperiment {
+                    message: format!("failed to read held-out source object {oid}: {error}"),
+                })?;
+        if object.kind() != kind {
+            return Err(EvaluationError::FakeSuperviseExperiment {
+                message: format!("held-out source object {oid} changed kind during copy"),
+            });
+        }
+        let written = target_odb.write(kind, object.data()).map_err(|error| {
+            EvaluationError::FakeSuperviseExperiment {
+                message: format!("failed to materialize held-out source object {oid}: {error}"),
+            }
+        })?;
+        if written != oid {
+            return Err(EvaluationError::FakeSuperviseExperiment {
+                message: format!(
+                    "held-out source object materialization changed identity for {oid}"
+                ),
+            });
+        }
+    }
+    target
+        .find_commit(root_commit)
+        .map_err(|error| EvaluationError::FakeSuperviseExperiment {
+            message: format!(
+                "isolated held-out repository omitted materialized commit {root_commit}: {error}"
+            ),
+        })?;
+    Ok(())
 }
 
 fn commit_isolated(
