@@ -1874,6 +1874,7 @@ pub(super) fn deterministic_fake_run(
         stderr: crate::external_agent::CapturedOutput::default(),
         error: None,
         output_last_message: Some(output),
+        grok_stream_usage_evidence: None,
     }
 }
 
@@ -2252,6 +2253,7 @@ pub(super) fn command_record_from_external_for_runtime(
         environment_preflight_results: run.environment_preflight_results().to_vec(),
         environment_failures: sanitized_environment_failures(run.environment_failures().to_vec()),
         error: run.error.clone(),
+        grok_stream_usage_evidence: run.grok_stream_usage_evidence.clone(),
     }
 }
 
@@ -2382,4 +2384,80 @@ fn serializable_external_command(
                 .unwrap_or_else(|| argument.clone())
         })
         .collect()
+}
+
+#[cfg(test)]
+mod grok_stream_usage_evidence {
+    use super::*;
+    use crate::external_agent::{
+        CapturedOutput, ExternalAgentCommand, ExternalAgentRun, ExternalProgramTrust,
+    };
+    use crate::process_runner::{
+        ContainmentBackend, ProcessTreeEvidence, SideEffectConfinementEvidence,
+        SideEffectConfinementProfileKind,
+    };
+    use crate::runtime_adapter::grok::{GrokStreamUsageEvidence, GrokStreamUsageNativeEvidence};
+    use crate::runtime_adapter::{RuntimeAdapterConfig, RuntimeId};
+    use std::time::Duration;
+
+    #[test]
+    fn authenticated_command_record_retains_grok_stream_usage_evidence() {
+        let command = ExternalAgentCommand::codex(
+            "grok",
+            ".",
+            "prompt",
+            "log",
+            "output",
+            Duration::from_secs(1),
+        )
+        .with_runtime_adapter(
+            RuntimeId::Grok,
+            RuntimeAdapterConfig::defaults(RuntimeId::Grok),
+        );
+        let external_run = ExternalAgentRun {
+            command: vec!["grok".to_string()],
+            cwd: command.cwd.clone(),
+            timeout_seconds: 1,
+            exit_code: Some(0),
+            duration_ms: 1,
+            timed_out: false,
+            process_tree: Some(ProcessTreeEvidence::VerifiedEmpty(
+                ContainmentBackend::SystemdUserService,
+            )),
+            side_effects: Some(SideEffectConfinementEvidence::Verified(
+                SideEffectConfinementProfileKind::ExternalGrok,
+            )),
+            publishable: true,
+            program_trust: ExternalProgramTrust::ExplicitCustom,
+            codex_permissions: None,
+            stdout: CapturedOutput::default(),
+            stderr: CapturedOutput::default(),
+            error: None,
+            output_last_message: None,
+            grok_stream_usage_evidence: Some(GrokStreamUsageEvidence::Native(
+                GrokStreamUsageNativeEvidence {
+                    input_tokens: 3,
+                    output_tokens: 1,
+                    cache_read_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                    reasoning_tokens: None,
+                    total_tokens: Some(4),
+                },
+            )),
+        };
+        let record = command_record_from_external_for_runtime(
+            &external_run,
+            &command,
+            SupervisorRuntime::Grok,
+        );
+        assert_eq!(
+            record.grok_stream_usage_evidence,
+            external_run.grok_stream_usage_evidence
+        );
+        let value = serde_json::to_value(&record).expect("serialize command record");
+        assert_eq!(
+            value["grok_stream_usage_evidence"]["status"],
+            serde_json::json!("native")
+        );
+    }
 }

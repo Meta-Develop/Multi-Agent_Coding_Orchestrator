@@ -1,0 +1,3 @@
+# Preserve the exact captured bytes and the strict JSONL protocol on every checkout.
+tests/fixtures/runtime_adapter/grok/captured-minimal-20260821.txt text eol=lf
+tests/fixtures/runtime_adapter/grok/writable-managed-child.streaming-json text eol=lf

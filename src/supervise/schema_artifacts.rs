@@ -2584,6 +2584,7 @@ pub(super) fn codex_response_format_schema(
             properties.remove(supervisor_owned);
         }
     }
+    remove_parent_process_usage_from_child_schema(&mut authoritative);
     apply_codex_serde_option_projection(&mut authoritative)?;
     make_codex_response_format_compatible(&mut authoritative)?;
     validate_codex_response_format_schema(&authoritative)?;
@@ -2591,6 +2592,34 @@ pub(super) fn codex_response_format_schema(
 }
 
 const CODEX_SERDE_OPTION_PROJECTION: &str = "x-maco-serde-option";
+
+fn remove_parent_process_usage_from_child_schema(schema: &mut serde_json::Value) {
+    match schema {
+        serde_json::Value::Object(object) => {
+            if let Some(properties) = object
+                .get_mut("properties")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                properties.remove("grok_stream_usage_evidence");
+            }
+            if let Some(required) = object
+                .get_mut("required")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                required.retain(|name| name != "grok_stream_usage_evidence");
+            }
+            for value in object.values_mut() {
+                remove_parent_process_usage_from_child_schema(value);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                remove_parent_process_usage_from_child_schema(value);
+            }
+        }
+        _ => {}
+    }
+}
 
 fn apply_codex_serde_option_projection(schema: &mut serde_json::Value) -> Result<()> {
     let expected = match schema
@@ -3249,6 +3278,44 @@ fn decomposition_completion_schema_value_with_binding(
     })
 }
 
+fn grok_stream_usage_evidence_schema_value() -> serde_json::Value {
+    json!({
+        "oneOf": [
+            {"type": "null"},
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["status"],
+                "properties": {
+                    "status": {"const": "not_process_observable", "type": "string"}
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["status"],
+                "properties": {
+                    "status": {"const": "incomplete", "type": "string"}
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["status", "input_tokens", "output_tokens"],
+                "properties": {
+                    "status": {"const": "native", "type": "string"},
+                    "input_tokens": {"type": "integer", "minimum": 0},
+                    "output_tokens": {"type": "integer", "minimum": 0},
+                    "cache_read_input_tokens": {"type": ["integer", "null"], "minimum": 0},
+                    "cache_creation_input_tokens": {"type": ["integer", "null"], "minimum": 0},
+                    "reasoning_tokens": {"type": ["integer", "null"], "minimum": 0},
+                    "total_tokens": {"type": ["integer", "null"], "minimum": 0}
+                }
+            }
+        ]
+    })
+}
+
 pub(super) fn command_run_record_schema_value() -> serde_json::Value {
     json!({
         "type": "object",
@@ -3288,7 +3355,8 @@ pub(super) fn command_run_record_schema_value() -> serde_json::Value {
                 "type": "array",
                 "items": environment_failure_schema_value()
             },
-            "error": {"type": ["string", "null"]}
+            "error": {"type": ["string", "null"]},
+            "grok_stream_usage_evidence": grok_stream_usage_evidence_schema_value()
         },
         "allOf": [command_environment_failure_outcome_schema_value()]
     })
@@ -3972,6 +4040,9 @@ mod selection_schema_tests {
             .is_none());
         let worker = &codex["properties"]["worker_reports"]["items"];
         let command = &worker["properties"]["commands_run"]["items"];
+        assert!(command["properties"]
+            .get("grok_stream_usage_evidence")
+            .is_none());
         for field in [
             "sandbox_denials",
             "environment_preflight_results",
@@ -4062,6 +4133,7 @@ mod selection_schema_tests {
             }],
             environment_failures: vec![failure.clone()],
             error: Some("representative failure".to_string()),
+            grok_stream_usage_evidence: None,
         };
         let validation_result = ValidationResult {
             name: "cargo check".to_string(),
@@ -4248,6 +4320,108 @@ mod selection_schema_tests {
             invalid["provenance"]["operator_prior_data"]["extra_grant"] = json!(true);
             assert!(!schema_accepts_instance(event_schema, &invalid));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn command_run_record_grok_stream_usage_evidence_schema_regression() -> Result<()> {
+        use crate::runtime_adapter::grok::{
+            GrokStreamUsageEvidence, GrokStreamUsageNativeEvidence,
+        };
+
+        let command_schema = command_run_record_schema_value();
+        assert!(command_schema["properties"]
+            .get("grok_stream_usage_evidence")
+            .is_some());
+        assert!(!command_schema["required"]
+            .as_array()
+            .expect("required fields")
+            .iter()
+            .any(|field| field == "grok_stream_usage_evidence"));
+
+        let schema_id = "https://example.invalid/command-run-record";
+        let mut compiler = boon::Compiler::new();
+        compiler.set_default_draft(boon::Draft::V2020_12);
+        compiler
+            .add_resource(schema_id, command_schema.clone())
+            .expect("register command-run-record schema");
+        let mut schemas = boon::Schemas::new();
+        let index = compiler
+            .compile(schema_id, &mut schemas)
+            .expect("compile command-run-record schema");
+
+        let base = json!({
+            "command": ["grok".to_string()],
+            "cwd": ".",
+            "status": "succeeded",
+            "timeout_seconds": 1,
+            "duration_ms": 1,
+            "timed_out": false,
+            "stdout": "",
+            "stderr": "",
+            "environment_preflight_results": [],
+            "environment_failures": []
+        });
+        schemas.validate(&base, index).unwrap_or_else(|error| {
+            panic!("schema rejected legacy omitted grok_stream_usage_evidence: {error:#}")
+        });
+
+        let statuses = [
+            (
+                "not_process_observable",
+                GrokStreamUsageEvidence::NotProcessObservable,
+            ),
+            ("incomplete", GrokStreamUsageEvidence::Incomplete),
+            (
+                "native",
+                GrokStreamUsageEvidence::Native(GrokStreamUsageNativeEvidence {
+                    input_tokens: 4,
+                    output_tokens: 2,
+                    cache_read_input_tokens: Some(1),
+                    cache_creation_input_tokens: None,
+                    reasoning_tokens: Some(0),
+                    total_tokens: Some(6),
+                }),
+            ),
+        ];
+        for (label, evidence) in statuses {
+            let mut instance = base.clone();
+            instance["grok_stream_usage_evidence"] = serde_json::to_value(&evidence)?;
+            schemas.validate(&instance, index).unwrap_or_else(|error| {
+                panic!("schema rejected {label} grok_stream_usage_evidence: {error:#}")
+            });
+        }
+
+        let mut unknown_field = base.clone();
+        unknown_field["grok_stream_usage_evidence"] = json!({
+            "status": "native",
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "forged_extra_field": true
+        });
+        schemas
+            .validate(&unknown_field, index)
+            .expect_err("extra grok_stream_usage_evidence field must be rejected");
+
+        let mut negative_tokens = base.clone();
+        negative_tokens["grok_stream_usage_evidence"] = json!({
+            "status": "native",
+            "input_tokens": -1,
+            "output_tokens": 1
+        });
+        schemas
+            .validate(&negative_tokens, index)
+            .expect_err("negative native token count must be rejected");
+
+        let mut missing_required = base.clone();
+        missing_required["grok_stream_usage_evidence"] = json!({
+            "status": "native",
+            "input_tokens": 1
+        });
+        schemas
+            .validate(&missing_required, index)
+            .expect_err("missing required native token field must be rejected");
+
         Ok(())
     }
 

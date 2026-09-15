@@ -18,7 +18,7 @@ use crate::{
     },
 };
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -316,6 +316,50 @@ impl GrokUsageStatus {
             Self::NotProcessObservable => "not_process_observable",
             Self::Incomplete => "incomplete",
             Self::Native(_) => "native",
+        }
+    }
+}
+
+/// Persisted Grok streaming-json spend observation on external run reports.
+///
+/// This is not Codex JSONL `Usage`, not priced role economics, and does not
+/// carry identity, effort, or total cost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum GrokStreamUsageEvidence {
+    NotProcessObservable,
+    Incomplete,
+    Native(GrokStreamUsageNativeEvidence),
+}
+
+/// Exact token buckets from Grok's native terminal `end.usage` object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrokStreamUsageNativeEvidence {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+}
+
+impl GrokStreamUsageEvidence {
+    pub fn from_usage_status(status: GrokUsageStatus) -> Self {
+        match status {
+            GrokUsageStatus::NotProcessObservable => Self::NotProcessObservable,
+            GrokUsageStatus::Incomplete => Self::Incomplete,
+            GrokUsageStatus::Native(usage) => Self::Native(GrokStreamUsageNativeEvidence {
+                input_tokens: usage.input_tokens(),
+                output_tokens: usage.output_tokens(),
+                cache_read_input_tokens: usage.cache_read_input_tokens(),
+                cache_creation_input_tokens: usage.cache_creation_input_tokens(),
+                reasoning_tokens: usage.reasoning_tokens(),
+                total_tokens: usage.total_tokens(),
+            }),
         }
     }
 }
