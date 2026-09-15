@@ -4,7 +4,9 @@ mod support;
 use anyhow::{Context, Result};
 use multi_agent_coding_orchestrator::{
     artifacts::{ArtifactRunReader, RunArtifactFamily},
-    evaluation::{CommandObservationStatus, ExecutedExperimentResults},
+    evaluation::{
+        CommandObservationStatus, ExecutedExperimentResults, RealProviderExecutionObservation,
+    },
     orchestrator::RunId,
 };
 use serde_json::{json, Value};
@@ -132,6 +134,7 @@ fn production_cli_observes_actual_exit_mutation_and_unknown_and_retains_authenti
     assert!(results.synthetic_baseline);
     assert!(
         !results.real_provider_executed
+            && results.real_provider_execution == RealProviderExecutionObservation::NotRequested
             && !results.production_eligible
             && !results.eligible_for_production_economics
             && !results.eligible_to_justify_named_default
@@ -379,5 +382,100 @@ fn explicit_source_leaves_dirty_source_repository_unchanged() -> Result<()> {
     assert_eq!(fs::read(&dirty)?, dirty_bytes);
     assert_eq!(fs::read(source_repo.join(".git/index"))?, index_bytes);
     assert!(!source_repo.join(".git/worktrees").exists());
+    Ok(())
+}
+
+#[test]
+fn real_provider_incomplete_tuple_is_refused_before_artifact_reservation() -> Result<()> {
+    let workspace = TempDir::new()?;
+    let (source_repo, base_commit, _) = init_source_repo(workspace.path())?;
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/model_mix_evaluation/experiment-manifest-v1.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(fixture)?)?;
+    manifest["held_out_validation"] = json!([{"id":"present", "command":["true"]}]);
+    let manifest_path = workspace.path().join("manifest.json");
+    fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
+    let artifact_owner = workspace.path().join("artifact-owner");
+    git2::Repository::init(&artifact_owner)?;
+    let plan_path = workspace.path().join("provider-plan.json");
+    fs::write(
+        &plan_path,
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "task": "cli real-provider caller plan",
+            "max_depth": 2,
+            "max_child_assignments": 1,
+            "max_child_retries": 0,
+            "child_timeout_seconds": 10,
+            "assignments": [{
+                "id": "docs-child",
+                "phase": "execution",
+                "assigned_paths": ["README.md"],
+                "worker_assignments": [{"id": "worker-a", "assigned_paths": ["README.md"]}]
+            }]
+        }))?,
+    )?;
+    let before = supervise_run_count(&artifact_owner)?;
+    let output = Command::new(BIN)
+        .args(["evaluation", "experiment"])
+        .arg(&manifest_path)
+        .args([
+            "--execute-held-out",
+            "--execution",
+            "real-provider",
+            "--allow-real-provider",
+            "--json",
+            "--repo",
+        ])
+        .arg(&artifact_owner)
+        .arg("--source-repo")
+        .arg(&source_repo)
+        .arg("--base-commit")
+        .arg(&base_commit)
+        .arg("--provider-plan")
+        .arg(&plan_path)
+        .args(["--runtime", "grok"])
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--runtime-bin") || stderr.contains("runtime executable"),
+        "stderr={stderr}"
+    );
+    assert_eq!(supervise_run_count(&artifact_owner)?, before);
+
+    let output = Command::new(BIN)
+        .args(["evaluation", "experiment"])
+        .arg(&manifest_path)
+        .args([
+            "--execute-held-out",
+            "--execution",
+            "real-provider",
+            "--allow-real-provider",
+            "--json",
+            "--repo",
+        ])
+        .arg(&artifact_owner)
+        .arg("--source-repo")
+        .arg(&source_repo)
+        .arg("--base-commit")
+        .arg(&base_commit)
+        .arg("--provider-plan")
+        .arg(&plan_path)
+        .args(["--runtime", "fake", "--runtime-bin", "/usr/bin/true"])
+        .args([
+            "--machine-global-config",
+            "/tmp/maco-machine-global.json",
+            "--machine-global-runtime-root-id",
+            "runtime",
+        ])
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("non-Fake") || stderr.contains("Fake fallback"),
+        "stderr={stderr}"
+    );
+    assert_eq!(supervise_run_count(&artifact_owner)?, before);
     Ok(())
 }

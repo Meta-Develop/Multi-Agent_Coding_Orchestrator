@@ -63,7 +63,50 @@ fn runtime_model_catalog_for_launch(
     )
 }
 
-fn selected_runtime_program(
+pub(crate) fn canonicalize_explicit_runtime_executable(path: &Path) -> Result<PathBuf> {
+    if path.as_os_str().is_empty() {
+        bail!("runtime executable must not be empty");
+    }
+    if !path.is_absolute() {
+        bail!(
+            "runtime executable must be an absolute path; ambient PATH and relative resolution are refused (requested {})",
+            path.display()
+        );
+    }
+    let canonical = std::fs::canonicalize(path)
+        .with_context(|| format!("runtime executable '{}' is missing", path.display()))?;
+    if !canonical.is_file() {
+        bail!(
+            "runtime executable '{}' is not a regular file",
+            canonical.display()
+        );
+    }
+    Ok(canonical)
+}
+
+pub(crate) fn refuse_runtime_executable_binding_mismatch(
+    runtime: SupervisorRuntime,
+    requested_executable: &Path,
+    options: &SupervisorRunOptions,
+) -> Result<()> {
+    if runtime == SupervisorRuntime::Fake {
+        bail!("held-out production runtime executable binding refuses Fake runtime");
+    }
+    let requested = canonicalize_explicit_runtime_executable(requested_executable)?;
+    let configured = selected_runtime_program(runtime, options)?;
+    let configured = canonicalize_explicit_runtime_executable(&configured)?;
+    if requested != configured {
+        bail!(
+            "configured runtime executable {} does not match required --runtime-bin {} for runtime '{}'; set the matching MACO_*_BIN (or Codex --runtime-bin) before reservation",
+            configured.display(),
+            requested.display(),
+            runtime_name(runtime)
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn selected_runtime_program(
     launch_runtime: SupervisorRuntime,
     options: &SupervisorRunOptions,
 ) -> Result<PathBuf> {

@@ -4102,6 +4102,19 @@ fn deduplicate_sandbox_denials(evidence: &mut Vec<SandboxDenialEvidence>) {
     evidence.dedup();
 }
 
+pub(crate) fn refused_external_run_before_launch(
+    spec: &ExternalAgentCommand,
+    error: String,
+) -> ExternalAgentRun {
+    failed_external_run(
+        spec,
+        Instant::now(),
+        command_display(&spec.program, &[]),
+        false,
+        error,
+    )
+}
+
 fn failed_external_run(
     spec: &ExternalAgentCommand,
     started: Instant,

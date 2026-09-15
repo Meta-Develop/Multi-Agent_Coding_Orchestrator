@@ -2637,6 +2637,290 @@ pub(crate) fn run_held_out_fake_experiment(
     )
 }
 
+/// Frozen operator-owned caller plan for held-out real-provider experiments.
+/// Assignment identity, metadata, and paths come from this document, never from
+/// synthetic Fake generation.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FrozenHeldOutProductionCallerPlan {
+    loaded: LoadedSupervisorPlan,
+    pub(crate) caller_plan_bytes: Vec<u8>,
+    pub(crate) caller_plan_sha256: String,
+    pub assignment_id: String,
+    pub assigned_paths: Vec<PathBuf>,
+}
+
+/// Read and freeze a caller plan once through the bounded/confined supervisor
+/// loader. Generated follow-ups, execution targets, and extra assignments are
+/// refused before any experiment artifact reservation.
+pub(crate) fn freeze_held_out_production_caller_plan(
+    plan_file: &Path,
+) -> Result<FrozenHeldOutProductionCallerPlan> {
+    #[cfg(unix)]
+    let caller_plan_bytes =
+        BoundedRegularReader::read_tree_no_follow(plan_file, MAX_SUPERVISOR_INPUT_BYTES)
+            .with_context(|| {
+                format!(
+                    "failed to read held-out production caller plan {}",
+                    plan_file.display()
+                )
+            })?;
+    #[cfg(not(unix))]
+    let caller_plan_bytes = BoundedRegularReader::read(plan_file, MAX_SUPERVISOR_INPUT_BYTES)
+        .with_context(|| {
+            format!(
+                "failed to read held-out production caller plan {}",
+                plan_file.display()
+            )
+        })?;
+    let contents = String::from_utf8(caller_plan_bytes.clone()).with_context(|| {
+        format!(
+            "held-out production caller plan is not UTF-8: {}",
+            plan_file.display()
+        )
+    })?;
+    let loaded = parse_supervisor_plan_with_consultant(&contents).with_context(|| {
+        format!(
+            "failed to parse held-out production caller plan {}",
+            plan_file.display()
+        )
+    })?;
+    refuse_held_out_production_caller_plan(&loaded)?;
+    let assignment = &loaded.plan.assignments[0];
+    let caller_plan_sha256 = crate::artifacts::state_auth::sha256_hex(&caller_plan_bytes);
+    Ok(FrozenHeldOutProductionCallerPlan {
+        caller_plan_bytes,
+        caller_plan_sha256,
+        assignment_id: assignment.id.clone(),
+        assigned_paths: assignment.assigned_paths.clone(),
+        loaded,
+    })
+}
+
+/// Overlay only profile `role_models` onto the frozen full document, round-trip
+/// through the ordinary loader, and refuse silent authority drift.
+pub(crate) fn materialize_held_out_profile_effective_caller_plan(
+    frozen: &FrozenHeldOutProductionCallerPlan,
+    role_models: &BTreeMap<AgentRole, RoleModelSelection>,
+) -> Result<Vec<u8>> {
+    let mut loaded = frozen.loaded.clone();
+    loaded.plan.role_models = role_models.clone();
+    for (role, selection) in &loaded.plan.role_models {
+        selection.validate_model_fallback().with_context(|| {
+            format!("profile role_models.{} fallback is invalid", role.as_str())
+        })?;
+    }
+    let (plan, plan_metadata) = validate_supervisor_plan(loaded.plan, loaded.plan_metadata)?;
+    loaded.plan = plan;
+    loaded.plan_metadata = plan_metadata;
+    bind_assignment_role_categories(&mut loaded.plan);
+    let value = supervisor_plan_value(
+        &loaded.plan,
+        &loaded.consultant,
+        &loaded.assignment_metadata,
+        &loaded.plan_metadata,
+    )?;
+    let effective_bytes = serde_json::to_vec_pretty(&value)
+        .context("failed to serialize effective held-out caller plan")?;
+    let effective_text = String::from_utf8(effective_bytes.clone())
+        .context("effective held-out caller plan is not UTF-8")?;
+    let effective_loaded = parse_supervisor_plan_with_consultant(&effective_text)
+        .context("effective held-out caller plan failed full-document validation")?;
+    if effective_loaded.plan != loaded.plan
+        || effective_loaded.consultant != loaded.consultant
+        || effective_loaded.plan_metadata != loaded.plan_metadata
+        || effective_loaded.assignment_metadata != loaded.assignment_metadata
+    {
+        bail!("effective held-out caller plan materialization changed plan authority");
+    }
+    Ok(effective_bytes)
+}
+
+pub(crate) fn refuse_held_out_production_runtime_executable_binding(
+    runtime: SupervisorRuntime,
+    requested_executable: &Path,
+    options: &SupervisorRunOptions,
+) -> Result<()> {
+    assignment_execution::refuse_runtime_executable_binding_mismatch(
+        runtime,
+        requested_executable,
+        options,
+    )
+}
+
+fn refuse_held_out_production_caller_plan(loaded: &LoadedSupervisorPlan) -> Result<()> {
+    validate_execution_target_pre_dispatch(loaded, false)?;
+    if loaded.plan_metadata.generated_follow_up.is_some() {
+        bail!("held-out production caller plan must not declare generated_follow_up");
+    }
+    if loaded.plan_metadata.execution_target.is_some() {
+        bail!("held-out production caller plan must not declare execution_target");
+    }
+    if loaded.plan_metadata.evidence_only_reaudit.is_some() {
+        bail!("held-out production caller plan must not declare evidence_only_reaudit");
+    }
+    if loaded.plan.assignments.len() != 1 {
+        bail!("held-out production caller plan must contain exactly one assignment");
+    }
+    Ok(())
+}
+
+/// Parent-captured launch and native-runtime observations from the production
+/// external runner. Evidence is taken from live `ExternalAgentRun` fields, not
+/// from report success, child JSON, or a requested execution enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HeldOutProductionLaunchObservation {
+    pub target_launch_attempted: bool,
+    pub native_runtime_result_captured: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct HeldOutProductionExperimentOutcome {
+    pub report: Result<SupervisorFinalReport>,
+    pub launch: HeldOutProductionLaunchObservation,
+}
+
+pub(crate) fn validate_held_out_launch_binding(
+    command: &ExternalAgentCommand,
+    runtime: SupervisorRuntime,
+    executable: &Path,
+) -> Result<()> {
+    if command.invocation.adapter_id() != Some(crate::runtime_adapter::AdapterId::from(runtime))
+        || command.invocation.is_adapter_subprocess() != runtime.is_adapter_subprocess()
+        || command.runtime_adapter.is_some() != runtime.is_adapter_subprocess()
+    {
+        bail!("held-out production run refused runtime substitution");
+    }
+    let actual = assignment_execution::canonicalize_explicit_runtime_executable(&command.program)?;
+    if actual != executable {
+        bail!("held-out production run refused executable substitution");
+    }
+    Ok(())
+}
+
+pub(crate) fn held_out_native_runtime_result_captured(run: &ExternalAgentRun) -> bool {
+    run.publishable
+        && run.exit_code == Some(0)
+        && !run.timed_out
+        && run.error.is_none()
+        && run.stdout.target_launch_attempted
+        && run
+            .process_tree
+            .is_some_and(ProcessTreeEvidence::is_verified_empty)
+        && run
+            .side_effects
+            .is_some_and(SideEffectConfinementEvidence::is_verified)
+        && run
+            .output_last_message()
+            .is_some_and(|message| !message.is_empty())
+}
+
+/// Production held-out experiment entrypoint. Uses the ordinary Verified
+/// supervisor, Bound worktree creation, production catalog/account admission,
+/// and `run_external_agent_cancellable_reviewed`. Never reuses
+/// NonpublishableSimulation or the Fake panic runner.
+pub(crate) fn run_held_out_production_experiment(
+    options: SupervisorRunOptions,
+    authority: held_out::ParentValidationAuthority,
+) -> Result<HeldOutProductionExperimentOutcome> {
+    run_held_out_production_experiment_with_runner(
+        options,
+        authority,
+        &run_external_agent_cancellable_reviewed,
+    )
+}
+
+/// Narrow test injection following `run_fake_supervisor_plan_file_for_test`.
+/// Injected runs are never production-eligible; launch evidence still comes
+/// only from live `target_launch_attempted`.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(super) fn run_held_out_production_experiment_with_injected_runner(
+    options: SupervisorRunOptions,
+    authority: held_out::ParentValidationAuthority,
+    external_runner: &CancellableExternalRunner<'_>,
+) -> Result<HeldOutProductionExperimentOutcome> {
+    run_held_out_production_experiment_with_runner(options, authority, external_runner)
+}
+
+fn run_held_out_production_experiment_with_runner(
+    options: SupervisorRunOptions,
+    authority: held_out::ParentValidationAuthority,
+    external_runner: &CancellableExternalRunner<'_>,
+) -> Result<HeldOutProductionExperimentOutcome> {
+    if options.runtime == SupervisorRuntime::Fake {
+        bail!("the held-out production experiment entrypoint requires a non-Fake runtime");
+    }
+    if options.codex_bin.as_os_str().is_empty() {
+        bail!(
+            "the held-out production experiment entrypoint requires an explicit runtime executable"
+        );
+    }
+    if options.machine_global_retention.is_none() {
+        bail!("the held-out production experiment entrypoint requires a caller-supplied machine-global retention binding");
+    }
+    let repo = discover_repo_root(&options.repo)?;
+    let mut loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    refuse_held_out_production_caller_plan(&loaded)?;
+    if loaded.plan.assignments[0].id != authority.binding.assignment_id
+        || options.run_id.as_str() != authority.binding.supervisor_run_id
+    {
+        bail!("experiment validation authority does not match the isolated assignment");
+    }
+    loaded.assignment_metadata.parent_validation = Some(authority);
+    let bound_runtime = options.runtime;
+    let bound_executable =
+        assignment_execution::canonicalize_explicit_runtime_executable(&options.codex_bin)?;
+    assignment_execution::refuse_runtime_executable_binding_mismatch(
+        bound_runtime,
+        &options.codex_bin,
+        &options,
+    )?;
+    let runtime_model_catalog =
+        admit_production_supervisor_catalog_preflight_grant(&options, &repo)
+            .and_then(|grant| RuntimeModelCatalog::for_supervisor(&options, &repo, grant));
+    let manager = WorktreeManager::new(&repo);
+    let cleanliness = manager.acquire_repository_cleanliness()?;
+    let launch_attempted = AtomicBool::new(false);
+    let native_result_captured = AtomicBool::new(false);
+    let wrapped_runner = |command: &ExternalAgentCommand,
+                          cancellation: &ProcessCancellation,
+                          review: Option<ExternalPreActionReviewRuntime<'_>>|
+     -> ExternalAgentRun {
+        if let Err(error) =
+            validate_held_out_launch_binding(command, bound_runtime, &bound_executable)
+        {
+            return crate::external_agent::refused_external_run_before_launch(
+                command,
+                error.to_string(),
+            );
+        }
+        let run = external_runner(command, cancellation, review);
+        if run.stdout.target_launch_attempted {
+            launch_attempted.store(true, Ordering::SeqCst);
+        }
+        if held_out_native_runtime_result_captured(&run) {
+            native_result_captured.store(true, Ordering::SeqCst);
+        }
+        run
+    };
+    let report = run_supervisor_plan_with_runner_and_creation(
+        loaded,
+        options,
+        1,
+        SupervisorExecutionRuntime::Verified,
+        SupervisorWorktreeCreation::Bound(&cleanliness),
+        runtime_model_catalog,
+        &wrapped_runner,
+    );
+    Ok(HeldOutProductionExperimentOutcome {
+        report,
+        launch: HeldOutProductionLaunchObservation {
+            target_launch_attempted: launch_attempted.load(Ordering::SeqCst),
+            native_runtime_result_captured: native_result_captured.load(Ordering::SeqCst),
+        },
+    })
+}
+
 /// Runs a Fake plan-file experiment through the nonpublishable-simulation
 /// worktree path. This test wrapper verifies the same production seam used by
 /// Fake autopilot while keeping direct Fake plan-file execution unavailable.
