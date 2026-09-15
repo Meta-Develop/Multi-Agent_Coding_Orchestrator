@@ -125,6 +125,10 @@ fn committed_summary() -> EvaluationSummary {
     serde_json::from_str(FIXTURE_SUMMARY).expect("deserialize committed evaluation summary")
 }
 
+fn normalize_fixture_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
 fn precise_quality(score: QualityScore) -> PreciseQualityScore {
     PreciseQualityScore {
         held_out_basis_points: PreciseMean {
@@ -700,12 +704,12 @@ fn committed_fixtures_match_the_deterministic_harness() {
     )
     .expect("reproduce committed deterministic results");
     assert_eq!(
-        FIXTURE_RESULTS,
-        format!(
+        normalize_fixture_newlines(FIXTURE_RESULTS),
+        normalize_fixture_newlines(&format!(
             "{}\n",
             serde_json::to_string_pretty(&reproduced)
                 .expect("serialize reproduced deterministic results")
-        )
+        ))
     );
 
     let summary = committed_summary();
@@ -713,12 +717,12 @@ fn committed_fixtures_match_the_deterministic_harness() {
         .validate_against(&manifest, &results)
         .expect("committed summary is an exact validated projection");
     assert_eq!(
-        FIXTURE_SUMMARY,
-        format!(
+        normalize_fixture_newlines(FIXTURE_SUMMARY),
+        normalize_fixture_newlines(&format!(
             "{}\n",
             serde_json::to_string_pretty(&reproduced.summary())
                 .expect("serialize reproduced deterministic summary")
-        )
+        ))
     );
 }
 
@@ -2225,4 +2229,660 @@ fn held_out_explicit_source_run_refuses_checkout_expansion_before_artifact_reser
     );
     let runs = artifact_repo.join(".maco/o2/runs");
     assert!(!runs.exists() || fs::read_dir(runs).expect("runs").next().is_none());
+}
+
+fn caller_plan_document(
+    assignment_id: &str,
+    extra_assignment: bool,
+    execution_target: bool,
+) -> Vec<u8> {
+    let (assigned_paths, worker_assignments) = if execution_target {
+        (json!(["local/deploy.txt"]), json!([]))
+    } else {
+        (
+            json!(["README.md"]),
+            json!([{
+                "id": "worker-a",
+                "assigned_paths": ["README.md"],
+                "task": "edit README.md"
+            }]),
+        )
+    };
+    let mut plan = json!({
+        "version": 1,
+        "task": "tiny held-out production caller plan",
+        "max_depth": 2,
+        "max_child_assignments": if extra_assignment { 2 } else { 1 },
+        "max_child_retries": 0,
+        "max_gate_corrections": 0,
+        "child_timeout_seconds": 10,
+        "assignments": [{
+            "id": assignment_id,
+            "phase": "execution",
+            "assigned_paths": assigned_paths,
+            "worker_assignments": worker_assignments,
+        }]
+    });
+    if extra_assignment {
+        plan["assignments"]
+            .as_array_mut()
+            .expect("assignments")
+            .push(json!({
+                "id": "child-b",
+                "phase": "execution",
+                "assigned_paths": ["OTHER.md"],
+                "worker_assignments": [{
+                    "id": "worker-b",
+                    "assigned_paths": ["OTHER.md"],
+                    "task": "edit OTHER.md"
+                }]
+            }));
+    }
+    if execution_target {
+        plan["execution_target"] = json!({
+            "kind": "primary_worktree",
+            "claim_paths": ["local/deploy.txt"]
+        });
+    }
+    serde_json::to_vec_pretty(&plan).expect("serialize caller plan")
+}
+
+fn write_caller_plan(
+    dir: &std::path::Path,
+    assignment_id: &str,
+    extra_assignment: bool,
+    execution_target: bool,
+) -> std::path::PathBuf {
+    let path = dir.join("provider-plan.json");
+    fs::write(
+        &path,
+        caller_plan_document(assignment_id, extra_assignment, execution_target),
+    )
+    .expect("write caller plan");
+    path
+}
+
+fn dummy_retention() -> crate::machine_global::MachineGlobalRetentionBinding {
+    crate::machine_global::MachineGlobalRetentionBinding {
+        config: std::path::PathBuf::from("/tmp/maco-evaluation-machine-global.json"),
+        root_id: "runtime".to_string(),
+        owner: "maco-evaluation-experiment".to_string(),
+        correction_correlation_id: "test".to_string(),
+    }
+}
+
+fn real_provider_request(
+    source: HeldOutExplicitSourceBaseline,
+    provider_plan: std::path::PathBuf,
+) -> HeldOutRealProviderExperimentRequest {
+    HeldOutRealProviderExperimentRequest {
+        execution: EvaluationExecution::RealProvider,
+        allow_real_provider: true,
+        source,
+        provider_plan,
+        runtime: crate::supervise::SupervisorRuntime::Grok,
+        runtime_executable: std::path::PathBuf::from("/usr/bin/true"),
+        machine_global_retention: dummy_retention(),
+    }
+}
+
+fn artifact_owner() -> (tempfile::TempDir, std::path::PathBuf) {
+    let workspace = tempfile::TempDir::new().expect("artifact workspace");
+    let repo = workspace.path().join("artifact-owner");
+    git2::Repository::init(&repo).expect("artifact repo");
+    (workspace, repo)
+}
+
+fn no_reserved_runs(artifact_repo: &std::path::Path) {
+    let runs = artifact_repo.join(".maco/o2/runs");
+    assert!(
+        !runs.exists() || fs::read_dir(&runs).expect("runs").next().is_none(),
+        "opt-in refusal reserved artifacts at {}",
+        runs.display()
+    );
+}
+
+#[test]
+fn held_out_real_provider_refuses_incomplete_tuple_before_artifact_reservation() {
+    let manifest = experiment_manifest();
+    let (_source_workspace, source_repo, base_commit) = init_committed_source_repo("baseline");
+    let plan_workspace = tempfile::TempDir::new().expect("plan workspace");
+    let provider_plan = write_caller_plan(plan_workspace.path(), "docs-child", false, false);
+    let source = HeldOutExplicitSourceBaseline {
+        source_repo: source_repo.clone(),
+        base_commit: base_commit.clone(),
+    };
+    let (_artifact, artifact_repo) = artifact_owner();
+
+    let mut missing_opt_in = real_provider_request(source.clone(), provider_plan.clone());
+    missing_opt_in.allow_real_provider = false;
+    let error = run_held_out_real_provider_experiment(&manifest, missing_opt_in, &artifact_repo)
+        .expect_err("missing allow_real_provider");
+    assert!(
+        error.to_string().contains("allow_real_provider=true"),
+        "{error}"
+    );
+    no_reserved_runs(&artifact_repo);
+
+    let mut fake_runtime = real_provider_request(source.clone(), provider_plan.clone());
+    fake_runtime.runtime = crate::supervise::SupervisorRuntime::Fake;
+    let error = run_held_out_real_provider_experiment(&manifest, fake_runtime, &artifact_repo)
+        .expect_err("Fake runtime must not fall back");
+    assert!(
+        error.to_string().contains("non-Fake") && error.to_string().contains("Fake fallback"),
+        "{error}"
+    );
+    no_reserved_runs(&artifact_repo);
+
+    let mut missing_executable = real_provider_request(source.clone(), provider_plan.clone());
+    missing_executable.runtime_executable = std::path::PathBuf::new();
+    let error =
+        run_held_out_real_provider_experiment(&manifest, missing_executable, &artifact_repo)
+            .expect_err("missing executable");
+    assert!(error.to_string().contains("runtime executable"), "{error}");
+    no_reserved_runs(&artifact_repo);
+
+    let mut fake_execution = real_provider_request(source, provider_plan);
+    fake_execution.execution = EvaluationExecution::DeterministicFake;
+    let error = run_held_out_real_provider_experiment(&manifest, fake_execution, &artifact_repo)
+        .expect_err("deterministic-fake must not enter production");
+    assert!(
+        error.to_string().contains("--execution real-provider"),
+        "{error}"
+    );
+    no_reserved_runs(&artifact_repo);
+}
+
+#[test]
+fn held_out_fake_entrypoint_does_not_accept_real_provider() {
+    let manifest = experiment_manifest();
+    let (_artifact, artifact_repo) = artifact_owner();
+    let error = run_experiment_with_held_out_and_source(
+        &manifest,
+        ExperimentRunRequest {
+            execution: EvaluationExecution::RealProvider,
+            allow_real_provider: true,
+        },
+        &artifact_repo,
+        None,
+    )
+    .expect_err("Fake held-out entrypoint must keep refusing real-provider");
+    assert!(
+        error
+            .to_string()
+            .contains("supports only deterministic-fake"),
+        "{error}"
+    );
+    no_reserved_runs(&artifact_repo);
+}
+
+#[test]
+fn held_out_real_provider_refuses_caller_plan_mismatch_before_reservation() {
+    let manifest = experiment_manifest();
+    let (_source_workspace, source_repo, base_commit) = init_committed_source_repo("baseline");
+    let plan_workspace = tempfile::TempDir::new().expect("plan workspace");
+    let source = HeldOutExplicitSourceBaseline {
+        source_repo: source_repo.clone(),
+        base_commit,
+    };
+    let (_artifact, artifact_repo) = artifact_owner();
+    fs::write(source_repo.join("OTHER.md"), "other held-out path\n").expect("other path");
+
+    let extra = write_caller_plan(plan_workspace.path(), "docs-child", true, false);
+    let error = run_held_out_real_provider_experiment(
+        &manifest,
+        real_provider_request(source.clone(), extra),
+        &artifact_repo,
+    )
+    .expect_err("extra assignments");
+    let message = format!("{error:#}");
+    assert!(message.contains("exactly one assignment"), "{message}");
+    no_reserved_runs(&artifact_repo);
+
+    let target = write_caller_plan(plan_workspace.path(), "docs-child", false, true);
+    let error = run_held_out_real_provider_experiment(
+        &manifest,
+        real_provider_request(source.clone(), target),
+        &artifact_repo,
+    )
+    .expect_err("execution_target");
+    let message = format!("{error:#}");
+    assert!(message.contains("execution_target"), "{message}");
+    no_reserved_runs(&artifact_repo);
+
+    let inside = source_repo.join("inside-plan.json");
+    fs::write(&inside, caller_plan_document("docs-child", false, false))
+        .expect("write inside plan");
+    let error = run_held_out_real_provider_experiment(
+        &manifest,
+        real_provider_request(source, inside),
+        &artifact_repo,
+    )
+    .expect_err("plan inside source");
+    assert!(
+        error
+            .to_string()
+            .contains("outside the evaluated source repository"),
+        "{error}"
+    );
+    no_reserved_runs(&artifact_repo);
+}
+
+#[test]
+fn held_out_real_provider_binds_caller_assignment_and_requested_profile_models() {
+    let manifest = experiment_manifest();
+    let profile = &manifest.profiles[0];
+    let (_source_workspace, source_repo, full_oid) = init_committed_source_repo("baseline");
+    let plan_workspace = tempfile::TempDir::new().expect("plan workspace");
+    let provider_plan = write_caller_plan(plan_workspace.path(), "docs-child", false, false);
+    let frozen = crate::supervise::freeze_held_out_production_caller_plan(&provider_plan)
+        .expect("freeze caller plan");
+    assert_eq!(frozen.assignment_id, "docs-child");
+    assert_eq!(
+        frozen.assigned_paths,
+        vec![std::path::PathBuf::from("README.md")]
+    );
+    let source = HeldOutExplicitSourceBaseline {
+        source_repo,
+        base_commit: full_oid.clone(),
+    };
+    let commit_oid = resolve_held_out_explicit_source_baseline(&source).expect("resolve source");
+    let (isolated, effective_bytes) =
+        super::experiment::IsolatedSuperviseState::create_with_explicit_source_and_frozen_plan(
+            &manifest, profile, 0, &source, commit_oid, &frozen,
+        )
+        .expect("materialize production baseline");
+    assert_eq!(
+        crate::artifacts::state_auth::sha256_hex(&effective_bytes),
+        crate::artifacts::state_auth::sha256_hex(&fs::read(isolated.plan_file()).expect("read"))
+    );
+    let git = git2::Repository::open(&isolated.repo).expect("open isolated");
+    let head = git.head().expect("head").peel_to_commit().expect("commit");
+    assert_eq!(head.id().to_string(), full_oid);
+    let bound: crate::supervise::SupervisorPlan =
+        serde_json::from_slice(&fs::read(isolated.plan_file()).expect("read bound plan"))
+            .expect("parse bound plan");
+    assert_eq!(bound.assignments.len(), 1);
+    assert_eq!(bound.assignments[0].id, "docs-child");
+    assert_eq!(
+        bound.assignments[0].assigned_paths,
+        vec![std::path::PathBuf::from("README.md")]
+    );
+    assert_eq!(bound.role_models, profile.role_models);
+    assert_ne!(bound.assignments[0].id, "child-a");
+}
+
+#[test]
+fn held_out_production_entrypoint_refuses_authority_mismatch() {
+    let manifest = experiment_manifest();
+    let profile = &manifest.profiles[0];
+    let (_source_workspace, source_repo, full_oid) = init_committed_source_repo("baseline");
+    let plan_workspace = tempfile::TempDir::new().expect("plan workspace");
+    let provider_plan = write_caller_plan(plan_workspace.path(), "docs-child", false, false);
+    let frozen = crate::supervise::freeze_held_out_production_caller_plan(&provider_plan)
+        .expect("freeze caller plan");
+    let source = HeldOutExplicitSourceBaseline {
+        source_repo,
+        base_commit: full_oid,
+    };
+    let commit_oid = resolve_held_out_explicit_source_baseline(&source).expect("resolve source");
+    let (isolated, _effective_bytes) =
+        super::experiment::IsolatedSuperviseState::create_with_explicit_source_and_frozen_plan(
+            &manifest, profile, 0, &source, commit_oid, &frozen,
+        )
+        .expect("materialize");
+    let (_artifact, artifact_repo) = artifact_owner();
+    crate::git_repository::configure_libgit2_repository_extensions().expect("git extensions");
+    let family = crate::artifacts::RunArtifactFamily::Supervise;
+    let run_id = crate::artifacts::generate_run_id(&artifact_repo, family).expect("run id");
+    let writer = crate::artifacts::ArtifactRunWriter::reserve(
+        &artifact_repo,
+        family,
+        run_id.clone(),
+        "evaluation-held-out",
+    )
+    .expect("reserve writer for authority only");
+    let authority = crate::supervise::held_out::ParentValidationAuthority::new(
+        crate::supervise::held_out::HeldOutRunBinding {
+            manifest_sha256: "abc".into(),
+            profile_sha256: "def".into(),
+            profile_id: profile.id.clone(),
+            repetition: 0,
+            experiment_run_id: run_id.as_str().into(),
+            supervisor_run_id: isolated.run_id.as_str().into(),
+            assignment_id: "other-child".into(),
+            baseline_head: "0".repeat(40),
+            baseline_tree: "0".repeat(40),
+        },
+        manifest.held_out_validation.clone(),
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+        manifest.limits.max_dispatches,
+        std::sync::Arc::new(std::sync::Mutex::new(writer)),
+    );
+    let options = isolated.production_options(
+        crate::supervise::SupervisorRuntime::Grok,
+        std::path::PathBuf::from("/usr/bin/true"),
+        dummy_retention(),
+    );
+    let error = crate::supervise::run_held_out_production_experiment(options, authority)
+        .expect_err("authority mismatch must fail before provider dispatch");
+    assert!(
+        error
+            .to_string()
+            .contains("does not match the isolated assignment"),
+        "{error}"
+    );
+}
+
+#[test]
+fn real_provider_execution_observation_distinguishes_launch_and_native_capture() {
+    assert_eq!(
+        super::executed_experiment::real_provider_execution_from_parent_capture(false, false),
+        RealProviderExecutionObservation::RequestedUnknown
+    );
+    assert_eq!(
+        super::executed_experiment::real_provider_execution_from_parent_capture(true, false),
+        RealProviderExecutionObservation::LaunchAttempted
+    );
+    assert_eq!(
+        super::executed_experiment::real_provider_execution_from_parent_capture(true, true),
+        RealProviderExecutionObservation::NativeRuntimeResultCaptured
+    );
+    assert_eq!(
+        super::executed_experiment::real_provider_execution_from_parent_capture(false, true),
+        RealProviderExecutionObservation::NativeRuntimeResultCaptured
+    );
+    let legacy = serde_json::json!({
+        "version": 3,
+        "schema": "evaluation_experiment_observations_v3",
+        "experiment_id": "legacy",
+        "manifest_sha256": "00",
+        "artifact_run_id": "run",
+        "artifact_report": "report.json",
+        "synthetic_baseline": true,
+        "real_provider_executed": false,
+        "production_eligible": false,
+        "eligible_for_production_economics": false,
+        "eligible_to_justify_named_default": false,
+        "quality": null,
+        "total_cost_usd": null,
+        "confidence": null,
+        "runs": [],
+        "notice": "legacy"
+    });
+    let decoded: ExecutedExperimentResults =
+        serde_json::from_value(legacy).expect("legacy v3 without new field");
+    assert_eq!(
+        decoded.real_provider_execution,
+        RealProviderExecutionObservation::NotRequested
+    );
+    assert!(!decoded.real_provider_executed);
+}
+
+fn observation_manifest_one_profile() -> ExperimentManifest {
+    let mut manifest = experiment_manifest();
+    manifest.profiles.truncate(1);
+    manifest
+}
+
+#[test]
+fn observation_manifest_accepts_one_profile_and_refuses_empty() {
+    let one = observation_manifest_one_profile();
+    parse_observation_experiment_manifest(&serde_json::to_vec(&one).expect("serialize"))
+        .expect("one profile observation manifest");
+    let mut empty_profiles = one.clone();
+    empty_profiles.profiles.clear();
+    let error = parse_observation_experiment_manifest(
+        &serde_json::to_vec(&empty_profiles).expect("serialize"),
+    )
+    .expect_err("empty profiles");
+    assert!(
+        error
+            .to_string()
+            .contains("at least one role/model profile"),
+        "{error}"
+    );
+}
+
+#[test]
+fn legacy_comparison_manifest_still_refuses_one_profile() {
+    let manifest = observation_manifest_one_profile();
+    let error = parse_experiment_manifest(&serde_json::to_vec(&manifest).expect("serialize"))
+        .expect_err("comparison requires two profiles");
+    assert!(
+        error
+            .to_string()
+            .contains("at least two role/model profiles"),
+        "{error}"
+    );
+}
+
+#[test]
+fn held_out_real_provider_refuses_local_deterministic_fake_profile_fallback() {
+    let mut manifest = observation_manifest_one_profile();
+    manifest.profiles[0]
+        .role_models
+        .get_mut(&AgentRole::Worker)
+        .expect("worker")
+        .unavailable_model_fallback = UnavailableModelFallback::LocalDeterministicFake;
+    let (_source_workspace, source_repo, base_commit) = init_committed_source_repo("baseline");
+    let plan_workspace = tempfile::TempDir::new().expect("plan workspace");
+    let provider_plan = write_caller_plan(plan_workspace.path(), "docs-child", false, false);
+    let (_artifact, artifact_repo) = artifact_owner();
+    let error = run_held_out_real_provider_experiment(
+        &manifest,
+        real_provider_request(
+            HeldOutExplicitSourceBaseline {
+                source_repo,
+                base_commit,
+            },
+            provider_plan,
+        ),
+        &artifact_repo,
+    )
+    .expect_err("LocalDeterministicFake fallback");
+    assert!(
+        error.to_string().contains("LocalDeterministicFake"),
+        "{error}"
+    );
+    no_reserved_runs(&artifact_repo);
+}
+
+#[test]
+fn held_out_real_provider_preserves_caller_plan_metadata_through_freeze_and_materialize() {
+    let manifest = observation_manifest_one_profile();
+    let profile = &manifest.profiles[0];
+    let plan_workspace = tempfile::TempDir::new().expect("plan workspace");
+    let mut plan = caller_plan_document("docs-child", false, false);
+    let mut value: serde_json::Value = serde_json::from_slice(&plan).expect("plan json");
+    value["assignments"][0]["reasoning_effort"] = json!("medium");
+    value["concurrency"] = json!({"max_concurrent_children": 1});
+    plan = serde_json::to_vec_pretty(&value).expect("plan bytes");
+    let path = plan_workspace.path().join("provider-plan.json");
+    fs::write(&path, plan).expect("write plan");
+    let frozen = crate::supervise::freeze_held_out_production_caller_plan(&path)
+        .expect("freeze caller plan");
+    assert_eq!(
+        frozen.caller_plan_sha256,
+        crate::artifacts::state_auth::sha256_hex(&fs::read(&path).expect("read"))
+    );
+    let effective_bytes = crate::supervise::materialize_held_out_profile_effective_caller_plan(
+        &frozen,
+        &profile.role_models,
+    )
+    .expect("materialize");
+    let effective_text = String::from_utf8(effective_bytes).expect("utf8");
+    assert!(
+        effective_text.contains("\"reasoning_effort\"") && effective_text.contains("medium"),
+        "{effective_text}"
+    );
+    assert!(
+        effective_text.contains("\"concurrency\""),
+        "{effective_text}"
+    );
+}
+
+#[test]
+fn held_out_real_provider_refuses_configured_runtime_executable_mismatch_before_reservation() {
+    use crate::supervise::{
+        refuse_held_out_production_runtime_executable_binding, RunBudgetLimits,
+        SupervisorAdmissionConfig, SupervisorRunOptions, SupervisorRuntime,
+    };
+    let (_source_workspace, source_repo, _base_commit) = init_committed_source_repo("baseline");
+    let plan_workspace = tempfile::TempDir::new().expect("plan workspace");
+    let provider_plan = write_caller_plan(plan_workspace.path(), "docs-child", false, false);
+    let configured_executable = plan_workspace.path().join("configured-runtime");
+    let requested_executable = plan_workspace.path().join("requested-runtime");
+    fs::write(&configured_executable, b"configured").expect("configured file");
+    fs::write(&requested_executable, b"requested").expect("requested file");
+    let options = SupervisorRunOptions {
+        repo: source_repo.clone(),
+        plan_file: provider_plan.clone(),
+        run_id: crate::orchestrator::RunId::new("held-out-runtime-binding-test").expect("run id"),
+        parent_node: None,
+        codex_bin: configured_executable,
+        runtime: SupervisorRuntime::Codex,
+        allow_dirty_primary: false,
+        allow_live_run_collision: false,
+        admission_overrides: SupervisorAdmissionConfig::default(),
+        budget_overrides: RunBudgetLimits::default(),
+        budget_max_duration_seconds: None,
+        machine_global_retention: Some(dummy_retention()),
+    };
+    let error = refuse_held_out_production_runtime_executable_binding(
+        SupervisorRuntime::Codex,
+        &requested_executable,
+        &options,
+    )
+    .expect_err("executable mismatch");
+    assert!(
+        error
+            .to_string()
+            .contains("does not match required --runtime-bin"),
+        "{error}"
+    );
+}
+
+#[test]
+fn held_out_native_runtime_parent_capture_requires_successful_verified_output() {
+    use crate::external_agent::{CapturedOutput, ExternalAgentRun, ExternalProgramTrust};
+    use crate::process_runner::{
+        ContainmentBackend, ProcessTreeEvidence, SideEffectConfinementEvidence,
+        SideEffectConfinementProfileKind,
+    };
+    let mut launch_stdout = CapturedOutput::default();
+    launch_stdout.target_launch_attempted = true;
+    let launch_only = ExternalAgentRun {
+        command: vec!["launch".into()],
+        cwd: std::path::PathBuf::from("/"),
+        timeout_seconds: 1,
+        exit_code: Some(1),
+        duration_ms: 1,
+        timed_out: false,
+        process_tree: None,
+        side_effects: None,
+        publishable: false,
+        program_trust: ExternalProgramTrust::ExplicitCustom,
+        codex_permissions: None,
+        stdout: launch_stdout,
+        stderr: CapturedOutput::default(),
+        error: Some("spawn failed".into()),
+        output_last_message: None,
+        grok_stream_usage_evidence: None,
+    };
+    assert!(
+        !super::executed_experiment::native_runtime_result_captured_from_parent_run(&launch_only)
+    );
+    let failed_with_output = ExternalAgentRun {
+        publishable: true,
+        output_last_message: Some(b"child json".to_vec()),
+        ..launch_only.clone()
+    };
+    assert!(
+        !super::executed_experiment::native_runtime_result_captured_from_parent_run(
+            &failed_with_output
+        )
+    );
+    let completed = ExternalAgentRun {
+        publishable: true,
+        exit_code: Some(0),
+        error: None,
+        process_tree: Some(ProcessTreeEvidence::VerifiedEmpty(
+            ContainmentBackend::SystemdUserService,
+        )),
+        side_effects: Some(SideEffectConfinementEvidence::Verified(
+            SideEffectConfinementProfileKind::ExternalGrok,
+        )),
+        output_last_message: Some(b"verified native output".to_vec()),
+        ..launch_only
+    };
+    assert!(super::executed_experiment::native_runtime_result_captured_from_parent_run(&completed));
+    for incomplete in [
+        ExternalAgentRun {
+            timed_out: true,
+            ..completed.clone()
+        },
+        ExternalAgentRun {
+            process_tree: None,
+            ..completed.clone()
+        },
+        ExternalAgentRun {
+            side_effects: None,
+            ..completed.clone()
+        },
+        ExternalAgentRun {
+            output_last_message: None,
+            ..completed
+        },
+    ] {
+        assert!(
+            !super::executed_experiment::native_runtime_result_captured_from_parent_run(
+                &incomplete
+            )
+        );
+    }
+}
+
+#[test]
+fn held_out_runtime_binding_refuses_invocation_and_program_substitution() {
+    use crate::external_agent::{ExternalAgentCommand, ExternalAgentInvocation};
+    use crate::runtime_adapter::{RuntimeAdapterConfig, RuntimeId};
+    use crate::supervise::validate_held_out_launch_binding;
+    let workspace = tempfile::TempDir::new().unwrap();
+    let executable = workspace.path().join("bound-program");
+    let other = workspace.path().join("other-program");
+    fs::write(&executable, b"unexecuted test fixture").unwrap();
+    fs::write(&other, b"unexecuted test fixture").unwrap();
+    let bound = executable.canonicalize().unwrap();
+    let mut command = ExternalAgentCommand::codex(
+        &executable,
+        workspace.path(),
+        workspace.path().join("prompt"),
+        workspace.path().join("log"),
+        workspace.path().join("output"),
+        std::time::Duration::from_secs(1),
+    );
+    command.invocation = ExternalAgentInvocation::Grok;
+    command.runtime_adapter = Some(RuntimeAdapterConfig::defaults(RuntimeId::Grok));
+    validate_held_out_launch_binding(&command, RuntimeId::Grok, &bound).unwrap();
+    // Another adapter at the same path is still a runtime substitution.
+    command.invocation = ExternalAgentInvocation::Cursor;
+    assert!(
+        validate_held_out_launch_binding(&command, RuntimeId::Grok, &bound)
+            .unwrap_err()
+            .to_string()
+            .contains("runtime substitution")
+    );
+    command.invocation = ExternalAgentInvocation::Grok;
+    command.program = other;
+    assert!(
+        validate_held_out_launch_binding(&command, RuntimeId::Grok, &bound)
+            .unwrap_err()
+            .to_string()
+            .contains("executable substitution")
+    );
+    command.program = executable;
+    command.invocation = ExternalAgentInvocation::CodexSupervisor;
+    command.runtime_adapter = None;
+    assert!(validate_held_out_launch_binding(&command, RuntimeId::Grok, &bound).is_err());
 }

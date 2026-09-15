@@ -1363,7 +1363,9 @@ a provider, supervisor, or held-out command. `--execution` defaults to
 `deterministic-fake`. `--allow-real-provider` acknowledges a future real
 provider path and is still refused by the current runner.
 `maco evaluation experiment` runs the same goal/spec under multiple profiles
-through isolated Fake supervise and likewise refuses real-provider execution.
+through isolated Fake supervise by default. Real-provider execution is a
+separate opt-in tuple described below; omitting any required input still
+refuses before artifact reservation or provider calls.
 
 `maco evaluation experiment <manifest.json> --execute-held-out --repo <artifact-owner> --json`
 explicitly opts into executing each declared held-out argv against a separate
@@ -1395,8 +1397,56 @@ commands per profile/repetition. The declared wall-time limit is checked before
 each dispatch and bounds the command timeout; candidate preparation and cleanup
 retain the existing bounded local-Git/guardian behavior. These observations do
 not fabricate assertion counts, tokens, prices, confidence or quality scores.
-Production and named-default eligibility remain false. Evaluating an actual
-repository through a real account-bound runtime remains a separate prerequisite.
+Production and named-default eligibility remain false.
+
+One opt-in command connects the existing held-out parent-validation path to a
+non-Fake runtime. It does not establish measured quality, cost, or
+named-default eligibility. Every flag below is required together; credentials,
+retention roots, and the executable are never inferred from `--source-repo`.
+`--repo` remains the artifact owner.
+
+```bash
+maco evaluation experiment <manifest.json> \
+  --execute-held-out \
+  --execution real-provider \
+  --allow-real-provider \
+  --source-repo <evaluated-git-repo> \
+  --base-commit <full-40-character-oid> \
+  --provider-plan <plan-outside-source-repo> \
+  --runtime <grok|cursor|codex|claude-code|gemini-cli> \
+  --runtime-bin <explicit-executable> \
+  --machine-global-config <reviewed-config> \
+  --machine-global-runtime-root-id <reviewed-root-id> \
+  --repo <artifact-owner> \
+  --json
+```
+
+`--provider-plan` is the operator-owned supervisor plan. It must live outside
+the evaluated source repository, declare exactly one assignment, and must not
+declare generated follow-ups, `execution_target`, or evidence-only re-audit
+controls. The frozen original plan bytes and full parsed document (consultant,
+plan metadata, assignment metadata) are retained; only profile `role_models` are
+overlaid per run and revalidated. Each manifest profile supplies those
+`role_models`; observation manifests accept one profile (comparison manifests
+still require two). Profile `unavailable_model_fallback` must not be
+`LocalDeterministicFake`. The parent still executes held-out argv against
+contained candidates and retains authenticated evidence.
+
+`--runtime-bin` must exactly match the configured operator adapter executable
+for the requested runtime (`options.codex_bin` for Codex; `MACO_GROK_BIN` for
+Grok; `MACO_<RUNTIME>_BIN` for other adapter subprocess runtimes). Mismatch is
+refused before artifact reservation and rechecked before every external launch
+(including auditors).
+
+`real_provider_execution` observation values: `not_requested` (legacy/default),
+`requested_unknown` (opt-in without parent launch evidence),
+`launch_attempted` (`target_launch_attempted` only; not success), and
+`native_runtime_result_captured` (publishable parent-held `output_last_message`
+from the trusted runner, not child JSON self-report). `real_provider_executed`
+is true only for `native_runtime_result_captured`, not for failed
+login/quota/spawn or launch-only evidence. Quality, cost, and confidence stay
+unknown (`null`); production, economic, and named-default eligibility stay
+false.
 
 ```bash
 cargo run -- evaluation run tests/fixtures/model_mix_evaluation/manifest-v1.json \

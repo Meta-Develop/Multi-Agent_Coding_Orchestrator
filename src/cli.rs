@@ -4243,14 +4243,14 @@ struct RunExperimentArgs {
     /// Owns retained artifacts with --execute-held-out; never the evaluated source repository.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
-    /// Requested mode; this command supports deterministic-fake and refuses real-provider.
+    /// Requested mode; deterministic-fake is the default. real-provider requires the full opt-in tuple.
     #[arg(
         long,
         default_value = "deterministic-fake",
         value_parser = parse_evaluation_execution
     )]
     execution: crate::evaluation::EvaluationExecution,
-    /// Acknowledge future real-provider execution; the current runner still refuses it.
+    /// Acknowledge real-provider execution; required with --execution real-provider and the rest of the tuple.
     #[arg(long)]
     allow_real_provider: bool,
     /// Explicitly execute declared local argv in contained candidate copies and retain bound observations.
@@ -4262,6 +4262,21 @@ struct RunExperimentArgs {
     /// Full 40-character commit object name in --source-repo. Requires --execute-held-out and --source-repo.
     #[arg(long, value_name = "FULL_OID")]
     base_commit: Option<String>,
+    /// Operator-owned supervisor plan outside the evaluated source repository. Required with real-provider.
+    #[arg(long, value_name = "PATH")]
+    provider_plan: Option<PathBuf>,
+    /// Non-Fake runtime for real-provider held-out execution. Required with real-provider.
+    #[arg(long, value_enum)]
+    runtime: Option<supervise::SupervisorRuntime>,
+    /// Explicit runtime executable. Required with real-provider; never inferred from --source-repo.
+    #[arg(long, value_name = "PATH")]
+    runtime_bin: Option<PathBuf>,
+    /// Exact reviewed machine-global config. Required with real-provider; never inferred from --source-repo.
+    #[arg(long, value_name = "PATH")]
+    machine_global_config: Option<PathBuf>,
+    /// Reviewed machine-global runtime root id. Required with real-provider; never inferred from --source-repo.
+    #[arg(long)]
+    machine_global_runtime_root_id: Option<String>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -4290,9 +4305,11 @@ fn resolve_held_out_explicit_source_cli(
 fn run_evaluation_experiment_command(args: RunExperimentArgs) -> Result<()> {
     let held_out_explicit_source_baseline = resolve_held_out_explicit_source_cli(
         args.execute_held_out,
-        args.source_repo,
-        args.base_commit,
+        args.source_repo.clone(),
+        args.base_commit.clone(),
     )?;
+    let real_provider =
+        resolve_held_out_real_provider_cli(&args, held_out_explicit_source_baseline.as_ref())?;
     let manifest_bytes =
         BoundedRegularReader::read_tree_no_follow(&args.manifest, MAX_EVALUATION_MANIFEST_BYTES)
             .with_context(|| {
@@ -4301,13 +4318,29 @@ fn run_evaluation_experiment_command(args: RunExperimentArgs) -> Result<()> {
                     args.manifest.display()
                 )
             })?;
-    let manifest =
+    let manifest = if real_provider.is_some() {
+        crate::evaluation::parse_observation_experiment_manifest(&manifest_bytes).with_context(
+            || {
+                format!(
+                    "failed to parse evaluation observation manifest {}",
+                    args.manifest.display()
+                )
+            },
+        )?
+    } else {
         crate::evaluation::parse_experiment_manifest(&manifest_bytes).with_context(|| {
             format!(
                 "failed to parse evaluation experiment manifest {}",
                 args.manifest.display()
             )
-        })?;
+        })?
+    };
+    if let Some(request) = real_provider {
+        let results = crate::evaluation::run_held_out_real_provider_experiment(
+            &manifest, request, &args.repo,
+        )?;
+        return print_query_report(&results, args.json);
+    }
     if args.execute_held_out {
         let results = crate::evaluation::run_experiment_with_held_out_and_source(
             &manifest,
@@ -4328,6 +4361,68 @@ fn run_evaluation_experiment_command(args: RunExperimentArgs) -> Result<()> {
         },
     )?;
     print_query_report(&results, args.json)
+}
+
+fn resolve_held_out_real_provider_cli(
+    args: &RunExperimentArgs,
+    explicit_source: Option<&crate::evaluation::HeldOutExplicitSourceBaseline>,
+) -> Result<Option<crate::evaluation::HeldOutRealProviderExperimentRequest>> {
+    if args.execution != crate::evaluation::EvaluationExecution::RealProvider {
+        if args.provider_plan.is_some()
+            || args.runtime.is_some()
+            || args.runtime_bin.is_some()
+            || args.machine_global_config.is_some()
+            || args.machine_global_runtime_root_id.is_some()
+        {
+            bail!(
+                "provider plan, runtime, and retention options require --execution real-provider"
+            );
+        }
+        return Ok(None);
+    }
+    if !args.execute_held_out {
+        bail!("real-provider held-out execution requires --execute-held-out and the complete opt-in tuple");
+    }
+    let Some(source) = explicit_source.cloned() else {
+        bail!(
+            "real-provider held-out execution requires --source-repo and --base-commit; refusing to infer evaluated source from --repo"
+        );
+    };
+    let Some(provider_plan) = args.provider_plan.clone() else {
+        bail!("real-provider held-out execution requires --provider-plan");
+    };
+    let Some(runtime) = args.runtime else {
+        bail!("real-provider held-out execution requires --runtime");
+    };
+    let Some(runtime_bin) = args.runtime_bin.clone() else {
+        bail!(
+            "real-provider held-out execution requires --runtime-bin; refusing to infer the executable from the source repository"
+        );
+    };
+    let (Some(machine_global_config), Some(machine_global_runtime_root_id)) = (
+        args.machine_global_config.clone(),
+        args.machine_global_runtime_root_id.clone(),
+    ) else {
+        bail!(
+            "real-provider held-out execution requires --machine-global-config and --machine-global-runtime-root-id; refusing to infer retention roots from the source repository"
+        );
+    };
+    Ok(Some(
+        crate::evaluation::HeldOutRealProviderExperimentRequest {
+            execution: args.execution,
+            allow_real_provider: args.allow_real_provider,
+            source,
+            provider_plan,
+            runtime,
+            runtime_executable: runtime_bin,
+            machine_global_retention: MachineGlobalRetentionBinding {
+                config: machine_global_config,
+                root_id: machine_global_runtime_root_id,
+                owner: "maco-evaluation-experiment".to_string(),
+                correction_correlation_id: "held-out-real-provider".to_string(),
+            },
+        },
+    ))
 }
 
 #[derive(Debug, Args)]
@@ -4450,6 +4545,37 @@ include!("cli/part2.rs");
 #[cfg(test)]
 mod cli_integration_tests {
     use super::*;
+
+    #[test]
+    fn held_out_provider_routing_preserves_legacy_fake_opt_in() {
+        let parsed = Cli::try_parse_from([
+            "maco",
+            "evaluation",
+            "experiment",
+            "manifest.json",
+            "--allow-real-provider",
+        ])
+        .expect("legacy arguments parse");
+        let Command::Evaluation(EvaluationCommand {
+            command: EvaluationSubcommand::Experiment(mut args),
+        }) = parsed.command
+        else {
+            panic!("expected experiment");
+        };
+        assert!(resolve_held_out_real_provider_cli(&args, None)
+            .expect("bare legacy opt-in keeps Fake routing")
+            .is_none());
+        args.runtime = Some(supervise::SupervisorRuntime::Grok);
+        assert!(resolve_held_out_real_provider_cli(&args, None)
+            .expect_err("new provider options require explicit execution mode")
+            .to_string()
+            .contains("require --execution real-provider"));
+        args.execution = crate::evaluation::EvaluationExecution::RealProvider;
+        assert!(resolve_held_out_real_provider_cli(&args, None)
+            .expect_err("real execution requires the complete tuple")
+            .to_string()
+            .contains("requires --execute-held-out"));
+    }
 
     fn literal_default_config_with_roots(roots: &[(&str, &str)]) -> MachineGlobalConfig {
         MachineGlobalConfig {

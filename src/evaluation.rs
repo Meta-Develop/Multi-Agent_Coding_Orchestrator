@@ -3728,14 +3728,16 @@ pub use crate::supervise::held_out::{
 };
 pub use executed_experiment::{
     run_experiment_with_held_out, run_experiment_with_held_out_and_source,
-    ExecutedExperimentResults, ObservedExperimentRun,
+    run_held_out_real_provider_experiment, ExecutedExperimentResults, ObservedExperimentRun,
+    RealProviderExecutionObservation,
 };
 pub mod rescore;
 pub use experiment::{
     parse_canonical_full_commit_oid, parse_experiment_manifest,
-    resolve_held_out_explicit_source_baseline, run_fake_supervise_experiment, ExperimentEvidence,
-    ExperimentEvidenceKind, ExperimentManifest, ExperimentProfileSummary, ExperimentResults,
-    ExperimentRun, ExperimentRunRequest, HeldOutExplicitSourceBaseline,
+    parse_observation_experiment_manifest, resolve_held_out_explicit_source_baseline,
+    run_fake_supervise_experiment, ExperimentEvidence, ExperimentEvidenceKind, ExperimentManifest,
+    ExperimentProfileSummary, ExperimentResults, ExperimentRun, ExperimentRunRequest,
+    HeldOutExplicitSourceBaseline, HeldOutRealProviderExperimentRequest,
     EXPERIMENT_MANIFEST_SCHEMA_VERSION, EXPERIMENT_RESULTS_SCHEMA_VERSION,
     EXPERIMENT_RESULT_SCHEMA, LEGACY_EXPERIMENT_RESULTS_SCHEMA_VERSION,
     LEGACY_EXPERIMENT_RESULT_SCHEMA,

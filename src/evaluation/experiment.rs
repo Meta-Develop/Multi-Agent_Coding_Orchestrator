@@ -24,9 +24,10 @@ use crate::{
     orchestrator::{RunId, SemanticCoordinationMode},
     review::ReviewAggregationPolicy,
     supervise::{
-        AgentRole, AssignmentPhase, OrchestratorAssignment, RoleModelSelection, RoleUsageReport,
-        RunBudgetLimits, SupervisorAdmissionConfig, SupervisorFinalReport, SupervisorPlan,
-        SupervisorRunOptions, SupervisorRuntime, UnavailableModelFallback, WorkerAssignment,
+        self, AgentRole, AssignmentPhase, OrchestratorAssignment, RoleModelSelection,
+        RoleUsageReport, RunBudgetLimits, SupervisorAdmissionConfig, SupervisorFinalReport,
+        SupervisorPlan, SupervisorRunOptions, SupervisorRuntime, UnavailableModelFallback,
+        WorkerAssignment,
     },
 };
 use git2::{IndexAddOption, ObjectType, Oid, Repository, Signature};
@@ -107,6 +108,31 @@ pub struct ExperimentManifest {
 
 impl ExperimentManifest {
     pub fn validate(&self) -> Result<(), EvaluationError> {
+        self.validate_shared()?;
+        if self.profiles.len() < 2 {
+            return Err(invalid_experiment(
+                "profiles",
+                "must contain at least two role/model profiles for a comparison",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Real-provider held-out observation accepts one or more profiles for a
+    /// single connection task; legacy comparison manifests still require two.
+    pub fn validate_for_observation(&self) -> Result<(), EvaluationError> {
+        self.validate_shared()?;
+        if self.profiles.is_empty() {
+            return Err(invalid_experiment(
+                "profiles",
+                "must contain at least one role/model profile for observation",
+            ));
+        }
+        validate_experiment_profiles_no_local_deterministic_fake(&self.profiles)?;
+        Ok(())
+    }
+
+    fn validate_shared(&self) -> Result<(), EvaluationError> {
         if self.version != EXPERIMENT_MANIFEST_SCHEMA_VERSION {
             return Err(EvaluationError::UnsupportedExperimentManifestVersion {
                 found: self.version,
@@ -135,12 +161,6 @@ impl ExperimentManifest {
                     "must be between 1 and {MAX_EVALUATION_REPETITIONS}, got {}",
                     self.repetitions
                 ),
-            ));
-        }
-        if self.profiles.len() < 2 {
-            return Err(invalid_experiment(
-                "profiles",
-                "must contain at least two role/model profiles for a comparison",
             ));
         }
         if self.profiles.len() > MAX_EVALUATION_PROFILES {
@@ -213,6 +233,20 @@ impl Default for ExperimentRunRequest {
             allow_real_provider: false,
         }
     }
+}
+
+/// Explicit opt-in for held-out real-provider execution. Incomplete or
+/// contradictory tuples are refused before artifact reservation. Existing
+/// [`ExperimentRunRequest`] Fake entrypoints remain unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldOutRealProviderExperimentRequest {
+    pub execution: EvaluationExecution,
+    pub allow_real_provider: bool,
+    pub source: HeldOutExplicitSourceBaseline,
+    pub provider_plan: PathBuf,
+    pub runtime: SupervisorRuntime,
+    pub runtime_executable: PathBuf,
+    pub machine_global_retention: MachineGlobalRetentionBinding,
 }
 
 /// Requires a canonical 40-character commit object name; refuses refs and abbreviated SHAs.
@@ -923,6 +957,20 @@ pub fn parse_experiment_manifest(bytes: &[u8]) -> Result<ExperimentManifest, Eva
     Ok(manifest)
 }
 
+/// Parse and validate a manifest for the real-provider held-out observation route.
+pub fn parse_observation_experiment_manifest(
+    bytes: &[u8],
+) -> Result<ExperimentManifest, EvaluationError> {
+    let manifest = serde_json::from_slice::<ExperimentManifest>(bytes).map_err(|error| {
+        EvaluationError::InvalidManifest {
+            field: "manifest".to_string(),
+            message: error.to_string(),
+        }
+    })?;
+    manifest.validate_for_observation()?;
+    Ok(manifest)
+}
+
 /// Run every profile and repetition through isolated Fake supervise state.
 pub fn run_fake_supervise_experiment(
     manifest: &ExperimentManifest,
@@ -1492,6 +1540,67 @@ impl IsolatedSuperviseState {
         })
     }
 
+    /// Materialize the explicit source commit/tree and write the frozen caller
+    /// plan with this profile's exact requested `role_models`. Does not fall
+    /// back to the synthetic README Fake `experiment_plan`.
+    pub(super) fn create_with_explicit_source_and_frozen_plan(
+        manifest: &ExperimentManifest,
+        profile: &EvaluationProfile,
+        repetition: u32,
+        source: &HeldOutExplicitSourceBaseline,
+        commit_oid: Oid,
+        frozen: &supervise::FrozenHeldOutProductionCallerPlan,
+    ) -> Result<(Self, Vec<u8>), EvaluationError> {
+        let workspace =
+            tempfile::TempDir::new().map_err(|error| EvaluationError::FakeSuperviseExperiment {
+                message: format!(
+                    "failed to create isolated production supervise workspace: {error}"
+                ),
+            })?;
+        let repo = workspace.path().join("repo");
+        let git =
+            Repository::init(&repo).map_err(|error| EvaluationError::FakeSuperviseExperiment {
+                message: format!(
+                    "failed to initialize isolated production supervise repo: {error}"
+                ),
+            })?;
+        let source_repo = crate::git_repository::open(&source.source_repo).map_err(|error| {
+            EvaluationError::FakeSuperviseExperiment {
+                message: format!(
+                    "failed to reopen held-out source repository {}: {error}",
+                    source.source_repo.display()
+                ),
+            }
+        })?;
+        materialize_commit_object_closure(&source_repo, &git, commit_oid)?;
+        checkout_materialized_commit(&git, commit_oid)?;
+
+        let run_id = isolated_run_id(manifest, profile, repetition)?;
+        let plan_file = workspace.path().join(format!("{}.json", run_id.as_str()));
+        let bytes = supervise::materialize_held_out_profile_effective_caller_plan(
+            frozen,
+            &profile.role_models,
+        )
+        .map_err(|error| EvaluationError::FakeSuperviseExperiment {
+            message: format!("failed to materialize effective held-out caller plan: {error:#}"),
+        })?;
+        fs::write(&plan_file, &bytes).map_err(|error| {
+            EvaluationError::FakeSuperviseExperiment {
+                message: format!("failed to write isolated production supervise plan: {error}"),
+            }
+        })?;
+
+        Ok((
+            Self {
+                _workspace: workspace,
+                repo,
+                plan_file,
+                run_id,
+            },
+            bytes,
+        ))
+    }
+
     pub(super) fn options(&self) -> SupervisorRunOptions {
         SupervisorRunOptions {
             repo: self.repo.clone(),
@@ -1512,6 +1621,37 @@ impl IsolatedSuperviseState {
                 correction_correlation_id: self.run_id.as_str().to_string(),
             }),
         }
+    }
+
+    /// Production options use the caller-supplied runtime, executable, and
+    /// retention binding. Never the Fake placeholder executable or Fake
+    /// retention root.
+    pub(super) fn production_options(
+        &self,
+        runtime: SupervisorRuntime,
+        runtime_executable: PathBuf,
+        mut machine_global_retention: MachineGlobalRetentionBinding,
+    ) -> SupervisorRunOptions {
+        machine_global_retention.correction_correlation_id = self.run_id.as_str().to_string();
+        SupervisorRunOptions {
+            repo: self.repo.clone(),
+            plan_file: self.plan_file.clone(),
+            run_id: self.run_id.clone(),
+            parent_node: None,
+            codex_bin: runtime_executable,
+            runtime,
+            allow_dirty_primary: false,
+            allow_live_run_collision: false,
+            admission_overrides: SupervisorAdmissionConfig::default(),
+            budget_overrides: RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
+            machine_global_retention: Some(machine_global_retention),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn plan_file(&self) -> &std::path::Path {
+        &self.plan_file
     }
 }
 
@@ -1888,6 +2028,24 @@ fn validate_held_out(held_out: &[HeldOutValidation]) -> Result<(), EvaluationErr
                 format!("held_out_validation[{index}].command"),
                 "must contain an executable and may not be empty",
             ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_experiment_profiles_no_local_deterministic_fake(
+    profiles: &[EvaluationProfile],
+) -> Result<(), EvaluationError> {
+    for (index, profile) in profiles.iter().enumerate() {
+        for (role, selection) in &profile.role_models {
+            if selection.unavailable_model_fallback
+                == UnavailableModelFallback::LocalDeterministicFake
+            {
+                return Err(invalid_experiment(
+                    format!("profiles[{index}].role_models.{role:?}.unavailable_model_fallback"),
+                    "real-provider observation refuses LocalDeterministicFake fallback",
+                ));
+            }
         }
     }
     Ok(())
