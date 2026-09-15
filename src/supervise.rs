@@ -3057,6 +3057,8 @@ pub struct CommandRunRecord {
     pub environment_failures: Vec<EnvironmentFailure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grok_stream_usage_evidence: Option<crate::runtime_adapter::grok::GrokStreamUsageEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -3502,6 +3504,7 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         environment_preflight_results: Vec::new(),
         environment_failures: Vec::new(),
         error: None,
+        grok_stream_usage_evidence: None,
     };
     let worker = WorkerReport {
         id: worker_id.to_string(),

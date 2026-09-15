@@ -347,6 +347,7 @@ fn synthetic_lens_dispatch_evidence(
         environment_preflight_results: Vec::new(),
         environment_failures: Vec::new(),
         error: None,
+        grok_stream_usage_evidence: None,
     };
     review_lens_dispatch_evidence_from_records(
         [("agent-a-review-auditor-lens-0", Some(&command))],

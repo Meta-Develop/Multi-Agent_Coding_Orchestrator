@@ -1948,6 +1948,22 @@ impl CapturedBytes {
         &self.bytes
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_bytes_for_test(bytes: impl Into<Vec<u8>>) -> Self {
+        Self::from_bytes_with_truncation_for_test(bytes, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_bytes_with_truncation_for_test(
+        bytes: impl Into<Vec<u8>>,
+        truncated: bool,
+    ) -> Self {
+        Self {
+            bytes: bytes.into(),
+            truncated,
+        }
+    }
+
     pub fn is_truncated(&self) -> bool {
         self.truncated
     }

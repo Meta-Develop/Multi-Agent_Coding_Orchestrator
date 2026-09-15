@@ -510,6 +510,25 @@ impl FrozenReviewSnapshot {
         Ok(())
     }
 
+    /// Re-stamps the provider snapshot with a trusted local collection watermark
+    /// while preserving exact provider evidence. Used only by durable review-state
+    /// continuity; public observe/refresh paths keep provider timestamps.
+    pub(super) fn stamp_for_durable_collection(
+        &self,
+        collection_started_at: &ForgeTimestamp,
+    ) -> Result<Self> {
+        self.validate_not_after(collection_started_at)?;
+        let snapshot = self.snapshot();
+        let restamped = PullRequestReviewSnapshot::new(
+            snapshot.item().clone(),
+            collection_started_at.clone(),
+            snapshot.reviews().to_vec(),
+            snapshot.threads().to_vec(),
+            snapshot.checks().to_vec(),
+        )?;
+        Self::freeze(self.item(), restamped, collection_started_at)
+    }
+
     pub fn triage(&self, policy: &ReviewLoopPolicy) -> ReviewTriage {
         let mut blockers = Vec::new();
         let mut blocking_human_feedback = Vec::new();
@@ -2081,7 +2100,7 @@ impl ReviewLoopState {
         self.refresh_with_snapshot(current_item, refreshed, trusted_not_after, dispositions)
     }
 
-    fn refresh_with_snapshot(
+    pub(crate) fn refresh_with_snapshot(
         &self,
         current_item: &ForgeItem,
         refreshed: FrozenReviewSnapshot,

@@ -1783,7 +1783,275 @@ fn supervisor_required_optional_and_vector_paths_share_reversible_serialization(
         environment_preflight_results: Vec::new(),
         environment_failures: Vec::new(),
         error: None,
+        grok_stream_usage_evidence: None,
     };
     let value = serde_json::to_value(record).expect("serialize command cwd");
     assert_eq!(value["cwd"], encoded);
+}
+
+fn forged_grok_native_command_record() -> CommandRunRecord {
+    use crate::runtime_adapter::grok::{GrokStreamUsageEvidence, GrokStreamUsageNativeEvidence};
+
+    let mut record = injected_command_record();
+    record.grok_stream_usage_evidence = Some(GrokStreamUsageEvidence::Native(
+        GrokStreamUsageNativeEvidence {
+            input_tokens: 99,
+            output_tokens: 1,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+            reasoning_tokens: None,
+            total_tokens: Some(100),
+        },
+    ));
+    record
+}
+
+const CHILD_ASSERTED_GROK_STREAM_USAGE_MESSAGE: &str =
+    "child report attempted to self-assert parent-process Grok stream usage evidence";
+
+fn collect_fixture_child_report(
+    assignment: &OrchestratorAssignment,
+    command: &ExternalAgentCommand,
+    external_run: &ExternalAgentRun,
+) -> (OrchestratorReviewReport, Vec<String>) {
+    collect_child_report(ChildReportCollectionContext {
+        assignment,
+        assignment_metadata: &AssignmentMetadata::new(),
+        report_path: Path::new("grok-forgery-child.json"),
+        external_run,
+        external_command: command,
+        worktree_path: Path::new("."),
+        child_base_head: &injected_oid("grok-forgery-base"),
+        observed_changed_paths: None,
+        worker_journals: &WorkerExecutionJournalEvidenceSet::default(),
+        evidence_only_source: None,
+    })
+}
+
+#[test]
+fn collect_child_report_rejects_orchestrator_self_asserted_grok_stream_usage_evidence() {
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    let command = ExternalAgentCommand::codex(
+        "codex",
+        &repo_path,
+        temp.path().join("prompt.md"),
+        temp.path().join("events.jsonl"),
+        temp.path().join("report.json"),
+        Duration::from_secs(1),
+    );
+    let mut child = injected_child_report(&assignment);
+    child.commands_run.push(forged_grok_native_command_record());
+    write_injected_json(&command.output_last_message, &child);
+    let external_run = injected_verified_run(&command);
+    let (report, shape_problems) =
+        collect_fixture_child_report(&assignment, &command, &external_run);
+    assert!(shape_problems.is_empty());
+    assert!(report.rejected);
+    assert_eq!(report.status, ReviewStatus::Failed);
+    assert!(finding_messages(&report).contains(CHILD_ASSERTED_GROK_STREAM_USAGE_MESSAGE));
+    assert!(report
+        .commands_run
+        .iter()
+        .all(|record| record.grok_stream_usage_evidence.is_none()));
+}
+
+#[test]
+fn collect_child_report_rejects_nested_worker_and_auditor_self_asserted_grok_usage() {
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    let command = ExternalAgentCommand::codex(
+        "codex",
+        &repo_path,
+        temp.path().join("prompt-worker-auditor.md"),
+        temp.path().join("events-worker-auditor.jsonl"),
+        temp.path().join("report-worker-auditor.json"),
+        Duration::from_secs(1),
+    );
+    let mut child = injected_child_report(&assignment);
+    let auditor = injected_auditor_report(&assignment, &child);
+    child.audit_reports.push(auditor);
+    child.worker_reports[0]
+        .commands_run
+        .push(forged_grok_native_command_record());
+    child.audit_reports[0]
+        .commands_run
+        .push(forged_grok_native_command_record());
+    write_injected_json(&command.output_last_message, &child);
+    let external_run = injected_verified_run(&command);
+    let (report, _) = collect_fixture_child_report(&assignment, &command, &external_run);
+    assert!(report.rejected);
+    assert!(finding_messages(&report).contains(CHILD_ASSERTED_GROK_STREAM_USAGE_MESSAGE));
+    assert!(report.worker_reports[0]
+        .commands_run
+        .iter()
+        .all(|record| record.grok_stream_usage_evidence.is_none()));
+    assert!(report.audit_reports[0]
+        .commands_run
+        .iter()
+        .all(|record| record.grok_stream_usage_evidence.is_none()));
+}
+
+#[test]
+fn collect_child_report_rejects_direct_worker_self_asserted_grok_stream_usage_evidence() {
+    let (temp, repo_path) = injected_repository();
+    let mut assignment = injected_assignment(false);
+    assignment.id = "direct-worker-grok-forgery".to_string();
+    assignment.role = AgentRole::Worker;
+    assignment.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+    let command = ExternalAgentCommand::codex(
+        "codex",
+        &repo_path,
+        temp.path().join("direct-worker-prompt.md"),
+        temp.path().join("direct-worker-events.jsonl"),
+        temp.path().join("direct-worker-report.json"),
+        Duration::from_secs(1),
+    );
+    let worker = WorkerReport {
+        id: assignment.id.clone(),
+        role: AgentRole::Worker,
+        assignment_kind: AssignmentKind::Ordinary,
+        target_path: None,
+        assigned_paths: assignment.assigned_paths.clone(),
+        semantic_symbols: Vec::new(),
+        semantic_modules: Vec::new(),
+        claim_token: Some(1),
+        semantic_intent_token: Some(2),
+        commands_run: vec![forged_grok_native_command_record()],
+        environment_failures: Vec::new(),
+        files_changed: Vec::new(),
+        validation_results: Vec::new(),
+        findings: Vec::new(),
+        field_guide_entries: Vec::new(),
+        bloated_file_flags: Vec::new(),
+        decomposition_completion: None,
+        no_further_delegation: Some(true),
+        accepted: true,
+        rejected: false,
+        status: ReviewStatus::Succeeded,
+        remaining_risk: String::new(),
+        next_safe_action: String::new(),
+    };
+    write_injected_json(&command.output_last_message, &worker);
+    let external_run = injected_verified_run(&command);
+    let (report, _) = collect_fixture_child_report(&assignment, &command, &external_run);
+    assert!(report.rejected);
+    assert!(finding_messages(&report).contains(CHILD_ASSERTED_GROK_STREAM_USAGE_MESSAGE));
+    assert!(report
+        .commands_run
+        .iter()
+        .all(|record| record.grok_stream_usage_evidence.is_none()));
+    assert!(report.worker_reports[0]
+        .commands_run
+        .iter()
+        .all(|record| record.grok_stream_usage_evidence.is_none()));
+}
+
+#[test]
+fn collect_child_report_preserves_parent_grok_evidence_when_child_report_missing_or_malformed() {
+    use crate::runtime_adapter::grok::{GrokStreamUsageEvidence, GrokStreamUsageNativeEvidence};
+
+    let parent_evidence = GrokStreamUsageEvidence::Native(GrokStreamUsageNativeEvidence {
+        input_tokens: 7,
+        output_tokens: 2,
+        cache_read_input_tokens: None,
+        cache_creation_input_tokens: None,
+        reasoning_tokens: None,
+        total_tokens: Some(9),
+    });
+    for (label, write_malformed) in [("missing", false), ("malformed", true)] {
+        let (temp, repo_path) = injected_repository();
+        let assignment = injected_assignment(true);
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            &repo_path,
+            temp.path().join(format!("{label}-prompt.md")),
+            temp.path().join(format!("{label}-events.jsonl")),
+            temp.path().join(format!("{label}-report.json")),
+            Duration::from_secs(1),
+        );
+        if write_malformed {
+            fs::write(
+                &command.output_last_message,
+                "{\n  \"role\": \"child_orchestrator\"\n}",
+            )
+            .expect("write malformed child report");
+        }
+        let mut external_run = injected_verified_run(&command);
+        external_run.grok_stream_usage_evidence = Some(parent_evidence.clone());
+        let (report, _) = collect_fixture_child_report(&assignment, &command, &external_run);
+        assert!(
+            report.rejected && !report.accepted && report.status != ReviewStatus::Succeeded,
+            "{label} child report must remain failed"
+        );
+        assert!(
+            finding_messages(&report).contains("missing or invalid"),
+            "{label} child report must keep the missing/invalid finding"
+        );
+        assert!(
+            !finding_messages(&report).contains(CHILD_ASSERTED_GROK_STREAM_USAGE_MESSAGE),
+            "{label} child report must not emit a false self-assertion finding"
+        );
+        assert_eq!(
+            report.commands_run.len(),
+            1,
+            "{label} parent command record"
+        );
+        assert_eq!(
+            report.commands_run[0].grok_stream_usage_evidence,
+            Some(parent_evidence.clone()),
+            "{label} must preserve captured parent evidence"
+        );
+    }
+}
+
+#[test]
+fn collect_parent_auditor_report_rejects_self_asserted_grok_but_retains_parent_process_evidence() {
+    use crate::runtime_adapter::grok::{GrokStreamUsageEvidence, GrokStreamUsageNativeEvidence};
+
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    let child = injected_child_report(&assignment);
+    let command = ExternalAgentCommand::codex(
+        "codex",
+        &repo_path,
+        temp.path().join("parent-auditor-prompt.md"),
+        temp.path().join("parent-auditor-events.jsonl"),
+        temp.path().join("parent-auditor-report.json"),
+        Duration::from_secs(1),
+    );
+    let expected_id = parent_auditor_id(&assignment);
+    let mut auditor = injected_auditor_report(&assignment, &child);
+    auditor
+        .commands_run
+        .push(forged_grok_native_command_record());
+    write_injected_json(&command.output_last_message, &auditor);
+    let mut external_run = injected_verified_run(&command);
+    let parent_evidence = GrokStreamUsageEvidence::Native(GrokStreamUsageNativeEvidence {
+        input_tokens: 7,
+        output_tokens: 2,
+        cache_read_input_tokens: None,
+        cache_creation_input_tokens: None,
+        reasoning_tokens: None,
+        total_tokens: Some(9),
+    });
+    external_run.grok_stream_usage_evidence = Some(parent_evidence.clone());
+    let report = collect_parent_auditor_report(
+        &expected_id,
+        Path::new("parent-auditor-grok-forgery.json"),
+        &external_run,
+        &command,
+        SupervisorRuntime::Codex,
+    );
+    assert!(report.rejected);
+    assert!(report
+        .findings
+        .iter()
+        .any(|finding| finding.message == CHILD_ASSERTED_GROK_STREAM_USAGE_MESSAGE));
+    assert_eq!(report.commands_run.len(), 2);
+    assert_eq!(report.commands_run[0].grok_stream_usage_evidence, None);
+    assert_eq!(
+        report.commands_run[1].grok_stream_usage_evidence,
+        Some(parent_evidence)
+    );
 }

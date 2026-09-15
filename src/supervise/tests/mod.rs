@@ -962,6 +962,7 @@ fn injected_verified_run_without_journals(command: &ExternalAgentCommand) -> Ext
         stderr: CapturedOutput::default(),
         error: None,
         output_last_message: fs::read(&command.output_last_message).ok(),
+        grok_stream_usage_evidence: None,
     }
 }
 
@@ -1030,6 +1031,7 @@ fn injected_command_record() -> CommandRunRecord {
         environment_preflight_results: Vec::new(),
         environment_failures: Vec::new(),
         error: None,
+        grok_stream_usage_evidence: None,
     }
 }
 
