@@ -2,6 +2,7 @@ mod repair_attempts;
 pub mod review_loop;
 pub mod review_loop_entry;
 mod review_policy_input;
+mod review_state_journal;
 
 use self::review_policy_input::BoundReviewPolicy;
 

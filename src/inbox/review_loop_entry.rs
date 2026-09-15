@@ -11,6 +11,7 @@ use super::review_loop::{
     TrustedActorIdentity, TrustedActorRole,
 };
 use super::review_policy_input::{BoundReviewPolicy, ReviewPolicyRepositoryMismatch};
+use super::review_state_journal;
 use super::{
     revalidate_inbox_item_source, GithubCheckSummary, GithubPrCandidate, GithubPrSourceTrust,
     InboxIndependentAuditMergeLaneTask, InboxItem, InboxItemKind, InboxSourceProvider,
@@ -913,10 +914,13 @@ fn observe_github_review_loop(
         repo,
         source.repository_selector(),
     )?);
-    let cutoff = ForgeTimestamp::new(crate::orchestration_event::format_rfc3339_utc(
-        SystemTime::now(),
-    )?)?;
-    let snapshot = FrozenReviewSnapshot::observe(&transport, &forge_item, &cutoff)?;
+    // Trusted local collection watermark: captured before any provider fetch so
+    // delayed scans cannot reorder durable state and provider event times cannot
+    // postdate collection.
+    let collection_started_at = ForgeTimestamp::new(
+        crate::orchestration_event::format_rfc3339_utc(SystemTime::now())?,
+    )?;
+    let snapshot = FrozenReviewSnapshot::observe(&transport, &forge_item, &collection_started_at)?;
     let request = ForgeObservationRequest::item_thread(forge_item.clone())?;
     let item_thread = match transport.observe(&request)? {
         ForgeObservation::ItemThread(thread) => thread,
@@ -929,15 +933,23 @@ fn observe_github_review_loop(
     if snapshot.item() != &forge_item || item_thread.item() != &forge_item {
         bail!("GitHub review observations changed exact item identity");
     }
-    complete_authenticated_review_observation(item, snapshot, item_thread, policy, &cutoff)
+    complete_authenticated_review_observation(
+        repo,
+        item,
+        snapshot,
+        item_thread,
+        policy,
+        &collection_started_at,
+    )
 }
 
 fn complete_authenticated_review_observation(
+    repo: &Path,
     item: &InboxItem,
     snapshot: FrozenReviewSnapshot,
     item_thread: ItemThreadObservation,
     policy: Option<&BoundReviewPolicy>,
-    cutoff: &ForgeTimestamp,
+    collection_started_at: &ForgeTimestamp,
 ) -> Result<InboxReviewObservation> {
     if snapshot.item() != item_thread.item()
         || snapshot.item().number() != item.source_snapshot.number()
@@ -949,9 +961,23 @@ fn complete_authenticated_review_observation(
     if let Some(policy) = policy {
         policy.verify_repository(snapshot.item().repository())?;
     }
-    let state = policy
-        .map(|policy| ReviewLoopState::new(policy.policy().clone(), snapshot.clone(), cutoff))
-        .transpose()?;
+    let state = match policy
+        .map(|policy| {
+            review_state_journal::observe(repo, &snapshot, policy.policy(), collection_started_at)
+        })
+        .transpose()
+    {
+        Ok(state) => state,
+        Err(error) if error.is::<review_state_journal::ReviewStateRefreshBlocked>() => {
+            return Ok(InboxReviewObservation {
+                report: blocked_review_report(item, &["unresolved_review_feedback"]),
+                snapshot: Some(snapshot),
+                item_thread: Some(item_thread),
+                state: None,
+            });
+        }
+        Err(error) => return Err(error),
+    };
     let report = match &state {
         Some(state) => report_from_state(item, state),
         None => {
@@ -960,7 +986,12 @@ fn complete_authenticated_review_observation(
     };
     Ok(InboxReviewObservation {
         report,
-        snapshot: Some(snapshot),
+        snapshot: Some(
+            state
+                .as_ref()
+                .map(|state| state.current_snapshot().clone())
+                .unwrap_or(snapshot),
+        ),
         item_thread: Some(item_thread),
         state,
     })
@@ -1939,13 +1970,14 @@ mod tests {
             Some(base.to_string()),
         )
         .unwrap();
-        let observed_at = ForgeTimestamp::new("2026-08-16T01:02:03Z").unwrap();
+        let provider_observed_at = ForgeTimestamp::new("2026-08-16T01:02:03Z").unwrap();
+        let collection_started_at = ForgeTimestamp::new("2026-08-16T01:02:03Z").unwrap();
         let review = ForgeReview::new(
             object_id("github", ProviderObjectKind::Review, "REV_actual").unwrap(),
             human,
             ForgeReviewState::Approved,
             "approved",
-            observed_at.clone(),
+            provider_observed_at.clone(),
             head,
         )
         .unwrap();
@@ -1956,12 +1988,12 @@ mod tests {
             ForgeCheckStatus::Completed,
             Some(ForgeCheckConclusion::Success),
             head,
-            observed_at.clone(),
+            provider_observed_at.clone(),
         )
         .unwrap();
         let snapshot = PullRequestReviewSnapshot::new(
             forge_item.clone(),
-            observed_at.clone(),
+            provider_observed_at.clone(),
             vec![review.clone()],
             Vec::new(),
             vec![check.clone()],
@@ -1974,16 +2006,21 @@ mod tests {
                 ForgeObservation::PullRequestReviewSnapshot(snapshot),
             )
             .unwrap();
-        let frozen = FrozenReviewSnapshot::observe(&transport, &forge_item, &observed_at).unwrap();
-        let thread =
-            ItemThreadObservation::new(forge_item.clone(), observed_at.clone(), Vec::new())
-                .unwrap();
+        let frozen =
+            FrozenReviewSnapshot::observe(&transport, &forge_item, &collection_started_at).unwrap();
+        let thread = ItemThreadObservation::new(
+            forge_item.clone(),
+            collection_started_at.clone(),
+            Vec::new(),
+        )
+        .unwrap();
         let result = complete_authenticated_review_observation(
+            &repo,
             &item,
             frozen.clone(),
             thread.clone(),
             Some(&bound),
-            &observed_at,
+            &collection_started_at,
         )
         .unwrap();
         assert!(result.report.ready);
@@ -1993,6 +2030,56 @@ mod tests {
         assert_eq!(
             result.report.state_sha256.as_deref(),
             Some(state.state_sha256())
+        );
+
+        let rescan_collection_started_at = ForgeTimestamp::new("2026-08-16T01:03:03Z").unwrap();
+        let same_evidence = PullRequestReviewSnapshot::new(
+            forge_item.clone(),
+            provider_observed_at.clone(),
+            frozen.snapshot().reviews().to_vec(),
+            frozen.snapshot().threads().to_vec(),
+            frozen.snapshot().checks().to_vec(),
+        )
+        .unwrap();
+        let mut later_transport = FakeForgeTransport::new();
+        later_transport
+            .register_observation(
+                ForgeObservationRequest::pull_request_review_snapshot(forge_item.clone()).unwrap(),
+                ForgeObservation::PullRequestReviewSnapshot(same_evidence),
+            )
+            .unwrap();
+        let later_frozen = FrozenReviewSnapshot::observe(
+            &later_transport,
+            &forge_item,
+            &rescan_collection_started_at,
+        )
+        .unwrap();
+        assert_eq!(later_frozen.canonical_sha256(), frozen.canonical_sha256());
+        let later_thread = ItemThreadObservation::new(
+            forge_item.clone(),
+            rescan_collection_started_at.clone(),
+            Vec::new(),
+        )
+        .unwrap();
+        let repeated = complete_authenticated_review_observation(
+            &repo,
+            &item,
+            later_frozen,
+            later_thread,
+            Some(&bound),
+            &rescan_collection_started_at,
+        )
+        .unwrap();
+        let archived_snapshot = repeated.snapshot.as_ref().unwrap();
+        let repeated_state = repeated.state.as_ref().unwrap();
+        assert_eq!(repeated_state, &state);
+        assert_eq!(
+            archived_snapshot.canonical_sha256(),
+            repeated_state.current_snapshot().canonical_sha256()
+        );
+        assert_eq!(
+            repeated.report.snapshot_sha256.as_deref(),
+            Some(archived_snapshot.canonical_sha256())
         );
 
         let run_id = RunId::new("authenticated-review-state").unwrap();
@@ -2046,7 +2133,7 @@ mod tests {
         );
         let restored = ReviewLoopState::restore_json(
             &reader.read("item-1-review-state.json").unwrap(),
-            &observed_at,
+            &collection_started_at,
         )
         .unwrap();
         assert_eq!(restored, state);
@@ -2098,11 +2185,12 @@ mod tests {
         let foreign_binding =
             BoundReviewPolicy::load(&repo, &crate::inbox::InboxConfig::default(), &path).unwrap();
         let wrong_repository_error = complete_authenticated_review_observation(
+            &repo,
             &item,
             frozen.clone(),
             thread.clone(),
             Some(&foreign_binding),
-            &observed_at,
+            &collection_started_at,
         )
         .err()
         .expect("provider repository ID mismatch cannot admit review state");
@@ -2124,17 +2212,18 @@ mod tests {
         )
         .unwrap();
         assert!(complete_authenticated_review_observation(
+            &repo,
             &moved_head,
             frozen.clone(),
             thread,
             Some(&bound),
-            &observed_at
+            &collection_started_at
         )
         .is_err());
 
         let with_thread = PullRequestReviewSnapshot::new(
             forge_item.clone(),
-            observed_at.clone(),
+            provider_observed_at.clone(),
             vec![review],
             vec![ForgeReviewThread::new(
                 object_id("github", ProviderObjectKind::ReviewThread, "THREAD_actual").unwrap(),
@@ -2153,8 +2242,10 @@ mod tests {
             )
             .unwrap();
         let threaded =
-            FrozenReviewSnapshot::observe(&threaded_transport, &forge_item, &observed_at).unwrap();
-        let blocked = ReviewLoopState::new(bound.policy().clone(), threaded, &observed_at).unwrap();
+            FrozenReviewSnapshot::observe(&threaded_transport, &forge_item, &collection_started_at)
+                .unwrap();
+        let blocked =
+            ReviewLoopState::new(bound.policy().clone(), threaded, &collection_started_at).unwrap();
         assert!(matches!(
             blocked.readiness().unwrap(),
             ReviewLoopReadinessEvaluation::Blocked(_)
