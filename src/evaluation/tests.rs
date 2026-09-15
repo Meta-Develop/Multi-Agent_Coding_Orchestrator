@@ -4,6 +4,7 @@ use crate::autopilot::{
     AutopilotRoleModelExecutionBinding,
 };
 use serde_json::json;
+use std::fs;
 
 const FIXTURE_PLAN: &[u8] =
     include_bytes!("../../tests/fixtures/model_mix_evaluation/hand-authored-plan-v1.json");
@@ -1823,4 +1824,405 @@ fn fake_supervise_experiment_refuses_real_provider() {
         ),
         Err(EvaluationError::RealProviderUnavailableInPhaseA)
     );
+}
+
+fn init_committed_source_repo(message: &str) -> (tempfile::TempDir, std::path::PathBuf, String) {
+    let workspace = tempfile::TempDir::new().expect("source workspace");
+    let repo_path = workspace.path().join("source");
+    let repo = git2::Repository::init(&repo_path).expect("init source");
+    std::fs::write(repo_path.join("README.md"), "held-out source baseline\n").expect("readme");
+    let tree_id = {
+        let mut index = repo.index().expect("index");
+        index
+            .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+            .expect("stage");
+        index.write().expect("write index");
+        index.write_tree().expect("tree")
+    };
+    let tree = repo.find_tree(tree_id).expect("find tree");
+    let signature =
+        git2::Signature::now("held-out-test", "held-out-test@example.invalid").expect("sig");
+    let oid = repo
+        .commit(Some("HEAD"), &signature, &signature, message, &tree, &[])
+        .expect("commit");
+    let head = fs::read_to_string(repo_path.join(".git/HEAD")).expect("head");
+    assert!(head.contains("refs/heads"));
+    (workspace, repo_path, oid.to_string())
+}
+
+#[test]
+fn held_out_base_commit_oid_validation_refuses_refs_and_abbreviations() {
+    let (_workspace, repo_path, full_oid) = init_committed_source_repo("baseline");
+    assert!(matches!(
+        parse_canonical_full_commit_oid(&full_oid[..7]),
+        Err(EvaluationError::InvalidManifest { field, .. }) if field == "base_commit"
+    ));
+    assert!(matches!(
+        parse_canonical_full_commit_oid("HEAD"),
+        Err(EvaluationError::InvalidManifest { field, .. }) if field == "base_commit"
+    ));
+    let source = HeldOutExplicitSourceBaseline {
+        source_repo: repo_path,
+        base_commit: full_oid,
+    };
+    resolve_held_out_explicit_source_baseline(&source).expect("full commit oid");
+}
+
+#[test]
+fn held_out_explicit_source_resolve_refuses_non_commit_objects() {
+    let (_workspace, repo_path, full_oid) = init_committed_source_repo("baseline");
+    let git = git2::Repository::open(&repo_path).expect("open source");
+    let commit = git
+        .find_commit(git2::Oid::from_str(&full_oid).expect("oid"))
+        .expect("commit");
+    let tree_oid = commit.tree_id().to_string();
+    let source = HeldOutExplicitSourceBaseline {
+        source_repo: repo_path,
+        base_commit: tree_oid,
+    };
+    assert!(matches!(
+        resolve_held_out_explicit_source_baseline(&source),
+        Err(EvaluationError::InvalidManifest { field, .. }) if field == "base_commit"
+    ));
+}
+
+fn init_source_repo_with_root_gitlink() -> (tempfile::TempDir, std::path::PathBuf, String) {
+    let (workspace, repo_path, parent_oid) = init_committed_source_repo("parent");
+    let repo = git2::Repository::open(&repo_path).expect("open source");
+    let gitlink = git2::Oid::from_str(&parent_oid).expect("parent oid");
+    let mut builder = repo.treebuilder(None).expect("treebuilder");
+    builder
+        .insert("linked", gitlink, 0o160000)
+        .expect("gitlink");
+    let tree_id = builder.write().expect("write tree");
+    let tree = repo.find_tree(tree_id).expect("find tree");
+    let signature =
+        git2::Signature::now("held-out-test", "held-out-test@example.invalid").expect("sig");
+    let parent = repo
+        .find_commit(gitlink)
+        .expect("parent commit for gitlink baseline");
+    let oid = repo
+        .commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "gitlink baseline",
+            &tree,
+            &[&parent],
+        )
+        .expect("commit");
+    (workspace, repo_path, oid.to_string())
+}
+
+#[test]
+fn held_out_explicit_source_resolve_refuses_evaluated_tree_gitlink() {
+    let (_workspace, repo_path, commit_oid) = init_source_repo_with_root_gitlink();
+    let source = HeldOutExplicitSourceBaseline {
+        source_repo: repo_path,
+        base_commit: commit_oid,
+    };
+    assert!(matches!(
+        resolve_held_out_explicit_source_baseline(&source),
+        Err(EvaluationError::InvalidManifest { field, .. }) if field == "base_commit"
+    ));
+}
+
+#[test]
+fn held_out_explicit_source_materialized_worktree_matches_commit_and_is_clean() {
+    let manifest = experiment_manifest();
+    let profile = &manifest.profiles[0];
+    let (_workspace, repo_path, full_oid) = init_committed_source_repo("baseline");
+    let expected_readme = fs::read_to_string(repo_path.join("README.md")).expect("source readme");
+    let head_before = fs::read_to_string(repo_path.join(".git/HEAD")).expect("head");
+    let dirty = repo_path.join("dirty.txt");
+    fs::write(&dirty, b"preserved\n").expect("dirty");
+    let dirty_bytes = fs::read(&dirty).expect("dirty bytes");
+    let source = HeldOutExplicitSourceBaseline {
+        source_repo: repo_path.clone(),
+        base_commit: full_oid.clone(),
+    };
+    let commit_oid =
+        resolve_held_out_explicit_source_baseline(&source).expect("resolve explicit source");
+    let isolated = super::experiment::IsolatedSuperviseState::create_with_explicit_source_baseline(
+        &manifest, profile, 0, &source, commit_oid,
+    )
+    .expect("materialize isolated baseline");
+    let git = git2::Repository::open(&isolated.repo).expect("open isolated");
+    let head = git.head().expect("head").peel_to_commit().expect("commit");
+    assert_eq!(head.id().to_string(), full_oid);
+    assert_eq!(
+        fs::read_to_string(isolated.repo.join("README.md")).expect("isolated readme"),
+        expected_readme
+    );
+    let mut status_options = git2::StatusOptions::new();
+    status_options.include_untracked(false);
+    let statuses = git.statuses(Some(&mut status_options)).expect("statuses");
+    for entry in statuses.iter() {
+        assert_eq!(
+            entry.status(),
+            git2::Status::CURRENT,
+            "unexpected path status: {:?}",
+            entry.path()
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(repo_path.join(".git/HEAD")).expect("head"),
+        head_before
+    );
+    assert_eq!(fs::read(&dirty).expect("dirty reread"), dirty_bytes);
+}
+
+#[test]
+fn held_out_explicit_source_run_refuses_gitlink_before_artifact_reservation() {
+    let manifest = experiment_manifest();
+    let (_workspace, repo_path, commit_oid) = init_source_repo_with_root_gitlink();
+    let artifact = tempfile::TempDir::new().expect("artifact");
+    let artifact_repo = artifact.path().join("artifact-owner");
+    git2::Repository::init(&artifact_repo).expect("artifact repo");
+    let source = HeldOutExplicitSourceBaseline {
+        source_repo: repo_path,
+        base_commit: commit_oid,
+    };
+    let error = run_experiment_with_held_out_and_source(
+        &manifest,
+        ExperimentRunRequest::default(),
+        &artifact_repo,
+        Some(&source),
+    )
+    .expect_err("gitlink baseline must fail before reservation");
+    assert!(
+        error.to_string().contains("git submodule link"),
+        "unexpected error: {error}"
+    );
+    let runs = artifact_repo.join(".maco/o2/runs");
+    assert!(!runs.exists() || fs::read_dir(runs).expect("runs").next().is_none());
+}
+
+fn held_out_preflight_bounds(
+    max_distinct_objects: usize,
+    max_bytes: u64,
+) -> super::experiment::HeldOutSourceBaselineBounds {
+    super::experiment::HeldOutSourceBaselineBounds {
+        max_distinct_objects,
+        max_bytes,
+    }
+}
+
+fn assert_preflight_fails_checkout_expansion(
+    repo_path: &std::path::Path,
+    commit_oid: &str,
+    bounds: super::experiment::HeldOutSourceBaselineBounds,
+) {
+    let repository = git2::Repository::open(repo_path).expect("open source");
+    let oid = git2::Oid::from_str(commit_oid).expect("commit oid");
+    let tree = repository.find_commit(oid).expect("commit").tree_id();
+    let error = super::experiment::preflight_held_out_explicit_source_commit(
+        &repository,
+        oid,
+        tree,
+        bounds,
+    )
+    .expect_err("preflight must fail");
+    assert!(
+        error.to_string().contains("checkout expansion"),
+        "unexpected error: {error}"
+    );
+}
+
+fn write_blob(repo: &git2::Repository, bytes: &[u8]) -> git2::Oid {
+    repo.blob(bytes).expect("write blob")
+}
+
+fn write_tree(repo: &git2::Repository, entries: &[(&str, git2::Oid, i32)]) -> git2::Oid {
+    let mut builder = repo.treebuilder(None).expect("treebuilder");
+    for &(name, oid, mode) in entries {
+        builder.insert(name, oid, mode).expect("tree entry");
+    }
+    builder.write().expect("write tree")
+}
+
+fn commit_tree(repo: &git2::Repository, tree_oid: git2::Oid, parents: &[git2::Oid]) -> git2::Oid {
+    let tree = repo.find_tree(tree_oid).expect("tree");
+    let signature =
+        git2::Signature::now("held-out-test", "held-out-test@example.invalid").expect("sig");
+    let parent_commits = parents
+        .iter()
+        .map(|oid| repo.find_commit(*oid).expect("parent"))
+        .collect::<Vec<_>>();
+    let parent_refs = parent_commits
+        .iter()
+        .map(|commit| commit as &git2::Commit)
+        .collect::<Vec<_>>();
+    repo.commit(
+        Some("HEAD"),
+        &signature,
+        &signature,
+        "held-out fixture",
+        &tree,
+        &parent_refs,
+    )
+    .expect("commit")
+}
+
+fn init_empty_leaf_shared_dag_repo(
+    shared_layers: u32,
+) -> (tempfile::TempDir, std::path::PathBuf, String) {
+    let workspace = tempfile::TempDir::new().expect("workspace");
+    let repo_path = workspace.path().join("source");
+    let repo = git2::Repository::init(&repo_path).expect("init");
+    let mut tree_oid = write_tree(&repo, &[]);
+    for _ in 0..shared_layers {
+        tree_oid = write_tree(
+            &repo,
+            &[("left", tree_oid, 0o040000), ("right", tree_oid, 0o040000)],
+        );
+    }
+    let commit_oid = commit_tree(&repo, tree_oid, &[]);
+    (workspace, repo_path, commit_oid.to_string())
+}
+
+fn init_shared_subtree_dag_repo(
+    shared_layers: u32,
+) -> (tempfile::TempDir, std::path::PathBuf, String) {
+    let workspace = tempfile::TempDir::new().expect("workspace");
+    let repo_path = workspace.path().join("source");
+    let repo = git2::Repository::init(&repo_path).expect("init");
+    let leaf_blob = write_blob(&repo, b"leaf");
+    let mut tree_oid = write_tree(&repo, &[("leaf", leaf_blob, 0o100644)]);
+    for _ in 0..shared_layers {
+        tree_oid = write_tree(
+            &repo,
+            &[("left", tree_oid, 0o040000), ("right", tree_oid, 0o040000)],
+        );
+    }
+    let commit_oid = commit_tree(&repo, tree_oid, &[]);
+    (workspace, repo_path, commit_oid.to_string())
+}
+
+fn init_deep_chain_repo(depth: u32) -> (tempfile::TempDir, std::path::PathBuf, String) {
+    let workspace = tempfile::TempDir::new().expect("workspace");
+    let repo_path = workspace.path().join("source");
+    let repo = git2::Repository::init(&repo_path).expect("init");
+    let leaf_blob = write_blob(&repo, b"deep-leaf");
+    let mut tree_oid = write_tree(&repo, &[("leaf", leaf_blob, 0o100644)]);
+    for index in 0..depth {
+        tree_oid = write_tree(&repo, &[(&format!("dir-{index}"), tree_oid, 0o040000)]);
+    }
+    let commit_oid = commit_tree(&repo, tree_oid, &[]);
+    (workspace, repo_path, commit_oid.to_string())
+}
+
+fn init_repeated_blob_repo(
+    references: usize,
+    blob_len: usize,
+) -> (tempfile::TempDir, std::path::PathBuf, String) {
+    let workspace = tempfile::TempDir::new().expect("workspace");
+    let repo_path = workspace.path().join("source");
+    let repo = git2::Repository::init(&repo_path).expect("init");
+    let blob = write_blob(&repo, &vec![b'x'; blob_len]);
+    let entries = (0..references)
+        .map(|index| (format!("file-{index}"), blob, 0o100644))
+        .collect::<Vec<_>>();
+    let entry_refs = entries
+        .iter()
+        .map(|(name, oid, mode)| (name.as_str(), *oid, *mode))
+        .collect::<Vec<_>>();
+    let tree_oid = write_tree(&repo, &entry_refs);
+    let commit_oid = commit_tree(&repo, tree_oid, &[]);
+    (workspace, repo_path, commit_oid.to_string())
+}
+
+#[test]
+fn held_out_preflight_refuses_shared_subtree_dag_checkout_expansion() {
+    let (_workspace, repo_path, commit_oid) = init_shared_subtree_dag_repo(5);
+    assert_preflight_fails_checkout_expansion(
+        &repo_path,
+        &commit_oid,
+        held_out_preflight_bounds(16, 4 * 1024 * 1024),
+    );
+}
+
+#[test]
+fn held_out_preflight_counts_empty_leaf_shared_directory_dag() {
+    let (_workspace, repo_path, commit_oid) = init_empty_leaf_shared_dag_repo(5);
+    assert_preflight_fails_checkout_expansion(
+        &repo_path,
+        &commit_oid,
+        held_out_preflight_bounds(16, 4 * 1024 * 1024),
+    );
+}
+
+#[test]
+fn held_out_preflight_walks_deep_tree_without_recursive_host_stack() {
+    let (_workspace, repo_path, commit_oid) = init_deep_chain_repo(256);
+    let repository = git2::Repository::open(&repo_path).expect("open source");
+    let oid = git2::Oid::from_str(&commit_oid).expect("oid");
+    let tree = repository.find_commit(oid).expect("commit").tree_id();
+    super::experiment::preflight_held_out_explicit_source_commit(
+        &repository,
+        oid,
+        tree,
+        held_out_preflight_bounds(10_000, 4 * 1024 * 1024),
+    )
+    .expect("deep chain preflight");
+}
+
+#[test]
+fn held_out_preflight_refuses_repeated_blob_checkout_bytes_before_distinct_closure() {
+    let (_workspace, repo_path, commit_oid) = init_repeated_blob_repo(12, 1024);
+    let repository = git2::Repository::open(&repo_path).expect("open source");
+    let oid = git2::Oid::from_str(&commit_oid).expect("commit oid");
+    let commit = repository.find_commit(oid).expect("commit");
+    let tree = commit.tree_id();
+    let error = super::experiment::preflight_held_out_explicit_source_commit(
+        &repository,
+        oid,
+        tree,
+        held_out_preflight_bounds(10_000, 4096),
+    )
+    .expect_err("preflight must fail");
+    assert!(
+        error.to_string().contains("checkout expansion"),
+        "unexpected error: {error}"
+    );
+    let odb = repository.odb().expect("odb");
+    let tree_object = repository.find_tree(tree).expect("tree");
+    let blob = tree_object.get(0).expect("blob entry").id();
+    let mut distinct_bytes = 0_u64;
+    for object in [oid, tree, blob] {
+        let (size, _) = odb.read_header(object).expect("header");
+        distinct_bytes += u64::try_from(size).expect("object size");
+    }
+    assert!(
+        distinct_bytes < 4096,
+        "distinct closure {distinct_bytes} should remain below 4096"
+    );
+}
+
+#[test]
+fn held_out_explicit_source_run_refuses_checkout_expansion_before_artifact_reservation() {
+    let manifest = experiment_manifest();
+    // Directory-inclusive expansion of 18 shared layers exceeds 262_144; 2^18 leaf
+    // blobs equal that ceiling and would not refuse on blob paths alone.
+    let (_workspace, repo_path, commit_oid) = init_shared_subtree_dag_repo(18);
+    let artifact = tempfile::TempDir::new().expect("artifact");
+    let artifact_repo = artifact.path().join("artifact-owner");
+    git2::Repository::init(&artifact_repo).expect("artifact repo");
+    let source = HeldOutExplicitSourceBaseline {
+        source_repo: repo_path,
+        base_commit: commit_oid,
+    };
+    let error = run_experiment_with_held_out_and_source(
+        &manifest,
+        ExperimentRunRequest::default(),
+        &artifact_repo,
+        Some(&source),
+    )
+    .expect_err("expanded checkout must fail before reservation");
+    assert!(
+        error.to_string().contains("checkout expansion"),
+        "unexpected error: {error}"
+    );
+    let runs = artifact_repo.join(".maco/o2/runs");
+    assert!(!runs.exists() || fs::read_dir(runs).expect("runs").next().is_none());
 }

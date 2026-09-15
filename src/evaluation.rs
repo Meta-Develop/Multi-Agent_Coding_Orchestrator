@@ -3727,15 +3727,18 @@ pub use crate::supervise::held_out::{
     HeldOutCandidateEvidence, HeldOutCommandEvidence, HeldOutRunBinding,
 };
 pub use executed_experiment::{
-    run_experiment_with_held_out, ExecutedExperimentResults, ObservedExperimentRun,
+    run_experiment_with_held_out, run_experiment_with_held_out_and_source,
+    ExecutedExperimentResults, ObservedExperimentRun,
 };
 pub mod rescore;
 pub use experiment::{
-    parse_experiment_manifest, run_fake_supervise_experiment, ExperimentEvidence,
+    parse_canonical_full_commit_oid, parse_experiment_manifest,
+    resolve_held_out_explicit_source_baseline, run_fake_supervise_experiment, ExperimentEvidence,
     ExperimentEvidenceKind, ExperimentManifest, ExperimentProfileSummary, ExperimentResults,
-    ExperimentRun, ExperimentRunRequest, EXPERIMENT_MANIFEST_SCHEMA_VERSION,
-    EXPERIMENT_RESULTS_SCHEMA_VERSION, EXPERIMENT_RESULT_SCHEMA,
-    LEGACY_EXPERIMENT_RESULTS_SCHEMA_VERSION, LEGACY_EXPERIMENT_RESULT_SCHEMA,
+    ExperimentRun, ExperimentRunRequest, HeldOutExplicitSourceBaseline,
+    EXPERIMENT_MANIFEST_SCHEMA_VERSION, EXPERIMENT_RESULTS_SCHEMA_VERSION,
+    EXPERIMENT_RESULT_SCHEMA, LEGACY_EXPERIMENT_RESULTS_SCHEMA_VERSION,
+    LEGACY_EXPERIMENT_RESULT_SCHEMA,
 };
 
 #[cfg(test)]

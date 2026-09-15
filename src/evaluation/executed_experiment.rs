@@ -1,7 +1,7 @@
 //! Observed local validation, deliberately separate from legacy synthetic scores.
 use super::{
-    experiment::IsolatedSuperviseState, EvaluationExecution, ExperimentManifest,
-    ExperimentRunRequest,
+    experiment::{self, HeldOutExplicitSourceBaseline, IsolatedSuperviseState},
+    EvaluationExecution, ExperimentManifest, ExperimentRunRequest,
 };
 use crate::{
     artifacts::{
@@ -65,6 +65,16 @@ pub fn run_experiment_with_held_out(
     request: ExperimentRunRequest,
     artifact_repo: &Path,
 ) -> Result<ExecutedExperimentResults> {
+    run_experiment_with_held_out_and_source(manifest, request, artifact_repo, None)
+}
+
+/// Held-out execution with an optional explicit evaluated source baseline.
+pub fn run_experiment_with_held_out_and_source(
+    manifest: &ExperimentManifest,
+    request: ExperimentRunRequest,
+    artifact_repo: &Path,
+    explicit_source: Option<&HeldOutExplicitSourceBaseline>,
+) -> Result<ExecutedExperimentResults> {
     manifest.validate()?;
     if request.execution != EvaluationExecution::DeterministicFake || request.allow_real_provider {
         bail!("held-out execution supports only deterministic-fake generation without real-provider opt-in");
@@ -72,6 +82,14 @@ pub fn run_experiment_with_held_out(
     if manifest.held_out_validation.is_empty() {
         bail!("--execute-held-out requires at least one declared validation");
     }
+    let resolved_commit = match explicit_source {
+        Some(source) => Some(
+            experiment::resolve_held_out_explicit_source_baseline(source).map_err(|error| {
+                anyhow!("held-out explicit source baseline is invalid: {error}")
+            })?,
+        ),
+        None => None,
+    };
     crate::git_repository::configure_libgit2_repository_extensions()?;
     let repo = artifacts::discover_repo_root(artifact_repo)?;
     let family = RunArtifactFamily::Supervise;
@@ -88,8 +106,12 @@ pub fn run_experiment_with_held_out(
     let writer = Arc::new(Mutex::new(writer));
     // One real timestamp fixes the synthetic commit as well as its tree across
     // profiles/repetitions. It is not a claimed source-repository revision.
-    let seconds = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?;
-    let baseline_time = git2::Time::new(seconds, 0);
+    let baseline_time = if resolved_commit.is_some() {
+        None
+    } else {
+        let seconds = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?;
+        Some(git2::Time::new(seconds, 0))
+    };
     let mut runs = Vec::new();
     let mut common_baseline: Option<(String, String)> = None;
     for (profile_index, profile) in manifest.profiles.iter().enumerate() {
@@ -98,12 +120,20 @@ pub fn run_experiment_with_held_out(
             let deadline = started
                 .checked_add(Duration::from_secs(manifest.limits.wall_time_seconds))
                 .context("experiment wall-time limit cannot be represented")?;
-            let mut isolated = IsolatedSuperviseState::create_with_baseline_time(
-                manifest,
-                profile,
-                repetition,
-                Some(baseline_time),
-            )?;
+            let mut isolated = match (explicit_source, resolved_commit) {
+                (Some(source), Some(commit_oid)) => {
+                    IsolatedSuperviseState::create_with_explicit_source_baseline(
+                        manifest, profile, repetition, source, commit_oid,
+                    )?
+                }
+                (None, None) => IsolatedSuperviseState::create_with_baseline_time(
+                    manifest,
+                    profile,
+                    repetition,
+                    baseline_time,
+                )?,
+                _ => bail!("held-out explicit source baseline resolution was inconsistent"),
+            };
             isolated.run_id = RunId::new(format!(
                 "{}-p{profile_index}-r{repetition}",
                 run_id.as_str()
@@ -191,7 +221,8 @@ pub fn run_experiment_with_held_out(
         version: 3, schema: "evaluation_experiment_observations_v3".into(),
         experiment_id: manifest.experiment_id.clone(), manifest_sha256,
         artifact_run_id: run_id.as_str().into(), artifact_report: report_path,
-        synthetic_baseline: true, real_provider_executed: false,
+        synthetic_baseline: explicit_source.is_none(),
+        real_provider_executed: false,
         production_eligible: false, eligible_for_production_economics: false,
         eligible_to_justify_named_default: false,
         quality: None, total_cost_usd: None, confidence: None, runs,

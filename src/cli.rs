@@ -4256,12 +4256,43 @@ struct RunExperimentArgs {
     /// Explicitly execute declared local argv in contained candidate copies and retain bound observations.
     #[arg(long)]
     execute_held_out: bool,
+    /// Evaluated Git repository for held-out baselines. Requires --execute-held-out and --base-commit.
+    #[arg(long, value_name = "PATH")]
+    source_repo: Option<PathBuf>,
+    /// Full 40-character commit object name in --source-repo. Requires --execute-held-out and --source-repo.
+    #[arg(long, value_name = "FULL_OID")]
+    base_commit: Option<String>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
 }
 
+fn resolve_held_out_explicit_source_cli(
+    execute_held_out: bool,
+    source_repo: Option<PathBuf>,
+    base_commit: Option<String>,
+) -> Result<Option<crate::evaluation::HeldOutExplicitSourceBaseline>> {
+    match (source_repo, base_commit) {
+        (Some(source_repo), Some(base_commit)) => {
+            if !execute_held_out {
+                bail!("--source-repo and --base-commit are accepted only with --execute-held-out");
+            }
+            Ok(Some(crate::evaluation::HeldOutExplicitSourceBaseline {
+                source_repo,
+                base_commit,
+            }))
+        }
+        (None, None) => Ok(None),
+        _ => bail!("--source-repo and --base-commit must be provided together"),
+    }
+}
+
 fn run_evaluation_experiment_command(args: RunExperimentArgs) -> Result<()> {
+    let held_out_explicit_source_baseline = resolve_held_out_explicit_source_cli(
+        args.execute_held_out,
+        args.source_repo,
+        args.base_commit,
+    )?;
     let manifest_bytes =
         BoundedRegularReader::read_tree_no_follow(&args.manifest, MAX_EVALUATION_MANIFEST_BYTES)
             .with_context(|| {
@@ -4278,13 +4309,14 @@ fn run_evaluation_experiment_command(args: RunExperimentArgs) -> Result<()> {
             )
         })?;
     if args.execute_held_out {
-        let results = crate::evaluation::run_experiment_with_held_out(
+        let results = crate::evaluation::run_experiment_with_held_out_and_source(
             &manifest,
             crate::evaluation::ExperimentRunRequest {
                 execution: args.execution,
                 allow_real_provider: args.allow_real_provider,
             },
             &args.repo,
+            held_out_explicit_source_baseline.as_ref(),
         )?;
         return print_query_report(&results, args.json);
     }
