@@ -1797,6 +1797,7 @@ mod tests {
             stderr: CapturedOutput::default(),
             error: Some(error.to_string()),
             output_last_message: None,
+            grok_stream_usage_evidence: None,
         }
     }
 

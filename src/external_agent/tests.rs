@@ -5248,6 +5248,17 @@ printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-sessio
     assert_eq!(usage.input_tokens(), 12);
     assert_eq!(usage.output_tokens(), 4);
     assert_eq!(usage.total_tokens(), Some(16));
+    let Some(crate::runtime_adapter::grok::GrokStreamUsageEvidence::Native(persisted)) =
+        &report.grok_stream_usage_evidence
+    else {
+        bail!(
+            "Grok production path must persist native stream usage evidence, got {:?}",
+            report.grok_stream_usage_evidence
+        );
+    };
+    assert_eq!(persisted.input_tokens, 12);
+    assert_eq!(persisted.output_tokens, 4);
+    assert_eq!(persisted.total_tokens, Some(16));
     assert!(codex_usage_from_jsonl(&captured)?.is_none());
 
     assert_eq!(snapshot_primary_git_surface(&primary)?, primary_before);
@@ -5282,6 +5293,220 @@ printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-sessio
         tracked_before
     );
     fs::write(&helper_receipt, GROK_PRODUCTION_HELPER_RECEIPT)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run_wire() -> Result<()>
+{
+    use crate::process_runner::CapturedBytes;
+    use crate::runtime_adapter::grok::{GrokStreamUsageEvidence, GrokStreamUsageNativeEvidence};
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    let temp = tempfile::tempdir()?;
+    create_mandatory_control_roots(temp.path())?;
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+    }
+    let prompt = temp.path().join("prompt.md");
+    fs::write(&prompt, "grok\n")?;
+    let finish = |invocation_id: &str,
+                  command: &ExternalAgentCommand,
+                  stdout: CapturedBytes|
+     -> Result<ExternalAgentRun> {
+        let staged_path = incoming.join(format!("staged-{invocation_id}.raw"));
+        let mut staged_output = reserve_external_output(&staged_path)?;
+        let mut output_reservation = reserve_external_output(&command.output_last_message)?;
+        let mut json_log_reservation = reserve_external_output(&command.json_log)?;
+        let identity_path = temp.path().join(format!("identity-{invocation_id}.txt"));
+        fs::write(&identity_path, b"id")?;
+        let program_identity = external_program_identity(&identity_path)?;
+        let mut report = ExternalAgentRun {
+            command: vec!["runner".to_string()],
+            cwd: command.cwd.clone(),
+            timeout_seconds: command.timeout.as_secs(),
+            exit_code: None,
+            duration_ms: 0,
+            timed_out: false,
+            process_tree: None,
+            side_effects: None,
+            publishable: false,
+            program_trust: ExternalProgramTrust::ExplicitCustom,
+            codex_permissions: None,
+            stdout: CapturedOutput::default(),
+            stderr: CapturedOutput::default(),
+            error: None,
+            output_last_message: None,
+            grok_stream_usage_evidence: None,
+        };
+        let side_effects = if command.invocation == ExternalAgentInvocation::Grok {
+            SideEffectConfinementEvidence::Verified(SideEffectConfinementProfileKind::ExternalGrok)
+        } else {
+            SideEffectConfinementEvidence::Verified(SideEffectConfinementProfileKind::ExternalCodex)
+        };
+        let output = ProcessOutput {
+            status: Some(ExitStatus::from_raw(0)),
+            duration: Duration::from_millis(1),
+            timed_out: false,
+            process_tree: ProcessTreeEvidence::VerifiedEmpty(
+                ContainmentBackend::SystemdUserService,
+            ),
+            side_effects,
+            stdout,
+            stderr: CapturedBytes::default(),
+            process_error: None,
+            stdin_error: None,
+        };
+        let protected_controls = protected_worktree_controls(command)?;
+        record_completed_target(
+            &mut report,
+            output,
+            &mut staged_output,
+            &mut output_reservation,
+            &mut json_log_reservation,
+            &CredentialRedactor::default(),
+            CompletedTargetContext {
+                runtime: ExternalExecutionRuntime::Verified,
+                codex_version: None,
+                spec: command,
+                protected_controls: &protected_controls,
+                argv_digest: "digest",
+                program_identity: &program_identity,
+            },
+        );
+        Ok(report)
+    };
+
+    let grok_command = |invocation_id: &str| -> ExternalAgentCommand {
+        ExternalAgentCommand::codex(
+            "grok",
+            temp.path(),
+            &prompt,
+            incoming.join(format!("grok-events-{invocation_id}.jsonl")),
+            incoming.join(format!("grok-report-{invocation_id}.json")),
+            Duration::from_secs(5),
+        )
+        .with_runtime_adapter(
+            RuntimeId::Grok,
+            RuntimeAdapterConfig::defaults(RuntimeId::Grok),
+        )
+    };
+    let codex_command = |invocation_id: &str| -> ExternalAgentCommand {
+        ExternalAgentCommand::codex(
+            "codex",
+            temp.path(),
+            &prompt,
+            incoming.join(format!("codex-events-{invocation_id}.jsonl")),
+            incoming.join(format!("codex-report-{invocation_id}.json")),
+            Duration::from_secs(5),
+        )
+    };
+
+    let native_stdout = concat!(
+        "{\"type\":\"end\",\"stopReason\":\"end_turn\",\"sessionId\":\"s\",\"requestId\":\"r\",",
+        "\"usage\":{\"input_tokens\":9,\"output_tokens\":3,\"total_tokens\":12}}\n",
+    );
+    let native_report = finish(
+        "native",
+        &grok_command("native"),
+        CapturedBytes::from_bytes_for_test(native_stdout.as_bytes().to_vec()),
+    )?;
+    assert_eq!(
+        native_report.grok_stream_usage_evidence,
+        Some(GrokStreamUsageEvidence::Native(
+            GrokStreamUsageNativeEvidence {
+                input_tokens: 9,
+                output_tokens: 3,
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+                reasoning_tokens: None,
+                total_tokens: Some(12),
+            }
+        ))
+    );
+    let restored: ExternalAgentRun = serde_json::from_slice(&serde_json::to_vec(&native_report)?)?;
+    assert_eq!(
+        restored.grok_stream_usage_evidence,
+        native_report.grok_stream_usage_evidence
+    );
+
+    let incomplete_stdout = concat!(
+        "{\"type\":\"end\",\"stopReason\":\"end_turn\",\"sessionId\":\"s\",\"requestId\":\"r\",",
+        "\"usage_is_incomplete\":true,\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n",
+    );
+    let incomplete_report = finish(
+        "incomplete",
+        &grok_command("incomplete"),
+        CapturedBytes::from_bytes_for_test(incomplete_stdout.as_bytes().to_vec()),
+    )?;
+    assert_eq!(
+        incomplete_report.grok_stream_usage_evidence,
+        Some(GrokStreamUsageEvidence::Incomplete)
+    );
+
+    let omitted_stdout =
+        b"{\"type\":\"end\",\"stopReason\":\"end_turn\",\"sessionId\":\"s\",\"requestId\":\"r\"}\n";
+    let omitted_report = finish(
+        "omitted",
+        &grok_command("omitted"),
+        CapturedBytes::from_bytes_for_test(omitted_stdout.to_vec()),
+    )?;
+    assert_eq!(
+        omitted_report.grok_stream_usage_evidence,
+        Some(GrokStreamUsageEvidence::NotProcessObservable)
+    );
+    assert_ne!(
+        incomplete_report.grok_stream_usage_evidence,
+        omitted_report.grok_stream_usage_evidence
+    );
+
+    let codex_report = finish(
+        "codex-non-grok",
+        &codex_command("codex-non-grok"),
+        CapturedBytes::from_bytes_for_test(native_stdout.as_bytes().to_vec()),
+    )?;
+    assert!(codex_report.grok_stream_usage_evidence.is_none());
+
+    let truncated_report = finish(
+        "truncated-valid-prefix",
+        &grok_command("truncated-valid-prefix"),
+        CapturedBytes::from_bytes_with_truncation_for_test(native_stdout.as_bytes().to_vec(), true),
+    )?;
+    assert_eq!(
+        truncated_report.grok_stream_usage_evidence,
+        Some(GrokStreamUsageEvidence::NotProcessObservable)
+    );
+
+    let malformed_report = finish(
+        "malformed-stream",
+        &grok_command("malformed-stream"),
+        CapturedBytes::from_bytes_for_test(b"{not-valid-grok-stream}\n".to_vec()),
+    )?;
+    assert_eq!(
+        malformed_report.grok_stream_usage_evidence,
+        Some(GrokStreamUsageEvidence::NotProcessObservable)
+    );
+
+    let legacy = serde_json::json!({
+        "command": ["legacy"],
+        "cwd": ".",
+        "timeout_seconds": 1,
+        "duration_ms": 0,
+        "timed_out": false,
+        "publishable": false,
+        "program_trust": "trusted_system_codex",
+        "stdout": {"text": "", "truncated": false, "target_launch_attempted": false},
+        "stderr": {"text": "", "truncated": false, "target_launch_attempted": false},
+    });
+    let legacy_run: ExternalAgentRun = serde_json::from_value(legacy)?;
+    assert!(legacy_run.grok_stream_usage_evidence.is_none());
+
     Ok(())
 }
 
@@ -5819,6 +6044,7 @@ fn external_errors_are_composed_and_success_requires_verified_empty_containment(
         stderr: CapturedOutput::default(),
         error: None,
         output_last_message: None,
+        grok_stream_usage_evidence: None,
     };
     assert!(!report.succeeded());
     report.process_tree = Some(ProcessTreeEvidence::TrustedBestEffort(
@@ -5979,6 +6205,7 @@ fn verified_nonzero_target_retains_permission_and_containment_evidence() -> Resu
         stderr: CapturedOutput::default(),
         error: None,
         output_last_message: None,
+        grok_stream_usage_evidence: None,
     };
     let output = ProcessOutput {
         status: Some(ExitStatus::from_raw(7 << 8)),

@@ -642,6 +642,9 @@ fn issue32_denials_propagate_deduplicate_round_trip_and_default() {
     assert!(command_run_record_schema_value()["properties"]
         .get("sandbox_denials")
         .is_some());
+    assert!(command_run_record_schema_value()["properties"]
+        .get("grok_stream_usage_evidence")
+        .is_some());
     assert!(!command_run_record_schema_value()["required"]
         .as_array()
         .expect("required fields")

@@ -1,5 +1,87 @@
 use super::*;
 
+const CHILD_ASSERTED_GROK_STREAM_USAGE_MESSAGE: &str =
+    "child report attempted to self-assert parent-process Grok stream usage evidence";
+
+fn command_records_contain_grok_stream_usage_evidence(records: &[CommandRunRecord]) -> bool {
+    records
+        .iter()
+        .any(|record| record.grok_stream_usage_evidence.is_some())
+}
+
+fn strip_grok_stream_usage_evidence_from_command_records(records: &mut [CommandRunRecord]) {
+    for record in records {
+        record.grok_stream_usage_evidence = None;
+    }
+}
+
+fn reject_child_asserted_grok_stream_usage_evidence(
+    report_path: &Path,
+    report: &mut OrchestratorReviewReport,
+) {
+    let mut asserted = command_records_contain_grok_stream_usage_evidence(&report.commands_run);
+    for worker in &report.worker_reports {
+        asserted |= command_records_contain_grok_stream_usage_evidence(&worker.commands_run);
+    }
+    for auditor in &report.audit_reports {
+        asserted |= command_records_contain_grok_stream_usage_evidence(&auditor.commands_run);
+    }
+    if !asserted {
+        return;
+    }
+    strip_grok_stream_usage_evidence_from_command_records(&mut report.commands_run);
+    for worker in &mut report.worker_reports {
+        strip_grok_stream_usage_evidence_from_command_records(&mut worker.commands_run);
+    }
+    for auditor in &mut report.audit_reports {
+        strip_grok_stream_usage_evidence_from_command_records(&mut auditor.commands_run);
+    }
+    report.status = ReviewStatus::Failed;
+    report.accepted = false;
+    report.rejected = true;
+    report.findings.push(Finding {
+        severity: FindingSeverity::Error,
+        message: CHILD_ASSERTED_GROK_STREAM_USAGE_MESSAGE.to_string(),
+        paths: vec![report_path.to_path_buf()],
+    });
+}
+
+fn reject_worker_asserted_grok_stream_usage_evidence(
+    report_path: &Path,
+    worker: &mut WorkerReport,
+) {
+    if !command_records_contain_grok_stream_usage_evidence(&worker.commands_run) {
+        return;
+    }
+    strip_grok_stream_usage_evidence_from_command_records(&mut worker.commands_run);
+    worker.status = ReviewStatus::Failed;
+    worker.accepted = false;
+    worker.rejected = true;
+    worker.findings.push(Finding {
+        severity: FindingSeverity::Error,
+        message: CHILD_ASSERTED_GROK_STREAM_USAGE_MESSAGE.to_string(),
+        paths: vec![report_path.to_path_buf()],
+    });
+}
+
+fn reject_auditor_asserted_grok_stream_usage_evidence(
+    report_path: &Path,
+    auditor: &mut AuditorReport,
+) {
+    if !command_records_contain_grok_stream_usage_evidence(&auditor.commands_run) {
+        return;
+    }
+    strip_grok_stream_usage_evidence_from_command_records(&mut auditor.commands_run);
+    auditor.status = ReviewStatus::Failed;
+    auditor.accepted = false;
+    auditor.rejected = true;
+    auditor.findings.push(Finding {
+        severity: FindingSeverity::Error,
+        message: CHILD_ASSERTED_GROK_STREAM_USAGE_MESSAGE.to_string(),
+        paths: vec![report_path.to_path_buf()],
+    });
+}
+
 #[cfg(test)]
 pub(super) fn collect_child_report(
     context: ChildReportCollectionContext<'_>,
@@ -53,8 +135,10 @@ pub(super) fn collect_child_report_for_runtime(
     let mut report_shape_problems = Vec::new();
     let parsed_report = if direct_worker {
         read_direct_worker_report(external_run.output_last_message(), report_path).map(|parsed| {
+            let mut worker = parsed.report;
+            reject_worker_asserted_grok_stream_usage_evidence(report_path, &mut worker);
             ParsedReport {
-                report: direct_worker_report_envelope(parsed.report),
+                report: direct_worker_report_envelope(worker),
                 recovered: parsed.recovered,
             }
         })
@@ -64,6 +148,7 @@ pub(super) fn collect_child_report_for_runtime(
     let mut report = match parsed_report {
         Ok(parsed) => {
             let mut report = parsed.report;
+            reject_child_asserted_grok_stream_usage_evidence(report_path, &mut report);
             if parsed.recovered {
                 report.findings.push(Finding {
                     severity: FindingSeverity::Warning,
@@ -737,6 +822,7 @@ pub(super) fn collect_parent_auditor_report(
         }
         Err(error) => missing_parent_auditor_report(expected_id, report_path, external_run, error),
     };
+    reject_auditor_asserted_grok_stream_usage_evidence(report_path, &mut report);
     report
         .commands_run
         .push(command_record_from_external_for_runtime(

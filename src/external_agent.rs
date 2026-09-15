@@ -28,8 +28,8 @@ use crate::protected_path::{DeclaredPathCoordinate, ProtectedPathSpec};
 #[cfg(target_os = "linux")]
 use crate::runtime_adapter::grok::GrokCredentialSource;
 use crate::runtime_adapter::{
-    AdapterId, LaunchContext, RuntimeAdapterConfig, RuntimeId, SideEffectConfinement, TypedRuntime,
-    TypedRuntimeContract, WritableLaunchTarget,
+    grok::GrokStreamUsageEvidence, AdapterId, LaunchContext, RuntimeAdapterConfig, RuntimeId,
+    SideEffectConfinement, TypedRuntime, TypedRuntimeContract, WritableLaunchTarget,
 };
 use crate::safe_state::{unsigned_to_u32, ReservedDirectory};
 use crate::secure_output::{ReservedOutputFile, SecureOutputRoot};
@@ -1452,6 +1452,9 @@ pub struct ExternalAgentRun {
     /// Descriptor-captured final output. This is deliberately excluded from the public report
     /// surface so callers cannot confuse a tainted pathname with the held capability.
     pub(crate) output_last_message: Option<Vec<u8>>,
+    /// Exact Grok streaming-json spend observation when the trusted runner executed Grok.
+    /// Absent for non-Grok runs and legacy deserialized reports.
+    pub grok_stream_usage_evidence: Option<GrokStreamUsageEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -1500,6 +1503,10 @@ impl std::fmt::Debug for ExternalAgentRun {
             .field("stderr", &self.stderr)
             .field("error", &self.error)
             .field("output_last_message", &held_output)
+            .field(
+                "grok_stream_usage_evidence",
+                &self.grok_stream_usage_evidence,
+            )
             .finish()
     }
 }
@@ -1687,6 +1694,8 @@ struct ExternalAgentRunWireRef<'a> {
     stdout: &'a CapturedOutput,
     stderr: &'a CapturedOutput,
     error: &'a Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grok_stream_usage_evidence: &'a Option<GrokStreamUsageEvidence>,
 }
 
 #[derive(Deserialize)]
@@ -1724,6 +1733,8 @@ struct ExternalAgentRunWireOwned {
     stdout: CapturedOutput,
     stderr: CapturedOutput,
     error: Option<String>,
+    #[serde(default)]
+    grok_stream_usage_evidence: Option<GrokStreamUsageEvidence>,
 }
 
 impl Serialize for ExternalAgentRun {
@@ -1762,6 +1773,7 @@ impl Serialize for ExternalAgentRun {
             stdout: &self.stdout,
             stderr: &self.stderr,
             error: &self.error,
+            grok_stream_usage_evidence: &self.grok_stream_usage_evidence,
         }
         .serialize(serializer)
     }
@@ -1802,6 +1814,7 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
             stderr: wire.stderr,
             error: wire.error,
             output_last_message: None,
+            grok_stream_usage_evidence: wire.grok_stream_usage_evidence,
         })
     }
 }
@@ -2499,6 +2512,7 @@ fn run_external_agent_runtime(
         stderr: CapturedOutput::default(),
         error: None,
         output_last_message: None,
+        grok_stream_usage_evidence: None,
     };
 
     let mut codex_version = None;
@@ -3854,6 +3868,16 @@ enum RuntimeAdapterCapturedOutput {
     Unavailable,
 }
 
+fn grok_bounded_stdout_usage_evidence(stdout: &CapturedBytes) -> GrokStreamUsageEvidence {
+    if stdout.is_truncated() {
+        return GrokStreamUsageEvidence::NotProcessObservable;
+    }
+    match crate::runtime_adapter::grok::parse_grok_event_stream(stdout.as_bytes()) {
+        Ok(stream) => GrokStreamUsageEvidence::from_usage_status(stream.usage_status()),
+        Err(_) => GrokStreamUsageEvidence::NotProcessObservable,
+    }
+}
+
 fn runtime_adapter_captured_output(
     spec: &ExternalAgentCommand,
     stdout: &[u8],
@@ -3963,6 +3987,10 @@ fn record_completed_target(
     report.stdout.target_launch_attempted = true;
     report.stdout.run_metadata.sandbox_denials = sandbox_denials;
     report.stderr = summarize_redacted_output(&output.stderr, credential_redactor);
+    if context.spec.invocation == ExternalAgentInvocation::Grok {
+        report.grok_stream_usage_evidence =
+            Some(grok_bounded_stdout_usage_evidence(&output.stdout));
+    }
     report.error = append_external_error(
         report.error.take(),
         append_external_error(output.stdin_error, output.process_error)
@@ -4097,6 +4125,7 @@ fn failed_external_run(
         stderr: CapturedOutput::default(),
         error: Some(error),
         output_last_message: None,
+        grok_stream_usage_evidence: None,
     }
 }
 
