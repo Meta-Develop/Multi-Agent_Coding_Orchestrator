@@ -15,6 +15,88 @@ uid="$(id -u)"
 user_name="$(id -un)"
 runtime_dir="/run/user/${uid}"
 
+read_readonly_sysctl() {
+  local key="$1"
+  local value=""
+  value="$(sysctl -n "${key}" 2>/dev/null || true)"
+  if [[ -z "${value}" ]]; then
+    printf 'unknown'
+  else
+    printf '%s' "${value}"
+  fi
+}
+
+capture_probe_sysctls() {
+  local key
+  for key in \
+    kernel.unprivileged_userns_clone \
+    user.max_user_namespaces \
+    kernel.apparmor_restrict_unprivileged_userns
+  do
+    printf 'maco-ci-inner-probe sysctl %s=%s\n' "${key}" "$(read_readonly_sysctl "${key}")"
+  done
+}
+
+capture_probe_apparmor_denied() {
+  local unit="$1"
+  local pid=""
+  local start_ts=""
+  local end_ts=""
+  local invocation=""
+  local start_epoch=""
+  local end_epoch=""
+  local denied_output=""
+  pid="$(systemctl --user show "${unit}" -p ExecMainPID --value 2>/dev/null || true)"
+  start_ts="$(systemctl --user --timestamp=us show "${unit}" -p ExecMainStartTimestamp --value 2>/dev/null || true)"
+  end_ts="$(systemctl --user --timestamp=us show "${unit}" -p ExecMainExitTimestamp --value 2>/dev/null || true)"
+  invocation="$(systemctl --user show "${unit}" -p InvocationID --value 2>/dev/null || true)"
+  printf 'maco-ci-inner-probe ExecMainPID=%s\n' "${pid}"
+  printf 'maco-ci-inner-probe ExecMainStartTimestamp=%s\n' "${start_ts}"
+  printf 'maco-ci-inner-probe ExecMainExitTimestamp=%s\n' "${end_ts}"
+  printf 'maco-ci-inner-probe InvocationID=%s\n' "${invocation}"
+  if [[ ! "${pid}" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'maco-ci-inner-probe apparmor denied mapping unavailable: ExecMainPID not a positive numeric PID\n'
+    return 0
+  fi
+  case "${start_ts}" in
+    ''|n/a|N/A|-)
+      printf 'maco-ci-inner-probe apparmor denied mapping unavailable: execution interval not recorded\n'
+      return 0
+      ;;
+  esac
+  case "${end_ts}" in
+    ''|n/a|N/A|-)
+      printf 'maco-ci-inner-probe apparmor denied mapping unavailable: execution interval not recorded\n'
+      return 0
+      ;;
+  esac
+  start_epoch="$(date -u -d "${start_ts}" +%s%6N 2>/dev/null || true)"
+  end_epoch="$(date -u -d "${end_ts}" +%s%6N 2>/dev/null || true)"
+  if [[ -z "${start_epoch}" || -z "${end_epoch}" ]]; then
+    printf 'maco-ci-inner-probe apparmor denied mapping unavailable: timestamps not parseable\n'
+    return 0
+  fi
+  if [[ "${start_epoch}" -gt "${end_epoch}" ]]; then
+    printf 'maco-ci-inner-probe apparmor denied mapping unavailable: execution interval not bounded\n'
+    return 0
+  fi
+  printf 'maco-ci-inner-probe apparmor denied pid=%s since=%s until=%s\n' \
+    "${pid}" "${start_ts}" "${end_ts}"
+  if ! denied_output="$(sudo -n journalctl --no-pager --quiet -o short-iso -n 80 \
+      -k --since="${start_ts}" --until="${end_ts}" \
+      -g 'apparmor="DENIED"' 2>&1)"; then
+    printf 'maco-ci-inner-probe apparmor denied unavailable for pid=%s\n' "${pid}"
+    return 0
+  fi
+  denied_output="$(printf '%s\n' "${denied_output}" | grep -E "(^|[[:space:]])pid=${pid}([[:space:]]|$)" || true)"
+  if [[ -z "${denied_output}" ]]; then
+    printf 'maco-ci-inner-probe apparmor denied unavailable: no matching records\n'
+  else
+    printf '%s\n' "${denied_output}" | head -c 4096 || true
+    printf '\n'
+  fi
+}
+
 capture_probe_unit_journal() {
   local unit="$1"
   local probe_uid
@@ -115,6 +197,7 @@ run_inner_transient_probe() {
   if [[ "${load_state}" == loaded ]]; then
     systemctl --user show "${unit}" \
       -p Id -p LoadState -p ActiveState -p SubState -p Result -p ExecMainStatus -p ExecMainCode \
+      -p ExecMainPID -p ExecMainStartTimestamp -p ExecMainExitTimestamp -p InvocationID \
       -p StatusErrno -p StatusText -p NoNewPrivileges -p PrivateDevices -p PrivateUsers \
       -p ProtectControlGroups -p CapabilityBoundingSet -p AmbientCapabilities \
       -p RestrictNamespaces -p ProtectSystem -p PrivateTmp || true
@@ -127,6 +210,10 @@ run_inner_transient_probe() {
   fi
   if [[ "${status}" -ne 0 ]]; then
     capture_probe_unit_journal "${unit}"
+    capture_probe_sysctls
+    if [[ "${load_state}" == loaded ]]; then
+      capture_probe_apparmor_denied "${unit}"
+    fi
   fi
   systemctl --user stop "${unit}" >/dev/null 2>&1 || true
   systemctl --user reset-failed "${unit}" >/dev/null 2>&1 || true
