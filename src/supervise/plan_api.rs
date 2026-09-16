@@ -3027,6 +3027,10 @@ fn run_held_out_production_experiment_with_runner(
         bail!("experiment validation authority does not match the isolated assignment");
     }
     loaded.assignment_metadata.parent_validation = Some(authority);
+    // Catalog preflight admits logical `codex` and binds the frozen absolute
+    // `--runtime-bin` to trusted system resolution in
+    // `admit_production_supervisor_catalog_preflight_grant` before any catalog
+    // process is prepared.
     let runtime_model_catalog =
         admit_production_supervisor_catalog_preflight_grant(&options, &repo)
             .and_then(|grant| RuntimeModelCatalog::for_supervisor(&options, &repo, grant));
