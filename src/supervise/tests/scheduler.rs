@@ -1494,6 +1494,96 @@ fn degraded_manifest_boundary_finalization_still_releases_serial_claims() {
         .is_empty());
 }
 
+fn assert_scheduler_assignment_runner_cancellation_scopes_isolated(max_concurrent_children: usize) {
+    #[derive(Default)]
+    struct CapturedRunnerTokens {
+        scope_a: Option<ProcessCancellation>,
+        scope_b: Option<ProcessCancellation>,
+    }
+
+    let (temp, _repo_path) = injected_repository();
+    let assignments = vec![
+        injected_named_assignment("scope-a", "README.md"),
+        injected_named_assignment("scope-b", "src/lib.rs"),
+    ];
+    let plan = injected_multi_plan(assignments.clone(), 0);
+    let run_id = format!("assignment-runner-scope-{max_concurrent_children}");
+    let options = injected_options(&_repo_path, temp.path(), run_id.as_str());
+    let captured = Arc::new(Mutex::new(CapturedRunnerTokens::default()));
+    let runner = {
+        let assignments = assignments.clone();
+        let captured = Arc::clone(&captured);
+        move |command: &ExternalAgentCommand,
+              cancellation: &ProcessCancellation,
+              _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
+            let id = injected_command_assignment_id(command);
+            let mut tokens = captured
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match id.as_str() {
+                "scope-a" if tokens.scope_a.is_none() => {
+                    tokens.scope_a = Some(cancellation.clone());
+                }
+                "scope-b" if tokens.scope_b.is_none() => {
+                    tokens.scope_b = Some(cancellation.clone());
+                }
+                _ => {}
+            }
+            let assignment = assignments
+                .iter()
+                .find(|assignment| assignment.id == id)
+                .unwrap_or_else(|| panic!("missing assignment {id}"));
+            write_injected_assignment_report(command, assignment);
+            injected_verified_run(command)
+        }
+    };
+
+    let report = run_supervisor_plan_with_concurrent_cancellable_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        max_concurrent_children,
+        &runner,
+    )
+    .expect("assignment runner scope isolation fixture remains reportable");
+
+    assert!(
+        report.success,
+        "scope isolation proves token handoff only after successful assignments: {report:#?}"
+    );
+    assert_eq!(report.orchestrator_reports.len(), 2);
+
+    let tokens = captured
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let scope_a = tokens
+        .scope_a
+        .as_ref()
+        .expect("scope-a runner must receive an assignment cancellation token");
+    let scope_b = tokens
+        .scope_b
+        .as_ref()
+        .expect("scope-b runner must receive an assignment cancellation token");
+    assert!(!scope_a.is_cancelled());
+    assert!(!scope_b.is_cancelled());
+    scope_a.cancel();
+    assert!(scope_a.is_cancelled());
+    assert!(
+        !scope_b.is_cancelled(),
+        "cancelling one assignment runner scope must not flip a sibling assignment token"
+    );
+}
+
+#[test]
+fn serial_scheduler_passes_isolated_assignment_cancellation_to_runner() {
+    assert_scheduler_assignment_runner_cancellation_scopes_isolated(1);
+}
+
+#[test]
+fn concurrent_scheduler_passes_isolated_assignment_cancellation_to_runner() {
+    assert_scheduler_assignment_runner_cancellation_scopes_isolated(2);
+}
+
 #[test]
 fn admission_commit_recv_failure_cancels_and_drains_active_assignments() {
     const TEST: &str = "admission_commit_recv_failure_cancels_and_drains_active_assignments";

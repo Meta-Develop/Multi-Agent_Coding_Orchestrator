@@ -4992,4 +4992,82 @@ fn stuck_owned_io_thread_aborts_instead_of_detaching() {
     );
 }
 
+mod process_cancellation_child_scope {
+    use super::ProcessCancellation;
+
+    #[test]
+    fn sibling_child_scopes_isolate_targeted_cancellation() {
+        let root = ProcessCancellation::new();
+        let child_a = root.child_scope();
+        let child_b = root.child_scope();
+
+        assert!(!root.is_cancelled());
+        assert!(!child_a.is_cancelled());
+        assert!(!child_b.is_cancelled());
+
+        child_a.cancel();
+
+        assert!(child_a.is_cancelled());
+        assert!(!child_b.is_cancelled());
+        assert!(!root.is_cancelled());
+    }
+
+    #[test]
+    fn parent_cancel_propagates_to_existing_child_scopes() {
+        let root = ProcessCancellation::new();
+        let child_a = root.child_scope();
+        let child_b = root.child_scope();
+
+        root.cancel();
+
+        assert!(root.is_cancelled());
+        assert!(child_a.is_cancelled());
+        assert!(child_b.is_cancelled());
+    }
+
+    #[test]
+    fn grandchild_observes_ancestor_cancellation_without_upward_propagation() {
+        let root = ProcessCancellation::new();
+        let child = root.child_scope();
+        let grandchild = child.child_scope();
+
+        root.cancel();
+        assert!(grandchild.is_cancelled());
+        assert!(child.is_cancelled());
+
+        let root = ProcessCancellation::new();
+        let child = root.child_scope();
+        let grandchild = child.child_scope();
+
+        grandchild.cancel();
+        assert!(grandchild.is_cancelled());
+        assert!(!child.is_cancelled());
+        assert!(!root.is_cancelled());
+    }
+
+    #[test]
+    fn scope_clones_share_cancellation_but_sibling_child_scopes_do_not() {
+        let root = ProcessCancellation::new();
+        let child = root.child_scope();
+        let clone_a = child.clone();
+        let clone_b = child.clone();
+        let sibling = root.child_scope();
+
+        clone_a.cancel();
+
+        assert!(child.is_cancelled());
+        assert!(clone_b.is_cancelled());
+        assert!(!sibling.is_cancelled());
+        assert!(!root.is_cancelled());
+    }
+
+    #[test]
+    fn child_scope_created_from_cancelled_parent_starts_cancelled() {
+        let root = ProcessCancellation::new();
+        root.cancel();
+        let child = root.child_scope();
+        assert!(child.is_cancelled());
+    }
+}
+
 include!("tests_part2.rs");
