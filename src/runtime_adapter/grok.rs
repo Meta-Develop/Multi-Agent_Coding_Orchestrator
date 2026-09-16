@@ -201,6 +201,249 @@ pub const GROK_RUNTIME_DESCRIPTOR: GrokRuntimeDescriptor = GrokRuntimeDescriptor
     headless_approval_flag: "--always-approve",
 };
 
+/// Pinned Grok `agent stdio` launch contract (ACP parent path).
+///
+/// Global hardening flags match headless posture; the prompt is sent only over
+/// the ACP `session/prompt` channel, not via `--prompt-file`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrokAcpRuntimeDescriptor {
+    executable: &'static str,
+    sandbox_profile: &'static str,
+    headless_approval_flag: &'static str,
+}
+
+impl GrokAcpRuntimeDescriptor {
+    pub const fn executable(self) -> &'static str {
+        self.executable
+    }
+
+    pub fn immutable_argument_template(self) -> Vec<String> {
+        [
+            "--sandbox",
+            self.sandbox_profile,
+            self.headless_approval_flag,
+            "--disable-web-search",
+            "--no-memory",
+            "--no-subagents",
+            "agent",
+            "--no-leader",
+            "-m",
+            "{model}",
+            "--reasoning-effort",
+            "{effort}",
+            "stdio",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+}
+
+pub const GROK_ACP_RUNTIME_DESCRIPTOR: GrokAcpRuntimeDescriptor = GrokAcpRuntimeDescriptor {
+    executable: "grok",
+    sandbox_profile: "strict",
+    headless_approval_flag: "--always-approve",
+};
+
+/// Native Grok ACP cost scale: `costUsdTicks` uses 10^10 ticks per USD (upstream `PromptUsage`).
+pub const GROK_ACP_COST_USD_TICKS_PER_USD: u64 = 10_000_000_000;
+/// Repository USD microunit scale for attributable cost-equivalent projection.
+pub const GROK_NATIVE_COST_MICROUNITS_PER_USD: u64 = 100_000;
+
+const GROK_ACP_TICKS_PER_MICROUNIT: u64 =
+    GROK_ACP_COST_USD_TICKS_PER_USD / GROK_NATIVE_COST_MICROUNITS_PER_USD;
+
+/// Parent-owned Grok ACP execution evidence (not child-reportable).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct GrokAcpParentEvidence {
+    pub protocol: String,
+    pub session_id: String,
+    pub requested_model: Option<String>,
+    pub requested_effort: Option<String>,
+    pub client_resolved_model: GrokAcpParentResolvedField,
+    pub client_resolved_effort: GrokAcpParentResolvedField,
+    pub resolution_status: String,
+    pub terminal_usage: Option<GrokAcpParentTerminalUsage>,
+    pub native_cost_equivalent_microunits: GrokAcpNativeCostEquivalent,
+    pub permission_escalation_refused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrokAcpParentResolvedField {
+    Known(String),
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct GrokAcpParentTerminalUsage {
+    pub usage_is_incomplete: bool,
+    pub cost_is_partial: bool,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projected: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum GrokAcpNativeCostEquivalent {
+    Unknown {
+        reason: String,
+    },
+    Known {
+        cost_usd_ticks: u64,
+        microunits: u64,
+    },
+}
+
+pub(crate) fn grok_acp_parent_evidence_from_execution(
+    execution: super::grok_acp::GrokAcpExecutionEvidence,
+) -> GrokAcpParentEvidence {
+    let (native_cost_equivalent_microunits, terminal_usage) =
+        project_parent_terminal_usage(&execution);
+    let (structured_output, structured_output_error) =
+        structured_output_from_prompt_meta(execution.prompt_result_meta.as_ref());
+    GrokAcpParentEvidence {
+        protocol: execution.runtime.to_string(),
+        session_id: execution.session_id,
+        requested_model: execution.requested.model,
+        requested_effort: execution.requested.effort,
+        client_resolved_model: map_resolved_field(execution.client_resolved.model),
+        client_resolved_effort: map_resolved_field(execution.client_resolved.effort),
+        resolution_status: resolution_status_label(execution.resolution_status),
+        terminal_usage,
+        native_cost_equivalent_microunits,
+        permission_escalation_refused: execution.permission_escalation_refused,
+        structured_output,
+        structured_output_error,
+        final_text: execution.final_text,
+        stop_reason: execution.stop_reason,
+    }
+}
+
+fn map_resolved_field(field: super::grok_acp::GrokAcpResolvedField) -> GrokAcpParentResolvedField {
+    match field {
+        super::grok_acp::GrokAcpResolvedField::Known(value) => {
+            GrokAcpParentResolvedField::Known(value)
+        }
+        super::grok_acp::GrokAcpResolvedField::Unknown => GrokAcpParentResolvedField::Unknown,
+    }
+}
+
+fn resolution_status_label(status: super::grok_acp::GrokAcpResolutionStatus) -> String {
+    match status {
+        super::grok_acp::GrokAcpResolutionStatus::Complete => "complete",
+        super::grok_acp::GrokAcpResolutionStatus::Incomplete => "incomplete",
+        super::grok_acp::GrokAcpResolutionStatus::Truncated => "truncated",
+        super::grok_acp::GrokAcpResolutionStatus::AmbiguousModelChange => "ambiguous_model_change",
+        super::grok_acp::GrokAcpResolutionStatus::Unresolved => "unresolved",
+    }
+    .to_string()
+}
+
+fn structured_output_from_prompt_meta(meta: Option<&Value>) -> (Option<Value>, Option<String>) {
+    let Some(meta) = meta.and_then(Value::as_object) else {
+        return (None, None);
+    };
+    if let Some(err) = meta.get("structuredOutputError").and_then(Value::as_str) {
+        return (None, Some(err.to_string()));
+    }
+    if let Some(value) = meta.get("structuredOutput") {
+        return (Some(value.clone()), None);
+    }
+    (None, None)
+}
+
+fn project_parent_terminal_usage(
+    execution: &super::grok_acp::GrokAcpExecutionEvidence,
+) -> (
+    GrokAcpNativeCostEquivalent,
+    Option<GrokAcpParentTerminalUsage>,
+) {
+    let terminal = execution
+        .terminal_usage
+        .as_ref()
+        .map(|usage| GrokAcpParentTerminalUsage {
+            usage_is_incomplete: usage.usage_is_incomplete,
+            cost_is_partial: usage.cost_is_partial,
+            session_id: usage.session_id.clone(),
+            prompt_id: usage.prompt_id.clone(),
+            projected: usage.projected.clone(),
+        });
+    let native_cost = native_cost_from_sources(
+        execution.prompt_result_meta.as_ref(),
+        execution.terminal_usage.as_ref(),
+    );
+    (native_cost, terminal)
+}
+
+fn native_cost_from_sources(
+    prompt_meta: Option<&Value>,
+    terminal: Option<&super::grok_acp::GrokAcpTerminalUsage>,
+) -> GrokAcpNativeCostEquivalent {
+    let usage_incomplete = terminal
+        .map(|usage| usage.usage_is_incomplete)
+        .unwrap_or(true);
+    let cost_partial = terminal.map(|usage| usage.cost_is_partial).unwrap_or(true);
+    if usage_incomplete || cost_partial {
+        return GrokAcpNativeCostEquivalent::Unknown {
+            reason: "terminal usage marked incomplete or cost partial".to_string(),
+        };
+    }
+    let meta_usage = prompt_meta
+        .and_then(|meta| meta.get("usage"))
+        .or_else(|| terminal.and_then(|usage| usage.projected.as_ref()));
+    project_native_cost_from_meta_usage(meta_usage)
+}
+
+pub fn project_native_cost_from_meta_usage(
+    meta_usage: Option<&Value>,
+) -> GrokAcpNativeCostEquivalent {
+    let Some(usage) = meta_usage else {
+        return GrokAcpNativeCostEquivalent::Unknown {
+            reason: "prompt _meta.usage absent".to_string(),
+        };
+    };
+    let ticks_value = usage
+        .get("costUsdTicks")
+        .or_else(|| usage.get("cost_usd_ticks"));
+    match ticks_value {
+        Some(Value::Number(number)) if number.is_u64() => {
+            let ticks = number.as_u64().unwrap();
+            match ticks.checked_div(GROK_ACP_TICKS_PER_MICROUNIT) {
+                Some(microunits) => GrokAcpNativeCostEquivalent::Known {
+                    cost_usd_ticks: ticks,
+                    microunits,
+                },
+                None => GrokAcpNativeCostEquivalent::Unknown {
+                    reason: "costUsdTicks overflowed microunit conversion".to_string(),
+                },
+            }
+        }
+        Some(Value::Number(_)) => GrokAcpNativeCostEquivalent::Unknown {
+            reason: "costUsdTicks is not an exact integer".to_string(),
+        },
+        Some(_) => GrokAcpNativeCostEquivalent::Unknown {
+            reason: "costUsdTicks has unexpected JSON type".to_string(),
+        },
+        None => GrokAcpNativeCostEquivalent::Unknown {
+            reason: "costUsdTicks absent from usage object".to_string(),
+        },
+    }
+}
+
 /// One validated event from Grok's `streaming-json` output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrokStreamEvent {
@@ -1687,6 +1930,45 @@ mod tests {
                 "--no-subagents",
             ]
         );
+    }
+
+    #[test]
+    fn grok_acp_command_template_contract_is_exact() {
+        assert_eq!(
+            GROK_ACP_RUNTIME_DESCRIPTOR.immutable_argument_template(),
+            [
+                "--sandbox",
+                "strict",
+                "--always-approve",
+                "--disable-web-search",
+                "--no-memory",
+                "--no-subagents",
+                "agent",
+                "--no-leader",
+                "-m",
+                "{model}",
+                "--reasoning-effort",
+                "{effort}",
+                "stdio",
+            ]
+        );
+    }
+
+    #[test]
+    fn grok_acp_cost_usd_ticks_convert_to_repository_microunits() {
+        use super::{project_native_cost_from_meta_usage, GrokAcpNativeCostEquivalent};
+        let usage = serde_json::json!({"costUsdTicks": 20_000_000});
+        assert_eq!(
+            project_native_cost_from_meta_usage(Some(&usage)),
+            GrokAcpNativeCostEquivalent::Known {
+                cost_usd_ticks: 20_000_000,
+                microunits: 200,
+            }
+        );
+        assert!(matches!(
+            project_native_cost_from_meta_usage(Some(&serde_json::json!({"costUsdTicks": 1.5}))),
+            GrokAcpNativeCostEquivalent::Unknown { .. }
+        ));
     }
 
     #[test]

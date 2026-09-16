@@ -1875,6 +1875,7 @@ pub(super) fn deterministic_fake_run(
         error: None,
         output_last_message: Some(output),
         grok_stream_usage_evidence: None,
+        grok_acp_parent_evidence: None,
     }
 }
 
@@ -2254,6 +2255,7 @@ pub(super) fn command_record_from_external_for_runtime(
         environment_failures: sanitized_environment_failures(run.environment_failures().to_vec()),
         error: run.error.clone(),
         grok_stream_usage_evidence: run.grok_stream_usage_evidence.clone(),
+        grok_acp_parent_evidence: run.grok_acp_parent_evidence.clone(),
     }
 }
 
@@ -2444,6 +2446,7 @@ mod grok_stream_usage_evidence {
                     total_tokens: Some(4),
                 },
             )),
+            grok_acp_parent_evidence: None,
         };
         let record = command_record_from_external_for_runtime(
             &external_run,

@@ -2601,12 +2601,14 @@ fn remove_parent_process_usage_from_child_schema(schema: &mut serde_json::Value)
                 .and_then(serde_json::Value::as_object_mut)
             {
                 properties.remove("grok_stream_usage_evidence");
+                properties.remove("grok_acp_parent_evidence");
             }
             if let Some(required) = object
                 .get_mut("required")
                 .and_then(serde_json::Value::as_array_mut)
             {
                 required.retain(|name| name != "grok_stream_usage_evidence");
+                required.retain(|name| name != "grok_acp_parent_evidence");
             }
             for value in object.values_mut() {
                 remove_parent_process_usage_from_child_schema(value);
@@ -3278,6 +3280,97 @@ fn decomposition_completion_schema_value_with_binding(
     })
 }
 
+fn grok_acp_parent_evidence_schema_value() -> serde_json::Value {
+    json!({
+        "oneOf": [
+            {"type": "null"},
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "protocol",
+                    "session_id",
+                    "client_resolved_model",
+                    "client_resolved_effort",
+                    "resolution_status",
+                    "native_cost_equivalent_microunits",
+                    "permission_escalation_refused"
+                ],
+                "properties": {
+                    "protocol": {"type": "string"},
+                    "session_id": {"type": "string"},
+                    "requested_model": {"type": ["string", "null"]},
+                    "requested_effort": {"type": ["string", "null"]},
+                    "client_resolved_model": {
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["known"],
+                                "properties": {"known": {"type": "string"}}
+                            },
+                            {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": [],
+                                "properties": {},
+                                "enum": [{"unknown": null}]
+                            }
+                        ]
+                    },
+                    "client_resolved_effort": {
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["known"],
+                                "properties": {"known": {"type": "string"}}
+                            },
+                            {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": [],
+                                "properties": {},
+                                "enum": [{"unknown": null}]
+                            }
+                        ]
+                    },
+                    "resolution_status": {"type": "string"},
+                    "terminal_usage": {"type": ["object", "null"]},
+                    "native_cost_equivalent_microunits": {
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["status", "reason"],
+                                "properties": {
+                                    "status": {"const": "unknown"},
+                                    "reason": {"type": "string"}
+                                }
+                            },
+                            {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["status", "cost_usd_ticks", "microunits"],
+                                "properties": {
+                                    "status": {"const": "known"},
+                                    "cost_usd_ticks": {"type": "integer", "minimum": 0},
+                                    "microunits": {"type": "integer", "minimum": 0}
+                                }
+                            }
+                        ]
+                    },
+                    "permission_escalation_refused": {"type": "boolean"},
+                    "structured_output": {"type": ["object", "null"]},
+                    "structured_output_error": {"type": ["string", "null"]},
+                    "final_text": {"type": ["string", "null"]},
+                    "stop_reason": {"type": ["string", "null"]}
+                }
+            }
+        ]
+    })
+}
+
 fn grok_stream_usage_evidence_schema_value() -> serde_json::Value {
     json!({
         "oneOf": [
@@ -3356,7 +3449,8 @@ pub(super) fn command_run_record_schema_value() -> serde_json::Value {
                 "items": environment_failure_schema_value()
             },
             "error": {"type": ["string", "null"]},
-            "grok_stream_usage_evidence": grok_stream_usage_evidence_schema_value()
+            "grok_stream_usage_evidence": grok_stream_usage_evidence_schema_value(),
+            "grok_acp_parent_evidence": grok_acp_parent_evidence_schema_value()
         },
         "allOf": [command_environment_failure_outcome_schema_value()]
     })
@@ -4134,6 +4228,7 @@ mod selection_schema_tests {
             environment_failures: vec![failure.clone()],
             error: Some("representative failure".to_string()),
             grok_stream_usage_evidence: None,
+            grok_acp_parent_evidence: None,
         };
         let validation_result = ValidationResult {
             name: "cargo check".to_string(),

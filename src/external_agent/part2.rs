@@ -4747,7 +4747,9 @@ fn external_side_effect_profile(
                     profile = profile.with_visible_read_only_file(schema);
                 }
             }
-            if spec.invocation == ExternalAgentInvocation::Grok {
+            if spec.invocation == ExternalAgentInvocation::Grok
+                && !grok_acp_stdio_protocol_selected(spec)
+            {
                 // Grok's pinned headless protocol reads the prompt by pathname. The shared
                 // runner still owns prompt validation; expose only that exact held input to the
                 // contained child instead of its parent directory.
@@ -5571,12 +5573,22 @@ fn command_argv_with_controls_and_service_tier_input(
     }
 }
 
+pub(crate) fn grok_acp_stdio_protocol_selected(spec: &ExternalAgentCommand) -> bool {
+    spec.invocation == ExternalAgentInvocation::Grok
+        && spec
+            .runtime_adapter
+            .as_ref()
+            .is_some_and(|config| {
+                config.grok_interaction_protocol() == crate::runtime_adapter::GrokInteractionProtocol::AcpStdio
+            })
+}
+
 fn external_agent_stdin_mode(
     spec: &ExternalAgentCommand,
     duplex_review_required: bool,
     prompt: Vec<u8>,
 ) -> StdinMode {
-    if duplex_review_required {
+    if duplex_review_required || grok_acp_stdio_protocol_selected(spec) {
         StdinMode::Interactive
     } else if spec
         .runtime_adapter
