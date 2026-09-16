@@ -18,7 +18,9 @@ use crate::{
         catalog_preflight_grant_origin_mismatch_failure, codex_usage_from_jsonl,
         collect_and_import_managed_child_git_commit, load_codex_runtime_model_catalog_authorized,
         missing_supervisor_catalog_preflight_grant_failure,
+        resolve_trusted_system_codex_executable_for_catalog,
         run_external_agent_cancellable_reviewed, supervisor_catalog_preflight_grant_admit_failure,
+        supervisor_explicit_codex_catalog_binding_mismatch_failure,
         validate_environment_requirements, CodexRuntimeModelCatalog, EnvironmentFailure,
         EnvironmentFailureCategory, EnvironmentPreflightResult, EnvironmentRemediation,
         EnvironmentRemediationScope, EnvironmentRequirement, ExternalAgentCommand,
@@ -26,6 +28,7 @@ use crate::{
         ManagedChildGitImport, PreActionJournalPhase, PreActionJournalRationale,
         PreActionJournalRecord, PreActionJournalSink, SandboxDenialEvidence,
         WorkerJournalArtifactCapture, WorkerJournalArtifactCaptureStatus,
+        TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM,
     },
     field_guide::{
         decode_canonical_prompt_entry_line, DecodedFieldGuidePromptEntry, FieldGuideDraft,
@@ -1121,19 +1124,32 @@ struct RoleModelResolution {
 /// Callers invoke this **before** [`RuntimeModelCatalog::for_supervisor`].
 /// This helper must not live inside the catalog builder, and `for_supervisor`
 /// must not mint a grant from its own result.
-fn admit_production_supervisor_catalog_preflight_grant(
+///
+/// Catalog admission always uses the trusted logical program spelling `codex`.
+/// The returned grant is sealed to the independently verified canonical
+/// executable (explicit absolute `--runtime-bin` when supplied, otherwise
+/// trusted logical resolution) so catalog preparation cannot rebind via a later
+/// PATH/symlink resolution race.
+pub(crate) fn admit_production_supervisor_catalog_preflight_grant(
     options: &SupervisorRunOptions,
     resolver_search_base: &Path,
 ) -> Result<Option<SupervisorCatalogCodexPreflightGrant>, Box<EnvironmentFailure>> {
     match options.runtime {
         SupervisorRuntime::Codex => {
-            SupervisorCatalogCodexPreflightGrant::admit_from_supervisor_catalog_intent(
+            let canonical = independently_verified_supervisor_catalog_codex_executable(
+                &options.codex_bin,
+                resolver_search_base,
+            )?;
+            let grant = SupervisorCatalogCodexPreflightGrant::admit_from_supervisor_catalog_intent(
                 options.run_id.as_str(),
                 resolver_search_base,
-                &options.codex_bin,
+                Path::new(TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM),
             )
-            .map(Some)
-            .map_err(supervisor_catalog_preflight_grant_admit_failure)
+            .map_err(supervisor_catalog_preflight_grant_admit_failure)?;
+            grant
+                .seal_independently_verified_canonical_binding(&canonical)
+                .map(Some)
+                .map_err(supervisor_catalog_preflight_grant_admit_failure)
         }
         SupervisorRuntime::Fake
         | SupervisorRuntime::Grok
@@ -1141,6 +1157,31 @@ fn admit_production_supervisor_catalog_preflight_grant(
         | SupervisorRuntime::ClaudeCode
         | SupervisorRuntime::GeminiCli => Ok(None),
     }
+}
+
+fn independently_verified_supervisor_catalog_codex_executable(
+    explicit_runtime_executable: &Path,
+    resolver_search_base: &Path,
+) -> Result<PathBuf, Box<EnvironmentFailure>> {
+    if explicit_runtime_executable.is_absolute() {
+        let explicit = canonicalize_explicit_runtime_executable(explicit_runtime_executable)
+            .map_err(|error| {
+                Box::new(EnvironmentFailure::runtime_model_catalog(format!(
+                    "Codex runtime model catalog acquisition failed: {error}"
+                )))
+            })?;
+        let trusted = resolve_trusted_system_codex_executable_for_catalog(resolver_search_base)
+            .map_err(|_| supervisor_explicit_codex_catalog_binding_mismatch_failure())?;
+        if explicit != trusted {
+            return Err(supervisor_explicit_codex_catalog_binding_mismatch_failure());
+        }
+        return Ok(explicit);
+    }
+    if explicit_runtime_executable != Path::new(TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM) {
+        return Err(supervisor_explicit_codex_catalog_binding_mismatch_failure());
+    }
+    resolve_trusted_system_codex_executable_for_catalog(resolver_search_base)
+        .map_err(|_| supervisor_explicit_codex_catalog_binding_mismatch_failure())
 }
 
 impl RuntimeModelCatalog {
@@ -1158,7 +1199,7 @@ impl RuntimeModelCatalog {
                     return Err(catalog_preflight_grant_origin_mismatch_failure());
                 }
                 load_codex_runtime_model_catalog_authorized(
-                    &options.codex_bin,
+                    Path::new(TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM),
                     repo,
                     CODEX_MODEL_CATALOG_TIMEOUT,
                     grant,

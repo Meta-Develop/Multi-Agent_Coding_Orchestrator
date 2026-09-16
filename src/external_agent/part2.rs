@@ -577,6 +577,87 @@ pub(crate) fn load_codex_runtime_model_catalog(
     catalog.map_err(|error| codex_runtime_model_catalog_failure(&error))
 }
 
+/// Trusted logical `codex` spelling required by catalog preflight admission.
+pub(crate) const TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM: &str = "codex";
+
+/// Resolve the trusted system Codex executable used for catalog preflight.
+///
+/// Distinct from an operator `--runtime-bin` absolute path: held-out and
+/// explicit-runtime callers must prove their frozen executable is exactly this
+/// resolution before catalog preparation.
+pub(crate) fn resolve_trusted_system_codex_executable_for_catalog(
+    resolver_search_base: &Path,
+) -> Result<PathBuf> {
+    resolve_external_program(
+        Path::new(TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM),
+        resolver_search_base,
+    )
+}
+
+/// Refuse when logical `codex` resolution no longer matches the canonical
+/// executable sealed into the supervisor catalog preflight grant.
+pub(crate) fn supervisor_catalog_preflight_refuse_sealed_executable_resolution_drift(
+    grant: &SupervisorCatalogCodexPreflightGrant,
+    resolver_search_base: &Path,
+) -> Result<PathBuf, SupervisorCatalogCodexPreflightGrantError> {
+    let sealed = grant
+        .independently_verified_canonical_program()
+        .ok_or(SupervisorCatalogCodexPreflightGrantError::ProgramMismatch)?;
+    let fresh = resolve_external_program(
+        Path::new(TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM),
+        resolver_search_base,
+    )
+    .map_err(|_| SupervisorCatalogCodexPreflightGrantError::ProgramMismatch)?;
+    if fresh != sealed {
+        return Err(SupervisorCatalogCodexPreflightGrantError::ProgramMismatch);
+    }
+    Ok(fresh)
+}
+
+#[cfg(test)]
+thread_local! {
+    static INJECTED_TRUSTED_CODEX_EXECUTABLE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+    static CODEX_RUNTIME_MODEL_CATALOG_PROCESS_LAUNCH_ATTEMPTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_injected_trusted_codex_executable_for_test(path: Option<PathBuf>) {
+    INJECTED_TRUSTED_CODEX_EXECUTABLE.with(|injected| *injected.borrow_mut() = path);
+}
+
+#[cfg(test)]
+pub(crate) fn codex_runtime_model_catalog_process_launch_attempts_for_test() -> usize {
+    CODEX_RUNTIME_MODEL_CATALOG_PROCESS_LAUNCH_ATTEMPTS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_codex_runtime_model_catalog_process_launch_attempts_for_test() {
+    CODEX_RUNTIME_MODEL_CATALOG_PROCESS_LAUNCH_ATTEMPTS.with(|attempts| attempts.set(0));
+}
+
+#[cfg(test)]
+fn injected_trusted_codex_resolution(program: &Path) -> Result<Option<PathBuf>> {
+    if program != Path::new(TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM) {
+        return Ok(None);
+    }
+    let Some(path) = INJECTED_TRUSTED_CODEX_EXECUTABLE.with(|injected| injected.borrow().clone()) else {
+        return Ok(None);
+    };
+    let canonical = fs::canonicalize(&path)
+        .with_context(|| format!("failed to canonicalize injected codex {}", path.display()))?;
+    validate_external_program_identity(&canonical, false)?;
+    Ok(Some(canonical))
+}
+
+pub(crate) fn supervisor_explicit_codex_catalog_binding_mismatch_failure() -> Box<EnvironmentFailure> {
+    Box::new(EnvironmentFailure::runtime_model_catalog(format!(
+        "Codex runtime model catalog acquisition failed: cause={}",
+        CodexRuntimeModelCatalogFailureCause::UntrustedCustomExecutable
+    )))
+}
+
 pub(crate) fn load_codex_runtime_model_catalog_authorized(
     program: &Path,
     resolver_search_base: &Path,
@@ -628,14 +709,42 @@ fn prepare_codex_runtime_model_catalog_process(
 
     #[cfg(target_os = "linux")]
     {
-        if program != Path::new("codex") {
+        if program != Path::new(TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM) {
             return Err(CodexRuntimeModelCatalogFailureCause::UntrustedCustomExecutable.into());
         }
         if timeout.is_zero() {
             return Err(CodexRuntimeModelCatalogFailureCause::InvalidTimeout.into());
         }
-        let resolved_program = resolve_external_program(program, resolver_search_base)
-            .context(CodexRuntimeModelCatalogFailureCause::ExecutableResolutionFailed)?;
+
+        let (resolved_program, grant) = match grant {
+            Some(grant) => {
+                if let Some(sealed_program) = grant.independently_verified_canonical_program() {
+                    supervisor_catalog_preflight_refuse_sealed_executable_resolution_drift(
+                        &grant,
+                        resolver_search_base,
+                    )
+                    .map_err(|error| {
+                        anyhow::Error::from(CodexRuntimeModelCatalogFailureCause::from(error))
+                    })?;
+                    (sealed_program.to_path_buf(), Some(grant))
+                } else {
+                    let resolved_program = resolve_external_program(program, resolver_search_base)
+                        .context(CodexRuntimeModelCatalogFailureCause::ExecutableResolutionFailed)?;
+                    let grant = grant
+                        .seal_independently_verified_canonical_binding(&resolved_program)
+                        .map_err(|error| {
+                            anyhow::Error::from(CodexRuntimeModelCatalogFailureCause::from(error))
+                        })?;
+                    (resolved_program, Some(grant))
+                }
+            }
+            None => {
+                let resolved_program = resolve_external_program(program, resolver_search_base)
+                    .context(CodexRuntimeModelCatalogFailureCause::ExecutableResolutionFailed)?;
+                (resolved_program, None)
+            }
+        };
+
         let program_identity = external_program_identity(&resolved_program)
             .context(CodexRuntimeModelCatalogFailureCause::ExecutableIdentityFailed)?;
         let auth = ValidatedCodexAuth::load()
@@ -646,11 +755,6 @@ fn prepare_codex_runtime_model_catalog_process(
 
         let (spec_program, spec_parent, grant) = match grant {
             Some(grant) => {
-                let grant = grant
-                    .seal_independently_verified_canonical_binding(&resolved_program)
-                    .map_err(|error| {
-                        anyhow::Error::from(CodexRuntimeModelCatalogFailureCause::from(error))
-                    })?;
                 let spec_program = grant
                     .independently_verified_canonical_program()
                     .ok_or(CodexRuntimeModelCatalogFailureCause::CatalogPreflightGrantMismatch)?
@@ -733,6 +837,9 @@ fn execute_prepared_codex_runtime_model_catalog(
         auth,
         process_spec,
     } = prepared;
+    #[cfg(test)]
+    CODEX_RUNTIME_MODEL_CATALOG_PROCESS_LAUNCH_ATTEMPTS
+        .with(|attempts| attempts.set(attempts.get() + 1));
     let process_result = run_process_cancellable(process_spec, &ProcessCancellation::new());
     let current_identity = external_program_identity(&resolved_program)
         .context(CodexRuntimeModelCatalogFailureCause::ExecutableRevalidationFailed)?;
@@ -1042,7 +1149,11 @@ fn trusted_codex_fixed_candidate_exists() -> bool {
 }
 
 fn resolve_external_program(program: &Path, cwd: &Path) -> Result<PathBuf> {
-    let require_root_owned = program == Path::new("codex");
+    #[cfg(test)]
+    if let Some(resolved) = injected_trusted_codex_resolution(program)? {
+        return Ok(resolved);
+    }
+    let require_root_owned = program == Path::new(TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM);
     let candidate = if require_root_owned {
         [
             "/run/current-system/sw/bin/codex",
