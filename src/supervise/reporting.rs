@@ -2256,11 +2256,12 @@ pub(super) fn command_record_from_external_for_runtime(
         error: run.error.clone(),
         grok_stream_usage_evidence: run.grok_stream_usage_evidence.clone(),
         grok_acp_parent_evidence: run.grok_acp_parent_evidence.clone(),
+        fixed_version_probe_evidence: run.fixed_version_probe_evidence().cloned(),
     }
 }
 
 #[cfg(test)]
-pub(super) fn command_record_from_external(
+pub(crate) fn command_record_from_external(
     run: &ExternalAgentRun,
     command: &ExternalAgentCommand,
 ) -> CommandRunRecord {

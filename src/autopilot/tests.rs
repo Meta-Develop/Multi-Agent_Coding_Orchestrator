@@ -349,6 +349,7 @@ fn synthetic_lens_dispatch_evidence(
         error: None,
         grok_stream_usage_evidence: None,
         grok_acp_parent_evidence: None,
+        fixed_version_probe_evidence: None,
     };
     review_lens_dispatch_evidence_from_records(
         [("agent-a-review-auditor-lens-0", Some(&command))],

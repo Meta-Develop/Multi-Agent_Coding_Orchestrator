@@ -4154,6 +4154,7 @@ fn environment_preflight_classifies_static_blockers_without_launching_probes() {
             codex_version,
             verified_confinement,
             None,
+            None,
             &mut process_evidence,
         );
         assert_eq!(result.status, EnvironmentPreflightStatus::Blocked);
@@ -4175,6 +4176,7 @@ fn environment_preflight_classifies_static_blockers_without_launching_probes() {
         &wrong_profile,
         None,
         Some(EnvironmentVersion::new(0, 142, 0)),
+        None,
         None,
         None,
         &mut process_evidence,

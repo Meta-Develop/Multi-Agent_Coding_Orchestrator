@@ -1034,6 +1034,7 @@ fn injected_command_record() -> CommandRunRecord {
         error: None,
         grok_stream_usage_evidence: None,
         grok_acp_parent_evidence: None,
+        fixed_version_probe_evidence: None,
     }
 }
 
