@@ -3945,6 +3945,23 @@ pub(crate) fn capture_worktree_diff_from_commit(
     ))
 }
 
+/// Exact `raw_diff` bytes hashed by [`candidate_validation_binding`], using the
+/// same bounded isolated-git candidate snapshot path as merge preview/collect.
+pub(crate) fn raw_candidate_snapshot_diff(
+    repo: &Repository,
+    worktree_path: &Path,
+    merge_base: Oid,
+    candidate_head: Oid,
+) -> Result<Vec<u8>> {
+    let captured = snapshot_worktree_candidate_from_base(
+        repo,
+        worktree_path,
+        Some(candidate_head),
+        Some(merge_base),
+    )?;
+    Ok(captured.raw_diff)
+}
+
 fn snapshot_worktree_candidate_from_base(
     repo: &Repository,
     worktree_path: &Path,

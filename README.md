@@ -191,6 +191,15 @@ The current implementation covers a local-first command-line slice:
   inbox path used by `maco inbox run`.
 - `maco inbox artifacts list/latest/prune` inspects or prunes durable inbox run
   artifacts.
+- Bounded GitHub PR repair under operator review policy is two-phase: `maco inbox
+  run` may finish with `awaiting_original_pr_update_grant` after autopilot
+  produces a validated candidate **C**, an independent per-feedback disposition
+  audit, and durable pending repair artifacts. It does not update the original
+  PR or imply feedback is addressed. Phase two is explicit:
+  `maco inbox resume-repair --run-id <id> --item-index <n> --grant <file>` loads
+  the authenticated pending bundle, applies `maco pr update-existing` with the
+  operator grant, observes head **C** on the provider, and advances the
+  review-state journal.
 - `maco evaluation run` generates deterministic fake model-mix fixture results
   from a versioned manifest and digest-bound plan. `maco evaluation experiment`
   runs the same goal/spec under multiple profiles through isolated Fake
