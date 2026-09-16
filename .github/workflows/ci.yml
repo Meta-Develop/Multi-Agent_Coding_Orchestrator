@@ -44,6 +44,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Allow systemd-executor userns on GitHub-hosted Ubuntu
+        run: bash .github/scripts/configure-github-hosted-userns.sh
+
       - name: Verify delegated Linux process startup
         run: bash .github/scripts/run-linux-all-tests-in-delegated-user-scope.sh /usr/bin/true
 
