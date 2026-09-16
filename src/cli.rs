@@ -4305,6 +4305,14 @@ struct RunExperimentArgs {
     /// Explicit runtime executable. Required with real-provider; never inferred from --source-repo.
     #[arg(long, value_name = "PATH")]
     runtime_bin: Option<PathBuf>,
+    /// Additional explicit runtime executable allowlist entries (`RUNTIME=ABSOLUTE_EXECUTABLE`).
+    /// Real-provider only. Not a parent-runtime or plan-selection override.
+    #[arg(
+        long = "additional-runtime-bin",
+        value_name = "RUNTIME=ABSOLUTE_EXECUTABLE",
+        value_parser = parse_additional_runtime_bin
+    )]
+    additional_runtime_bin: Vec<crate::evaluation::HeldOutAdditionalRuntimeBinding>,
     /// Exact reviewed machine-global config. Required with real-provider; never inferred from --source-repo.
     #[arg(long, value_name = "PATH")]
     machine_global_config: Option<PathBuf>,
@@ -4314,6 +4322,26 @@ struct RunExperimentArgs {
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
+}
+
+fn parse_additional_runtime_bin(
+    value: &str,
+) -> std::result::Result<crate::evaluation::HeldOutAdditionalRuntimeBinding, String> {
+    let Some((runtime_name, executable)) = value.split_once('=') else {
+        return Err("expected RUNTIME=ABSOLUTE_EXECUTABLE".to_string());
+    };
+    if runtime_name.is_empty() {
+        return Err("additional runtime must not be empty".to_string());
+    }
+    if executable.is_empty() {
+        return Err("additional runtime executable must not be empty".to_string());
+    }
+    let runtime = supervise::SupervisorRuntime::from_str(runtime_name, false)
+        .map_err(|_| format!("unknown additional runtime '{runtime_name}'"))?;
+    Ok(crate::evaluation::HeldOutAdditionalRuntimeBinding {
+        runtime,
+        executable: PathBuf::from(executable),
+    })
 }
 
 fn resolve_held_out_explicit_source_cli(
@@ -4405,6 +4433,7 @@ fn resolve_held_out_real_provider_cli(
         if args.provider_plan.is_some()
             || args.runtime.is_some()
             || args.runtime_bin.is_some()
+            || !args.additional_runtime_bin.is_empty()
             || args.machine_global_config.is_some()
             || args.machine_global_runtime_root_id.is_some()
         {
@@ -4449,6 +4478,7 @@ fn resolve_held_out_real_provider_cli(
             provider_plan,
             runtime,
             runtime_executable: runtime_bin,
+            additional_runtime_executables: args.additional_runtime_bin.clone(),
             machine_global_retention: MachineGlobalRetentionBinding {
                 config: machine_global_config,
                 root_id: machine_global_runtime_root_id,
@@ -4604,6 +4634,16 @@ mod cli_integration_tests {
             .expect_err("new provider options require explicit execution mode")
             .to_string()
             .contains("require --execution real-provider"));
+        args.runtime = None;
+        args.additional_runtime_bin = vec![crate::evaluation::HeldOutAdditionalRuntimeBinding {
+            runtime: supervise::SupervisorRuntime::Grok,
+            executable: PathBuf::from("/usr/bin/true"),
+        }];
+        assert!(resolve_held_out_real_provider_cli(&args, None)
+            .expect_err("additional runtime bindings require explicit execution mode")
+            .to_string()
+            .contains("require --execution real-provider"));
+        args.additional_runtime_bin.clear();
         args.execution = crate::evaluation::EvaluationExecution::RealProvider;
         assert!(resolve_held_out_real_provider_cli(&args, None)
             .expect_err("real execution requires the complete tuple")
