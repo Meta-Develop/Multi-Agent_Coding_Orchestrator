@@ -3737,10 +3737,10 @@ pub use experiment::{
     parse_observation_experiment_manifest, resolve_held_out_explicit_source_baseline,
     run_fake_supervise_experiment, ExperimentEvidence, ExperimentEvidenceKind, ExperimentManifest,
     ExperimentProfileSummary, ExperimentResults, ExperimentRun, ExperimentRunRequest,
-    HeldOutExplicitSourceBaseline, HeldOutRealProviderExperimentRequest,
-    EXPERIMENT_MANIFEST_SCHEMA_VERSION, EXPERIMENT_RESULTS_SCHEMA_VERSION,
-    EXPERIMENT_RESULT_SCHEMA, LEGACY_EXPERIMENT_RESULTS_SCHEMA_VERSION,
-    LEGACY_EXPERIMENT_RESULT_SCHEMA,
+    HeldOutAdditionalRuntimeBinding, HeldOutExplicitSourceBaseline,
+    HeldOutRealProviderExperimentRequest, EXPERIMENT_MANIFEST_SCHEMA_VERSION,
+    EXPERIMENT_RESULTS_SCHEMA_VERSION, EXPERIMENT_RESULT_SCHEMA,
+    LEGACY_EXPERIMENT_RESULTS_SCHEMA_VERSION, LEGACY_EXPERIMENT_RESULT_SCHEMA,
 };
 
 #[cfg(test)]

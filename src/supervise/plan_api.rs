@@ -2747,6 +2747,128 @@ pub(crate) fn refuse_held_out_production_runtime_executable_binding(
     )
 }
 
+/// One frozen executable binding. Stored as a Vec because [`SupervisorRuntime`]
+/// lacks `Ord`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FrozenHeldOutRuntimeBinding {
+    pub runtime: SupervisorRuntime,
+    pub executable: PathBuf,
+}
+
+/// Explicit held-out launch allowlist. Primary is first; additional entries are
+/// allowlist-only and never rewrite parent runtime selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FrozenHeldOutRuntimeAllowlist {
+    bindings: Vec<FrozenHeldOutRuntimeBinding>,
+}
+
+impl FrozenHeldOutRuntimeAllowlist {
+    pub(crate) fn from_frozen_bindings(
+        bindings: Vec<(SupervisorRuntime, PathBuf)>,
+    ) -> Result<Self> {
+        if bindings.is_empty() {
+            bail!("held-out production run requires a frozen runtime executable binding");
+        }
+        Ok(Self {
+            bindings: bindings
+                .into_iter()
+                .map(|(runtime, executable)| FrozenHeldOutRuntimeBinding {
+                    runtime,
+                    executable,
+                })
+                .collect(),
+        })
+    }
+
+    pub(crate) fn primary_runtime(&self) -> SupervisorRuntime {
+        self.bindings[0].runtime
+    }
+
+    pub(crate) fn executable_for(&self, runtime: SupervisorRuntime) -> Option<&Path> {
+        self.bindings
+            .iter()
+            .find(|binding| binding.runtime == runtime)
+            .map(|binding| binding.executable.as_path())
+    }
+
+    pub(crate) fn artifact_value(&self) -> Value {
+        json!({
+            "primary": {
+                "runtime": self.bindings[0].runtime,
+                "executable": self.bindings[0].executable,
+            },
+            "additional": self.bindings[1..].iter().map(|binding| json!({
+                "runtime": binding.runtime,
+                "executable": binding.executable,
+            })).collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// Canonicalize and verify every declared runtime executable against current
+/// operator program selection. Does not mutate `MACO_*_BIN` or process
+/// environment.
+pub(crate) fn freeze_held_out_runtime_allowlist(
+    primary_runtime: SupervisorRuntime,
+    primary_executable: &Path,
+    additional: &[(SupervisorRuntime, PathBuf)],
+    options: &SupervisorRunOptions,
+) -> Result<FrozenHeldOutRuntimeAllowlist> {
+    refuse_held_out_additional_runtime_bindings(primary_runtime, additional)?;
+    refuse_held_out_production_runtime_executable_binding(
+        primary_runtime,
+        primary_executable,
+        options,
+    )?;
+    let mut bindings = vec![(
+        primary_runtime,
+        assignment_execution::canonicalize_explicit_runtime_executable(primary_executable)?,
+    )];
+    for (runtime, executable) in additional {
+        refuse_held_out_production_runtime_executable_binding(*runtime, executable, options)?;
+        bindings.push((
+            *runtime,
+            assignment_execution::canonicalize_explicit_runtime_executable(executable)?,
+        ));
+    }
+    FrozenHeldOutRuntimeAllowlist::from_frozen_bindings(bindings)
+}
+
+pub(crate) fn refuse_held_out_additional_runtime_bindings(
+    primary_runtime: SupervisorRuntime,
+    additional: &[(SupervisorRuntime, PathBuf)],
+) -> Result<()> {
+    let mut seen = Vec::new();
+    for (runtime, executable) in additional {
+        if *runtime == SupervisorRuntime::Fake {
+            bail!("held-out additional runtime binding refuses Fake runtime");
+        }
+        if executable.as_os_str().is_empty() {
+            bail!("held-out additional runtime executable must not be empty");
+        }
+        if !executable.is_absolute() {
+            bail!(
+                "held-out additional runtime executable must be an absolute path; ambient PATH and relative resolution are refused (requested {})",
+                executable.display()
+            );
+        }
+        if *runtime == primary_runtime {
+            bail!(
+                "held-out additional runtime binding duplicates the primary runtime '{}'",
+                runtime.as_str()
+            );
+        }
+        if seen.contains(runtime) {
+            bail!(
+                "held-out additional runtime binding for '{}' is duplicated",
+                runtime.as_str()
+            );
+        }
+        seen.push(*runtime);
+    }
+    Ok(())
+}
+
 fn refuse_held_out_production_caller_plan(loaded: &LoadedSupervisorPlan) -> Result<()> {
     validate_execution_target_pre_dispatch(loaded, false)?;
     if loaded.plan_metadata.generated_follow_up.is_some() {
@@ -2797,6 +2919,32 @@ pub(crate) fn validate_held_out_launch_binding(
     Ok(())
 }
 
+fn held_out_invocation_runtime(command: &ExternalAgentCommand) -> Result<SupervisorRuntime> {
+    command
+        .invocation
+        .adapter_id()
+        .and_then(crate::runtime_adapter::AdapterId::to_runtime_id)
+        .filter(|runtime| *runtime != SupervisorRuntime::Fake)
+        .ok_or_else(|| anyhow!("held-out production run refused unknown runtime"))
+}
+
+/// Require a declared frozen binding for the command's actual invocation
+/// runtime, then apply the existing launch-binding checks against that exact
+/// runtime and frozen executable. Never rereads process environment.
+pub(crate) fn validate_held_out_declared_launch(
+    command: &ExternalAgentCommand,
+    allowlist: &FrozenHeldOutRuntimeAllowlist,
+) -> Result<()> {
+    let runtime = held_out_invocation_runtime(command)?;
+    let Some(executable) = allowlist.executable_for(runtime) else {
+        bail!(
+            "held-out production run refused undeclared runtime '{}'",
+            runtime.as_str()
+        );
+    };
+    validate_held_out_launch_binding(command, runtime, executable)
+}
+
 pub(crate) fn held_out_native_runtime_result_captured(run: &ExternalAgentRun) -> bool {
     run.publishable
         && run.exit_code == Some(0)
@@ -2821,10 +2969,12 @@ pub(crate) fn held_out_native_runtime_result_captured(run: &ExternalAgentRun) ->
 pub(crate) fn run_held_out_production_experiment(
     options: SupervisorRunOptions,
     authority: held_out::ParentValidationAuthority,
+    runtime_allowlist: FrozenHeldOutRuntimeAllowlist,
 ) -> Result<HeldOutProductionExperimentOutcome> {
     run_held_out_production_experiment_with_runner(
         options,
         authority,
+        runtime_allowlist,
         &run_external_agent_cancellable_reviewed,
     )
 }
@@ -2837,14 +2987,21 @@ pub(crate) fn run_held_out_production_experiment(
 pub(super) fn run_held_out_production_experiment_with_injected_runner(
     options: SupervisorRunOptions,
     authority: held_out::ParentValidationAuthority,
+    runtime_allowlist: FrozenHeldOutRuntimeAllowlist,
     external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<HeldOutProductionExperimentOutcome> {
-    run_held_out_production_experiment_with_runner(options, authority, external_runner)
+    run_held_out_production_experiment_with_runner(
+        options,
+        authority,
+        runtime_allowlist,
+        external_runner,
+    )
 }
 
 fn run_held_out_production_experiment_with_runner(
     options: SupervisorRunOptions,
     authority: held_out::ParentValidationAuthority,
+    runtime_allowlist: FrozenHeldOutRuntimeAllowlist,
     external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<HeldOutProductionExperimentOutcome> {
     if options.runtime == SupervisorRuntime::Fake {
@@ -2858,6 +3015,9 @@ fn run_held_out_production_experiment_with_runner(
     if options.machine_global_retention.is_none() {
         bail!("the held-out production experiment entrypoint requires a caller-supplied machine-global retention binding");
     }
+    if runtime_allowlist.primary_runtime() != options.runtime {
+        bail!("held-out production frozen runtime allowlist must start with the parent runtime");
+    }
     let repo = discover_repo_root(&options.repo)?;
     let mut loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
     refuse_held_out_production_caller_plan(&loaded)?;
@@ -2867,14 +3027,6 @@ fn run_held_out_production_experiment_with_runner(
         bail!("experiment validation authority does not match the isolated assignment");
     }
     loaded.assignment_metadata.parent_validation = Some(authority);
-    let bound_runtime = options.runtime;
-    let bound_executable =
-        assignment_execution::canonicalize_explicit_runtime_executable(&options.codex_bin)?;
-    assignment_execution::refuse_runtime_executable_binding_mismatch(
-        bound_runtime,
-        &options.codex_bin,
-        &options,
-    )?;
     let runtime_model_catalog =
         admit_production_supervisor_catalog_preflight_grant(&options, &repo)
             .and_then(|grant| RuntimeModelCatalog::for_supervisor(&options, &repo, grant));
@@ -2886,9 +3038,7 @@ fn run_held_out_production_experiment_with_runner(
                           cancellation: &ProcessCancellation,
                           review: Option<ExternalPreActionReviewRuntime<'_>>|
      -> ExternalAgentRun {
-        if let Err(error) =
-            validate_held_out_launch_binding(command, bound_runtime, &bound_executable)
-        {
+        if let Err(error) = validate_held_out_declared_launch(command, &runtime_allowlist) {
             return crate::external_agent::refused_external_run_before_launch(
                 command,
                 error.to_string(),

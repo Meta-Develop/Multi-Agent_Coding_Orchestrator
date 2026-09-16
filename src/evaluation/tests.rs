@@ -2322,6 +2322,7 @@ fn real_provider_request(
         provider_plan,
         runtime: crate::supervise::SupervisorRuntime::Grok,
         runtime_executable: std::path::PathBuf::from("/usr/bin/true"),
+        additional_runtime_executables: Vec::new(),
         machine_global_retention: dummy_retention(),
     }
 }
@@ -2564,7 +2565,12 @@ fn held_out_production_entrypoint_refuses_authority_mismatch() {
         std::path::PathBuf::from("/usr/bin/true"),
         dummy_retention(),
     );
-    let error = crate::supervise::run_held_out_production_experiment(options, authority)
+    let allowlist = crate::supervise::FrozenHeldOutRuntimeAllowlist::from_frozen_bindings(vec![(
+        crate::supervise::SupervisorRuntime::Grok,
+        std::path::PathBuf::from("/usr/bin/true"),
+    )])
+    .expect("primary allowlist");
+    let error = crate::supervise::run_held_out_production_experiment(options, authority, allowlist)
         .expect_err("authority mismatch must fail before provider dispatch");
     assert!(
         error
@@ -2885,4 +2891,150 @@ fn held_out_runtime_binding_refuses_invocation_and_program_substitution() {
     command.invocation = ExternalAgentInvocation::CodexSupervisor;
     command.runtime_adapter = None;
     assert!(validate_held_out_launch_binding(&command, RuntimeId::Grok, &bound).is_err());
+}
+
+#[test]
+fn held_out_declared_runtime_bindings_permit_only_matching_invocation_shapes() {
+    use crate::external_agent::{ExternalAgentCommand, ExternalAgentInvocation};
+    use crate::runtime_adapter::{RuntimeAdapterConfig, RuntimeId};
+    use crate::supervise::{
+        validate_held_out_declared_launch, FrozenHeldOutRuntimeAllowlist, SupervisorRuntime,
+    };
+    let workspace = tempfile::TempDir::new().unwrap();
+    let codex_exe = workspace.path().join("codex-program");
+    let grok_exe = workspace.path().join("grok-program");
+    let other_exe = workspace.path().join("other-program");
+    fs::write(&codex_exe, b"unexecuted test fixture").unwrap();
+    fs::write(&grok_exe, b"unexecuted test fixture").unwrap();
+    fs::write(&other_exe, b"unexecuted test fixture").unwrap();
+    let bound_codex = codex_exe.canonicalize().unwrap();
+    let bound_grok = grok_exe.canonicalize().unwrap();
+    let allowlist = FrozenHeldOutRuntimeAllowlist::from_frozen_bindings(vec![
+        (SupervisorRuntime::Codex, bound_codex.clone()),
+        (SupervisorRuntime::Grok, bound_grok.clone()),
+    ])
+    .expect("two declared bindings");
+
+    let mut command = ExternalAgentCommand::codex(
+        &codex_exe,
+        workspace.path(),
+        workspace.path().join("prompt"),
+        workspace.path().join("log"),
+        workspace.path().join("output"),
+        std::time::Duration::from_secs(1),
+    );
+    validate_held_out_declared_launch(&command, &allowlist)
+        .expect("declared Codex native invocation must be permitted");
+
+    command.program = grok_exe.clone();
+    command.invocation = ExternalAgentInvocation::Grok;
+    command.runtime_adapter = Some(RuntimeAdapterConfig::defaults(RuntimeId::Grok));
+    validate_held_out_declared_launch(&command, &allowlist)
+        .expect("declared Grok adapter invocation must be permitted");
+
+    command.invocation = ExternalAgentInvocation::Cursor;
+    command.runtime_adapter = Some(RuntimeAdapterConfig::defaults(RuntimeId::Cursor));
+    let undeclared = validate_held_out_declared_launch(&command, &allowlist)
+        .expect_err("undeclared Cursor must be refused");
+    assert!(
+        undeclared.to_string().contains("undeclared runtime"),
+        "{undeclared}"
+    );
+
+    command.invocation = ExternalAgentInvocation::Grok;
+    command.runtime_adapter = Some(RuntimeAdapterConfig::defaults(RuntimeId::Grok));
+    command.program = other_exe;
+    let substituted = validate_held_out_declared_launch(&command, &allowlist)
+        .expect_err("declared Grok with a different executable is substitution");
+    assert!(
+        substituted.to_string().contains("executable substitution"),
+        "{substituted}"
+    );
+
+    command.program = grok_exe.clone();
+    command.runtime_adapter = None;
+    let wrong_shape = validate_held_out_declared_launch(&command, &allowlist)
+        .expect_err("Grok invocation without adapter config is the wrong shape");
+    assert!(
+        wrong_shape.to_string().contains("runtime substitution"),
+        "{wrong_shape}"
+    );
+
+    let single = FrozenHeldOutRuntimeAllowlist::from_frozen_bindings(vec![(
+        SupervisorRuntime::Codex,
+        bound_codex,
+    )])
+    .expect("legacy single binding");
+    command.program = grok_exe;
+    command.runtime_adapter = Some(RuntimeAdapterConfig::defaults(RuntimeId::Grok));
+    let legacy_undeclared = validate_held_out_declared_launch(&command, &single)
+        .expect_err("single Codex binding must not admit Grok");
+    assert!(
+        legacy_undeclared.to_string().contains("undeclared runtime"),
+        "{legacy_undeclared}"
+    );
+}
+
+#[test]
+fn held_out_additional_runtime_bindings_refuse_fake_relative_and_duplicates_before_reservation() {
+    let manifest = experiment_manifest();
+    let (_source_workspace, source_repo, base_commit) = init_committed_source_repo("baseline");
+    let plan_workspace = tempfile::TempDir::new().expect("plan workspace");
+    let provider_plan = write_caller_plan(plan_workspace.path(), "docs-child", false, false);
+    let source = HeldOutExplicitSourceBaseline {
+        source_repo: source_repo.clone(),
+        base_commit: base_commit.clone(),
+    };
+    let (_artifact, artifact_repo) = artifact_owner();
+
+    let mut fake_additional = real_provider_request(source.clone(), provider_plan.clone());
+    fake_additional.additional_runtime_executables = vec![HeldOutAdditionalRuntimeBinding {
+        runtime: crate::supervise::SupervisorRuntime::Fake,
+        executable: std::path::PathBuf::from("/usr/bin/true"),
+    }];
+    let error = run_held_out_real_provider_experiment(&manifest, fake_additional, &artifact_repo)
+        .expect_err("Fake additional binding");
+    assert!(error.to_string().contains("Fake"), "{error}");
+    no_reserved_runs(&artifact_repo);
+
+    let mut relative = real_provider_request(source.clone(), provider_plan.clone());
+    relative.additional_runtime_executables = vec![HeldOutAdditionalRuntimeBinding {
+        runtime: crate::supervise::SupervisorRuntime::Cursor,
+        executable: std::path::PathBuf::from("relative-cursor"),
+    }];
+    let error = run_held_out_real_provider_experiment(&manifest, relative, &artifact_repo)
+        .expect_err("relative additional binding");
+    assert!(error.to_string().contains("absolute path"), "{error}");
+    no_reserved_runs(&artifact_repo);
+
+    let mut duplicate_primary = real_provider_request(source.clone(), provider_plan.clone());
+    duplicate_primary.additional_runtime_executables = vec![HeldOutAdditionalRuntimeBinding {
+        runtime: crate::supervise::SupervisorRuntime::Grok,
+        executable: std::path::PathBuf::from("/usr/bin/true"),
+    }];
+    let error = run_held_out_real_provider_experiment(&manifest, duplicate_primary, &artifact_repo)
+        .expect_err("additional duplicate of primary");
+    assert!(
+        error.to_string().contains("duplicates the primary runtime"),
+        "{error}"
+    );
+    no_reserved_runs(&artifact_repo);
+
+    let mut duplicate_additional = real_provider_request(source, provider_plan);
+    duplicate_additional.runtime = crate::supervise::SupervisorRuntime::Codex;
+    duplicate_additional.additional_runtime_executables = vec![
+        HeldOutAdditionalRuntimeBinding {
+            runtime: crate::supervise::SupervisorRuntime::Grok,
+            executable: std::path::PathBuf::from("/usr/bin/true"),
+        },
+        HeldOutAdditionalRuntimeBinding {
+            runtime: crate::supervise::SupervisorRuntime::Grok,
+            executable: std::path::PathBuf::from("/bin/true"),
+        },
+    ];
+    let error =
+        run_held_out_real_provider_experiment(&manifest, duplicate_additional, &artifact_repo)
+            .expect_err("duplicate additional runtime");
+    assert!(error.to_string().contains("duplicated"), "{error}");
+    no_reserved_runs(&artifact_repo);
 }
