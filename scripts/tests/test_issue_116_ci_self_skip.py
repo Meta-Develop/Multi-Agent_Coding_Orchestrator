@@ -17,7 +17,15 @@ class Issue116CiSelfSkipContract(unittest.TestCase):
             "ci.yml must not keep a hand-maintained containment skip list",
         )
         self.assertNotIn("--skip", source)
-        self.assertIn("cargo test --locked --all-targets\n", source)
+        self.assertIn(
+            "bash .github/scripts/run-linux-ci-cargo-test-partition.sh lib",
+            source,
+        )
+        self.assertIn(
+            "bash .github/scripts/run-linux-ci-cargo-test-partition.sh non-lib",
+            source,
+        )
+        self.assertIn("run-linux-ci-cargo-test-partition.sh", source)
         self.assertTrue(PROBE.is_file())
         helper = HELPER.read_text(encoding="utf-8")
         self.assertIn("skip_without_containment", helper)

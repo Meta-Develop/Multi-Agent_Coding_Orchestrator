@@ -843,6 +843,74 @@
     }
 
     #[cfg(unix)]
+    fn format_lifecycle_runner_result(result: &Result<ProcessOutput, ProcessRunError>) -> String {
+        match result {
+            Ok(output) => {
+                let stdout = output.stdout.summarize_chars(128);
+                let stderr = output.stderr.summarize_chars(128);
+                format!(
+                        "ok status={:?} timed_out={} duration_ms={} process_error={:?} stdin_error={:?} stdout={:?}{} stderr={:?}{} process_tree={:?} side_effects={:?}",
+                        output.status,
+                        output.timed_out,
+                        output.duration_ms(),
+                        output.process_error,
+                        output.stdin_error,
+                        stdout.text,
+                        if stdout.truncated { " (truncated)" } else { "" },
+                        stderr.text,
+                        if stderr.truncated { " (truncated)" } else { "" },
+                        output.process_tree,
+                        output.side_effects
+                    )
+            }
+            Err(error) => format!("err {error}"),
+        }
+    }
+
+    #[cfg(unix)]
+    struct OwnedCancellableProcessRunner {
+        cancellation: ProcessCancellation,
+        handle: Option<thread::JoinHandle<Result<ProcessOutput, ProcessRunError>>>,
+    }
+
+    #[cfg(unix)]
+    impl OwnedCancellableProcessRunner {
+        fn spawn(spec: ProcessSpec) -> Self {
+            let cancellation = ProcessCancellation::new();
+            let worker_cancellation = cancellation.clone();
+            let handle = thread::spawn(move || run_process_cancellable(spec, &worker_cancellation));
+            Self {
+                cancellation,
+                handle: Some(handle),
+            }
+        }
+
+        fn is_finished(&self) -> bool {
+            self.handle
+                .as_ref()
+                .is_some_and(|handle| handle.is_finished())
+        }
+
+        fn finish(mut self, context: &str) -> Result<ProcessOutput, ProcessRunError> {
+            let handle = self.handle.take().expect("process runner already joined");
+            match handle.join() {
+                Ok(result) => result,
+                Err(_) => panic!("{context}: process runner thread panicked"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for OwnedCancellableProcessRunner {
+        fn drop(&mut self) {
+            self.cancellation.cancel();
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn agent_lifecycle_metadata_stamps_environment_and_registers_running_process() {
         skip_without_containment!();
@@ -884,7 +952,7 @@
         );
 
         let registry = AgentRegistry::open(temp.path()).expect("agent registry");
-        let runner = thread::spawn(move || run_process(spec));
+        let runner = OwnedCancellableProcessRunner::spawn(spec);
         let registered = loop {
             let processes = registry
                 .list(&crate::agent_lifecycle::AgentListFilter::default())
@@ -892,10 +960,20 @@
             if let Some(process) = processes.first() {
                 break process.clone();
             }
-            assert!(
-                !runner.is_finished(),
-                "process runner completed before registering its agent lifecycle identity"
-            );
+            if runner.is_finished() {
+                let processes = registry
+                    .list(&crate::agent_lifecycle::AgentListFilter::default())
+                    .expect("list lifecycle processes after runner completion");
+                if let Some(process) = processes.first() {
+                    break process.clone();
+                }
+                let runner_result = runner
+                    .finish("process runner completed before registering its agent lifecycle identity");
+                panic!(
+                        "process runner completed before registering its agent lifecycle identity; registry=empty; runner={}",
+                        format_lifecycle_runner_result(&runner_result)
+                    );
+            }
             thread::sleep(Duration::from_millis(10));
         };
         assert_eq!(registered.run_id, "runner-run");
@@ -910,8 +988,7 @@
             .expect("stop lifecycle process");
         assert_eq!(stopped.stopped.len(), 1);
         let output = runner
-            .join()
-            .unwrap_or_else(|_| panic!("process runner thread panicked"))
+            .finish("process runner result")
             .expect("process runner result");
         assert!(output.status.is_some_and(|status| !status.success()));
     }

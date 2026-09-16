@@ -847,6 +847,7 @@ fn external_grok_profile_projects_exact_systemd_properties() {
         "--property=ProtectSystem=strict".to_string(),
         "--property=ProtectHome=tmpfs".to_string(),
         "--property=NoNewPrivileges=yes".to_string(),
+        "--property=PrivateUsers=yes".to_string(),
         "--property=RestrictNamespaces=yes".to_string(),
         "--property=PrivateNetwork=no".to_string(),
         "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6".to_string(),
@@ -3047,6 +3048,9 @@ fn external_codex_alone_admits_inner_bubblewrap_namespaces_and_mounts() {
     assert!(arguments
         .iter()
         .any(|argument| argument == "--property=RestrictNamespaces=no"));
+    assert!(arguments
+        .iter()
+        .any(|argument| argument == "--property=PrivateUsers=yes"));
     assert!(arguments.iter().any(|argument| {
         argument == "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"
     }));
@@ -3090,6 +3094,12 @@ fn external_codex_alone_admits_inner_bubblewrap_namespaces_and_mounts() {
                 .iter()
                 .any(|argument| argument == "--property=RestrictNamespaces=yes"),
             "{kind:?} namespace confinement changed"
+        );
+        assert!(
+            arguments
+                .iter()
+                .any(|argument| argument == "--property=PrivateUsers=yes"),
+            "{kind:?} user-namespace confinement omitted PrivateUsers"
         );
         let expected_address_families = match kind {
             SideEffectConfinementProfileKind::StrictOfflineWorkspace => {

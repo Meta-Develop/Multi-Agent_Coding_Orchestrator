@@ -1,6 +1,14 @@
 mod repair_attempts;
 pub mod review_loop;
 pub mod review_loop_entry;
+mod review_repair_evidence;
+mod review_repair_flow;
+
+use review_repair_evidence::{
+    build_repair_disposition_audit_task, repair_disposition_auditor_actor,
+    repair_disposition_auditor_prompt, verify_repair_disposition_audit_capture,
+    RepairDispositionAuditLaunchRecord, RepairDispositionAuditTask, VerifiedRepairDispositions,
+};
 mod review_policy_input;
 mod review_state_journal;
 
@@ -2626,6 +2634,7 @@ fn run_inbox_with_bound_policy_and_resolver(
         run_id: &options.run_id,
         config: &loaded.config,
         review_policy: bound_policy,
+        review_policy_file: options.review_policy_file.clone(),
         action_policy,
         permission_mode,
         codex_bin: options
@@ -3797,6 +3806,7 @@ struct InboxItemRunContext<'a> {
     run_id: &'a RunId,
     config: &'a InboxConfig,
     review_policy: Option<&'a BoundReviewPolicy>,
+    review_policy_file: Option<PathBuf>,
     action_policy: InboxActionPolicy,
     permission_mode: InboxPermissionMode,
     codex_bin: Option<PathBuf>,
@@ -3874,7 +3884,9 @@ fn run_inbox_item(
             )?;
         }
     }
-    let review_loop = review_observation.map(|observation| observation.report);
+    let review_loop = review_observation
+        .as_ref()
+        .map(|observation| observation.report.clone());
     if let Some(pr_intake) = pr_intake {
         return run_independent_audit_intake_item(
             writer,
@@ -4081,13 +4093,76 @@ fn run_inbox_item(
         }
     };
     let mut refusal = None;
-    let (autopilot_success, autopilot_message) = match autopilot_result {
+    let mut repair_awaiting_grant = None;
+    let (autopilot_success, autopilot_message, _autopilot_report_opt) = match autopilot_result {
         Ok(report) => {
             let success = report.success;
             let message = report.next_action.clone();
             refusal = inbox_source_base_refusal(&report).or_else(|| inbox_budget_refusal(&report));
             write_private_artifact_json(writer, &autopilot_report_relative, &report)?;
-            (success, Some(message))
+            if success && refusal.is_none() && expected_source_head.is_some() {
+                if let (Some(policy), Some(policy_file), Some(observation)) = (
+                    context.review_policy,
+                    context.review_policy_file.as_deref(),
+                    review_observation.as_ref(),
+                ) {
+                    if let Some(state) = observation.state.as_ref() {
+                        match review_repair_flow::process_bounded_pr_repair_after_autopilot(
+                            review_repair_flow::RepairConsumerInput {
+                                writer,
+                                repo,
+                                run_id,
+                                item_index,
+                                item,
+                                policy,
+                                policy_file,
+                                state,
+                                autopilot_report: &report,
+                                action_policy,
+                                permission_mode,
+                                codex_bin: context.codex_bin.clone(),
+                                machine_global: context.machine_global.clone(),
+                            },
+                        ) {
+                            Ok(review_repair_flow::RepairConsumerOutcome::NotApplicable) => {}
+                            Ok(review_repair_flow::RepairConsumerOutcome::Refused {
+                                kind,
+                                message,
+                            }) => {
+                                refusal = Some(InboxRefusal {
+                                    kind,
+                                    message,
+                                    paths: Vec::new(),
+                                    lock_details: Vec::new(),
+                                });
+                            }
+                            Ok(review_repair_flow::RepairConsumerOutcome::AwaitingGrant {
+                                from_branch,
+                                candidate_head,
+                                prior_head,
+                                resume_command,
+                            }) => {
+                                repair_awaiting_grant =
+                                    Some((from_branch, candidate_head, prior_head, resume_command));
+                            }
+                            Err(error) => {
+                                refusal = Some(InboxRefusal {
+                                    kind: "review_repair_consumer_failed".to_string(),
+                                    message: sanitize_public_text(
+                                        repo,
+                                        &error.to_string(),
+                                        GH_DIAGNOSTIC_LIMIT,
+                                    )
+                                    .text,
+                                    paths: Vec::new(),
+                                    lock_details: Vec::new(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            (success, Some(message), Some(report))
         }
         Err(error) => {
             let message = sanitize_public_text(repo, &error.to_string(), GH_DIAGNOSTIC_LIMIT).text;
@@ -4103,11 +4178,25 @@ fn run_inbox_item(
             (
                 false,
                 Some("autopilot failed before producing a final report".to_string()),
+                None,
             )
         }
     };
 
-    let github_report = if refusal.is_some() {
+    let github_report = if repair_awaiting_grant.is_some() {
+        InboxGithubActionReport {
+            mode: action_policy,
+            permission_mode,
+            status: "awaiting_original_pr_update_grant".to_string(),
+            success: true,
+            target: item_target(item),
+            comment_url: None,
+            message: Some(
+                "verified repair candidate and independent per-feedback proof are durable; original PR update requires an explicit operator grant"
+                    .to_string(),
+            ),
+        }
+    } else if refusal.is_some() {
         InboxGithubActionReport {
             mode: action_policy,
             permission_mode,
@@ -4131,7 +4220,29 @@ fn run_inbox_item(
         )
     };
     write_private_artifact_json(writer, &github_report_relative, &github_report)?;
-    let success = autopilot_success && github_report.success;
+    let success = autopilot_success && github_report.success && refusal.is_none();
+    let status = if refusal.is_some() {
+        "refused".to_string()
+    } else if repair_awaiting_grant.is_some() {
+        "awaiting_original_pr_update_grant".to_string()
+    } else if success {
+        "succeeded".to_string()
+    } else {
+        "failed".to_string()
+    };
+    let next_action = if let Some((from_branch, candidate_head, _prior_head, resume_command)) =
+        repair_awaiting_grant
+    {
+        format!(
+            "candidate {candidate_head} is on branch {from_branch}; run `{resume_command}` after supplying an exact operator grant"
+        )
+    } else if refusal.is_some() {
+        "wait for or increase the rolling inbox quota before retrying".to_string()
+    } else if success {
+        "review the generated autopilot and GitHub reports".to_string()
+    } else {
+        "inspect the item autopilot and GitHub reports before retrying".to_string()
+    };
     Ok(InboxItemRunOutcome {
         report: InboxItemRunReport {
             item_index,
@@ -4139,13 +4250,7 @@ fn run_inbox_item(
             kind: item.kind,
             title: item.title.clone(),
             success,
-            status: if refusal.is_some() {
-                "refused".to_string()
-            } else if success {
-                "succeeded".to_string()
-            } else {
-                "failed".to_string()
-            },
+            status,
             plan_path: public_item_path(run_id, &format!("item-{item_index}-plan.json")),
             autopilot_run_id: autopilot_run_id.as_str().to_string(),
             autopilot_report_path: public_item_path(
@@ -4161,17 +4266,15 @@ fn run_inbox_item(
             review_loop,
             pr_intake: pr_intake_report_for_item(item),
             independent_audit_lane: None,
-            next_action: if refusal.is_some() {
-                "wait for or increase the rolling inbox quota before retrying".to_string()
-            } else if success {
-                "review the generated autopilot and GitHub reports".to_string()
-            } else {
-                "inspect the item autopilot and GitHub reports before retrying".to_string()
-            },
+            next_action,
         },
         refusal,
     })
 }
+
+pub use review_repair_flow::{
+    resume_inbox_repair, InboxResumeRepairOptions, InboxResumeRepairReport,
+};
 
 fn run_independent_audit_intake_item(
     writer: &mut ArtifactRunWriter,
@@ -4234,7 +4337,7 @@ fn inbox_skips_codex_catalog_process(
         || matches!(permission_mode, InboxPermissionMode::Fake)
 }
 
-struct IndependentAuditRunnerResult {
+pub(super) struct IndependentAuditRunnerResult {
     raw_output: Option<Vec<u8>>,
     report_sha256: Option<String>,
     exit_code: Option<i32>,
@@ -5836,6 +5939,148 @@ fn selector_effort_label(effort: crate::selection::ReasoningEffort) -> &'static 
         crate::selection::ReasoningEffort::Max => "max",
         crate::selection::ReasoningEffort::Ultra => "ultra",
     }
+}
+
+pub(super) struct InboxReadOnlyAuditorLaunchOutcome {
+    pub selection: review_loop_entry::InboxIndependentAuditorSelectionEvidence,
+    pub launch: review_loop_entry::InboxIndependentAuditLaunchEvidence,
+    pub raw_report_json: Vec<u8>,
+}
+
+pub(super) struct InboxReadOnlyAuditorLaunchInput<'a> {
+    pub repo: &'a Path,
+    pub run_id: &'a RunId,
+    pub item_index: usize,
+    pub action_policy: InboxActionPolicy,
+    pub permission_mode: InboxPermissionMode,
+    pub codex_bin: Option<&'a Path>,
+    pub machine_global: Option<&'a InboxMachineGlobalInput>,
+    pub catalog_models_override: Option<&'a BTreeSet<String>>,
+}
+
+pub(super) fn launch_inbox_read_only_independent_auditor(
+    input: InboxReadOnlyAuditorLaunchInput<'_>,
+    prompt_builder: impl FnOnce(
+        &review_loop_entry::InboxIndependentAuditorSelectionEvidence,
+    ) -> Result<String, String>,
+    external_runner: &mut dyn FnMut(&ExternalAgentCommand) -> IndependentAuditRunnerResult,
+) -> Result<InboxReadOnlyAuditorLaunchOutcome, String> {
+    let InboxReadOnlyAuditorLaunchInput {
+        repo,
+        run_id,
+        item_index,
+        action_policy,
+        permission_mode,
+        codex_bin,
+        machine_global,
+        catalog_models_override,
+    } = input;
+    if action_policy == InboxActionPolicy::DryRun || !permission_mode.launches_autopilot() {
+        return Err("permission mode does not launch the independent auditor".to_string());
+    }
+    let timeout = Duration::from_secs(600);
+    let program = codex_bin
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("codex"));
+    let available_models = if let Some(models) = catalog_models_override {
+        models.clone()
+    } else if inbox_skips_codex_catalog_process(action_policy, permission_mode) {
+        return Err(
+            "Codex runtime model catalog acquisition skipped: cause=fake_runtime_skips_codex_catalog"
+                .to_string(),
+        );
+    } else {
+        let grant = admit_inbox_catalog_preflight_grant(run_id.as_str(), repo, &program)
+            .map_err(supervisor_catalog_preflight_grant_admit_failure)
+            .map_err(|failure| failure.summary)?;
+        independent_auditor_available_models(&program, repo, timeout, Some(grant))
+            .map_err(|blocker| format!("{blocker:?}"))?
+    };
+    let decision = review_loop_entry::select_critical_independent_auditor(&available_models)
+        .map_err(|error| error.to_string())?;
+    let selection = review_loop_entry::compact_independent_auditor_selection(&decision)
+        .map_err(|_| decision.decision_reason)?;
+    let prompt = prompt_builder(&selection)?;
+    let auditor_session_id = format!("{}-item-{item_index}-repair-auditor", run_id.as_str());
+    let prompt_sha256 = crate::artifacts::state_auth::sha256_hex(prompt.as_bytes());
+    let incoming = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let output_path = incoming.path().join("auditor-output.json");
+    let json_log_path = incoming.path().join("auditor-events.jsonl");
+    let mut command = ExternalAgentCommand::codex_read_only_consultant(
+        &program,
+        repo,
+        incoming.path().join("prompt.txt"),
+        &json_log_path,
+        &output_path,
+        timeout,
+    )
+    .with_model_selection(
+        Some(selection.model.clone()),
+        Some(selector_effort_label(selection.effort).to_string()),
+    );
+    if let Some(machine_global) = machine_global {
+        let autopilot_run_id = RunId::new(format!("{}-item-{item_index}", run_id.as_str()))
+            .map_err(|e| e.to_string())?;
+        command = command.with_machine_global_retention(
+            machine_global.retention_binding_for_run(&autopilot_run_id),
+        );
+    }
+    command = command.with_agent_lifecycle(
+        repo,
+        AgentRole::Auditor.as_str(),
+        run_id.as_str(),
+        &auditor_session_id,
+    );
+    let grant = admit_inbox_independent_auditor_process_intent(
+        run_id.as_str(),
+        &auditor_session_id,
+        item_index,
+        Path::new("codex"),
+        command.model.as_deref(),
+        INBOX_INDEPENDENT_AUDITOR_PROCESS_DUTY,
+    )
+    .map_err(|error| {
+        format!(
+            "inbox independent-auditor launch grant failed: {}",
+            error.cause_id()
+        )
+    })?;
+    command = command.with_assignment_process_launch(
+        AssignmentProcessLaunchKind::InboxIndependentAuditor,
+        grant,
+    );
+    std::fs::write(incoming.path().join("prompt.txt"), prompt).map_err(|e| e.to_string())?;
+    let runner_result = external_runner(&command);
+    if !runner_result.scratch_quiescence_verified {
+        return Err("independent-auditor scratch quiescence was not verified".to_string());
+    }
+    let raw_report_json = runner_result
+        .raw_output
+        .clone()
+        .ok_or_else(|| "independent auditor produced no output".to_string())?;
+    let launch = review_loop_entry::InboxIndependentAuditLaunchEvidence {
+        adapter: "codex_read_only_consultant".to_string(),
+        permission_profile: review_loop_entry::independent_auditor_permission_profile().to_string(),
+        auditor_identity: review_loop_entry::independent_auditor_stable_id().to_string(),
+        auditor_session_id,
+        prompt_sha256,
+        report_sha256: runner_result.report_sha256.clone(),
+        exit_code: runner_result.exit_code,
+        duration_ms: runner_result.duration_ms,
+        timed_out: runner_result.timed_out,
+        safely_executed: runner_result.safely_executed,
+        publishable: runner_result.publishable,
+    };
+    if !runner_result.succeeded {
+        return Err(runner_result
+            .error
+            .unwrap_or_else(|| "independent auditor failed".to_string()));
+    }
+    Ok(InboxReadOnlyAuditorLaunchOutcome {
+        selection,
+        launch,
+        raw_report_json,
+    })
 }
 
 fn finish_independent_audit_lane_item(
@@ -7705,6 +7950,7 @@ mod pr_intake_always_on_audit_tests {
             run_id: &run_id,
             config: &config,
             review_policy: None,
+            review_policy_file: None,
             action_policy: InboxActionPolicy::Fake,
             permission_mode: InboxPermissionMode::Fake,
             codex_bin: Some(PathBuf::from("/fake/codex")),
@@ -7836,6 +8082,7 @@ mod pr_intake_always_on_audit_tests {
             run_id: &run_id,
             config: &config,
             review_policy: None,
+            review_policy_file: None,
             action_policy: InboxActionPolicy::DryRun,
             permission_mode: InboxPermissionMode::Fake,
             codex_bin: Some(PathBuf::from("/must-not-run/codex")),
@@ -7921,6 +8168,7 @@ mod pr_intake_always_on_audit_tests {
             run_id: &run_id,
             config: &config,
             review_policy: None,
+            review_policy_file: None,
             action_policy: InboxActionPolicy::Github,
             permission_mode: InboxPermissionMode::GithubFull,
             codex_bin: Some(PathBuf::from("codex")),
@@ -7992,6 +8240,7 @@ mod pr_intake_always_on_audit_tests {
             run_id: &run_id,
             config: &config,
             review_policy: None,
+            review_policy_file: None,
             action_policy: InboxActionPolicy::Github,
             permission_mode: InboxPermissionMode::GithubFull,
             codex_bin: Some(PathBuf::from("codex")),
@@ -8049,6 +8298,7 @@ mod pr_intake_always_on_audit_tests {
             run_id: &run_id,
             config: &config,
             review_policy: None,
+            review_policy_file: None,
             action_policy: InboxActionPolicy::Fake,
             permission_mode: InboxPermissionMode::Fake,
             codex_bin: Some(PathBuf::from("/must-not-run/codex")),
@@ -8180,6 +8430,7 @@ mod pr_intake_always_on_audit_tests {
             run_id: &run_id,
             config: &config,
             review_policy: None,
+            review_policy_file: None,
             action_policy: InboxActionPolicy::Github,
             permission_mode: InboxPermissionMode::GithubFull,
             codex_bin: Some(PathBuf::from("codex")),

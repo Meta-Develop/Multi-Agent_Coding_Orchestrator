@@ -298,6 +298,7 @@ const SYSTEMD_SANDBOX_SHOW_PROPERTIES: &[&str] = &[
     "LockPersonality",
     "PrivateTmp",
     "PrivateDevices",
+    "PrivateUsers",
     "PrivateNetwork",
     "PrivateIPC",
     "ProtectKernelTunables",

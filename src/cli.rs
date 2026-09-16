@@ -1920,6 +1920,19 @@ impl InboxCommand {
                 let report = inbox::inbox_status(args.repo, RunId::new(&args.run_id)?)?;
                 print_query_report(&report, args.json)
             }
+            InboxSubcommand::ResumeRepair(args) => {
+                let report = inbox::resume_inbox_repair(inbox::InboxResumeRepairOptions {
+                    repo: args.repo,
+                    run_id: RunId::new(&args.run_id)?,
+                    item_index: args.item_index,
+                    grant_file: args.grant_file,
+                })?;
+                print_query_report(&report, args.json)?;
+                if !report.success {
+                    bail!("inbox resume-repair refused");
+                }
+                Ok(())
+            }
             InboxSubcommand::Collect(args) => {
                 let report = inbox::collect_inbox_run(args.repo, RunId::new(&args.run_id)?)?;
                 print_query_report(&report, args.json)?;
@@ -2012,6 +2025,8 @@ enum InboxSubcommand {
     Intake(IntakeInboxArgs),
     /// Report durable inbox run artifact state.
     Status(StatusInboxArgs),
+    /// Resume a two-phase inbox PR repair after operator grant (phase two).
+    ResumeRepair(ResumeRepairInboxArgs),
     /// Collect the durable inbox final report.
     Collect(CollectInboxArgs),
     /// Poll for inbox items and react according to policy.
@@ -2020,6 +2035,25 @@ enum InboxSubcommand {
     Workspace(WorkspaceInboxCommand),
     /// List, inspect, or prune durable run artifacts.
     Artifacts(ArtifactsCommand),
+}
+
+#[derive(Debug, Args)]
+struct ResumeRepairInboxArgs {
+    /// Repository that produced the authenticated inbox repair run.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Authenticated inbox run id from phase one.
+    #[arg(long)]
+    run_id: String,
+    /// One-based inbox item index from the run report.
+    #[arg(long)]
+    item_index: usize,
+    /// Absolute operator-owned grant JSON outside the repository.
+    #[arg(long = "grant-file", alias = "grant")]
+    grant_file: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -4683,6 +4717,35 @@ mod cli_integration_tests {
                 "must refuse ambiguous roots {roots:?}"
             );
         }
+    }
+
+    fn resume_repair_args(argv: &[&str]) -> ResumeRepairInboxArgs {
+        let parsed = Cli::try_parse_from(argv).expect("inbox resume-repair arguments should parse");
+        let Command::Inbox(InboxCommand {
+            command: InboxSubcommand::ResumeRepair(args),
+        }) = parsed.command
+        else {
+            panic!("expected inbox resume-repair command");
+        };
+        args
+    }
+
+    #[test]
+    fn inbox_resume_repair_parses_required_flags() {
+        let args = resume_repair_args(&[
+            "maco",
+            "inbox",
+            "resume-repair",
+            "--run-id",
+            "inbox-run-1",
+            "--item-index",
+            "2",
+            "--grant",
+            "/tmp/grant.json",
+        ]);
+        assert_eq!(args.run_id, "inbox-run-1");
+        assert_eq!(args.item_index, 2);
+        assert_eq!(args.grant_file, PathBuf::from("/tmp/grant.json"));
     }
 
     fn inbox_run_args(argv: &[&str]) -> RunInboxArgs {

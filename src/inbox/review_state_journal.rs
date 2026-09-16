@@ -4,7 +4,7 @@
 //! records review evidence; it neither spends a repair slot nor grants merge.
 
 use super::review_loop::{
-    FrozenReviewSnapshot, ReviewLoopPhase, ReviewLoopPolicy, ReviewLoopState,
+    FrozenReviewSnapshot, ReviewLoopPhase, ReviewLoopPolicy, ReviewLoopState, VerifiedDisposition,
 };
 use crate::{
     artifacts::{repository_auth_writer, state_auth::sha256_hex},
@@ -233,6 +233,103 @@ fn replay(
     })
 }
 
+fn state_at_digest(
+    journal: &StateJournal,
+    snapshot: &FrozenReviewSnapshot,
+    trusted_not_after: &ForgeTimestamp,
+    digest: &str,
+) -> Result<Option<ReviewLoopState>> {
+    let item = snapshot.item();
+    let mut previous: Option<ReviewLoopState> = None;
+    for record in journal.records() {
+        if record.subject.is_some() {
+            bail!("authenticated review-state journal contains an unknown event");
+        }
+        let event: StateEvent = serde_json::from_value(record.payload.clone())
+            .context("authenticated review-state event is malformed")?;
+        if event.version != VERSION {
+            bail!("authenticated review-state event missing collection watermark evidence");
+        }
+        if event.provider != item.repository().provider_id()
+            || event.provider_repository_id
+                != item.repository().provider_repository_id().stable_id()
+            || event.number != item.number()
+            || event.previous_state_sha256.as_deref()
+                != previous.as_ref().map(ReviewLoopState::state_sha256)
+        {
+            bail!("authenticated review-state event changed its logical PR or state chain");
+        }
+        let provider_observed_at =
+            parse_event_timestamp("provider_observed_at", &event.provider_observed_at)?;
+        let collection_started_at =
+            parse_event_timestamp("collection_started_at", &event.collection_started_at)?;
+        validate_provider_collection_bounds(&provider_observed_at, &collection_started_at)?;
+        let bytes = serde_json::to_vec(&event.state)?;
+        let state = ReviewLoopState::restore_json(&bytes, trusted_not_after)
+            .context("authenticated review-state record failed structural validation")?;
+        if !same_pr(state.current_snapshot(), snapshot) {
+            bail!("authenticated review-state record belongs to another PR");
+        }
+        match record.phase.as_str() {
+            PHASE_WATERMARK => {
+                let prior = previous.as_ref().context(
+                    "authenticated review-state collection watermark precedes initial state",
+                )?;
+                if state.state_sha256() != prior.state_sha256() {
+                    bail!("authenticated review-state collection watermark changed durable state");
+                }
+            }
+            PHASE_STATE => {
+                if state.state_sha256() == digest {
+                    return Ok(Some(state));
+                }
+            }
+            _ => bail!("authenticated review-state journal contains an unknown event"),
+        }
+        previous = Some(state);
+    }
+    Ok(None)
+}
+
+fn refuse_dispositions_without_transition(dispositions: &[VerifiedDisposition]) -> Result<()> {
+    if !dispositions.is_empty() {
+        bail!(
+            "authenticated review-state advance cannot supply dispositions without a state transition"
+        );
+    }
+    Ok(())
+}
+
+fn compute_advanced_transition(
+    prior: &ReviewLoopState,
+    provider_snapshot: &FrozenReviewSnapshot,
+    policy: &ReviewLoopPolicy,
+    collection_started_at: &ForgeTimestamp,
+    dispositions: &[VerifiedDisposition],
+) -> Result<ReviewLoopState> {
+    if prior.policy_sha256() != policy.canonical_sha256()? {
+        bail!("review-state policy changed; explicit migration is required");
+    }
+    if !same_pr(prior.current_snapshot(), provider_snapshot) {
+        bail!("authenticated review-state advance belongs to another PR");
+    }
+    match prior.phase() {
+        ReviewLoopPhase::Active => {}
+        ReviewLoopPhase::Ready | ReviewLoopPhase::Exhausted => {
+            bail!("authenticated review-state advance cannot reset terminal review-loop state");
+        }
+    }
+    let stamped = provider_snapshot.stamp_for_durable_collection(collection_started_at)?;
+    prior
+        .refresh_with_snapshot(
+            provider_snapshot.item(),
+            stamped,
+            collection_started_at,
+            dispositions.to_vec(),
+        )
+        .context("authenticated review-state advance failed")
+}
+
 fn append_event(journal: &mut StateJournal, phase: &str, event: &StateEvent) -> Result<()> {
     journal
         .append(phase, None, event)
@@ -283,15 +380,15 @@ pub(super) fn observe(
     let mut journal =
         StateJournal::open_or_initialize(authenticator, &instance_id(provider_snapshot)?)
             .context("authenticated review-state journal is unavailable")?;
-    let replay = replay(&journal, provider_snapshot, collection_started_at)?;
+    let replay_cursor = replay(&journal, provider_snapshot, collection_started_at)?;
     let stamped = provider_snapshot.stamp_for_durable_collection(collection_started_at)?;
-    let state = match replay.state.as_ref() {
+    let state = match replay_cursor.state.as_ref() {
         None => ReviewLoopState::new(policy.clone(), stamped, collection_started_at)?,
         Some(prior) => {
             if prior.policy_sha256() != policy.canonical_sha256()? {
                 bail!("review-state policy changed; explicit migration is required");
             }
-            let last_collection = replay
+            let last_collection = replay_cursor
                 .last_collection_started_at
                 .as_ref()
                 .context("authenticated review-state journal missing collection watermark")?;
@@ -340,7 +437,7 @@ pub(super) fn observe(
     };
     let event = build_event(
         &key,
-        replay.state.as_ref(),
+        replay_cursor.state.as_ref(),
         provider_snapshot,
         collection_started_at,
         &state,
@@ -349,12 +446,132 @@ pub(super) fn observe(
     Ok(state)
 }
 
+pub(super) fn advance_with_verified_dispositions(
+    repo: &Path,
+    expected_prior_state_sha256: &str,
+    provider_snapshot: &FrozenReviewSnapshot,
+    policy: &ReviewLoopPolicy,
+    collection_started_at: &ForgeTimestamp,
+    dispositions: &[VerifiedDisposition],
+) -> Result<ReviewLoopState> {
+    provider_snapshot.validate_not_after(collection_started_at)?;
+    let item = provider_snapshot.item();
+    let key = LogicalPrKey {
+        provider: item.repository().provider_id(),
+        provider_repository_id: item.repository().provider_repository_id().stable_id(),
+        number: item.number(),
+    };
+    let authenticator = repository_auth_writer(repo)?
+        .into_authenticator()
+        .context("failed to bind review-state repository authentication")?;
+    let mut journal = StateJournal::open_instance(authenticator, &instance_id(provider_snapshot)?)
+        .context("authenticated review-state journal is unavailable")?;
+    let replay_cursor = replay(&journal, provider_snapshot, collection_started_at)?;
+    let head = replay_cursor
+        .state
+        .as_ref()
+        .context("authenticated review-state advance requires an existing journal state")?;
+    let last_collection = replay_cursor
+        .last_collection_started_at
+        .as_ref()
+        .context("authenticated review-state journal missing collection watermark")?;
+    if collection_started_at < last_collection {
+        bail!("authenticated review collection is stale against persisted watermark");
+    }
+    if head.state_sha256() != expected_prior_state_sha256 {
+        if head.predecessor_state_sha256() != Some(expected_prior_state_sha256) {
+            bail!("authenticated review-state advance stale or mismatched expected prior digest");
+        }
+        if head.policy_sha256() != policy.canonical_sha256()? {
+            bail!("review-state policy changed; explicit migration is required");
+        }
+        if head.current_snapshot().observed_at() != collection_started_at {
+            bail!(
+                "authenticated review-state advance collection watermark does not match committed transition"
+            );
+        }
+        let prior = state_at_digest(
+            &journal,
+            provider_snapshot,
+            collection_started_at,
+            expected_prior_state_sha256,
+        )?
+        .context("authenticated review-state advance missing expected prior state")?;
+        let recomputed = compute_advanced_transition(
+            &prior,
+            provider_snapshot,
+            policy,
+            collection_started_at,
+            dispositions,
+        )?;
+        if recomputed.state_sha256() != head.state_sha256() {
+            bail!(
+                "authenticated review-state advance changed proof or encountered concurrent state"
+            );
+        }
+        return Ok(head.clone());
+    }
+    let prior = head;
+    if prior.policy_sha256() != policy.canonical_sha256()? {
+        bail!("review-state policy changed; explicit migration is required");
+    }
+    if !same_pr(prior.current_snapshot(), provider_snapshot) {
+        bail!("authenticated review-state advance belongs to another PR");
+    }
+    let same_evidence = same_provider_evidence(prior.current_snapshot(), provider_snapshot);
+    if collection_started_at == last_collection {
+        if same_evidence {
+            refuse_dispositions_without_transition(dispositions)?;
+            return Ok(prior.clone());
+        }
+        bail!("authenticated review collection at equal watermark with changed provider evidence");
+    }
+    if same_evidence {
+        refuse_dispositions_without_transition(dispositions)?;
+        let event = build_event(
+            &key,
+            Some(prior),
+            provider_snapshot,
+            collection_started_at,
+            prior,
+        )?;
+        append_event(&mut journal, PHASE_WATERMARK, &event)?;
+        return Ok(prior.clone());
+    }
+    let state = compute_advanced_transition(
+        prior,
+        provider_snapshot,
+        policy,
+        collection_started_at,
+        dispositions,
+    )?;
+    validate_replayed_state_event(prior, &state, collection_started_at, collection_started_at)?;
+    let event = build_event(
+        &key,
+        Some(prior),
+        provider_snapshot,
+        collection_started_at,
+        &state,
+    )?;
+    append_event(&mut journal, PHASE_STATE, &event)?;
+    let verified = replay(&journal, provider_snapshot, collection_started_at)?;
+    let restored = verified
+        .state
+        .as_ref()
+        .context("authenticated review-state advance left journal without head state")?;
+    if restored.state_sha256() != state.state_sha256() {
+        bail!("authenticated review-state advance failed replay round-trip validation");
+    }
+    Ok(state)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         inbox::review_loop::{
-            RequiredCheck, TrustedActorBinding, TrustedActorIdentity, TrustedActorRole,
+            DispositionDecision, RequiredCheck, ReviewFeedbackIdentity, TrustedActorBinding,
+            TrustedActorIdentity, TrustedActorRole,
         },
         publication::forge_transport::{
             FakeForgeTransport, ForgeActor, ForgeCheck, ForgeCheckConclusion, ForgeCheckStatus,
@@ -949,5 +1166,570 @@ mod tests {
         bytes[start + marker.len()] = b'X';
         std::fs::write(&watermark_path, bytes).unwrap();
         assert!(super::observe(&repo, &rescan, &policy, &collection_t3).is_err());
+    }
+
+    fn trusted_identity(human: &ForgeActor) -> TrustedActorIdentity {
+        TrustedActorIdentity::new(
+            human.provider_actor_id().clone(),
+            human.canonical_handle(),
+            human.reported_kind(),
+        )
+        .unwrap()
+    }
+
+    fn blocking_feedback_identity() -> ReviewFeedbackIdentity {
+        ReviewFeedbackIdentity::review(object(ProviderObjectKind::Review, "review:blocking"))
+    }
+
+    fn addressed_disposition(
+        snapshot: &FrozenReviewSnapshot,
+        human: &ForgeActor,
+    ) -> VerifiedDisposition {
+        VerifiedDisposition::new(
+            snapshot,
+            blocking_feedback_identity(),
+            trusted_identity(human),
+            DispositionDecision::Addressed,
+            "Addressed the blocking review feedback.",
+        )
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn advance_requires_existing_journal_and_refuses_initial_creation() {
+        let (_temp, repo, policy, human, bot) = fixture();
+        let collection = ts("2026-08-16T01:02:03Z");
+        let snapshot = observe_provider(
+            "2026-08-16T01:02:03Z",
+            &collection,
+            &"a".repeat(40),
+            "revision:1",
+            false,
+            false,
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+            &human,
+            &bot,
+        );
+        let err = super::advance_with_verified_dispositions(
+            &repo,
+            "0".repeat(64).as_str(),
+            &snapshot,
+            &policy,
+            &collection,
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("journal is unavailable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn advance_applies_verified_dispositions_when_observe_is_blocked() {
+        let (_temp, repo, policy, human, bot) = fixture();
+        let collection_t1 = ts("2026-08-16T01:02:03Z");
+        let collection_t2 = ts("2026-08-16T01:03:03Z");
+        let blocking_snapshot = observe_provider(
+            "2026-08-16T01:02:03Z",
+            &collection_t1,
+            &"a".repeat(40),
+            "revision:1",
+            false,
+            true,
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+            &human,
+            &bot,
+        );
+        let ready = observe_provider(
+            "2026-08-16T01:03:03Z",
+            &collection_t2,
+            &"c".repeat(40),
+            "revision:2",
+            true,
+            false,
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+            &human,
+            &bot,
+        );
+        let prior = super::observe(&repo, &blocking_snapshot, &policy, &collection_t1).unwrap();
+        assert_eq!(prior.phase(), ReviewLoopPhase::Active);
+        let observe_refusal = super::observe(&repo, &ready, &policy, &collection_t2).unwrap_err();
+        assert!(observe_refusal.is::<ReviewStateRefreshBlocked>());
+        let disposition = addressed_disposition(prior.current_snapshot(), &human);
+        let advanced = super::advance_with_verified_dispositions(
+            &repo,
+            prior.state_sha256(),
+            &ready,
+            &policy,
+            &collection_t2,
+            std::slice::from_ref(&disposition),
+        )
+        .unwrap();
+        assert_eq!(advanced.phase(), ReviewLoopPhase::Ready);
+        assert_eq!(advanced.attempts().len(), 1);
+        assert_eq!(
+            advanced.predecessor_state_sha256(),
+            Some(prior.state_sha256())
+        );
+        let auth = repository_auth_writer(&repo)
+            .unwrap()
+            .into_authenticator()
+            .unwrap();
+        let journal =
+            StateJournal::open_instance(auth, &instance_id(&blocking_snapshot).unwrap()).unwrap();
+        assert_eq!(journal.records().len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn advance_requires_complete_addressed_coverage() {
+        let (_temp, repo, policy, human, bot) = fixture();
+        let collection_t1 = ts("2026-08-16T01:02:03Z");
+        let collection_t2 = ts("2026-08-16T01:03:03Z");
+        let blocked = observe_provider(
+            "2026-08-16T01:02:03Z",
+            &collection_t1,
+            &"a".repeat(40),
+            "revision:1",
+            false,
+            true,
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+            &human,
+            &bot,
+        );
+        let ready = observe_provider(
+            "2026-08-16T01:03:03Z",
+            &collection_t2,
+            &"c".repeat(40),
+            "revision:2",
+            true,
+            false,
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+            &human,
+            &bot,
+        );
+        let prior = super::observe(&repo, &blocked, &policy, &collection_t1).unwrap();
+        assert!(super::advance_with_verified_dispositions(
+            &repo,
+            prior.state_sha256(),
+            &ready,
+            &policy,
+            &collection_t2,
+            &[],
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn advance_rejects_wrong_prior_digest_policy_and_stale_collection() {
+        let (_temp, repo, policy, human, bot) = fixture();
+        let collection_t1 = ts("2026-08-16T01:02:03Z");
+        let collection_t2 = ts("2026-08-16T01:03:03Z");
+        let blocked = observe_provider(
+            "2026-08-16T01:02:03Z",
+            &collection_t1,
+            &"a".repeat(40),
+            "revision:1",
+            false,
+            true,
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+            &human,
+            &bot,
+        );
+        let ready = observe_provider(
+            "2026-08-16T01:03:03Z",
+            &collection_t2,
+            &"c".repeat(40),
+            "revision:2",
+            true,
+            false,
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+            &human,
+            &bot,
+        );
+        let prior = super::observe(&repo, &blocked, &policy, &collection_t1).unwrap();
+        let disposition = addressed_disposition(prior.current_snapshot(), &human);
+        assert!(super::advance_with_verified_dispositions(
+            &repo,
+            "f".repeat(64).as_str(),
+            &ready,
+            &policy,
+            &collection_t2,
+            std::slice::from_ref(&disposition),
+        )
+        .is_err());
+        let altered = ReviewLoopPolicy::new(
+            policy.trusted_feedback_actors().to_vec(),
+            policy.required_checks().to_vec(),
+            2,
+            policy.max_attempts(),
+        )
+        .unwrap();
+        assert!(super::advance_with_verified_dispositions(
+            &repo,
+            prior.state_sha256(),
+            &ready,
+            &altered,
+            &collection_t2,
+            std::slice::from_ref(&disposition),
+        )
+        .is_err());
+        assert!(super::advance_with_verified_dispositions(
+            &repo,
+            prior.state_sha256(),
+            &ready,
+            &policy,
+            &collection_t1,
+            std::slice::from_ref(&disposition),
+        )
+        .is_err());
+        let conflicting = observe_provider(
+            "2026-08-16T01:02:03Z",
+            &collection_t1,
+            &"c".repeat(40),
+            "revision:2",
+            true,
+            false,
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+            &human,
+            &bot,
+        );
+        assert!(super::advance_with_verified_dispositions(
+            &repo,
+            prior.state_sha256(),
+            &conflicting,
+            &policy,
+            &collection_t1,
+            std::slice::from_ref(&disposition),
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn advance_rejects_mismatched_disposition_binding_and_duplicates() {
+        let (_temp, repo, policy, human, bot) = fixture();
+        let collection_t1 = ts("2026-08-16T01:02:03Z");
+        let collection_t2 = ts("2026-08-16T01:03:03Z");
+        let blocked = observe_provider(
+            "2026-08-16T01:02:03Z",
+            &collection_t1,
+            &"a".repeat(40),
+            "revision:1",
+            false,
+            true,
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+            &human,
+            &bot,
+        );
+        let ready = observe_provider(
+            "2026-08-16T01:03:03Z",
+            &collection_t2,
+            &"c".repeat(40),
+            "revision:2",
+            true,
+            false,
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+            &human,
+            &bot,
+        );
+        let prior = super::observe(&repo, &blocked, &policy, &collection_t1).unwrap();
+        let disposition = addressed_disposition(prior.current_snapshot(), &human);
+        let mismatched = VerifiedDisposition::new(
+            &ready,
+            ReviewFeedbackIdentity::review(object(ProviderObjectKind::Review, "review:approved")),
+            trusted_identity(&human),
+            DispositionDecision::Addressed,
+            "Addressed the blocking review feedback.",
+        )
+        .unwrap();
+        assert!(super::advance_with_verified_dispositions(
+            &repo,
+            prior.state_sha256(),
+            &ready,
+            &policy,
+            &collection_t2,
+            std::slice::from_ref(&mismatched),
+        )
+        .is_err());
+        assert!(super::advance_with_verified_dispositions(
+            &repo,
+            prior.state_sha256(),
+            &ready,
+            &policy,
+            &collection_t2,
+            &[disposition.clone(), disposition],
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn advance_replays_exact_interrupted_success_without_duplicate_attempt() {
+        let (_temp, repo, policy, human, bot) = fixture();
+        let collection_t1 = ts("2026-08-16T01:02:03Z");
+        let collection_t2 = ts("2026-08-16T01:03:03Z");
+        let blocked = observe_provider(
+            "2026-08-16T01:02:03Z",
+            &collection_t1,
+            &"a".repeat(40),
+            "revision:1",
+            false,
+            true,
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+            &human,
+            &bot,
+        );
+        let ready = observe_provider(
+            "2026-08-16T01:03:03Z",
+            &collection_t2,
+            &"c".repeat(40),
+            "revision:2",
+            true,
+            false,
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+            &human,
+            &bot,
+        );
+        let prior = super::observe(&repo, &blocked, &policy, &collection_t1).unwrap();
+        let disposition = addressed_disposition(prior.current_snapshot(), &human);
+        let args = (prior.state_sha256(), std::slice::from_ref(&disposition));
+        let first = super::advance_with_verified_dispositions(
+            &repo,
+            args.0,
+            &ready,
+            &policy,
+            &collection_t2,
+            args.1,
+        )
+        .unwrap();
+        let second = super::advance_with_verified_dispositions(
+            &repo,
+            args.0,
+            &ready,
+            &policy,
+            &collection_t2,
+            args.1,
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        let auth = repository_auth_writer(&repo)
+            .unwrap()
+            .into_authenticator()
+            .unwrap();
+        let journal = StateJournal::open_instance(auth, &instance_id(&blocked).unwrap()).unwrap();
+        assert_eq!(journal.records().len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn advance_refuses_changed_retry_after_success() {
+        let (_temp, repo, policy, human, bot) = fixture();
+        let collection_t1 = ts("2026-08-16T01:02:03Z");
+        let collection_t2 = ts("2026-08-16T01:03:03Z");
+        let blocked = observe_provider(
+            "2026-08-16T01:02:03Z",
+            &collection_t1,
+            &"a".repeat(40),
+            "revision:1",
+            false,
+            true,
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+            &human,
+            &bot,
+        );
+        let ready = observe_provider(
+            "2026-08-16T01:03:03Z",
+            &collection_t2,
+            &"c".repeat(40),
+            "revision:2",
+            true,
+            false,
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+            &human,
+            &bot,
+        );
+        let prior = super::observe(&repo, &blocked, &policy, &collection_t1).unwrap();
+        let disposition = addressed_disposition(prior.current_snapshot(), &human);
+        super::advance_with_verified_dispositions(
+            &repo,
+            prior.state_sha256(),
+            &ready,
+            &policy,
+            &collection_t2,
+            std::slice::from_ref(&disposition),
+        )
+        .unwrap();
+        let deferred = VerifiedDisposition::new(
+            prior.current_snapshot(),
+            blocking_feedback_identity(),
+            trusted_identity(&human),
+            DispositionDecision::Addressed,
+            "Changed retry after success.",
+        )
+        .unwrap();
+        assert!(super::advance_with_verified_dispositions(
+            &repo,
+            prior.state_sha256(),
+            &ready,
+            &policy,
+            &collection_t2,
+            std::slice::from_ref(&deferred),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("changed proof"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn advance_rejects_dispositions_on_no_transition_retry() {
+        let (_temp, repo, policy, human, bot) = fixture();
+        let collection_t1 = ts("2026-08-16T01:02:03Z");
+        let blocking_snapshot = observe_provider(
+            "2026-08-16T01:02:03Z",
+            &collection_t1,
+            &"a".repeat(40),
+            "revision:1",
+            false,
+            true,
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+            &human,
+            &bot,
+        );
+        let prior = super::observe(&repo, &blocking_snapshot, &policy, &collection_t1).unwrap();
+        let disposition = addressed_disposition(prior.current_snapshot(), &human);
+        let err = super::advance_with_verified_dispositions(
+            &repo,
+            prior.state_sha256(),
+            &blocking_snapshot,
+            &policy,
+            &collection_t1,
+            std::slice::from_ref(&disposition),
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cannot supply dispositions without a state transition"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn advance_rejects_stale_collection_after_later_observation_watermark() {
+        let (_temp, repo, policy, human, bot) = fixture();
+        let collection_t1 = ts("2026-08-16T01:02:03Z");
+        let collection_t2 = ts("2026-08-16T01:03:03Z");
+        let collection_t3 = ts("2026-08-16T01:04:03Z");
+        let blocking_snapshot = observe_provider(
+            "2026-08-16T01:02:03Z",
+            &collection_t1,
+            &"a".repeat(40),
+            "revision:1",
+            false,
+            true,
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+            &human,
+            &bot,
+        );
+        let ready = observe_provider(
+            "2026-08-16T01:03:03Z",
+            &collection_t2,
+            &"c".repeat(40),
+            "revision:2",
+            true,
+            false,
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+            &human,
+            &bot,
+        );
+        let rescan = observe_provider(
+            "2026-08-16T01:03:03Z",
+            &collection_t3,
+            &"c".repeat(40),
+            "revision:2",
+            true,
+            false,
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+            &human,
+            &bot,
+        );
+        let prior = super::observe(&repo, &blocking_snapshot, &policy, &collection_t1).unwrap();
+        let disposition = addressed_disposition(prior.current_snapshot(), &human);
+        super::advance_with_verified_dispositions(
+            &repo,
+            prior.state_sha256(),
+            &ready,
+            &policy,
+            &collection_t2,
+            std::slice::from_ref(&disposition),
+        )
+        .unwrap();
+        super::observe(&repo, &rescan, &policy, &collection_t3).unwrap();
+        let err = super::advance_with_verified_dispositions(
+            &repo,
+            prior.state_sha256(),
+            &ready,
+            &policy,
+            &collection_t2,
+            std::slice::from_ref(&disposition),
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("stale against persisted watermark"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observe_behavior_unchanged_when_advance_exists() {
+        let (_temp, repo, policy, human, bot) = fixture();
+        let collection_t1 = ts("2026-08-16T01:02:03Z");
+        let collection_t2 = ts("2026-08-16T01:03:03Z");
+        let first = observe_provider(
+            "2026-08-16T01:02:03Z",
+            &collection_t1,
+            &"a".repeat(40),
+            "revision:1",
+            false,
+            true,
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+            &human,
+            &bot,
+        );
+        let second = observe_provider(
+            "2026-08-16T01:03:03Z",
+            &collection_t2,
+            &"c".repeat(40),
+            "revision:2",
+            true,
+            false,
+            ForgeCheckStatus::Completed,
+            Some(ForgeCheckConclusion::Success),
+            &human,
+            &bot,
+        );
+        super::observe(&repo, &first, &policy, &collection_t1).unwrap();
+        let blocked = super::observe(&repo, &second, &policy, &collection_t2).unwrap_err();
+        assert!(blocked.is::<ReviewStateRefreshBlocked>());
     }
 }
