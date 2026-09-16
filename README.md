@@ -1438,6 +1438,41 @@ Grok; `MACO_<RUNTIME>_BIN` for other adapter subprocess runtimes). Mismatch is
 refused before artifact reservation and rechecked before every external launch
 (including auditors).
 
+`--additional-runtime-bin RUNTIME=ABSOLUTE_EXECUTABLE` is optional and repeatable.
+It does not replace `--runtime` / `--runtime-bin`, which remain required and still
+select the parent supervisor. Each additional entry is an explicit launch
+allowlist binding for a distinct non-Fake runtime. The operator caller plan and
+`role_models` are not rewritten except for the existing per-profile overlay.
+Unknown runtimes, Fake, empty or relative executables, duplicate additional
+runtimes, and a duplicate of the primary runtime are refused before artifact
+reservation. Declared executables are canonicalized and frozen before
+reservation; later launches must match that frozen path and invocation shape.
+This is not unrestricted runtime substitution and is not live acceptance of
+mixed-runtime quality, cost, or named-default evidence. Actual runtime admission
+(catalog, account, confinement, and the matching operator `MACO_*_BIN`
+configuration) remains required.
+
+Example: parent Codex auditor with an explicit Grok worker executable. Replace
+the placeholders with reviewed local paths; do not infer them from
+`--source-repo`.
+
+```bash
+maco evaluation experiment <manifest.json> \
+  --execute-held-out \
+  --execution real-provider \
+  --allow-real-provider \
+  --source-repo <evaluated-git-repo> \
+  --base-commit <full-40-character-oid> \
+  --provider-plan <plan-outside-source-repo> \
+  --runtime codex \
+  --runtime-bin <codex-executable> \
+  --additional-runtime-bin grok=<grok-executable> \
+  --machine-global-config <reviewed-config> \
+  --machine-global-runtime-root-id <reviewed-root-id> \
+  --repo <artifact-owner> \
+  --json
+```
+
 `real_provider_execution` observation values: `not_requested` (legacy/default),
 `requested_unknown` (opt-in without parent launch evidence),
 `launch_attempted` (`target_launch_attempted` only; not success), and

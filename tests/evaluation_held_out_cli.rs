@@ -479,3 +479,246 @@ fn real_provider_incomplete_tuple_is_refused_before_artifact_reservation() -> Re
     assert_eq!(supervise_run_count(&artifact_owner)?, before);
     Ok(())
 }
+
+fn write_cli_real_provider_inputs(
+    workspace: &TempDir,
+) -> Result<(PathBuf, PathBuf, String, PathBuf, PathBuf)> {
+    let (source_repo, base_commit, _) = init_source_repo(workspace.path())?;
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/model_mix_evaluation/experiment-manifest-v1.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(fixture)?)?;
+    manifest["held_out_validation"] = json!([{"id":"present", "command":["true"]}]);
+    let manifest_path = workspace.path().join("manifest.json");
+    fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
+    let artifact_owner = workspace.path().join("artifact-owner");
+    git2::Repository::init(&artifact_owner)?;
+    let plan_path = workspace.path().join("provider-plan.json");
+    fs::write(
+        &plan_path,
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "task": "cli real-provider caller plan",
+            "max_depth": 2,
+            "max_child_assignments": 1,
+            "max_child_retries": 0,
+            "child_timeout_seconds": 10,
+            "assignments": [{
+                "id": "docs-child",
+                "phase": "execution",
+                "assigned_paths": ["README.md"],
+                "worker_assignments": [{"id": "worker-a", "assigned_paths": ["README.md"]}]
+            }]
+        }))?,
+    )?;
+    Ok((
+        manifest_path,
+        artifact_owner,
+        base_commit,
+        source_repo,
+        plan_path,
+    ))
+}
+
+fn real_provider_cli_base<'a>(
+    command: &'a mut Command,
+    manifest_path: &Path,
+    artifact_owner: &Path,
+    source_repo: &Path,
+    base_commit: &str,
+    plan_path: &Path,
+) -> &'a mut Command {
+    command
+        .args(["evaluation", "experiment"])
+        .arg(manifest_path)
+        .args([
+            "--execute-held-out",
+            "--execution",
+            "real-provider",
+            "--allow-real-provider",
+            "--json",
+            "--repo",
+        ])
+        .arg(artifact_owner)
+        .arg("--source-repo")
+        .arg(source_repo)
+        .arg("--base-commit")
+        .arg(base_commit)
+        .arg("--provider-plan")
+        .arg(plan_path)
+        .args([
+            "--machine-global-config",
+            "/tmp/maco-machine-global.json",
+            "--machine-global-runtime-root-id",
+            "runtime",
+        ])
+}
+
+#[test]
+fn additional_runtime_bin_cli_entries_refuse_before_artifact_reservation() -> Result<()> {
+    let workspace = TempDir::new()?;
+    let (manifest_path, artifact_owner, base_commit, source_repo, plan_path) =
+        write_cli_real_provider_inputs(&workspace)?;
+    let before = supervise_run_count(&artifact_owner)?;
+
+    let output = real_provider_cli_base(
+        &mut Command::new(BIN),
+        &manifest_path,
+        &artifact_owner,
+        &source_repo,
+        &base_commit,
+        &plan_path,
+    )
+    .args([
+        "--runtime",
+        "codex",
+        "--runtime-bin",
+        "/usr/bin/true",
+        "--additional-runtime-bin",
+        "fake=/usr/bin/true",
+    ])
+    .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Fake"), "stderr={stderr}");
+    assert_eq!(supervise_run_count(&artifact_owner)?, before);
+
+    let output = real_provider_cli_base(
+        &mut Command::new(BIN),
+        &manifest_path,
+        &artifact_owner,
+        &source_repo,
+        &base_commit,
+        &plan_path,
+    )
+    .args([
+        "--runtime",
+        "codex",
+        "--runtime-bin",
+        "/usr/bin/true",
+        "--additional-runtime-bin",
+        "grok=relative-grok",
+    ])
+    .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("absolute path") || stderr.contains("relative"),
+        "stderr={stderr}"
+    );
+    assert_eq!(supervise_run_count(&artifact_owner)?, before);
+
+    let output = real_provider_cli_base(
+        &mut Command::new(BIN),
+        &manifest_path,
+        &artifact_owner,
+        &source_repo,
+        &base_commit,
+        &plan_path,
+    )
+    .args([
+        "--runtime",
+        "codex",
+        "--runtime-bin",
+        "/usr/bin/true",
+        "--additional-runtime-bin",
+        "grok=/usr/bin/true",
+        "--additional-runtime-bin",
+        "grok=/bin/true",
+    ])
+    .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("duplicated") || stderr.contains("duplicate"),
+        "stderr={stderr}"
+    );
+    assert_eq!(supervise_run_count(&artifact_owner)?, before);
+
+    let output = real_provider_cli_base(
+        &mut Command::new(BIN),
+        &manifest_path,
+        &artifact_owner,
+        &source_repo,
+        &base_commit,
+        &plan_path,
+    )
+    .args([
+        "--runtime",
+        "codex",
+        "--runtime-bin",
+        "/usr/bin/true",
+        "--additional-runtime-bin",
+        "not-a-runtime=/usr/bin/true",
+    ])
+    .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown additional runtime"),
+        "stderr={stderr}"
+    );
+    assert_eq!(supervise_run_count(&artifact_owner)?, before);
+
+    let output = Command::new(BIN)
+        .args(["evaluation", "experiment"])
+        .arg(&manifest_path)
+        .args(["--execute-held-out", "--json", "--repo"])
+        .arg(&artifact_owner)
+        .args(["--additional-runtime-bin", "grok=/usr/bin/true"])
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("real-provider"), "stderr={stderr}");
+    assert_eq!(supervise_run_count(&artifact_owner)?, before);
+    Ok(())
+}
+
+#[test]
+fn additional_runtime_bin_freeze_refuses_operator_program_mismatch_before_reservation() -> Result<()>
+{
+    let workspace = TempDir::new()?;
+    let (manifest_path, artifact_owner, base_commit, source_repo, plan_path) =
+        write_cli_real_provider_inputs(&workspace)?;
+    let configured_grok = workspace.path().join("configured-grok");
+    let requested_grok = workspace.path().join("requested-grok");
+    fs::write(&configured_grok, b"unexecuted grok operator fixture")?;
+    fs::write(&requested_grok, b"unexecuted grok requested fixture")?;
+    let configured_canonical = configured_grok.canonicalize()?;
+    let requested_canonical = requested_grok.canonicalize()?;
+    assert_ne!(configured_canonical, requested_canonical);
+    let before = supervise_run_count(&artifact_owner)?;
+    let parent_grok = std::env::var_os("MACO_GROK_BIN");
+
+    let output = real_provider_cli_base(
+        &mut Command::new(BIN),
+        &manifest_path,
+        &artifact_owner,
+        &source_repo,
+        &base_commit,
+        &plan_path,
+    )
+    .env("MACO_GROK_BIN", &configured_grok)
+    .args([
+        "--runtime",
+        "codex",
+        "--runtime-bin",
+        "/usr/bin/true",
+        "--additional-runtime-bin",
+        &format!("grok={}", requested_grok.display()),
+    ])
+    .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("does not match required --runtime-bin")
+            && stderr.contains("runtime 'grok'")
+            && stderr.contains(configured_canonical.to_str().expect("configured utf8"))
+            && stderr.contains(requested_canonical.to_str().expect("requested utf8"))
+            && !stderr.contains("unknown additional runtime")
+            && !stderr.contains("is missing"),
+        "stderr={stderr}"
+    );
+    assert_eq!(supervise_run_count(&artifact_owner)?, before);
+    assert_eq!(std::env::var_os("MACO_GROK_BIN"), parent_grok);
+    Ok(())
+}

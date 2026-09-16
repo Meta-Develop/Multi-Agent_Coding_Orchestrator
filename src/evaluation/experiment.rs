@@ -235,6 +235,15 @@ impl Default for ExperimentRunRequest {
     }
 }
 
+/// Explicit additional runtime executable for held-out real-provider
+/// experiments. Empty by default. Each entry is an allowlist binding, not a
+/// parent-runtime or plan-selection override.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldOutAdditionalRuntimeBinding {
+    pub runtime: SupervisorRuntime,
+    pub executable: PathBuf,
+}
+
 /// Explicit opt-in for held-out real-provider execution. Incomplete or
 /// contradictory tuples are refused before artifact reservation. Existing
 /// [`ExperimentRunRequest`] Fake entrypoints remain unchanged.
@@ -246,6 +255,7 @@ pub struct HeldOutRealProviderExperimentRequest {
     pub provider_plan: PathBuf,
     pub runtime: SupervisorRuntime,
     pub runtime_executable: PathBuf,
+    pub additional_runtime_executables: Vec<HeldOutAdditionalRuntimeBinding>,
     pub machine_global_retention: MachineGlobalRetentionBinding,
 }
 

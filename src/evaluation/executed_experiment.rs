@@ -289,7 +289,7 @@ pub fn run_held_out_real_provider_experiment(
         .map_err(|error| anyhow!("held-out production caller plan is invalid: {error}"))?;
     let resolved_commit = experiment::resolve_held_out_explicit_source_baseline(&request.source)
         .map_err(|error| anyhow!("held-out explicit source baseline is invalid: {error}"))?;
-    refuse_runtime_executable_binding_before_reservation(&request)?;
+    let runtime_allowlist = freeze_runtime_bindings_before_reservation(&request)?;
     crate::git_repository::configure_libgit2_repository_extensions()?;
     let repo = artifacts::discover_repo_root(artifact_repo)?;
     let family = RunArtifactFamily::Supervise;
@@ -314,6 +314,11 @@ pub fn run_held_out_real_provider_experiment(
             "assigned_paths": frozen.assigned_paths,
             "observation": "requested",
         }),
+        ArtifactFileDisposition::PrivateEvidence,
+    )?;
+    writer.write_json(
+        "held-out/runtime-bindings.json",
+        &runtime_allowlist.artifact_value(),
         ArtifactFileDisposition::PrivateEvidence,
     )?;
     let manifest_sha256 = sha256_hex(&serde_json::to_vec(manifest)?);
@@ -415,7 +420,11 @@ pub fn run_held_out_real_provider_experiment(
                 request.machine_global_retention.clone(),
             );
             options.budget_max_duration_seconds = Some(manifest.limits.wall_time_seconds);
-            let outcome = supervise::run_held_out_production_experiment(options, authority.clone());
+            let outcome = supervise::run_held_out_production_experiment(
+                options,
+                authority.clone(),
+                runtime_allowlist.clone(),
+            );
             let (report, launch) = match outcome {
                 Ok(outcome) => (outcome.report, outcome.launch),
                 Err(error) => {
@@ -572,13 +581,18 @@ pub(super) fn real_provider_execution_from_parent_capture(
     }
 }
 
-fn refuse_runtime_executable_binding_before_reservation(
+fn freeze_runtime_bindings_before_reservation(
     request: &HeldOutRealProviderExperimentRequest,
-) -> Result<()> {
+) -> Result<crate::supervise::FrozenHeldOutRuntimeAllowlist> {
     use crate::supervise::{
-        refuse_held_out_production_runtime_executable_binding, RunBudgetLimits,
-        SupervisorAdmissionConfig, SupervisorRunOptions,
+        freeze_held_out_runtime_allowlist, RunBudgetLimits, SupervisorAdmissionConfig,
+        SupervisorRunOptions,
     };
+    let additional: Vec<(SupervisorRuntime, PathBuf)> = request
+        .additional_runtime_executables
+        .iter()
+        .map(|binding| (binding.runtime, binding.executable.clone()))
+        .collect();
     let options = SupervisorRunOptions {
         repo: request.source.source_repo.clone(),
         plan_file: request.provider_plan.clone(),
@@ -593,9 +607,10 @@ fn refuse_runtime_executable_binding_before_reservation(
         budget_max_duration_seconds: None,
         machine_global_retention: Some(request.machine_global_retention.clone()),
     };
-    refuse_held_out_production_runtime_executable_binding(
+    freeze_held_out_runtime_allowlist(
         request.runtime,
         &request.runtime_executable,
+        &additional,
         &options,
     )
 }
@@ -617,6 +632,12 @@ fn refuse_incomplete_real_provider_request(
     if request.runtime_executable.as_os_str().is_empty() {
         bail!("held-out real-provider execution requires an explicit runtime executable; refusing to infer it from the source repository");
     }
+    let additional: Vec<(SupervisorRuntime, PathBuf)> = request
+        .additional_runtime_executables
+        .iter()
+        .map(|binding| (binding.runtime, binding.executable.clone()))
+        .collect();
+    crate::supervise::refuse_held_out_additional_runtime_bindings(request.runtime, &additional)?;
     if request.provider_plan.as_os_str().is_empty() {
         bail!("held-out real-provider execution requires --provider-plan");
     }
