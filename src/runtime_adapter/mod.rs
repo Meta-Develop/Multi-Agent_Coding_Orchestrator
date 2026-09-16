@@ -8,6 +8,7 @@
 mod capabilities;
 pub mod cursor;
 pub mod grok;
+pub(crate) mod grok_acp;
 pub mod hosted_callback;
 
 pub use capabilities::{
@@ -34,6 +35,38 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
+
+/// Explicit Grok parent interaction protocol. Default remains headless streaming-json.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum GrokInteractionProtocol {
+    #[default]
+    HeadlessStreamingJson,
+    AcpStdio,
+}
+
+/// Operator selector for [`RuntimeAdapterConfig::try_from_environment`].
+const GROK_INTERACTION_PROTOCOL_ENV: &str = "MACO_GROK_INTERACTION_PROTOCOL";
+
+fn grok_interaction_protocol_from_operator_env(
+    lookup: impl Fn(&str) -> Result<String, env::VarError>,
+) -> Result<GrokInteractionProtocol> {
+    match lookup(GROK_INTERACTION_PROTOCOL_ENV) {
+        Err(env::VarError::NotPresent) => Ok(GrokInteractionProtocol::HeadlessStreamingJson),
+        Err(env::VarError::NotUnicode(_)) => {
+            bail!(
+                "unsupported {GROK_INTERACTION_PROTOCOL_ENV} value; expected exactly headless_streaming_json or acp_stdio"
+            )
+        }
+        Ok(value) => match value.as_str() {
+            "headless_streaming_json" => Ok(GrokInteractionProtocol::HeadlessStreamingJson),
+            "acp_stdio" => Ok(GrokInteractionProtocol::AcpStdio),
+            _ => bail!(
+                "unsupported {GROK_INTERACTION_PROTOCOL_ENV} {value:?}; expected exactly headless_streaming_json or acp_stdio"
+            ),
+        },
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -438,6 +471,9 @@ pub struct RuntimeAdapterConfig {
     /// Headless CLIs that take the prompt as a string can then keep the text off argv.
     #[serde(default)]
     pub feed_prompt_on_stdin: bool,
+    /// Grok-only: selects headless NDJSON vs contained `agent stdio` ACP parent path.
+    #[serde(default)]
+    pub grok_interaction_protocol: GrokInteractionProtocol,
 }
 
 impl RuntimeAdapterConfig {
@@ -505,6 +541,7 @@ impl RuntimeAdapterConfig {
             working_dir_flag: None,
             output_capture,
             feed_prompt_on_stdin,
+            grok_interaction_protocol: GrokInteractionProtocol::default(),
         }
     }
 
@@ -512,38 +549,74 @@ impl RuntimeAdapterConfig {
     /// `MACO_<RUNTIME>_ARGS` is whitespace-separated and supports the same placeholders.
     /// Grok's protocol and safety argv are immutable; Grok operator overrides
     /// may select only the binary and screened environment passthrough.
+    ///
+    /// This infallible loader keeps the default Grok protocol. Supervisor
+    /// construction uses [`Self::try_from_environment`], which refuses an
+    /// unsupported `MACO_GROK_INTERACTION_PROTOCOL` instead of falling back.
     pub fn from_environment(runtime: RuntimeId) -> Self {
         Self::from_adapter_environment(AdapterId::from_runtime(runtime))
     }
 
     pub fn from_adapter_environment(adapter: AdapterId) -> Self {
+        Self::load_adapter_environment(adapter, |name| env::var(name))
+    }
+
+    /// Checked operator environment load for supervisor worker/auditor construction.
+    /// Grok accepts only `MACO_GROK_INTERACTION_PROTOCOL=headless_streaming_json`
+    /// or `acp_stdio`. Absent keeps [`GrokInteractionProtocol::HeadlessStreamingJson`].
+    /// Any other value, including empty or non-Unicode, is an error.
+    pub fn try_from_environment(runtime: RuntimeId) -> Result<Self> {
+        Self::try_from_adapter_environment(AdapterId::from_runtime(runtime))
+    }
+
+    pub fn try_from_adapter_environment(adapter: AdapterId) -> Result<Self> {
+        Self::try_from_adapter_environment_lookup(adapter, |name| env::var(name))
+    }
+
+    fn try_from_adapter_environment_lookup(
+        adapter: AdapterId,
+        lookup: impl Fn(&str) -> Result<String, env::VarError>,
+    ) -> Result<Self> {
+        let mut config = Self::load_adapter_environment(adapter, &lookup);
+        if adapter == AdapterId::Grok {
+            config.grok_interaction_protocol =
+                grok_interaction_protocol_from_operator_env(&lookup)?;
+            config.restore_immutable_grok_descriptor();
+        }
+        Ok(config)
+    }
+
+    fn load_adapter_environment(
+        adapter: AdapterId,
+        lookup: impl Fn(&str) -> Result<String, env::VarError>,
+    ) -> Self {
         let mut config = Self::defaults_for(adapter);
         let Some(prefix) = adapter.env_prefix() else {
             return config;
         };
-        if let Ok(binary) = env::var(format!("{prefix}_BIN")) {
+        if let Ok(binary) = lookup(&format!("{prefix}_BIN")) {
             config.binary = Some(PathBuf::from(binary));
         }
-        if let Ok(args) = env::var(format!("{prefix}_ARGS")) {
+        if let Ok(args) = lookup(&format!("{prefix}_ARGS")) {
             config.replace_operator_argument_template(adapter, &args);
         }
-        if let Ok(names) = env::var(format!("{prefix}_ENV")) {
+        if let Ok(names) = lookup(&format!("{prefix}_ENV")) {
             // Drop denied names here so the live insert in external_agent.rs
             // cannot reinstate them. Remaining names are still refused at
             // render if a caller constructs the config directly.
             config.env_passthrough = env_passthrough_names_from_operator_list(&names);
         }
-        if let Ok(flag) = env::var(format!("{prefix}_CWD_FLAG")) {
+        if let Ok(flag) = lookup(&format!("{prefix}_CWD_FLAG")) {
             config.working_dir_flag = Some(flag);
         }
-        if let Ok(mode) = env::var(format!("{prefix}_OUTPUT_CAPTURE")) {
+        if let Ok(mode) = lookup(&format!("{prefix}_OUTPUT_CAPTURE")) {
             config.output_capture = match mode.as_str() {
                 "stdout" => OutputCaptureMode::Stdout,
                 "stdout_and_stderr" => OutputCaptureMode::StdoutAndStderr,
                 _ => OutputCaptureMode::OutputFile,
             };
         }
-        if let Ok(stdin) = env::var(format!("{prefix}_STDIN_PROMPT")) {
+        if let Ok(stdin) = lookup(&format!("{prefix}_STDIN_PROMPT")) {
             config.feed_prompt_on_stdin = matches!(stdin.as_str(), "1" | "true" | "stdin");
         }
         if adapter == AdapterId::Grok {
@@ -560,20 +633,44 @@ impl RuntimeAdapterConfig {
     }
 
     fn restore_immutable_grok_descriptor(&mut self) {
-        self.argument_template = grok::GROK_RUNTIME_DESCRIPTOR.immutable_argument_template();
+        self.argument_template = match self.grok_interaction_protocol {
+            GrokInteractionProtocol::AcpStdio => {
+                grok::GROK_ACP_RUNTIME_DESCRIPTOR.immutable_argument_template()
+            }
+            GrokInteractionProtocol::HeadlessStreamingJson => {
+                grok::GROK_RUNTIME_DESCRIPTOR.immutable_argument_template()
+            }
+        };
         self.working_dir_flag = None;
         self.output_capture = OutputCaptureMode::Stdout;
         self.feed_prompt_on_stdin = false;
     }
 
+    pub const fn grok_interaction_protocol(&self) -> GrokInteractionProtocol {
+        self.grok_interaction_protocol
+    }
+
+    #[cfg(test)]
+    fn try_from_adapter_environment_vars(
+        adapter: AdapterId,
+        vars: &[(&str, &str)],
+    ) -> Result<Self> {
+        Self::try_from_adapter_environment_lookup(adapter, |name| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_string())
+                .ok_or(env::VarError::NotPresent)
+        })
+    }
+
     /// Prove a typed runtime from the fully rendered adapter contract.
     ///
     /// Grok capability elevation requires an absolute cwd, the selected
-    /// executable, the exact immutable argv (including strict sandboxing,
-    /// headless tool approval, streaming JSON, and no subagents), stdout
-    /// capture for the bounded parser, and no operator environment or stdin
-    /// alteration. A model/effort string without these checks remains on the
-    /// fail-closed adapter-level capability row.
+    /// executable, the exact immutable argv for the selected interaction
+    /// protocol (strict sandboxing, headless tool approval, no subagents;
+    /// headless streaming-json or ACP `agent stdio`), stdout capture, and no
+    /// operator environment or stdin alteration. A model/effort string without
+    /// these checks remains on the fail-closed adapter-level capability row.
     pub fn typed_runtime_contract(
         &self,
         adapter: AdapterId,
@@ -600,9 +697,6 @@ impl RuntimeAdapterConfig {
                 {
                     return None;
                 }
-                let actual = self
-                    .render_grok_with_output_schema(context, output_schema)
-                    .ok()?;
                 // The operator may select an alternate executable pathname, but that is the
                 // only mutable part of the Grok process contract. Compare against a canonical
                 // descriptor carrying that same selected binary so argv, cwd, capture, stdin,
@@ -610,13 +704,31 @@ impl RuntimeAdapterConfig {
                 // the default PATH location.
                 let mut expected_config = Self::defaults_for(AdapterId::Grok);
                 expected_config.binary = self.binary.clone();
-                let expected = expected_config
-                    .render_grok_with_output_schema(context, output_schema)
-                    .ok()?;
-                if actual != expected {
-                    return None;
+                expected_config.grok_interaction_protocol = self.grok_interaction_protocol;
+                expected_config.restore_immutable_grok_descriptor();
+                match self.grok_interaction_protocol {
+                    GrokInteractionProtocol::AcpStdio => {
+                        // ACP structured output is parent/protocol-owned, never an argv flag.
+                        let actual = self.render(context).ok()?;
+                        let expected = expected_config.render(context).ok()?;
+                        if actual != expected {
+                            return None;
+                        }
+                        Some(TypedRuntimeContract { runtime })
+                    }
+                    GrokInteractionProtocol::HeadlessStreamingJson => {
+                        let actual = self
+                            .render_grok_with_output_schema(context, output_schema)
+                            .ok()?;
+                        let expected = expected_config
+                            .render_grok_with_output_schema(context, output_schema)
+                            .ok()?;
+                        if actual != expected {
+                            return None;
+                        }
+                        Some(TypedRuntimeContract { runtime })
+                    }
                 }
-                Some(TypedRuntimeContract { runtime })
             }
         }
     }
@@ -738,6 +850,14 @@ impl RuntimeAdapterConfig {
         context: &LaunchContext<'_>,
         output_schema: Option<&Path>,
     ) -> Result<Vec<OsString>> {
+        if self.grok_interaction_protocol == GrokInteractionProtocol::AcpStdio {
+            return Ok(self
+                .render(context)?
+                .argv
+                .into_iter()
+                .map(OsString::from)
+                .collect());
+        }
         Ok(self
             .render_grok_with_output_schema(context, output_schema)?
             .argv
@@ -1438,6 +1558,101 @@ mod tests {
     }
 
     #[test]
+    fn grok_checked_loader_defaults_and_refuses_invalid_protocol() -> Result<()> {
+        let absent = RuntimeAdapterConfig::try_from_adapter_environment_vars(AdapterId::Grok, &[])?;
+        assert_eq!(absent, RuntimeAdapterConfig::defaults(RuntimeId::Grok));
+        assert_eq!(
+            absent.grok_interaction_protocol(),
+            GrokInteractionProtocol::HeadlessStreamingJson
+        );
+
+        let explicit_default = RuntimeAdapterConfig::try_from_adapter_environment_vars(
+            AdapterId::Grok,
+            &[("MACO_GROK_INTERACTION_PROTOCOL", "headless_streaming_json")],
+        )?;
+        assert_eq!(
+            explicit_default.grok_interaction_protocol(),
+            GrokInteractionProtocol::HeadlessStreamingJson
+        );
+        assert_eq!(
+            explicit_default.argument_template,
+            grok::GROK_RUNTIME_DESCRIPTOR.immutable_argument_template()
+        );
+
+        let error = RuntimeAdapterConfig::try_from_adapter_environment_vars(
+            AdapterId::Grok,
+            &[("MACO_GROK_INTERACTION_PROTOCOL", "native")],
+        )
+        .expect_err("unsupported protocol must fail closed");
+        let message = error.to_string();
+        assert!(
+            message.contains("MACO_GROK_INTERACTION_PROTOCOL"),
+            "{message}"
+        );
+        assert!(message.contains("native"), "{message}");
+
+        let cursor = RuntimeAdapterConfig::try_from_adapter_environment_vars(
+            AdapterId::Cursor,
+            &[("MACO_GROK_INTERACTION_PROTOCOL", "native")],
+        )?;
+        assert_eq!(cursor, RuntimeAdapterConfig::defaults(RuntimeId::Cursor));
+        Ok(())
+    }
+
+    #[test]
+    fn grok_checked_loader_selects_immutable_acp_argv_despite_operator_args() -> Result<()> {
+        let config = RuntimeAdapterConfig::try_from_adapter_environment_vars(
+            AdapterId::Grok,
+            &[
+                ("MACO_GROK_INTERACTION_PROTOCOL", "acp_stdio"),
+                (
+                    "MACO_GROK_ARGS",
+                    "--prompt-file {prompt} --permission-mode dontAsk streaming-json",
+                ),
+            ],
+        )?;
+        assert_eq!(
+            config.grok_interaction_protocol(),
+            GrokInteractionProtocol::AcpStdio
+        );
+        assert_eq!(
+            config.argument_template,
+            grok::GROK_ACP_RUNTIME_DESCRIPTOR.immutable_argument_template()
+        );
+        let spec = config.render(&launch_context(
+            Path::new("prompt.txt"),
+            Some("grok-4.6"),
+            Some("xhigh"),
+            Path::new("/tmp/work"),
+            Path::new("out.txt"),
+        ))?;
+        assert_eq!(
+            spec.argv,
+            [
+                "--sandbox",
+                "strict",
+                "--always-approve",
+                "--disable-web-search",
+                "--no-memory",
+                "--no-subagents",
+                "agent",
+                "--no-leader",
+                "-m",
+                "grok-4.6",
+                "--reasoning-effort",
+                "xhigh",
+                "stdio",
+            ]
+        );
+        assert!(!spec
+            .argv
+            .iter()
+            .any(|argument| argument == "streaming-json"));
+        assert!(!spec.argv.iter().any(|argument| argument == "--prompt-file"));
+        Ok(())
+    }
+
+    #[test]
     fn cursor_defaults_match_print_mode_and_capture_stdout() -> Result<()> {
         let config = RuntimeAdapterConfig::defaults(RuntimeId::Cursor);
         assert_eq!(config.binary_path(), Path::new("cursor-agent"));
@@ -1649,6 +1864,7 @@ mod tests {
             working_dir_flag: Some("--cwd".into()),
             output_capture: OutputCaptureMode::Stdout,
             feed_prompt_on_stdin: false,
+            grok_interaction_protocol: GrokInteractionProtocol::default(),
         };
         let spec = config.render(&LaunchContext {
             prompt: Path::new("prompt.txt"),

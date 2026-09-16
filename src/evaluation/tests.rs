@@ -2795,6 +2795,7 @@ fn held_out_native_runtime_parent_capture_requires_successful_verified_output() 
         error: Some("spawn failed".into()),
         output_last_message: None,
         grok_stream_usage_evidence: None,
+        grok_acp_parent_evidence: None,
     };
     assert!(
         !super::executed_experiment::native_runtime_result_captured_from_parent_run(&launch_only)

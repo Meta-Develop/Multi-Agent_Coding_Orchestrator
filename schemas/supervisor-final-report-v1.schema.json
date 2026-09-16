@@ -1706,6 +1706,282 @@
               "null"
             ]
           },
+          "grok_acp_parent_evidence": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "client_resolved_effort": {
+                    "oneOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "known": {
+                            "minLength": 1,
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "known"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "const": "unknown",
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "client_resolved_model": {
+                    "oneOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "known": {
+                            "minLength": 1,
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "known"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "const": "unknown",
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "final_text": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "native_cost_equivalent_microunits": {
+                    "oneOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "reason": {
+                            "type": "string"
+                          },
+                          "status": {
+                            "const": "unknown"
+                          }
+                        },
+                        "required": [
+                          "status",
+                          "reason"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "cost_usd_ticks": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "microunits": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "status": {
+                            "const": "known"
+                          }
+                        },
+                        "required": [
+                          "status",
+                          "cost_usd_ticks",
+                          "microunits"
+                        ],
+                        "type": "object"
+                      }
+                    ]
+                  },
+                  "permission_escalation_refused": {
+                    "type": "boolean"
+                  },
+                  "protocol": {
+                    "const": "grok_acp_stdio",
+                    "type": "string"
+                  },
+                  "requested_effort": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "requested_model": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "resolution_status": {
+                    "enum": [
+                      "complete",
+                      "incomplete",
+                      "truncated",
+                      "ambiguous_model_change",
+                      "unresolved"
+                    ],
+                    "type": "string"
+                  },
+                  "session_id": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "stop_reason": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "structured_output_error": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "terminal_usage": {
+                    "oneOf": [
+                      {
+                        "type": "null"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "cost_is_partial": {
+                            "type": "boolean"
+                          },
+                          "prompt_id": {
+                            "minLength": 1,
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "session_id": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "usage_is_incomplete": {
+                            "type": "boolean"
+                          }
+                        },
+                        "required": [
+                          "usage_is_incomplete",
+                          "cost_is_partial",
+                          "session_id"
+                        ],
+                        "type": "object"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "protocol",
+                  "session_id",
+                  "client_resolved_model",
+                  "client_resolved_effort",
+                  "resolution_status",
+                  "native_cost_equivalent_microunits",
+                  "permission_escalation_refused"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "grok_stream_usage_evidence": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "status": {
+                    "const": "not_process_observable",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "status"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "status": {
+                    "const": "incomplete",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "status"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "cache_creation_input_tokens": {
+                    "minimum": 0,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "cache_read_input_tokens": {
+                    "minimum": 0,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "input_tokens": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "output_tokens": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "reasoning_tokens": {
+                    "minimum": 0,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "status": {
+                    "const": "native",
+                    "type": "string"
+                  },
+                  "total_tokens": {
+                    "minimum": 0,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "status",
+                  "input_tokens",
+                  "output_tokens"
+                ],
+                "type": "object"
+              }
+            ]
+          },
           "sandbox_denials": {
             "items": {
               "additionalProperties": false,
@@ -1772,90 +2048,6 @@
           },
           "timeout_seconds": {
             "type": "integer"
-          },
-          "grok_stream_usage_evidence": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "type": "object",
-                "additionalProperties": false,
-                "required": [
-                  "status"
-                ],
-                "properties": {
-                  "status": {
-                    "const": "not_process_observable",
-                    "type": "string"
-                  }
-                }
-              },
-              {
-                "type": "object",
-                "additionalProperties": false,
-                "required": [
-                  "status"
-                ],
-                "properties": {
-                  "status": {
-                    "const": "incomplete",
-                    "type": "string"
-                  }
-                }
-              },
-              {
-                "type": "object",
-                "additionalProperties": false,
-                "required": [
-                  "status",
-                  "input_tokens",
-                  "output_tokens"
-                ],
-                "properties": {
-                  "status": {
-                    "const": "native",
-                    "type": "string"
-                  },
-                  "input_tokens": {
-                    "type": "integer",
-                    "minimum": 0
-                  },
-                  "output_tokens": {
-                    "type": "integer",
-                    "minimum": 0
-                  },
-                  "cache_read_input_tokens": {
-                    "type": [
-                      "integer",
-                      "null"
-                    ],
-                    "minimum": 0
-                  },
-                  "cache_creation_input_tokens": {
-                    "type": [
-                      "integer",
-                      "null"
-                    ],
-                    "minimum": 0
-                  },
-                  "reasoning_tokens": {
-                    "type": [
-                      "integer",
-                      "null"
-                    ],
-                    "minimum": 0
-                  },
-                  "total_tokens": {
-                    "type": [
-                      "integer",
-                      "null"
-                    ],
-                    "minimum": 0
-                  }
-                }
-              }
-            ]
           }
         },
         "required": [
@@ -5170,6 +5362,282 @@
                           "null"
                         ]
                       },
+                      "grok_acp_parent_evidence": {
+                        "oneOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "client_resolved_effort": {
+                                "oneOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "known": {
+                                        "minLength": 1,
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "known"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "const": "unknown",
+                                    "type": "string"
+                                  }
+                                ]
+                              },
+                              "client_resolved_model": {
+                                "oneOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "known": {
+                                        "minLength": 1,
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "known"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "const": "unknown",
+                                    "type": "string"
+                                  }
+                                ]
+                              },
+                              "final_text": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "native_cost_equivalent_microunits": {
+                                "oneOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "reason": {
+                                        "type": "string"
+                                      },
+                                      "status": {
+                                        "const": "unknown"
+                                      }
+                                    },
+                                    "required": [
+                                      "status",
+                                      "reason"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "cost_usd_ticks": {
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "microunits": {
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "status": {
+                                        "const": "known"
+                                      }
+                                    },
+                                    "required": [
+                                      "status",
+                                      "cost_usd_ticks",
+                                      "microunits"
+                                    ],
+                                    "type": "object"
+                                  }
+                                ]
+                              },
+                              "permission_escalation_refused": {
+                                "type": "boolean"
+                              },
+                              "protocol": {
+                                "const": "grok_acp_stdio",
+                                "type": "string"
+                              },
+                              "requested_effort": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "requested_model": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "resolution_status": {
+                                "enum": [
+                                  "complete",
+                                  "incomplete",
+                                  "truncated",
+                                  "ambiguous_model_change",
+                                  "unresolved"
+                                ],
+                                "type": "string"
+                              },
+                              "session_id": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "stop_reason": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "structured_output_error": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "terminal_usage": {
+                                "oneOf": [
+                                  {
+                                    "type": "null"
+                                  },
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "cost_is_partial": {
+                                        "type": "boolean"
+                                      },
+                                      "prompt_id": {
+                                        "minLength": 1,
+                                        "type": [
+                                          "string",
+                                          "null"
+                                        ]
+                                      },
+                                      "session_id": {
+                                        "minLength": 1,
+                                        "type": "string"
+                                      },
+                                      "usage_is_incomplete": {
+                                        "type": "boolean"
+                                      }
+                                    },
+                                    "required": [
+                                      "usage_is_incomplete",
+                                      "cost_is_partial",
+                                      "session_id"
+                                    ],
+                                    "type": "object"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "protocol",
+                              "session_id",
+                              "client_resolved_model",
+                              "client_resolved_effort",
+                              "resolution_status",
+                              "native_cost_equivalent_microunits",
+                              "permission_escalation_refused"
+                            ],
+                            "type": "object"
+                          }
+                        ]
+                      },
+                      "grok_stream_usage_evidence": {
+                        "oneOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "status": {
+                                "const": "not_process_observable",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "status"
+                            ],
+                            "type": "object"
+                          },
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "status": {
+                                "const": "incomplete",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "status"
+                            ],
+                            "type": "object"
+                          },
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "cache_creation_input_tokens": {
+                                "minimum": 0,
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "cache_read_input_tokens": {
+                                "minimum": 0,
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "input_tokens": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "output_tokens": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "reasoning_tokens": {
+                                "minimum": 0,
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "status": {
+                                "const": "native",
+                                "type": "string"
+                              },
+                              "total_tokens": {
+                                "minimum": 0,
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "status",
+                              "input_tokens",
+                              "output_tokens"
+                            ],
+                            "type": "object"
+                          }
+                        ]
+                      },
                       "sandbox_denials": {
                         "items": {
                           "additionalProperties": false,
@@ -5236,90 +5704,6 @@
                       },
                       "timeout_seconds": {
                         "type": "integer"
-                      },
-                      "grok_stream_usage_evidence": {
-                        "oneOf": [
-                          {
-                            "type": "null"
-                          },
-                          {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "required": [
-                              "status"
-                            ],
-                            "properties": {
-                              "status": {
-                                "const": "not_process_observable",
-                                "type": "string"
-                              }
-                            }
-                          },
-                          {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "required": [
-                              "status"
-                            ],
-                            "properties": {
-                              "status": {
-                                "const": "incomplete",
-                                "type": "string"
-                              }
-                            }
-                          },
-                          {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "required": [
-                              "status",
-                              "input_tokens",
-                              "output_tokens"
-                            ],
-                            "properties": {
-                              "status": {
-                                "const": "native",
-                                "type": "string"
-                              },
-                              "input_tokens": {
-                                "type": "integer",
-                                "minimum": 0
-                              },
-                              "output_tokens": {
-                                "type": "integer",
-                                "minimum": 0
-                              },
-                              "cache_read_input_tokens": {
-                                "type": [
-                                  "integer",
-                                  "null"
-                                ],
-                                "minimum": 0
-                              },
-                              "cache_creation_input_tokens": {
-                                "type": [
-                                  "integer",
-                                  "null"
-                                ],
-                                "minimum": 0
-                              },
-                              "reasoning_tokens": {
-                                "type": [
-                                  "integer",
-                                  "null"
-                                ],
-                                "minimum": 0
-                              },
-                              "total_tokens": {
-                                "type": [
-                                  "integer",
-                                  "null"
-                                ],
-                                "minimum": 0
-                              }
-                            }
-                          }
-                        ]
                       }
                     },
                     "required": [
@@ -6315,6 +6699,282 @@
                     "null"
                   ]
                 },
+                "grok_acp_parent_evidence": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "client_resolved_effort": {
+                          "oneOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "known": {
+                                  "minLength": 1,
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "known"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "const": "unknown",
+                              "type": "string"
+                            }
+                          ]
+                        },
+                        "client_resolved_model": {
+                          "oneOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "known": {
+                                  "minLength": 1,
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "known"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "const": "unknown",
+                              "type": "string"
+                            }
+                          ]
+                        },
+                        "final_text": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "native_cost_equivalent_microunits": {
+                          "oneOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "reason": {
+                                  "type": "string"
+                                },
+                                "status": {
+                                  "const": "unknown"
+                                }
+                              },
+                              "required": [
+                                "status",
+                                "reason"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "cost_usd_ticks": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "microunits": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "status": {
+                                  "const": "known"
+                                }
+                              },
+                              "required": [
+                                "status",
+                                "cost_usd_ticks",
+                                "microunits"
+                              ],
+                              "type": "object"
+                            }
+                          ]
+                        },
+                        "permission_escalation_refused": {
+                          "type": "boolean"
+                        },
+                        "protocol": {
+                          "const": "grok_acp_stdio",
+                          "type": "string"
+                        },
+                        "requested_effort": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "requested_model": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "resolution_status": {
+                          "enum": [
+                            "complete",
+                            "incomplete",
+                            "truncated",
+                            "ambiguous_model_change",
+                            "unresolved"
+                          ],
+                          "type": "string"
+                        },
+                        "session_id": {
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "stop_reason": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "structured_output_error": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "terminal_usage": {
+                          "oneOf": [
+                            {
+                              "type": "null"
+                            },
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "cost_is_partial": {
+                                  "type": "boolean"
+                                },
+                                "prompt_id": {
+                                  "minLength": 1,
+                                  "type": [
+                                    "string",
+                                    "null"
+                                  ]
+                                },
+                                "session_id": {
+                                  "minLength": 1,
+                                  "type": "string"
+                                },
+                                "usage_is_incomplete": {
+                                  "type": "boolean"
+                                }
+                              },
+                              "required": [
+                                "usage_is_incomplete",
+                                "cost_is_partial",
+                                "session_id"
+                              ],
+                              "type": "object"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "protocol",
+                        "session_id",
+                        "client_resolved_model",
+                        "client_resolved_effort",
+                        "resolution_status",
+                        "native_cost_equivalent_microunits",
+                        "permission_escalation_refused"
+                      ],
+                      "type": "object"
+                    }
+                  ]
+                },
+                "grok_stream_usage_evidence": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "status": {
+                          "const": "not_process_observable",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "status"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "status": {
+                          "const": "incomplete",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "status"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "cache_creation_input_tokens": {
+                          "minimum": 0,
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "cache_read_input_tokens": {
+                          "minimum": 0,
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "input_tokens": {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "output_tokens": {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "reasoning_tokens": {
+                          "minimum": 0,
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "status": {
+                          "const": "native",
+                          "type": "string"
+                        },
+                        "total_tokens": {
+                          "minimum": 0,
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "status",
+                        "input_tokens",
+                        "output_tokens"
+                      ],
+                      "type": "object"
+                    }
+                  ]
+                },
                 "sandbox_denials": {
                   "items": {
                     "additionalProperties": false,
@@ -6381,90 +7041,6 @@
                 },
                 "timeout_seconds": {
                   "type": "integer"
-                },
-                "grok_stream_usage_evidence": {
-                  "oneOf": [
-                    {
-                      "type": "null"
-                    },
-                    {
-                      "type": "object",
-                      "additionalProperties": false,
-                      "required": [
-                        "status"
-                      ],
-                      "properties": {
-                        "status": {
-                          "const": "not_process_observable",
-                          "type": "string"
-                        }
-                      }
-                    },
-                    {
-                      "type": "object",
-                      "additionalProperties": false,
-                      "required": [
-                        "status"
-                      ],
-                      "properties": {
-                        "status": {
-                          "const": "incomplete",
-                          "type": "string"
-                        }
-                      }
-                    },
-                    {
-                      "type": "object",
-                      "additionalProperties": false,
-                      "required": [
-                        "status",
-                        "input_tokens",
-                        "output_tokens"
-                      ],
-                      "properties": {
-                        "status": {
-                          "const": "native",
-                          "type": "string"
-                        },
-                        "input_tokens": {
-                          "type": "integer",
-                          "minimum": 0
-                        },
-                        "output_tokens": {
-                          "type": "integer",
-                          "minimum": 0
-                        },
-                        "cache_read_input_tokens": {
-                          "type": [
-                            "integer",
-                            "null"
-                          ],
-                          "minimum": 0
-                        },
-                        "cache_creation_input_tokens": {
-                          "type": [
-                            "integer",
-                            "null"
-                          ],
-                          "minimum": 0
-                        },
-                        "reasoning_tokens": {
-                          "type": [
-                            "integer",
-                            "null"
-                          ],
-                          "minimum": 0
-                        },
-                        "total_tokens": {
-                          "type": [
-                            "integer",
-                            "null"
-                          ],
-                          "minimum": 0
-                        }
-                      }
-                    }
-                  ]
                 }
               },
               "required": [
@@ -10031,6 +10607,282 @@
                           "null"
                         ]
                       },
+                      "grok_acp_parent_evidence": {
+                        "oneOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "client_resolved_effort": {
+                                "oneOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "known": {
+                                        "minLength": 1,
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "known"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "const": "unknown",
+                                    "type": "string"
+                                  }
+                                ]
+                              },
+                              "client_resolved_model": {
+                                "oneOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "known": {
+                                        "minLength": 1,
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "known"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "const": "unknown",
+                                    "type": "string"
+                                  }
+                                ]
+                              },
+                              "final_text": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "native_cost_equivalent_microunits": {
+                                "oneOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "reason": {
+                                        "type": "string"
+                                      },
+                                      "status": {
+                                        "const": "unknown"
+                                      }
+                                    },
+                                    "required": [
+                                      "status",
+                                      "reason"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "cost_usd_ticks": {
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "microunits": {
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "status": {
+                                        "const": "known"
+                                      }
+                                    },
+                                    "required": [
+                                      "status",
+                                      "cost_usd_ticks",
+                                      "microunits"
+                                    ],
+                                    "type": "object"
+                                  }
+                                ]
+                              },
+                              "permission_escalation_refused": {
+                                "type": "boolean"
+                              },
+                              "protocol": {
+                                "const": "grok_acp_stdio",
+                                "type": "string"
+                              },
+                              "requested_effort": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "requested_model": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "resolution_status": {
+                                "enum": [
+                                  "complete",
+                                  "incomplete",
+                                  "truncated",
+                                  "ambiguous_model_change",
+                                  "unresolved"
+                                ],
+                                "type": "string"
+                              },
+                              "session_id": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "stop_reason": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "structured_output_error": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "terminal_usage": {
+                                "oneOf": [
+                                  {
+                                    "type": "null"
+                                  },
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "cost_is_partial": {
+                                        "type": "boolean"
+                                      },
+                                      "prompt_id": {
+                                        "minLength": 1,
+                                        "type": [
+                                          "string",
+                                          "null"
+                                        ]
+                                      },
+                                      "session_id": {
+                                        "minLength": 1,
+                                        "type": "string"
+                                      },
+                                      "usage_is_incomplete": {
+                                        "type": "boolean"
+                                      }
+                                    },
+                                    "required": [
+                                      "usage_is_incomplete",
+                                      "cost_is_partial",
+                                      "session_id"
+                                    ],
+                                    "type": "object"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "protocol",
+                              "session_id",
+                              "client_resolved_model",
+                              "client_resolved_effort",
+                              "resolution_status",
+                              "native_cost_equivalent_microunits",
+                              "permission_escalation_refused"
+                            ],
+                            "type": "object"
+                          }
+                        ]
+                      },
+                      "grok_stream_usage_evidence": {
+                        "oneOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "status": {
+                                "const": "not_process_observable",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "status"
+                            ],
+                            "type": "object"
+                          },
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "status": {
+                                "const": "incomplete",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "status"
+                            ],
+                            "type": "object"
+                          },
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "cache_creation_input_tokens": {
+                                "minimum": 0,
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "cache_read_input_tokens": {
+                                "minimum": 0,
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "input_tokens": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "output_tokens": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "reasoning_tokens": {
+                                "minimum": 0,
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "status": {
+                                "const": "native",
+                                "type": "string"
+                              },
+                              "total_tokens": {
+                                "minimum": 0,
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "status",
+                              "input_tokens",
+                              "output_tokens"
+                            ],
+                            "type": "object"
+                          }
+                        ]
+                      },
                       "sandbox_denials": {
                         "items": {
                           "additionalProperties": false,
@@ -10097,90 +10949,6 @@
                       },
                       "timeout_seconds": {
                         "type": "integer"
-                      },
-                      "grok_stream_usage_evidence": {
-                        "oneOf": [
-                          {
-                            "type": "null"
-                          },
-                          {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "required": [
-                              "status"
-                            ],
-                            "properties": {
-                              "status": {
-                                "const": "not_process_observable",
-                                "type": "string"
-                              }
-                            }
-                          },
-                          {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "required": [
-                              "status"
-                            ],
-                            "properties": {
-                              "status": {
-                                "const": "incomplete",
-                                "type": "string"
-                              }
-                            }
-                          },
-                          {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "required": [
-                              "status",
-                              "input_tokens",
-                              "output_tokens"
-                            ],
-                            "properties": {
-                              "status": {
-                                "const": "native",
-                                "type": "string"
-                              },
-                              "input_tokens": {
-                                "type": "integer",
-                                "minimum": 0
-                              },
-                              "output_tokens": {
-                                "type": "integer",
-                                "minimum": 0
-                              },
-                              "cache_read_input_tokens": {
-                                "type": [
-                                  "integer",
-                                  "null"
-                                ],
-                                "minimum": 0
-                              },
-                              "cache_creation_input_tokens": {
-                                "type": [
-                                  "integer",
-                                  "null"
-                                ],
-                                "minimum": 0
-                              },
-                              "reasoning_tokens": {
-                                "type": [
-                                  "integer",
-                                  "null"
-                                ],
-                                "minimum": 0
-                              },
-                              "total_tokens": {
-                                "type": [
-                                  "integer",
-                                  "null"
-                                ],
-                                "minimum": 0
-                              }
-                            }
-                          }
-                        ]
                       }
                     },
                     "required": [
@@ -16191,6 +16959,29 @@
                         ],
                         "type": "object"
                       },
+                      "operator_prior_data": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "effective_sha256": {
+                            "pattern": "^[0-9a-f]{64}$",
+                            "type": "string"
+                          },
+                          "raw_sha256": {
+                            "pattern": "^[0-9a-f]{64}$",
+                            "type": "string"
+                          },
+                          "relative_path": {
+                            "minLength": 1,
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "relative_path",
+                          "raw_sha256",
+                          "effective_sha256"
+                        ],
+                        "type": "object"
+                      },
                       "outcome_history": {
                         "additionalProperties": false,
                         "properties": {
@@ -16222,29 +17013,6 @@
                           "source_digests",
                           "exclusions",
                           "projected_attempt_count"
-                        ],
-                        "type": "object"
-                      },
-                      "operator_prior_data": {
-                        "additionalProperties": false,
-                        "properties": {
-                          "effective_sha256": {
-                            "pattern": "^[0-9a-f]{64}$",
-                            "type": "string"
-                          },
-                          "raw_sha256": {
-                            "pattern": "^[0-9a-f]{64}$",
-                            "type": "string"
-                          },
-                          "relative_path": {
-                            "minLength": 1,
-                            "type": "string"
-                          }
-                        },
-                        "required": [
-                          "relative_path",
-                          "raw_sha256",
-                          "effective_sha256"
                         ],
                         "type": "object"
                       },

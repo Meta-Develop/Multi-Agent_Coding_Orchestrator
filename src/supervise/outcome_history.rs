@@ -3,7 +3,14 @@
 //! replay provenance, not an independent signature or a source of authority.
 
 use super::*;
-use crate::selection::{CandidateKey, FailureClass, OutcomeRecord, OutcomeResult, TaskProfile};
+use crate::external_agent::ExternalAgentRun;
+use crate::runtime_adapter::grok::{
+    GrokAcpNativeCostEquivalent, GrokAcpParentEvidence, GrokAcpParentResolvedField,
+};
+use crate::selection::{
+    CandidateKey, FailureClass, OutcomeRecord, OutcomeResult, ReasoningEffort, RuntimeCatalog,
+    TaskProfile,
+};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -80,9 +87,15 @@ pub(super) fn record_child_attempt_outcome(
     requested_effort: Option<&str>,
     verified_execution: bool,
     retried: bool,
+    external_run: Option<&ExternalAgentRun>,
 ) -> Result<AttemptOutcomeEvidence> {
     let selection =
         selection_binding_for_attempt(role, assignment_id, attempt, events, initial_events);
+    let frozen_catalogs =
+        selection_event_for_attempt(role, assignment_id, attempt, events, initial_events)
+            .map(|event| event.provenance.normalized_input.catalogs.as_slice());
+    let (observed_candidate, execution_cost_microunits) =
+        parent_attempt_observation(external_run, frozen_catalogs);
     let evidence = AttemptOutcomeEvidence {
         version: ATTEMPT_EVIDENCE_VERSION,
         run_id: run_id.as_str().to_string(),
@@ -93,24 +106,27 @@ pub(super) fn record_child_attempt_outcome(
         requested_runtime: requested_runtime.to_string(),
         requested_model: requested_model.map(str::to_string),
         requested_effort: requested_effort.map(str::to_string),
-        observed_candidate: None,
+        observed_candidate,
         parent_result: retried.then_some(OutcomeResult::Rejected),
         parent_cause: retried.then(|| "parent_authorized_retry".to_string()),
         failure_class: None,
-        costs: AttemptAttributableCosts::default(),
+        costs: AttemptAttributableCosts {
+            execution_cost_microunits,
+            ..AttemptAttributableCosts::default()
+        },
     };
     write_attempt_evidence(artifacts, &evidence)?;
     Ok(evidence)
 }
 
-fn selection_binding_for_attempt(
+fn selection_event_for_attempt<'a>(
     role: AgentRole,
     assignment_id: &str,
     attempt: usize,
-    events: &[SupervisorSelectionEvent],
-    initial_events: &[SupervisorSelectionEvent],
-) -> Option<AttemptSelectionBinding> {
-    let event = events
+    events: &'a [SupervisorSelectionEvent],
+    initial_events: &'a [SupervisorSelectionEvent],
+) -> Option<&'a SupervisorSelectionEvent> {
+    events
         .iter()
         .rev()
         .find(|event| {
@@ -122,23 +138,109 @@ fn selection_binding_for_attempt(
             initial_events.iter().find(|event| {
                 event.role == role && event.assignment_id.is_none() && event.attempt == 0
             })
-        });
-    event.and_then(|event| {
-        let choice = event.provenance.choice.as_ref()?;
-        Some(AttemptSelectionBinding {
-            role,
-            event_assignment_id: event.assignment_id.clone(),
-            event_attempt: event.attempt,
-            normalized_input_sha256: event
-                .provenance
-                .input_digests
-                .normalized_input
-                .value
-                .clone(),
-            task: event.provenance.normalized_task.clone(),
-            requested_candidate: choice.candidate.clone(),
         })
+}
+
+fn parent_attempt_observation(
+    external_run: Option<&ExternalAgentRun>,
+    frozen_catalogs: Option<&[RuntimeCatalog]>,
+) -> (Option<CandidateKey>, Option<u64>) {
+    let Some(external_run) = external_run else {
+        return (None, None);
+    };
+    let Some(parent_evidence) = external_run.grok_acp_parent_evidence.as_ref() else {
+        return (None, None);
+    };
+    let observed_candidate =
+        complete_grok_acp_session(parent_evidence).and_then(|(model, effort)| {
+            frozen_catalogs
+                .and_then(|catalogs| candidate_key_from_admitted_catalogs(catalogs, model, effort))
+        });
+    let execution_cost_microunits = attributable_execution_cost_microunits(parent_evidence);
+    (observed_candidate, execution_cost_microunits)
+}
+
+fn complete_grok_acp_session(evidence: &GrokAcpParentEvidence) -> Option<(&str, ReasoningEffort)> {
+    if evidence.resolution_status != "complete" || evidence.permission_escalation_refused {
+        return None;
+    }
+    let model = resolved_field_known(&evidence.client_resolved_model)?;
+    let effort_label = resolved_field_known(&evidence.client_resolved_effort)?;
+    let effort = reasoning_effort_from_observed_label(effort_label)?;
+    Some((model, effort))
+}
+
+fn resolved_field_known(field: &GrokAcpParentResolvedField) -> Option<&str> {
+    match field {
+        GrokAcpParentResolvedField::Known(value) => Some(value.as_str()),
+        GrokAcpParentResolvedField::Unknown => None,
+    }
+}
+
+fn reasoning_effort_from_observed_label(label: &str) -> Option<ReasoningEffort> {
+    Some(match label {
+        "minimal" | "low" => ReasoningEffort::Low,
+        "medium" => ReasoningEffort::Medium,
+        "high" => ReasoningEffort::High,
+        "xhigh" => ReasoningEffort::Xhigh,
+        "max" => ReasoningEffort::Max,
+        "ultra" => ReasoningEffort::Ultra,
+        _ => return None,
     })
+}
+
+fn candidate_key_from_admitted_catalogs(
+    catalogs: &[RuntimeCatalog],
+    model: &str,
+    effort: ReasoningEffort,
+) -> Option<CandidateKey> {
+    for catalog in catalogs {
+        for listed in &catalog.models {
+            if listed.model == model && listed.supported_efforts.contains(&effort) {
+                return Some(CandidateKey {
+                    runtime: catalog.runtime.clone(),
+                    model: model.to_string(),
+                    effort,
+                });
+            }
+        }
+    }
+    None
+}
+
+fn attributable_execution_cost_microunits(evidence: &GrokAcpParentEvidence) -> Option<u64> {
+    complete_grok_acp_session(evidence)?;
+    match &evidence.native_cost_equivalent_microunits {
+        GrokAcpNativeCostEquivalent::Known { microunits, .. } => Some(*microunits),
+        GrokAcpNativeCostEquivalent::Unknown { .. } => None,
+    }
+}
+
+fn selection_binding_for_attempt(
+    role: AgentRole,
+    assignment_id: &str,
+    attempt: usize,
+    events: &[SupervisorSelectionEvent],
+    initial_events: &[SupervisorSelectionEvent],
+) -> Option<AttemptSelectionBinding> {
+    selection_event_for_attempt(role, assignment_id, attempt, events, initial_events).and_then(
+        |event| {
+            let choice = event.provenance.choice.as_ref()?;
+            Some(AttemptSelectionBinding {
+                role,
+                event_assignment_id: event.assignment_id.clone(),
+                event_attempt: event.attempt,
+                normalized_input_sha256: event
+                    .provenance
+                    .input_digests
+                    .normalized_input
+                    .value
+                    .clone(),
+                task: event.provenance.normalized_task.clone(),
+                requested_candidate: choice.candidate.clone(),
+            })
+        },
+    )
 }
 
 fn write_attempt_evidence(
@@ -1059,5 +1161,286 @@ mod tests {
         other.task_class = "other".to_string();
         assert!(snapshot.outcomes_for(&other).is_empty());
         assert_eq!(snapshot.provenance.snapshot_sha256, "fixture");
+    }
+
+    fn trusted_grok_acp_parent_evidence(
+        model: &str,
+        effort: &str,
+        cost: GrokAcpNativeCostEquivalent,
+    ) -> GrokAcpParentEvidence {
+        GrokAcpParentEvidence {
+            protocol: "grok_acp_stdio".to_string(),
+            session_id: "trusted-parent-session".to_string(),
+            requested_model: None,
+            requested_effort: None,
+            client_resolved_model: GrokAcpParentResolvedField::Known(model.to_string()),
+            client_resolved_effort: GrokAcpParentResolvedField::Known(effort.to_string()),
+            resolution_status: "complete".to_string(),
+            terminal_usage: None,
+            native_cost_equivalent_microunits: cost,
+            permission_escalation_refused: false,
+            structured_output: None,
+            structured_output_error: None,
+            final_text: None,
+            stop_reason: None,
+        }
+    }
+
+    fn grok_worker_selection_event() -> SupervisorSelectionEvent {
+        let decision = crate::selection::select(&crate::selection::selection_test_base_input())
+            .expect("fixture selector decision");
+        let grok_candidate = CandidateKey {
+            runtime: "grok".to_string(),
+            model: "grok-code-fast-1".to_string(),
+            effort: ReasoningEffort::High,
+        };
+        let mut provenance = decision;
+        if let Some(choice) = provenance.choice.as_mut() {
+            choice.candidate = grok_candidate.clone();
+        }
+        SupervisorSelectionEvent {
+            assignment_id: None,
+            attempt: 0,
+            role: AgentRole::Worker,
+            primary_cause: SupervisorSelectionEventCause::Initial,
+            provenance,
+        }
+    }
+
+    fn injected_parent_command(
+        temp: &tempfile::TempDir,
+        repo: &Path,
+    ) -> crate::external_agent::ExternalAgentCommand {
+        crate::external_agent::ExternalAgentCommand::codex(
+            "codex",
+            repo,
+            temp.path().join("parent-acp-prompt.md"),
+            temp.path().join("parent-acp-events.jsonl"),
+            temp.path().join("parent-acp-report.json"),
+            std::time::Duration::from_secs(1),
+        )
+    }
+
+    fn record_attempt_with_parent_run(
+        external_run: Option<ExternalAgentRun>,
+        run_name: &str,
+    ) -> Result<(AttemptOutcomeEvidence, tempfile::TempDir, PathBuf, RunId)> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let run_id = RunId::new(run_name)?;
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "maco-supervise",
+        )?;
+        let mut journal = None;
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let initial = grok_worker_selection_event();
+        let recorded = record_child_attempt_outcome(
+            &artifacts,
+            &run_id,
+            "assignment-1",
+            1,
+            AgentRole::Worker,
+            &[],
+            std::slice::from_ref(&initial),
+            "grok",
+            Some("grok-code-fast-1"),
+            Some("high"),
+            true,
+            false,
+            external_run.as_ref(),
+        )?;
+        let relative = PathBuf::from("selection-attempts/assignment-1.attempt-1.json");
+        let stored_path = repo
+            .join(RunArtifactFamily::Supervise.run_root())
+            .join(run_id.as_str())
+            .join(&relative);
+        let stored: AttemptOutcomeEvidence = serde_json::from_slice(&std::fs::read(&stored_path)?)?;
+        assert_eq!(stored, recorded);
+        Ok((recorded, temp, repo, run_id))
+    }
+
+    fn parent_run_with_trusted_acp(
+        temp: &tempfile::TempDir,
+        repo: &Path,
+        model: &str,
+        cost: GrokAcpNativeCostEquivalent,
+    ) -> ExternalAgentRun {
+        let mut external_run =
+            super::super::tests::injected_verified_run(&injected_parent_command(temp, repo));
+        external_run.grok_acp_parent_evidence =
+            Some(trusted_grok_acp_parent_evidence(model, "high", cost));
+        external_run
+    }
+
+    #[test]
+    fn record_child_attempt_outcome_retains_parent_acp_identity_and_execution_cost() -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let external_run = parent_run_with_trusted_acp(
+            &temp,
+            &repo,
+            "grok-code-fast-1",
+            GrokAcpNativeCostEquivalent::Known {
+                cost_usd_ticks: 20_000_000,
+                microunits: 200,
+            },
+        );
+        let (recorded, _, _, _) =
+            record_attempt_with_parent_run(Some(external_run), "parent-acp-outcome-record")?;
+        let observed = recorded
+            .observed_candidate
+            .as_ref()
+            .expect("mapped observed candidate");
+        assert_eq!(observed.runtime, "grok");
+        assert_eq!(observed.model, "grok-code-fast-1");
+        assert_eq!(observed.effort, ReasoningEffort::High);
+        assert_eq!(recorded.costs.execution_cost_microunits, Some(200));
+        assert!(project_numeric_row(&recorded).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn observed_requested_mismatch_is_recorded_but_not_numeric_eligible() -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let external_run = parent_run_with_trusted_acp(
+            &temp,
+            &repo,
+            "gpt-5.6-sol",
+            GrokAcpNativeCostEquivalent::Known {
+                cost_usd_ticks: 10_000_000,
+                microunits: 100,
+            },
+        );
+        let (recorded, _, _, _) =
+            record_attempt_with_parent_run(Some(external_run), "parent-acp-mismatch-record")?;
+        assert_eq!(
+            recorded
+                .observed_candidate
+                .as_ref()
+                .map(|key| key.model.as_str()),
+            Some("gpt-5.6-sol")
+        );
+        assert!(project_numeric_row(&recorded).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_parent_acp_observation_cannot_promote_identity_or_cost() -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let mut external_run = parent_run_with_trusted_acp(
+            &temp,
+            &repo,
+            "grok-code-fast-1",
+            GrokAcpNativeCostEquivalent::Known {
+                cost_usd_ticks: 1,
+                microunits: 0,
+            },
+        );
+        external_run
+            .grok_acp_parent_evidence
+            .as_mut()
+            .expect("parent evidence")
+            .resolution_status = "incomplete".to_string();
+        let (recorded, _, _, _) =
+            record_attempt_with_parent_run(Some(external_run), "parent-acp-incomplete-record")?;
+        assert!(recorded.observed_candidate.is_none());
+        assert!(recorded.costs.execution_cost_microunits.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_parent_run_cannot_fabricate_observation() -> Result<()> {
+        let (recorded, _, _, _) =
+            record_attempt_with_parent_run(None, "parent-acp-missing-run-record")?;
+        assert!(recorded.observed_candidate.is_none());
+        assert!(recorded.costs.execution_cost_microunits.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn partial_parent_execution_cost_excludes_numeric_projection() -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let external_run = parent_run_with_trusted_acp(
+            &temp,
+            &repo,
+            "grok-code-fast-1",
+            GrokAcpNativeCostEquivalent::Unknown {
+                reason: "terminal usage marked incomplete or cost partial".to_string(),
+            },
+        );
+        let (recorded, _, _, _) =
+            record_attempt_with_parent_run(Some(external_run), "parent-acp-partial-cost-record")?;
+        assert!(recorded.observed_candidate.is_some());
+        assert!(recorded.costs.execution_cost_microunits.is_none());
+        assert!(project_numeric_row(&recorded).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn parent_auditor_retry_preserves_parent_acp_observation() -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let run_id = RunId::new("parent-acp-auditor-retry-record")?;
+        let external_run = parent_run_with_trusted_acp(
+            &temp,
+            &repo,
+            "grok-code-fast-1",
+            GrokAcpNativeCostEquivalent::Known {
+                cost_usd_ticks: 20_000_000,
+                microunits: 200,
+            },
+        );
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "maco-supervise",
+        )?;
+        let mut journal = None;
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let initial = grok_worker_selection_event();
+        let recorded = record_child_attempt_outcome(
+            &artifacts,
+            &run_id,
+            "assignment-1",
+            1,
+            AgentRole::Worker,
+            &[],
+            std::slice::from_ref(&initial),
+            "grok",
+            Some("grok-code-fast-1"),
+            Some("high"),
+            true,
+            false,
+            Some(&external_run),
+        )?;
+        record_parent_auditor_retry(&artifacts, &recorded)?;
+        let stored: AttemptOutcomeEvidence = serde_json::from_slice(&std::fs::read(
+            repo.join(RunArtifactFamily::Supervise.run_root())
+                .join(run_id.as_str())
+                .join("selection-attempts/assignment-1.attempt-1.json"),
+        )?)?;
+        assert_eq!(stored.observed_candidate, recorded.observed_candidate);
+        assert_eq!(
+            stored.costs.execution_cost_microunits,
+            recorded.costs.execution_cost_microunits
+        );
+        assert_eq!(
+            stored.parent_cause.as_deref(),
+            Some("parent_auditor_authorized_retry")
+        );
+        Ok(())
     }
 }

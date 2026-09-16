@@ -4478,6 +4478,721 @@ fn runtime_adapter_argv_propagates_render_failure() {
 }
 
 #[test]
+fn grok_acp_runtime_adapter_argv_uses_contained_agent_stdio() {
+    let mut config = RuntimeAdapterConfig::defaults(RuntimeId::Grok);
+    config.grok_interaction_protocol = crate::runtime_adapter::GrokInteractionProtocol::AcpStdio;
+    config.argument_template =
+        crate::runtime_adapter::grok::GROK_ACP_RUNTIME_DESCRIPTOR.immutable_argument_template();
+    let grok = ExternalAgentCommand::codex(
+        "grok",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(1),
+    )
+    .with_runtime_adapter(RuntimeId::Grok, config)
+    .with_model_selection(Some("grok-4.6".to_string()), Some("xhigh".to_string()));
+    let argv = runtime_adapter_argv(&grok)
+        .expect("Grok ACP argv")
+        .into_iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        argv,
+        [
+            "--sandbox",
+            "strict",
+            "--always-approve",
+            "--disable-web-search",
+            "--no-memory",
+            "--no-subagents",
+            "agent",
+            "--no-leader",
+            "-m",
+            "grok-4.6",
+            "--reasoning-effort",
+            "xhigh",
+            "stdio",
+        ]
+    );
+    assert!(!argv.iter().any(|argument| argument == "--prompt-file"));
+    assert!(!argv.iter().any(|argument| argument == "streaming-json"));
+}
+
+const FAKE_GROK_ACP_DRIVER_PY: &str = r#"import json, sys
+MODE = sys.argv[1]
+SESSION = "sess-managed"
+XAI = "_x.ai/session_notification"
+
+def send(v):
+    sys.stdout.write(json.dumps(v, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        sys.exit(0)
+    return json.loads(line)
+
+msg = recv()
+assert msg["method"] == "initialize"
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"protocolVersion": 1}})
+msg = recv()
+assert msg["method"] == "session/new"
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"sessionId": SESSION}})
+msg = recv()
+assert msg["method"] == "session/set_model"
+send({
+    "jsonrpc": "2.0",
+    "method": XAI,
+    "params": {
+        "sessionId": SESSION,
+        "update": {
+            "sessionUpdate": "model_changed",
+            "model_id": "grok-resolved-4",
+            "reasoning_effort": "high",
+        },
+    },
+})
+send({"jsonrpc": "2.0", "id": msg["id"], "result": {"_meta": {"model": "grok-resolved-4"}}})
+while True:
+    msg = recv()
+    method = msg.get("method")
+    if method == "session/prompt":
+        if MODE == "permission":
+            send({
+                "jsonrpc": "2.0",
+                "id": 99,
+                "method": "session/request_permission",
+                "params": {"sessionId": SESSION, "toolCallId": "tc-1", "options": []},
+            })
+            recv()
+        incomplete = MODE == "incomplete"
+        send({
+            "jsonrpc": "2.0",
+            "id": msg["id"],
+            "result": {
+                "stopReason": "end_turn",
+                "text": "fixture-response",
+                "usage_is_incomplete": incomplete,
+                "cost_is_partial": False,
+                "_meta": {
+                    "structuredOutput": {"accepted": True, "path": "ok.txt"},
+                    "usage": {
+                        "inputTokens": 10,
+                        "outputTokens": 2,
+                        "costUsdTicks": 20000000,
+                    },
+                },
+            },
+        })
+        break
+    if method == "terminal/create":
+        send({
+            "jsonrpc": "2.0",
+            "id": msg["id"],
+            "error": {"code": -32601, "message": "forbidden"},
+        })
+        continue
+    if method == "session/cancel":
+        if "id" in msg:
+            send({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+        break
+"#;
+
+const MANAGED_GROK_ACP_SCHEMA: &str = r#"{"type":"object","required":["accepted","path"],"properties":{"accepted":{"type":"boolean"},"path":{"type":"string"}}}"#;
+
+fn write_fake_grok_acp_stdio_provider(workspace: &Path, mode: &str) -> Result<PathBuf> {
+    let driver = workspace.join("fake-grok-acp-driver.py");
+    fs::write(&driver, FAKE_GROK_ACP_DRIVER_PY)?;
+    let provider = workspace.join(format!("fake-grok-acp-{mode}"));
+    fs::write(
+        &provider,
+        format!(
+            "#!/bin/sh\nset -eu\nMODE={mode}\ncase \" $* \" in *\" agent \"*) ;; *) exit 3;; esac\ncase \" $* \" in *\" --no-leader \"*) ;; *) exit 3;; esac\ncase \" $* \" in *\" stdio \"*) ;; *) exit 4;; esac\nexec python3 \"$(dirname \"$0\")/fake-grok-acp-driver.py\" \"$MODE\"\n"
+        ),
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&provider, fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(provider)
+}
+
+fn managed_child_grok_acp_stdio_command(
+    provider: &Path,
+    workspace: &Path,
+    output_schema: Option<PathBuf>,
+) -> ExternalAgentCommand {
+    let incoming = workspace
+        .parent()
+        .expect("managed child workspace parent")
+        .join("incoming");
+    fs::create_dir_all(&incoming).expect("incoming");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700)).expect("incoming mode");
+    }
+    let mut config = RuntimeAdapterConfig::defaults(RuntimeId::Grok);
+    config.grok_interaction_protocol = crate::runtime_adapter::GrokInteractionProtocol::AcpStdio;
+    config.argument_template =
+        crate::runtime_adapter::grok::GROK_ACP_RUNTIME_DESCRIPTOR.immutable_argument_template();
+    let mut command = ExternalAgentCommand::codex(
+        provider,
+        workspace,
+        workspace.join("prompt.md"),
+        incoming.join("events.jsonl"),
+        incoming.join("report.json"),
+        Duration::from_secs(10),
+    );
+    command.invocation = ExternalAgentInvocation::Grok;
+    command.workspace_access = WorkspaceAccess::ReadOnly;
+    command.runtime_adapter = Some(config);
+    command.model = Some("grok-requested-4".to_string());
+    command.reasoning_effort = Some("low".to_string());
+    command.output_schema = output_schema;
+    command
+}
+
+#[test]
+fn nonpublishable_managed_child_grok_acp_stdio_run_external_agent_parent_evidence() -> Result<()> {
+    use crate::process_runner::ProcessTreeEvidence;
+    use crate::runtime_adapter::grok::{GrokAcpNativeCostEquivalent, GrokAcpParentResolvedField};
+
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("child-worktree");
+    create_mandatory_control_roots(&workspace)?;
+    fs::write(workspace.join("prompt.md"), "managed child acp prompt\n")?;
+    let schema_path = workspace.join("worker-report.schema.json");
+    fs::write(&schema_path, MANAGED_GROK_ACP_SCHEMA)?;
+    let provider = write_fake_grok_acp_stdio_provider(temp.path(), "success")?;
+    let command = managed_child_grok_acp_stdio_command(&provider, &workspace, Some(schema_path));
+    let report = run_external_agent_nonpublishable_simulation(&command);
+    assert!(
+        report.error.is_none(),
+        "managed Grok ACP simulation failed: {:?}",
+        report.error
+    );
+    assert_eq!(report.exit_code, Some(0));
+    assert!(report.stdout.target_launch_attempted);
+    assert!(report.grok_stream_usage_evidence.is_none());
+    let evidence = report
+        .grok_acp_parent_evidence
+        .as_ref()
+        .context("parent must author Grok ACP evidence")?;
+    assert_eq!(
+        evidence.requested_model.as_deref(),
+        Some("grok-requested-4")
+    );
+    assert_eq!(evidence.requested_effort.as_deref(), Some("low"));
+    assert_eq!(
+        evidence.client_resolved_model,
+        GrokAcpParentResolvedField::Known("grok-resolved-4".to_string())
+    );
+    assert_eq!(
+        evidence.client_resolved_effort,
+        GrokAcpParentResolvedField::Known("high".to_string())
+    );
+    assert_eq!(evidence.resolution_status, "complete");
+    assert_eq!(
+        evidence.native_cost_equivalent_microunits,
+        GrokAcpNativeCostEquivalent::Known {
+            cost_usd_ticks: 20_000_000,
+            microunits: 200,
+        }
+    );
+    assert!(!evidence.permission_escalation_refused);
+    assert!(matches!(
+        report.process_tree,
+        Some(ProcessTreeEvidence::TrustedBestEffort(_))
+    ));
+    let staged = fs::read_to_string(command.output_last_message)?;
+    assert!(staged.contains("\"accepted\":true") || staged.contains("\"accepted\": true"));
+    Ok(())
+}
+
+#[test]
+fn nonpublishable_managed_child_grok_acp_stdio_incomplete_usage_not_complete() -> Result<()> {
+    use crate::runtime_adapter::grok::GrokAcpNativeCostEquivalent;
+
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("child-worktree");
+    create_mandatory_control_roots(&workspace)?;
+    fs::write(workspace.join("prompt.md"), "incomplete usage\n")?;
+    let provider = write_fake_grok_acp_stdio_provider(temp.path(), "incomplete")?;
+    let command = managed_child_grok_acp_stdio_command(&provider, &workspace, None);
+    let report = run_external_agent_nonpublishable_simulation(&command);
+    let evidence = report
+        .grok_acp_parent_evidence
+        .as_ref()
+        .context("ACP evidence")?;
+    assert_ne!(evidence.resolution_status, "complete");
+    assert!(matches!(
+        evidence.native_cost_equivalent_microunits,
+        GrokAcpNativeCostEquivalent::Unknown { .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn nonpublishable_managed_child_grok_acp_stdio_permission_escalation_refused() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("child-worktree");
+    create_mandatory_control_roots(&workspace)?;
+    fs::write(workspace.join("prompt.md"), "permission\n")?;
+    let provider = write_fake_grok_acp_stdio_provider(temp.path(), "permission")?;
+    let command = managed_child_grok_acp_stdio_command(&provider, &workspace, None);
+    let report = run_external_agent_nonpublishable_simulation(&command);
+    let evidence = report
+        .grok_acp_parent_evidence
+        .as_ref()
+        .context("ACP evidence")?;
+    assert!(evidence.permission_escalation_refused);
+    Ok(())
+}
+
+const WRITABLE_GROK_ACP_FIXTURE_DIR: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/runtime_adapter/grok"
+);
+const WRITABLE_GROK_ACP_PRODUCTION_TEST_NAME: &str =
+    "external_agent::tests::writable_grok_acp_run_external_agent_accepts_bounded_write_and_parent_evidence";
+const WRITABLE_GROK_ACP_PRODUCTION_HELPER_ENV: &str =
+    "MACO_TEST_WRITABLE_GROK_ACP_PRODUCTION_HELPER";
+const WRITABLE_GROK_ACP_PRODUCTION_HELPER_RECEIPT_ENV: &str =
+    "MACO_TEST_WRITABLE_GROK_ACP_PRODUCTION_HELPER_RECEIPT";
+const WRITABLE_GROK_ACP_PRODUCTION_HELPER_RECEIPT: &[u8] =
+    b"writable Grok ACP production helper completed\n";
+const WRITABLE_GROK_ACP_STRUCTURED_OUTPUT_SCHEMA: &str = r#"{"properties":{"accepted":{"type":"boolean"},"path":{"type":"string"}},"required":["accepted","path"],"type":"object"}"#;
+
+#[cfg(unix)]
+fn install_selected_writable_grok_acp_executable(
+    bin: &Path,
+    mode: &str,
+    grok_home: &Path,
+) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture_dir = Path::new(WRITABLE_GROK_ACP_FIXTURE_DIR);
+    let provider_src = fixture_dir.join("writable-managed-child-acp-provider.sh");
+    let provider_dst = bin.join("writable-grok-acp-selected");
+    let hidden_auth = grok_home
+        .join("auth.json")
+        .to_str()
+        .context("UTF-8 ambient Grok auth path")?
+        .replace('\'', "'\\''");
+    let escaped_mode = mode.replace('\'', "'\\''");
+    let body = fs::read_to_string(&provider_src)?
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let body = body.strip_prefix("#!/bin/sh\n").unwrap_or(&body);
+    fs::write(
+        &provider_dst,
+        format!(
+            "#!/bin/sh\nset -eu\nexport MACO_WRITABLE_GROK_ACP_FIXTURE_MODE='{escaped_mode}'\n[ ! -r '{hidden_auth}' ]\n{body}"
+        ),
+    )?;
+    fs::set_permissions(&provider_dst, fs::Permissions::from_mode(0o755))?;
+    Ok(provider_dst)
+}
+
+#[cfg(unix)]
+fn selected_writable_grok_acp_stdio_command(
+    program: &Path,
+    workspace: &Path,
+    prompt: &Path,
+    incoming: &Path,
+    schema: Option<PathBuf>,
+) -> Result<ExternalAgentCommand> {
+    let mut config = RuntimeAdapterConfig::defaults(RuntimeId::Grok);
+    config.grok_interaction_protocol = crate::runtime_adapter::GrokInteractionProtocol::AcpStdio;
+    config.argument_template =
+        crate::runtime_adapter::grok::GROK_ACP_RUNTIME_DESCRIPTOR.immutable_argument_template();
+    config.binary = Some(program.to_path_buf());
+    let mut command = ExternalAgentCommand::codex(
+        program,
+        workspace,
+        prompt,
+        incoming.join("events.jsonl"),
+        incoming.join("report.json"),
+        Duration::from_secs(30),
+    )
+    .with_runtime_adapter(RuntimeId::Grok, config)
+    .with_model_selection(Some("grok-4.6".to_string()), Some("xhigh".to_string()))
+    .with_workspace_access(WorkspaceAccess::ReadWrite)
+    .with_writable_launch_target(WritableLaunchTarget::ManagedChildWorktree);
+    command.output_schema = schema;
+    Ok(command)
+}
+
+#[cfg(target_os = "linux")]
+fn run_writable_grok_acp_helper_subprocess(test_name: &str) -> Result<()> {
+    const HELPER_STDERR_MAX_BYTES: usize = 64 * 1024;
+
+    let temp = tempfile::tempdir()?;
+    let grok_home = temp.path().join("grok-home");
+    fs::create_dir(&grok_home)?;
+    fs::write(grok_home.join("auth.json"), "hermetic-grok-auth-fixture\n")?;
+    fs::write(
+        grok_home.join("ambient-secret"),
+        "must stay outside the child\n",
+    )?;
+
+    let environment = BTreeMap::from([
+        (
+            WRITABLE_GROK_ACP_PRODUCTION_HELPER_ENV.to_string(),
+            "1".to_string(),
+        ),
+        (
+            "GROK_HOME".to_string(),
+            grok_home
+                .to_str()
+                .context("writable Grok ACP helper home path is not UTF-8")?
+                .to_string(),
+        ),
+    ]);
+    let output = crate::process_runner::run_process(
+        ProcessSpec::direct(
+            "exact writable Grok ACP helper test",
+            std::env::current_exe()?,
+            ["--exact", test_name, "--nocapture", "--test-threads=1"],
+            std::env::current_dir()?,
+            HELPER_STDERR_MAX_BYTES,
+        )
+        .with_environment(EnvironmentMode::InheritAndSet(environment))
+        .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort)
+        .with_stdin(StdinMode::Null)
+        .with_timeout(Some(Duration::from_secs(90)))
+        .with_stdout(StreamCapture::bounded(0))
+        .with_stderr(StreamCapture::bounded(HELPER_STDERR_MAX_BYTES)),
+    )
+    .context("spawn exact writable Grok ACP helper test")?;
+    let stderr = String::from_utf8_lossy(output.stderr.as_bytes());
+    if !output
+        .status
+        .as_ref()
+        .is_some_and(|status| status.success())
+        || output.timed_out
+        || output.process_error.is_some()
+        || output.stdin_error.is_some()
+    {
+        bail!("writable Grok ACP helper failed; stderr:\n{stderr}");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn run_writable_grok_acp_production_helper_subprocess() -> Result<()> {
+    const HELPER_STDERR_MAX_BYTES: usize = 64 * 1024;
+
+    let temp = tempfile::tempdir()?;
+    let grok_home = temp.path().join("grok-home");
+    let receipt = temp.path().join("helper-completed");
+    fs::create_dir(&grok_home)?;
+    fs::write(grok_home.join("auth.json"), "hermetic-grok-auth-fixture\n")?;
+    fs::write(
+        grok_home.join("ambient-secret"),
+        "must stay outside the child\n",
+    )?;
+    if receipt.try_exists()? {
+        bail!("writable Grok ACP helper receipt must start absent");
+    }
+
+    let environment = BTreeMap::from([
+        (
+            WRITABLE_GROK_ACP_PRODUCTION_HELPER_ENV.to_string(),
+            "1".to_string(),
+        ),
+        (
+            WRITABLE_GROK_ACP_PRODUCTION_HELPER_RECEIPT_ENV.to_string(),
+            receipt
+                .to_str()
+                .context("writable Grok ACP helper receipt path is not UTF-8")?
+                .to_string(),
+        ),
+        (
+            "GROK_HOME".to_string(),
+            grok_home
+                .to_str()
+                .context("writable Grok ACP helper home path is not UTF-8")?
+                .to_string(),
+        ),
+    ]);
+    let output = crate::process_runner::run_process(
+        ProcessSpec::direct(
+            "exact writable Grok ACP production helper test",
+            std::env::current_exe()?,
+            [
+                "--exact",
+                WRITABLE_GROK_ACP_PRODUCTION_TEST_NAME,
+                "--nocapture",
+                "--test-threads=1",
+            ],
+            std::env::current_dir()?,
+            HELPER_STDERR_MAX_BYTES,
+        )
+        .with_environment(EnvironmentMode::InheritAndSet(environment))
+        .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort)
+        .with_stdin(StdinMode::Null)
+        .with_timeout(Some(Duration::from_secs(90)))
+        .with_stdout(StreamCapture::bounded(0))
+        .with_stderr(StreamCapture::bounded(HELPER_STDERR_MAX_BYTES)),
+    )
+    .context("spawn exact writable Grok ACP production helper test")?;
+    let stderr = String::from_utf8_lossy(output.stderr.as_bytes());
+    if !output
+        .status
+        .as_ref()
+        .is_some_and(|status| status.success())
+        || output.timed_out
+        || output.process_error.is_some()
+        || output.stdin_error.is_some()
+    {
+        bail!("writable Grok ACP production helper failed; stderr:\n{stderr}");
+    }
+    let observed_receipt = fs::read(&receipt).context("writable Grok ACP helper receipt")?;
+    if observed_receipt.as_slice() != WRITABLE_GROK_ACP_PRODUCTION_HELPER_RECEIPT {
+        bail!("writable Grok ACP helper wrote an invalid receipt");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn writable_grok_acp_run_external_agent_accepts_bounded_write_and_parent_evidence() -> Result<()> {
+    let cgroups = fs::read_to_string("/proc/self/cgroup")?;
+    if let Some(message) =
+        crate::containment_probe::skip_reason(WRITABLE_GROK_ACP_PRODUCTION_TEST_NAME, &cgroups)
+    {
+        write_visible_grok_production_skip(&message)?;
+        return Ok(());
+    }
+    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none()
+        && std::env::var_os("XDG_RUNTIME_DIR").is_none()
+    {
+        write_visible_grok_production_skip(&format!(
+            "SKIP {WRITABLE_GROK_ACP_PRODUCTION_TEST_NAME}: DBUS_SESSION_BUS_ADDRESS and XDG_RUNTIME_DIR are both absent"
+        ))?;
+        return Ok(());
+    }
+    match std::env::var_os(WRITABLE_GROK_ACP_PRODUCTION_HELPER_ENV) {
+        None => return run_writable_grok_acp_production_helper_subprocess(),
+        Some(value) if value == std::ffi::OsStr::new("1") => {}
+        Some(_) => bail!("writable Grok ACP production helper selector must be unset or exactly 1"),
+    }
+    writable_grok_acp_run_external_agent_helper("success")
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn writable_grok_acp_run_external_agent_permission_denied_has_no_bounded_effect() -> Result<()> {
+    const TEST_NAME: &str =
+        "external_agent::tests::writable_grok_acp_run_external_agent_permission_denied_has_no_bounded_effect";
+    let cgroups = fs::read_to_string("/proc/self/cgroup")?;
+    if let Some(message) = crate::containment_probe::skip_reason(TEST_NAME, &cgroups) {
+        write_visible_grok_production_skip(&message)?;
+        return Ok(());
+    }
+    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none()
+        && std::env::var_os("XDG_RUNTIME_DIR").is_none()
+    {
+        write_visible_grok_production_skip(&format!(
+            "SKIP {TEST_NAME}: DBUS_SESSION_BUS_ADDRESS and XDG_RUNTIME_DIR are both absent"
+        ))?;
+        return Ok(());
+    }
+    match std::env::var_os(WRITABLE_GROK_ACP_PRODUCTION_HELPER_ENV) {
+        None => return run_writable_grok_acp_helper_subprocess(TEST_NAME),
+        Some(value) if value == std::ffi::OsStr::new("1") => {}
+        Some(_) => bail!("writable Grok ACP production helper selector must be unset or exactly 1"),
+    }
+    writable_grok_acp_run_external_agent_helper("permission")
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn writable_grok_acp_run_external_agent_outside_assigned_path_stays_denied() -> Result<()> {
+    const TEST_NAME: &str =
+        "external_agent::tests::writable_grok_acp_run_external_agent_outside_assigned_path_stays_denied";
+    let cgroups = fs::read_to_string("/proc/self/cgroup")?;
+    if let Some(message) = crate::containment_probe::skip_reason(TEST_NAME, &cgroups) {
+        write_visible_grok_production_skip(&message)?;
+        return Ok(());
+    }
+    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none()
+        && std::env::var_os("XDG_RUNTIME_DIR").is_none()
+    {
+        write_visible_grok_production_skip(&format!(
+            "SKIP {TEST_NAME}: DBUS_SESSION_BUS_ADDRESS and XDG_RUNTIME_DIR are both absent"
+        ))?;
+        return Ok(());
+    }
+    match std::env::var_os(WRITABLE_GROK_ACP_PRODUCTION_HELPER_ENV) {
+        None => return run_writable_grok_acp_helper_subprocess(TEST_NAME),
+        Some(value) if value == std::ffi::OsStr::new("1") => {}
+        Some(_) => bail!("writable Grok ACP production helper selector must be unset or exactly 1"),
+    }
+    writable_grok_acp_run_external_agent_helper("outside_write")
+}
+
+#[cfg(target_os = "linux")]
+fn writable_grok_acp_run_external_agent_helper(fixture_mode: &str) -> Result<()> {
+    use crate::process_runner::ProcessTreeEvidence;
+    use crate::runtime_adapter::grok::{GrokAcpNativeCostEquivalent, GrokAcpParentResolvedField};
+    use std::os::unix::fs::PermissionsExt;
+
+    let grok_home = PathBuf::from(
+        std::env::var_os("GROK_HOME")
+            .context("writable Grok ACP production helper requires process-local GROK_HOME")?,
+    );
+    assert_eq!(
+        fs::read_to_string(grok_home.join("auth.json"))?,
+        "hermetic-grok-auth-fixture\n"
+    );
+    let helper_receipt =
+        std::env::var_os(WRITABLE_GROK_ACP_PRODUCTION_HELPER_RECEIPT_ENV).map(PathBuf::from);
+    if fixture_mode == "success" {
+        let receipt = helper_receipt
+            .as_ref()
+            .context("success helper requires receipt path")?;
+        if receipt.try_exists()? {
+            bail!("writable Grok ACP helper receipt must start absent");
+        }
+    }
+
+    let temp = tempfile::tempdir()?;
+    let repos = temp.path().join("repos");
+    fs::create_dir(&repos)?;
+    let (primary, child, _common, _child_git_dir) = create_linked_git_metadata_fixture(&repos)?;
+    let incoming = temp.path().join("incoming");
+    let prompt_root = temp.path().join("prompt-root");
+    let schema_root = temp.path().join("schema-root");
+    let bin = temp.path().join("bin");
+    fs::create_dir(&incoming)?;
+    fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+    fs::create_dir(&prompt_root)?;
+    fs::create_dir(&schema_root)?;
+    fs::create_dir(&bin)?;
+    let prompt = prompt_root.join("prompt.md");
+    fs::write(&prompt, "write the bounded managed-child result\n")?;
+    let schema = schema_root.join("worker-report.schema.json");
+    fs::write(&schema, WRITABLE_GROK_ACP_STRUCTURED_OUTPUT_SCHEMA)?;
+    let program = install_selected_writable_grok_acp_executable(&bin, fixture_mode, &grok_home)?;
+    let outside = repos.join("outside-untouched.txt");
+    fs::write(&outside, "outside\n")?;
+
+    let primary_before = snapshot_primary_git_surface(&primary)?;
+    let primary_status_before = snapshot_worktree_status(&primary)?;
+
+    let declared = selected_writable_grok_acp_stdio_command(
+        &program,
+        &child,
+        &prompt,
+        &incoming,
+        Some(schema.clone()),
+    )?
+    .with_agent_lifecycle(&primary, "worker", "run-grok-acp", "grok-worker")
+    .with_writable_runtime_selection("grok-worker", RuntimeId::Grok, true)?
+    .with_worktree_writable_confinement(writable_grok_confinement(SideEffectConfinement::Verified));
+
+    let report = run_external_agent(&declared);
+    let stderr = String::from_utf8_lossy(&report.stderr.bytes);
+    let evidence = report.grok_acp_parent_evidence.as_ref().with_context(|| {
+        format!(
+            "verified writable Grok ACP must author parent evidence; error={:?}; launch={}; exit={:?}; stderr={stderr}",
+            report.error,
+            report.stdout.target_launch_attempted,
+            report.exit_code
+        )
+    })?;
+
+    if fixture_mode == "success" {
+        assert!(
+            report.error.is_none(),
+            "writable Grok ACP path failed: {:?}",
+            report.error
+        );
+        assert_eq!(report.exit_code, Some(0));
+        assert!(report.stdout.target_launch_attempted);
+        assert!(report.grok_stream_usage_evidence.is_none());
+        assert_eq!(
+            evidence.client_resolved_model,
+            GrokAcpParentResolvedField::Known("maco-fixture-synthetic-4.6".to_string())
+        );
+        assert_eq!(
+            evidence.client_resolved_effort,
+            GrokAcpParentResolvedField::Known("xhigh".to_string())
+        );
+        assert_eq!(evidence.resolution_status, "complete");
+        assert!(!evidence.permission_escalation_refused);
+        assert_eq!(
+            evidence.native_cost_equivalent_microunits,
+            GrokAcpNativeCostEquivalent::Known {
+                cost_usd_ticks: 20_000_000,
+                microunits: 200,
+            }
+        );
+        assert_eq!(
+            report.output_last_message(),
+            Some(br#"{"accepted":true,"path":"bounded-result.txt"}"#.as_slice())
+        );
+        assert_eq!(
+            fs::read_to_string(child.join("bounded-result.txt"))?,
+            "bounded managed child acp write\n"
+        );
+        assert_eq!(fs::read_to_string(&outside)?, "outside\n");
+        assert!(report
+            .process_tree
+            .is_some_and(ProcessTreeEvidence::is_verified_empty));
+        assert_eq!(
+            report.side_effects,
+            Some(SideEffectConfinementEvidence::Verified(
+                SideEffectConfinementProfileKind::ExternalGrok
+            ))
+        );
+        assert_eq!(snapshot_primary_git_surface(&primary)?, primary_before);
+        assert_eq!(snapshot_worktree_status(&primary)?, primary_status_before);
+        let receipt = helper_receipt.context("success helper receipt path")?;
+        fs::write(&receipt, WRITABLE_GROK_ACP_PRODUCTION_HELPER_RECEIPT)?;
+        return Ok(());
+    }
+
+    if fixture_mode == "permission" {
+        assert!(evidence.permission_escalation_refused);
+        assert!(!child.join("bounded-result.txt").exists());
+        assert_eq!(fs::read_to_string(&outside)?, "outside\n");
+        assert!(!report.publishable);
+        return Ok(());
+    }
+
+    if fixture_mode == "outside_write" {
+        assert_eq!(fs::read_to_string(&outside)?, "outside\n");
+        assert!(!child.join("bounded-result.txt").exists());
+        return Ok(());
+    }
+
+    bail!("unknown writable Grok ACP fixture mode: {fixture_mode}");
+}
+
+#[test]
+fn nonpublishable_managed_child_grok_acp_stdio_cancelled_before_launch() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("child-worktree");
+    create_mandatory_control_roots(&workspace).expect("controls");
+    fs::write(workspace.join("prompt.md"), "cancel\n").expect("prompt");
+    let provider = write_fake_grok_acp_stdio_provider(temp.path(), "success").expect("provider");
+    let command = managed_child_grok_acp_stdio_command(&provider, &workspace, None);
+    let cancellation = ProcessCancellation::new();
+    cancellation.cancel();
+    let report = run_external_agent_nonpublishable_simulation_cancellable(&command, &cancellation);
+    assert!(!report.stdout.target_launch_attempted);
+    assert!(report.grok_acp_parent_evidence.is_none());
+}
+
+#[test]
 fn grok_runtime_adapter_argv_immutably_disables_subagents() {
     let grok = ExternalAgentCommand::codex(
         "grok",
@@ -5344,6 +6059,7 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
             error: None,
             output_last_message: None,
             grok_stream_usage_evidence: None,
+            grok_acp_parent_evidence: None,
         };
         let side_effects = if command.invocation == ExternalAgentInvocation::Grok {
             SideEffectConfinementEvidence::Verified(SideEffectConfinementProfileKind::ExternalGrok)
@@ -5378,6 +6094,7 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
                 protected_controls: &protected_controls,
                 argv_digest: "digest",
                 program_identity: &program_identity,
+                grok_acp_parent_evidence: None,
             },
         );
         Ok(report)
@@ -6045,6 +6762,7 @@ fn external_errors_are_composed_and_success_requires_verified_empty_containment(
         error: None,
         output_last_message: None,
         grok_stream_usage_evidence: None,
+        grok_acp_parent_evidence: None,
     };
     assert!(!report.succeeded());
     report.process_tree = Some(ProcessTreeEvidence::TrustedBestEffort(
@@ -6206,6 +6924,7 @@ fn verified_nonzero_target_retains_permission_and_containment_evidence() -> Resu
         error: None,
         output_last_message: None,
         grok_stream_usage_evidence: None,
+        grok_acp_parent_evidence: None,
     };
     let output = ProcessOutput {
         status: Some(ExitStatus::from_raw(7 << 8)),
@@ -6236,6 +6955,7 @@ fn verified_nonzero_target_retains_permission_and_containment_evidence() -> Resu
             protected_controls: &protected_controls,
             argv_digest: "verified-argv-digest",
             program_identity: &program_identity,
+            grok_acp_parent_evidence: None,
         },
     );
 

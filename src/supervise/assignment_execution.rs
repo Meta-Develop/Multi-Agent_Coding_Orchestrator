@@ -123,7 +123,7 @@ pub(crate) fn selected_runtime_program(
         SupervisorRuntime::Cursor
         | SupervisorRuntime::ClaudeCode
         | SupervisorRuntime::GeminiCli => Ok(
-            crate::runtime_adapter::RuntimeAdapterConfig::from_environment(launch_runtime)
+            crate::runtime_adapter::RuntimeAdapterConfig::try_from_environment(launch_runtime)?
                 .binary
                 .filter(|path| !path.as_os_str().is_empty())
                 .unwrap_or_else(|| PathBuf::from(launch_runtime.default_binary())),
@@ -588,7 +588,7 @@ fn bind_selected_runtime_launch(
         command.program = selected_runtime_program(launch_runtime, options)?;
         command = command.with_runtime_adapter(
             launch_runtime,
-            crate::runtime_adapter::RuntimeAdapterConfig::from_environment(launch_runtime),
+            crate::runtime_adapter::RuntimeAdapterConfig::try_from_environment(launch_runtime)?,
         );
         if command.runtime_adapter.is_none() {
             bail!(
@@ -3465,7 +3465,7 @@ fn prepare_parent_auditor<'a>(
         auditor_command.program = selected_runtime_program(launch_runtime, options)?;
         auditor_command = auditor_command.with_runtime_adapter(
             launch_runtime,
-            crate::runtime_adapter::RuntimeAdapterConfig::from_environment(launch_runtime),
+            crate::runtime_adapter::RuntimeAdapterConfig::try_from_environment(launch_runtime)?,
         );
     }
     // `lens` already comes from the active budget-policy plan. Keep its per-lens model and
@@ -4530,11 +4530,13 @@ fn execute_supervisor_assignment_inner(
                         requested_effort.as_deref(),
                         context.execution_runtime == SupervisorExecutionRuntime::Verified,
                         false,
+                        None,
                     )?;
                     return Err(error);
                 }
             };
             let attempted_launch_model_provenance = collected.model_provenance.clone();
+            let attempt_external_run = collected.external_run.clone();
             let disposition = match decide_child_attempt(
                 context,
                 outcome,
@@ -4562,6 +4564,7 @@ fn execute_supervisor_assignment_inner(
                         requested_effort.as_deref(),
                         context.execution_runtime == SupervisorExecutionRuntime::Verified,
                         false,
+                        Some(&attempt_external_run),
                     )?;
                     return Err(error);
                 }
@@ -4579,6 +4582,7 @@ fn execute_supervisor_assignment_inner(
                 requested_effort.as_deref(),
                 context.execution_runtime == SupervisorExecutionRuntime::Verified,
                 matches!(&disposition, ChildAttemptDisposition::Retry),
+                Some(&attempt_external_run),
             )?;
             match disposition {
                 ChildAttemptDisposition::Retry => continue,
@@ -4990,19 +4994,37 @@ mod decomposition_tests {
     static GROK_BINARY_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
     struct GrokBinaryEnvironmentGuard {
-        previous: Option<OsString>,
+        previous: Vec<(&'static str, Option<OsString>)>,
     }
 
     impl GrokBinaryEnvironmentGuard {
         fn install(program: &Path) -> (MutexGuard<'static, ()>, Self) {
+            Self::install_with(program, &[])
+        }
+
+        fn install_with(
+            program: &Path,
+            extra: &[(&'static str, Option<&str>)],
+        ) -> (MutexGuard<'static, ()>, Self) {
             let lock = GROK_BINARY_ENVIRONMENT_LOCK
                 .lock()
                 .expect("lock Grok binary environment");
-            let previous = std::env::var_os("MACO_GROK_BIN");
-            // SAFETY: this test serializes its MACO_GROK_BIN mutation and the
-            // guard restores the exact prior process value before releasing
-            // that lock.
-            unsafe { std::env::set_var("MACO_GROK_BIN", program) };
+            let mut previous = Vec::new();
+            let mut apply = |name: &'static str, value: Option<&std::ffi::OsStr>| {
+                previous.push((name, std::env::var_os(name)));
+                // SAFETY: this test serializes MACO_GROK_* mutation under
+                // GROK_BINARY_ENVIRONMENT_LOCK and restores prior values in Drop.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            };
+            apply("MACO_GROK_BIN", Some(program.as_os_str()));
+            for (name, value) in extra {
+                apply(name, value.map(std::ffi::OsStr::new));
+            }
             (lock, Self { previous })
         }
     }
@@ -5012,9 +5034,11 @@ mod decomposition_tests {
             // SAFETY: the corresponding lock remains held until after this
             // guard drops because the tuple binding declares it first.
             unsafe {
-                match &self.previous {
-                    Some(previous) => std::env::set_var("MACO_GROK_BIN", previous),
-                    None => std::env::remove_var("MACO_GROK_BIN"),
+                for (name, previous) in self.previous.drain(..).rev() {
+                    match previous {
+                        Some(previous) => std::env::set_var(name, previous),
+                        None => std::env::remove_var(name),
+                    }
                 }
             }
         }
@@ -8149,6 +8173,125 @@ done
         Ok(())
     }
 
+    fn bind_selector_grok_worker_launch(
+        extra_env: &[(&'static str, Option<&str>)],
+    ) -> Result<(tempfile::TempDir, SupervisorRuntime, ExternalAgentCommand)> {
+        let temp = tempfile::tempdir()?;
+        let primary = temp.path().join("primary");
+        let managed_child = temp.path().join("managed-child");
+        let incoming = temp.path().join("incoming");
+        let bin = temp.path().join("bin");
+        for directory in [&primary, &managed_child, &incoming, &bin] {
+            fs::create_dir(directory)?;
+        }
+        let prompt = temp.path().join("prompt.txt");
+        fs::write(&prompt, "bounded selected Grok task\n")?;
+        let grok = bin.join("grok");
+        fs::write(&grok, "fixture")?;
+        let (_environment_lock, _environment_guard) =
+            GrokBinaryEnvironmentGuard::install_with(&grok, extra_env);
+        let assignment = OrchestratorAssignment {
+            id: "grok-worker".to_string(),
+            phase: AssignmentPhase::Execution,
+            runtime: None,
+            role: AgentRole::Worker,
+            role_category: Some(RoleCategory::NonDelegatingTerminalWorker),
+            selection_source: Some(AssignmentSelectionSource::Automatic),
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        };
+        let mut policy = AssignmentBudgetPolicy::default();
+        policy.set_selector_binding_for_test(
+            AgentRole::Worker,
+            SupervisorRuntime::Grok,
+            RoleModelSelection {
+                model: Some("grok-4.6".to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        let plan = policy.apply(&worker_plan("gpt-5.6-codex"));
+        let catalog =
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-codex"])?);
+        let initial_command = ExternalAgentCommand::codex(
+            "unused-codex",
+            &managed_child,
+            &prompt,
+            incoming.join("events.jsonl"),
+            incoming.join("report.json"),
+            Duration::from_secs(1),
+        )
+        .with_hidden_root(&primary);
+        let bound = bind_selected_assignment_launch_for_test(
+            initial_command,
+            &assignment,
+            &policy,
+            &plan,
+            &launch_fixture_options(SupervisorRuntime::Codex),
+            &catalog,
+        );
+        drop(_environment_guard);
+        drop(_environment_lock);
+        let (runtime, command) = bound?;
+        Ok((temp, runtime, command))
+    }
+
+    #[test]
+    fn selector_bound_grok_worker_uses_checked_acp_protocol_and_ignores_operator_args() -> Result<()>
+    {
+        let (_temp, runtime, command) = bind_selector_grok_worker_launch(&[
+            ("MACO_GROK_INTERACTION_PROTOCOL", Some("acp_stdio")),
+            (
+                "MACO_GROK_ARGS",
+                Some("--prompt-file {prompt} --permission-mode dontAsk"),
+            ),
+        ])?;
+        assert_eq!(runtime, SupervisorRuntime::Grok);
+        let adapter = command
+            .runtime_adapter
+            .as_ref()
+            .context("selected Grok runtime adapter")?;
+        assert_eq!(
+            adapter.grok_interaction_protocol(),
+            crate::runtime_adapter::GrokInteractionProtocol::AcpStdio
+        );
+        let argv = crate::external_agent::command_argv(&command)
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(argv
+            .windows(2)
+            .any(|window| window == ["agent", "--no-leader"]));
+        assert_eq!(argv.last().map(String::as_str), Some("stdio"));
+        assert!(!argv.iter().any(|argument| argument == "streaming-json"));
+        assert!(!argv.iter().any(|argument| argument == "--prompt-file"));
+        Ok(())
+    }
+
+    #[test]
+    fn selector_bound_grok_worker_refuses_unsupported_interaction_protocol() -> Result<()> {
+        let error = match bind_selector_grok_worker_launch(&[(
+            "MACO_GROK_INTERACTION_PROTOCOL",
+            Some("native"),
+        )]) {
+            Ok((_, runtime, _)) => bail!("unsupported protocol launched as {runtime:?}"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("MACO_GROK_INTERACTION_PROTOCOL"),
+            "{message}"
+        );
+        assert!(message.contains("native"), "{message}");
+        Ok(())
+    }
+
     #[test]
     fn writable_grok_supervisor_admission_names_missing_stale_and_inexact_selection() -> Result<()>
     {
@@ -8885,6 +9028,7 @@ done
             working_dir_flag: None,
             output_capture: crate::runtime_adapter::OutputCaptureMode::Stdout,
             feed_prompt_on_stdin: true,
+            grok_interaction_protocol: crate::runtime_adapter::GrokInteractionProtocol::default(),
         });
         let error = prerender_selected_runtime_adapter_command(&command, SupervisorRuntime::Cursor)
             .expect_err("empty adapter argv must fail closed");
