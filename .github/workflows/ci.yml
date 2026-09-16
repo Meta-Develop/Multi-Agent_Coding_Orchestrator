@@ -61,7 +61,9 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Run all tests
-        run: cargo test --locked --all-targets
+        run: |
+          bash .github/scripts/run-linux-all-tests-in-delegated-user-scope.sh \
+            cargo test --locked --all-targets
 
   portable-build:
     name: ${{ matrix.os }} compile and test build
