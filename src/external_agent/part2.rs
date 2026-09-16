@@ -711,13 +711,25 @@ pub(crate) fn supervisor_catalog_preflight_refuse_sealed_executable_resolution_d
 thread_local! {
     static INJECTED_TRUSTED_CODEX_EXECUTABLE: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
+    static INJECTED_CODEX_AUTH_HOME: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
     static CODEX_RUNTIME_MODEL_CATALOG_PROCESS_LAUNCH_ATTEMPTS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 pub(crate) fn set_injected_trusted_codex_executable_for_test(path: Option<PathBuf>) {
-    INJECTED_TRUSTED_CODEX_EXECUTABLE.with(|injected| *injected.borrow_mut() = path);
+    let _ = replace_injected_trusted_codex_executable_for_test(path);
+}
+
+#[cfg(test)]
+fn replace_injected_trusted_codex_executable_for_test(path: Option<PathBuf>) -> Option<PathBuf> {
+    INJECTED_TRUSTED_CODEX_EXECUTABLE.with(|injected| injected.replace(path))
+}
+
+#[cfg(test)]
+pub(crate) fn set_injected_codex_auth_home_for_test(home: Option<PathBuf>) -> Option<PathBuf> {
+    INJECTED_CODEX_AUTH_HOME.with(|injected| injected.replace(home))
 }
 
 #[cfg(test)]
@@ -1172,12 +1184,35 @@ fn validate_codex_model_slug(slug: &str) -> Result<()> {
     Ok(())
 }
 
+/// Classify program trust before executable resolution (fail-closed for held-out absolutes).
 fn external_program_trust(spec: &ExternalAgentCommand) -> ExternalProgramTrust {
-    if spec.program == Path::new("codex") {
+    if spec.program == Path::new(TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM) {
         ExternalProgramTrust::TrustedSystemCodex
     } else {
         ExternalProgramTrust::ExplicitCustom
     }
+}
+
+/// Classify trust after `resolve_external_program` validated the requested executable identity.
+fn external_program_trust_for_resolved_executable(
+    spec: &ExternalAgentCommand,
+    resolved_program: &Path,
+) -> ExternalProgramTrust {
+    if spec.program == Path::new(TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM) {
+        return ExternalProgramTrust::TrustedSystemCodex;
+    }
+    if matches!(
+        spec.invocation,
+        ExternalAgentInvocation::CodexSupervisor | ExternalAgentInvocation::CodexConsultant
+    ) && spec.program.is_absolute() {
+        match resolve_trusted_system_codex_executable_for_catalog(&spec.cwd) {
+            Ok(trusted) if trusted == resolved_program => {
+                return ExternalProgramTrust::TrustedSystemCodex;
+            }
+            _ => {}
+        }
+    }
+    ExternalProgramTrust::ExplicitCustom
 }
 
 fn codex_permission_evidence(
@@ -5371,6 +5406,10 @@ struct ValidatedCodexAuth {
 
 impl ValidatedCodexAuth {
     fn load() -> Result<Option<Self>> {
+        #[cfg(test)]
+        if let Some(home) = INJECTED_CODEX_AUTH_HOME.with(|injected| injected.borrow().clone()) {
+            return Self::load_from_home(&home);
+        }
         let Some(home) = env::var_os("CODEX_HOME").map(PathBuf::from).or_else(|| {
             env::var_os("HOME")
                 .map(PathBuf::from)

@@ -2391,7 +2391,6 @@ fn run_external_agent_runtime(
             );
         }
     }
-    let program_trust = external_program_trust(spec);
     let resolved_program = match resolve_external_program(&spec.program, &spec.cwd) {
         Ok(program) => program,
         Err(error) => {
@@ -2445,6 +2444,7 @@ fn run_external_agent_runtime(
             return report;
         }
     };
+    let program_trust = external_program_trust_for_resolved_executable(spec, &resolved_program);
     let program_identity = match external_program_identity(&resolved_program) {
         Ok(identity) => identity,
         Err(error) => {
@@ -3070,17 +3070,18 @@ fn run_external_agent_runtime(
         );
         return report;
     };
-    if let Err(error) =
-        validate_external_program_identity(&resolved_program, spec.program == Path::new("codex"))
-            .and_then(|()| {
-                let current = external_program_identity(&resolved_program)?;
-                if current == program_identity {
-                    Ok(())
-                } else {
-                    bail!("external executable identity changed after version preflight")
-                }
-            })
-    {
+    if let Err(error) = validate_external_program_identity(
+        &resolved_program,
+        program_trust == ExternalProgramTrust::TrustedSystemCodex,
+    )
+    .and_then(|()| {
+        let current = external_program_identity(&resolved_program)?;
+        if current == program_identity {
+            Ok(())
+        } else {
+            bail!("external executable identity changed after version preflight")
+        }
+    }) {
         report.duration_ms = duration_millis(started.elapsed());
         record_environment_failure(
             &mut report,
