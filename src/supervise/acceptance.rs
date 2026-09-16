@@ -4,6 +4,8 @@ const CHILD_ASSERTED_GROK_STREAM_USAGE_MESSAGE: &str =
     "child report attempted to self-assert parent-process Grok stream usage evidence";
 const CHILD_ASSERTED_GROK_ACP_PARENT_EVIDENCE_MESSAGE: &str =
     "child report attempted to self-assert parent-process Grok ACP evidence";
+const CHILD_ASSERTED_FIXED_VERSION_PROBE_MESSAGE: &str =
+    "child report attempted to self-assert parent-process fixed version preflight probe evidence";
 
 fn command_records_contain_grok_stream_usage_evidence(records: &[CommandRunRecord]) -> bool {
     records
@@ -26,6 +28,18 @@ fn command_records_contain_grok_acp_parent_evidence(records: &[CommandRunRecord]
 fn strip_grok_acp_parent_evidence_from_command_records(records: &mut [CommandRunRecord]) {
     for record in records {
         record.grok_acp_parent_evidence = None;
+    }
+}
+
+fn command_records_contain_fixed_version_probe_evidence(records: &[CommandRunRecord]) -> bool {
+    records
+        .iter()
+        .any(|record| record.fixed_version_probe_evidence.is_some())
+}
+
+fn strip_fixed_version_probe_evidence_from_command_records(records: &mut [CommandRunRecord]) {
+    for record in records {
+        record.fixed_version_probe_evidence = None;
     }
 }
 
@@ -91,6 +105,37 @@ fn reject_child_asserted_grok_acp_parent_evidence(
     });
 }
 
+fn reject_child_asserted_fixed_version_probe_evidence(
+    report_path: &Path,
+    report: &mut OrchestratorReviewReport,
+) {
+    let mut asserted = command_records_contain_fixed_version_probe_evidence(&report.commands_run);
+    for worker in &report.worker_reports {
+        asserted |= command_records_contain_fixed_version_probe_evidence(&worker.commands_run);
+    }
+    for auditor in &report.audit_reports {
+        asserted |= command_records_contain_fixed_version_probe_evidence(&auditor.commands_run);
+    }
+    if !asserted {
+        return;
+    }
+    strip_fixed_version_probe_evidence_from_command_records(&mut report.commands_run);
+    for worker in &mut report.worker_reports {
+        strip_fixed_version_probe_evidence_from_command_records(&mut worker.commands_run);
+    }
+    for auditor in &mut report.audit_reports {
+        strip_fixed_version_probe_evidence_from_command_records(&mut auditor.commands_run);
+    }
+    report.status = ReviewStatus::Failed;
+    report.accepted = false;
+    report.rejected = true;
+    report.findings.push(Finding {
+        severity: FindingSeverity::Error,
+        message: CHILD_ASSERTED_FIXED_VERSION_PROBE_MESSAGE.to_string(),
+        paths: vec![report_path.to_path_buf()],
+    });
+}
+
 fn reject_worker_asserted_grok_acp_parent_evidence(report_path: &Path, worker: &mut WorkerReport) {
     if !command_records_contain_grok_acp_parent_evidence(&worker.commands_run) {
         return;
@@ -138,6 +183,24 @@ fn reject_worker_asserted_grok_stream_usage_evidence(
     worker.findings.push(Finding {
         severity: FindingSeverity::Error,
         message: CHILD_ASSERTED_GROK_STREAM_USAGE_MESSAGE.to_string(),
+        paths: vec![report_path.to_path_buf()],
+    });
+}
+
+fn reject_worker_asserted_fixed_version_probe_evidence(
+    report_path: &Path,
+    worker: &mut WorkerReport,
+) {
+    if !command_records_contain_fixed_version_probe_evidence(&worker.commands_run) {
+        return;
+    }
+    strip_fixed_version_probe_evidence_from_command_records(&mut worker.commands_run);
+    worker.status = ReviewStatus::Failed;
+    worker.accepted = false;
+    worker.rejected = true;
+    worker.findings.push(Finding {
+        severity: FindingSeverity::Error,
+        message: CHILD_ASSERTED_FIXED_VERSION_PROBE_MESSAGE.to_string(),
         paths: vec![report_path.to_path_buf()],
     });
 }
@@ -216,6 +279,7 @@ pub(super) fn collect_child_report_for_runtime(
             let mut worker = parsed.report;
             reject_worker_asserted_grok_stream_usage_evidence(report_path, &mut worker);
             reject_worker_asserted_grok_acp_parent_evidence(report_path, &mut worker);
+            reject_worker_asserted_fixed_version_probe_evidence(report_path, &mut worker);
             ParsedReport {
                 report: direct_worker_report_envelope(worker),
                 recovered: parsed.recovered,
@@ -229,6 +293,7 @@ pub(super) fn collect_child_report_for_runtime(
             let mut report = parsed.report;
             reject_child_asserted_grok_stream_usage_evidence(report_path, &mut report);
             reject_child_asserted_grok_acp_parent_evidence(report_path, &mut report);
+            reject_child_asserted_fixed_version_probe_evidence(report_path, &mut report);
             if parsed.recovered {
                 report.findings.push(Finding {
                     severity: FindingSeverity::Warning,
@@ -904,6 +969,17 @@ pub(super) fn collect_parent_auditor_report(
     };
     reject_auditor_asserted_grok_stream_usage_evidence(report_path, &mut report);
     reject_auditor_asserted_grok_acp_parent_evidence(report_path, &mut report);
+    if command_records_contain_fixed_version_probe_evidence(&report.commands_run) {
+        strip_fixed_version_probe_evidence_from_command_records(&mut report.commands_run);
+        report.status = ReviewStatus::Failed;
+        report.accepted = false;
+        report.rejected = true;
+        report.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message: CHILD_ASSERTED_FIXED_VERSION_PROBE_MESSAGE.to_string(),
+            paths: vec![report_path.to_path_buf()],
+        });
+    }
     report
         .commands_run
         .push(command_record_from_external_for_runtime(

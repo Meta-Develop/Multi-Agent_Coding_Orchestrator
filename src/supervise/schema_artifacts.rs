@@ -2602,6 +2602,7 @@ fn remove_parent_process_usage_from_child_schema(schema: &mut serde_json::Value)
             {
                 properties.remove("grok_stream_usage_evidence");
                 properties.remove("grok_acp_parent_evidence");
+                properties.remove("fixed_version_probe_evidence");
             }
             if let Some(required) = object
                 .get_mut("required")
@@ -2609,6 +2610,7 @@ fn remove_parent_process_usage_from_child_schema(schema: &mut serde_json::Value)
             {
                 required.retain(|name| name != "grok_stream_usage_evidence");
                 required.retain(|name| name != "grok_acp_parent_evidence");
+                required.retain(|name| name != "fixed_version_probe_evidence");
             }
             for value in object.values_mut() {
                 remove_parent_process_usage_from_child_schema(value);
@@ -3468,9 +3470,159 @@ pub(super) fn command_run_record_schema_value() -> serde_json::Value {
             },
             "error": {"type": ["string", "null"]},
             "grok_stream_usage_evidence": grok_stream_usage_evidence_schema_value(),
-            "grok_acp_parent_evidence": grok_acp_parent_evidence_schema_value()
+            "grok_acp_parent_evidence": grok_acp_parent_evidence_schema_value(),
+            "fixed_version_probe_evidence": fixed_version_probe_evidence_schema_value()
         },
         "allOf": [command_environment_failure_outcome_schema_value()]
+    })
+}
+
+fn containment_backend_schema_value() -> serde_json::Value {
+    json!({
+        "type": "string",
+        "enum": [
+            "systemd_user_service",
+            "windows_job_object",
+            "unix_process_group",
+            "direct_child"
+        ]
+    })
+}
+
+fn process_tree_evidence_schema_value() -> serde_json::Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["status", "backend"],
+                "properties": {
+                    "status": {"const": "verified_empty", "type": "string"},
+                    "backend": containment_backend_schema_value()
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["status", "backend"],
+                "properties": {
+                    "status": {"const": "trusted_best_effort", "type": "string"},
+                    "backend": containment_backend_schema_value()
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["status", "backend"],
+                "properties": {
+                    "status": {"const": "unverified", "type": "string"},
+                    "backend": containment_backend_schema_value()
+                }
+            }
+        ]
+    })
+}
+
+fn side_effect_confinement_profile_kind_schema_value() -> serde_json::Value {
+    json!({
+        "type": "string",
+        "enum": [
+            "strict_offline_workspace",
+            "trusted_fixed_network",
+            "external_codex",
+            "external_grok",
+            "trusted_compatibility"
+        ]
+    })
+}
+
+fn side_effect_confinement_evidence_schema_value() -> serde_json::Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["status", "profile"],
+                "properties": {
+                    "status": {"const": "verified", "type": "string"},
+                    "profile": side_effect_confinement_profile_kind_schema_value()
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["status", "profile"],
+                "properties": {
+                    "status": {"const": "trusted_best_effort", "type": "string"},
+                    "profile": side_effect_confinement_profile_kind_schema_value()
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["status", "profile"],
+                "properties": {
+                    "status": {"const": "unverified", "type": "string"},
+                    "profile": side_effect_confinement_profile_kind_schema_value()
+                }
+            }
+        ]
+    })
+}
+
+fn fixed_version_probe_evidence_schema_value() -> serde_json::Value {
+    json!({
+        "oneOf": [
+            {"type": "null"},
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "executable",
+                    "exit_code",
+                    "timed_out",
+                    "stdout",
+                    "stderr",
+                    "process_tree",
+                    "side_effects"
+                ],
+                "properties": {
+                    "executable": {
+                        "type": "string",
+                        "enum": [
+                            "bash",
+                            "cargo",
+                            "cmake",
+                            "codex",
+                            "git",
+                            "nix",
+                            "node",
+                            "npm",
+                            "python3",
+                            "rustc"
+                        ]
+                    },
+                    "exit_code": {"type": ["integer", "null"]},
+                    "timed_out": {"type": "boolean"},
+                    "stdout": fixed_version_probe_stream_schema_value(),
+                    "stderr": fixed_version_probe_stream_schema_value(),
+                    "process_tree": process_tree_evidence_schema_value(),
+                    "side_effects": side_effect_confinement_evidence_schema_value()
+                }
+            }
+        ]
+    })
+}
+
+fn fixed_version_probe_stream_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["text", "truncated"],
+        "properties": {
+            "text": {"type": "string"},
+            "truncated": {"type": "boolean"}
+        }
     })
 }
 
@@ -4247,6 +4399,7 @@ mod selection_schema_tests {
             error: Some("representative failure".to_string()),
             grok_stream_usage_evidence: None,
             grok_acp_parent_evidence: None,
+            fixed_version_probe_evidence: None,
         };
         let validation_result = ValidationResult {
             name: "cargo check".to_string(),

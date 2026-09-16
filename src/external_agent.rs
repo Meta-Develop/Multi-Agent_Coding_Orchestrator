@@ -739,6 +739,29 @@ pub struct EnvironmentPreflightResult {
     pub observation: Option<EnvironmentPreflightObservation>,
 }
 
+/// Bounded, redacted capture from the fixed `--version` preflight probe. Parent-held only;
+/// propagated through private supervisor command records, not child-writable report summaries.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentFixedVersionProbeStream {
+    pub text: String,
+    pub truncated: bool,
+}
+
+/// Structured diagnostic for a fixed-argv version preflight launch. Separate from main target
+/// stdout/stderr and from sanitized public environment-failure summaries.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentFixedVersionProbeEvidence {
+    pub executable: EnvironmentExecutable,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub stdout: EnvironmentFixedVersionProbeStream,
+    pub stderr: EnvironmentFixedVersionProbeStream,
+    pub process_tree: ProcessTreeEvidence,
+    pub side_effects: SideEffectConfinementEvidence,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnvironmentFailureCategory {
@@ -1535,6 +1558,21 @@ impl ExternalAgentRun {
         &self.stdout.run_metadata.environment_failures
     }
 
+    pub fn fixed_version_probe_evidence(&self) -> Option<&EnvironmentFixedVersionProbeEvidence> {
+        self.stdout
+            .run_metadata
+            .fixed_version_probe_evidence
+            .as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn attach_fixed_version_probe_evidence_for_test(
+        &mut self,
+        evidence: EnvironmentFixedVersionProbeEvidence,
+    ) {
+        self.stdout.run_metadata.fixed_version_probe_evidence = Some(evidence);
+    }
+
     pub fn environment_blocked(&self) -> bool {
         !self.environment_failures().is_empty()
     }
@@ -1836,6 +1874,7 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
 struct ExternalAgentRunMetadata {
     environment_preflight_results: Vec<EnvironmentPreflightResult>,
     environment_failures: Vec<EnvironmentFailure>,
+    fixed_version_probe_evidence: Option<EnvironmentFixedVersionProbeEvidence>,
     environment_preflight_process_started: bool,
     /// Held proof for scratch cleanup after a probe-only run. This is never serialized: a
     /// restored report cannot confer cleanup authority, and a target launch must earn fresh
@@ -2967,6 +3006,7 @@ fn run_external_agent_runtime(
             preflight_profile,
             codex_auth.as_ref(),
             agent_lifecycle.as_ref(),
+            Some(&credential_redactor),
         );
         for failure in &mut preflight.failures {
             failure.summary = credential_redactor.redact_string(&failure.summary);
@@ -4682,6 +4722,7 @@ struct EnvironmentPreflightProcessEvidence {
     started: bool,
     process_tree: Option<ProcessTreeEvidence>,
     side_effects: Option<SideEffectConfinementEvidence>,
+    fixed_version_probe_evidence: Option<EnvironmentFixedVersionProbeEvidence>,
 }
 
 impl EnvironmentPreflightProcessEvidence {
@@ -4799,6 +4840,8 @@ fn retain_environment_preflight_process_evidence(
     report: &mut ExternalAgentRun,
     evidence: &EnvironmentPreflightProcessEvidence,
 ) {
+    report.stdout.run_metadata.fixed_version_probe_evidence =
+        evidence.fixed_version_probe_evidence.clone();
     report
         .stdout
         .run_metadata
@@ -4835,6 +4878,7 @@ fn preflight_codex_version(
     side_effect_profile: &SideEffectConfinementProfile,
     codex_auth: Option<&ValidatedCodexAuth>,
     agent_lifecycle: Option<&AgentLaunchMetadata>,
+    credential_redactor: Option<&CredentialRedactor>,
     process_evidence: &mut EnvironmentPreflightProcessEvidence,
 ) -> std::result::Result<EnvironmentVersionProbe, CodexPreflightFailure> {
     let requirement = codex_environment_requirement();
@@ -4848,6 +4892,7 @@ fn preflight_codex_version(
         side_effect_profile,
         codex_auth,
         agent_lifecycle,
+        credential_redactor,
         process_evidence,
     )
     .map_err(|probe| CodexPreflightFailure {
@@ -4914,6 +4959,7 @@ fn preflight_custom_codex_version(
         &profile,
         None,
         agent_lifecycle,
+        None,
         process_evidence,
     )
 }
@@ -4928,6 +4974,7 @@ fn run_environment_preflight(
     side_effect_profile: &SideEffectConfinementProfile,
     codex_auth: Option<&ValidatedCodexAuth>,
     agent_lifecycle: Option<&AgentLaunchMetadata>,
+    credential_redactor: Option<&CredentialRedactor>,
 ) -> EnvironmentPreflightReport {
     let mut report = EnvironmentPreflightReport::default();
     if let Err(error) = validate_environment_requirements(&spec.environment_requirements) {
@@ -4950,6 +4997,7 @@ fn run_environment_preflight(
         side_effect_profile,
         codex_auth,
         agent_lifecycle,
+        credential_redactor,
         &mut report.process_evidence,
     );
     match codex_probe {
@@ -4989,6 +5037,7 @@ fn run_environment_preflight(
             report.codex_version,
             report.verified_confinement,
             agent_lifecycle,
+            credential_redactor,
             &mut report.process_evidence,
         );
         report.results.push(result);
@@ -5012,6 +5061,7 @@ fn evaluate_environment_requirement(
     observed_codex_version: Option<EnvironmentVersion>,
     verified_confinement: Option<SideEffectConfinementProfileKind>,
     agent_lifecycle: Option<&AgentLaunchMetadata>,
+    credential_redactor: Option<&CredentialRedactor>,
     process_evidence: &mut EnvironmentPreflightProcessEvidence,
 ) -> (EnvironmentPreflightResult, Option<EnvironmentFailure>, bool) {
     match requirement {
@@ -5041,6 +5091,7 @@ fn evaluate_environment_requirement(
                         side_effect_profile,
                         codex_auth,
                         agent_lifecycle,
+                        credential_redactor,
                         process_evidence,
                     )
                     .map(|probe| probe.version)

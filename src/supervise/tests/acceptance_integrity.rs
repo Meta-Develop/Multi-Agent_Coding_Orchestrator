@@ -1785,6 +1785,7 @@ fn supervisor_required_optional_and_vector_paths_share_reversible_serialization(
         error: None,
         grok_stream_usage_evidence: None,
         grok_acp_parent_evidence: None,
+        fixed_version_probe_evidence: None,
     };
     let value = serde_json::to_value(record).expect("serialize command cwd");
     assert_eq!(value["cwd"], encoded);
@@ -2265,6 +2266,257 @@ fn collect_parent_auditor_report_rejects_self_asserted_grok_but_retains_parent_p
     assert_eq!(report.commands_run[0].grok_stream_usage_evidence, None);
     assert_eq!(
         report.commands_run[1].grok_stream_usage_evidence,
+        Some(parent_evidence)
+    );
+}
+
+fn forged_fixed_version_probe_command_record() -> CommandRunRecord {
+    use crate::external_agent::{
+        EnvironmentExecutable, EnvironmentFixedVersionProbeEvidence,
+        EnvironmentFixedVersionProbeStream,
+    };
+    use crate::process_runner::{
+        ContainmentBackend, ProcessTreeEvidence, SideEffectConfinementEvidence,
+        SideEffectConfinementProfileKind,
+    };
+
+    let mut record = injected_command_record();
+    record.fixed_version_probe_evidence = Some(EnvironmentFixedVersionProbeEvidence {
+        executable: EnvironmentExecutable::Codex,
+        exit_code: Some(101),
+        timed_out: false,
+        stdout: EnvironmentFixedVersionProbeStream {
+            text: "child-forged-fixed-version-probe-stdout-31".to_string(),
+            truncated: false,
+        },
+        stderr: EnvironmentFixedVersionProbeStream {
+            text: "child-forged-fixed-version-probe-stderr-31".to_string(),
+            truncated: false,
+        },
+        process_tree: ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService),
+        side_effects: SideEffectConfinementEvidence::Verified(
+            SideEffectConfinementProfileKind::ExternalCodex,
+        ),
+    });
+    record
+}
+
+fn parent_authenticated_fixed_version_probe_evidence(
+) -> crate::external_agent::EnvironmentFixedVersionProbeEvidence {
+    use crate::external_agent::{
+        EnvironmentExecutable, EnvironmentFixedVersionProbeEvidence,
+        EnvironmentFixedVersionProbeStream,
+    };
+    use crate::process_runner::{
+        ContainmentBackend, ProcessTreeEvidence, SideEffectConfinementEvidence,
+        SideEffectConfinementProfileKind,
+    };
+
+    EnvironmentFixedVersionProbeEvidence {
+        executable: EnvironmentExecutable::Codex,
+        exit_code: Some(101),
+        timed_out: false,
+        stdout: EnvironmentFixedVersionProbeStream {
+            text: String::new(),
+            truncated: false,
+        },
+        stderr: EnvironmentFixedVersionProbeStream {
+            text: "parent-authenticated-fixed-version-probe-stderr-31".to_string(),
+            truncated: false,
+        },
+        process_tree: ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService),
+        side_effects: SideEffectConfinementEvidence::Verified(
+            SideEffectConfinementProfileKind::ExternalCodex,
+        ),
+    }
+}
+
+const CHILD_ASSERTED_FIXED_VERSION_PROBE_MESSAGE: &str =
+    "child report attempted to self-assert parent-process fixed version preflight probe evidence";
+
+fn collect_fixture_child_report_fixed_version_probe(
+    assignment: &OrchestratorAssignment,
+    command: &ExternalAgentCommand,
+    external_run: &ExternalAgentRun,
+) -> (OrchestratorReviewReport, Vec<String>) {
+    collect_child_report(ChildReportCollectionContext {
+        assignment,
+        assignment_metadata: &AssignmentMetadata::new(),
+        report_path: Path::new("fixed-version-probe-forgery-child.json"),
+        external_run,
+        external_command: command,
+        worktree_path: Path::new("."),
+        child_base_head: &injected_oid("fixed-version-probe-forgery-base"),
+        observed_changed_paths: None,
+        worker_journals: &WorkerExecutionJournalEvidenceSet::default(),
+        evidence_only_source: None,
+    })
+}
+
+#[test]
+fn collect_child_report_rejects_orchestrator_self_asserted_fixed_version_probe_evidence() {
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    let command = ExternalAgentCommand::codex(
+        "codex",
+        &repo_path,
+        temp.path().join("fixed-version-orchestrator-prompt.md"),
+        temp.path().join("fixed-version-orchestrator-events.jsonl"),
+        temp.path().join("fixed-version-orchestrator-report.json"),
+        Duration::from_secs(1),
+    );
+    let mut child = injected_child_report(&assignment);
+    child
+        .commands_run
+        .push(forged_fixed_version_probe_command_record());
+    write_injected_json(&command.output_last_message, &child);
+    let external_run = injected_verified_run(&command);
+    let (report, shape_problems) =
+        collect_fixture_child_report_fixed_version_probe(&assignment, &command, &external_run);
+    assert!(shape_problems.is_empty());
+    assert!(report.rejected);
+    assert_eq!(report.status, ReviewStatus::Failed);
+    assert!(finding_messages(&report).contains(CHILD_ASSERTED_FIXED_VERSION_PROBE_MESSAGE));
+    assert!(report
+        .commands_run
+        .iter()
+        .all(|record| record.fixed_version_probe_evidence.is_none()));
+}
+
+#[test]
+fn collect_child_report_rejects_nested_worker_and_auditor_self_asserted_fixed_version_probe() {
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    let command = ExternalAgentCommand::codex(
+        "codex",
+        &repo_path,
+        temp.path().join("fixed-version-worker-auditor-prompt.md"),
+        temp.path()
+            .join("fixed-version-worker-auditor-events.jsonl"),
+        temp.path().join("fixed-version-worker-auditor-report.json"),
+        Duration::from_secs(1),
+    );
+    let mut child = injected_child_report(&assignment);
+    let auditor = injected_auditor_report(&assignment, &child);
+    child.audit_reports.push(auditor);
+    child.worker_reports[0]
+        .commands_run
+        .push(forged_fixed_version_probe_command_record());
+    child.audit_reports[0]
+        .commands_run
+        .push(forged_fixed_version_probe_command_record());
+    write_injected_json(&command.output_last_message, &child);
+    let external_run = injected_verified_run(&command);
+    let (report, _) =
+        collect_fixture_child_report_fixed_version_probe(&assignment, &command, &external_run);
+    assert!(report.rejected);
+    assert!(finding_messages(&report).contains(CHILD_ASSERTED_FIXED_VERSION_PROBE_MESSAGE));
+    assert!(report.worker_reports[0]
+        .commands_run
+        .iter()
+        .all(|record| record.fixed_version_probe_evidence.is_none()));
+    assert!(report.audit_reports[0]
+        .commands_run
+        .iter()
+        .all(|record| record.fixed_version_probe_evidence.is_none()));
+}
+
+#[test]
+fn collect_child_report_rejects_direct_worker_self_asserted_fixed_version_probe_evidence() {
+    let (temp, repo_path) = injected_repository();
+    let mut assignment = injected_assignment(false);
+    assignment.id = "direct-worker-fixed-version-forgery".to_string();
+    assignment.role = AgentRole::Worker;
+    assignment.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+    let command = ExternalAgentCommand::codex(
+        "codex",
+        &repo_path,
+        temp.path().join("direct-worker-fixed-version-prompt.md"),
+        temp.path().join("direct-worker-fixed-version-events.jsonl"),
+        temp.path().join("direct-worker-fixed-version-report.json"),
+        Duration::from_secs(1),
+    );
+    let worker = WorkerReport {
+        id: assignment.id.clone(),
+        role: AgentRole::Worker,
+        assignment_kind: AssignmentKind::Ordinary,
+        target_path: None,
+        assigned_paths: assignment.assigned_paths.clone(),
+        semantic_symbols: Vec::new(),
+        semantic_modules: Vec::new(),
+        claim_token: Some(1),
+        semantic_intent_token: Some(2),
+        commands_run: vec![forged_fixed_version_probe_command_record()],
+        environment_failures: Vec::new(),
+        files_changed: Vec::new(),
+        validation_results: Vec::new(),
+        findings: Vec::new(),
+        field_guide_entries: Vec::new(),
+        bloated_file_flags: Vec::new(),
+        decomposition_completion: None,
+        no_further_delegation: Some(true),
+        accepted: true,
+        rejected: false,
+        status: ReviewStatus::Succeeded,
+        remaining_risk: String::new(),
+        next_safe_action: String::new(),
+    };
+    write_injected_json(&command.output_last_message, &worker);
+    let external_run = injected_verified_run(&command);
+    let (report, _) =
+        collect_fixture_child_report_fixed_version_probe(&assignment, &command, &external_run);
+    assert!(report.rejected);
+    assert!(finding_messages(&report).contains(CHILD_ASSERTED_FIXED_VERSION_PROBE_MESSAGE));
+    assert!(report
+        .commands_run
+        .iter()
+        .all(|record| record.fixed_version_probe_evidence.is_none()));
+    assert!(report.worker_reports[0]
+        .commands_run
+        .iter()
+        .all(|record| record.fixed_version_probe_evidence.is_none()));
+}
+
+#[test]
+fn collect_parent_auditor_report_rejects_self_asserted_fixed_version_probe_but_retains_parent_evidence(
+) {
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    let child = injected_child_report(&assignment);
+    let command = ExternalAgentCommand::codex(
+        "codex",
+        &repo_path,
+        temp.path().join("parent-auditor-fixed-version-prompt.md"),
+        temp.path()
+            .join("parent-auditor-fixed-version-events.jsonl"),
+        temp.path().join("parent-auditor-fixed-version-report.json"),
+        Duration::from_secs(1),
+    );
+    let expected_id = parent_auditor_id(&assignment);
+    let mut auditor = injected_auditor_report(&assignment, &child);
+    auditor
+        .commands_run
+        .push(forged_fixed_version_probe_command_record());
+    write_injected_json(&command.output_last_message, &auditor);
+    let mut external_run = injected_verified_run(&command);
+    let parent_evidence = parent_authenticated_fixed_version_probe_evidence();
+    external_run.attach_fixed_version_probe_evidence_for_test(parent_evidence.clone());
+    let report = collect_parent_auditor_report(
+        &expected_id,
+        Path::new("parent-auditor-fixed-version-forgery.json"),
+        &external_run,
+        &command,
+        SupervisorRuntime::Codex,
+    );
+    assert!(report.rejected);
+    assert!(report
+        .findings
+        .iter()
+        .any(|finding| finding.message == CHILD_ASSERTED_FIXED_VERSION_PROBE_MESSAGE));
+    assert_eq!(report.commands_run.len(), 2);
+    assert_eq!(report.commands_run[0].fixed_version_probe_evidence, None);
+    assert_eq!(
+        report.commands_run[1].fixed_version_probe_evidence,
         Some(parent_evidence)
     );
 }

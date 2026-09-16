@@ -317,6 +317,9 @@ use acceptance::*;
 mod reporting;
 use reporting::*;
 
+#[cfg(test)]
+pub(crate) use reporting::command_record_from_external;
+
 mod schema_artifacts;
 use schema_artifacts::*;
 
@@ -3102,6 +3105,9 @@ pub struct CommandRunRecord {
     pub grok_stream_usage_evidence: Option<crate::runtime_adapter::grok::GrokStreamUsageEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grok_acp_parent_evidence: Option<crate::runtime_adapter::grok::GrokAcpParentEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_version_probe_evidence:
+        Option<crate::external_agent::EnvironmentFixedVersionProbeEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -3549,6 +3555,7 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         error: None,
         grok_stream_usage_evidence: None,
         grok_acp_parent_evidence: None,
+        fixed_version_probe_evidence: None,
     };
     let worker = WorkerReport {
         id: worker_id.to_string(),

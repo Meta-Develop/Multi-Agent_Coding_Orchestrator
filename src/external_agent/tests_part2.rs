@@ -371,6 +371,83 @@
 
     #[cfg(unix)]
     #[test]
+    fn explicit_custom_version_preflight_retains_private_probe_stderr_on_failure() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        const MARKER: &str = "MACO_FIXED_VERSION_PROBE_DIAGNOSTIC_MARKER";
+
+        let temp = tempfile::tempdir()?;
+        create_mandatory_control_roots(temp.path())?;
+        let marker = temp.path().join("actual-target-ran");
+        let agent = temp.path().join("custom-codex.sh");
+        fs::write(
+            &agent,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' '{MARKER}' >&2; exit 101; fi\ntouch '{}'\n",
+                marker.display()
+            ),
+        )?;
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o755))?;
+        let prompt = temp.path().join("prompt.txt");
+        fs::write(&prompt, "never run custom target\n")?;
+        let incoming = temp.path().join("incoming");
+        fs::create_dir(&incoming)?;
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+        let spec = ExternalAgentCommand::codex(
+            agent,
+            temp.path(),
+            &prompt,
+            incoming.join("events.jsonl"),
+            incoming.join("last-message.txt"),
+            Duration::from_secs(3),
+        );
+
+        let report = run_external_agent(&spec);
+
+        assert!(!marker.exists());
+        assert!(!report.publishable);
+        assert!(!report.stdout.target_launch_attempted);
+        assert!(report.environment_blocked());
+        assert!(report.stdout.text.is_empty());
+        assert!(report.stderr.text.is_empty());
+        let evidence = report
+            .fixed_version_probe_evidence()
+            .expect("version preflight probe evidence");
+        assert_eq!(evidence.exit_code, Some(101));
+        assert!(evidence.stderr.text.contains(MARKER));
+        assert_eq!(evidence.executable, EnvironmentExecutable::Codex);
+        let expected_category = if evidence.process_tree.is_verified_empty()
+            && evidence.side_effects.is_verified()
+        {
+            EnvironmentFailureCategory::ProbeFailed
+        } else {
+            EnvironmentFailureCategory::SandboxUnavailable
+        };
+        assert!(
+            report
+                .environment_failures()
+                .iter()
+                .any(|failure| failure.category == expected_category),
+            "environment failures: {:?}",
+            report.environment_failures()
+        );
+        let serialized = serde_json::to_string(&report)?;
+        assert!(!serialized.contains(MARKER));
+
+        let record = crate::supervise::command_record_from_external(&report, &spec);
+        assert!(
+            record
+                .fixed_version_probe_evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence.stderr.text.contains(MARKER))
+        );
+        let record_json = serde_json::to_string(&record)?;
+        assert!(record_json.contains(MARKER));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn explicit_custom_runs_at_most_version_diagnostic_and_never_target() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
