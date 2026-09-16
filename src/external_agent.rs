@@ -28,8 +28,12 @@ use crate::protected_path::{DeclaredPathCoordinate, ProtectedPathSpec};
 #[cfg(target_os = "linux")]
 use crate::runtime_adapter::grok::GrokCredentialSource;
 use crate::runtime_adapter::{
-    grok::GrokStreamUsageEvidence, AdapterId, LaunchContext, RuntimeAdapterConfig, RuntimeId,
-    SideEffectConfinement, TypedRuntime, TypedRuntimeContract, WritableLaunchTarget,
+    grok::{
+        grok_acp_parent_evidence_from_execution, GrokAcpParentEvidence, GrokStreamUsageEvidence,
+    },
+    grok_acp::{GrokAcpContainedTransport, GrokAcpExecutionEvidence, GrokAcpLimits, GrokAcpTurn},
+    AdapterId, LaunchContext, RuntimeAdapterConfig, RuntimeId, SideEffectConfinement, TypedRuntime,
+    TypedRuntimeContract, WritableLaunchTarget,
 };
 use crate::safe_state::{unsigned_to_u32, ReservedDirectory};
 use crate::secure_output::{ReservedOutputFile, SecureOutputRoot};
@@ -1455,6 +1459,8 @@ pub struct ExternalAgentRun {
     /// Exact Grok streaming-json spend observation when the trusted runner executed Grok.
     /// Absent for non-Grok runs and legacy deserialized reports.
     pub grok_stream_usage_evidence: Option<GrokStreamUsageEvidence>,
+    /// Parent-owned Grok ACP stdio observation. Never accepted from child reports.
+    pub grok_acp_parent_evidence: Option<GrokAcpParentEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -1507,6 +1513,7 @@ impl std::fmt::Debug for ExternalAgentRun {
                 "grok_stream_usage_evidence",
                 &self.grok_stream_usage_evidence,
             )
+            .field("grok_acp_parent_evidence", &self.grok_acp_parent_evidence)
             .finish()
     }
 }
@@ -1696,6 +1703,8 @@ struct ExternalAgentRunWireRef<'a> {
     error: &'a Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     grok_stream_usage_evidence: &'a Option<GrokStreamUsageEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grok_acp_parent_evidence: &'a Option<GrokAcpParentEvidence>,
 }
 
 #[derive(Deserialize)]
@@ -1735,6 +1744,8 @@ struct ExternalAgentRunWireOwned {
     error: Option<String>,
     #[serde(default)]
     grok_stream_usage_evidence: Option<GrokStreamUsageEvidence>,
+    #[serde(default)]
+    grok_acp_parent_evidence: Option<GrokAcpParentEvidence>,
 }
 
 impl Serialize for ExternalAgentRun {
@@ -1774,6 +1785,7 @@ impl Serialize for ExternalAgentRun {
             stderr: &self.stderr,
             error: &self.error,
             grok_stream_usage_evidence: &self.grok_stream_usage_evidence,
+            grok_acp_parent_evidence: &self.grok_acp_parent_evidence,
         }
         .serialize(serializer)
     }
@@ -1815,6 +1827,7 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
             error: wire.error,
             output_last_message: None,
             grok_stream_usage_evidence: wire.grok_stream_usage_evidence,
+            grok_acp_parent_evidence: wire.grok_acp_parent_evidence,
         })
     }
 }
@@ -2513,6 +2526,7 @@ fn run_external_agent_runtime(
         error: None,
         output_last_message: None,
         grok_stream_usage_evidence: None,
+        grok_acp_parent_evidence: None,
     };
 
     let mut codex_version = None;
@@ -2713,6 +2727,21 @@ fn run_external_agent_runtime(
                 record_external_error(
                     &mut report,
                     "writable Codex app-server prompt is not valid UTF-8".to_string(),
+                );
+                return report;
+            }
+        }
+    } else {
+        None
+    };
+    let grok_acp_prompt = if grok_acp_stdio_protocol_selected(&target_spec) {
+        match String::from_utf8(prompt.clone()) {
+            Ok(prompt) => Some(prompt),
+            Err(_) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_external_error(
+                    &mut report,
+                    "Grok ACP stdio prompt is not valid UTF-8".to_string(),
                 );
                 return report;
             }
@@ -3153,6 +3182,7 @@ fn run_external_agent_runtime(
         protected_controls: &target_controls,
         argv_digest: &argv_digest,
         program_identity: &program_identity,
+        grok_acp_parent_evidence: None,
     };
     let mut retained_gate_denials = Vec::new();
     let mut retained_review_metrics = None;
@@ -3228,6 +3258,107 @@ fn run_external_agent_runtime(
                         report.error.take(),
                         Some(credential_redactor.redact_string(&format!(
                             "duplex app-server protocol failed closed: {error}"
+                        ))),
+                    );
+                    report.publishable = false;
+                }
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    } else if grok_acp_stdio_protocol_selected(&target_spec) {
+        let Some(prompt) = grok_acp_prompt else {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_external_error(
+                &mut report,
+                "Grok ACP stdio prompt was unavailable".to_string(),
+            );
+            return report;
+        };
+        match run_grok_acp_external_process(
+            process_spec,
+            cancellation,
+            &target_spec,
+            prompt,
+            timeout,
+        ) {
+            Ok(interactive) => {
+                let mut parent_evidence = None;
+                let mut final_message_error = None;
+                if let Ok(outcome) = &interactive.interaction {
+                    parent_evidence = Some(grok_acp_parent_evidence_from_execution(
+                        outcome.evidence.clone(),
+                    ));
+                    if let Some(parent) = &parent_evidence {
+                        let target_ok = !interactive.process.timed_out
+                            && interactive
+                                .process
+                                .status
+                                .is_some_and(|status| status.success())
+                            && interactive.process.process_error.is_none()
+                            && interactive.process.stdin_error.is_none();
+                        if target_ok {
+                            match grok_acp_staged_output_bytes(&target_spec, parent, true) {
+                                Ok(final_message) => {
+                                    let staged =
+                                        output_staging.reservation_mut().and_then(|reservation| {
+                                            reservation.write_bytes_atomic(
+                                                &final_message,
+                                                OUTPUT_TEE_LIMIT_BYTES,
+                                            )
+                                        });
+                                    if let Err(error) = staged {
+                                        final_message_error = Some(format!(
+                                            "failed to stage Grok ACP final message: {error:#}"
+                                        ));
+                                    }
+                                }
+                                Err(error) => {
+                                    final_message_error = Some(credential_redactor.redact_string(
+                                        &format!("Grok ACP output validation failed: {error:#}"),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                match output_staging.reservation_mut() {
+                    Ok(staged_output) => record_completed_target(
+                        &mut report,
+                        interactive.process,
+                        staged_output,
+                        &mut output_reservation,
+                        &mut json_log_reservation,
+                        &credential_redactor,
+                        CompletedTargetContext {
+                            runtime,
+                            codex_version,
+                            spec: &target_spec,
+                            protected_controls: &target_controls,
+                            argv_digest: &argv_digest,
+                            program_identity: &program_identity,
+                            grok_acp_parent_evidence: parent_evidence.as_ref(),
+                        },
+                    ),
+                    Err(error) => {
+                        report.error = append_external_error(
+                            report.error.take(),
+                            Some(format!(
+                                "private external-agent output staging became unavailable: {error:#}"
+                            )),
+                        );
+                        report.publishable = false;
+                    }
+                }
+                if let Some(error) = final_message_error {
+                    report.error = append_external_error(report.error.take(), Some(error));
+                    report.publishable = false;
+                }
+                if let Err(error) = interactive.interaction {
+                    report.error = append_external_error(
+                        report.error.take(),
+                        Some(credential_redactor.redact_string(&format!(
+                            "Grok ACP stdio protocol failed closed: {error}"
                         ))),
                     );
                     report.publishable = false;
@@ -3859,6 +3990,70 @@ struct CompletedTargetContext<'a> {
     protected_controls: &'a ProtectedWorktreeControls,
     argv_digest: &'a str,
     program_identity: &'a ExternalProgramIdentity,
+    grok_acp_parent_evidence: Option<&'a GrokAcpParentEvidence>,
+}
+
+struct GrokAcpInteractiveOutcome {
+    evidence: GrokAcpExecutionEvidence,
+}
+
+fn run_grok_acp_external_process(
+    process_spec: ProcessSpec,
+    cancellation: &ProcessCancellation,
+    spec: &ExternalAgentCommand,
+    prompt: String,
+    operation_timeout: Duration,
+) -> Result<InteractiveProcessOutput<GrokAcpInteractiveOutcome>, ProcessRunError> {
+    let turn = GrokAcpTurn {
+        cwd: spec.cwd.to_string_lossy().into_owned(),
+        prompt,
+        requested_model: spec.model.clone(),
+        requested_effort: spec.reasoning_effort.clone(),
+    };
+    let limits =
+        GrokAcpLimits::from_parent_operation_timeout(operation_timeout).map_err(|error| {
+            ProcessRunError::IoSetup {
+                label: "Grok ACP stdio".to_string(),
+                command: spec.program.display().to_string(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string()),
+            }
+        })?;
+    run_process_interactive(process_spec, cancellation, |session| {
+        let mut transport = GrokAcpContainedTransport::new(session);
+        let evidence = crate::runtime_adapter::grok_acp::run_grok_acp_turn(
+            &mut transport,
+            &turn,
+            limits,
+            || cancellation.is_cancelled(),
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(GrokAcpInteractiveOutcome { evidence })
+    })
+}
+
+fn grok_acp_staged_output_bytes(
+    spec: &ExternalAgentCommand,
+    evidence: &GrokAcpParentEvidence,
+    target_completed_successfully: bool,
+) -> Result<Vec<u8>> {
+    if !target_completed_successfully {
+        bail!("Grok ACP target did not complete successfully");
+    }
+    if spec.output_schema.is_some() {
+        if evidence.structured_output_error.is_some() {
+            bail!("Grok ACP returned a terminal structuredOutputError");
+        }
+        let structured = evidence
+            .structured_output
+            .as_ref()
+            .context("Grok ACP terminal response is missing structuredOutput")?;
+        return crate::runtime_adapter::grok::canonical_grok_structured_output(structured);
+    }
+    let text = evidence
+        .final_text
+        .as_deref()
+        .context("Grok ACP terminal response is missing final text")?;
+    Ok(text.as_bytes().to_vec())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3885,6 +4080,9 @@ fn runtime_adapter_captured_output(
     target_completed_successfully: bool,
 ) -> Result<RuntimeAdapterCapturedOutput> {
     if spec.invocation == ExternalAgentInvocation::Grok {
+        if grok_acp_stdio_protocol_selected(spec) {
+            return Ok(RuntimeAdapterCapturedOutput::ExistingStagedOutput);
+        }
         if !target_completed_successfully {
             return Ok(RuntimeAdapterCapturedOutput::Unavailable);
         }
@@ -3987,7 +4185,9 @@ fn record_completed_target(
     report.stdout.target_launch_attempted = true;
     report.stdout.run_metadata.sandbox_denials = sandbox_denials;
     report.stderr = summarize_redacted_output(&output.stderr, credential_redactor);
-    if context.spec.invocation == ExternalAgentInvocation::Grok {
+    if let Some(evidence) = context.grok_acp_parent_evidence {
+        report.grok_acp_parent_evidence = Some(evidence.clone());
+    } else if context.spec.invocation == ExternalAgentInvocation::Grok {
         report.grok_stream_usage_evidence =
             Some(grok_bounded_stdout_usage_evidence(&output.stdout));
     }
@@ -4073,7 +4273,11 @@ fn record_completed_target(
                 && report.codex_permissions.is_some()))
         && report.exit_code == Some(0)
         && !report.timed_out
-        && report.error.is_none();
+        && report.error.is_none()
+        && !report
+            .grok_acp_parent_evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.permission_escalation_refused);
 }
 
 fn capture_redacted_staged_output(
@@ -4139,6 +4343,7 @@ fn failed_external_run(
         error: Some(error),
         output_last_message: None,
         grok_stream_usage_evidence: None,
+        grok_acp_parent_evidence: None,
     }
 }
 

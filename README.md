@@ -1447,6 +1447,19 @@ Grok; `MACO_<RUNTIME>_BIN` for other adapter subprocess runtimes). Mismatch is
 refused before artifact reservation and rechecked before every external launch
 (including auditors).
 
+Grok parent interaction protocol is selected only by the operator environment
+variable `MACO_GROK_INTERACTION_PROTOCOL`. Exact values are
+`headless_streaming_json` (default when unset) and `acp_stdio`. Any other value
+is refused while the supervisor loads worker and auditor adapter config, before
+usable launch; it is not coerced to the default. `MACO_GROK_ARGS` cannot replace
+Grok's immutable safety argv. `acp_stdio` renders contained
+`grok agent --no-leader … stdio`. Observed model and effort are client-resolved
+parent session evidence after `session/set_model`, not backend attestation.
+Known native cost is a repository microunit equivalent of provider
+`costUsdTicks` (100000 microunits per USD), not a billed quota. Live writable
+ExternalGrok credential confinement and remaining compatibility gates stay
+unproven. This is not production economics and does not close issue 149.
+
 `--additional-runtime-bin RUNTIME=ABSOLUTE_EXECUTABLE` is optional and repeatable.
 It does not replace `--runtime` / `--runtime-bin`, which remain required and still
 select the parent supervisor. Each additional entry is an explicit launch
