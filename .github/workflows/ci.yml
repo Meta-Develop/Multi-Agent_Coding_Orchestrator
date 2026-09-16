@@ -34,8 +34,8 @@ jobs:
       - name: Check tracked path portability
         run: python3 scripts/check_repository_portability.py
 
-  linux:
-    name: Linux fmt, check, clippy, and test
+  linux-library:
+    name: Linux library tests
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -72,14 +72,61 @@ jobs:
       - name: Verify nested Codex sandbox integration
         run: |
           bash .github/scripts/run-linux-all-tests-in-delegated-user-scope.sh \
-            cargo test --locked --all-targets \
+            cargo test --locked --lib \
             'process_runner::tests::nested_codex_profile_appends_exact_journal_while_outer_keeps_parent_nonwritable' \
             -- --exact --nocapture
 
-      - name: Run all tests
+      - name: Run library tests
+        run: bash .github/scripts/run-linux-ci-cargo-test-partition.sh lib
+
+  linux-integration:
+    name: Linux integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Allow systemd-executor userns on GitHub-hosted Ubuntu
+        run: bash .github/scripts/configure-github-hosted-userns.sh
+
+      - name: Verify delegated Linux process startup
+        run: bash .github/scripts/run-linux-all-tests-in-delegated-user-scope.sh /usr/bin/true
+
+      - name: Install repository Rust toolchain
         run: |
-          bash .github/scripts/run-linux-all-tests-in-delegated-user-scope.sh \
-            cargo test --locked --all-targets
+          rustup toolchain install
+          rustc --version --verbose
+          cargo --version --verbose
+          cargo clippy --version
+
+      - name: Install pinned Codex CLI on GitHub-hosted Ubuntu
+        run: bash .github/scripts/install-github-hosted-ci-codex.sh
+
+      - name: Run integration and binary tests
+        run: bash .github/scripts/run-linux-ci-cargo-test-partition.sh non-lib
+
+  linux-gate:
+    name: Linux fmt, check, clippy, and test
+    runs-on: ubuntu-latest
+    needs:
+      - linux-library
+      - linux-integration
+    if: always()
+    timeout-minutes: 5
+    steps:
+      - name: Require partitioned Linux test jobs
+        env:
+          LIBRARY_RESULT: ${{ needs.linux-library.result }}
+          INTEGRATION_RESULT: ${{ needs.linux-integration.result }}
+        run: |
+          if [[ "${LIBRARY_RESULT}" != "success" || "${INTEGRATION_RESULT}" != "success" ]]; then
+            echo "linux-library result: ${LIBRARY_RESULT}"
+            echo "linux-integration result: ${INTEGRATION_RESULT}"
+            exit 1
+          fi
 
   portable-build:
     name: ${{ matrix.os }} compile and test build

@@ -163,11 +163,18 @@ source "{LIB}"
         install = "bash .github/scripts/install-github-hosted-ci-codex.sh"
         nested = NESTED_CODEX_TEST
         nested_step = "name: Verify nested Codex sandbox integration"
-        full_step = "name: Run all tests"
-        linux_job = source.split("linux:", 1)[1].split("portable-build:", 1)[0]
+        full_step = "name: Run library tests"
+        linux_job = source.split("linux-library:", 1)[1].split("linux-integration:", 1)[0]
         self.assertIn(install, linux_job)
         self.assertIn(nested, linux_job)
         self.assertIn(nested_step, linux_job)
         self.assertIn(full_step, linux_job)
+        self.assertIn("cargo test --locked --lib", linux_job)
         self.assertLess(linux_job.index(install), linux_job.index(nested_step))
         self.assertLess(linux_job.index(nested_step), linux_job.index(full_step))
+        integration_job = source.split("linux-integration:", 1)[1].split("linux-gate:", 1)[0]
+        self.assertIn(install, integration_job)
+        self.assertIn(
+            "bash .github/scripts/run-linux-ci-cargo-test-partition.sh non-lib",
+            integration_job,
+        )
