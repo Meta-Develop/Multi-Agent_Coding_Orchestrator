@@ -921,6 +921,32 @@ impl LeaseState {
         }
     }
 
+    /// Derives the claimable [`Available`](LeasePhase::Available) lease for a
+    /// new graph visit after a completed, acknowledged occurrence.
+    ///
+    /// The follow-up queue must separately authenticate graph advancement and
+    /// retain this acknowledged lease as immutable evidence of the prior
+    /// occurrence. This constructor alone is not admission authority for
+    /// scheduling another visit.
+    ///
+    /// `self` is not mutated. The next journal claim must use generation `+ 1`
+    /// and a strictly later trusted observation than the carried
+    /// [`last_observed_at`](Self::last_observed_at). Generation overflow is
+    /// rejected at claim time, consistent with ordinary available transitions.
+    pub(crate) fn for_next_occurrence(&self) -> Result<Self> {
+        let Self::Acknowledged(acknowledged) = self else {
+            bail!("next occurrence lease requires acknowledged state");
+        };
+        let active = &acknowledged.fence.active;
+        let available = AvailableLease {
+            last_generation: active.proof.generation,
+            last_observed_at: Some(acknowledged.acknowledged_at),
+            last_reclaim: active.last_reclaim.clone(),
+        };
+        available.validate()?;
+        Ok(Self::Available(available))
+    }
+
     fn validate(&self) -> Result<()> {
         match self {
             Self::Available(available) => available.validate(),
@@ -1138,6 +1164,134 @@ mod tests {
         let original = state.clone();
         assert!(state.apply(event).is_err());
         assert_eq!(*state, original);
+    }
+
+    fn acknowledged_state(active: &LeaseProof, acknowledged_at: u64) -> LeaseState {
+        let mut state = LeaseState::initial();
+        apply(
+            &mut state,
+            LeaseEvent::claimed(active.clone(), 10, 20).expect("claim"),
+        );
+        apply(
+            &mut state,
+            LeaseEvent::effect_started(active.clone(), 13).expect("effect"),
+        );
+        apply(
+            &mut state,
+            LeaseEvent::acknowledged(active.clone(), acknowledged_at).expect("ack"),
+        );
+        state
+    }
+
+    #[test]
+    fn for_next_occurrence_leaves_acknowledged_source_unchanged() {
+        let active = proof("worker-a", "lease-a", 1);
+        let source = acknowledged_state(&active, 30);
+        let snapshot = source.clone();
+        let next = source.for_next_occurrence().expect("next occurrence");
+        assert_eq!(source, snapshot);
+        assert_eq!(next.phase(), LeasePhase::Available);
+        assert_eq!(next.generation(), 1);
+        assert_eq!(next.last_observed_at(), Some(30));
+        assert_eq!(next.last_reclaim(), None);
+    }
+
+    #[test]
+    fn for_next_occurrence_carries_reclaim_lineage_and_accepts_next_generation_claim() {
+        let predecessor = proof("worker-a", "lease-a", 1);
+        let successor = proof("worker-b", "lease-b", 2);
+        let mut source = LeaseState::initial();
+        apply(
+            &mut source,
+            LeaseEvent::claimed(predecessor.clone(), 10, 20).expect("claim"),
+        );
+        apply(
+            &mut source,
+            LeaseEvent::reclaimed(predecessor, 20, 20, successor.clone(), 30).expect("reclaim"),
+        );
+        apply(
+            &mut source,
+            LeaseEvent::effect_started(successor.clone(), 21).expect("effect"),
+        );
+        apply(
+            &mut source,
+            LeaseEvent::acknowledged(successor.clone(), 40).expect("ack"),
+        );
+        let snapshot = source.clone();
+        let mut next = source.for_next_occurrence().expect("next occurrence");
+        assert_eq!(source, snapshot);
+        let lineage = next.last_reclaim().expect("retained lineage");
+        assert_eq!(lineage.successor(), &successor);
+        let third = proof("worker-c", "lease-c", 3);
+        apply(
+            &mut next,
+            LeaseEvent::claimed(third, 41, 50).expect("next-generation claim"),
+        );
+        assert_eq!(next.phase(), LeasePhase::Active);
+        assert_eq!(next.generation(), 3);
+    }
+
+    #[test]
+    fn for_next_occurrence_rejects_stale_generation_or_time_without_mutation() {
+        let active = proof("worker-a", "lease-a", 1);
+        let source = acknowledged_state(&active, 30);
+        let mut next = source.for_next_occurrence().expect("next occurrence");
+        assert_rejected_atomically(
+            &mut next,
+            &LeaseEvent::claimed(proof("worker-b", "lease-b", 1), 31, 40).expect("claim"),
+        );
+        assert_rejected_atomically(
+            &mut next,
+            &LeaseEvent::claimed(proof("worker-b", "lease-b", 2), 30, 40).expect("claim"),
+        );
+        assert_rejected_atomically(
+            &mut next,
+            &LeaseEvent::claimed(proof("worker-b", "lease-b", 2), 29, 40).expect("claim"),
+        );
+    }
+
+    #[test]
+    fn for_next_occurrence_acknowledged_proof_stays_terminal() {
+        let active = proof("worker-a", "lease-a", 1);
+        let mut source = acknowledged_state(&active, 30);
+        source.for_next_occurrence().expect("next occurrence");
+        let successor = proof("worker-b", "lease-b", 2);
+        assert_rejected_atomically(
+            &mut source,
+            &LeaseEvent::released(active.clone(), 31).expect("release"),
+        );
+        assert_rejected_atomically(
+            &mut source,
+            &LeaseEvent::reclaimed(active.clone(), 20, 31, successor, 40).expect("reclaim"),
+        );
+        assert_rejected_atomically(
+            &mut source,
+            &LeaseEvent::effect_started(active.clone(), 31).expect("effect"),
+        );
+        assert_rejected_atomically(
+            &mut source,
+            &LeaseEvent::acknowledged(active, 32).expect("repeat ack"),
+        );
+    }
+
+    #[test]
+    fn for_next_occurrence_refuses_non_acknowledged_states() {
+        let active = proof("worker-a", "lease-a", 1);
+        assert!(LeaseState::initial().for_next_occurrence().is_err());
+
+        let mut active_state = LeaseState::initial();
+        apply(
+            &mut active_state,
+            LeaseEvent::claimed(active.clone(), 1, 10).expect("claim"),
+        );
+        assert!(active_state.for_next_occurrence().is_err());
+
+        let mut fenced = active_state.clone();
+        apply(
+            &mut fenced,
+            LeaseEvent::effect_started(active, 2).expect("effect"),
+        );
+        assert!(fenced.for_next_occurrence().is_err());
     }
 
     #[test]
