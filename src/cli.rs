@@ -44,7 +44,11 @@ use crate::{
     },
     protected_path::DeclaredPathCoordinate,
     publication::{
-        self, ForgeKind, IssuePublicationOptions, PrPublicationOptions, PrPublicationReport,
+        self,
+        coordination_mode::{
+            configure_remote_coordination, disable_remote_coordination, remote_coordination_status,
+        },
+        ForgeKind, IssuePublicationOptions, PrPublicationOptions, PrPublicationReport,
         PrPublicationStatus,
     },
     repo_map::{self, RepoEntryKind, RepoMap},
@@ -3369,8 +3373,66 @@ impl SyncCommand {
                 let history = store.supersession_history()?;
                 print_query_report(&history, args.json)
             }
+            SyncSubcommand::Coordination(command) => command.run(),
         }
     }
+}
+
+#[derive(Debug, Args)]
+struct SyncCoordinationCommand {
+    #[command(subcommand)]
+    command: SyncCoordinationSubcommand,
+}
+
+impl SyncCoordinationCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            SyncCoordinationSubcommand::Configure(args) => {
+                let report = configure_remote_coordination(&args.repo, &args.config)?;
+                print_query_report(&report, args.json)
+            }
+            SyncCoordinationSubcommand::Status(args) => {
+                let report = remote_coordination_status(&args.repo)?;
+                print_query_report(&report, args.json)
+            }
+            SyncCoordinationSubcommand::Disable(args) => {
+                let report = disable_remote_coordination(&args.repo)?;
+                print_query_report(&report, args.json)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum SyncCoordinationSubcommand {
+    /// Validate and persist explicit remote GitHub CAS coordination selection.
+    Configure(ConfigureRemoteCoordinationArgs),
+    /// Report the authenticated remote coordination selection, if any.
+    Status(RemoteCoordinationStatusArgs),
+    /// Clear an explicit remote coordination selection.
+    Disable(RemoteCoordinationStatusArgs),
+}
+
+#[derive(Debug, Args)]
+struct ConfigureRemoteCoordinationArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Repository-relative operator coordination config JSON.
+    config: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct RemoteCoordinationStatusArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -3395,6 +3457,8 @@ enum SyncSubcommand {
     Takeover(TakeoverSyncArgs),
     /// List the bounded durable claim-supersession audit history.
     History(StatusSyncArgs),
+    /// Configure explicit remote GitHub CAS coordination for sync claims.
+    Coordination(SyncCoordinationCommand),
 }
 
 #[derive(Debug, Args)]
@@ -5063,6 +5127,32 @@ mod cli_integration_tests {
                 .expect("serialize automatic source"),
             "automatic"
         );
+    }
+
+    #[test]
+    fn sync_coordination_configure_parses_repo_relative_config() {
+        let parsed = Cli::try_parse_from([
+            "maco",
+            "sync",
+            "coordination",
+            "configure",
+            "config/coordination.json",
+            "--repo",
+            ".",
+            "--json",
+        ])
+        .expect("sync coordination configure should parse");
+        let Command::Sync(SyncCommand {
+            command:
+                SyncSubcommand::Coordination(SyncCoordinationCommand {
+                    command: SyncCoordinationSubcommand::Configure(args),
+                }),
+        }) = parsed.command
+        else {
+            panic!("expected sync coordination configure command");
+        };
+        assert_eq!(args.config, PathBuf::from("config/coordination.json"));
+        assert!(args.json);
     }
 
     fn eval_harness_run_args(argv: &[&str]) -> RunEvalHarnessArgs {

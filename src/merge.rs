@@ -31,10 +31,10 @@ use crate::{
     },
     orchestrator::RunId,
     process_runner::{
-        run_process, ContainmentEvidence, EnvironmentMode, ProcessOutput, ProcessSpec, Shell,
-        SideEffectConfinementEvidence, SideEffectConfinementProfile,
-        SideEffectConfinementProfileKind, StdinMode, StrictOfflineWorkspaceProfile,
-        TrustedFixedNetworkProfile, WorkspaceAccess,
+        run_process, run_process_cancellable, ContainmentEvidence, EnvironmentMode,
+        ProcessCancellation, ProcessOutput, ProcessSpec, Shell, SideEffectConfinementEvidence,
+        SideEffectConfinementProfile, SideEffectConfinementProfileKind, StdinMode,
+        StrictOfflineWorkspaceProfile, TrustedFixedNetworkProfile, WorkspaceAccess,
     },
     semantic_coord::{SemanticIntent, SemanticIntentStore},
     supervise::{
@@ -2105,6 +2105,7 @@ pub enum MergeApplyReportStatus {
     Blocked,
 }
 
+#[derive(Debug)]
 pub(crate) struct RequiredCommandOutput {
     pub(crate) success: bool,
     pub(crate) stdout: Vec<u8>,

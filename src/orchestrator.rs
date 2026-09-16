@@ -3267,13 +3267,16 @@ fn run_agent_schedule(
             )?;
         }
         let state_intact = run_agent_validation_commands(
-            &context.plan.agents[index],
-            &mut summaries[index],
-            &context.worktrees[index],
-            context.manager,
-            &expected,
-            context.base_oid,
-            context.runtime,
+            &recovery_guard,
+            AgentValidationCommandTarget {
+                agent: &context.plan.agents[index],
+                summary: &mut summaries[index],
+                worktree: &context.worktrees[index],
+                manager: context.manager,
+                expected_state: &expected,
+                base_oid: context.base_oid,
+                runtime: context.runtime,
+            },
         );
         if let Some(writer) = checkpoint_writer.as_deref_mut() {
             writer.agent_event(
@@ -3394,14 +3397,18 @@ fn run_agent_schedule(
             .start_guard_owned_heartbeat()
             .context("failed to start ready-wave claim heartbeat")?;
         let outcomes = run_ready_agents(
-            context.manager,
-            context.plan,
-            summaries,
-            context.worktrees,
+            ReadyAgentsWave {
+                manager: context.manager,
+                plan: context.plan,
+                summaries,
+                worktrees: context.worktrees,
+                runtime: context.runtime,
+                #[cfg(test)]
+                repo: context.repo,
+            },
             &ready,
-            context.runtime,
-            #[cfg(test)]
-            context.repo,
+            &wave_guard,
+            None,
         )?;
 
         for (index, run_result) in outcomes {
@@ -3460,13 +3467,16 @@ fn run_agent_schedule(
                         )?;
                     }
                     state_intact = run_agent_validation_commands(
-                        &context.plan.agents[index],
-                        &mut summaries[index],
-                        &context.worktrees[index],
-                        context.manager,
-                        expected_state,
-                        context.base_oid,
-                        context.runtime,
+                        &wave_guard,
+                        AgentValidationCommandTarget {
+                            agent: &context.plan.agents[index],
+                            summary: &mut summaries[index],
+                            worktree: &context.worktrees[index],
+                            manager: context.manager,
+                            expected_state,
+                            base_oid: context.base_oid,
+                            runtime: context.runtime,
+                        },
                     );
                     if let Some(writer) = checkpoint_writer.as_deref_mut() {
                         writer.agent_event(

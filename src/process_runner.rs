@@ -271,9 +271,19 @@ fn measured_available_disk_mib(_path: &Path) -> Option<usize> {
 /// Clones observe the same state. Cancellation is cooperative at setup boundaries and in the
 /// process poll loop; once a child has started, its own containment backend remains responsible
 /// for terminating and proving its process tree empty.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ProcessCancellation {
     requested: Arc<AtomicBool>,
+    observed: Vec<Arc<AtomicBool>>,
+}
+
+impl Default for ProcessCancellation {
+    fn default() -> Self {
+        Self {
+            requested: Arc::new(AtomicBool::new(false)),
+            observed: Vec::new(),
+        }
+    }
 }
 
 impl ProcessCancellation {
@@ -286,7 +296,30 @@ impl ProcessCancellation {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.requested.load(Ordering::Acquire)
+        if self.requested.load(Ordering::Acquire) {
+            return true;
+        }
+        self.observed
+            .iter()
+            .any(|flag| flag.load(Ordering::Acquire))
+    }
+
+    pub fn combined(sources: &[ProcessCancellation]) -> Self {
+        compose_process_cancellations(sources)
+    }
+}
+
+/// Clones each source's own cancellation flag plus any flattened inherited flags.
+/// `cancel()` on the result affects only this handle; sources are not mutated.
+pub fn compose_process_cancellations(sources: &[ProcessCancellation]) -> ProcessCancellation {
+    let mut observed = Vec::new();
+    for source in sources {
+        observed.push(Arc::clone(&source.requested));
+        observed.extend(source.observed.iter().cloned());
+    }
+    ProcessCancellation {
+        requested: Arc::new(AtomicBool::new(false)),
+        observed,
     }
 }
 #[cfg(target_os = "linux")]
@@ -4428,5 +4461,26 @@ mod mechanical_executor_lifecycle_tests {
             "changed cwd must not execute the named-codex fixture"
         );
         drop(overlay);
+    }
+
+    #[test]
+    fn compose_process_cancellations_observes_sources_without_mutating_them() {
+        let source = ProcessCancellation::new();
+        let composed = compose_process_cancellations(std::slice::from_ref(&source));
+        assert!(!composed.is_cancelled());
+        source.cancel();
+        assert!(composed.is_cancelled());
+        composed.cancel();
+        assert!(source.is_cancelled());
+    }
+
+    #[test]
+    fn process_cancellation_combined_matches_compose_helper() {
+        let a = ProcessCancellation::new();
+        let b = ProcessCancellation::new();
+        let via_combined = ProcessCancellation::combined(&[a.clone(), b.clone()]);
+        b.cancel();
+        assert!(via_combined.is_cancelled());
+        assert!(!a.is_cancelled());
     }
 }

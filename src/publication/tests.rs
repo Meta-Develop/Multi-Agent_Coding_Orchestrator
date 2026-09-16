@@ -1724,6 +1724,7 @@ impl GithubApi for ScriptedGithubApi {
         body: &str,
         _draft: bool,
         _repository: &GithubRepositoryIdentity,
+        _process_cancellation: Option<&crate::process_runner::ProcessCancellation>,
     ) -> Result<GithubCreateOutput> {
         self.create_calls += 1;
         self.created_title = Some(title.to_string());
@@ -3634,6 +3635,7 @@ fn gh_command_refuses_changed_private_runtime_before_spawn() {
         "gh identity test",
         vec![OsString::from("--version")],
         StdinMode::Null,
+        None,
     );
     fs::set_permissions(
         context.runtime_directory.path(),

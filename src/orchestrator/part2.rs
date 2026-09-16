@@ -14,15 +14,31 @@ fn agent_status_label(status: AgentRunStatus) -> &'static str {
     }
 }
 
-fn run_ready_agents(
-    manager: &WorktreeManager,
-    plan: &OrchestrationPlan,
-    summaries: &[AgentRunSummary],
-    worktrees: &[SelectedWorktree],
-    ready: &[usize],
+struct ReadyAgentsWave<'a> {
+    manager: &'a WorktreeManager,
+    plan: &'a OrchestrationPlan,
+    summaries: &'a [AgentRunSummary],
+    worktrees: &'a [SelectedWorktree],
     runtime: OrchestrationExecutionRuntime,
-    #[cfg(test)] repo: &Path,
+    #[cfg(test)]
+    repo: &'a Path,
+}
+
+fn run_ready_agents(
+    wave: ReadyAgentsWave<'_>,
+    ready: &[usize],
+    wave_guard: &crate::collect_revalidation::RevalidationGuard,
+    operator_cancellation: Option<&crate::process_runner::ProcessCancellation>,
 ) -> Result<Vec<(usize, Result<CommandRunResult, ProcessRunError>)>> {
+    let ReadyAgentsWave {
+        manager,
+        plan,
+        summaries,
+        worktrees,
+        runtime,
+        #[cfg(test)]
+        repo,
+    } = wave;
     // Claim authority for this wave is the caller's one batch
     // RevalidationGuard. Do not acquire per-agent RevalidationGuard /
     // ExistingClaimsGuard here: a second claims.lock would deadlock or
@@ -37,11 +53,23 @@ fn run_ready_agents(
             &summaries[index],
             &worktrees[index],
         )?;
+        let process_cancellation = wave_guard
+            .process_cancellation_for_managed_agent(
+                &plan.agents[index].id,
+                operator_cancellation,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to bind managed-process cancellation for agent '{}'",
+                    plan.agents[index].id
+                )
+            })?;
         let spec = command_spec(
             &plan.agents[index],
             &summaries[index],
             &worktrees[index],
             runtime,
+            process_cancellation,
         )?;
         return Ok(vec![(index, run_agent_command(spec))]);
     }
@@ -54,11 +82,23 @@ fn run_ready_agents(
             &summaries[*index],
             &worktrees[*index],
         )?;
+        let process_cancellation = wave_guard
+            .process_cancellation_for_managed_agent(
+                &plan.agents[*index].id,
+                operator_cancellation,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to bind managed-process cancellation for agent '{}'",
+                    plan.agents[*index].id
+                )
+            })?;
         let spec = command_spec(
             &plan.agents[*index],
             &summaries[*index],
             &worktrees[*index],
             runtime,
+            process_cancellation,
         )?;
         prepared.push((*index, spec));
     }
@@ -1029,6 +1069,7 @@ fn command_spec(
     summary: &AgentRunSummary,
     worktree: &SelectedWorktree,
     runtime: OrchestrationExecutionRuntime,
+    process_cancellation: crate::process_runner::ProcessCancellation,
 ) -> Result<CommandRunSpec> {
     #[cfg(test)]
     if take_ready_agent_setup_fault(&agent.id) {
@@ -1061,6 +1102,7 @@ fn command_spec(
         visible_read_write_roots: vec![git_common_root],
         hidden_roots: vec![sensitive_root],
         runtime,
+        process_cancellation,
     })
 }
 
@@ -1077,15 +1119,29 @@ fn orchestration_sandbox_roots(worktree: &Path) -> Result<(PathBuf, PathBuf)> {
     Ok((common_dir, sensitive))
 }
 
-fn run_agent_validation_commands(
-    agent: &AgentPlan,
-    summary: &mut AgentRunSummary,
-    worktree: &SelectedWorktree,
-    manager: &WorktreeManager,
-    expected_state: &CandidateStateSnapshot,
-    base_oid: &Oid,
+struct AgentValidationCommandTarget<'a> {
+    agent: &'a AgentPlan,
+    summary: &'a mut AgentRunSummary,
+    worktree: &'a SelectedWorktree,
+    manager: &'a WorktreeManager,
+    expected_state: &'a CandidateStateSnapshot,
+    base_oid: &'a Oid,
     runtime: OrchestrationExecutionRuntime,
+}
+
+fn run_agent_validation_commands(
+    wave_guard: &crate::collect_revalidation::RevalidationGuard,
+    target: AgentValidationCommandTarget<'_>,
 ) -> bool {
+    let AgentValidationCommandTarget {
+        agent,
+        summary,
+        worktree,
+        manager,
+        expected_state,
+        base_oid,
+        runtime,
+    } = target;
     let Some(recorded) = summary.worktree.as_ref() else {
         fail_summary(summary, "agent has no selected worktree for validation");
         return false;
@@ -1101,6 +1157,22 @@ fn run_agent_validation_commands(
         return false;
     }
     let worktree_path = worktree.path().to_path_buf();
+    let process_cancellation = match wave_guard.process_cancellation_for_managed_agent(
+        &agent.id,
+        None,
+    ) {
+        Ok(cancellation) => cancellation,
+        Err(error) => {
+            fail_summary(
+                summary,
+                format!(
+                    "failed to bind managed-process cancellation for agent '{}': {error:#}",
+                    agent.id
+                ),
+            );
+            return false;
+        }
+    };
     let mut state_intact = true;
 
     for validation in &agent.validation_commands {
@@ -1110,6 +1182,7 @@ fn run_agent_validation_commands(
             base_oid,
             expected_state,
             runtime,
+            &process_cancellation,
             || verify_selected_worktree_binding(manager, agent, summary, worktree),
         );
         #[cfg(test)]
@@ -1137,6 +1210,7 @@ fn run_candidate_bound_validation_command(
     base_oid: &Oid,
     expected_state: &CandidateStateSnapshot,
     runtime: OrchestrationExecutionRuntime,
+    process_cancellation: &crate::process_runner::ProcessCancellation,
     mut verify_binding: impl FnMut() -> Result<()>,
 ) -> (ValidationRunSummary, bool) {
     if let Err(error) = verify_binding() {
@@ -1148,7 +1222,8 @@ fn run_candidate_bound_validation_command(
             false,
         );
     }
-    let mut run_summary = run_validation_command(validation, root, runtime);
+    let mut run_summary =
+        run_validation_command(validation, root, runtime, process_cancellation);
     if let Err(error) = verify_binding() {
         append_validation_error(
             &mut run_summary,
@@ -1628,6 +1703,7 @@ fn run_bound_repo_validation_commands(
             )]
         }
     };
+    let standalone_cancellation = crate::process_runner::ProcessCancellation::new();
     for validation in &plan.repo_validation_commands {
         let (mut run_summary, binding_intact) = run_candidate_bound_validation_command(
             validation,
@@ -1635,6 +1711,7 @@ fn run_bound_repo_validation_commands(
             base_oid,
             expected_state,
             runtime,
+            &standalone_cancellation,
             || validation_worktree.verify_binding(),
         );
         if !binding_intact
@@ -1724,6 +1801,7 @@ fn run_validation_command(
     validation: &ValidationCommandPlan,
     root: &Path,
     runtime: OrchestrationExecutionRuntime,
+    process_cancellation: &crate::process_runner::ProcessCancellation,
 ) -> ValidationRunSummary {
     let working_directory = validation
         .working_directory
@@ -1758,6 +1836,7 @@ fn run_validation_command(
         visible_read_write_roots: Vec::new(),
         hidden_roots,
         runtime,
+        process_cancellation: process_cancellation.clone(),
     });
     validation_summary_from_result(validation, result)
 }
@@ -1837,6 +1916,7 @@ struct CommandRunSpec {
     visible_read_write_roots: Vec<PathBuf>,
     hidden_roots: Vec<PathBuf>,
     runtime: OrchestrationExecutionRuntime,
+    process_cancellation: crate::process_runner::ProcessCancellation,
 }
 
 fn strict_command_profile(spec: &CommandRunSpec) -> StrictOfflineWorkspaceProfile {
@@ -1868,16 +1948,19 @@ fn run_agent_command(spec: CommandRunSpec) -> Result<CommandRunResult, ProcessRu
     )
     .with_environment(EnvironmentMode::ClearAndSet(environment))
     .with_timeout(spec.timeout);
-    let mut output = run_process(match spec.runtime {
-        OrchestrationExecutionRuntime::Verified => process_spec
-            .with_private_runtime_home(true)
-            .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
-                strict_profile,
-            )),
-        #[cfg(test)]
-        OrchestrationExecutionRuntime::NonpublishableSimulation => process_spec
-            .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
-    })?;
+    let mut output = crate::process_runner::run_process_cancellable(
+        match spec.runtime {
+            OrchestrationExecutionRuntime::Verified => process_spec
+                .with_private_runtime_home(true)
+                .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
+                    strict_profile,
+                )),
+            #[cfg(test)]
+            OrchestrationExecutionRuntime::NonpublishableSimulation => process_spec
+                .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
+        },
+        &spec.process_cancellation,
+    )?;
 
     let safety_verified = output.safety_evidence_verified();
     let safety_evidence = (output.process_tree, output.side_effects);

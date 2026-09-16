@@ -37,6 +37,7 @@ The current implementation covers a local-first command-line slice:
 - `maco sync release-agent <agent-id>` releases all claims for an agent.
 - `maco sync owner <path>` reports the owner of a path, if one exists.
 - `maco sync status` lists active durable claims.
+- Remote GitHub CAS coordination is opt-in: without `maco sync coordination configure`, sync claims stay local-only. `maco sync coordination configure <repo-relative-config>` validates live GitHub repository/issue identity and journal-branch protection, then persists a frozen authenticated selection (not raw operator JSON). `maco sync coordination status` is read-only. `maco sync coordination disable` clears the selection and refuses while local claims, pending coordination operations, or remote active owners/reservations exist. Shared-effect journal reconciliation still requires a separate production verifier; configuring remote mode does not enable it.
 - `maco repo map` prints a read-only repository file map with coarse file
   categories and Git status while excluding runtime-only `.maco` output and
   local `.agents/temp`, `.agents/storage`, and `.agents/live` coordination data.
