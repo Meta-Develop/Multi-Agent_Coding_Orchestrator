@@ -24,11 +24,8 @@ os_release_id() {
 }
 
 kernel_profiles() {
-  if [[ -r "${PROFILES_FS}" ]]; then
-    cat -- "${PROFILES_FS}"
-  else
-    sudo -n cat -- "${PROFILES_FS}"
-  fi
+  # securityfs may report readable mode bits while still requiring privilege.
+  sudo -n cat -- "${PROFILES_FS}"
 }
 
 profile_name_loaded() {
