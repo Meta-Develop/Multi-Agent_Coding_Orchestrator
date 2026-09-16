@@ -46,6 +46,15 @@ class TarMemberValidationTests(unittest.TestCase):
                 )
             self.assertIn("link", str(ctx.exception).lower())
 
+    def test_accepts_bwrap_release_member_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "bwrap.tar.gz"
+            self._write_archive(
+                archive,
+                [("bwrap-x86_64-unknown-linux-musl", b"bwrap", tarfile.REGTYPE)],
+            )
+            validate_tar_single_regular_member(archive, "bwrap-x86_64-unknown-linux-musl")
+
 
 class DestinationDigestValidationTests(unittest.TestCase):
     def test_dangling_symlink_refused(self) -> None:

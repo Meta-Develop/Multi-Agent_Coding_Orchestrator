@@ -69,6 +69,13 @@ jobs:
       - name: Install pinned Codex CLI on GitHub-hosted Ubuntu
         run: bash .github/scripts/install-github-hosted-ci-codex.sh
 
+      - name: Verify nested Codex sandbox integration
+        run: |
+          bash .github/scripts/run-linux-all-tests-in-delegated-user-scope.sh \
+            cargo test --locked --all-targets \
+            'process_runner::tests::nested_codex_profile_appends_exact_journal_while_outer_keeps_parent_nonwritable' \
+            -- --exact --nocapture
+
       - name: Run all tests
         run: |
           bash .github/scripts/run-linux-all-tests-in-delegated-user-scope.sh \

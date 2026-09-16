@@ -9,10 +9,15 @@ install_github_hosted_ci_codex_sha256_file() {
   sha256sum -- "$1" | awk '{ print $1; exit }'
 }
 
-install_github_hosted_ci_codex_refuse_destination_symlink() {
-  if [[ -L "${INSTALL_PATH}" ]]; then
-    install_github_hosted_ci_codex_die "refusing: ${INSTALL_PATH} is a symlink"
+install_github_hosted_ci_codex_refuse_path_symlink() {
+  local target="$1"
+  if [[ -L "${target}" ]]; then
+    install_github_hosted_ci_codex_die "refusing: ${target} is a symlink"
   fi
+}
+
+install_github_hosted_ci_codex_refuse_destination_symlink() {
+  install_github_hosted_ci_codex_refuse_path_symlink "${INSTALL_PATH}"
 }
 
 install_github_hosted_ci_codex_verify_install_bin_dir() {
@@ -32,6 +37,38 @@ install_github_hosted_ci_codex_verify_install_bin_dir() {
   (( (8#${bin_mode} & 8#022) == 0 )) || \
     install_github_hosted_ci_codex_die \
       "refusing: ${INSTALL_BIN_DIR} is group- or world-writable"
+}
+
+install_github_hosted_ci_codex_verify_resource_parent_dir() {
+  local resource_dir="$1"
+  [[ "${resource_dir}" == "${INSTALL_BIN_DIR}/codex-resources" ]] || \
+    install_github_hosted_ci_codex_die \
+      "refusing: resource parent ${resource_dir} is outside ${INSTALL_BIN_DIR}"
+  install_github_hosted_ci_codex_verify_install_bin_dir
+  install_github_hosted_ci_codex_refuse_path_symlink "${resource_dir}"
+  if [[ -e "${resource_dir}" ]]; then
+    [[ -d "${resource_dir}" ]] || \
+      install_github_hosted_ci_codex_die \
+        "refusing: ${resource_dir} exists but is not a directory"
+    local canonical_resource
+    canonical_resource="$(realpath -e "${resource_dir}")"
+    [[ "${canonical_resource}" == "${resource_dir}" ]] || \
+      install_github_hosted_ci_codex_die \
+        "refusing: ${resource_dir} is not the canonical path (${canonical_resource})"
+    [[ "$(stat -c '%u' "${resource_dir}")" == 0 ]] || \
+      install_github_hosted_ci_codex_die "refusing: ${resource_dir} is not root-owned"
+    local resource_mode
+    resource_mode="$(stat -c '%a' "${resource_dir}")"
+    [[ "${resource_mode}" == 755 ]] || \
+      install_github_hosted_ci_codex_die \
+        "refusing: ${resource_dir} mode is ${resource_mode}, expected 755"
+    (( (8#${resource_mode} & 8#022) == 0 )) || \
+      install_github_hosted_ci_codex_die \
+        "refusing: ${resource_dir} is group- or world-writable"
+    return 0
+  fi
+  sudo -n install -d -m 0755 -o root -g root -- "${resource_dir}"
+  install_github_hosted_ci_codex_verify_resource_parent_dir "${resource_dir}"
 }
 
 install_github_hosted_ci_codex_verify_install_path_metadata() {
@@ -89,4 +126,32 @@ install_github_hosted_ci_codex_destination_digest_state() {
   fi
   install_github_hosted_ci_codex_verify_digest_matches "${INSTALL_PATH}" "${source_digest}"
   printf '%s\n' present
+}
+
+install_github_hosted_ci_codex_install_verified_artifact() {
+  local extracted="$1"
+  local source_digest="$2"
+  local verify_version="$3"
+
+  if [[ -e "${INSTALL_PATH}" || -L "${INSTALL_PATH}" ]]; then
+    install_github_hosted_ci_codex_refuse_destination_symlink
+    local destination_state
+    destination_state="$(
+      install_github_hosted_ci_codex_destination_digest_state "${source_digest}"
+    )"
+    if [[ "${destination_state}" == present ]]; then
+      install_github_hosted_ci_codex_verify_install_path_metadata
+      if [[ "${verify_version}" == true ]]; then
+        install_github_hosted_ci_codex_verify_installed_version
+      fi
+      return 0
+    fi
+  fi
+
+  sudo -n install -m 0755 -o root -g root -- "${extracted}" "${INSTALL_PATH}"
+  install_github_hosted_ci_codex_verify_install_path_metadata
+  install_github_hosted_ci_codex_verify_digest_matches "${INSTALL_PATH}" "${source_digest}"
+  if [[ "${verify_version}" == true ]]; then
+    install_github_hosted_ci_codex_verify_installed_version
+  fi
 }

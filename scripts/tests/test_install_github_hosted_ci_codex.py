@@ -11,10 +11,18 @@ HELPER = ROOT / ".github" / "scripts" / "install-github-hosted-ci-codex.sh"
 LIB = ROOT / ".github" / "scripts" / "install-github-hosted-ci-codex.lib.sh"
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 
-PINNED_SHA256 = (
+PINNED_CODEX_SHA256 = (
     "37c985be9d89e8c4f43b3aa0594c1213eac212d30ae2b95221f08fec807515d1"
 )
-ARCHIVE_MEMBER = "codex-x86_64-unknown-linux-musl"
+PINNED_BWRAP_SHA256 = (
+    "bf821348773e12a8c10b901759679824d0bb96482c9fcf2cc1eb6f866ec614d7"
+)
+CODEX_ARCHIVE_MEMBER = "codex-x86_64-unknown-linux-musl"
+BWRAP_ARCHIVE_MEMBER = "bwrap-x86_64-unknown-linux-musl"
+NESTED_CODEX_TEST = (
+    "process_runner::tests::nested_codex_profile_appends_exact_journal_"
+    "while_outer_keeps_parent_nonwritable"
+)
 
 
 class InstallGithubHostedCiCodexGuardTests(unittest.TestCase):
@@ -38,13 +46,13 @@ class InstallGithubHostedCiCodexGuardTests(unittest.TestCase):
         )
 
     def test_pinned_provenance_constants(self) -> None:
-        self.assertIn(f"readonly EXPECTED_SHA256={PINNED_SHA256}", self.source)
+        self.assertIn(f"readonly CODEX_EXPECTED_SHA256={PINNED_CODEX_SHA256}", self.source)
+        self.assertIn(f"readonly BWRAP_EXPECTED_SHA256={PINNED_BWRAP_SHA256}", self.source)
         self.assertIn("readonly RELEASE_TAG=rust-v0.144.4", self.source)
-        self.assertIn(
-            'DOWNLOAD_URL="https://github.com/openai/codex/releases/download/${RELEASE_TAG}/codex-x86_64-unknown-linux-musl.tar.gz"',
-            self.source,
-        )
-        self.assertIn(f"readonly ARCHIVE_MEMBER={ARCHIVE_MEMBER}", self.source)
+        self.assertIn(f"readonly CODEX_ARCHIVE_MEMBER={CODEX_ARCHIVE_MEMBER}", self.source)
+        self.assertIn(f"readonly BWRAP_ARCHIVE_MEMBER={BWRAP_ARCHIVE_MEMBER}", self.source)
+        self.assertIn("readonly BWRAP_INSTALL_PATH=/usr/bin/codex-resources/bwrap", self.source)
+        self.assertIn("readonly CODEX_RESOURCES_DIR=/usr/bin/codex-resources", self.source)
         self.assertIn("readonly CODEX_VERSION=0.144.4", self.source)
         lib = LIB.read_text(encoding="utf-8")
         self.assertIn(
@@ -52,14 +60,23 @@ class InstallGithubHostedCiCodexGuardTests(unittest.TestCase):
             lib,
         )
         self.assertNotIn("head -n1", lib)
-        self.assertIn('rm -f -- "${archive}" "${extracted}"', self.source)
+        self.assertIn(
+            'rm -f -- "${codex_archive}" "${bwrap_archive}"', self.source
+        )
         self.assertNotIn("rm -rf", self.source)
-        self.assertIn('[[ -e "${INSTALL_PATH}" || -L "${INSTALL_PATH}" ]]', self.source)
-        self.assertIn("readonly EXPECTED_BYTES=109377995", self.source)
-        self.assertIn('validate-tar "${archive}" "${ARCHIVE_MEMBER}"', self.source)
-        self.assertIn('"${ARCHIVE_MEMBER}"', self.source)
+        self.assertIn("readonly BWRAP_EXPECTED_BYTES=261563", self.source)
+        self.assertIn('validate-tar "${archive}" "${archive_member}"', self.source)
         self.assertNotIn("--wildcards", self.source)
         self.assertNotIn("--strip-components", self.source)
+
+    def test_already_installed_codex_does_not_skip_bundled_bwrap(self) -> None:
+        codex_marker = 'install_github_hosted_ci_codex_install_verified_artifact \\\n  "${codex_extracted}"'
+        bwrap_marker = 'install_github_hosted_ci_codex_install_verified_artifact \\\n  "${bwrap_extracted}"'
+        codex_idx = self.source.index(codex_marker)
+        bwrap_idx = self.source.index(bwrap_marker)
+        between = self.source[codex_idx:bwrap_idx]
+        self.assertNotIn("exit 0", between)
+        self.assertIn("verify_resource_parent_dir", between)
 
     def test_refuses_without_github_actions_before_sudo(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -119,27 +136,38 @@ source "{LIB}"
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("is a symlink", result.stderr)
 
+    def test_lib_refuses_resource_parent_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            resource = Path(tmp) / "codex-resources"
+            resource.symlink_to("/missing/resources")
+            result = self._run_lib(
+                {},
+                f'install_github_hosted_ci_codex_refuse_path_symlink "{resource}"',
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("is a symlink", result.stderr)
+
     def test_lib_refuses_existing_file_with_authenticated_digest_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            destination = Path(tmp) / "codex"
+            destination = Path(tmp) / "bwrap"
             destination.write_bytes(b"wrong-bytes")
             result = self._run_lib(
-                {
-                    "INSTALL_PATH": str(destination),
-                    "CODEX_VERSION": "0.144.4",
-                },
+                {"INSTALL_PATH": str(destination)},
                 'install_github_hosted_ci_codex_destination_digest_state "deadbeef"',
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("digest does not match", result.stderr)
 
-    def test_linux_job_invokes_helper_before_cargo_test(self) -> None:
+    def test_linux_job_runs_nested_codex_test_before_full_suite(self) -> None:
         source = WORKFLOW.read_text(encoding="utf-8")
         install = "bash .github/scripts/install-github-hosted-ci-codex.sh"
-        tests = (
-            "bash .github/scripts/run-linux-all-tests-in-delegated-user-scope.sh \\\n"
-            "            cargo test --locked --all-targets"
-        )
-        self.assertIn(install, source)
-        self.assertIn(tests, source)
-        self.assertLess(source.index(install), source.index(tests))
+        nested = NESTED_CODEX_TEST
+        nested_step = "name: Verify nested Codex sandbox integration"
+        full_step = "name: Run all tests"
+        linux_job = source.split("linux:", 1)[1].split("portable-build:", 1)[0]
+        self.assertIn(install, linux_job)
+        self.assertIn(nested, linux_job)
+        self.assertIn(nested_step, linux_job)
+        self.assertIn(full_step, linux_job)
+        self.assertLess(linux_job.index(install), linux_job.index(nested_step))
+        self.assertLess(linux_job.index(nested_step), linux_job.index(full_step))
