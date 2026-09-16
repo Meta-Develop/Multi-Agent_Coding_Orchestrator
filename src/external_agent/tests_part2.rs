@@ -494,6 +494,316 @@
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    mod held_out_explicit_trusted_codex_binding {
+        use super::*;
+        use crate::mutation_taxonomy::AssignmentProcessLaunchKind;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        struct InjectedTrustedCodexResolution {
+            previous: Option<PathBuf>,
+            _path: PathBuf,
+        }
+
+        impl InjectedTrustedCodexResolution {
+            fn install(path: PathBuf) -> Self {
+                let previous =
+                    replace_injected_trusted_codex_executable_for_test(Some(path.clone()));
+                Self { previous, _path: path }
+            }
+        }
+
+        impl Drop for InjectedTrustedCodexResolution {
+            fn drop(&mut self) {
+                set_injected_trusted_codex_executable_for_test(self.previous.take());
+            }
+        }
+
+        struct InjectedCodexAuthHome {
+            previous: Option<PathBuf>,
+            _home: PathBuf,
+            _guard: tempfile::TempDir,
+        }
+
+        impl InjectedCodexAuthHome {
+            fn install() -> Result<Self> {
+                let home_base = std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .context("HOME must be set for bounded Codex auth fixture")?;
+                let guard = tempfile::tempdir_in(&home_base)
+                    .context("create uniquely owned Codex auth home under HOME")?;
+                let home = guard.path().join("codex-auth-home");
+                fs::create_dir(&home)?;
+                fs::set_permissions(&home, fs::Permissions::from_mode(0o700))?;
+                let auth = home.join("auth.json");
+                fs::write(
+                    &auth,
+                    r#"{"token":"synthetic-held-out-auth-fixture-31b"}"#,
+                )?;
+                fs::set_permissions(&auth, fs::Permissions::from_mode(0o600))?;
+                let previous = set_injected_codex_auth_home_for_test(Some(home.clone()));
+                Ok(Self {
+                    previous,
+                    _home: home,
+                    _guard: guard,
+                })
+            }
+        }
+
+        impl Drop for InjectedCodexAuthHome {
+            fn drop(&mut self) {
+                let _ = set_injected_codex_auth_home_for_test(self.previous.take());
+            }
+        }
+
+        fn write_trusted_codex_fixture(dir: &Path, name: &str, target_marker: &Path) -> PathBuf {
+            let path = dir.join(name);
+            fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'codex-cli 0.142.3\\n'; exit 0; fi\ntouch '{}'\nexit 0\n",
+                    target_marker.display()
+                ),
+            )
+            .expect("write trusted codex fixture");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+                .expect("chmod trusted codex fixture");
+            path
+        }
+
+        fn held_out_codex_spec(program: PathBuf, workspace: &Path) -> ExternalAgentCommand {
+            let prompt = workspace.join("prompt.txt");
+            fs::write(&prompt, "held-out binding probe\n").expect("prompt");
+            let incoming = workspace.join("incoming");
+            fs::create_dir_all(&incoming).expect("incoming");
+            fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700)).expect("incoming mode");
+            ExternalAgentCommand::codex(
+                program,
+                workspace,
+                &prompt,
+                incoming.join("events.jsonl"),
+                incoming.join("last-message.txt"),
+                Duration::from_secs(3),
+            )
+        }
+
+        fn attach_missing_assignment_child_launch(spec: &mut ExternalAgentCommand) {
+            spec.assignment_process_launch_kind = Some(AssignmentProcessLaunchKind::AssignmentChild);
+            *spec = spec.clone().with_agent_lifecycle(
+                &spec.cwd,
+                "worker",
+                "held-out-trusted-binding-run",
+                "held-out-trusted-binding-assignment",
+            );
+        }
+
+        fn assert_explicit_custom_strict_offline_refusal(
+            report: &ExternalAgentRun,
+            target_marker: &Path,
+        ) {
+            assert!(!target_marker.exists());
+            assert!(!report.stdout.target_launch_attempted);
+            assert_eq!(report.program_trust, ExternalProgramTrust::ExplicitCustom);
+            assert!(
+                report.error.as_deref().is_some_and(|error| {
+                    error.contains(
+                        "explicit custom executables are limited to a strict-offline version diagnostic",
+                    )
+                }),
+                "expected strict-offline explicit-custom refusal: {:?}",
+                report.error
+            );
+            let evidence = report
+                .fixed_version_probe_evidence()
+                .expect("explicit custom must run the strict-offline version diagnostic");
+            assert!(matches!(
+                evidence.side_effects,
+                SideEffectConfinementEvidence::Verified(
+                    SideEffectConfinementProfileKind::StrictOfflineWorkspace
+                )
+            ));
+        }
+
+        fn assert_verified_external_codex_fixed_version_preflight(report: &ExternalAgentRun) {
+            let requirement = codex_environment_requirement();
+            assert!(
+                report
+                    .environment_preflight_results()
+                    .iter()
+                    .any(|result| {
+                        result.requirement == requirement
+                            && result.status == EnvironmentPreflightStatus::Satisfied
+                            && matches!(
+                                result.observation,
+                                Some(EnvironmentPreflightObservation::ExecutableVersion {
+                                    executable: EnvironmentExecutable::Codex,
+                                    ..
+                                })
+                            )
+                    }),
+                "trusted held-out executable must satisfy Codex version preflight: {:?}",
+                report.environment_preflight_results()
+            );
+            let evidence = report
+                .fixed_version_probe_evidence()
+                .expect("verified trusted Codex must record fixed-version probe evidence");
+            assert_eq!(evidence.executable, EnvironmentExecutable::Codex);
+            assert!(matches!(
+                evidence.side_effects,
+                SideEffectConfinementEvidence::Verified(
+                    SideEffectConfinementProfileKind::ExternalCodex
+                )
+            ));
+        }
+
+        #[test]
+        fn verified_absolute_trusted_codex_runs_external_codex_version_preflight() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            create_mandatory_control_roots(temp.path())?;
+            let target_marker = temp.path().join("actual-target-ran");
+            let trusted =
+                write_trusted_codex_fixture(temp.path(), "trusted-codex", &target_marker);
+            let _inject = InjectedTrustedCodexResolution::install(trusted);
+            let _auth_home = InjectedCodexAuthHome::install()?;
+            let canonical = fs::canonicalize(temp.path().join("trusted-codex"))?;
+            let spec = held_out_codex_spec(canonical.clone(), temp.path());
+            assert!(spec.program.is_absolute());
+            assert_eq!(spec.program, canonical);
+            assert!(spec.assignment_process_launch_kind.is_none());
+            assert!(spec.assignment_process_launch_grant.is_none());
+
+            let report = run_external_agent(&spec);
+
+            assert_eq!(report.program_trust, ExternalProgramTrust::TrustedSystemCodex);
+            assert_eq!(
+                report.command.first().map(String::as_str),
+                canonical.to_str()
+            );
+            assert_verified_external_codex_fixed_version_preflight(&report);
+            assert!(!target_marker.exists());
+            assert!(!report.stdout.target_launch_attempted);
+            assert!(
+                report.error.as_deref().is_some_and(|error| {
+                    error.contains("external executable changed before target release")
+                        && error.contains("default Codex executable must be root-owned")
+                }),
+                "trusted absolute binding must pass preflight then fail trusted root-ownership revalidation: {:?}",
+                report.error
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn assignment_child_missing_grant_fails_closed_before_preflight_or_target() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            create_mandatory_control_roots(temp.path())?;
+            let target_marker = temp.path().join("actual-target-ran");
+            let trusted =
+                write_trusted_codex_fixture(temp.path(), "trusted-codex", &target_marker);
+            let _inject = InjectedTrustedCodexResolution::install(trusted);
+            let canonical = fs::canonicalize(temp.path().join("trusted-codex"))?;
+            let mut spec = held_out_codex_spec(canonical, temp.path());
+            attach_missing_assignment_child_launch(&mut spec);
+
+            let report = run_external_agent(&spec);
+
+            assert!(report.fixed_version_probe_evidence().is_none());
+            super::assert_assignment_process_launch_refused(
+                &report,
+                &target_marker,
+                crate::mutation_taxonomy::AssignmentProcessLaunchGrantError::MissingGrant,
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn mismatched_absolute_executable_stays_explicit_custom_on_verified_runtime() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            create_mandatory_control_roots(temp.path())?;
+            let target_marker = temp.path().join("actual-target-ran");
+            let trusted = write_trusted_codex_fixture(
+                temp.path(),
+                "trusted-codex",
+                &target_marker,
+            );
+            let other = write_trusted_codex_fixture(temp.path(), "other-codex", &target_marker);
+            let _inject = InjectedTrustedCodexResolution::install(trusted);
+            let other_canonical = fs::canonicalize(&other)?;
+            let spec = held_out_codex_spec(other_canonical, temp.path());
+
+            let report = run_external_agent(&spec);
+
+            assert_explicit_custom_strict_offline_refusal(&report, &target_marker);
+            Ok(())
+        }
+
+        #[test]
+        fn hardlink_alias_path_stays_explicit_custom_without_target_launch() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            create_mandatory_control_roots(temp.path())?;
+            let target_marker = temp.path().join("actual-target-ran");
+            let trusted = write_trusted_codex_fixture(
+                temp.path(),
+                "trusted-codex",
+                &target_marker,
+            );
+            let alias = temp.path().join("codex-hardlink-alias");
+            fs::hard_link(&trusted, &alias)?;
+            let _inject = InjectedTrustedCodexResolution::install(trusted);
+            let alias_canonical = fs::canonicalize(&alias)?;
+            let trusted_canonical = fs::canonicalize(temp.path().join("trusted-codex"))?;
+            assert_ne!(alias_canonical, trusted_canonical);
+            let spec = held_out_codex_spec(alias_canonical, temp.path());
+
+            let report = run_external_agent(&spec);
+
+            assert_explicit_custom_strict_offline_refusal(&report, &target_marker);
+            Ok(())
+        }
+
+        /// Exercises `resolve_external_program` symlink rejection for an explicit absolute
+        /// executable before trust classification, version preflight, or target release.
+        #[test]
+        fn explicit_symlink_absolute_path_refuses_before_trust_or_target() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            create_mandatory_control_roots(temp.path())?;
+            let target_marker = temp.path().join("actual-target-ran");
+            let trusted = write_trusted_codex_fixture(
+                temp.path(),
+                "trusted-codex",
+                &target_marker,
+            );
+            let link = temp.path().join("codex-symlink");
+            symlink(&trusted, &link)?;
+            let _inject = InjectedTrustedCodexResolution::install(trusted);
+            let spec = held_out_codex_spec(link, temp.path());
+
+            let report = run_external_agent(&spec);
+
+            assert!(!target_marker.exists());
+            assert!(!report.stdout.target_launch_attempted);
+            assert_eq!(report.program_trust, ExternalProgramTrust::ExplicitCustom);
+            assert!(
+                report
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("may not be a symlink")),
+                "symlink explicit executable must fail closed during resolution: {:?}",
+                report.error
+            );
+            assert!(report.fixed_version_probe_evidence().is_none());
+            assert!(
+                report
+                    .environment_preflight_results()
+                    .iter()
+                    .all(|result| result.status != EnvironmentPreflightStatus::Satisfied),
+                "symlink refusal must occur before satisfied Codex version preflight: {:?}",
+                report.environment_preflight_results()
+            );
+            Ok(())
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn run_external_agent_drains_large_stdout_and_stderr_while_child_runs() -> Result<()> {
