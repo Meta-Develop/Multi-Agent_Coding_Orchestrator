@@ -4604,8 +4604,6 @@ while True:
 const MANAGED_GROK_ACP_SCHEMA: &str = r#"{"type":"object","required":["accepted","path"],"properties":{"accepted":{"type":"boolean"},"path":{"type":"string"}}}"#;
 
 fn write_fake_grok_acp_stdio_provider(workspace: &Path, mode: &str) -> Result<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-
     let driver = workspace.join("fake-grok-acp-driver.py");
     fs::write(&driver, FAKE_GROK_ACP_DRIVER_PY)?;
     let provider = workspace.join(format!("fake-grok-acp-{mode}"));
@@ -4615,7 +4613,11 @@ fn write_fake_grok_acp_stdio_provider(workspace: &Path, mode: &str) -> Result<Pa
             "#!/bin/sh\nset -eu\nMODE={mode}\ncase \" $* \" in *\" agent \"*) ;; *) exit 3;; esac\ncase \" $* \" in *\" --no-leader \"*) ;; *) exit 3;; esac\ncase \" $* \" in *\" stdio \"*) ;; *) exit 4;; esac\nexec python3 \"$(dirname \"$0\")/fake-grok-acp-driver.py\" \"$MODE\"\n"
         ),
     )?;
-    fs::set_permissions(&provider, fs::Permissions::from_mode(0o755))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&provider, fs::Permissions::from_mode(0o755))?;
+    }
     Ok(provider)
 }
 
