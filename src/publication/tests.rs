@@ -3225,12 +3225,23 @@ fn every_allowlisted_human_gh_mutation_uses_the_actor_guard() {
     let source =
         fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/publication/part3.rs"))
             .expect("read publication transport source");
-    assert_eq!(source.matches(".run_human_mutation(").count(), 3);
-    for label in ["gh pr create", "gh issue create", "gh source comment"] {
+    // Two ordinary entry points, one cancellable entry point, and its forwarding wrapper.
+    assert_eq!(source.matches(".run_human_mutation(").count(), 2);
+    assert_eq!(
+        source
+            .matches(".run_human_mutation_with_cancellation(")
+            .count(),
+        2
+    );
+    for (label, guard_needle) in [
+        ("gh pr create", "run_human_mutation_with_cancellation"),
+        ("gh issue create", "run_human_mutation"),
+        ("gh source comment", "run_human_mutation"),
+    ] {
         let label_offset = source.find(label).expect("human mutation label");
         let prefix = &source[label_offset.saturating_sub(160)..label_offset];
         assert!(
-            prefix.contains("run_human_mutation"),
+            prefix.contains(guard_needle),
             "{label} bypassed the actor guard"
         );
     }
@@ -3296,8 +3307,11 @@ fn publication_network_capability_callsites_are_exactly_audited() {
     let source_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut constructors = Vec::new();
     let mut runners = Vec::new();
+    let mut cancellable_runners = Vec::new();
     let constructor_needle = ["TrustedFixedNetworkProfile", "::read_write("].concat();
     let runner_needle = ["merge::run_required_", "network_direct("].concat();
+    let cancellable_runner_needle =
+        ["merge::run_required_", "network_direct_cancellable("].concat();
     for path in rust_sources_under(&source_directory) {
         if is_rust_test_source(&path) {
             continue;
@@ -3313,9 +3327,13 @@ fn publication_network_capability_callsites_are_exactly_audited() {
         for _ in production_source.match_indices(&runner_needle) {
             runners.push(name.clone());
         }
+        for _ in production_source.match_indices(&cancellable_runner_needle) {
+            cancellable_runners.push(name.clone());
+        }
     }
     constructors.sort();
     runners.sort();
+    cancellable_runners.sort();
     assert_eq!(
         constructors,
         [
@@ -3335,8 +3353,10 @@ fn publication_network_capability_callsites_are_exactly_audited() {
             "publication.rs",
             "publication.rs",
             "publication.rs",
+            "publication.rs",
         ]
     );
+    assert_eq!(cancellable_runners, ["publication.rs", "publication.rs",]);
 }
 
 fn rust_sources_under(root: &Path) -> Vec<PathBuf> {
