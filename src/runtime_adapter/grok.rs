@@ -267,7 +267,10 @@ pub struct GrokAcpParentEvidence {
     pub terminal_usage: Option<GrokAcpParentTerminalUsage>,
     pub native_cost_equivalent_microunits: GrokAcpNativeCostEquivalent,
     pub permission_escalation_refused: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Native structuredOutput object used to stage the worker last-message.
+    /// Kept in-memory only: the public wire is finite and must not admit an
+    /// arbitrary object. Live capture reads this field before serialization.
+    #[serde(skip)]
     pub structured_output: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_output_error: Option<String>,
@@ -277,6 +280,7 @@ pub struct GrokAcpParentEvidence {
     pub stop_reason: Option<String>,
 }
 
+/// Externally tagged: `{"known":"<id>"}` or the string `"unknown"`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GrokAcpParentResolvedField {
@@ -292,8 +296,6 @@ pub struct GrokAcpParentTerminalUsage {
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub projected: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -380,7 +382,6 @@ fn project_parent_terminal_usage(
             cost_is_partial: usage.cost_is_partial,
             session_id: usage.session_id.clone(),
             prompt_id: usage.prompt_id.clone(),
-            projected: usage.projected.clone(),
         });
     let native_cost = native_cost_from_sources(
         execution.prompt_result_meta.as_ref(),
@@ -1952,6 +1953,37 @@ mod tests {
                 "stdio",
             ]
         );
+    }
+
+    #[test]
+    fn grok_acp_parent_resolved_field_serializes_known_object_and_unknown_string() -> Result<()> {
+        assert_eq!(
+            serde_json::to_value(GrokAcpParentResolvedField::Known("grok-4.6".to_string()))?,
+            serde_json::json!({"known": "grok-4.6"})
+        );
+        assert_eq!(
+            serde_json::to_value(GrokAcpParentResolvedField::Unknown)?,
+            serde_json::json!("unknown")
+        );
+        let unknown: GrokAcpParentResolvedField =
+            serde_json::from_value(serde_json::json!("unknown"))?;
+        assert_eq!(unknown, GrokAcpParentResolvedField::Unknown);
+        let known: GrokAcpParentResolvedField =
+            serde_json::from_value(serde_json::json!({"known": "xhigh"}))?;
+        assert_eq!(
+            known,
+            GrokAcpParentResolvedField::Known("xhigh".to_string())
+        );
+        // Serde may accept the noncanonical unit-object form for an externally
+        // tagged unit variant. Canonical serialization remains the string
+        // `"unknown"`; JSON Schema still rejects `{unknown:null}`.
+        if let Ok(value) = serde_json::from_value::<GrokAcpParentResolvedField>(
+            serde_json::json!({"unknown": null}),
+        ) {
+            assert_eq!(value, GrokAcpParentResolvedField::Unknown);
+            assert_eq!(serde_json::to_value(value)?, serde_json::json!("unknown"));
+        }
+        Ok(())
     }
 
     #[test]

@@ -3280,6 +3280,48 @@ fn decomposition_completion_schema_value_with_binding(
     })
 }
 
+fn grok_acp_parent_resolved_field_schema_value() -> serde_json::Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["known"],
+                "properties": {
+                    "known": {"type": "string", "minLength": 1}
+                }
+            },
+            {
+                "type": "string",
+                "const": "unknown"
+            }
+        ]
+    })
+}
+
+fn grok_acp_parent_terminal_usage_schema_value() -> serde_json::Value {
+    json!({
+        "oneOf": [
+            {"type": "null"},
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "usage_is_incomplete",
+                    "cost_is_partial",
+                    "session_id"
+                ],
+                "properties": {
+                    "usage_is_incomplete": {"type": "boolean"},
+                    "cost_is_partial": {"type": "boolean"},
+                    "session_id": {"type": "string", "minLength": 1},
+                    "prompt_id": {"type": ["string", "null"], "minLength": 1}
+                }
+            }
+        ]
+    })
+}
+
 fn grok_acp_parent_evidence_schema_value() -> serde_json::Value {
     json!({
         "oneOf": [
@@ -3297,46 +3339,23 @@ fn grok_acp_parent_evidence_schema_value() -> serde_json::Value {
                     "permission_escalation_refused"
                 ],
                 "properties": {
-                    "protocol": {"type": "string"},
-                    "session_id": {"type": "string"},
+                    "protocol": {"type": "string", "const": "grok_acp_stdio"},
+                    "session_id": {"type": "string", "minLength": 1},
                     "requested_model": {"type": ["string", "null"]},
                     "requested_effort": {"type": ["string", "null"]},
-                    "client_resolved_model": {
-                        "oneOf": [
-                            {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "required": ["known"],
-                                "properties": {"known": {"type": "string"}}
-                            },
-                            {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "required": [],
-                                "properties": {},
-                                "enum": [{"unknown": null}]
-                            }
+                    "client_resolved_model": grok_acp_parent_resolved_field_schema_value(),
+                    "client_resolved_effort": grok_acp_parent_resolved_field_schema_value(),
+                    "resolution_status": {
+                        "type": "string",
+                        "enum": [
+                            "complete",
+                            "incomplete",
+                            "truncated",
+                            "ambiguous_model_change",
+                            "unresolved"
                         ]
                     },
-                    "client_resolved_effort": {
-                        "oneOf": [
-                            {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "required": ["known"],
-                                "properties": {"known": {"type": "string"}}
-                            },
-                            {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "required": [],
-                                "properties": {},
-                                "enum": [{"unknown": null}]
-                            }
-                        ]
-                    },
-                    "resolution_status": {"type": "string"},
-                    "terminal_usage": {"type": ["object", "null"]},
+                    "terminal_usage": grok_acp_parent_terminal_usage_schema_value(),
                     "native_cost_equivalent_microunits": {
                         "oneOf": [
                             {
@@ -3361,7 +3380,6 @@ fn grok_acp_parent_evidence_schema_value() -> serde_json::Value {
                         ]
                     },
                     "permission_escalation_refused": {"type": "boolean"},
-                    "structured_output": {"type": ["object", "null"]},
                     "structured_output_error": {"type": ["string", "null"]},
                     "final_text": {"type": ["string", "null"]},
                     "stop_reason": {"type": ["string", "null"]}
@@ -4517,6 +4535,183 @@ mod selection_schema_tests {
             .validate(&missing_required, index)
             .expect_err("missing required native token field must be rejected");
 
+        Ok(())
+    }
+
+    fn grok_acp_parent_evidence_schema_index() -> Result<(boon::Schemas, boon::SchemaIndex)> {
+        let schema = grok_acp_parent_evidence_schema_value();
+        let schema_id = "https://example.invalid/grok-acp-parent-evidence";
+        let mut compiler = boon::Compiler::new();
+        compiler.set_default_draft(boon::Draft::V2020_12);
+        compiler
+            .add_resource(schema_id, schema)
+            .expect("register grok ACP parent-evidence schema");
+        let mut schemas = boon::Schemas::new();
+        let index = compiler
+            .compile(schema_id, &mut schemas)
+            .expect("compile grok ACP parent-evidence schema");
+        Ok((schemas, index))
+    }
+
+    fn known_complete_parent_evidence() -> crate::runtime_adapter::grok::GrokAcpParentEvidence {
+        use crate::runtime_adapter::grok::{
+            GrokAcpNativeCostEquivalent, GrokAcpParentEvidence, GrokAcpParentResolvedField,
+            GrokAcpParentTerminalUsage,
+        };
+        GrokAcpParentEvidence {
+            protocol: "grok_acp_stdio".to_string(),
+            session_id: "sess-complete".to_string(),
+            requested_model: Some("grok-4.6".to_string()),
+            requested_effort: Some("xhigh".to_string()),
+            client_resolved_model: GrokAcpParentResolvedField::Known(
+                "maco-fixture-synthetic-4.6".to_string(),
+            ),
+            client_resolved_effort: GrokAcpParentResolvedField::Known("xhigh".to_string()),
+            resolution_status: "complete".to_string(),
+            terminal_usage: Some(GrokAcpParentTerminalUsage {
+                usage_is_incomplete: false,
+                cost_is_partial: false,
+                session_id: "sess-complete".to_string(),
+                prompt_id: Some("prompt-1".to_string()),
+            }),
+            native_cost_equivalent_microunits: GrokAcpNativeCostEquivalent::Known {
+                cost_usd_ticks: 20_000_000,
+                microunits: 200,
+            },
+            permission_escalation_refused: false,
+            structured_output: Some(
+                serde_json::json!({"accepted": true, "path": "bounded-result.txt"}),
+            ),
+            structured_output_error: None,
+            final_text: Some("fixture-acp-response".to_string()),
+            stop_reason: Some("end_turn".to_string()),
+        }
+    }
+
+    fn unknown_incomplete_parent_evidence() -> crate::runtime_adapter::grok::GrokAcpParentEvidence {
+        use crate::runtime_adapter::grok::{
+            GrokAcpNativeCostEquivalent, GrokAcpParentEvidence, GrokAcpParentResolvedField,
+            GrokAcpParentTerminalUsage,
+        };
+        GrokAcpParentEvidence {
+            protocol: "grok_acp_stdio".to_string(),
+            session_id: "sess-unknown".to_string(),
+            requested_model: None,
+            requested_effort: None,
+            client_resolved_model: GrokAcpParentResolvedField::Unknown,
+            client_resolved_effort: GrokAcpParentResolvedField::Unknown,
+            resolution_status: "incomplete".to_string(),
+            terminal_usage: Some(GrokAcpParentTerminalUsage {
+                usage_is_incomplete: true,
+                cost_is_partial: true,
+                session_id: "sess-unknown".to_string(),
+                prompt_id: None,
+            }),
+            native_cost_equivalent_microunits: GrokAcpNativeCostEquivalent::Unknown {
+                reason: "terminal usage marked incomplete or cost partial".to_string(),
+            },
+            permission_escalation_refused: true,
+            structured_output: None,
+            structured_output_error: Some("structuredOutputError".to_string()),
+            final_text: None,
+            stop_reason: None,
+        }
+    }
+
+    fn partial_unresolved_parent_evidence() -> crate::runtime_adapter::grok::GrokAcpParentEvidence {
+        use crate::runtime_adapter::grok::{
+            GrokAcpNativeCostEquivalent, GrokAcpParentEvidence, GrokAcpParentResolvedField,
+        };
+        GrokAcpParentEvidence {
+            protocol: "grok_acp_stdio".to_string(),
+            session_id: "sess-partial".to_string(),
+            requested_model: None,
+            requested_effort: Some("low".to_string()),
+            client_resolved_model: GrokAcpParentResolvedField::Known("grok-resolved-4".to_string()),
+            client_resolved_effort: GrokAcpParentResolvedField::Unknown,
+            resolution_status: "unresolved".to_string(),
+            terminal_usage: None,
+            native_cost_equivalent_microunits: GrokAcpNativeCostEquivalent::Unknown {
+                reason: "prompt _meta.usage absent".to_string(),
+            },
+            permission_escalation_refused: false,
+            structured_output: None,
+            structured_output_error: None,
+            final_text: None,
+            stop_reason: None,
+        }
+    }
+
+    #[test]
+    fn grok_acp_parent_evidence_schema_accepts_serialized_known_unknown_and_partial() -> Result<()>
+    {
+        let (schemas, index) = grok_acp_parent_evidence_schema_index()?;
+        schemas
+            .validate(&serde_json::Value::Null, index)
+            .expect("null parent evidence must remain valid");
+
+        let known = serde_json::to_value(known_complete_parent_evidence())?;
+        assert!(
+            known.get("structured_output").is_none(),
+            "raw structuredOutput must not appear on the public wire: {known}"
+        );
+        schemas.validate(&known, index).unwrap_or_else(|error| {
+            panic!("schema rejected known complete GrokAcpParentEvidence: {error:#}")
+        });
+
+        let unknown = serde_json::to_value(unknown_incomplete_parent_evidence())?;
+        assert_eq!(unknown["client_resolved_model"], json!("unknown"));
+        assert_eq!(unknown["client_resolved_effort"], json!("unknown"));
+        assert_eq!(
+            unknown["terminal_usage"]["usage_is_incomplete"],
+            json!(true)
+        );
+        schemas.validate(&unknown, index).unwrap_or_else(|error| {
+            panic!("schema rejected unknown incomplete GrokAcpParentEvidence: {error:#}")
+        });
+
+        let partial = serde_json::to_value(partial_unresolved_parent_evidence())?;
+        assert_eq!(partial["terminal_usage"], json!(null));
+        schemas.validate(&partial, index).unwrap_or_else(|error| {
+            panic!("schema rejected partial unresolved GrokAcpParentEvidence: {error:#}")
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn grok_acp_parent_evidence_schema_refuses_extra_and_invalid_properties() -> Result<()> {
+        let (schemas, index) = grok_acp_parent_evidence_schema_index()?;
+        let base = serde_json::to_value(known_complete_parent_evidence())?;
+
+        let mut extra = base.clone();
+        extra["forged_extra_field"] = json!(true);
+        schemas
+            .validate(&extra, index)
+            .expect_err("extra parent-evidence field must be rejected");
+
+        let mut raw_output = base.clone();
+        raw_output["structured_output"] = json!({"accepted": true});
+        schemas
+            .validate(&raw_output, index)
+            .expect_err("public parent-evidence must refuse arbitrary structured_output");
+
+        let mut projected = base.clone();
+        projected["terminal_usage"]["projected"] = json!({"costUsdTicks": 1});
+        schemas
+            .validate(&projected, index)
+            .expect_err("public terminal_usage must refuse raw projected usage");
+
+        let mut tagged_unknown = base.clone();
+        tagged_unknown["client_resolved_model"] = json!({"unknown": null});
+        schemas
+            .validate(&tagged_unknown, index)
+            .expect_err("Unknown must not be an empty tagged object");
+
+        let mut invalid_status = base;
+        invalid_status["resolution_status"] = json!("complete-not-a-status");
+        schemas
+            .validate(&invalid_status, index)
+            .expect_err("invalid resolution_status must be rejected");
         Ok(())
     }
 
