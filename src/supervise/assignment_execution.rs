@@ -3653,15 +3653,23 @@ struct ParentAuditorCollection {
     verdict: ReviewLensVerdict,
 }
 
+struct ParentAuditorDispatchFrame<'a> {
+    journal_parent_id: &'a str,
+    auditor_attempt: usize,
+    review_cost_binding: &'a mut ParentWorkerAttemptReviewCostBinding,
+}
+
 fn dispatch_and_collect_parent_auditor(
     context: &AssignmentExecutionContext<'_, '_>,
     outcome: &mut AssignmentExecutionOutcome,
     preflight: &AssignmentExecutionPreflight<'_>,
-    journal_parent_id: &str,
-    auditor_attempt: usize,
     child_report: &mut OrchestratorReviewReport,
     prepared: PreparedParentAuditor<'_>,
+    frame: &mut ParentAuditorDispatchFrame<'_>,
 ) -> Result<ParentAuditorCollection> {
+    let journal_parent_id = frame.journal_parent_id;
+    let auditor_attempt = frame.auditor_attempt;
+    let review_cost_binding = &mut frame.review_cost_binding;
     let AssignmentExecutionContext {
         repo,
         execution_runtime,
@@ -3820,6 +3828,7 @@ fn dispatch_and_collect_parent_auditor(
             return Err(error).context("failed to produce deterministic parent auditor output");
         }
     };
+    review_cost_binding.observe_parent_auditor_external_run(&auditor_run);
     let auditor_environment_blocked = auditor_run.environment_blocked();
     outcome
         .gate_denials
@@ -4600,7 +4609,7 @@ fn execute_supervisor_assignment_inner(
             }
         }
 
-        let Some((mut child_report, child_launch_model_provenance, terminal_attempt_outcome)) =
+        let Some((mut child_report, child_launch_model_provenance, mut terminal_attempt_outcome)) =
             child_result
         else {
             let error = anyhow!(
@@ -4751,6 +4760,10 @@ fn execute_supervisor_assignment_inner(
         let mut auditor_primary_integrity_failed = false;
         let mut auditor_sandbox_denied = false;
         let mut auditor_environment_blocked = false;
+        let mut review_cost_binding = ParentWorkerAttemptReviewCostBinding::bind(
+            &assignment.id,
+            terminal_attempt_outcome.attempt,
+        );
         if child_containment_verified
             && !child_gate_terminal
             && parent_auditor_required(assignment, &child_report)
@@ -4813,6 +4826,7 @@ fn execute_supervisor_assignment_inner(
                 .unwrap_or(options.runtime);
             let mut expected_requests = Vec::with_capacity(active_plan.review_lenses.len());
             let mut verdicts = Vec::with_capacity(active_plan.review_lenses.len());
+            review_cost_binding.begin_stacked_parent_review_lenses(active_plan.review_lenses.len());
             for (lens_index, lens) in active_plan.review_lenses.iter().enumerate() {
                 let expected_request =
                     crate::review::build_bounded_review_lens_request(lens, sources)?;
@@ -4822,6 +4836,7 @@ fn execute_supervisor_assignment_inner(
                     runtime_model_catalog,
                 );
                 if let Err(error) = runtime_validation {
+                    review_cost_binding.record_parent_auditor_lens_undispatched();
                     child_report.findings.push(Finding {
                         severity: FindingSeverity::Error,
                         message: format!(
@@ -4856,8 +4871,11 @@ fn execute_supervisor_assignment_inner(
                     },
                 )? {
                     ParentAuditorPreparation::Ready(prepared) => prepared,
+                    // Assignment failure: inner returns without persisting review
+                    // cost on the worker attempt row (no safe dispatch-set boundary).
                     ParentAuditorPreparation::AssignmentComplete => return Ok(()),
                     ParentAuditorPreparation::GateComplete { verdict } => {
+                        review_cost_binding.mark_parent_review_stack_short_circuited();
                         expected_requests.push(expected_request);
                         verdicts.push(verdict);
                         for remaining_lens in active_plan.review_lenses.iter().skip(lens_index + 1)
@@ -4879,14 +4897,18 @@ fn execute_supervisor_assignment_inner(
                         break;
                     }
                 };
+                let mut auditor_dispatch_frame = ParentAuditorDispatchFrame {
+                    journal_parent_id,
+                    auditor_attempt,
+                    review_cost_binding: &mut review_cost_binding,
+                };
                 let auditor_collection = dispatch_and_collect_parent_auditor(
                     context,
                     outcome,
                     &preflight,
-                    journal_parent_id,
-                    auditor_attempt,
                     &mut child_report,
                     prepared_auditor,
+                    &mut auditor_dispatch_frame,
                 )?;
                 assignment_containment_verified &= auditor_collection.containment_verified;
                 auditor_primary_integrity_failed |= auditor_collection.primary_integrity_failed;
@@ -4942,6 +4964,11 @@ fn execute_supervisor_assignment_inner(
             &mut retry_feedback,
         )? {
             ParentAuditorGateDisposition::Retry => {
+                persist_worker_attempt_review_cost(
+                    artifacts,
+                    &review_cost_binding,
+                    &mut terminal_attempt_outcome,
+                )?;
                 record_parent_auditor_retry(artifacts, &terminal_attempt_outcome)?;
                 warning_streak = None;
                 continue 'gate_controller;
@@ -4951,6 +4978,11 @@ fn execute_supervisor_assignment_inner(
                 candidate,
                 containment_verified,
             } => {
+                persist_worker_attempt_review_cost(
+                    artifacts,
+                    &review_cost_binding,
+                    &mut terminal_attempt_outcome,
+                )?;
                 break 'gate_controller (
                     report,
                     candidate,
@@ -5828,16 +5860,24 @@ mod decomposition_tests {
             prepared_auditor.auditor_command.machine_global_retention,
             options.machine_global_retention
         );
+        let mut review_cost_binding = ParentWorkerAttemptReviewCostBinding::bind(&assignment.id, 1);
+        review_cost_binding.begin_stacked_parent_review_lenses(1);
+        let mut auditor_dispatch_frame = ParentAuditorDispatchFrame {
+            journal_parent_id: options.run_id.as_str(),
+            auditor_attempt,
+            review_cost_binding: &mut review_cost_binding,
+        };
         let auditor_collection = dispatch_and_collect_parent_auditor(
             &context,
             &mut outcome,
             &preflight,
-            options.run_id.as_str(),
-            auditor_attempt,
             &mut child_report,
             prepared_auditor,
+            &mut auditor_dispatch_frame,
         )
         .expect("direct auditor dispatch invocation");
+        assert_eq!(review_cost_binding.parent_auditor_invocation_count(), 1);
+        assert!(review_cost_binding.review_total_microunits().is_none());
         assert!(auditor_collection.containment_verified);
         assert_eq!(child_report.audit_reports.len(), 1);
 
@@ -5884,6 +5924,467 @@ mod decomposition_tests {
         assert!(outcome.report.is_some());
         assert_eq!(outcome.command_records.len(), 2);
         assert!(!outcome.external_containment_failed);
+    }
+
+    #[test]
+    fn parent_gate_complete_persists_trusted_grok_review_cost_on_worker_attempt_row() {
+        use crate::mutation_taxonomy::AssignmentProcessLaunchKind;
+
+        const REVIEW_COST_MICROUNITS: u64 = 41;
+
+        let temp = tempfile::tempdir().expect("temporary phase fixture");
+        let grok_bin = temp.path().join("bin").join("grok");
+        fs::create_dir_all(grok_bin.parent().expect("grok bin parent"))
+            .expect("create grok bin directory");
+        fs::write(&grok_bin, "fixture-grok-binary\n").expect("write grok fixture binary");
+        let (_grok_environment_lock, _grok_environment_guard) =
+            GrokBinaryEnvironmentGuard::install(&grok_bin);
+        let repo = temp.path().join("repo");
+        Repository::init(&repo).expect("initialize phase fixture repository");
+        fs::write(repo.join("README.md"), "baseline\n").expect("write fixture file");
+        commit_fixture_repository(&repo);
+
+        let assignment = OrchestratorAssignment {
+            id: "phase-child".to_string(),
+            phase: AssignmentPhase::Execution,
+            runtime: None,
+            role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        };
+        let plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "parent review cost gate wiring".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: 10,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+            assignments: vec![assignment.clone()],
+        };
+        let budget_config = SupervisorBudgetConfig::default();
+        let consultant = SupervisorConsultantPlan::default();
+        let assignment_metadata = AssignmentMetadata::new();
+        let options = SupervisorRunOptions {
+            repo: repo.clone(),
+            plan_file: temp.path().join("plan.json"),
+            run_id: RunId::new("parent-gate-review-cost").expect("valid fixture run id"),
+            parent_node: None,
+            codex_bin: PathBuf::from("unused-codex"),
+            runtime: SupervisorRuntime::Fake,
+            allow_dirty_primary: false,
+            allow_live_run_collision: false,
+            admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+            budget_overrides: crate::supervise::RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
+            machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
+                config: temp.path().join("unused-machine-global.json"),
+                root_id: "runtime".to_string(),
+                owner: "maco-supervise".to_string(),
+                correction_correlation_id: "parent-gate-review-cost".to_string(),
+            }),
+        };
+        let mut artifact_writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            options.run_id.clone(),
+            "parent-gate-review-cost-test",
+        )
+        .expect("reserve phase artifacts");
+        let run_dir = artifact_writer.run_dir().to_path_buf();
+        let dirs = RunDirs::for_writer(&artifact_writer);
+        let manager = WorktreeManager::new(&repo);
+        let sync_store = SyncStore::open(&repo).expect("open fixture sync store");
+        let semantic_store = SemanticIntentStore::open(&repo).expect("open fixture semantic store");
+        let assignment_schedule = vec![AssignmentScheduleEntry {
+            assignment_id: assignment.id.clone(),
+            parent_assignment_id: None,
+            depth: 1,
+            flattened_index: 0,
+        }];
+        let field_guide = SupervisorFieldGuidePrompt::empty().expect("empty fixture field guide");
+        let budget_ledger =
+            RunBudgetLedger::new(RunBudgetLimits::default()).expect("fixture budget ledger");
+        let child_budget_policy = AssignmentBudgetPolicy::default();
+        let fake_runtime_model_catalog = RuntimeModelCatalog::LocalDeterministicFake;
+        let cancellation = ProcessCancellation::new();
+        let mut journal = initialize_orchestration_event_journal(
+            &repo,
+            &options.run_id,
+            options.parent_node.as_deref(),
+        );
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut artifact_writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let assignment_for_runner = assignment.clone();
+        let child_report_for_runner = Mutex::new(OrchestratorReviewReport {
+            id: assignment.id.clone(),
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: assignment.assigned_paths.clone(),
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            claim_token: None,
+            semantic_intent_token: None,
+            commands_run: Vec::new(),
+            environment_failures: Vec::new(),
+            files_changed: vec![PathBuf::from("README.md")],
+            validation_results: Vec::new(),
+            findings: Vec::new(),
+            field_guide_entries: Vec::new(),
+            worker_reports: Vec::new(),
+            audit_reports: Vec::new(),
+            review_lens_aggregate: None,
+            decomposition_completions: Vec::new(),
+            licensed_breakage_review: None,
+            generated_follow_up_tasks: Vec::new(),
+            gate_denials: Vec::new(),
+            gate_correction_outcomes: Vec::new(),
+            accepted: true,
+            rejected: false,
+            status: ReviewStatus::Succeeded,
+            remaining_risk: String::new(),
+            next_safe_action: String::new(),
+        });
+        let grok_runner = {
+            let assignment_for_runner = assignment_for_runner.clone();
+            let child_report_for_runner = &child_report_for_runner;
+            move |command: &ExternalAgentCommand,
+                  _cancellation: &ProcessCancellation,
+                  _review: Option<ExternalPreActionReviewRuntime<'_>>|
+                  -> ExternalAgentRun {
+                if command.assignment_process_launch_kind
+                    != Some(AssignmentProcessLaunchKind::ParentAuditor)
+                {
+                    panic!(
+                        "unexpected external runner invocation for parent gate review-cost test"
+                    );
+                }
+                let auditor_id = command
+                    .agent_lifecycle
+                    .as_ref()
+                    .map(|identity| identity.task_id.as_str())
+                    .expect("parent auditor command identity");
+                let child_report = child_report_for_runner
+                    .lock()
+                    .expect("child report for parent auditor runner");
+                let mut fake_auditor_command = command.clone();
+                fake_auditor_command.model = None;
+                fake_auditor_command.model_provider = None;
+                let mut run = deterministic_fake_auditor_run(
+                    &fake_auditor_command,
+                    auditor_id,
+                    &assignment_for_runner,
+                    &child_report,
+                )
+                .expect("deterministic parent auditor output");
+                run.grok_acp_parent_evidence =
+                    super::super::test_trusted_grok_parent_auditor_external_run(
+                        command,
+                        REVIEW_COST_MICROUNITS,
+                        4_100_000,
+                    )
+                    .grok_acp_parent_evidence;
+                run
+            }
+        };
+        let child_runner = unused_external_runner;
+        let child_context = AssignmentExecutionContext {
+            index: 0,
+            concurrent_mode: false,
+            plan: &plan,
+            requested_plan: &plan,
+            execution_target: None,
+            budget_config: &budget_config,
+            consultant: &consultant,
+            assignment_metadata: &assignment_metadata,
+            assignment: &assignment,
+            evidence_only_reaudit: None,
+            options: &options,
+            repo: &repo,
+            run_dir: &run_dir,
+            dirs: &dirs,
+            execution_runtime: SupervisorExecutionRuntime::NonpublishableSimulation,
+            worktree_creation: SupervisorWorktreeCreation::TestOnly,
+            manager: &manager,
+            reused: false,
+            sync_store: &sync_store,
+            semantic_store: &semantic_store,
+            prepared_semantic_token: None,
+            prepared_semantic_findings: &[],
+            prepared_semantic_signals: &[],
+            prepared_semantic_failed: false,
+            assignment_schedule: &assignment_schedule,
+            field_guide: &field_guide,
+            serial_semantic_warn_intents: None,
+            semantic_block_order: None,
+            semantic_block_gate: None,
+            artifacts: &artifacts,
+            budget_ledger: &budget_ledger,
+            budget_policy: child_budget_policy,
+            admission_commit: None,
+            runtime_model_catalog: &fake_runtime_model_catalog,
+            cancellation: cancellation.clone(),
+            external_runner: &child_runner,
+        };
+        let mut outcome = AssignmentExecutionOutcome {
+            gate_tracker: Some(GateCorrectionTracker::new(plan.max_gate_corrections)),
+            ..AssignmentExecutionOutcome::default()
+        };
+        let preflight = match prepare_assignment_execution(&child_context, &mut outcome)
+            .expect("parent gate review-cost preflight")
+        {
+            AssignmentExecutionDisposition::Continue(preflight) => preflight,
+            AssignmentExecutionDisposition::Complete => {
+                panic!("preflight unexpectedly completed assignment")
+            }
+        };
+        let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
+        let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
+        let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
+        fs::create_dir_all(&dirs.schemas).expect("create schema directory");
+        fs::write(&auditor_schema_path, "{\"type\":\"object\"}\n")
+            .expect("materialize auditor schema");
+        let prepared = match prepare_child_attempt(
+            &child_context,
+            &mut outcome,
+            &child_context.budget_policy,
+            &preflight,
+            options.run_id.as_str(),
+            1,
+            1,
+            &None,
+            &schema_path,
+            &worker_schema_path,
+            &auditor_schema_path,
+        )
+        .expect("child preparation")
+        {
+            AssignmentExecutionDisposition::Continue(prepared) => prepared,
+            AssignmentExecutionDisposition::Complete => panic!("child preparation completed early"),
+        };
+        let collected = dispatch_and_collect_child_attempt(
+            &child_context,
+            &mut outcome,
+            &preflight,
+            options.run_id.as_str(),
+            1,
+            prepared,
+        )
+        .expect("child dispatch");
+        let attempt_external_run = collected.external_run.clone();
+        let mut structural_attempt = 1;
+        let mut retry_feedback = None;
+        let mut attempt_history = Vec::new();
+        let mut warning_streak = None;
+        let child_report = match decide_child_attempt(
+            &child_context,
+            &mut outcome,
+            &preflight,
+            options.run_id.as_str(),
+            1,
+            &mut structural_attempt,
+            &mut retry_feedback,
+            &mut attempt_history,
+            &mut warning_streak,
+            collected,
+        )
+        .expect("child gate")
+        {
+            ChildAttemptDisposition::Finish { report, .. } => report,
+            ChildAttemptDisposition::Retry => panic!("unexpected child retry"),
+        };
+        *child_report_for_runner.lock().expect("child report lock") = child_report.clone();
+        let mut terminal_attempt_outcome = record_child_attempt_outcome(
+            &artifacts,
+            &options.run_id,
+            &assignment.id,
+            1,
+            assignment.role,
+            &outcome.selection_decisions,
+            &child_context.budget_policy.initial_selector_decisions,
+            "grok",
+            Some("grok-code-fast-1"),
+            Some("high"),
+            true,
+            false,
+            Some(&attempt_external_run),
+        )
+        .expect("record worker attempt outcome");
+        let execution_cost_before_persist =
+            terminal_attempt_outcome.costs.execution_cost_microunits;
+        let final_report_path = dirs.reports.join("phase-child.json");
+        let mut grok_budget_policy = AssignmentBudgetPolicy::default();
+        grok_budget_policy
+            .set_selected_runtime_for_test(AgentRole::Auditor, SupervisorRuntime::Grok);
+        let grok_runtime_model_catalog = RuntimeModelCatalog::OperatorDeclared;
+        let grok_context = AssignmentExecutionContext {
+            index: child_context.index,
+            concurrent_mode: child_context.concurrent_mode,
+            plan: child_context.plan,
+            requested_plan: child_context.requested_plan,
+            execution_target: child_context.execution_target,
+            budget_config: child_context.budget_config,
+            consultant: child_context.consultant,
+            assignment_metadata: child_context.assignment_metadata,
+            assignment: child_context.assignment,
+            evidence_only_reaudit: child_context.evidence_only_reaudit,
+            options: child_context.options,
+            repo: child_context.repo,
+            run_dir: child_context.run_dir,
+            dirs: child_context.dirs,
+            execution_runtime: child_context.execution_runtime,
+            worktree_creation: child_context.worktree_creation,
+            manager: child_context.manager,
+            reused: child_context.reused,
+            sync_store: child_context.sync_store,
+            semantic_store: child_context.semantic_store,
+            prepared_semantic_token: child_context.prepared_semantic_token,
+            prepared_semantic_findings: child_context.prepared_semantic_findings,
+            prepared_semantic_signals: child_context.prepared_semantic_signals,
+            prepared_semantic_failed: child_context.prepared_semantic_failed,
+            assignment_schedule: child_context.assignment_schedule,
+            field_guide: child_context.field_guide,
+            serial_semantic_warn_intents: child_context.serial_semantic_warn_intents,
+            semantic_block_order: child_context.semantic_block_order,
+            semantic_block_gate: child_context.semantic_block_gate,
+            artifacts: child_context.artifacts,
+            budget_ledger: child_context.budget_ledger,
+            budget_policy: grok_budget_policy,
+            admission_commit: child_context.admission_commit,
+            runtime_model_catalog: &grok_runtime_model_catalog,
+            cancellation: child_context.cancellation.clone(),
+            external_runner: &grok_runner,
+        };
+        let mut auditor_attempt = 0;
+        let lens = plan.review_lenses[0].clone();
+        let output_report = serde_json::to_string(&child_report).expect("serialize child report");
+        let expected_request = build_review_lens_request(
+            &lens,
+            ReviewLensRequestSources {
+                child_transcript: "parent gate review-cost transcript",
+                diff: "parent gate review-cost diff",
+                output_report: &output_report,
+            },
+        )
+        .expect("build review request");
+        let required_coverage = ReviewCoverageRequirement {
+            worker_ids: assignment
+                .worker_assignments
+                .iter()
+                .map(|worker| worker.id.clone())
+                .collect(),
+            paths: assignment.assigned_paths.clone(),
+        };
+        let mut child_report_for_gate = child_report.clone();
+        let prepared_auditor = match prepare_parent_auditor(
+            &grok_context,
+            &mut outcome,
+            &preflight,
+            options.run_id.as_str(),
+            &mut child_report_for_gate,
+            &mut auditor_attempt,
+            ParentAuditorLensExecution {
+                budget_policy: &grok_context.budget_policy,
+                lens: &lens,
+                lens_index: 0,
+                expected_request: &expected_request,
+                required_coverage: &required_coverage,
+            },
+        )
+        .expect("auditor preparation")
+        {
+            ParentAuditorPreparation::Ready(prepared) => prepared,
+            ParentAuditorPreparation::AssignmentComplete => {
+                panic!("auditor preparation completed assignment early")
+            }
+            ParentAuditorPreparation::GateComplete { .. } => {
+                panic!("auditor preparation short-circuited gate")
+            }
+        };
+        let mut review_cost_binding = ParentWorkerAttemptReviewCostBinding::bind(&assignment.id, 1);
+        review_cost_binding.begin_stacked_parent_review_lenses(1);
+        let mut auditor_dispatch_frame = ParentAuditorDispatchFrame {
+            journal_parent_id: options.run_id.as_str(),
+            auditor_attempt,
+            review_cost_binding: &mut review_cost_binding,
+        };
+        dispatch_and_collect_parent_auditor(
+            &grok_context,
+            &mut outcome,
+            &preflight,
+            &mut child_report_for_gate,
+            prepared_auditor,
+            &mut auditor_dispatch_frame,
+        )
+        .expect("parent auditor dispatch");
+        match decide_parent_auditor_gate(
+            &grok_context,
+            &mut outcome,
+            &preflight,
+            options.run_id.as_str(),
+            &final_report_path,
+            true,
+            true,
+            false,
+            false,
+            false,
+            None,
+            child_report_for_gate,
+            &mut retry_feedback,
+        )
+        .expect("parent auditor gate")
+        {
+            ParentAuditorGateDisposition::Complete { .. } => {}
+            ParentAuditorGateDisposition::Retry => panic!("unexpected parent auditor retry"),
+        }
+        persist_worker_attempt_review_cost(
+            &artifacts,
+            &review_cost_binding,
+            &mut terminal_attempt_outcome,
+        )
+        .expect("persist review cost on complete path");
+        assert_eq!(
+            terminal_attempt_outcome.costs.review_cost_microunits,
+            Some(REVIEW_COST_MICROUNITS)
+        );
+        let stored: AttemptOutcomeEvidence = serde_json::from_slice(
+            &std::fs::read(
+                repo.join(RunArtifactFamily::Supervise.run_root())
+                    .join(options.run_id.as_str())
+                    .join("selection-attempts/phase-child.attempt-1.json"),
+            )
+            .expect("read attempt evidence"),
+        )
+        .expect("decode attempt evidence");
+        assert_eq!(
+            stored.costs.review_cost_microunits,
+            Some(REVIEW_COST_MICROUNITS)
+        );
+        assert_eq!(
+            stored.costs.execution_cost_microunits,
+            execution_cost_before_persist
+        );
+        assert!(stored.costs.rework_cost_microunits.is_none());
+        assert!(stored.costs.rereview_cost_microunits.is_none());
+        assert!(stored.costs.environment_cost_microunits.is_none());
     }
 
     #[cfg(target_os = "linux")]

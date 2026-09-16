@@ -216,6 +216,130 @@ fn attributable_execution_cost_microunits(evidence: &GrokAcpParentEvidence) -> O
     }
 }
 
+fn attributable_parent_auditor_cost_microunits(external_run: &ExternalAgentRun) -> Option<u64> {
+    external_run
+        .grok_acp_parent_evidence
+        .as_ref()
+        .and_then(attributable_execution_cost_microunits)
+}
+
+/// Parent-owned review dispatch costs for one worker attempt on one assignment.
+///
+/// A stacked-lens pass is persistable only when every planned lens either
+/// executed a parent auditor dispatch or the pass short-circuited before any
+/// dispatch (see `parent_review_dispatch_set_is_complete`). Partial stacks after
+/// at least one dispatch retain `None` rather than a partial sum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ParentWorkerAttemptReviewCostBinding {
+    assignment_id: String,
+    worker_attempt: usize,
+    total_microunits: Option<u64>,
+    parent_auditor_invocations: usize,
+    planned_lens_count: usize,
+    lenses_undispatched_without_run: usize,
+    parent_review_stack_short_circuited: bool,
+}
+
+impl ParentWorkerAttemptReviewCostBinding {
+    pub(super) fn bind(assignment_id: &str, worker_attempt: usize) -> Self {
+        Self {
+            assignment_id: assignment_id.to_string(),
+            worker_attempt,
+            total_microunits: None,
+            parent_auditor_invocations: 0,
+            planned_lens_count: 0,
+            lenses_undispatched_without_run: 0,
+            parent_review_stack_short_circuited: false,
+        }
+    }
+
+    pub(super) fn begin_stacked_parent_review_lenses(&mut self, planned_lens_count: usize) {
+        self.planned_lens_count = planned_lens_count;
+        self.lenses_undispatched_without_run = 0;
+        self.parent_review_stack_short_circuited = false;
+    }
+
+    pub(super) fn record_parent_auditor_lens_undispatched(&mut self) {
+        self.lenses_undispatched_without_run += 1;
+    }
+
+    pub(super) fn mark_parent_review_stack_short_circuited(&mut self) {
+        self.parent_review_stack_short_circuited = true;
+    }
+
+    pub(super) fn parent_review_dispatch_set_is_complete(&self) -> bool {
+        if self.parent_review_stack_short_circuited {
+            return false;
+        }
+        if self.planned_lens_count == 0 {
+            return true;
+        }
+        self.lenses_undispatched_without_run == 0
+            && self.parent_auditor_invocations == self.planned_lens_count
+    }
+
+    pub(super) fn observe_parent_auditor_external_run(&mut self, external_run: &ExternalAgentRun) {
+        self.parent_auditor_invocations += 1;
+        let addend = attributable_parent_auditor_cost_microunits(external_run);
+        self.total_microunits = match (self.total_microunits, addend) {
+            (_, None) => None,
+            (None, Some(microunits)) if self.parent_auditor_invocations == 1 => Some(microunits),
+            (None, Some(_)) => None,
+            (Some(current), Some(microunits)) => current.checked_add(microunits),
+        };
+    }
+
+    fn persistable_review_cost_microunits(&self) -> Option<Option<u64>> {
+        if self.parent_auditor_invocations == 0 {
+            return None;
+        }
+        Some(if self.parent_review_dispatch_set_is_complete() {
+            self.total_microunits
+        } else {
+            None
+        })
+    }
+}
+
+#[cfg(test)]
+impl ParentWorkerAttemptReviewCostBinding {
+    pub(super) fn review_total_microunits(&self) -> Option<u64> {
+        self.total_microunits
+    }
+
+    pub(super) fn parent_auditor_invocation_count(&self) -> usize {
+        self.parent_auditor_invocations
+    }
+
+    pub(super) fn parent_review_dispatch_set_complete_for_test(&self) -> bool {
+        self.parent_review_dispatch_set_is_complete()
+    }
+}
+
+pub(super) fn persist_worker_attempt_review_cost(
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    binding: &ParentWorkerAttemptReviewCostBinding,
+    attempt_record: &mut AttemptOutcomeEvidence,
+) -> Result<()> {
+    if attempt_record.assignment_id != binding.assignment_id
+        || attempt_record.attempt != binding.worker_attempt
+    {
+        bail!(
+            "review cost binding {}/{} does not match attempt record {}/{}",
+            binding.assignment_id,
+            binding.worker_attempt,
+            attempt_record.assignment_id,
+            attempt_record.attempt
+        );
+    }
+    let Some(microunits) = binding.persistable_review_cost_microunits() else {
+        return Ok(());
+    };
+    attempt_record.costs.review_cost_microunits = microunits;
+    write_attempt_evidence(artifacts, attempt_record)?;
+    Ok(())
+}
+
 fn selection_binding_for_attempt(
     role: AgentRole,
     assignment_id: &str,
@@ -564,6 +688,35 @@ fn project_numeric_row(row: &AttemptOutcomeEvidence) -> Option<OutcomeRecord> {
         environment_failures: Vec::new(),
         fixed_cause_relaunch: None,
     })
+}
+
+#[cfg(test)]
+pub(super) fn test_trusted_grok_parent_auditor_external_run(
+    command: &crate::external_agent::ExternalAgentCommand,
+    microunits: u64,
+    cost_usd_ticks: u64,
+) -> ExternalAgentRun {
+    let mut external_run = super::tests::injected_verified_run(command);
+    external_run.grok_acp_parent_evidence = Some(GrokAcpParentEvidence {
+        protocol: "grok_acp_stdio".to_string(),
+        session_id: "trusted-parent-auditor-session".to_string(),
+        requested_model: None,
+        requested_effort: None,
+        client_resolved_model: GrokAcpParentResolvedField::Known("grok-code-fast-1".to_string()),
+        client_resolved_effort: GrokAcpParentResolvedField::Known("high".to_string()),
+        resolution_status: "complete".to_string(),
+        terminal_usage: None,
+        native_cost_equivalent_microunits: GrokAcpNativeCostEquivalent::Known {
+            cost_usd_ticks,
+            microunits,
+        },
+        permission_escalation_refused: false,
+        structured_output: None,
+        structured_output_error: None,
+        final_text: None,
+        stop_reason: None,
+    });
+    external_run
 }
 
 #[cfg(test)]
@@ -1383,6 +1536,263 @@ mod tests {
         Ok(())
     }
 
+    fn parent_auditor_run_with_trusted_acp_on(
+        temp: &tempfile::TempDir,
+        repo: &Path,
+        microunits: u64,
+        cost_usd_ticks: u64,
+    ) -> ExternalAgentRun {
+        let mut external_run =
+            super::super::tests::injected_verified_run(&injected_parent_command(temp, repo));
+        external_run.grok_acp_parent_evidence = Some(trusted_grok_acp_parent_evidence(
+            "grok-code-fast-1",
+            "high",
+            GrokAcpNativeCostEquivalent::Known {
+                cost_usd_ticks,
+                microunits,
+            },
+        ));
+        external_run
+    }
+
+    #[test]
+    fn parent_review_cost_binding_sums_stacked_auditor_dispatches() {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let mut binding = ParentWorkerAttemptReviewCostBinding::bind("assignment-a", 1);
+        binding.begin_stacked_parent_review_lenses(2);
+        binding.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
+            &temp, &repo, 11, 1_100_000,
+        ));
+        binding.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
+            &temp, &repo, 29, 2_900_000,
+        ));
+        assert_eq!(binding.parent_auditor_invocation_count(), 2);
+        assert_eq!(binding.review_total_microunits(), Some(40));
+        assert!(binding.parent_review_dispatch_set_complete_for_test());
+    }
+
+    #[test]
+    fn parent_review_cost_binding_unknown_contaminates_total() {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let mut binding = ParentWorkerAttemptReviewCostBinding::bind("assignment-a", 1);
+        binding.begin_stacked_parent_review_lenses(2);
+        binding.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
+            &temp, &repo, 5, 500_000,
+        ));
+        let mut incomplete = parent_auditor_run_with_trusted_acp_on(&temp, &repo, 0, 0);
+        incomplete
+            .grok_acp_parent_evidence
+            .as_mut()
+            .expect("parent evidence")
+            .resolution_status = "incomplete".to_string();
+        binding.observe_parent_auditor_external_run(&incomplete);
+        assert_eq!(binding.parent_auditor_invocation_count(), 2);
+        assert!(binding.review_total_microunits().is_none());
+    }
+
+    #[test]
+    fn parent_review_cost_binding_overflow_makes_total_unknown() {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let ticks_per_microunit = 100_000;
+        let microunits = u64::MAX / ticks_per_microunit;
+        let run = parent_auditor_run_with_trusted_acp_on(
+            &temp,
+            &repo,
+            microunits,
+            microunits * ticks_per_microunit,
+        );
+        let dispatch_count =
+            usize::try_from(u64::MAX / microunits + 1).expect("overflow dispatch count fits usize");
+        let mut binding = ParentWorkerAttemptReviewCostBinding::bind("assignment-a", 1);
+        binding.begin_stacked_parent_review_lenses(dispatch_count);
+        for _ in 0..dispatch_count {
+            binding.observe_parent_auditor_external_run(&run);
+        }
+        assert_eq!(binding.parent_auditor_invocation_count(), dispatch_count);
+        assert!(binding.review_total_microunits().is_none());
+    }
+
+    #[test]
+    fn parent_review_cost_binding_isolated_per_assignment_attempt() {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let mut first = ParentWorkerAttemptReviewCostBinding::bind("assignment-a", 1);
+        let mut second = ParentWorkerAttemptReviewCostBinding::bind("assignment-a", 2);
+        let mut other = ParentWorkerAttemptReviewCostBinding::bind("assignment-b", 1);
+        first.begin_stacked_parent_review_lenses(1);
+        second.begin_stacked_parent_review_lenses(1);
+        other.begin_stacked_parent_review_lenses(1);
+        first.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
+            &temp, &repo, 11, 1_100_000,
+        ));
+        second.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
+            &temp, &repo, 22, 2_200_000,
+        ));
+        other.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
+            &temp, &repo, 33, 3_300_000,
+        ));
+        assert_eq!(first.review_total_microunits(), Some(11));
+        assert_eq!(second.review_total_microunits(), Some(22));
+        assert_eq!(other.review_total_microunits(), Some(33));
+    }
+
+    #[test]
+    fn persist_worker_attempt_review_cost_rejects_partial_stacked_lens_sum() -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let run_id = RunId::new("review-cost-partial-stack")?;
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "maco-supervise",
+        )?;
+        let mut journal = None;
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let initial = grok_worker_selection_event();
+        let mut recorded = record_child_attempt_outcome(
+            &artifacts,
+            &run_id,
+            "assignment-1",
+            1,
+            AgentRole::Worker,
+            &[],
+            std::slice::from_ref(&initial),
+            "grok",
+            Some("grok-code-fast-1"),
+            Some("high"),
+            true,
+            false,
+            None,
+        )?;
+        let mut binding = ParentWorkerAttemptReviewCostBinding::bind("assignment-1", 1);
+        binding.begin_stacked_parent_review_lenses(2);
+        binding.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
+            &temp, &repo, 50, 5_000_000,
+        ));
+        binding.record_parent_auditor_lens_undispatched();
+        assert!(!binding.parent_review_dispatch_set_complete_for_test());
+        persist_worker_attempt_review_cost(&artifacts, &binding, &mut recorded)?;
+        assert!(recorded.costs.review_cost_microunits.is_none());
+        let stored: AttemptOutcomeEvidence = serde_json::from_slice(&std::fs::read(
+            repo.join(RunArtifactFamily::Supervise.run_root())
+                .join(run_id.as_str())
+                .join("selection-attempts/assignment-1.attempt-1.json"),
+        )?)?;
+        assert!(stored.costs.review_cost_microunits.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn persist_worker_attempt_review_cost_rejects_assignment_attempt_mismatch() -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let run_id = RunId::new("review-cost-binding-mismatch")?;
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "maco-supervise",
+        )?;
+        let mut journal = None;
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let initial = grok_worker_selection_event();
+        let mut recorded = record_child_attempt_outcome(
+            &artifacts,
+            &run_id,
+            "assignment-1",
+            1,
+            AgentRole::Worker,
+            &[],
+            std::slice::from_ref(&initial),
+            "grok",
+            Some("grok-code-fast-1"),
+            Some("high"),
+            true,
+            false,
+            None,
+        )?;
+        let mut binding = ParentWorkerAttemptReviewCostBinding::bind("other-assignment", 1);
+        binding.begin_stacked_parent_review_lenses(1);
+        binding.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
+            &temp, &repo, 1, 100_000,
+        ));
+        let error = persist_worker_attempt_review_cost(&artifacts, &binding, &mut recorded)
+            .expect_err("binding mismatch must fail closed");
+        assert!(error.to_string().contains("does not match attempt record"));
+        drop(temp);
+        Ok(())
+    }
+
+    #[test]
+    fn persist_worker_attempt_review_cost_preserves_execution_and_identity() -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let run_id = RunId::new("review-cost-persist-record")?;
+        let external_run = parent_run_with_trusted_acp(
+            &temp,
+            &repo,
+            "grok-code-fast-1",
+            GrokAcpNativeCostEquivalent::Known {
+                cost_usd_ticks: 20_000_000,
+                microunits: 200,
+            },
+        );
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "maco-supervise",
+        )?;
+        let mut journal = None;
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let initial = grok_worker_selection_event();
+        let mut recorded = record_child_attempt_outcome(
+            &artifacts,
+            &run_id,
+            "assignment-1",
+            1,
+            AgentRole::Worker,
+            &[],
+            std::slice::from_ref(&initial),
+            "grok",
+            Some("grok-code-fast-1"),
+            Some("high"),
+            true,
+            false,
+            Some(&external_run),
+        )?;
+        let mut binding = ParentWorkerAttemptReviewCostBinding::bind("assignment-1", 1);
+        binding.begin_stacked_parent_review_lenses(1);
+        binding.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
+            &temp, &repo, 17, 1_700_000,
+        ));
+        persist_worker_attempt_review_cost(&artifacts, &binding, &mut recorded)?;
+        let stored: AttemptOutcomeEvidence = serde_json::from_slice(&std::fs::read(
+            repo.join(RunArtifactFamily::Supervise.run_root())
+                .join(run_id.as_str())
+                .join("selection-attempts/assignment-1.attempt-1.json"),
+        )?)?;
+        assert_eq!(stored.costs.review_cost_microunits, Some(17));
+        assert_eq!(stored.costs.execution_cost_microunits, Some(200));
+        assert_eq!(stored.observed_candidate, recorded.observed_candidate);
+        Ok(())
+    }
+
     #[test]
     fn parent_auditor_retry_preserves_parent_acp_observation() -> Result<()> {
         let (temp, repo) = super::super::tests::injected_repository();
@@ -1411,7 +1821,7 @@ mod tests {
             checkpoint: None,
         });
         let initial = grok_worker_selection_event();
-        let recorded = record_child_attempt_outcome(
+        let mut recorded = record_child_attempt_outcome(
             &artifacts,
             &run_id,
             "assignment-1",
@@ -1426,6 +1836,12 @@ mod tests {
             false,
             Some(&external_run),
         )?;
+        let mut review_binding = ParentWorkerAttemptReviewCostBinding::bind("assignment-1", 1);
+        review_binding.begin_stacked_parent_review_lenses(1);
+        review_binding.observe_parent_auditor_external_run(
+            &parent_auditor_run_with_trusted_acp_on(&temp, &repo, 9, 900_000),
+        );
+        persist_worker_attempt_review_cost(&artifacts, &review_binding, &mut recorded)?;
         record_parent_auditor_retry(&artifacts, &recorded)?;
         let stored: AttemptOutcomeEvidence = serde_json::from_slice(&std::fs::read(
             repo.join(RunArtifactFamily::Supervise.run_root())
@@ -1437,6 +1853,7 @@ mod tests {
             stored.costs.execution_cost_microunits,
             recorded.costs.execution_cost_microunits
         );
+        assert_eq!(stored.costs.review_cost_microunits, Some(9));
         assert_eq!(
             stored.parent_cause.as_deref(),
             Some("parent_auditor_authorized_retry")
