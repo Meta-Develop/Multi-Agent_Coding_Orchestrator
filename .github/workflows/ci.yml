@@ -44,6 +44,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Verify delegated Linux process startup
+        run: bash .github/scripts/run-linux-all-tests-in-delegated-user-scope.sh /usr/bin/true
+
       - name: Install repository Rust toolchain
         run: |
           rustup toolchain install
