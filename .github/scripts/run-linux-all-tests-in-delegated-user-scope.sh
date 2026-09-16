@@ -74,6 +74,7 @@ run_inner_transient_probe() {
     --property=LockPersonality=yes \
     --property=PrivateTmp=yes \
     --property=PrivateDevices=yes \
+    --property=PrivateUsers=yes \
     --property=PrivateIPC=yes \
     --property=ProtectKernelTunables=yes \
     --property=ProtectKernelModules=yes \
