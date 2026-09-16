@@ -15,6 +15,28 @@ uid="$(id -u)"
 user_name="$(id -un)"
 runtime_dir="/run/user/${uid}"
 
+capture_probe_unit_journal() {
+  local unit="$1"
+  local probe_uid
+  local journal_output=""
+  probe_uid="$(id -u)"
+  printf 'maco-ci-inner-probe journal unit=%s uid=%s\n' "${unit}" "${probe_uid}"
+  # Include executor and user-manager records for this exact probe only.
+  # Extra invocation matches can exclude the manager's startup error.
+  if ! journal_output="$(sudo -n journalctl --no-pager --quiet -o short-iso -n 80 \
+      "_UID=${probe_uid}" "_SYSTEMD_USER_UNIT=${unit}" + \
+      "_UID=${probe_uid}" "USER_UNIT=${unit}" 2>&1)"; then
+    printf 'maco-ci-inner-probe journal unavailable for unit=%s uid=%s\n' "${unit}" "${probe_uid}"
+    return 0
+  fi
+  if [[ -z "${journal_output}" ]]; then
+    printf 'maco-ci-inner-probe journal unavailable: no matching records\n'
+  else
+    printf '%s\n' "${journal_output}" | head -c 4096 || true
+    printf '\n'
+  fi
+}
+
 run_inner_transient_probe() {
   local unit="maco-ci-inner-probe-$$.service"
   local true_bin=""
@@ -101,6 +123,9 @@ run_inner_transient_probe() {
   if command -v systemd-analyze >/dev/null && [[ "${status}" -ne 0 ]]; then
     printf 'maco-ci-inner-probe systemd-analyze-exit-status=\n'
     systemd-analyze exit-status "${status}" || true
+  fi
+  if [[ "${status}" -ne 0 ]]; then
+    capture_probe_unit_journal "${unit}"
   fi
   systemctl --user stop "${unit}" >/dev/null 2>&1 || true
   systemctl --user reset-failed "${unit}" >/dev/null 2>&1 || true
