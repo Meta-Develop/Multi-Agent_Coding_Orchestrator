@@ -1392,6 +1392,80 @@ fn pending_github_checks_without_conclusion_keep_pr_intake_launch_blocked() {
 }
 
 #[test]
+fn github_pr_review_decision_parsing_treats_blank_as_absent_and_retains_explicit_values() {
+    let source = test_source_repository_binding();
+    let mut pr = valid_raw_pr_value();
+    pr["reviewDecision"] = json!("");
+    pr["latestReviews"] = json!([]);
+    pr["statusCheckRollup"] = json!([{
+        "name": "ci",
+        "status": "IN_PROGRESS",
+        "conclusion": ""
+    }]);
+
+    let raw = raw_pr_from_value(&pr, &InboxConfig::default(), &source).expect("raw pr");
+    assert!(raw.review_feedback.review_decision.is_none());
+    assert!(!raw.review_feedback.requested_changes);
+
+    let mut pr = valid_raw_pr_value();
+    pr["reviewDecision"] = json!("APPROVED");
+    pr["latestReviews"] = json!([]);
+    let raw = raw_pr_from_value(&pr, &InboxConfig::default(), &source).expect("raw pr");
+    assert_eq!(
+        raw.review_feedback.review_decision.as_deref(),
+        Some("APPROVED")
+    );
+    assert!(!raw.review_feedback.requested_changes);
+
+    let raw =
+        raw_pr_from_value(&valid_raw_pr_value(), &InboxConfig::default(), &source).expect("raw pr");
+    assert_eq!(
+        raw.review_feedback.review_decision.as_deref(),
+        Some("CHANGES_REQUESTED")
+    );
+    assert!(raw.review_feedback.requested_changes);
+}
+
+#[test]
+fn github_pr_review_decision_parsing_rejects_malformed_values() {
+    let source = test_source_repository_binding();
+    let reject = |decision: serde_json::Value| {
+        let mut pr = valid_raw_pr_value();
+        pr["reviewDecision"] = decision;
+        let error = raw_pr_from_value(&pr, &InboxConfig::default(), &source)
+            .expect_err("malformed reviewDecision must be rejected");
+        format!("{error:#}").contains("reviewDecision")
+    };
+
+    assert!(reject(json!(1)));
+    assert!(reject(json!("x".repeat(MAX_GITHUB_STATUS_BYTES + 1))));
+}
+
+#[test]
+fn blank_review_decision_with_pending_checks_parses_but_blocks_pr_intake() {
+    let source = test_source_repository_binding();
+    let mut pr = valid_raw_pr_value();
+    pr["reviewDecision"] = json!("");
+    pr["latestReviews"] = json!([]);
+    pr["statusCheckRollup"] = json!([{
+        "name": "ci",
+        "status": "IN_PROGRESS",
+        "conclusion": ""
+    }]);
+
+    let raw = raw_pr_from_value(&pr, &InboxConfig::default(), &source).expect("raw pr");
+    let item = pr_item(raw, &InboxConfig::default(), &source, &BTreeMap::new()).expect("item");
+    let pull_request = item.pull_request.as_ref().expect("pull request");
+    assert!(!pr_needs_repair(pull_request));
+    let intake = pr_intake_report_for_item(&item).expect("intake report");
+    assert_eq!(intake.status, InboxPrIntakeStatus::LaunchBlocked);
+    assert_eq!(
+        intake.launch_block.as_ref().unwrap().reason,
+        "missing_eligibility"
+    );
+}
+
+#[test]
 fn validate_candidate_repository_url_accepts_api_mixed_case_owner_and_name() {
     let selector = "github.com/meta-develop/multi-agent_coding_orchestrator";
     validate_candidate_repository_url(

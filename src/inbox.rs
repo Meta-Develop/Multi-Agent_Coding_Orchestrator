@@ -7490,6 +7490,20 @@ fn github_check_status_allows_absent_conclusion(status: Option<&str>) -> bool {
     })
 }
 
+fn optional_github_pr_review_decision(
+    value: Option<&Value>,
+    label: &str,
+    max_bytes: usize,
+) -> Result<Option<String>> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    if value.as_str() == Some("") {
+        return Ok(None);
+    }
+    optional_input_string(Some(value), label, max_bytes)
+}
+
 fn optional_github_check_conclusion(
     object: &serde_json::Map<String, Value>,
     status: Option<&str>,
@@ -7554,7 +7568,7 @@ fn review_feedback_from_value(value: &Value) -> Result<GithubReviewFeedbackSumma
     let object = value
         .as_object()
         .context("GitHub PR review payload must be an object")?;
-    let review_decision = optional_input_string(
+    let review_decision = optional_github_pr_review_decision(
         object.get("reviewDecision"),
         "GitHub PR reviewDecision",
         MAX_GITHUB_STATUS_BYTES,
