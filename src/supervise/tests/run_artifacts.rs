@@ -1204,8 +1204,7 @@ fn run_messaging_session_refuses_tampered_descriptor_and_missing_durable_journal
     messaging_bridge::forget_supervisor_messaging_session_for_test(&run_directory)
         .expect("drop in-memory factory before tamper recovery");
     let tampered_error = messaging_bridge::recover_supervisor_messaging_session(&run_directory)
-        .err()
-        .expect("tampered messaging session descriptor must refuse recovery");
+        .expect_err("tampered messaging session descriptor must refuse recovery");
     assert!(
         format!("{tampered_error:#}").contains("descriptor")
             || format!("{tampered_error:#}").contains("authentic")
@@ -1238,8 +1237,7 @@ fn run_messaging_session_refuses_tampered_descriptor_and_missing_durable_journal
         .expect("drop in-memory factory before journal removal");
     fs::remove_file(&durable_store).expect("remove durable messaging journal");
     let missing_error = messaging_bridge::recover_supervisor_messaging_session(&missing_directory)
-        .err()
-        .expect("missing durable journal must refuse recovery");
+        .expect_err("missing durable journal must refuse recovery");
     assert!(
         format!("{missing_error:#}").contains("open")
             || format!("{missing_error:#}").contains("broker")
@@ -1275,8 +1273,7 @@ fn legacy_run_messaging_session_refuses_recovery_without_memory_factory() {
     messaging_bridge::forget_supervisor_messaging_session_for_test(&run_directory)
         .expect("simulate legacy credential loss");
     let error = messaging_bridge::recover_supervisor_messaging_session(&run_directory)
-        .err()
-        .expect("legacy journal without durable descriptor must refuse recovery");
+        .expect_err("legacy journal without durable descriptor must refuse recovery");
     assert!(
         format!("{error:#}").contains("memory-resident credentials are unavailable"),
         "unexpected legacy refusal: {error:#}"
