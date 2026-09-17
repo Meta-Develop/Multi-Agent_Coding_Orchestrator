@@ -17,11 +17,18 @@ use super::{
 use crate::artifacts::state_auth::random_identifier;
 use crate::{
     hierarchy_ledger::{HierarchyLedgerSnapshot, RoleCategory},
-    messaging::{CredentialRegistry, MessagingBroker, MessagingLimits, PresentedCredential},
+    messaging::{
+        transport::{serialize_messaging_result, string_array_to_set, AssignmentMessagingServer},
+        AcknowledgementOutcome, CredentialRegistry, MessageId, MessagingBroker, MessagingError,
+        MessagingLimits, PresentedCredential,
+    },
+    orchestrator::RunId,
     safe_state::SafeRoot,
 };
 use anyhow::{bail, Context, Result};
 use persistence::PersistentMessagingBinding;
+use serde::Deserialize;
+use serde_json::{json, Value};
 #[cfg(test)]
 use std::fs;
 use std::{
@@ -291,12 +298,32 @@ impl SupervisorMessagingSessionFactory {
     /// Returns one launched agent's own process-local presentation capability.
     ///
     /// The returned value is neither serializable nor secret-revealing under `Debug`.
-    #[cfg(test)]
-    pub(super) fn capability_for(&self, agent_id: &str) -> Result<PresentedCredential> {
+    pub(crate) fn capability_for(&self, agent_id: &str) -> Result<PresentedCredential> {
         self.capabilities
             .get(agent_id)
             .cloned()
             .with_context(|| format!("supervisor messaging identity {agent_id:?} was not launched"))
+    }
+
+    /// Binds a caller-supplied run id to this factory's authenticated artifact root.
+    pub(crate) fn ensure_authenticated_run_id(&self, run_id: &str) -> Result<()> {
+        self.verify_run_and_binding()?;
+        let validated = RunId::new(run_id)
+            .context("assignment messaging run id is not a valid supervisor run identifier")?;
+        let authenticated_leaf = self
+            .artifact_root
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("supervisor messaging artifact root has no directory name")?;
+        if authenticated_leaf != validated.as_str() {
+            bail!(
+                "assignment messaging run id {:?} does not match the authenticated supervisor run binding {:?}",
+                validated.as_str(),
+                authenticated_leaf
+            );
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -559,8 +586,7 @@ pub(super) fn legacy_initialize_supervisor_messaging_session_for_test(
     Ok(())
 }
 
-#[cfg(test)]
-pub(super) fn with_supervisor_messaging_session<T>(
+pub(crate) fn with_supervisor_messaging_session<T>(
     run_directory: &Path,
     operation: impl FnOnce(&SupervisorMessagingSessionFactory) -> Result<T>,
 ) -> Result<T> {
@@ -569,8 +595,147 @@ pub(super) fn with_supervisor_messaging_session<T>(
         .map_err(|_| anyhow::anyhow!("supervisor messaging session registry is poisoned"))?;
     let factory = sessions
         .get(run_directory)
-        .context("supervisor messaging test session is not initialized")?;
+        .context("supervisor messaging session is not initialized")?;
     operation(factory)
+}
+
+/// Starts loopback assignment messaging for one already-admitted `task_id`.
+pub(super) fn start_assignment_messaging(
+    run_directory: &Path,
+    run_id: &str,
+    task_id: &str,
+) -> Result<AssignmentMessagingServer> {
+    recover_supervisor_messaging_session(run_directory)?;
+    let bound_run_id = with_supervisor_messaging_session(run_directory, |factory| {
+        factory.ensure_authenticated_run_id(run_id)?;
+        factory
+            .capability_for(task_id)
+            .map(|_| ())
+            .with_context(|| {
+                format!(
+                    "assignment messaging transport cannot bind to non-admitted task {:?}",
+                    task_id
+                )
+            })?;
+        RunId::new(run_id).map(|validated| validated.as_str().to_string())
+    })?;
+    let run_directory = run_directory.to_path_buf();
+    let handler_task_id = task_id.to_string();
+    AssignmentMessagingServer::start(&bound_run_id, task_id, move |request| {
+        dispatch_assignment_messaging_operation(&run_directory, &handler_task_id, request)
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+enum AssignmentMessagingOperation {
+    SendDirect {
+        recipient_id: String,
+        payload: Value,
+    },
+    CreateChannel {
+        channel_id: String,
+        members: Vec<String>,
+        publishers: Vec<String>,
+    },
+    PublishChannel {
+        channel_id: String,
+        payload: Value,
+    },
+    ReceiveNext {},
+    ReceiveNextFromChannel {
+        channel_id: String,
+    },
+    Acknowledge {
+        message_id: String,
+    },
+}
+
+fn dispatch_assignment_messaging_operation(
+    run_directory: &Path,
+    task_id: &str,
+    request: Value,
+) -> Result<Value> {
+    let operation: AssignmentMessagingOperation = serde_json::from_value(request)
+        .context("assignment messaging operation is ill-typed or contains unknown fields")?;
+    with_supervisor_messaging_session(run_directory, |factory| {
+        let credential = factory.capability_for(task_id)?;
+        let mut broker = factory.open_or_create()?;
+        match operation {
+            AssignmentMessagingOperation::SendDirect {
+                recipient_id,
+                payload,
+            } => {
+                let envelope = broker
+                    .send_direct(&credential, recipient_id, payload)
+                    .map_err(messaging_error)?;
+                serialize_messaging_result(&envelope)
+                    .context("failed to serialize send_direct result")
+            }
+            AssignmentMessagingOperation::CreateChannel {
+                channel_id,
+                members,
+                publishers,
+            } => {
+                let members = string_array_to_set(members);
+                let publishers = string_array_to_set(publishers);
+                let channel = broker
+                    .create_channel(&credential, channel_id, members, publishers)
+                    .map_err(messaging_error)?;
+                serialize_messaging_result(&channel)
+                    .context("failed to serialize create_channel result")
+            }
+            AssignmentMessagingOperation::PublishChannel {
+                channel_id,
+                payload,
+            } => {
+                let envelope = broker
+                    .publish_channel(&credential, channel_id, payload)
+                    .map_err(messaging_error)?;
+                serialize_messaging_result(&envelope)
+                    .context("failed to serialize publish_channel result")
+            }
+            AssignmentMessagingOperation::ReceiveNext {} => {
+                let envelope = broker.receive_next(&credential).map_err(messaging_error)?;
+                match envelope {
+                    Some(envelope) => serialize_messaging_result(&envelope)
+                        .context("failed to serialize receive_next result"),
+                    None => Ok(Value::Null),
+                }
+            }
+            AssignmentMessagingOperation::ReceiveNextFromChannel { channel_id } => {
+                let envelope = broker
+                    .receive_next_from_channel(&credential, channel_id)
+                    .map_err(messaging_error)?;
+                match envelope {
+                    Some(envelope) => serialize_messaging_result(&envelope)
+                        .context("failed to serialize receive_next_from_channel result"),
+                    None => Ok(Value::Null),
+                }
+            }
+            AssignmentMessagingOperation::Acknowledge { message_id } => {
+                let message_id = MessageId::new(message_id).map_err(|error| {
+                    anyhow::anyhow!("acknowledge message_id is invalid: {error}")
+                })?;
+                let outcome = broker
+                    .acknowledge(&credential, &message_id)
+                    .map_err(messaging_error)?;
+                serialize_acknowledgement_outcome(outcome)
+            }
+        }
+    })
+}
+
+fn serialize_acknowledgement_outcome(outcome: AcknowledgementOutcome) -> Result<Value> {
+    let label = match outcome {
+        AcknowledgementOutcome::Acknowledged => "acknowledged",
+        AcknowledgementOutcome::AlreadyAcknowledged => "already_acknowledged",
+    };
+    Ok(json!(label))
+}
+
+fn messaging_error(error: MessagingError) -> anyhow::Error {
+    anyhow::Error::new(error)
 }
 
 fn admitted_messaging_authority(
@@ -909,6 +1074,55 @@ mod tests {
             }
         }
         assert!(debug.contains("[REDACTED]"));
+        Ok(())
+    }
+
+    #[test]
+    fn start_assignment_messaging_rejects_authenticated_run_id_mismatch() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let run_directory = temporary.path().to_path_buf();
+        let factory = factory_with_known_secrets(&run_directory)?;
+        let authenticated_run_id = run_directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("run directory must have a UTF-8 leaf name")?;
+        {
+            let mut sessions = run_sessions().lock().map_err(|_| {
+                anyhow::anyhow!("supervisor messaging session registry is poisoned")
+            })?;
+            sessions.insert(run_directory.clone(), factory);
+        }
+        let mismatch = start_assignment_messaging(&run_directory, "not-that-run", "coordinator")
+            .expect_err("mismatched run id must be refused before transport bind");
+        assert!(mismatch
+            .to_string()
+            .contains("authenticated supervisor run binding"));
+        let server =
+            start_assignment_messaging(&run_directory, authenticated_run_id, "coordinator")?;
+        drop(server);
+        Ok(())
+    }
+
+    #[test]
+    fn dispatch_rejects_unknown_operation_fields_before_broker_mutation() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let run_directory = temporary.path().to_path_buf();
+        let factory = factory_with_known_secrets(&run_directory)?;
+        {
+            let mut sessions = run_sessions().lock().map_err(|_| {
+                anyhow::anyhow!("supervisor messaging session registry is poisoned")
+            })?;
+            sessions.insert(run_directory.clone(), factory);
+        }
+        let error = dispatch_assignment_messaging_operation(
+            &run_directory,
+            "coordinator",
+            json!({"operation": "receive_next", "task_id": "stolen"}),
+        )
+        .expect_err("unknown operation fields must be refused");
+        assert!(error
+            .to_string()
+            .contains("ill-typed or contains unknown fields"));
         Ok(())
     }
 
