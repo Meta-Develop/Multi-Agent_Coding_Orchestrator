@@ -1,0 +1,57 @@
+{
+  "name": "coding-agent-manager",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Unified account, credential, and quota manager for AI coding agents.",
+  "license": "GPL-3.0-or-later",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "npm run typecheck && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "rust:fmt": "cargo fmt --manifest-path src-tauri/Cargo.toml --all",
+    "rust:check": "cargo check --manifest-path src-tauri/Cargo.toml --all-targets",
+    "rust:clippy": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings",
+    "rust:test": "cargo test --manifest-path src-tauri/Cargo.toml"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "react": "^19",
+    "react-dom": "^19",
+    "react-router-dom": "^7"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9",
+    "@tailwindcss/vite": "^4",
+    "@tauri-apps/cli": "^2",
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.5",
+    "@types/node": "^22",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@vitejs/plugin-react": "^5",
+    "eslint": "^9",
+    "eslint-plugin-react-hooks": "^6",
+    "globals": "^16",
+    "jsdom": "^30.0.1",
+    "prettier": "^3",
+    "tailwindcss": "^4",
+    "typescript": "^5.9",
+    "typescript-eslint": "^8",
+    "vite": "^7",
+    "vitest": "^4.1.11"
+  }
+}

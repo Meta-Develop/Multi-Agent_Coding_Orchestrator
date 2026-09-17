@@ -1,0 +1,9 @@
+{
+  "https://auth.example.invalid::FAKE-client-managed": {
+    "auth_mode": "FAKE-web-login",
+    "email": "FAKE-managed@example.invalid",
+    "oidc_client_id": "FAKE-client-managed",
+    "oidc_issuer": "https://auth.example.invalid",
+    "refresh_token": "FAKE-managed-refresh"
+  }
+}

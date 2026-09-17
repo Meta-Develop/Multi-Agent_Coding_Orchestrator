@@ -1,0 +1,7 @@
+{
+  "model": "gpt-4o",
+  "max_tokens": 256,
+  "system": "You are a terse assistant.",
+  "metadata": { "user_id": "FAKE-user-0001" },
+  "messages": [{ "role": "user", "content": "Ping" }]
+}

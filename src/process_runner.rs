@@ -268,12 +268,17 @@ fn measured_available_disk_mib(_path: &Path) -> Option<usize> {
 
 /// A run-scoped cancellation signal for independently contained child processes.
 ///
-/// Clones observe the same state. Cancellation is cooperative at setup boundaries and in the
-/// process poll loop; once a child has started, its own containment backend remains responsible
-/// for terminating and proving its process tree empty.
+/// [`Clone`] shares the same scope: cancelling one clone cancels every clone of that scope, but
+/// does **not** create a child scope. Use [`Self::child_scope`] when a nested assignment needs its
+/// own cancellable scope that still observes parent cancellation without cancelling siblings.
+///
+/// Cancellation is cooperative at setup boundaries and in the process poll loop; once a child has
+/// started, its own containment backend remains responsible for terminating and proving its
+/// process tree empty.
 #[derive(Debug, Clone, Default)]
 pub struct ProcessCancellation {
     requested: Arc<AtomicBool>,
+    inherited: Vec<Arc<AtomicBool>>,
 }
 
 impl ProcessCancellation {
@@ -281,12 +286,30 @@ impl ProcessCancellation {
         Self::default()
     }
 
+    /// Returns a child scope with its own [`Self::cancel`] target.
+    ///
+    /// The child observes cancellation on this scope and every ancestor scope, but cancelling the
+    /// child does not affect this scope or any sibling child scopes.
+    pub fn child_scope(&self) -> Self {
+        let mut inherited = self.inherited.clone();
+        inherited.push(Arc::clone(&self.requested));
+        Self {
+            requested: Arc::new(AtomicBool::new(false)),
+            inherited,
+        }
+    }
+
     pub fn cancel(&self) {
         self.requested.store(true, Ordering::Release);
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.requested.load(Ordering::Acquire)
+        if self.requested.load(Ordering::Acquire) {
+            return true;
+        }
+        self.inherited
+            .iter()
+            .any(|flag| flag.load(Ordering::Acquire))
     }
 }
 #[cfg(target_os = "linux")]

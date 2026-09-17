@@ -1,0 +1,42 @@
+{
+  "model": "gpt-4o",
+  "max_tokens": 256,
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "lookup_account",
+        "description": "Look up an account by id.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "account_id": { "type": "string" }
+          },
+          "required": ["account_id"]
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "messages": [
+    { "role": "user", "content": "Look up FAKE-account-0001" },
+    {
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "id": "FAKE-tool-call-0001",
+          "type": "function",
+          "function": {
+            "name": "lookup_account",
+            "arguments": "{\"account_id\":\"FAKE-account-0001\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "FAKE-tool-call-0001",
+      "content": "{\"label\":\"primary\"}"
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+# Machine-scoped Codex CLI client configuration.
+# Shape taken from docs/research/codex-cli.md §2: per-project trust entries
+# live under [projects."<path>"] [verified-local]. The project path is
+# synthetic so this file is never a copy of anyone's real config.
+
+[projects."/workspace/example-project"]

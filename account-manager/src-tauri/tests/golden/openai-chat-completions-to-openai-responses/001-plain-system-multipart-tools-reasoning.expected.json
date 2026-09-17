@@ -1,0 +1,46 @@
+{
+  "body": {
+    "model": "response-target",
+    "max_output_tokens": 256,
+    "reasoning": { "effort": "low" },
+    "input": [
+      {
+        "type": "message",
+        "role": "system",
+        "content": [{ "type": "input_text", "text": "Be concise." }]
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          { "type": "input_text", "text": "Inspect" },
+          {
+            "type": "input_image",
+            "image_url": "data:image/png;base64,FAKE-image-0001"
+          }
+        ]
+      },
+      {
+        "type": "function_call",
+        "call_id": "FAKE-call-0001",
+        "name": "inspect",
+        "arguments": "{\"id\":\"FAKE-item-0001\"}"
+      },
+      {
+        "type": "function_call_output",
+        "call_id": "FAKE-call-0001",
+        "output": "{\"ok\":true}"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "name": "inspect",
+        "description": "Inspect one item.",
+        "parameters": { "type": "object" }
+      }
+    ]
+  },
+  "target_model": null,
+  "stream": false
+}

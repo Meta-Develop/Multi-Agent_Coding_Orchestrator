@@ -1,0 +1,38 @@
+{
+  "$response": {
+    "responseId": "FAKE-image-response-0002",
+    "modelVersion": "gemini-image-source",
+    "candidates": [
+      {
+        "index": 0,
+        "finishReason": "STOP",
+        "safetyRatings": [
+          {
+            "category": "HARM_CATEGORY_HARASSMENT",
+            "probability": "NEGLIGIBLE",
+            "blocked": false,
+            "probabilityScore": 0.01,
+            "severity": "NEGLIGIBLE",
+            "severityScore": 0.01,
+            "overwrittenThreshold": "BLOCK_NONE"
+          }
+        ],
+        "content": {
+          "role": "model",
+          "parts": [
+            {
+              "inlineData": {
+                "mimeType": "image/png",
+                "data": "FAKE-image-bytes-0002"
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "usageMetadata": {
+      "promptTokenCount": 2,
+      "candidatesTokenCount": 3
+    }
+  }
+}

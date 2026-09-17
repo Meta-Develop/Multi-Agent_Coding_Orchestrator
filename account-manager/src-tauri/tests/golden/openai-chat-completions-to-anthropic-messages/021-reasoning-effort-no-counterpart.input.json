@@ -1,0 +1,9 @@
+{
+  "$context": { "target_model": "FAKE-anthropic-target" },
+  "$body": {
+    "model": "FAKE-chat-source",
+    "max_completion_tokens": 4096,
+    "reasoning_effort": "medium",
+    "messages": [{ "role": "user", "content": "Think" }]
+  }
+}

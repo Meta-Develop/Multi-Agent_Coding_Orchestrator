@@ -1,0 +1,10 @@
+{
+  "$context": {
+    "source_model": "FAKE-gemini-source",
+    "target_model": "FAKE-chat-target"
+  },
+  "$body": {
+    "contents": [{ "role": "user", "parts": [{ "text": "Think" }] }],
+    "generationConfig": { "thinkingConfig": { "thinkingBudget": 1024 } }
+  }
+}

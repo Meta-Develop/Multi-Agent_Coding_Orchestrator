@@ -1,0 +1,9 @@
+{
+  "$context": { "target_model": "gemini-image-target" },
+  "$body": {
+    "model": "gpt-image-source",
+    "prompt": "A blue square",
+    "size": "1024x1024",
+    "n": 1
+  }
+}

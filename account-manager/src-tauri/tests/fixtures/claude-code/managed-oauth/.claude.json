@@ -1,0 +1,19 @@
+{
+  "oauthAccount": {
+    "accountUuid": "FAKE-account-uuid-0002",
+    "emailAddress": "FAKE-user-0002@example.invalid",
+    "organizationUuid": "FAKE-organization-uuid-0002",
+    "displayName": "FAKE-display-0002",
+    "hasExtraUsageEnabled": false,
+    "billingType": "pro",
+    "organizationName": "FAKE-org-0002"
+  },
+  "userID": "FAKE-managed-user-must-not-be-copied",
+  "machineID": "FAKE-managed-machine-must-not-be-copied",
+  "mcpServers": {
+    "managed-only": {}
+  },
+  "projects": {
+    "/tmp/managed-only": {}
+  }
+}

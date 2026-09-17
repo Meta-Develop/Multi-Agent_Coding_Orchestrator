@@ -943,6 +943,40 @@ impl AgentRegistry {
         self.stop_records(matches, wait)
     }
 
+    pub(crate) fn stop_assignment(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        wait: Duration,
+    ) -> Result<AgentStopReport> {
+        validate_text_field("run id", run_id, MAX_IDENTIFIER_BYTES)?;
+        validate_text_field("task id", task_id, MAX_IDENTIFIER_BYTES)?;
+        let live = self.list(&AgentListFilter {
+            run_id: Some(run_id.to_string()),
+        })?;
+        let matches = live
+            .into_iter()
+            .filter(|process| process.task_id == task_id)
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            return Ok(AgentStopReport {
+                stopped: Vec::new(),
+            });
+        }
+        if matches.len() > 1 {
+            let details = matches
+                .iter()
+                .map(AgentProcessRecord::summary)
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "agent assignment ({run_id}, {task_id}) is ambiguous; {} matches: {details}",
+                matches.len()
+            );
+        }
+        self.stop_records(matches, wait)
+    }
+
     fn stop_records(
         &self,
         records: Vec<AgentProcessRecord>,
@@ -977,9 +1011,15 @@ impl AgentRegistry {
         let root = SafeRoot::open_or_create(self.repo.join(".maco").join("agents"))?;
         let lock = KernelStateLock::acquire_direct(&root, REGISTRY_LOCK)?;
         AtomicStateWriter::scavenge_direct_temps(&root, REGISTRY_FILE)?;
-        let mut state = read_state(&root, &self.repo)?;
+        let registry_existed = root.direct_child_exists(REGISTRY_FILE)?;
+        let before = read_state(&root, &self.repo)?;
+        let mut state = before.clone();
         operation(&mut state)?;
         state.validate(&self.repo)?;
+        if registry_existed && state == before {
+            lock.verify_direct_binding(&root)?;
+            return Ok(());
+        }
         let mut contents =
             serde_json::to_vec_pretty(&state).context("failed to serialize agent registry")?;
         contents.push(b'\n');
@@ -1434,6 +1474,71 @@ mod tests {
 
         assert!(registry.list(&AgentListFilter::default())?.is_empty());
         assert!(registry.snapshot_all()?.is_empty());
+        let reopened = AgentRegistry::open(registry.repo())?;
+        assert!(reopened.snapshot_all()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn first_list_initializes_absent_registry_file() -> Result<()> {
+        let (_temp, registry) = registry()?;
+        let path = registry.registry_path();
+        assert!(!path.exists());
+        assert!(registry.list(&AgentListFilter::default())?.is_empty());
+        assert!(path.is_file());
+        assert!(registry.snapshot_all()?.is_empty());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unchanged_list_preserves_registry_file_identity_and_bytes() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let (_temp, registry) = registry()?;
+        let child = SleepChild::spawn()?;
+        registry.register(
+            &metadata(&registry, "run-noop-list", "task-noop")?,
+            child.pid(),
+            vec!["sleep".to_string(), "60".to_string()],
+        )?;
+        let path = registry.registry_path();
+        let handle = std::fs::File::open(&path).context("open registry for identity pinning")?;
+        let before_meta = handle.metadata().context("registry metadata before list")?;
+        let before_bytes = std::fs::read(&path).context("registry bytes before list")?;
+
+        registry.list(&AgentListFilter::default())?;
+
+        let after_meta = std::fs::metadata(&path).context("registry metadata after list")?;
+        assert_eq!(before_meta.dev(), after_meta.dev());
+        assert_eq!(before_meta.ino(), after_meta.ino());
+        assert_eq!(std::fs::read(&path)?, before_bytes);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_prune_rewrites_registry_file() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let (_temp, registry) = registry()?;
+        let mut dead = SleepChild::spawn()?;
+        registry.register(
+            &metadata(&registry, "run-prune-write", "dead")?,
+            dead.pid(),
+            vec!["sleep".to_string(), "60".to_string()],
+        )?;
+        let path = registry.registry_path();
+        let handle = std::fs::File::open(&path).context("pin pre-prune registry inode")?;
+        let before_ino = handle.metadata()?.ino();
+        dead.0.kill().context("kill prune fixture")?;
+        dead.0.wait().context("wait prune fixture")?;
+
+        assert!(registry.list(&AgentListFilter::default())?.is_empty());
+        let after_ino = std::fs::metadata(&path)?.ino();
+        assert_ne!(before_ino, after_ino);
+        let reopened = AgentRegistry::open(registry.repo())?;
+        assert!(reopened.snapshot_all()?.is_empty());
         Ok(())
     }
 
@@ -1545,6 +1650,31 @@ mod tests {
         let error = registry
             .stop_selector("shared-run", Duration::from_millis(50))
             .expect_err("selector must be ambiguous");
+        let message = error.to_string();
+        assert!(message.contains("ambiguous"));
+        assert!(message.contains(&first.pid().to_string()));
+        assert!(message.contains(&second.pid().to_string()));
+        assert!(process_exists(first.pid())?);
+        assert!(process_exists(second.pid())?);
+        Ok(())
+    }
+
+    #[test]
+    fn stop_assignment_refuses_ambiguous_same_run_and_task() -> Result<()> {
+        let (_temp, registry) = registry()?;
+        let first = SleepChild::spawn()?;
+        let second = SleepChild::spawn()?;
+        for child in [&first, &second] {
+            registry.register(
+                &metadata(&registry, "shared-run", "shared-task")?,
+                child.pid(),
+                vec!["sleep".to_string(), "60".to_string()],
+            )?;
+        }
+
+        let error = registry
+            .stop_assignment("shared-run", "shared-task", Duration::from_millis(50))
+            .expect_err("assignment must be ambiguous");
         let message = error.to_string();
         assert!(message.contains("ambiguous"));
         assert!(message.contains(&first.pid().to_string()));

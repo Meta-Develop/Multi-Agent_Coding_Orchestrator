@@ -1,0 +1,12 @@
+{
+  "$response": {
+    "created": 1,
+    "output_format": "png",
+    "data": [{ "b64_json": "FAKE-image-bytes-0004" }],
+    "usage": {
+      "input_tokens": 2,
+      "output_tokens": 3,
+      "input_tokens_details": { "text_tokens": 2 }
+    }
+  }
+}

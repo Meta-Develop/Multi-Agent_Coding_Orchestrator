@@ -1,0 +1,27 @@
+{
+  "oauthAccount": {
+    "accountUuid": "FAKE-account-uuid-0001",
+    "emailAddress": "FAKE-user-0001@example.invalid",
+    "organizationUuid": "FAKE-organization-uuid-0001",
+    "displayName": "FAKE-display-0001",
+    "hasExtraUsageEnabled": false,
+    "billingType": "pro",
+    "organizationName": "FAKE-org-0001"
+  },
+  "userID": "FAKE-user-0001",
+  "machineID": "FAKE-machine-0001",
+  "mcpServers": {
+    "keep-live": {
+      "command": "echo"
+    }
+  },
+  "projects": {
+    "/tmp/keep-live": {
+      "allowed": true
+    }
+  },
+  "cachedUsageUtilization": {
+    "keep": true
+  },
+  "futureIdentityKey": "preserve-identity-sibling"
+}
