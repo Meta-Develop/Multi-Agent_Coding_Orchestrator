@@ -3391,6 +3391,18 @@ fn resume_generated_follow_up_cascade(
     if source_was_finalized {
         ensure_generated_follow_up_cascade_needs_resume(&repo, &loaded, &source_report)?;
     }
+    let source_plan_sha256 = normalized_supervisor_plan_sha256(
+        &loaded.plan,
+        &loaded.consultant,
+        &loaded.assignment_metadata,
+        &loaded.plan_metadata,
+    )?;
+    let outer_context = resolve_follow_up_cascade_outer_context_for_resume(
+        &repo,
+        &source_report,
+        &source_plan_sha256,
+        &run_id,
+    )?;
     let mut permit = |_plan: &SupervisorPlan| Ok(None);
     let cancellation_observed = AtomicBool::new(false);
     run_generated_follow_up_cascade(
@@ -3399,8 +3411,8 @@ fn resume_generated_follow_up_cascade(
         source_report,
         &options,
         FollowUpCascadeInvocation {
-            outer_entrypoint: GeneratedFollowUpQueueEntrypoint::SuperviseRun,
-            outer_command_run_id: &run_id,
+            outer_entrypoint: outer_context.outer_entrypoint,
+            outer_command_run_id: &outer_context.outer_command_run_id,
             concurrency_policy,
             runtime_catalog: FollowUpRuntimeCatalog::Production,
         },

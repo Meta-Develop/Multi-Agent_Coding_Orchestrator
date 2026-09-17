@@ -2,10 +2,13 @@
 
 use std::fs;
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 use coding_agent_manager_lib::account_authority::test_worker::WORKER_ENV;
 use coding_agent_manager_lib::account_authority::StoredAccountRegistry;
 use coding_agent_manager_lib::error::Error;
@@ -239,12 +242,14 @@ fn failed_select_does_not_advance_revision() {
     assert_eq!(selection_revision_on_disk(&path, "gemini-cli"), before);
 }
 
+#[cfg(unix)]
 fn batch_account_ids(slot: u8) -> Vec<String> {
     (0..8)
         .map(|index| format!("batch-a{slot}-{index:02}"))
         .collect()
 }
 
+#[cfg(unix)]
 fn wait_for_ready_files(paths: &[PathBuf], deadline: Instant) {
     for path in paths {
         while !path.is_file() {
@@ -256,6 +261,7 @@ fn wait_for_ready_files(paths: &[PathBuf], deadline: Instant) {
     }
 }
 
+#[cfg(unix)]
 fn wait_for_children(
     children: &mut [std::process::Child],
     done_paths: &[PathBuf],
@@ -281,6 +287,7 @@ fn wait_for_children(
     }
 }
 
+#[cfg(unix)]
 fn spawn_concurrent_batch_child(
     exe: &std::path::Path,
     test_name: &str,

@@ -261,6 +261,8 @@ use role_transition::*;
 
 mod follow_up_cascade;
 use follow_up_cascade::*;
+mod follow_up_graph;
+mod follow_up_lease;
 #[cfg(test)]
 pub(crate) use follow_up_cascade::{
     clear_follow_up_cascade_test_isolation, clear_generated_follow_up_queue_observer,
@@ -272,6 +274,11 @@ pub(crate) use follow_up_cascade::{
     generated_follow_up_dispatch_evidence_after_cascade_error,
     normalized_supervisor_plan_file_sha256, AuthenticatedGeneratedFollowUpTerminal,
     GeneratedFollowUpDispatchEvidence,
+};
+#[cfg(test)]
+pub(crate) use follow_up_lease::{
+    clear_follow_up_lease_test_isolation, set_follow_up_lease_heartbeat_test_hook,
+    FollowUpLeaseClaimTimingOverride,
 };
 
 mod repository;
@@ -3453,6 +3460,18 @@ pub(crate) fn resume_supervisor_plan_file_cascade_with_runner(
             bail!("injected cascade source is not safely finalized or finalization-resumable")
         }
     };
+    let source_plan_sha256 = normalized_supervisor_plan_sha256(
+        &loaded.plan,
+        &loaded.consultant,
+        &loaded.assignment_metadata,
+        &loaded.plan_metadata,
+    )?;
+    let outer_context = resolve_follow_up_cascade_outer_context_for_resume(
+        &repo,
+        &source_report,
+        &source_plan_sha256,
+        &run_id,
+    )?;
     let serialized_runner = Mutex::new(external_runner);
     let mut permit = |_plan: &SupervisorPlan| Ok(None);
     let cancellation_observed = AtomicBool::new(false);
@@ -3462,8 +3481,8 @@ pub(crate) fn resume_supervisor_plan_file_cascade_with_runner(
         source_report,
         &options,
         FollowUpCascadeInvocation {
-            outer_entrypoint: GeneratedFollowUpQueueEntrypoint::SuperviseRun,
-            outer_command_run_id: &run_id,
+            outer_entrypoint: outer_context.outer_entrypoint,
+            outer_command_run_id: &outer_context.outer_command_run_id,
             concurrency_policy: SupervisorConcurrencyPolicy::Fixed(NonZeroUsize::MIN),
             runtime_catalog: FollowUpRuntimeCatalog::Injected,
         },

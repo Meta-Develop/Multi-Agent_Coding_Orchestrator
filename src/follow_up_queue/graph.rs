@@ -1273,16 +1273,20 @@ impl DurableGraphRuntimeState {
         compute_eligible_edge_ids(self, source_node_id)
     }
 
+    pub(crate) fn join_ready(&self, join_node_id: &GraphNodeId) -> Result<bool> {
+        let node = self.definition.node(join_node_id)?;
+        let DurableGraphNodeKind::Join { branches } = &node.kind else {
+            bail!("durable graph fan-in readiness query names a non-join node");
+        };
+        join_arrivals_complete(self, join_node_id, branches)
+    }
+
     pub(crate) fn expected_join_result(&self, join_node_id: &GraphNodeId) -> Result<FanInResult> {
         let node = self.definition.node(join_node_id)?;
         let DurableGraphNodeKind::Join { branches } = &node.kind else {
             bail!("durable graph fan-in query names a non-join node");
         };
-        let arrivals = self
-            .join_arrivals
-            .get(join_node_id)
-            .context("durable graph fan-in query has no arrival frontier")?;
-        if arrivals != &branches.iter().cloned().collect::<BTreeSet<_>>() {
+        if !join_arrivals_complete(self, join_node_id, branches)? {
             bail!("durable graph fan-in query occurs before every required branch arrives");
         }
         derive_fan_in_result(self, branches)
@@ -2158,6 +2162,18 @@ fn terminate_graph(
         outcome: observed,
     });
     Ok(())
+}
+
+fn join_arrivals_complete(
+    state: &DurableGraphRuntimeState,
+    join_node_id: &GraphNodeId,
+    branches: &[GraphBranchId],
+) -> Result<bool> {
+    let arrivals = state
+        .join_arrivals
+        .get(join_node_id)
+        .context("durable graph fan-in query has no arrival frontier")?;
+    Ok(arrivals == &branches.iter().cloned().collect::<BTreeSet<_>>())
 }
 
 fn derive_fan_in_result(

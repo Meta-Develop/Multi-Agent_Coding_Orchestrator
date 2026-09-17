@@ -946,8 +946,13 @@ fn validate_candidate_repository_url(
         InboxItemKind::Issue => "issues",
         InboxItemKind::PullRequest => "pull",
     };
-    let expected_url = format!("https://{repository_selector}/{expected_kind}/{number}");
-    if url != expected_url {
+    let suffix = format!("/{expected_kind}/{number}");
+    let repository = url
+        .strip_prefix("https://")
+        .and_then(|remainder| remainder.strip_suffix(&suffix));
+    if number == 0
+        || !repository.is_some_and(|actual| actual.eq_ignore_ascii_case(repository_selector))
+    {
         bail!("GitHub candidate URL does not match its exact host, repository, kind, and number");
     }
     Ok(())
