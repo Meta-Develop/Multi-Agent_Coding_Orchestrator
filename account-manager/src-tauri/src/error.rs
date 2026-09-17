@@ -13,6 +13,18 @@ pub enum Error {
     #[error("no account is registered with id `{0}`")]
     UnknownAccount(String),
 
+    #[error("no complete account is selected for provider `{0}`")]
+    NoSelectedAccount(String),
+
+    #[error("selection for provider `{provider}` is stale")]
+    StaleSelection { provider: String },
+
+    #[error("account `{account_id}` no longer matches the requested incarnation")]
+    StaleAccount { account_id: String },
+
+    #[error("account authority is busy: {reason}")]
+    AccountAuthorityBusy { reason: String },
+
     #[error("`{provider}` is not installed on this machine")]
     ProviderNotInstalled { provider: String },
 

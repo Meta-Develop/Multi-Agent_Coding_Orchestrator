@@ -140,6 +140,8 @@ pub struct StoredAccountMetadata {
     pub material: StoredAccountMaterial,
     /// At most one complete account per provider is selected.
     pub is_selected: bool,
+    /// Opaque identity of this materialization; changes on delete/recreate.
+    pub account_incarnation: String,
 }
 
 /// Non-secret result returned after the core starts a provider child.
@@ -568,6 +570,7 @@ mod tests {
             state: StoredAccountState::Complete,
             material: StoredAccountMaterial::CredentialStore,
             is_selected: true,
+            account_incarnation: "0123456789abcdef0123456789abcdef".to_string(),
         };
         assert_eq!(
             serde_json::to_value(&account).unwrap(),
@@ -578,7 +581,8 @@ mod tests {
                 "authKind": "api-key",
                 "state": "complete",
                 "material": "credential-store",
-                "isSelected": true
+                "isSelected": true,
+                "accountIncarnation": "0123456789abcdef0123456789abcdef"
             })
         );
     }

@@ -1041,6 +1041,7 @@ mod tests {
             state,
             material: StoredAccountMaterial::CredentialStore,
             is_selected: false,
+            account_incarnation: "0123456789abcdef0123456789abcdef".to_string(),
         }
     }
 
@@ -1178,6 +1179,7 @@ mod tests {
             state,
             material: StoredAccountMaterial::VendorHome,
             is_selected: false,
+            account_incarnation: "0123456789abcdef0123456789abcdef".to_string(),
         }
     }
 
