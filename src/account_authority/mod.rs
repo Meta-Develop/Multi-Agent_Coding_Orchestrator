@@ -18,4 +18,7 @@ pub(crate) struct ManagedGrokAccountSelectionEvidence {
 #[cfg(target_os = "linux")]
 pub(crate) use grok::GrokLaunchAuthority;
 #[cfg(all(test, target_os = "linux"))]
-pub(crate) use grok::{activate_cam_grok_test_harness, CamGrokTestHarness, GROK_CLI_PROVIDER_ID};
+pub(crate) use grok::{
+    activate_cam_grok_test_harness, build_cam_grok_test_harness, CamGrokTestHarness,
+    GROK_CLI_PROVIDER_ID,
+};

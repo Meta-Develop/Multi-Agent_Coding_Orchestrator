@@ -15,64 +15,7 @@ const CAM_GROK_AUTH_FIXTURE: &str = concat!(
 );
 
 #[cfg(target_os = "linux")]
-fn build_cam_grok_test_harness(
-    selected_account: &str,
-) -> anyhow::Result<(
-    crate::account_authority::CamGrokTestHarness,
-    std::path::PathBuf,
-    crate::account_authority::ManagedGrokAccountSelectionEvidence,
-)> {
-    use std::io;
-
-    use coding_agent_manager_lib::account_authority::StoredAccountRegistry;
-    use coding_agent_manager_lib::fsx;
-    use coding_agent_manager_lib::paths::stored_accounts_path;
-    use coding_agent_manager_lib::providers::grok_cli::GrokCliAdapter;
-    use coding_agent_manager_lib::providers::{add_managed_account, select_launch_account};
-
-    fn fake_login(home: &std::path::Path) -> io::Result<i32> {
-        std::fs::copy(CAM_GROK_AUTH_FIXTURE, home.join("auth.json"))?;
-        Ok(0)
-    }
-
-    let root = tempfile::tempdir()?;
-    let user_home = root.path().join("cam-user-home");
-    let data_dir = root.path().join("cam-data");
-    std::fs::create_dir_all(user_home.join(".grok"))?;
-    fsx::create_dir_all_private(&data_dir)?;
-    let registry = StoredAccountRegistry::new(stored_accounts_path(&data_dir));
-    let adapter = GrokCliAdapter::with_home(&user_home)
-        .with_data_dir(&data_dir)
-        .with_login_runner(fake_login);
-    for account_id in ["account-a", "account-b"] {
-        add_managed_account(&registry, &adapter, account_id, account_id, None)?;
-    }
-    select_launch_account(&registry, &adapter, selected_account)?;
-    let binding = registry
-        .selected_binding(crate::account_authority::GROK_CLI_PROVIDER_ID)?
-        .expect("selected binding");
-    let managed_home = data_dir
-        .join("accounts")
-        .join("grok-cli")
-        .join(selected_account);
-    let evidence = crate::account_authority::ManagedGrokAccountSelectionEvidence {
-        provider_id: binding.provider_id,
-        account_id: binding.account_id,
-        account_incarnation: binding.account_incarnation,
-        selection_revision: binding.selection_revision,
-    };
-    Ok((
-        crate::account_authority::CamGrokTestHarness {
-            _root: root,
-            registry,
-            adapter,
-            user_home,
-            data_dir,
-        },
-        managed_home,
-        evidence,
-    ))
-}
+use crate::account_authority::build_cam_grok_test_harness;
 
 #[cfg(target_os = "linux")]
 fn build_cam_grok_test_harness_unselected(

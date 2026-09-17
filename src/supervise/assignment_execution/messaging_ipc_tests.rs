@@ -27,6 +27,9 @@ use super::super::{
     SUPERVISOR_SCHEMA_VERSION,
 };
 use super::*;
+use crate::account_authority::ManagedGrokAccountSelectionEvidence;
+#[cfg(target_os = "linux")]
+use crate::account_authority::{activate_cam_grok_test_harness, build_cam_grok_test_harness};
 use crate::supervise::messaging_bridge::{
     initialize_supervisor_messaging_session, recover_supervisor_messaging_session,
     with_supervisor_messaging_session,
@@ -93,22 +96,8 @@ fn run_messaging_ipc_fixture_helper_subprocess(
     const HELPER_STDERR_MAX_BYTES: usize = 64 * 1024;
     const HELPER_STDOUT_MAX_BYTES: usize = 64 * 1024;
 
-    let temp = tempfile::tempdir()?;
-    let grok_home = temp.path().join("grok-home");
-    fs::create_dir(&grok_home)?;
-    fs::write(grok_home.join("auth.json"), "hermetic-grok-auth-fixture\n")?;
-
-    let mut environment = BTreeMap::from([
-        (FIXTURE_HELPER_ENV.to_string(), "1".to_string()),
-        (
-            "GROK_HOME".to_string(),
-            grok_home
-                .to_str()
-                .context("assignment messaging fixture helper GROK_HOME path is not UTF-8")?
-                .to_string(),
-        ),
-    ]);
-    for ambient_auth_override in ["GROK_AUTH_PATH", "MACO_GROK_AUTH_PATH"] {
+    let mut environment = BTreeMap::from([(FIXTURE_HELPER_ENV.to_string(), "1".to_string())]);
+    for ambient_auth_override in ["GROK_AUTH_PATH", "MACO_GROK_AUTH_PATH", "GROK_HOME"] {
         if std::env::var_os(ambient_auth_override).is_some() {
             environment.insert(ambient_auth_override.to_string(), String::new());
         }
@@ -224,8 +213,22 @@ fn external_run_succeeded(kind: MessagingIpcLaunchKind, report: &ExternalAgentRu
     }
 }
 
-fn assert_external_run(label: &str, kind: MessagingIpcLaunchKind, report: &ExternalAgentRun) {
+fn assert_external_run(
+    label: &str,
+    kind: MessagingIpcLaunchKind,
+    report: &ExternalAgentRun,
+    expected_verified_cam_binding: Option<&ManagedGrokAccountSelectionEvidence>,
+) {
     if external_run_succeeded(kind, report) {
+        if kind == MessagingIpcLaunchKind::Verified {
+            let expected = expected_verified_cam_binding
+                .expect("verified IPC fixture must specify its selected-account binding");
+            assert_eq!(
+                report.managed_grok_selection_evidence(),
+                Some(expected),
+                "{label}: verified Grok run must retain fixture selected-account evidence"
+            );
+        }
         return;
     }
     let launch = match kind {
@@ -906,6 +909,7 @@ fn assignment_messaging_ipc_acceptance(
     launch_kind: MessagingIpcLaunchKind,
     exact_filter: &'static str,
     disposable_peer: Option<DisposablePeerProcess>,
+    expected_verified_cam_binding: Option<&ManagedGrokAccountSelectionEvidence>,
 ) -> Result<()> {
     let (plan, metadata) = messaging_plan_and_metadata();
     let temp = tempfile::tempdir()?;
@@ -1162,6 +1166,7 @@ fn assignment_messaging_ipc_acceptance(
         "grok child must complete first receive",
         launch_kind,
         &first_report,
+        expected_verified_cam_binding,
     );
     if let Some(peer) = disposable_peer.as_ref() {
         peer.assert_secret_not_in_captured_output(&first_report);
@@ -1198,7 +1203,12 @@ fn assignment_messaging_ipc_acceptance(
         &second_probe,
         &mut command,
     )?;
-    assert_external_run("grok child ack phase", launch_kind, &second_report);
+    assert_external_run(
+        "grok child ack phase",
+        launch_kind,
+        &second_report,
+        expected_verified_cam_binding,
+    );
     let second_payload: Value = serde_json::from_slice(&fs::read(&result_second)?)?;
     assert_eq!(
         second_payload.get("message_id").and_then(Value::as_str),
@@ -1225,7 +1235,12 @@ fn assignment_messaging_ipc_acceptance(
         &exchange_probe,
         &mut command,
     )?;
-    assert_external_run("grok child exchange phase", launch_kind, &exchange_report);
+    assert_external_run(
+        "grok child exchange phase",
+        launch_kind,
+        &exchange_report,
+        expected_verified_cam_binding,
+    );
     let exchange_payload: Value = serde_json::from_slice(&fs::read(&result_exchange)?)?;
     assert_eq!(exchange_payload.get("direct_ok"), Some(&json!(true)));
     assert_eq!(exchange_payload.get("channel_ok"), Some(&json!(true)));
@@ -1258,6 +1273,7 @@ fn assignment_messaging_ipc_acceptance(
         "grok child wrong-bearer phase",
         launch_kind,
         &refusal_report,
+        expected_verified_cam_binding,
     );
     let refusal_payload: Value = serde_json::from_slice(&fs::read(&result_refusal)?)?;
     assert_eq!(refusal_payload.get("refused"), Some(&json!(true)));
@@ -1331,6 +1347,7 @@ fn assignment_messaging_ipc_acceptance(
                 "dispatch external runner must succeed",
                 launch_kind,
                 &collected.external_run,
+                expected_verified_cam_binding,
             );
             if let Some(peer) = disposable_peer.as_ref() {
                 peer.assert_secret_not_in_captured_output(&collected.external_run);
@@ -1382,6 +1399,7 @@ fn assignment_messaging_ipc_at_least_once_from_simulated_grok_child() -> Result<
             MessagingIpcLaunchKind::Simulated,
             EXACT_FILTER_SIMULATED,
             None,
+            None,
         );
     }
     run_messaging_ipc_fixture_helper_subprocess(EXACT_FILTER_SIMULATED, false)
@@ -1393,16 +1411,27 @@ fn assignment_messaging_grok_verified_process_peer_isolation_and_ipc() -> Result
         return confined_child_probe();
     }
     if fixture_helper_process_active() {
-        if crate::test_containment::skip_current()? {
-            bail!("verified assignment messaging fixture requires containment");
+        #[cfg(not(target_os = "linux"))]
+        {
+            bail!("verified assignment messaging fixture requires Linux");
         }
-        let disposable_peer = DisposablePeerProcess::spawn()?;
-        assignment_messaging_ipc_acceptance(
-            MessagingIpcLaunchKind::Verified,
-            EXACT_FILTER_VERIFIED,
-            Some(disposable_peer),
-        )?;
-        println!("{VERIFIED_COMPLETION_MARKER}");
+        #[cfg(target_os = "linux")]
+        {
+            if crate::test_containment::skip_current()? {
+                bail!("verified assignment messaging fixture requires containment");
+            }
+            let (cam_harness, _managed_grok_home, expected_cam_binding) =
+                build_cam_grok_test_harness("account-a")?;
+            let _cam_guard = activate_cam_grok_test_harness(cam_harness);
+            let disposable_peer = DisposablePeerProcess::spawn()?;
+            assignment_messaging_ipc_acceptance(
+                MessagingIpcLaunchKind::Verified,
+                EXACT_FILTER_VERIFIED,
+                Some(disposable_peer),
+                Some(&expected_cam_binding),
+            )?;
+            println!("{VERIFIED_COMPLETION_MARKER}");
+        }
         return Ok(());
     }
     run_messaging_ipc_fixture_helper_subprocess(EXACT_FILTER_VERIFIED, true)

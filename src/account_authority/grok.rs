@@ -219,6 +219,71 @@ thread_local! {
 }
 
 #[cfg(test)]
+const CAM_GROK_AUTH_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/account-manager/core/tests/fixtures/grok/valid-auth.json"
+);
+
+#[cfg(test)]
+pub(crate) fn build_cam_grok_test_harness(
+    selected_account: &str,
+) -> Result<(
+    CamGrokTestHarness,
+    PathBuf,
+    super::ManagedGrokAccountSelectionEvidence,
+)> {
+    use std::io;
+
+    use coding_agent_manager_lib::fsx;
+    use coding_agent_manager_lib::providers::{add_managed_account, select_launch_account};
+
+    fn fake_login(home: &Path) -> io::Result<i32> {
+        std::fs::copy(CAM_GROK_AUTH_FIXTURE, home.join("auth.json"))?;
+        Ok(0)
+    }
+
+    let root = tempfile::tempdir()?;
+    let user_home = root.path().join("cam-user-home");
+    let data_dir = root.path().join("cam-data");
+    std::fs::create_dir_all(user_home.join(".grok"))?;
+    fsx::create_dir_all_private(&data_dir)?;
+    let registry = StoredAccountRegistry::new(stored_accounts_path(&data_dir));
+    let adapter = GrokCliAdapter::with_home(&user_home)
+        .with_data_dir(&data_dir)
+        .with_login_runner(fake_login);
+    for account_id in ["account-a", "account-b"] {
+        add_managed_account(&registry, &adapter, account_id, account_id, None)
+            .map_err(map_cam_error)?;
+    }
+    select_launch_account(&registry, &adapter, selected_account).map_err(map_cam_error)?;
+    let binding = registry
+        .selected_binding(GROK_CLI_PROVIDER_ID)
+        .map_err(map_cam_error)?
+        .expect("selected binding");
+    let managed_home = data_dir
+        .join("accounts")
+        .join("grok-cli")
+        .join(selected_account);
+    let evidence = super::ManagedGrokAccountSelectionEvidence {
+        provider_id: binding.provider_id,
+        account_id: binding.account_id,
+        account_incarnation: binding.account_incarnation,
+        selection_revision: binding.selection_revision,
+    };
+    Ok((
+        CamGrokTestHarness {
+            _root: root,
+            registry,
+            adapter,
+            user_home,
+            data_dir,
+        },
+        managed_home,
+        evidence,
+    ))
+}
+
+#[cfg(test)]
 pub(crate) fn activate_cam_grok_test_harness(harness: CamGrokTestHarness) -> CamGrokTestGuard {
     let previous = CAM_GROK_TEST_OVERRIDE.with(|cell| cell.borrow_mut().replace(harness));
     CamGrokTestGuard { previous }

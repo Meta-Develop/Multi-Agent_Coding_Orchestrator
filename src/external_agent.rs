@@ -1634,7 +1634,7 @@ impl ExternalAgentRun {
         &self.stdout.run_metadata.environment_failures
     }
 
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(test)]
     pub(crate) fn managed_grok_selection_evidence(
         &self,
     ) -> Option<&ManagedGrokAccountSelectionEvidence> {
