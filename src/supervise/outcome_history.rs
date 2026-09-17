@@ -71,6 +71,75 @@ pub(super) struct AttemptOutcomeEvidence {
     pub parent_cause: Option<String>,
     pub failure_class: Option<FailureClass>,
     pub costs: AttemptAttributableCosts,
+    /// Parent-owned continuation proof for review-cycle attribution across gate
+    /// retries. Absent on legacy rows and when the parent cannot reconstruct
+    /// earlier dispatched review cycles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_phase_continuation: Option<AttemptParentPhaseContinuation>,
+}
+
+/// Authenticated parent control-flow proof carried on attempt evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AttemptParentPhaseContinuation {
+    pub prior_dispatched_review_cycles: ParentPriorDispatchedReviewCycleProof,
+}
+
+/// Whether the parent can prove how many review cycles actually dispatched before
+/// this worker attempt began.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub(super) enum ParentPriorDispatchedReviewCycleProof {
+    KnownNone,
+    KnownPrior {
+        completed_dispatched_review_cycles: usize,
+    },
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for AttemptParentPhaseContinuation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Current {
+            prior_dispatched_review_cycles: ParentPriorDispatchedReviewCycleProof,
+        }
+        #[derive(Deserialize)]
+        struct Legacy {
+            completed_dispatched_review_cycles: usize,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Helper {
+            Current(Current),
+            Legacy(Legacy),
+        }
+        match Helper::deserialize(deserializer)? {
+            Helper::Current(current) => Ok(Self {
+                prior_dispatched_review_cycles: current.prior_dispatched_review_cycles,
+            }),
+            Helper::Legacy(legacy) => Ok(Self {
+                prior_dispatched_review_cycles: if legacy.completed_dispatched_review_cycles == 0 {
+                    ParentPriorDispatchedReviewCycleProof::KnownNone
+                } else {
+                    ParentPriorDispatchedReviewCycleProof::KnownPrior {
+                        completed_dispatched_review_cycles: legacy
+                            .completed_dispatched_review_cycles,
+                    }
+                },
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ParentDispatchedReviewCycleSlot {
+    FirstCycle,
+    SubsequentCycle,
+    Unknown,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -88,14 +157,17 @@ pub(super) fn record_child_attempt_outcome(
     verified_execution: bool,
     retried: bool,
     external_run: Option<&ExternalAgentRun>,
+    parent_phase_continuation: Option<AttemptParentPhaseContinuation>,
 ) -> Result<AttemptOutcomeEvidence> {
     let selection =
         selection_binding_for_attempt(role, assignment_id, attempt, events, initial_events);
     let frozen_catalogs =
         selection_event_for_attempt(role, assignment_id, attempt, events, initial_events)
             .map(|event| event.provenance.normalized_input.catalogs.as_slice());
-    let (observed_candidate, execution_cost_microunits) =
+    let (observed_candidate, worker_observed_microunits) =
         parent_attempt_observation(external_run, frozen_catalogs);
+    let (execution_cost_microunits, rework_cost_microunits) =
+        classify_worker_observed_spend(attempt, worker_observed_microunits);
     let evidence = AttemptOutcomeEvidence {
         version: ATTEMPT_EVIDENCE_VERSION,
         run_id: run_id.as_str().to_string(),
@@ -112,11 +184,23 @@ pub(super) fn record_child_attempt_outcome(
         failure_class: None,
         costs: AttemptAttributableCosts {
             execution_cost_microunits,
+            rework_cost_microunits,
             ..AttemptAttributableCosts::default()
         },
+        parent_phase_continuation,
     };
     write_attempt_evidence(artifacts, &evidence)?;
     Ok(evidence)
+}
+
+fn classify_worker_observed_spend(
+    attempt: usize,
+    observed_microunits: Option<u64>,
+) -> (Option<u64>, Option<u64>) {
+    match attempt {
+        1 => (observed_microunits, Some(0)),
+        _ => (Some(0), observed_microunits),
+    }
 }
 
 fn selection_event_for_attempt<'a>(
@@ -233,6 +317,7 @@ fn attributable_parent_auditor_cost_microunits(external_run: &ExternalAgentRun) 
 pub(super) struct ParentWorkerAttemptReviewCostBinding {
     assignment_id: String,
     worker_attempt: usize,
+    review_cycle_slot: ParentDispatchedReviewCycleSlot,
     total_microunits: Option<u64>,
     parent_auditor_invocations: usize,
     planned_lens_count: usize,
@@ -241,16 +326,31 @@ pub(super) struct ParentWorkerAttemptReviewCostBinding {
 }
 
 impl ParentWorkerAttemptReviewCostBinding {
-    pub(super) fn bind(assignment_id: &str, worker_attempt: usize) -> Self {
+    pub(super) fn bind(
+        assignment_id: &str,
+        worker_attempt: usize,
+        review_cycle_slot: ParentDispatchedReviewCycleSlot,
+    ) -> Self {
         Self {
             assignment_id: assignment_id.to_string(),
             worker_attempt,
+            review_cycle_slot,
             total_microunits: None,
             parent_auditor_invocations: 0,
             planned_lens_count: 0,
             lenses_undispatched_without_run: 0,
             parent_review_stack_short_circuited: false,
         }
+    }
+
+    pub(super) fn review_cycle_slot(&self) -> ParentDispatchedReviewCycleSlot {
+        self.review_cycle_slot
+    }
+
+    /// True when at least one parent auditor process actually dispatched in this
+    /// stacked review cycle (independent of complete lens telemetry).
+    pub(super) fn parent_review_cycle_actually_dispatched(&self) -> bool {
+        self.parent_auditor_invocations > 0
     }
 
     pub(super) fn begin_stacked_parent_review_lenses(&mut self, planned_lens_count: usize) {
@@ -289,8 +389,11 @@ impl ParentWorkerAttemptReviewCostBinding {
         };
     }
 
-    fn persistable_review_cost_microunits(&self) -> Option<Option<u64>> {
+    fn persistable_review_phase_cost_microunits(&self) -> Option<Option<u64>> {
         if self.parent_auditor_invocations == 0 {
+            return None;
+        }
+        if self.review_cycle_slot == ParentDispatchedReviewCycleSlot::Unknown {
             return None;
         }
         Some(if self.parent_review_dispatch_set_is_complete() {
@@ -332,12 +435,233 @@ pub(super) fn persist_worker_attempt_review_cost(
             attempt_record.attempt
         );
     }
-    let Some(microunits) = binding.persistable_review_cost_microunits() else {
+    let Some(microunits) = binding.persistable_review_phase_cost_microunits() else {
         return Ok(());
     };
-    attempt_record.costs.review_cost_microunits = microunits;
+    match binding.review_cycle_slot() {
+        ParentDispatchedReviewCycleSlot::FirstCycle => {
+            attempt_record.costs.review_cost_microunits = microunits;
+            if microunits.is_some() {
+                attempt_record.costs.rereview_cost_microunits = Some(0);
+            }
+        }
+        ParentDispatchedReviewCycleSlot::SubsequentCycle => {
+            attempt_record.costs.rereview_cost_microunits = microunits;
+            if microunits.is_some() {
+                attempt_record.costs.review_cost_microunits = Some(0);
+            }
+        }
+        ParentDispatchedReviewCycleSlot::Unknown => {}
+    }
     write_attempt_evidence(artifacts, attempt_record)?;
     Ok(())
+}
+
+pub(super) fn persist_proven_no_parent_review_cycle_costs(
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    attempt_record: &mut AttemptOutcomeEvidence,
+) -> Result<()> {
+    attempt_record.costs.review_cost_microunits = Some(0);
+    attempt_record.costs.rereview_cost_microunits = Some(0);
+    write_attempt_evidence(artifacts, attempt_record)?;
+    Ok(())
+}
+
+pub(super) fn persist_proven_worker_attempt_bypassed_parent_review(
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    attempt_record: &mut AttemptOutcomeEvidence,
+) -> Result<()> {
+    persist_proven_no_parent_review_cycle_costs(artifacts, attempt_record)
+}
+
+pub(super) fn prior_dispatched_review_cycle_count(
+    proof: &ParentPriorDispatchedReviewCycleProof,
+) -> Option<usize> {
+    match proof {
+        ParentPriorDispatchedReviewCycleProof::KnownNone => Some(0),
+        ParentPriorDispatchedReviewCycleProof::KnownPrior {
+            completed_dispatched_review_cycles,
+        } => Some(*completed_dispatched_review_cycles),
+        ParentPriorDispatchedReviewCycleProof::Unknown => None,
+    }
+}
+
+pub(super) fn attempt_parent_phase_continuation_from_count(
+    completed_parent_review_cycles: Option<usize>,
+) -> AttemptParentPhaseContinuation {
+    AttemptParentPhaseContinuation {
+        prior_dispatched_review_cycles: match completed_parent_review_cycles {
+            None => ParentPriorDispatchedReviewCycleProof::Unknown,
+            Some(0) => ParentPriorDispatchedReviewCycleProof::KnownNone,
+            Some(completed_dispatched_review_cycles) => {
+                ParentPriorDispatchedReviewCycleProof::KnownPrior {
+                    completed_dispatched_review_cycles,
+                }
+            }
+        },
+    }
+}
+
+pub(super) fn sync_attempt_parent_phase_continuation(
+    attempt_record: &mut AttemptOutcomeEvidence,
+    completed_parent_review_cycles: Option<usize>,
+) {
+    attempt_record.parent_phase_continuation = Some(attempt_parent_phase_continuation_from_count(
+        completed_parent_review_cycles,
+    ));
+}
+
+pub(super) fn persist_attempt_parent_phase_continuation(
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    attempt_record: &mut AttemptOutcomeEvidence,
+    completed_parent_review_cycles: Option<usize>,
+) -> Result<()> {
+    sync_attempt_parent_phase_continuation(attempt_record, completed_parent_review_cycles);
+    write_attempt_evidence(artifacts, attempt_record)?;
+    Ok(())
+}
+
+pub(super) fn review_cycle_slot_for_completed_dispatched_cycles(
+    completed_parent_review_cycles: Option<usize>,
+) -> ParentDispatchedReviewCycleSlot {
+    match completed_parent_review_cycles {
+        Some(0) => ParentDispatchedReviewCycleSlot::FirstCycle,
+        Some(_) => ParentDispatchedReviewCycleSlot::SubsequentCycle,
+        None => ParentDispatchedReviewCycleSlot::Unknown,
+    }
+}
+
+#[cfg(test)]
+pub(super) fn review_cycle_slot_from_continuation(
+    continuation: Option<&AttemptParentPhaseContinuation>,
+) -> ParentDispatchedReviewCycleSlot {
+    review_cycle_slot_for_completed_dispatched_cycles(continuation.and_then(|proof| {
+        prior_dispatched_review_cycle_count(&proof.prior_dispatched_review_cycles)
+    }))
+}
+
+pub(super) fn authenticated_prior_dispatched_review_cycle_proof(
+    repo: &Path,
+    source_run_id: &RunId,
+    assignment_id: &str,
+) -> Result<ParentPriorDispatchedReviewCycleProof> {
+    let reader = ArtifactRunReader::open(repo, RunArtifactFamily::Supervise, source_run_id)
+        .with_context(|| {
+            format!(
+                "phase continuation source run '{}' is not authenticated",
+                source_run_id.as_str()
+            )
+        })?;
+    let mut latest_attempt = 0usize;
+    let mut latest_continuation = None;
+    for file in &reader.finalization().files {
+        if !file.path.starts_with(ATTEMPT_EVIDENCE_DIR)
+            || file.path.extension().and_then(|ext| ext.to_str()) != Some("json")
+        {
+            continue;
+        }
+        let name = file
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .with_context(|| {
+                format!("attempt evidence path '{}' is invalid", file.path.display())
+            })?;
+        let (assignment, attempt_label) = name
+            .strip_suffix(".json")
+            .and_then(|name| name.rsplit_once(".attempt-"))
+            .with_context(|| format!("attempt evidence filename '{}' is invalid", name))?;
+        if assignment != assignment_id {
+            continue;
+        }
+        let attempt = attempt_label
+            .parse::<usize>()
+            .with_context(|| format!("attempt evidence ordinal '{}' is invalid", attempt_label))?;
+        if attempt <= latest_attempt {
+            continue;
+        }
+        let bytes = reader
+            .read(&file.path)
+            .with_context(|| format!("attempt evidence '{}' is unreadable", file.path.display()))?;
+        let evidence =
+            serde_json::from_slice::<AttemptOutcomeEvidence>(&bytes).with_context(|| {
+                format!("attempt evidence '{}' is invalid JSON", file.path.display())
+            })?;
+        if evidence.assignment_id != assignment_id || evidence.attempt != attempt {
+            continue;
+        }
+        latest_attempt = attempt;
+        latest_continuation = evidence.parent_phase_continuation;
+    }
+    if latest_attempt == 0 {
+        return Ok(ParentPriorDispatchedReviewCycleProof::Unknown);
+    }
+    Ok(latest_continuation
+        .map(|continuation| continuation.prior_dispatched_review_cycles)
+        .unwrap_or(ParentPriorDispatchedReviewCycleProof::Unknown))
+}
+
+pub(super) fn advance_completed_parent_review_cycles_after_actual_dispatch(
+    completed_parent_review_cycles: &mut Option<usize>,
+    binding: &ParentWorkerAttemptReviewCostBinding,
+) {
+    if binding.parent_review_cycle_actually_dispatched() {
+        *completed_parent_review_cycles = Some(completed_parent_review_cycles.unwrap_or(0) + 1);
+    }
+}
+
+/// Single production seam: persist review/rereview phase costs (partial stacks stay
+/// `None`), advance the dispatched-cycle counter only after actual auditor dispatch,
+/// and persist authenticated continuation proof.
+pub(super) fn finalize_parent_review_cycle_attribution_for_worker_attempt(
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    binding: &ParentWorkerAttemptReviewCostBinding,
+    attempt_record: &mut AttemptOutcomeEvidence,
+    completed_parent_review_cycles: &mut Option<usize>,
+) -> Result<()> {
+    persist_worker_attempt_review_cost(artifacts, binding, attempt_record)?;
+    advance_completed_parent_review_cycles_after_actual_dispatch(
+        completed_parent_review_cycles,
+        binding,
+    );
+    if binding.parent_review_cycle_actually_dispatched() {
+        persist_attempt_parent_phase_continuation(
+            artifacts,
+            attempt_record,
+            *completed_parent_review_cycles,
+        )?;
+    }
+    Ok(())
+}
+
+pub(super) fn persist_review_cycle_attribution_or_chain_primary(
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    binding: &ParentWorkerAttemptReviewCostBinding,
+    attempt_record: &mut AttemptOutcomeEvidence,
+    completed_parent_review_cycles: &mut Option<usize>,
+    primary_error: Option<anyhow::Error>,
+) -> Result<()> {
+    match finalize_parent_review_cycle_attribution_for_worker_attempt(
+        artifacts,
+        binding,
+        attempt_record,
+        completed_parent_review_cycles,
+    ) {
+        Ok(()) => {
+            if let Some(primary_error) = primary_error {
+                return Err(primary_error);
+            }
+            Ok(())
+        }
+        Err(finalize_error) => {
+            if let Some(primary_error) = primary_error {
+                return Err(primary_error).context(format!(
+                    "review cycle attribution persistence failed: {finalize_error:#}"
+                ));
+            }
+            Err(finalize_error)
+        }
+    }
 }
 
 fn selection_binding_for_attempt(
@@ -767,6 +1091,7 @@ mod tests {
                 rereview_cost_microunits: Some(0),
                 environment_cost_microunits: Some(0),
             },
+            parent_phase_continuation: None,
         }
     }
 
@@ -1409,6 +1734,7 @@ mod tests {
             true,
             false,
             external_run.as_ref(),
+            None,
         )?;
         let relative = PathBuf::from("selection-attempts/assignment-1.attempt-1.json");
         let stored_path = repo
@@ -1455,7 +1781,57 @@ mod tests {
         assert_eq!(observed.model, "grok-code-fast-1");
         assert_eq!(observed.effort, ReasoningEffort::High);
         assert_eq!(recorded.costs.execution_cost_microunits, Some(200));
+        assert_eq!(recorded.costs.rework_cost_microunits, Some(0));
         assert!(project_numeric_row(&recorded).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn worker_retry_observed_spend_attributes_to_rework_not_execution() -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let external_run = parent_run_with_trusted_acp(
+            &temp,
+            &repo,
+            "grok-code-fast-1",
+            GrokAcpNativeCostEquivalent::Known {
+                cost_usd_ticks: 10_000_000,
+                microunits: 88,
+            },
+        );
+        let run_id = RunId::new("worker-rework-phase")?;
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "maco-supervise",
+        )?;
+        let mut journal = None;
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let initial = grok_worker_selection_event();
+        let recorded = record_child_attempt_outcome(
+            &artifacts,
+            &run_id,
+            "assignment-1",
+            2,
+            AgentRole::Worker,
+            &[],
+            std::slice::from_ref(&initial),
+            "grok",
+            Some("grok-code-fast-1"),
+            Some("high"),
+            true,
+            false,
+            Some(&external_run),
+            Some(attempt_parent_phase_continuation_from_count(Some(0))),
+        )?;
+        assert_eq!(recorded.costs.execution_cost_microunits, Some(0));
+        assert_eq!(recorded.costs.rework_cost_microunits, Some(88));
         Ok(())
     }
 
@@ -1558,7 +1934,11 @@ mod tests {
     #[test]
     fn parent_review_cost_binding_sums_stacked_auditor_dispatches() {
         let (temp, repo) = super::super::tests::injected_repository();
-        let mut binding = ParentWorkerAttemptReviewCostBinding::bind("assignment-a", 1);
+        let mut binding = ParentWorkerAttemptReviewCostBinding::bind(
+            "assignment-a",
+            1,
+            ParentDispatchedReviewCycleSlot::FirstCycle,
+        );
         binding.begin_stacked_parent_review_lenses(2);
         binding.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
             &temp, &repo, 11, 1_100_000,
@@ -1569,12 +1949,48 @@ mod tests {
         assert_eq!(binding.parent_auditor_invocation_count(), 2);
         assert_eq!(binding.review_total_microunits(), Some(40));
         assert!(binding.parent_review_dispatch_set_complete_for_test());
+        assert!(binding.parent_review_cycle_actually_dispatched());
+    }
+
+    #[test]
+    fn partial_lens_dispatch_advances_cycle_counter_without_complete_telemetry() {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let mut binding = ParentWorkerAttemptReviewCostBinding::bind(
+            "assignment-a",
+            1,
+            ParentDispatchedReviewCycleSlot::FirstCycle,
+        );
+        binding.begin_stacked_parent_review_lenses(2);
+        binding.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
+            &temp, &repo, 7, 700_000,
+        ));
+        binding.record_parent_auditor_lens_undispatched();
+        assert!(binding.parent_review_cycle_actually_dispatched());
+        assert!(!binding.parent_review_dispatch_set_complete_for_test());
+        let mut completed_parent_review_cycles = Some(0usize);
+        advance_completed_parent_review_cycles_after_actual_dispatch(
+            &mut completed_parent_review_cycles,
+            &binding,
+        );
+        assert_eq!(completed_parent_review_cycles, Some(1));
+        assert_eq!(
+            review_cycle_slot_for_completed_dispatched_cycles(completed_parent_review_cycles),
+            ParentDispatchedReviewCycleSlot::SubsequentCycle
+        );
+        assert_eq!(
+            binding.persistable_review_phase_cost_microunits(),
+            Some(None)
+        );
     }
 
     #[test]
     fn parent_review_cost_binding_unknown_contaminates_total() {
         let (temp, repo) = super::super::tests::injected_repository();
-        let mut binding = ParentWorkerAttemptReviewCostBinding::bind("assignment-a", 1);
+        let mut binding = ParentWorkerAttemptReviewCostBinding::bind(
+            "assignment-a",
+            1,
+            ParentDispatchedReviewCycleSlot::FirstCycle,
+        );
         binding.begin_stacked_parent_review_lenses(2);
         binding.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
             &temp, &repo, 5, 500_000,
@@ -1603,7 +2019,11 @@ mod tests {
         );
         let dispatch_count =
             usize::try_from(u64::MAX / microunits + 1).expect("overflow dispatch count fits usize");
-        let mut binding = ParentWorkerAttemptReviewCostBinding::bind("assignment-a", 1);
+        let mut binding = ParentWorkerAttemptReviewCostBinding::bind(
+            "assignment-a",
+            1,
+            ParentDispatchedReviewCycleSlot::FirstCycle,
+        );
         binding.begin_stacked_parent_review_lenses(dispatch_count);
         for _ in 0..dispatch_count {
             binding.observe_parent_auditor_external_run(&run);
@@ -1615,9 +2035,21 @@ mod tests {
     #[test]
     fn parent_review_cost_binding_isolated_per_assignment_attempt() {
         let (temp, repo) = super::super::tests::injected_repository();
-        let mut first = ParentWorkerAttemptReviewCostBinding::bind("assignment-a", 1);
-        let mut second = ParentWorkerAttemptReviewCostBinding::bind("assignment-a", 2);
-        let mut other = ParentWorkerAttemptReviewCostBinding::bind("assignment-b", 1);
+        let mut first = ParentWorkerAttemptReviewCostBinding::bind(
+            "assignment-a",
+            1,
+            ParentDispatchedReviewCycleSlot::FirstCycle,
+        );
+        let mut second = ParentWorkerAttemptReviewCostBinding::bind(
+            "assignment-a",
+            2,
+            ParentDispatchedReviewCycleSlot::SubsequentCycle,
+        );
+        let mut other = ParentWorkerAttemptReviewCostBinding::bind(
+            "assignment-b",
+            1,
+            ParentDispatchedReviewCycleSlot::FirstCycle,
+        );
         first.begin_stacked_parent_review_lenses(1);
         second.begin_stacked_parent_review_lenses(1);
         other.begin_stacked_parent_review_lenses(1);
@@ -1668,8 +2100,13 @@ mod tests {
             true,
             false,
             None,
+            None,
         )?;
-        let mut binding = ParentWorkerAttemptReviewCostBinding::bind("assignment-1", 1);
+        let mut binding = ParentWorkerAttemptReviewCostBinding::bind(
+            "assignment-1",
+            1,
+            ParentDispatchedReviewCycleSlot::FirstCycle,
+        );
         binding.begin_stacked_parent_review_lenses(2);
         binding.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
             &temp, &repo, 50, 5_000_000,
@@ -1720,8 +2157,13 @@ mod tests {
             true,
             false,
             None,
+            None,
         )?;
-        let mut binding = ParentWorkerAttemptReviewCostBinding::bind("other-assignment", 1);
+        let mut binding = ParentWorkerAttemptReviewCostBinding::bind(
+            "other-assignment",
+            1,
+            ParentDispatchedReviewCycleSlot::FirstCycle,
+        );
         binding.begin_stacked_parent_review_lenses(1);
         binding.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
             &temp, &repo, 1, 100_000,
@@ -1775,8 +2217,13 @@ mod tests {
             true,
             false,
             Some(&external_run),
+            None,
         )?;
-        let mut binding = ParentWorkerAttemptReviewCostBinding::bind("assignment-1", 1);
+        let mut binding = ParentWorkerAttemptReviewCostBinding::bind(
+            "assignment-1",
+            1,
+            ParentDispatchedReviewCycleSlot::FirstCycle,
+        );
         binding.begin_stacked_parent_review_lenses(1);
         binding.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
             &temp, &repo, 17, 1_700_000,
@@ -1788,6 +2235,7 @@ mod tests {
                 .join("selection-attempts/assignment-1.attempt-1.json"),
         )?)?;
         assert_eq!(stored.costs.review_cost_microunits, Some(17));
+        assert_eq!(stored.costs.rereview_cost_microunits, Some(0));
         assert_eq!(stored.costs.execution_cost_microunits, Some(200));
         assert_eq!(stored.observed_candidate, recorded.observed_candidate);
         Ok(())
@@ -1835,8 +2283,13 @@ mod tests {
             true,
             false,
             Some(&external_run),
+            None,
         )?;
-        let mut review_binding = ParentWorkerAttemptReviewCostBinding::bind("assignment-1", 1);
+        let mut review_binding = ParentWorkerAttemptReviewCostBinding::bind(
+            "assignment-1",
+            1,
+            ParentDispatchedReviewCycleSlot::FirstCycle,
+        );
         review_binding.begin_stacked_parent_review_lenses(1);
         review_binding.observe_parent_auditor_external_run(
             &parent_auditor_run_with_trusted_acp_on(&temp, &repo, 9, 900_000),
@@ -1858,6 +2311,273 @@ mod tests {
             stored.parent_cause.as_deref(),
             Some("parent_auditor_authorized_retry")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn subsequent_review_cycle_persists_rereview_not_review() -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let run_id = RunId::new("rereview-phase-slot")?;
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "maco-supervise",
+        )?;
+        let mut journal = None;
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let initial = grok_worker_selection_event();
+        let mut recorded = record_child_attempt_outcome(
+            &artifacts,
+            &run_id,
+            "assignment-1",
+            2,
+            AgentRole::Worker,
+            &[],
+            std::slice::from_ref(&initial),
+            "grok",
+            Some("grok-code-fast-1"),
+            Some("high"),
+            true,
+            false,
+            None,
+            Some(attempt_parent_phase_continuation_from_count(Some(1))),
+        )?;
+        let mut binding = ParentWorkerAttemptReviewCostBinding::bind(
+            "assignment-1",
+            2,
+            ParentDispatchedReviewCycleSlot::SubsequentCycle,
+        );
+        binding.begin_stacked_parent_review_lenses(1);
+        binding.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
+            &temp, &repo, 31, 3_100_000,
+        ));
+        persist_worker_attempt_review_cost(&artifacts, &binding, &mut recorded)?;
+        assert_eq!(recorded.costs.review_cost_microunits, Some(0));
+        assert_eq!(recorded.costs.rereview_cost_microunits, Some(31));
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_review_cycle_slot_withholds_review_phase_costs() -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let run_id = RunId::new("unknown-review-cycle")?;
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "maco-supervise",
+        )?;
+        let mut journal = None;
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let initial = grok_worker_selection_event();
+        let mut recorded = record_child_attempt_outcome(
+            &artifacts,
+            &run_id,
+            "assignment-1",
+            2,
+            AgentRole::Worker,
+            &[],
+            std::slice::from_ref(&initial),
+            "grok",
+            Some("grok-code-fast-1"),
+            Some("high"),
+            true,
+            false,
+            None,
+            None,
+        )?;
+        let mut binding = ParentWorkerAttemptReviewCostBinding::bind(
+            "assignment-1",
+            2,
+            review_cycle_slot_from_continuation(recorded.parent_phase_continuation.as_ref()),
+        );
+        binding.begin_stacked_parent_review_lenses(1);
+        binding.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
+            &temp, &repo, 9, 900_000,
+        ));
+        persist_worker_attempt_review_cost(&artifacts, &binding, &mut recorded)?;
+        assert!(recorded.costs.review_cost_microunits.is_none());
+        assert!(recorded.costs.rereview_cost_microunits.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn proven_no_review_cycle_records_zero_review_and_rereview() -> Result<()> {
+        let run_id = RunId::new("no-review-phase")?;
+        let (_temp, repo) = super::super::tests::injected_repository();
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "maco-supervise",
+        )?;
+        let mut journal = None;
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let mut recorded = fixture();
+        recorded.run_id = run_id.as_str().to_string();
+        recorded.costs.environment_cost_microunits = None;
+        persist_proven_no_parent_review_cycle_costs(&artifacts, &mut recorded)?;
+        assert_eq!(recorded.costs.review_cost_microunits, Some(0));
+        assert_eq!(recorded.costs.rereview_cost_microunits, Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_and_accepted_attempt_rows_sum_without_double_counting() -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let first_run = parent_run_with_trusted_acp(
+            &temp,
+            &repo,
+            "grok-code-fast-1",
+            GrokAcpNativeCostEquivalent::Known {
+                cost_usd_ticks: 1,
+                microunits: 10,
+            },
+        );
+        let second_run = parent_run_with_trusted_acp(
+            &temp,
+            &repo,
+            "grok-code-fast-1",
+            GrokAcpNativeCostEquivalent::Known {
+                cost_usd_ticks: 1,
+                microunits: 20,
+            },
+        );
+        let run_id = RunId::new("sum-phase-rows")?;
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "maco-supervise",
+        )?;
+        let mut journal = None;
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let initial = grok_worker_selection_event();
+        let rejected = record_child_attempt_outcome(
+            &artifacts,
+            &run_id,
+            "assignment-1",
+            1,
+            AgentRole::Worker,
+            &[],
+            std::slice::from_ref(&initial),
+            "grok",
+            Some("grok-code-fast-1"),
+            Some("high"),
+            true,
+            true,
+            Some(&first_run),
+            Some(attempt_parent_phase_continuation_from_count(Some(0))),
+        )?;
+        let accepted = record_child_attempt_outcome(
+            &artifacts,
+            &run_id,
+            "assignment-1",
+            2,
+            AgentRole::Worker,
+            &[],
+            std::slice::from_ref(&initial),
+            "grok",
+            Some("grok-code-fast-1"),
+            Some("high"),
+            true,
+            false,
+            Some(&second_run),
+            Some(attempt_parent_phase_continuation_from_count(Some(1))),
+        )?;
+        let execution_total = rejected.costs.execution_cost_microunits.unwrap()
+            + accepted.costs.execution_cost_microunits.unwrap();
+        let rework_total = rejected.costs.rework_cost_microunits.unwrap()
+            + accepted.costs.rework_cost_microunits.unwrap();
+        assert_eq!(execution_total + rework_total, 30);
+        assert_eq!(execution_total, 10);
+        assert_eq!(rework_total, 20);
+        assert_eq!(accepted.costs.rework_cost_microunits, Some(20));
+        Ok(())
+    }
+
+    #[test]
+    fn authenticated_reaudit_source_without_attempt_evidence_yields_unknown_history() -> Result<()>
+    {
+        let (_temp, repo) = super::super::tests::injected_repository();
+        let run_id = RunId::new("reaudit-source-missing-proof")?;
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "maco-supervise",
+        )?;
+        let final_relative = RunArtifactFamily::Supervise.final_report_relative_path();
+        writer.write_json(
+            &final_relative,
+            &super::super::tests::artifact_test_final_report(&run_id),
+            ArtifactFileDisposition::Publishable,
+        )?;
+        writer.finalize(&final_relative, false)?;
+        let proof =
+            authenticated_prior_dispatched_review_cycle_proof(&repo, &run_id, "assignment-1")?;
+        assert_eq!(proof, ParentPriorDispatchedReviewCycleProof::Unknown);
+        assert_eq!(
+            review_cycle_slot_for_completed_dispatched_cycles(prior_dispatched_review_cycle_count(
+                &proof
+            ),),
+            ParentDispatchedReviewCycleSlot::Unknown
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn child_retry_bypass_persists_proven_no_review_zeros() -> Result<()> {
+        let run_id = RunId::new("child-retry-no-review")?;
+        let (_temp, repo) = super::super::tests::injected_repository();
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "maco-supervise",
+        )?;
+        let mut journal = None;
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let mut recorded = fixture();
+        recorded.run_id = run_id.as_str().to_string();
+        recorded.costs.environment_cost_microunits = None;
+        recorded.costs.review_cost_microunits = None;
+        recorded.costs.rereview_cost_microunits = None;
+        persist_proven_worker_attempt_bypassed_parent_review(&artifacts, &mut recorded)?;
+        assert_eq!(recorded.costs.review_cost_microunits, Some(0));
+        assert_eq!(recorded.costs.rereview_cost_microunits, Some(0));
+        assert!(recorded.costs.environment_cost_microunits.is_none());
         Ok(())
     }
 }
