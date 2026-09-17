@@ -79,6 +79,7 @@ The current implementation covers a local-first command-line slice:
   expose and safely mutate repo-local Markdown claim liveness for active,
   blocked, ready-for-review, handoff, and done work.
 - `maco llm providers` and `maco llm prompt-preview` expose the provider-neutral prompt boundary without network calls.
+
 - `maco agent run` executes one agent assignment in an isolated managed worktree. Verified assignment creation derives the capability-bound repository cleanliness input before creating the worktree; a dirty primary repository fails with the required remedy.
 - `maco supervise plan <task-or-plan-file>` normalizes the existing plain-text
   task or JSON plan form, while `maco supervise plan --from-goal <file>`
@@ -222,6 +223,49 @@ The current implementation covers a local-first command-line slice:
 - `maco agents list` inspects live MACO-launched agent process records.
   `maco agents stop` stops one unambiguous process or every process in one
   explicitly selected run.
+
+## Live assignment steering
+
+Operators with repository-local owner authority can queue authenticated corrective
+input and related steering actions against **registered** in-flight assignments.
+The request file must already name the run, assignment, action id, actor, action,
+and deadline; the CLI does not invent those fields.
+
+Use the actual run and assignment IDs. Replace the example deadline with the current
+Unix millisecond timestamp plus the requested timeout, at most 300,000 milliseconds:
+
+```json
+{
+  "version": 1,
+  "action_id": "act-operator-001",
+  "run_id": "run-supervise-001",
+  "assignment_id": "task-worker-001",
+  "actor": { "kind": "operator", "agent_id": "operator" },
+  "action": {
+    "type": "inject_corrective_input",
+    "message": "Stop editing README.md; finish the CLI wiring only."
+  },
+  "deadline_unix_ms": 0
+}
+```
+
+Examples:
+
+```bash
+maco steer submit steer-request.json --repo .
+maco steer evidence run-supervise-001 --repo . --json
+maco steer sweep run-supervise-001 --repo .
+```
+
+**Delivered** means the action was authenticated and queued. For Grok ACP corrective
+input, **Acknowledged** is recorded after the corrective prompt's correlated terminal
+response; task success and model compliance require their own evidence. The CLI does
+not print signing keys or MAC material.
+
+Grok ACP sessions launched with lifecycle identity consume corrective input. The
+in-process Fake API also supports corrections. Other runtime transports currently
+support cancellation without a corrective-input consumer. Cancellation targets
+registered child processes across runtimes. Review and merge authority are unchanged.
 
 ## Roadmap
 

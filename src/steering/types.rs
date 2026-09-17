@@ -166,6 +166,7 @@ pub enum SteeringRefusal {
     MergeBypass,
     DuplicateAction,
     DeadlineExpired,
+    RuntimeUnsupported,
 }
 
 impl SteeringRefusal {
@@ -179,6 +180,7 @@ impl SteeringRefusal {
             Self::MergeBypass => "merge_bypass",
             Self::DuplicateAction => "duplicate_action",
             Self::DeadlineExpired => "deadline_expired",
+            Self::RuntimeUnsupported => "runtime_unsupported",
         }
     }
 }

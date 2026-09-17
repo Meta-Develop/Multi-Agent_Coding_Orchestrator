@@ -188,6 +188,28 @@ impl GrokAcpLimits {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GrokAcpCorrection {
+    pub(crate) action_id: String,
+    pub(crate) prompt: String,
+    pub(crate) deadline: std::time::Instant,
+}
+
+pub(crate) trait GrokAcpSteering {
+    fn next_correction(&mut self) -> Result<Option<GrokAcpCorrection>, String>;
+    fn acknowledge(&mut self, action_id: &str) -> Result<(), String>;
+}
+
+impl GrokAcpSteering for () {
+    fn next_correction(&mut self) -> Result<Option<GrokAcpCorrection>, String> {
+        Ok(None)
+    }
+
+    fn acknowledge(&mut self, _action_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 /// Client-reported resolution status (not cryptographic backend proof).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -369,6 +391,11 @@ impl ProtocolState {
         Ok(RequestId::Number(id))
     }
 
+    fn correction_still_actionable(&self, correction_deadline: Instant) -> bool {
+        let now = Instant::now();
+        now < self.deadline && now < correction_deadline
+    }
+
     fn send<T: GrokAcpJsonLineTransport>(
         &mut self,
         transport: &mut T,
@@ -394,6 +421,78 @@ impl ProtocolState {
             .map_err(|message| GrokAcpError::Transport { message })
     }
 
+    fn receive_one_slice<T, C>(
+        &mut self,
+        transport: &mut T,
+        phase: &'static str,
+        cancelled: &C,
+        line: &mut Vec<u8>,
+        correction_deadline: Option<Instant>,
+    ) -> Result<ReceiveOneSliceOutcome, GrokAcpError>
+    where
+        T: GrokAcpJsonLineTransport,
+        C: Fn() -> bool,
+    {
+        if cancelled() {
+            return Err(GrokAcpError::Cancelled { phase });
+        }
+        let now = Instant::now();
+        let effective_deadline = match correction_deadline {
+            Some(correction) => self.deadline.min(correction),
+            None => self.deadline,
+        };
+        if now >= effective_deadline {
+            let timed_out_phase = if correction_deadline.is_some_and(|correction| now >= correction)
+            {
+                "steering correction"
+            } else {
+                phase
+            };
+            return Err(GrokAcpError::Timeout {
+                phase: timed_out_phase,
+            });
+        }
+        let remaining = effective_deadline.saturating_duration_since(now);
+        let wait = remaining.min(CANCELLATION_POLL_INTERVAL);
+        line.clear();
+        match transport
+            .receive(wait, self.limits.max_line_bytes, line)
+            .map_err(|message| GrokAcpError::Transport { message })?
+        {
+            GrokAcpTransportRead::Timeout if Instant::now() < effective_deadline => {
+                return Ok(ReceiveOneSliceOutcome::Idle);
+            }
+            GrokAcpTransportRead::Timeout => {
+                let timed_out_phase =
+                    if correction_deadline.is_some_and(|correction| Instant::now() >= correction) {
+                        "steering correction"
+                    } else {
+                        phase
+                    };
+                return Err(GrokAcpError::Timeout {
+                    phase: timed_out_phase,
+                });
+            }
+            GrokAcpTransportRead::Eof => return Err(GrokAcpError::ProtocolLoss { phase }),
+            GrokAcpTransportRead::Line => {}
+        }
+        self.messages_received = self.messages_received.saturating_add(1);
+        self.bytes_received = self.bytes_received.saturating_add(line.len());
+        if self.messages_received > self.limits.max_messages
+            || self.bytes_received > self.limits.max_total_bytes
+        {
+            return Err(GrokAcpError::Malformed {
+                phase,
+                message: "grok acp output exceeded its aggregate bound".to_string(),
+            });
+        }
+        let message = serde_json::from_slice(line).map_err(|error| GrokAcpError::Malformed {
+            phase,
+            message: format!("invalid JSON: {error}"),
+        })?;
+        Ok(ReceiveOneSliceOutcome::Message(message))
+    }
+
     fn receive<T, C>(
         &mut self,
         transport: &mut T,
@@ -406,40 +505,17 @@ impl ProtocolState {
     {
         let mut line = Vec::new();
         loop {
-            if cancelled() {
-                return Err(GrokAcpError::Cancelled { phase });
+            match self.receive_one_slice(transport, phase, cancelled, &mut line, None)? {
+                ReceiveOneSliceOutcome::Idle => continue,
+                ReceiveOneSliceOutcome::Message(message) => return Ok(message),
             }
-            let now = Instant::now();
-            if now >= self.deadline {
-                return Err(GrokAcpError::Timeout { phase });
-            }
-            let remaining = self.deadline.saturating_duration_since(now);
-            let wait = remaining.min(CANCELLATION_POLL_INTERVAL);
-            match transport
-                .receive(wait, self.limits.max_line_bytes, &mut line)
-                .map_err(|message| GrokAcpError::Transport { message })?
-            {
-                GrokAcpTransportRead::Timeout if Instant::now() < self.deadline => continue,
-                GrokAcpTransportRead::Timeout => return Err(GrokAcpError::Timeout { phase }),
-                GrokAcpTransportRead::Eof => return Err(GrokAcpError::ProtocolLoss { phase }),
-                GrokAcpTransportRead::Line => {}
-            }
-            self.messages_received = self.messages_received.saturating_add(1);
-            self.bytes_received = self.bytes_received.saturating_add(line.len());
-            if self.messages_received > self.limits.max_messages
-                || self.bytes_received > self.limits.max_total_bytes
-            {
-                return Err(GrokAcpError::Malformed {
-                    phase,
-                    message: "grok acp output exceeded its aggregate bound".to_string(),
-                });
-            }
-            return serde_json::from_slice(&line).map_err(|error| GrokAcpError::Malformed {
-                phase,
-                message: format!("invalid JSON: {error}"),
-            });
         }
     }
+}
+
+enum ReceiveOneSliceOutcome {
+    Message(Value),
+    Idle,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -639,6 +715,21 @@ where
     T: GrokAcpJsonLineTransport,
     C: Fn() -> bool,
 {
+    run_grok_acp_turn_with_steering(transport, turn, limits, cancelled, &mut ())
+}
+
+pub(crate) fn run_grok_acp_turn_with_steering<T, C, S>(
+    transport: &mut T,
+    turn: &GrokAcpTurn,
+    limits: GrokAcpLimits,
+    cancelled: C,
+    steering: &mut S,
+) -> Result<GrokAcpExecutionEvidence, GrokAcpError>
+where
+    T: GrokAcpJsonLineTransport,
+    C: Fn() -> bool,
+    S: GrokAcpSteering,
+{
     turn.validate()?;
     let limits = limits.validate()?;
     let mut state = ProtocolState::new(limits)?;
@@ -750,23 +841,28 @@ where
         }),
     )?;
 
+    let mut prompt_ctx = PromptSessionContext {
+        session_id: &session_id,
+        model_tracker: &mut model_tracker,
+        permission_escalation_refused: &mut permission_escalation_refused,
+    };
     let prompt_outcome = drive_prompt(
         &mut state,
         transport,
-        &session_id,
+        &mut prompt_ctx,
         &prompt_id,
-        &mut model_tracker,
         &cancelled,
-        &mut permission_escalation_refused,
+        steering,
     );
 
     let PromptDriveOutcome {
         final_text,
         stop_reason,
-        terminal_usage,
+        mut terminal_usage,
         prompt_result_meta,
         prompt_acknowledged,
         truncated,
+        prior_prompts_interrupted,
     } = match prompt_outcome {
         Ok(value) => value,
         Err(error) => {
@@ -777,9 +873,18 @@ where
 
     let _ = best_effort_cancel(&mut state, transport, &session_id);
 
-    let usage_incomplete = terminal_usage
-        .as_ref()
-        .is_some_and(|usage| usage.usage_is_incomplete || usage.cost_is_partial);
+    if prior_prompts_interrupted {
+        if let Some(usage) = terminal_usage.as_mut() {
+            usage.usage_is_incomplete = true;
+            usage.cost_is_partial = true;
+            usage.projected = None;
+        }
+    }
+
+    let usage_incomplete = prior_prompts_interrupted
+        || terminal_usage
+            .as_ref()
+            .is_some_and(|usage| usage.usage_is_incomplete || usage.cost_is_partial);
     let resolution_status =
         model_tracker.resolution_status(prompt_acknowledged, truncated, usage_incomplete);
     let client_resolved = model_tracker.client_resolved();
@@ -810,217 +915,593 @@ struct PromptDriveOutcome {
     prompt_result_meta: Option<Value>,
     prompt_acknowledged: bool,
     truncated: bool,
+    prior_prompts_interrupted: bool,
 }
 
-fn drive_prompt<T, C>(
+fn validate_steering_prompt(prompt: &str) -> Result<(), GrokAcpError> {
+    if prompt.len() > HARD_MAX_PROMPT_BYTES || prompt.contains('\0') {
+        return Err(GrokAcpError::InvalidConfiguration {
+            message: "grok acp steering prompt is malformed or exceeds its bound".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn superseded_prompt_drained(stop_reason: Option<&str>) -> bool {
+    matches!(stop_reason, Some("cancelled") | Some("end_turn"))
+}
+
+#[derive(Default)]
+struct PromptTurnAccumulators {
+    final_text: Option<String>,
+    stop_reason: Option<String>,
+    terminal_usage: Option<GrokAcpTerminalUsage>,
+    prompt_result_meta: Option<Value>,
+    truncated: bool,
+    prompt_acknowledged: bool,
+}
+
+struct SteeringApplication {
+    prompt_request_id: RequestId,
+    action_id: String,
+    correction_deadline: Instant,
+}
+
+enum SupersededPromptState<'a> {
+    Active { request_id: &'a RequestId },
+    Completed,
+}
+
+struct PromptSessionContext<'a> {
+    session_id: &'a str,
+    model_tracker: &'a mut ModelResolutionTracker,
+    permission_escalation_refused: &'a mut bool,
+}
+
+fn ensure_correction_actionable(
+    state: &ProtocolState,
+    correction_deadline: Instant,
+) -> Result<(), GrokAcpError> {
+    if !state.correction_still_actionable(correction_deadline) {
+        return Err(GrokAcpError::Timeout {
+            phase: "steering correction",
+        });
+    }
+    Ok(())
+}
+
+fn send_session_cancel_notification<T: GrokAcpJsonLineTransport>(
     state: &mut ProtocolState,
     transport: &mut T,
     session_id: &str,
-    prompt_request_id: &RequestId,
-    model_tracker: &mut ModelResolutionTracker,
+) -> Result<(), GrokAcpError> {
+    state.send(
+        transport,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": METHOD_SESSION_CANCEL,
+            "params": {"sessionId": session_id}
+        }),
+    )
+}
+
+fn apply_steering_correction<T, C>(
+    state: &mut ProtocolState,
+    transport: &mut T,
+    prompt_ctx: &mut PromptSessionContext<'_>,
+    superseded: SupersededPromptState<'_>,
+    correction: &GrokAcpCorrection,
     cancelled: &C,
-    permission_escalation_refused: &mut bool,
-) -> Result<PromptDriveOutcome, GrokAcpError>
+) -> Result<SteeringApplication, GrokAcpError>
 where
     T: GrokAcpJsonLineTransport,
     C: Fn() -> bool,
 {
-    let mut final_text: Option<String> = None;
-    let mut stop_reason: Option<String> = None;
-    let mut terminal_usage: Option<GrokAcpTerminalUsage> = None;
-    let mut prompt_result_meta: Option<Value> = None;
-    let mut truncated = false;
-    let prompt_acknowledged;
-    let prompt_response_seen;
+    validate_steering_prompt(&correction.prompt)?;
+    ensure_correction_actionable(state, correction.deadline)?;
+    match superseded {
+        SupersededPromptState::Active { request_id } => {
+            send_session_cancel_notification(state, transport, prompt_ctx.session_id)?;
+            drain_superseded_prompt(
+                state,
+                transport,
+                prompt_ctx,
+                request_id,
+                correction.deadline,
+                cancelled,
+            )?;
+            ensure_correction_actionable(state, correction.deadline)?;
+        }
+        SupersededPromptState::Completed => {}
+    }
+    ensure_correction_actionable(state, correction.deadline)?;
+    let new_prompt_id = state.allocate_request_id()?;
+    state.send(
+        transport,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": new_prompt_id.to_value(),
+            "method": METHOD_SESSION_PROMPT,
+            "params": {
+                "sessionId": prompt_ctx.session_id,
+                "prompt": [{"type": "text", "text": correction.prompt}]
+            }
+        }),
+    )?;
+    Ok(SteeringApplication {
+        prompt_request_id: new_prompt_id,
+        action_id: correction.action_id.clone(),
+        correction_deadline: correction.deadline,
+    })
+}
 
+fn try_poll_steering_correction<T, C, S>(
+    state: &mut ProtocolState,
+    transport: &mut T,
+    prompt_ctx: &mut PromptSessionContext<'_>,
+    superseded: SupersededPromptState<'_>,
+    cancelled: &C,
+    steering: &mut S,
+) -> Result<Option<SteeringApplication>, GrokAcpError>
+where
+    T: GrokAcpJsonLineTransport,
+    C: Fn() -> bool,
+    S: GrokAcpSteering,
+{
+    let Some(correction) = steering
+        .next_correction()
+        .map_err(|message| GrokAcpError::Transport { message })?
+    else {
+        return Ok(None);
+    };
+    if !state.correction_still_actionable(correction.deadline) {
+        return Err(GrokAcpError::Timeout {
+            phase: "steering correction",
+        });
+    }
+    Ok(Some(apply_steering_correction(
+        state,
+        transport,
+        prompt_ctx,
+        superseded,
+        &correction,
+        cancelled,
+    )?))
+}
+
+fn drain_superseded_prompt<T, C>(
+    state: &mut ProtocolState,
+    transport: &mut T,
+    prompt_ctx: &mut PromptSessionContext<'_>,
+    superseded_prompt_id: &RequestId,
+    correction_deadline: Instant,
+    cancelled: &C,
+) -> Result<(), GrokAcpError>
+where
+    T: GrokAcpJsonLineTransport,
+    C: Fn() -> bool,
+{
+    let phase = "session/prompt drain";
+    let mut line = Vec::new();
     loop {
-        let message = state.receive(transport, "session/prompt", cancelled)?;
+        let message = match state.receive_one_slice(
+            transport,
+            phase,
+            cancelled,
+            &mut line,
+            Some(correction_deadline),
+        )? {
+            ReceiveOneSliceOutcome::Idle => continue,
+            ReceiveOneSliceOutcome::Message(message) => message,
+        };
         if let Some(id) = message.get("id") {
             if message.get("method").is_some() {
-                let method = required_text(&message, &["method"], "session/prompt", "method")?;
+                let method = required_text(&message, &["method"], phase, "method")?;
                 refuse_server_request(
                     state,
                     transport,
                     &message,
                     method,
-                    permission_escalation_refused,
+                    prompt_ctx.permission_escalation_refused,
                 )?;
                 continue;
             }
-            let parsed = RequestId::parse(id, "session/prompt")?;
+            let parsed = RequestId::parse(id, phase)?;
             if !state.response_ids.insert(parsed.clone()) {
                 return Err(GrokAcpError::Duplicate {
-                    phase: "session/prompt",
+                    phase,
                     message: "duplicate response id".to_string(),
                 });
             }
-            if &parsed == prompt_request_id {
-                if message.get("error").is_some() {
-                    return Err(GrokAcpError::Remote {
-                        phase: "session/prompt",
-                        message: bounded_json_summary(message.get("error").unwrap_or(&Value::Null)),
-                    });
-                }
-                prompt_response_seen = true;
-                prompt_acknowledged = true;
-                if let Some(reason) = message
-                    .pointer("/result/stopReason")
-                    .and_then(Value::as_str)
-                {
-                    stop_reason = Some(reason.to_string());
-                }
-                truncated = message
-                    .pointer("/result/error_kind")
-                    .and_then(Value::as_str)
-                    .is_some_and(|kind| kind.contains("truncation"));
-                let usage_incomplete = message
-                    .pointer("/result/usage_is_incomplete")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let cost_partial = message
-                    .pointer("/result/cost_is_partial")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                if let Some(usage) = message.pointer("/result/usage") {
-                    terminal_usage = Some(project_terminal_usage_from_prompt(
-                        session_id,
-                        message.pointer("/result/promptId").and_then(Value::as_str),
-                        usage,
-                        usage_incomplete,
-                        cost_partial,
-                    ));
-                }
-                if let Some(meta) = message.pointer("/result/_meta") {
-                    prompt_result_meta = Some(meta.clone());
-                    if terminal_usage.is_none() {
-                        if let Some(usage) = meta.get("usage") {
-                            terminal_usage = Some(project_terminal_usage_from_prompt(
-                                session_id,
-                                message.pointer("/result/promptId").and_then(Value::as_str),
-                                usage,
-                                usage_incomplete,
-                                cost_partial,
-                            ));
-                        }
-                    }
-                }
-                if let Some(text) = message.pointer("/result/text").and_then(Value::as_str) {
-                    final_text = Some(text.to_string());
-                }
-                break;
+            if &parsed != superseded_prompt_id {
+                return Err(GrokAcpError::Unexpected {
+                    phase,
+                    message: "unexpected correlated response while draining superseded prompt"
+                        .to_string(),
+                });
             }
-            return Err(GrokAcpError::Unexpected {
-                phase: "session/prompt",
-                message: "unexpected correlated response during prompt".to_string(),
-            });
+            if message.get("error").is_some() {
+                return Err(GrokAcpError::Remote {
+                    phase,
+                    message: bounded_json_summary(message.get("error").unwrap_or(&Value::Null)),
+                });
+            }
+            let stop_reason = message
+                .pointer("/result/stopReason")
+                .and_then(Value::as_str);
+            if !superseded_prompt_drained(stop_reason) {
+                return Err(GrokAcpError::Unexpected {
+                    phase,
+                    message:
+                        "superseded prompt terminal reason did not authorize steering correction"
+                            .to_string(),
+                });
+            }
+            return Ok(());
         }
+        dispatch_prompt_notification(state, transport, prompt_ctx, &message, phase, None)?;
+    }
+}
 
-        if message.get("method").is_none() {
-            return Err(GrokAcpError::Malformed {
-                phase: "session/prompt",
-                message: "message lacks method and response id".to_string(),
-            });
-        }
-
-        let method = required_text(&message, &["method"], "session/prompt", "method")?;
-        match method {
-            METHOD_SESSION_UPDATE => {
-                let params = required_object(&message, &["params"], "session/prompt", "params")?;
-                let wire_session =
-                    map_required_text(params, "sessionId", "session/prompt", "session id")?;
-                if wire_session != session_id {
-                    return Err(GrokAcpError::Unexpected {
-                        phase: "session/prompt",
-                        message: "session/update targeted a different session".to_string(),
-                    });
-                }
-                let update = params
-                    .get("update")
-                    .and_then(Value::as_object)
-                    .ok_or_else(|| GrokAcpError::Malformed {
-                        phase: "session/prompt",
-                        message: "session/update update is not an object".to_string(),
-                    })?;
-                if let Some(tag) = update.get("sessionUpdate").and_then(Value::as_str) {
-                    match tag {
-                        "model_changed" => {
-                            let model_id = update
+fn dispatch_prompt_notification<T: GrokAcpJsonLineTransport>(
+    state: &mut ProtocolState,
+    transport: &mut T,
+    prompt_ctx: &mut PromptSessionContext<'_>,
+    message: &Value,
+    phase: &'static str,
+    supplement: Option<(&mut Option<String>, &mut Option<String>, &mut bool)>,
+) -> Result<(), GrokAcpError> {
+    if message.get("method").is_none() {
+        return Err(GrokAcpError::Malformed {
+            phase,
+            message: "message lacks method and response id".to_string(),
+        });
+    }
+    let method = required_text(message, &["method"], phase, "method")?;
+    match method {
+        METHOD_SESSION_UPDATE => {
+            let params = required_object(message, &["params"], phase, "params")?;
+            let wire_session = map_required_text(params, "sessionId", phase, "session id")?;
+            if wire_session != prompt_ctx.session_id {
+                return Err(GrokAcpError::Unexpected {
+                    phase,
+                    message: "session/update targeted a different session".to_string(),
+                });
+            }
+            let update = params
+                .get("update")
+                .and_then(Value::as_object)
+                .ok_or_else(|| GrokAcpError::Malformed {
+                    phase,
+                    message: "session/update update is not an object".to_string(),
+                })?;
+            if let Some(tag) = update.get("sessionUpdate").and_then(Value::as_str) {
+                match tag {
+                    "model_changed" => {
+                        let model_id =
+                            update
                                 .get("model_id")
                                 .and_then(Value::as_str)
                                 .ok_or_else(|| GrokAcpError::Malformed {
-                                    phase: "session/prompt",
+                                    phase,
                                     message: "model_changed missing model_id".to_string(),
                                 })?;
-                            let effort = update.get("reasoning_effort").and_then(Value::as_str);
-                            model_tracker.note_model_changed(model_id, effort);
-                        }
-                        "agent_message_chunk" => {
+                        let effort = update.get("reasoning_effort").and_then(Value::as_str);
+                        prompt_ctx
+                            .model_tracker
+                            .note_model_changed(model_id, effort);
+                    }
+                    "agent_message_chunk" => {
+                        if let Some((final_text, _, _)) = supplement {
                             if let Some(text) = update
                                 .get("content")
                                 .and_then(|content| content.get("text"))
                                 .and_then(Value::as_str)
                             {
-                                let mut combined = final_text.unwrap_or_default();
+                                let mut combined = final_text.take().unwrap_or_default();
                                 combined.push_str(text);
-                                final_text = Some(combined);
+                                *final_text = Some(combined);
                             }
                         }
-                        "turn_completed" => {
+                    }
+                    "turn_completed" => {
+                        if let Some((final_text, stop_reason, truncated)) = supplement {
                             apply_turn_completed_supplement(
                                 update,
-                                &mut final_text,
-                                &mut stop_reason,
-                                &mut truncated,
+                                final_text,
+                                stop_reason,
+                                truncated,
                             );
                         }
-                        _ => {}
                     }
-                }
-            }
-            _ if method == METHOD_XAI_SESSION_NOTIFICATION => {
-                handle_xai_session_notification(
-                    &message,
-                    session_id,
-                    model_tracker,
-                    Some((&mut final_text, &mut stop_reason, &mut truncated)),
-                )?;
-            }
-            _ if method == METHOD_SESSION_REQUEST_PERMISSION || method.starts_with('_') => {
-                refuse_server_request(
-                    state,
-                    transport,
-                    &message,
-                    method,
-                    permission_escalation_refused,
-                )?;
-            }
-            _ => {
-                if is_escalation_method(method) {
-                    refuse_server_request(
-                        state,
-                        transport,
-                        &message,
-                        method,
-                        permission_escalation_refused,
-                    )?;
+                    _ => {}
                 }
             }
         }
+        _ if method == METHOD_XAI_SESSION_NOTIFICATION => {
+            handle_xai_session_notification(
+                message,
+                prompt_ctx.session_id,
+                prompt_ctx.model_tracker,
+                supplement,
+            )?;
+        }
+        _ if method == METHOD_SESSION_REQUEST_PERMISSION || method.starts_with('_') => {
+            refuse_server_request(
+                state,
+                transport,
+                message,
+                method,
+                prompt_ctx.permission_escalation_refused,
+            )?;
+        }
+        _ => {
+            if is_escalation_method(method) {
+                refuse_server_request(
+                    state,
+                    transport,
+                    message,
+                    method,
+                    prompt_ctx.permission_escalation_refused,
+                )?;
+            }
+        }
     }
+    Ok(())
+}
 
-    if !prompt_response_seen {
-        return Err(GrokAcpError::ProtocolLoss {
-            phase: "session/prompt",
-        });
+fn ingest_prompt_terminal_response(
+    message: &Value,
+    session_id: &str,
+    turn: &mut PromptTurnAccumulators,
+) {
+    turn.prompt_acknowledged = true;
+    if let Some(reason) = message
+        .pointer("/result/stopReason")
+        .and_then(Value::as_str)
+    {
+        turn.stop_reason = Some(reason.to_string());
     }
+    turn.truncated = message
+        .pointer("/result/error_kind")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.contains("truncation"));
+    let usage_incomplete = message
+        .pointer("/result/usage_is_incomplete")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let cost_partial = message
+        .pointer("/result/cost_is_partial")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if let Some(usage) = message.pointer("/result/usage") {
+        turn.terminal_usage = Some(project_terminal_usage_from_prompt(
+            session_id,
+            message.pointer("/result/promptId").and_then(Value::as_str),
+            usage,
+            usage_incomplete,
+            cost_partial,
+        ));
+    }
+    if let Some(meta) = message.pointer("/result/_meta") {
+        turn.prompt_result_meta = Some(meta.clone());
+        if turn.terminal_usage.is_none() {
+            if let Some(usage) = meta.get("usage") {
+                turn.terminal_usage = Some(project_terminal_usage_from_prompt(
+                    session_id,
+                    message.pointer("/result/promptId").and_then(Value::as_str),
+                    usage,
+                    usage_incomplete,
+                    cost_partial,
+                ));
+            }
+        }
+    }
+    if let Some(text) = message.pointer("/result/text").and_then(Value::as_str) {
+        turn.final_text = Some(text.to_string());
+    }
+}
+
+fn poll_active_steering_correction<T, C, S>(
+    state: &mut ProtocolState,
+    transport: &mut T,
+    prompt_ctx: &mut PromptSessionContext<'_>,
+    prompt_request_id: &RequestId,
+    cancelled: &C,
+    steering: &mut S,
+) -> Result<Option<SteeringApplication>, GrokAcpError>
+where
+    T: GrokAcpJsonLineTransport,
+    C: Fn() -> bool,
+    S: GrokAcpSteering,
+{
+    try_poll_steering_correction(
+        state,
+        transport,
+        prompt_ctx,
+        SupersededPromptState::Active {
+            request_id: prompt_request_id,
+        },
+        cancelled,
+        steering,
+    )
+}
+
+fn poll_completed_steering_correction<T, C, S>(
+    state: &mut ProtocolState,
+    transport: &mut T,
+    prompt_ctx: &mut PromptSessionContext<'_>,
+    cancelled: &C,
+    steering: &mut S,
+) -> Result<Option<SteeringApplication>, GrokAcpError>
+where
+    T: GrokAcpJsonLineTransport,
+    C: Fn() -> bool,
+    S: GrokAcpSteering,
+{
+    try_poll_steering_correction(
+        state,
+        transport,
+        prompt_ctx,
+        SupersededPromptState::Completed,
+        cancelled,
+        steering,
+    )
+}
+
+fn drive_prompt<T, C, S>(
+    state: &mut ProtocolState,
+    transport: &mut T,
+    prompt_ctx: &mut PromptSessionContext<'_>,
+    initial_prompt_request_id: &RequestId,
+    cancelled: &C,
+    steering: &mut S,
+) -> Result<PromptDriveOutcome, GrokAcpError>
+where
+    T: GrokAcpJsonLineTransport,
+    C: Fn() -> bool,
+    S: GrokAcpSteering,
+{
+    let mut prompt_request_id = initial_prompt_request_id.clone();
+    let mut prior_prompts_interrupted = false;
+    let mut pending_ack: Option<SteeringApplication> = None;
+    let mut line = Vec::new();
+
+    let latest_terminal = loop {
+        let mut turn = PromptTurnAccumulators::default();
+        let mut restarted_for_steering = false;
+
+        'receive: loop {
+            if pending_ack.is_none() {
+                if let Some(application) = poll_active_steering_correction(
+                    state,
+                    transport,
+                    prompt_ctx,
+                    &prompt_request_id,
+                    cancelled,
+                    steering,
+                )? {
+                    prior_prompts_interrupted = true;
+                    prompt_request_id = application.prompt_request_id.clone();
+                    pending_ack = Some(application);
+                    restarted_for_steering = true;
+                    break 'receive;
+                }
+            }
+
+            let correction_deadline = pending_ack
+                .as_ref()
+                .map(|pending| pending.correction_deadline);
+            match state.receive_one_slice(
+                transport,
+                "session/prompt",
+                cancelled,
+                &mut line,
+                correction_deadline,
+            )? {
+                ReceiveOneSliceOutcome::Idle => continue,
+                ReceiveOneSliceOutcome::Message(message) => {
+                    if let Some(id) = message.get("id") {
+                        if message.get("method").is_some() {
+                            let method =
+                                required_text(&message, &["method"], "session/prompt", "method")?;
+                            refuse_server_request(
+                                state,
+                                transport,
+                                &message,
+                                method,
+                                prompt_ctx.permission_escalation_refused,
+                            )?;
+                            continue;
+                        }
+                        let parsed = RequestId::parse(id, "session/prompt")?;
+                        if !state.response_ids.insert(parsed.clone()) {
+                            return Err(GrokAcpError::Duplicate {
+                                phase: "session/prompt",
+                                message: "duplicate response id".to_string(),
+                            });
+                        }
+                        if parsed != prompt_request_id {
+                            return Err(GrokAcpError::Unexpected {
+                                phase: "session/prompt",
+                                message: "unexpected correlated response during prompt".to_string(),
+                            });
+                        }
+                        if message.get("error").is_some() {
+                            return Err(GrokAcpError::Remote {
+                                phase: "session/prompt",
+                                message: bounded_json_summary(
+                                    message.get("error").unwrap_or(&Value::Null),
+                                ),
+                            });
+                        }
+                        ingest_prompt_terminal_response(&message, prompt_ctx.session_id, &mut turn);
+                        break 'receive;
+                    }
+
+                    dispatch_prompt_notification(
+                        state,
+                        transport,
+                        prompt_ctx,
+                        &message,
+                        "session/prompt",
+                        Some((
+                            &mut turn.final_text,
+                            &mut turn.stop_reason,
+                            &mut turn.truncated,
+                        )),
+                    )?;
+
+                    if pending_ack.is_none() {
+                        if let Some(application) = poll_active_steering_correction(
+                            state,
+                            transport,
+                            prompt_ctx,
+                            &prompt_request_id,
+                            cancelled,
+                            steering,
+                        )? {
+                            prior_prompts_interrupted = true;
+                            prompt_request_id = application.prompt_request_id.clone();
+                            pending_ack = Some(application);
+                            restarted_for_steering = true;
+                            break 'receive;
+                        }
+                    }
+                }
+            }
+        }
+
+        if restarted_for_steering {
+            continue;
+        }
+
+        if let Some(pending) = pending_ack.take() {
+            ensure_correction_actionable(state, pending.correction_deadline)?;
+            steering
+                .acknowledge(&pending.action_id)
+                .map_err(|message| GrokAcpError::Transport { message })?;
+        }
+
+        if let Some(application) =
+            poll_completed_steering_correction(state, transport, prompt_ctx, cancelled, steering)?
+        {
+            prior_prompts_interrupted = true;
+            prompt_request_id = application.prompt_request_id.clone();
+            pending_ack = Some(application);
+            continue;
+        }
+        break turn;
+    };
 
     Ok(PromptDriveOutcome {
-        final_text,
-        stop_reason,
-        terminal_usage,
-        prompt_result_meta,
-        prompt_acknowledged,
-        truncated,
+        final_text: latest_terminal.final_text,
+        stop_reason: latest_terminal.stop_reason,
+        terminal_usage: latest_terminal.terminal_usage,
+        prompt_result_meta: latest_terminal.prompt_result_meta,
+        prompt_acknowledged: latest_terminal.prompt_acknowledged,
+        truncated: latest_terminal.truncated,
+        prior_prompts_interrupted,
     })
 }
 
@@ -1298,14 +1779,10 @@ fn best_effort_cancel<T: GrokAcpJsonLineTransport>(
     transport: &mut T,
     session_id: &str,
 ) -> Result<(), GrokAcpError> {
-    let Ok(id) = state.allocate_request_id() else {
-        return Ok(());
-    };
     let _ = state.send(
         transport,
         &json!({
             "jsonrpc": "2.0",
-            "id": id.to_value(),
             "method": METHOD_SESSION_CANCEL,
             "params": {"sessionId": session_id}
         }),
@@ -1850,5 +2327,1170 @@ mod tests {
             evidence.resolution_status,
             GrokAcpResolutionStatus::Complete
         );
+    }
+
+    #[derive(Default)]
+    struct SequenceFixtureState {
+        idle_slices_returned: usize,
+    }
+
+    struct SequenceSteeringTransport {
+        early: VecDeque<Vec<u8>>,
+        late: VecDeque<Vec<u8>>,
+        outbound: Vec<Vec<u8>>,
+        idle_before_correction: bool,
+        prompt_sends: usize,
+        idle_slices_returned: usize,
+        shared: std::rc::Rc<std::cell::RefCell<SequenceFixtureState>>,
+    }
+
+    impl SequenceSteeringTransport {
+        fn for_steering_turn(early_messages: Vec<Value>, late_messages: Vec<Value>) -> Self {
+            let map_lines = |values: Vec<Value>| {
+                values
+                    .into_iter()
+                    .map(|value| {
+                        let mut line = serde_json::to_vec(&value).expect("fixture json");
+                        line.push(b'\n');
+                        line
+                    })
+                    .collect::<VecDeque<_>>()
+            };
+            Self {
+                early: map_lines(early_messages),
+                late: map_lines(late_messages),
+                outbound: Vec::new(),
+                idle_before_correction: false,
+                prompt_sends: 0,
+                idle_slices_returned: 0,
+                shared: std::rc::Rc::new(std::cell::RefCell::new(SequenceFixtureState::default())),
+            }
+        }
+
+        fn idle_slices_returned(&self) -> usize {
+            self.idle_slices_returned
+        }
+
+        fn shared_fixture_state(&self) -> std::rc::Rc<std::cell::RefCell<SequenceFixtureState>> {
+            self.shared.clone()
+        }
+
+        fn outbound_frames(&self) -> Vec<Value> {
+            self.outbound
+                .iter()
+                .map(|line| serde_json::from_slice(line).expect("outbound json"))
+                .collect()
+        }
+
+        fn record_idle_slice(&mut self) {
+            self.idle_slices_returned = self.idle_slices_returned.saturating_add(1);
+            self.shared.borrow_mut().idle_slices_returned = self.idle_slices_returned;
+        }
+    }
+
+    impl GrokAcpJsonLineTransport for SequenceSteeringTransport {
+        fn receive(
+            &mut self,
+            _wait: Duration,
+            max_line_bytes: usize,
+            destination: &mut Vec<u8>,
+        ) -> Result<GrokAcpTransportRead, String> {
+            destination.clear();
+            if let Some(line) = self.early.pop_front() {
+                if line.len() > max_line_bytes {
+                    return Err("fixture line exceeded bound".to_string());
+                }
+                destination.extend_from_slice(&line);
+                return Ok(GrokAcpTransportRead::Line);
+            }
+            if self.idle_before_correction {
+                self.idle_before_correction = false;
+                self.record_idle_slice();
+                return Ok(GrokAcpTransportRead::Timeout);
+            }
+            let Some(line) = self.late.pop_front() else {
+                self.record_idle_slice();
+                return Ok(GrokAcpTransportRead::Timeout);
+            };
+            if line.len() > max_line_bytes {
+                return Err("fixture line exceeded bound".to_string());
+            }
+            destination.extend_from_slice(&line);
+            Ok(GrokAcpTransportRead::Line)
+        }
+
+        fn send(&mut self, line: &[u8]) -> Result<(), String> {
+            let value: Value = serde_json::from_slice(line).expect("outbound json");
+            if value.get("method") == Some(&Value::from(METHOD_SESSION_PROMPT))
+                && self.early.is_empty()
+            {
+                self.prompt_sends = self.prompt_sends.saturating_add(1);
+                if self.prompt_sends == 1 {
+                    self.idle_before_correction = true;
+                }
+            }
+            self.outbound.push(line.to_vec());
+            Ok(())
+        }
+    }
+
+    struct TimeAdvancingSequenceTransport {
+        inner: SequenceSteeringTransport,
+    }
+
+    impl TimeAdvancingSequenceTransport {
+        fn for_steering_turn(early_messages: Vec<Value>, late_messages: Vec<Value>) -> Self {
+            Self {
+                inner: SequenceSteeringTransport::for_steering_turn(early_messages, late_messages),
+            }
+        }
+
+        fn outbound(&self) -> &[Vec<u8>] {
+            &self.inner.outbound
+        }
+    }
+
+    impl GrokAcpJsonLineTransport for TimeAdvancingSequenceTransport {
+        fn receive(
+            &mut self,
+            wait: Duration,
+            max_line_bytes: usize,
+            destination: &mut Vec<u8>,
+        ) -> Result<GrokAcpTransportRead, String> {
+            let outcome = self.inner.receive(wait, max_line_bytes, destination)?;
+            if outcome == GrokAcpTransportRead::Timeout {
+                std::thread::sleep(wait);
+            }
+            Ok(outcome)
+        }
+
+        fn send(&mut self, line: &[u8]) -> Result<(), String> {
+            self.inner.send(line)
+        }
+    }
+
+    struct CorrectiveCompletionDeadlineTransport {
+        inbound: VecDeque<Vec<u8>>,
+        outbound: Vec<Vec<u8>>,
+        corrective_prompt_sent: bool,
+    }
+
+    impl CorrectiveCompletionDeadlineTransport {
+        fn from_values(values: Vec<Value>) -> Self {
+            let inbound: Vec<Vec<u8>> = values
+                .into_iter()
+                .map(|value| {
+                    let mut line = serde_json::to_vec(&value).expect("fixture json");
+                    line.push(b'\n');
+                    line
+                })
+                .collect();
+            Self {
+                inbound: VecDeque::from(inbound),
+                outbound: Vec::new(),
+                corrective_prompt_sent: false,
+            }
+        }
+
+        fn outbound_frames(&self) -> Vec<Value> {
+            self.outbound
+                .iter()
+                .map(|line| serde_json::from_slice(line).expect("outbound json"))
+                .collect()
+        }
+    }
+
+    impl GrokAcpJsonLineTransport for CorrectiveCompletionDeadlineTransport {
+        fn receive(
+            &mut self,
+            wait: Duration,
+            max_line_bytes: usize,
+            destination: &mut Vec<u8>,
+        ) -> Result<GrokAcpTransportRead, String> {
+            destination.clear();
+            if let Some(line) = self.inbound.pop_front() {
+                if line.len() > max_line_bytes {
+                    return Err("fixture line exceeded bound".to_string());
+                }
+                destination.extend_from_slice(&line);
+                return Ok(GrokAcpTransportRead::Line);
+            }
+            if self.corrective_prompt_sent {
+                std::thread::sleep(wait);
+            }
+            Ok(GrokAcpTransportRead::Timeout)
+        }
+
+        fn send(&mut self, line: &[u8]) -> Result<(), String> {
+            let value: Value = serde_json::from_slice(line).expect("outbound json");
+            if value.get("method") == Some(&Value::from(METHOD_SESSION_PROMPT))
+                && value.get("id") == Some(&Value::from(5))
+            {
+                self.corrective_prompt_sent = true;
+            }
+            self.outbound.push(line.to_vec());
+            Ok(())
+        }
+    }
+
+    struct ObservedInboundScriptTransport {
+        inbound: VecDeque<Vec<u8>>,
+        outbound: Vec<Vec<u8>>,
+        original_prompt_terminal_delivered: std::rc::Rc<std::cell::RefCell<bool>>,
+    }
+
+    impl ObservedInboundScriptTransport {
+        fn from_values(values: Vec<Value>) -> Self {
+            let inbound: Vec<Vec<u8>> = values
+                .into_iter()
+                .map(|value| {
+                    let mut line = serde_json::to_vec(&value).expect("fixture json");
+                    line.push(b'\n');
+                    line
+                })
+                .collect();
+            Self {
+                inbound: VecDeque::from(inbound),
+                outbound: Vec::new(),
+                original_prompt_terminal_delivered: std::rc::Rc::new(std::cell::RefCell::new(
+                    false,
+                )),
+            }
+        }
+
+        fn original_prompt_terminal_gate(&self) -> std::rc::Rc<std::cell::RefCell<bool>> {
+            self.original_prompt_terminal_delivered.clone()
+        }
+
+        fn outbound_frames(&self) -> Vec<Value> {
+            self.outbound
+                .iter()
+                .map(|line| serde_json::from_slice(line).expect("outbound json"))
+                .collect()
+        }
+    }
+
+    impl GrokAcpJsonLineTransport for ObservedInboundScriptTransport {
+        fn receive(
+            &mut self,
+            _wait: Duration,
+            max_line_bytes: usize,
+            destination: &mut Vec<u8>,
+        ) -> Result<GrokAcpTransportRead, String> {
+            destination.clear();
+            let line = self
+                .inbound
+                .pop_front()
+                .ok_or_else(|| "fixture exhausted".to_string())?;
+            if line.len() > max_line_bytes {
+                return Err("fixture line exceeded bound".to_string());
+            }
+            if let Ok(value) = serde_json::from_slice::<Value>(&line) {
+                if value.get("id") == Some(&Value::from(4)) && value.get("result").is_some() {
+                    *self.original_prompt_terminal_delivered.borrow_mut() = true;
+                }
+            }
+            destination.extend_from_slice(&line);
+            Ok(GrokAcpTransportRead::Line)
+        }
+
+        fn send(&mut self, line: &[u8]) -> Result<(), String> {
+            self.outbound.push(line.to_vec());
+            Ok(())
+        }
+    }
+
+    struct ActiveCorrectiveLifecycleTransport {
+        inbound: VecDeque<Vec<u8>>,
+        outbound: Vec<Vec<u8>>,
+        corrective_prompt_sent: std::rc::Rc<std::cell::RefCell<bool>>,
+    }
+
+    impl ActiveCorrectiveLifecycleTransport {
+        fn for_whole_task_cancel() -> Self {
+            let mut messages = base_handshake("sess-cancel");
+            messages.push(model_changed_notification(
+                "sess-cancel",
+                "grok-4",
+                Some("high"),
+            ));
+            messages.push(set_model_ack("grok-4"));
+            messages.push(agent_message_chunk("sess-cancel", "streaming"));
+            messages.push(prompt_cancelled_response(4));
+            Self::from_values(messages)
+        }
+
+        fn from_values(values: Vec<Value>) -> Self {
+            let inbound: Vec<Vec<u8>> = values
+                .into_iter()
+                .map(|value| {
+                    let mut line = serde_json::to_vec(&value).expect("fixture json");
+                    line.push(b'\n');
+                    line
+                })
+                .collect();
+            Self {
+                inbound: VecDeque::from(inbound),
+                outbound: Vec::new(),
+                corrective_prompt_sent: std::rc::Rc::new(std::cell::RefCell::new(false)),
+            }
+        }
+
+        fn corrective_prompt_sent_flag(&self) -> std::rc::Rc<std::cell::RefCell<bool>> {
+            self.corrective_prompt_sent.clone()
+        }
+
+        fn outbound_frames(&self) -> Vec<Value> {
+            self.outbound
+                .iter()
+                .map(|line| serde_json::from_slice(line).expect("outbound json"))
+                .collect()
+        }
+    }
+
+    impl GrokAcpJsonLineTransport for ActiveCorrectiveLifecycleTransport {
+        fn receive(
+            &mut self,
+            _wait: Duration,
+            max_line_bytes: usize,
+            destination: &mut Vec<u8>,
+        ) -> Result<GrokAcpTransportRead, String> {
+            destination.clear();
+            let Some(line) = self.inbound.pop_front() else {
+                return Ok(GrokAcpTransportRead::Timeout);
+            };
+            if line.len() > max_line_bytes {
+                return Err("fixture line exceeded bound".to_string());
+            }
+            destination.extend_from_slice(&line);
+            Ok(GrokAcpTransportRead::Line)
+        }
+
+        fn send(&mut self, line: &[u8]) -> Result<(), String> {
+            let value: Value = serde_json::from_slice(line).expect("outbound json");
+            if value.get("method") == Some(&Value::from(METHOD_SESSION_PROMPT))
+                && value.get("id") == Some(&Value::from(5))
+            {
+                *self.corrective_prompt_sent.borrow_mut() = true;
+            }
+            self.outbound.push(line.to_vec());
+            Ok(())
+        }
+    }
+
+    fn outbound_prompt_ids(transport: &TimeAdvancingSequenceTransport) -> Vec<Value> {
+        transport
+            .outbound()
+            .iter()
+            .filter(|line| {
+                serde_json::from_slice::<Value>(line).is_ok_and(|value| {
+                    value.get("method") == Some(&Value::from(METHOD_SESSION_PROMPT))
+                })
+            })
+            .map(|line| {
+                serde_json::from_slice::<Value>(line)
+                    .expect("outbound json")
+                    .get("id")
+                    .cloned()
+                    .expect("prompt request id")
+            })
+            .collect()
+    }
+
+    fn short_correction_deadline_from_now() -> Instant {
+        Instant::now() + CANCELLATION_POLL_INTERVAL / 2
+    }
+
+    struct DeadlineAtFetchSteering {
+        action_id: String,
+        prompt: String,
+        fetched: bool,
+        acked: Vec<String>,
+    }
+
+    impl GrokAcpSteering for DeadlineAtFetchSteering {
+        fn next_correction(&mut self) -> Result<Option<GrokAcpCorrection>, String> {
+            if self.fetched {
+                return Ok(None);
+            }
+            self.fetched = true;
+            Ok(Some(GrokAcpCorrection {
+                action_id: self.action_id.clone(),
+                prompt: self.prompt.clone(),
+                deadline: short_correction_deadline_from_now(),
+            }))
+        }
+
+        fn acknowledge(&mut self, action_id: &str) -> Result<(), String> {
+            self.acked.push(action_id.to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn steering_correction_deadline_expires_during_old_prompt_drain_without_late_prompt_or_ack() {
+        let early = steering_early_messages("sess-drain-exp");
+        let late = Vec::new();
+        let mut transport = TimeAdvancingSequenceTransport::for_steering_turn(early, late);
+        let mut steering = DeadlineAtFetchSteering {
+            action_id: "drain-expired".into(),
+            prompt: "never sent".into(),
+            fetched: false,
+            acked: Vec::new(),
+        };
+        let error = run_grok_acp_turn_with_steering(
+            &mut transport,
+            &GrokAcpTurn {
+                cwd: "/tmp".into(),
+                prompt: "original".into(),
+                requested_model: Some("grok-4".into()),
+                requested_effort: Some("low".into()),
+            },
+            GrokAcpLimits::for_fixture_test(),
+            || false,
+            &mut steering,
+        )
+        .expect_err("drain should hit steering correction deadline");
+        assert!(matches!(
+            error,
+            GrokAcpError::Timeout {
+                phase: "steering correction",
+            }
+        ));
+        assert!(steering.acked.is_empty());
+        assert_eq!(outbound_prompt_ids(&transport), vec![Value::from(4)]);
+    }
+
+    #[test]
+    fn steering_correction_deadline_expires_during_corrective_completion_without_ack() {
+        let mut messages = base_handshake("sess-corrective-exp");
+        messages.push(model_changed_notification(
+            "sess-corrective-exp",
+            "grok-4",
+            Some("high"),
+        ));
+        messages.push(set_model_ack("grok-4"));
+        messages.push(agent_message_chunk("sess-corrective-exp", "streaming"));
+        messages.push(prompt_cancelled_response(4));
+        let mut transport = CorrectiveCompletionDeadlineTransport::from_values(messages);
+        let mut steering = DeadlineAtFetchSteering {
+            action_id: "corrective-expired".into(),
+            prompt: "corrective".into(),
+            fetched: false,
+            acked: Vec::new(),
+        };
+        let error = run_grok_acp_turn_with_steering(
+            &mut transport,
+            &GrokAcpTurn {
+                cwd: "/tmp".into(),
+                prompt: "original".into(),
+                requested_model: Some("grok-4".into()),
+                requested_effort: Some("low".into()),
+            },
+            GrokAcpLimits::for_fixture_test(),
+            || false,
+            &mut steering,
+        )
+        .expect_err("corrective completion should hit steering correction deadline");
+        assert!(matches!(
+            error,
+            GrokAcpError::Timeout {
+                phase: "steering correction",
+            }
+        ));
+        assert!(steering.acked.is_empty());
+        let prompt_ids: Vec<_> = transport
+            .outbound_frames()
+            .iter()
+            .filter(|frame| frame.get("method") == Some(&Value::from(METHOD_SESSION_PROMPT)))
+            .map(|frame| frame.get("id").cloned().expect("prompt id"))
+            .collect();
+        assert_eq!(prompt_ids, vec![Value::from(4), Value::from(5)]);
+    }
+
+    struct QueueSteering {
+        corrections: VecDeque<GrokAcpCorrection>,
+        acked: Vec<String>,
+    }
+
+    impl GrokAcpSteering for QueueSteering {
+        fn next_correction(&mut self) -> Result<Option<GrokAcpCorrection>, String> {
+            Ok(self.corrections.pop_front())
+        }
+
+        fn acknowledge(&mut self, action_id: &str) -> Result<(), String> {
+            self.acked.push(action_id.to_string());
+            Ok(())
+        }
+    }
+
+    struct IdleSliceGatedSteering {
+        fixture: std::rc::Rc<std::cell::RefCell<SequenceFixtureState>>,
+        correction: GrokAcpCorrection,
+        offered: bool,
+        acked: Vec<String>,
+    }
+
+    impl GrokAcpSteering for IdleSliceGatedSteering {
+        fn next_correction(&mut self) -> Result<Option<GrokAcpCorrection>, String> {
+            if self.fixture.borrow().idle_slices_returned == 0 {
+                return Ok(None);
+            }
+            if self.offered {
+                return Ok(None);
+            }
+            self.offered = true;
+            Ok(Some(self.correction.clone()))
+        }
+
+        fn acknowledge(&mut self, action_id: &str) -> Result<(), String> {
+            self.acked.push(action_id.to_string());
+            Ok(())
+        }
+    }
+
+    struct QueuedAfterOriginalTerminalSteering {
+        original_terminal_gate: std::rc::Rc<std::cell::RefCell<bool>>,
+        correction: GrokAcpCorrection,
+        offered: bool,
+        acked: Vec<String>,
+    }
+
+    impl GrokAcpSteering for QueuedAfterOriginalTerminalSteering {
+        fn next_correction(&mut self) -> Result<Option<GrokAcpCorrection>, String> {
+            if !*self.original_terminal_gate.borrow() {
+                return Ok(None);
+            }
+            if self.offered {
+                return Ok(None);
+            }
+            self.offered = true;
+            Ok(Some(self.correction.clone()))
+        }
+
+        fn acknowledge(&mut self, action_id: &str) -> Result<(), String> {
+            self.acked.push(action_id.to_string());
+            Ok(())
+        }
+    }
+
+    fn outbound_frames_from_script(transport: &ScriptTransport) -> Vec<Value> {
+        transport
+            .outbound
+            .iter()
+            .map(|line| serde_json::from_slice(line).expect("outbound json"))
+            .collect()
+    }
+
+    fn prompt_frame_indices(frames: &[Value]) -> Vec<(usize, Value)> {
+        frames
+            .iter()
+            .enumerate()
+            .filter(|(_, frame)| frame.get("method") == Some(&Value::from(METHOD_SESSION_PROMPT)))
+            .map(|(index, frame)| (index, frame.get("id").cloned().expect("prompt id")))
+            .collect()
+    }
+
+    fn cancel_frame_indices(frames: &[Value]) -> Vec<usize> {
+        frames
+            .iter()
+            .enumerate()
+            .filter(|(_, frame)| frame.get("method") == Some(&Value::from(METHOD_SESSION_CANCEL)))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn assert_no_cancel_between_outbound_indices(frames: &[Value], start: usize, end: usize) {
+        for (index, frame) in frames.iter().enumerate() {
+            if index <= start || index >= end {
+                continue;
+            }
+            assert_ne!(
+                frame.get("method"),
+                Some(&Value::from(METHOD_SESSION_CANCEL)),
+                "unexpected session/cancel between outbound indices {start} and {end}"
+            );
+        }
+    }
+
+    fn assert_teardown_cancel_notification_last(frames: &[Value]) {
+        let cancel_indices = cancel_frame_indices(frames);
+        assert_eq!(
+            cancel_indices.len(),
+            1,
+            "expected exactly one trailing teardown session/cancel notification"
+        );
+        assert_eq!(
+            cancel_indices[0],
+            frames.len() - 1,
+            "teardown session/cancel must be the final outbound frame"
+        );
+        assert_session_cancel_notification(&frames[cancel_indices[0]]);
+    }
+
+    fn prompt_cancelled_response(id: u64) -> Value {
+        json!({
+            "id": id,
+            "result": {"stopReason": "cancelled", "text": "discarded"}
+        })
+    }
+
+    fn prompt_success_response(id: u64, text: &str) -> Value {
+        json!({
+            "id": id,
+            "result": {
+                "stopReason": "end_turn",
+                "text": text,
+                "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+                "usage_is_incomplete": false,
+                "cost_is_partial": false
+            }
+        })
+    }
+
+    fn agent_message_chunk(session_id: &str, text: &str) -> Value {
+        json!({
+            "method": METHOD_SESSION_UPDATE,
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": text}
+                }
+            }
+        })
+    }
+
+    fn assert_session_cancel_notification(frame: &Value) {
+        assert_eq!(
+            frame.get("method"),
+            Some(&Value::from(METHOD_SESSION_CANCEL))
+        );
+        assert!(
+            frame.get("id").is_none(),
+            "session/cancel must be a notification without a request id"
+        );
+    }
+
+    #[test]
+    fn no_steering_wrapper_preserves_existing_turn_behavior() {
+        let mut transport = ScriptTransport::from_values(successful_transcript("high"));
+        let evidence = run_grok_acp_turn(
+            &mut transport,
+            &GrokAcpTurn {
+                cwd: "/tmp".into(),
+                prompt: "ping".into(),
+                requested_model: Some("grok-4".into()),
+                requested_effort: Some("low".into()),
+            },
+            GrokAcpLimits::for_fixture_test(),
+            || false,
+        )
+        .expect("unsteered turn");
+        assert_eq!(evidence.final_text.as_deref(), Some("hello"));
+        let frames = outbound_frames_from_script(&transport);
+        let prompts = prompt_frame_indices(&frames);
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].1, Value::from(4));
+        assert_teardown_cancel_notification_last(&frames);
+    }
+
+    fn steering_early_messages(session_id: &str) -> Vec<Value> {
+        let mut messages = base_handshake(session_id);
+        messages.push(model_changed_notification(
+            session_id,
+            "grok-4",
+            Some("high"),
+        ));
+        messages.push(set_model_ack("grok-4"));
+        messages
+    }
+
+    #[test]
+    fn steering_applies_cancel_drain_then_same_session_prompt() {
+        let early = steering_early_messages("sess-steer");
+        let late = vec![
+            prompt_cancelled_response(4),
+            prompt_success_response(5, "corrected"),
+        ];
+        let mut transport = SequenceSteeringTransport::for_steering_turn(early, late);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut steering = QueueSteering {
+            corrections: VecDeque::from([GrokAcpCorrection {
+                action_id: "act-1".into(),
+                prompt: "fix it".into(),
+                deadline,
+            }]),
+            acked: Vec::new(),
+        };
+        let evidence = run_grok_acp_turn_with_steering(
+            &mut transport,
+            &GrokAcpTurn {
+                cwd: "/tmp".into(),
+                prompt: "original".into(),
+                requested_model: Some("grok-4".into()),
+                requested_effort: Some("low".into()),
+            },
+            GrokAcpLimits::for_fixture_test(),
+            || false,
+            &mut steering,
+        )
+        .expect("steered turn");
+        assert_eq!(evidence.final_text.as_deref(), Some("corrected"));
+        assert_eq!(steering.acked, vec!["act-1".to_string()]);
+        let outbound: Vec<Value> = transport
+            .outbound
+            .iter()
+            .map(|line| serde_json::from_slice(line).expect("outbound json"))
+            .collect();
+        let cancel_frame = outbound
+            .iter()
+            .find(|frame| frame.get("method") == Some(&Value::from(METHOD_SESSION_CANCEL)))
+            .expect("session/cancel notification");
+        assert_session_cancel_notification(cancel_frame);
+        let prompt_ids: Vec<_> = outbound
+            .iter()
+            .filter(|frame| frame.get("method") == Some(&Value::from(METHOD_SESSION_PROMPT)))
+            .map(|frame| frame.get("id").cloned().expect("prompt request id"))
+            .collect();
+        assert_eq!(prompt_ids, vec![Value::from(4), Value::from(5)]);
+        let cancel_idx = outbound
+            .iter()
+            .position(|frame| frame.get("method") == Some(&Value::from(METHOD_SESSION_CANCEL)))
+            .expect("cancel");
+        let second_prompt_idx = outbound
+            .iter()
+            .rposition(|frame| frame.get("method") == Some(&Value::from(METHOD_SESSION_PROMPT)))
+            .expect("second prompt");
+        assert!(cancel_idx < second_prompt_idx);
+        assert!(evidence
+            .terminal_usage
+            .as_ref()
+            .is_some_and(|usage| usage.cost_is_partial && usage.usage_is_incomplete));
+    }
+
+    #[test]
+    fn steering_polls_mailbox_on_no_output_timeout() {
+        let early = steering_early_messages("sess-idle");
+        let late = vec![
+            prompt_cancelled_response(4),
+            prompt_success_response(5, "after-idle"),
+        ];
+        let mut transport = SequenceSteeringTransport::for_steering_turn(early, late);
+        let fixture = transport.shared_fixture_state();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut polled_on_idle_slice = false;
+        let mut steering = IdleSliceGatedSteering {
+            fixture: fixture.clone(),
+            correction: GrokAcpCorrection {
+                action_id: "act-idle".into(),
+                prompt: "after idle".into(),
+                deadline,
+            },
+            offered: false,
+            acked: Vec::new(),
+        };
+        struct IdlePollProbe<'a> {
+            inner: &'a mut IdleSliceGatedSteering,
+            fixture: std::rc::Rc<std::cell::RefCell<SequenceFixtureState>>,
+            polled_on_idle_slice: &'a mut bool,
+        }
+        impl GrokAcpSteering for IdlePollProbe<'_> {
+            fn next_correction(&mut self) -> Result<Option<GrokAcpCorrection>, String> {
+                if self.fixture.borrow().idle_slices_returned == 0 {
+                    return Ok(None);
+                }
+                *self.polled_on_idle_slice = true;
+                self.inner.next_correction()
+            }
+            fn acknowledge(&mut self, action_id: &str) -> Result<(), String> {
+                self.inner.acknowledge(action_id)
+            }
+        }
+        let mut probe = IdlePollProbe {
+            inner: &mut steering,
+            fixture,
+            polled_on_idle_slice: &mut polled_on_idle_slice,
+        };
+        run_grok_acp_turn_with_steering(
+            &mut transport,
+            &GrokAcpTurn {
+                cwd: "/tmp".into(),
+                prompt: "wait".into(),
+                requested_model: Some("grok-4".into()),
+                requested_effort: Some("low".into()),
+            },
+            GrokAcpLimits::for_fixture_test(),
+            || false,
+            &mut probe,
+        )
+        .expect("idle poll turn");
+        assert!(
+            polled_on_idle_slice,
+            "steering mailbox must be polled only after an idle receive slice"
+        );
+        assert!(transport.idle_slices_returned() > 0);
+    }
+
+    #[test]
+    fn steering_polls_mailbox_while_output_keeps_flowing() {
+        let mut messages = base_handshake("sess-stream");
+        messages.push(model_changed_notification(
+            "sess-stream",
+            "grok-4",
+            Some("high"),
+        ));
+        messages.push(set_model_ack("grok-4"));
+        messages.push(agent_message_chunk("sess-stream", "stale-chunk"));
+        messages.push(prompt_cancelled_response(4));
+        messages.push(prompt_success_response(5, "clean-final"));
+        let mut transport = ScriptTransport::from_values(messages);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut polled = false;
+        let mut steering = QueueSteering {
+            corrections: VecDeque::from([GrokAcpCorrection {
+                action_id: "stream-act".into(),
+                prompt: "fix stream".into(),
+                deadline,
+            }]),
+            acked: Vec::new(),
+        };
+        struct PollProbe<'a> {
+            inner: &'a mut QueueSteering,
+            polled: &'a mut bool,
+        }
+        impl GrokAcpSteering for PollProbe<'_> {
+            fn next_correction(&mut self) -> Result<Option<GrokAcpCorrection>, String> {
+                *self.polled = true;
+                self.inner.next_correction()
+            }
+            fn acknowledge(&mut self, action_id: &str) -> Result<(), String> {
+                self.inner.acknowledge(action_id)
+            }
+        }
+        let mut probe = PollProbe {
+            inner: &mut steering,
+            polled: &mut polled,
+        };
+        let evidence = run_grok_acp_turn_with_steering(
+            &mut transport,
+            &GrokAcpTurn {
+                cwd: "/tmp".into(),
+                prompt: "original".into(),
+                requested_model: Some("grok-4".into()),
+                requested_effort: Some("low".into()),
+            },
+            GrokAcpLimits::for_fixture_test(),
+            || false,
+            &mut probe,
+        )
+        .expect("streaming steering turn");
+        assert!(polled);
+        assert_eq!(evidence.final_text.as_deref(), Some("clean-final"));
+        assert!(evidence
+            .final_text
+            .as_deref()
+            .is_some_and(|text| !text.contains("stale-chunk")));
+    }
+
+    #[test]
+    fn steering_queued_after_terminal_skips_cancel_and_drain() {
+        let mut messages = base_handshake("sess-queue");
+        messages.push(model_changed_notification(
+            "sess-queue",
+            "grok-4",
+            Some("high"),
+        ));
+        messages.push(set_model_ack("grok-4"));
+        messages.push(prompt_ack(true));
+        messages.push(prompt_success_response(5, "queued-fix"));
+        let mut transport = ObservedInboundScriptTransport::from_values(messages);
+        let original_terminal_gate = transport.original_prompt_terminal_gate();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut steering = QueuedAfterOriginalTerminalSteering {
+            original_terminal_gate,
+            correction: GrokAcpCorrection {
+                action_id: "queued".into(),
+                prompt: "after terminal".into(),
+                deadline,
+            },
+            offered: false,
+            acked: Vec::new(),
+        };
+        let evidence = run_grok_acp_turn_with_steering(
+            &mut transport,
+            &GrokAcpTurn {
+                cwd: "/tmp".into(),
+                prompt: "ping".into(),
+                requested_model: Some("grok-4".into()),
+                requested_effort: Some("low".into()),
+            },
+            GrokAcpLimits::for_fixture_test(),
+            || false,
+            &mut steering,
+        )
+        .expect("queued correction turn");
+        assert_eq!(evidence.final_text.as_deref(), Some("queued-fix"));
+        assert_eq!(steering.acked, vec!["queued".to_string()]);
+        let frames = transport.outbound_frames();
+        let prompts = prompt_frame_indices(&frames);
+        assert_eq!(
+            prompts,
+            vec![
+                (prompts[0].0, Value::from(4)),
+                (prompts[1].0, Value::from(5))
+            ]
+        );
+        assert_no_cancel_between_outbound_indices(&frames, prompts[0].0, prompts[1].0);
+        assert_teardown_cancel_notification_last(&frames);
+    }
+
+    #[test]
+    fn steering_serial_second_correction_uses_completed_path() {
+        let early = steering_early_messages("sess-serial");
+        let late = vec![
+            prompt_cancelled_response(4),
+            prompt_success_response(5, "first-fix"),
+            prompt_success_response(6, "second-fix"),
+        ];
+        let mut transport = SequenceSteeringTransport::for_steering_turn(early, late);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut steering = QueueSteering {
+            corrections: VecDeque::from([
+                GrokAcpCorrection {
+                    action_id: "first".into(),
+                    prompt: "first correction".into(),
+                    deadline,
+                },
+                GrokAcpCorrection {
+                    action_id: "second".into(),
+                    prompt: "second correction".into(),
+                    deadline,
+                },
+            ]),
+            acked: Vec::new(),
+        };
+        let evidence = run_grok_acp_turn_with_steering(
+            &mut transport,
+            &GrokAcpTurn {
+                cwd: "/tmp".into(),
+                prompt: "original".into(),
+                requested_model: Some("grok-4".into()),
+                requested_effort: Some("low".into()),
+            },
+            GrokAcpLimits::for_fixture_test(),
+            || false,
+            &mut steering,
+        )
+        .expect("serial corrections");
+        assert_eq!(
+            steering.acked,
+            vec!["first".to_string(), "second".to_string()]
+        );
+        assert_eq!(evidence.final_text.as_deref(), Some("second-fix"));
+        let outbound: Vec<Value> = transport.outbound_frames();
+        let prompts = prompt_frame_indices(&outbound);
+        assert_eq!(
+            prompts,
+            vec![
+                (prompts[0].0, Value::from(4)),
+                (prompts[1].0, Value::from(5)),
+                (prompts[2].0, Value::from(6))
+            ]
+        );
+        let cancels = cancel_frame_indices(&outbound);
+        assert_eq!(cancels.len(), 2, "one steering cancel plus teardown cancel");
+        assert!(
+            cancels[0] > prompts[0].0 && cancels[0] < prompts[1].0,
+            "steering session/cancel must occur between the original and first corrective prompts"
+        );
+        assert!(
+            cancels[1] > prompts[2].0,
+            "teardown session/cancel must follow the final corrective prompt"
+        );
+        assert_session_cancel_notification(&outbound[cancels[0]]);
+        assert_session_cancel_notification(&outbound[cancels[1]]);
+        assert_eq!(cancels[1], outbound.len() - 1);
+    }
+
+    #[test]
+    fn steering_does_not_ack_when_correction_deadline_passed() {
+        let mut messages = base_handshake("sess-exp");
+        messages.push(model_changed_notification(
+            "sess-exp",
+            "grok-4",
+            Some("high"),
+        ));
+        messages.push(set_model_ack("grok-4"));
+        messages.push(prompt_ack(true));
+        let mut transport = ScriptTransport::from_values(messages);
+        let mut steering = QueueSteering {
+            corrections: VecDeque::from([GrokAcpCorrection {
+                action_id: "expired".into(),
+                prompt: "late".into(),
+                deadline: Instant::now() - Duration::from_secs(1),
+            }]),
+            acked: Vec::new(),
+        };
+        let error = run_grok_acp_turn_with_steering(
+            &mut transport,
+            &GrokAcpTurn {
+                cwd: "/tmp".into(),
+                prompt: "ping".into(),
+                requested_model: Some("grok-4".into()),
+                requested_effort: Some("low".into()),
+            },
+            GrokAcpLimits::for_fixture_test(),
+            || false,
+            &mut steering,
+        )
+        .expect_err("expired queued correction");
+        assert!(matches!(
+            error,
+            GrokAcpError::Timeout {
+                phase: "steering correction",
+            }
+        ));
+        assert!(steering.acked.is_empty());
+    }
+
+    #[test]
+    fn steering_does_not_ack_when_whole_task_cancelled() {
+        let mut transport = ActiveCorrectiveLifecycleTransport::for_whole_task_cancel();
+        let corrective_sent = transport.corrective_prompt_sent_flag();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut steering = QueueSteering {
+            corrections: VecDeque::from([GrokAcpCorrection {
+                action_id: "never-acked".into(),
+                prompt: "fix".into(),
+                deadline,
+            }]),
+            acked: Vec::new(),
+        };
+        let cancel_after_corrective = corrective_sent.clone();
+        let error = run_grok_acp_turn_with_steering(
+            &mut transport,
+            &GrokAcpTurn {
+                cwd: "/tmp".into(),
+                prompt: "original".into(),
+                requested_model: Some("grok-4".into()),
+                requested_effort: Some("low".into()),
+            },
+            GrokAcpLimits::for_fixture_test(),
+            move || *cancel_after_corrective.borrow(),
+            &mut steering,
+        )
+        .expect_err("whole-task cancel");
+        assert!(matches!(error, GrokAcpError::Cancelled { .. }));
+        assert!(steering.acked.is_empty());
+        assert!(*corrective_sent.borrow());
+        let prompts = prompt_frame_indices(&transport.outbound_frames());
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[1].1, Value::from(5));
+    }
+
+    #[test]
+    fn steering_does_not_ack_on_protocol_loss_before_corrective_terminal() {
+        let early = steering_early_messages("sess-loss");
+        let late = vec![prompt_cancelled_response(4)];
+        let mut transport = SequenceSteeringTransport::for_steering_turn(early, late);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut steering = QueueSteering {
+            corrections: VecDeque::from([GrokAcpCorrection {
+                action_id: "lost".into(),
+                prompt: "fix".into(),
+                deadline,
+            }]),
+            acked: Vec::new(),
+        };
+        let error = run_grok_acp_turn_with_steering(
+            &mut transport,
+            &GrokAcpTurn {
+                cwd: "/tmp".into(),
+                prompt: "original".into(),
+                requested_model: Some("grok-4".into()),
+                requested_effort: Some("low".into()),
+            },
+            GrokAcpLimits::for_fixture_test(),
+            || false,
+            &mut steering,
+        )
+        .expect_err("corrective prompt never terminalizes");
+        assert!(matches!(
+            error,
+            GrokAcpError::Timeout { .. } | GrokAcpError::ProtocolLoss { .. }
+        ));
+        assert!(steering.acked.is_empty());
+    }
+
+    #[test]
+    fn steering_rejects_unexpected_prompt_response_id() {
+        let mut messages = base_handshake("sess-dup");
+        messages.push(model_changed_notification(
+            "sess-dup",
+            "grok-4",
+            Some("high"),
+        ));
+        messages.push(set_model_ack("grok-4"));
+        messages.push(json!({"id": 99, "result": {"stopReason": "end_turn", "text": "wrong"}}));
+        let mut transport = ScriptTransport::from_values(messages);
+        let mut steering = QueueSteering {
+            corrections: VecDeque::new(),
+            acked: Vec::new(),
+        };
+        let error = run_grok_acp_turn_with_steering(
+            &mut transport,
+            &GrokAcpTurn {
+                cwd: "/tmp".into(),
+                prompt: "ping".into(),
+                requested_model: Some("grok-4".into()),
+                requested_effort: None,
+            },
+            GrokAcpLimits::for_fixture_test(),
+            || false,
+            &mut steering,
+        )
+        .expect_err("unexpected response id");
+        assert!(matches!(
+            error,
+            GrokAcpError::Unexpected {
+                phase: "session/prompt",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn steering_rejects_cross_session_notification_during_prompt() {
+        let mut messages = base_handshake("sess-1");
+        messages.push(model_changed_notification("sess-1", "grok-4", Some("high")));
+        messages.push(set_model_ack("grok-4"));
+        messages.push(model_changed_notification("sess-other", "grok-4", None));
+        messages.push(prompt_ack(true));
+        let mut transport = ScriptTransport::from_values(messages);
+        let mut steering = QueueSteering {
+            corrections: VecDeque::new(),
+            acked: Vec::new(),
+        };
+        let error = run_grok_acp_turn_with_steering(
+            &mut transport,
+            &GrokAcpTurn {
+                cwd: "/tmp".into(),
+                prompt: "ping".into(),
+                requested_model: Some("grok-4".into()),
+                requested_effort: None,
+            },
+            GrokAcpLimits::for_fixture_test(),
+            || false,
+            &mut steering,
+        )
+        .expect_err("cross session");
+        assert!(matches!(
+            error,
+            GrokAcpError::Unexpected {
+                phase: "x.ai/session_notification",
+                ..
+            }
+        ));
     }
 }
