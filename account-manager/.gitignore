@@ -1,0 +1,43 @@
+# --- Node / front end ---
+node_modules/
+dist/
+dist-ssr/
+.vite/
+*.local
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Rust / Tauri ---
+target/
+src-tauri/target/
+src-tauri/gen/
+**/*.rs.bk
+
+# --- Nix ---
+result
+result-*
+.direnv/
+
+# --- Editors / OS ---
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# --- Agent scratch (never tracked) ---
+.agents/temp/
+.agents/storage/
+.agents/research/local/
+.maco/
+
+# --- Local secrets and captures (never tracked) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+captures/

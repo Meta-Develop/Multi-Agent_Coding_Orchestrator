@@ -1,0 +1,20 @@
+{
+  "id": "FAKE-response-gemini-0001",
+  "object": "chat.completion",
+  "created": 0,
+  "model": "FAKE-gemini-model",
+  "choices": [
+    {
+      "index": 0,
+      "message": { "role": "assistant", "content": "Hello" },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 2,
+    "prompt_tokens_details": { "cached_tokens": 1 },
+    "completion_tokens": 7,
+    "completion_tokens_details": { "reasoning_tokens": 4 },
+    "total_tokens": 9
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "$context": { "target_model": "response-target" },
+  "$body": {
+    "model": "chat-source",
+    "max_completion_tokens": 256,
+    "reasoning_effort": "low",
+    "messages": [
+      { "role": "system", "content": "Be concise." },
+      {
+        "role": "user",
+        "content": [
+          { "type": "text", "text": "Inspect" },
+          {
+            "type": "image_url",
+            "image_url": { "url": "data:image/png;base64,FAKE-image-0001" }
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "FAKE-call-0001",
+            "type": "function",
+            "function": {
+              "name": "inspect",
+              "arguments": "{\"id\":\"FAKE-item-0001\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "FAKE-call-0001",
+        "content": "{\"ok\":true}"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "inspect",
+          "description": "Inspect one item.",
+          "parameters": { "type": "object" }
+        }
+      }
+    ]
+  }
+}

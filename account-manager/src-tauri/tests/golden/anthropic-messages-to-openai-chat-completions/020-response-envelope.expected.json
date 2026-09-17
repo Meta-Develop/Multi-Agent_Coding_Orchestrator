@@ -1,0 +1,19 @@
+{
+  "id": "FAKE-response-anthropic-0001",
+  "object": "chat.completion",
+  "created": 0,
+  "model": "FAKE-anthropic-model",
+  "choices": [
+    {
+      "index": 0,
+      "message": { "role": "assistant", "content": "Hello" },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 5,
+    "prompt_tokens_details": { "cached_tokens": 2 },
+    "completion_tokens": 3,
+    "total_tokens": 8
+  }
+}

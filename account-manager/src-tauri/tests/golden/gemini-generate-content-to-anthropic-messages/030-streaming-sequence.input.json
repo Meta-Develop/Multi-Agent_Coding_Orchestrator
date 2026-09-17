@@ -1,0 +1,34 @@
+{
+  "$events": [
+    {
+      "data": {
+        "responseId": "FAKE-stream-gemini-anthropic",
+        "modelVersion": "FAKE-gemini-model",
+        "usageMetadata": {
+          "promptTokenCount": 2,
+          "candidatesTokenCount": 0,
+          "totalTokenCount": 2
+        },
+        "candidates": [
+          {
+            "index": 0,
+            "content": { "role": "model", "parts": [{ "text": "Hello" }] }
+          }
+        ]
+      }
+    },
+    {
+      "data": {
+        "responseId": "FAKE-stream-gemini-anthropic",
+        "modelVersion": "FAKE-gemini-model",
+        "candidates": [{ "index": 0, "finishReason": "STOP" }],
+        "usageMetadata": {
+          "promptTokenCount": 2,
+          "candidatesTokenCount": 3,
+          "totalTokenCount": 5
+        }
+      }
+    },
+    { "data": null, "terminal": true }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "model": "gpt-4o",
+  "max_tokens": 256,
+  "messages": [
+    { "role": "user", "content": "Look up FAKE-account-0001" },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "FAKE-tool-call-0001",
+          "name": "lookup_account",
+          "input": { "account_id": "FAKE-account-0001" }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "FAKE-tool-call-0001",
+          "is_error": false,
+          "content": "{\"label\":\"primary\"}"
+        }
+      ]
+    }
+  ]
+}

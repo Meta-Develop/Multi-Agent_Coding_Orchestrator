@@ -1,0 +1,6 @@
+{
+  "model": "gpt-4o",
+  "max_tokens": 256,
+  "logit_bias": { "42": -100 },
+  "messages": [{ "role": "user", "content": "Hi" }]
+}

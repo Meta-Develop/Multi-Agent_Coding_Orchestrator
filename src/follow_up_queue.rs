@@ -695,6 +695,21 @@ enum QueueJournalEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         environment_failures: Vec<EnvironmentFailure>,
     },
+    PreparationWhileEnqueued {
+        item_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gate_denial: Option<GateDenial>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        environment_failures: Vec<EnvironmentFailure>,
+    },
+    PreparationWhileClaimed {
+        item_id: String,
+        proof: LeaseProof,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gate_denial: Option<GateDenial>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        environment_failures: Vec<EnvironmentFailure>,
+    },
     DispatchStarted {
         item_id: String,
         subordinate_run_id: String,
@@ -783,6 +798,8 @@ impl QueueJournalEvent {
             Self::Enqueued { .. } => "enqueued",
             Self::Claimed { .. } => "claimed",
             Self::ReleasedBeforeDispatch { .. } => "released_before_dispatch",
+            Self::PreparationWhileEnqueued { .. } => "preparation_while_enqueued",
+            Self::PreparationWhileClaimed { .. } => "preparation_while_claimed",
             Self::DispatchStarted { .. } => "dispatch_started",
             Self::DispatchObserved { .. } => "dispatch_observed",
             Self::AcknowledgedTerminal { .. } => "acknowledged_terminal",
@@ -808,6 +825,8 @@ impl QueueJournalEvent {
             Self::EnqueueStaged { item } => Some(&item.item_id),
             Self::Claimed { item_id }
             | Self::ReleasedBeforeDispatch { item_id, .. }
+            | Self::PreparationWhileEnqueued { item_id, .. }
+            | Self::PreparationWhileClaimed { item_id, .. }
             | Self::DispatchStarted { item_id, .. }
             | Self::DispatchObserved { item_id, .. }
             | Self::AcknowledgedTerminal { item_id, .. }
@@ -1492,6 +1511,36 @@ impl GeneratedFollowUpQueue {
         })
     }
 
+    pub(crate) fn record_preparation_while_enqueued(
+        &mut self,
+        item_id: &str,
+        gate_denial: Option<GateDenial>,
+        environment_failures: Vec<EnvironmentFailure>,
+    ) -> Result<GeneratedFollowUpQueueEventData> {
+        self.append_event(QueueJournalEvent::PreparationWhileEnqueued {
+            item_id: item_id.to_string(),
+            gate_denial,
+            environment_failures,
+        })
+    }
+
+    /// Records admission or environment diagnostics for a crash-recovered claim
+    /// that already holds an active lease and in-progress branch attempt.
+    pub(crate) fn record_leased_preparation(
+        &mut self,
+        item_id: &str,
+        proof: LeaseProof,
+        gate_denial: Option<GateDenial>,
+        environment_failures: Vec<EnvironmentFailure>,
+    ) -> Result<GeneratedFollowUpQueueEventData> {
+        self.append_event(QueueJournalEvent::PreparationWhileClaimed {
+            item_id: item_id.to_string(),
+            proof,
+            gate_denial,
+            environment_failures,
+        })
+    }
+
     /// Releases every crash-surviving claim that has no durable dispatch
     /// marker. DispatchStarted items are excluded by phase and remain
     /// ambiguous until the caller supplies stronger subordinate-run evidence.
@@ -1805,6 +1854,46 @@ fn apply_queue_event(
             item.last_environment_failures = environment_failures.clone();
             item.external_side_effect_state = None;
         }
+        QueueJournalEvent::PreparationWhileEnqueued {
+            item_id,
+            gate_denial,
+            environment_failures,
+        } => {
+            require_phase(
+                queue_item(&snapshot, item_id)?,
+                GeneratedFollowUpQueuePhase::Enqueued,
+                "preparation refusal while enqueued",
+            )?;
+            require_bound_branch_runnable_while_enqueued(&snapshot, item_id)?;
+            let item = queue_item_mut(&mut snapshot, item_id)?;
+            if item.subordinate_run_id.is_some() {
+                bail!("generated follow-up item with a dispatch marker cannot record preparation refusal");
+            }
+            item.last_gate_denial = gate_denial.clone();
+            item.last_environment_failures = environment_failures.clone();
+        }
+        QueueJournalEvent::PreparationWhileClaimed {
+            item_id,
+            proof,
+            gate_denial,
+            environment_failures,
+        } => {
+            require_phase(
+                queue_item(&snapshot, item_id)?,
+                GeneratedFollowUpQueuePhase::Claimed,
+                "preparation refusal while claimed",
+            )?;
+            require_bound_active_lease_proof(&snapshot, item_id, proof)?;
+            if !bound_branch_attempt_in_progress(&snapshot, item_id)? {
+                bail!("leased preparation refusal requires the bound graph branch attempt to be in progress");
+            }
+            let item = queue_item_mut(&mut snapshot, item_id)?;
+            if item.subordinate_run_id.is_some() {
+                bail!("generated follow-up item with a dispatch marker cannot record leased preparation refusal");
+            }
+            item.last_gate_denial = gate_denial.clone();
+            item.last_environment_failures = environment_failures.clone();
+        }
         QueueJournalEvent::DispatchStarted {
             item_id,
             subordinate_run_id: observed_run_id,
@@ -1967,11 +2056,34 @@ fn apply_queue_event(
                 bail!("lease heartbeat queue record contains the wrong lease transition");
             }
             require_bound_lease_identity(&snapshot, item_id, lease_event)?;
-            require_phase(
-                queue_item(&snapshot, item_id)?,
-                GeneratedFollowUpQueuePhase::Claimed,
-                "lease heartbeat",
-            )?;
+            let item = queue_item(&snapshot, item_id)?;
+            match item.phase {
+                GeneratedFollowUpQueuePhase::Claimed => {
+                    let lease = snapshot
+                        .lease(item_id)
+                        .context("graph-bound queue item has no lease state")?;
+                    if lease.phase() != LeasePhase::Active {
+                        bail!("lease heartbeat during claim requires an active lease");
+                    }
+                }
+                GeneratedFollowUpQueuePhase::DispatchStarted => {
+                    let lease = snapshot
+                        .lease(item_id)
+                        .context("graph-bound queue item has no lease state")?;
+                    if lease.phase() != LeasePhase::EffectFenced {
+                        bail!("lease heartbeat during dispatch requires an effect-fenced lease");
+                    }
+                }
+                GeneratedFollowUpQueuePhase::HeldAmbiguous
+                | GeneratedFollowUpQueuePhase::DispatchObserved
+                | GeneratedFollowUpQueuePhase::AcknowledgedTerminal
+                | GeneratedFollowUpQueuePhase::Enqueued => {
+                    bail!(
+                        "lease heartbeat transition would skip or repeat from {:?}",
+                        item.phase
+                    );
+                }
+            }
             apply_item_lease_event(&mut snapshot, item_id, lease_event)?;
         }
         QueueJournalEvent::LeaseReleasedBeforeDispatch {
@@ -2333,6 +2445,34 @@ fn require_bound_lease_identity(
     Ok(())
 }
 
+fn require_bound_active_lease_proof(
+    snapshot: &GeneratedFollowUpQueueSnapshot,
+    item_id: &str,
+    proof: &LeaseProof,
+) -> Result<()> {
+    if snapshot
+        .lease_identity_items
+        .get(proof.lease_id().as_str())
+        .map(String::as_str)
+        != Some(item_id)
+    {
+        bail!("lease proof identity is not durably bound to this queue item");
+    }
+    let lease = snapshot
+        .lease(item_id)
+        .context("graph-bound queue item has no lease state")?;
+    if lease.phase() != LeasePhase::Active {
+        bail!("leased preparation refusal requires an active lease");
+    }
+    let active = lease
+        .active_proof()
+        .context("queue lease has no active proof")?;
+    if active != proof {
+        bail!("lease proof does not match the replayed active lease");
+    }
+    Ok(())
+}
+
 fn require_matching_effect_fenced_lease_proof(
     snapshot: &GeneratedFollowUpQueueSnapshot,
     item_id: &str,
@@ -2415,6 +2555,23 @@ fn bound_branch_attempt_in_progress(
         .context("queue item binding names an unknown graph branch")?
         .attempt_in_progress()
         .is_some())
+}
+
+fn require_bound_branch_runnable_while_enqueued(
+    snapshot: &GeneratedFollowUpQueueSnapshot,
+    item_id: &str,
+) -> Result<()> {
+    if !snapshot.item_to_branch.contains_key(item_id) {
+        return Ok(());
+    }
+    if bound_branch_attempt_in_progress(snapshot, item_id)? {
+        bail!("preparation refusal cannot proceed while a graph branch attempt is in progress");
+    }
+    let item = queue_item(snapshot, item_id)?;
+    if !snapshot.item_is_pending(item) {
+        bail!("preparation refusal requires the bound graph branch to be runnable");
+    }
+    Ok(())
 }
 
 fn queue_item_mut<'a>(
@@ -2925,6 +3082,17 @@ fn queue_event_data(
                 item_id,
                 gate_denial,
                 environment_failures,
+            }
+            | QueueJournalEvent::PreparationWhileEnqueued {
+                item_id,
+                gate_denial,
+                environment_failures,
+            }
+            | QueueJournalEvent::PreparationWhileClaimed {
+                item_id,
+                gate_denial,
+                environment_failures,
+                ..
             } => (
                 vec![item_id.clone()],
                 None,
@@ -3863,6 +4031,287 @@ mod tests {
         );
     }
 
+    #[test]
+    fn preparation_refusal_while_enqueued_preserves_graph_branch_and_allows_claim() {
+        let (_temp, repo) = repository();
+        let source = source(&repo, "source-prep-refusal-enqueued");
+        let task = generated_task("01");
+        let item_id = generated_follow_up_item_id(&source, &task).expect("item id");
+        let branch = branch_id("branch-main");
+        let mut queue =
+            GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(1))
+                .expect("create queue");
+        queue.enqueue_all_before_dispatch(&[task]).expect("enqueue");
+        queue
+            .define_graph(
+                conditional_graph_definition(),
+                vec![
+                    DurableGraphQueueItemBinding::new(branch.clone(), item_id.clone())
+                        .expect("binding"),
+                ],
+            )
+            .expect("define graph");
+        let graph_events_before = queue.snapshot().graph_event_count();
+        let attempts_before = queue
+            .snapshot()
+            .graph()
+            .and_then(|graph| graph.branch(&branch))
+            .map(|branch| branch.attempts().len())
+            .expect("branch attempts");
+        queue
+            .record_preparation_while_enqueued(&item_id, None, Vec::new())
+            .expect("record preparation refusal");
+        queue = reopen_typed_queue(&repo, &source, queue);
+        let item = queue.snapshot().item(&item_id).expect("item");
+        assert_eq!(item.phase(), GeneratedFollowUpQueuePhase::Enqueued);
+        assert!(item.subordinate_run_id().is_none());
+        assert!(item.external_side_effect_state().is_none());
+        assert_eq!(
+            queue.snapshot().lease_phase(&item_id),
+            Some(LeasePhase::Available)
+        );
+        assert_eq!(queue.snapshot().graph_event_count(), graph_events_before);
+        assert_eq!(
+            queue
+                .snapshot()
+                .graph()
+                .and_then(|graph| graph.branch(&branch))
+                .map(|branch| branch.attempts().len()),
+            Some(attempts_before)
+        );
+        queue
+            .claim_with_lease(
+                &item_id,
+                worker("worker-prep"),
+                lease_id("lease-prep"),
+                1,
+                5,
+                DurableGraphEvent::BranchAttemptStarted {
+                    branch_id: branch.clone(),
+                    visit: 1,
+                    attempt: 1,
+                },
+            )
+            .expect("claim after preparation refusal");
+    }
+
+    #[test]
+    fn preparation_refusal_while_enqueued_rejects_non_enqueued_phase_without_mutation() {
+        let (_temp, repo) = repository();
+        let source = source(&repo, "source-prep-refusal-phase");
+        let task = generated_task("01");
+        let item_id = generated_follow_up_item_id(&source, &task).expect("item id");
+        let mut queue =
+            GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(1))
+                .expect("create queue");
+        queue.enqueue_all_before_dispatch(&[task]).expect("enqueue");
+        queue.claim(&item_id).expect("claim");
+        let before = queue.snapshot().clone();
+        let records = queue.journal.records().len();
+        assert!(queue
+            .record_preparation_while_enqueued(&item_id, None, Vec::new())
+            .is_err());
+        assert_eq!(queue.snapshot(), &before);
+        assert_eq!(queue.journal.records().len(), records);
+    }
+
+    #[test]
+    fn post_effect_lease_heartbeat_queue_replay_preserves_fence_and_rejects_invalid() {
+        let (_temp, repo) = repository();
+        let source = source(&repo, "source-post-effect-heartbeat");
+        let task = generated_task("01");
+        let item_id = generated_follow_up_item_id(&source, &task).expect("item id");
+        let mut queue =
+            GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(1))
+                .expect("create queue");
+        queue.enqueue_all_before_dispatch(&[task]).expect("enqueue");
+        queue
+            .define_graph(
+                conditional_graph_definition(),
+                vec![
+                    DurableGraphQueueItemBinding::new(branch_id("branch-main"), item_id.clone())
+                        .expect("binding"),
+                ],
+            )
+            .expect("define graph");
+        let (_, proof) = queue
+            .claim_with_lease(
+                &item_id,
+                worker("worker-post"),
+                lease_id("lease-post"),
+                10,
+                30,
+                DurableGraphEvent::BranchAttemptStarted {
+                    branch_id: branch_id("branch-main"),
+                    visit: 1,
+                    attempt: 1,
+                },
+            )
+            .expect("claim");
+        queue
+            .mark_leased_effect_started(&item_id, proof.clone(), 13)
+            .expect("effect fence");
+        queue
+            .heartbeat_lease(&item_id, proof.clone(), 14, 40)
+            .expect("first post-effect heartbeat");
+        queue
+            .heartbeat_lease(&item_id, proof.clone(), 15, 45)
+            .expect("second post-effect heartbeat");
+        queue = reopen_typed_queue(&repo, &source, queue);
+        let lease = queue.snapshot().lease(&item_id).expect("lease");
+        assert_eq!(lease.phase(), LeasePhase::EffectFenced);
+        assert_eq!(lease.expires_at(), Some(45));
+        let LeaseState::EffectFenced(fenced) = lease else {
+            panic!("expected fenced lease");
+        };
+        let encoded_fence = serde_json::to_value(fenced).expect("serialize fenced lease");
+        assert_eq!(encoded_fence["effect_started_at"], serde_json::json!(13));
+        assert_eq!(encoded_fence["active"]["expires_at"], serde_json::json!(30));
+        assert_eq!(
+            encoded_fence["active"]["last_heartbeat_at"],
+            serde_json::json!(10)
+        );
+
+        let before = queue.snapshot().clone();
+        let records = queue.journal.records().len();
+        assert!(queue
+            .heartbeat_lease(
+                &item_id,
+                LeaseProof::new(worker("worker-x"), lease_id("lease-x"), 1).expect("wrong proof"),
+                16,
+                50,
+            )
+            .is_err());
+        assert!(queue
+            .heartbeat_lease(&item_id, proof.clone(), 15, 50)
+            .is_err());
+        assert!(queue
+            .heartbeat_lease(&item_id, proof.clone(), 16, 44)
+            .is_err());
+        assert!(queue
+            .heartbeat_lease(&item_id, proof.clone(), 50, 55)
+            .is_err());
+        assert_eq!(queue.snapshot(), &before);
+        assert_eq!(queue.journal.records().len(), records);
+
+        let run_id = queue
+            .snapshot()
+            .item(&item_id)
+            .and_then(GeneratedFollowUpQueueItemSnapshot::subordinate_run_id)
+            .expect("subordinate run")
+            .to_string();
+        queue
+            .append_leased_terminal_observation(
+                &item_id,
+                GeneratedFollowUpDispatchObservation::new(
+                    run_id,
+                    None,
+                    Vec::new(),
+                    Some(ExternalSideEffectState::Completed),
+                )
+                .expect("observation"),
+                proof,
+                50,
+                DurableGraphEvent::BranchAttemptCompleted {
+                    branch_id: branch_id("branch-main"),
+                    visit: 1,
+                    attempt: 1,
+                    outcome: graph_success("post-effect", &[]),
+                },
+            )
+            .expect("late ack after post-effect expiry");
+        queue = reopen_typed_queue(&repo, &source, queue);
+        assert_eq!(
+            queue.snapshot().lease_phase(&item_id),
+            Some(LeasePhase::Acknowledged)
+        );
+    }
+
+    #[test]
+    fn record_leased_preparation_while_claimed_updates_diagnostics_and_preserves_attempt() {
+        let (_temp, repo) = repository();
+        let source = source(&repo, "source-leased-prep");
+        let task = generated_task("01");
+        let item_id = generated_follow_up_item_id(&source, &task).expect("item id");
+        let branch = branch_id("branch-main");
+        let mut queue =
+            GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(1))
+                .expect("create queue");
+        queue.enqueue_all_before_dispatch(&[task]).expect("enqueue");
+        queue
+            .define_graph(
+                conditional_graph_definition(),
+                vec![
+                    DurableGraphQueueItemBinding::new(branch.clone(), item_id.clone())
+                        .expect("binding"),
+                ],
+            )
+            .expect("define graph");
+        let (_, proof) = queue
+            .claim_with_lease(
+                &item_id,
+                worker("worker-prep-leased"),
+                lease_id("lease-prep-leased"),
+                1,
+                10,
+                DurableGraphEvent::BranchAttemptStarted {
+                    branch_id: branch.clone(),
+                    visit: 1,
+                    attempt: 1,
+                },
+            )
+            .expect("claim");
+        let graph_events_before = queue.snapshot().graph_event_count();
+        queue
+            .record_leased_preparation(&item_id, proof.clone(), None, Vec::new())
+            .expect("record leased preparation");
+        queue = reopen_typed_queue(&repo, &source, queue);
+        let item = queue.snapshot().item(&item_id).expect("item");
+        assert_eq!(item.phase(), GeneratedFollowUpQueuePhase::Claimed);
+        assert!(item.subordinate_run_id().is_none());
+        assert_eq!(
+            queue.snapshot().lease_phase(&item_id),
+            Some(LeasePhase::Active)
+        );
+        assert_eq!(queue.snapshot().graph_event_count(), graph_events_before);
+        assert!(queue
+            .snapshot()
+            .graph()
+            .and_then(|graph| graph.branch(&branch))
+            .and_then(|branch| branch.attempt_in_progress())
+            .is_some());
+
+        let before = queue.snapshot().clone();
+        let records = queue.journal.records().len();
+        let wrong_proof =
+            LeaseProof::new(worker("worker-wrong"), lease_id("lease-wrong"), 1).expect("wrong");
+        assert!(queue
+            .record_leased_preparation(&item_id, wrong_proof, None, Vec::new())
+            .is_err());
+        assert_eq!(queue.snapshot(), &before);
+        assert_eq!(queue.journal.records().len(), records);
+    }
+
+    #[test]
+    fn record_leased_preparation_rejects_non_claimed_phase_without_mutation() {
+        let (_temp, repo) = repository();
+        let source = source(&repo, "source-leased-prep-phase");
+        let task = generated_task("01");
+        let item_id = generated_follow_up_item_id(&source, &task).expect("item id");
+        let mut queue =
+            GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(1))
+                .expect("create queue");
+        queue.enqueue_all_before_dispatch(&[task]).expect("enqueue");
+        let before = queue.snapshot().clone();
+        let records = queue.journal.records().len();
+        let proof = LeaseProof::new(worker("worker-a"), lease_id("lease-a"), 1).expect("proof");
+        assert!(queue
+            .record_leased_preparation(&item_id, proof, None, Vec::new())
+            .is_err());
+        assert_eq!(queue.snapshot(), &before);
+        assert_eq!(queue.journal.records().len(), records);
+    }
+
     fn graph_id(value: &str) -> graph::DurableGraphId {
         graph::DurableGraphId::new(value).expect("graph id")
     }
@@ -4279,13 +4728,28 @@ mod tests {
             GeneratedFollowUpQueuePhase::DispatchStarted
         );
 
-        for rejected in ["heartbeat", "release", "reclaim", "second-effect"] {
+        queue
+            .heartbeat_lease(&item_id, successor.clone(), 8, 20)
+            .expect("post-effect heartbeat");
+        queue = reopen_typed_queue(&repo, &source, queue);
+        assert_eq!(
+            queue
+                .snapshot()
+                .lease(&item_id)
+                .and_then(LeaseState::expires_at),
+            Some(20)
+        );
+        let LeaseState::EffectFenced(fenced) = queue.snapshot().lease(&item_id).expect("lease")
+        else {
+            panic!("expected effect-fenced lease");
+        };
+        let encoded_fence = serde_json::to_value(fenced).expect("serialize fenced lease");
+        assert_eq!(encoded_fence["active"]["expires_at"], serde_json::json!(12));
+
+        for rejected in ["release", "reclaim", "second-effect"] {
             let before = queue.snapshot().clone();
             let records = queue.journal.records().len();
             let result = match rejected {
-                "heartbeat" => queue
-                    .heartbeat_lease(&item_id, successor.clone(), 8, 13)
-                    .map(|_| ()),
                 "release" => queue
                     .release_lease_before_dispatch(
                         &item_id,

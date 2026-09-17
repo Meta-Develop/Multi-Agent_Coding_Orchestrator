@@ -1,0 +1,45 @@
+[
+  {
+    "event_name": null,
+    "data": {
+      "id": "FAKE-stream-0002",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "claude-fake",
+      "choices": [
+        {
+          "index": 0,
+          "delta": { "role": "assistant", "content": "" },
+          "finish_reason": null
+        }
+      ]
+    },
+    "terminal": false
+  },
+  {
+    "event_name": null,
+    "data": {
+      "id": "FAKE-stream-0002",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "claude-fake",
+      "choices": [
+        { "index": 0, "delta": { "content": "Hello" }, "finish_reason": null }
+      ]
+    },
+    "terminal": false
+  },
+  {
+    "event_name": null,
+    "data": {
+      "id": "FAKE-stream-0002",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "claude-fake",
+      "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+      "usage": { "prompt_tokens": 0, "completion_tokens": 1, "total_tokens": 1 }
+    },
+    "terminal": false
+  },
+  { "event_name": null, "data": "[DONE]", "terminal": true }
+]

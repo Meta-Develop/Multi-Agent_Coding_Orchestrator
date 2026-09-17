@@ -1,0 +1,6 @@
+{
+  "model": "gpt-4o",
+  "max_tokens": 256,
+  "metadata": {},
+  "messages": [{ "role": "user", "content": "Hi" }]
+}

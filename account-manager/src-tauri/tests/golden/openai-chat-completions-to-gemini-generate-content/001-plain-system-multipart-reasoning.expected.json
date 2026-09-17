@@ -1,0 +1,22 @@
+{
+  "body": {
+    "systemInstruction": { "parts": [{ "text": "Be concise." }] },
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          { "text": "Describe" },
+          {
+            "inlineData": { "mimeType": "image/png", "data": "FAKE-image-0003" }
+          }
+        ]
+      }
+    ],
+    "generationConfig": {
+      "maxOutputTokens": 256,
+      "thinkingConfig": { "thinkingLevel": "HIGH" }
+    }
+  },
+  "target_model": "gemini-target",
+  "stream": false
+}

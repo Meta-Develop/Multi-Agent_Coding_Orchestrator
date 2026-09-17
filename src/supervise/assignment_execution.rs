@@ -4469,6 +4469,21 @@ pub(super) fn persist_final_assignment_report(
     Ok(())
 }
 
+fn initial_completed_parent_review_cycles(
+    context: &AssignmentExecutionContext<'_, '_>,
+) -> Result<Option<usize>> {
+    if let Some(source) = context.evidence_only_reaudit {
+        let proof = authenticated_prior_dispatched_review_cycle_proof(
+            context.repo,
+            &source.operation.source_run_id,
+            &source.operation.assignment_id,
+        )?;
+        Ok(prior_dispatched_review_cycle_count(&proof))
+    } else {
+        Ok(Some(0))
+    }
+}
+
 fn execute_supervisor_assignment_inner(
     context: &AssignmentExecutionContext<'_, '_>,
     outcome: &mut AssignmentExecutionOutcome,
@@ -4505,6 +4520,7 @@ fn execute_supervisor_assignment_inner(
         .saturating_add(1);
     let mut next_attempt = 1usize;
     let mut auditor_attempt = 0usize;
+    let mut completed_parent_review_cycles = initial_completed_parent_review_cycles(context)?;
     let (
         child_report,
         completed_candidate_inspection,
@@ -4577,6 +4593,9 @@ fn execute_supervisor_assignment_inner(
                         context.execution_runtime == SupervisorExecutionRuntime::Verified,
                         false,
                         None,
+                        Some(attempt_parent_phase_continuation_from_count(
+                            completed_parent_review_cycles,
+                        )),
                     )?;
                     return Err(error);
                 }
@@ -4611,11 +4630,14 @@ fn execute_supervisor_assignment_inner(
                         context.execution_runtime == SupervisorExecutionRuntime::Verified,
                         false,
                         Some(&attempt_external_run),
+                        Some(attempt_parent_phase_continuation_from_count(
+                            completed_parent_review_cycles,
+                        )),
                     )?;
                     return Err(error);
                 }
             };
-            let recorded_attempt = record_child_attempt_outcome(
+            let mut recorded_attempt = record_child_attempt_outcome(
                 artifacts,
                 &options.run_id,
                 &assignment.id,
@@ -4629,9 +4651,18 @@ fn execute_supervisor_assignment_inner(
                 context.execution_runtime == SupervisorExecutionRuntime::Verified,
                 matches!(&disposition, ChildAttemptDisposition::Retry),
                 Some(&attempt_external_run),
+                Some(attempt_parent_phase_continuation_from_count(
+                    completed_parent_review_cycles,
+                )),
             )?;
             match disposition {
-                ChildAttemptDisposition::Retry => continue,
+                ChildAttemptDisposition::Retry => {
+                    persist_proven_worker_attempt_bypassed_parent_review(
+                        artifacts,
+                        &mut recorded_attempt,
+                    )?;
+                    continue;
+                }
                 ChildAttemptDisposition::Finish {
                     report,
                     containment_verified,
@@ -4797,14 +4828,19 @@ fn execute_supervisor_assignment_inner(
         let mut auditor_primary_integrity_failed = false;
         let mut auditor_sandbox_denied = false;
         let mut auditor_environment_blocked = false;
+        let parent_review_required = child_containment_verified
+            && !child_gate_terminal
+            && parent_auditor_required(assignment, &child_report);
+        let review_cycle_slot =
+            review_cycle_slot_for_completed_dispatched_cycles(completed_parent_review_cycles);
         let mut review_cost_binding = ParentWorkerAttemptReviewCostBinding::bind(
             &assignment.id,
             terminal_attempt_outcome.attempt,
+            review_cycle_slot,
         );
-        if child_containment_verified
-            && !child_gate_terminal
-            && parent_auditor_required(assignment, &child_report)
-        {
+        let mut parent_review_dispatched = false;
+        if parent_review_required {
+            parent_review_dispatched = true;
             let transcript_relative = attempt_history
                 .last()
                 .map(|history| history.raw_stdout_path.as_path())
@@ -4864,9 +4900,17 @@ fn execute_supervisor_assignment_inner(
             let mut expected_requests = Vec::with_capacity(active_plan.review_lenses.len());
             let mut verdicts = Vec::with_capacity(active_plan.review_lenses.len());
             review_cost_binding.begin_stacked_parent_review_lenses(active_plan.review_lenses.len());
-            for (lens_index, lens) in active_plan.review_lenses.iter().enumerate() {
+            let mut assignment_complete_after_review = false;
+            let mut review_stack_error: Option<anyhow::Error> = None;
+            'review_lenses: for (lens_index, lens) in active_plan.review_lenses.iter().enumerate() {
                 let expected_request =
-                    crate::review::build_bounded_review_lens_request(lens, sources)?;
+                    match crate::review::build_bounded_review_lens_request(lens, sources) {
+                        Ok(expected_request) => expected_request,
+                        Err(error) => {
+                            review_stack_error = Some(error);
+                            break 'review_lenses;
+                        }
+                    };
                 let runtime_validation = validate_review_lens_runtime_selection(
                     lens,
                     auditor_launch_runtime,
@@ -4882,13 +4926,19 @@ fn execute_supervisor_assignment_inner(
                         ),
                         paths: assignment.assigned_paths.clone(),
                     });
-                    verdicts.push(ReviewLensVerdict::for_lens(
+                    match ReviewLensVerdict::for_lens(
                         lens,
                         expected_request.request_binding.clone(),
                         ReviewLensVerdictStatus::ProceduralFailure,
                         ReviewLensCoverage::default(),
                         Vec::new(),
-                    )?);
+                    ) {
+                        Ok(verdict) => verdicts.push(verdict),
+                        Err(error) => {
+                            review_stack_error = Some(error);
+                            break 'review_lenses;
+                        }
+                    }
                     expected_requests.push(expected_request);
                     continue;
                 }
@@ -4906,32 +4956,51 @@ fn execute_supervisor_assignment_inner(
                         expected_request: &expected_request,
                         required_coverage: &required_coverage,
                     },
-                )? {
-                    ParentAuditorPreparation::Ready(prepared) => prepared,
-                    // Assignment failure: inner returns without persisting review
-                    // cost on the worker attempt row (no safe dispatch-set boundary).
-                    ParentAuditorPreparation::AssignmentComplete => return Ok(()),
-                    ParentAuditorPreparation::GateComplete { verdict } => {
+                ) {
+                    Ok(ParentAuditorPreparation::Ready(prepared)) => prepared,
+                    Ok(ParentAuditorPreparation::AssignmentComplete) => {
+                        assignment_complete_after_review = true;
+                        break 'review_lenses;
+                    }
+                    Ok(ParentAuditorPreparation::GateComplete { verdict }) => {
                         review_cost_binding.mark_parent_review_stack_short_circuited();
                         expected_requests.push(expected_request);
                         verdicts.push(verdict);
                         for remaining_lens in active_plan.review_lenses.iter().skip(lens_index + 1)
                         {
-                            let remaining_request =
-                                crate::review::build_bounded_review_lens_request(
-                                    remaining_lens,
-                                    sources,
-                                )?;
-                            verdicts.push(ReviewLensVerdict::for_lens(
+                            match crate::review::build_bounded_review_lens_request(
                                 remaining_lens,
-                                remaining_request.request_binding.clone(),
-                                ReviewLensVerdictStatus::ProceduralFailure,
-                                ReviewLensCoverage::default(),
-                                Vec::new(),
-                            )?);
-                            expected_requests.push(remaining_request);
+                                sources,
+                            ) {
+                                Ok(remaining_request) => {
+                                    match ReviewLensVerdict::for_lens(
+                                        remaining_lens,
+                                        remaining_request.request_binding.clone(),
+                                        ReviewLensVerdictStatus::ProceduralFailure,
+                                        ReviewLensCoverage::default(),
+                                        Vec::new(),
+                                    ) {
+                                        Ok(remaining_verdict) => {
+                                            verdicts.push(remaining_verdict);
+                                            expected_requests.push(remaining_request);
+                                        }
+                                        Err(error) => {
+                                            review_stack_error = Some(error);
+                                            break 'review_lenses;
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    review_stack_error = Some(error);
+                                    break 'review_lenses;
+                                }
+                            }
                         }
-                        break;
+                        break 'review_lenses;
+                    }
+                    Err(error) => {
+                        review_stack_error = Some(error);
+                        break 'review_lenses;
                     }
                 };
                 let mut auditor_dispatch_frame = ParentAuditorDispatchFrame {
@@ -4939,28 +5008,60 @@ fn execute_supervisor_assignment_inner(
                     auditor_attempt,
                     review_cost_binding: &mut review_cost_binding,
                 };
-                let auditor_collection = dispatch_and_collect_parent_auditor(
+                match dispatch_and_collect_parent_auditor(
                     context,
                     outcome,
                     &preflight,
                     &mut child_report,
                     prepared_auditor,
                     &mut auditor_dispatch_frame,
-                )?;
-                assignment_containment_verified &= auditor_collection.containment_verified;
-                auditor_primary_integrity_failed |= auditor_collection.primary_integrity_failed;
-                auditor_sandbox_denied |= auditor_collection.sandbox_denied;
-                auditor_environment_blocked |= auditor_collection.environment_blocked;
-                expected_requests.push(expected_request);
-                verdicts.push(auditor_collection.verdict);
+                ) {
+                    Ok(auditor_collection) => {
+                        assignment_containment_verified &= auditor_collection.containment_verified;
+                        auditor_primary_integrity_failed |=
+                            auditor_collection.primary_integrity_failed;
+                        auditor_sandbox_denied |= auditor_collection.sandbox_denied;
+                        auditor_environment_blocked |= auditor_collection.environment_blocked;
+                        expected_requests.push(expected_request);
+                        verdicts.push(auditor_collection.verdict);
+                    }
+                    Err(error) => {
+                        review_stack_error = Some(error);
+                        break 'review_lenses;
+                    }
+                }
             }
-            let aggregate = aggregate_active_parent_review_lenses(
+            if assignment_complete_after_review || review_stack_error.is_some() {
+                return persist_review_cycle_attribution_or_chain_primary(
+                    artifacts,
+                    &review_cost_binding,
+                    &mut terminal_attempt_outcome,
+                    &mut completed_parent_review_cycles,
+                    if assignment_complete_after_review {
+                        None
+                    } else {
+                        review_stack_error
+                    },
+                );
+            }
+            let aggregate = match aggregate_active_parent_review_lenses(
                 &active_plan,
                 &expected_requests,
                 required_coverage,
                 verdicts,
-            )?;
-            with_supervisor_artifacts(artifacts, |writer, journal| {
+            ) {
+                Ok(aggregate) => aggregate,
+                Err(error) => {
+                    return persist_review_cycle_attribution_or_chain_primary(
+                        artifacts,
+                        &review_cost_binding,
+                        &mut terminal_attempt_outcome,
+                        &mut completed_parent_review_cycles,
+                        Some(error),
+                    );
+                }
+            };
+            if let Err(error) = with_supervisor_artifacts(artifacts, |writer, journal| {
                 record_gate_correction_event_strict(
                     journal,
                     writer,
@@ -4969,7 +5070,15 @@ fn execute_supervisor_assignment_inner(
                     OrchestrationRole::Auditor,
                     json!({"review_lens_aggregate": &aggregate}),
                 )
-            })?;
+            }) {
+                return persist_review_cycle_attribution_or_chain_primary(
+                    artifacts,
+                    &review_cost_binding,
+                    &mut terminal_attempt_outcome,
+                    &mut completed_parent_review_cycles,
+                    Some(error),
+                );
+            }
             if aggregate.decision != ReviewAggregationDecision::Accept {
                 child_report.status = ReviewStatus::Failed;
                 child_report.accepted = false;
@@ -4984,6 +5093,12 @@ fn execute_supervisor_assignment_inner(
                 });
             }
             child_report.review_lens_aggregate = Some(aggregate);
+            finalize_parent_review_cycle_attribution_for_worker_attempt(
+                artifacts,
+                &review_cost_binding,
+                &mut terminal_attempt_outcome,
+                &mut completed_parent_review_cycles,
+            )?;
         }
         match decide_parent_auditor_gate(
             context,
@@ -5001,11 +5116,6 @@ fn execute_supervisor_assignment_inner(
             &mut retry_feedback,
         )? {
             ParentAuditorGateDisposition::Retry => {
-                persist_worker_attempt_review_cost(
-                    artifacts,
-                    &review_cost_binding,
-                    &mut terminal_attempt_outcome,
-                )?;
                 record_parent_auditor_retry(artifacts, &terminal_attempt_outcome)?;
                 warning_streak = None;
                 continue 'gate_controller;
@@ -5015,11 +5125,12 @@ fn execute_supervisor_assignment_inner(
                 candidate,
                 containment_verified,
             } => {
-                persist_worker_attempt_review_cost(
-                    artifacts,
-                    &review_cost_binding,
-                    &mut terminal_attempt_outcome,
-                )?;
+                if !parent_review_dispatched && !parent_auditor_required(assignment, &report) {
+                    persist_proven_no_parent_review_cycle_costs(
+                        artifacts,
+                        &mut terminal_attempt_outcome,
+                    )?;
+                }
                 break 'gate_controller (
                     report,
                     candidate,
@@ -5139,6 +5250,91 @@ mod decomposition_tests {
             Signature::now("maco test", "maco-test@example.invalid").expect("fixture signature");
         repo.commit(Some("HEAD"), &signature, &signature, "baseline", &tree, &[])
             .expect("commit fixture baseline");
+    }
+
+    #[cfg(unix)]
+    fn commit_managed_worktree_assignment_change(worktree_path: &Path, contents: &str) {
+        fs::write(worktree_path.join("README.md"), contents).expect("write managed worktree file");
+        let repo = crate::git_repository::open(worktree_path).expect("open managed worktree");
+        let mut index = repo.index().expect("open managed worktree index");
+        index
+            .add_path(Path::new("README.md"))
+            .expect("stage managed worktree file");
+        index.write().expect("write managed worktree index");
+        let tree_id = index.write_tree().expect("write managed worktree tree");
+        let tree = repo.find_tree(tree_id).expect("find managed worktree tree");
+        let parent = repo
+            .head()
+            .and_then(|head| head.peel_to_commit())
+            .expect("find managed worktree parent commit");
+        let signature =
+            Signature::now("maco test", "maco-test@example.invalid").expect("fixture signature");
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "phase child inner path fixture change",
+            &tree,
+            &[&parent],
+        )
+        .expect("commit managed worktree fixture change");
+    }
+
+    #[cfg(unix)]
+    fn ensure_phase_child_review_schemas(writer: &mut ArtifactRunWriter) {
+        const MIN_SCHEMA: &[u8] = b"{\"type\":\"object\"}\n";
+        for relative in [
+            Path::new("schemas/orchestrator-review-report.schema.json"),
+            Path::new("schemas/worker-report.schema.json"),
+            Path::new("schemas/auditor-report.schema.json"),
+        ] {
+            writer
+                .write_bytes(
+                    relative,
+                    MIN_SCHEMA,
+                    ArtifactFileDisposition::PrivateEvidence,
+                )
+                .expect("materialize phase child review schema through artifact writer");
+        }
+        super::super::schema_artifacts::write_codex_orchestrator_schema(
+            writer,
+            Path::new("schemas/orchestrator-review-report.codex-output.schema.json"),
+        )
+        .expect("materialize Codex child review schema");
+        super::super::schema_artifacts::write_codex_worker_schema(
+            writer,
+            Path::new("schemas/worker-report.codex-output.schema.json"),
+        )
+        .expect("materialize Codex worker schema");
+        super::super::schema_artifacts::write_codex_auditor_schema(
+            writer,
+            Path::new("schemas/auditor-report.codex-output.schema.json"),
+        )
+        .expect("materialize Codex auditor schema");
+    }
+
+    #[cfg(unix)]
+    fn apply_fake_simulation_child_containment(
+        command: &ExternalAgentCommand,
+        run: &mut ExternalAgentRun,
+    ) {
+        run.process_tree = Some(ProcessTreeEvidence::VerifiedEmpty(
+            crate::process_runner::ContainmentBackend::SystemdUserService,
+        ));
+        run.side_effects = Some(SideEffectConfinementEvidence::Verified(
+            crate::process_runner::SideEffectConfinementProfileKind::ExternalCodex,
+        ));
+        run.publishable = true;
+        run.program_trust = ExternalProgramTrust::TrustedSystemCodex;
+        run.codex_permissions = Some(crate::external_agent::CodexPermissionEvidence {
+            codex_version: "0.142.3".to_string(),
+            minimum_version: "0.138.0".to_string(),
+            permission_profile: "maco_external_codex".to_string(),
+            workspace_access: command.workspace_access,
+            network_enabled: false,
+            argv_digest: "fixture-digest".to_string(),
+            executable_identity: "fixture-identity".to_string(),
+        });
     }
 
     #[test]
@@ -5910,7 +6106,11 @@ mod decomposition_tests {
             prepared_auditor.auditor_command.machine_global_retention,
             options.machine_global_retention
         );
-        let mut review_cost_binding = ParentWorkerAttemptReviewCostBinding::bind(&assignment.id, 1);
+        let mut review_cost_binding = ParentWorkerAttemptReviewCostBinding::bind(
+            &assignment.id,
+            1,
+            ParentDispatchedReviewCycleSlot::FirstCycle,
+        );
         review_cost_binding.begin_stacked_parent_review_lenses(1);
         let mut auditor_dispatch_frame = ParentAuditorDispatchFrame {
             journal_parent_id: options.run_id.as_str(),
@@ -6276,6 +6476,7 @@ mod decomposition_tests {
             true,
             false,
             Some(&attempt_external_run),
+            Some(attempt_parent_phase_continuation_from_count(Some(0))),
         )
         .expect("record worker attempt outcome");
         let execution_cost_before_persist =
@@ -6369,7 +6570,11 @@ mod decomposition_tests {
                 panic!("auditor preparation short-circuited gate")
             }
         };
-        let mut review_cost_binding = ParentWorkerAttemptReviewCostBinding::bind(&assignment.id, 1);
+        let mut review_cost_binding = ParentWorkerAttemptReviewCostBinding::bind(
+            &assignment.id,
+            1,
+            ParentDispatchedReviewCycleSlot::FirstCycle,
+        );
         review_cost_binding.begin_stacked_parent_review_lenses(1);
         let mut auditor_dispatch_frame = ParentAuditorDispatchFrame {
             journal_parent_id: options.run_id.as_str(),
@@ -6432,9 +6637,641 @@ mod decomposition_tests {
             stored.costs.execution_cost_microunits,
             execution_cost_before_persist
         );
-        assert!(stored.costs.rework_cost_microunits.is_none());
-        assert!(stored.costs.rereview_cost_microunits.is_none());
+        assert_eq!(stored.costs.rework_cost_microunits, Some(0));
+        assert_eq!(stored.costs.rereview_cost_microunits, Some(0));
         assert!(stored.costs.environment_cost_microunits.is_none());
+    }
+
+    #[cfg(unix)]
+    struct EphemeralAgentsControlRenameGuard {
+        worktree: PathBuf,
+        hidden: PathBuf,
+        renamed: bool,
+    }
+
+    #[cfg(unix)]
+    impl EphemeralAgentsControlRenameGuard {
+        fn hide(worktree: &Path, temp_root: &Path) -> Self {
+            assert!(
+                worktree.starts_with(temp_root),
+                "managed worktree must stay inside the ephemeral fixture root"
+            );
+            let agents = worktree.join(".agents");
+            let hidden = worktree.join(format!(
+                ".agents-renamed-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_nanos())
+                    .unwrap_or(0)
+            ));
+            let renamed = agents.is_dir();
+            if renamed {
+                fs::rename(&agents, &hidden).expect("rename synthetic .agents control");
+            }
+            Self {
+                worktree: worktree.to_path_buf(),
+                hidden,
+                renamed,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for EphemeralAgentsControlRenameGuard {
+        fn drop(&mut self) {
+            if !self.renamed {
+                return;
+            }
+            let agents = self.worktree.join(".agents");
+            if self.hidden.is_dir() && !agents.exists() {
+                let _ = fs::rename(&self.hidden, &agents);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_supervisor_assignment_persists_cycle_proof_on_assignment_complete_after_dispatch() {
+        use crate::mutation_taxonomy::AssignmentProcessLaunchKind;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp = tempfile::tempdir().expect("temporary phase fixture");
+        let repo = temp.path().join("repo");
+        Repository::init(&repo).expect("initialize phase fixture repository");
+        fs::write(repo.join("README.md"), "baseline\n").expect("write fixture file");
+        commit_fixture_repository(&repo);
+
+        let assignment = OrchestratorAssignment {
+            id: "phase-child".to_string(),
+            phase: AssignmentPhase::Execution,
+            runtime: None,
+            role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        };
+        let mut lenses = default_supervisor_review_lenses();
+        let second_lens = lenses[0].clone();
+        lenses.push(ReviewLensConfig {
+            id: "parent-acceptance-followup".to_string(),
+            ..second_lens
+        });
+        let mut plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "assignment-complete after partial review dispatch".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: 10,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: lenses,
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+            assignments: vec![assignment.clone()],
+        };
+        plan.role_models.insert(
+            AgentRole::ChildOrchestrator,
+            RoleModelSelection {
+                model: Some("gpt-5.6-sol".to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        plan.role_models.insert(
+            AgentRole::Auditor,
+            RoleModelSelection {
+                model: Some("gpt-5.6-sol".to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        let budget_config = SupervisorBudgetConfig::default();
+        let consultant = SupervisorConsultantPlan::default();
+        let assignment_metadata = AssignmentMetadata::new();
+        let options = SupervisorRunOptions {
+            repo: repo.clone(),
+            plan_file: temp.path().join("plan.json"),
+            run_id: RunId::new("partial-review-assignment-complete").expect("fixture run id"),
+            parent_node: None,
+            codex_bin: PathBuf::from("unused-codex"),
+            runtime: SupervisorRuntime::Codex,
+            allow_dirty_primary: false,
+            allow_live_run_collision: false,
+            admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+            budget_overrides: crate::supervise::RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
+            machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
+                config: temp.path().join("unused-machine-global.json"),
+                root_id: "runtime".to_string(),
+                owner: "maco-supervise".to_string(),
+                correction_correlation_id: "partial-review-assignment-complete".to_string(),
+            }),
+        };
+        let mut artifact_writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            options.run_id.clone(),
+            "partial-review-assignment-complete-test",
+        )
+        .expect("reserve phase artifacts");
+        ensure_phase_child_review_schemas(&mut artifact_writer);
+        let run_dir = artifact_writer.run_dir().to_path_buf();
+        let dirs = RunDirs::for_writer(&artifact_writer);
+        let manager = WorktreeManager::new(&repo);
+        let sync_store = SyncStore::open(&repo).expect("open fixture sync store");
+        let semantic_store = SemanticIntentStore::open(&repo).expect("open fixture semantic store");
+        let assignment_schedule = vec![AssignmentScheduleEntry {
+            assignment_id: assignment.id.clone(),
+            parent_assignment_id: None,
+            depth: 1,
+            flattened_index: 0,
+        }];
+        let field_guide = SupervisorFieldGuidePrompt::empty().expect("empty fixture field guide");
+        let budget_ledger =
+            RunBudgetLedger::new(RunBudgetLimits::default()).expect("fixture budget ledger");
+        let budget_policy = AssignmentBudgetPolicy::default();
+        let runtime_model_catalog = RuntimeModelCatalog::Codex(
+            CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-sol"])
+                .expect("fixture codex runtime model catalog"),
+        );
+        let cancellation = ProcessCancellation::new();
+        let mut journal = initialize_orchestration_event_journal(
+            &repo,
+            &options.run_id,
+            options.parent_node.as_deref(),
+        );
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut artifact_writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let child_report_for_runner = Mutex::new(OrchestratorReviewReport {
+            id: assignment.id.clone(),
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: assignment.assigned_paths.clone(),
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            claim_token: None,
+            semantic_intent_token: None,
+            commands_run: Vec::new(),
+            environment_failures: Vec::new(),
+            files_changed: vec![PathBuf::from("README.md")],
+            validation_results: vec![ValidationResult {
+                name: "deterministic fake child validation".to_string(),
+                status: ReviewStatus::Succeeded,
+                command: Vec::new(),
+                message: None,
+            }],
+            findings: Vec::new(),
+            field_guide_entries: Vec::new(),
+            worker_reports: Vec::new(),
+            audit_reports: Vec::new(),
+            review_lens_aggregate: None,
+            decomposition_completions: Vec::new(),
+            licensed_breakage_review: None,
+            generated_follow_up_tasks: Vec::new(),
+            gate_denials: Vec::new(),
+            gate_correction_outcomes: Vec::new(),
+            accepted: true,
+            rejected: false,
+            status: ReviewStatus::Succeeded,
+            remaining_risk: String::new(),
+            next_safe_action: String::new(),
+        });
+        let auditor_invocations = std::sync::Arc::new(AtomicUsize::new(0));
+        let auditor_invocations_for_runner = std::sync::Arc::clone(&auditor_invocations);
+        let assignment_for_runner = assignment.clone();
+        let assignment_metadata_for_runner = assignment_metadata.clone();
+        let fixture_root = temp.path().to_path_buf();
+        let agents_rename_guard = Mutex::new(None);
+        let managed_child_worktree = Mutex::new(None::<PathBuf>);
+        let runner = move |command: &ExternalAgentCommand,
+                           _cancellation: &ProcessCancellation,
+                           _review: Option<ExternalPreActionReviewRuntime<'_>>|
+              -> ExternalAgentRun {
+            if command.assignment_process_launch_kind
+                == Some(AssignmentProcessLaunchKind::ParentAuditor)
+            {
+                let invocation = auditor_invocations_for_runner.fetch_add(1, Ordering::SeqCst) + 1;
+                let child_report = child_report_for_runner
+                    .lock()
+                    .expect("child report for parent auditor runner");
+                let mut fake_auditor_command = command.clone();
+                fake_auditor_command.model = None;
+                fake_auditor_command.model_provider = None;
+                let mut run = deterministic_fake_auditor_run(
+                    &fake_auditor_command,
+                    command
+                        .agent_lifecycle
+                        .as_ref()
+                        .map(|identity| identity.task_id.as_str())
+                        .expect("parent auditor command identity"),
+                    &assignment_for_runner,
+                    &child_report,
+                )
+                .expect("deterministic parent auditor output");
+                apply_fake_simulation_child_containment(command, &mut run);
+                if invocation == 1 {
+                    let worktree = managed_child_worktree
+                        .lock()
+                        .expect("managed child worktree path")
+                        .clone()
+                        .expect(
+                            "child dispatch must record the managed worktree before parent auditor",
+                        );
+                    *agents_rename_guard.lock().expect("agents rename guard") = Some(
+                        EphemeralAgentsControlRenameGuard::hide(&worktree, &fixture_root),
+                    );
+                }
+                return run;
+            }
+            if command.assignment_process_launch_kind
+                == Some(AssignmentProcessLaunchKind::AssignmentChild)
+            {
+                *managed_child_worktree
+                    .lock()
+                    .expect("managed child worktree path") = Some(command.cwd.clone());
+                commit_managed_worktree_assignment_change(
+                    &command.cwd,
+                    "phase child assignment-complete change\n",
+                );
+            }
+            let mut report_command = command.clone();
+            report_command.model = None;
+            let mut run = deterministic_fake_child_run(
+                &report_command,
+                &assignment_for_runner,
+                &assignment_metadata_for_runner,
+                1,
+                None,
+            )
+            .expect("fixture child report");
+            apply_fake_simulation_child_containment(command, &mut run);
+            run
+        };
+        let context = AssignmentExecutionContext {
+            index: 0,
+            concurrent_mode: false,
+            plan: &plan,
+            requested_plan: &plan,
+            execution_target: None,
+            budget_config: &budget_config,
+            consultant: &consultant,
+            assignment_metadata: &assignment_metadata,
+            assignment: &assignment,
+            evidence_only_reaudit: None,
+            options: &options,
+            repo: &repo,
+            run_dir: &run_dir,
+            dirs: &dirs,
+            execution_runtime: SupervisorExecutionRuntime::NonpublishableSimulation,
+            worktree_creation: SupervisorWorktreeCreation::TestOnly,
+            manager: &manager,
+            reused: false,
+            sync_store: &sync_store,
+            semantic_store: &semantic_store,
+            prepared_semantic_token: None,
+            prepared_semantic_findings: &[],
+            prepared_semantic_signals: &[],
+            prepared_semantic_failed: false,
+            assignment_schedule: &assignment_schedule,
+            field_guide: &field_guide,
+            serial_semantic_warn_intents: None,
+            semantic_block_order: None,
+            semantic_block_gate: None,
+            artifacts: &artifacts,
+            budget_ledger: &budget_ledger,
+            budget_policy,
+            admission_commit: None,
+            runtime_model_catalog: &runtime_model_catalog,
+            cancellation,
+            external_runner: &runner,
+        };
+        let outcome = execute_supervisor_assignment(context);
+        assert!(
+            outcome.fatal_error.is_none(),
+            "unexpected fatal error: {:?}",
+            outcome.fatal_error
+        );
+        assert_eq!(auditor_invocations.load(Ordering::SeqCst), 1);
+        let stored: AttemptOutcomeEvidence = serde_json::from_slice(
+            &std::fs::read(
+                repo.join(RunArtifactFamily::Supervise.run_root())
+                    .join(options.run_id.as_str())
+                    .join("selection-attempts/phase-child.attempt-1.json"),
+            )
+            .expect("read attempt evidence"),
+        )
+        .expect("decode attempt evidence");
+        assert!(stored.costs.review_cost_microunits.is_none());
+        assert_eq!(
+            stored.parent_phase_continuation,
+            Some(AttemptParentPhaseContinuation {
+                prior_dispatched_review_cycles: ParentPriorDispatchedReviewCycleProof::KnownPrior {
+                    completed_dispatched_review_cycles: 1,
+                },
+            })
+        );
+        assert!(stored.costs.environment_cost_microunits.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_supervisor_assignment_inner_retains_cycle_proof_when_gate_decision_errors() {
+        use crate::mutation_taxonomy::AssignmentProcessLaunchKind;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp = tempfile::tempdir().expect("temporary phase fixture");
+        let repo = temp.path().join("repo");
+        Repository::init(&repo).expect("initialize phase fixture repository");
+        fs::write(repo.join("README.md"), "baseline\n").expect("write fixture file");
+        commit_fixture_repository(&repo);
+        let assignment = OrchestratorAssignment {
+            id: "phase-child".to_string(),
+            phase: AssignmentPhase::Execution,
+            runtime: None,
+            role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+        };
+        let mut plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "gate error after review dispatch".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: 10,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+            assignments: vec![assignment.clone()],
+        };
+        plan.role_models.insert(
+            AgentRole::ChildOrchestrator,
+            RoleModelSelection {
+                model: Some("gpt-5.6-sol".to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        plan.role_models.insert(
+            AgentRole::Auditor,
+            RoleModelSelection {
+                model: Some("gpt-5.6-sol".to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        let budget_config = SupervisorBudgetConfig::default();
+        let consultant = SupervisorConsultantPlan::default();
+        let assignment_metadata = AssignmentMetadata::new();
+        let options = SupervisorRunOptions {
+            repo: repo.clone(),
+            plan_file: temp.path().join("plan.json"),
+            run_id: RunId::new("gate-error-after-review-dispatch").expect("fixture run id"),
+            parent_node: None,
+            codex_bin: PathBuf::from("unused-codex"),
+            runtime: SupervisorRuntime::Codex,
+            allow_dirty_primary: false,
+            allow_live_run_collision: false,
+            admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+            budget_overrides: crate::supervise::RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
+            machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
+                config: temp.path().join("unused-machine-global.json"),
+                root_id: "runtime".to_string(),
+                owner: "maco-supervise".to_string(),
+                correction_correlation_id: "gate-error-after-review-dispatch".to_string(),
+            }),
+        };
+        let mut artifact_writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            options.run_id.clone(),
+            "gate-error-after-review-dispatch-test",
+        )
+        .expect("reserve phase artifacts");
+        ensure_phase_child_review_schemas(&mut artifact_writer);
+        let run_dir = artifact_writer.run_dir().to_path_buf();
+        let dirs = RunDirs::for_writer(&artifact_writer);
+        let manager = WorktreeManager::new(&repo);
+        let sync_store = SyncStore::open(&repo).expect("open fixture sync store");
+        let semantic_store = SemanticIntentStore::open(&repo).expect("open fixture semantic store");
+        let assignment_schedule = vec![AssignmentScheduleEntry {
+            assignment_id: assignment.id.clone(),
+            parent_assignment_id: None,
+            depth: 1,
+            flattened_index: 0,
+        }];
+        let field_guide = SupervisorFieldGuidePrompt::empty().expect("empty fixture field guide");
+        let budget_ledger =
+            RunBudgetLedger::new(RunBudgetLimits::default()).expect("fixture budget ledger");
+        let budget_policy = AssignmentBudgetPolicy::default();
+        let runtime_model_catalog = RuntimeModelCatalog::Codex(
+            CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-sol"])
+                .expect("fixture codex runtime model catalog"),
+        );
+        let cancellation = ProcessCancellation::new();
+        let mut journal = initialize_orchestration_event_journal(
+            &repo,
+            &options.run_id,
+            options.parent_node.as_deref(),
+        );
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut artifact_writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let child_report_for_runner = Mutex::new(OrchestratorReviewReport {
+            id: assignment.id.clone(),
+            role: AgentRole::ChildOrchestrator,
+            assigned_paths: assignment.assigned_paths.clone(),
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            claim_token: None,
+            semantic_intent_token: None,
+            commands_run: Vec::new(),
+            environment_failures: Vec::new(),
+            files_changed: vec![PathBuf::from("README.md")],
+            validation_results: vec![ValidationResult {
+                name: "deterministic fake child validation".to_string(),
+                status: ReviewStatus::Succeeded,
+                command: Vec::new(),
+                message: None,
+            }],
+            findings: Vec::new(),
+            field_guide_entries: Vec::new(),
+            worker_reports: Vec::new(),
+            audit_reports: Vec::new(),
+            review_lens_aggregate: None,
+            decomposition_completions: Vec::new(),
+            licensed_breakage_review: None,
+            generated_follow_up_tasks: Vec::new(),
+            gate_denials: Vec::new(),
+            gate_correction_outcomes: Vec::new(),
+            accepted: true,
+            rejected: false,
+            status: ReviewStatus::Succeeded,
+            remaining_risk: String::new(),
+            next_safe_action: String::new(),
+        });
+        let auditor_invocations = std::sync::Arc::new(AtomicUsize::new(0));
+        let auditor_invocations_for_runner = std::sync::Arc::clone(&auditor_invocations);
+        let assignment_for_runner = assignment.clone();
+        let assignment_metadata_for_runner = assignment_metadata.clone();
+        let runner = move |command: &ExternalAgentCommand,
+                           _cancellation: &ProcessCancellation,
+                           _review: Option<ExternalPreActionReviewRuntime<'_>>|
+              -> ExternalAgentRun {
+            if command.assignment_process_launch_kind
+                == Some(AssignmentProcessLaunchKind::ParentAuditor)
+            {
+                auditor_invocations_for_runner.fetch_add(1, Ordering::SeqCst);
+                let child_report = child_report_for_runner
+                    .lock()
+                    .expect("child report for parent auditor runner");
+                let mut fake_auditor_command = command.clone();
+                fake_auditor_command.model = None;
+                fake_auditor_command.model_provider = None;
+                let mut run = deterministic_fake_auditor_run(
+                    &fake_auditor_command,
+                    command
+                        .agent_lifecycle
+                        .as_ref()
+                        .map(|identity| identity.task_id.as_str())
+                        .expect("parent auditor command identity"),
+                    &assignment_for_runner,
+                    &child_report,
+                )
+                .expect("deterministic parent auditor output");
+                apply_fake_simulation_child_containment(command, &mut run);
+                return run;
+            }
+            if command.assignment_process_launch_kind
+                == Some(AssignmentProcessLaunchKind::AssignmentChild)
+            {
+                commit_managed_worktree_assignment_change(
+                    &command.cwd,
+                    "phase child gate-error inner path change\n",
+                );
+            }
+            let mut report_command = command.clone();
+            report_command.model = None;
+            let mut run = deterministic_fake_child_run(
+                &report_command,
+                &assignment_for_runner,
+                &assignment_metadata_for_runner,
+                1,
+                None,
+            )
+            .expect("fixture child report");
+            apply_fake_simulation_child_containment(command, &mut run);
+            run
+        };
+        let context = AssignmentExecutionContext {
+            index: 0,
+            concurrent_mode: false,
+            plan: &plan,
+            requested_plan: &plan,
+            execution_target: None,
+            budget_config: &budget_config,
+            consultant: &consultant,
+            assignment_metadata: &assignment_metadata,
+            assignment: &assignment,
+            evidence_only_reaudit: None,
+            options: &options,
+            repo: &repo,
+            run_dir: &run_dir,
+            dirs: &dirs,
+            execution_runtime: SupervisorExecutionRuntime::NonpublishableSimulation,
+            worktree_creation: SupervisorWorktreeCreation::TestOnly,
+            manager: &manager,
+            reused: false,
+            sync_store: &sync_store,
+            semantic_store: &semantic_store,
+            prepared_semantic_token: None,
+            prepared_semantic_findings: &[],
+            prepared_semantic_signals: &[],
+            prepared_semantic_failed: false,
+            assignment_schedule: &assignment_schedule,
+            field_guide: &field_guide,
+            serial_semantic_warn_intents: None,
+            semantic_block_order: None,
+            semantic_block_gate: None,
+            artifacts: &artifacts,
+            budget_ledger: &budget_ledger,
+            budget_policy,
+            admission_commit: None,
+            runtime_model_catalog: &runtime_model_catalog,
+            cancellation,
+            external_runner: &runner,
+        };
+        let mut outcome = AssignmentExecutionOutcome {
+            gate_tracker: None,
+            selection_decisions: context.budget_policy.selector_decisions.clone(),
+            ..AssignmentExecutionOutcome::default()
+        };
+        let gate_error = execute_supervisor_assignment_inner(&context, &mut outcome)
+            .expect_err("gate decision must fail without a correction tracker");
+        let gate_error_display = format!("{gate_error:#}");
+        assert!(
+            gate_error_display.contains("gate correction tracker was not initialized"),
+            "unexpected gate error: {gate_error_display}"
+        );
+        assert_eq!(
+            auditor_invocations.load(Ordering::SeqCst),
+            1,
+            "expected one parent auditor dispatch before gate failure; gate error was: {gate_error_display}"
+        );
+        let stored: AttemptOutcomeEvidence = serde_json::from_slice(
+            &std::fs::read(
+                repo.join(RunArtifactFamily::Supervise.run_root())
+                    .join(options.run_id.as_str())
+                    .join("selection-attempts/phase-child.attempt-1.json"),
+            )
+            .expect("read attempt evidence"),
+        )
+        .expect("decode attempt evidence");
+        assert_ne!(
+            stored.parent_phase_continuation,
+            Some(AttemptParentPhaseContinuation {
+                prior_dispatched_review_cycles: ParentPriorDispatchedReviewCycleProof::KnownNone,
+            })
+        );
+        assert_eq!(
+            stored.parent_phase_continuation,
+            Some(AttemptParentPhaseContinuation {
+                prior_dispatched_review_cycles: ParentPriorDispatchedReviewCycleProof::KnownPrior {
+                    completed_dispatched_review_cycles: 1,
+                },
+            })
+        );
     }
 
     #[cfg(target_os = "linux")]
