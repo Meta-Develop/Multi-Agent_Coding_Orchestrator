@@ -261,6 +261,8 @@ use role_transition::*;
 
 mod follow_up_cascade;
 use follow_up_cascade::*;
+mod follow_up_graph;
+mod follow_up_lease;
 #[cfg(test)]
 pub(crate) use follow_up_cascade::{
     clear_follow_up_cascade_test_isolation, clear_generated_follow_up_queue_observer,

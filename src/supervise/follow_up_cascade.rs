@@ -1,17 +1,23 @@
-use super::*;
+use super::{
+    follow_up_graph::{advance_licensed_follow_up_graph, ensure_licensed_follow_up_graph},
+    follow_up_lease::FollowUpLeaseDriver,
+    *,
+};
 use crate::{
     artifacts::repository_authenticator_key_only,
     follow_up_queue::{
-        GeneratedFollowUpDispatchObservation, GeneratedFollowUpQueue, GeneratedFollowUpQueueBounds,
-        GeneratedFollowUpQueueEntrypoint, GeneratedFollowUpQueuePhase,
-        GeneratedFollowUpQueueRootInput, GeneratedFollowUpQueueSource,
+        graph::GraphTermination, GeneratedFollowUpDispatchObservation, GeneratedFollowUpQueue,
+        GeneratedFollowUpQueueBounds, GeneratedFollowUpQueueEntrypoint,
+        GeneratedFollowUpQueuePhase, GeneratedFollowUpQueueRootInput, GeneratedFollowUpQueueSource,
         GeneratedFollowUpRetentionBinding,
     },
     gate_denial::ApprovalReviewDenial,
     machine_global::MachineGlobalRetentionBinding,
     mutation_taxonomy::autonomous_decision_for_supervisor_child_dispatch,
 };
-use std::io::Write;
+use std::{collections::BTreeSet, io::Write};
+
+mod leased_execution;
 
 const FOLLOW_UP_CASCADE_VERSION: u32 = 1;
 
@@ -207,7 +213,22 @@ pub(super) fn run_generated_follow_up_cascade(
     #[cfg(test)]
     interrupt_after_follow_up_enqueue()?;
 
-    queue.release_claimed_before_dispatch()?;
+    let graph_mode = ensure_licensed_follow_up_graph(&mut queue)?;
+    if graph_mode {
+        advance_licensed_follow_up_graph(&mut queue)?;
+    } else {
+        queue.release_claimed_before_dispatch()?;
+    }
+    let worker_run_id =
+        authenticated_outer_command_run_id(&queue, invocation.outer_command_run_id)?;
+    let mut lease_driver = if graph_mode {
+        let mut driver = FollowUpLeaseDriver::new(&queue, &worker_run_id)?;
+        driver.prepare_existing_claims(&mut queue)?;
+        advance_licensed_follow_up_graph(&mut queue)?;
+        Some(driver)
+    } else {
+        None
+    };
     let mut follow_up_reports = Vec::new();
     let mut authenticated_child_dispatch_started_count = 0_usize;
     let mut cascade_success = true;
@@ -217,25 +238,27 @@ pub(super) fn run_generated_follow_up_cascade(
     reconcile_started_items(
         repo,
         &mut queue,
+        graph_mode,
         &mut follow_up_reports,
         &mut authenticated_child_dispatch_started_count,
         &mut cascade_success,
         &mut cascade_gate_denials,
     )?;
+    if graph_mode {
+        advance_licensed_follow_up_graph(&mut queue)?;
+    }
 
     // Never overtake an unresolved earlier effect. In particular an Active
     // subordinate remains DispatchStarted and blocks every pending sibling
     // until a later invocation can authenticate a terminal report.
-    let reconciled_summary = queue.summary();
-    let unresolved = reconciled_summary.claimed > 0
-        || reconciled_summary.dispatch_started > 0
-        || reconciled_summary.dispatch_observed > 0
-        || reconciled_summary.held_ambiguous > 0;
+    let unresolved = follow_up_dispatch_unresolved(&queue, graph_mode, lease_driver.as_ref());
     if unresolved {
         cascade_success = false;
     }
     let pending = if unresolved {
         Vec::new()
+    } else if graph_mode {
+        graph_dispatch_pending_item_ids(&queue, lease_driver.as_ref())?
     } else {
         queue
             .snapshot()
@@ -245,7 +268,9 @@ pub(super) fn run_generated_follow_up_cascade(
             .collect::<Vec<_>>()
     };
     for item_id in pending {
-        queue.claim(&item_id)?;
+        if !graph_mode {
+            queue.claim(&item_id)?;
+        }
         let preparation = (|| -> Result<FollowUpPreparation> {
             if primary_worktree_snapshot_sha256(repo, SupervisorExecutionRuntime::Verified)?
                 != primary_baseline
@@ -351,18 +376,54 @@ pub(super) fn run_generated_follow_up_cascade(
         let (mut plan_file, reloaded) = match preparation {
             Ok(FollowUpPreparation::Ready { plan_file, loaded }) => (plan_file, *loaded),
             Ok(FollowUpPreparation::Refused(denial)) => {
-                queue.release_before_dispatch(&item_id, Some(denial.clone()), Vec::new())?;
+                if graph_mode {
+                    record_graph_preparation_diagnostics(
+                        &mut queue,
+                        lease_driver
+                            .as_mut()
+                            .expect("graph mode requires lease driver"),
+                        &item_id,
+                        Some(denial.clone()),
+                        Vec::new(),
+                    )?;
+                } else {
+                    queue.release_before_dispatch(&item_id, Some(denial.clone()), Vec::new())?;
+                }
                 cascade_gate_denials.push(denial);
                 cascade_success = false;
                 break;
             }
             Ok(FollowUpPreparation::Cancelled) => {
-                queue.release_before_dispatch(&item_id, None, Vec::new())?;
+                if graph_mode {
+                    record_graph_preparation_diagnostics(
+                        &mut queue,
+                        lease_driver
+                            .as_mut()
+                            .expect("graph mode requires lease driver"),
+                        &item_id,
+                        None,
+                        Vec::new(),
+                    )?;
+                } else {
+                    queue.release_before_dispatch(&item_id, None, Vec::new())?;
+                }
                 cascade_success = false;
                 break;
             }
             Ok(FollowUpPreparation::EnvironmentFailed(failure)) => {
-                queue.release_before_dispatch(&item_id, None, vec![failure.clone()])?;
+                if graph_mode {
+                    record_graph_preparation_diagnostics(
+                        &mut queue,
+                        lease_driver
+                            .as_mut()
+                            .expect("graph mode requires lease driver"),
+                        &item_id,
+                        None,
+                        vec![failure.clone()],
+                    )?;
+                } else {
+                    queue.release_before_dispatch(&item_id, None, vec![failure.clone()])?;
+                }
                 cascade_environment_failures.push(failure);
                 cascade_success = false;
                 #[cfg(test)]
@@ -374,6 +435,20 @@ pub(super) fn run_generated_follow_up_cascade(
                 break;
             }
             Err(error) => {
+                if graph_mode {
+                    record_graph_preparation_diagnostics(
+                        &mut queue,
+                        lease_driver
+                            .as_mut()
+                            .expect("graph mode requires lease driver"),
+                        &item_id,
+                        None,
+                        Vec::new(),
+                    )?;
+                    return Err(error.context(
+                        "generated follow-up preparation failed before durable dispatch start",
+                    ));
+                }
                 // No dispatch marker exists yet, so an injected crash or
                 // validation/read error can be made explicitly retryable.
                 queue.release_before_dispatch(&item_id, None, Vec::new())?;
@@ -382,7 +457,70 @@ pub(super) fn run_generated_follow_up_cascade(
                 ));
             }
         };
-        let started = queue.mark_dispatch_started(&item_id)?;
+        let started = if graph_mode {
+            let driver = lease_driver
+                .as_mut()
+                .expect("graph mode requires lease driver");
+            driver.claim_prepared(&mut queue, &item_id)?;
+            if primary_worktree_snapshot_sha256(repo, SupervisorExecutionRuntime::Verified)?
+                != primary_baseline
+            {
+                let denial = primary_integrity_denial(&item_id)?;
+                record_graph_preparation_diagnostics(
+                    &mut queue,
+                    driver,
+                    &item_id,
+                    Some(denial.clone()),
+                    Vec::new(),
+                )?;
+                cascade_gate_denials.push(denial);
+                cascade_success = false;
+                break;
+            }
+            match retention_binding_matches(retention, &queue) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let denial = permission_expansion_denial(&item_id)?;
+                    record_graph_preparation_diagnostics(
+                        &mut queue,
+                        driver,
+                        &item_id,
+                        Some(denial.clone()),
+                        Vec::new(),
+                    )?;
+                    cascade_gate_denials.push(denial);
+                    cascade_success = false;
+                    break;
+                }
+                Err(error) => {
+                    let failure = retention_probe_failure(&error);
+                    record_graph_preparation_diagnostics(
+                        &mut queue,
+                        driver,
+                        &item_id,
+                        None,
+                        vec![failure.clone()],
+                    )?;
+                    cascade_environment_failures.push(failure);
+                    cascade_success = false;
+                    break;
+                }
+            }
+            if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
+                record_graph_preparation_diagnostics(
+                    &mut queue,
+                    driver,
+                    &item_id,
+                    None,
+                    Vec::new(),
+                )?;
+                cascade_success = false;
+                break;
+            }
+            driver.mark_effect_started(&mut queue, &item_id)?
+        } else {
+            queue.mark_dispatch_started(&item_id)?
+        };
         #[cfg(test)]
         record_queue_test_observation(
             "dispatch_started",
@@ -392,7 +530,7 @@ pub(super) fn run_generated_follow_up_cascade(
         #[cfg(test)]
         if take_interrupt_after_follow_up_dispatch_started() {
             let denial = ambiguous_dispatch_denial(&item_id)?;
-            queue.mark_held_ambiguous(&item_id, Some(denial), Vec::new())?;
+            leased_execution::hold_ambiguous(&mut queue, &item_id, Some(denial), Vec::new())?;
             record_queue_test_observation(
                 "held_ambiguous",
                 &queue,
@@ -420,13 +558,55 @@ pub(super) fn run_generated_follow_up_cascade(
             budget_max_duration_seconds: supervisor_template.budget_max_duration_seconds,
             machine_global_retention: Some(retention.clone()),
         };
-        let result = run_follow_up_supervisor_loaded_plan(
-            subordinate_options,
-            reloaded,
-            invocation.concurrency_policy,
-            invocation.runtime_catalog,
-            external_runner,
-        );
+        let result = if graph_mode {
+            let driver = lease_driver
+                .as_ref()
+                .expect("graph mode requires lease driver");
+            leased_execution::with_heartbeat(
+                &mut queue,
+                driver,
+                &item_id,
+                |heartbeat_cancellation| {
+                    let heartbeat_observed = AtomicBool::new(false);
+                    let monitored_runner = |command: &ExternalAgentCommand,
+                                        scheduler_cancellation: &ProcessCancellation,
+                                        review: Option<ExternalPreActionReviewRuntime<'_>>| {
+                    let run = || {
+                        run_with_caller_process_cancellation(
+                            heartbeat_cancellation,
+                            scheduler_cancellation,
+                            &heartbeat_observed,
+                            || external_runner(command, scheduler_cancellation, review),
+                        )
+                    };
+                    match caller_cancellation {
+                        Some(caller) => run_with_caller_process_cancellation(
+                            caller,
+                            scheduler_cancellation,
+                            cancellation_observed,
+                            run,
+                        ),
+                        None => run(),
+                    }
+                };
+                    run_follow_up_supervisor_loaded_plan(
+                        subordinate_options,
+                        reloaded,
+                        invocation.concurrency_policy,
+                        invocation.runtime_catalog,
+                        &monitored_runner,
+                    )
+                },
+            )
+        } else {
+            run_follow_up_supervisor_loaded_plan(
+                subordinate_options,
+                reloaded,
+                invocation.concurrency_policy,
+                invocation.runtime_catalog,
+                external_runner,
+            )
+        };
         #[cfg(test)]
         interrupt_after_authenticated_follow_up_child_start(repo, &subordinate_run_id)?;
         // The loader no longer needs the private file once the ordinary call
@@ -437,6 +617,7 @@ pub(super) fn run_generated_follow_up_cascade(
                 let child_started = match observe_and_acknowledge(
                     repo,
                     &mut queue,
+                    graph_mode,
                     &item_id,
                     &subordinate_run_id,
                     &report,
@@ -476,6 +657,7 @@ pub(super) fn run_generated_follow_up_cascade(
                     let child_started = match observe_and_acknowledge(
                         repo,
                         &mut queue,
+                        graph_mode,
                         &item_id,
                         &subordinate_run_id,
                         &report,
@@ -519,12 +701,20 @@ pub(super) fn run_generated_follow_up_cascade(
                 }
                 SubordinateReconciliation::Ambiguous => {
                     let denial = ambiguous_dispatch_denial(&item_id)?;
-                    queue.mark_held_ambiguous(&item_id, Some(denial.clone()), Vec::new())?;
+                    leased_execution::hold_ambiguous(
+                        &mut queue,
+                        &item_id,
+                        Some(denial.clone()),
+                        Vec::new(),
+                    )?;
                     cascade_gate_denials.push(denial);
                     cascade_success = false;
                     break;
                 }
             },
+        }
+        if graph_mode {
+            advance_licensed_follow_up_graph(&mut queue)?;
         }
         if !cascade_success {
             // A failed/refused generated subordinate never authorizes a later
@@ -541,6 +731,9 @@ pub(super) fn run_generated_follow_up_cascade(
         cascade_gate_denials.push(primary_integrity_denial(source_report.run_id.as_str())?);
         cascade_success = false;
     }
+    if graph_mode {
+        advance_licensed_follow_up_graph(&mut queue)?;
+    }
     let queue_summary = queue.summary();
     cascade_success &= queue_summary.acknowledged_terminal == queue_summary.capacity
         && queue_summary.enqueued == 0
@@ -548,6 +741,14 @@ pub(super) fn run_generated_follow_up_cascade(
         && queue_summary.dispatch_started == 0
         && queue_summary.dispatch_observed == 0
         && queue_summary.held_ambiguous == 0;
+    if graph_mode {
+        let graph_success = queue
+            .snapshot()
+            .graph()
+            .and_then(|graph| graph.termination())
+            == Some(GraphTermination::Success);
+        cascade_success &= graph_success;
+    }
     Ok(SupervisorCascadeOutcome {
         source_report,
         follow_up_cascade_version: FOLLOW_UP_CASCADE_VERSION,
@@ -726,6 +927,102 @@ fn run_follow_up_supervisor_loaded_plan(
     )
 }
 
+fn authenticated_outer_command_run_id(
+    queue: &GeneratedFollowUpQueue,
+    outer_command_run_id: &RunId,
+) -> Result<RunId> {
+    let authenticated = queue.snapshot().source().outer_command_run_id();
+    if authenticated != outer_command_run_id.as_str() {
+        bail!("generated follow-up cascade outer command run id does not match authenticated queue source");
+    }
+    RunId::new(authenticated)
+}
+
+fn follow_up_dispatch_unresolved(
+    queue: &GeneratedFollowUpQueue,
+    graph_mode: bool,
+    driver: Option<&FollowUpLeaseDriver>,
+) -> bool {
+    for item in queue.snapshot().items().values() {
+        match item.phase() {
+            GeneratedFollowUpQueuePhase::DispatchStarted
+            | GeneratedFollowUpQueuePhase::DispatchObserved
+            | GeneratedFollowUpQueuePhase::HeldAmbiguous => return true,
+            GeneratedFollowUpQueuePhase::Claimed => {
+                if graph_mode {
+                    if let Some(driver) = driver {
+                        if !driver.owns_claim(queue, item.item_id()) {
+                            return true;
+                        }
+                    } else {
+                        return true;
+                    }
+                } else {
+                    return true;
+                }
+            }
+            GeneratedFollowUpQueuePhase::Enqueued
+            | GeneratedFollowUpQueuePhase::AcknowledgedTerminal => {}
+        }
+    }
+    false
+}
+
+fn graph_dispatch_pending_item_ids(
+    queue: &GeneratedFollowUpQueue,
+    driver: Option<&FollowUpLeaseDriver>,
+) -> Result<Vec<String>> {
+    let pending = queue
+        .snapshot()
+        .pending_item_ids()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let mut ordered = Vec::new();
+    for item_id in queue.snapshot().items().keys() {
+        if pending.contains(item_id.as_str()) {
+            ordered.push(item_id.clone());
+            continue;
+        }
+        let item = queue
+            .snapshot()
+            .item(item_id)
+            .context("generated follow-up queue item disappeared during pending admission")?;
+        if item.phase() == GeneratedFollowUpQueuePhase::Claimed
+            && driver.is_some_and(|driver| driver.owns_claim(queue, item_id))
+        {
+            ordered.push(item_id.clone());
+        }
+    }
+    Ok(ordered)
+}
+
+fn record_graph_preparation_diagnostics(
+    queue: &mut GeneratedFollowUpQueue,
+    driver: &mut FollowUpLeaseDriver,
+    item_id: &str,
+    gate_denial: Option<GateDenial>,
+    environment_failures: Vec<EnvironmentFailure>,
+) -> Result<()> {
+    let phase = queue
+        .snapshot()
+        .item(item_id)
+        .context("generated follow-up item disappeared during preparation diagnostics")?
+        .phase();
+    match phase {
+        GeneratedFollowUpQueuePhase::Enqueued => {
+            queue.record_preparation_while_enqueued(item_id, gate_denial, environment_failures)?;
+        }
+        GeneratedFollowUpQueuePhase::Claimed => {
+            let proof = driver.claim_prepared(queue, item_id)?;
+            queue.record_leased_preparation(item_id, proof, gate_denial, environment_failures)?;
+        }
+        _ => {
+            bail!("graph follow-up preparation diagnostics require enqueued or owned claimed state")
+        }
+    }
+    Ok(())
+}
+
 fn retention_binding_matches(
     retention: &MachineGlobalRetentionBinding,
     queue: &GeneratedFollowUpQueue,
@@ -740,6 +1037,7 @@ fn retention_binding_matches(
 fn reconcile_started_items(
     repo: &Path,
     queue: &mut GeneratedFollowUpQueue,
+    graph_mode: bool,
     reports: &mut Vec<SupervisorFinalReport>,
     authenticated_dispatches: &mut usize,
     cascade_success: &mut bool,
@@ -768,18 +1066,18 @@ fn reconcile_started_items(
                 )?;
                 match subordinate_reconciliation(repo, &run_id)? {
                     SubordinateReconciliation::Finalized(report) => {
-                        let child_started =
-                            match observe_and_acknowledge(repo, queue, &item_id, &run_id, &report)?
-                            {
-                                FinalizedTerminalTransition::Acknowledged { child_started } => {
-                                    child_started
-                                }
-                                FinalizedTerminalTransition::PlanMismatch(denial) => {
-                                    cascade_gate_denials.push(denial);
-                                    *cascade_success = false;
-                                    continue;
-                                }
-                            };
+                        let child_started = match observe_and_acknowledge(
+                            repo, queue, graph_mode, &item_id, &run_id, &report,
+                        )? {
+                            FinalizedTerminalTransition::Acknowledged { child_started } => {
+                                child_started
+                            }
+                            FinalizedTerminalTransition::PlanMismatch(denial) => {
+                                cascade_gate_denials.push(denial);
+                                *cascade_success = false;
+                                continue;
+                            }
+                        };
                         if child_started {
                             *authenticated_dispatches =
                                 authenticated_dispatches.checked_add(1).context(
@@ -819,7 +1117,12 @@ fn reconcile_started_items(
                                 )?;
                         }
                         let denial = ambiguous_dispatch_denial(&item_id)?;
-                        queue.mark_held_ambiguous(&item_id, Some(denial.clone()), Vec::new())?;
+                        leased_execution::hold_ambiguous(
+                            queue,
+                            &item_id,
+                            Some(denial.clone()),
+                            Vec::new(),
+                        )?;
                         cascade_gate_denials.push(denial);
                         *cascade_success = false;
                     }
@@ -832,17 +1135,18 @@ fn reconcile_started_items(
                         .context("observed generated follow-up has no subordinate run id")?,
                 )?;
                 if let Some(report) = conclusive_finalized_report(repo, &run_id)? {
-                    let child_started =
-                        match observe_and_acknowledge(repo, queue, &item_id, &run_id, &report)? {
-                            FinalizedTerminalTransition::Acknowledged { child_started } => {
-                                child_started
-                            }
-                            FinalizedTerminalTransition::PlanMismatch(denial) => {
-                                cascade_gate_denials.push(denial);
-                                *cascade_success = false;
-                                continue;
-                            }
-                        };
+                    let child_started = match observe_and_acknowledge(
+                        repo, queue, graph_mode, &item_id, &run_id, &report,
+                    )? {
+                        FinalizedTerminalTransition::Acknowledged { child_started } => {
+                            child_started
+                        }
+                        FinalizedTerminalTransition::PlanMismatch(denial) => {
+                            cascade_gate_denials.push(denial);
+                            *cascade_success = false;
+                            continue;
+                        }
+                    };
                     if child_started {
                         *authenticated_dispatches = authenticated_dispatches
                             .checked_add(1)
@@ -879,18 +1183,18 @@ fn reconcile_started_items(
                 )?;
                 match subordinate_reconciliation(repo, &run_id)? {
                     SubordinateReconciliation::Finalized(report) => {
-                        let child_started =
-                            match observe_and_acknowledge(repo, queue, &item_id, &run_id, &report)?
-                            {
-                                FinalizedTerminalTransition::Acknowledged { child_started } => {
-                                    child_started
-                                }
-                                FinalizedTerminalTransition::PlanMismatch(denial) => {
-                                    cascade_gate_denials.push(denial);
-                                    *cascade_success = false;
-                                    continue;
-                                }
-                            };
+                        let child_started = match observe_and_acknowledge(
+                            repo, queue, graph_mode, &item_id, &run_id, &report,
+                        )? {
+                            FinalizedTerminalTransition::Acknowledged { child_started } => {
+                                child_started
+                            }
+                            FinalizedTerminalTransition::PlanMismatch(denial) => {
+                                cascade_gate_denials.push(denial);
+                                *cascade_success = false;
+                                continue;
+                            }
+                        };
                         if child_started {
                             *authenticated_dispatches =
                                 authenticated_dispatches.checked_add(1).context(
@@ -1023,6 +1327,7 @@ fn conclusive_finalized_report(
 fn observe_and_acknowledge(
     repo: &Path,
     queue: &mut GeneratedFollowUpQueue,
+    graph_mode: bool,
     item_id: &str,
     run_id: &RunId,
     report: &SupervisorFinalReport,
@@ -1036,7 +1341,7 @@ fn observe_and_acknowledge(
     {
         let denial = permission_expansion_denial(item_id)?;
         if phase == GeneratedFollowUpQueuePhase::DispatchStarted {
-            queue.mark_held_ambiguous(item_id, Some(denial.clone()), Vec::new())?;
+            leased_execution::hold_ambiguous(queue, item_id, Some(denial.clone()), Vec::new())?;
         }
         return Ok(FinalizedTerminalTransition::PlanMismatch(denial));
     }
@@ -1052,7 +1357,10 @@ fn observe_and_acknowledge(
         item_id: item_id.to_string(),
         observation,
     };
-    queue.apply_authenticated_terminal(authenticated)?;
+    leased_execution::apply_terminal(queue, authenticated, report)?;
+    if graph_mode {
+        advance_licensed_follow_up_graph(queue)?;
+    }
     Ok(FinalizedTerminalTransition::Acknowledged { child_started })
 }
 
