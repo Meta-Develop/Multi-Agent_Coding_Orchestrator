@@ -1476,6 +1476,58 @@ mod tests {
     }
 
     #[test]
+    fn selected_remote_heartbeat_refuses_wrong_local_owner_before_remote_mutation() {
+        let temp = init_repo();
+        let sim = SimTransport::new(temp.path().to_path_buf());
+        let store = open_sync_with_sim_remote(temp.path(), sim.shared_clone()).expect("open");
+        let claim = store
+            .claim_paths_with_timing("agent-a", ["src/a.rs"], ClaimTiming::default())
+            .expect("claim")
+            .claim;
+        let journal_before = sim.journal_entries().len();
+        let liveness_before = store.liveness_snapshot().expect("liveness before")[0]
+            .heartbeat_unix_seconds
+            .expect("initialized heartbeat");
+        let error = store
+            .heartbeat_at(claim.token, "agent-b", None, liveness_before + 1)
+            .expect_err("wrong local owner");
+        assert!(
+            format!("{error:#}").contains("does not exactly match owner"),
+            "{error:#}"
+        );
+        assert_eq!(sim.journal_entries().len(), journal_before);
+        assert_eq!(
+            store.liveness_snapshot().expect("liveness after refusal")[0].heartbeat_unix_seconds,
+            Some(liveness_before)
+        );
+        let journal_before_owner = sim.journal_entries().len();
+        store
+            .heartbeat_at(claim.token, "agent-a", None, liveness_before + 1)
+            .expect("exact owner heartbeat");
+        assert!(
+            sim.journal_entries().len() > journal_before_owner,
+            "correct owner must record remote heartbeat in journal"
+        );
+        assert_eq!(
+            store
+                .liveness_snapshot_at(liveness_before + 1)
+                .expect("liveness after owner heartbeat")[0]
+                .heartbeat_unix_seconds,
+            Some(liveness_before + 1)
+        );
+        let journal_after_owner = sim.journal_entries().len();
+        let unknown = crate::sync::ClaimToken::from_u64(9_999_999);
+        let absent_error = store
+            .heartbeat_at(unknown, "agent-a", None, liveness_before + 2)
+            .expect_err("absent token");
+        assert!(
+            format!("{absent_error:#}").contains("claim token is not active"),
+            "{absent_error:#}"
+        );
+        assert_eq!(sim.journal_entries().len(), journal_after_owner);
+    }
+
+    #[test]
     fn selected_remote_heartbeat_missing_binding_cannot_extend_local_claim() {
         let temp = init_repo();
         let sim = SimTransport::new(temp.path().to_path_buf());

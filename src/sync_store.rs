@@ -1916,6 +1916,37 @@ impl SyncStore {
         Ok(store.current().value.remote_owners.clone())
     }
 
+    /// Refuses unknown tokens and exact-owner mismatches before any remote heartbeat I/O.
+    fn admit_heartbeat_remote_binding(
+        &self,
+        token: ClaimToken,
+        agent_id: &str,
+    ) -> Result<remote_coordination::RemoteOwnerBinding> {
+        let lock = self.state.lock()?;
+        let store = self.open_authenticated_store(&lock)?;
+        let coordinator = SyncCoordinator::from_snapshot(SyncSnapshot {
+            next_token: store.current().value.next_token,
+            claims: store.current().value.claims.clone(),
+        })?;
+        let claims = coordinator.snapshot()?;
+        let claim = claims
+            .iter()
+            .find(|claim| claim.token == token)
+            .cloned()
+            .with_context(|| format!("claim token is not active: {}", token.get()))?;
+        if claim.agent_id != agent_id {
+            bail!(
+                "claim heartbeat agent '{}' does not exactly match owner '{}'",
+                agent_id,
+                claim.agent_id
+            );
+        }
+        let bindings = store.current().value.remote_owners.clone();
+        remote_coordination::remote_binding_for_token(&bindings, token)?.context(
+            "selected remote coordination requires an authenticated owner binding before heartbeat",
+        )
+    }
+
     fn rehydrate_remote_permits(&self) -> Result<()> {
         if let Some(remote) = &self.remote {
             let bindings = self.read_remote_owner_bindings()?;
@@ -2272,9 +2303,7 @@ impl SyncStore {
         }
         let agent_id = agent_id.as_ref();
         if let Some(remote) = &self.remote {
-            let bindings = self.read_remote_owner_bindings()?;
-            let binding = remote_coordination::remote_binding_for_token(&bindings, token)?
-                .context("selected remote coordination requires an authenticated owner binding before heartbeat")?;
+            let binding = self.admit_heartbeat_remote_binding(token, agent_id)?;
             remote.heartbeat_binding(&binding)?;
         }
         self.with_locked_update(|coordinator, _, liveness, supersessions, _remote_owners| {
