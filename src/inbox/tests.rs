@@ -618,6 +618,8 @@ fn source_repository_binding_matches_configured_owner_name_and_is_locally_durabl
 #[test]
 fn raw_github_candidates_fail_closed_on_malformed_identity_and_nested_values() {
     let source = test_source_repository_binding();
+    raw_pr_from_value(&valid_raw_pr_value(), &InboxConfig::default(), &source)
+        .expect("baseline PR fixture is valid before malformed-field checks");
     let mut pr = valid_raw_pr_value();
     pr.as_object_mut().unwrap().remove("headRefOid");
     assert!(raw_pr_from_value(&pr, &InboxConfig::default(), &source).is_err());
@@ -1253,6 +1255,8 @@ fn valid_raw_pr_value() -> Value {
         "headRefOid": "1111111111111111111111111111111111111111",
         "baseRefOid": "2222222222222222222222222222222222222222",
         "isDraft": false,
+        "isCrossRepository": false,
+        "headRepository": {"nameWithOwner": "acme/repo"},
         "files": [{"path": "src/inbox.rs"}],
         "reviewDecision": "CHANGES_REQUESTED",
         "latestReviews": [],
@@ -1273,6 +1277,118 @@ fn safe_privacy() -> PrivacyScanResult {
         body_summary: String::new(),
         body_truncated: false,
     }
+}
+
+#[test]
+fn github_check_conclusion_parsing_preserves_pending_empty_and_completed_outcomes() {
+    let source = test_source_repository_binding();
+    let mut pr = valid_raw_pr_value();
+    pr["reviewDecision"] = json!(null);
+    pr["statusCheckRollup"] = json!([
+        {
+            "name": "ci",
+            "status": "IN_PROGRESS",
+            "conclusion": ""
+        },
+        {
+            "name": "lint",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS"
+        },
+        {
+            "name": "tests",
+            "status": "completed",
+            "conclusion": "failure"
+        }
+    ]);
+
+    let raw = raw_pr_from_value(&pr, &InboxConfig::default(), &source).expect("raw pr");
+
+    let ci = raw
+        .checks
+        .iter()
+        .find(|check| check.name == "ci")
+        .expect("ci check");
+    assert_eq!(ci.status.as_deref(), Some("IN_PROGRESS"));
+    assert!(ci.conclusion.is_none());
+    assert!(!check_failed(
+        ci.conclusion.as_deref(),
+        ci.status.as_deref()
+    ));
+
+    let lint = raw
+        .checks
+        .iter()
+        .find(|check| check.name == "lint")
+        .expect("lint check");
+    assert_eq!(lint.conclusion.as_deref(), Some("SUCCESS"));
+
+    let tests = raw
+        .checks
+        .iter()
+        .find(|check| check.name == "tests")
+        .expect("tests check");
+    assert_eq!(tests.conclusion.as_deref(), Some("failure"));
+    assert!(check_failed(
+        tests.conclusion.as_deref(),
+        tests.status.as_deref()
+    ));
+}
+
+#[test]
+fn github_check_conclusion_parsing_rejects_completed_empty_and_malformed_values() {
+    let source = test_source_repository_binding();
+    let reject = |rollup: serde_json::Value| {
+        let mut pr = valid_raw_pr_value();
+        pr["statusCheckRollup"] = rollup;
+        let error = raw_pr_from_value(&pr, &InboxConfig::default(), &source)
+            .expect_err("malformed check conclusion must be rejected");
+        format!("{error:#}").contains("conclusion")
+    };
+
+    assert!(reject(json!([{
+        "name": "ci",
+        "status": "COMPLETED",
+        "conclusion": ""
+    }])));
+    assert!(reject(json!([{
+        "name": "ci",
+        "status": "COMPLETED",
+        "conclusion": 1
+    }])));
+    assert!(reject(json!([{
+        "name": "ci",
+        "status": "COMPLETED",
+        "conclusion": "x".repeat(MAX_GITHUB_STATUS_BYTES + 1)
+    }])));
+}
+
+#[test]
+fn pending_github_checks_without_conclusion_keep_pr_intake_launch_blocked() {
+    let source = test_source_repository_binding();
+    let mut pr = valid_raw_pr_value();
+    pr["reviewDecision"] = json!(null);
+    pr["latestReviews"] = json!([]);
+    pr["statusCheckRollup"] = json!([{
+        "name": "ci",
+        "status": "IN_PROGRESS",
+        "conclusion": ""
+    }]);
+
+    let raw = raw_pr_from_value(&pr, &InboxConfig::default(), &source).expect("raw pr");
+    let item = pr_item(raw, &InboxConfig::default(), &source, &BTreeMap::new()).expect("item");
+    let intake = pr_intake_report_for_item(&item).expect("intake report");
+    assert_eq!(intake.status, InboxPrIntakeStatus::LaunchBlocked);
+    assert_eq!(
+        intake.launch_block.as_ref().unwrap().reason,
+        "missing_eligibility"
+    );
+    assert!(intake
+        .launch_block
+        .as_ref()
+        .unwrap()
+        .missing_evidence
+        .contains(&"passing_completed_ci".to_string()));
 }
 
 #[test]

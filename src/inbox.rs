@@ -7481,6 +7481,33 @@ fn files_from_value(value: Option<&Value>) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+fn github_check_status_allows_absent_conclusion(status: Option<&str>) -> bool {
+    status.is_some_and(|status| {
+        matches!(
+            status.to_ascii_lowercase().as_str(),
+            "pending" | "in_progress" | "inprogress" | "queued" | "waiting"
+        )
+    })
+}
+
+fn optional_github_check_conclusion(
+    object: &serde_json::Map<String, Value>,
+    status: Option<&str>,
+    label: &str,
+    max_bytes: usize,
+) -> Result<Option<String>> {
+    let Some(value) = object.get("conclusion").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    if value.as_str() == Some("") {
+        if github_check_status_allows_absent_conclusion(status) {
+            return Ok(None);
+        }
+        validate_bounded_text("", label, max_bytes, false)?;
+    }
+    optional_input_string(Some(value), label, max_bytes)
+}
+
 fn checks_from_value(value: Option<&Value>) -> Result<Vec<GithubCheckSummary>> {
     let values = optional_input_array(value, "GitHub checks", MAX_GITHUB_CHECKS)?;
     let mut checks = Vec::with_capacity(values.len());
@@ -7500,9 +7527,9 @@ fn checks_from_value(value: Option<&Value>) -> Result<Vec<GithubCheckSummary>> {
             &format!("GitHub check {} status", index + 1),
             MAX_GITHUB_STATUS_BYTES,
         )?;
-        let conclusion = first_optional_input_string(
+        let conclusion = optional_github_check_conclusion(
             object,
-            &["conclusion"],
+            status.as_deref(),
             &format!("GitHub check {} conclusion", index + 1),
             MAX_GITHUB_STATUS_BYTES,
         )?;
