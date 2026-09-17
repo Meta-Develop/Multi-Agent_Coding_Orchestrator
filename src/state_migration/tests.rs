@@ -449,7 +449,7 @@ fn registered_authenticated_consumer_roots_and_state_locks_migrate_across_all_mo
     KernelStateLock::acquire_direct(&state, "claims.lock").expect("claims lock");
 
     let sources = crate::artifacts::state_auth::authenticated_state_consumers();
-    assert_eq!(sources.len(), 9, "all authenticated consumer sources");
+    assert_eq!(sources.len(), 10, "all authenticated consumer sources");
     let registered_roots = sources
         .iter()
         .map(|source| source.root_name)
@@ -458,6 +458,7 @@ fn registered_authenticated_consumer_roots_and_state_locks_migrate_across_all_mo
         "authenticated-field-guide-state-v1",
         "authenticated-megafile-history-v1",
         "authenticated-generated-follow-up-queues-v1",
+        "supervisor-messaging-v1",
     ] {
         assert!(
             registered_roots.contains(required),
@@ -474,6 +475,7 @@ fn registered_authenticated_consumer_roots_and_state_locks_migrate_across_all_mo
         ".authenticated-megafile-history.lock",
         "megafile-history-operation-v1.lock",
         ".generated-follow-up-queues.lock",
+        ".supervisor-messaging.lock",
     ] {
         assert!(
             registered_state_root_locks.contains(required),
