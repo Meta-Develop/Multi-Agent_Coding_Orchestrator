@@ -1491,7 +1491,6 @@ impl SyncStore {
             }
         };
         let store = Self { remote, ..store };
-        store.rehydrate_remote_permits()?;
         Ok(store)
     }
 
@@ -1512,7 +1511,6 @@ impl SyncStore {
             remote: Some(remote),
         };
         store.ensure_authenticated_initialized()?;
-        store.rehydrate_remote_permits()?;
         #[cfg(test)]
         if let Some(remote) = store.remote.as_ref() {
             register_test_injected_remote_coordination(&store.repo_path, Arc::clone(remote));
@@ -1945,14 +1943,6 @@ impl SyncStore {
         remote_coordination::remote_binding_for_token(&bindings, token)?.context(
             "selected remote coordination requires an authenticated owner binding before heartbeat",
         )
-    }
-
-    fn rehydrate_remote_permits(&self) -> Result<()> {
-        if let Some(remote) = &self.remote {
-            let bindings = self.read_remote_owner_bindings()?;
-            remote.bootstrap_existing_bindings(&bindings)?;
-        }
-        Ok(())
     }
 
     pub fn state_path(&self) -> &Path {
