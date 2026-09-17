@@ -1,0 +1,26 @@
+[
+  {
+    "event_name": null,
+    "data": {
+      "responseId": "FAKE-stream-chat-gemini",
+      "modelVersion": "FAKE-openai-model",
+      "candidates": [
+        {
+          "index": 0,
+          "content": { "role": "model", "parts": [{ "text": "Hello" }] }
+        }
+      ]
+    },
+    "terminal": false
+  },
+  {
+    "event_name": null,
+    "data": {
+      "responseId": "FAKE-stream-chat-gemini",
+      "modelVersion": "FAKE-openai-model",
+      "candidates": [{ "index": 0, "finishReason": "STOP" }]
+    },
+    "terminal": false
+  },
+  { "event_name": null, "data": null, "terminal": true }
+]

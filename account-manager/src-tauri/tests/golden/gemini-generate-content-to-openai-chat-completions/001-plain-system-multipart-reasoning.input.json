@@ -1,0 +1,23 @@
+{
+  "$context": {
+    "source_model": "gemini-source",
+    "target_model": "chat-target"
+  },
+  "$body": {
+    "systemInstruction": { "parts": [{ "text": "Be exact." }] },
+    "contents": [
+      {
+        "parts": [
+          { "text": "Describe" },
+          {
+            "inlineData": { "mimeType": "image/png", "data": "FAKE-image-0004" }
+          }
+        ]
+      }
+    ],
+    "generationConfig": {
+      "maxOutputTokens": 512,
+      "thinkingConfig": { "thinkingLevel": "MEDIUM" }
+    }
+  }
+}

@@ -322,6 +322,7 @@ impl Cli {
             Command::Evaluation(command) => command.run(),
             Command::EvalHarness(command) => command.run(),
             Command::Optimizer(command) => command.run(),
+            Command::Steer(command) => command.run(),
         }
     }
 }
@@ -378,6 +379,8 @@ enum Command {
     EvalHarness(EvalHarnessCommand),
     /// Inspect the optimizer policy library, replay snapshots, and preference profiles.
     Optimizer(OptimizerCommand),
+    /// Submit authenticated in-flight steering against registered assignments.
+    Steer(SteerCommand),
 }
 
 #[derive(Debug, Args)]
@@ -4605,6 +4608,9 @@ fn execute_eval_harness_v2_operator_path(
 }
 
 include!("cli/part2.rs");
+
+mod steering_commands;
+use steering_commands::SteerCommand;
 
 #[cfg(test)]
 mod cli_integration_tests {

@@ -1,0 +1,8 @@
+{
+  "security": {
+    "auth": {}
+  },
+  "context": {
+    "includeDirectories": ["../shared"]
+  }
+}

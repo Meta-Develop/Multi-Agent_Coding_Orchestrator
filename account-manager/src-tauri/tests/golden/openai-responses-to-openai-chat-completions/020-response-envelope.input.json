@@ -1,0 +1,69 @@
+{
+  "$response": {
+    "id": "FAKE-response-responses-0002",
+    "object": "response",
+    "created_at": 1,
+    "completed_at": 2,
+    "model": "FAKE-responses-model",
+    "status": "completed",
+    "background": false,
+    "conversation": { "id": "FAKE-conversation-0002" },
+    "error": null,
+    "incomplete_details": null,
+    "instructions": "Return a concise answer.",
+    "max_output_tokens": 128,
+    "max_tool_calls": null,
+    "metadata": { "trace": "FAKE-trace-0002" },
+    "moderation": null,
+    "parallel_tool_calls": true,
+    "previous_response_id": "FAKE-response-previous-0001",
+    "prompt": null,
+    "prompt_cache_key": "FAKE-cache-key-0002",
+    "prompt_cache_options": { "mode": "implicit", "ttl": "30m" },
+    "prompt_cache_retention": "in_memory",
+    "reasoning": { "effort": "medium", "summary": null },
+    "safety_identifier": "FAKE-safety-0002",
+    "service_tier": "default",
+    "store": true,
+    "temperature": 1,
+    "text": { "format": { "type": "text" }, "verbosity": "medium" },
+    "tool_choice": "auto",
+    "tools": [
+      {
+        "type": "function",
+        "name": "lookup",
+        "description": "Look up a value",
+        "parameters": { "type": "object" },
+        "strict": true
+      }
+    ],
+    "top_logprobs": 0,
+    "top_p": 1,
+    "truncation": "disabled",
+    "user": "FAKE-user-0002",
+    "output": [
+      {
+        "id": "FAKE-output-message-0002",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Hello",
+            "annotations": [],
+            "logprobs": []
+          }
+        ]
+      }
+    ],
+    "output_text": "Hello",
+    "usage": {
+      "input_tokens": 2,
+      "input_tokens_details": { "cached_tokens": 1 },
+      "output_tokens": 3,
+      "output_tokens_details": { "reasoning_tokens": 1 },
+      "total_tokens": 5
+    }
+  }
+}

@@ -1,0 +1,22 @@
+Coding Agent Manager
+Copyright © 2026 Meta-Develop
+
+Licensed under the GNU General Public License version 3 or later. See LICENSE.
+
+MACO integration note: the following attribution records the source snapshot's
+previous Gemini OAuth implementation. That module was excluded from the import
+and independently reimplemented from official Google and OAuth protocol facts.
+See docs/OAUTH_PROVENANCE.md. The original attribution is retained below.
+
+This project adapts the Gemini Google OAuth loopback and token-exchange
+approach from:
+
+  lbjlaq/Antigravity-Manager
+  https://github.com/lbjlaq/Antigravity-Manager
+  Copyright the Antigravity-Manager contributors
+  Licensed under CC-BY-NC-SA-4.0
+
+The installed-app OAuth client used for Gemini CLI login is the client
+published by google-gemini/gemini-cli (Apache-2.0) in
+packages/core/src/code_assist/oauth2.ts. It is not the Antigravity
+Manager client.

@@ -1,0 +1,9 @@
+{
+  "$body": {
+    "model": "FAKE-gemini-model",
+    "messages": [
+      { "role": "assistant", "content": "Hello" },
+      { "role": "developer", "content": "Late instruction" }
+    ]
+  }
+}

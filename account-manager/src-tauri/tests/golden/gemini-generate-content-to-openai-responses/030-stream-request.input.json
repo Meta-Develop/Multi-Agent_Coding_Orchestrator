@@ -1,0 +1,10 @@
+{
+  "$context": {
+    "source_model": "FAKE-gemini-source",
+    "target_model": "FAKE-responses-target",
+    "source_stream": true
+  },
+  "$body": {
+    "contents": [{ "role": "user", "parts": [{ "text": "Hello" }] }]
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "body": {
+    "model": "gpt-image-target",
+    "prompt": "A blue square",
+    "size": "1024x1024"
+  },
+  "target_model": null,
+  "stream": false
+}

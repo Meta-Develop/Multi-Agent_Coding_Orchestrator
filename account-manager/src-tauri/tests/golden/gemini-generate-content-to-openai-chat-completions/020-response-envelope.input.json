@@ -1,0 +1,31 @@
+{
+  "$response": {
+    "responseId": "FAKE-response-gemini-0001",
+    "modelVersion": "FAKE-gemini-model",
+    "candidates": [
+      {
+        "index": 0,
+        "content": {
+          "role": "model",
+          "parts": [{ "text": "Hello" }]
+        },
+        "finishReason": "STOP",
+        "safetyRatings": [
+          {
+            "category": "HARM_CATEGORY_HATE_SPEECH",
+            "probability": "NEGLIGIBLE",
+            "blocked": false
+          }
+        ]
+      }
+    ],
+    "usageMetadata": {
+      "promptTokenCount": 2,
+      "cachedContentTokenCount": 1,
+      "toolUsePromptTokenCount": 0,
+      "candidatesTokenCount": 3,
+      "thoughtsTokenCount": 4,
+      "totalTokenCount": 9
+    }
+  }
+}

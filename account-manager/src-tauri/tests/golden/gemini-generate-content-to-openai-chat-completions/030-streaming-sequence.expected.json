@@ -1,0 +1,51 @@
+[
+  {
+    "event_name": null,
+    "data": {
+      "id": "FAKE-stream-gemini-chat",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "FAKE-gemini-model",
+      "choices": [
+        {
+          "index": 0,
+          "delta": { "role": "assistant", "content": "" },
+          "finish_reason": null
+        }
+      ]
+    },
+    "terminal": false
+  },
+  {
+    "event_name": null,
+    "data": {
+      "id": "FAKE-stream-gemini-chat",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "FAKE-gemini-model",
+      "choices": [
+        { "index": 0, "delta": { "content": "Hello" }, "finish_reason": null }
+      ]
+    },
+    "terminal": false
+  },
+  {
+    "event_name": null,
+    "data": {
+      "id": "FAKE-stream-gemini-chat",
+      "object": "chat.completion.chunk",
+      "created": 0,
+      "model": "FAKE-gemini-model",
+      "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+      "usage": {
+        "prompt_tokens": 2,
+        "prompt_tokens_details": { "cached_tokens": 1 },
+        "completion_tokens": 7,
+        "completion_tokens_details": { "reasoning_tokens": 4 },
+        "total_tokens": 9
+      }
+    },
+    "terminal": false
+  },
+  { "event_name": null, "data": "[DONE]", "terminal": true }
+]

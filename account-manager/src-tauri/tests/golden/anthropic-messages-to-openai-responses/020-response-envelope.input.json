@@ -1,0 +1,12 @@
+{
+  "$response": {
+    "id": "FAKE-response-anthropic-0003",
+    "type": "message",
+    "role": "assistant",
+    "model": "FAKE-anthropic-model",
+    "content": [{ "type": "text", "text": "Hello" }],
+    "stop_reason": "end_turn",
+    "stop_sequence": null,
+    "usage": { "input_tokens": 2, "output_tokens": 3 }
+  }
+}

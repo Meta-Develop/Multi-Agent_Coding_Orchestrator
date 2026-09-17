@@ -1,0 +1,8 @@
+{
+  "model": "FAKE-openai-model",
+  "max_tokens": 64,
+  "messages": [
+    { "role": "user", "content": "Hello" },
+    { "role": "system", "content": "Late instruction" }
+  ]
+}
