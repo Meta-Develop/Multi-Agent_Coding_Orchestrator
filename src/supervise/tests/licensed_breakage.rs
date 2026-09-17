@@ -3,6 +3,9 @@ use super::*;
 const LICENSED_INTERFACE: &str = "crate::api::new_name";
 const LICENSED_SIGNATURE: &str =
     "error[E0425]: cannot find function crate::api::new_name in dependent client";
+const LICENSED_INTERFACE_B: &str = "crate::api::server_symbol";
+const LICENSED_SIGNATURE_B: &str =
+    "error[E0425]: cannot find function crate::api::server_symbol in dependent server";
 
 #[cfg(target_os = "linux")]
 #[test]
@@ -151,6 +154,82 @@ fn licensed_assignment() -> OrchestratorAssignment {
         }],
     });
     assignment
+}
+
+fn licensed_dual_dependent_assignment() -> OrchestratorAssignment {
+    let mut assignment = injected_assignment(false);
+    assignment.licensed_breakage = Some(LicensedBreakageDeclaration {
+        migration_rationale:
+            "Rename callers to crate::api::new_name and crate::api::server_symbol before dispatching dependent updates"
+                .to_string(),
+        dependents: vec![
+            LicensedBreakageDependentScope {
+                dependent_id: "client-a".to_string(),
+                paths: vec![PathBuf::from("src/client.rs")],
+                interfaces: vec![LICENSED_INTERFACE.to_string()],
+            },
+            LicensedBreakageDependentScope {
+                dependent_id: "client-b".to_string(),
+                paths: vec![PathBuf::from("src/server.rs")],
+                interfaces: vec![LICENSED_INTERFACE_B.to_string()],
+            },
+        ],
+    });
+    assignment
+}
+
+fn dual_dependent_failure_child(assignment: &OrchestratorAssignment) -> OrchestratorReviewReport {
+    let mut child = dependent_failure_child(assignment, "src/client.rs");
+    child.validation_results.push(ValidationResult {
+        name: "client-b".to_string(),
+        status: ReviewStatus::Failed,
+        command: vec![
+            "cargo".to_string(),
+            "check".to_string(),
+            "-p".to_string(),
+            "client-b".to_string(),
+        ],
+        message: Some(LICENSED_SIGNATURE_B.to_string()),
+    });
+    child.findings.push(Finding {
+        severity: FindingSeverity::Error,
+        message: LICENSED_SIGNATURE_B.to_string(),
+        paths: vec![PathBuf::from("src/server.rs")],
+    });
+    child.remaining_risk =
+        "client-a and client-b require the declared migration before dependents can pass"
+            .to_string();
+    child.next_safe_action = "generate the scoped dependent updates".to_string();
+    child
+}
+
+fn licensed_follow_up_assignment_for_ordinal(ordinal: usize) -> OrchestratorAssignment {
+    OrchestratorAssignment {
+        id: format!("child-a-licensed-update-{ordinal:02}"),
+        phase: AssignmentPhase::Execution,
+        runtime: None,
+        role: AgentRole::ChildOrchestrator,
+        role_category: None,
+        selection_source: None,
+        assigned_paths: if ordinal == 1 {
+            vec![PathBuf::from("src/client.rs")]
+        } else {
+            vec![PathBuf::from("src/server.rs")]
+        },
+        semantic_symbols: if ordinal == 1 {
+            vec![LICENSED_INTERFACE.to_string()]
+        } else {
+            vec![LICENSED_INTERFACE_B.to_string()]
+        },
+        semantic_modules: Vec::new(),
+        task: Some(format!(
+            "apply generated licensed dependent update {ordinal:02}"
+        )),
+        worker_assignments: Vec::new(),
+        environment_requirements: Vec::new(),
+        licensed_breakage: None,
+        notes: None,
+    }
 }
 
 fn dependent_failure_child(
@@ -479,6 +558,52 @@ fn assert_licensed_follow_up_consumer_queue_after_cascade(
     let expected_ref = authenticated_supervisor_final_report_ref(child_report)
         .expect("authenticated child final report ref");
     assert_eq!(success.result_ref().as_str(), expected_ref.as_str());
+}
+
+#[cfg(target_os = "linux")]
+fn licensed_branch_success_result_ref(queue: &GeneratedFollowUpQueue, item_id: &str) -> String {
+    let branch_id = queue
+        .snapshot()
+        .item_branch_id(item_id)
+        .expect("graph branch binding");
+    queue
+        .snapshot()
+        .graph()
+        .expect("graph runtime")
+        .branch(branch_id)
+        .expect("branch runtime")
+        .successful_outcome()
+        .expect("successful branch outcome")
+        .result_ref()
+        .as_str()
+        .to_string()
+}
+
+#[cfg(target_os = "linux")]
+fn queue_item_assignment_id(queue: &GeneratedFollowUpQueue, item_id: &str) -> String {
+    queue
+        .snapshot()
+        .item(item_id)
+        .expect("queue item")
+        .task()
+        .supervisor_plan
+        .assignments
+        .first()
+        .expect("generated follow-up assignment")
+        .id
+        .clone()
+}
+
+#[cfg(target_os = "linux")]
+fn assert_leased_post_effect_heartbeat(queue: &GeneratedFollowUpQueue, item_id: &str) {
+    let lease = queue
+        .snapshot()
+        .lease(item_id)
+        .expect("leased queue item state");
+    assert!(
+        lease.last_heartbeat_at().expect("lease heartbeat")
+            > lease.effect_started_at().expect("effect fence timestamp")
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -2815,4 +2940,491 @@ fn held_ambiguous_finalized_round_two_tasks_refuse_maximum_round() {
     assert_eq!(scenario.unexpected_reconciliation_dispatches, 0);
     assert_eq!(scenario.primary_after, scenario.primary_before);
     assert!(!scenario.repo.join("src/client.rs").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn licensed_cascade_partial_fan_in_preserves_successful_sibling_across_failure_and_resume() {
+    skip_without_containment!();
+    let (temp, repo) = injected_repository();
+    let source_assignment = licensed_dual_dependent_assignment();
+    let follow_up_a = licensed_follow_up_assignment_for_ordinal(1);
+    let follow_up_b = licensed_follow_up_assignment_for_ordinal(2);
+    let plan = injected_plan(source_assignment.clone(), 0);
+    let source_run_id =
+        RunId::new("licensed-cascade-partial-sibling").expect("partial sibling source run id");
+    let plan_file = temp.path().join("licensed-cascade-partial-sibling.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_vec_pretty(&plan).expect("serialize partial sibling source plan"),
+    )
+    .expect("write partial sibling source plan");
+    let source_options = SupervisorRunOptions {
+        repo: repo.clone(),
+        plan_file,
+        run_id: source_run_id.clone(),
+        parent_node: None,
+        codex_bin: PathBuf::from("unused-injected-codex"),
+        runtime: SupervisorRuntime::Codex,
+        allow_dirty_primary: false,
+        allow_live_run_collision: false,
+        admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+        budget_overrides: crate::supervise::RunBudgetLimits::default(),
+        budget_max_duration_seconds: None,
+        machine_global_retention: Some(secure_machine_global_retention(
+            temp.path(),
+            "licensed-cascade-partial-sibling",
+        )),
+    };
+    let declaration_sha256 = licensed_breakage_declaration_sha256(
+        source_assignment
+            .licensed_breakage
+            .as_ref()
+            .expect("partial sibling declaration"),
+    )
+    .expect("hash partial sibling declaration");
+    let primary_before =
+        verified_whole_primary_snapshot_sha256(&repo).expect("capture partial sibling primary");
+    let source_child_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let follow_up_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let succeeded_assignment_id = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let source_dispatches = std::sync::Arc::clone(&source_child_dispatches);
+    let follow_up_count = std::sync::Arc::clone(&follow_up_dispatches);
+    let succeeded_id_slot = std::sync::Arc::clone(&succeeded_assignment_id);
+    let mut cascade_runner = |command: &ExternalAgentCommand| {
+        let output_path = command.output_last_message.to_string_lossy();
+        let is_follow_up_01 = output_path.contains("child-a-licensed-update-01");
+        let is_follow_up_02 = output_path.contains("child-a-licensed-update-02");
+        let is_auditor = output_path.contains("review-auditor");
+        if is_auditor && (is_follow_up_01 || is_follow_up_02) {
+            let assignment = if is_follow_up_01 {
+                &follow_up_a
+            } else {
+                &follow_up_b
+            };
+            let mut child = injected_child_report(assignment);
+            if is_follow_up_01 {
+                child.files_changed = vec![PathBuf::from("src/client.rs")];
+            } else {
+                child.files_changed = vec![PathBuf::from("src/server.rs")];
+            }
+            write_injected_json(
+                &command.output_last_message,
+                &injected_auditor_report(assignment, &child),
+            );
+        } else if is_auditor {
+            write_injected_json(
+                &command.output_last_message,
+                &licensed_auditor_report(&source_assignment, Some(&declaration_sha256)),
+            );
+        } else if is_follow_up_01 || is_follow_up_02 {
+            let assignment = if is_follow_up_01 {
+                &follow_up_a
+            } else {
+                &follow_up_b
+            };
+            let ordinal = follow_up_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .saturating_add(1);
+            if ordinal == 1 {
+                succeeded_id_slot
+                    .lock()
+                    .expect("record first successful sibling")
+                    .replace(assignment.id.clone());
+                if is_follow_up_01 {
+                    fs::create_dir_all(command.cwd.join("src")).expect("client dir");
+                    fs::write(
+                        command.cwd.join("src/client.rs"),
+                        "pub fn migrated_client() {}\n",
+                    )
+                    .expect("write first sibling update");
+                } else {
+                    fs::create_dir_all(command.cwd.join("src")).expect("server dir");
+                    fs::write(
+                        command.cwd.join("src/server.rs"),
+                        "pub fn migrated_server() {}\n",
+                    )
+                    .expect("write first sibling update");
+                }
+                let mut child = injected_child_report(assignment);
+                child.files_changed = if is_follow_up_01 {
+                    vec![PathBuf::from("src/client.rs")]
+                } else {
+                    vec![PathBuf::from("src/server.rs")]
+                };
+                write_injected_json(&command.output_last_message, &child);
+            } else {
+                assert_eq!(ordinal, 2, "unexpected third follow-up dispatch");
+                let mut child = injected_child_report(assignment);
+                child.accepted = false;
+                child.rejected = true;
+                child.status = ReviewStatus::Failed;
+                child.remaining_risk = "second sibling intentionally fails".to_string();
+                write_injected_json(&command.output_last_message, &child);
+            }
+        } else {
+            let count = source_dispatches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .saturating_add(1);
+            assert_eq!(count, 1, "source child reran");
+            fs::write(command.cwd.join("README.md"), "licensed breaking change\n")
+                .expect("write partial sibling source candidate");
+            write_injected_json(
+                &command.output_last_message,
+                &dual_dependent_failure_child(&source_assignment),
+            );
+        }
+        write_injected_usage(command, 0, 1);
+        injected_verified_run(command)
+    };
+
+    let first_outcome =
+        run_supervisor_plan_file_cascade_with_runner(source_options.clone(), &mut cascade_runner)
+            .expect("run partial sibling cascade through success then failure");
+    assert!(
+        first_outcome.source_report.success,
+        "{:#?}",
+        first_outcome.source_report
+    );
+    assert_eq!(
+        first_outcome.source_report.generated_follow_up_tasks.len(),
+        2
+    );
+    assert!(
+        !first_outcome.follow_up_cascade_success,
+        "{:#?}",
+        first_outcome
+    );
+    assert!(first_outcome.generated_follow_up_dispatch_performed());
+    assert_eq!(first_outcome.follow_up_reports.len(), 2);
+    assert_eq!(
+        follow_up_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    assert_eq!(
+        source_child_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    let succeeded_assignment_id = succeeded_assignment_id
+        .lock()
+        .expect("read first successful sibling")
+        .clone()
+        .expect("first follow-up dispatch succeeded");
+    let successful_report = first_outcome
+        .follow_up_reports
+        .iter()
+        .find(|report| report.success)
+        .expect("one successful follow-up report");
+    let failed_report = first_outcome
+        .follow_up_reports
+        .iter()
+        .find(|report| !report.success)
+        .expect("one failed follow-up report");
+    let queue_after_failure = reopen_authenticated_source_follow_up_queue(&repo, &source_run_id)
+        .expect("reopen partial sibling queue");
+    assert_eq!(
+        queue_after_failure
+            .snapshot()
+            .graph()
+            .and_then(|graph| graph.termination()),
+        Some(GraphTermination::Failure)
+    );
+    assert_eq!(queue_after_failure.snapshot().items().len(), 2);
+    let successful_item_id = queue_after_failure
+        .snapshot()
+        .items()
+        .iter()
+        .find(|(item_id, _)| {
+            queue_item_assignment_id(&queue_after_failure, item_id) == succeeded_assignment_id
+        })
+        .map(|(item_id, _)| item_id.clone())
+        .expect("successful sibling queue item");
+    let preserved_ref =
+        licensed_branch_success_result_ref(&queue_after_failure, &successful_item_id);
+    let expected_ref = authenticated_supervisor_final_report_ref(successful_report)
+        .expect("successful sibling authenticated ref");
+    assert_eq!(preserved_ref, expected_ref);
+    assert_eq!(
+        queue_after_failure
+            .snapshot()
+            .item(&successful_item_id)
+            .expect("successful item")
+            .phase(),
+        GeneratedFollowUpQueuePhase::AcknowledgedTerminal
+    );
+    let failed_item_id = queue_after_failure
+        .snapshot()
+        .items()
+        .iter()
+        .find(|(item_id, _)| {
+            queue_item_assignment_id(&queue_after_failure, item_id) != succeeded_assignment_id
+        })
+        .map(|(item_id, _)| item_id.clone())
+        .expect("failed sibling queue item");
+    assert_eq!(
+        queue_after_failure
+            .snapshot()
+            .item(&failed_item_id)
+            .expect("failed item")
+            .phase(),
+        GeneratedFollowUpQueuePhase::AcknowledgedTerminal
+    );
+    assert_ne!(
+        failed_report.run_id.as_str(),
+        successful_report.run_id.as_str()
+    );
+    drop(queue_after_failure);
+
+    let unexpected_resume_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let unexpected = std::sync::Arc::clone(&unexpected_resume_dispatches);
+    let mut resume_runner = move |_command: &ExternalAgentCommand| {
+        unexpected.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        panic!("partial sibling resume attempted a new external dispatch");
+    };
+    let resumed_outcome =
+        resume_supervisor_plan_file_cascade_with_runner(source_options.clone(), &mut resume_runner)
+            .expect("resume partial sibling cascade without redispatch");
+    let primary_after =
+        verified_whole_primary_snapshot_sha256(&repo).expect("capture partial sibling primary");
+    assert!(!resumed_outcome.follow_up_cascade_success);
+    assert_eq!(
+        unexpected_resume_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        follow_up_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    assert_eq!(primary_after, primary_before);
+    assert!(!repo.join("src/client.rs").exists());
+    assert!(!repo.join("src/server.rs").exists());
+    let queue_after_resume = reopen_authenticated_source_follow_up_queue(&repo, &source_run_id)
+        .expect("reopen partial sibling queue after resume");
+    assert_eq!(
+        licensed_branch_success_result_ref(&queue_after_resume, &successful_item_id),
+        preserved_ref
+    );
+    assert_eq!(
+        queue_after_resume
+            .snapshot()
+            .graph()
+            .and_then(|graph| graph.termination()),
+        Some(GraphTermination::Failure)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn licensed_follow_up_heartbeat_interruption_recovers_through_authenticated_finalization() {
+    skip_without_containment!();
+    use crate::sync_store::ClaimTiming;
+    use std::{
+        sync::{mpsc, Arc, Mutex},
+        thread,
+        time::Duration,
+    };
+    let _claim_timing = FollowUpLeaseClaimTimingOverride::install(
+        ClaimTiming::new(1, 120).expect("one-second heartbeat with generous stale bound"),
+    );
+    let main_thread = thread::current().id();
+    let (periodic_tx, periodic_rx) = mpsc::sync_channel(2);
+    let periodic_rx = Arc::new(Mutex::new(periodic_rx));
+    let periodic_deadline = Duration::from_secs(15);
+    let heartbeat_hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        if thread::current().id() != main_thread {
+            // Observation must never block the lease driver's shutdown after
+            // the child has received the two notifications it needs.
+            let _ = periodic_tx.try_send(());
+        }
+    });
+    let _heartbeat_hook = set_follow_up_lease_heartbeat_test_hook(heartbeat_hook);
+    let (temp, repo) = injected_repository();
+    let source_assignment = licensed_assignment();
+    let follow_up_assignment = licensed_follow_up_assignment();
+    let plan = injected_plan(source_assignment.clone(), 0);
+    let source_run_id =
+        RunId::new("licensed-cascade-heartbeat-interrupt").expect("heartbeat interrupt run id");
+    let plan_file = temp
+        .path()
+        .join("licensed-cascade-heartbeat-interrupt.json");
+    fs::write(
+        &plan_file,
+        serde_json::to_vec_pretty(&plan).expect("serialize heartbeat interrupt source plan"),
+    )
+    .expect("write heartbeat interrupt source plan");
+    let source_options = SupervisorRunOptions {
+        repo: repo.clone(),
+        plan_file,
+        run_id: source_run_id.clone(),
+        parent_node: None,
+        codex_bin: PathBuf::from("unused-injected-codex"),
+        runtime: SupervisorRuntime::Codex,
+        allow_dirty_primary: false,
+        allow_live_run_collision: false,
+        admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
+        budget_overrides: crate::supervise::RunBudgetLimits::default(),
+        budget_max_duration_seconds: None,
+        machine_global_retention: Some(secure_machine_global_retention(
+            temp.path(),
+            "licensed-cascade-heartbeat-interrupt",
+        )),
+    };
+    let declaration_sha256 = licensed_breakage_declaration_sha256(
+        source_assignment
+            .licensed_breakage
+            .as_ref()
+            .expect("heartbeat interrupt declaration"),
+    )
+    .expect("hash heartbeat interrupt declaration");
+    let primary_before =
+        verified_whole_primary_snapshot_sha256(&repo).expect("capture heartbeat primary before");
+    let source_child_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let follow_up_child_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let source_dispatches = std::sync::Arc::clone(&source_child_dispatches);
+    let follow_up_dispatches = std::sync::Arc::clone(&follow_up_child_dispatches);
+    let periodic_rx_for_runner = Arc::clone(&periodic_rx);
+    let mut cascade_runner = |command: &ExternalAgentCommand| {
+        let output_path = command.output_last_message.to_string_lossy();
+        let is_follow_up = output_path.contains("child-a-licensed-update-01");
+        let is_auditor = output_path.contains("review-auditor");
+        if is_auditor && is_follow_up {
+            let mut child = injected_child_report(&follow_up_assignment);
+            child.files_changed = vec![PathBuf::from("src/client.rs")];
+            write_injected_json(
+                &command.output_last_message,
+                &injected_auditor_report(&follow_up_assignment, &child),
+            );
+        } else if is_auditor {
+            write_injected_json(
+                &command.output_last_message,
+                &licensed_auditor_report(&source_assignment, Some(&declaration_sha256)),
+            );
+        } else if is_follow_up {
+            let count = follow_up_dispatches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .saturating_add(1);
+            assert_eq!(count, 1, "heartbeat interrupt follow-up reran");
+            let receiver = periodic_rx_for_runner
+                .lock()
+                .expect("periodic heartbeat receiver");
+            for index in 0..2 {
+                receiver
+                    .recv_timeout(periodic_deadline)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "timed out waiting for periodic heartbeat notification {index}: {error}"
+                        )
+                    });
+            }
+            fs::create_dir_all(command.cwd.join("src")).expect("create follow-up dir");
+            fs::write(
+                command.cwd.join("src/client.rs"),
+                "pub fn migrated_client() {}\n",
+            )
+            .expect("write heartbeat follow-up update");
+            let mut child = injected_child_report(&follow_up_assignment);
+            child.files_changed = vec![PathBuf::from("src/client.rs")];
+            write_injected_json(&command.output_last_message, &child);
+        } else {
+            let count = source_dispatches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .saturating_add(1);
+            assert_eq!(count, 1, "heartbeat interrupt source child reran");
+            fs::write(command.cwd.join("README.md"), "licensed breaking change\n")
+                .expect("write heartbeat interrupt source candidate");
+            write_injected_json(
+                &command.output_last_message,
+                &dependent_failure_child(&source_assignment, "src/client.rs"),
+            );
+        }
+        write_injected_usage(command, 0, 1);
+        injected_verified_run(command)
+    };
+
+    set_interrupt_after_authenticated_follow_up_child_start();
+    let error =
+        run_supervisor_plan_file_cascade_with_runner(source_options.clone(), &mut cascade_runner)
+            .expect_err("interrupt after authenticated follow-up child start");
+    clear_follow_up_cascade_test_isolation();
+    clear_follow_up_lease_test_isolation();
+    assert!(format!("{error:#}")
+        .contains("injected interruption after authenticated generated follow-up child start"));
+    assert_eq!(
+        source_child_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        follow_up_child_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    let queue_interrupted = reopen_authenticated_source_follow_up_queue(&repo, &source_run_id)
+        .expect("reopen heartbeat-interrupted queue");
+    let item_id = queue_interrupted
+        .snapshot()
+        .items()
+        .keys()
+        .next()
+        .expect("one queue item")
+        .clone();
+    assert_eq!(
+        queue_interrupted
+            .snapshot()
+            .item(&item_id)
+            .expect("interrupted item")
+            .phase(),
+        GeneratedFollowUpQueuePhase::DispatchStarted
+    );
+    assert_leased_post_effect_heartbeat(&queue_interrupted, &item_id);
+    let subordinate_run_id = queue_interrupted
+        .snapshot()
+        .item(&item_id)
+        .expect("interrupted item")
+        .subordinate_run_id()
+        .expect("interrupted subordinate run id")
+        .to_string();
+    let subordinate_run_id = RunId::new(&subordinate_run_id).expect("parse subordinate run id");
+    let finalized_subordinate = supervisor_status(&repo, subordinate_run_id.clone())
+        .expect("read finalized heartbeat subordinate")
+        .final_report
+        .expect("heartbeat subordinate final report");
+    assert!(finalized_subordinate.success, "{finalized_subordinate:#?}");
+    drop(queue_interrupted);
+
+    let unexpected_reconciliation_dispatches =
+        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let unexpected = std::sync::Arc::clone(&unexpected_reconciliation_dispatches);
+    let mut reconciliation_runner = move |_command: &ExternalAgentCommand| {
+        unexpected.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        panic!("heartbeat interruption reconciliation attempted a new external dispatch");
+    };
+    let outcome =
+        resume_supervisor_plan_file_cascade_with_runner(source_options, &mut reconciliation_runner)
+            .expect("reconcile heartbeat-interrupted follow-up through authenticated finalization");
+    let primary_after =
+        verified_whole_primary_snapshot_sha256(&repo).expect("capture heartbeat primary after");
+
+    assert!(outcome.follow_up_cascade_success, "{:#?}", outcome);
+    assert!(outcome.generated_follow_up_dispatch_performed());
+    assert_eq!(outcome.follow_up_reports.len(), 1);
+    assert_eq!(
+        unexpected_reconciliation_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        source_child_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        follow_up_child_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(primary_after, primary_before);
+    assert!(!repo.join("src/client.rs").exists());
+    let child_report = &outcome.follow_up_reports[0];
+    assert_licensed_follow_up_consumer_queue_after_cascade(
+        &repo,
+        &source_run_id,
+        child_report,
+        true,
+    );
 }

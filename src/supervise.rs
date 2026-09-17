@@ -275,6 +275,11 @@ pub(crate) use follow_up_cascade::{
     normalized_supervisor_plan_file_sha256, AuthenticatedGeneratedFollowUpTerminal,
     GeneratedFollowUpDispatchEvidence,
 };
+#[cfg(test)]
+pub(crate) use follow_up_lease::{
+    clear_follow_up_lease_test_isolation, set_follow_up_lease_heartbeat_test_hook,
+    FollowUpLeaseClaimTimingOverride,
+};
 
 mod repository;
 use repository::*;

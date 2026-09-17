@@ -20,17 +20,97 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use std::{
     collections::BTreeMap,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+/// Upper bound for waiting on a real system-clock tick between durable lease
+/// observations that must strictly advance (claim → effect start on a sibling).
+const LEASE_OBSERVATION_STRICT_ADVANCE_WAIT: Duration = Duration::from_millis(100);
 
 const WORKER_ID_PREFIX: &str = "follow-up-worker-";
 const LEASE_ID_PREFIX: &str = "follow-up-lease-";
+
+#[cfg(test)]
+thread_local! {
+    static CLAIM_TIMING_OVERRIDE: std::cell::RefCell<Option<ClaimTiming>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static HEARTBEAT_TEST_HOOK: std::cell::RefCell<
+        Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct FollowUpLeaseClaimTimingOverride {
+    restored: Option<ClaimTiming>,
+}
+
+#[cfg(test)]
+impl FollowUpLeaseClaimTimingOverride {
+    pub(crate) fn install(timing: ClaimTiming) -> Self {
+        let restored = CLAIM_TIMING_OVERRIDE.with(|slot| slot.borrow_mut().replace(timing));
+        Self { restored }
+    }
+}
+
+#[cfg(test)]
+impl Drop for FollowUpLeaseClaimTimingOverride {
+    fn drop(&mut self) {
+        CLAIM_TIMING_OVERRIDE.with(|slot| *slot.borrow_mut() = self.restored);
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct FollowUpLeaseHeartbeatTestHookGuard {
+    restored: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+}
+
+#[cfg(test)]
+pub(crate) fn set_follow_up_lease_heartbeat_test_hook(
+    hook: std::sync::Arc<dyn Fn() + Send + Sync>,
+) -> FollowUpLeaseHeartbeatTestHookGuard {
+    let restored = HEARTBEAT_TEST_HOOK.with(|slot| slot.borrow_mut().replace(hook));
+    FollowUpLeaseHeartbeatTestHookGuard { restored }
+}
+
+#[cfg(test)]
+impl Drop for FollowUpLeaseHeartbeatTestHookGuard {
+    fn drop(&mut self) {
+        HEARTBEAT_TEST_HOOK.with(|slot| *slot.borrow_mut() = self.restored.take());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn clear_follow_up_lease_test_isolation() {
+    CLAIM_TIMING_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+    HEARTBEAT_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+}
+
+fn claim_timing_for_new_driver() -> ClaimTiming {
+    #[cfg(test)]
+    {
+        if let Some(timing) = CLAIM_TIMING_OVERRIDE.with(|slot| *slot.borrow()) {
+            return timing;
+        }
+    }
+    ClaimTiming::default()
+}
+
+#[cfg(test)]
+fn heartbeat_test_hook_for_new_driver() -> Option<std::sync::Arc<dyn Fn() + Send + Sync>> {
+    HEARTBEAT_TEST_HOOK.with(|slot| slot.borrow().clone())
+}
 
 pub(super) struct FollowUpLeaseDriver {
     queue_instance_id: String,
     worker: WorkerIdentity,
     timing: ClaimTiming,
     proofs: BTreeMap<String, LeaseProof>,
+    #[cfg(test)]
+    heartbeat_test_hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl FollowUpLeaseDriver {
@@ -40,8 +120,10 @@ impl FollowUpLeaseDriver {
         Ok(Self {
             queue_instance_id,
             worker,
-            timing: ClaimTiming::default(),
+            timing: claim_timing_for_new_driver(),
             proofs: BTreeMap::new(),
+            #[cfg(test)]
+            heartbeat_test_hook: heartbeat_test_hook_for_new_driver(),
         })
     }
 
@@ -185,7 +267,20 @@ impl FollowUpLeaseDriver {
     ) -> Result<GeneratedFollowUpQueueEventData> {
         self.ensure_queue_instance(queue)?;
         let proof = self.require_owned_proof(queue, item_id)?;
-        let observed_at = observed_lease_time()?;
+        let previous_heartbeat = queue
+            .snapshot()
+            .lease(item_id)
+            .and_then(|lease| lease.last_heartbeat_at())
+            .with_context(|| {
+                format!("effect start requires active lease heartbeat baseline for item {item_id}")
+            })?;
+        let observed_at = observed_lease_time_strictly_after(previous_heartbeat).with_context(
+            || {
+                format!(
+                    "effect start observation for item {item_id} after last_heartbeat_at={previous_heartbeat}"
+                )
+            },
+        )?;
         queue.mark_leased_effect_started(item_id, proof, observed_at)
     }
 
@@ -198,9 +293,12 @@ impl FollowUpLeaseDriver {
         let proof = self.require_owned_heartbeat_proof(queue, item_id)?;
         let observed_at = observed_lease_time()?;
         let expires_at = lease_expires_at(observed_at, self.timing.stale_after_seconds)?;
-        queue
-            .heartbeat_lease(item_id, proof, observed_at, expires_at)
-            .map(|_| ())
+        queue.heartbeat_lease(item_id, proof, observed_at, expires_at)?;
+        #[cfg(test)]
+        if let Some(hook) = &self.heartbeat_test_hook {
+            hook();
+        }
+        Ok(())
     }
 
     pub(super) fn heartbeat_interval(&self) -> Duration {
@@ -346,6 +444,21 @@ pub(super) fn observed_lease_time() -> Result<u64> {
         .duration_since(UNIX_EPOCH)
         .context("system clock is before the UNIX epoch")?;
     u64::try_from(duration.as_nanos()).context("lease observation exceeds u64 nanosecond bound")
+}
+
+fn observed_lease_time_strictly_after(previous: u64) -> Result<u64> {
+    let deadline = Instant::now() + LEASE_OBSERVATION_STRICT_ADVANCE_WAIT;
+    let mut latest = observed_lease_time()?;
+    while latest <= previous {
+        if Instant::now() >= deadline {
+            bail!(
+                "lease observation did not strictly advance past previous nanosecond boundary (previous={previous}, latest={latest})"
+            );
+        }
+        std::thread::sleep(Duration::from_nanos(1));
+        latest = observed_lease_time()?;
+    }
+    Ok(latest)
 }
 
 pub(super) fn current_lease_proof(
@@ -572,6 +685,23 @@ fn branch_attempt_completed_event(
 mod tests {
     use super::*;
     use crate::follow_up_queue::graph::{BranchOutcome, GraphBranchId};
+
+    #[test]
+    fn observed_lease_time_strictly_after_waits_for_real_clock_tick() {
+        let first = observed_lease_time().expect("first lease observation");
+        let second = observed_lease_time_strictly_after(first).expect("strict advance");
+        assert!(second > first);
+    }
+
+    #[test]
+    fn claim_timing_override_restores_on_drop() {
+        let default = claim_timing_for_new_driver();
+        let fast = ClaimTiming::new(1, 120).expect("fast timing");
+        let guard = FollowUpLeaseClaimTimingOverride::install(fast);
+        assert_eq!(claim_timing_for_new_driver(), fast);
+        drop(guard);
+        assert_eq!(claim_timing_for_new_driver(), default);
+    }
 
     #[test]
     fn logical_worker_identity_is_stable_and_parent_bound() {
