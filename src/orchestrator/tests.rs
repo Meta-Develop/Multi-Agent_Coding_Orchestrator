@@ -122,9 +122,108 @@ fn run_candidate_validation_test_with_setup(
         &base_oid,
         &expected,
         OrchestrationExecutionRuntime::NonpublishableSimulation,
+        &crate::process_runner::ProcessCancellation::new(),
         || Ok(()),
     )
     .0
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrator_validation_command_cancels_on_remote_authority_loss() -> Result<()> {
+    use crate::collect_revalidation::{revalidate_existing_worker_batch, RevalidationRequest};
+    use crate::sync_store::remote_coordination::test_support::{
+        open_sync_with_sim_remote, sim_peer_remote_takeover_with_activation_nonce, SimTransport,
+    };
+    use crate::sync_store::ClaimTiming;
+    use crate::worktree::WorktreeCreateOptions;
+    use std::time::Duration;
+
+    let temp = TempDir::new()?;
+    let repo_path = temp.path().join("repo");
+    WorktreeManager::init_repository(&repo_path, "main")?;
+    let repo = crate::git_repository::open(&repo_path)?;
+    fs::write(repo_path.join("agent-a.txt"), "base\n")?;
+    let base_oid = commit_all(&repo, "init")?;
+    fs::write(repo_path.join("agent-a.txt"), "candidate\n")?;
+    let timing = ClaimTiming::new(1, 3)?;
+    let sim = SimTransport::new(repo_path.clone());
+    let manager = WorktreeManager::new(&repo_path);
+    let worktree = manager.create_for_test(WorktreeCreateOptions {
+        agent_id: "agent-a".to_string(),
+        branch: None,
+        base: None,
+        worktree_root: None,
+    })?;
+    let head = crate::git_repository::open(&worktree.path)?
+        .head()?
+        .peel_to_commit()?
+        .id();
+    let store = open_sync_with_sim_remote(&repo_path, sim.shared_clone())?;
+    let claim = store
+        .claim_paths_with_timing("agent-a", ["agent-a.txt"], timing)?
+        .claim;
+    let predecessor = store
+        .inspect_remote_claim_owner(claim.token)?
+        .owner()
+        .clone();
+    store.heartbeat(claim.token, "agent-a", None)?;
+    let guard = revalidate_existing_worker_batch(
+        &repo_path,
+        vec![RevalidationRequest {
+            repo_path: repo_path.clone(),
+            agent_id: "agent-a".to_string(),
+            claim_token: claim.token,
+            claimed_paths: claim.paths.clone(),
+            expected_worktree: worktree.clone(),
+            expected_head_oid: head,
+        }],
+    )?;
+    guard.start_guard_owned_heartbeat()?;
+    let expected = capture_consistent_candidate_state(
+        &repo_path,
+        &base_oid,
+        OrchestrationExecutionRuntime::NonpublishableSimulation,
+    )?;
+    let validation = ValidationCommandPlan {
+        name: Some("remote cancel probe".to_string()),
+        command: "sleep 30".to_string(),
+        env: BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]),
+        timeout: Some(Duration::from_secs(60)),
+        working_directory: None,
+    };
+    let claim_paths = claim.paths.clone();
+    let sim_for_peer = sim.shared_clone();
+    let takeover = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(1));
+        sim_peer_remote_takeover_with_activation_nonce(
+            &sim_for_peer,
+            predecessor,
+            "agent-b",
+            &claim_paths,
+            None,
+        )
+        .expect("remote takeover");
+    });
+    let cancellation = guard.process_cancellation_for_managed_agent("agent-a", None)?;
+    let summary = run_candidate_bound_validation_command(
+        &validation,
+        &repo_path,
+        &base_oid,
+        &expected,
+        OrchestrationExecutionRuntime::NonpublishableSimulation,
+        &cancellation,
+        || Ok(()),
+    )
+    .0;
+    takeover.join().expect("takeover thread");
+    let error = summary.error.unwrap_or_default();
+    assert_eq!(summary.status, AgentRunStatus::Failed);
+    assert!(
+        error.contains("Cancelled") || error.to_ascii_lowercase().contains("cancelled"),
+        "validation must observe composed cancellation, got {error}"
+    );
+    Ok(())
 }
 
 fn clone_candidate(
@@ -907,6 +1006,7 @@ fn repo_validation_materializes_exact_combined_candidate_and_not_primary() {
         &base_oid,
         &combined_state,
         OrchestrationExecutionRuntime::NonpublishableSimulation,
+        &crate::process_runner::ProcessCancellation::new(),
         || Ok(()),
     );
 
@@ -3524,6 +3624,7 @@ fn orchestration_profile_binds_git_common_and_hides_sensitive_state() {
         visible_read_write_roots: vec![common.clone()],
         hidden_roots: vec![sensitive.clone()],
         runtime: OrchestrationExecutionRuntime::Verified,
+        process_cancellation: crate::process_runner::ProcessCancellation::new(),
     };
     let profile = strict_command_profile(&spec);
     assert!(
@@ -4111,6 +4212,7 @@ fn agent_command_drains_large_output_before_timeout() {
             visible_read_write_roots: Vec::new(),
             hidden_roots: Vec::new(),
             runtime: OrchestrationExecutionRuntime::NonpublishableSimulation,
+            process_cancellation: crate::process_runner::ProcessCancellation::new(),
         })
         .expect("run large-output agent command");
 
@@ -4804,6 +4906,7 @@ fn old_per_agent_revalidation_drop_before_spawn_allows_exact_token_release_durin
         &summary,
         &worktree,
         OrchestrationExecutionRuntime::NonpublishableSimulation,
+        crate::process_runner::ProcessCancellation::new(),
     )
     .expect("old-path command spec");
     drop(guard);

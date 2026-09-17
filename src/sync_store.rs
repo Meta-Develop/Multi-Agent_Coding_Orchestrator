@@ -13,6 +13,7 @@ use crate::{
     },
     megafile::{MegafileAssessment, MegafileStore, MegafileThresholds},
     orchestrator::RunId,
+    publication::coordination_journal::CoordinationOwnerIdentity,
     safe_state::{stable_checksum, ExistingExclusiveLock, FileIdentity, KernelStateLock, SafeRoot},
     state_journal::JournalSpec,
     state_migration::{
@@ -31,6 +32,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
+
+pub(crate) mod remote_coordination;
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -58,10 +61,31 @@ const MAX_SUPERSESSION_RECORDS: usize = 1_024;
 pub const DEFAULT_CLAIM_HEARTBEAT_INTERVAL_SECONDS: u64 = 12 * 60 * 60;
 pub const DEFAULT_CLAIM_STALE_AFTER_SECONDS: u64 = 24 * 60 * 60;
 
+/// Keeps the remote work lease alive for the lifetime of managed subprocesses on a claim.
+pub(crate) struct ManagedClaimProcessCancellation {
+    pub(crate) cancellation: crate::process_runner::ProcessCancellation,
+    _remote_lease: Option<remote_coordination::RemoteWorkLease>,
+}
+
+impl ManagedClaimProcessCancellation {
+    pub(crate) fn cancellation(&self) -> &crate::process_runner::ProcessCancellation {
+        &self.cancellation
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SyncStore {
     repo_path: PathBuf,
     state: RepositoryStateRoot,
+    remote: Option<Arc<remote_coordination::RemoteCoordination>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AuthenticatedClaimRemoteOwner {
+    token: ClaimToken,
+    run_identity: String,
+    activation_nonce: String,
 }
 
 /// Authenticated claims observed while holding the durable claims writer lock.
@@ -198,6 +222,225 @@ impl HeldClaimsPersist {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct RevalidationRemoteBindingSnapshot {
+    pub(crate) agent_id: String,
+    pub(crate) token: ClaimToken,
+    pub(crate) binding: remote_coordination::RemoteOwnerBinding,
+}
+
+#[derive(Debug)]
+pub(crate) enum RevalidationRemoteSupport {
+    LocalOnly,
+    Selected {
+        remote: Arc<remote_coordination::RemoteCoordination>,
+        bindings: Vec<RevalidationRemoteBindingSnapshot>,
+    },
+}
+
+#[derive(Clone)]
+pub(crate) struct RevalidationRemoteLease {
+    pub(crate) agent_id: String,
+    pub(crate) token: ClaimToken,
+    pub(crate) binding: remote_coordination::RemoteOwnerBinding,
+    pub(crate) lease: remote_coordination::RemoteWorkLease,
+}
+
+impl std::fmt::Debug for RevalidationRemoteLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RevalidationRemoteLease")
+            .field("agent_id", &self.agent_id)
+            .field("token", &self.token)
+            .field("binding", &self.binding)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum RevalidationRemotePrepareError {
+    #[error(
+        "remote coordination is selected but claim token {token} for agent '{agent_id}' has no authenticated remote owner binding"
+    )]
+    MissingRemoteOwnerBinding { agent_id: String, token: u64 },
+    #[error(transparent)]
+    State(#[from] anyhow::Error),
+}
+
+#[cfg(test)]
+static TEST_INJECTED_REMOTE_COORDINATION: Mutex<
+    BTreeMap<PathBuf, Arc<remote_coordination::RemoteCoordination>>,
+> = Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+pub(crate) fn register_test_injected_remote_coordination(
+    repo_path: &Path,
+    remote: Arc<remote_coordination::RemoteCoordination>,
+) {
+    let repo_path = repo_path
+        .canonicalize()
+        .unwrap_or_else(|_| repo_path.to_path_buf());
+    TEST_INJECTED_REMOTE_COORDINATION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(repo_path, remote);
+}
+
+#[cfg(test)]
+fn test_injected_remote_coordination(
+    repo_path: &Path,
+) -> Option<Arc<remote_coordination::RemoteCoordination>> {
+    let repo_path = repo_path
+        .canonicalize()
+        .unwrap_or_else(|_| repo_path.to_path_buf());
+    TEST_INJECTED_REMOTE_COORDINATION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&repo_path)
+        .cloned()
+}
+
+pub(crate) fn load_selected_remote_coordination(
+    repo_path: &Path,
+) -> Result<Option<Arc<remote_coordination::RemoteCoordination>>> {
+    if let Some(service) =
+        crate::publication::coordination_mode::load_selected_remote_service(repo_path)?
+    {
+        return Ok(Some(Arc::new(
+            remote_coordination::RemoteCoordination::from_production_service(service),
+        )));
+    }
+    #[cfg(test)]
+    if let Some(remote) = test_injected_remote_coordination(repo_path) {
+        return Ok(Some(remote));
+    }
+    Ok(None)
+}
+
+fn read_authenticated_claims_readonly(repo_path: &Path) -> Result<AuthenticatedClaimsState> {
+    let repo = crate::git_repository::discover(repo_path).context("discover repository")?;
+    let state = RepositoryStateRoot::open_existing(&repo, "claims.json", "claims.lock")
+        .context("open claims state")?;
+    let lock = state.lock().context("lock claims state")?;
+    let repo_path = repo.workdir().unwrap_or_else(|| repo.path()).to_path_buf();
+    read_existing_authenticated_claims(&repo_path, &state, &lock)
+}
+
+pub(crate) fn prepare_revalidation_remote_support(
+    repo_path: &Path,
+    requests: &[ExistingClaimBindingRequest],
+) -> std::result::Result<RevalidationRemoteSupport, RevalidationRemotePrepareError> {
+    let Some(remote) = load_selected_remote_coordination(repo_path)? else {
+        return Ok(RevalidationRemoteSupport::LocalOnly);
+    };
+    let snapshot = read_authenticated_claims_readonly(repo_path)
+        .map_err(RevalidationRemotePrepareError::State)?;
+    let mut bindings = Vec::with_capacity(requests.len());
+    for request in requests {
+        let claim = snapshot
+            .claims
+            .iter()
+            .find(|claim| claim.token == request.token)
+            .with_context(|| format!("claim token is not active: {}", request.token.get()))
+            .map_err(RevalidationRemotePrepareError::State)?;
+        if claim.agent_id != request.agent_id {
+            return Err(RevalidationRemotePrepareError::State(anyhow::anyhow!(
+                "claim agent '{}' does not exactly match owner '{}'",
+                request.agent_id,
+                claim.agent_id
+            )));
+        }
+        if claim.paths != request.paths {
+            return Err(RevalidationRemotePrepareError::State(anyhow::anyhow!(
+                "claim paths for token {} do not exactly match the revalidation request",
+                request.token.get()
+            )));
+        }
+        let owner = snapshot
+            .remote_owners
+            .iter()
+            .find(|owner| owner.token == request.token);
+        let Some(owner) = owner else {
+            return Err(RevalidationRemotePrepareError::MissingRemoteOwnerBinding {
+                agent_id: request.agent_id.clone(),
+                token: request.token.get(),
+            });
+        };
+        bindings.push(RevalidationRemoteBindingSnapshot {
+            agent_id: request.agent_id.clone(),
+            token: request.token,
+            binding: remote_coordination::RemoteOwnerBinding {
+                run_identity: owner.run_identity.clone(),
+                activation_nonce: owner.activation_nonce.clone(),
+            },
+        });
+    }
+    Ok(RevalidationRemoteSupport::Selected { remote, bindings })
+}
+
+fn verify_revalidation_remote_bindings_unchanged(
+    frozen: &AuthenticatedClaimsState,
+    prepared: &[RevalidationRemoteBindingSnapshot],
+) -> Result<()> {
+    for entry in prepared {
+        let owner = frozen
+            .remote_owners
+            .iter()
+            .find(|owner| owner.token == entry.token)
+            .with_context(|| {
+                format!(
+                    "remote owner row is missing for token {}",
+                    entry.token.get()
+                )
+            })?;
+        if owner.run_identity != entry.binding.run_identity
+            || owner.activation_nonce != entry.binding.activation_nonce
+        {
+            bail!(
+                "authenticated remote owner binding changed while acquiring the revalidation guard"
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn establish_revalidation_remote_leases(
+    remote: &remote_coordination::RemoteCoordination,
+    bindings: &[RevalidationRemoteBindingSnapshot],
+) -> Result<Vec<RevalidationRemoteLease>> {
+    let mut leases = Vec::with_capacity(bindings.len());
+    for entry in bindings {
+        remote.bootstrap_existing_bindings(&[AuthenticatedClaimRemoteOwner {
+            token: entry.token,
+            run_identity: entry.binding.run_identity.clone(),
+            activation_nonce: entry.binding.activation_nonce.clone(),
+        }])?;
+        let lease = remote.work_lease(&entry.binding)?;
+        leases.push(RevalidationRemoteLease {
+            agent_id: entry.agent_id.clone(),
+            token: entry.token,
+            binding: entry.binding.clone(),
+            lease,
+        });
+    }
+    Ok(leases)
+}
+
+pub(crate) fn heartbeat_revalidation_remote_bindings(
+    remote: &remote_coordination::RemoteCoordination,
+    bindings: &[remote_coordination::RemoteOwnerBinding],
+) -> Result<()> {
+    for binding in bindings {
+        remote.heartbeat_binding(binding)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn invalidate_revalidation_remote_leases(leases: &[RevalidationRemoteLease]) {
+    for lease in leases {
+        lease.lease.signal_protected_work_lost();
+    }
+}
+
 /// Retains the already-existing claims writer lock for one bounded batch of
 /// mutation authorities. Heartbeat, sweep, takeover, and release stay
 /// serialized while the guard is alive. This is the claims lock only; it must
@@ -232,6 +475,18 @@ impl ExistingClaimsGuard {
 
     pub(crate) fn persist_handle(&self) -> Arc<Mutex<HeldClaimsPersist>> {
         Arc::clone(&self.persist)
+    }
+
+    pub(crate) fn verify_remote_bindings_unchanged(
+        &self,
+        prepared: &[RevalidationRemoteBindingSnapshot],
+    ) -> std::result::Result<(), ExistingClaimRevalidationError> {
+        let persist = self
+            .persist
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        verify_revalidation_remote_bindings_unchanged(&persist.frozen, prepared)
+            .map_err(|source| ExistingClaimRevalidationError::StateUnavailable { source })
     }
 }
 
@@ -276,7 +531,7 @@ impl ClaimTiming {
         Ok(timing)
     }
 
-    fn validate(self) -> Result<()> {
+    pub(crate) fn validate(self) -> Result<()> {
         if self.heartbeat_interval_seconds == 0
             || self.heartbeat_interval_seconds > MAX_CLAIM_TIMING_SECONDS
         {
@@ -402,6 +657,8 @@ struct AuthenticatedClaimsState {
     liveness: Vec<AuthenticatedClaimLiveness>,
     #[serde(default)]
     supersessions: Vec<AuthenticatedClaimSupersession>,
+    #[serde(default)]
+    remote_owners: Vec<AuthenticatedClaimRemoteOwner>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -552,7 +809,7 @@ impl RepositoryStateRoot {
         })
     }
 
-    fn open_existing(
+    pub(crate) fn open_existing(
         repo: &Repository,
         state_file: &'static str,
         lock_file: &'static str,
@@ -807,6 +1064,7 @@ fn validate_existing_authenticated_claims_snapshot(
         claims: snapshot.value.claims.clone(),
     })?;
     validate_claim_run_owners(&snapshot.value.claims, &snapshot.value.run_owners)?;
+    validate_claim_remote_owners(&snapshot.value.claims, &snapshot.value.remote_owners)?;
     validate_claim_liveness(
         snapshot.value.next_token,
         &snapshot.value.claims,
@@ -1001,6 +1259,7 @@ fn persist_exact_owner_heartbeat_locked(held: &mut HeldClaimsPersist, now: u64) 
         claims: next.claims.clone(),
     })?;
     validate_claim_run_owners(&next.claims, &next.run_owners)?;
+    validate_claim_remote_owners(&next.claims, &next.remote_owners)?;
     validate_claim_liveness(
         next.next_token,
         &next.claims,
@@ -1162,8 +1421,85 @@ fn claim_paths_overlap(left: &Path, right: &Path) -> bool {
     left == right || left.starts_with(right) || right.starts_with(left)
 }
 
+fn remote_authority_scopes_cover_claim_paths(
+    remote_scopes: &[String],
+    claim_paths: &[PathBuf],
+) -> Result<bool> {
+    use crate::publication::coordination_journal::normalize_coordination_scopes;
+    let claim_scopes = normalize_coordination_scopes(claim_paths)?;
+    Ok(claim_scopes.iter().all(|claim_scope| {
+        remote_scopes.iter().any(|remote_scope| {
+            claim_scope == remote_scope
+                || claim_scope
+                    .strip_prefix(remote_scope)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+    }))
+}
+
+#[cfg(test)]
+mod coordination_scope_coverage_tests {
+    use super::*;
+
+    #[test]
+    fn remote_scope_cannot_authorize_a_parent_sibling_or_uncovered_claim() {
+        for (remote, claims, expected) in [
+            (vec!["path:src/lib.rs"], vec!["src"], false),
+            (vec!["path:src"], vec!["src-other/lib.rs"], false),
+            (vec!["path:src"], vec!["src/lib.rs", "README.md"], false),
+            (
+                vec!["path:src", "path:README.md"],
+                vec!["src/lib.rs", "README.md"],
+                true,
+            ),
+            (vec!["path:src/lib.rs"], vec!["src/lib.rs"], true),
+        ] {
+            let remote = remote.into_iter().map(String::from).collect::<Vec<_>>();
+            let claims = claims.into_iter().map(PathBuf::from).collect::<Vec<_>>();
+            assert_eq!(
+                remote_authority_scopes_cover_claim_paths(&remote, &claims).unwrap(),
+                expected,
+                "remote={remote:?}, claims={claims:?}"
+            );
+        }
+    }
+}
+
 impl SyncStore {
     pub fn open(repo_path: impl AsRef<Path>) -> Result<Self> {
+        let repo = crate::git_repository::discover(repo_path.as_ref()).with_context(|| {
+            format!(
+                "failed to discover repository from {}",
+                repo_path.as_ref().display()
+            )
+        })?;
+        let repo_path = repo.workdir().unwrap_or_else(|| repo.path()).to_path_buf();
+        let store = Self {
+            repo_path,
+            state: RepositoryStateRoot::open(&repo, "claims.json", "claims.lock")?,
+            remote: None,
+        };
+        store.ensure_authenticated_initialized()?;
+        let remote = match crate::publication::coordination_mode::load_selected_remote_service(
+            &store.repo_path,
+        )? {
+            None => None,
+            Some(service) => {
+                let coordination =
+                    remote_coordination::RemoteCoordination::from_production_service(service);
+                Some(Arc::new(coordination))
+            }
+        };
+        let store = Self { remote, ..store };
+        store.rehydrate_remote_permits()?;
+        Ok(store)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_with_remote_coordination(
+        repo_path: impl AsRef<Path>,
+        remote: Arc<remote_coordination::RemoteCoordination>,
+    ) -> Result<Self> {
         let repo = crate::git_repository::discover(repo_path.as_ref()).with_context(|| {
             format!(
                 "failed to discover repository from {}",
@@ -1173,9 +1509,419 @@ impl SyncStore {
         let store = Self {
             repo_path: repo.workdir().unwrap_or_else(|| repo.path()).to_path_buf(),
             state: RepositoryStateRoot::open(&repo, "claims.json", "claims.lock")?,
+            remote: Some(remote),
         };
         store.ensure_authenticated_initialized()?;
+        store.rehydrate_remote_permits()?;
+        #[cfg(test)]
+        if let Some(remote) = store.remote.as_ref() {
+            register_test_injected_remote_coordination(&store.repo_path, Arc::clone(remote));
+        }
         Ok(store)
+    }
+
+    pub(crate) fn remote_coordination_handle(
+        &self,
+    ) -> Option<Arc<remote_coordination::RemoteCoordination>> {
+        self.remote.clone()
+    }
+
+    /// Live remote work lease plus composed cancellation for managed subprocesses on a claim.
+    /// Reserve a remote shared-effect slot for publication Git/PR writes on `token`.
+    ///
+    /// Returns [`RemotePublicationEffectAdmission::LocalOnly`] when remote coordination is not
+    /// selected. Selected remote without an authenticated owner binding fails closed.
+    pub(crate) fn reserve_remote_publication_effect(
+        &self,
+        token: ClaimToken,
+        publication_effect: crate::publication::coordination_effect::PublicationEffectDescriptorV1,
+    ) -> Result<remote_coordination::RemotePublicationEffectAdmission> {
+        let Some(remote) = &self.remote else {
+            return Ok(remote_coordination::RemotePublicationEffectAdmission::LocalOnly);
+        };
+        let bindings = self.read_remote_owner_bindings()?;
+        let binding = remote_coordination::remote_binding_for_token(&bindings, token)?
+            .with_context(|| {
+                format!(
+                    "claim token {} has no authenticated remote owner binding while remote coordination is selected",
+                    token.get()
+                )
+            })?;
+        let inspection = self.inspect_remote_claim_owner(token)?;
+        if !inspection.locally_authenticated() {
+            bail!(
+                "remote publication effect reservation requires locally authenticated remote activation on this host"
+            );
+        }
+        let binding_owner = binding.owner()?;
+        if inspection.owner() != &binding_owner {
+            bail!(
+                "claim token {} remote inspection owner does not match authenticated binding",
+                token.get()
+            );
+        }
+        let claim_paths = self
+            .snapshot()?
+            .into_iter()
+            .find(|claim| claim.token == token)
+            .map(|claim| claim.paths)
+            .with_context(|| format!("claim token {} is not active", token.get()))?;
+        if !remote_authority_scopes_cover_claim_paths(inspection.scopes(), &claim_paths)? {
+            bail!(
+                "remote authority scopes do not cover authenticated claim paths for token {}",
+                token.get()
+            );
+        }
+        let effect_id = publication_effect.effect_id().to_string();
+        let shared = remote.reserve_bound_publication_effect(&binding, publication_effect)?;
+        let work_lease = remote.work_lease(&binding)?;
+        Ok(
+            remote_coordination::RemotePublicationEffectAdmission::Reserved(Box::new(
+                remote_coordination::RemoteClaimSharedEffectReservation::new(
+                    token, binding, effect_id, shared, work_lease,
+                ),
+            )),
+        )
+    }
+
+    /// Complete a reserved shared effect using caller-supplied provider-read reconciliation.
+    pub(crate) fn complete_remote_publication_effect(
+        &self,
+        reservation: remote_coordination::RemoteClaimSharedEffectReservation,
+        reconciliation: crate::publication::coordination_journal::EffectReconciliationReceipt,
+    ) -> Result<()> {
+        let remote = self
+            .remote
+            .as_ref()
+            .context("remote coordination is not selected")?;
+        let bindings = self.read_remote_owner_bindings()?;
+        let binding = remote_coordination::remote_binding_for_token(&bindings, reservation.claim_token())?
+            .with_context(|| {
+                format!(
+                    "claim token {} has no authenticated remote owner binding while remote coordination is selected",
+                    reservation.claim_token().get()
+                )
+            })?;
+        if binding != *reservation.binding() {
+            bail!(
+                "claim token {} remote owner binding changed since effect reservation",
+                reservation.claim_token().get()
+            );
+        }
+        let reservation_owner = reservation.owner()?;
+        let binding_owner = binding.owner()?;
+        if reservation_owner != binding_owner {
+            bail!(
+                "claim token {} reserved publication effect owner does not match live remote binding",
+                reservation.claim_token().get()
+            );
+        }
+        let reserved_descriptor = reservation
+            .shared_permit()
+            .publication_effect()
+            .context("reserved publication effect missing bound descriptor")?;
+        if reserved_descriptor.effect_id() != reservation.effect_id() {
+            bail!("reserved shared permit descriptor does not match reservation effect id");
+        }
+        if reconciliation.effect_id() != reservation.effect_id() {
+            bail!("effect reconciliation receipt id does not match reserved publication effect");
+        }
+        if reservation.work_cancellation().is_cancelled() {
+            bail!("remote publication effect completion refused because remote work was cancelled");
+        }
+        let (binding, shared) = reservation.into_completion_parts();
+        remote.complete_bound_publication_effect(&binding, shared, reconciliation)
+    }
+
+    pub(crate) fn managed_process_cancellation_for_claim(
+        &self,
+        token: ClaimToken,
+        run: &crate::process_runner::ProcessCancellation,
+    ) -> Result<ManagedClaimProcessCancellation> {
+        let remote_lease = self.remote_work_lease(token)?;
+        let cancellation = match remote_lease.as_ref() {
+            Some(lease) => crate::process_runner::compose_process_cancellations(&[
+                run.clone(),
+                lease.cancellation().clone(),
+            ]),
+            None => run.clone(),
+        };
+        Ok(ManagedClaimProcessCancellation {
+            cancellation,
+            _remote_lease: remote_lease,
+        })
+    }
+
+    pub(crate) fn remote_work_lease(
+        &self,
+        token: ClaimToken,
+    ) -> Result<Option<remote_coordination::RemoteWorkLease>> {
+        let Some(remote) = &self.remote else {
+            return Ok(None);
+        };
+        let bindings = self.read_remote_owner_bindings()?;
+        let binding = remote_coordination::remote_binding_for_token(&bindings, token)?
+            .with_context(|| {
+                format!(
+                    "claim token {} has no authenticated remote owner binding while remote coordination is selected",
+                    token.get()
+                )
+            })?;
+        remote.work_lease(&binding).map(Some)
+    }
+
+    pub(crate) fn inspect_remote_claim_owner(
+        &self,
+        token: ClaimToken,
+    ) -> Result<crate::publication::coordination_admission::RemoteAuthorityInspection> {
+        let remote = self
+            .remote
+            .as_ref()
+            .context("remote coordination is not selected")?;
+        let bindings = self.read_remote_owner_bindings()?;
+        let binding = remote_coordination::remote_binding_for_token(&bindings, token)?
+            .context("claim token has no authenticated remote owner binding")?;
+        remote.inspect_binding(&binding)
+    }
+
+    /// Trusted remote journal authority for the configured coordination selection.
+    /// Never mints scope permits or mutates local claims.
+    pub fn remote_authority_observation(
+        &self,
+    ) -> Result<crate::publication::coordination_mode::RemoteCoordinationAuthorityReport> {
+        let remote = self
+            .remote
+            .as_ref()
+            .context("remote coordination is not selected")?;
+        let snapshot = remote.trusted_authority_snapshot()?;
+        crate::publication::coordination_mode::remote_coordination_authority_report_from_snapshot(
+            &snapshot,
+            remote.remote_claim_timing(),
+            remote.worktree(),
+            None,
+        )
+    }
+
+    /// Explicit remote takeover on a fresh host: observed predecessor identity is comparison input only.
+    /// Staleness, reservations, and journal CAS are enforced by the configured remote admission service.
+    pub fn takeover_remote<I, P>(
+        &self,
+        predecessor: CoordinationOwnerIdentity,
+        agent_id: impl AsRef<str>,
+        paths: I,
+        timing: Option<ClaimTiming>,
+    ) -> Result<ClaimTelemetryOutcome>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let remote = self
+            .remote
+            .as_ref()
+            .context("remote coordination is not selected")?;
+        let timing = timing.unwrap_or_else(|| remote.remote_claim_timing());
+        timing.validate()?;
+        self.takeover_remote_with_timing_internal(
+            predecessor,
+            agent_id,
+            paths,
+            timing,
+            current_unix_seconds,
+        )
+    }
+
+    fn takeover_remote_with_timing_internal<I, P>(
+        &self,
+        predecessor: CoordinationOwnerIdentity,
+        agent_id: impl AsRef<str>,
+        paths: I,
+        timing: ClaimTiming,
+        sample_now_unix_seconds: impl FnOnce() -> Result<u64>,
+    ) -> Result<ClaimTelemetryOutcome>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let remote = self
+            .remote
+            .as_ref()
+            .context("remote coordination is not selected")?;
+        let agent_id = agent_id.as_ref();
+        let scope_paths = paths
+            .into_iter()
+            .map(|path| PathBuf::from(path.as_ref()))
+            .collect::<Vec<_>>();
+        let normalized_scopes =
+            crate::publication::coordination_journal::normalize_coordination_scopes(
+                scope_paths.iter(),
+            )?;
+        let snapshot = remote.trusted_authority_snapshot()?;
+        let predecessor_record = snapshot
+            .active_owners()
+            .iter()
+            .find(|record| record.owner() == &predecessor)
+            .with_context(|| {
+                format!(
+                    "predecessor owner {} is not active in trusted remote authority",
+                    predecessor.run_identity()
+                )
+            })?;
+        if predecessor_record.scopes() != normalized_scopes {
+            bail!("takeover scope paths must exactly match predecessor remote scopes");
+        }
+        let successor_run = agent_id.to_string();
+        let activation_nonce = remote.mint_activation_nonce(&successor_run)?;
+        let reserved = self.with_locked_update(
+            move |coordinator, run_owners, liveness, supersessions, _remote_owners| {
+                let now_unix_seconds = sample_now_unix_seconds()?;
+                let active_claims = coordinator.snapshot()?;
+                ensure_unambiguous_liveness(
+                    &active_claims,
+                    liveness,
+                    supersessions,
+                    now_unix_seconds,
+                )?;
+                let claim = coordinator.claim_paths(agent_id, scope_paths.clone())?;
+                liveness.push(new_claim_liveness(&claim, timing, now_unix_seconds, None)?);
+                let _ = run_owners;
+                Ok((claim, activation_nonce))
+            },
+        )?;
+        let (claim, activation_nonce) = reserved;
+        let remote_outcome = remote.apply_remote_scope_authority(
+            remote_coordination::RemoteScopeAuthorityOperation::Takeover {
+                predecessor,
+                run_identity: successor_run.clone(),
+                activation_nonce: activation_nonce.clone(),
+            },
+            &claim.paths,
+        );
+        let claim = self.finalize_remote_local_claim_after_authority(claim, remote_outcome)?;
+        let assessments = (|| {
+            MegafileStore::open_with_thresholds(
+                &self.repo_path,
+                MegafileThresholds::provisional_bootstrap(),
+            )
+            .context("takeover-remote megafile telemetry could not be opened")?
+            .record_claim(&claim)
+            .context("takeover-remote megafile telemetry could not be recorded")
+        })()
+        .with_context(|| {
+            format!(
+                "remote takeover successor claim token {} remains durable for agent '{}' and paths {:?}, but its required megafile telemetry failed; inspect the authenticated claim list and explicitly release token {} before retrying if rollback is intended",
+                claim.token.get(),
+                claim.agent_id,
+                claim.paths,
+                claim.token.get()
+            )
+        })?;
+        let warnings = assessments
+            .into_iter()
+            .filter(|assessment| assessment.is_megafile)
+            .map(|assessment| MegafileClaimWarning {
+                version: 1,
+                path: assessment.path.clone(),
+                assessment,
+            })
+            .collect::<Vec<_>>();
+        Ok(ClaimTelemetryOutcome { claim, warnings })
+    }
+
+    fn finalize_remote_local_claim_after_authority(
+        &self,
+        claim: PathClaim,
+        remote_outcome: Result<
+            crate::publication::coordination_admission::CoordinationAdmissionResult<
+                remote_coordination::RemoteOwnerBinding,
+            >,
+        >,
+    ) -> Result<PathClaim> {
+        use crate::publication::coordination_admission::{
+            format_coordination_admission_refusal, CoordinationAdmissionRefusal,
+            CoordinationAdmissionResult,
+        };
+
+        enum FinalizeOutcome {
+            Committed(PathClaim),
+            RolledBackRefusal(String),
+            AmbiguousRemoteOutcome(String),
+        }
+
+        let claim_token = claim.token;
+        let outcome = self.with_locked_update(
+            move |coordinator, _run_owners, liveness, _supersessions, remote_owners| {
+                let active = coordinator.snapshot()?;
+                let still_active = active
+                    .iter()
+                    .any(|active_claim| active_claim.token == claim.token);
+                if !still_active {
+                    bail!(
+                        "local claim token {} was released while remote authority ran; refusing ambiguous claim",
+                        claim.token.get()
+                    );
+                }
+                match remote_outcome {
+                    Ok(CoordinationAdmissionResult::Ready(binding)) => {
+                        remote_owners.push(AuthenticatedClaimRemoteOwner {
+                            token: claim.token,
+                            run_identity: binding.run_identity,
+                            activation_nonce: binding.activation_nonce,
+                        });
+                        Ok(FinalizeOutcome::Committed(claim))
+                    }
+                    Ok(CoordinationAdmissionResult::Refused(
+                        reason @ CoordinationAdmissionRefusal::RemoteUnknown { .. },
+                    )) => Ok(FinalizeOutcome::AmbiguousRemoteOutcome(
+                        format_coordination_admission_refusal(&reason),
+                    )),
+                    Ok(CoordinationAdmissionResult::Refused(reason)) => {
+                        Self::release_local_claim_reservation(coordinator, liveness, claim.token)?;
+                        Ok(FinalizeOutcome::RolledBackRefusal(
+                            format_coordination_admission_refusal(&reason),
+                        ))
+                    }
+                    Err(error) => Ok(FinalizeOutcome::AmbiguousRemoteOutcome(format!(
+                        "{error:#}"
+                    ))),
+                }
+            },
+        )?;
+        match outcome {
+            FinalizeOutcome::Committed(claim) => Ok(claim),
+            FinalizeOutcome::RolledBackRefusal(reason) => {
+                bail!("remote scope authority refused: {reason}")
+            }
+            FinalizeOutcome::AmbiguousRemoteOutcome(reason) => {
+                bail!(
+                    "remote scope authority outcome is ambiguous; local claim token {} remains reserved for reconciliation: {reason}",
+                    claim_token.get()
+                )
+            }
+        }
+    }
+
+    fn release_local_claim_reservation(
+        coordinator: &SyncCoordinator,
+        liveness: &mut Vec<AuthenticatedClaimLiveness>,
+        token: ClaimToken,
+    ) -> Result<()> {
+        coordinator.release(token)?;
+        liveness.retain(|entry| entry.token != token);
+        Ok(())
+    }
+
+    fn read_remote_owner_bindings(&self) -> Result<Vec<AuthenticatedClaimRemoteOwner>> {
+        let lock = self.state.lock()?;
+        let store = self.open_authenticated_store(&lock)?;
+        Ok(store.current().value.remote_owners.clone())
+    }
+
+    fn rehydrate_remote_permits(&self) -> Result<()> {
+        if let Some(remote) = &self.remote {
+            let bindings = self.read_remote_owner_bindings()?;
+            remote.bootstrap_existing_bindings(&bindings)?;
+        }
+        Ok(())
     }
 
     pub fn state_path(&self) -> &Path {
@@ -1342,27 +2088,39 @@ impl SyncStore {
             .validate()
             .context("configured megafile claim thresholds are invalid")?;
         timing.validate()?;
-        let claim =
-            self.with_locked_update(move |coordinator, run_owners, liveness, supersessions| {
-                let now_unix_seconds = sample_now_unix_seconds()?;
-                let active_claims = coordinator.snapshot()?;
-                ensure_unambiguous_liveness(
-                    &active_claims,
-                    liveness,
-                    supersessions,
-                    now_unix_seconds,
-                )?;
-                let claim = coordinator.claim_paths(agent_id.as_ref(), paths)?;
-                liveness.push(new_claim_liveness(&claim, timing, now_unix_seconds, None)?);
-                if let Some((run_id, process)) = run_owner {
-                    run_owners.push(AuthenticatedClaimRunOwner {
-                        token: claim.token,
-                        run_id,
-                        process,
-                    });
-                }
-                Ok(claim)
-            })?;
+        let claim = if let Some(remote) = &self.remote {
+            self.claim_paths_with_remote_authority(
+                remote,
+                agent_id.as_ref(),
+                paths,
+                timing,
+                sample_now_unix_seconds,
+                run_owner,
+            )?
+        } else {
+            self.with_locked_update(
+                move |coordinator, run_owners, liveness, supersessions, _remote_owners| {
+                    let now_unix_seconds = sample_now_unix_seconds()?;
+                    let active_claims = coordinator.snapshot()?;
+                    ensure_unambiguous_liveness(
+                        &active_claims,
+                        liveness,
+                        supersessions,
+                        now_unix_seconds,
+                    )?;
+                    let claim = coordinator.claim_paths(agent_id.as_ref(), paths)?;
+                    liveness.push(new_claim_liveness(&claim, timing, now_unix_seconds, None)?);
+                    if let Some((run_id, process)) = run_owner {
+                        run_owners.push(AuthenticatedClaimRunOwner {
+                            token: claim.token,
+                            run_id,
+                            process,
+                        });
+                    }
+                    Ok(claim)
+                },
+            )?
+        };
         let assessments = (|| {
             MegafileStore::open_with_thresholds(&self.repo_path, thresholds)
                 .context("megafile telemetry could not be opened")?
@@ -1391,17 +2149,105 @@ impl SyncStore {
         Ok(ClaimTelemetryOutcome { claim, warnings })
     }
 
+    fn claim_paths_with_remote_authority<I, P>(
+        &self,
+        remote: &remote_coordination::RemoteCoordination,
+        agent_id: &str,
+        paths: I,
+        timing: ClaimTiming,
+        sample_now_unix_seconds: impl FnOnce() -> Result<u64>,
+        run_owner: Option<(String, ClaimProcessIdentity)>,
+    ) -> Result<PathClaim>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let run_identity = run_owner
+            .as_ref()
+            .map(|(run_id, _)| run_id.clone())
+            .unwrap_or_else(|| agent_id.to_string());
+        let activation_nonce = remote.mint_activation_nonce(&run_identity)?;
+        let scope_paths = paths
+            .into_iter()
+            .map(|path| PathBuf::from(path.as_ref()))
+            .collect::<Vec<_>>();
+        let reserved = self.with_locked_update(
+            move |coordinator, run_owners, liveness, supersessions, _remote_owners| {
+                let now_unix_seconds = sample_now_unix_seconds()?;
+                let active_claims = coordinator.snapshot()?;
+                ensure_unambiguous_liveness(
+                    &active_claims,
+                    liveness,
+                    supersessions,
+                    now_unix_seconds,
+                )?;
+                let claim = coordinator.claim_paths(agent_id, scope_paths.clone())?;
+                liveness.push(new_claim_liveness(&claim, timing, now_unix_seconds, None)?);
+                if let Some((run_id, process)) = run_owner.clone() {
+                    run_owners.push(AuthenticatedClaimRunOwner {
+                        token: claim.token,
+                        run_id,
+                        process,
+                    });
+                }
+                Ok((claim, activation_nonce))
+            },
+        )?;
+        let (claim, activation_nonce) = reserved;
+        let remote_outcome = remote.apply_remote_scope_authority(
+            remote_coordination::RemoteScopeAuthorityOperation::Admit {
+                run_identity: run_identity.clone(),
+                activation_nonce: activation_nonce.clone(),
+            },
+            &claim.paths,
+        );
+        self.finalize_remote_local_claim_after_authority(claim, remote_outcome)
+    }
+
     pub fn release(&self, token: ClaimToken) -> Result<PathClaim> {
-        self.with_locked_update(|coordinator, _, _, _| {
+        if let Some(remote) = &self.remote {
+            let bindings = self.read_remote_owner_bindings()?;
+            if let Some(binding) = remote_coordination::remote_binding_for_token(&bindings, token)?
+            {
+                remote.release_binding(&binding, "sync-store-release")?;
+            }
+        }
+        self.with_locked_update(|coordinator, _, _, _, remote_owners| {
+            remote_owners.retain(|owner| owner.token != token);
             coordinator.release(token).map_err(Into::into)
         })
     }
 
     pub fn release_by_agent(&self, agent_id: impl AsRef<str>) -> Result<Vec<PathClaim>> {
-        self.with_locked_update(|coordinator, _, _, _| {
-            coordinator
-                .release_by_agent(agent_id.as_ref())
-                .map_err(Into::into)
+        let agent_id = agent_id.as_ref();
+        if let Some(remote) = &self.remote {
+            let bindings = self.read_remote_owner_bindings()?;
+            let lock = self.state.lock()?;
+            let store = self.open_authenticated_store(&lock)?;
+            for claim in store
+                .current()
+                .value
+                .claims
+                .iter()
+                .filter(|claim| claim.agent_id == agent_id)
+            {
+                if let Some(binding) =
+                    remote_coordination::remote_binding_for_token(&bindings, claim.token)?
+                {
+                    remote.release_binding(&binding, "sync-store-release-by-agent")?;
+                }
+            }
+        }
+        self.with_locked_update(|coordinator, _, _, _, remote_owners| {
+            let released = coordinator
+                .release_by_agent(agent_id)
+                .map_err(anyhow::Error::from)?;
+            let released_tokens = released
+                .iter()
+                .map(|claim| claim.token)
+                .collect::<BTreeSet<_>>();
+            remote_owners.retain(|owner| !released_tokens.contains(&owner.token));
+            Ok(released)
         })
     }
 
@@ -1425,7 +2271,13 @@ impl SyncStore {
             timing.validate()?;
         }
         let agent_id = agent_id.as_ref();
-        self.with_locked_update(|coordinator, _, liveness, supersessions| {
+        if let Some(remote) = &self.remote {
+            let bindings = self.read_remote_owner_bindings()?;
+            let binding = remote_coordination::remote_binding_for_token(&bindings, token)?
+                .context("selected remote coordination requires an authenticated owner binding before heartbeat")?;
+            remote.heartbeat_binding(&binding)?;
+        }
+        self.with_locked_update(|coordinator, _, liveness, supersessions, _remote_owners| {
             ensure_supersession_time_not_future(supersessions, now_unix_seconds)?;
             let claims = coordinator.snapshot()?;
             let claim = claims
@@ -1512,7 +2364,7 @@ impl SyncStore {
     }
 
     fn sweep_stale_at(&self, now_unix_seconds: u64) -> Result<ClaimSweepReport> {
-        self.with_locked_update(|coordinator, _, liveness, supersessions| {
+        self.with_locked_update(|coordinator, _, liveness, supersessions, _remote_owners| {
             let claims = coordinator.snapshot()?;
             ensure_unambiguous_liveness(&claims, liveness, supersessions, now_unix_seconds)?;
             let mut newly_takeover_eligible = Vec::new();
@@ -1568,85 +2420,121 @@ impl SyncStore {
             timing.validate()?;
         }
         let agent_id = agent_id.as_ref();
-        let mut outcome = self.with_locked_update(|coordinator, _, liveness, supersessions| {
-            let claims = coordinator.snapshot()?;
-            ensure_unambiguous_liveness(&claims, liveness, supersessions, now_unix_seconds)?;
-            let prior_claim = claims
-                .iter()
-                .find(|claim| claim.token == prior_token)
-                .cloned()
-                .with_context(|| format!("claim token is not active: {}", prior_token.get()))?;
-            let prior_liveness = liveness
-                .iter()
-                .find(|entry| entry.token == prior_token)
-                .cloned()
-                .context("active predecessor claim has ambiguous liveness metadata")?;
-            let prior_report = claim_liveness_report(
-                prior_claim.clone(),
-                Some(&prior_liveness),
-                now_unix_seconds,
-            )?;
-            if prior_report.state != ClaimLivenessState::TakeoverEligible {
-                bail!(
-                    "claim '{}' is not takeover-eligible (state: {:?})",
-                    prior_liveness.claim_id,
-                    prior_report.state
-                );
+        let remote_successor = if let Some(remote) = &self.remote {
+            let bindings = self.read_remote_owner_bindings()?;
+            if let Some(binding) =
+                remote_coordination::remote_binding_for_token(&bindings, prior_token)?
+            {
+                let predecessor = binding.owner()?;
+                let lock = self.state.lock()?;
+                let store = self.open_authenticated_store(&lock)?;
+                let prior_claim = store
+                    .current()
+                    .value
+                    .claims
+                    .iter()
+                    .find(|claim| claim.token == prior_token)
+                    .cloned()
+                    .with_context(|| format!("claim token is not active: {}", prior_token.get()))?;
+                let successor_run = agent_id.to_string();
+                Some(remote.remote_takeover(predecessor, &successor_run, &prior_claim.paths)?)
+            } else {
+                None
             }
-            if supersessions.len() >= MAX_SUPERSESSION_RECORDS {
-                bail!(
-                    "claim supersession history reached its {} record bound",
-                    MAX_SUPERSESSION_RECORDS
-                );
-            }
-            let lineage_depth =
-                supersession_lineage_depth(&prior_liveness.claim_id, supersessions)?;
-            if lineage_depth >= MAX_SUPERSESSION_LINEAGE_DEPTH {
-                bail!(
-                    "claim supersession lineage reached its {}-claim depth bound",
-                    MAX_SUPERSESSION_LINEAGE_DEPTH
-                );
-            }
-            let inherited_timing = ClaimTiming {
-                heartbeat_interval_seconds: prior_liveness.heartbeat_interval_seconds,
-                stale_after_seconds: prior_liveness.stale_after_seconds,
-            };
-            let successor_timing = timing.unwrap_or(inherited_timing);
-            successor_timing.validate()?;
-            let path_count = prior_claim.paths.len();
-            let paths_checksum = claim_paths_checksum(&prior_claim.paths)?;
+        } else {
+            None
+        };
+        let mut outcome =
+            self.with_locked_update(|coordinator, _, liveness, supersessions, remote_owners| {
+                let claims = coordinator.snapshot()?;
+                ensure_unambiguous_liveness(&claims, liveness, supersessions, now_unix_seconds)?;
+                let prior_claim = claims
+                    .iter()
+                    .find(|claim| claim.token == prior_token)
+                    .cloned()
+                    .with_context(|| format!("claim token is not active: {}", prior_token.get()))?;
+                let prior_liveness = liveness
+                    .iter()
+                    .find(|entry| entry.token == prior_token)
+                    .cloned()
+                    .context("active predecessor claim has ambiguous liveness metadata")?;
+                let prior_report = claim_liveness_report(
+                    prior_claim.clone(),
+                    Some(&prior_liveness),
+                    now_unix_seconds,
+                )?;
+                if prior_report.state != ClaimLivenessState::TakeoverEligible {
+                    bail!(
+                        "claim '{}' is not takeover-eligible (state: {:?})",
+                        prior_liveness.claim_id,
+                        prior_report.state
+                    );
+                }
+                if supersessions.len() >= MAX_SUPERSESSION_RECORDS {
+                    bail!(
+                        "claim supersession history reached its {} record bound",
+                        MAX_SUPERSESSION_RECORDS
+                    );
+                }
+                let lineage_depth =
+                    supersession_lineage_depth(&prior_liveness.claim_id, supersessions)?;
+                if lineage_depth >= MAX_SUPERSESSION_LINEAGE_DEPTH {
+                    bail!(
+                        "claim supersession lineage reached its {}-claim depth bound",
+                        MAX_SUPERSESSION_LINEAGE_DEPTH
+                    );
+                }
+                let inherited_timing = ClaimTiming {
+                    heartbeat_interval_seconds: prior_liveness.heartbeat_interval_seconds,
+                    stale_after_seconds: prior_liveness.stale_after_seconds,
+                };
+                let successor_timing = timing.unwrap_or(inherited_timing);
+                successor_timing.validate()?;
+                let path_count = prior_claim.paths.len();
+                let paths_checksum = claim_paths_checksum(&prior_claim.paths)?;
 
-            let superseded_claim = coordinator.release(prior_token)?;
-            let claim = coordinator.claim_paths(agent_id, superseded_claim.paths.clone())?;
-            let successor_liveness = new_claim_liveness(
-                &claim,
-                successor_timing,
-                now_unix_seconds,
-                Some(prior_liveness.claim_id.clone()),
-            )?;
-            liveness.push(successor_liveness.clone());
-            let authenticated_lineage = AuthenticatedClaimSupersession {
-                prior_token,
-                prior_claim_id: prior_liveness.claim_id,
-                prior_agent_id: superseded_claim.agent_id.clone(),
-                successor_token: claim.token,
-                successor_claim_id: successor_liveness.claim_id.clone(),
-                successor_agent_id: claim.agent_id.clone(),
-                path_count,
-                paths_checksum,
-                superseded_at_unix_seconds: now_unix_seconds,
-            };
-            supersessions.push(authenticated_lineage.clone());
-            let liveness_report =
-                claim_liveness_report(claim.clone(), Some(&successor_liveness), now_unix_seconds)?;
-            Ok(ClaimTakeoverOutcome {
-                superseded_claim,
-                claim,
-                liveness: liveness_report,
-                lineage: claim_supersession_report(authenticated_lineage),
-                warnings: Vec::new(),
-            })
-        })?;
+                let superseded_claim = coordinator.release(prior_token)?;
+                let claim = coordinator.claim_paths(agent_id, superseded_claim.paths.clone())?;
+                let successor_liveness = new_claim_liveness(
+                    &claim,
+                    successor_timing,
+                    now_unix_seconds,
+                    Some(prior_liveness.claim_id.clone()),
+                )?;
+                liveness.push(successor_liveness.clone());
+                let authenticated_lineage = AuthenticatedClaimSupersession {
+                    prior_token,
+                    prior_claim_id: prior_liveness.claim_id,
+                    prior_agent_id: superseded_claim.agent_id.clone(),
+                    successor_token: claim.token,
+                    successor_claim_id: successor_liveness.claim_id.clone(),
+                    successor_agent_id: claim.agent_id.clone(),
+                    path_count,
+                    paths_checksum,
+                    superseded_at_unix_seconds: now_unix_seconds,
+                };
+                supersessions.push(authenticated_lineage.clone());
+                if let Some(binding) = &remote_successor {
+                    remote_owners.retain(|owner| owner.token != prior_token);
+                    remote_owners.push(AuthenticatedClaimRemoteOwner {
+                        token: claim.token,
+                        run_identity: binding.run_identity.clone(),
+                        activation_nonce: binding.activation_nonce.clone(),
+                    });
+                }
+                let liveness_report = claim_liveness_report(
+                    claim.clone(),
+                    Some(&successor_liveness),
+                    now_unix_seconds,
+                )?;
+                Ok(ClaimTakeoverOutcome {
+                    superseded_claim,
+                    claim,
+                    liveness: liveness_report,
+                    lineage: claim_supersession_report(authenticated_lineage),
+                    warnings: Vec::new(),
+                })
+            })?;
         let assessments = (|| {
             MegafileStore::open_with_thresholds(
                 &self.repo_path,
@@ -1767,6 +2655,7 @@ impl SyncStore {
             &mut Vec<AuthenticatedClaimRunOwner>,
             &mut Vec<AuthenticatedClaimLiveness>,
             &mut Vec<AuthenticatedClaimSupersession>,
+            &mut Vec<AuthenticatedClaimRemoteOwner>,
         ) -> Result<T>,
     ) -> Result<T> {
         let lock = self.state.lock()?;
@@ -1778,11 +2667,13 @@ impl SyncStore {
         let mut run_owners = store.current().value.run_owners.clone();
         let mut liveness = store.current().value.liveness.clone();
         let mut supersessions = store.current().value.supersessions.clone();
+        let mut remote_owners = store.current().value.remote_owners.clone();
         let output = operation(
             &coordinator,
             &mut run_owners,
             &mut liveness,
             &mut supersessions,
+            &mut remote_owners,
         )?;
         let snapshot = coordinator.to_snapshot()?;
         validate_sync_snapshot(&snapshot)?;
@@ -1793,10 +2684,13 @@ impl SyncStore {
             .collect::<BTreeSet<_>>();
         run_owners.retain(|owner| active_tokens.contains(&owner.token));
         liveness.retain(|entry| active_tokens.contains(&entry.token));
+        remote_owners.retain(|owner| active_tokens.contains(&owner.token));
         run_owners.sort_by_key(|owner| owner.token);
         liveness.sort_by_key(|entry| entry.token);
+        remote_owners.sort_by_key(|owner| owner.token);
         supersessions.sort_by_key(|entry| entry.successor_token);
         validate_claim_run_owners(&snapshot.claims, &run_owners)?;
+        validate_claim_remote_owners(&snapshot.claims, &remote_owners)?;
         validate_claim_liveness(
             snapshot.next_token,
             &snapshot.claims,
@@ -1808,6 +2702,7 @@ impl SyncStore {
             && run_owners == store.current().value.run_owners
             && liveness == store.current().value.liveness
             && supersessions == store.current().value.supersessions
+            && remote_owners == store.current().value.remote_owners
         {
             self.state.verify_lock(&lock)?;
             return Ok(output);
@@ -1827,6 +2722,7 @@ impl SyncStore {
             run_owners,
             liveness,
             supersessions,
+            remote_owners,
         };
         if revision % 4_096 == 0 {
             let authenticator = repository_authenticator_key_only(&self.repo_path)?;
@@ -1838,6 +2734,14 @@ impl SyncStore {
         self.ensure_legacy_retirement(&store, &lock)?;
         self.state.verify_lock(&lock)?;
         Ok(output)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_clear_authenticated_remote_owner_bindings(&self) -> Result<()> {
+        self.with_locked_update(|_, _, _, _, remote_owners| {
+            remote_owners.clear();
+            Ok(())
+        })
     }
 
     fn with_locked_read<T>(
@@ -1894,6 +2798,7 @@ impl SyncStore {
                 run_owners: Vec::new(),
                 liveness: Vec::new(),
                 supersessions: Vec::new(),
+                remote_owners: Vec::new(),
             },
             LegacyAdoption::Present(bytes) => {
                 let snapshot = match serde_json::from_slice::<PersistedSyncState>(&bytes) {
@@ -1930,6 +2835,7 @@ impl SyncStore {
                     run_owners: Vec::new(),
                     liveness: Vec::new(),
                     supersessions: Vec::new(),
+                    remote_owners: Vec::new(),
                 }
             }
         };
@@ -1974,16 +2880,18 @@ impl SyncStore {
             next_token: snapshot.value.next_token,
             claims: snapshot.value.claims.clone(),
         })?;
-        validate_claim_run_owners(&snapshot.value.claims, &snapshot.value.run_owners).and_then(
-            |()| {
+        validate_claim_run_owners(&snapshot.value.claims, &snapshot.value.run_owners)
+            .and_then(|()| {
+                validate_claim_remote_owners(&snapshot.value.claims, &snapshot.value.remote_owners)
+            })
+            .and_then(|()| {
                 validate_claim_liveness(
                     snapshot.value.next_token,
                     &snapshot.value.claims,
                     &snapshot.value.liveness,
                     &snapshot.value.supersessions,
                 )
-            },
-        )
+            })
     }
 
     fn ensure_legacy_retirement(
@@ -2031,6 +2939,7 @@ impl SyncStore {
             run_owners: Vec::new(),
             liveness: Vec::new(),
             supersessions: Vec::new(),
+            remote_owners: Vec::new(),
         };
         store.commit(revision, value)?;
         self.state.verify_lock(lock)
@@ -2285,6 +3194,37 @@ fn supersession_lineage_depth(
         current = &entry.prior_claim_id;
     }
     Ok(depth)
+}
+
+fn validate_claim_remote_owners(
+    claims: &[PathClaim],
+    remote_owners: &[AuthenticatedClaimRemoteOwner],
+) -> Result<()> {
+    if remote_owners.len() > claims.len() {
+        bail!("authenticated remote-owner count exceeds active claim count");
+    }
+    let active_tokens = claims
+        .iter()
+        .map(|claim| claim.token)
+        .collect::<BTreeSet<_>>();
+    let mut seen_tokens = BTreeSet::new();
+    for owner in remote_owners {
+        if !active_tokens.contains(&owner.token) {
+            bail!(
+                "authenticated remote owner references inactive claim token {}",
+                owner.token.get()
+            );
+        }
+        if !seen_tokens.insert(owner.token) {
+            bail!(
+                "authenticated claim token {} has duplicate remote owners",
+                owner.token.get()
+            );
+        }
+        CoordinationOwnerIdentity::new(&owner.run_identity, &owner.activation_nonce)
+            .context("authenticated remote owner identity is invalid")?;
+    }
+    Ok(())
 }
 
 fn validate_claim_run_owners(
@@ -3572,7 +4512,7 @@ mod tests {
         let writer_thread = std::thread::spawn(move || {
             ready_tx.send(()).expect("signal ready");
             start_rx.recv().expect("receive start");
-            writer.with_locked_update(|coordinator, _, _, _| {
+            writer.with_locked_update(|coordinator, _, _, _, _| {
                 coordinator
                     .claim_paths("neutral-arbiter", ["src"])
                     .map_err(Into::into)

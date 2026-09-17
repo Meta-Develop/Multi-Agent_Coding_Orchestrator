@@ -43,8 +43,14 @@ use crate::{
         WorktreeReusePolicy,
     },
     protected_path::DeclaredPathCoordinate,
+    publication::coordination_journal::CoordinationOwnerIdentity,
     publication::{
-        self, ForgeKind, IssuePublicationOptions, PrPublicationOptions, PrPublicationReport,
+        self,
+        coordination_mode::{
+            configure_remote_coordination, disable_remote_coordination,
+            remote_coordination_authority_observation, remote_coordination_status,
+        },
+        ForgeKind, IssuePublicationOptions, PrPublicationOptions, PrPublicationReport,
         PrPublicationStatus,
     },
     repo_map::{self, RepoEntryKind, RepoMap},
@@ -3367,13 +3373,98 @@ impl SyncCommand {
                 )?;
                 print_query_report(&report, args.json)
             }
+            SyncSubcommand::TakeoverRemote(args) => {
+                let predecessor = CoordinationOwnerIdentity::new(
+                    &args.predecessor_run_identity,
+                    &args.predecessor_activation_nonce,
+                )
+                .context("invalid predecessor remote owner identity")?;
+                let paths = args
+                    .paths
+                    .iter()
+                    .map(normalize_repo_relative_path)
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .context("takeover-remote paths must be repository-relative")?;
+                let store = SyncStore::open(args.repo)?;
+                let outcome = store.takeover_remote(
+                    predecessor,
+                    &args.agent_id,
+                    paths,
+                    args.timing.timing()?,
+                )?;
+                print_claim_telemetry_outcome(&outcome, args.json)
+            }
             SyncSubcommand::History(args) => {
                 let store = SyncStore::open(args.repo)?;
                 let history = store.supersession_history()?;
                 print_query_report(&history, args.json)
             }
+            SyncSubcommand::Coordination(command) => command.run(),
         }
     }
+}
+
+#[derive(Debug, Args)]
+struct SyncCoordinationCommand {
+    #[command(subcommand)]
+    command: SyncCoordinationSubcommand,
+}
+
+impl SyncCoordinationCommand {
+    fn run(self) -> Result<()> {
+        match self.command {
+            SyncCoordinationSubcommand::Configure(args) => {
+                let report = configure_remote_coordination(&args.repo, &args.config)?;
+                print_query_report(&report, args.json)
+            }
+            SyncCoordinationSubcommand::Status(args) => {
+                let report = remote_coordination_status(&args.repo)?;
+                print_query_report(&report, args.json)
+            }
+            SyncCoordinationSubcommand::Observe(args) => {
+                let report = remote_coordination_authority_observation(&args.repo)?;
+                print_query_report(&report, args.json)
+            }
+            SyncCoordinationSubcommand::Disable(args) => {
+                let report = disable_remote_coordination(&args.repo)?;
+                print_query_report(&report, args.json)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum SyncCoordinationSubcommand {
+    /// Validate and persist explicit remote GitHub CAS coordination selection.
+    Configure(ConfigureRemoteCoordinationArgs),
+    /// Report the authenticated remote coordination selection, if any.
+    Status(RemoteCoordinationStatusArgs),
+    /// Report trusted remote journal authority (active owners and timing); observation only.
+    Observe(RemoteCoordinationStatusArgs),
+    /// Clear an explicit remote coordination selection.
+    Disable(RemoteCoordinationStatusArgs),
+}
+
+#[derive(Debug, Args)]
+struct ConfigureRemoteCoordinationArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Repository-relative operator coordination config JSON.
+    config: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct RemoteCoordinationStatusArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -3396,8 +3487,12 @@ enum SyncSubcommand {
     Sweep(SweepSyncArgs),
     /// Atomically replace one takeover-eligible claim with a successor.
     Takeover(TakeoverSyncArgs),
+    /// Replace a stale remote owner using an explicitly observed predecessor identity.
+    TakeoverRemote(TakeoverRemoteSyncArgs),
     /// List the bounded durable claim-supersession audit history.
     History(StatusSyncArgs),
+    /// Configure explicit remote GitHub CAS coordination for sync claims.
+    Coordination(SyncCoordinationCommand),
 }
 
 #[derive(Debug, Args)]
@@ -3520,6 +3615,29 @@ struct TakeoverSyncArgs {
     prior_token: u64,
     /// Stable agent id for the successor claim.
     agent_id: String,
+    #[command(flatten)]
+    timing: ClaimTimingArgs,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct TakeoverRemoteSyncArgs {
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Observed predecessor coordination run identity (comparison input only).
+    #[arg(long)]
+    predecessor_run_identity: String,
+    /// Observed predecessor activation nonce (comparison input only).
+    #[arg(long)]
+    predecessor_activation_nonce: String,
+    /// Stable agent id for the successor claim / remote run identity.
+    agent_id: String,
+    /// Repository-relative scope paths that must exactly match the predecessor remote scopes.
+    #[arg(required = true)]
+    paths: Vec<PathBuf>,
     #[command(flatten)]
     timing: ClaimTimingArgs,
     /// Emit machine-readable JSON.
@@ -5069,6 +5187,82 @@ mod cli_integration_tests {
                 .expect("serialize automatic source"),
             "automatic"
         );
+    }
+
+    #[test]
+    fn sync_coordination_configure_parses_repo_relative_config() {
+        let parsed = Cli::try_parse_from([
+            "maco",
+            "sync",
+            "coordination",
+            "configure",
+            "config/coordination.json",
+            "--repo",
+            ".",
+            "--json",
+        ])
+        .expect("sync coordination configure should parse");
+        let Command::Sync(SyncCommand {
+            command:
+                SyncSubcommand::Coordination(SyncCoordinationCommand {
+                    command: SyncCoordinationSubcommand::Configure(args),
+                }),
+        }) = parsed.command
+        else {
+            panic!("expected sync coordination configure command");
+        };
+        assert_eq!(args.config, PathBuf::from("config/coordination.json"));
+        assert!(args.json);
+    }
+
+    #[test]
+    fn sync_coordination_observe_parses() {
+        let parsed = Cli::try_parse_from([
+            "maco",
+            "sync",
+            "coordination",
+            "observe",
+            "--repo",
+            ".",
+            "--json",
+        ])
+        .expect("sync coordination observe should parse");
+        let Command::Sync(SyncCommand {
+            command:
+                SyncSubcommand::Coordination(SyncCoordinationCommand {
+                    command: SyncCoordinationSubcommand::Observe(args),
+                }),
+        }) = parsed.command
+        else {
+            panic!("expected sync coordination observe command");
+        };
+        assert!(args.json);
+    }
+
+    #[test]
+    fn sync_takeover_remote_parses() {
+        let parsed = Cli::try_parse_from([
+            "maco",
+            "sync",
+            "takeover-remote",
+            "--predecessor-run-identity",
+            "run-a",
+            "--predecessor-activation-nonce",
+            "nonce-a",
+            "agent-b",
+            "src/a.rs",
+            "--json",
+        ])
+        .expect("sync takeover-remote should parse");
+        let Command::Sync(SyncCommand {
+            command: SyncSubcommand::TakeoverRemote(args),
+        }) = parsed.command
+        else {
+            panic!("expected sync takeover-remote command");
+        };
+        assert_eq!(args.predecessor_run_identity, "run-a");
+        assert_eq!(args.agent_id, "agent-b");
+        assert_eq!(args.paths, vec![PathBuf::from("src/a.rs")]);
     }
 
     fn eval_harness_run_args(argv: &[&str]) -> RunEvalHarnessArgs {

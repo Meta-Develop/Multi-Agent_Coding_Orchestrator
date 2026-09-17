@@ -311,6 +311,24 @@ impl ProcessCancellation {
             .iter()
             .any(|flag| flag.load(Ordering::Acquire))
     }
+
+    pub fn combined(sources: &[ProcessCancellation]) -> Self {
+        compose_process_cancellations(sources)
+    }
+}
+
+/// Clones each source's own cancellation flag plus any flattened inherited flags.
+/// `cancel()` on the result affects only this handle; sources are not mutated.
+pub fn compose_process_cancellations(sources: &[ProcessCancellation]) -> ProcessCancellation {
+    let mut inherited = Vec::new();
+    for source in sources {
+        inherited.push(Arc::clone(&source.requested));
+        inherited.extend(source.inherited.iter().cloned());
+    }
+    ProcessCancellation {
+        requested: Arc::new(AtomicBool::new(false)),
+        inherited,
+    }
 }
 #[cfg(target_os = "linux")]
 const SYSTEMD_SANDBOX_SHOW_PROPERTIES: &[&str] = &[
@@ -4451,5 +4469,36 @@ mod mechanical_executor_lifecycle_tests {
             "changed cwd must not execute the named-codex fixture"
         );
         drop(overlay);
+    }
+
+    #[test]
+    fn compose_process_cancellations_observes_sources_without_mutating_them() {
+        let source = ProcessCancellation::new();
+        let composed = compose_process_cancellations(std::slice::from_ref(&source));
+        assert!(!composed.is_cancelled());
+        source.cancel();
+        assert!(composed.is_cancelled());
+        composed.cancel();
+        assert!(source.is_cancelled());
+    }
+
+    #[test]
+    fn process_cancellation_combined_matches_compose_helper() {
+        let a = ProcessCancellation::new();
+        let b = ProcessCancellation::new();
+        let via_combined = ProcessCancellation::combined(&[a.clone(), b.clone()]);
+        b.cancel();
+        assert!(via_combined.is_cancelled());
+        assert!(!a.is_cancelled());
+    }
+
+    #[test]
+    fn compose_process_cancellations_observes_child_scope_without_cancelling_parent() {
+        let root = ProcessCancellation::new();
+        let child = root.child_scope();
+        let composed = compose_process_cancellations(std::slice::from_ref(&child));
+        child.cancel();
+        assert!(composed.is_cancelled());
+        assert!(!root.is_cancelled());
     }
 }
