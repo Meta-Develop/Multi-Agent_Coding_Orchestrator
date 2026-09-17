@@ -896,6 +896,18 @@ mod tests {
                         );
                     }
                 }
+                CoordinationGithubOperation::JournalRefHeadWithProviderTime { branch_name } => {
+                    let expected_ref = format!("refs/heads/{}", branch_name);
+                    crate::publication::coordination_github::parse_journal_ref_head_with_provider_time_response(
+                        &response,
+                        &expected_ref,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "JournalRefHeadWithProviderTime fixture for {label} was invalid: {response}"
+                        )
+                    })?;
+                }
                 CoordinationGithubOperation::AnchorItemComments { .. } => {
                     serde_json::from_str::<serde_json::Value>(&response).with_context(|| {
                         format!("AnchorItemComments fixture for {label} was not JSON: {response}")

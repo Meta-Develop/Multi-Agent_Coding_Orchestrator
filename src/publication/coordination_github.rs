@@ -5,10 +5,10 @@
 
 use super::coordination_journal::{
     preflight_proposed_journal_transition, AuthenticatedCommentEvidence, AuthoritySnapshot,
-    CoordinationIntent, CoordinationJournalConfig, EffectReconciliationVerifier,
-    IntentAdmissionTiming, JournalPointer, ProposedIntentAdmission, TrustedFiniteJournalHistory,
-    TrustedJournalReductionInput, VerifiedJournalEntry, MAX_JOURNAL_ENTRIES,
-    MAX_POINTER_FILE_BYTES,
+    CoordinationIntent, CoordinationIntentAction, CoordinationJournalConfig,
+    EffectReconciliationVerifier, IntentAdmissionTiming, JournalPointer, ProposedIntentAdmission,
+    TrustedFiniteJournalHistory, TrustedJournalReductionInput, VerifiedJournalEntry,
+    MAX_JOURNAL_ENTRIES, MAX_POINTER_FILE_BYTES,
 };
 use super::forge_transport::{
     ForgeActor, ForgeComment, ForgeItem, ForgeItemKind, ForgeRepository, ForgeTimestamp,
@@ -246,6 +246,9 @@ pub(crate) enum CoordinationGithubOperation {
     JournalRefHead {
         branch_name: String,
     },
+    JournalRefHeadWithProviderTime {
+        branch_name: String,
+    },
     Commit {
         oid: String,
     },
@@ -316,6 +319,20 @@ impl CoordinationGithubOperation {
                     "{base}/git/ref/heads/{}",
                     encode_github_path_segment(branch_name)
                 ))
+            }
+            Self::JournalRefHeadWithProviderTime { branch_name } => {
+                validate_branch_name(branch_name)?;
+                let endpoint = format!(
+                    "{base}/git/ref/heads/{}",
+                    encode_github_path_segment(branch_name)
+                );
+                (
+                    ["api", "--include", "--method", "GET", endpoint.as_str()]
+                        .into_iter()
+                        .map(OsString::from)
+                        .collect(),
+                    StdinMode::Null,
+                )
             }
             Self::Commit { oid } => {
                 validate_authenticated_github_oid(oid)?;
@@ -423,6 +440,196 @@ impl CoordinationGithubOperation {
             }
         })
     }
+}
+
+/// Bound `GET …/git/ref/heads/…` with a single authenticated `Date` response header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JournalRefHeadWithProviderTime {
+    pub(crate) head_oid: String,
+    pub(crate) provider_time: ForgeTimestamp,
+}
+
+fn split_github_include_response(raw: &str) -> Result<(&str, &str)> {
+    if raw.len() > GH_CAPTURE_LIMIT_BYTES {
+        bail!("coordination GitHub include response exceeds capture bound");
+    }
+    let (headers, body) = raw
+        .split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))
+        .context("coordination GitHub include response missing header/body separator")?;
+    if body.is_empty() {
+        bail!("coordination GitHub include response body is empty");
+    }
+    if body.len() > GH_CAPTURE_LIMIT_BYTES {
+        bail!("coordination GitHub include response body exceeds capture bound");
+    }
+    Ok((headers, body))
+}
+
+fn parse_github_include_date_header(headers: &str) -> Result<String> {
+    let mut lines = headers.lines();
+    let status = lines
+        .next()
+        .context("coordination GitHub include response omitted status line")?;
+    if !status.starts_with("HTTP/") {
+        bail!("coordination GitHub include response status line was malformed");
+    }
+    let status_code = status
+        .split_whitespace()
+        .nth(1)
+        .context("coordination GitHub include status line omitted status code")?;
+    if status_code != "200" {
+        bail!("coordination GitHub include response status was not HTTP 200");
+    }
+    let mut dates = Vec::new();
+    for line in lines {
+        if line.starts_with("HTTP/") {
+            bail!("coordination GitHub include response contained multiple HTTP status blocks");
+        }
+        if line.is_empty() {
+            continue;
+        }
+        let (name, value) = line
+            .split_once(':')
+            .context("coordination GitHub include header line was malformed")?;
+        if name.eq_ignore_ascii_case("date") {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                bail!("coordination GitHub Date header was empty");
+            }
+            dates.push(trimmed.to_string());
+        }
+    }
+    if dates.is_empty() {
+        bail!("coordination GitHub include response omitted Date header");
+    }
+    if dates.len() != 1 {
+        bail!("coordination GitHub include response contained duplicate Date headers");
+    }
+    Ok(dates[0].clone())
+}
+
+fn validate_imf_fixdate_weekday(token: &str) -> Result<()> {
+    if token.len() != 4 || !token.ends_with(',') {
+        bail!("coordination GitHub Date weekday token was malformed");
+    }
+    match &token.as_bytes()[..3] {
+        b"Mon" | b"Tue" | b"Wed" | b"Thu" | b"Fri" | b"Sat" | b"Sun" => Ok(()),
+        _ => bail!("coordination GitHub Date weekday was invalid"),
+    }
+}
+
+fn imf_fixdate_to_forge_timestamp(value: &str) -> Result<ForgeTimestamp> {
+    if value.len() > 128 || !value.is_ascii() {
+        bail!("coordination GitHub Date header is malformed");
+    }
+    let parts = value.split_whitespace().collect::<Vec<_>>();
+    if parts.len() != 6 || parts[5] != "GMT" {
+        bail!("coordination GitHub Date header is not IMF-fixdate GMT");
+    }
+    validate_imf_fixdate_weekday(parts[0])?;
+    if parts[1].len() != 2 || !parts[1].bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("coordination GitHub Date day was invalid");
+    }
+    if parts[2].len() != 3 {
+        bail!("coordination GitHub Date month was invalid");
+    }
+    if parts[3].len() != 4 || !parts[3].bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("coordination GitHub Date year was invalid");
+    }
+    let clock = parts[4].as_bytes();
+    if clock.len() != 8
+        || clock[2] != b':'
+        || clock[5] != b':'
+        || !clock[..2].iter().all(|byte| byte.is_ascii_digit())
+        || !clock[3..5].iter().all(|byte| byte.is_ascii_digit())
+        || !clock[6..8].iter().all(|byte| byte.is_ascii_digit())
+    {
+        bail!("coordination GitHub Date time was malformed");
+    }
+    let day = parts[1]
+        .parse::<u32>()
+        .context("coordination GitHub Date day was invalid")?;
+    let year = parts[3]
+        .parse::<u32>()
+        .context("coordination GitHub Date year was invalid")?;
+    let month = match parts[2].to_ascii_lowercase().as_str() {
+        "jan" => 1,
+        "feb" => 2,
+        "mar" => 3,
+        "apr" => 4,
+        "may" => 5,
+        "jun" => 6,
+        "jul" => 7,
+        "aug" => 8,
+        "sep" => 9,
+        "oct" => 10,
+        "nov" => 11,
+        "dec" => 12,
+        _ => bail!("coordination GitHub Date month was invalid"),
+    };
+    let hour = std::str::from_utf8(&clock[..2])?
+        .parse::<u32>()
+        .context("coordination GitHub Date hour was invalid")?;
+    let minute = std::str::from_utf8(&clock[3..5])?
+        .parse::<u32>()
+        .context("coordination GitHub Date minute was invalid")?;
+    let second = std::str::from_utf8(&clock[6..8])?
+        .parse::<u32>()
+        .context("coordination GitHub Date second was invalid")?;
+    ForgeTimestamp::new(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
+    ))
+    .context("coordination GitHub Date header failed forge timestamp validation")
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubJournalRefHeadIncludeWire {
+    #[serde(rename = "ref")]
+    ref_name: String,
+    object: GithubJournalRefHeadIncludeObjectWire,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubJournalRefHeadIncludeObjectWire {
+    sha: String,
+    #[serde(rename = "type")]
+    type_field: String,
+}
+
+fn validate_bound_journal_ref_head_include_body(body: &str, expected_ref: &str) -> Result<String> {
+    let wire: GithubJournalRefHeadIncludeWire = parse_authenticated_github_json(
+        body,
+        "GitHub coordination journal ref head with provider time",
+    )?;
+    if wire.ref_name != expected_ref {
+        bail!("bound journal ref does not match configured journal branch ref");
+    }
+    if wire.object.type_field != "commit" {
+        bail!("bound journal ref object type is not commit");
+    }
+    validate_observed_git_oid(&wire.object.sha)?;
+    Ok(wire.object.sha)
+}
+
+pub(crate) fn parse_journal_ref_head_with_provider_time_response(
+    raw: &str,
+    expected_ref: &str,
+) -> Result<JournalRefHeadWithProviderTime> {
+    let (headers, body) = split_github_include_response(raw)?;
+    let date = parse_github_include_date_header(headers)?;
+    let provider_time = imf_fixdate_to_forge_timestamp(&date)?;
+    let head_oid = validate_bound_journal_ref_head_include_body(body, expected_ref)?;
+    Ok(JournalRefHeadWithProviderTime {
+        head_oid,
+        provider_time,
+    })
+}
+
+#[derive(Debug)]
+enum TakeoverProviderTimePreflightFailure {
+    JournalHeadRace,
+    Refused(anyhow::Error),
 }
 
 pub(crate) trait CoordinationGithubRunner: Send + Sync {
@@ -614,6 +821,25 @@ struct CoordinationCasReceipt {
     parent_oid: String,
 }
 
+fn preflight_refusal_outcome(
+    wal: &EffectWal,
+    plan: &CoordinationGithubIntentApplyPlan,
+    error: impl std::fmt::Display,
+    unknown_prefix: &str,
+) -> CoordinationMutationOutcome {
+    if wal.phase(&plan.comment_effect_id) == Some(EffectPhase::Planned)
+        && wal.phase(&plan.cas_effect_id) == Some(EffectPhase::Planned)
+    {
+        CoordinationMutationOutcome::NotApplied {
+            reason: format!("{error}"),
+        }
+    } else {
+        CoordinationMutationOutcome::Unknown {
+            evidence: format!("{unknown_prefix}: {error}"),
+        }
+    }
+}
+
 struct CoordinationGithubIntentApplyPlan {
     comment_effect_id: String,
     cas_effect_id: String,
@@ -776,21 +1002,69 @@ impl<R: CoordinationGithubRunner> CoordinationGithubTransport<R> {
             },
             effect_reconciliation,
         ) {
-            Ok(()) => Ok(None),
-            Err(error)
-                if wal.phase(&plan.comment_effect_id) == Some(EffectPhase::Planned)
-                    && wal.phase(&plan.cas_effect_id) == Some(EffectPhase::Planned) =>
-            {
-                Ok(Some(CoordinationMutationOutcome::NotApplied {
-                    reason: format!("{error:#}"),
-                }))
+            Ok(()) => {}
+            Err(error) => {
+                return Ok(Some(preflight_refusal_outcome(
+                    wal,
+                    plan,
+                    error,
+                    "coordination transition refused after a prior effect may have started",
+                )));
             }
-            Err(error) => Ok(Some(CoordinationMutationOutcome::Unknown {
-                evidence: format!(
-                    "coordination transition refused after a prior effect may have started: {error:#}"
-                ),
-            })),
         }
+        if matches!(
+            plan.intent.action(),
+            CoordinationIntentAction::Takeover { .. }
+        ) {
+            match self.preflight_takeover_provider_time_refusal(
+                &snapshot,
+                plan,
+                effect_reconciliation,
+            ) {
+                Ok(()) => {}
+                Err(TakeoverProviderTimePreflightFailure::JournalHeadRace) => {
+                    return Ok(Some(CoordinationMutationOutcome::Unknown {
+                        evidence: "in-flight intent parent does not match current journal tip"
+                            .to_string(),
+                    }));
+                }
+                Err(TakeoverProviderTimePreflightFailure::Refused(error)) => {
+                    return Ok(Some(preflight_refusal_outcome(
+                        wal,
+                        plan,
+                        error,
+                        "coordination takeover provider-time refusal after a prior effect may have started",
+                    )));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn preflight_takeover_provider_time_refusal(
+        &self,
+        snapshot: &AuthoritySnapshot,
+        plan: &CoordinationGithubIntentApplyPlan,
+        effect_reconciliation: Option<&dyn EffectReconciliationVerifier>,
+    ) -> Result<(), TakeoverProviderTimePreflightFailure> {
+        let observed = self
+            .journal_ref_head_with_provider_time()
+            .map_err(TakeoverProviderTimePreflightFailure::Refused)?;
+        if observed.head_oid != snapshot.journal_head_oid() {
+            return Err(TakeoverProviderTimePreflightFailure::JournalHeadRace);
+        }
+        preflight_proposed_journal_transition(
+            self.config.journal(),
+            snapshot,
+            &plan.intent,
+            &ProposedIntentAdmission {
+                bound_actor: plan.comment_author.clone(),
+                timing: IntentAdmissionTiming::Observed(observed.provider_time),
+            },
+            effect_reconciliation,
+        )
+        .map_err(TakeoverProviderTimePreflightFailure::Refused)?;
+        Ok(())
     }
 
     fn preflight_after_comment_observed(
@@ -1306,6 +1580,18 @@ impl<R: CoordinationGithubRunner> CoordinationGithubTransport<R> {
             parse_authenticated_github_json(&json, "GitHub coordination journal ref")?;
         validate_observed_git_oid(&wire.object.sha)?;
         Ok(wire.object.sha)
+    }
+
+    fn journal_ref_head_with_provider_time(&self) -> Result<JournalRefHeadWithProviderTime> {
+        let raw = self.runner.run(
+            &self.config,
+            "gh coordination journal ref head with provider time",
+            CoordinationGithubOperation::JournalRefHeadWithProviderTime {
+                branch_name: self.config.branch_name.clone(),
+            },
+        )?;
+        let expected_ref = format!("refs/heads/{}", self.config.branch_name);
+        parse_journal_ref_head_with_provider_time_response(&raw, &expected_ref)
     }
 
     fn complete_ancestry_to_anchor(&self, tip: &str) -> Result<Vec<VerifiedCommit>> {
@@ -2619,8 +2905,77 @@ mod tests {
         (oid, json)
     }
 
+    const JOURNAL_BRANCH_REF: &str = "refs/heads/maco/coordination/journal";
+
     fn json_ref_head(oid: &str) -> String {
         serde_json::json!({ "object": { "sha": oid } }).to_string()
+    }
+
+    fn json_ref_head_include_body(oid: &str) -> String {
+        serde_json::json!({
+            "ref": JOURNAL_BRANCH_REF,
+            "object": { "sha": oid, "type": "commit" }
+        })
+        .to_string()
+    }
+
+    fn ref_head_include_response(oid: &str, date: &str) -> String {
+        format!(
+            "HTTP/2.0 200 OK\r\nDate: {}\r\n\r\n{}",
+            date,
+            json_ref_head_include_body(oid)
+        )
+    }
+
+    fn child_claim_journal_fixture() -> (String, String, String) {
+        let owner = CoordinationOwnerIdentity::new("run-old", "nonce-old").expect("owner");
+        let claim = CoordinationIntent::claim(
+            &item(),
+            "evt-claim-old",
+            ANCHOR_OID,
+            owner,
+            vec!["scope/a".to_string()],
+            ClaimTiming::new(10, 30).expect("timing"),
+        )
+        .expect("claim");
+        let claim_body = claim.render().expect("claim body");
+        let pointer = JournalPointer::new(
+            claim.event_nonce(),
+            github_node_object_id(ProviderObjectKind::Comment, "IC_comment").expect("comment id"),
+            sha256_hex(claim_body.as_bytes()),
+            ANCHOR_OID,
+        )
+        .expect("pointer");
+        let pointer_file = pointer.render_pointer_file().expect("pointer file");
+        let (pointer_blob_oid, pointer_blob_json) = blob_wire(&pointer_file);
+        (claim_body, pointer_blob_oid, pointer_blob_json)
+    }
+
+    fn takeover_intent_for_predecessor(
+        predecessor: CoordinationOwnerIdentity,
+    ) -> CoordinationIntent {
+        CoordinationIntent::takeover(
+            &item(),
+            "evt-takeover",
+            CHILD_OID,
+            CoordinationOwnerIdentity::new("run-new", "nonce-new").expect("successor"),
+            predecessor,
+            vec!["scope/a".to_string()],
+            ClaimTiming::new(10, 30).expect("timing"),
+        )
+        .expect("takeover")
+    }
+
+    fn comment_json_with_node_and_created_at(
+        body: &str,
+        node_id: &str,
+        database_id: u64,
+        created_at: &str,
+    ) -> String {
+        let mut value = comment_json_with_node(body, node_id, database_id);
+        value["created_at"] = serde_json::json!(created_at);
+        value["updated_at"] = serde_json::json!(created_at);
+        value.to_string()
     }
 
     fn json_empty_comments_page() -> String {
@@ -2671,7 +3026,7 @@ mod tests {
         body_a: &str,
         child_pointer_blob_oid: &str,
         child_pointer_blob_json: &str,
-        body_b: &str,
+        comment_b: serde_json::Value,
         grandchild_pointer_blob_oid: &str,
         grandchild_pointer_blob_json: &str,
     ) {
@@ -2683,11 +3038,8 @@ mod tests {
         ));
         out.push(json_commit(CHILD_OID, CHILD_TREE, Some(ANCHOR_OID)));
         out.push(
-            serde_json::to_string(&vec![
-                comment_json(body_a),
-                comment_json_with_node(body_b, "IC_comment_b", 102),
-            ])
-            .expect("issue comments page"),
+            serde_json::to_string(&vec![comment_json(body_a), comment_b])
+                .expect("issue comments page"),
         );
         out.push(json_commit(ANCHOR_OID, ANCHOR_TREE, None));
         out.push(json_pointer_child_tree(CHILD_TREE, child_pointer_blob_oid));
@@ -3481,7 +3833,7 @@ mod tests {
             &body_a,
             &pointer_blob_oid_a,
             &pointer_blob_json_a,
-            &body_b,
+            comment_json_with_node(&body_b, "IC_comment_b", 102),
             &pointer_blob_oid_b,
             &pointer_blob_json_b,
         );
@@ -3558,5 +3910,356 @@ mod tests {
         .expect("reopen WAL");
         assert_eq!(wal.phase(&comment_effect_id), Some(EffectPhase::Planned));
         assert_eq!(wal.phase(&cas_effect_id), Some(EffectPhase::Planned));
+    }
+
+    #[test]
+    fn parse_journal_ref_head_with_provider_time_accepts_imf_fixdate() {
+        let raw = ref_head_include_response(CHILD_OID, "Sat, 16 Aug 2026 00:00:31 GMT");
+        let parsed = parse_journal_ref_head_with_provider_time_response(&raw, JOURNAL_BRANCH_REF)
+            .expect("parsed");
+        assert_eq!(parsed.head_oid, CHILD_OID);
+        assert_eq!(parsed.provider_time.as_str(), "2026-08-16T00:00:31Z");
+    }
+
+    #[test]
+    fn parse_journal_ref_head_with_provider_time_rejects_wrong_ref_or_object_type() {
+        let date = "Sat, 16 Aug 2026 00:00:31 GMT";
+        let wrong_ref = format!(
+            "HTTP/2.0 200 OK\r\nDate: {}\r\n\r\n{}",
+            date,
+            serde_json::json!({
+                "ref": "refs/heads/other",
+                "object": { "sha": CHILD_OID, "type": "commit" }
+            })
+        );
+        assert!(
+            parse_journal_ref_head_with_provider_time_response(&wrong_ref, JOURNAL_BRANCH_REF)
+                .is_err()
+        );
+        let wrong_type = format!(
+            "HTTP/2.0 200 OK\r\nDate: {}\r\n\r\n{}",
+            date,
+            serde_json::json!({
+                "ref": JOURNAL_BRANCH_REF,
+                "object": { "sha": CHILD_OID, "type": "tag" }
+            })
+        );
+        assert!(parse_journal_ref_head_with_provider_time_response(
+            &wrong_type,
+            JOURNAL_BRANCH_REF
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn takeover_live_provider_time_refuses_before_post() {
+        let (_temp, repo) = coordination_git_repo();
+        let bind_runner =
+            ScriptedCoordinationRunner::new(adapter_responses([]).into_iter().collect::<Vec<_>>());
+        let config = adapter_config(&repo, &bind_runner);
+        let (claim_body, pointer_blob_oid, pointer_blob_json) = child_claim_journal_fixture();
+        let predecessor =
+            CoordinationOwnerIdentity::new("run-old", "nonce-old").expect("predecessor");
+        let intent = takeover_intent_for_predecessor(predecessor);
+        let author = actor("trusted-a");
+        let mut apply_responses = Vec::new();
+        append_verified_child_journal_history_load(
+            &mut apply_responses,
+            &claim_body,
+            &pointer_blob_oid,
+            &pointer_blob_json,
+        );
+        append_verified_child_journal_history_load(
+            &mut apply_responses,
+            &claim_body,
+            &pointer_blob_oid,
+            &pointer_blob_json,
+        );
+        apply_responses.push(ref_head_include_response(
+            CHILD_OID,
+            "Sat, 16 Aug 2026 00:00:15 GMT",
+        ));
+        let runner = Arc::new(ScriptedCoordinationRunner::new(apply_responses));
+        let transport = CoordinationGithubTransport::new(config, Arc::clone(&runner));
+        let outcome = transport
+            .apply_authorized_intent(intent, author, None)
+            .expect("live takeover refusal");
+        assert!(matches!(
+            outcome,
+            CoordinationMutationOutcome::NotApplied { .. }
+        ));
+        assert_eq!(runner.post_issue_comment_calls(), 0);
+        assert_eq!(runner.create_commit_on_branch_calls(), 0);
+    }
+
+    #[test]
+    fn takeover_missing_or_duplicate_provider_date_refuses_without_effects() {
+        let (_temp, repo) = coordination_git_repo();
+        let bind_runner =
+            ScriptedCoordinationRunner::new(adapter_responses([]).into_iter().collect::<Vec<_>>());
+        let config = adapter_config(&repo, &bind_runner);
+        let (claim_body, pointer_blob_oid, pointer_blob_json) = child_claim_journal_fixture();
+        let predecessor =
+            CoordinationOwnerIdentity::new("run-old", "nonce-old").expect("predecessor");
+        let intent = takeover_intent_for_predecessor(predecessor);
+        let author = actor("trusted-a");
+
+        let mut missing = Vec::new();
+        append_verified_child_journal_history_load(
+            &mut missing,
+            &claim_body,
+            &pointer_blob_oid,
+            &pointer_blob_json,
+        );
+        append_verified_child_journal_history_load(
+            &mut missing,
+            &claim_body,
+            &pointer_blob_oid,
+            &pointer_blob_json,
+        );
+        missing.push(format!(
+            "HTTP/2.0 200 OK\r\n\r\n{}",
+            json_ref_head_include_body(CHILD_OID)
+        ));
+        let runner = Arc::new(ScriptedCoordinationRunner::new(missing));
+        let transport = CoordinationGithubTransport::new(config, Arc::clone(&runner));
+        let outcome = transport
+            .apply_authorized_intent(intent.clone(), author.clone(), None)
+            .expect("missing date refusal");
+        assert!(matches!(
+            outcome,
+            CoordinationMutationOutcome::NotApplied { .. }
+        ));
+        assert_eq!(runner.post_issue_comment_calls(), 0);
+        assert_eq!(runner.create_commit_on_branch_calls(), 0);
+
+        let bind_runner =
+            ScriptedCoordinationRunner::new(adapter_responses([]).into_iter().collect::<Vec<_>>());
+        let config = adapter_config(&repo, &bind_runner);
+        let mut duplicate = Vec::new();
+        append_verified_child_journal_history_load(
+            &mut duplicate,
+            &claim_body,
+            &pointer_blob_oid,
+            &pointer_blob_json,
+        );
+        append_verified_child_journal_history_load(
+            &mut duplicate,
+            &claim_body,
+            &pointer_blob_oid,
+            &pointer_blob_json,
+        );
+        duplicate.push(format!(
+            "HTTP/2.0 200 OK\r\nDate: Sat, 16 Aug 2026 00:01:00 GMT\r\nDate: Sat, 16 Aug 2026 00:01:01 GMT\r\n\r\n{}",
+            json_ref_head_include_body(CHILD_OID)
+        ));
+        let runner = Arc::new(ScriptedCoordinationRunner::new(duplicate));
+        let transport = CoordinationGithubTransport::new(config, Arc::clone(&runner));
+        let outcome = transport
+            .apply_authorized_intent(intent, author, None)
+            .expect("duplicate date refusal");
+        assert!(matches!(
+            outcome,
+            CoordinationMutationOutcome::NotApplied { .. }
+        ));
+        assert_eq!(runner.post_issue_comment_calls(), 0);
+        assert_eq!(runner.create_commit_on_branch_calls(), 0);
+    }
+
+    #[test]
+    fn takeover_stale_provider_time_allows_comment_and_cas() {
+        let (_temp, repo) = coordination_git_repo();
+        let bind_runner =
+            ScriptedCoordinationRunner::new(adapter_responses([]).into_iter().collect::<Vec<_>>());
+        let config = adapter_config(&repo, &bind_runner);
+        let (claim_body, claim_pointer_blob_oid, claim_pointer_blob_json) =
+            child_claim_journal_fixture();
+        let predecessor =
+            CoordinationOwnerIdentity::new("run-old", "nonce-old").expect("predecessor");
+        let intent = takeover_intent_for_predecessor(predecessor);
+        let author = actor("trusted-a");
+        let body = intent.render().expect("takeover body");
+        let pointer = JournalPointer::new(
+            intent.event_nonce(),
+            github_node_object_id(ProviderObjectKind::Comment, "IC_comment_b").expect("comment id"),
+            sha256_hex(body.as_bytes()),
+            CHILD_OID,
+        )
+        .expect("pointer");
+        let pointer_file = pointer.render_pointer_file().expect("pointer file");
+        let (pointer_blob_oid, pointer_blob_json) = blob_wire(&pointer_file);
+        let cas_graphql = serde_json::json!({
+            "data": { "createCommitOnBranch": { "commit": { "oid": GRANDCHILD_OID } } }
+        })
+        .to_string();
+        let takeover_comment = comment_json_with_node_and_created_at(
+            &body,
+            "IC_comment_b",
+            102,
+            "2026-08-16T00:01:00Z",
+        );
+        let mut apply_responses = Vec::new();
+        append_verified_child_journal_history_load(
+            &mut apply_responses,
+            &claim_body,
+            &claim_pointer_blob_oid,
+            &claim_pointer_blob_json,
+        );
+        append_verified_child_journal_history_load(
+            &mut apply_responses,
+            &claim_body,
+            &claim_pointer_blob_oid,
+            &claim_pointer_blob_json,
+        );
+        apply_responses.push(ref_head_include_response(
+            CHILD_OID,
+            "Sat, 16 Aug 2026 00:01:01 GMT",
+        ));
+        apply_responses.push(json_empty_comments_page());
+        apply_responses.push(takeover_comment.clone());
+        apply_responses.push(takeover_comment.clone());
+        apply_responses.push(takeover_comment.clone());
+        append_verified_child_journal_history_load(
+            &mut apply_responses,
+            &claim_body,
+            &claim_pointer_blob_oid,
+            &claim_pointer_blob_json,
+        );
+        apply_responses.push(json_ref_head(CHILD_OID));
+        apply_responses.push(json_commit(CHILD_OID, CHILD_TREE, Some(ANCHOR_OID)));
+        apply_responses.push(json_commit(ANCHOR_OID, ANCHOR_TREE, None));
+        apply_responses.push(json_pointer_child_tree(CHILD_TREE, &claim_pointer_blob_oid));
+        apply_responses.push(json_empty_tree(ANCHOR_TREE));
+        apply_responses.push(claim_pointer_blob_json.clone());
+        apply_responses.push(cas_graphql);
+        append_cas_receipt_verification_grandchild(
+            &mut apply_responses,
+            &claim_pointer_blob_oid,
+            &pointer_blob_oid,
+            &pointer_blob_json,
+        );
+        append_verified_grandchild_journal_history_load(
+            &mut apply_responses,
+            &claim_body,
+            &claim_pointer_blob_oid,
+            &claim_pointer_blob_json,
+            serde_json::from_str(&takeover_comment).expect("takeover comment JSON"),
+            &pointer_blob_oid,
+            &pointer_blob_json,
+        );
+        let runner = Arc::new(ScriptedCoordinationRunner::new(apply_responses));
+        let transport = CoordinationGithubTransport::new(config, Arc::clone(&runner));
+        let outcome = transport
+            .apply_authorized_intent(intent, author, None)
+            .expect("stale takeover apply");
+        assert!(matches!(
+            outcome,
+            CoordinationMutationOutcome::Applied { .. }
+        ));
+        assert_eq!(runner.post_issue_comment_calls(), 1);
+        assert_eq!(runner.create_commit_on_branch_calls(), 1);
+    }
+
+    #[test]
+    fn takeover_future_provider_time_with_live_comment_is_unknown_without_cas() {
+        let (_temp, repo) = coordination_git_repo();
+        let bind_runner =
+            ScriptedCoordinationRunner::new(adapter_responses([]).into_iter().collect::<Vec<_>>());
+        let config = adapter_config(&repo, &bind_runner);
+        let (claim_body, pointer_blob_oid, pointer_blob_json) = child_claim_journal_fixture();
+        let predecessor =
+            CoordinationOwnerIdentity::new("run-old", "nonce-old").expect("predecessor");
+        let intent = takeover_intent_for_predecessor(predecessor);
+        let author = actor("trusted-a");
+        let body = intent.render().expect("takeover body");
+        let live_comment = comment_json_with_node_and_created_at(
+            &body,
+            "IC_comment_b",
+            102,
+            "2026-08-16T00:00:15Z",
+        );
+        let mut apply_responses = Vec::new();
+        append_verified_child_journal_history_load(
+            &mut apply_responses,
+            &claim_body,
+            &pointer_blob_oid,
+            &pointer_blob_json,
+        );
+        append_verified_child_journal_history_load(
+            &mut apply_responses,
+            &claim_body,
+            &pointer_blob_oid,
+            &pointer_blob_json,
+        );
+        apply_responses.push(ref_head_include_response(
+            CHILD_OID,
+            "Sat, 16 Aug 2026 01:00:00 GMT",
+        ));
+        apply_responses.push(json_empty_comments_page());
+        apply_responses.push(live_comment.clone());
+        apply_responses.push(live_comment.clone());
+        apply_responses.push(live_comment.clone());
+        append_verified_child_journal_history_load(
+            &mut apply_responses,
+            &claim_body,
+            &pointer_blob_oid,
+            &pointer_blob_json,
+        );
+        let runner = Arc::new(ScriptedCoordinationRunner::new(apply_responses));
+        let transport = CoordinationGithubTransport::new(config, Arc::clone(&runner));
+        let outcome = transport
+            .apply_authorized_intent(intent, author, None)
+            .expect("future provider time with live comment");
+        match outcome {
+            CoordinationMutationOutcome::Unknown { evidence } => {
+                assert!(evidence.contains("semantic transition was refused"));
+            }
+            other => panic!("expected unknown after live comment observation, got {other:?}"),
+        }
+        assert_eq!(runner.post_issue_comment_calls(), 1);
+        assert_eq!(runner.create_commit_on_branch_calls(), 0);
+    }
+
+    #[test]
+    fn takeover_provider_time_journal_head_race_is_unknown_without_post_or_cas() {
+        let (_temp, repo) = coordination_git_repo();
+        let bind_runner =
+            ScriptedCoordinationRunner::new(adapter_responses([]).into_iter().collect::<Vec<_>>());
+        let config = adapter_config(&repo, &bind_runner);
+        let (claim_body, pointer_blob_oid, pointer_blob_json) = child_claim_journal_fixture();
+        let predecessor =
+            CoordinationOwnerIdentity::new("run-old", "nonce-old").expect("predecessor");
+        let intent = takeover_intent_for_predecessor(predecessor);
+        let author = actor("trusted-a");
+        let mut apply_responses = Vec::new();
+        append_verified_child_journal_history_load(
+            &mut apply_responses,
+            &claim_body,
+            &pointer_blob_oid,
+            &pointer_blob_json,
+        );
+        append_verified_child_journal_history_load(
+            &mut apply_responses,
+            &claim_body,
+            &pointer_blob_oid,
+            &pointer_blob_json,
+        );
+        apply_responses.push(ref_head_include_response(
+            ANCHOR_OID,
+            "Sat, 16 Aug 2026 00:01:01 GMT",
+        ));
+        let runner = Arc::new(ScriptedCoordinationRunner::new(apply_responses));
+        let transport = CoordinationGithubTransport::new(config, Arc::clone(&runner));
+        let outcome = transport
+            .apply_authorized_intent(intent, author, None)
+            .expect("journal head race");
+        match outcome {
+            CoordinationMutationOutcome::Unknown { evidence } => {
+                assert!(evidence.contains("does not match current journal tip"));
+            }
+            other => panic!("expected unknown journal head race, got {other:?}"),
+        }
+        assert_eq!(runner.post_issue_comment_calls(), 0);
+        assert_eq!(runner.create_commit_on_branch_calls(), 0);
     }
 }
