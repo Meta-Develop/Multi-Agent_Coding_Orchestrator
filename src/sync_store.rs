@@ -4416,6 +4416,43 @@ mod tests {
             .contains("regular"));
     }
 
+    /// True when `KernelStateLock::acquire_direct` exhausted its fixed acquire
+    /// window without taking the flock. This happens before any claims mutation.
+    fn kernel_state_lock_acquire_timed_out(store: &SyncStore, error: &anyhow::Error) -> bool {
+        // Match the top-level refusal for this claims lock only. A telemetry
+        // lock timeout is wrapped with a durable-claim warning after the write
+        // and must never be treated as permission to repeat the claim.
+        error.to_string()
+            == format!(
+                "timed out after 5 seconds waiting for kernel state lock {}",
+                store
+                    .state
+                    .root()
+                    .path()
+                    .join(store.state.lock_file)
+                    .display()
+            )
+    }
+
+    fn claim_paths_retrying_pre_mutation_lock_timeout(
+        store: &SyncStore,
+        agent_id: &str,
+        paths: &[String],
+        deadline: std::time::Instant,
+    ) -> Result<PathClaim> {
+        loop {
+            match store.claim_paths(agent_id, paths.iter().map(String::as_str)) {
+                Ok(claim) => return Ok(claim),
+                Err(error) if kernel_state_lock_acquire_timed_out(store, &error) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     #[test]
     fn concurrent_claims_are_serialized_without_lost_updates() {
         #[cfg(unix)]
@@ -4448,13 +4485,18 @@ mod tests {
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
         let store = SyncStore::open(&repo_path).expect("open store");
+        let lock_retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(100);
         let mut workers = Vec::new();
         for index in 0..16usize {
             let store = store.clone();
             workers.push(std::thread::spawn(move || {
-                store.claim_paths(
-                    format!("agent-{index}"),
-                    [format!("generated/path-{index}")],
+                let agent_id = format!("agent-{index}");
+                let paths = vec![format!("generated/path-{index}")];
+                claim_paths_retrying_pre_mutation_lock_timeout(
+                    &store,
+                    &agent_id,
+                    &paths,
+                    lock_retry_deadline,
                 )
             }));
         }
