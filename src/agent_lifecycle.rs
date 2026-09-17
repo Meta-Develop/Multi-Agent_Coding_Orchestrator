@@ -943,6 +943,40 @@ impl AgentRegistry {
         self.stop_records(matches, wait)
     }
 
+    pub(crate) fn stop_assignment(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        wait: Duration,
+    ) -> Result<AgentStopReport> {
+        validate_text_field("run id", run_id, MAX_IDENTIFIER_BYTES)?;
+        validate_text_field("task id", task_id, MAX_IDENTIFIER_BYTES)?;
+        let live = self.list(&AgentListFilter {
+            run_id: Some(run_id.to_string()),
+        })?;
+        let matches = live
+            .into_iter()
+            .filter(|process| process.task_id == task_id)
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            return Ok(AgentStopReport {
+                stopped: Vec::new(),
+            });
+        }
+        if matches.len() > 1 {
+            let details = matches
+                .iter()
+                .map(AgentProcessRecord::summary)
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "agent assignment ({run_id}, {task_id}) is ambiguous; {} matches: {details}",
+                matches.len()
+            );
+        }
+        self.stop_records(matches, wait)
+    }
+
     fn stop_records(
         &self,
         records: Vec<AgentProcessRecord>,
@@ -1616,6 +1650,31 @@ mod tests {
         let error = registry
             .stop_selector("shared-run", Duration::from_millis(50))
             .expect_err("selector must be ambiguous");
+        let message = error.to_string();
+        assert!(message.contains("ambiguous"));
+        assert!(message.contains(&first.pid().to_string()));
+        assert!(message.contains(&second.pid().to_string()));
+        assert!(process_exists(first.pid())?);
+        assert!(process_exists(second.pid())?);
+        Ok(())
+    }
+
+    #[test]
+    fn stop_assignment_refuses_ambiguous_same_run_and_task() -> Result<()> {
+        let (_temp, registry) = registry()?;
+        let first = SleepChild::spawn()?;
+        let second = SleepChild::spawn()?;
+        for child in [&first, &second] {
+            registry.register(
+                &metadata(&registry, "shared-run", "shared-task")?,
+                child.pid(),
+                vec!["sleep".to_string(), "60".to_string()],
+            )?;
+        }
+
+        let error = registry
+            .stop_assignment("shared-run", "shared-task", Duration::from_millis(50))
+            .expect_err("assignment must be ambiguous");
         let message = error.to_string();
         assert!(message.contains("ambiguous"));
         assert!(message.contains(&first.pid().to_string()));

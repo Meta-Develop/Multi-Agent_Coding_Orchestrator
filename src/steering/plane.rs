@@ -625,23 +625,10 @@ enum StopResult {
 
 fn stop_launched_child(repo: &Path, run_id: &str, assignment_id: &str) -> Result<StopResult> {
     let registry = AgentRegistry::open(repo)?;
-    let live = registry.list(&crate::agent_lifecycle::AgentListFilter {
-        run_id: Some(run_id.to_string()),
-    })?;
-    let matches = live
-        .into_iter()
-        .filter(|process| process.task_id == assignment_id)
-        .collect::<Vec<_>>();
-    if matches.is_empty() {
+    let report = registry.stop_assignment(run_id, assignment_id, Duration::from_secs(1))?;
+    if report.stopped.is_empty() {
         return Ok(StopResult::NotFound);
     }
-    if matches.len() > 1 {
-        bail!(
-            "steering cancel selector for assignment {assignment_id} is ambiguous ({} live processes)",
-            matches.len()
-        );
-    }
-    let report = registry.stop_selector(assignment_id, Duration::from_secs(1))?;
     if report.stopped.iter().any(|stopped| {
         matches!(
             stopped.outcome,

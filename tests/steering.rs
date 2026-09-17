@@ -198,3 +198,134 @@ fn lost_child_cannot_leave_an_unacknowledged_steered_state() -> Result<()> {
     assert!(!ack.steered);
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn cancel_stops_only_the_matching_run_when_assignment_ids_collide() -> Result<()> {
+    let (temp, plane) = plane()?;
+    let registry = AgentRegistry::open(temp.path())?;
+    let mut child_a = SleepChild::spawn()?;
+    let mut child_b = SleepChild::spawn()?;
+    let shared_task = "shared-assignment";
+    registry.register(
+        &AgentLaunchMetadata::new(temp.path(), "worker", "run-a", shared_task)?,
+        child_a.0.id(),
+        vec!["sleep".to_string(), "60".to_string()],
+    )?;
+    registry.register(
+        &AgentLaunchMetadata::new(temp.path(), "worker", "run-b", shared_task)?,
+        child_b.0.id(),
+        vec!["sleep".to_string(), "60".to_string()],
+    )?;
+    for run_id in ["run-a", "run-b"] {
+        plane.register_assignment(AssignmentBinding {
+            run_id: run_id.to_string(),
+            assignment_id: shared_task.to_string(),
+            role_category: RoleCategory::NonDelegatingTerminalWorker,
+            model_capability: Some(ModelCapabilityClass::WeakMechanical),
+            parent_agent_id: Some("o1-1".to_string()),
+            kind: AssignmentKind::Execution,
+        })?;
+    }
+
+    let now = plane.current_unix_ms()?;
+    let decision = plane.submit(
+        SteeringRequest {
+            version: STEERING_REQUEST_VERSION,
+            action_id: "act-run-a-only".to_string(),
+            run_id: "run-a".to_string(),
+            assignment_id: shared_task.to_string(),
+            actor: SteeringActor::Operator {
+                agent_id: "operator".to_string(),
+            },
+            action: SteeringAction::CancelAssignment {
+                reason: "cancel run-a worker only".to_string(),
+            },
+            deadline_unix_ms: now + 10_000,
+        },
+        now,
+    )?;
+    assert_eq!(decision.ack().outcome, SteeringOutcome::Acknowledged);
+    assert!(decision.ack().steered);
+
+    let status = child_a.0.wait().context("wait stopped run-a child")?;
+    assert!(!status.success());
+    assert!(child_b.0.try_wait()?.is_none());
+
+    let leftover = registry.list(
+        &multi_agent_coding_orchestrator::agent_lifecycle::AgentListFilter {
+            run_id: Some("run-b".to_string()),
+        },
+    )?;
+    assert_eq!(leftover.len(), 1);
+    assert_eq!(leftover[0].task_id, shared_task);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn cancel_already_gone_target_does_not_stop_same_task_on_another_run() -> Result<()> {
+    let (temp, plane) = plane()?;
+    let registry = AgentRegistry::open(temp.path())?;
+    let shared_task = "shared-assignment";
+    let mut gone_child = SleepChild::spawn()?;
+    let mut live_child = SleepChild::spawn()?;
+    registry.register(
+        &AgentLaunchMetadata::new(temp.path(), "worker", "run-gone", shared_task)?,
+        gone_child.0.id(),
+        vec!["sleep".to_string(), "60".to_string()],
+    )?;
+    registry.register(
+        &AgentLaunchMetadata::new(temp.path(), "worker", "run-live", shared_task)?,
+        live_child.0.id(),
+        vec!["sleep".to_string(), "60".to_string()],
+    )?;
+    plane.register_assignment(AssignmentBinding {
+        run_id: "run-gone".to_string(),
+        assignment_id: shared_task.to_string(),
+        role_category: RoleCategory::NonDelegatingTerminalWorker,
+        model_capability: Some(ModelCapabilityClass::WeakMechanical),
+        parent_agent_id: Some("o1-1".to_string()),
+        kind: AssignmentKind::Execution,
+    })?;
+    plane.register_assignment(AssignmentBinding {
+        run_id: "run-live".to_string(),
+        assignment_id: shared_task.to_string(),
+        role_category: RoleCategory::NonDelegatingTerminalWorker,
+        model_capability: Some(ModelCapabilityClass::WeakMechanical),
+        parent_agent_id: Some("o1-1".to_string()),
+        kind: AssignmentKind::Execution,
+    })?;
+    gone_child.0.kill().context("kill gone child")?;
+    gone_child.0.wait().context("wait gone child")?;
+
+    let now = plane.current_unix_ms()?;
+    let decision = plane.submit(
+        SteeringRequest {
+            version: STEERING_REQUEST_VERSION,
+            action_id: "act-gone-only".to_string(),
+            run_id: "run-gone".to_string(),
+            assignment_id: shared_task.to_string(),
+            actor: SteeringActor::Operator {
+                agent_id: "operator".to_string(),
+            },
+            action: SteeringAction::CancelAssignment {
+                reason: "gone child must not take down sibling run".to_string(),
+            },
+            deadline_unix_ms: now + 10_000,
+        },
+        now,
+    )?;
+    assert_eq!(decision.ack().outcome, SteeringOutcome::LostChild);
+    assert!(!decision.ack().steered);
+    assert!(live_child.0.try_wait()?.is_none());
+
+    let sibling = registry.list(
+        &multi_agent_coding_orchestrator::agent_lifecycle::AgentListFilter {
+            run_id: Some("run-live".to_string()),
+        },
+    )?;
+    assert_eq!(sibling.len(), 1);
+    assert_eq!(sibling[0].task_id, shared_task);
+    Ok(())
+}
