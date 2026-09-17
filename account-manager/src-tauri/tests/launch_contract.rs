@@ -223,6 +223,7 @@ fn selected_account(provider_id: &str, material: StoredAccountMaterial) -> Store
         state: StoredAccountState::Complete,
         material,
         is_selected: true,
+        account_incarnation: "0123456789abcdef0123456789abcdef".to_string(),
     }
 }
 
@@ -423,7 +424,8 @@ fn metadata_is_versioned_durable_selected_and_contains_no_secret_or_secret_ref()
 
     let bytes = fs::read(&path).expect("read metadata");
     let text = String::from_utf8(bytes).expect("metadata UTF-8");
-    assert!(text.contains(r#""schemaVersion": 1"#), "{text}");
+    assert!(text.contains(r#""schemaVersion": 2"#), "{text}");
+    assert!(text.contains(r#""accountIncarnation""#), "{text}");
     assert!(!text.contains("FAKE-"), "metadata serialized a credential");
     assert!(
         !text.contains("gemini-cli/work"),
@@ -586,7 +588,7 @@ fn newer_metadata_schema_is_refused_without_echoing_document_contents() {
     let path = metadata_path(&dir);
     fs::write(
         &path,
-        br#"{"schemaVersion":2,"accounts":[{"id":"work","providerId":"gemini-cli","label":"FAKE-must-not-echo","authKind":"api-key","state":"complete","material":"credential-store","isSelected":false}]}"#,
+        br#"{"schemaVersion":3,"accounts":[{"id":"work","providerId":"gemini-cli","label":"FAKE-must-not-echo","authKind":"api-key","state":"complete","material":"credential-store","isSelected":false}]}"#,
     )
     .expect("write newer metadata fixture");
     let error = StoredAccountRegistry::new(path)
@@ -594,7 +596,7 @@ fn newer_metadata_schema_is_refused_without_echoing_document_contents() {
         .expect_err("newer schema must be refused");
     let message = error.to_string();
     assert!(
-        message.contains("unsupported schema version 2"),
+        message.contains("unsupported schema version 3"),
         "{message}"
     );
     assert!(!message.contains("FAKE-"), "error echoed document contents");

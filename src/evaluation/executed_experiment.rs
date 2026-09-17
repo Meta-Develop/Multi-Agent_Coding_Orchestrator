@@ -1,5 +1,10 @@
 //! Observed local validation, deliberately separate from legacy synthetic scores.
 use super::{
+    executed_measurements::{
+        observed_run_measurements_from_captured_supervisor_final_report,
+        observed_run_measurements_unavailable, ObservedRunMeasurements,
+    },
+    executed_summary::{summarize_executed_observation_runs, ExecutedExperimentSummary},
     experiment::{
         self, HeldOutExplicitSourceBaseline, HeldOutRealProviderExperimentRequest,
         IsolatedSuperviseState,
@@ -22,6 +27,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -51,6 +57,17 @@ pub struct ExecutedExperimentResults {
     pub total_cost_usd: Option<f64>,
     pub confidence: Option<f64>,
     pub runs: Vec<ObservedExperimentRun>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profile_summaries: Vec<super::executed_summary::ExecutedProfileSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dispatch_comparisons: Vec<super::DispatchComparison>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_pareto_conclusion:
+        Option<super::executed_summary::ExecutedObservationParetoConclusion>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observation_pareto_frontier: Vec<super::executed_summary::ExecutedParetoPoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality_proxy_label: Option<String>,
     pub notice: String,
 }
 
@@ -66,6 +83,8 @@ pub struct ObservedExperimentRun {
     pub failure: Option<String>,
     #[serde(default)]
     pub real_provider_execution: RealProviderExecutionObservation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurements: Option<ObservedRunMeasurements>,
 }
 
 /// Parent-owned observation of whether a real provider was actually launched.
@@ -204,9 +223,23 @@ pub fn run_experiment_with_held_out_and_source(
             let held_out = authority.evidence()?;
             let admitted_dispatches = authority.dispatches()?;
             let prefix = PathBuf::from("held-out").join(format!("p{profile_index}-r{repetition}"));
-            let (supervisor_succeeded, supervisor_evidence, failure) = match report {
+            let (supervisor_succeeded, supervisor_evidence, failure, measurements) = match report {
                 Ok(report) => {
                     let reader = ArtifactRunReader::open(&isolated.repo, family, &isolated.run_id)?;
+                    let report_relative = family.final_report_relative_path();
+                    let report_bytes = reader.read(&report_relative)?;
+                    let measurements = observed_run_measurements_from_captured_supervisor_final_report(
+                        &held_out,
+                        &report,
+                        &report_bytes,
+                        &isolated.repo,
+                        &BTreeSet::new(),
+                    )
+                    .map(Some)
+                    .unwrap_or_else(|error| {
+                        let reason = error.to_string();
+                        Some(observed_run_measurements_unavailable(&held_out, &reason))
+                    });
                     let mut retained = writer.lock().map_err(|_| anyhow!("experiment artifact lock poisoned"))?;
                     // Verification happens while the original repository/auth key
                     // still exists. The outer run then authenticates the copies.
@@ -214,9 +247,22 @@ pub fn run_experiment_with_held_out_and_source(
                         retained.write_bytes(prefix.join(&record.path), &reader.read(&record.path)?, ArtifactFileDisposition::PrivateEvidence)?;
                     }
                     retained.write_json(prefix.join("source-finalization.json"), reader.finalization(), ArtifactFileDisposition::PrivateEvidence)?;
-                    (report.success, Some(prefix.join(family.final_report_relative_path())), None)
+                    (
+                        report.success,
+                        Some(prefix.join(report_relative)),
+                        None,
+                        measurements,
+                    )
                 }
-                Err(_) => (false, None, Some("supervisor did not produce a verified finalized report; unfinished validation is unknown".into())),
+                Err(_) => (
+                    false,
+                    None,
+                    Some("supervisor did not produce a verified finalized report; unfinished validation is unknown".into()),
+                    Some(observed_run_measurements_unavailable(
+                        &held_out,
+                        "supervisor did not produce a verified finalized report",
+                    )),
+                ),
             };
             let run = ObservedExperimentRun {
                 required_validation_passed: held_out.passed(),
@@ -227,6 +273,7 @@ pub fn run_experiment_with_held_out_and_source(
                 supervisor_evidence,
                 failure,
                 real_provider_execution: RealProviderExecutionObservation::NotRequested,
+                measurements,
             };
             writer
                 .lock()
@@ -241,18 +288,17 @@ pub fn run_experiment_with_held_out_and_source(
             // retained before the temporary source/candidate repository is dropped.
         }
     }
-    let results = ExecutedExperimentResults {
-        version: 3, schema: "evaluation_experiment_observations_v3".into(),
-        experiment_id: manifest.experiment_id.clone(), manifest_sha256,
-        artifact_run_id: run_id.as_str().into(), artifact_report: report_path,
-        synthetic_baseline: explicit_source.is_none(),
-        real_provider_executed: false,
-        real_provider_execution: RealProviderExecutionObservation::NotRequested,
-        production_eligible: false, eligible_for_production_economics: false,
-        eligible_to_justify_named_default: false,
-        quality: None, total_cost_usd: None, confidence: None, runs,
-        notice: "Observed local argv validation of isolated synthetic Fake candidates. No provider execution, measured model quality, price, confidence, or production eligibility. Required unknown/failed validation cannot pass. No command replay or interrupted-run resume is supported; an unfinalized artifact run remains unknown and nonpublishable.".into(),
-    };
+    let results = finalize_executed_results(
+        manifest,
+        manifest_sha256,
+        run_id.as_str(),
+        report_path,
+        explicit_source.is_none(),
+        false,
+        RealProviderExecutionObservation::NotRequested,
+        runs,
+        "Observed local argv validation of isolated synthetic Fake candidates. No provider execution, measured model quality, price, confidence, or production eligibility. Required unknown/failed validation cannot pass. No command replay or interrupted-run resume is supported; an unfinalized artifact run remains unknown and nonpublishable.".into(),
+    )?;
     let mut writer = Arc::try_unwrap(writer)
         .map_err(|_| anyhow!("experiment validation authority still retained"))?
         .into_inner()
@@ -429,6 +475,9 @@ pub fn run_held_out_real_provider_experiment(
                 Ok(outcome) => (outcome.report, outcome.launch),
                 Err(error) => {
                     let held_out = authority.evidence()?;
+                    let reason = error.to_string();
+                    let measurements =
+                        Some(observed_run_measurements_unavailable(&held_out, &reason));
                     let run = ObservedExperimentRun {
                         required_validation_passed: held_out.passed(),
                         admitted_dispatches: authority.dispatches()?,
@@ -439,6 +488,7 @@ pub fn run_held_out_real_provider_experiment(
                         failure: Some(error.to_string()),
                         held_out,
                         real_provider_execution: RealProviderExecutionObservation::RequestedUnknown,
+                        measurements,
                     };
                     retain_completed_run(&writer, &run)?;
                     runs.push(run);
@@ -466,10 +516,27 @@ pub fn run_held_out_real_provider_experiment(
                     }),
                     ArtifactFileDisposition::PrivateEvidence,
                 )?;
-            let (supervisor_succeeded, supervisor_evidence, failure) = match report {
+            let (supervisor_succeeded, supervisor_evidence, failure, measurements) = match report {
                 Ok(report) => {
                     let reader = ArtifactRunReader::open(&isolated.repo, family, &isolated.run_id)?;
-                    let mut retained = writer.lock().map_err(|_| anyhow!("experiment artifact lock poisoned"))?;
+                    let report_relative = family.final_report_relative_path();
+                    let report_bytes = reader.read(&report_relative)?;
+                    let measurements =
+                        observed_run_measurements_from_captured_supervisor_final_report(
+                            &held_out,
+                            &report,
+                            &report_bytes,
+                            &isolated.repo,
+                            &BTreeSet::new(),
+                        )
+                        .map(Some)
+                        .unwrap_or_else(|error| {
+                            let reason = error.to_string();
+                            Some(observed_run_measurements_unavailable(&held_out, &reason))
+                        });
+                    let mut retained = writer
+                        .lock()
+                        .map_err(|_| anyhow!("experiment artifact lock poisoned"))?;
                     for record in &reader.finalization().files {
                         retained.write_bytes(
                             prefix.join(&record.path),
@@ -484,17 +551,23 @@ pub fn run_held_out_real_provider_experiment(
                     )?;
                     (
                         report.success,
-                        Some(prefix.join(family.final_report_relative_path())),
+                        Some(prefix.join(report_relative)),
                         None,
+                        measurements,
                     )
                 }
-                Err(error) => (
-                    false,
-                    None,
-                    Some(format!(
-                        "supervisor did not produce a verified finalized report; unfinished validation is unknown: {error}"
-                    )),
-                ),
+                Err(error) => {
+                    let reason =
+                        format!("supervisor did not produce a verified finalized report: {error}");
+                    (
+                        false,
+                        None,
+                        Some(format!(
+                            "supervisor did not produce a verified finalized report; unfinished validation is unknown: {error}"
+                        )),
+                        Some(observed_run_measurements_unavailable(&held_out, &reason)),
+                    )
+                }
             };
             let run = ObservedExperimentRun {
                 required_validation_passed: held_out.passed(),
@@ -505,6 +578,7 @@ pub fn run_held_out_real_provider_experiment(
                 supervisor_evidence,
                 failure,
                 real_provider_execution: run_observation,
+                measurements,
             };
             retain_completed_run(&writer, &run)?;
             runs.push(run);
@@ -514,25 +588,17 @@ pub fn run_held_out_real_provider_experiment(
         any_target_launch_attempted,
         any_native_runtime_result,
     );
-    let results = ExecutedExperimentResults {
-        version: 3,
-        schema: "evaluation_experiment_observations_v3".into(),
-        experiment_id: manifest.experiment_id.clone(),
+    let results = finalize_executed_results(
+        manifest,
         manifest_sha256,
-        artifact_run_id: run_id.as_str().into(),
-        artifact_report: report_path,
-        synthetic_baseline: false,
-        real_provider_executed: any_native_runtime_result,
+        run_id.as_str(),
+        report_path,
+        false,
+        any_native_runtime_result,
         real_provider_execution,
-        production_eligible: false,
-        eligible_for_production_economics: false,
-        eligible_to_justify_named_default: false,
-        quality: None,
-        total_cost_usd: None,
-        confidence: None,
         runs,
-        notice: REAL_PROVIDER_HELD_OUT_NOTICE.into(),
-    };
+        REAL_PROVIDER_HELD_OUT_NOTICE.into(),
+    )?;
     let mut writer = Arc::try_unwrap(writer)
         .map_err(|_| anyhow!("experiment validation authority still retained"))?
         .into_inner()
@@ -544,6 +610,72 @@ pub fn run_held_out_real_provider_experiment(
     )?;
     writer.finalize(family.final_report_relative_path(), false)?;
     Ok(results)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_executed_results(
+    manifest: &ExperimentManifest,
+    manifest_sha256: String,
+    artifact_run_id: &str,
+    artifact_report: PathBuf,
+    synthetic_baseline: bool,
+    real_provider_executed: bool,
+    real_provider_execution: RealProviderExecutionObservation,
+    runs: Vec<ObservedExperimentRun>,
+    notice: String,
+) -> Result<ExecutedExperimentResults> {
+    let summary = summarize_executed_observation_runs(manifest, &manifest_sha256, &runs)?;
+    Ok(apply_executed_summary(
+        manifest,
+        manifest_sha256,
+        artifact_run_id,
+        artifact_report,
+        synthetic_baseline,
+        real_provider_executed,
+        real_provider_execution,
+        runs,
+        notice,
+        summary,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn apply_executed_summary(
+    manifest: &ExperimentManifest,
+    manifest_sha256: String,
+    artifact_run_id: &str,
+    artifact_report: PathBuf,
+    synthetic_baseline: bool,
+    real_provider_executed: bool,
+    real_provider_execution: RealProviderExecutionObservation,
+    runs: Vec<ObservedExperimentRun>,
+    notice: String,
+    summary: ExecutedExperimentSummary,
+) -> ExecutedExperimentResults {
+    ExecutedExperimentResults {
+        version: 3,
+        schema: "evaluation_experiment_observations_v3".into(),
+        experiment_id: manifest.experiment_id.clone(),
+        manifest_sha256,
+        artifact_run_id: artifact_run_id.into(),
+        artifact_report,
+        synthetic_baseline,
+        real_provider_executed,
+        real_provider_execution,
+        production_eligible: false,
+        eligible_for_production_economics: false,
+        eligible_to_justify_named_default: false,
+        quality: summary.labelled_quality_proxy,
+        total_cost_usd: summary.total_reported_cost_usd,
+        confidence: None,
+        runs,
+        profile_summaries: summary.profile_summaries,
+        dispatch_comparisons: summary.dispatch_comparisons,
+        observation_pareto_conclusion: Some(summary.pareto_conclusion),
+        observation_pareto_frontier: summary.pareto_frontier,
+        quality_proxy_label: summary.quality_proxy_label,
+        notice,
+    }
 }
 
 fn retain_completed_run(

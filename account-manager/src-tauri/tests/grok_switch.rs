@@ -159,6 +159,7 @@ fn selected_metadata(account_id: &str) -> StoredAccountMetadata {
         state: StoredAccountState::Complete,
         material: StoredAccountMaterial::VendorHome,
         is_selected: true,
+        account_incarnation: "0123456789abcdef0123456789abcdef".to_string(),
     }
 }
 

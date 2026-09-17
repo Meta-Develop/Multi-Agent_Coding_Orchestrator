@@ -3721,6 +3721,8 @@ impl fmt::Display for EvaluationEvidenceKind {
 }
 
 mod executed_experiment;
+mod executed_measurements;
+mod executed_summary;
 mod experiment;
 pub use crate::merge::held_out::{CommandObservation, CommandObservationStatus};
 pub use crate::supervise::held_out::{
@@ -3730,6 +3732,20 @@ pub use executed_experiment::{
     run_experiment_with_held_out, run_experiment_with_held_out_and_source,
     run_held_out_real_provider_experiment, ExecutedExperimentResults, ObservedExperimentRun,
     RealProviderExecutionObservation,
+};
+pub use executed_measurements::{
+    observed_run_measurements_from_captured_supervisor_final_report,
+    observed_run_measurements_from_retained_supervisor_final_report,
+    review_aggregate_establishes_full_independent_coverage, ObservedCandidateFootprint,
+    ObservedRunMeasurements, ParentReviewCaptureObservation, OBSERVED_RUN_MEASUREMENTS_VERSION,
+    REPORTED_COST_EQUIVALENT_NOTICE,
+};
+pub use executed_summary::{
+    summarize_executed_observation_runs, ExecutedAcceptedQualityStatus,
+    ExecutedAcceptedQualitySummary, ExecutedExperimentSummary, ExecutedObservationParetoConclusion,
+    ExecutedObservationParetoStatus, ExecutedOutcomeCount, ExecutedOutcomeCounts,
+    ExecutedParetoPoint, ExecutedProfileSummary, EXECUTED_SUMMARY_SCHEMA_VERSION,
+    MISSING_PARENT_REVIEW_PRODUCER_NOTICE, QUALIFIED_ACCEPTED_TASK_FRACTION_LABEL,
 };
 pub mod rescore;
 pub use experiment::{
