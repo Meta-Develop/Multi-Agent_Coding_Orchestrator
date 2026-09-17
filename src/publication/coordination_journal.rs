@@ -1118,6 +1118,53 @@ impl TrustedJournalReductionInput<'_> {
     }
 }
 
+/// Whether a proposed journal append can observe provider comment time yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IntentAdmissionTiming {
+    /// Before the first transport mutation; monotonic/stale proofs are deferred.
+    PreflightDeferred,
+    Observed(ForgeTimestamp),
+}
+
+/// Admission context for one proposed journal semantic transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProposedIntentAdmission {
+    pub bound_actor: ForgeActor,
+    pub timing: IntentAdmissionTiming,
+}
+
+/// Pure semantic preflight against an authoritative snapshot from observed history.
+pub(crate) fn preflight_proposed_journal_transition(
+    config: &CoordinationJournalConfig,
+    snapshot: &AuthoritySnapshot,
+    intent: &CoordinationIntent,
+    admission: &ProposedIntentAdmission,
+    effect_reconciliation: Option<&dyn EffectReconciliationVerifier>,
+) -> Result<()> {
+    intent.require_target(config.anchor_item())?;
+    if intent.expected_parent_oid() != snapshot.journal_head_oid() {
+        bail!("proposed intent parent does not match authoritative journal head");
+    }
+    let mut active_owners = snapshot
+        .active_owners()
+        .iter()
+        .map(|record| (record.owner().clone(), record.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut pending = snapshot
+        .pending_reservations()
+        .iter()
+        .map(|reserve| (reserve.effect_id().to_owned(), reserve.clone()))
+        .collect::<BTreeMap<_, _>>();
+    apply_intent_semantics(
+        config,
+        intent,
+        admission,
+        &mut active_owners,
+        &mut pending,
+        effect_reconciliation,
+    )
+}
+
 pub(crate) fn verify_journal_entry_contract(
     config: &CoordinationJournalConfig,
     entry: &VerifiedJournalEntry,
@@ -1202,7 +1249,34 @@ fn apply_intent(
     pending: &mut BTreeMap<String, PendingEffectReservation>,
     effect_reconciliation: Option<&dyn EffectReconciliationVerifier>,
 ) -> Result<()> {
-    let created_at = entry.comment().created_at();
+    let admission = ProposedIntentAdmission {
+        bound_actor: entry.comment().author().clone(),
+        timing: IntentAdmissionTiming::Observed(entry.comment().created_at().clone()),
+    };
+    apply_intent_semantics(
+        config,
+        intent,
+        &admission,
+        active_owners,
+        pending,
+        effect_reconciliation,
+    )
+}
+
+fn apply_intent_semantics(
+    config: &CoordinationJournalConfig,
+    intent: &CoordinationIntent,
+    admission: &ProposedIntentAdmission,
+    active_owners: &mut BTreeMap<CoordinationOwnerIdentity, ActiveOwnerRecord>,
+    pending: &mut BTreeMap<String, PendingEffectReservation>,
+    effect_reconciliation: Option<&dyn EffectReconciliationVerifier>,
+) -> Result<()> {
+    let observed_at = match &admission.timing {
+        IntentAdmissionTiming::Observed(timestamp) => Some(timestamp),
+        IntentAdmissionTiming::PreflightDeferred => None,
+    };
+    let placeholder_at = || ForgeTimestamp::new("1970-01-01T00:00:00Z").expect("placeholder");
+    let created_at = observed_at.cloned().unwrap_or_else(placeholder_at);
     match &intent.action {
         CoordinationIntentAction::Claim { scopes, lease } => {
             ensure_lease_matches_config(lease, config.timing())?;
@@ -1216,7 +1290,7 @@ fn apply_intent(
                 intent.owner().clone(),
                 ActiveOwnerRecord {
                     owner: intent.owner().clone(),
-                    bound_claim_actor: entry.comment().author().clone(),
+                    bound_claim_actor: admission.bound_actor.clone(),
                     scopes: scopes.clone(),
                     lease: *lease,
                     activation_at: created_at.clone(),
@@ -1227,14 +1301,16 @@ fn apply_intent(
         }
         CoordinationIntentAction::Heartbeat => {
             let owner = active_owner_mut(active_owners, intent.owner())?;
-            require_exact_bound_actor(owner, entry)?;
-            if created_at < &owner.last_heartbeat_at {
-                bail!("heartbeat provider time moved backward");
+            require_exact_bound_actor(owner, &admission.bound_actor)?;
+            if let Some(created_at) = observed_at {
+                if created_at < &owner.last_heartbeat_at {
+                    bail!("heartbeat provider time moved backward");
+                }
+                owner.last_heartbeat_at = created_at.clone();
             }
             if owner_has_blocking_reserve(pending, intent.owner()) {
                 // Heartbeats remain allowed while reserved; reserve blocks takeover/release only.
             }
-            owner.last_heartbeat_at = created_at.clone();
         }
         CoordinationIntentAction::Takeover {
             predecessor,
@@ -1252,14 +1328,16 @@ fn apply_intent(
             if owner_has_blocking_reserve(pending, predecessor) {
                 bail!("takeover blocked by active effect reservation");
             }
-            let at = timestamp_seconds(created_at)?;
-            let heartbeat_at = timestamp_seconds(&predecessor_record.last_heartbeat_at)?;
-            if !elapsed_strictly_after(
-                heartbeat_at,
-                at,
-                predecessor_record.lease.stale_after_seconds,
-            )? {
-                bail!("takeover provider time is not past predecessor lease duration");
+            if let Some(created_at) = observed_at {
+                let at = timestamp_seconds(created_at)?;
+                let heartbeat_at = timestamp_seconds(&predecessor_record.last_heartbeat_at)?;
+                if !elapsed_strictly_after(
+                    heartbeat_at,
+                    at,
+                    predecessor_record.lease.stale_after_seconds,
+                )? {
+                    bail!("takeover provider time is not past predecessor lease duration");
+                }
             }
             if let Some(conflict) = active_scope_conflict(active_owners, scopes, Some(predecessor))
             {
@@ -1273,7 +1351,7 @@ fn apply_intent(
                 intent.owner().clone(),
                 ActiveOwnerRecord {
                     owner: intent.owner().clone(),
-                    bound_claim_actor: entry.comment().author().clone(),
+                    bound_claim_actor: admission.bound_actor.clone(),
                     scopes: scopes.clone(),
                     lease: *lease,
                     activation_at: created_at.clone(),
@@ -1284,7 +1362,7 @@ fn apply_intent(
         }
         CoordinationIntentAction::Release { .. } => {
             let owner = active_owner_mut(active_owners, intent.owner())?;
-            require_exact_bound_actor(owner, entry)?;
+            require_exact_bound_actor(owner, &admission.bound_actor)?;
             if owner_has_blocking_reserve(pending, intent.owner()) {
                 bail!("release blocked by active effect reservation");
             }
@@ -1295,14 +1373,18 @@ fn apply_intent(
             publication_effect,
         } => {
             let owner = active_owner_mut(active_owners, intent.owner())?;
-            require_exact_bound_actor(owner, entry)?;
+            require_exact_bound_actor(owner, &admission.bound_actor)?;
             if pending.contains_key(effect_id) {
                 bail!("effect id is already reserved");
             }
-            let at = timestamp_seconds(created_at)?;
-            let heartbeat_at = timestamp_seconds(&owner.last_heartbeat_at)?;
-            if elapsed_strictly_after(heartbeat_at, at, owner.lease.stale_after_seconds)? {
-                bail!("effect reserve requires a current lease proof from this intent timestamp");
+            if let Some(created_at) = observed_at {
+                let at = timestamp_seconds(created_at)?;
+                let heartbeat_at = timestamp_seconds(&owner.last_heartbeat_at)?;
+                if elapsed_strictly_after(heartbeat_at, at, owner.lease.stale_after_seconds)? {
+                    bail!(
+                        "effect reserve requires a current lease proof from this intent timestamp"
+                    );
+                }
             }
             pending.insert(
                 effect_id.clone(),
@@ -1320,7 +1402,7 @@ fn apply_intent(
             reconciliation,
         } => {
             let owner = active_owner_mut(active_owners, intent.owner())?;
-            require_exact_bound_actor(owner, entry)?;
+            require_exact_bound_actor(owner, &admission.bound_actor)?;
             let reserve = pending
                 .get(effect_id)
                 .context("effect completion names an unknown reservation")?;
@@ -1358,11 +1440,8 @@ fn apply_intent(
     Ok(())
 }
 
-fn require_exact_bound_actor(
-    owner: &ActiveOwnerRecord,
-    entry: &VerifiedJournalEntry,
-) -> Result<()> {
-    if entry.comment().author() != &owner.bound_claim_actor {
+fn require_exact_bound_actor(owner: &ActiveOwnerRecord, actor: &ForgeActor) -> Result<()> {
+    if actor != &owner.bound_claim_actor {
         bail!("coordination intent actor does not match the bound claim activation actor");
     }
     Ok(())
@@ -1816,6 +1895,70 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn preflight_refuses_overlapping_claim_before_append() {
+        let cfg = config();
+        let first = verified_entry(
+            ANCHOR,
+            &oid(1),
+            "evt-a",
+            &CoordinationIntent::claim(
+                cfg.anchor_item(),
+                "evt-a",
+                ANCHOR,
+                owner("run-a", "nonce-a"),
+                vec!["path:src/shared.rs".to_string()],
+                cfg.timing(),
+            )
+            .expect("claim"),
+            &trusted_actor_a(),
+            T0,
+            "c-a",
+        );
+        let snapshot = reduce_history(vec![first], None);
+        let overlapping = CoordinationIntent::claim(
+            cfg.anchor_item(),
+            "evt-b",
+            oid(1),
+            owner("run-b", "nonce-b"),
+            vec!["path:src/shared.rs".to_string()],
+            cfg.timing(),
+        )
+        .expect("overlap claim");
+        let error = preflight_proposed_journal_transition(
+            &cfg,
+            &snapshot,
+            &overlapping,
+            &ProposedIntentAdmission {
+                bound_actor: trusted_actor_a(),
+                timing: IntentAdmissionTiming::PreflightDeferred,
+            },
+            None,
+        )
+        .expect_err("overlap");
+        assert!(error.to_string().contains("scopes overlap"));
+        let disjoint = CoordinationIntent::claim(
+            cfg.anchor_item(),
+            "evt-c",
+            oid(1),
+            owner("run-c", "nonce-c"),
+            vec!["path:src/other.rs".to_string()],
+            cfg.timing(),
+        )
+        .expect("disjoint claim");
+        preflight_proposed_journal_transition(
+            &cfg,
+            &snapshot,
+            &disjoint,
+            &ProposedIntentAdmission {
+                bound_actor: trusted_actor_a(),
+                timing: IntentAdmissionTiming::PreflightDeferred,
+            },
+            None,
+        )
+        .expect("disjoint preflight");
     }
 
     #[test]

@@ -4,8 +4,9 @@
 //! explicit adapter construction after branch-protection proof.
 
 use super::coordination_journal::{
-    AuthenticatedCommentEvidence, AuthoritySnapshot, CoordinationIntent, CoordinationJournalConfig,
-    EffectReconciliationVerifier, JournalPointer, TrustedFiniteJournalHistory,
+    preflight_proposed_journal_transition, AuthenticatedCommentEvidence, AuthoritySnapshot,
+    CoordinationIntent, CoordinationJournalConfig, EffectReconciliationVerifier,
+    IntentAdmissionTiming, JournalPointer, ProposedIntentAdmission, TrustedFiniteJournalHistory,
     TrustedJournalReductionInput, VerifiedJournalEntry, MAX_JOURNAL_ENTRIES,
     MAX_POINTER_FILE_BYTES,
 };
@@ -662,6 +663,11 @@ impl<R: CoordinationGithubRunner> CoordinationGithubTransport<R> {
                 effect_reconciliation,
             );
         }
+        if let Some(outcome) =
+            self.preflight_before_first_mutation(wal, &plan, effect_reconciliation)?
+        {
+            return Ok(outcome);
+        }
         let comment_record = match self.run_comment_phase(
             wal,
             &plan.comment_effect_id,
@@ -680,6 +686,11 @@ impl<R: CoordinationGithubRunner> CoordinationGithubTransport<R> {
         };
         let readback = self.fetch_comment_exact(comment_record.provider_comment_id)?;
         self.validate_comment_wire(&readback, &plan.body, &plan.comment_author)?;
+        if let Some(outcome) =
+            self.preflight_after_comment_observed(&plan, &readback, effect_reconciliation)?
+        {
+            return Ok(outcome);
+        }
         let evidence = AuthenticatedCommentEvidence::from_verified_transport(
             &forge_comment_from_wire(self.config.journal().anchor_item(), &readback)?,
             self.config.journal().anchor_item(),
@@ -728,11 +739,93 @@ impl<R: CoordinationGithubRunner> CoordinationGithubTransport<R> {
             self.config.journal(),
             self.history_prefix_plus(entry.clone())?,
         )?;
-        let snapshot = self.reduce_loaded_history(&history, effect_reconciliation)?;
+        let snapshot = match self.reduce_loaded_history(&history, effect_reconciliation) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return Ok(CoordinationMutationOutcome::Unknown {
+                    evidence: format!("{error:#}"),
+                });
+            }
+        };
         Ok(CoordinationMutationOutcome::Applied {
             entry: Box::new(entry),
             snapshot,
         })
+    }
+
+    fn preflight_before_first_mutation(
+        &self,
+        wal: &EffectWal,
+        plan: &CoordinationGithubIntentApplyPlan,
+        effect_reconciliation: Option<&dyn EffectReconciliationVerifier>,
+    ) -> Result<Option<CoordinationMutationOutcome>> {
+        let history = self.load_trusted_history()?;
+        let snapshot = self.reduce_loaded_history(&history, effect_reconciliation)?;
+        if plan.intent.expected_parent_oid() != snapshot.journal_head_oid() {
+            return Ok(Some(CoordinationMutationOutcome::Unknown {
+                evidence: "in-flight intent parent does not match current journal tip".to_string(),
+            }));
+        }
+        match preflight_proposed_journal_transition(
+            self.config.journal(),
+            &snapshot,
+            &plan.intent,
+            &ProposedIntentAdmission {
+                bound_actor: plan.comment_author.clone(),
+                timing: IntentAdmissionTiming::PreflightDeferred,
+            },
+            effect_reconciliation,
+        ) {
+            Ok(()) => Ok(None),
+            Err(error)
+                if wal.phase(&plan.comment_effect_id) == Some(EffectPhase::Planned)
+                    && wal.phase(&plan.cas_effect_id) == Some(EffectPhase::Planned) =>
+            {
+                Ok(Some(CoordinationMutationOutcome::NotApplied {
+                    reason: format!("{error:#}"),
+                }))
+            }
+            Err(error) => Ok(Some(CoordinationMutationOutcome::Unknown {
+                evidence: format!(
+                    "coordination transition refused after a prior effect may have started: {error:#}"
+                ),
+            })),
+        }
+    }
+
+    fn preflight_after_comment_observed(
+        &self,
+        plan: &CoordinationGithubIntentApplyPlan,
+        readback: &GithubCommentWire,
+        effect_reconciliation: Option<&dyn EffectReconciliationVerifier>,
+    ) -> Result<Option<CoordinationMutationOutcome>> {
+        let history = self.load_trusted_history()?;
+        let snapshot = self.reduce_loaded_history(&history, effect_reconciliation)?;
+        if plan.intent.expected_parent_oid() != snapshot.journal_head_oid() {
+            return Ok(Some(CoordinationMutationOutcome::Unknown {
+                evidence: "coordination comment was posted but journal tip moved before CAS"
+                    .to_string(),
+            }));
+        }
+        let observed_at = ForgeTimestamp::new(&readback.created_at)
+            .context("authenticated coordination comment timestamp")?;
+        match preflight_proposed_journal_transition(
+            self.config.journal(),
+            &snapshot,
+            &plan.intent,
+            &ProposedIntentAdmission {
+                bound_actor: plan.comment_author.clone(),
+                timing: IntentAdmissionTiming::Observed(observed_at),
+            },
+            effect_reconciliation,
+        ) {
+            Ok(()) => Ok(None),
+            Err(error) => Ok(Some(CoordinationMutationOutcome::Unknown {
+                evidence: format!(
+                    "coordination comment was posted but semantic transition was refused: {error:#}"
+                ),
+            })),
+        }
     }
 
     fn history_for_committed_nonce(
@@ -2158,8 +2251,10 @@ mod tests {
 
     const ANCHOR_OID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const CHILD_OID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const GRANDCHILD_OID: &str = "1111111111111111111111111111111111111111";
     const ANCHOR_TREE: &str = "cccccccccccccccccccccccccccccccccccccccc";
     const CHILD_TREE: &str = "dddddddddddddddddddddddddddddddddddddddd";
+    const GRANDCHILD_TREE: &str = "2222222222222222222222222222222222222222";
     const POINTER_BLOB: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
     const ISSUE_HTML_URL: &str = "https://github.com/meta-develop/maco/issues/89";
     const ISSUE_API_URL: &str = "https://api.github.com/repos/meta-develop/maco/issues/89";
@@ -2308,10 +2403,14 @@ mod tests {
     }
 
     fn comment_json(body: &str) -> serde_json::Value {
+        comment_json_with_node(body, "IC_comment", 101)
+    }
+
+    fn comment_json_with_node(body: &str, node_id: &str, database_id: u64) -> serde_json::Value {
         serde_json::json!({
-            "id": 101_u64,
-            "node_id": "IC_comment",
-            "html_url": "https://github.com/meta-develop/maco/issues/89#issuecomment-101",
+            "id": database_id,
+            "node_id": node_id,
+            "html_url": format!("https://github.com/meta-develop/maco/issues/89#issuecomment-{database_id}"),
             "issue_url": ISSUE_API_URL,
             "body": body,
             "created_at": "2026-08-16T00:00:00Z",
@@ -2532,6 +2631,77 @@ mod tests {
         serde_json::to_string(&vec![comment_json(body)]).expect("issue comments page")
     }
 
+    fn append_empty_anchor_history_read(out: &mut Vec<String>) {
+        out.push(json_ref_head(ANCHOR_OID));
+        out.push(json_empty_comments_page());
+    }
+
+    fn append_active_child_journal_history_read(
+        out: &mut Vec<String>,
+        body: &str,
+        pointer_blob_oid: &str,
+        pointer_blob_json: &str,
+    ) {
+        append_verified_child_journal_history_load(out, body, pointer_blob_oid, pointer_blob_json);
+    }
+
+    fn append_cas_receipt_verification_grandchild(
+        out: &mut Vec<String>,
+        child_pointer_blob_oid: &str,
+        grandchild_pointer_blob_oid: &str,
+        grandchild_pointer_blob_json: &str,
+    ) {
+        out.push(json_commit(
+            GRANDCHILD_OID,
+            GRANDCHILD_TREE,
+            Some(CHILD_OID),
+        ));
+        out.push(json_commit(CHILD_OID, CHILD_TREE, Some(ANCHOR_OID)));
+        out.push(json_pointer_child_tree(
+            GRANDCHILD_TREE,
+            grandchild_pointer_blob_oid,
+        ));
+        out.push(json_pointer_child_tree(CHILD_TREE, child_pointer_blob_oid));
+        out.push(grandchild_pointer_blob_json.to_string());
+        out.push(json_ref_head(GRANDCHILD_OID));
+    }
+
+    fn append_verified_grandchild_journal_history_load(
+        out: &mut Vec<String>,
+        body_a: &str,
+        child_pointer_blob_oid: &str,
+        child_pointer_blob_json: &str,
+        body_b: &str,
+        grandchild_pointer_blob_oid: &str,
+        grandchild_pointer_blob_json: &str,
+    ) {
+        out.push(json_ref_head(GRANDCHILD_OID));
+        out.push(json_commit(
+            GRANDCHILD_OID,
+            GRANDCHILD_TREE,
+            Some(CHILD_OID),
+        ));
+        out.push(json_commit(CHILD_OID, CHILD_TREE, Some(ANCHOR_OID)));
+        out.push(
+            serde_json::to_string(&vec![
+                comment_json(body_a),
+                comment_json_with_node(body_b, "IC_comment_b", 102),
+            ])
+            .expect("issue comments page"),
+        );
+        out.push(json_commit(ANCHOR_OID, ANCHOR_TREE, None));
+        out.push(json_pointer_child_tree(CHILD_TREE, child_pointer_blob_oid));
+        out.push(json_empty_tree(ANCHOR_TREE));
+        out.push(child_pointer_blob_json.to_string());
+        out.push(json_commit(CHILD_OID, CHILD_TREE, Some(ANCHOR_OID)));
+        out.push(json_pointer_child_tree(
+            GRANDCHILD_TREE,
+            grandchild_pointer_blob_oid,
+        ));
+        out.push(json_pointer_child_tree(CHILD_TREE, child_pointer_blob_oid));
+        out.push(grandchild_pointer_blob_json.to_string());
+    }
+
     fn json_commit(sha: &str, tree: &str, parent: Option<&str>) -> String {
         let parents = parent
             .map(|parent_sha| vec![serde_json::json!({ "sha": parent_sha })])
@@ -2694,11 +2864,11 @@ mod tests {
             .expect("comment started");
         drop(wal);
 
-        let runner = Arc::new(ScriptedCoordinationRunner::new([
-            json_ref_head(ANCHOR_OID),
-            json_empty_comments_page(),
-            json_empty_comments_page(),
-        ]));
+        let mut apply_responses = Vec::new();
+        append_empty_anchor_history_read(&mut apply_responses);
+        append_empty_anchor_history_read(&mut apply_responses);
+        apply_responses.push(json_empty_comments_page());
+        let runner = Arc::new(ScriptedCoordinationRunner::new(apply_responses));
         let transport = CoordinationGithubTransport::new(config, Arc::clone(&runner));
         let outcome = transport
             .apply_authorized_intent(intent, author, None)
@@ -2762,12 +2932,13 @@ mod tests {
         wal.started(&cas_effect_id, &planned).expect("cas started");
         drop(wal);
 
-        let runner = Arc::new(ScriptedCoordinationRunner::new([
-            json_ref_head(ANCHOR_OID),
-            json_empty_comments_page(),
-            comment_json(&body).to_string(),
-            json_ref_head(ANCHOR_OID),
-        ]));
+        let mut apply_responses = Vec::new();
+        append_empty_anchor_history_read(&mut apply_responses);
+        append_empty_anchor_history_read(&mut apply_responses);
+        apply_responses.push(comment_json(&body).to_string());
+        append_empty_anchor_history_read(&mut apply_responses);
+        apply_responses.push(json_ref_head(ANCHOR_OID));
+        let runner = Arc::new(ScriptedCoordinationRunner::new(apply_responses));
         let transport = CoordinationGithubTransport::new(config, Arc::clone(&runner));
         let outcome = transport
             .apply_authorized_intent(intent, author, None)
@@ -2814,16 +2985,16 @@ mod tests {
             "data": { "createCommitOnBranch": { "commit": { "oid": CHILD_OID } } }
         })
         .to_string();
-        let mut apply_responses = vec![
-            json_ref_head(ANCHOR_OID),
-            json_empty_comments_page(),
-            json_empty_comments_page(),
-            comment_json(&body).to_string(),
-            comment_json(&body).to_string(),
-            comment_json(&body).to_string(),
-            json_ref_head(ANCHOR_OID),
-            cas_graphql,
-        ];
+        let mut apply_responses = Vec::new();
+        append_empty_anchor_history_read(&mut apply_responses);
+        append_empty_anchor_history_read(&mut apply_responses);
+        apply_responses.push(json_empty_comments_page());
+        apply_responses.push(comment_json(&body).to_string());
+        apply_responses.push(comment_json(&body).to_string());
+        apply_responses.push(comment_json(&body).to_string());
+        append_empty_anchor_history_read(&mut apply_responses);
+        apply_responses.push(json_ref_head(ANCHOR_OID));
+        apply_responses.push(cas_graphql);
         append_cas_receipt_verification(
             &mut apply_responses,
             &pointer_blob_oid,
@@ -3101,6 +3272,230 @@ mod tests {
         assert_eq!(wal.phase(&comment_effect_id), Some(EffectPhase::Completed));
         assert_eq!(wal.phase(&cas_effect_id), Some(EffectPhase::Completed));
         assert_eq!(wal.events().len(), event_count_before);
+    }
+
+    #[test]
+    fn overlapping_claim_refused_before_github_transport_mutation() {
+        assert_overlapping_claim_refusal(false);
+    }
+
+    #[test]
+    fn overlapping_claim_with_started_wal_remains_unknown_without_more_mutation() {
+        assert_overlapping_claim_refusal(true);
+    }
+
+    fn assert_overlapping_claim_refusal(comment_started: bool) {
+        let (_temp, repo) = coordination_git_repo();
+        let bind_runner =
+            ScriptedCoordinationRunner::new(adapter_responses([]).into_iter().collect::<Vec<_>>());
+        let config = adapter_config(&repo, &bind_runner);
+        let author = actor("trusted-a");
+        let owner_a = CoordinationOwnerIdentity::new("run-a", "nonce-a").expect("owner a");
+        let intent_a = CoordinationIntent::claim(
+            &item(),
+            "event-host-a",
+            ANCHOR_OID,
+            owner_a,
+            vec!["scope/shared".to_string()],
+            ClaimTiming::new(10, 30).expect("timing"),
+        )
+        .expect("claim a");
+        let body_a = intent_a.render().expect("body a");
+        let pointer_a = JournalPointer::new(
+            intent_a.event_nonce(),
+            github_node_object_id(ProviderObjectKind::Comment, "IC_comment").expect("comment id"),
+            sha256_hex(body_a.as_bytes()),
+            ANCHOR_OID,
+        )
+        .expect("pointer a");
+        let pointer_file_a = pointer_a.render_pointer_file().expect("pointer file a");
+        let (pointer_blob_oid_a, pointer_blob_json_a) = blob_wire(&pointer_file_a);
+        let owner_b = CoordinationOwnerIdentity::new("run-b", "nonce-b").expect("owner b");
+        let intent_b = CoordinationIntent::claim(
+            &item(),
+            "event-host-b",
+            CHILD_OID,
+            owner_b,
+            vec!["scope/shared".to_string()],
+            ClaimTiming::new(10, 30).expect("timing"),
+        )
+        .expect("claim b");
+        let (logical_id, comment_effect_id, cas_effect_id, planned) =
+            mutation_plan(&intent_b, &author);
+        if comment_started {
+            let mut wal: DefaultEffectWal = EffectWal::open_or_create_planned(
+                || {
+                    repository_auth_writer(&repo)?
+                        .into_authenticator()
+                        .context("coordination WAL authenticator")
+                },
+                &logical_id,
+                &comment_effect_id,
+                &planned,
+            )
+            .expect("seed WAL");
+            wal.planned(&cas_effect_id, &planned).expect("cas planned");
+            wal.started(&comment_effect_id, &planned)
+                .expect("comment started");
+        }
+        let mut apply_responses = Vec::new();
+        for _ in 0..4 {
+            append_active_child_journal_history_read(
+                &mut apply_responses,
+                &body_a,
+                &pointer_blob_oid_a,
+                &pointer_blob_json_a,
+            );
+        }
+        let runner = Arc::new(ScriptedCoordinationRunner::new(apply_responses));
+        let transport = CoordinationGithubTransport::new(config, Arc::clone(&runner));
+        let outcome = transport
+            .apply_authorized_intent(intent_b, author, None)
+            .expect("overlapping claim apply");
+        match outcome {
+            CoordinationMutationOutcome::NotApplied { reason } if !comment_started => {
+                assert!(reason.contains("scopes overlap"));
+            }
+            CoordinationMutationOutcome::Unknown { evidence } if comment_started => {
+                assert!(evidence.contains("scopes overlap"));
+                assert!(evidence.contains("prior effect may have started"));
+            }
+            other => panic!("expected pre-effect refusal, got {other:?}"),
+        }
+        assert_eq!(runner.post_issue_comment_calls(), 0);
+        assert_eq!(runner.create_commit_on_branch_calls(), 0);
+        transport
+            .load_trusted_history()
+            .expect("journal still loads");
+        transport
+            .reduce_loaded_history(&transport.load_trusted_history().expect("history"), None)
+            .expect("journal still reduces");
+        let wal: DefaultEffectWal = EffectWal::open_instance(
+            repository_auth_writer(&repo)
+                .expect("auth")
+                .into_authenticator()
+                .expect("authenticator"),
+            &logical_id,
+        )
+        .expect("reopen WAL");
+        let expected_comment_phase = if comment_started {
+            EffectPhase::Started
+        } else {
+            EffectPhase::Planned
+        };
+        assert_eq!(wal.phase(&comment_effect_id), Some(expected_comment_phase));
+        assert_eq!(wal.phase(&cas_effect_id), Some(EffectPhase::Planned));
+    }
+
+    #[test]
+    fn disjoint_claim_applies_on_github_transport_after_active_claim() {
+        let (_temp, repo) = coordination_git_repo();
+        let bind_runner =
+            ScriptedCoordinationRunner::new(adapter_responses([]).into_iter().collect::<Vec<_>>());
+        let config = adapter_config(&repo, &bind_runner);
+        let author = actor("trusted-a");
+        let owner_a = CoordinationOwnerIdentity::new("run-a", "nonce-a").expect("owner a");
+        let intent_a = CoordinationIntent::claim(
+            &item(),
+            "event-host-a",
+            ANCHOR_OID,
+            owner_a,
+            vec!["scope/shared".to_string()],
+            ClaimTiming::new(10, 30).expect("timing"),
+        )
+        .expect("claim a");
+        let body_a = intent_a.render().expect("body a");
+        let pointer_a = JournalPointer::new(
+            intent_a.event_nonce(),
+            github_node_object_id(ProviderObjectKind::Comment, "IC_comment").expect("comment id"),
+            sha256_hex(body_a.as_bytes()),
+            ANCHOR_OID,
+        )
+        .expect("pointer a");
+        let pointer_file_a = pointer_a.render_pointer_file().expect("pointer file a");
+        let (pointer_blob_oid_a, pointer_blob_json_a) = blob_wire(&pointer_file_a);
+        let owner_b = CoordinationOwnerIdentity::new("run-b", "nonce-b").expect("owner b");
+        let intent_b = CoordinationIntent::claim(
+            &item(),
+            "event-host-b-disjoint",
+            CHILD_OID,
+            owner_b,
+            vec!["scope/disjoint".to_string()],
+            ClaimTiming::new(10, 30).expect("timing"),
+        )
+        .expect("claim b");
+        let body_b = intent_b.render().expect("body b");
+        let pointer_b = JournalPointer::new(
+            intent_b.event_nonce(),
+            github_node_object_id(ProviderObjectKind::Comment, "IC_comment_b").expect("comment id"),
+            sha256_hex(body_b.as_bytes()),
+            CHILD_OID,
+        )
+        .expect("pointer b");
+        let pointer_file_b = pointer_b.render_pointer_file().expect("pointer file b");
+        let (pointer_blob_oid_b, pointer_blob_json_b) = blob_wire(&pointer_file_b);
+        let cas_graphql = serde_json::json!({
+            "data": { "createCommitOnBranch": { "commit": { "oid": GRANDCHILD_OID } } }
+        })
+        .to_string();
+        let comment_b_wire = comment_json_with_node(&body_b, "IC_comment_b", 102).to_string();
+        let mut apply_responses = Vec::new();
+        append_active_child_journal_history_read(
+            &mut apply_responses,
+            &body_a,
+            &pointer_blob_oid_a,
+            &pointer_blob_json_a,
+        );
+        append_active_child_journal_history_read(
+            &mut apply_responses,
+            &body_a,
+            &pointer_blob_oid_a,
+            &pointer_blob_json_a,
+        );
+        apply_responses.push(json_empty_comments_page());
+        apply_responses.push(comment_b_wire.clone());
+        apply_responses.push(comment_b_wire.clone());
+        apply_responses.push(comment_b_wire);
+        append_active_child_journal_history_read(
+            &mut apply_responses,
+            &body_a,
+            &pointer_blob_oid_a,
+            &pointer_blob_json_a,
+        );
+        // CAS reconciliation must inspect A's committed pointer before posting B.
+        apply_responses.push(json_ref_head(CHILD_OID));
+        apply_responses.push(json_commit(CHILD_OID, CHILD_TREE, Some(ANCHOR_OID)));
+        apply_responses.push(json_commit(ANCHOR_OID, ANCHOR_TREE, None));
+        apply_responses.push(json_pointer_child_tree(CHILD_TREE, &pointer_blob_oid_a));
+        apply_responses.push(json_empty_tree(ANCHOR_TREE));
+        apply_responses.push(pointer_blob_json_a.clone());
+        apply_responses.push(cas_graphql);
+        append_cas_receipt_verification_grandchild(
+            &mut apply_responses,
+            &pointer_blob_oid_a,
+            &pointer_blob_oid_b,
+            &pointer_blob_json_b,
+        );
+        append_verified_grandchild_journal_history_load(
+            &mut apply_responses,
+            &body_a,
+            &pointer_blob_oid_a,
+            &pointer_blob_json_a,
+            &body_b,
+            &pointer_blob_oid_b,
+            &pointer_blob_json_b,
+        );
+        let runner = Arc::new(ScriptedCoordinationRunner::new(apply_responses));
+        let transport = CoordinationGithubTransport::new(config, Arc::clone(&runner));
+        let outcome = transport
+            .apply_authorized_intent(intent_b, author, None)
+            .expect("disjoint claim apply");
+        assert!(matches!(
+            outcome,
+            CoordinationMutationOutcome::Applied { .. }
+        ));
+        assert_eq!(runner.post_issue_comment_calls(), 1);
+        assert_eq!(runner.create_commit_on_branch_calls(), 1);
     }
 
     #[test]
