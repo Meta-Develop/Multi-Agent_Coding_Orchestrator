@@ -1,0 +1,31 @@
+[
+  {
+    "event_name": null,
+    "data": {
+      "responseId": "FAKE-stream-anthropic-gemini",
+      "modelVersion": "FAKE-anthropic-model",
+      "candidates": [
+        {
+          "index": 0,
+          "content": { "role": "model", "parts": [{ "text": "Hello" }] }
+        }
+      ]
+    },
+    "terminal": false
+  },
+  {
+    "event_name": null,
+    "data": {
+      "responseId": "FAKE-stream-anthropic-gemini",
+      "modelVersion": "FAKE-anthropic-model",
+      "candidates": [{ "index": 0, "finishReason": "STOP" }],
+      "usageMetadata": {
+        "promptTokenCount": 0,
+        "candidatesTokenCount": 3,
+        "totalTokenCount": 3
+      }
+    },
+    "terminal": false
+  },
+  { "event_name": null, "data": null, "terminal": true }
+]

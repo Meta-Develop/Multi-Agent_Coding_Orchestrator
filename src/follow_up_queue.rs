@@ -59,6 +59,8 @@ const ITEM_ID_DOMAIN: &[u8] = b"MACO\0generated-follow-up-queue-item\0v1\0";
 const QUEUE_ID_DOMAIN: &[u8] = b"MACO\0generated-follow-up-queue-instance\0v1\0";
 const QUEUE_SLOT_ID_DOMAIN: &[u8] = b"MACO\0generated-follow-up-queue-slot\0v2\0";
 const BATCH_ID_DOMAIN: &[u8] = b"MACO\0generated-follow-up-queue-batch\0v1\0";
+const SUBORDINATE_RUN_GRAPH_VISIT_DOMAIN: &[u8] =
+    b"MACO\0generated-follow-up-subordinate-run\0v1\0";
 
 enum GeneratedFollowUpQueueJournalSpec {}
 
@@ -618,6 +620,57 @@ impl DurableGraphQueueItemBinding {
     }
 }
 
+/// Immutable evidence of one completed graph-scheduled queue occurrence.
+///
+/// Per-item occurrence history length is not capped separately from the queue's
+/// authenticated journal record bound and the graph module's visit bound; each
+/// [`QueueJournalEvent::GraphOccurrenceOpened`] appends one archived record.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CompletedGraphOccurrenceSnapshot {
+    graph_visit: u16,
+    subordinate_run_id: String,
+    observation: GeneratedFollowUpDispatchObservation,
+    lease: LeaseState,
+}
+
+impl CompletedGraphOccurrenceSnapshot {
+    pub(crate) fn graph_visit(&self) -> u16 {
+        self.graph_visit
+    }
+
+    pub(crate) fn subordinate_run_id(&self) -> &str {
+        &self.subordinate_run_id
+    }
+
+    pub(crate) fn observation(&self) -> &GeneratedFollowUpDispatchObservation {
+        &self.observation
+    }
+
+    pub(crate) fn lease(&self) -> &LeaseState {
+        &self.lease
+    }
+
+    fn validate(&self, item_id: &str, archive_index: usize) -> Result<()> {
+        if self.graph_visit == 0 {
+            bail!("completed graph occurrence visit must be nonzero");
+        }
+        let expected_run_id = expected_archived_occurrence_subordinate_run_id(
+            item_id,
+            self.graph_visit,
+            archive_index,
+        )?;
+        if self.subordinate_run_id != expected_run_id {
+            bail!("completed graph occurrence run id is not canonical for its visit");
+        }
+        self.observation.validate(Some(&expected_run_id))?;
+        if self.lease.phase() != LeasePhase::Acknowledged {
+            bail!("completed graph occurrence must retain an acknowledged lease");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
 enum QueueJournalEvent {
@@ -698,12 +751,27 @@ enum QueueJournalEvent {
         subordinate_run_id: String,
         lease_event: LeaseEvent,
     },
+    LeaseHeldAmbiguous {
+        item_id: String,
+        subordinate_run_id: String,
+        proof: LeaseProof,
+        external_side_effect_state: ExternalSideEffectState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gate_denial: Option<GateDenial>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        environment_failures: Vec<EnvironmentFailure>,
+    },
     LeaseTerminalAcknowledged {
         item_id: String,
         subordinate_run_id: String,
         observation: GeneratedFollowUpDispatchObservation,
         lease_event: LeaseEvent,
         graph_event: DurableGraphEvent,
+    },
+    GraphOccurrenceOpened {
+        item_id: String,
+        graph_visit: u16,
+        archived: CompletedGraphOccurrenceSnapshot,
     },
 }
 
@@ -726,7 +794,9 @@ impl QueueJournalEvent {
             Self::LeaseReleasedBeforeDispatch { .. } => "lease_released",
             Self::LeaseReclaimed { .. } => "lease_reclaimed",
             Self::LeaseEffectStarted { .. } => "lease_effect_started",
+            Self::LeaseHeldAmbiguous { .. } => "lease_held_ambiguous",
             Self::LeaseTerminalAcknowledged { .. } => "lease_terminal_ack",
+            Self::GraphOccurrenceOpened { .. } => "graph_occurrence_opened",
         }
     }
 
@@ -747,7 +817,9 @@ impl QueueJournalEvent {
             | Self::LeaseReleasedBeforeDispatch { item_id, .. }
             | Self::LeaseReclaimed { item_id, .. }
             | Self::LeaseEffectStarted { item_id, .. }
-            | Self::LeaseTerminalAcknowledged { item_id, .. } => Some(item_id),
+            | Self::LeaseHeldAmbiguous { item_id, .. }
+            | Self::LeaseTerminalAcknowledged { item_id, .. }
+            | Self::GraphOccurrenceOpened { item_id, .. } => Some(item_id),
             Self::GraphTransition { graph_event } => graph_event.subject(),
         }
     }
@@ -780,6 +852,8 @@ pub(crate) struct GeneratedFollowUpQueueItemSnapshot {
     last_gate_denial: Option<GateDenial>,
     last_environment_failures: Vec<EnvironmentFailure>,
     external_side_effect_state: Option<ExternalSideEffectState>,
+    current_occurrence_graph_visit: u16,
+    completed_occurrences: Vec<CompletedGraphOccurrenceSnapshot>,
 }
 
 impl GeneratedFollowUpQueueItemSnapshot {
@@ -813,6 +887,14 @@ impl GeneratedFollowUpQueueItemSnapshot {
 
     pub(crate) fn external_side_effect_state(&self) -> Option<ExternalSideEffectState> {
         self.external_side_effect_state
+    }
+
+    pub(crate) fn current_occurrence_graph_visit(&self) -> u16 {
+        self.current_occurrence_graph_visit
+    }
+
+    pub(crate) fn completed_occurrences(&self) -> &[CompletedGraphOccurrenceSnapshot] {
+        &self.completed_occurrences
     }
 }
 
@@ -1306,11 +1388,39 @@ impl GeneratedFollowUpQueue {
         proof: LeaseProof,
         observed_at: u64,
     ) -> Result<GeneratedFollowUpQueueEventData> {
-        let subordinate_run_id = subordinate_run_id(item_id)?;
+        let graph_visit = bound_graph_task_visit(&self.snapshot, item_id)?;
+        let subordinate_run_id =
+            expected_graph_bound_subordinate_run_id(&self.snapshot, item_id, graph_visit)?;
         self.append_event(QueueJournalEvent::LeaseEffectStarted {
             item_id: item_id.to_string(),
             subordinate_run_id,
             lease_event: LeaseEvent::effect_started(proof, observed_at)?,
+        })
+    }
+
+    /// Records authenticated uncertain effect evidence after the durable
+    /// leased dispatch fence. The subordinate run id is derived from replayed
+    /// queue state; callers cannot supply sibling or alternate run identities.
+    pub(crate) fn mark_leased_held_ambiguous(
+        &mut self,
+        item_id: &str,
+        proof: LeaseProof,
+        gate_denial: Option<GateDenial>,
+        environment_failures: Vec<EnvironmentFailure>,
+    ) -> Result<GeneratedFollowUpQueueEventData> {
+        let subordinate_run_id = self
+            .snapshot
+            .item(item_id)
+            .and_then(GeneratedFollowUpQueueItemSnapshot::subordinate_run_id)
+            .context("generated follow-up item has no durable leased dispatch start")?
+            .to_string();
+        self.append_event(QueueJournalEvent::LeaseHeldAmbiguous {
+            item_id: item_id.to_string(),
+            subordinate_run_id,
+            proof,
+            external_side_effect_state: ExternalSideEffectState::Ambiguous,
+            gate_denial,
+            environment_failures,
         })
     }
 
@@ -1494,6 +1604,11 @@ impl GeneratedFollowUpQueue {
         gate_denial: Option<GateDenial>,
         environment_failures: Vec<EnvironmentFailure>,
     ) -> Result<GeneratedFollowUpQueueEventData> {
+        if self.snapshot.leases.contains_key(item_id) {
+            bail!(
+                "graph/lease-enforced queue item cannot use legacy ambiguous hold; use mark_leased_held_ambiguous"
+            );
+        }
         let subordinate_run_id = self
             .snapshot
             .item(item_id)
@@ -1506,6 +1621,34 @@ impl GeneratedFollowUpQueue {
             external_side_effect_state: ExternalSideEffectState::Ambiguous,
             gate_denial,
             environment_failures,
+        })
+    }
+
+    /// Admits the next graph-scheduled occurrence for one bound item after a
+    /// completed, acknowledged prior occurrence. The target visit is derived
+    /// from replayed graph state; callers cannot supply visit, run id, or
+    /// substitute terminal evidence.
+    pub(crate) fn open_next_graph_occurrence(
+        &mut self,
+        item_id: &str,
+    ) -> Result<GeneratedFollowUpQueueEventData> {
+        let graph_visit = derive_next_graph_occurrence_visit(&self.snapshot, item_id)?;
+        let item = queue_item(&self.snapshot, item_id)?;
+        let archived_visit = item.current_occurrence_graph_visit;
+        if archived_visit == 0 {
+            bail!("graph occurrence reopen requires a completed current occurrence visit");
+        }
+        let lease = self
+            .snapshot
+            .lease(item_id)
+            .context("graph-bound queue item has no lease state")?;
+        let archived =
+            build_completed_graph_occurrence_archive(item_id, item, lease, archived_visit)?;
+        archived.validate(item_id, item.completed_occurrences.len())?;
+        self.append_event(QueueJournalEvent::GraphOccurrenceOpened {
+            item_id: item_id.to_string(),
+            graph_visit,
+            archived,
         })
     }
 
@@ -1626,6 +1769,8 @@ fn apply_queue_event(
                         last_gate_denial: None,
                         last_environment_failures: Vec::new(),
                         external_side_effect_state: None,
+                        current_occurrence_graph_visit: 0,
+                        completed_occurrences: Vec::new(),
                     },
                 );
             }
@@ -1892,7 +2037,9 @@ fn apply_queue_event(
             if !bound_branch_attempt_in_progress(&snapshot, item_id)? {
                 bail!("leased effect start requires the bound graph attempt to be in progress");
             }
-            let expected_run_id = subordinate_run_id(item_id)?;
+            let graph_visit = bound_graph_task_visit(&snapshot, item_id)?;
+            let expected_run_id =
+                expected_graph_bound_subordinate_run_id(&snapshot, item_id, graph_visit)?;
             if observed_run_id != &expected_run_id {
                 bail!("leased dispatch marker has a non-deterministic run id");
             }
@@ -1900,6 +2047,42 @@ fn apply_queue_event(
             let item = queue_item_mut(&mut snapshot, item_id)?;
             item.phase = GeneratedFollowUpQueuePhase::DispatchStarted;
             item.subordinate_run_id = Some(expected_run_id);
+            item.external_side_effect_state = Some(ExternalSideEffectState::Ambiguous);
+            if item.current_occurrence_graph_visit == 0 {
+                item.current_occurrence_graph_visit = graph_visit;
+            } else if item.current_occurrence_graph_visit != graph_visit {
+                bail!("leased dispatch start does not match the current graph occurrence visit");
+            }
+        }
+        QueueJournalEvent::LeaseHeldAmbiguous {
+            item_id,
+            subordinate_run_id: observed_run_id,
+            proof,
+            external_side_effect_state,
+            gate_denial,
+            environment_failures,
+        } => {
+            require_matching_effect_fenced_lease_proof(&snapshot, item_id, proof)?;
+            if *external_side_effect_state != ExternalSideEffectState::Ambiguous {
+                bail!("held generated follow-up must use the existing ambiguous effect state");
+            }
+            if !bound_branch_attempt_in_progress(&snapshot, item_id)? {
+                bail!(
+                    "leased ambiguous hold requires the bound graph attempt to remain in progress"
+                );
+            }
+            let item = queue_item_mut(&mut snapshot, item_id)?;
+            require_phase(
+                item,
+                GeneratedFollowUpQueuePhase::DispatchStarted,
+                "leased ambiguous hold",
+            )?;
+            if item.subordinate_run_id.as_deref() != Some(observed_run_id) {
+                bail!("generated follow-up ambiguous hold names a different subordinate run");
+            }
+            item.phase = GeneratedFollowUpQueuePhase::HeldAmbiguous;
+            item.last_gate_denial = gate_denial.clone();
+            item.last_environment_failures = environment_failures.clone();
             item.external_side_effect_state = Some(ExternalSideEffectState::Ambiguous);
         }
         QueueJournalEvent::LeaseTerminalAcknowledged {
@@ -1938,6 +2121,13 @@ fn apply_queue_event(
                 .context("leased terminal acknowledgement has no dispatch marker")?
                 .to_string();
             require_bound_worker_graph_event(&snapshot, item_id, graph_event, false)?;
+            let graph_visit = graph_event_branch_visit(graph_event)?;
+            let item = queue_item(&snapshot, item_id)?;
+            if item.current_occurrence_graph_visit != 0
+                && item.current_occurrence_graph_visit != graph_visit
+            {
+                bail!("leased terminal acknowledgement does not match the current graph occurrence visit");
+            }
             apply_item_lease_event(&mut snapshot, item_id, lease_event)?;
             apply_embedded_graph_event(&mut snapshot, graph_event)?;
             if observed_run_id != &expected_run_id {
@@ -1950,6 +2140,47 @@ fn apply_queue_event(
             item.last_gate_denial = observation.gate_denial.clone();
             item.last_environment_failures = observation.environment_failures.clone();
             item.external_side_effect_state = observation.external_side_effect_state;
+            if item.current_occurrence_graph_visit == 0 {
+                item.current_occurrence_graph_visit = graph_visit;
+            }
+        }
+        QueueJournalEvent::GraphOccurrenceOpened {
+            item_id,
+            graph_visit,
+            archived,
+        } => {
+            let expected_visit = derive_next_graph_occurrence_visit(&snapshot, item_id)?;
+            if *graph_visit != expected_visit {
+                bail!("graph occurrence open names a non-derived visit");
+            }
+            let item = queue_item(&snapshot, item_id)?;
+            let expected_archive = build_completed_graph_occurrence_archive(
+                item_id,
+                item,
+                snapshot
+                    .lease(item_id)
+                    .context("graph-bound queue item has no lease state")?,
+                item.current_occurrence_graph_visit,
+            )?;
+            if archived != &expected_archive {
+                bail!("graph occurrence archive does not match replayed terminal evidence");
+            }
+            archived.validate(item_id, item.completed_occurrences.len())?;
+            let lease = snapshot
+                .leases
+                .get(item_id)
+                .context("graph-bound queue item has no lease state")?;
+            let next_lease = lease.for_next_occurrence()?;
+            let item = queue_item_mut(&mut snapshot, item_id)?;
+            item.completed_occurrences.push(archived.clone());
+            item.phase = GeneratedFollowUpQueuePhase::Enqueued;
+            item.subordinate_run_id = None;
+            item.observation = None;
+            item.last_gate_denial = None;
+            item.last_environment_failures.clear();
+            item.external_side_effect_state = None;
+            item.current_occurrence_graph_visit = 0;
+            snapshot.leases.insert(item_id.clone(), next_lease);
         }
     }
     Ok(snapshot)
@@ -2102,6 +2333,34 @@ fn require_bound_lease_identity(
     Ok(())
 }
 
+fn require_matching_effect_fenced_lease_proof(
+    snapshot: &GeneratedFollowUpQueueSnapshot,
+    item_id: &str,
+    proof: &LeaseProof,
+) -> Result<()> {
+    if snapshot
+        .lease_identity_items
+        .get(proof.lease_id().as_str())
+        .map(String::as_str)
+        != Some(item_id)
+    {
+        bail!("lease proof identity is not durably bound to this queue item");
+    }
+    let lease = snapshot
+        .lease(item_id)
+        .context("graph-bound queue item has no lease state")?;
+    if lease.phase() != LeasePhase::EffectFenced {
+        bail!("leased ambiguous hold requires effect-fenced lease state");
+    }
+    let active = lease
+        .active_proof()
+        .context("queue lease has no active proof")?;
+    if active != proof {
+        bail!("lease proof does not match the replayed active lease");
+    }
+    Ok(())
+}
+
 fn require_bound_worker_graph_event(
     snapshot: &GeneratedFollowUpQueueSnapshot,
     item_id: &str,
@@ -2130,6 +2389,11 @@ fn require_bound_worker_graph_event(
             != Some(item_id)
     {
         bail!("worker graph event does not match the queue item's immutable branch binding");
+    }
+    let task_visit = bound_graph_task_visit(snapshot, item_id)?;
+    let event_visit = graph_event_branch_visit(graph_event)?;
+    if event_visit != task_visit {
+        bail!("worker graph event does not match the bound task's active visit");
     }
     Ok(())
 }
@@ -2335,9 +2599,227 @@ fn verify_source_repository_binding(
     Ok(())
 }
 
-fn subordinate_run_id(item_id: &str) -> Result<String> {
+fn legacy_subordinate_run_id(item_id: &str) -> Result<String> {
     validate_sha256_id(item_id, "generated follow-up item id")?;
     Ok(format!("follow-up-{item_id}"))
+}
+
+fn subordinate_run_id(item_id: &str) -> Result<String> {
+    legacy_subordinate_run_id(item_id)
+}
+
+fn hashed_graph_occurrence_subordinate_run_id(item_id: &str, graph_visit: u16) -> Result<String> {
+    validate_sha256_id(item_id, "generated follow-up item id")?;
+    if graph_visit == 0 {
+        bail!("graph occurrence visit must be nonzero");
+    }
+    let digest = domain_separated_sha256(
+        SUBORDINATE_RUN_GRAPH_VISIT_DOMAIN,
+        &[item_id.as_bytes(), &graph_visit.to_be_bytes()],
+    )?;
+    let run_id = format!("follow-up-{digest}");
+    validate_source_run_id(&run_id)?;
+    Ok(run_id)
+}
+
+/// Run id for the current graph-bound dispatch occurrence before it is archived.
+fn expected_graph_bound_subordinate_run_id(
+    snapshot: &GeneratedFollowUpQueueSnapshot,
+    item_id: &str,
+    graph_visit: u16,
+) -> Result<String> {
+    if graph_visit == 0 {
+        bail!("graph occurrence visit must be nonzero");
+    }
+    let item = queue_item(snapshot, item_id)?;
+    if item.completed_occurrences.is_empty() {
+        legacy_subordinate_run_id(item_id)
+    } else {
+        hashed_graph_occurrence_subordinate_run_id(item_id, graph_visit)
+    }
+}
+
+/// Run id bound to one archived occurrence at its stable index in item history.
+fn expected_archived_occurrence_subordinate_run_id(
+    item_id: &str,
+    graph_visit: u16,
+    archive_index: usize,
+) -> Result<String> {
+    if graph_visit == 0 {
+        bail!("graph occurrence visit must be nonzero");
+    }
+    if archive_index == 0 {
+        legacy_subordinate_run_id(item_id)
+    } else {
+        hashed_graph_occurrence_subordinate_run_id(item_id, graph_visit)
+    }
+}
+
+fn graph_event_branch_visit(graph_event: &DurableGraphEvent) -> Result<u16> {
+    match graph_event {
+        DurableGraphEvent::BranchAttemptStarted { visit, .. }
+        | DurableGraphEvent::BranchAttemptCompleted { visit, .. } => Ok(*visit),
+        _ => bail!("graph branch attempt event is required"),
+    }
+}
+
+fn bound_graph_task_visit(snapshot: &GeneratedFollowUpQueueSnapshot, item_id: &str) -> Result<u16> {
+    let branch_id = snapshot
+        .item_to_branch
+        .get(item_id)
+        .context("queue item has no immutable graph branch binding")?;
+    let graph = snapshot
+        .graph
+        .as_ref()
+        .context("queue item binding has no replay-derived graph state")?;
+    let task_node = graph
+        .definition()
+        .nodes()
+        .iter()
+        .find(|node| {
+            matches!(
+                node.kind(),
+                DurableGraphNodeKind::Task {
+                    branch_id: candidate,
+                    ..
+                } if candidate == branch_id
+            )
+        })
+        .context("queue item binding has no graph task node")?;
+    graph
+        .node_visit(task_node.id())
+        .filter(|visit| *visit > 0)
+        .context("queue item binding has no active graph task visit")
+}
+
+fn branch_visit_has_terminal_completion(
+    snapshot: &GeneratedFollowUpQueueSnapshot,
+    item_id: &str,
+    visit: u16,
+) -> Result<bool> {
+    let branch_id = snapshot
+        .item_to_branch
+        .get(item_id)
+        .context("queue item has no immutable graph branch binding")?;
+    let graph = snapshot
+        .graph
+        .as_ref()
+        .context("queue item binding has no replay-derived graph state")?;
+    let branch = graph
+        .branch(branch_id)
+        .context("queue item binding names an unknown graph branch")?;
+    if branch.attempt_in_progress().is_some() || branch.retry_scheduled() {
+        return Ok(false);
+    }
+    Ok(branch.attempts().last().is_some_and(|attempt| {
+        attempt.visit() == visit
+            && matches!(
+                attempt.outcome(),
+                graph::BranchOutcome::Success { .. } | graph::BranchOutcome::Failure { .. }
+            )
+    }))
+}
+
+fn derive_next_graph_occurrence_visit(
+    snapshot: &GeneratedFollowUpQueueSnapshot,
+    item_id: &str,
+) -> Result<u16> {
+    if !snapshot.item_to_branch.contains_key(item_id) {
+        bail!("graph occurrence open requires an immutable graph item binding");
+    }
+    let graph = snapshot
+        .graph
+        .as_ref()
+        .context("graph occurrence open requires a replay-derived graph")?;
+    if graph.termination().is_some() {
+        bail!("graph occurrence open is refused after global graph termination");
+    }
+    let item = queue_item(snapshot, item_id)?;
+    require_phase(
+        item,
+        GeneratedFollowUpQueuePhase::AcknowledgedTerminal,
+        "graph occurrence open",
+    )?;
+    let archived_visit = item.current_occurrence_graph_visit;
+    if archived_visit == 0 {
+        bail!("graph occurrence open requires a completed current occurrence visit");
+    }
+    let lease = snapshot
+        .lease(item_id)
+        .context("graph-bound queue item has no lease state")?;
+    if lease.phase() != LeasePhase::Acknowledged {
+        bail!("graph occurrence open requires an acknowledged lease for the prior occurrence");
+    }
+    if !branch_visit_has_terminal_completion(snapshot, item_id, archived_visit)? {
+        bail!("graph occurrence open requires a completed graph attempt for the prior occurrence visit");
+    }
+    let current_visit = bound_graph_task_visit(snapshot, item_id)?;
+    if current_visit <= archived_visit {
+        bail!("graph occurrence open is not scheduled at a later graph visit");
+    }
+    let branch_id = snapshot.item_to_branch.get(item_id).expect("binding");
+    let task_node = graph
+        .definition()
+        .nodes()
+        .iter()
+        .find(|node| {
+            matches!(
+                node.kind(),
+                DurableGraphNodeKind::Task {
+                    branch_id: candidate,
+                    ..
+                } if candidate == branch_id
+            )
+        })
+        .expect("task node");
+    if !graph
+        .active_node_ids()
+        .any(|node_id| node_id == task_node.id())
+    {
+        bail!("graph occurrence open requires the bound task node to be active");
+    }
+    let branch = graph.branch(branch_id).expect("branch");
+    if branch.attempt_in_progress().is_some() {
+        bail!("graph occurrence open cannot bypass an in-progress graph attempt");
+    }
+    if branch.retry_scheduled() {
+        bail!("graph occurrence open cannot bypass a scheduled graph retry");
+    }
+    if branch
+        .attempts()
+        .last()
+        .is_some_and(|attempt| attempt.visit() >= current_visit)
+    {
+        bail!("graph occurrence open cannot duplicate an already-started visit");
+    }
+    Ok(current_visit)
+}
+
+fn build_completed_graph_occurrence_archive(
+    item_id: &str,
+    item: &GeneratedFollowUpQueueItemSnapshot,
+    lease: &LeaseState,
+    graph_visit: u16,
+) -> Result<CompletedGraphOccurrenceSnapshot> {
+    if graph_visit == 0 {
+        bail!("completed graph occurrence visit must be nonzero");
+    }
+    let observation = item
+        .observation
+        .clone()
+        .context("completed graph occurrence has no terminal observation")?;
+    let archive_index = item.completed_occurrences.len();
+    let subordinate_run_id =
+        expected_archived_occurrence_subordinate_run_id(item_id, graph_visit, archive_index)?;
+    if item.subordinate_run_id.as_deref() != Some(subordinate_run_id.as_str()) {
+        bail!("completed graph occurrence run id does not match replayed dispatch evidence");
+    }
+    Ok(CompletedGraphOccurrenceSnapshot {
+        graph_visit,
+        subordinate_run_id,
+        observation,
+        lease: lease.clone(),
+    })
 }
 
 fn batch_sha256(item_ids: &[String]) -> Result<String> {
@@ -2528,6 +3010,20 @@ fn queue_event_data(
                 Vec::new(),
                 Some(ExternalSideEffectState::Ambiguous),
             ),
+            QueueJournalEvent::LeaseHeldAmbiguous {
+                item_id,
+                subordinate_run_id,
+                external_side_effect_state,
+                gate_denial,
+                environment_failures,
+                ..
+            } => (
+                vec![item_id.clone()],
+                Some(subordinate_run_id.clone()),
+                gate_denial.clone(),
+                environment_failures.clone(),
+                Some(*external_side_effect_state),
+            ),
             QueueJournalEvent::LeaseTerminalAcknowledged {
                 item_id,
                 subordinate_run_id,
@@ -2539,6 +3035,15 @@ fn queue_event_data(
                 observation.gate_denial.clone(),
                 observation.environment_failures.clone(),
                 observation.external_side_effect_state,
+            ),
+            QueueJournalEvent::GraphOccurrenceOpened {
+                item_id, archived, ..
+            } => (
+                vec![item_id.clone()],
+                Some(archived.subordinate_run_id.clone()),
+                archived.observation.gate_denial.clone(),
+                archived.observation.environment_failures.clone(),
+                archived.observation.external_side_effect_state,
             ),
         };
     GeneratedFollowUpQueueEventData {
@@ -3583,12 +4088,20 @@ mod tests {
     }
 
     fn loop_graph_definition() -> DurableGraphDefinition {
+        loop_graph_definition_with_max_iterations(3)
+    }
+
+    /// `max_iterations` is the loop node's hard Continue bound: exactly
+    /// `max_iterations - 1` Continue decisions may enter the body; the final
+    /// decision must Exit at iteration `max_iterations`. Task branch visit N
+    /// matches Continue iteration N on the loop node.
+    fn loop_graph_definition_with_max_iterations(max_iterations: u16) -> DurableGraphDefinition {
         let loop_node = node_id("n00-loop");
         DurableGraphDefinition::new(
             graph_id("queue-loop"),
             loop_node.clone(),
             vec![
-                graph_node("n00-loop", DurableGraphNodeKind::Loop { max_iterations: 3 }),
+                graph_node("n00-loop", DurableGraphNodeKind::Loop { max_iterations }),
                 graph_node(
                     "n10-task",
                     DurableGraphNodeKind::Task {
@@ -5228,5 +5741,1102 @@ mod tests {
         bytes[position] = b'L';
         fs::write(&record, bytes).expect("tamper nested lease payload");
         assert!(GeneratedFollowUpQueue::open(authenticator(&repo), &lease_source).is_err());
+    }
+
+    #[test]
+    fn leased_ambiguous_hold_survives_reopen_with_unchanged_fence_and_attempt() {
+        let (_temp, repo) = repository();
+        let source = source(&repo, "source-leased-hold-replay");
+        let task = generated_task("01");
+        let item_id = generated_follow_up_item_id(&source, &task).expect("item id");
+        let mut queue =
+            GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(1))
+                .expect("create queue");
+        queue.enqueue_all_before_dispatch(&[task]).expect("enqueue");
+        queue
+            .define_graph(
+                conditional_graph_definition(),
+                vec![
+                    DurableGraphQueueItemBinding::new(branch_id("branch-main"), item_id.clone())
+                        .expect("binding"),
+                ],
+            )
+            .expect("define graph");
+        let (_, proof) = queue
+            .claim_with_lease(
+                &item_id,
+                worker("worker-hold"),
+                lease_id("lease-hold"),
+                1,
+                10,
+                DurableGraphEvent::BranchAttemptStarted {
+                    branch_id: branch_id("branch-main"),
+                    visit: 1,
+                    attempt: 1,
+                },
+            )
+            .expect("claim");
+        queue
+            .mark_leased_effect_started(&item_id, proof.clone(), 2)
+            .expect("effect fence");
+        let run_id = queue
+            .snapshot()
+            .item(&item_id)
+            .and_then(GeneratedFollowUpQueueItemSnapshot::subordinate_run_id)
+            .expect("run id")
+            .to_string();
+        queue
+            .mark_leased_held_ambiguous(&item_id, proof.clone(), None, Vec::new())
+            .expect("leased hold");
+        queue = reopen_typed_queue(&repo, &source, queue);
+        let item = queue.snapshot().item(&item_id).expect("item");
+        assert_eq!(item.phase(), GeneratedFollowUpQueuePhase::HeldAmbiguous);
+        assert_eq!(item.subordinate_run_id(), Some(run_id.as_str()));
+        assert_eq!(
+            item.external_side_effect_state(),
+            Some(ExternalSideEffectState::Ambiguous)
+        );
+        assert_eq!(
+            queue.snapshot().lease_phase(&item_id),
+            Some(LeasePhase::EffectFenced)
+        );
+        assert_eq!(
+            queue
+                .snapshot()
+                .graph()
+                .and_then(|state| state.branch(&branch_id("branch-main")))
+                .and_then(graph::BranchRuntimeState::attempt_in_progress),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn leased_ambiguous_hold_rejects_wrong_or_pre_effect_proof_without_journal_mutation() {
+        let (_temp, repo) = repository();
+        let source = source(&repo, "source-leased-hold-reject");
+        let task = generated_task("01");
+        let item_id = generated_follow_up_item_id(&source, &task).expect("item id");
+        let mut queue =
+            GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(1))
+                .expect("create queue");
+        queue.enqueue_all_before_dispatch(&[task]).expect("enqueue");
+        queue
+            .define_graph(
+                conditional_graph_definition(),
+                vec![
+                    DurableGraphQueueItemBinding::new(branch_id("branch-main"), item_id.clone())
+                        .expect("binding"),
+                ],
+            )
+            .expect("define graph");
+        let (_, proof) = queue
+            .claim_with_lease(
+                &item_id,
+                worker("worker-hold"),
+                lease_id("lease-hold"),
+                1,
+                10,
+                DurableGraphEvent::BranchAttemptStarted {
+                    branch_id: branch_id("branch-main"),
+                    visit: 1,
+                    attempt: 1,
+                },
+            )
+            .expect("claim");
+
+        let before = queue.snapshot().clone();
+        let records = queue.journal.records().len();
+        assert!(queue
+            .mark_leased_held_ambiguous(&item_id, proof.clone(), None, Vec::new())
+            .is_err());
+        assert_eq!(queue.snapshot(), &before);
+        assert_eq!(queue.journal.records().len(), records);
+
+        queue
+            .mark_leased_effect_started(&item_id, proof.clone(), 2)
+            .expect("effect fence");
+        assert!(queue
+            .mark_held_ambiguous(&item_id, None, Vec::new())
+            .is_err());
+
+        let before = queue.snapshot().clone();
+        let records = queue.journal.records().len();
+        let wrong_proof =
+            LeaseProof::new(worker("worker-y"), lease_id("lease-y"), 2).expect("stale proof");
+        assert!(queue
+            .mark_leased_held_ambiguous(&item_id, wrong_proof, None, Vec::new())
+            .is_err());
+        assert_eq!(queue.snapshot(), &before);
+        assert_eq!(queue.journal.records().len(), records);
+
+        queue
+            .mark_leased_held_ambiguous(&item_id, proof, None, Vec::new())
+            .expect("valid hold");
+    }
+
+    #[test]
+    fn leased_held_ambiguous_items_stay_fenced_against_release_reclaim_and_redispatch() {
+        let (_temp, repo) = repository();
+        let source = source(&repo, "source-leased-hold-fence");
+        let task = generated_task("01");
+        let item_id = generated_follow_up_item_id(&source, &task).expect("item id");
+        let mut queue =
+            GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(1))
+                .expect("create queue");
+        queue.enqueue_all_before_dispatch(&[task]).expect("enqueue");
+        queue
+            .define_graph(
+                conditional_graph_definition(),
+                vec![
+                    DurableGraphQueueItemBinding::new(branch_id("branch-main"), item_id.clone())
+                        .expect("binding"),
+                ],
+            )
+            .expect("define graph");
+        let (_, proof) = queue
+            .claim_with_lease(
+                &item_id,
+                worker("worker-hold"),
+                lease_id("lease-hold"),
+                1,
+                5,
+                DurableGraphEvent::BranchAttemptStarted {
+                    branch_id: branch_id("branch-main"),
+                    visit: 1,
+                    attempt: 1,
+                },
+            )
+            .expect("claim");
+        queue
+            .mark_leased_effect_started(&item_id, proof.clone(), 2)
+            .expect("effect fence");
+        queue
+            .mark_leased_held_ambiguous(&item_id, proof.clone(), None, Vec::new())
+            .expect("hold");
+        queue = reopen_typed_queue(&repo, &source, queue);
+
+        for rejected in [
+            "heartbeat",
+            "release",
+            "reclaim",
+            "second-effect",
+            "second-hold",
+        ] {
+            let before = queue.snapshot().clone();
+            let records = queue.journal.records().len();
+            let result = match rejected {
+                "heartbeat" => queue
+                    .heartbeat_lease(&item_id, proof.clone(), 20, 25)
+                    .map(|_| ()),
+                "release" => queue
+                    .release_lease_before_dispatch(
+                        &item_id,
+                        proof.clone(),
+                        20,
+                        DurableGraphEvent::BranchAttemptCompleted {
+                            branch_id: branch_id("branch-main"),
+                            visit: 1,
+                            attempt: 1,
+                            outcome: graph_failure("must-not-release-held"),
+                        },
+                        None,
+                        Vec::new(),
+                    )
+                    .map(|_| ()),
+                "reclaim" => queue
+                    .reclaim_expired_lease(
+                        &item_id,
+                        20,
+                        worker("worker-successor"),
+                        lease_id("lease-successor"),
+                        30,
+                    )
+                    .map(|_| ()),
+                "second-effect" => queue
+                    .mark_leased_effect_started(&item_id, proof.clone(), 20)
+                    .map(|_| ()),
+                "second-hold" => queue
+                    .mark_leased_held_ambiguous(&item_id, proof.clone(), None, Vec::new())
+                    .map(|_| ()),
+                _ => unreachable!(),
+            };
+            assert!(result.is_err(), "{rejected} crossed the held effect fence");
+            assert_eq!(queue.snapshot(), &before);
+            assert_eq!(queue.journal.records().len(), records);
+        }
+    }
+
+    #[test]
+    fn leased_authenticated_terminal_finalizes_held_ambiguous_and_rejects_wrong_sibling() {
+        let (_temp, repo) = repository();
+        let source = source(&repo, "source-leased-hold-terminal");
+        let task_a = generated_task("01");
+        let task_b = generated_task("02");
+        let item_a = generated_follow_up_item_id(&source, &task_a).expect("item a");
+        let item_b = generated_follow_up_item_id(&source, &task_b).expect("item b");
+        let mut queue =
+            GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(2))
+                .expect("create queue");
+        queue
+            .enqueue_all_before_dispatch(&[task_a, task_b])
+            .expect("enqueue");
+        queue
+            .define_graph(
+                fan_in_graph_definition("queue-held-terminal"),
+                vec![
+                    DurableGraphQueueItemBinding::new(branch_id("branch-a"), item_a.clone())
+                        .expect("bind a"),
+                    DurableGraphQueueItemBinding::new(branch_id("branch-b"), item_b.clone())
+                        .expect("bind b"),
+                ],
+            )
+            .expect("define graph");
+        queue
+            .apply_graph_transition(DurableGraphEvent::EdgesSelected {
+                source_node_id: node_id("n00-fork"),
+                visit: 1,
+                edge_ids: vec![edge_id("e00-a"), edge_id("e01-b")],
+            })
+            .expect("fork");
+
+        let (_, proof_a) = queue
+            .claim_with_lease(
+                &item_a,
+                worker("worker-a"),
+                lease_id("lease-a"),
+                1,
+                10,
+                DurableGraphEvent::BranchAttemptStarted {
+                    branch_id: branch_id("branch-a"),
+                    visit: 1,
+                    attempt: 1,
+                },
+            )
+            .expect("claim a");
+        let (_, proof_b) = queue
+            .claim_with_lease(
+                &item_b,
+                worker("worker-b"),
+                lease_id("lease-b"),
+                1,
+                10,
+                DurableGraphEvent::BranchAttemptStarted {
+                    branch_id: branch_id("branch-b"),
+                    visit: 1,
+                    attempt: 1,
+                },
+            )
+            .expect("claim b");
+        queue
+            .mark_leased_effect_started(&item_a, proof_a.clone(), 2)
+            .expect("effect a");
+        queue
+            .mark_leased_effect_started(&item_b, proof_b.clone(), 2)
+            .expect("effect b");
+        let run_a = queue
+            .snapshot()
+            .item(&item_a)
+            .and_then(GeneratedFollowUpQueueItemSnapshot::subordinate_run_id)
+            .expect("run a")
+            .to_string();
+        let run_b = queue
+            .snapshot()
+            .item(&item_b)
+            .and_then(GeneratedFollowUpQueueItemSnapshot::subordinate_run_id)
+            .expect("run b")
+            .to_string();
+        queue
+            .mark_leased_held_ambiguous(&item_a, proof_a.clone(), None, Vec::new())
+            .expect("hold a");
+
+        let before = queue.snapshot().clone();
+        let records = queue.journal.records().len();
+        assert!(queue
+            .append_leased_terminal_observation(
+                &item_b,
+                GeneratedFollowUpDispatchObservation::new(
+                    run_b.clone(),
+                    None,
+                    Vec::new(),
+                    Some(ExternalSideEffectState::Completed),
+                )
+                .expect("observation b"),
+                proof_a.clone(),
+                3,
+                DurableGraphEvent::BranchAttemptCompleted {
+                    branch_id: branch_id("branch-b"),
+                    visit: 1,
+                    attempt: 1,
+                    outcome: graph_success("wrong-proof", &[]),
+                },
+            )
+            .is_err());
+        assert_eq!(queue.snapshot(), &before);
+        assert_eq!(queue.journal.records().len(), records);
+
+        queue
+            .append_leased_terminal_observation(
+                &item_a,
+                GeneratedFollowUpDispatchObservation::new(
+                    run_a,
+                    None,
+                    Vec::new(),
+                    Some(ExternalSideEffectState::Completed),
+                )
+                .expect("observation a"),
+                proof_a,
+                3,
+                DurableGraphEvent::BranchAttemptCompleted {
+                    branch_id: branch_id("branch-a"),
+                    visit: 1,
+                    attempt: 1,
+                    outcome: graph_success("held-terminal", &["write-held"]),
+                },
+            )
+            .expect("terminal a");
+        queue = reopen_typed_queue(&repo, &source, queue);
+        assert_eq!(
+            queue.snapshot().item(&item_a).expect("item a").phase(),
+            GeneratedFollowUpQueuePhase::AcknowledgedTerminal
+        );
+        assert_eq!(
+            queue.snapshot().item(&item_b).expect("item b").phase(),
+            GeneratedFollowUpQueuePhase::DispatchStarted
+        );
+    }
+
+    fn schedule_loop_body_visit(queue: &mut GeneratedFollowUpQueue, iteration: u16) {
+        queue
+            .apply_graph_transition(DurableGraphEvent::LoopIterationCompleted {
+                loop_node_id: node_id("n00-loop"),
+                iteration,
+                decision: graph::LoopDecision::Continue,
+            })
+            .expect("continue loop");
+        queue
+            .apply_graph_transition(DurableGraphEvent::EdgesSelected {
+                source_node_id: node_id("n00-loop"),
+                visit: iteration,
+                edge_ids: vec![edge_id("e00-body")],
+            })
+            .expect("enter loop body");
+    }
+
+    fn loop_back_from_task_visit(queue: &mut GeneratedFollowUpQueue, visit: u16) {
+        queue
+            .apply_graph_transition(DurableGraphEvent::EdgesSelected {
+                source_node_id: node_id("n10-task"),
+                visit,
+                edge_ids: vec![edge_id("e10-back")],
+            })
+            .expect("loop back");
+    }
+
+    fn leased_effect_terminal_at_visit(
+        queue: &mut GeneratedFollowUpQueue,
+        item_id: &str,
+        visit: u16,
+        worker_name: &str,
+        lease_name: &str,
+        result_ref: &str,
+    ) -> String {
+        let (_, proof) = queue
+            .claim_with_lease(
+                item_id,
+                worker(worker_name),
+                lease_id(lease_name),
+                u64::from(visit) * 10,
+                u64::from(visit) * 10 + 8,
+                DurableGraphEvent::BranchAttemptStarted {
+                    branch_id: branch_id("branch-loop"),
+                    visit,
+                    attempt: 1,
+                },
+            )
+            .expect("claim loop visit");
+        queue
+            .mark_leased_effect_started(item_id, proof.clone(), u64::from(visit) * 10 + 1)
+            .expect("effect start");
+        let run_id = queue
+            .snapshot()
+            .item(item_id)
+            .and_then(GeneratedFollowUpQueueItemSnapshot::subordinate_run_id)
+            .expect("subordinate run id")
+            .to_string();
+        queue
+            .append_leased_terminal_observation(
+                item_id,
+                GeneratedFollowUpDispatchObservation::new(
+                    run_id.clone(),
+                    None,
+                    Vec::new(),
+                    Some(ExternalSideEffectState::Completed),
+                )
+                .expect("terminal observation"),
+                proof,
+                u64::from(visit) * 10 + 2,
+                DurableGraphEvent::BranchAttemptCompleted {
+                    branch_id: branch_id("branch-loop"),
+                    visit,
+                    attempt: 1,
+                    outcome: graph_success(result_ref, &["write-loop"]),
+                },
+            )
+            .expect("leased terminal");
+        run_id
+    }
+
+    /// Exercises the private queue reducer path because production terminal
+    /// capability construction remains supervisor-authenticated.
+    #[test]
+    fn graph_loop_effect_terminal_reopens_with_distinct_run_ids_and_history() {
+        let (_temp, repo) = repository();
+        let source = source(&repo, "source-graph-loop-effect");
+        let task = generated_task("01");
+        let item_id = generated_follow_up_item_id(&source, &task).expect("item id");
+        let mut queue =
+            GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(1))
+                .expect("create queue");
+        queue
+            .enqueue_all_before_dispatch(&[task])
+            .expect("enqueue loop task");
+        queue
+            .define_graph(
+                loop_graph_definition(),
+                vec![
+                    DurableGraphQueueItemBinding::new(branch_id("branch-loop"), item_id.clone())
+                        .expect("loop binding"),
+                ],
+            )
+            .expect("define loop graph");
+
+        schedule_loop_body_visit(&mut queue, 1);
+        let run_visit_1 =
+            leased_effect_terminal_at_visit(&mut queue, &item_id, 1, "worker-v1", "lease-v1", "r1");
+        queue = reopen_typed_queue(&repo, &source, queue);
+        assert_eq!(
+            queue.snapshot().item(&item_id).expect("item").phase(),
+            GeneratedFollowUpQueuePhase::AcknowledgedTerminal
+        );
+        assert!(queue.snapshot().pending_item_ids().is_empty());
+
+        queue
+            .apply_graph_transition(DurableGraphEvent::EdgesSelected {
+                source_node_id: node_id("n10-task"),
+                visit: 1,
+                edge_ids: vec![edge_id("e10-back")],
+            })
+            .expect("loop back after visit 1");
+        schedule_loop_body_visit(&mut queue, 2);
+        queue = reopen_typed_queue(&repo, &source, queue);
+        queue
+            .open_next_graph_occurrence(&item_id)
+            .expect("open visit 2");
+        queue = reopen_typed_queue(&repo, &source, queue);
+        let item = queue.snapshot().item(&item_id).expect("item");
+        assert_eq!(item.phase(), GeneratedFollowUpQueuePhase::Enqueued);
+        assert_eq!(item.completed_occurrences().len(), 1);
+        assert_eq!(item.completed_occurrences()[0].graph_visit(), 1);
+        assert_eq!(
+            item.completed_occurrences()[0].subordinate_run_id(),
+            run_visit_1.as_str()
+        );
+        assert_eq!(
+            item.completed_occurrences()[0].lease().phase(),
+            LeasePhase::Acknowledged
+        );
+        assert_eq!(
+            queue.snapshot().lease_phase(&item_id),
+            Some(LeasePhase::Available)
+        );
+        assert_eq!(queue.snapshot().pending_item_ids(), vec![item_id.as_str()]);
+
+        let run_visit_2 =
+            leased_effect_terminal_at_visit(&mut queue, &item_id, 2, "worker-v2", "lease-v2", "r2");
+        assert_ne!(run_visit_1, run_visit_2);
+        queue = reopen_typed_queue(&repo, &source, queue);
+        assert_eq!(
+            queue.snapshot().item(&item_id).expect("item").phase(),
+            GeneratedFollowUpQueuePhase::AcknowledgedTerminal
+        );
+        assert_eq!(
+            queue
+                .snapshot()
+                .item(&item_id)
+                .expect("item")
+                .current_occurrence_graph_visit(),
+            2
+        );
+    }
+
+    #[test]
+    fn graph_occurrence_open_rejects_same_incomplete_ambiguous_and_unscheduled_without_mutation() {
+        let (_temp, repo) = repository();
+        let source = source(&repo, "source-graph-open-reject");
+        let task = generated_task("01");
+        let item_id = generated_follow_up_item_id(&source, &task).expect("item id");
+        let mut queue =
+            GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(1))
+                .expect("create queue");
+        queue.enqueue_all_before_dispatch(&[task]).expect("enqueue");
+        queue
+            .define_graph(
+                loop_graph_definition(),
+                vec![
+                    DurableGraphQueueItemBinding::new(branch_id("branch-loop"), item_id.clone())
+                        .expect("binding"),
+                ],
+            )
+            .expect("define graph");
+
+        let before = queue.snapshot().clone();
+        let records = queue.journal.records().len();
+        assert!(queue.open_next_graph_occurrence(&item_id).is_err());
+        assert_eq!(queue.snapshot(), &before);
+        assert_eq!(queue.journal.records().len(), records);
+
+        schedule_loop_body_visit(&mut queue, 1);
+        let (_, proof) = queue
+            .claim_with_lease(
+                &item_id,
+                worker("worker-pre"),
+                lease_id("lease-pre"),
+                10,
+                18,
+                DurableGraphEvent::BranchAttemptStarted {
+                    branch_id: branch_id("branch-loop"),
+                    visit: 1,
+                    attempt: 1,
+                },
+            )
+            .expect("claim");
+        queue
+            .release_lease_before_dispatch(
+                &item_id,
+                proof,
+                11,
+                DurableGraphEvent::BranchAttemptCompleted {
+                    branch_id: branch_id("branch-loop"),
+                    visit: 1,
+                    attempt: 1,
+                    outcome: graph_success("pre-effect", &[]),
+                },
+                None,
+                Vec::new(),
+            )
+            .expect("pre-effect release");
+        let before = queue.snapshot().clone();
+        let records = queue.journal.records().len();
+        assert!(queue.open_next_graph_occurrence(&item_id).is_err());
+        assert_eq!(queue.snapshot(), &before);
+        assert_eq!(queue.journal.records().len(), records);
+
+        loop_back_from_task_visit(&mut queue, 1);
+        schedule_loop_body_visit(&mut queue, 2);
+        let (_, proof) = queue
+            .claim_with_lease(
+                &item_id,
+                worker("worker-ambig"),
+                lease_id("lease-ambig"),
+                20,
+                28,
+                DurableGraphEvent::BranchAttemptStarted {
+                    branch_id: branch_id("branch-loop"),
+                    visit: 2,
+                    attempt: 1,
+                },
+            )
+            .expect("claim ambiguous");
+        queue
+            .mark_leased_effect_started(&item_id, proof.clone(), 21)
+            .expect("effect");
+        queue
+            .mark_leased_held_ambiguous(&item_id, proof, None, Vec::new())
+            .expect("hold");
+        let before = queue.snapshot().clone();
+        let records = queue.journal.records().len();
+        assert!(queue.open_next_graph_occurrence(&item_id).is_err());
+        assert_eq!(queue.snapshot(), &before);
+        assert_eq!(queue.journal.records().len(), records);
+
+        let unscheduled_source = self::source(&repo, "source-graph-open-unscheduled");
+        let unscheduled_task = generated_task("02");
+        let unscheduled_item =
+            generated_follow_up_item_id(&unscheduled_source, &unscheduled_task).expect("item id");
+        let mut queue = GeneratedFollowUpQueue::create(
+            authenticator(&repo),
+            unscheduled_source.clone(),
+            bounds(1),
+        )
+        .expect("create terminal queue");
+        queue
+            .enqueue_all_before_dispatch(&[unscheduled_task])
+            .expect("enqueue");
+        queue
+            .define_graph(
+                loop_graph_definition(),
+                vec![DurableGraphQueueItemBinding::new(
+                    branch_id("branch-loop"),
+                    unscheduled_item.clone(),
+                )
+                .expect("binding")],
+            )
+            .expect("define graph");
+        schedule_loop_body_visit(&mut queue, 1);
+        leased_effect_terminal_at_visit(
+            &mut queue,
+            &unscheduled_item,
+            1,
+            "worker-done",
+            "lease-done",
+            "done",
+        );
+        let before = queue.snapshot().clone();
+        let records = queue.journal.records().len();
+        assert!(queue.open_next_graph_occurrence(&unscheduled_item).is_err());
+        assert_eq!(queue.snapshot(), &before);
+        assert_eq!(queue.journal.records().len(), records);
+
+        loop_back_from_task_visit(&mut queue, 1);
+        schedule_loop_body_visit(&mut queue, 2);
+        queue
+            .open_next_graph_occurrence(&unscheduled_item)
+            .expect("first open");
+        let before = queue.snapshot().clone();
+        let records = queue.journal.records().len();
+        assert!(queue.open_next_graph_occurrence(&unscheduled_item).is_err());
+        assert_eq!(queue.snapshot(), &before);
+        assert_eq!(queue.journal.records().len(), records);
+    }
+
+    #[test]
+    fn stale_prior_visit_terminal_cannot_close_current_graph_occurrence() {
+        let (_temp, repo) = repository();
+        let source = source(&repo, "source-stale-terminal");
+        let task = generated_task("01");
+        let item_id = generated_follow_up_item_id(&source, &task).expect("item id");
+        let mut queue =
+            GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(1))
+                .expect("create queue");
+        queue.enqueue_all_before_dispatch(&[task]).expect("enqueue");
+        queue
+            .define_graph(
+                loop_graph_definition(),
+                vec![
+                    DurableGraphQueueItemBinding::new(branch_id("branch-loop"), item_id.clone())
+                        .expect("binding"),
+                ],
+            )
+            .expect("define graph");
+        schedule_loop_body_visit(&mut queue, 1);
+        let run_visit_1 =
+            leased_effect_terminal_at_visit(&mut queue, &item_id, 1, "worker-v1", "lease-v1", "r1");
+        queue
+            .apply_graph_transition(DurableGraphEvent::EdgesSelected {
+                source_node_id: node_id("n10-task"),
+                visit: 1,
+                edge_ids: vec![edge_id("e10-back")],
+            })
+            .expect("loop back after visit 1");
+        schedule_loop_body_visit(&mut queue, 2);
+        queue
+            .open_next_graph_occurrence(&item_id)
+            .expect("open visit 2");
+        let (_, proof) = queue
+            .claim_with_lease(
+                &item_id,
+                worker("worker-v2"),
+                lease_id("lease-v2"),
+                30,
+                38,
+                DurableGraphEvent::BranchAttemptStarted {
+                    branch_id: branch_id("branch-loop"),
+                    visit: 2,
+                    attempt: 1,
+                },
+            )
+            .expect("claim visit 2");
+        queue
+            .mark_leased_effect_started(&item_id, proof.clone(), 31)
+            .expect("effect visit 2");
+
+        let before = queue.snapshot().clone();
+        let records = queue.journal.records().len();
+        assert!(queue
+            .append_leased_terminal_observation(
+                &item_id,
+                GeneratedFollowUpDispatchObservation::new(
+                    run_visit_1,
+                    None,
+                    Vec::new(),
+                    Some(ExternalSideEffectState::Completed),
+                )
+                .expect("stale observation"),
+                proof.clone(),
+                32,
+                DurableGraphEvent::BranchAttemptCompleted {
+                    branch_id: branch_id("branch-loop"),
+                    visit: 1,
+                    attempt: 1,
+                    outcome: graph_success("stale", &[]),
+                },
+            )
+            .is_err());
+        assert_eq!(queue.snapshot(), &before);
+        assert_eq!(queue.journal.records().len(), records);
+
+        assert!(queue
+            .append_leased_terminal_observation(
+                &item_id,
+                GeneratedFollowUpDispatchObservation::new(
+                    queue
+                        .snapshot()
+                        .item(&item_id)
+                        .and_then(GeneratedFollowUpQueueItemSnapshot::subordinate_run_id)
+                        .expect("visit 2 run"),
+                    None,
+                    Vec::new(),
+                    Some(ExternalSideEffectState::Completed),
+                )
+                .expect("current observation"),
+                proof,
+                33,
+                DurableGraphEvent::BranchAttemptCompleted {
+                    branch_id: branch_id("branch-loop"),
+                    visit: 2,
+                    attempt: 1,
+                    outcome: graph_success("visit-2", &["write-v2"]),
+                },
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn graph_occurrence_open_refuses_after_loop_termination_without_bypassing_bound() {
+        let (_temp, repo) = repository();
+        let source = source(&repo, "source-loop-bound-open");
+        let task = generated_task("01");
+        let item_id = generated_follow_up_item_id(&source, &task).expect("item id");
+        let mut queue =
+            GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(1))
+                .expect("create queue");
+        queue.enqueue_all_before_dispatch(&[task]).expect("enqueue");
+        queue
+            .define_graph(
+                loop_graph_definition_with_max_iterations(4),
+                vec![
+                    DurableGraphQueueItemBinding::new(branch_id("branch-loop"), item_id.clone())
+                        .expect("binding"),
+                ],
+            )
+            .expect("define graph");
+
+        schedule_loop_body_visit(&mut queue, 1);
+        leased_effect_terminal_at_visit(&mut queue, &item_id, 1, "worker-1", "lease-1", "result-1");
+        loop_back_from_task_visit(&mut queue, 1);
+        schedule_loop_body_visit(&mut queue, 2);
+        queue
+            .open_next_graph_occurrence(&item_id)
+            .expect("open after visit 1");
+        leased_effect_terminal_at_visit(&mut queue, &item_id, 2, "worker-2", "lease-2", "result-2");
+        loop_back_from_task_visit(&mut queue, 2);
+        schedule_loop_body_visit(&mut queue, 3);
+        queue
+            .open_next_graph_occurrence(&item_id)
+            .expect("open after visit 2");
+        leased_effect_terminal_at_visit(&mut queue, &item_id, 3, "worker-3", "lease-3", "result-3");
+        loop_back_from_task_visit(&mut queue, 3);
+
+        queue
+            .apply_graph_transition(DurableGraphEvent::LoopIterationCompleted {
+                loop_node_id: node_id("n00-loop"),
+                iteration: 4,
+                decision: graph::LoopDecision::Exit,
+            })
+            .expect("exit loop");
+        queue
+            .apply_graph_transition(DurableGraphEvent::EdgesSelected {
+                source_node_id: node_id("n00-loop"),
+                visit: 4,
+                edge_ids: vec![edge_id("e20-exit")],
+            })
+            .expect("route loop exit");
+        queue
+            .apply_graph_transition(DurableGraphEvent::Terminated {
+                node_id: node_id("n20-exit"),
+                outcome: graph::GraphTermination::Success,
+            })
+            .expect("terminate");
+        let before = queue.snapshot().clone();
+        let records = queue.journal.records().len();
+        assert!(queue.open_next_graph_occurrence(&item_id).is_err());
+        assert_eq!(queue.snapshot(), &before);
+        assert_eq!(queue.journal.records().len(), records);
+        assert_eq!(
+            queue
+                .snapshot()
+                .item(&item_id)
+                .expect("item")
+                .completed_occurrences()
+                .len(),
+            2
+        );
+    }
+
+    /// Pre-effect visit-1 release, first effect at visit 2 with the historical
+    /// legacy run id (including raw journal replay), then post-open hashed ids.
+    #[test]
+    fn legacy_first_actual_effect_run_id_replays_pre_effect_visit_one_and_hashes_after_open() {
+        let (_temp, repo) = repository();
+        let reject_source = source(&repo, "source-legacy-effect-bad-run-id");
+        let task = generated_task("01");
+        let reject_item = generated_follow_up_item_id(&reject_source, &task).expect("item id");
+        let mut queue =
+            GeneratedFollowUpQueue::create(authenticator(&repo), reject_source.clone(), bounds(1))
+                .expect("create queue");
+        queue
+            .enqueue_all_before_dispatch(std::slice::from_ref(&task))
+            .expect("enqueue");
+        queue
+            .define_graph(
+                loop_graph_definition_with_max_iterations(4),
+                vec![DurableGraphQueueItemBinding::new(
+                    branch_id("branch-loop"),
+                    reject_item.clone(),
+                )
+                .expect("binding")],
+            )
+            .expect("define graph");
+        schedule_loop_body_visit(&mut queue, 1);
+        let (_, proof) = queue
+            .claim_with_lease(
+                &reject_item,
+                worker("worker-bad"),
+                lease_id("lease-bad"),
+                10,
+                18,
+                DurableGraphEvent::BranchAttemptStarted {
+                    branch_id: branch_id("branch-loop"),
+                    visit: 1,
+                    attempt: 1,
+                },
+            )
+            .expect("claim visit 1");
+        queue
+            .release_lease_before_dispatch(
+                &reject_item,
+                proof,
+                11,
+                DurableGraphEvent::BranchAttemptCompleted {
+                    branch_id: branch_id("branch-loop"),
+                    visit: 1,
+                    attempt: 1,
+                    outcome: graph_success("pre-effect", &[]),
+                },
+                None,
+                Vec::new(),
+            )
+            .expect("pre-effect release");
+        queue
+            .apply_graph_transition(DurableGraphEvent::EdgesSelected {
+                source_node_id: node_id("n10-task"),
+                visit: 1,
+                edge_ids: vec![edge_id("e10-back")],
+            })
+            .expect("loop back visit 1");
+        schedule_loop_body_visit(&mut queue, 2);
+        let (_, proof_v2) = queue
+            .claim_with_lease(
+                &reject_item,
+                worker("worker-bad-v2"),
+                lease_id("lease-bad-v2"),
+                20,
+                28,
+                DurableGraphEvent::BranchAttemptStarted {
+                    branch_id: branch_id("branch-loop"),
+                    visit: 2,
+                    attempt: 1,
+                },
+            )
+            .expect("claim visit 2");
+        let legacy_run_id = subordinate_run_id(&reject_item).expect("legacy run id");
+        let noncanonical =
+            hashed_graph_occurrence_subordinate_run_id(&reject_item, 2).expect("hashed run id");
+        assert_ne!(legacy_run_id, noncanonical);
+        let bad_effect = QueueJournalEvent::LeaseEffectStarted {
+            item_id: reject_item.clone(),
+            subordinate_run_id: noncanonical,
+            lease_event: LeaseEvent::effect_started(proof_v2, 21).expect("effect event"),
+        };
+        queue
+            .journal
+            .append(bad_effect.phase(), bad_effect.subject(), &bad_effect)
+            .expect("append authenticated bad effect run id");
+        assert!(queue.replay_snapshot().is_err());
+
+        let source = source(&repo, "source-legacy-effect-replay");
+        let item_id = generated_follow_up_item_id(&source, &task).expect("item id");
+        let mut queue =
+            GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(1))
+                .expect("create queue");
+        queue.enqueue_all_before_dispatch(&[task]).expect("enqueue");
+        queue
+            .define_graph(
+                loop_graph_definition_with_max_iterations(4),
+                vec![
+                    DurableGraphQueueItemBinding::new(branch_id("branch-loop"), item_id.clone())
+                        .expect("binding"),
+                ],
+            )
+            .expect("define graph");
+        schedule_loop_body_visit(&mut queue, 1);
+        let (_, proof_v1) = queue
+            .claim_with_lease(
+                &item_id,
+                worker("worker-v1-pre"),
+                lease_id("lease-v1-pre"),
+                10,
+                18,
+                DurableGraphEvent::BranchAttemptStarted {
+                    branch_id: branch_id("branch-loop"),
+                    visit: 1,
+                    attempt: 1,
+                },
+            )
+            .expect("claim visit 1");
+        queue
+            .release_lease_before_dispatch(
+                &item_id,
+                proof_v1,
+                11,
+                DurableGraphEvent::BranchAttemptCompleted {
+                    branch_id: branch_id("branch-loop"),
+                    visit: 1,
+                    attempt: 1,
+                    outcome: graph_success("visit-1-pre-effect", &[]),
+                },
+                None,
+                Vec::new(),
+            )
+            .expect("pre-effect visit 1");
+        queue
+            .apply_graph_transition(DurableGraphEvent::EdgesSelected {
+                source_node_id: node_id("n10-task"),
+                visit: 1,
+                edge_ids: vec![edge_id("e10-back")],
+            })
+            .expect("loop back after pre-effect");
+        schedule_loop_body_visit(&mut queue, 2);
+        let (_, proof_v2) = queue
+            .claim_with_lease(
+                &item_id,
+                worker("worker-v2"),
+                lease_id("lease-v2"),
+                20,
+                28,
+                DurableGraphEvent::BranchAttemptStarted {
+                    branch_id: branch_id("branch-loop"),
+                    visit: 2,
+                    attempt: 1,
+                },
+            )
+            .expect("claim visit 2");
+        let legacy_run_id = subordinate_run_id(&item_id).expect("legacy run id");
+        let legacy_effect = QueueJournalEvent::LeaseEffectStarted {
+            item_id: item_id.clone(),
+            subordinate_run_id: legacy_run_id.clone(),
+            lease_event: LeaseEvent::effect_started(proof_v2.clone(), 21).expect("effect event"),
+        };
+        queue
+            .journal
+            .append(
+                legacy_effect.phase(),
+                legacy_effect.subject(),
+                &legacy_effect,
+            )
+            .expect("append authenticated legacy effect");
+        queue.snapshot = queue.replay_snapshot().expect("replay legacy effect");
+        assert_eq!(
+            queue
+                .snapshot()
+                .item(&item_id)
+                .and_then(GeneratedFollowUpQueueItemSnapshot::subordinate_run_id),
+            Some(legacy_run_id.as_str())
+        );
+        queue
+            .append_leased_terminal_observation(
+                &item_id,
+                GeneratedFollowUpDispatchObservation::new(
+                    legacy_run_id.clone(),
+                    None,
+                    Vec::new(),
+                    Some(ExternalSideEffectState::Completed),
+                )
+                .expect("observation"),
+                proof_v2,
+                22,
+                DurableGraphEvent::BranchAttemptCompleted {
+                    branch_id: branch_id("branch-loop"),
+                    visit: 2,
+                    attempt: 1,
+                    outcome: graph_success("visit-2-legacy", &["write-legacy"]),
+                },
+            )
+            .expect("terminal visit 2");
+        queue = reopen_typed_queue(&repo, &source, queue);
+        assert_eq!(
+            queue.snapshot().item(&item_id).expect("item").phase(),
+            GeneratedFollowUpQueuePhase::AcknowledgedTerminal
+        );
+
+        queue
+            .apply_graph_transition(DurableGraphEvent::EdgesSelected {
+                source_node_id: node_id("n10-task"),
+                visit: 2,
+                edge_ids: vec![edge_id("e10-back")],
+            })
+            .expect("loop back visit 2");
+        schedule_loop_body_visit(&mut queue, 3);
+        queue
+            .open_next_graph_occurrence(&item_id)
+            .expect("open visit 3");
+        queue = reopen_typed_queue(&repo, &source, queue);
+        let archived = queue
+            .snapshot()
+            .item(&item_id)
+            .expect("item")
+            .completed_occurrences();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].graph_visit(), 2);
+        assert_eq!(archived[0].subordinate_run_id(), legacy_run_id.as_str());
+        assert_eq!(archived[0].lease().phase(), LeasePhase::Acknowledged);
+
+        let (_, proof_v3) = queue
+            .claim_with_lease(
+                &item_id,
+                worker("worker-v3"),
+                lease_id("lease-v3"),
+                30,
+                38,
+                DurableGraphEvent::BranchAttemptStarted {
+                    branch_id: branch_id("branch-loop"),
+                    visit: 3,
+                    attempt: 1,
+                },
+            )
+            .expect("claim visit 3");
+        queue
+            .mark_leased_effect_started(&item_id, proof_v3.clone(), 31)
+            .expect("effect visit 3");
+        let visit_3_run_id = queue
+            .snapshot()
+            .item(&item_id)
+            .and_then(GeneratedFollowUpQueueItemSnapshot::subordinate_run_id)
+            .expect("visit 3 run id")
+            .to_string();
+        let expected_visit_3 =
+            hashed_graph_occurrence_subordinate_run_id(&item_id, 3).expect("hashed visit 3");
+        assert_eq!(visit_3_run_id, expected_visit_3);
+        assert_ne!(visit_3_run_id, legacy_run_id);
     }
 }

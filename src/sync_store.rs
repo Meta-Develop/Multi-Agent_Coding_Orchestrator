@@ -1730,7 +1730,7 @@ impl SyncStore {
                 paths,
                 MegafileThresholds::provisional_bootstrap(),
                 ClaimTiming::default(),
-                current_unix_seconds()?,
+                current_unix_seconds,
                 Some((
                     run_id.as_str().to_string(),
                     current_claim_process_identity(),
@@ -1796,7 +1796,7 @@ impl SyncStore {
             paths,
             thresholds,
             timing,
-            current_unix_seconds()?,
+            current_unix_seconds,
             None,
         )
     }
@@ -1811,11 +1811,19 @@ impl SyncStore {
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
-        self.claim_paths_with_timing_at(agent_id, paths, timing, current_unix_seconds()?)
+        self.claim_paths_with_telemetry_thresholds_internal(
+            agent_id,
+            paths,
+            MegafileThresholds::provisional_bootstrap(),
+            timing,
+            current_unix_seconds,
+            None,
+        )
     }
 
     /// Caller-supplied time is an internal deterministic test seam. Production
     /// callers use the trusted system-clock wrapper above.
+    #[cfg(test)]
     fn claim_paths_with_timing_at<I, P>(
         &self,
         agent_id: impl AsRef<str>,
@@ -1832,7 +1840,7 @@ impl SyncStore {
             paths,
             MegafileThresholds::provisional_bootstrap(),
             timing,
-            now_unix_seconds,
+            move || Ok(now_unix_seconds),
             None,
         )
     }
@@ -1843,7 +1851,7 @@ impl SyncStore {
         paths: I,
         thresholds: MegafileThresholds,
         timing: ClaimTiming,
-        now_unix_seconds: u64,
+        sample_now_unix_seconds: impl FnOnce() -> Result<u64>,
         run_owner: Option<(String, ClaimProcessIdentity)>,
     ) -> Result<ClaimTelemetryOutcome>
     where
@@ -1860,12 +1868,13 @@ impl SyncStore {
                 agent_id.as_ref(),
                 paths,
                 timing,
-                now_unix_seconds,
+                sample_now_unix_seconds,
                 run_owner,
             )?
         } else {
             self.with_locked_update(
-                |coordinator, run_owners, liveness, supersessions, _remote_owners| {
+                move |coordinator, run_owners, liveness, supersessions, _remote_owners| {
+                    let now_unix_seconds = sample_now_unix_seconds()?;
                     let active_claims = coordinator.snapshot()?;
                     ensure_unambiguous_liveness(
                         &active_claims,
@@ -1920,7 +1929,7 @@ impl SyncStore {
         agent_id: &str,
         paths: I,
         timing: ClaimTiming,
-        now_unix_seconds: u64,
+        sample_now_unix_seconds: impl FnOnce() -> Result<u64>,
         run_owner: Option<(String, ClaimProcessIdentity)>,
     ) -> Result<PathClaim>
     where
@@ -1937,7 +1946,8 @@ impl SyncStore {
             .map(|path| PathBuf::from(path.as_ref()))
             .collect::<Vec<_>>();
         let reserved = self.with_locked_update(
-            |coordinator, run_owners, liveness, supersessions, _remote_owners| {
+            move |coordinator, run_owners, liveness, supersessions, _remote_owners| {
+                let now_unix_seconds = sample_now_unix_seconds()?;
                 let active_claims = coordinator.snapshot()?;
                 ensure_unambiguous_liveness(
                     &active_claims,
@@ -4263,7 +4273,7 @@ mod tests {
                 ["README.md"],
                 MegafileThresholds::provisional_bootstrap(),
                 ClaimTiming::default(),
-                current_unix_seconds().expect("current time"),
+                current_unix_seconds,
                 Some(("interrupted-run".to_string(), process)),
             )
             .expect("record run-owned claim")
@@ -4335,6 +4345,37 @@ mod tests {
             store.snapshot().expect("snapshot after writer"),
             vec![claim]
         );
+    }
+
+    #[test]
+    fn claim_observed_time_is_sampled_while_state_lock_is_held() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        let store = SyncStore::open(&repo_path).expect("open claims");
+        let state = &store.state;
+        let thresholds = MegafileThresholds::provisional_bootstrap();
+        let timing = ClaimTiming::default();
+        store
+            .claim_paths_with_telemetry_thresholds_internal(
+                "clock-under-lock",
+                ["src/claim-clock-regression"],
+                thresholds,
+                timing,
+                || {
+                    assert!(matches!(
+                        state.lock_existing(),
+                        Err(ExistingClaimRevalidationError::LockBusy)
+                    ));
+                    current_unix_seconds()
+                },
+                None,
+            )
+            .expect("production claim samples clock under writer lock");
+        store
+            .state
+            .lock()
+            .expect("claims lock reusable after claim");
     }
 
     #[cfg(target_os = "linux")]

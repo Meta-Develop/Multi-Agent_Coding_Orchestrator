@@ -2641,8 +2641,47 @@ fn publication_profiles_expose_only_required_config_and_git_objects() {
     })
     .expect("create gh context");
     assert!(gh.profile.visible_read_only_roots().is_empty());
-    assert_eq!(gh.profile.visible_read_only_files().len(), 1);
+    assert_eq!(gh.profile.visible_read_only_files().len(), 2);
     assert!(gh.profile.hidden_roots().contains(&state));
+}
+
+#[test]
+fn gh_private_versioned_config_identity_tamper_is_refused_before_spawn() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    Repository::init(&repo_path).expect("init repo");
+    let repository = GithubRepositoryIdentity {
+        host: "github.example".to_string(),
+        owner: "owner".to_string(),
+        name: "repo".to_string(),
+    };
+    let context = GhCommandContext::create_with_token_source(&repo_path, &repository, |key| {
+        enterprise_test_value("github.example", key)
+    })
+    .expect("create gh context");
+    assert_eq!(context.config_files.len(), 2);
+    let config_path = context.runtime_directory.path().join("config.yml");
+    let tracked = context
+        .config_files
+        .iter()
+        .find(|identity| identity.path == config_path)
+        .expect("gh context tracks config.yml identity");
+    let mut original = tracked.bytes.clone();
+    fs::write(&config_path, b"version: 1\nprompt: disabled\n").expect("mutate config.yml");
+    assert!(verify_private_config_files(&context.config_files).is_err());
+    merge::write_private_file(
+        &context.runtime_directory.path().join("replacement"),
+        &original,
+    )
+    .expect("write replacement config");
+    fs::remove_file(&config_path).expect("remove mutated config");
+    fs::rename(
+        context.runtime_directory.path().join("replacement"),
+        &config_path,
+    )
+    .expect("restore config path with changed inode");
+    assert!(verify_private_config_files(&context.config_files).is_err());
+    zeroize_bytes(&mut original);
 }
 
 #[test]

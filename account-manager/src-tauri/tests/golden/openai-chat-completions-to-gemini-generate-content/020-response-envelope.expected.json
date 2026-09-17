@@ -1,0 +1,16 @@
+{
+  "responseId": "FAKE-response-openai-0002",
+  "modelVersion": "FAKE-openai-model",
+  "candidates": [
+    {
+      "index": 0,
+      "content": { "role": "model", "parts": [{ "text": "Hello" }] },
+      "finishReason": "STOP"
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 2,
+    "candidatesTokenCount": 3,
+    "totalTokenCount": 5
+  }
+}

@@ -268,27 +268,35 @@ fn measured_available_disk_mib(_path: &Path) -> Option<usize> {
 
 /// A run-scoped cancellation signal for independently contained child processes.
 ///
-/// Clones observe the same state. Cancellation is cooperative at setup boundaries and in the
-/// process poll loop; once a child has started, its own containment backend remains responsible
-/// for terminating and proving its process tree empty.
-#[derive(Debug, Clone)]
+/// [`Clone`] shares the same scope: cancelling one clone cancels every clone of that scope, but
+/// does **not** create a child scope. Use [`Self::child_scope`] when a nested assignment needs its
+/// own cancellable scope that still observes parent cancellation without cancelling siblings.
+///
+/// Cancellation is cooperative at setup boundaries and in the process poll loop; once a child has
+/// started, its own containment backend remains responsible for terminating and proving its
+/// process tree empty.
+#[derive(Debug, Clone, Default)]
 pub struct ProcessCancellation {
     requested: Arc<AtomicBool>,
-    observed: Vec<Arc<AtomicBool>>,
-}
-
-impl Default for ProcessCancellation {
-    fn default() -> Self {
-        Self {
-            requested: Arc::new(AtomicBool::new(false)),
-            observed: Vec::new(),
-        }
-    }
+    inherited: Vec<Arc<AtomicBool>>,
 }
 
 impl ProcessCancellation {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Returns a child scope with its own [`Self::cancel`] target.
+    ///
+    /// The child observes cancellation on this scope and every ancestor scope, but cancelling the
+    /// child does not affect this scope or any sibling child scopes.
+    pub fn child_scope(&self) -> Self {
+        let mut inherited = self.inherited.clone();
+        inherited.push(Arc::clone(&self.requested));
+        Self {
+            requested: Arc::new(AtomicBool::new(false)),
+            inherited,
+        }
     }
 
     pub fn cancel(&self) {
@@ -299,7 +307,7 @@ impl ProcessCancellation {
         if self.requested.load(Ordering::Acquire) {
             return true;
         }
-        self.observed
+        self.inherited
             .iter()
             .any(|flag| flag.load(Ordering::Acquire))
     }
@@ -312,14 +320,14 @@ impl ProcessCancellation {
 /// Clones each source's own cancellation flag plus any flattened inherited flags.
 /// `cancel()` on the result affects only this handle; sources are not mutated.
 pub fn compose_process_cancellations(sources: &[ProcessCancellation]) -> ProcessCancellation {
-    let mut observed = Vec::new();
+    let mut inherited = Vec::new();
     for source in sources {
-        observed.push(Arc::clone(&source.requested));
-        observed.extend(source.observed.iter().cloned());
+        inherited.push(Arc::clone(&source.requested));
+        inherited.extend(source.inherited.iter().cloned());
     }
     ProcessCancellation {
         requested: Arc::new(AtomicBool::new(false)),
-        observed,
+        inherited,
     }
 }
 #[cfg(target_os = "linux")]
@@ -4482,5 +4490,15 @@ mod mechanical_executor_lifecycle_tests {
         b.cancel();
         assert!(via_combined.is_cancelled());
         assert!(!a.is_cancelled());
+    }
+
+    #[test]
+    fn compose_process_cancellations_observes_child_scope_without_cancelling_parent() {
+        let root = ProcessCancellation::new();
+        let child = root.child_scope();
+        let composed = compose_process_cancellations(std::slice::from_ref(&child));
+        child.cancel();
+        assert!(composed.is_cancelled());
+        assert!(!root.is_cancelled());
     }
 }

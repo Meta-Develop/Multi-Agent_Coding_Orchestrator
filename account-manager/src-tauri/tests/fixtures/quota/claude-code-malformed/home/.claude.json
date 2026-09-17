@@ -1,0 +1,7 @@
+{
+  "oauthAccount": {
+    "billingType": {
+      "value": "FAKE-CLAUDE-MALFORMED"
+    }
+  }
+}

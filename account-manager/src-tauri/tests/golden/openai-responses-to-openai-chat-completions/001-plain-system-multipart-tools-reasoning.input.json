@@ -1,0 +1,45 @@
+{
+  "$context": { "target_model": "chat-target" },
+  "$body": {
+    "model": "response-source",
+    "max_output_tokens": 256,
+    "reasoning": { "effort": "medium" },
+    "input": [
+      {
+        "type": "message",
+        "role": "system",
+        "content": [{ "type": "input_text", "text": "Be exact." }]
+      },
+      {
+        "type": "message",
+        "role": "user",
+        "content": [
+          { "type": "input_text", "text": "Inspect" },
+          {
+            "type": "input_image",
+            "image_url": "data:image/png;base64,FAKE-image-0002"
+          }
+        ]
+      },
+      {
+        "type": "function_call",
+        "call_id": "FAKE-call-0002",
+        "name": "inspect",
+        "arguments": "{\"id\":\"FAKE-item-0002\"}"
+      },
+      {
+        "type": "function_call_output",
+        "call_id": "FAKE-call-0002",
+        "output": "{\"ok\":true}"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "name": "inspect",
+        "description": "Inspect one item.",
+        "parameters": { "type": "object" }
+      }
+    ]
+  }
+}

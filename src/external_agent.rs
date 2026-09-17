@@ -59,6 +59,9 @@ use std::{
 pub(crate) mod codex_app_server;
 #[allow(dead_code, unused_imports)]
 pub(crate) mod executor;
+mod grok_steering;
+
+use grok_steering::GrokAcpSteeringBridge;
 
 pub use crate::protected_path::SandboxDenialRetryability;
 
@@ -2391,7 +2394,6 @@ fn run_external_agent_runtime(
             );
         }
     }
-    let program_trust = external_program_trust(spec);
     let resolved_program = match resolve_external_program(&spec.program, &spec.cwd) {
         Ok(program) => program,
         Err(error) => {
@@ -2445,6 +2447,7 @@ fn run_external_agent_runtime(
             return report;
         }
     };
+    let program_trust = external_program_trust_for_resolved_executable(spec, &resolved_program);
     let program_identity = match external_program_identity(&resolved_program) {
         Ok(identity) => identity,
         Err(error) => {
@@ -3070,17 +3073,18 @@ fn run_external_agent_runtime(
         );
         return report;
     };
-    if let Err(error) =
-        validate_external_program_identity(&resolved_program, spec.program == Path::new("codex"))
-            .and_then(|()| {
-                let current = external_program_identity(&resolved_program)?;
-                if current == program_identity {
-                    Ok(())
-                } else {
-                    bail!("external executable identity changed after version preflight")
-                }
-            })
-    {
+    if let Err(error) = validate_external_program_identity(
+        &resolved_program,
+        program_trust == ExternalProgramTrust::TrustedSystemCodex,
+    )
+    .and_then(|()| {
+        let current = external_program_identity(&resolved_program)?;
+        if current == program_identity {
+            Ok(())
+        } else {
+            bail!("external executable identity changed after version preflight")
+        }
+    }) {
         report.duration_ms = duration_millis(started.elapsed());
         record_environment_failure(
             &mut report,
@@ -4058,17 +4062,51 @@ fn run_grok_acp_external_process(
                 source: std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string()),
             }
         })?;
-    run_process_interactive(process_spec, cancellation, |session| {
+    let mut steering_bridge = spec
+        .agent_lifecycle
+        .as_ref()
+        .map(GrokAcpSteeringBridge::from_identity)
+        .transpose()
+        .map_err(|error| ProcessRunError::IoSetup {
+            label: "Grok ACP steering bridge".to_string(),
+            command: spec.program.display().to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string()),
+        })?;
+
+    let interactive = run_process_interactive(process_spec, cancellation, |session| {
         let mut transport = GrokAcpContainedTransport::new(session);
-        let evidence = crate::runtime_adapter::grok_acp::run_grok_acp_turn(
-            &mut transport,
-            &turn,
-            limits,
-            || cancellation.is_cancelled(),
-        )
+        let cancelled = || cancellation.is_cancelled();
+        let evidence = if let Some(bridge) = steering_bridge.as_mut() {
+            crate::runtime_adapter::grok_acp::run_grok_acp_turn_with_steering(
+                &mut transport,
+                &turn,
+                limits,
+                cancelled,
+                bridge,
+            )
+        } else {
+            crate::runtime_adapter::grok_acp::run_grok_acp_turn(
+                &mut transport,
+                &turn,
+                limits,
+                cancelled,
+            )
+        }
         .map_err(|error| error.to_string())?;
         Ok(GrokAcpInteractiveOutcome { evidence })
-    })
+    });
+
+    if let Some(bridge) = steering_bridge {
+        bridge
+            .finalize_after_child_exit()
+            .map_err(|error| ProcessRunError::IoSetup {
+                label: "Grok ACP steering finalization".to_string(),
+                command: spec.program.display().to_string(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string()),
+            })?;
+    }
+
+    interactive
 }
 
 fn grok_acp_staged_output_bytes(

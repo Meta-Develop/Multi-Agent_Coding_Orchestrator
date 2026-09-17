@@ -1,0 +1,10 @@
+{
+  "id": "FAKE-response-responses-0001",
+  "type": "message",
+  "role": "assistant",
+  "model": "FAKE-responses-model",
+  "content": [{ "type": "text", "text": "Hello" }],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": { "input_tokens": 2, "output_tokens": 3 }
+}

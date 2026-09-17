@@ -1,0 +1,107 @@
+name: Account Manager CI
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: account-manager-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+defaults:
+  run:
+    working-directory: account-manager
+
+jobs:
+  frontend:
+    name: Account manager frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: account-manager/.nvmrc
+          cache: npm
+          cache-dependency-path: account-manager/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm test
+      - run: npm run build
+      - name: Check application versions agree
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, tomllib
+          package = json.loads(pathlib.Path('package.json').read_text())['version']
+          native = tomllib.loads(pathlib.Path('src-tauri/Cargo.toml').read_text())['package']['version']
+          desktop = json.loads(pathlib.Path('src-tauri/tauri.conf.json').read_text())['version']
+          assert package == native == desktop, (package, native, desktop)
+          PY
+
+  rust:
+    name: Account manager ${{ matrix.mode }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        mode: [desktop, headless]
+    defaults:
+      run:
+        shell: bash
+        working-directory: account-manager
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Linux native prerequisites
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libdbus-1-dev
+      - name: Install Linux desktop prerequisites
+        if: matrix.os == 'ubuntu-latest' && matrix.mode == 'desktop'
+        run: |
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev libsoup-3.0-dev libsecret-1-dev patchelf
+      - name: Install pinned application toolchain
+        run: |
+          rustup toolchain install
+          rustc --version --verbose
+          cargo --version --verbose
+          cargo clippy --version
+      - name: Select native core features
+        if: matrix.mode == 'headless'
+        run: echo 'CORE_FEATURES=--no-default-features' >> "$GITHUB_ENV"
+      - name: Refuse desktop dependencies in native core
+        if: matrix.mode == 'headless'
+        run: |
+          cargo tree --locked --manifest-path src-tauri/Cargo.toml --no-default-features \
+            --edges normal,build,dev --prefix none --format '{p}' > headless-dependencies.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          names = {line.split()[0] for line in Path('headless-dependencies.txt').read_text().splitlines()}
+          forbidden = sorted(name for name in names if name == 'tauri' or name.startswith(('tauri-', 'gtk', 'webkit')))
+          assert not forbidden, forbidden
+          PY
+      - name: Format
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+      - name: Check all targets
+        run: cargo check --locked --manifest-path src-tauri/Cargo.toml ${CORE_FEATURES:-} --all-targets
+      - name: Clippy
+        run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml ${CORE_FEATURES:-} --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml ${CORE_FEATURES:-}

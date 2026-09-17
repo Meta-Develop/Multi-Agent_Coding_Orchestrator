@@ -2085,6 +2085,13 @@ fn authenticated_github_actor(repo: &Path) -> Result<String, InboxApprovedGithub
                 "GitHub authentication token was malformed",
             )
         })?;
+        let config_path = directory.join("config.yml");
+        crate::merge::write_private_file(&config_path, b"version: 1\n").map_err(|_| {
+            InboxApprovedGithubActorError::new(
+                InboxApprovedGithubActorFailure::ActorUnavailable,
+                "authenticated GitHub actor configuration was unavailable",
+            )
+        })?;
         let hosts_path = directory.join("hosts.yml");
         let hosts =
             format!("'github.com':\n    oauth_token: '{token_text}'\n    git_protocol: https\n");
@@ -2141,6 +2148,7 @@ fn authenticated_github_actor(repo: &Path) -> Result<String, InboxApprovedGithub
             0,
             TrustedFixedNetworkProfile::read_write(&directory)
                 .with_resource_limits(ProcessResourceLimits::default())
+                .with_visible_read_only_file(&config_path)
                 .with_visible_read_only_file(&hosts_path),
         )
         .map_err(|_| {
@@ -7473,6 +7481,47 @@ fn files_from_value(value: Option<&Value>) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+fn github_check_status_allows_absent_conclusion(status: Option<&str>) -> bool {
+    status.is_some_and(|status| {
+        matches!(
+            status.to_ascii_lowercase().as_str(),
+            "pending" | "in_progress" | "inprogress" | "queued" | "waiting"
+        )
+    })
+}
+
+fn optional_github_pr_review_decision(
+    value: Option<&Value>,
+    label: &str,
+    max_bytes: usize,
+) -> Result<Option<String>> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    if value.as_str() == Some("") {
+        return Ok(None);
+    }
+    optional_input_string(Some(value), label, max_bytes)
+}
+
+fn optional_github_check_conclusion(
+    object: &serde_json::Map<String, Value>,
+    status: Option<&str>,
+    label: &str,
+    max_bytes: usize,
+) -> Result<Option<String>> {
+    let Some(value) = object.get("conclusion").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    if value.as_str() == Some("") {
+        if github_check_status_allows_absent_conclusion(status) {
+            return Ok(None);
+        }
+        validate_bounded_text("", label, max_bytes, false)?;
+    }
+    optional_input_string(Some(value), label, max_bytes)
+}
+
 fn checks_from_value(value: Option<&Value>) -> Result<Vec<GithubCheckSummary>> {
     let values = optional_input_array(value, "GitHub checks", MAX_GITHUB_CHECKS)?;
     let mut checks = Vec::with_capacity(values.len());
@@ -7492,9 +7541,9 @@ fn checks_from_value(value: Option<&Value>) -> Result<Vec<GithubCheckSummary>> {
             &format!("GitHub check {} status", index + 1),
             MAX_GITHUB_STATUS_BYTES,
         )?;
-        let conclusion = first_optional_input_string(
+        let conclusion = optional_github_check_conclusion(
             object,
-            &["conclusion"],
+            status.as_deref(),
             &format!("GitHub check {} conclusion", index + 1),
             MAX_GITHUB_STATUS_BYTES,
         )?;
@@ -7519,7 +7568,7 @@ fn review_feedback_from_value(value: &Value) -> Result<GithubReviewFeedbackSumma
     let object = value
         .as_object()
         .context("GitHub PR review payload must be an object")?;
-    let review_decision = optional_input_string(
+    let review_decision = optional_github_pr_review_decision(
         object.get("reviewDecision"),
         "GitHub PR reviewDecision",
         MAX_GITHUB_STATUS_BYTES,

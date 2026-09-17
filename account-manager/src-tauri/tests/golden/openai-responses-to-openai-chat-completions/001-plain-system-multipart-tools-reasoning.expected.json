@@ -1,0 +1,54 @@
+{
+  "body": {
+    "model": "chat-target",
+    "max_completion_tokens": 256,
+    "reasoning_effort": "medium",
+    "messages": [
+      {
+        "role": "system",
+        "content": [{ "type": "text", "text": "Be exact." }]
+      },
+      {
+        "role": "user",
+        "content": [
+          { "type": "text", "text": "Inspect" },
+          {
+            "type": "image_url",
+            "image_url": { "url": "data:image/png;base64,FAKE-image-0002" }
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "FAKE-call-0002",
+            "type": "function",
+            "function": {
+              "name": "inspect",
+              "arguments": "{\"id\":\"FAKE-item-0002\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "FAKE-call-0002",
+        "content": "{\"ok\":true}"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "inspect",
+          "description": "Inspect one item.",
+          "parameters": { "type": "object" }
+        }
+      }
+    ]
+  },
+  "target_model": null,
+  "stream": false
+}

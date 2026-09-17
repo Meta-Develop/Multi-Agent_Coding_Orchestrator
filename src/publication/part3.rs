@@ -202,6 +202,8 @@ impl GhCommandContext {
                 )
             })?;
             let token = select_network_token_with(&repository.host, &mut value_for)?;
+            let config_path = directory.join("config.yml");
+            merge::write_private_file(config_path.as_path(), b"version: 1\n")?;
             let hosts_path = directory.join("hosts.yml");
             let escaped_token = ZeroizingString(token.as_str()?.replace('\'', "''"));
             let hosts = ZeroizingString(format!(
@@ -210,7 +212,10 @@ impl GhCommandContext {
                 escaped_token.as_str()
             ));
             merge::write_private_file(&hosts_path, hosts.as_bytes())?;
-            let config_files = vec![capture_private_config_file(&hosts_path)?];
+            let config_files = vec![
+                capture_private_config_file(&config_path)?,
+                capture_private_config_file(&hosts_path)?,
+            ];
 
             let common_state =
                 fs::canonicalize(merge::ensure_repo_common_state_directory(&source)?)
@@ -248,6 +253,7 @@ impl GhCommandContext {
             validate_gh_environment(&environment, &directory)?;
             let profile = TrustedFixedNetworkProfile::read_write(&directory)
                 .with_resource_limits(Default::default())
+                .with_visible_read_only_file(&config_path)
                 .with_visible_read_only_file(&hosts_path)
                 .with_hidden_root(&primary_worktree)
                 .with_hidden_root(&source_worktree)
@@ -271,7 +277,10 @@ impl GhCommandContext {
                 source_config_path,
             }),
             Err(error) => {
-                let erase = erase_private_config_paths_if_present(&[directory.join("hosts.yml")]);
+                let erase = erase_private_config_paths_if_present(&[
+                    directory.join("config.yml"),
+                    directory.join("hosts.yml"),
+                ]);
                 let close = runtime_directory.close();
                 match (erase, close) {
                     (Ok(()), Ok(())) => Err(error),

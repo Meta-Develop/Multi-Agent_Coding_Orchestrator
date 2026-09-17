@@ -323,8 +323,9 @@ pub(crate) use reporting::command_record_from_external;
 mod schema_artifacts;
 use schema_artifacts::*;
 
-/// Persists the normalized plan and establishes its authenticated messaging identity set before
-/// scheduler dispatch. This local definition intentionally takes precedence over the private
+/// Persists the normalized plan and admits the durable messaging session descriptor before
+/// scheduler dispatch. Live broker journals remain in the authenticated state namespace, not the
+/// run manifest. This local definition intentionally takes precedence over the private
 /// schema-module helper imported above.
 fn write_plan_snapshot(
     writer: &mut ArtifactRunWriter,
@@ -346,9 +347,9 @@ fn write_plan_snapshot(
         .context("supervisor messaging pre-launch initialization failed")
 }
 
-/// Recovers a run's existing messaging journal before the authenticated supervisor finalization
-/// resume path proceeds. A finalized run needs no live identities; an unfinished journal never
-/// receives replacement credentials when the original process-local session is absent.
+/// Recovers a run's durable messaging journal before the authenticated supervisor finalization
+/// resume path proceeds. A finalized run needs no live identities; legacy artifact journals without
+/// a session descriptor still refuse recovery when the original process-local factory is absent.
 pub fn resume_supervisor_run(
     repo: impl AsRef<Path>,
     run_id: RunId,
