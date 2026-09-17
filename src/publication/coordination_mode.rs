@@ -7,12 +7,14 @@
 //! as the bound publication live verifier.
 
 use super::coordination_admission::{
-    worktree_has_planned_coordination_pending_intents, CoordinationAdmissionService,
+    coordination_owner_locally_authenticated, worktree_has_planned_coordination_pending_intents,
+    CoordinationAdmissionService,
 };
 use super::coordination_github::{
     CoordinationGithubAdapterConfig, CoordinationGithubAdapterOpenInput, CoordinationGithubRunner,
     CoordinationGithubTransport, ProductionCoordinationGithubRunner,
 };
+use super::coordination_journal::AuthoritySnapshot;
 use super::coordination_provider::ParentPublicationProviderVerifier;
 use super::forge_transport::{
     ForgeActor, ForgeItem, ForgeItemKind, ForgeRepository, ProviderObjectId, ProviderObjectKind,
@@ -155,6 +157,112 @@ pub struct RemoteCoordinationStatusReport {
 pub struct RemoteCoordinationDisableReport {
     pub disabled: bool,
     pub was_selected: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteCoordinationAuthorityOwnerReport {
+    pub run_identity: String,
+    pub activation_nonce: String,
+    pub scopes: Vec<String>,
+    pub heartbeat_interval_seconds: u64,
+    pub stale_after_seconds: u64,
+    pub activation_at: String,
+    pub last_heartbeat_at: String,
+    pub activation_event_nonce: String,
+    pub locally_authenticated_on_this_host: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteCoordinationAuthorityReport {
+    /// Observation never mints scope work permits.
+    pub observation_permits_work: bool,
+    pub configured: bool,
+    pub selection_digest: Option<String>,
+    pub repository_selector: Option<String>,
+    pub authenticated_selection_revision: Option<u64>,
+    pub journal_head_oid: String,
+    pub claim_timing: ClaimTiming,
+    pub active_owners: Vec<RemoteCoordinationAuthorityOwnerReport>,
+    pub pending_effect_reservation_count: usize,
+}
+
+pub(crate) fn remote_coordination_authority_report_from_snapshot(
+    snapshot: &AuthoritySnapshot,
+    claim_timing: ClaimTiming,
+    worktree: &Path,
+    selection: Option<(&RemoteCoordinationStatusReport, u64)>,
+) -> Result<RemoteCoordinationAuthorityReport> {
+    let (configured, selection_digest, repository_selector, authenticated_selection_revision) =
+        match selection {
+            Some((status, revision)) => (
+                status.selected,
+                status.selection_digest.clone(),
+                status.repository_selector.clone(),
+                Some(revision),
+            ),
+            None => (true, None, None, None),
+        };
+    let mut active_owners = snapshot
+        .active_owners()
+        .iter()
+        .map(|record| {
+            Ok(RemoteCoordinationAuthorityOwnerReport {
+                run_identity: record.owner().run_identity().to_string(),
+                activation_nonce: record.owner().activation_nonce().to_string(),
+                scopes: record.scopes().to_vec(),
+                heartbeat_interval_seconds: record.lease().heartbeat_interval_seconds,
+                stale_after_seconds: record.lease().stale_after_seconds,
+                activation_at: record.activation_at().as_str().to_string(),
+                last_heartbeat_at: record.last_heartbeat_at().as_str().to_string(),
+                activation_event_nonce: record.activation_event_nonce().to_string(),
+                locally_authenticated_on_this_host: coordination_owner_locally_authenticated(
+                    worktree,
+                    record.owner(),
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    active_owners.sort_by(|left, right| {
+        left.run_identity
+            .cmp(&right.run_identity)
+            .then_with(|| left.activation_nonce.cmp(&right.activation_nonce))
+    });
+    Ok(RemoteCoordinationAuthorityReport {
+        observation_permits_work: false,
+        configured,
+        selection_digest,
+        repository_selector,
+        authenticated_selection_revision,
+        journal_head_oid: snapshot.journal_head_oid().to_string(),
+        claim_timing,
+        active_owners,
+        pending_effect_reservation_count: snapshot.pending_reservations().len(),
+    })
+}
+
+pub(crate) fn remote_coordination_authority_observation(
+    repo: &Path,
+) -> Result<RemoteCoordinationAuthorityReport> {
+    let status = remote_coordination_status(repo)?;
+    if !status.selected {
+        bail!("remote coordination is not configured for this repository");
+    }
+    let authenticated = read_authenticated_state(repo)?
+        .context("remote coordination authenticated selection state is unavailable")?;
+    let revision = authenticated.snapshot_revision;
+    let worktree = repo_workdir(repo)?;
+    let service = load_selected_remote_service(repo)?.context(
+        "remote coordination selection is configured but cannot load trusted admission service",
+    )?;
+    let snapshot = service.remote_authority_snapshot()?;
+    remote_coordination_authority_report_from_snapshot(
+        &snapshot,
+        service.claim_timing(),
+        &worktree,
+        Some((&status, revision)),
+    )
 }
 
 fn require_supported_operator_config_platform() -> Result<()> {

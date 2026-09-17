@@ -1643,6 +1643,13 @@ fn write_local_activation(
     }
 }
 
+pub(crate) fn coordination_owner_locally_authenticated(
+    worktree: &Path,
+    owner: &CoordinationOwnerIdentity,
+) -> Result<bool> {
+    Ok(read_local_activation(worktree, owner)?.is_some())
+}
+
 fn read_local_activation(
     worktree: &Path,
     owner: &CoordinationOwnerIdentity,

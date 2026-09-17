@@ -1684,6 +1684,232 @@ impl SyncStore {
         remote.inspect_binding(&binding)
     }
 
+    /// Trusted remote journal authority for the configured coordination selection.
+    /// Never mints scope permits or mutates local claims.
+    pub fn remote_authority_observation(
+        &self,
+    ) -> Result<crate::publication::coordination_mode::RemoteCoordinationAuthorityReport> {
+        let remote = self
+            .remote
+            .as_ref()
+            .context("remote coordination is not selected")?;
+        let snapshot = remote.trusted_authority_snapshot()?;
+        crate::publication::coordination_mode::remote_coordination_authority_report_from_snapshot(
+            &snapshot,
+            remote.remote_claim_timing(),
+            remote.worktree(),
+            None,
+        )
+    }
+
+    /// Explicit remote takeover on a fresh host: observed predecessor identity is comparison input only.
+    /// Staleness, reservations, and journal CAS are enforced by the configured remote admission service.
+    pub fn takeover_remote<I, P>(
+        &self,
+        predecessor: CoordinationOwnerIdentity,
+        agent_id: impl AsRef<str>,
+        paths: I,
+        timing: Option<ClaimTiming>,
+    ) -> Result<ClaimTelemetryOutcome>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let remote = self
+            .remote
+            .as_ref()
+            .context("remote coordination is not selected")?;
+        let timing = timing.unwrap_or_else(|| remote.remote_claim_timing());
+        timing.validate()?;
+        self.takeover_remote_with_timing_internal(
+            predecessor,
+            agent_id,
+            paths,
+            timing,
+            current_unix_seconds,
+        )
+    }
+
+    fn takeover_remote_with_timing_internal<I, P>(
+        &self,
+        predecessor: CoordinationOwnerIdentity,
+        agent_id: impl AsRef<str>,
+        paths: I,
+        timing: ClaimTiming,
+        sample_now_unix_seconds: impl FnOnce() -> Result<u64>,
+    ) -> Result<ClaimTelemetryOutcome>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let remote = self
+            .remote
+            .as_ref()
+            .context("remote coordination is not selected")?;
+        let agent_id = agent_id.as_ref();
+        let scope_paths = paths
+            .into_iter()
+            .map(|path| PathBuf::from(path.as_ref()))
+            .collect::<Vec<_>>();
+        let normalized_scopes =
+            crate::publication::coordination_journal::normalize_coordination_scopes(
+                scope_paths.iter(),
+            )?;
+        let snapshot = remote.trusted_authority_snapshot()?;
+        let predecessor_record = snapshot
+            .active_owners()
+            .iter()
+            .find(|record| record.owner() == &predecessor)
+            .with_context(|| {
+                format!(
+                    "predecessor owner {} is not active in trusted remote authority",
+                    predecessor.run_identity()
+                )
+            })?;
+        if predecessor_record.scopes() != normalized_scopes {
+            bail!("takeover scope paths must exactly match predecessor remote scopes");
+        }
+        let successor_run = agent_id.to_string();
+        let activation_nonce = remote.mint_activation_nonce(&successor_run)?;
+        let reserved = self.with_locked_update(
+            move |coordinator, run_owners, liveness, supersessions, _remote_owners| {
+                let now_unix_seconds = sample_now_unix_seconds()?;
+                let active_claims = coordinator.snapshot()?;
+                ensure_unambiguous_liveness(
+                    &active_claims,
+                    liveness,
+                    supersessions,
+                    now_unix_seconds,
+                )?;
+                let claim = coordinator.claim_paths(agent_id, scope_paths.clone())?;
+                liveness.push(new_claim_liveness(&claim, timing, now_unix_seconds, None)?);
+                let _ = run_owners;
+                Ok((claim, activation_nonce))
+            },
+        )?;
+        let (claim, activation_nonce) = reserved;
+        let remote_outcome = remote.apply_remote_scope_authority(
+            remote_coordination::RemoteScopeAuthorityOperation::Takeover {
+                predecessor,
+                run_identity: successor_run.clone(),
+                activation_nonce: activation_nonce.clone(),
+            },
+            &claim.paths,
+        );
+        let claim = self.finalize_remote_local_claim_after_authority(claim, remote_outcome)?;
+        let assessments = (|| {
+            MegafileStore::open_with_thresholds(
+                &self.repo_path,
+                MegafileThresholds::provisional_bootstrap(),
+            )
+            .context("takeover-remote megafile telemetry could not be opened")?
+            .record_claim(&claim)
+            .context("takeover-remote megafile telemetry could not be recorded")
+        })()
+        .with_context(|| {
+            format!(
+                "remote takeover successor claim token {} remains durable for agent '{}' and paths {:?}, but its required megafile telemetry failed; inspect the authenticated claim list and explicitly release token {} before retrying if rollback is intended",
+                claim.token.get(),
+                claim.agent_id,
+                claim.paths,
+                claim.token.get()
+            )
+        })?;
+        let warnings = assessments
+            .into_iter()
+            .filter(|assessment| assessment.is_megafile)
+            .map(|assessment| MegafileClaimWarning {
+                version: 1,
+                path: assessment.path.clone(),
+                assessment,
+            })
+            .collect::<Vec<_>>();
+        Ok(ClaimTelemetryOutcome { claim, warnings })
+    }
+
+    fn finalize_remote_local_claim_after_authority(
+        &self,
+        claim: PathClaim,
+        remote_outcome: Result<
+            crate::publication::coordination_admission::CoordinationAdmissionResult<
+                remote_coordination::RemoteOwnerBinding,
+            >,
+        >,
+    ) -> Result<PathClaim> {
+        use crate::publication::coordination_admission::{
+            format_coordination_admission_refusal, CoordinationAdmissionRefusal,
+            CoordinationAdmissionResult,
+        };
+
+        enum FinalizeOutcome {
+            Committed(PathClaim),
+            RolledBackRefusal(String),
+            AmbiguousRemoteOutcome(String),
+        }
+
+        let claim_token = claim.token;
+        let outcome = self.with_locked_update(
+            move |coordinator, _run_owners, liveness, _supersessions, remote_owners| {
+                let active = coordinator.snapshot()?;
+                let still_active = active
+                    .iter()
+                    .any(|active_claim| active_claim.token == claim.token);
+                if !still_active {
+                    bail!(
+                        "local claim token {} was released while remote authority ran; refusing ambiguous claim",
+                        claim.token.get()
+                    );
+                }
+                match remote_outcome {
+                    Ok(CoordinationAdmissionResult::Ready(binding)) => {
+                        remote_owners.push(AuthenticatedClaimRemoteOwner {
+                            token: claim.token,
+                            run_identity: binding.run_identity,
+                            activation_nonce: binding.activation_nonce,
+                        });
+                        Ok(FinalizeOutcome::Committed(claim))
+                    }
+                    Ok(CoordinationAdmissionResult::Refused(
+                        reason @ CoordinationAdmissionRefusal::RemoteUnknown { .. },
+                    )) => Ok(FinalizeOutcome::AmbiguousRemoteOutcome(
+                        format_coordination_admission_refusal(&reason),
+                    )),
+                    Ok(CoordinationAdmissionResult::Refused(reason)) => {
+                        Self::release_local_claim_reservation(coordinator, liveness, claim.token)?;
+                        Ok(FinalizeOutcome::RolledBackRefusal(
+                            format_coordination_admission_refusal(&reason),
+                        ))
+                    }
+                    Err(error) => Ok(FinalizeOutcome::AmbiguousRemoteOutcome(format!(
+                        "{error:#}"
+                    ))),
+                }
+            },
+        )?;
+        match outcome {
+            FinalizeOutcome::Committed(claim) => Ok(claim),
+            FinalizeOutcome::RolledBackRefusal(reason) => {
+                bail!("remote scope authority refused: {reason}")
+            }
+            FinalizeOutcome::AmbiguousRemoteOutcome(reason) => {
+                bail!(
+                    "remote scope authority outcome is ambiguous; local claim token {} remains reserved for reconciliation: {reason}",
+                    claim_token.get()
+                )
+            }
+        }
+    }
+
+    fn release_local_claim_reservation(
+        coordinator: &SyncCoordinator,
+        liveness: &mut Vec<AuthenticatedClaimLiveness>,
+        token: ClaimToken,
+    ) -> Result<()> {
+        coordinator.release(token)?;
+        liveness.retain(|entry| entry.token != token);
+        Ok(())
+    }
+
     fn read_remote_owner_bindings(&self) -> Result<Vec<AuthenticatedClaimRemoteOwner>> {
         let lock = self.state.lock()?;
         let store = self.open_authenticated_store(&lock)?;
@@ -1968,54 +2194,14 @@ impl SyncStore {
             },
         )?;
         let (claim, activation_nonce) = reserved;
-        let remote_outcome =
-            remote
-                .backend()
-                .admit_scopes(&run_identity, &activation_nonce, &claim.paths);
-        let finalized = self.with_locked_update(
-            |coordinator, _run_owners, _liveness, _supersessions, remote_owners| {
-                let active = coordinator.snapshot()?;
-                let still_active = active
-                    .iter()
-                    .any(|active_claim| active_claim.token == claim.token);
-                if !still_active {
-                    bail!(
-                        "local claim token {} was released while remote admission ran; refusing ambiguous claim",
-                        claim.token.get()
-                    );
-                }
-                match remote_outcome {
-                    Ok(crate::publication::coordination_admission::CoordinationAdmissionResult::Ready(
-                        binding,
-                    )) => {
-                        remote_owners.push(AuthenticatedClaimRemoteOwner {
-                            token: claim.token,
-                            run_identity: binding.run_identity,
-                            activation_nonce: binding.activation_nonce,
-                        });
-                        Ok(claim)
-                    }
-                    Ok(
-                        crate::publication::coordination_admission::CoordinationAdmissionResult::Refused(
-                            reason,
-                        ),
-                    ) => {
-                        coordinator.release(claim.token)?;
-                        bail!(
-                            "remote scope admission refused: {}",
-                            crate::publication::coordination_admission::format_coordination_admission_refusal(
-                                &reason
-                            )
-                        )
-                    }
-                    Err(error) => {
-                        coordinator.release(claim.token)?;
-                        Err(error)
-                    }
-                }
+        let remote_outcome = remote.apply_remote_scope_authority(
+            remote_coordination::RemoteScopeAuthorityOperation::Admit {
+                run_identity: run_identity.clone(),
+                activation_nonce: activation_nonce.clone(),
             },
+            &claim.paths,
         );
-        finalized
+        self.finalize_remote_local_claim_after_authority(claim, remote_outcome)
     }
 
     pub fn release(&self, token: ClaimToken) -> Result<PathClaim> {

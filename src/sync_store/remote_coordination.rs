@@ -139,9 +139,50 @@ pub(crate) enum RemotePublicationEffectAdmission {
     Reserved(Box<RemoteClaimSharedEffectReservation>),
 }
 
+/// Explicit remote journal mutation after a durable local claim reservation.
+pub(crate) enum RemoteScopeAuthorityOperation {
+    Admit {
+        run_identity: String,
+        activation_nonce: String,
+    },
+    Takeover {
+        predecessor: CoordinationOwnerIdentity,
+        run_identity: String,
+        activation_nonce: String,
+    },
+}
+
+impl RemoteScopeAuthorityOperation {
+    pub(crate) fn apply(
+        &self,
+        backend: &dyn RemoteCoordinationBackend,
+        scope_paths: &[PathBuf],
+    ) -> Result<CoordinationAdmissionResult<RemoteOwnerBinding>> {
+        match self {
+            Self::Admit {
+                run_identity,
+                activation_nonce,
+            } => backend.admit_scopes(run_identity, activation_nonce, scope_paths),
+            Self::Takeover {
+                predecessor,
+                run_identity,
+                activation_nonce,
+            } => backend.takeover(
+                predecessor.clone(),
+                run_identity,
+                activation_nonce,
+                scope_paths,
+            ),
+        }
+    }
+}
+
 pub(crate) trait RemoteCoordinationBackend: Send + Sync {
     fn worktree(&self) -> &Path;
     fn claim_timing(&self) -> ClaimTiming;
+    fn trusted_authority_snapshot(
+        &self,
+    ) -> Result<crate::publication::coordination_journal::AuthoritySnapshot>;
     fn admit_scopes(
         &self,
         run_identity: &str,
@@ -271,6 +312,12 @@ impl<T: CoordinationAdmissionTransport + 'static> RemoteCoordinationBackend
 
     fn claim_timing(&self) -> ClaimTiming {
         self.service.claim_timing()
+    }
+
+    fn trusted_authority_snapshot(
+        &self,
+    ) -> Result<crate::publication::coordination_journal::AuthoritySnapshot> {
+        self.service.remote_authority_snapshot()
     }
 
     fn admit_scopes(
@@ -422,10 +469,6 @@ impl RemoteCoordination {
         }
     }
 
-    pub(crate) fn backend(&self) -> &Arc<dyn RemoteCoordinationBackend> {
-        &self.backend
-    }
-
     pub(crate) fn bootstrap_existing_bindings(
         &self,
         bindings: &[AuthenticatedClaimRemoteOwner],
@@ -463,6 +506,24 @@ impl RemoteCoordination {
 
     pub(crate) fn remote_claim_timing(&self) -> ClaimTiming {
         self.backend.claim_timing()
+    }
+
+    pub(crate) fn trusted_authority_snapshot(
+        &self,
+    ) -> Result<crate::publication::coordination_journal::AuthoritySnapshot> {
+        self.backend.trusted_authority_snapshot()
+    }
+
+    pub(crate) fn apply_remote_scope_authority(
+        &self,
+        operation: RemoteScopeAuthorityOperation,
+        scope_paths: &[PathBuf],
+    ) -> Result<CoordinationAdmissionResult<RemoteOwnerBinding>> {
+        operation.apply(self.backend.as_ref(), scope_paths)
+    }
+
+    pub(crate) fn worktree(&self) -> &Path {
+        self.backend.worktree()
     }
 
     pub(crate) fn heartbeat_binding(&self, binding: &RemoteOwnerBinding) -> Result<()> {
@@ -1440,5 +1501,119 @@ mod tests {
             store.liveness_snapshot().expect("liveness after")[0].heartbeat_unix_seconds,
             Some(before)
         );
+    }
+
+    #[test]
+    fn fresh_peer_sync_store_observes_and_takeover_remote_without_predecessor_local_state() {
+        use crate::worktree::WorktreeManager;
+        use tempfile::TempDir;
+
+        let timing = ClaimTiming::new(1, 3).expect("timing");
+        let temp_a = init_repo();
+        let temp_b = TempDir::new().expect("tempdir b");
+        let temp_c = TempDir::new().expect("tempdir c");
+        let repo_b = temp_b.path().join("repo");
+        let repo_c = temp_c.path().join("repo");
+        WorktreeManager::init_repository(&repo_b, "main").expect("init b");
+        WorktreeManager::init_repository(&repo_c, "main").expect("init c");
+
+        let sim = SimTransport::new(temp_a.path().to_path_buf());
+        let shared = sim.shared_clone();
+        let store_a = open_sync_with_sim_remote(temp_a.path(), sim).expect("open a");
+        let claim = store_a
+            .claim_paths_with_timing("agent-a", ["src/a.rs"], timing)
+            .expect("claim a")
+            .claim;
+        let predecessor = store_a
+            .inspect_remote_claim_owner(claim.token)
+            .expect("inspect a")
+            .owner()
+            .clone();
+
+        let store_b = open_sync_with_sim_remote(&repo_b, shared.shared_clone()).expect("open b");
+        let observation = store_b.remote_authority_observation().expect("observe b");
+        assert!(!observation.observation_permits_work);
+        assert_eq!(observation.active_owners.len(), 1);
+        assert_eq!(
+            observation.active_owners[0].run_identity,
+            predecessor.run_identity()
+        );
+        assert_eq!(
+            observation.active_owners[0].activation_nonce,
+            predecessor.activation_nonce()
+        );
+
+        let wrong_predecessor =
+            CoordinationOwnerIdentity::new("other-run", "wrong-nonce").expect("wrong");
+        assert!(store_b
+            .takeover_remote(
+                wrong_predecessor,
+                "agent-b",
+                claim.paths.clone(),
+                Some(timing),
+            )
+            .is_err());
+
+        let live_refusal = store_b
+            .takeover_remote(
+                predecessor.clone(),
+                "agent-b",
+                claim.paths.clone(),
+                Some(timing),
+            )
+            .expect_err("live predecessor must block remote takeover until provider lease elapses");
+        let live_refusal_message = format!("{live_refusal:#}");
+        assert!(
+            live_refusal_message.contains("remote scope authority refused")
+                && live_refusal_message.contains("RemoteNotApplied"),
+            "expected trusted journal refusal, got: {live_refusal_message}"
+        );
+        assert!(
+            store_b.snapshot().expect("snapshot after refused takeover").is_empty(),
+            "confirmed remote refusal must roll back the local reservation on host B: {live_refusal_message}"
+        );
+
+        shared.advance_provider_clock();
+
+        let successor_outcome = store_b
+            .takeover_remote(
+                predecessor.clone(),
+                "agent-b",
+                claim.paths.clone(),
+                Some(timing),
+            )
+            .expect("takeover b");
+        assert_eq!(successor_outcome.claim.agent_id, "agent-b");
+        let successor_owner = store_b
+            .inspect_remote_claim_owner(successor_outcome.claim.token)
+            .expect("inspect successor")
+            .owner()
+            .clone();
+        assert_eq!(successor_owner.run_identity(), "agent-b");
+        assert_ne!(
+            successor_owner.activation_nonce(),
+            predecessor.activation_nonce()
+        );
+
+        store_a
+            .heartbeat(claim.token, "agent-a", None)
+            .expect_err("predecessor local token must refuse remote heartbeat after takeover");
+
+        let store_c = open_sync_with_sim_remote(&repo_c, shared).expect("open c");
+        let observed_c = store_c.remote_authority_observation().expect("observe c");
+        assert_eq!(observed_c.active_owners.len(), 1);
+        assert_eq!(
+            observed_c.active_owners[0].run_identity,
+            successor_owner.run_identity()
+        );
+        assert_eq!(
+            observed_c.active_owners[0].activation_nonce,
+            successor_owner.activation_nonce()
+        );
+
+        assert!(store_b
+            .remote_work_lease(successor_outcome.claim.token)
+            .expect("lease lookup")
+            .is_some());
     }
 }
