@@ -7,6 +7,7 @@ use crate::machine_global::{
     DestructiveTargetInput, GateOutcome, MachineGlobalRetentionBinding, MachineGlobalStore,
     RetentionOperation, RetentionOperationId,
 };
+use crate::messaging::transport::AssignmentMessagingLaunch;
 use crate::mutation_taxonomy::{
     AssignmentProcessLaunchGrant, AssignmentProcessLaunchGrantError, AssignmentProcessLaunchKind,
     AssignmentProcessMechanicalBinding, CatalogPreflightOrigin, SealedMechanicalExecutorDuty,
@@ -264,7 +265,33 @@ pub struct ExternalAgentCommand {
     pub(crate) assignment_process_launch_attempt: Option<usize>,
     pub(crate) assignment_process_launch_duty: Option<String>,
     pub(crate) assignment_mechanical_executor_duty: Option<SealedMechanicalExecutorDuty>,
+    /// Ephemeral assignment messaging IPC capability for this launch only. Never serialized into
+    /// task artifacts or argv.
+    assignment_messaging_launch: Option<AssignmentMessagingLaunch>,
 }
+
+const ASSIGNMENT_MESSAGING_PROTOCOL_PROMPT_APPENDIX: &str = r#"
+
+## Assignment messaging (loopback IPC)
+
+This launch exposes private environment variables MACO_MESSAGE_ENDPOINT and MACO_MESSAGE_TOKEN.
+Connect to MACO_MESSAGE_ENDPOINT on loopback only. Send exactly one NDJSON request line per TCP
+connection, then read exactly one NDJSON response line.
+
+Request shape:
+{"bearer":"<value from MACO_MESSAGE_TOKEN>","request":{"operation":"<name>", ...}}
+
+Response shape:
+{"ok":true,"result":<value>} or {"ok":false,"error":"<message>"}
+
+The inner `request` object must not include run_id, task_id, artifact paths, sender identity, or
+any attempt to override MACO_MESSAGE_TOKEN or MACO_MESSAGE_ENDPOINT. Supported operations:
+send_direct (recipient_id, payload), create_channel (channel_id, members, publishers),
+publish_channel (channel_id, payload), receive_next, receive_next_from_channel (channel_id),
+acknowledge (message_id). Delivery is at-least-once until acknowledge succeeds; duplicates may
+arrive until then.
+
+"#;
 
 pub(crate) const WRITABLE_GROK_TERMINAL_WORKER_REQUIRED: &str =
     "writable_grok_terminal_worker_required";
@@ -1052,6 +1079,7 @@ impl ExternalAgentCommand {
             assignment_process_launch_attempt: None,
             assignment_process_launch_duty: None,
             assignment_mechanical_executor_duty: None,
+            assignment_messaging_launch: None,
         }
     }
 
@@ -1092,6 +1120,7 @@ impl ExternalAgentCommand {
             assignment_process_launch_attempt: None,
             assignment_process_launch_duty: None,
             assignment_mechanical_executor_duty: None,
+            assignment_messaging_launch: None,
         }
     }
 
@@ -1132,6 +1161,7 @@ impl ExternalAgentCommand {
             assignment_process_launch_attempt: None,
             assignment_process_launch_duty: None,
             assignment_mechanical_executor_duty: None,
+            assignment_messaging_launch: None,
         }
     }
 
@@ -1460,6 +1490,48 @@ impl ExternalAgentCommand {
         self.assignment_process_launch_kind = Some(kind);
         self.assignment_process_launch_grant = Some(grant);
         self
+    }
+
+    pub(crate) fn with_assignment_messaging(mut self, launch: AssignmentMessagingLaunch) -> Self {
+        self.assignment_messaging_launch = Some(launch);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assignment_messaging_launch(&self) -> Option<&AssignmentMessagingLaunch> {
+        self.assignment_messaging_launch.as_ref()
+    }
+
+    /// Appends static protocol instructions to the prompt file when messaging is bound.
+    pub(crate) fn append_assignment_messaging_protocol_instructions(&self) -> Result<()> {
+        if self.assignment_messaging_launch.is_none() {
+            return Ok(());
+        }
+        let existing = read_bounded_regular_file_nofollow(&self.prompt, MAX_PROMPT_BYTES)
+            .with_context(|| {
+                format!(
+                    "failed to read prompt before assignment messaging appendix: {}",
+                    self.prompt.display()
+                )
+            })?;
+        let combined_len = existing
+            .len()
+            .saturating_add(ASSIGNMENT_MESSAGING_PROTOCOL_PROMPT_APPENDIX.len());
+        if combined_len > MAX_PROMPT_BYTES {
+            bail!(
+                "assignment messaging protocol appendix would exceed the bounded prompt size for {}",
+                self.prompt.display()
+            );
+        }
+        let mut updated = existing;
+        updated.extend_from_slice(ASSIGNMENT_MESSAGING_PROTOCOL_PROMPT_APPENDIX.as_bytes());
+        fs::write(&self.prompt, &updated).with_context(|| {
+            format!(
+                "failed to append assignment messaging protocol instructions to {}",
+                self.prompt.display()
+            )
+        })?;
+        Ok(())
     }
 }
 
@@ -3031,6 +3103,16 @@ fn run_external_agent_runtime(
             target_spec.cwd.display().to_string(),
         );
     }
+    if let Err(error) =
+        extend_common_runtime_environment_with_assignment_messaging(spec, &mut external_environment)
+    {
+        report.duration_ms = duration_millis(started.elapsed());
+        record_external_error(
+            &mut report,
+            format!("failed to prepare assignment messaging runtime environment: {error:#}"),
+        );
+        return report;
+    }
     let credential_redactor =
         match CredentialRedactor::from_runtime(&external_environment, codex_auth.as_ref()) {
             Ok(redactor) => redactor,
@@ -3249,11 +3331,26 @@ fn run_external_agent_runtime(
         }
         #[cfg(test)]
         ExternalExecutionRuntime::NonpublishableSimulation => {
-            let process_spec = process_spec
+            let mut process_spec = process_spec
                 .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort);
-            match agent_lifecycle.as_ref() {
-                Some(metadata) => process_spec.with_agent_lifecycle(metadata.clone()),
-                None => process_spec,
+            if let Some(metadata) = agent_lifecycle.as_ref() {
+                process_spec = process_spec.with_agent_lifecycle(metadata.clone());
+            }
+            match assignment_messaging_launch_environment_overlay(spec) {
+                Ok(overlay) if !overlay.is_empty() => {
+                    process_spec.with_environment(EnvironmentMode::InheritAndSet(overlay))
+                }
+                Ok(_) => process_spec,
+                Err(error) => {
+                    report.duration_ms = duration_millis(started.elapsed());
+                    record_external_error(
+                        &mut report,
+                        format!(
+                            "failed to prepare sealed assignment messaging simulation environment: {error:#}"
+                        ),
+                    );
+                    return report;
+                }
             }
         }
     };

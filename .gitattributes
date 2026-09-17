@@ -3,3 +3,7 @@ tests/fixtures/runtime_adapter/grok/captured-minimal-20260821.txt text eol=lf
 tests/fixtures/runtime_adapter/grok/writable-managed-child.streaming-json text eol=lf
 # The evaluation manifest binds the SHA-256 of these exact plan bytes.
 tests/fixtures/model_mix_evaluation/hand-authored-plan-v1.json text eol=lf
+
+# Assignment IPC provider emits strict JSONL bytes on every checkout.
+tests/fixtures/runtime_adapter/grok/assignment-messaging-provider.streaming-json text eol=lf
+tests/fixtures/runtime_adapter/grok/assignment-messaging-provider.sh text eol=lf

@@ -9928,4 +9928,79 @@ fn verified_grok_cam_run_releases_use_lease_on_failure() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn assignment_messaging_launch_environment_refuses_mismatched_binding() -> Result<()> {
+    use crate::messaging::transport::AssignmentMessagingServer;
+
+    let server = AssignmentMessagingServer::start(
+        "external-agent-run",
+        "external-agent-task",
+        |_payload| Ok(serde_json::json!({"ok": true})),
+    )?;
+    let launch = server.launch();
+    assert!(launch
+        .environment_for("external-agent-run", "wrong-task")
+        .is_err());
+    assert!(launch
+        .environment_for("wrong-run", "external-agent-task")
+        .is_err());
+    Ok(())
+}
+
+#[test]
+fn assignment_messaging_token_is_redacted_from_runtime_output() -> Result<()> {
+    use crate::messaging::transport::{AssignmentMessagingServer, MACO_MESSAGE_TOKEN_ENV};
+
+    let server = AssignmentMessagingServer::start("run-redact", "task-redact", |_| {
+        Ok(serde_json::json!({}))
+    })?;
+    let launch = server.launch();
+    let mut environment = BTreeMap::new();
+    for (key, value) in launch.environment_for("run-redact", "task-redact")? {
+        environment.insert(key, value);
+    }
+    let token = environment
+        .get(MACO_MESSAGE_TOKEN_ENV)
+        .context("assignment messaging token env")?;
+    let redactor = CredentialRedactor::from_runtime(&environment, None)?;
+    let redacted = redactor.redact_string(&format!("seen token={token}"));
+    assert!(!redacted.contains(token.as_str()));
+    assert!(redacted.contains("[REDACTED]"));
+    Ok(())
+}
+
+#[test]
+fn assignment_messaging_environment_extends_runtime_on_exact_binding() -> Result<()> {
+    use crate::messaging::transport::{
+        AssignmentMessagingServer, MACO_MESSAGE_ENDPOINT_ENV, MACO_MESSAGE_TOKEN_ENV,
+    };
+
+    let server =
+        AssignmentMessagingServer::start("run-bind", "task-bind", |_| Ok(serde_json::json!({})))?;
+    let command = ExternalAgentCommand::codex("codex", ".", "p", "l", "o", Duration::from_secs(1))
+        .with_agent_lifecycle(".", "worker", "run-bind", "task-bind")
+        .with_assignment_messaging(server.launch());
+    let mut environment = BTreeMap::new();
+    extend_common_runtime_environment_with_assignment_messaging(&command, &mut environment)?;
+    assert!(environment.contains_key(MACO_MESSAGE_ENDPOINT_ENV));
+    assert!(environment.contains_key(MACO_MESSAGE_TOKEN_ENV));
+    Ok(())
+}
+
+#[test]
+fn assignment_messaging_environment_requires_bound_lifecycle_identity() -> Result<()> {
+    use crate::messaging::transport::AssignmentMessagingServer;
+
+    let server = AssignmentMessagingServer::start("run", "task", |_| Ok(serde_json::json!({})))?;
+    let command = ExternalAgentCommand::codex("codex", ".", "p", "l", "o", Duration::from_secs(1))
+        .with_assignment_messaging(server.launch());
+    let mut environment = BTreeMap::new();
+    assert!(extend_common_runtime_environment_with_assignment_messaging(
+        &command,
+        &mut environment
+    )
+    .is_err());
+    Ok(())
+}
+
 include!("tests_part2.rs");

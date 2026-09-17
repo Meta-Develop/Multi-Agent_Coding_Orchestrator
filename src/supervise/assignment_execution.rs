@@ -2119,6 +2119,24 @@ struct ManagedChildMaterializationGate {
     external_side_effect_absent: bool,
 }
 
+fn bind_assignment_messaging_for_external_child_launch(
+    context: &AssignmentExecutionContext<'_, '_>,
+    task_id: &str,
+    command: &mut ExternalAgentCommand,
+) -> Result<crate::messaging::transport::AssignmentMessagingServer> {
+    let run_directory = with_supervisor_artifacts(context.artifacts, |writer, _| {
+        Ok(writer.run_dir().to_path_buf())
+    })?;
+    let server = super::messaging_bridge::start_assignment_messaging(
+        &run_directory,
+        context.options.run_id.as_str(),
+        task_id,
+    )?;
+    *command = command.clone().with_assignment_messaging(server.launch());
+    command.append_assignment_messaging_protocol_instructions()?;
+    Ok(server)
+}
+
 impl ManagedChildMaterializationGate {
     fn eligible(self) -> bool {
         self.codex_supervisor
@@ -2278,35 +2296,47 @@ fn dispatch_and_collect_child_attempt<'a>(
                 return Err(error);
             }
             record_dispatch_checkpoint(artifacts, false, false, &assignment.id, attempt)?;
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if let Some(review_context) = review_context.as_ref() {
-                    let mut review_journal = SupervisorPreActionJournalSink {
-                        artifacts,
-                        node: &assignment.id,
-                        parent: Some(journal_parent_id),
-                    };
-                    external_runner(
-                        &command,
-                        cancellation,
-                        Some(ExternalPreActionReviewRuntime {
-                            context: review_context,
-                            journal: &mut review_journal,
-                        }),
-                    )
-                } else {
-                    external_runner(&command, cancellation, None)
-                }
-            })) {
-                Ok(run) => Ok(run),
-                Err(payload) => {
-                    drop(incoming_output_root);
-                    drop(capture_output_root);
-                    with_supervisor_artifacts(artifacts, |writer, _| {
-                        discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
-                    })?;
-                    std::panic::resume_unwind(payload);
-                }
-            }
+            let messaging_server = bind_assignment_messaging_for_external_child_launch(
+                context,
+                &assignment.id,
+                &mut command,
+            )?;
+            let external_run_result =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if let Some(review_context) = review_context.as_ref() {
+                        let mut review_journal = SupervisorPreActionJournalSink {
+                            artifacts,
+                            node: &assignment.id,
+                            parent: Some(journal_parent_id),
+                        };
+                        external_runner(
+                            &command,
+                            cancellation,
+                            Some(ExternalPreActionReviewRuntime {
+                                context: review_context,
+                                journal: &mut review_journal,
+                            }),
+                        )
+                    } else {
+                        external_runner(&command, cancellation, None)
+                    }
+                })) {
+                    Ok(run) => Ok(run),
+                    Err(payload) => {
+                        drop(incoming_output_root);
+                        drop(capture_output_root);
+                        with_supervisor_artifacts(artifacts, |writer, _| {
+                            discard_invocation_scratches(
+                                writer,
+                                &incoming_scratch,
+                                &capture_scratch,
+                            )
+                        })?;
+                        std::panic::resume_unwind(payload);
+                    }
+                };
+            drop(messaging_server);
+            external_run_result
         }
         SupervisorRuntime::Grok
         | SupervisorRuntime::Cursor
@@ -2321,7 +2351,14 @@ fn dispatch_and_collect_child_attempt<'a>(
                 return Err(error);
             }
             record_dispatch_checkpoint(artifacts, false, false, &assignment.id, attempt)?;
-            Ok(external_runner(&command, cancellation, None))
+            let messaging_server = bind_assignment_messaging_for_external_child_launch(
+                context,
+                &assignment.id,
+                &mut command,
+            )?;
+            let external_run = external_runner(&command, cancellation, None);
+            drop(messaging_server);
+            Ok(external_run)
         }
         SupervisorRuntime::Fake => {
             if let Err(error) = budget_reservation.mark_invoked_for_runtime(launch_runtime) {
@@ -5155,6 +5192,19 @@ mod decomposition_tests {
 
     static GROK_BINARY_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
+    fn initialize_child_dispatch_messaging_session(
+        writer: &mut ArtifactRunWriter,
+        plan: &SupervisorPlan,
+        assignment_schedule: &[AssignmentScheduleEntry],
+    ) {
+        let metadata = SupervisorPlanMetadata {
+            assignment_schedule: assignment_schedule.to_vec(),
+            ..SupervisorPlanMetadata::default()
+        };
+        super::messaging_bridge::initialize_supervisor_messaging_session(writer, plan, &metadata)
+            .expect("initialize child-dispatch messaging session for fixture");
+    }
+
     struct GrokBinaryEnvironmentGuard {
         previous: Vec<(&'static str, Option<OsString>)>,
     }
@@ -7944,6 +7994,11 @@ mod decomposition_tests {
             depth: 1,
             flattened_index: 0,
         }];
+        initialize_child_dispatch_messaging_session(
+            &mut artifact_writer,
+            &plan,
+            &assignment_schedule,
+        );
         let field_guide = SupervisorFieldGuidePrompt::empty().expect("empty fixture field guide");
         let budget_ledger =
             RunBudgetLedger::new(RunBudgetLimits::default()).expect("fixture budget ledger");
@@ -11894,6 +11949,11 @@ done
             depth: 1,
             flattened_index: 0,
         }];
+        initialize_child_dispatch_messaging_session(
+            &mut artifact_writer,
+            &plan,
+            &assignment_schedule,
+        );
         let field_guide =
             SupervisorFieldGuidePrompt::empty().context("empty fixture field guide")?;
         let budget_ledger =
@@ -11952,6 +12012,10 @@ done
                             .as_ref()
                             .map(|identity| identity.task_id.as_str()),
                         Some(ASSIGNMENT_ID)
+                    );
+                    assert!(
+                        command.assignment_messaging_launch().is_some(),
+                        "production child dispatch must bind assignment messaging before external runner"
                     );
                     *captured.lock().expect("capture mutex") = Some(command.clone());
                     weak_mechanical_executor_injected_deterministic_run(
@@ -12260,6 +12324,11 @@ done
             depth: 1,
             flattened_index: 0,
         }];
+        initialize_child_dispatch_messaging_session(
+            &mut artifact_writer,
+            &plan,
+            &assignment_schedule,
+        );
         let field_guide =
             SupervisorFieldGuidePrompt::empty().context("empty fixture field guide")?;
         let cancellation = ProcessCancellation::new();
@@ -12295,6 +12364,10 @@ done
                 |command: &ExternalAgentCommand,
                  _cancellation: &ProcessCancellation,
                  _review: Option<ExternalPreActionReviewRuntime<'_>>| {
+                    assert!(
+                        command.assignment_messaging_launch().is_some(),
+                        "production child dispatch must bind assignment messaging before external runner"
+                    );
                     *captured.lock().expect("capture mutex") = Some(command.clone());
                     weak_mechanical_executor_injected_deterministic_run(
                         command,
@@ -12638,3 +12711,7 @@ done
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "assignment_execution/messaging_ipc_tests.rs"]
+mod messaging_ipc_tests;
