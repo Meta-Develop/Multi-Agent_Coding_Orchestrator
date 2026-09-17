@@ -1688,7 +1688,7 @@ fn loc_or_held_out_pass_inflation_alone_cannot_win_quality() {
     assert!(!dominates(&inflated, &broad));
 }
 
-fn experiment_manifest() -> ExperimentManifest {
+pub(crate) fn experiment_manifest() -> ExperimentManifest {
     ExperimentManifest {
         version: EXPERIMENT_MANIFEST_SCHEMA_VERSION,
         experiment_id: "issue-26-fake-supervise".to_string(),
@@ -2623,6 +2623,50 @@ fn real_provider_execution_observation_distinguishes_launch_and_native_capture()
         RealProviderExecutionObservation::NotRequested
     );
     assert!(!decoded.real_provider_executed);
+    assert!(decoded.runs.is_empty());
+}
+
+#[test]
+fn executed_observation_run_measurements_deserialize_from_supervisor_fixture_projection() {
+    let held_out = crate::supervise::held_out::HeldOutCandidateEvidence {
+        version: 1,
+        run: crate::supervise::held_out::HeldOutRunBinding {
+            manifest_sha256: "m".repeat(64),
+            profile_sha256: "p".repeat(64),
+            profile_id: "profile".to_string(),
+            repetition: 0,
+            experiment_run_id: "experiment".to_string(),
+            supervisor_run_id: "supervisor".to_string(),
+            assignment_id: "child-a".to_string(),
+            baseline_head: "b".repeat(40),
+            baseline_tree: "t".repeat(40),
+        },
+        candidate: None,
+        candidate_revalidated: false,
+        commands: Vec::new(),
+    };
+    let workspace = tempfile::TempDir::new().expect("workspace");
+    let repo_path = workspace.path().join("repo");
+    git2::Repository::init(&repo_path).expect("init");
+    let report_bytes =
+        super::executed_measurements::supervisor_final_report_execution_fixture_bytes();
+    let measurements =
+        super::executed_measurements::observed_run_measurements_from_retained_supervisor_final_report(
+            &held_out,
+            &report_bytes,
+            &repo_path,
+            &std::collections::BTreeSet::new(),
+        )
+        .expect("project supervisor fixture");
+    assert_eq!(
+        measurements
+            .total_usage
+            .as_ref()
+            .map(|usage| usage.input_tokens),
+        Some(1200)
+    );
+    assert_eq!(measurements.total_cost_usd, Some(0.0125));
+    assert!(measurements.observed_dispatch.is_some());
 }
 
 fn observation_manifest_one_profile() -> ExperimentManifest {
@@ -3039,3 +3083,6 @@ fn held_out_additional_runtime_bindings_refuse_fake_relative_and_duplicates_befo
     assert!(error.to_string().contains("duplicated"), "{error}");
     no_reserved_runs(&artifact_repo);
 }
+
+#[path = "executed_observation_capture_tests.rs"]
+mod executed_observation_capture_tests;
