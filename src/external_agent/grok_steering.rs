@@ -130,6 +130,7 @@ impl GrokAcpSteering for GrokAcpSteeringBridge {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use crate::agent_lifecycle::{AgentListFilter, AgentRegistry};
     use crate::external_agent::{
         run_external_agent_nonpublishable_simulation, ExternalAgentCommand, ExternalAgentInvocation,
     };
@@ -218,6 +219,9 @@ while True:
         if first_prompt is None:
             first_prompt = msg
             SIGNAL.write_text("started", encoding="utf-8")
+            if MODE == "cancel_hold":
+                while True:
+                    recv()
             continue
         params = msg.get("params") or {}
         blocks = params.get("prompt") or []
@@ -310,6 +314,30 @@ while True:
         command.model = Some("grok-requested-4".to_string());
         command.reasoning_effort = Some("low".to_string());
         command.with_agent_lifecycle(supervisor_repo, "worker", run_id, task_id)
+    }
+
+    fn operator_cancel(
+        run_id: &str,
+        assignment_id: &str,
+        action_id: &str,
+        now_unix_ms: u64,
+        operation_timeout: Duration,
+    ) -> SteeringRequest {
+        SteeringRequest {
+            version: STEERING_REQUEST_VERSION,
+            action_id: action_id.to_string(),
+            run_id: run_id.to_string(),
+            assignment_id: assignment_id.to_string(),
+            actor: SteeringActor::Operator {
+                agent_id: "operator".to_string(),
+            },
+            action: SteeringAction::CancelAssignment {
+                reason: "operator abort running grok acp child".to_string(),
+            },
+            deadline_unix_ms: now_unix_ms
+                + u64::try_from(operation_timeout.as_millis())
+                    .expect("operation timeout fits in unix milliseconds"),
+        }
     }
 
     fn operator_inject(
@@ -484,6 +512,71 @@ while True:
         let (outcome, steered) = final_action_outcome(&reopened, "run-lost", "act-lost")?;
         assert_eq!(outcome, SteeringOutcome::LostChild);
         assert!(!steered);
+        Ok(())
+    }
+
+    #[test]
+    fn grok_acp_stdio_operator_cancel_stops_running_contained_child() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let supervisor_repo = temp.path().join("supervisor-repo");
+        let fixture_root = temp.path().join("fixture-root");
+        let child_workspace = fixture_root.join("child-worktree");
+        let incoming = fixture_root.join("incoming");
+        init_git_repo(&supervisor_repo)?;
+        init_git_repo(&child_workspace)?;
+        fs::write(
+            child_workspace.join("prompt.md"),
+            "original grok acp prompt\n",
+        )?;
+
+        let signal = incoming.join("grok-acp-prompt-started");
+        let provider = write_steerable_provider(&fixture_root, "cancel_hold", &signal)?;
+        let command = grok_acp_command(
+            &provider,
+            &child_workspace,
+            &incoming,
+            &supervisor_repo,
+            "run-cancel",
+            "task-cancel",
+        );
+
+        let operator_plane = SteeringPlane::open(&supervisor_repo)?;
+        let readiness_deadline = Instant::now() + GROK_ACP_STEER_OPERATION_TIMEOUT;
+        let runner = thread::spawn(move || run_external_agent_nonpublishable_simulation(&command));
+        let interaction = (|| -> Result<()> {
+            wait_for_signal(&signal, readiness_deadline)?;
+            let now = operator_plane.current_unix_ms()?;
+            let request = operator_cancel(
+                "run-cancel",
+                "task-cancel",
+                "act-cancel",
+                now,
+                GROK_ACP_STEER_OPERATION_TIMEOUT,
+            );
+            let decision = operator_plane.submit(request, now)?;
+            assert_eq!(decision.ack().outcome, SteeringOutcome::Acknowledged);
+            assert!(decision.ack().steered);
+            Ok(())
+        })();
+        let report = runner
+            .join()
+            .map_err(|_| anyhow::anyhow!("grok acp cancel runner panicked"))?;
+        interaction?;
+        assert!(
+            !report.simulation_succeeded(),
+            "cancelled grok acp child must not complete as success: {report:#?}"
+        );
+
+        let registry = AgentRegistry::open(&supervisor_repo)?;
+        assert!(
+            registry.list(&AgentListFilter::default())?.is_empty(),
+            "registry must quiesce after operator cancel"
+        );
+
+        let reopened = SteeringPlane::open(&supervisor_repo)?;
+        let (outcome, steered) = final_action_outcome(&reopened, "run-cancel", "act-cancel")?;
+        assert_eq!(outcome, SteeringOutcome::Acknowledged);
+        assert!(steered);
         Ok(())
     }
 }
