@@ -20,6 +20,11 @@
     flake-utils.lib.eachDefaultSystem (
       system:
       let
+        # Headless `coding-agent-manager` is a MACO root workspace member
+        # (`../../account-manager/core`, root `Cargo.lock`). Desktop builds use
+        # `src-tauri/Cargo.lock` (standalone workspace, path `../core`) and are
+        # not merged into the root supply-chain audit graph.
+        desktopCoreSrc = ./core;
         pkgs = import nixpkgs { inherit system; };
         toolchainPkgs = import toolchain-nixpkgs {
           inherit system;
@@ -76,7 +81,7 @@
 
         packages = pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux rec {
           coding-agent-manager = pkgs.callPackage ./nix/package.nix {
-            inherit linuxLibs;
+            inherit linuxLibs desktopCoreSrc;
             iconDir = ./src-tauri/icons;
             # Content hash of the Linux release binary from `npm run tauri:build`.
             # Refresh with `nix hash file --sri` after rebuilding that binary.

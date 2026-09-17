@@ -27,6 +27,11 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install Linux native build dependencies for headless CAM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libdbus-1-dev
+
       - name: Resolve declared MSRV
         id: msrv
         shell: bash

@@ -5,6 +5,16 @@ The original design discussion is [CAM issue #16](https://github.com/Meta-Develo
 This document specifies work to implement and review. It does not advertise a
 working headless service, Codex launch adapter, or reset scheduler.
 
+**Repository packaging.** MACO and the headless `coding-agent-manager` core crate
+(`account-manager/core`, rlib only) share the root workspace and `Cargo.lock`, so
+`cargo package --locked --workspace --no-default-features` verifies MACO plus core
+without registry publish. The Tauri shell (`coding-agent-manager-desktop` at
+`account-manager/src-tauri`) is a separate workspace with its own
+`src-tauri/Cargo.lock`, consuming the same `../core` sources via a path
+dependency. Root `cargo audit --deny warnings` and `cargo deny` apply to the root
+lock only; desktop-only advisories stay on the documented desktop baseline
+([DEPENDENCY_AUDIT.md](DEPENDENCY_AUDIT.md)), not root suppressions.
+
 Coding Agent Manager owns accounts, login, and credential use.
 [Multi-Agent Coding Orchestrator (MACO)](https://github.com/Meta-Develop/Multi-Agent_Coding_Orchestrator)
 owns task execution, resource admission, proposal validation, and review. The
@@ -26,7 +36,7 @@ confidence markers in [the research notes](research/README.md).
 | `providers/gemini_oauth.rs` and `providers/gemini_cli.rs`  | Native Google loopback OAuth and managed Gemini launch selection.                                                       | Integration lifecycle projections and verified subscription/model evidence. OAuth alone does not establish Google AI Pro entitlement.                              |
 | `commands.rs` and the Accounts UI                          | Manual account actions and asynchronous waiting for blocking login.                                                     | Shared authority service calls and recoverable login progress. No common login status/cancel operation exists.                                                     |
 | `model.rs`, `ProviderAdapter::quota`, and Dashboard        | Sourced snapshots and distinct available/no-signal/failed outcomes.                                                     | Every current adapter returns no numeric quota. Model discovery, quota persistence, and reset scheduling are absent.                                               |
-| `main.rs`, `lib.rs`, and `Cargo.toml`                      | The default desktop feature retains Tauri; `--no-default-features` builds the native library without it.                | A headless authority service and shared service entry point; the library build does not implement them.                                                            |
+| `main.rs`, `lib.rs`, and `Cargo.toml`                      | Core logic lives in `account-manager/core` (`--no-default-features`); the desktop shell adds Tauri commands and the `coding-agent-manager` binary. | A headless authority service and shared service entry point; the core library does not implement them.                                                            |
 
 The relay is a separate interface. Its runtime targets do not consume managed
 account selection, and its ordered rules can advance after HTTP 429. The MACO

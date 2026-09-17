@@ -444,6 +444,12 @@ fn sanitized_grok_credential_validation_summary(error: &anyhow::Error) -> &'stat
         "Grok configuration source config.toml is unavailable",
         "Grok configuration source config.toml is not a regular file",
         "Grok configuration source config.toml identity changed",
+        "no complete account is selected for Coding Agent Manager provider",
+        "Coding Agent Manager selection for",
+        "Coding Agent Manager account",
+        "Coding Agent Manager data directory is unavailable",
+        "Coding Agent Manager Grok launch spec did not declare GROK_HOME",
+        "Coding Agent Manager account authority is busy",
     ]
     .into_iter()
     .find(|known| summary.contains(known))

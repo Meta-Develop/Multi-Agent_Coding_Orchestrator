@@ -1,3 +1,8 @@
+[workspace]
+members = [".", "account-manager/core"]
+resolver = "2"
+default-members = ["."]
+
 [package]
 name = "multi-agent-coding-orchestrator"
 version = "0.3.0"
@@ -48,6 +53,8 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+[target.'cfg(target_os = "linux")'.dependencies]
+coding_agent_manager_lib = { path = "account-manager/core", package = "coding-agent-manager", version = "0.1.0", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
