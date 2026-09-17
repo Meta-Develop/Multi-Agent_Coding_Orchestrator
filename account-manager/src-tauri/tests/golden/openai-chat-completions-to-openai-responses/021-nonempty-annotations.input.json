@@ -1,0 +1,19 @@
+{
+  "$response": {
+    "id": "FAKE-response-openai-annotations",
+    "object": "chat.completion",
+    "created": 1,
+    "model": "FAKE-openai-model",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "Hello",
+          "annotations": [{ "type": "url_citation" }]
+        },
+        "finish_reason": "stop"
+      }
+    ]
+  }
+}

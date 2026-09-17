@@ -1,0 +1,15 @@
+{
+  "body": {
+    "model": "FAKE-responses-target",
+    "max_output_tokens": 256,
+    "input": [
+      {
+        "type": "message",
+        "role": "user",
+        "content": [{ "type": "input_text", "text": "Hello" }]
+      }
+    ]
+  },
+  "target_model": null,
+  "stream": false
+}

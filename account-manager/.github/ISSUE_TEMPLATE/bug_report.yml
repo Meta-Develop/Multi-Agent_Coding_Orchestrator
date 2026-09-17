@@ -1,0 +1,76 @@
+name: Bug report
+description: Something does not work the way it should
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Never paste a real credential, token, API key, or the raw contents of
+        a credential file.** Redact values; key names and structure are fine.
+
+        If this is a security issue, do not file it here — use
+        [private reporting](https://github.com/Meta-Develop/Coding-Agent-Manager/security/advisories/new).
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider involved
+      options:
+        - Not provider-specific
+        - Claude Code
+        - Codex CLI
+        - Cursor
+        - Grok CLI
+        - Gemini CLI
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Coding Agent Manager version
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options: [Linux, macOS, Windows]
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: Redact anything credential-shaped before pasting.
+      render: text
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmation
+      options:
+        - label: I have removed every credential value from this report.
+          required: true

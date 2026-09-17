@@ -352,6 +352,123 @@ impl SteeringPlane {
         Ok(load_run_state(&self.repo, run_id)?.evidence)
     }
 
+    /// Expire pending or delivered actions for one assignment whose deadlines passed.
+    pub(crate) fn sweep_assignment_deadlines(
+        &self,
+        run_id: &str,
+        assignment_id: &str,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        validate_identifier("run id", run_id)?;
+        validate_identifier("assignment id", assignment_id)?;
+        with_run_journal(&self.repo, run_id, |journal| {
+            let state = crate::steering::evidence::reconstruct(journal)?;
+            for action in state.actions.values() {
+                if action.request.assignment_id != assignment_id {
+                    continue;
+                }
+                if !matches!(
+                    action.outcome,
+                    SteeringOutcome::Pending | SteeringOutcome::Delivered
+                ) {
+                    continue;
+                }
+                if now_unix_ms <= action.request.deadline_unix_ms {
+                    continue;
+                }
+                append_event(
+                    journal,
+                    "timeout",
+                    &payload_for_action(
+                        "timeout",
+                        &action.request,
+                        SteeringOutcome::TimedOut,
+                        None,
+                        now_unix_ms,
+                    ),
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Durably refuse a live action this Grok ACP transport cannot apply.
+    pub(crate) fn refuse_runtime_unsupported_live_action(
+        &self,
+        run_id: &str,
+        assignment_id: &str,
+        action_id: &str,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        validate_identifier("run id", run_id)?;
+        validate_identifier("assignment id", assignment_id)?;
+        validate_identifier("action id", action_id)?;
+        with_run_journal(&self.repo, run_id, |journal| {
+            let state = crate::steering::evidence::reconstruct(journal)?;
+            let Some(existing) = state.actions.get(action_id).cloned() else {
+                bail!("steering action {action_id} is not in run {run_id}");
+            };
+            if existing.request.assignment_id != assignment_id {
+                bail!("steering action {action_id} does not belong to assignment {assignment_id}");
+            }
+            if !matches!(
+                existing.outcome,
+                SteeringOutcome::Pending | SteeringOutcome::Delivered
+            ) {
+                return Ok(());
+            }
+            append_event(
+                journal,
+                "refuse",
+                &payload_for_action(
+                    "refuse",
+                    &existing.request,
+                    SteeringOutcome::Refused,
+                    Some(SteeringRefusal::RuntimeUnsupported),
+                    now_unix_ms,
+                ),
+            )?;
+            Ok(())
+        })
+    }
+
+    /// After the external child exits, close out remaining mailbox actions for one assignment.
+    pub(crate) fn finalize_assignment_execution_pending(
+        &self,
+        run_id: &str,
+        assignment_id: &str,
+    ) -> Result<()> {
+        validate_identifier("run id", run_id)?;
+        validate_identifier("assignment id", assignment_id)?;
+        let now_unix_ms = current_unix_ms()?;
+        with_run_journal(&self.repo, run_id, |journal| {
+            let state = crate::steering::evidence::reconstruct(journal)?;
+            for action in state.actions.values() {
+                if action.request.assignment_id != assignment_id {
+                    continue;
+                }
+                if !matches!(
+                    action.outcome,
+                    SteeringOutcome::Pending | SteeringOutcome::Delivered
+                ) {
+                    continue;
+                }
+                let timed_out = now_unix_ms > action.request.deadline_unix_ms;
+                let (phase, outcome) = if timed_out {
+                    ("timeout", SteeringOutcome::TimedOut)
+                } else {
+                    ("lost_child", SteeringOutcome::LostChild)
+                };
+                append_event(
+                    journal,
+                    phase,
+                    &payload_for_action(phase, &action.request, outcome, None, now_unix_ms),
+                )?;
+            }
+            Ok(())
+        })
+    }
+
     fn verify_request_mac_only(&self, signed: &SignedSteeringRequest) -> Result<()> {
         let authenticator = repository_authenticator_key_only(&self.repo)?;
         verify_request_mac(&authenticator, &signed.request, &signed.mac)
@@ -625,23 +742,10 @@ enum StopResult {
 
 fn stop_launched_child(repo: &Path, run_id: &str, assignment_id: &str) -> Result<StopResult> {
     let registry = AgentRegistry::open(repo)?;
-    let live = registry.list(&crate::agent_lifecycle::AgentListFilter {
-        run_id: Some(run_id.to_string()),
-    })?;
-    let matches = live
-        .into_iter()
-        .filter(|process| process.task_id == assignment_id)
-        .collect::<Vec<_>>();
-    if matches.is_empty() {
+    let report = registry.stop_assignment(run_id, assignment_id, Duration::from_secs(1))?;
+    if report.stopped.is_empty() {
         return Ok(StopResult::NotFound);
     }
-    if matches.len() > 1 {
-        bail!(
-            "steering cancel selector for assignment {assignment_id} is ambiguous ({} live processes)",
-            matches.len()
-        );
-    }
-    let report = registry.stop_selector(assignment_id, Duration::from_secs(1))?;
     if report.stopped.iter().any(|stopped| {
         matches!(
             stopped.outcome,

@@ -59,6 +59,9 @@ use std::{
 pub(crate) mod codex_app_server;
 #[allow(dead_code, unused_imports)]
 pub(crate) mod executor;
+mod grok_steering;
+
+use grok_steering::GrokAcpSteeringBridge;
 
 pub use crate::protected_path::SandboxDenialRetryability;
 
@@ -737,6 +740,29 @@ pub struct EnvironmentPreflightResult {
     pub status: EnvironmentPreflightStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observation: Option<EnvironmentPreflightObservation>,
+}
+
+/// Bounded, redacted capture from the fixed `--version` preflight probe. Parent-held only;
+/// propagated through private supervisor command records, not child-writable report summaries.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentFixedVersionProbeStream {
+    pub text: String,
+    pub truncated: bool,
+}
+
+/// Structured diagnostic for a fixed-argv version preflight launch. Separate from main target
+/// stdout/stderr and from sanitized public environment-failure summaries.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentFixedVersionProbeEvidence {
+    pub executable: EnvironmentExecutable,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub stdout: EnvironmentFixedVersionProbeStream,
+    pub stderr: EnvironmentFixedVersionProbeStream,
+    pub process_tree: ProcessTreeEvidence,
+    pub side_effects: SideEffectConfinementEvidence,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -1535,6 +1561,21 @@ impl ExternalAgentRun {
         &self.stdout.run_metadata.environment_failures
     }
 
+    pub fn fixed_version_probe_evidence(&self) -> Option<&EnvironmentFixedVersionProbeEvidence> {
+        self.stdout
+            .run_metadata
+            .fixed_version_probe_evidence
+            .as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn attach_fixed_version_probe_evidence_for_test(
+        &mut self,
+        evidence: EnvironmentFixedVersionProbeEvidence,
+    ) {
+        self.stdout.run_metadata.fixed_version_probe_evidence = Some(evidence);
+    }
+
     pub fn environment_blocked(&self) -> bool {
         !self.environment_failures().is_empty()
     }
@@ -1836,6 +1877,7 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
 struct ExternalAgentRunMetadata {
     environment_preflight_results: Vec<EnvironmentPreflightResult>,
     environment_failures: Vec<EnvironmentFailure>,
+    fixed_version_probe_evidence: Option<EnvironmentFixedVersionProbeEvidence>,
     environment_preflight_process_started: bool,
     /// Held proof for scratch cleanup after a probe-only run. This is never serialized: a
     /// restored report cannot confer cleanup authority, and a target launch must earn fresh
@@ -2352,7 +2394,6 @@ fn run_external_agent_runtime(
             );
         }
     }
-    let program_trust = external_program_trust(spec);
     let resolved_program = match resolve_external_program(&spec.program, &spec.cwd) {
         Ok(program) => program,
         Err(error) => {
@@ -2406,6 +2447,7 @@ fn run_external_agent_runtime(
             return report;
         }
     };
+    let program_trust = external_program_trust_for_resolved_executable(spec, &resolved_program);
     let program_identity = match external_program_identity(&resolved_program) {
         Ok(identity) => identity,
         Err(error) => {
@@ -2967,6 +3009,7 @@ fn run_external_agent_runtime(
             preflight_profile,
             codex_auth.as_ref(),
             agent_lifecycle.as_ref(),
+            Some(&credential_redactor),
         );
         for failure in &mut preflight.failures {
             failure.summary = credential_redactor.redact_string(&failure.summary);
@@ -3030,17 +3073,18 @@ fn run_external_agent_runtime(
         );
         return report;
     };
-    if let Err(error) =
-        validate_external_program_identity(&resolved_program, spec.program == Path::new("codex"))
-            .and_then(|()| {
-                let current = external_program_identity(&resolved_program)?;
-                if current == program_identity {
-                    Ok(())
-                } else {
-                    bail!("external executable identity changed after version preflight")
-                }
-            })
-    {
+    if let Err(error) = validate_external_program_identity(
+        &resolved_program,
+        program_trust == ExternalProgramTrust::TrustedSystemCodex,
+    )
+    .and_then(|()| {
+        let current = external_program_identity(&resolved_program)?;
+        if current == program_identity {
+            Ok(())
+        } else {
+            bail!("external executable identity changed after version preflight")
+        }
+    }) {
         report.duration_ms = duration_millis(started.elapsed());
         record_environment_failure(
             &mut report,
@@ -4018,17 +4062,51 @@ fn run_grok_acp_external_process(
                 source: std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string()),
             }
         })?;
-    run_process_interactive(process_spec, cancellation, |session| {
+    let mut steering_bridge = spec
+        .agent_lifecycle
+        .as_ref()
+        .map(GrokAcpSteeringBridge::from_identity)
+        .transpose()
+        .map_err(|error| ProcessRunError::IoSetup {
+            label: "Grok ACP steering bridge".to_string(),
+            command: spec.program.display().to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string()),
+        })?;
+
+    let interactive = run_process_interactive(process_spec, cancellation, |session| {
         let mut transport = GrokAcpContainedTransport::new(session);
-        let evidence = crate::runtime_adapter::grok_acp::run_grok_acp_turn(
-            &mut transport,
-            &turn,
-            limits,
-            || cancellation.is_cancelled(),
-        )
+        let cancelled = || cancellation.is_cancelled();
+        let evidence = if let Some(bridge) = steering_bridge.as_mut() {
+            crate::runtime_adapter::grok_acp::run_grok_acp_turn_with_steering(
+                &mut transport,
+                &turn,
+                limits,
+                cancelled,
+                bridge,
+            )
+        } else {
+            crate::runtime_adapter::grok_acp::run_grok_acp_turn(
+                &mut transport,
+                &turn,
+                limits,
+                cancelled,
+            )
+        }
         .map_err(|error| error.to_string())?;
         Ok(GrokAcpInteractiveOutcome { evidence })
-    })
+    });
+
+    if let Some(bridge) = steering_bridge {
+        bridge
+            .finalize_after_child_exit()
+            .map_err(|error| ProcessRunError::IoSetup {
+                label: "Grok ACP steering finalization".to_string(),
+                command: spec.program.display().to_string(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string()),
+            })?;
+    }
+
+    interactive
 }
 
 fn grok_acp_staged_output_bytes(
@@ -4682,6 +4760,7 @@ struct EnvironmentPreflightProcessEvidence {
     started: bool,
     process_tree: Option<ProcessTreeEvidence>,
     side_effects: Option<SideEffectConfinementEvidence>,
+    fixed_version_probe_evidence: Option<EnvironmentFixedVersionProbeEvidence>,
 }
 
 impl EnvironmentPreflightProcessEvidence {
@@ -4799,6 +4878,8 @@ fn retain_environment_preflight_process_evidence(
     report: &mut ExternalAgentRun,
     evidence: &EnvironmentPreflightProcessEvidence,
 ) {
+    report.stdout.run_metadata.fixed_version_probe_evidence =
+        evidence.fixed_version_probe_evidence.clone();
     report
         .stdout
         .run_metadata
@@ -4835,6 +4916,7 @@ fn preflight_codex_version(
     side_effect_profile: &SideEffectConfinementProfile,
     codex_auth: Option<&ValidatedCodexAuth>,
     agent_lifecycle: Option<&AgentLaunchMetadata>,
+    credential_redactor: Option<&CredentialRedactor>,
     process_evidence: &mut EnvironmentPreflightProcessEvidence,
 ) -> std::result::Result<EnvironmentVersionProbe, CodexPreflightFailure> {
     let requirement = codex_environment_requirement();
@@ -4848,6 +4930,7 @@ fn preflight_codex_version(
         side_effect_profile,
         codex_auth,
         agent_lifecycle,
+        credential_redactor,
         process_evidence,
     )
     .map_err(|probe| CodexPreflightFailure {
@@ -4914,6 +4997,7 @@ fn preflight_custom_codex_version(
         &profile,
         None,
         agent_lifecycle,
+        None,
         process_evidence,
     )
 }
@@ -4928,6 +5012,7 @@ fn run_environment_preflight(
     side_effect_profile: &SideEffectConfinementProfile,
     codex_auth: Option<&ValidatedCodexAuth>,
     agent_lifecycle: Option<&AgentLaunchMetadata>,
+    credential_redactor: Option<&CredentialRedactor>,
 ) -> EnvironmentPreflightReport {
     let mut report = EnvironmentPreflightReport::default();
     if let Err(error) = validate_environment_requirements(&spec.environment_requirements) {
@@ -4950,6 +5035,7 @@ fn run_environment_preflight(
         side_effect_profile,
         codex_auth,
         agent_lifecycle,
+        credential_redactor,
         &mut report.process_evidence,
     );
     match codex_probe {
@@ -4989,6 +5075,7 @@ fn run_environment_preflight(
             report.codex_version,
             report.verified_confinement,
             agent_lifecycle,
+            credential_redactor,
             &mut report.process_evidence,
         );
         report.results.push(result);
@@ -5012,6 +5099,7 @@ fn evaluate_environment_requirement(
     observed_codex_version: Option<EnvironmentVersion>,
     verified_confinement: Option<SideEffectConfinementProfileKind>,
     agent_lifecycle: Option<&AgentLaunchMetadata>,
+    credential_redactor: Option<&CredentialRedactor>,
     process_evidence: &mut EnvironmentPreflightProcessEvidence,
 ) -> (EnvironmentPreflightResult, Option<EnvironmentFailure>, bool) {
     match requirement {
@@ -5041,6 +5129,7 @@ fn evaluate_environment_requirement(
                         side_effect_profile,
                         codex_auth,
                         agent_lifecycle,
+                        credential_redactor,
                         process_evidence,
                     )
                     .map(|probe| probe.version)

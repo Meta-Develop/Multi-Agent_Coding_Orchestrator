@@ -4154,6 +4154,7 @@ fn environment_preflight_classifies_static_blockers_without_launching_probes() {
             codex_version,
             verified_confinement,
             None,
+            None,
             &mut process_evidence,
         );
         assert_eq!(result.status, EnvironmentPreflightStatus::Blocked);
@@ -4175,6 +4176,7 @@ fn environment_preflight_classifies_static_blockers_without_launching_probes() {
         &wrong_profile,
         None,
         Some(EnvironmentVersion::new(0, 142, 0)),
+        None,
         None,
         None,
         &mut process_evidence,
@@ -5066,7 +5068,10 @@ fn writable_grok_acp_run_external_agent_helper(fixture_mode: &str) -> Result<()>
     let temp = tempfile::tempdir()?;
     let repos = temp.path().join("repos");
     fs::create_dir(&repos)?;
-    let (primary, child, _common, _child_git_dir) = create_linked_git_metadata_fixture(&repos)?;
+    let (primary, child, common, _child_git_dir) = create_linked_git_metadata_fixture(&repos)?;
+    // Replace only the empty state directory created by this disposable fixture.
+    fs::remove_dir(common.join("maco/state"))?;
+    crate::safe_state::SafeRoot::open_or_create(common.join("maco/state"))?;
     let incoming = temp.path().join("incoming");
     let prompt_root = temp.path().join("prompt-root");
     let schema_root = temp.path().join("schema-root");

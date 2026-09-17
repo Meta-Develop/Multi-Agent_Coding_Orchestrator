@@ -1,0 +1,36 @@
+{
+  "$stream": {
+    "from": "openai-responses",
+    "to": "gemini-generate-content"
+  },
+  "$events": [
+    {
+      "event_name": "response.created",
+      "data": {
+        "type": "response.created",
+        "response": {
+          "id": "FAKE-stream-responses-gemini",
+          "model": "FAKE-responses-model",
+          "created_at": 1
+        }
+      }
+    },
+    {
+      "event_name": "response.output_text.delta",
+      "data": {
+        "type": "response.output_text.delta",
+        "output_index": 0,
+        "delta": "Hello"
+      }
+    },
+    {
+      "event_name": "response.completed",
+      "data": {
+        "type": "response.completed",
+        "response": {
+          "usage": { "input_tokens": 2, "output_tokens": 3, "total_tokens": 5 }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "body": {
+    "model": "claude-target",
+    "max_tokens": 4096,
+    "thinking": { "type": "enabled", "budget_tokens": 1024 },
+    "messages": [{ "role": "user", "content": "Hello" }]
+  },
+  "target_model": null,
+  "stream": false
+}

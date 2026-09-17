@@ -1,0 +1,13 @@
+{
+  "$context": {
+    "source_model": "gemini-source",
+    "target_model": "response-target"
+  },
+  "$body": {
+    "contents": [{ "role": "user", "parts": [{ "text": "Hello" }] }],
+    "generationConfig": {
+      "maxOutputTokens": 256,
+      "thinkingConfig": { "thinkingLevel": "LOW" }
+    }
+  }
+}

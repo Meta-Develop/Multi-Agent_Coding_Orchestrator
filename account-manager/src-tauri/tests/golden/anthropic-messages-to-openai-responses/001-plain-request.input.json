@@ -1,0 +1,8 @@
+{
+  "$context": { "target_model": "FAKE-responses-target" },
+  "$body": {
+    "model": "FAKE-anthropic-source",
+    "max_tokens": 256,
+    "messages": [{ "role": "user", "content": "Hello" }]
+  }
+}

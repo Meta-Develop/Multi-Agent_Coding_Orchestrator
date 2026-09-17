@@ -261,6 +261,8 @@ use role_transition::*;
 
 mod follow_up_cascade;
 use follow_up_cascade::*;
+mod follow_up_graph;
+mod follow_up_lease;
 #[cfg(test)]
 pub(crate) use follow_up_cascade::{
     clear_follow_up_cascade_test_isolation, clear_generated_follow_up_queue_observer,
@@ -272,6 +274,11 @@ pub(crate) use follow_up_cascade::{
     generated_follow_up_dispatch_evidence_after_cascade_error,
     normalized_supervisor_plan_file_sha256, AuthenticatedGeneratedFollowUpTerminal,
     GeneratedFollowUpDispatchEvidence,
+};
+#[cfg(test)]
+pub(crate) use follow_up_lease::{
+    clear_follow_up_lease_test_isolation, set_follow_up_lease_heartbeat_test_hook,
+    FollowUpLeaseClaimTimingOverride,
 };
 
 mod repository;
@@ -317,11 +324,15 @@ use acceptance::*;
 mod reporting;
 use reporting::*;
 
+#[cfg(test)]
+pub(crate) use reporting::command_record_from_external;
+
 mod schema_artifacts;
 use schema_artifacts::*;
 
-/// Persists the normalized plan and establishes its authenticated messaging identity set before
-/// scheduler dispatch. This local definition intentionally takes precedence over the private
+/// Persists the normalized plan and admits the durable messaging session descriptor before
+/// scheduler dispatch. Live broker journals remain in the authenticated state namespace, not the
+/// run manifest. This local definition intentionally takes precedence over the private
 /// schema-module helper imported above.
 fn write_plan_snapshot(
     writer: &mut ArtifactRunWriter,
@@ -343,9 +354,9 @@ fn write_plan_snapshot(
         .context("supervisor messaging pre-launch initialization failed")
 }
 
-/// Recovers a run's existing messaging journal before the authenticated supervisor finalization
-/// resume path proceeds. A finalized run needs no live identities; an unfinished journal never
-/// receives replacement credentials when the original process-local session is absent.
+/// Recovers a run's durable messaging journal before the authenticated supervisor finalization
+/// resume path proceeds. A finalized run needs no live identities; legacy artifact journals without
+/// a session descriptor still refuse recovery when the original process-local factory is absent.
 pub fn resume_supervisor_run(
     repo: impl AsRef<Path>,
     run_id: RunId,
@@ -3102,6 +3113,9 @@ pub struct CommandRunRecord {
     pub grok_stream_usage_evidence: Option<crate::runtime_adapter::grok::GrokStreamUsageEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grok_acp_parent_evidence: Option<crate::runtime_adapter::grok::GrokAcpParentEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_version_probe_evidence:
+        Option<crate::external_agent::EnvironmentFixedVersionProbeEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -3446,6 +3460,18 @@ pub(crate) fn resume_supervisor_plan_file_cascade_with_runner(
             bail!("injected cascade source is not safely finalized or finalization-resumable")
         }
     };
+    let source_plan_sha256 = normalized_supervisor_plan_sha256(
+        &loaded.plan,
+        &loaded.consultant,
+        &loaded.assignment_metadata,
+        &loaded.plan_metadata,
+    )?;
+    let outer_context = resolve_follow_up_cascade_outer_context_for_resume(
+        &repo,
+        &source_report,
+        &source_plan_sha256,
+        &run_id,
+    )?;
     let serialized_runner = Mutex::new(external_runner);
     let mut permit = |_plan: &SupervisorPlan| Ok(None);
     let cancellation_observed = AtomicBool::new(false);
@@ -3455,8 +3481,8 @@ pub(crate) fn resume_supervisor_plan_file_cascade_with_runner(
         source_report,
         &options,
         FollowUpCascadeInvocation {
-            outer_entrypoint: GeneratedFollowUpQueueEntrypoint::SuperviseRun,
-            outer_command_run_id: &run_id,
+            outer_entrypoint: outer_context.outer_entrypoint,
+            outer_command_run_id: &outer_context.outer_command_run_id,
             concurrency_policy: SupervisorConcurrencyPolicy::Fixed(NonZeroUsize::MIN),
             runtime_catalog: FollowUpRuntimeCatalog::Injected,
         },
@@ -3549,6 +3575,7 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         error: None,
         grok_stream_usage_evidence: None,
         grok_acp_parent_evidence: None,
+        fixed_version_probe_evidence: None,
     };
     let worker = WorkerReport {
         id: worker_id.to_string(),

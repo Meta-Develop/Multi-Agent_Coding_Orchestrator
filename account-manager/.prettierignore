@@ -1,0 +1,11 @@
+dist
+node_modules
+src-tauri/target
+src-tauri/gen
+LICENSE
+flake.lock
+*.png
+*.ico
+*.icns
+# Registry-synced local files are not covered by repository formatting.
+.agents/

@@ -1,0 +1,20 @@
+{
+  "id": "FAKE-response-responses-0002",
+  "object": "chat.completion",
+  "created": 1,
+  "model": "FAKE-responses-model",
+  "choices": [
+    {
+      "index": 0,
+      "message": { "role": "assistant", "content": "Hello" },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 2,
+    "prompt_tokens_details": { "cached_tokens": 1 },
+    "completion_tokens": 3,
+    "completion_tokens_details": { "reasoning_tokens": 1 },
+    "total_tokens": 5
+  }
+}

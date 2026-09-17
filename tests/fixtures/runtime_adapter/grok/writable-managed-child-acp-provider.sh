@@ -102,6 +102,10 @@ while :; do
 			incomplete=true
 		fi
 		send "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"stopReason\":\"end_turn\",\"text\":\"fixture-acp-response\",\"usage_is_incomplete\":$incomplete,\"cost_is_partial\":false,\"_meta\":{\"structuredOutput\":{\"accepted\":true,\"path\":\"bounded-result.txt\"},\"usage\":{\"inputTokens\":11,\"outputTokens\":3,\"costUsdTicks\":$COST_TICKS}}}}"
+		# Keep a successful session alive until the parent sends teardown cancel.
+		if [ "$MODE" = "success" ]; then
+			continue
+		fi
 		break
 		;;
 	terminal/create)

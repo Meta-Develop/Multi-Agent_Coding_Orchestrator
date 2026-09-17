@@ -5,27 +5,37 @@
 //! later transport wiring can borrow the already-admitted capability instead of creating a new
 //! identity.
 
+mod persistence;
+
+#[cfg(test)]
+use super::ArtifactFileDisposition;
 use super::{
-    role_authority::RoleCategory as AssignmentRoleCategory, ArtifactFileDisposition,
-    ArtifactRunWriter, OrchestratorAssignment, SupervisorPlan, SupervisorPlanMetadata,
-    WorkerAssignment,
+    role_authority::RoleCategory as AssignmentRoleCategory, ArtifactRunWriter,
+    OrchestratorAssignment, SupervisorPlan, SupervisorPlanMetadata, WorkerAssignment,
 };
+#[cfg(test)]
+use crate::artifacts::state_auth::random_identifier;
 use crate::{
-    artifacts::state_auth::random_identifier,
     hierarchy_ledger::{HierarchyLedgerSnapshot, RoleCategory},
     messaging::{CredentialRegistry, MessagingBroker, MessagingLimits, PresentedCredential},
     safe_state::SafeRoot,
 };
 use anyhow::{bail, Context, Result};
+use persistence::PersistentMessagingBinding;
+#[cfg(test)]
+use std::fs;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fmt, fs,
+    fmt,
     path::{Component, Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
 
 const SUPERVISOR_MESSAGING_STORE_NAME: &str = "messaging.jsonl";
 const SUPERVISOR_MESSAGING_ANCHOR_NAME: &str = "messaging.jsonl.tail-anchor";
+
+pub(super) const MESSAGING_SESSION_DESCRIPTOR_NAME: &str =
+    PersistentMessagingBinding::DESCRIPTOR_NAME;
 
 /// One assignment identity that the supervisor has already admitted for launch.
 ///
@@ -74,8 +84,9 @@ const fn hierarchy_role_category(category: AssignmentRoleCategory) -> RoleCatego
 /// Memory-resident credentials plus the authority and path binding for one supervisor run.
 ///
 /// A single factory may create the broker and later reopen it after the previous handle has been
-/// dropped. A new factory intentionally receives fresh credentials and therefore cannot silently
-/// take over an existing authenticated store.
+/// dropped. Production sessions bind a [`PersistentMessagingBinding`] so a fresh process can
+/// re-derive credentials; legacy memory-only factories still refuse recovery when credentials are
+/// gone.
 pub(super) struct SupervisorMessagingSessionFactory {
     artifact_root: SafeRoot,
     store_path: PathBuf,
@@ -83,9 +94,11 @@ pub(super) struct SupervisorMessagingSessionFactory {
     limits: MessagingLimits,
     registry: CredentialRegistry,
     capabilities: BTreeMap<String, PresentedCredential>,
+    persistent: Option<PersistentMessagingBinding>,
 }
 
 impl SupervisorMessagingSessionFactory {
+    #[cfg(test)]
     pub(super) fn new(
         run_artifact_directory: impl AsRef<Path>,
         hierarchy: &HierarchyLedgerSnapshot,
@@ -99,6 +112,7 @@ impl SupervisorMessagingSessionFactory {
         )
     }
 
+    #[cfg(test)]
     fn new_with_secret_generator<F>(
         run_artifact_directory: &Path,
         hierarchy: &HierarchyLedgerSnapshot,
@@ -150,31 +164,152 @@ impl SupervisorMessagingSessionFactory {
             limits,
             registry,
             capabilities,
+            persistent: None,
         })
     }
 
-    /// Opens the run's authenticated broker, creating its durable journal on first use.
-    pub(super) fn open_or_create(&self) -> Result<MessagingBroker> {
+    fn from_persistent_binding(
+        run_artifact_directory: &Path,
+        binding: PersistentMessagingBinding,
+    ) -> Result<Self> {
+        validate_absolute_run_artifact_directory(run_artifact_directory)?;
+        let hierarchy = binding.hierarchy();
+        let launched_identities = binding.identities();
+        validate_launched_identities(hierarchy, launched_identities)?;
+
+        let artifact_root = SafeRoot::open_existing(run_artifact_directory).with_context(|| {
+            format!(
+                "supervisor messaging store is not a safe existing directory: {}",
+                run_artifact_directory.display()
+            )
+        })?;
+        let store_path = binding
+            .store_path()
+            .context("failed to bind durable supervisor messaging store path")?;
+
+        let limits = binding.limits().clone();
+        let mut registry = CredentialRegistry::from_limits(&limits)
+            .context("failed to initialize supervisor messaging credential registry")?;
+        let mut capabilities = BTreeMap::new();
+        for identity in launched_identities {
+            let secret = binding
+                .credential_for(&identity.agent_id)
+                .with_context(|| {
+                    format!(
+                        "failed to derive supervisor messaging credential for {:?}",
+                        identity.agent_id
+                    )
+                })?;
+            let capability = registry
+                .register(identity.agent_id.clone(), secret)
+                .with_context(|| {
+                    format!(
+                        "failed to register supervisor messaging identity {:?}",
+                        identity.agent_id
+                    )
+                })?;
+            capabilities.insert(identity.agent_id.clone(), capability);
+        }
+
+        Ok(Self {
+            artifact_root,
+            store_path,
+            hierarchy: hierarchy.clone(),
+            limits,
+            registry,
+            capabilities,
+            persistent: Some(binding),
+        })
+    }
+
+    fn verify_run_and_binding(&self) -> Result<()> {
         self.artifact_root
             .verify()
             .context("supervisor messaging artifact directory changed before broker open")?;
-        let broker = MessagingBroker::open_or_create(
+        if let Some(binding) = &self.persistent {
+            binding
+                .verify()
+                .context("supervisor messaging durable binding failed verification")?;
+        }
+        Ok(())
+    }
+
+    fn create_initial_persistent_broker(&self) -> Result<MessagingBroker> {
+        let binding = self
+            .persistent
+            .as_ref()
+            .context("persistent supervisor messaging session is not bound")?;
+        binding.verify()?;
+        self.verify_run_and_binding()?;
+        let broker = MessagingBroker::create(
             &self.store_path,
             self.registry.clone(),
             &self.hierarchy,
             self.limits.clone(),
         )
-        .context("failed to open supervisor messaging broker")?;
+        .context("failed to create durable supervisor messaging broker")?;
         self.artifact_root
             .verify()
-            .context("supervisor messaging artifact directory changed during broker open")?;
+            .context("supervisor messaging artifact directory changed after broker creation")?;
+        binding.verify()?;
         Ok(broker)
     }
 
-    /// Creates the initial broker header and adopts its exact bytes into the authenticated run
-    /// manifest before reopening it. Child transport is not wired in this slice, so no message
-    /// append can bypass the artifact writer during a supervisor run.
-    fn create_manifested_store(&self, writer: &mut ArtifactRunWriter) -> Result<()> {
+    fn open_existing_broker(&self) -> Result<MessagingBroker> {
+        self.verify_run_and_binding()?;
+        let broker = if self.persistent.is_some() {
+            MessagingBroker::open(
+                &self.store_path,
+                self.registry.clone(),
+                &self.hierarchy,
+                self.limits.clone(),
+            )
+            .context("failed to open durable supervisor messaging broker")?
+        } else {
+            MessagingBroker::open_or_create(
+                &self.store_path,
+                self.registry.clone(),
+                &self.hierarchy,
+                self.limits.clone(),
+            )
+            .context("failed to open supervisor messaging broker")?
+        };
+        self.artifact_root
+            .verify()
+            .context("supervisor messaging artifact directory changed during broker open")?;
+        if let Some(binding) = &self.persistent {
+            binding.verify()?;
+        }
+        Ok(broker)
+    }
+
+    /// Opens the run's authenticated broker, creating its durable journal on first use.
+    pub(super) fn open_or_create(&self) -> Result<MessagingBroker> {
+        self.open_existing_broker()
+    }
+
+    /// Returns one launched agent's own process-local presentation capability.
+    ///
+    /// The returned value is neither serializable nor secret-revealing under `Debug`.
+    #[cfg(test)]
+    pub(super) fn capability_for(&self, agent_id: &str) -> Result<PresentedCredential> {
+        self.capabilities
+            .get(agent_id)
+            .cloned()
+            .with_context(|| format!("supervisor messaging identity {agent_id:?} was not launched"))
+    }
+
+    #[cfg(test)]
+    pub(super) fn durable_store_path(&self) -> &Path {
+        &self.store_path
+    }
+
+    /// Legacy unit-fixture path that manifests live broker bytes into the run artifact manifest.
+    #[cfg(test)]
+    fn legacy_create_manifested_store(&self, writer: &mut ArtifactRunWriter) -> Result<()> {
+        if self.persistent.is_some() {
+            bail!("legacy manifested store creation is incompatible with durable bindings");
+        }
         if self
             .artifact_root
             .direct_child_exists(SUPERVISOR_MESSAGING_STORE_NAME)?
@@ -231,17 +366,17 @@ impl SupervisorMessagingSessionFactory {
         );
         Ok(())
     }
+}
 
-    /// Returns one launched agent's own process-local presentation capability.
-    ///
-    /// The returned value is neither serializable nor secret-revealing under `Debug`.
-    #[cfg(test)]
-    pub(super) fn capability_for(&self, agent_id: &str) -> Result<PresentedCredential> {
-        self.capabilities
-            .get(agent_id)
-            .cloned()
-            .with_context(|| format!("supervisor messaging identity {agent_id:?} was not launched"))
-    }
+fn reopen_registered_session(run_directory: &Path) -> Result<()> {
+    let sessions = run_sessions()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervisor messaging session registry is poisoned"))?;
+    let factory = sessions
+        .get(run_directory)
+        .context("supervisor messaging session is not initialized")?;
+    drop(factory.open_or_create()?);
+    Ok(())
 }
 
 fn run_sessions() -> &'static Mutex<BTreeMap<PathBuf, SupervisorMessagingSessionFactory>> {
@@ -250,12 +385,153 @@ fn run_sessions() -> &'static Mutex<BTreeMap<PathBuf, SupervisorMessagingSession
     RUN_SESSIONS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+fn legacy_artifact_messaging_exists(run_directory: &Path) -> Result<bool> {
+    let store = run_directory.join(SUPERVISOR_MESSAGING_STORE_NAME);
+    let anchor = run_directory.join(SUPERVISOR_MESSAGING_ANCHOR_NAME);
+    Ok(store
+        .try_exists()
+        .context("failed to inspect legacy supervisor messaging store")?
+        || anchor
+            .try_exists()
+            .context("failed to inspect legacy supervisor messaging tail anchor")?)
+}
+
+fn authenticated_descriptor_present(run_directory: &Path) -> Result<bool> {
+    run_directory
+        .join(MESSAGING_SESSION_DESCRIPTOR_NAME)
+        .try_exists()
+        .context("failed to inspect supervisor messaging session descriptor")
+}
+
+fn legacy_credentials_unavailable_message(store: &Path) -> String {
+    format!(
+        "supervisor messaging journal {} cannot be resumed because its memory-resident credentials are unavailable; refusing to grant replacement identities",
+        store.display()
+    )
+}
+
 /// Establishes exactly one process-local identity set for an authenticated supervisor run.
 ///
 /// This is called from scheduler evidence initialization after plan normalization and before the
-/// first dispatch-capable scheduler action. An existing durable journal without the original
-/// memory-resident factory is refused instead of receiving replacement credentials.
+/// first dispatch-capable scheduler action. Durable sessions restore their authenticated authority;
+/// legacy journals still require their original memory-resident credentials.
 pub(super) fn initialize_supervisor_messaging_session(
+    writer: &mut ArtifactRunWriter,
+    plan: &SupervisorPlan,
+    metadata: &SupervisorPlanMetadata,
+) -> Result<()> {
+    if plan.assignments.is_empty() {
+        return Ok(());
+    }
+    let run_directory = writer.run_dir().to_path_buf();
+    let (hierarchy, identities) = admitted_messaging_authority(plan, metadata)?;
+
+    let resume_existing = {
+        let mut sessions = run_sessions()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("supervisor messaging session registry is poisoned"))?;
+        sessions.retain(|directory, _| {
+            directory.is_dir()
+                && !directory
+                    .join(super::ARTIFACT_FINALIZATION_MARKER)
+                    .is_file()
+        });
+        if let Some(existing) = sessions.get(&run_directory) {
+            existing.revalidate_authority(&hierarchy, &identities)?;
+            true
+        } else {
+            false
+        }
+    };
+    if resume_existing {
+        return reopen_registered_session(&run_directory);
+    }
+
+    if legacy_artifact_messaging_exists(&run_directory)? {
+        bail!(
+            "supervisor messaging journal exists but its memory-resident credentials are unavailable; refusing to grant replacement identities"
+        );
+    }
+
+    let (binding, newly_created) =
+        PersistentMessagingBinding::prepare(writer, &hierarchy, &identities)
+            .context("supervisor messaging durable session preparation failed")?;
+    let factory =
+        SupervisorMessagingSessionFactory::from_persistent_binding(&run_directory, binding)
+            .context("supervisor messaging pre-launch admission failed")?;
+    if newly_created {
+        drop(
+            factory
+                .create_initial_persistent_broker()
+                .context("supervisor messaging pre-launch journal creation failed")?,
+        );
+    } else {
+        drop(
+            factory
+                .open_existing_broker()
+                .context("supervisor messaging pre-launch journal open failed")?,
+        );
+    }
+
+    let mut sessions = run_sessions()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervisor messaging session registry is poisoned"))?;
+    sessions.insert(run_directory, factory);
+    Ok(())
+}
+
+/// Authenticates and replays an existing durable session, retaining legacy credential refusals.
+pub(super) fn recover_supervisor_messaging_session(run_directory: &Path) -> Result<()> {
+    let already_registered = {
+        let sessions = run_sessions()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("supervisor messaging session registry is poisoned"))?;
+        sessions.contains_key(run_directory)
+    };
+    if already_registered {
+        return reopen_registered_session(run_directory);
+    }
+
+    let has_legacy = legacy_artifact_messaging_exists(run_directory)?;
+    let has_descriptor = authenticated_descriptor_present(run_directory)?;
+    if !has_legacy && !has_descriptor {
+        return Ok(());
+    }
+
+    if has_descriptor {
+        let binding = PersistentMessagingBinding::open(run_directory)
+            .context("failed to authenticate supervisor messaging session descriptor")?;
+        let factory =
+            SupervisorMessagingSessionFactory::from_persistent_binding(run_directory, binding)?;
+        drop(
+            factory
+                .open_existing_broker()
+                .context("failed to recover durable supervisor messaging journal")?,
+        );
+        let mut sessions = run_sessions()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("supervisor messaging session registry is poisoned"))?;
+        sessions.insert(run_directory.to_path_buf(), factory);
+        return Ok(());
+    }
+
+    let store = run_directory.join(SUPERVISOR_MESSAGING_STORE_NAME);
+    bail!(legacy_credentials_unavailable_message(&store));
+}
+
+#[cfg(test)]
+pub(super) fn forget_supervisor_messaging_session_for_test(run_directory: &Path) -> Result<()> {
+    let mut sessions = run_sessions()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervisor messaging session registry is poisoned"))?;
+    sessions
+        .remove(run_directory)
+        .context("supervisor messaging test session is not initialized")?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn legacy_initialize_supervisor_messaging_session_for_test(
     writer: &mut ArtifactRunWriter,
     plan: &SupervisorPlan,
     metadata: &SupervisorPlanMetadata,
@@ -268,68 +544,18 @@ pub(super) fn initialize_supervisor_messaging_session(
     let mut sessions = run_sessions()
         .lock()
         .map_err(|_| anyhow::anyhow!("supervisor messaging session registry is poisoned"))?;
-
-    sessions.retain(|directory, _| {
-        directory.is_dir()
-            && !directory
-                .join(super::ARTIFACT_FINALIZATION_MARKER)
-                .is_file()
-    });
-    if let Some(existing) = sessions.get(&run_directory) {
-        existing.validate_session_authority(&hierarchy, &identities)?;
-        drop(existing.open_or_create()?);
-        return Ok(());
+    if sessions.contains_key(&run_directory) {
+        bail!("legacy messaging test session is already initialized");
     }
-    let existing_store = run_directory.join(SUPERVISOR_MESSAGING_STORE_NAME);
-    let existing_anchor = run_directory.join(SUPERVISOR_MESSAGING_ANCHOR_NAME);
-    if existing_store
-        .try_exists()
-        .context("failed to inspect existing supervisor messaging store")?
-        || existing_anchor
-            .try_exists()
-            .context("failed to inspect existing supervisor messaging tail anchor")?
-    {
-        bail!(
-            "supervisor messaging journal exists but its memory-resident credentials are unavailable; refusing to grant replacement identities"
-        );
+    if authenticated_descriptor_present(&run_directory)? {
+        bail!("legacy messaging test fixture cannot share a durable descriptor");
     }
-
     let factory = SupervisorMessagingSessionFactory::new(&run_directory, &hierarchy, &identities)
-        .context("supervisor messaging pre-launch admission failed")?;
+        .context("legacy supervisor messaging pre-launch admission failed")?;
     factory
-        .create_manifested_store(writer)
-        .context("supervisor messaging pre-launch journal creation failed")?;
+        .legacy_create_manifested_store(writer)
+        .context("legacy supervisor messaging pre-launch journal creation failed")?;
     sessions.insert(run_directory, factory);
-    Ok(())
-}
-
-/// Reopens and fully replays the existing run journal with its original process-local registry.
-pub(super) fn recover_supervisor_messaging_session(run_directory: &Path) -> Result<()> {
-    let store = run_directory.join(SUPERVISOR_MESSAGING_STORE_NAME);
-    let anchor = run_directory.join(SUPERVISOR_MESSAGING_ANCHOR_NAME);
-    if !store
-        .try_exists()
-        .context("failed to inspect resumable supervisor messaging journal")?
-        && !anchor
-            .try_exists()
-            .context("failed to inspect resumable supervisor messaging tail anchor")?
-    {
-        return Ok(());
-    }
-    let sessions = run_sessions()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("supervisor messaging session registry is poisoned"))?;
-    let factory = sessions.get(run_directory).with_context(|| {
-        format!(
-            "supervisor messaging journal {} cannot be resumed because its memory-resident credentials are unavailable; refusing to grant replacement identities",
-            store.display()
-        )
-    })?;
-    drop(
-        factory
-            .open_or_create()
-            .context("failed to recover supervisor messaging journal")?,
-    );
     Ok(())
 }
 
@@ -416,6 +642,18 @@ fn insert_admitted_identity(
 }
 
 impl SupervisorMessagingSessionFactory {
+    fn revalidate_authority(
+        &self,
+        hierarchy: &HierarchyLedgerSnapshot,
+        identities: &[LaunchedMessagingIdentity],
+    ) -> Result<()> {
+        if let Some(binding) = &self.persistent {
+            binding.verify_authority(hierarchy, identities)?;
+            return Ok(());
+        }
+        self.validate_session_authority(hierarchy, identities)
+    }
+
     fn validate_session_authority(
         &self,
         hierarchy: &HierarchyLedgerSnapshot,
@@ -442,6 +680,7 @@ impl fmt::Debug for SupervisorMessagingSessionFactory {
             .debug_struct("SupervisorMessagingSessionFactory")
             .field("artifact_root", &self.artifact_root.path())
             .field("store_path", &self.store_path)
+            .field("persistent", &self.persistent.is_some())
             .field(
                 "capability_principals",
                 &self.capabilities.keys().collect::<Vec<_>>(),

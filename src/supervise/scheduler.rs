@@ -1782,7 +1782,7 @@ fn run_serial_assignment_schedule(
             budget_policy,
             admission_commit: None,
             runtime_model_catalog: context.runtime_model_catalog,
-            cancellation: cancellation.clone(),
+            cancellation: cancellation.child_scope(),
             external_runner: context.external_runner,
         });
         drop(concurrency_guard);
@@ -1952,7 +1952,7 @@ fn run_concurrent_assignment_schedule(
                             order
                         });
                     let completion_sender = completion_sender.clone();
-                    let assignment_cancellation = cancellation.clone();
+                    let assignment_cancellation = cancellation.child_scope();
                     let concurrency = progress.concurrency.clone();
                     let (admission_commit, admission_receiver) = AdmissionCommitSignal::new();
                     let prior_binding = super::prior_input::captured_binding();

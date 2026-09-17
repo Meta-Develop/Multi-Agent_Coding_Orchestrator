@@ -2054,6 +2054,233 @@
               "null"
             ]
           },
+          "fixed_version_probe_evidence": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "executable": {
+                    "enum": [
+                      "bash",
+                      "cargo",
+                      "cmake",
+                      "codex",
+                      "git",
+                      "nix",
+                      "node",
+                      "npm",
+                      "python3",
+                      "rustc"
+                    ],
+                    "type": "string"
+                  },
+                  "exit_code": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "process_tree": {
+                    "oneOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "backend": {
+                            "enum": [
+                              "systemd_user_service",
+                              "windows_job_object",
+                              "unix_process_group",
+                              "direct_child"
+                            ],
+                            "type": "string"
+                          },
+                          "status": {
+                            "const": "verified_empty",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "status",
+                          "backend"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "backend": {
+                            "enum": [
+                              "systemd_user_service",
+                              "windows_job_object",
+                              "unix_process_group",
+                              "direct_child"
+                            ],
+                            "type": "string"
+                          },
+                          "status": {
+                            "const": "trusted_best_effort",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "status",
+                          "backend"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "backend": {
+                            "enum": [
+                              "systemd_user_service",
+                              "windows_job_object",
+                              "unix_process_group",
+                              "direct_child"
+                            ],
+                            "type": "string"
+                          },
+                          "status": {
+                            "const": "unverified",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "status",
+                          "backend"
+                        ],
+                        "type": "object"
+                      }
+                    ]
+                  },
+                  "side_effects": {
+                    "oneOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "profile": {
+                            "enum": [
+                              "strict_offline_workspace",
+                              "trusted_fixed_network",
+                              "external_codex",
+                              "external_grok",
+                              "trusted_compatibility"
+                            ],
+                            "type": "string"
+                          },
+                          "status": {
+                            "const": "verified",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "status",
+                          "profile"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "profile": {
+                            "enum": [
+                              "strict_offline_workspace",
+                              "trusted_fixed_network",
+                              "external_codex",
+                              "external_grok",
+                              "trusted_compatibility"
+                            ],
+                            "type": "string"
+                          },
+                          "status": {
+                            "const": "trusted_best_effort",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "status",
+                          "profile"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "profile": {
+                            "enum": [
+                              "strict_offline_workspace",
+                              "trusted_fixed_network",
+                              "external_codex",
+                              "external_grok",
+                              "trusted_compatibility"
+                            ],
+                            "type": "string"
+                          },
+                          "status": {
+                            "const": "unverified",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "status",
+                          "profile"
+                        ],
+                        "type": "object"
+                      }
+                    ]
+                  },
+                  "stderr": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "text": {
+                        "type": "string"
+                      },
+                      "truncated": {
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "text",
+                      "truncated"
+                    ],
+                    "type": "object"
+                  },
+                  "stdout": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "text": {
+                        "type": "string"
+                      },
+                      "truncated": {
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "text",
+                      "truncated"
+                    ],
+                    "type": "object"
+                  },
+                  "timed_out": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "executable",
+                  "exit_code",
+                  "timed_out",
+                  "stdout",
+                  "stderr",
+                  "process_tree",
+                  "side_effects"
+                ],
+                "type": "object"
+              }
+            ]
+          },
           "grok_acp_parent_evidence": {
             "oneOf": [
               {
@@ -5713,6 +5940,233 @@
                           "null"
                         ]
                       },
+                      "fixed_version_probe_evidence": {
+                        "oneOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "executable": {
+                                "enum": [
+                                  "bash",
+                                  "cargo",
+                                  "cmake",
+                                  "codex",
+                                  "git",
+                                  "nix",
+                                  "node",
+                                  "npm",
+                                  "python3",
+                                  "rustc"
+                                ],
+                                "type": "string"
+                              },
+                              "exit_code": {
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "process_tree": {
+                                "oneOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "backend": {
+                                        "enum": [
+                                          "systemd_user_service",
+                                          "windows_job_object",
+                                          "unix_process_group",
+                                          "direct_child"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      "status": {
+                                        "const": "verified_empty",
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "status",
+                                      "backend"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "backend": {
+                                        "enum": [
+                                          "systemd_user_service",
+                                          "windows_job_object",
+                                          "unix_process_group",
+                                          "direct_child"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      "status": {
+                                        "const": "trusted_best_effort",
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "status",
+                                      "backend"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "backend": {
+                                        "enum": [
+                                          "systemd_user_service",
+                                          "windows_job_object",
+                                          "unix_process_group",
+                                          "direct_child"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      "status": {
+                                        "const": "unverified",
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "status",
+                                      "backend"
+                                    ],
+                                    "type": "object"
+                                  }
+                                ]
+                              },
+                              "side_effects": {
+                                "oneOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "profile": {
+                                        "enum": [
+                                          "strict_offline_workspace",
+                                          "trusted_fixed_network",
+                                          "external_codex",
+                                          "external_grok",
+                                          "trusted_compatibility"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      "status": {
+                                        "const": "verified",
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "status",
+                                      "profile"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "profile": {
+                                        "enum": [
+                                          "strict_offline_workspace",
+                                          "trusted_fixed_network",
+                                          "external_codex",
+                                          "external_grok",
+                                          "trusted_compatibility"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      "status": {
+                                        "const": "trusted_best_effort",
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "status",
+                                      "profile"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "profile": {
+                                        "enum": [
+                                          "strict_offline_workspace",
+                                          "trusted_fixed_network",
+                                          "external_codex",
+                                          "external_grok",
+                                          "trusted_compatibility"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      "status": {
+                                        "const": "unverified",
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "status",
+                                      "profile"
+                                    ],
+                                    "type": "object"
+                                  }
+                                ]
+                              },
+                              "stderr": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "text": {
+                                    "type": "string"
+                                  },
+                                  "truncated": {
+                                    "type": "boolean"
+                                  }
+                                },
+                                "required": [
+                                  "text",
+                                  "truncated"
+                                ],
+                                "type": "object"
+                              },
+                              "stdout": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "text": {
+                                    "type": "string"
+                                  },
+                                  "truncated": {
+                                    "type": "boolean"
+                                  }
+                                },
+                                "required": [
+                                  "text",
+                                  "truncated"
+                                ],
+                                "type": "object"
+                              },
+                              "timed_out": {
+                                "type": "boolean"
+                              }
+                            },
+                            "required": [
+                              "executable",
+                              "exit_code",
+                              "timed_out",
+                              "stdout",
+                              "stderr",
+                              "process_tree",
+                              "side_effects"
+                            ],
+                            "type": "object"
+                          }
+                        ]
+                      },
                       "grok_acp_parent_evidence": {
                         "oneOf": [
                           {
@@ -7048,6 +7502,233 @@
                   "type": [
                     "integer",
                     "null"
+                  ]
+                },
+                "fixed_version_probe_evidence": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "executable": {
+                          "enum": [
+                            "bash",
+                            "cargo",
+                            "cmake",
+                            "codex",
+                            "git",
+                            "nix",
+                            "node",
+                            "npm",
+                            "python3",
+                            "rustc"
+                          ],
+                          "type": "string"
+                        },
+                        "exit_code": {
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
+                        },
+                        "process_tree": {
+                          "oneOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "backend": {
+                                  "enum": [
+                                    "systemd_user_service",
+                                    "windows_job_object",
+                                    "unix_process_group",
+                                    "direct_child"
+                                  ],
+                                  "type": "string"
+                                },
+                                "status": {
+                                  "const": "verified_empty",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "status",
+                                "backend"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "backend": {
+                                  "enum": [
+                                    "systemd_user_service",
+                                    "windows_job_object",
+                                    "unix_process_group",
+                                    "direct_child"
+                                  ],
+                                  "type": "string"
+                                },
+                                "status": {
+                                  "const": "trusted_best_effort",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "status",
+                                "backend"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "backend": {
+                                  "enum": [
+                                    "systemd_user_service",
+                                    "windows_job_object",
+                                    "unix_process_group",
+                                    "direct_child"
+                                  ],
+                                  "type": "string"
+                                },
+                                "status": {
+                                  "const": "unverified",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "status",
+                                "backend"
+                              ],
+                              "type": "object"
+                            }
+                          ]
+                        },
+                        "side_effects": {
+                          "oneOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "profile": {
+                                  "enum": [
+                                    "strict_offline_workspace",
+                                    "trusted_fixed_network",
+                                    "external_codex",
+                                    "external_grok",
+                                    "trusted_compatibility"
+                                  ],
+                                  "type": "string"
+                                },
+                                "status": {
+                                  "const": "verified",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "status",
+                                "profile"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "profile": {
+                                  "enum": [
+                                    "strict_offline_workspace",
+                                    "trusted_fixed_network",
+                                    "external_codex",
+                                    "external_grok",
+                                    "trusted_compatibility"
+                                  ],
+                                  "type": "string"
+                                },
+                                "status": {
+                                  "const": "trusted_best_effort",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "status",
+                                "profile"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "profile": {
+                                  "enum": [
+                                    "strict_offline_workspace",
+                                    "trusted_fixed_network",
+                                    "external_codex",
+                                    "external_grok",
+                                    "trusted_compatibility"
+                                  ],
+                                  "type": "string"
+                                },
+                                "status": {
+                                  "const": "unverified",
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "status",
+                                "profile"
+                              ],
+                              "type": "object"
+                            }
+                          ]
+                        },
+                        "stderr": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "text": {
+                              "type": "string"
+                            },
+                            "truncated": {
+                              "type": "boolean"
+                            }
+                          },
+                          "required": [
+                            "text",
+                            "truncated"
+                          ],
+                          "type": "object"
+                        },
+                        "stdout": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "text": {
+                              "type": "string"
+                            },
+                            "truncated": {
+                              "type": "boolean"
+                            }
+                          },
+                          "required": [
+                            "text",
+                            "truncated"
+                          ],
+                          "type": "object"
+                        },
+                        "timed_out": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": [
+                        "executable",
+                        "exit_code",
+                        "timed_out",
+                        "stdout",
+                        "stderr",
+                        "process_tree",
+                        "side_effects"
+                      ],
+                      "type": "object"
+                    }
                   ]
                 },
                 "grok_acp_parent_evidence": {
@@ -10956,6 +11637,233 @@
                         "type": [
                           "integer",
                           "null"
+                        ]
+                      },
+                      "fixed_version_probe_evidence": {
+                        "oneOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "executable": {
+                                "enum": [
+                                  "bash",
+                                  "cargo",
+                                  "cmake",
+                                  "codex",
+                                  "git",
+                                  "nix",
+                                  "node",
+                                  "npm",
+                                  "python3",
+                                  "rustc"
+                                ],
+                                "type": "string"
+                              },
+                              "exit_code": {
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "process_tree": {
+                                "oneOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "backend": {
+                                        "enum": [
+                                          "systemd_user_service",
+                                          "windows_job_object",
+                                          "unix_process_group",
+                                          "direct_child"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      "status": {
+                                        "const": "verified_empty",
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "status",
+                                      "backend"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "backend": {
+                                        "enum": [
+                                          "systemd_user_service",
+                                          "windows_job_object",
+                                          "unix_process_group",
+                                          "direct_child"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      "status": {
+                                        "const": "trusted_best_effort",
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "status",
+                                      "backend"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "backend": {
+                                        "enum": [
+                                          "systemd_user_service",
+                                          "windows_job_object",
+                                          "unix_process_group",
+                                          "direct_child"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      "status": {
+                                        "const": "unverified",
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "status",
+                                      "backend"
+                                    ],
+                                    "type": "object"
+                                  }
+                                ]
+                              },
+                              "side_effects": {
+                                "oneOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "profile": {
+                                        "enum": [
+                                          "strict_offline_workspace",
+                                          "trusted_fixed_network",
+                                          "external_codex",
+                                          "external_grok",
+                                          "trusted_compatibility"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      "status": {
+                                        "const": "verified",
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "status",
+                                      "profile"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "profile": {
+                                        "enum": [
+                                          "strict_offline_workspace",
+                                          "trusted_fixed_network",
+                                          "external_codex",
+                                          "external_grok",
+                                          "trusted_compatibility"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      "status": {
+                                        "const": "trusted_best_effort",
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "status",
+                                      "profile"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "profile": {
+                                        "enum": [
+                                          "strict_offline_workspace",
+                                          "trusted_fixed_network",
+                                          "external_codex",
+                                          "external_grok",
+                                          "trusted_compatibility"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      "status": {
+                                        "const": "unverified",
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "status",
+                                      "profile"
+                                    ],
+                                    "type": "object"
+                                  }
+                                ]
+                              },
+                              "stderr": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "text": {
+                                    "type": "string"
+                                  },
+                                  "truncated": {
+                                    "type": "boolean"
+                                  }
+                                },
+                                "required": [
+                                  "text",
+                                  "truncated"
+                                ],
+                                "type": "object"
+                              },
+                              "stdout": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "text": {
+                                    "type": "string"
+                                  },
+                                  "truncated": {
+                                    "type": "boolean"
+                                  }
+                                },
+                                "required": [
+                                  "text",
+                                  "truncated"
+                                ],
+                                "type": "object"
+                              },
+                              "timed_out": {
+                                "type": "boolean"
+                              }
+                            },
+                            "required": [
+                              "executable",
+                              "exit_code",
+                              "timed_out",
+                              "stdout",
+                              "stderr",
+                              "process_tree",
+                              "side_effects"
+                            ],
+                            "type": "object"
+                          }
                         ]
                       },
                       "grok_acp_parent_evidence": {

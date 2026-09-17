@@ -123,6 +123,90 @@ fn resolve_environment_executable(
     })
 }
 
+const FIXED_VERSION_PROBE_CAPTURE_CHARS: usize = 4096;
+
+fn bounded_redacted_probe_stream(
+    output: &CapturedBytes,
+    redactor: &CredentialRedactor,
+    max_chars: usize,
+) -> EnvironmentFixedVersionProbeStream {
+    let redacted = redactor.redact_bytes(output.as_bytes());
+    let text = String::from_utf8_lossy(&redacted);
+    let mut chars = text.chars();
+    let value = chars.by_ref().take(max_chars).collect::<String>();
+    EnvironmentFixedVersionProbeStream {
+        text: value,
+        truncated: output.is_truncated() || chars.next().is_some(),
+    }
+}
+
+fn withheld_fixed_version_probe_stream() -> EnvironmentFixedVersionProbeStream {
+    EnvironmentFixedVersionProbeStream {
+        text: std::str::from_utf8(CREDENTIAL_REDACTION)
+            .expect("CREDENTIAL_REDACTION is valid UTF-8")
+            .to_string(),
+        truncated: false,
+    }
+}
+
+fn fixed_version_probe_streams(
+    output: &ProcessOutput,
+    environment: &BTreeMap<String, String>,
+    codex_auth: Option<&ValidatedCodexAuth>,
+    credential_redactor: Option<&CredentialRedactor>,
+) -> (EnvironmentFixedVersionProbeStream, EnvironmentFixedVersionProbeStream) {
+    let redact = |redactor: &CredentialRedactor| {
+        (
+            bounded_redacted_probe_stream(
+                &output.stdout,
+                redactor,
+                FIXED_VERSION_PROBE_CAPTURE_CHARS,
+            ),
+            bounded_redacted_probe_stream(
+                &output.stderr,
+                redactor,
+                FIXED_VERSION_PROBE_CAPTURE_CHARS,
+            ),
+        )
+    };
+    if let Some(redactor) = credential_redactor {
+        return redact(redactor);
+    }
+    match CredentialRedactor::from_runtime(environment, codex_auth) {
+        Ok(redactor) => redact(&redactor),
+        Err(_) => (
+            withheld_fixed_version_probe_stream(),
+            withheld_fixed_version_probe_stream(),
+        ),
+    }
+}
+
+fn record_fixed_version_probe_output(
+    executable: EnvironmentExecutable,
+    output: &ProcessOutput,
+    environment: &BTreeMap<String, String>,
+    codex_auth: Option<&ValidatedCodexAuth>,
+    credential_redactor: Option<&CredentialRedactor>,
+    process_evidence: &mut EnvironmentPreflightProcessEvidence,
+) {
+    let (stdout, stderr) = fixed_version_probe_streams(
+        output,
+        environment,
+        codex_auth,
+        credential_redactor,
+    );
+    process_evidence.fixed_version_probe_evidence =
+        Some(EnvironmentFixedVersionProbeEvidence {
+            executable,
+            exit_code: output.status.and_then(|status| status.code()),
+            timed_out: output.timed_out,
+            stdout,
+            stderr,
+            process_tree: output.process_tree,
+            side_effects: output.side_effects,
+        });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_fixed_version_probe(
     executable: EnvironmentExecutable,
@@ -134,6 +218,7 @@ fn run_fixed_version_probe(
     side_effect_profile: &SideEffectConfinementProfile,
     codex_auth: Option<&ValidatedCodexAuth>,
     agent_lifecycle: Option<&AgentLaunchMetadata>,
+    credential_redactor: Option<&CredentialRedactor>,
     process_evidence: &mut EnvironmentPreflightProcessEvidence,
 ) -> std::result::Result<EnvironmentVersionProbe, EnvironmentProbeFailure> {
     let label = format!("{} version preflight", executable.program_name());
@@ -156,6 +241,14 @@ fn run_fixed_version_probe(
     );
     let output = match run_process_cancellable(process_spec, cancellation) {
         Ok(output) => {
+            record_fixed_version_probe_output(
+                executable,
+                &output,
+                environment,
+                codex_auth,
+                credential_redactor,
+                process_evidence,
+            );
             process_evidence.record_output(&output);
             output
         }
@@ -618,13 +711,25 @@ pub(crate) fn supervisor_catalog_preflight_refuse_sealed_executable_resolution_d
 thread_local! {
     static INJECTED_TRUSTED_CODEX_EXECUTABLE: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
+    static INJECTED_CODEX_AUTH_HOME: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
     static CODEX_RUNTIME_MODEL_CATALOG_PROCESS_LAUNCH_ATTEMPTS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 pub(crate) fn set_injected_trusted_codex_executable_for_test(path: Option<PathBuf>) {
-    INJECTED_TRUSTED_CODEX_EXECUTABLE.with(|injected| *injected.borrow_mut() = path);
+    let _ = replace_injected_trusted_codex_executable_for_test(path);
+}
+
+#[cfg(test)]
+fn replace_injected_trusted_codex_executable_for_test(path: Option<PathBuf>) -> Option<PathBuf> {
+    INJECTED_TRUSTED_CODEX_EXECUTABLE.with(|injected| injected.replace(path))
+}
+
+#[cfg(test)]
+pub(crate) fn set_injected_codex_auth_home_for_test(home: Option<PathBuf>) -> Option<PathBuf> {
+    INJECTED_CODEX_AUTH_HOME.with(|injected| injected.replace(home))
 }
 
 #[cfg(test)]
@@ -1079,12 +1184,35 @@ fn validate_codex_model_slug(slug: &str) -> Result<()> {
     Ok(())
 }
 
+/// Classify program trust before executable resolution (fail-closed for held-out absolutes).
 fn external_program_trust(spec: &ExternalAgentCommand) -> ExternalProgramTrust {
-    if spec.program == Path::new("codex") {
+    if spec.program == Path::new(TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM) {
         ExternalProgramTrust::TrustedSystemCodex
     } else {
         ExternalProgramTrust::ExplicitCustom
     }
+}
+
+/// Classify trust after `resolve_external_program` validated the requested executable identity.
+fn external_program_trust_for_resolved_executable(
+    spec: &ExternalAgentCommand,
+    resolved_program: &Path,
+) -> ExternalProgramTrust {
+    if spec.program == Path::new(TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM) {
+        return ExternalProgramTrust::TrustedSystemCodex;
+    }
+    if matches!(
+        spec.invocation,
+        ExternalAgentInvocation::CodexSupervisor | ExternalAgentInvocation::CodexConsultant
+    ) && spec.program.is_absolute() {
+        match resolve_trusted_system_codex_executable_for_catalog(&spec.cwd) {
+            Ok(trusted) if trusted == resolved_program => {
+                return ExternalProgramTrust::TrustedSystemCodex;
+            }
+            _ => {}
+        }
+    }
+    ExternalProgramTrust::ExplicitCustom
 }
 
 fn codex_permission_evidence(
@@ -5278,6 +5406,10 @@ struct ValidatedCodexAuth {
 
 impl ValidatedCodexAuth {
     fn load() -> Result<Option<Self>> {
+        #[cfg(test)]
+        if let Some(home) = INJECTED_CODEX_AUTH_HOME.with(|injected| injected.borrow().clone()) {
+            return Self::load_from_home(&home);
+        }
         let Some(home) = env::var_os("CODEX_HOME").map(PathBuf::from).or_else(|| {
             env::var_os("HOME")
                 .map(PathBuf::from)
@@ -6440,5 +6572,75 @@ mod nixos_identity_regression_tests {
                     .starts_with("shell_environment_policy.set=")
             }));
         }
+    }
+}
+
+#[cfg(test)]
+mod fixed_version_probe_redaction_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn withholds_probe_streams_when_bounded_redaction_cannot_be_established() {
+        const SECRET: &str = "fixed-version-probe-redaction-failure-secret-31";
+        let oversized_values = (0..=MAX_CREDENTIAL_REDACTION_PATTERNS)
+            .map(|index| format!("distinct-credential-pattern-{index:04}-31"))
+            .collect::<Vec<_>>();
+        let oversized_bytes = serde_json::to_vec(&oversized_values).expect("serialize auth");
+        let oversized_auth = ValidatedCodexAuth {
+            path: PathBuf::from("/private/oversized-auth.json"),
+            length: oversized_bytes.len() as u64,
+            modified: None,
+            #[cfg(unix)]
+            device: 1,
+            #[cfg(unix)]
+            inode: 3,
+            bytes: oversized_bytes,
+        };
+        assert!(CredentialRedactor::from_runtime(&BTreeMap::new(), Some(&oversized_auth)).is_err());
+
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            Some(std::process::ExitStatus::from_raw(101 << 8))
+        };
+        #[cfg(not(unix))]
+        let status = None;
+
+        let output = ProcessOutput {
+            status,
+            duration: Duration::from_millis(1),
+            timed_out: false,
+            process_tree: ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService),
+            side_effects: SideEffectConfinementEvidence::Verified(
+                SideEffectConfinementProfileKind::ExternalCodex,
+            ),
+            stdout: CapturedBytes::default(),
+            stderr: CapturedBytes::from_bytes_with_truncation_for_test(SECRET, false),
+            process_error: None,
+            stdin_error: None,
+        };
+        let mut evidence = EnvironmentPreflightProcessEvidence::default();
+        record_fixed_version_probe_output(
+            EnvironmentExecutable::Codex,
+            &output,
+            &BTreeMap::new(),
+            Some(&oversized_auth),
+            None,
+            &mut evidence,
+        );
+        let retained = evidence
+            .fixed_version_probe_evidence
+            .expect("structured probe evidence");
+        assert_eq!(retained.exit_code, Some(101));
+        assert!(!retained.stderr.text.contains(SECRET));
+        assert_eq!(
+            retained.stderr.text,
+            std::str::from_utf8(CREDENTIAL_REDACTION).expect("CREDENTIAL_REDACTION is utf-8")
+        );
+        assert_eq!(
+            retained.stdout.text,
+            std::str::from_utf8(CREDENTIAL_REDACTION).expect("CREDENTIAL_REDACTION is utf-8")
+        );
     }
 }
