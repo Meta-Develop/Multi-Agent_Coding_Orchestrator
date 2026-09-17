@@ -1,3 +1,4 @@
+use crate::account_authority::ManagedGrokAccountSelectionEvidence;
 use crate::agent_lifecycle::{AgentLaunchMetadata, MACO_RUN_ID_ENV, MACO_TASK_ID_ENV};
 use crate::artifacts::state_auth::sha256_hex;
 use crate::gate_denial::{ExternalSideEffectState, GateDenial};
@@ -1561,6 +1562,13 @@ impl ExternalAgentRun {
         &self.stdout.run_metadata.environment_failures
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn managed_grok_selection_evidence(
+        &self,
+    ) -> Option<&ManagedGrokAccountSelectionEvidence> {
+        self.stdout.run_metadata.managed_grok_selection.as_ref()
+    }
+
     pub fn fixed_version_probe_evidence(&self) -> Option<&EnvironmentFixedVersionProbeEvidence> {
         self.stdout
             .run_metadata
@@ -1746,6 +1754,8 @@ struct ExternalAgentRunWireRef<'a> {
     grok_stream_usage_evidence: &'a Option<GrokStreamUsageEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     grok_acp_parent_evidence: &'a Option<GrokAcpParentEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_grok_selection: &'a Option<ManagedGrokAccountSelectionEvidence>,
 }
 
 #[derive(Deserialize)]
@@ -1787,6 +1797,8 @@ struct ExternalAgentRunWireOwned {
     grok_stream_usage_evidence: Option<GrokStreamUsageEvidence>,
     #[serde(default)]
     grok_acp_parent_evidence: Option<GrokAcpParentEvidence>,
+    #[serde(default)]
+    managed_grok_selection: Option<ManagedGrokAccountSelectionEvidence>,
 }
 
 impl Serialize for ExternalAgentRun {
@@ -1827,6 +1839,7 @@ impl Serialize for ExternalAgentRun {
             error: &self.error,
             grok_stream_usage_evidence: &self.grok_stream_usage_evidence,
             grok_acp_parent_evidence: &self.grok_acp_parent_evidence,
+            managed_grok_selection: &self.stdout.run_metadata.managed_grok_selection,
         }
         .serialize(serializer)
     }
@@ -1851,6 +1864,7 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
         stdout.run_metadata.machine_global_retention_operation_id =
             wire.machine_global_retention_operation_id;
         stdout.run_metadata.pre_action_review_metrics = wire.pre_action_review_metrics;
+        stdout.run_metadata.managed_grok_selection = wire.managed_grok_selection;
         Ok(Self {
             command: wire.command,
             cwd: wire.cwd,
@@ -1890,6 +1904,7 @@ struct ExternalAgentRunMetadata {
     pre_action_review_metrics: Option<ReviewMetricSnapshot>,
     external_side_effect_state: Option<ExternalSideEffectState>,
     worker_journal_artifacts: Vec<WorkerJournalArtifactCapture>,
+    managed_grok_selection: Option<ManagedGrokAccountSelectionEvidence>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1992,17 +2007,11 @@ struct AdmittedGrokCredentials {
 }
 
 impl AdmittedGrokCredentials {
-    fn from_ambient_environment() -> Result<Self> {
-        #[cfg(target_os = "linux")]
-        {
-            Ok(Self {
-                source: GrokCredentialSource::from_ambient_environment()?,
-            })
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            bail!("Grok credential capability confinement requires Linux");
-        }
+    #[cfg(target_os = "linux")]
+    fn from_managed_grok_home(grok_home: &Path) -> Result<Self> {
+        Ok(Self {
+            source: GrokCredentialSource::from_environment(None, Some(grok_home.as_os_str()))?,
+        })
     }
 
     fn grok_home_environment(&self) -> Result<&str> {
@@ -2039,8 +2048,37 @@ impl AdmittedGrokCredentials {
     }
 }
 
+#[cfg(target_os = "linux")]
+struct GrokVerifiedAccountSession {
+    authority: crate::account_authority::GrokLaunchAuthority,
+    credentials: AdmittedGrokCredentials,
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_verified_grok_account_session() -> Result<GrokVerifiedAccountSession> {
+    let authority = crate::account_authority::grok::acquire_grok_launch_authority()?;
+    let credentials =
+        AdmittedGrokCredentials::from_managed_grok_home(authority.managed_grok_home())?;
+    Ok(GrokVerifiedAccountSession {
+        authority,
+        credentials,
+    })
+}
+
 pub fn run_external_agent(spec: &ExternalAgentCommand) -> ExternalAgentRun {
     run_external_agent_cancellable(spec, &ProcessCancellation::new())
+}
+
+/// Run one verified external-agent invocation against an isolated CAM Grok registry.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn run_external_agent_with_cam_grok_test_harness(
+    harness: crate::account_authority::CamGrokTestHarness,
+    spec: &ExternalAgentCommand,
+) -> ExternalAgentRun {
+    let guard = crate::account_authority::activate_cam_grok_test_harness(harness);
+    let report = run_external_agent(spec);
+    drop(guard);
+    report
 }
 
 pub fn run_external_agent_cancellable(
@@ -2830,11 +2868,16 @@ fn run_external_agent_runtime(
         None
     };
 
-    let grok_credentials = if runtime == ExternalExecutionRuntime::Verified
+    #[cfg(target_os = "linux")]
+    let grok_session = if runtime == ExternalExecutionRuntime::Verified
         && spec.invocation == ExternalAgentInvocation::Grok
     {
-        match AdmittedGrokCredentials::from_ambient_environment() {
-            Ok(credentials) => Some(credentials),
+        match prepare_verified_grok_account_session() {
+            Ok(session) => {
+                report.stdout.run_metadata.managed_grok_selection =
+                    Some(session.authority.selection_evidence());
+                Some(session)
+            }
             Err(error) => {
                 report.duration_ms = duration_millis(started.elapsed());
                 record_grok_credential_environment_failure(&mut report, &error);
@@ -2844,6 +2887,23 @@ fn run_external_agent_runtime(
     } else {
         None
     };
+    if runtime == ExternalExecutionRuntime::Verified
+        && spec.invocation == ExternalAgentInvocation::Grok
+    {
+        #[cfg(not(target_os = "linux"))]
+        {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_grok_credential_environment_failure(
+                &mut report,
+                &anyhow::anyhow!("Grok credential capability confinement requires Linux"),
+            );
+            return report;
+        }
+    }
+    #[cfg(target_os = "linux")]
+    let grok_credentials = grok_session.as_ref().map(|session| &session.credentials);
+    #[cfg(not(target_os = "linux"))]
+    let grok_credentials: Option<&AdmittedGrokCredentials> = None;
 
     let side_effect_profile = if runtime == ExternalExecutionRuntime::Verified
         && (program_trust == ExternalProgramTrust::TrustedSystemCodex
@@ -2936,14 +2996,18 @@ fn run_external_agent_runtime(
             }
         }
     }
-    if let Some(credentials) = grok_credentials.as_ref() {
+    #[cfg(target_os = "linux")]
+    if let Some(session) = grok_session.as_ref() {
         if let Err(error) =
-            insert_admitted_grok_home_environment(&mut external_environment, credentials)
+            insert_admitted_grok_home_environment(&mut external_environment, &session.credentials)
         {
             report.duration_ms = duration_millis(started.elapsed());
             record_grok_credential_environment_failure(&mut report, &error);
             return report;
         }
+        session
+            .authority
+            .apply_launch_environment(&mut external_environment);
     }
     if let Some(metadata) = &agent_lifecycle {
         external_environment.insert(MACO_RUN_ID_ENV.to_string(), metadata.run_id().to_string());
@@ -3209,6 +3273,15 @@ fn run_external_agent_runtime(
         {
             report.duration_ms = duration_millis(started.elapsed());
             record_external_error(&mut report, assignment_process_launch_refusal(error));
+            return report;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(session) = grok_session.as_ref() {
+        if let Err(error) = session.authority.verify_binding_unchanged() {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_grok_credential_environment_failure(&mut report, &error);
             return report;
         }
     }

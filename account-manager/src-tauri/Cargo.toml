@@ -1,17 +1,21 @@
+[workspace]
+members = ["."]
+resolver = "2"
+
 [package]
-name = "coding-agent-manager"
+name = "coding-agent-manager-desktop"
 version = "0.1.0"
-description = "Unified account, credential, and quota manager for AI coding agents."
+description = "Desktop shell for the Coding Agent Manager."
 authors = ["Meta-Develop"]
 license = "GPL-3.0-or-later"
 repository = "https://github.com/Meta-Develop/Coding-Agent-Manager"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 
 [lib]
 # The `_lib` suffix keeps the desktop binary and the library target from
 # colliding on Windows. See https://v2.tauri.app/
-name = "coding_agent_manager_lib"
+name = "coding_agent_manager_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [[bin]]
@@ -19,73 +23,18 @@ name = "coding-agent-manager"
 path = "src/main.rs"
 required-features = ["desktop"]
 
-# Keep the application's lockfile and build profiles independent of MACO.
-[workspace]
-
 [build-dependencies]
 tauri-build = { version = "2", features = [], optional = true }
 
 [dependencies]
+coding_agent_manager_core = { package = "coding-agent-manager", path = "../core", version = "0.1.0", default-features = false }
 tauri = { version = "2", features = [], optional = true }
 tauri-plugin-opener = { version = "2", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-directories = "6"
-# Zeroes secret material on drop; `Secret` needs a real implementation (ADR 0003).
-# `zeroize_derive` is spelled out because `Secret`'s zeroing guarantee is a
-# derive, and relying on another crate's feature to supply it breaks on every
-# platform where that crate's Linux-only backend is inactive.
-zeroize = { version = "1.8", features = ["zeroize_derive"] }
-# OS credential service: macOS Keychain, Windows Credential Manager, Secret Service.
-# Every feature below is target-gated inside `keyring`, so one entry serves all
-# three CI platforms: on Linux only `sync-secret-service` and `crypto-rust` have
-# any effect, on macOS only `apple-native`, on Windows only `windows-native`.
-keyring = { version = "3", features = [
-  "apple-native",
-  "windows-native",
-  "sync-secret-service",
-  "crypto-rust",
-] }
-# Derives the encrypted-file fallback store's key from a user passphrase (ADR 0003).
-# Default features carry `password-hash/rand_core`, which supplies the salt, so no
-# separate random-number crate is needed.
-argon2 = { version = "0.5", features = ["std"] }
-# AEAD for the encrypted-file fallback store. `getrandom` (a default feature)
-# supplies keys and nonces; `zeroize` wipes the cipher state after use.
-chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
-# Encodes the binary fields of the encrypted-file JSON envelope. Held at 0.22 to
-# match the version `keyring` already pulls in rather than adding a second copy.
-base64 = "0.22"
-# CSRF state for in-app Gemini Google OAuth. Already compiled in via
-# `chacha20poly1305`; this listing makes the crate usable without adding a
-# new dependency family.
-getrandom = "0.2"
-# Already in the tree via password-hash; this adds no new compiled code.
-subtle = "2"
-# RFC 7636 S256 PKCE. This version is already present in the application lockfile.
-sha2 = "0.10.9"
-# RFC 3339 timestamps: backup file names (NFR-4) and `QuotaSnapshot.captured_at`.
+# RFC 3339 validation at the IPC boundary (`commands::is_rfc3339`); same pin as core.
 time = { version = "0.3", features = ["formatting", "parsing"] }
-# Relay HTTP boundary. Feature-minimal: HTTP/1 is what the loopback coding-agent
-# clients use, and request bodies are handled directly rather than via extractors.
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
-# Upstream client with platform-verified TLS and byte streaming. Redirects are
-# disabled in code so an authorization header cannot follow an upstream redirect.
-reqwest = { version = "0.13", default-features = false, features = ["form", "json", "rustls", "stream"] }
-# Listener lifecycle, graceful shutdown, and the application-wide relay mutex.
-# `io-util` is the Gemini OAuth loopback read/write path.
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
-# Adapts Reqwest response chunks into Axum bodies without buffering a stream.
-futures-util = { version = "0.3", default-features = false, features = ["async-await", "std"] }
-# Grok's vendor lock contract is a real non-blocking advisory file lock. Rust
-# 1.88 does not yet provide the stable std file-lock API, so use the same small
-# cross-platform primitive as the pinned vendor source.
-fs2 = "0.4"
-
-[target."cfg(windows)".dependencies]
-# Stable file-handle identity for replacement-race checks on Windows.
-same-file = "1.0.6"
 
 [dev-dependencies]
 tempfile = "3"
@@ -93,7 +42,6 @@ tempfile = "3"
 [features]
 default = ["desktop"]
 desktop = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-opener"]
-# Tauri's packaged desktop protocol still enables the desktop application.
 custom-protocol = ["desktop", "tauri/custom-protocol"]
 
 [profile.release]
