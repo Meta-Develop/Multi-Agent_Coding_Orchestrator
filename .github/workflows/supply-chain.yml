@@ -3,6 +3,8 @@ name: Supply-chain policy
 on:
   pull_request:
   push:
+    paths-ignore:
+      - maco-coordination.json
   schedule:
     - cron: "17 3 * * 1"
   workflow_dispatch:
