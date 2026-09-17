@@ -1033,7 +1033,20 @@ fn run_messaging_session_uses_exact_direct_and_broadcast_assignment_identities()
     let metadata = SupervisorPlanMetadata::default();
     messaging_bridge::initialize_supervisor_messaging_session(&mut writer, &plan, &metadata)
         .expect("initialize run messaging session");
+    assert!(
+        run_directory
+            .join(messaging_bridge::MESSAGING_SESSION_DESCRIPTOR_NAME)
+            .is_file(),
+        "production messaging init must manifest only the signed session descriptor"
+    );
+    assert!(
+        !run_directory.join("messaging.jsonl").exists(),
+        "live broker journals must not be written into the run artifact directory"
+    );
 
+    let resume_binding = writer
+        .resume_binding()
+        .expect("capture manifest binding before broker traffic");
     let (direct, broadcast) =
         messaging_bridge::with_supervisor_messaging_session(&run_directory, |factory| {
             let coordinator = factory.capability_for("child-a")?;
@@ -1050,6 +1063,9 @@ fn run_messaging_session_uses_exact_direct_and_broadcast_assignment_identities()
             Ok((direct, broadcast))
         })
         .expect("exercise run messaging identities");
+    drop(writer);
+    ArtifactRunWriter::reopen_unfinalized(&repo_path, &resume_binding)
+        .expect("broker appends must not invalidate the authenticated run manifest");
 
     assert_eq!(direct.sender_id, "child-a");
     assert_eq!(direct.address.identifier(), "worker-a");
@@ -1086,33 +1102,62 @@ fn run_messaging_session_recovers_without_regrant_and_refuses_role_mismatch() {
     messaging_bridge::initialize_supervisor_messaging_session(&mut writer, &plan, &metadata)
         .expect("initialize resumable messaging session");
 
-    let (broker_instance_id, message_id, original_capability) =
+    let (broker_instance_id, message_id, original_capability, durable_store) =
         messaging_bridge::with_supervisor_messaging_session(&run_directory, |factory| {
             let coordinator = factory.capability_for("child-a")?;
             let mut broker = factory.open_or_create()?;
             let broker_instance_id = broker.broker_instance_id().to_string();
             let message = broker.send_direct(&coordinator, "worker-a", "resume-me")?;
-            Ok((broker_instance_id, message.id, coordinator))
+            let worker = factory.capability_for("worker-a")?;
+            let first_delivery = broker
+                .receive_next(&worker)?
+                .context("first delivery before the simulated crash is missing")?;
+            assert_eq!(first_delivery.id, message.id);
+            Ok((
+                broker_instance_id,
+                message.id,
+                coordinator,
+                factory.durable_store_path().to_path_buf(),
+            ))
         })
         .expect("send resumable run message");
 
+    messaging_bridge::forget_supervisor_messaging_session_for_test(&run_directory)
+        .expect("simulate fresh process without the in-memory factory");
     messaging_bridge::recover_supervisor_messaging_session(&run_directory)
-        .expect("reopen and replay run messaging journal");
+        .expect("reopen and replay durable messaging journal from the session descriptor");
     messaging_bridge::with_supervisor_messaging_session(&run_directory, |factory| {
         assert_eq!(factory.capability_for("child-a")?, original_capability);
         let worker = factory.capability_for("worker-a")?;
         let mut broker = factory.open_or_create()?;
         assert_eq!(broker.broker_instance_id(), broker_instance_id);
-        assert_eq!(
-            broker
-                .receive_next(&worker)?
-                .context("recovered run message is missing")?
-                .id,
-            message_id
+        let redelivered = broker
+            .receive_next(&worker)?
+            .context("recovered run message is missing")?;
+        assert_eq!(redelivered.id, message_id);
+        broker.acknowledge(&worker, &message_id)?;
+        assert!(
+            broker.receive_next(&worker)?.is_none(),
+            "acknowledged direct messages must not redeliver in-process"
         );
         Ok(())
     })
-    .expect("receive recovered run message with original capability set");
+    .expect("receive recovered run message with re-derived credentials");
+
+    messaging_bridge::forget_supervisor_messaging_session_for_test(&run_directory)
+        .expect("simulate a second fresh process after acknowledgement");
+    messaging_bridge::recover_supervisor_messaging_session(&run_directory)
+        .expect("reopen durable journal after acknowledgement");
+    messaging_bridge::with_supervisor_messaging_session(&run_directory, |factory| {
+        let worker = factory.capability_for("worker-a")?;
+        let mut broker = factory.open_or_create()?;
+        assert!(
+            broker.receive_next(&worker)?.is_none(),
+            "acknowledged direct messages must not redeliver after durable replay"
+        );
+        Ok(())
+    })
+    .expect("verify durable acknowledgement survived recovery");
 
     let mut mismatched = plan;
     mismatched.assignments[0].role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
@@ -1122,12 +1167,120 @@ fn run_messaging_session_recovers_without_regrant_and_refuses_role_mismatch() {
         &metadata,
     )
     .expect_err("role-changing resume must be refused");
-    assert!(format!("{error:#}").contains("differs from the originally admitted identity set"));
+    let refusal = format!("{error:#}");
+    assert!(
+        refusal.contains("differs from the originally admitted identity set")
+            || refusal.contains("authority"),
+        "unexpected role refusal: {refusal}"
+    );
     messaging_bridge::with_supervisor_messaging_session(&run_directory, |factory| {
         assert_eq!(factory.capability_for("child-a")?, original_capability);
+        assert_eq!(factory.durable_store_path(), durable_store.as_path());
         Ok(())
     })
     .expect("role refusal must preserve the original capability");
+}
+
+#[test]
+fn run_messaging_session_refuses_tampered_descriptor_and_missing_durable_journal() {
+    let (_temp, repo_path) = injected_repository();
+    let run_id = RunId::new("artifact-messaging-durable-refusals").expect("valid run id");
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        run_id.clone(),
+        "supervise-test",
+    )
+    .expect("reserve durable messaging refusal fixture");
+    let run_directory = writer.run_dir().to_path_buf();
+    let plan = injected_plan(injected_assignment(true), 0);
+    let metadata = messaging_plan_metadata(&plan);
+    messaging_bridge::initialize_supervisor_messaging_session(&mut writer, &plan, &metadata)
+        .expect("initialize durable messaging refusal fixture");
+
+    let descriptor_path = run_directory.join(messaging_bridge::MESSAGING_SESSION_DESCRIPTOR_NAME);
+    let tampered_path = descriptor_path.clone();
+    fs::write(&tampered_path, b"{}\n").expect("tamper messaging session descriptor");
+    messaging_bridge::forget_supervisor_messaging_session_for_test(&run_directory)
+        .expect("drop in-memory factory before tamper recovery");
+    let tampered_error = messaging_bridge::recover_supervisor_messaging_session(&run_directory)
+        .err()
+        .expect("tampered messaging session descriptor must refuse recovery");
+    assert!(
+        format!("{tampered_error:#}").contains("descriptor")
+            || format!("{tampered_error:#}").contains("authentic")
+            || format!("{tampered_error:#}").contains("verify"),
+        "unexpected tamper refusal: {tampered_error:#}"
+    );
+
+    let missing_journal_id =
+        RunId::new("artifact-messaging-missing-journal").expect("valid missing journal run id");
+    let mut missing_writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        missing_journal_id,
+        "supervise-test",
+    )
+    .expect("reserve missing durable journal fixture");
+    let missing_directory = missing_writer.run_dir().to_path_buf();
+    messaging_bridge::initialize_supervisor_messaging_session(
+        &mut missing_writer,
+        &plan,
+        &metadata,
+    )
+    .expect("initialize missing journal fixture");
+    let durable_store =
+        messaging_bridge::with_supervisor_messaging_session(&missing_directory, |factory| {
+            Ok(factory.durable_store_path().to_path_buf())
+        })
+        .expect("capture durable store path");
+    messaging_bridge::forget_supervisor_messaging_session_for_test(&missing_directory)
+        .expect("drop in-memory factory before journal removal");
+    fs::remove_file(&durable_store).expect("remove durable messaging journal");
+    let missing_error = messaging_bridge::recover_supervisor_messaging_session(&missing_directory)
+        .err()
+        .expect("missing durable journal must refuse recovery");
+    assert!(
+        format!("{missing_error:#}").contains("open")
+            || format!("{missing_error:#}").contains("broker")
+            || format!("{missing_error:#}").contains("journal"),
+        "unexpected missing-journal refusal: {missing_error:#}"
+    );
+}
+
+#[test]
+fn legacy_run_messaging_session_refuses_recovery_without_memory_factory() {
+    let (_temp, repo_path) = injected_repository();
+    let run_id = RunId::new("artifact-messaging-legacy-refusal").expect("valid run id");
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        run_id,
+        "supervise-test",
+    )
+    .expect("reserve legacy messaging artifact run");
+    let run_directory = writer.run_dir().to_path_buf();
+    let plan = injected_plan(injected_assignment(true), 0);
+    let metadata = messaging_plan_metadata(&plan);
+    messaging_bridge::legacy_initialize_supervisor_messaging_session_for_test(
+        &mut writer,
+        &plan,
+        &metadata,
+    )
+    .expect("initialize legacy artifact messaging session");
+    assert!(
+        run_directory.join("messaging.jsonl").is_file(),
+        "legacy fixture must manifest the broker journal into the run artifact directory"
+    );
+    messaging_bridge::forget_supervisor_messaging_session_for_test(&run_directory)
+        .expect("simulate legacy credential loss");
+    let error = messaging_bridge::recover_supervisor_messaging_session(&run_directory)
+        .err()
+        .expect("legacy journal without durable descriptor must refuse recovery");
+    assert!(
+        format!("{error:#}").contains("memory-resident credentials are unavailable"),
+        "unexpected legacy refusal: {error:#}"
+    );
 }
 
 #[test]
@@ -1154,16 +1307,30 @@ fn fake_supervise_run_manifests_creation_only_messaging_artifacts() {
 
     let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
         .expect("open finalized messaging artifact run");
-    let journal = reader
-        .read("messaging.jsonl")
-        .expect("read authenticated messaging journal");
     reader
-        .read("messaging.jsonl.tail-anchor")
-        .expect("read authenticated messaging tail anchor");
-    let journal_text = std::str::from_utf8(&journal).expect("messaging journal is UTF-8");
+        .read(messaging_bridge::MESSAGING_SESSION_DESCRIPTOR_NAME)
+        .expect("read authenticated messaging session descriptor");
+    assert!(
+        reader.read("messaging.jsonl").is_err(),
+        "live broker journals must not be manifested in production runs"
+    );
+    assert!(
+        reader.read("messaging.jsonl.tail-anchor").is_err(),
+        "tail anchors must not be manifested in production runs"
+    );
+    let run_directory = repo_path
+        .join(RunArtifactFamily::Supervise.run_root())
+        .join(run_id.as_str());
+    let journal_text =
+        messaging_bridge::with_supervisor_messaging_session(&run_directory, |factory| {
+            let journal = fs::read_to_string(factory.durable_store_path())
+                .context("read durable messaging journal from state namespace")?;
+            Ok(journal)
+        })
+        .expect("inspect durable messaging journal after fake supervise run");
     assert_eq!(journal_text.lines().count(), 1);
     let created: serde_json::Value =
-        serde_json::from_slice(&journal).expect("decode messaging creation record");
+        serde_json::from_str(&journal_text).expect("decode messaging creation record");
     assert_eq!(created["event"]["event"], "created");
     assert_eq!(
         created["event"]["authority_binding"]["child-a"],
@@ -2349,10 +2516,16 @@ fn scheduler_crash_after_authenticated_report_plan_resumes_without_redispatch() 
     let run_root = repo
         .join(RunArtifactFamily::Supervise.run_root())
         .join(run_id.as_str());
-    let messaging_before = fs::read(run_root.join("messaging.jsonl"))
-        .expect("read messaging journal before scheduler resume");
-    let messaging_anchor_before = fs::read(run_root.join("messaging.jsonl.tail-anchor"))
-        .expect("read messaging anchor before scheduler resume");
+    assert!(
+        !run_root.join("messaging.jsonl").exists(),
+        "production scheduler resume must not write broker journals into the run artifact directory"
+    );
+    let durable_store = messaging_bridge::with_supervisor_messaging_session(&run_root, |factory| {
+        Ok(factory.durable_store_path().to_path_buf())
+    })
+    .expect("capture durable messaging store before scheduler resume");
+    let messaging_before =
+        fs::read(&durable_store).expect("read durable messaging journal before scheduler resume");
     let active_claims = SyncStore::open(&repo)
         .expect("open terminal-plan claim store")
         .snapshot()
@@ -2379,14 +2552,8 @@ fn scheduler_crash_after_authenticated_report_plan_resumes_without_redispatch() 
         .expect("snapshot claims after resumed release")
         .is_empty());
     assert_eq!(
-        fs::read(run_root.join("messaging.jsonl"))
-            .expect("read messaging journal after scheduler resume"),
+        fs::read(&durable_store).expect("read durable messaging journal after scheduler resume"),
         messaging_before
-    );
-    assert_eq!(
-        fs::read(run_root.join("messaging.jsonl.tail-anchor"))
-            .expect("read messaging anchor after scheduler resume"),
-        messaging_anchor_before
     );
     ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)
         .expect("scheduler resume finalizes the exact planned report");
