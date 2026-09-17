@@ -13,6 +13,7 @@
 //! Nothing below `commands` may depend on Tauri types, so the core stays
 //! testable without a webview and reusable from a future headless binary.
 
+pub mod account_authority;
 pub mod backup;
 #[cfg(feature = "desktop")]
 pub mod commands;

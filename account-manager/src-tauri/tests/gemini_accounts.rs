@@ -552,6 +552,7 @@ fn metadata(id: &str, state: StoredAccountState, provider_id: &str) -> StoredAcc
         state,
         material: StoredAccountMaterial::CredentialStore,
         is_selected: false,
+        account_incarnation: "0123456789abcdef0123456789abcdef".to_string(),
     }
 }
 
