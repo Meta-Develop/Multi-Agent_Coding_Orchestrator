@@ -85,6 +85,44 @@ pub(super) fn source_only_cascade_outcome(
     }
 }
 
+pub(super) struct ResolvedFollowUpCascadeOuterContext {
+    pub(super) outer_entrypoint: GeneratedFollowUpQueueEntrypoint,
+    pub(super) outer_command_run_id: RunId,
+}
+
+/// When a durable queue already exists, outer provenance must be taken from the
+/// authenticated journal snapshot, not from the resume operator's supervise run id.
+pub(super) fn resolve_follow_up_cascade_outer_context_for_resume(
+    repo: &Path,
+    source_report: &SupervisorFinalReport,
+    source_plan_sha256: &str,
+    supervise_outer_command_run_id: &RunId,
+) -> Result<ResolvedFollowUpCascadeOuterContext> {
+    let authenticator = repository_authenticator_key_only(repo)?;
+    if let Some(queue) = GeneratedFollowUpQueue::open_existing_for_source_execution(
+        authenticator,
+        source_report.run_id.as_str(),
+        source_plan_sha256,
+    )? {
+        let authenticated = queue.snapshot().source();
+        let outer_command_run_id =
+            RunId::new(authenticated.outer_command_run_id()).with_context(|| {
+                format!(
+                    "authenticated generated follow-up queue outer command run id {:?} is invalid",
+                    authenticated.outer_command_run_id()
+                )
+            })?;
+        return Ok(ResolvedFollowUpCascadeOuterContext {
+            outer_entrypoint: authenticated.outer_entrypoint(),
+            outer_command_run_id,
+        });
+    }
+    Ok(ResolvedFollowUpCascadeOuterContext {
+        outer_entrypoint: GeneratedFollowUpQueueEntrypoint::SuperviseRun,
+        outer_command_run_id: supervise_outer_command_run_id.clone(),
+    })
+}
+
 pub(super) fn ensure_generated_follow_up_cascade_needs_resume(
     repo: &Path,
     source_loaded: &LoadedSupervisorPlan,
