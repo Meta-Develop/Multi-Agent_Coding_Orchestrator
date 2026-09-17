@@ -6833,6 +6833,11 @@ mod decomposition_tests {
             depth: 1,
             flattened_index: 0,
         }];
+        initialize_child_dispatch_messaging_session(
+            &mut artifact_writer,
+            &plan,
+            &assignment_schedule,
+        );
         let field_guide = SupervisorFieldGuidePrompt::empty().expect("empty fixture field guide");
         let budget_ledger =
             RunBudgetLedger::new(RunBudgetLimits::default()).expect("fixture budget ledger");
@@ -7124,6 +7129,11 @@ mod decomposition_tests {
             depth: 1,
             flattened_index: 0,
         }];
+        initialize_child_dispatch_messaging_session(
+            &mut artifact_writer,
+            &plan,
+            &assignment_schedule,
+        );
         let field_guide = SupervisorFieldGuidePrompt::empty().expect("empty fixture field guide");
         let budget_ledger =
             RunBudgetLedger::new(RunBudgetLimits::default()).expect("fixture budget ledger");
