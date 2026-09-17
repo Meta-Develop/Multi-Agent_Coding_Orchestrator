@@ -1,0 +1,13 @@
+{
+  "$context": {
+    "source_model": "gemini-image-source",
+    "target_model": "gpt-image-target"
+  },
+  "$body": {
+    "contents": [{ "role": "user", "parts": [{ "text": "A blue square" }] }],
+    "generationConfig": {
+      "responseModalities": ["IMAGE"],
+      "imageConfig": { "aspectRatio": "1:1" }
+    }
+  }
+}

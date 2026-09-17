@@ -1,0 +1,16 @@
+{
+  "$response": {
+    "id": "FAKE-response-openai-0002",
+    "object": "chat.completion",
+    "created": 1,
+    "model": "FAKE-openai-model",
+    "choices": [
+      {
+        "index": 0,
+        "message": { "role": "assistant", "content": "Hello" },
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": { "prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5 }
+  }
+}

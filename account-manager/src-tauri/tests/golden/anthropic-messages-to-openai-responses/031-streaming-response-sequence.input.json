@@ -1,0 +1,37 @@
+{
+  "$stream": {
+    "from": "openai-responses",
+    "to": "anthropic-messages"
+  },
+  "$events": [
+    {
+      "event_name": "response.created",
+      "data": {
+        "type": "response.created",
+        "response": {
+          "id": "FAKE-stream-responses-anthropic",
+          "model": "FAKE-responses-model",
+          "created_at": 1,
+          "usage": { "input_tokens": 2, "output_tokens": 0, "total_tokens": 2 }
+        }
+      }
+    },
+    {
+      "event_name": "response.output_text.delta",
+      "data": {
+        "type": "response.output_text.delta",
+        "output_index": 0,
+        "delta": "Hello"
+      }
+    },
+    {
+      "event_name": "response.completed",
+      "data": {
+        "type": "response.completed",
+        "response": {
+          "usage": { "input_tokens": 2, "output_tokens": 3, "total_tokens": 5 }
+        }
+      }
+    }
+  ]
+}

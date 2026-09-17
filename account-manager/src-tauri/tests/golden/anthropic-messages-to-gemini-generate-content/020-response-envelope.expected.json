@@ -1,0 +1,16 @@
+{
+  "responseId": "FAKE-response-anthropic-0002",
+  "modelVersion": "FAKE-anthropic-model",
+  "candidates": [
+    {
+      "index": 0,
+      "content": { "role": "model", "parts": [{ "text": "Hello" }] },
+      "finishReason": "STOP"
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 2,
+    "candidatesTokenCount": 3,
+    "totalTokenCount": 5
+  }
+}

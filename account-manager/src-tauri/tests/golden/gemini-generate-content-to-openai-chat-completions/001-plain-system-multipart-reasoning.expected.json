@@ -1,0 +1,22 @@
+{
+  "body": {
+    "model": "chat-target",
+    "max_completion_tokens": 512,
+    "reasoning_effort": "medium",
+    "messages": [
+      { "role": "system", "content": "Be exact." },
+      {
+        "role": "user",
+        "content": [
+          { "type": "text", "text": "Describe" },
+          {
+            "type": "image_url",
+            "image_url": { "url": "data:image/png;base64,FAKE-image-0004" }
+          }
+        ]
+      }
+    ]
+  },
+  "target_model": null,
+  "stream": false
+}

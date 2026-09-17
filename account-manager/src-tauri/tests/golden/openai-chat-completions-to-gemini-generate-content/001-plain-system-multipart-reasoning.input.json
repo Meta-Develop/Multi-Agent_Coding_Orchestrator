@@ -1,0 +1,21 @@
+{
+  "$context": { "target_model": "gemini-target" },
+  "$body": {
+    "model": "chat-source",
+    "max_completion_tokens": 256,
+    "reasoning_effort": "high",
+    "messages": [
+      { "role": "system", "content": "Be concise." },
+      {
+        "role": "user",
+        "content": [
+          { "type": "text", "text": "Describe" },
+          {
+            "type": "image_url",
+            "image_url": { "url": "data:image/png;base64,FAKE-image-0003" }
+          }
+        ]
+      }
+    ]
+  }
+}

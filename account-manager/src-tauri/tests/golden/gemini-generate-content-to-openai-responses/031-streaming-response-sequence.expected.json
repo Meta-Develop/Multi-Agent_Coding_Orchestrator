@@ -1,0 +1,31 @@
+[
+  {
+    "event_name": null,
+    "data": {
+      "responseId": "FAKE-stream-responses-gemini",
+      "modelVersion": "FAKE-responses-model",
+      "candidates": [
+        {
+          "index": 0,
+          "content": { "role": "model", "parts": [{ "text": "Hello" }] }
+        }
+      ]
+    },
+    "terminal": false
+  },
+  {
+    "event_name": null,
+    "data": {
+      "responseId": "FAKE-stream-responses-gemini",
+      "modelVersion": "FAKE-responses-model",
+      "candidates": [{ "index": 0, "finishReason": "STOP" }],
+      "usageMetadata": {
+        "promptTokenCount": 2,
+        "candidatesTokenCount": 3,
+        "totalTokenCount": 5
+      }
+    },
+    "terminal": false
+  },
+  { "event_name": null, "data": null, "terminal": true }
+]

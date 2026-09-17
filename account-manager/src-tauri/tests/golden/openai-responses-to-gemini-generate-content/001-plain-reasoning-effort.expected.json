@@ -1,0 +1,11 @@
+{
+  "body": {
+    "contents": [{ "role": "user", "parts": [{ "text": "Hello" }] }],
+    "generationConfig": {
+      "maxOutputTokens": 256,
+      "thinkingConfig": { "thinkingLevel": "LOW" }
+    }
+  },
+  "target_model": "gemini-target",
+  "stream": false
+}

@@ -1,0 +1,23 @@
+{
+  "model": "gpt-4o",
+  "max_tokens": 256,
+  "parallel_tool_calls": false,
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "lookup_account",
+        "description": "Look up an account by id.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "account_id": { "type": "string" }
+          },
+          "required": ["account_id"]
+        }
+      }
+    }
+  ],
+  "tool_choice": "none",
+  "messages": [{ "role": "user", "content": "Look up FAKE-account-0001" }]
+}

@@ -1,0 +1,70 @@
+name: New provider
+description: Propose support for another AI coding agent
+labels: [provider, enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A provider adapter starts with research, not code. This issue is where
+        that research is gathered. See
+        [docs/research/README.md](https://github.com/Meta-Develop/Coding-Agent-Manager/blob/main/docs/research/README.md)
+        for the confidence markers and the redaction rules.
+
+        **Never paste a real credential or the raw contents of a credential file.**
+
+  - type: input
+    id: tool
+    attributes:
+      label: Tool name and vendor
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version you inspected
+    validations:
+      required: true
+
+  - type: textarea
+    id: config-paths
+    attributes:
+      label: Config and credential locations
+      description: Per OS where you know them. Add a confidence marker to each claim.
+      placeholder: |
+        ~/.example/auth.json        credentials      [verified-local]
+        ~/.example/config.toml      settings         [verified-local]
+        %APPDATA%\example\          Windows          [unknown]
+    validations:
+      required: true
+
+  - type: textarea
+    id: credential-shape
+    attributes:
+      label: Credential structure
+      description: Key names only. Replace every value with `<redacted>`.
+      render: json
+
+  - type: textarea
+    id: switching
+    attributes:
+      label: What would a switch have to change?
+      description: Files, environment variables, keychain entries, caches to invalidate.
+
+  - type: textarea
+    id: quota
+    attributes:
+      label: Quota or usage signals
+
+  - type: input
+    id: base-url
+    attributes:
+      label: Does it honour a base-URL override?
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmation
+      options:
+        - label: This report contains no credential value, email address, or account identifier.
+          required: true
