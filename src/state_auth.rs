@@ -29,7 +29,7 @@ const AUTH_KEY_BYTES: usize = 32;
 const AUTH_EPOCH_BYTES: usize = 32;
 const AUTH_BINDING_VERSION: u32 = 1;
 const MAX_AUTH_DOMAIN_BYTES: usize = 256;
-const MAX_AUTH_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_AUTH_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const AUTH_FRAME_MAGIC: &[u8] = b"MACO\0repository-auth\0hmac-sha256\0v1\0";
 const LEGACY_ARTIFACT_DOMAIN: &[u8] = b"MACO\0artifact-finalization\0hmac-sha256\0v2\0";
 
@@ -88,6 +88,11 @@ const AUTHENTICATED_STATE_CONSUMERS: &[AuthenticatedStateConsumerSource] = &[
         root_name: GENERATED_FOLLOW_UP_QUEUE_ROOT_NAME,
         state_root_lock_names: &[GENERATED_FOLLOW_UP_QUEUE_ROOT_LOCK],
         description: "authenticated generated follow-up queues",
+    },
+    AuthenticatedStateConsumerSource {
+        root_name: "supervisor-messaging-v1",
+        state_root_lock_names: &[".supervisor-messaging.lock"],
+        description: "authenticated supervisor messaging journals",
     },
 ];
 
