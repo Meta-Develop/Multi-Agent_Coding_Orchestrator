@@ -1274,3 +1274,101 @@ fn safe_privacy() -> PrivacyScanResult {
         body_truncated: false,
     }
 }
+
+#[test]
+fn validate_candidate_repository_url_accepts_api_mixed_case_owner_and_name() {
+    let selector = "github.com/meta-develop/multi-agent_coding_orchestrator";
+    validate_candidate_repository_url(
+        InboxSourceProvider::Github,
+        Some("https://github.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/pull/444"),
+        selector,
+        InboxItemKind::PullRequest,
+        444,
+    )
+    .expect("GitHub html_url preserves owner/name casing");
+}
+
+#[test]
+fn validate_candidate_repository_url_rejects_adversarial_url_forms() {
+    let selector = "github.com/meta-develop/multi-agent_coding_orchestrator";
+    let reject = |url: &str, kind: InboxItemKind, number: u64| {
+        validate_candidate_repository_url(
+            InboxSourceProvider::Github,
+            Some(url),
+            selector,
+            kind,
+            number,
+        )
+        .is_err()
+    };
+    assert!(reject(
+        "https://github.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/issues/444",
+        InboxItemKind::PullRequest,
+        444
+    ));
+    assert!(reject(
+        "https://github.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/pull/444?ref=main",
+        InboxItemKind::PullRequest,
+        444
+    ));
+    assert!(reject(
+        "https://github.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/pull/444#discussion",
+        InboxItemKind::PullRequest,
+        444
+    ));
+    assert!(reject(
+        "https://user@github.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/pull/444",
+        InboxItemKind::PullRequest,
+        444
+    ));
+    assert!(reject(
+        "https://github.com:443/Meta-Develop/Multi-Agent_Coding_Orchestrator/pull/444",
+        InboxItemKind::PullRequest,
+        444
+    ));
+    assert!(reject(
+        "http://github.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/pull/444",
+        InboxItemKind::PullRequest,
+        444
+    ));
+    assert!(reject(
+        "https://github.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/pull/0444",
+        InboxItemKind::PullRequest,
+        444
+    ));
+    assert!(reject(
+        "https://github.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/pull/444/extra",
+        InboxItemKind::PullRequest,
+        444
+    ));
+    assert!(reject(
+        "https://github.com/Meta-Develop/Other-Repo/pull/444",
+        InboxItemKind::PullRequest,
+        444
+    ));
+    assert!(reject(
+        "https://github.com/Meta-Develop//Multi-Agent_Coding_Orchestrator/pull/444",
+        InboxItemKind::PullRequest,
+        444
+    ));
+    assert!(reject(
+        "https://github.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/pull/444/",
+        InboxItemKind::PullRequest,
+        444
+    ));
+    assert!(reject(
+        "https://github.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/PULL/444",
+        InboxItemKind::PullRequest,
+        444
+    ));
+    assert!(reject(
+        "https://github.com.evil.example/Meta-Develop/Multi-Agent_Coding_Orchestrator/pull/444",
+        InboxItemKind::PullRequest,
+        444
+    ));
+    assert!(reject(
+        "https://github.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/%70ull/444",
+        InboxItemKind::PullRequest,
+        444
+    ));
+}
