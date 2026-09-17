@@ -2085,6 +2085,13 @@ fn authenticated_github_actor(repo: &Path) -> Result<String, InboxApprovedGithub
                 "GitHub authentication token was malformed",
             )
         })?;
+        let config_path = directory.join("config.yml");
+        crate::merge::write_private_file(&config_path, b"version: 1\n").map_err(|_| {
+            InboxApprovedGithubActorError::new(
+                InboxApprovedGithubActorFailure::ActorUnavailable,
+                "authenticated GitHub actor configuration was unavailable",
+            )
+        })?;
         let hosts_path = directory.join("hosts.yml");
         let hosts =
             format!("'github.com':\n    oauth_token: '{token_text}'\n    git_protocol: https\n");
@@ -2141,6 +2148,7 @@ fn authenticated_github_actor(repo: &Path) -> Result<String, InboxApprovedGithub
             0,
             TrustedFixedNetworkProfile::read_write(&directory)
                 .with_resource_limits(ProcessResourceLimits::default())
+                .with_visible_read_only_file(&config_path)
                 .with_visible_read_only_file(&hosts_path),
         )
         .map_err(|_| {
