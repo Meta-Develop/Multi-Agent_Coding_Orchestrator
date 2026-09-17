@@ -293,6 +293,27 @@ arrive until then.
 
 "#;
 
+pub(crate) fn render_prompt_with_assignment_messaging_protocol_appendix(
+    prompt: String,
+) -> Result<String> {
+    let combined_len = prompt
+        .len()
+        .saturating_add(ASSIGNMENT_MESSAGING_PROTOCOL_PROMPT_APPENDIX.len());
+    if combined_len > MAX_PROMPT_BYTES {
+        bail!(
+            "assignment messaging protocol appendix would exceed the bounded prompt size ({} bytes)",
+            combined_len
+        );
+    }
+    let mut rendered = prompt;
+    rendered.push_str(ASSIGNMENT_MESSAGING_PROTOCOL_PROMPT_APPENDIX);
+    Ok(rendered)
+}
+
+fn prompt_includes_assignment_messaging_protocol_appendix(prompt: &[u8]) -> bool {
+    prompt.ends_with(ASSIGNMENT_MESSAGING_PROTOCOL_PROMPT_APPENDIX.as_bytes())
+}
+
 pub(crate) const WRITABLE_GROK_TERMINAL_WORKER_REQUIRED: &str =
     "writable_grok_terminal_worker_required";
 pub(crate) const WRITABLE_GROK_SELECTION_EVIDENCE_MISSING: &str =
@@ -1502,36 +1523,25 @@ impl ExternalAgentCommand {
         self.assignment_messaging_launch.as_ref()
     }
 
-    /// Appends static protocol instructions to the prompt file when messaging is bound.
-    pub(crate) fn append_assignment_messaging_protocol_instructions(&self) -> Result<()> {
+    /// Ensures the launch prompt already contains the static messaging appendix.
+    pub(crate) fn verify_assignment_messaging_protocol_instructions(&self) -> Result<()> {
         if self.assignment_messaging_launch.is_none() {
             return Ok(());
         }
         let existing = read_bounded_regular_file_nofollow(&self.prompt, MAX_PROMPT_BYTES)
             .with_context(|| {
                 format!(
-                    "failed to read prompt before assignment messaging appendix: {}",
+                    "failed to read manifested launch prompt for assignment messaging verification: {}",
                     self.prompt.display()
                 )
             })?;
-        let combined_len = existing
-            .len()
-            .saturating_add(ASSIGNMENT_MESSAGING_PROTOCOL_PROMPT_APPENDIX.len());
-        if combined_len > MAX_PROMPT_BYTES {
-            bail!(
-                "assignment messaging protocol appendix would exceed the bounded prompt size for {}",
-                self.prompt.display()
-            );
+        if prompt_includes_assignment_messaging_protocol_appendix(&existing) {
+            return Ok(());
         }
-        let mut updated = existing;
-        updated.extend_from_slice(ASSIGNMENT_MESSAGING_PROTOCOL_PROMPT_APPENDIX.as_bytes());
-        fs::write(&self.prompt, &updated).with_context(|| {
-            format!(
-                "failed to append assignment messaging protocol instructions to {}",
-                self.prompt.display()
-            )
-        })?;
-        Ok(())
+        bail!(
+            "manifested launch prompt is missing assignment messaging protocol appendix at {}",
+            self.prompt.display()
+        );
     }
 }
 

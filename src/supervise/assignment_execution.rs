@@ -1702,6 +1702,13 @@ fn prepare_child_attempt<'a>(
         Some(ChildAttemptCorrection::Gate(denial)) => prompt_with_gate_correction(&prompt, denial)?,
         None => prompt,
     };
+    let attempt_prompt = if launch_runtime_binds_assignment_messaging(launch_runtime) {
+        crate::external_agent::render_prompt_with_assignment_messaging_protocol_appendix(
+            attempt_prompt,
+        )?
+    } else {
+        attempt_prompt
+    };
     measurements.record_final_launch_prompt_bytes(&attempt_prompt)?;
     let prompt_relative = dirs.relative(&attempt_artifacts.prompt_path)?;
     let measurements_relative = prompt_measurements_relative(&prompt_relative);
@@ -2119,6 +2126,17 @@ struct ManagedChildMaterializationGate {
     external_side_effect_absent: bool,
 }
 
+fn launch_runtime_binds_assignment_messaging(runtime: SupervisorRuntime) -> bool {
+    matches!(
+        runtime,
+        SupervisorRuntime::Codex
+            | SupervisorRuntime::Grok
+            | SupervisorRuntime::Cursor
+            | SupervisorRuntime::ClaudeCode
+            | SupervisorRuntime::GeminiCli
+    )
+}
+
 fn bind_assignment_messaging_for_external_child_launch(
     context: &AssignmentExecutionContext<'_, '_>,
     task_id: &str,
@@ -2133,7 +2151,7 @@ fn bind_assignment_messaging_for_external_child_launch(
         task_id,
     )?;
     *command = command.clone().with_assignment_messaging(server.launch());
-    command.append_assignment_messaging_protocol_instructions()?;
+    command.verify_assignment_messaging_protocol_instructions()?;
     Ok(server)
 }
 

@@ -1118,7 +1118,9 @@ fn assignment_messaging_ipc_acceptance(
     let prompt = worktree_root.join("prompt.md");
     fs::write(
         &prompt,
-        "Exercise assignment messaging from a confined Grok child.\n",
+        crate::external_agent::render_prompt_with_assignment_messaging_protocol_appendix(
+            "Exercise assignment messaging from a confined Grok child.\n".to_string(),
+        )?,
     )?;
     let authenticated_claims = sync_store.snapshot()?;
     let grok_assignment = MessagingAdmittedGrokWorkerAssignment {
@@ -1142,7 +1144,6 @@ fn assignment_messaging_ipc_acceptance(
     };
     let (mut command, grok_admission_binding) =
         build_admitted_grok_worker_command(&grok_assignment, &grok_paths)?;
-    command.append_assignment_messaging_protocol_instructions()?;
 
     let result_first = probe_result_path(&worktree_root, "first-receive");
     let first_probe = MessagingGrokChildProbeFixture {
