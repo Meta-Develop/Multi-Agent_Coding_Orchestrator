@@ -1,3 +1,13 @@
+pub mod coordination_admission;
+pub mod coordination_effect;
+pub mod coordination_github;
+pub mod coordination_journal;
+mod coordination_provider;
+mod coordination_publication;
+use self::coordination_publication::{
+    PublicationCoordinationAdmission, PublicationCoordinationBundle, PublicationCoordinationGuard,
+};
+pub mod coordination_mode;
 pub mod forge_coordination;
 pub mod forge_transport;
 mod github_review_observation;
@@ -1381,7 +1391,7 @@ pub(crate) struct GithubPullRequestMergeGroundTruth {
     pub(crate) same_repository_head: bool,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct GithubApiActor {
     node_id: String,
     login: String,
@@ -1907,6 +1917,77 @@ impl GhCommandContext {
         redact_private_bytes(&mut output.stdout, &self.token.basic);
         redact_private_bytes(&mut output.stderr, &self.token.basic);
         Ok(output)
+    }
+
+    /// Run one finite coordination-journal GitHub operation with the same
+    /// authenticated capture/redaction path as other publication gh effects.
+    pub(crate) fn run_coordination_github(
+        mut self,
+        label: &str,
+        args: Vec<OsString>,
+        stdin: StdinMode,
+        approved_mutation: bool,
+    ) -> Result<merge::RequiredCommandOutput> {
+        let execution = (|| {
+            let actor_binding = if approved_mutation {
+                let binding = capture_approved_github_actor_binding(&self.source_config_path)?;
+                let actual = self.authenticated_github_actor()?;
+                if actual != binding.login {
+                    bail!(
+                        "authenticated GitHub actor does not exactly match the approved repository login"
+                    );
+                }
+                verify_private_config_files(std::slice::from_ref(&binding.source_config)).context(
+                    "repository-local approved GitHub login changed after actor verification",
+                )?;
+                Some(binding)
+            } else {
+                None
+            };
+            self.runtime_directory
+                .verify_identity()
+                .context("private gh runtime changed before coordination journal operation")?;
+            verify_private_config_files(&self.config_files)?;
+            validate_gh_environment(&self.environment, self.runtime_directory.path())?;
+            let output = merge::run_required_network_direct(
+                label,
+                merge::resolve_trusted_executable("gh")?,
+                args,
+                self.runtime_directory.path(),
+                self.environment.clone(),
+                stdin,
+                merge::NETWORK_PROCESS_TIMEOUT,
+                GH_CAPTURE_LIMIT_BYTES,
+                GH_STDIN_LIMIT_BYTES,
+                self.profile.clone(),
+            )
+            .map_err(|error| {
+                let mut message = format!("{error:#}");
+                for private in [self.token.as_str(), self.token.basic_str()]
+                    .into_iter()
+                    .flatten()
+                {
+                    message = message.replace(private, "<redacted:network-token>");
+                }
+                anyhow::anyhow!(message)
+            })?;
+            self.runtime_directory
+                .verify_identity()
+                .context("private gh runtime changed during coordination journal operation")?;
+            verify_private_config_files(&self.config_files)?;
+            if let Some(binding) = &actor_binding {
+                verify_private_config_files(std::slice::from_ref(&binding.source_config)).context(
+                    "repository-local approved GitHub login changed during coordination journal operation",
+                )?;
+            }
+            let mut output = output;
+            redact_private_bytes(&mut output.stdout, &self.token.bytes);
+            redact_private_bytes(&mut output.stderr, &self.token.bytes);
+            redact_private_bytes(&mut output.stdout, &self.token.basic);
+            redact_private_bytes(&mut output.stderr, &self.token.basic);
+            Ok(output)
+        })();
+        self.finish(execution)
     }
 }
 
@@ -3406,7 +3487,7 @@ struct PublicationTransactionJournal {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct GithubRepositoryIdentity {
+pub(crate) struct GithubRepositoryIdentity {
     host: String,
     owner: String,
     name: String,
@@ -3452,7 +3533,7 @@ pub(crate) fn validate_github_source_repository_binding(host: &str, selector: &s
     Ok(())
 }
 
-struct PublicationTransaction {
+pub(crate) struct PublicationTransaction {
     directory: PathBuf,
     journal: PublicationTransactionJournal,
     remote_url: String,
@@ -3763,7 +3844,7 @@ pub struct IssuePublicationReport {
 }
 
 #[derive(Debug, Clone)]
-struct GithubPrResult {
+pub(crate) struct GithubPrResult {
     url: String,
     head_oid: String,
     base_oid: String,
@@ -3811,6 +3892,7 @@ trait GithubApi {
         body: &str,
         draft: bool,
         repository: &GithubRepositoryIdentity,
+        process_cancellation: Option<&crate::process_runner::ProcessCancellation>,
     ) -> Result<GithubCreateOutput>;
 }
 
@@ -3844,8 +3926,18 @@ impl GithubApi for CliGithubApi {
         body: &str,
         draft: bool,
         repository: &GithubRepositoryIdentity,
+        process_cancellation: Option<&crate::process_runner::ProcessCancellation>,
     ) -> Result<GithubCreateOutput> {
-        cli_github_pr_create(worktree_path, branch, base, title, body, draft, repository)
+        cli_github_pr_create(CliGithubPrCreateRequest {
+            worktree_path,
+            branch,
+            base,
+            title,
+            body,
+            draft,
+            repository,
+            process_cancellation,
+        })
     }
 }
 
@@ -5165,6 +5257,18 @@ fn block_excluded_reference_if_needed(
     )
 }
 
+fn block_publication_coordination_admission(
+    report: PrPublicationReport,
+    error: anyhow::Error,
+) -> PrPublicationReport {
+    block_publication(
+        report,
+        ApplyBlocker::PrimaryStateChanged,
+        &format!("remote coordination publication admission failed: {error:#}"),
+        "resolve remote coordination admission, then rerun the same pr publish command",
+    )
+}
+
 fn complete_pr_publication_effects(
     mut report: PrPublicationReport,
     repo_root: &Path,
@@ -5172,6 +5276,22 @@ fn complete_pr_publication_effects(
     raw_remote_url: Option<String>,
     source_guard: Option<ExternalSourceGuard>,
 ) -> Result<PrPublicationReport> {
+    let coordination = if matches!(report.forge, ForgeKind::Fake) {
+        PublicationCoordinationAdmission::LocalOnly
+    } else {
+        match PublicationCoordinationAdmission::establish(
+            repo_root,
+            &report.agent_id,
+            &report.changed_paths,
+            None,
+        ) {
+            Ok(admission) => admission,
+            Err(error) => {
+                return Ok(block_publication_coordination_admission(report, error));
+            }
+        }
+    };
+    let mut coordination_guard = PublicationCoordinationGuard::new(coordination);
     match report.forge {
         ForgeKind::Fake => {
             report.pr_url = Some(fake_pr_url(
@@ -5191,7 +5311,8 @@ fn complete_pr_publication_effects(
             let remote_url = raw_remote_url
                 .as_deref()
                 .context("Git publication report has no origin URL")?;
-            let mut transaction = PublicationTransaction::open(
+            let mut bundle = PublicationCoordinationBundle::open(
+                coordination_guard.take_admission(),
                 repo_root,
                 &report,
                 "origin",
@@ -5199,29 +5320,31 @@ fn complete_pr_publication_effects(
                 &expected_head,
                 source_guard.clone(),
             )?;
-            report.publication_receipt = Some(transaction.receipt());
-            if let Err(error) = ensure_remote_expected_commit(worktree_path, &mut transaction) {
-                return Ok(publication_transaction_failure(
-                    report,
-                    &mut transaction,
-                    error,
-                ));
+            report.publication_receipt = Some(bundle.transaction.receipt());
+            if let Err(error) = ensure_remote_expected_commit_for_bundle(worktree_path, &mut bundle)
+            {
+                let report =
+                    publication_transaction_failure(report, &mut bundle.transaction, error);
+                coordination_guard.restore_admission(bundle.coordination);
+                return Ok(report);
             }
             report.pushed = true;
             report.created = false;
             report.pr_url = None;
             report.next_action = "open a pull request on your Git host manually".to_string();
-            let previous = transaction.journal.clone();
-            transaction.advance_phase(PublicationTransactionPhase::Completed);
-            transaction.journal.last_error = None;
-            if let Err(error) = transaction.persist_if_changed(&previous) {
-                return Ok(publication_transaction_failure(
-                    report,
-                    &mut transaction,
-                    error,
-                ));
+            let previous = bundle.transaction.journal.clone();
+            bundle
+                .transaction
+                .advance_phase(PublicationTransactionPhase::Completed);
+            bundle.transaction.journal.last_error = None;
+            if let Err(error) = bundle.transaction.persist_if_changed(&previous) {
+                let report =
+                    publication_transaction_failure(report, &mut bundle.transaction, error);
+                coordination_guard.restore_admission(bundle.coordination);
+                return Ok(report);
             }
-            report.publication_receipt = Some(transaction.receipt());
+            report.publication_receipt = Some(bundle.transaction.receipt());
+            coordination_guard.restore_admission(bundle.coordination);
         }
         ForgeKind::Github => {
             let expected_head = report
@@ -5235,7 +5358,8 @@ fn complete_pr_publication_effects(
             publication_remote_transport(remote_url)?;
             merge::resolve_trusted_executable("gh")
                 .context("GitHub publication requires a trusted gh executable")?;
-            let mut transaction = PublicationTransaction::open(
+            let mut bundle = PublicationCoordinationBundle::open(
+                coordination_guard.take_admission(),
                 repo_root,
                 &report,
                 "origin",
@@ -5243,47 +5367,48 @@ fn complete_pr_publication_effects(
                 &expected_head,
                 source_guard.clone(),
             )?;
-            report.publication_receipt = Some(transaction.receipt());
+            report.publication_receipt = Some(bundle.transaction.receipt());
             if let Err(error) =
-                ensure_github_remote_expected_commit(worktree_path, &mut transaction)
+                ensure_github_remote_expected_commit_for_bundle(worktree_path, &mut bundle)
             {
-                return Ok(publication_transaction_failure(
-                    report,
-                    &mut transaction,
-                    error,
-                ));
+                let report =
+                    publication_transaction_failure(report, &mut bundle.transaction, error);
+                coordination_guard.restore_admission(bundle.coordination);
+                return Ok(report);
             }
             report.pushed = true;
-            report.publication_receipt = Some(transaction.receipt());
-            let github = match reconcile_github_pr(worktree_path, &mut transaction) {
+            report.publication_receipt = Some(bundle.transaction.receipt());
+            let github = match reconcile_github_pr_for_bundle(worktree_path, &mut bundle) {
                 Ok(github) => github,
                 Err(error) => {
-                    return Ok(publication_transaction_failure(
-                        report,
-                        &mut transaction,
-                        error,
-                    ))
+                    let report =
+                        publication_transaction_failure(report, &mut bundle.transaction, error);
+                    coordination_guard.restore_admission(bundle.coordination);
+                    return Ok(report);
                 }
             };
             report.pr_url = Some(github.url);
             report.pushed = true;
             report.created = github.created;
             report.next_action = "review the draft pull request on GitHub".to_string();
-            let previous = transaction.journal.clone();
-            transaction.advance_phase(PublicationTransactionPhase::Completed);
-            transaction.journal.last_error = None;
-            if let Err(error) = transaction.persist_if_changed(&previous) {
-                return Ok(publication_transaction_failure(
-                    report,
-                    &mut transaction,
-                    error,
-                ));
+            let previous = bundle.transaction.journal.clone();
+            bundle
+                .transaction
+                .advance_phase(PublicationTransactionPhase::Completed);
+            bundle.transaction.journal.last_error = None;
+            if let Err(error) = bundle.transaction.persist_if_changed(&previous) {
+                let report =
+                    publication_transaction_failure(report, &mut bundle.transaction, error);
+                coordination_guard.restore_admission(bundle.coordination);
+                return Ok(report);
             }
-            report.publication_receipt = Some(transaction.receipt());
+            report.publication_receipt = Some(bundle.transaction.receipt());
+            coordination_guard.restore_admission(bundle.coordination);
         }
     }
 
     report.status = PrPublicationStatus::Published;
+    coordination_guard.finish_success()?;
     Ok(report)
 }
 

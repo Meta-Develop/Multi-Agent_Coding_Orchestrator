@@ -123,6 +123,28 @@ impl LaunchSpec {
             .iter()
             .any(|entry| matches!(entry, LaunchEnvironment::SetSecret { .. }))
     }
+
+    /// Non-secret `SetPlain` environment mutations declared for a launch.
+    pub fn plain_environment(&self) -> Vec<(String, OsString)> {
+        self.environment
+            .iter()
+            .filter_map(|entry| match entry {
+                LaunchEnvironment::SetPlain { name, value } => Some((name.clone(), value.clone())),
+                LaunchEnvironment::SetSecret { .. } | LaunchEnvironment::Remove { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Inherited variables an adapter requires removing before launch.
+    pub fn environment_removals(&self) -> Vec<String> {
+        self.environment
+            .iter()
+            .filter_map(|entry| match entry {
+                LaunchEnvironment::Remove { name } => Some(name.clone()),
+                LaunchEnvironment::SetPlain { .. } | LaunchEnvironment::SetSecret { .. } => None,
+            })
+            .collect()
+    }
 }
 
 /// The contract every managed tool must satisfy.

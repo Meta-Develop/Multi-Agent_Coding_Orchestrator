@@ -8,6 +8,176 @@ use crate::process_runner::{
 use crate::runtime_adapter::RuntimeAdapterConfig;
 use crate::runtime_adapter::{RuntimeId, WritableLaunchTarget};
 
+#[cfg(target_os = "linux")]
+const CAM_GROK_AUTH_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/account-manager/core/tests/fixtures/grok/valid-auth.json"
+);
+
+#[cfg(target_os = "linux")]
+use crate::account_authority::build_cam_grok_test_harness;
+
+#[cfg(target_os = "linux")]
+fn build_cam_grok_test_harness_unselected(
+) -> anyhow::Result<crate::account_authority::CamGrokTestHarness> {
+    use std::io;
+
+    use coding_agent_manager_lib::account_authority::StoredAccountRegistry;
+    use coding_agent_manager_lib::fsx;
+    use coding_agent_manager_lib::paths::stored_accounts_path;
+    use coding_agent_manager_lib::providers::add_managed_account;
+    use coding_agent_manager_lib::providers::grok_cli::GrokCliAdapter;
+
+    fn fake_login(home: &std::path::Path) -> io::Result<i32> {
+        std::fs::copy(CAM_GROK_AUTH_FIXTURE, home.join("auth.json"))?;
+        Ok(0)
+    }
+
+    let root = tempfile::tempdir()?;
+    let user_home = root.path().join("cam-user-home");
+    let data_dir = root.path().join("cam-data");
+    std::fs::create_dir_all(user_home.join(".grok"))?;
+    fsx::create_dir_all_private(&data_dir)?;
+    let registry = StoredAccountRegistry::new(stored_accounts_path(&data_dir));
+    let adapter = GrokCliAdapter::with_home(&user_home)
+        .with_data_dir(&data_dir)
+        .with_login_runner(fake_login);
+    for account_id in ["account-a", "account-b"] {
+        add_managed_account(&registry, &adapter, account_id, account_id, None)?;
+    }
+    Ok(crate::account_authority::CamGrokTestHarness {
+        _root: root,
+        registry,
+        adapter,
+        user_home,
+        data_dir,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn admitted_verified_grok_cam_command(temp: &std::path::Path) -> Result<ExternalAgentCommand> {
+    use std::os::unix::fs::PermissionsExt;
+
+    const STRUCTURED_OUTPUT_SCHEMA: &str = r#"{"properties":{"accepted":{"type":"boolean"},"path":{"type":"string"}},"required":["accepted","path"],"type":"object"}"#;
+
+    let repos = temp.join("repos");
+    fs::create_dir(&repos)?;
+    let (primary, child, _common, _child_git_dir) = create_linked_git_metadata_fixture(&repos)?;
+    let incoming = temp.join("incoming");
+    fs::create_dir(&incoming)?;
+    fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+    let schema_root = temp.join("schema-root");
+    fs::create_dir(&schema_root)?;
+    let prompt = child.join("prompt.md");
+    fs::write(&prompt, "verified Grok CAM consumer\n")?;
+    let schema = schema_root.join("worker-report.schema.json");
+    fs::write(&schema, STRUCTURED_OUTPUT_SCHEMA)?;
+    let program = child.join("verified-grok-cam-provider");
+    fs::write(
+        &program,
+        r#"#!/bin/sh
+set -eu
+[ "$#" -eq 18 ]
+[ "$1" = "--prompt-file" ]
+[ "$3" = "--model" ]
+[ "$4" = "grok-4.6" ]
+[ "$5" = "--reasoning-effort" ]
+[ "$6" = "xhigh" ]
+[ "$7" = "--cwd" ]
+[ "$9" = "--json-schema" ]
+[ "${11}" = "--output-format" ]
+[ "${12}" = "streaming-json" ]
+[ "${13}" = "--sandbox" ]
+[ "${14}" = "strict" ]
+[ "${15}" = "--always-approve" ]
+[ "${16}" = "--disable-web-search" ]
+[ "${17}" = "--no-memory" ]
+[ "${18}" = "--no-subagents" ]
+[ "$HOME" = "$GROK_HOME" ]
+[ -r "$GROK_HOME/auth.json" ]
+printf '%s\n' 'verified-grok-cam-launch-blocked' >&2
+exit 42
+"#,
+    )?;
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755))?;
+    let mut command =
+        writable_grok_command_before_runtime_selection(&program, &child, &prompt, &incoming)?
+            .with_agent_lifecycle(&primary, "worker", "verified-grok-cam", "grok-worker");
+    command.output_schema = Some(schema);
+    Ok(command
+        .with_writable_runtime_selection("grok-worker", RuntimeId::Grok, true)?
+        .with_worktree_writable_confinement(writable_grok_confinement(
+            SideEffectConfinement::Verified,
+        )))
+}
+
+#[cfg(target_os = "linux")]
+const VERIFIED_GROK_CAM_PROVIDER_FAILURE_STDERR_MARKER: &str = "verified-grok-cam-launch-blocked";
+
+#[cfg(target_os = "linux")]
+fn assert_verified_grok_cam_admitted_provider_failure(
+    report: &ExternalAgentRun,
+    expected_binding: &crate::account_authority::ManagedGrokAccountSelectionEvidence,
+) -> Result<()> {
+    assert_eq!(
+        report.managed_grok_selection_evidence(),
+        Some(expected_binding),
+        "selected account binding must match registry evidence: {report:#?}"
+    );
+    assert!(
+        report.stdout.target_launch_attempted,
+        "admitted CAM Grok must launch the bounded provider: {report:#?}"
+    );
+    assert_eq!(
+        report.exit_code,
+        Some(42),
+        "fixture provider must exit 42 after auth/HOME validation: {report:#?}"
+    );
+    assert!(
+        !report.timed_out,
+        "provider run must not time out: {report:#?}"
+    );
+    assert!(
+        report.environment_failures().is_empty(),
+        "admitted provider failure must not be environment-classified: {report:#?}"
+    );
+    assert!(
+        !report.environment_blocked(),
+        "environment_blocked must stay false after contained provider exit: {report:#?}"
+    );
+    assert!(
+        report
+            .process_tree
+            .is_some_and(ProcessTreeEvidence::is_verified_empty),
+        "contained provider must leave a verified-empty process tree: {report:#?}"
+    );
+    assert_eq!(
+        report.side_effects,
+        Some(SideEffectConfinementEvidence::Verified(
+            SideEffectConfinementProfileKind::ExternalGrok
+        )),
+        "writable Grok side effects must remain verified after provider exit 42: {report:#?}"
+    );
+    let stderr = std::str::from_utf8(&report.stderr.bytes)
+        .context("provider stderr must be valid UTF-8 for fixture marker")?;
+    assert!(
+        stderr.contains(VERIFIED_GROK_CAM_PROVIDER_FAILURE_STDERR_MARKER),
+        "provider stderr must include fixture marker; stderr={stderr:?}; report={report:#?}"
+    );
+    assert!(
+        !report.succeeded(),
+        "non-zero bounded provider exit must not be publishable success: {report:#?}"
+    );
+    assert!(
+        report
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("exited with status 42")),
+        "run must surface non-zero provider exit without environment failure: {report:#?}"
+    );
+    Ok(())
+}
+
 #[test]
 fn codex_runtime_model_catalog_parser_is_bounded_unique_and_slug_strict() {
     let catalog = parse_codex_runtime_model_catalog(
@@ -4834,28 +5004,10 @@ fn selected_writable_grok_acp_stdio_command(
 fn run_writable_grok_acp_helper_subprocess(test_name: &str) -> Result<()> {
     const HELPER_STDERR_MAX_BYTES: usize = 64 * 1024;
 
-    let temp = tempfile::tempdir()?;
-    let grok_home = temp.path().join("grok-home");
-    fs::create_dir(&grok_home)?;
-    fs::write(grok_home.join("auth.json"), "hermetic-grok-auth-fixture\n")?;
-    fs::write(
-        grok_home.join("ambient-secret"),
-        "must stay outside the child\n",
-    )?;
-
-    let environment = BTreeMap::from([
-        (
-            WRITABLE_GROK_ACP_PRODUCTION_HELPER_ENV.to_string(),
-            "1".to_string(),
-        ),
-        (
-            "GROK_HOME".to_string(),
-            grok_home
-                .to_str()
-                .context("writable Grok ACP helper home path is not UTF-8")?
-                .to_string(),
-        ),
-    ]);
+    let environment = BTreeMap::from([(
+        WRITABLE_GROK_ACP_PRODUCTION_HELPER_ENV.to_string(),
+        "1".to_string(),
+    )]);
     let output = crate::process_runner::run_process(
         ProcessSpec::direct(
             "exact writable Grok ACP helper test",
@@ -4891,14 +5043,7 @@ fn run_writable_grok_acp_production_helper_subprocess() -> Result<()> {
     const HELPER_STDERR_MAX_BYTES: usize = 64 * 1024;
 
     let temp = tempfile::tempdir()?;
-    let grok_home = temp.path().join("grok-home");
     let receipt = temp.path().join("helper-completed");
-    fs::create_dir(&grok_home)?;
-    fs::write(grok_home.join("auth.json"), "hermetic-grok-auth-fixture\n")?;
-    fs::write(
-        grok_home.join("ambient-secret"),
-        "must stay outside the child\n",
-    )?;
     if receipt.try_exists()? {
         bail!("writable Grok ACP helper receipt must start absent");
     }
@@ -4913,13 +5058,6 @@ fn run_writable_grok_acp_production_helper_subprocess() -> Result<()> {
             receipt
                 .to_str()
                 .context("writable Grok ACP helper receipt path is not UTF-8")?
-                .to_string(),
-        ),
-        (
-            "GROK_HOME".to_string(),
-            grok_home
-                .to_str()
-                .context("writable Grok ACP helper home path is not UTF-8")?
                 .to_string(),
         ),
     ]);
@@ -5046,13 +5184,11 @@ fn writable_grok_acp_run_external_agent_helper(fixture_mode: &str) -> Result<()>
     use crate::runtime_adapter::grok::{GrokAcpNativeCostEquivalent, GrokAcpParentResolvedField};
     use std::os::unix::fs::PermissionsExt;
 
-    let grok_home = PathBuf::from(
-        std::env::var_os("GROK_HOME")
-            .context("writable Grok ACP production helper requires process-local GROK_HOME")?,
-    );
+    let (cam_harness, grok_home, expected_cam_binding) = build_cam_grok_test_harness("account-a")?;
+    let _cam_guard = crate::account_authority::activate_cam_grok_test_harness(cam_harness);
     assert_eq!(
-        fs::read_to_string(grok_home.join("auth.json"))?,
-        "hermetic-grok-auth-fixture\n"
+        fs::read(grok_home.join("auth.json"))?,
+        fs::read(CAM_GROK_AUTH_FIXTURE)?,
     );
     let helper_receipt =
         std::env::var_os(WRITABLE_GROK_ACP_PRODUCTION_HELPER_RECEIPT_ENV).map(PathBuf::from);
@@ -5104,6 +5240,11 @@ fn writable_grok_acp_run_external_agent_helper(fixture_mode: &str) -> Result<()>
     .with_worktree_writable_confinement(writable_grok_confinement(SideEffectConfinement::Verified));
 
     let report = run_external_agent(&declared);
+    assert_eq!(
+        report.managed_grok_selection_evidence(),
+        Some(&expected_cam_binding),
+        "ACP must retain exact selected-account evidence: {report:#?}"
+    );
     let stderr = String::from_utf8_lossy(&report.stderr.bytes);
     let evidence = report.grok_acp_parent_evidence.as_ref().with_context(|| {
         format!(
@@ -5335,7 +5476,7 @@ fn grok_runtime_adapter_argv_binds_schema_json_without_weakening_operators() -> 
     Ok(())
 }
 
-fn selected_writable_grok_command(
+fn writable_grok_command_before_runtime_selection(
     program: impl Into<PathBuf>,
     workspace: impl Into<PathBuf>,
     prompt: impl Into<PathBuf>,
@@ -5343,7 +5484,7 @@ fn selected_writable_grok_command(
 ) -> Result<ExternalAgentCommand> {
     let workspace = workspace.into();
     let incoming = incoming.into();
-    ExternalAgentCommand::codex(
+    Ok(ExternalAgentCommand::codex(
         program,
         &workspace,
         prompt,
@@ -5357,8 +5498,17 @@ fn selected_writable_grok_command(
     )
     .with_model_selection(Some("grok-4.6".to_string()), Some("xhigh".to_string()))
     .with_workspace_access(WorkspaceAccess::ReadWrite)
-    .with_writable_launch_target(WritableLaunchTarget::ManagedChildWorktree)
-    .with_writable_runtime_selection("grok-worker", RuntimeId::Grok, true)
+    .with_writable_launch_target(WritableLaunchTarget::ManagedChildWorktree))
+}
+
+fn selected_writable_grok_command(
+    program: impl Into<PathBuf>,
+    workspace: impl Into<PathBuf>,
+    prompt: impl Into<PathBuf>,
+    incoming: impl Into<PathBuf>,
+) -> Result<ExternalAgentCommand> {
+    writable_grok_command_before_runtime_selection(program, workspace, prompt, incoming)?
+        .with_writable_runtime_selection("grok-worker", RuntimeId::Grok, true)
 }
 
 fn writable_grok_confinement(
@@ -5606,14 +5756,7 @@ fn run_writable_grok_production_helper_subprocess() -> Result<()> {
     const HELPER_STDERR_MAX_BYTES: usize = 64 * 1024;
 
     let temp = tempfile::tempdir()?;
-    let grok_home = temp.path().join("grok-home");
     let receipt = temp.path().join("helper-completed");
-    fs::create_dir(&grok_home)?;
-    fs::write(grok_home.join("auth.json"), "hermetic-grok-auth-fixture\n")?;
-    fs::write(
-        grok_home.join("ambient-secret"),
-        "must stay outside the child\n",
-    )?;
     if receipt.try_exists()? {
         bail!("writable Grok helper receipt must start absent");
     }
@@ -5625,13 +5768,6 @@ fn run_writable_grok_production_helper_subprocess() -> Result<()> {
             receipt
                 .to_str()
                 .context("writable Grok helper receipt path is not UTF-8")?
-                .to_string(),
-        ),
-        (
-            "GROK_HOME".to_string(),
-            grok_home
-                .to_str()
-                .context("writable Grok helper home path is not UTF-8")?
                 .to_string(),
         ),
     ]);
@@ -5727,13 +5863,16 @@ fn writable_grok_run_external_agent_helper() -> Result<()> {
     const STRUCTURED_OUTPUT_SCHEMA: &str = r#"{"properties":{"accepted":{"type":"boolean"},"path":{"type":"string"}},"required":["accepted","path"],"type":"object"}"#;
     const APPROVAL_RECORD: &str = "approval-contract:sandbox=strict;headless=always-approve;web-search=disabled;memory=disabled;subagents=disabled";
 
-    let grok_home = PathBuf::from(
-        std::env::var_os("GROK_HOME")
-            .context("writable Grok production helper requires process-local GROK_HOME")?,
-    );
+    let (cam_harness, grok_home, expected_cam_binding) = build_cam_grok_test_harness("account-a")?;
+    let _cam_guard = crate::account_authority::activate_cam_grok_test_harness(cam_harness);
+    let sibling_b = grok_home
+        .parent()
+        .expect("managed account parent")
+        .join("account-b");
+    std::fs::write(sibling_b.join("auth.json"), "misleading-sibling-auth\n")?;
     assert_eq!(
         fs::read_to_string(grok_home.join("auth.json"))?,
-        "hermetic-grok-auth-fixture\n"
+        fs::read_to_string(CAM_GROK_AUTH_FIXTURE)?
     );
     let helper_receipt = PathBuf::from(
         std::env::var_os(GROK_PRODUCTION_HELPER_RECEIPT_ENV)
@@ -5920,6 +6059,10 @@ printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-sessio
     assert_eq!(report.exit_code, Some(0));
     assert!(!report.timed_out);
     assert!(report.stdout.target_launch_attempted);
+    assert_eq!(
+        report.managed_grok_selection_evidence(),
+        Some(&expected_cam_binding)
+    );
     assert_eq!(
         report.side_effects,
         Some(SideEffectConfinementEvidence::Verified(
@@ -9658,6 +9801,148 @@ fn consult_codex_consultant_lifecycle_is_listed_as_researcher_in_supervisor_repo
     assert!(registry.list(&AgentListFilter::default())?.is_empty());
     assert!(registry.registry_path().is_file());
     assert!(!child_repo.join(".maco/agents/registry.json").exists());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn verified_grok_cam_admission_refuses_unselected_registry() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let harness = build_cam_grok_test_harness_unselected()?;
+    let command = admitted_verified_grok_cam_command(temp.path())?;
+    let report = run_external_agent_with_cam_grok_test_harness(harness, &command);
+    assert!(!report.stdout.target_launch_attempted);
+    assert!(report.managed_grok_selection_evidence().is_none());
+    assert_eq!(report.process_tree, None);
+    assert_eq!(report.environment_failures().len(), 1);
+    assert_eq!(
+        report.environment_failures()[0].category,
+        EnvironmentFailureCategory::MissingCredential,
+        "unexpected pre-account refusal: {report:#?}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn verified_grok_cam_consumer_on_provider_failure() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (harness, _managed_home, expected_binding) = build_cam_grok_test_harness("account-a")?;
+    let command = admitted_verified_grok_cam_command(temp.path())?;
+    let report = run_external_agent_with_cam_grok_test_harness(harness, &command);
+    assert_verified_grok_cam_admitted_provider_failure(&report, &expected_binding)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn verified_grok_cam_run_releases_use_lease_on_failure() -> Result<()> {
+    use coding_agent_manager_lib::providers::grok_cli::GrokCliAdapter;
+    use coding_agent_manager_lib::providers::select_launch_account;
+
+    let temp = tempfile::tempdir()?;
+    let (harness, _, expected_binding) = build_cam_grok_test_harness("account-a")?;
+    let metadata_path = harness.registry.metadata_path().to_path_buf();
+    let user_home = harness.user_home.clone();
+    let data_dir = harness.data_dir.clone();
+    let command = admitted_verified_grok_cam_command(temp.path())?;
+    // Keep the fixture registry alive while independently checking that the
+    // completed run released its shared account-use lease.
+    let _fixture_guard = crate::account_authority::activate_cam_grok_test_harness(harness);
+    let report = run_external_agent(&command);
+    assert_verified_grok_cam_admitted_provider_failure(&report, &expected_binding)?;
+
+    let registry =
+        coding_agent_manager_lib::account_authority::StoredAccountRegistry::new(metadata_path);
+    let adapter = GrokCliAdapter::with_home(&user_home)
+        .with_data_dir(&data_dir)
+        .with_login_runner(|home| {
+            std::fs::copy(CAM_GROK_AUTH_FIXTURE, home.join("auth.json"))?;
+            Ok(0)
+        });
+    select_launch_account(&registry, &adapter, "account-b")?;
+    assert_eq!(
+        registry
+            .selected_binding(crate::account_authority::GROK_CLI_PROVIDER_ID)?
+            .expect("account-b selected")
+            .account_id,
+        "account-b"
+    );
+    Ok(())
+}
+
+#[test]
+fn assignment_messaging_launch_environment_refuses_mismatched_binding() -> Result<()> {
+    use crate::messaging::transport::AssignmentMessagingServer;
+
+    let server = AssignmentMessagingServer::start(
+        "external-agent-run",
+        "external-agent-task",
+        |_payload| Ok(serde_json::json!({"ok": true})),
+    )?;
+    let launch = server.launch();
+    assert!(launch
+        .environment_for("external-agent-run", "wrong-task")
+        .is_err());
+    assert!(launch
+        .environment_for("wrong-run", "external-agent-task")
+        .is_err());
+    Ok(())
+}
+
+#[test]
+fn assignment_messaging_token_is_redacted_from_runtime_output() -> Result<()> {
+    use crate::messaging::transport::{AssignmentMessagingServer, MACO_MESSAGE_TOKEN_ENV};
+
+    let server = AssignmentMessagingServer::start("run-redact", "task-redact", |_| {
+        Ok(serde_json::json!({}))
+    })?;
+    let launch = server.launch();
+    let mut environment = BTreeMap::new();
+    for (key, value) in launch.environment_for("run-redact", "task-redact")? {
+        environment.insert(key, value);
+    }
+    let token = environment
+        .get(MACO_MESSAGE_TOKEN_ENV)
+        .context("assignment messaging token env")?;
+    let redactor = CredentialRedactor::from_runtime(&environment, None)?;
+    let redacted = redactor.redact_string(&format!("seen token={token}"));
+    assert!(!redacted.contains(token.as_str()));
+    assert!(redacted.contains("[REDACTED]"));
+    Ok(())
+}
+
+#[test]
+fn assignment_messaging_environment_extends_runtime_on_exact_binding() -> Result<()> {
+    use crate::messaging::transport::{
+        AssignmentMessagingServer, MACO_MESSAGE_ENDPOINT_ENV, MACO_MESSAGE_TOKEN_ENV,
+    };
+
+    let server =
+        AssignmentMessagingServer::start("run-bind", "task-bind", |_| Ok(serde_json::json!({})))?;
+    let command = ExternalAgentCommand::codex("codex", ".", "p", "l", "o", Duration::from_secs(1))
+        .with_agent_lifecycle(".", "worker", "run-bind", "task-bind")
+        .with_assignment_messaging(server.launch());
+    let mut environment = BTreeMap::new();
+    extend_common_runtime_environment_with_assignment_messaging(&command, &mut environment)?;
+    assert!(environment.contains_key(MACO_MESSAGE_ENDPOINT_ENV));
+    assert!(environment.contains_key(MACO_MESSAGE_TOKEN_ENV));
+    Ok(())
+}
+
+#[test]
+fn assignment_messaging_environment_requires_bound_lifecycle_identity() -> Result<()> {
+    use crate::messaging::transport::AssignmentMessagingServer;
+
+    let server = AssignmentMessagingServer::start("run", "task", |_| Ok(serde_json::json!({})))?;
+    let command = ExternalAgentCommand::codex("codex", ".", "p", "l", "o", Duration::from_secs(1))
+        .with_assignment_messaging(server.launch());
+    let mut environment = BTreeMap::new();
+    assert!(extend_common_runtime_environment_with_assignment_messaging(
+        &command,
+        &mut environment
+    )
+    .is_err());
     Ok(())
 }
 

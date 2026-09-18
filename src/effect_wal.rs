@@ -57,6 +57,8 @@ impl EffectWalSpec for DefaultEffectWalSpec {
     const EFFECT_FORMAT_VERSION: u32 = 1;
 }
 
+pub(crate) type DefaultEffectWal = EffectWal<DefaultEffectWalSpec>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum EffectPhase {
@@ -99,6 +101,24 @@ struct EffectWalState {
 
 pub(crate) struct EffectWal<S: EffectWalSpec = DefaultEffectWalSpec> {
     store: AuthenticatedSnapshotStore<S, EffectWalState>,
+}
+
+pub(crate) enum OpenInitializedEffectWal<S: EffectWalSpec = DefaultEffectWalSpec> {
+    NeverInitialized,
+    Open(Box<EffectWal<S>>),
+}
+
+pub(crate) fn effect_phase_is_nonterminal(phase: EffectPhase) -> bool {
+    matches!(
+        phase,
+        EffectPhase::Planned | EffectPhase::Started | EffectPhase::Observed
+    )
+}
+
+pub(crate) fn effect_wal_has_nonterminal_operations<S: EffectWalSpec>(wal: &EffectWal<S>) -> bool {
+    wal.phases()
+        .values()
+        .any(|phase| effect_phase_is_nonterminal(*phase))
 }
 
 impl<S: EffectWalSpec> EffectWal<S> {
@@ -163,6 +183,35 @@ impl<S: EffectWalSpec> EffectWal<S> {
         let wal = Self { store };
         wal.validate()?;
         Ok(wal)
+    }
+
+    /// Distinguishes a never-initialized logical store from an initialized one.
+    /// When the signed locator exists, open failures propagate as storage errors rather
+    /// than being treated as logical absence.
+    pub(crate) fn open_when_initialized(
+        authenticator: RepositoryAuthenticator,
+        logical_id: &str,
+    ) -> Result<OpenInitializedEffectWal<S>> {
+        if !AuthenticatedSnapshotStore::<S, EffectWalState>::initialized(
+            &authenticator,
+            logical_id,
+        )? {
+            return Ok(OpenInitializedEffectWal::NeverInitialized);
+        }
+        Ok(OpenInitializedEffectWal::Open(Box::new(
+            Self::open_instance(authenticator, logical_id)?,
+        )))
+    }
+
+    pub(crate) fn phases(&self) -> &BTreeMap<String, EffectPhase> {
+        &self.store.current().value.phases
+    }
+
+    pub(crate) fn next_event_sequence(&self) -> Result<u64> {
+        u64::try_from(self.events().len())
+            .context("effect WAL sequence overflowed")?
+            .checked_add(1)
+            .context("effect WAL sequence exhausted")
     }
 
     pub(crate) fn identity(&self) -> &JournalIdentity {
@@ -351,6 +400,70 @@ mod tests {
             .expect("auth writer")
             .into_authenticator()
             .expect("authenticator")
+    }
+
+    #[test]
+    fn open_when_initialized_reports_never_initialized_without_locator() {
+        let (_temp, path) = repository();
+        let auth = authenticator(&path);
+        let open =
+            EffectWal::<DefaultEffectWalSpec>::open_when_initialized(auth, "missing-logical")
+                .expect("classify absence");
+        assert!(matches!(open, OpenInitializedEffectWal::NeverInitialized));
+    }
+
+    #[test]
+    fn open_when_initialized_opens_present_logical_store() {
+        let (_temp, path) = repository();
+        let auth = authenticator(&path);
+        EffectWal::<DefaultEffectWalSpec>::create_planned(
+            authenticator(&path),
+            "run-open",
+            "effect-a",
+            &(),
+        )
+        .expect("create");
+        let open = EffectWal::<DefaultEffectWalSpec>::open_when_initialized(auth, "run-open")
+            .expect("classify presence");
+        match open {
+            OpenInitializedEffectWal::Open(wal) => {
+                assert_eq!(wal.phase("effect-a"), Some(EffectPhase::Planned));
+            }
+            OpenInitializedEffectWal::NeverInitialized => panic!("expected initialized WAL"),
+        }
+    }
+
+    #[test]
+    fn open_when_initialized_refuses_deleted_payload_under_existing_locator() {
+        let (_temp, path) = repository();
+        let auth = authenticator(&path);
+        let wal = EffectWal::<DefaultEffectWalSpec>::create_planned(
+            authenticator(&path),
+            "run-tamper",
+            "effect-a",
+            &(),
+        )
+        .expect("create");
+        let instance_id = wal.identity().run_id.clone();
+        drop(wal);
+        let instance_dir = path
+            .join(".git")
+            .join("maco")
+            .join("state")
+            .join(DefaultEffectWalSpec::ROOT_NAME)
+            .join(instance_id);
+        fs::remove_dir_all(&instance_dir).expect("delete payload tree");
+        let open = EffectWal::<DefaultEffectWalSpec>::open_when_initialized(auth, "run-tamper");
+        let message = match open {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("deleted payload must not classify as absence"),
+        };
+        assert!(
+            message.contains("inventory")
+                || message.contains("incomplete")
+                || message.contains("missing")
+                || message.contains("substituted")
+        );
     }
 
     #[test]

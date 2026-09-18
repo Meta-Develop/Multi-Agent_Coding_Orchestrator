@@ -1,3 +1,4 @@
+use crate::account_authority::ManagedGrokAccountSelectionEvidence;
 use crate::agent_lifecycle::{AgentLaunchMetadata, MACO_RUN_ID_ENV, MACO_TASK_ID_ENV};
 use crate::artifacts::state_auth::sha256_hex;
 use crate::gate_denial::{ExternalSideEffectState, GateDenial};
@@ -6,6 +7,7 @@ use crate::machine_global::{
     DestructiveTargetInput, GateOutcome, MachineGlobalRetentionBinding, MachineGlobalStore,
     RetentionOperation, RetentionOperationId,
 };
+use crate::messaging::transport::AssignmentMessagingLaunch;
 use crate::mutation_taxonomy::{
     AssignmentProcessLaunchGrant, AssignmentProcessLaunchGrantError, AssignmentProcessLaunchKind,
     AssignmentProcessMechanicalBinding, CatalogPreflightOrigin, SealedMechanicalExecutorDuty,
@@ -263,6 +265,53 @@ pub struct ExternalAgentCommand {
     pub(crate) assignment_process_launch_attempt: Option<usize>,
     pub(crate) assignment_process_launch_duty: Option<String>,
     pub(crate) assignment_mechanical_executor_duty: Option<SealedMechanicalExecutorDuty>,
+    /// Ephemeral assignment messaging IPC capability for this launch only. Never serialized into
+    /// task artifacts or argv.
+    assignment_messaging_launch: Option<AssignmentMessagingLaunch>,
+}
+
+const ASSIGNMENT_MESSAGING_PROTOCOL_PROMPT_APPENDIX: &str = r#"
+
+## Assignment messaging (loopback IPC)
+
+This launch exposes private environment variables MACO_MESSAGE_ENDPOINT and MACO_MESSAGE_TOKEN.
+Connect to MACO_MESSAGE_ENDPOINT on loopback only. Send exactly one NDJSON request line per TCP
+connection, then read exactly one NDJSON response line.
+
+Request shape:
+{"bearer":"<value from MACO_MESSAGE_TOKEN>","request":{"operation":"<name>", ...}}
+
+Response shape:
+{"ok":true,"result":<value>} or {"ok":false,"error":"<message>"}
+
+The inner `request` object must not include run_id, task_id, artifact paths, sender identity, or
+any attempt to override MACO_MESSAGE_TOKEN or MACO_MESSAGE_ENDPOINT. Supported operations:
+send_direct (recipient_id, payload), create_channel (channel_id, members, publishers),
+publish_channel (channel_id, payload), receive_next, receive_next_from_channel (channel_id),
+acknowledge (message_id). Delivery is at-least-once until acknowledge succeeds; duplicates may
+arrive until then.
+
+"#;
+
+pub(crate) fn render_prompt_with_assignment_messaging_protocol_appendix(
+    prompt: String,
+) -> Result<String> {
+    let combined_len = prompt
+        .len()
+        .saturating_add(ASSIGNMENT_MESSAGING_PROTOCOL_PROMPT_APPENDIX.len());
+    if combined_len > MAX_PROMPT_BYTES {
+        bail!(
+            "assignment messaging protocol appendix would exceed the bounded prompt size ({} bytes)",
+            combined_len
+        );
+    }
+    let mut rendered = prompt;
+    rendered.push_str(ASSIGNMENT_MESSAGING_PROTOCOL_PROMPT_APPENDIX);
+    Ok(rendered)
+}
+
+fn prompt_includes_assignment_messaging_protocol_appendix(prompt: &[u8]) -> bool {
+    prompt.ends_with(ASSIGNMENT_MESSAGING_PROTOCOL_PROMPT_APPENDIX.as_bytes())
 }
 
 pub(crate) const WRITABLE_GROK_TERMINAL_WORKER_REQUIRED: &str =
@@ -1051,6 +1100,7 @@ impl ExternalAgentCommand {
             assignment_process_launch_attempt: None,
             assignment_process_launch_duty: None,
             assignment_mechanical_executor_duty: None,
+            assignment_messaging_launch: None,
         }
     }
 
@@ -1091,6 +1141,7 @@ impl ExternalAgentCommand {
             assignment_process_launch_attempt: None,
             assignment_process_launch_duty: None,
             assignment_mechanical_executor_duty: None,
+            assignment_messaging_launch: None,
         }
     }
 
@@ -1131,6 +1182,7 @@ impl ExternalAgentCommand {
             assignment_process_launch_attempt: None,
             assignment_process_launch_duty: None,
             assignment_mechanical_executor_duty: None,
+            assignment_messaging_launch: None,
         }
     }
 
@@ -1460,6 +1512,37 @@ impl ExternalAgentCommand {
         self.assignment_process_launch_grant = Some(grant);
         self
     }
+
+    pub(crate) fn with_assignment_messaging(mut self, launch: AssignmentMessagingLaunch) -> Self {
+        self.assignment_messaging_launch = Some(launch);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assignment_messaging_launch(&self) -> Option<&AssignmentMessagingLaunch> {
+        self.assignment_messaging_launch.as_ref()
+    }
+
+    /// Ensures the launch prompt already contains the static messaging appendix.
+    pub(crate) fn verify_assignment_messaging_protocol_instructions(&self) -> Result<()> {
+        if self.assignment_messaging_launch.is_none() {
+            return Ok(());
+        }
+        let existing = read_bounded_regular_file_nofollow(&self.prompt, MAX_PROMPT_BYTES)
+            .with_context(|| {
+                format!(
+                    "failed to read manifested launch prompt for assignment messaging verification: {}",
+                    self.prompt.display()
+                )
+            })?;
+        if prompt_includes_assignment_messaging_protocol_appendix(&existing) {
+            return Ok(());
+        }
+        bail!(
+            "manifested launch prompt is missing assignment messaging protocol appendix at {}",
+            self.prompt.display()
+        );
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1559,6 +1642,13 @@ impl ExternalAgentRun {
 
     pub fn environment_failures(&self) -> &[EnvironmentFailure] {
         &self.stdout.run_metadata.environment_failures
+    }
+
+    #[cfg(test)]
+    pub(crate) fn managed_grok_selection_evidence(
+        &self,
+    ) -> Option<&ManagedGrokAccountSelectionEvidence> {
+        self.stdout.run_metadata.managed_grok_selection.as_ref()
     }
 
     pub fn fixed_version_probe_evidence(&self) -> Option<&EnvironmentFixedVersionProbeEvidence> {
@@ -1746,6 +1836,8 @@ struct ExternalAgentRunWireRef<'a> {
     grok_stream_usage_evidence: &'a Option<GrokStreamUsageEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     grok_acp_parent_evidence: &'a Option<GrokAcpParentEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_grok_selection: &'a Option<ManagedGrokAccountSelectionEvidence>,
 }
 
 #[derive(Deserialize)]
@@ -1787,6 +1879,8 @@ struct ExternalAgentRunWireOwned {
     grok_stream_usage_evidence: Option<GrokStreamUsageEvidence>,
     #[serde(default)]
     grok_acp_parent_evidence: Option<GrokAcpParentEvidence>,
+    #[serde(default)]
+    managed_grok_selection: Option<ManagedGrokAccountSelectionEvidence>,
 }
 
 impl Serialize for ExternalAgentRun {
@@ -1827,6 +1921,7 @@ impl Serialize for ExternalAgentRun {
             error: &self.error,
             grok_stream_usage_evidence: &self.grok_stream_usage_evidence,
             grok_acp_parent_evidence: &self.grok_acp_parent_evidence,
+            managed_grok_selection: &self.stdout.run_metadata.managed_grok_selection,
         }
         .serialize(serializer)
     }
@@ -1851,6 +1946,7 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
         stdout.run_metadata.machine_global_retention_operation_id =
             wire.machine_global_retention_operation_id;
         stdout.run_metadata.pre_action_review_metrics = wire.pre_action_review_metrics;
+        stdout.run_metadata.managed_grok_selection = wire.managed_grok_selection;
         Ok(Self {
             command: wire.command,
             cwd: wire.cwd,
@@ -1890,6 +1986,7 @@ struct ExternalAgentRunMetadata {
     pre_action_review_metrics: Option<ReviewMetricSnapshot>,
     external_side_effect_state: Option<ExternalSideEffectState>,
     worker_journal_artifacts: Vec<WorkerJournalArtifactCapture>,
+    managed_grok_selection: Option<ManagedGrokAccountSelectionEvidence>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1992,17 +2089,11 @@ struct AdmittedGrokCredentials {
 }
 
 impl AdmittedGrokCredentials {
-    fn from_ambient_environment() -> Result<Self> {
-        #[cfg(target_os = "linux")]
-        {
-            Ok(Self {
-                source: GrokCredentialSource::from_ambient_environment()?,
-            })
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            bail!("Grok credential capability confinement requires Linux");
-        }
+    #[cfg(target_os = "linux")]
+    fn from_managed_grok_home(grok_home: &Path) -> Result<Self> {
+        Ok(Self {
+            source: GrokCredentialSource::from_environment(None, Some(grok_home.as_os_str()))?,
+        })
     }
 
     fn grok_home_environment(&self) -> Result<&str> {
@@ -2039,8 +2130,37 @@ impl AdmittedGrokCredentials {
     }
 }
 
+#[cfg(target_os = "linux")]
+struct GrokVerifiedAccountSession {
+    authority: crate::account_authority::GrokLaunchAuthority,
+    credentials: AdmittedGrokCredentials,
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_verified_grok_account_session() -> Result<GrokVerifiedAccountSession> {
+    let authority = crate::account_authority::grok::acquire_grok_launch_authority()?;
+    let credentials =
+        AdmittedGrokCredentials::from_managed_grok_home(authority.managed_grok_home())?;
+    Ok(GrokVerifiedAccountSession {
+        authority,
+        credentials,
+    })
+}
+
 pub fn run_external_agent(spec: &ExternalAgentCommand) -> ExternalAgentRun {
     run_external_agent_cancellable(spec, &ProcessCancellation::new())
+}
+
+/// Run one verified external-agent invocation against an isolated CAM Grok registry.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn run_external_agent_with_cam_grok_test_harness(
+    harness: crate::account_authority::CamGrokTestHarness,
+    spec: &ExternalAgentCommand,
+) -> ExternalAgentRun {
+    let guard = crate::account_authority::activate_cam_grok_test_harness(harness);
+    let report = run_external_agent(spec);
+    drop(guard);
+    report
 }
 
 pub fn run_external_agent_cancellable(
@@ -2830,11 +2950,16 @@ fn run_external_agent_runtime(
         None
     };
 
-    let grok_credentials = if runtime == ExternalExecutionRuntime::Verified
+    #[cfg(target_os = "linux")]
+    let grok_session = if runtime == ExternalExecutionRuntime::Verified
         && spec.invocation == ExternalAgentInvocation::Grok
     {
-        match AdmittedGrokCredentials::from_ambient_environment() {
-            Ok(credentials) => Some(credentials),
+        match prepare_verified_grok_account_session() {
+            Ok(session) => {
+                report.stdout.run_metadata.managed_grok_selection =
+                    Some(session.authority.selection_evidence());
+                Some(session)
+            }
             Err(error) => {
                 report.duration_ms = duration_millis(started.elapsed());
                 record_grok_credential_environment_failure(&mut report, &error);
@@ -2844,6 +2969,23 @@ fn run_external_agent_runtime(
     } else {
         None
     };
+    if runtime == ExternalExecutionRuntime::Verified
+        && spec.invocation == ExternalAgentInvocation::Grok
+    {
+        #[cfg(not(target_os = "linux"))]
+        {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_grok_credential_environment_failure(
+                &mut report,
+                &anyhow::anyhow!("Grok credential capability confinement requires Linux"),
+            );
+            return report;
+        }
+    }
+    #[cfg(target_os = "linux")]
+    let grok_credentials = grok_session.as_ref().map(|session| &session.credentials);
+    #[cfg(not(target_os = "linux"))]
+    let grok_credentials: Option<&AdmittedGrokCredentials> = None;
 
     let side_effect_profile = if runtime == ExternalExecutionRuntime::Verified
         && (program_trust == ExternalProgramTrust::TrustedSystemCodex
@@ -2936,14 +3078,18 @@ fn run_external_agent_runtime(
             }
         }
     }
-    if let Some(credentials) = grok_credentials.as_ref() {
+    #[cfg(target_os = "linux")]
+    if let Some(session) = grok_session.as_ref() {
         if let Err(error) =
-            insert_admitted_grok_home_environment(&mut external_environment, credentials)
+            insert_admitted_grok_home_environment(&mut external_environment, &session.credentials)
         {
             report.duration_ms = duration_millis(started.elapsed());
             record_grok_credential_environment_failure(&mut report, &error);
             return report;
         }
+        session
+            .authority
+            .apply_launch_environment(&mut external_environment);
     }
     if let Some(metadata) = &agent_lifecycle {
         external_environment.insert(MACO_RUN_ID_ENV.to_string(), metadata.run_id().to_string());
@@ -2966,6 +3112,16 @@ fn run_external_agent_runtime(
             "GIT_WORK_TREE".to_string(),
             target_spec.cwd.display().to_string(),
         );
+    }
+    if let Err(error) =
+        extend_common_runtime_environment_with_assignment_messaging(spec, &mut external_environment)
+    {
+        report.duration_ms = duration_millis(started.elapsed());
+        record_external_error(
+            &mut report,
+            format!("failed to prepare assignment messaging runtime environment: {error:#}"),
+        );
+        return report;
     }
     let credential_redactor =
         match CredentialRedactor::from_runtime(&external_environment, codex_auth.as_ref()) {
@@ -3185,11 +3341,26 @@ fn run_external_agent_runtime(
         }
         #[cfg(test)]
         ExternalExecutionRuntime::NonpublishableSimulation => {
-            let process_spec = process_spec
+            let mut process_spec = process_spec
                 .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort);
-            match agent_lifecycle.as_ref() {
-                Some(metadata) => process_spec.with_agent_lifecycle(metadata.clone()),
-                None => process_spec,
+            if let Some(metadata) = agent_lifecycle.as_ref() {
+                process_spec = process_spec.with_agent_lifecycle(metadata.clone());
+            }
+            match assignment_messaging_launch_environment_overlay(spec) {
+                Ok(overlay) if !overlay.is_empty() => {
+                    process_spec.with_environment(EnvironmentMode::InheritAndSet(overlay))
+                }
+                Ok(_) => process_spec,
+                Err(error) => {
+                    report.duration_ms = duration_millis(started.elapsed());
+                    record_external_error(
+                        &mut report,
+                        format!(
+                            "failed to prepare sealed assignment messaging simulation environment: {error:#}"
+                        ),
+                    );
+                    return report;
+                }
             }
         }
     };
@@ -3209,6 +3380,15 @@ fn run_external_agent_runtime(
         {
             report.duration_ms = duration_millis(started.elapsed());
             record_external_error(&mut report, assignment_process_launch_refusal(error));
+            return report;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(session) = grok_session.as_ref() {
+        if let Err(error) = session.authority.verify_binding_unchanged() {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_grok_credential_environment_failure(&mut report, &error);
             return report;
         }
     }

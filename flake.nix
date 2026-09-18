@@ -34,6 +34,10 @@
       rustToolchainFor = pkgs:
         pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
+      # Headless CAM crate (`coding-agent-manager`, rlib only). Omit the desktop
+      # shell, Node tree, and desktop-only lockfile.
+      camHeadlessLibSrc = ./account-manager/core;
+
       macoSrc = lib.fileset.toSource {
         root = ./.;
         fileset = lib.fileset.unions [
@@ -43,6 +47,7 @@
           ./Cargo.lock
           ./Cargo.toml
           ./src
+          camHeadlessLibSrc
         ];
       };
 
@@ -65,16 +70,20 @@
           # The crate also ships a long-name alias binary. The installable
           # package is the `maco` PATH entry required by the global-install
           # contract.
-          cargoBuildFlags = [ "--bin" "maco" ];
+          cargoBuildFlags = [ "-p" "multi-agent-coding-orchestrator" "--bin" "maco" ];
 
           nativeBuildInputs = [
             pkgs.cmake
             pkgs.pkg-config
           ];
 
-          buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
-            pkgs.libiconv
-          ];
+          buildInputs =
+            lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+              pkgs.dbus
+            ]
+            ++ lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+              pkgs.libiconv
+            ];
 
           # Packaging builds the release binary only. The repository Cargo
           # gates remain the correctness suite; they need Git, fixtures, and
@@ -165,13 +174,18 @@
         in
         {
           default = pkgs.mkShell {
-            packages = [
-              rustToolchain
-              pkgs.python3
-              pkgs.git
-              cargo-audit
-              cargo-deny
-            ];
+            packages =
+              [
+                rustToolchain
+                pkgs.python3
+                pkgs.git
+                cargo-audit
+                cargo-deny
+              ]
+              ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+                pkgs.pkg-config
+                pkgs.dbus
+              ];
 
             RUST_BACKTRACE = "1";
           };

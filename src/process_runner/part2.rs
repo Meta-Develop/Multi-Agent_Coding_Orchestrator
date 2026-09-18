@@ -2957,6 +2957,8 @@ fn apply_systemd_sandbox_properties(
         "--property=ProtectSystem=strict",
         "--property=ProtectHome=tmpfs",
         "--property=NoNewPrivileges=yes",
+        "--property=CapabilityBoundingSet=",
+        "--property=AmbientCapabilities=",
         "--property=RestrictSUIDSGID=yes",
         "--property=LockPersonality=yes",
         "--property=PrivateTmp=yes",
@@ -3148,6 +3150,9 @@ fn verify_systemd_sandbox_properties(
         ("OOMPolicy", "kill"),
     ] {
         require_effective_property(properties, name, |value| value == expected, expected)?;
+    }
+    for name in ["CapabilityBoundingSet", "AmbientCapabilities"] {
+        require_effective_property(properties, name, |value| value.is_empty(), "no capabilities")?;
     }
     verify_system_call_error_number(property_value(properties, "SystemCallErrorNumber")?)?;
     require_effective_property(

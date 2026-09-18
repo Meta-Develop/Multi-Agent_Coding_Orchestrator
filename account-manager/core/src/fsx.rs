@@ -89,7 +89,7 @@ pub fn create_dir_all_private(path: &Path) -> Result<()> {
 ///
 /// A path is safe to show; a value is not (`NFR-1`). Nothing in this module
 /// ever puts file content into an error.
-pub(crate) fn io_at(path: &Path, source: io::Error) -> Error {
+pub fn io_at(path: &Path, source: io::Error) -> Error {
     Error::Io(io::Error::new(
         source.kind(),
         format!("{}: {source}", path.display()),
