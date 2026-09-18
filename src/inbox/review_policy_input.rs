@@ -321,6 +321,7 @@ mod tests {
             source_trust: GithubPrSourceTrust::TrustedTargetRepository,
             head_repository: Some("example/project".to_string()),
             changed_files: vec![std::path::PathBuf::from("src/lib.rs")],
+            assigned_path_limit_exceeded: false,
             checks: vec![GithubCheckSummary {
                 name: "ci".to_string(),
                 status: Some("completed".to_string()),
