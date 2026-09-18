@@ -1154,9 +1154,7 @@ async function mountGeminiAccountsNicknameField() {
 /** Start Gemini OAuth after fake timers are active so poll `setTimeout`s are faked. */
 async function submitGeminiOAuthSignIn(nickname: HTMLElement) {
   fireEvent.change(nickname, { target: { value: 'work' } })
-  fireEvent.click(
-    screen.getByRole('button', { name: 'Sign in to Gemini CLI' }),
-  )
+  fireEvent.click(screen.getByRole('button', { name: 'Sign in to Gemini CLI' }))
   await flushReactUpdates()
 }
 

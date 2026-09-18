@@ -33,7 +33,7 @@ impl Deref for ManagedLoginService {
     type Target = LoginService;
 
     fn deref(&self) -> &LoginService {
-        &*self.inner
+        &self.inner
     }
 }
 
