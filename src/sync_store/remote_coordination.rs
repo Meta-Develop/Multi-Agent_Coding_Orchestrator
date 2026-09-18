@@ -932,8 +932,14 @@ pub(crate) mod test_support {
                     evidence: "simulated remote heartbeat unknown before permit ttl".to_string(),
                 });
             }
-            let timestamp = state.times.get(state.time_index).copied().unwrap_or(T30);
-            state.time_index += 1;
+            // The simulated provider clock is monotonic: once the schedule is exhausted it
+            // stays at the final time instead of rewinding to an earlier one. Otherwise a
+            // guard-owned heartbeat racing `advance_provider_clock` could consume the last
+            // slot and make the following takeover observe a clock earlier than the
+            // predecessor heartbeat, refusing it spuriously.
+            let last_index = state.times.len() - 1;
+            let timestamp = state.times[state.time_index.min(last_index)];
+            state.time_index = (state.time_index + 1).min(state.times.len());
             let commit = format!("{:02x}{:0>38}", state.next_commit, 0);
             state.next_commit += 1;
             let comment_id = format!("c{}", state.entries.len());
