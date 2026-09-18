@@ -2505,6 +2505,69 @@ mod tests {
         Ok(())
     }
 
+    fn minimal_external_run_for_proven_environment_helper() -> ExternalAgentRun {
+        use crate::external_agent::{CapturedOutput, ExternalProgramTrust};
+        ExternalAgentRun {
+            command: vec!["test".into()],
+            cwd: std::path::PathBuf::from("/"),
+            timeout_seconds: 1,
+            exit_code: Some(0),
+            duration_ms: 1,
+            timed_out: false,
+            process_tree: None,
+            side_effects: None,
+            publishable: false,
+            program_trust: ExternalProgramTrust::ExplicitCustom,
+            codex_permissions: None,
+            stdout: CapturedOutput::default(),
+            stderr: CapturedOutput::default(),
+            error: None,
+            output_last_message: None,
+            grok_stream_usage_evidence: None,
+            grok_acp_parent_evidence: None,
+        }
+    }
+
+    #[test]
+    fn worker_attempt_proven_no_environment_native_spend() {
+        assert!(super::worker_attempt_proven_no_environment_native_spend(
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            "fake",
+            None,
+            None,
+        ));
+
+        assert!(!super::worker_attempt_proven_no_environment_native_spend(
+            SupervisorExecutionRuntime::Verified,
+            "codex",
+            None,
+            None,
+        ));
+
+        assert!(!super::worker_attempt_proven_no_environment_native_spend(
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            "fake",
+            None,
+            Some(0),
+        ));
+
+        let mut grok_parent_run = minimal_external_run_for_proven_environment_helper();
+        grok_parent_run.grok_acp_parent_evidence = Some(trusted_grok_acp_parent_evidence(
+            "grok-code-fast-1",
+            "high",
+            GrokAcpNativeCostEquivalent::Known {
+                cost_usd_ticks: 1,
+                microunits: 1,
+            },
+        ));
+        assert!(!super::worker_attempt_proven_no_environment_native_spend(
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            "fake",
+            Some(&grok_parent_run),
+            None,
+        ));
+    }
+
     #[test]
     fn persist_proven_no_environment_attributable_cost_stamps_zero_when_unset() -> Result<()> {
         let run_id = RunId::new("proven-no-environment")?;
