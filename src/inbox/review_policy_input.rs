@@ -58,6 +58,17 @@ impl std::fmt::Display for ReviewPolicyRepositoryMismatch {
 
 impl std::error::Error for ReviewPolicyRepositoryMismatch {}
 
+#[derive(Debug)]
+pub(super) struct ReviewPolicyFileMissing;
+
+impl std::fmt::Display for ReviewPolicyFileMissing {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("operator review-policy file is missing")
+    }
+}
+
+impl std::error::Error for ReviewPolicyFileMissing {}
+
 impl BoundReviewPolicy {
     pub(super) fn load(repo: &Path, config: &InboxConfig, path: &Path) -> Result<Self> {
         #[cfg(not(unix))]
@@ -97,6 +108,7 @@ impl BoundReviewPolicy {
                 MAX_CONFIG_BYTES,
                 verify_operator_file_mode,
             )
+            .map_err(map_operator_policy_read_error)
             .context("failed to read bounded no-follow operator review-policy file")?;
             root.verify()?;
             let input: OperatorReviewPolicyInput = serde_json::from_slice(&raw)
@@ -157,6 +169,18 @@ impl BoundReviewPolicy {
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn map_operator_policy_read_error(error: anyhow::Error) -> anyhow::Error {
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    }) {
+        return ReviewPolicyFileMissing.into();
+    }
+    error
 }
 
 #[cfg(unix)]
@@ -512,6 +536,33 @@ mod tests {
     }
 
     #[test]
+    fn missing_operator_review_policy_file_is_typed_and_not_a_default_grant() {
+        let (_temp, repo, path) = fixture();
+        let missing = path
+            .parent()
+            .unwrap()
+            .join("absent-operator-review-policy.json");
+        let error = BoundReviewPolicy::load(&repo, &InboxConfig::default(), &missing)
+            .expect_err("missing operator review-policy file must fail closed");
+        assert!(error.is::<ReviewPolicyFileMissing>());
+        let run_id = RunId::new("missing-policy-before-run").unwrap();
+        let run_error = run_inbox(InboxRunOptions {
+            repo: repo.clone(),
+            run_id: run_id.clone(),
+            github: true,
+            permission_mode: Some(InboxPermissionMode::GithubRead),
+            dry_run: true,
+            max_items: None,
+            codex_bin: None,
+            machine_global: None,
+            review_policy_file: Some(missing),
+        })
+        .expect_err("missing policy path must refuse before run reservation");
+        assert!(run_error.is::<ReviewPolicyFileMissing>());
+        assert!(!repo.join(".maco/inbox/runs").join(run_id.as_str()).exists());
+    }
+
+    #[test]
     fn foreign_malformed_and_weakened_inputs_refuse_before_observation() {
         let (_temp, repo, path) = fixture();
         let mut foreign = input(repository("R_actual"));
@@ -570,6 +621,14 @@ mod tests {
         unknown["unexpected"] = serde_json::json!(true);
         fs::write(&path, serde_json::to_vec(&unknown).unwrap()).unwrap();
         assert!(BoundReviewPolicy::load(&repo, &InboxConfig::default(), &path).is_err());
+
+        let mut unsupported_version = serde_json::to_value(input(repository("R_actual"))).unwrap();
+        unsupported_version["version"] = serde_json::json!(2);
+        fs::write(&path, serde_json::to_vec(&unsupported_version).unwrap()).unwrap();
+        let version_error = BoundReviewPolicy::load(&repo, &InboxConfig::default(), &path)
+            .expect_err("unsupported review-policy version must fail closed");
+        assert!(format!("{version_error:#}")
+            .contains("operator review-policy version or provider is unsupported"));
 
         unknown.as_object_mut().unwrap().remove("unexpected");
         unknown["policy"]["minimum_approvals"] = serde_json::json!(0);
