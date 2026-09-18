@@ -2536,8 +2536,10 @@ mod tests {
     ) -> Result<()> {
         let (temp, repo) = super::super::tests::injected_repository();
         let command = injected_parent_command(&temp, &repo);
-        let fake_run =
-            super::super::reporting::deterministic_fake_run(&command, br#"{"accepted":true}"#.to_vec());
+        let fake_run = super::super::reporting::deterministic_fake_run(
+            &command,
+            br#"{"accepted":true}"#.to_vec(),
+        );
         assert!(fake_run.process_tree.is_none());
         let run_id = RunId::new("fake-nonpublishable-environment")?;
         let mut writer = ArtifactRunWriter::reserve(
@@ -2588,10 +2590,8 @@ mod tests {
                 microunits: 1,
             },
         );
-        let (recorded, ..) = record_attempt_with_parent_run(
-            Some(external_run),
-            "trusted-grok-environment-none",
-        )?;
+        let (recorded, ..) =
+            record_attempt_with_parent_run(Some(external_run), "trusted-grok-environment-none")?;
         assert!(recorded.costs.environment_cost_microunits.is_none());
         Ok(())
     }
