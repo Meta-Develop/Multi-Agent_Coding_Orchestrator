@@ -1502,6 +1502,10 @@ impl ExternalAgentCommand {
     }
 
     /// Appends static protocol instructions to the prompt file when messaging is bound.
+    ///
+    /// Production supervise runs include this appendix in the manifested prompt before
+    /// `write_private_prompt`. This method remains for direct prompt fixtures and idempotently
+    /// skips when the appendix is already present.
     pub(crate) fn append_assignment_messaging_protocol_instructions(&self) -> Result<()> {
         if self.assignment_messaging_launch.is_none() {
             return Ok(());
@@ -1513,6 +1517,9 @@ impl ExternalAgentCommand {
                     self.prompt.display()
                 )
             })?;
+        if existing.ends_with(ASSIGNMENT_MESSAGING_PROTOCOL_PROMPT_APPENDIX.as_bytes()) {
+            return Ok(());
+        }
         let combined_len = existing
             .len()
             .saturating_add(ASSIGNMENT_MESSAGING_PROTOCOL_PROMPT_APPENDIX.len());
@@ -1532,6 +1539,22 @@ impl ExternalAgentCommand {
         })?;
         Ok(())
     }
+}
+
+/// Extends an in-memory launch prompt with the static assignment messaging protocol appendix.
+pub(crate) fn extend_prompt_with_assignment_messaging_protocol_appendix(
+    prompt: &mut String,
+) -> Result<()> {
+    let combined_len = prompt
+        .len()
+        .saturating_add(ASSIGNMENT_MESSAGING_PROTOCOL_PROMPT_APPENDIX.len());
+    if combined_len > MAX_PROMPT_BYTES {
+        bail!(
+            "assignment messaging protocol appendix would exceed the bounded prompt size"
+        );
+    }
+    prompt.push_str(ASSIGNMENT_MESSAGING_PROTOCOL_PROMPT_APPENDIX);
+    Ok(())
 }
 
 #[derive(Clone, PartialEq, Eq)]

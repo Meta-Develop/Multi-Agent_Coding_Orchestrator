@@ -45,6 +45,17 @@ fn nested_worker_launch_runtime(
         .unwrap_or(enclosing_child_runtime)
 }
 
+fn external_child_launch_uses_assignment_messaging(runtime: SupervisorRuntime) -> bool {
+    matches!(
+        runtime,
+        SupervisorRuntime::Codex
+            | SupervisorRuntime::Grok
+            | SupervisorRuntime::Cursor
+            | SupervisorRuntime::ClaudeCode
+            | SupervisorRuntime::GeminiCli
+    )
+}
+
 fn runtime_model_catalog_for_launch(
     catalog: &RuntimeModelCatalog,
     run_runtime: SupervisorRuntime,
@@ -1678,11 +1689,16 @@ fn prepare_child_attempt<'a>(
             attempt,
         )?;
     }
-    let attempt_prompt = match retry_feedback {
+    let mut attempt_prompt = match retry_feedback {
         Some(ChildAttemptCorrection::StructuralReport) => prompt_with_structural_retry(&prompt),
         Some(ChildAttemptCorrection::Gate(denial)) => prompt_with_gate_correction(&prompt, denial)?,
         None => prompt,
     };
+    if external_child_launch_uses_assignment_messaging(launch_runtime) {
+        crate::external_agent::extend_prompt_with_assignment_messaging_protocol_appendix(
+            &mut attempt_prompt,
+        )?;
+    }
     measurements.record_final_launch_prompt_bytes(&attempt_prompt)?;
     let prompt_relative = dirs.relative(&attempt_artifacts.prompt_path)?;
     let measurements_relative = prompt_measurements_relative(&prompt_relative);
