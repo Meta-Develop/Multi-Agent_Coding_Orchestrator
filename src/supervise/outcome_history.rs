@@ -142,6 +142,34 @@ pub(super) enum ParentDispatchedReviewCycleSlot {
     Unknown,
 }
 
+/// True when the attempt is nonpublishable simulation or deterministic fake
+/// runtime, the collected run has no verified external child process tree, and
+/// parent-observed Grok ACP spend is absent (environment-native spend unproven).
+pub(super) fn worker_attempt_proven_no_environment_native_spend(
+    execution_runtime: SupervisorExecutionRuntime,
+    requested_runtime: &str,
+    external_run: Option<&ExternalAgentRun>,
+    environment_cost_microunits: Option<u64>,
+) -> bool {
+    if environment_cost_microunits.is_some() {
+        return false;
+    }
+    if execution_runtime != SupervisorExecutionRuntime::NonpublishableSimulation
+        && requested_runtime != "fake"
+    {
+        return false;
+    }
+    match external_run {
+        None => requested_runtime == "fake",
+        Some(run) => {
+            if run.grok_acp_parent_evidence.is_some() {
+                return false;
+            }
+            run.process_tree.is_none()
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn record_child_attempt_outcome(
     artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
@@ -156,6 +184,7 @@ pub(super) fn record_child_attempt_outcome(
     requested_effort: Option<&str>,
     verified_execution: bool,
     retried: bool,
+    execution_runtime: SupervisorExecutionRuntime,
     external_run: Option<&ExternalAgentRun>,
     parent_phase_continuation: Option<AttemptParentPhaseContinuation>,
 ) -> Result<AttemptOutcomeEvidence> {
@@ -168,7 +197,7 @@ pub(super) fn record_child_attempt_outcome(
         parent_attempt_observation(external_run, frozen_catalogs);
     let (execution_cost_microunits, rework_cost_microunits) =
         classify_worker_observed_spend(attempt, worker_observed_microunits);
-    let evidence = AttemptOutcomeEvidence {
+    let mut evidence = AttemptOutcomeEvidence {
         version: ATTEMPT_EVIDENCE_VERSION,
         run_id: run_id.as_str().to_string(),
         assignment_id: assignment_id.to_string(),
@@ -190,6 +219,14 @@ pub(super) fn record_child_attempt_outcome(
         parent_phase_continuation,
     };
     write_attempt_evidence(artifacts, &evidence)?;
+    if worker_attempt_proven_no_environment_native_spend(
+        execution_runtime,
+        requested_runtime,
+        external_run,
+        evidence.costs.environment_cost_microunits,
+    ) {
+        persist_proven_no_environment_attributable_cost(artifacts, &mut evidence)?;
+    }
     Ok(evidence)
 }
 
@@ -453,6 +490,20 @@ pub(super) fn persist_worker_attempt_review_cost(
         }
         ParentDispatchedReviewCycleSlot::Unknown => {}
     }
+    write_attempt_evidence(artifacts, attempt_record)?;
+    Ok(())
+}
+
+/// Proven zero only when the attempt path cannot incur environment-native spend
+/// (no real external launch). Callers must establish that proof separately.
+pub(super) fn persist_proven_no_environment_attributable_cost(
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    attempt_record: &mut AttemptOutcomeEvidence,
+) -> Result<()> {
+    if attempt_record.costs.environment_cost_microunits.is_some() {
+        return Ok(());
+    }
+    attempt_record.costs.environment_cost_microunits = Some(0);
     write_attempt_evidence(artifacts, attempt_record)?;
     Ok(())
 }
@@ -1565,6 +1616,9 @@ mod tests {
         evidence.costs.review_cost_microunits = None;
         assert!(project_numeric_row(&evidence).is_none());
         evidence.costs.review_cost_microunits = Some(0);
+        evidence.costs.environment_cost_microunits = None;
+        assert!(project_numeric_row(&evidence).is_none());
+        evidence.costs.environment_cost_microunits = Some(0);
         evidence.observed_candidate = None;
         assert!(project_numeric_row(&evidence).is_none());
         evidence.observed_candidate = Some(CandidateKey {
@@ -1733,6 +1787,7 @@ mod tests {
             Some("high"),
             true,
             false,
+            SupervisorExecutionRuntime::Verified,
             external_run.as_ref(),
             None,
         )?;
@@ -1782,6 +1837,7 @@ mod tests {
         assert_eq!(observed.effort, ReasoningEffort::High);
         assert_eq!(recorded.costs.execution_cost_microunits, Some(200));
         assert_eq!(recorded.costs.rework_cost_microunits, Some(0));
+        assert!(recorded.costs.environment_cost_microunits.is_none());
         assert!(project_numeric_row(&recorded).is_none());
         Ok(())
     }
@@ -1827,11 +1883,13 @@ mod tests {
             Some("high"),
             true,
             false,
+            SupervisorExecutionRuntime::Verified,
             Some(&external_run),
             Some(attempt_parent_phase_continuation_from_count(Some(0))),
         )?;
         assert_eq!(recorded.costs.execution_cost_microunits, Some(0));
         assert_eq!(recorded.costs.rework_cost_microunits, Some(88));
+        assert!(recorded.costs.environment_cost_microunits.is_none());
         Ok(())
     }
 
@@ -2099,6 +2157,7 @@ mod tests {
             Some("high"),
             true,
             false,
+            SupervisorExecutionRuntime::Verified,
             None,
             None,
         )?;
@@ -2156,6 +2215,7 @@ mod tests {
             Some("high"),
             true,
             false,
+            SupervisorExecutionRuntime::Verified,
             None,
             None,
         )?;
@@ -2216,6 +2276,7 @@ mod tests {
             Some("high"),
             true,
             false,
+            SupervisorExecutionRuntime::Verified,
             Some(&external_run),
             None,
         )?;
@@ -2282,6 +2343,7 @@ mod tests {
             Some("high"),
             true,
             false,
+            SupervisorExecutionRuntime::Verified,
             Some(&external_run),
             None,
         )?;
@@ -2346,6 +2408,7 @@ mod tests {
             Some("high"),
             true,
             false,
+            SupervisorExecutionRuntime::Verified,
             None,
             Some(attempt_parent_phase_continuation_from_count(Some(1))),
         )?;
@@ -2396,6 +2459,7 @@ mod tests {
             Some("high"),
             true,
             false,
+            SupervisorExecutionRuntime::Verified,
             None,
             None,
         )?;
@@ -2438,6 +2502,161 @@ mod tests {
         persist_proven_no_parent_review_cycle_costs(&artifacts, &mut recorded)?;
         assert_eq!(recorded.costs.review_cost_microunits, Some(0));
         assert_eq!(recorded.costs.rereview_cost_microunits, Some(0));
+        assert!(recorded.costs.environment_cost_microunits.is_none());
+        Ok(())
+    }
+
+    fn minimal_external_run_for_proven_environment_helper() -> ExternalAgentRun {
+        use crate::external_agent::{CapturedOutput, ExternalProgramTrust};
+        ExternalAgentRun {
+            command: vec!["test".into()],
+            cwd: std::path::PathBuf::from("/"),
+            timeout_seconds: 1,
+            exit_code: Some(0),
+            duration_ms: 1,
+            timed_out: false,
+            process_tree: None,
+            side_effects: None,
+            publishable: false,
+            program_trust: ExternalProgramTrust::ExplicitCustom,
+            codex_permissions: None,
+            stdout: CapturedOutput::default(),
+            stderr: CapturedOutput::default(),
+            error: None,
+            output_last_message: None,
+            grok_stream_usage_evidence: None,
+            grok_acp_parent_evidence: None,
+        }
+    }
+
+    #[test]
+    fn worker_attempt_proven_no_environment_native_spend() {
+        assert!(super::worker_attempt_proven_no_environment_native_spend(
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            "fake",
+            None,
+            None,
+        ));
+
+        assert!(!super::worker_attempt_proven_no_environment_native_spend(
+            SupervisorExecutionRuntime::Verified,
+            "codex",
+            None,
+            None,
+        ));
+
+        assert!(!super::worker_attempt_proven_no_environment_native_spend(
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            "fake",
+            None,
+            Some(0),
+        ));
+
+        let mut grok_parent_run = minimal_external_run_for_proven_environment_helper();
+        grok_parent_run.grok_acp_parent_evidence = Some(trusted_grok_acp_parent_evidence(
+            "grok-code-fast-1",
+            "high",
+            GrokAcpNativeCostEquivalent::Known {
+                cost_usd_ticks: 1,
+                microunits: 1,
+            },
+        ));
+        assert!(!super::worker_attempt_proven_no_environment_native_spend(
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            "fake",
+            Some(&grok_parent_run),
+            None,
+        ));
+    }
+
+    #[test]
+    fn persist_proven_no_environment_attributable_cost_stamps_zero_when_unset() -> Result<()> {
+        let run_id = RunId::new("proven-no-environment")?;
+        let (_temp, repo) = super::super::tests::injected_repository();
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "maco-supervise",
+        )?;
+        let mut journal = None;
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let mut recorded = fixture();
+        recorded.run_id = run_id.as_str().to_string();
+        recorded.costs.environment_cost_microunits = None;
+        persist_proven_no_environment_attributable_cost(&artifacts, &mut recorded)?;
+        assert_eq!(recorded.costs.environment_cost_microunits, Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn record_child_attempt_outcome_stamps_environment_zero_for_fake_nonpublishable_simulation(
+    ) -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let command = injected_parent_command(&temp, &repo);
+        let fake_run = super::super::reporting::deterministic_fake_run(
+            &command,
+            br#"{"accepted":true}"#.to_vec(),
+        );
+        assert!(fake_run.process_tree.is_none());
+        let run_id = RunId::new("fake-nonpublishable-environment")?;
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "maco-supervise",
+        )?;
+        let mut journal = None;
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let recorded = record_child_attempt_outcome(
+            &artifacts,
+            &run_id,
+            "assignment-1",
+            1,
+            AgentRole::Worker,
+            &[],
+            &[],
+            "fake",
+            None,
+            None,
+            false,
+            false,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            Some(&fake_run),
+            None,
+        )?;
+        assert_eq!(recorded.costs.environment_cost_microunits, Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn record_child_attempt_outcome_leaves_environment_none_for_trusted_grok_parent_run(
+    ) -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let external_run = parent_run_with_trusted_acp(
+            &temp,
+            &repo,
+            "grok-code-fast-1",
+            GrokAcpNativeCostEquivalent::Known {
+                cost_usd_ticks: 1,
+                microunits: 1,
+            },
+        );
+        let (recorded, ..) =
+            record_attempt_with_parent_run(Some(external_run), "trusted-grok-environment-none")?;
+        assert!(recorded.costs.environment_cost_microunits.is_none());
         Ok(())
     }
 
@@ -2491,6 +2710,7 @@ mod tests {
             Some("high"),
             true,
             true,
+            SupervisorExecutionRuntime::Verified,
             Some(&first_run),
             Some(attempt_parent_phase_continuation_from_count(Some(0))),
         )?;
@@ -2507,6 +2727,7 @@ mod tests {
             Some("high"),
             true,
             false,
+            SupervisorExecutionRuntime::Verified,
             Some(&second_run),
             Some(attempt_parent_phase_continuation_from_count(Some(1))),
         )?;
