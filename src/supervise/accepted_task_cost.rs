@@ -2,6 +2,10 @@
 //!
 //! Attempts with any missing attributable bucket — including `environment_cost_microunits:
 //! None` on verified external launches — are incomplete and excluded from numeric rollup.
+//!
+//! Not yet consumed by the supervisor report path; the rollup is wired in a later slice.
+
+#![cfg_attr(not(test), allow(dead_code))]
 
 use super::outcome_history::AttemptAttributableCosts;
 use crate::selection::OutcomeResult;
