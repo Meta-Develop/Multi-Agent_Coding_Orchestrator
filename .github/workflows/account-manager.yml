@@ -3,6 +3,8 @@ name: Account Manager CI
 on:
   pull_request:
   push:
+    paths-ignore:
+      - maco-coordination.json
   workflow_dispatch:
 
 permissions:
@@ -16,6 +18,7 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
+  DESKTOP_MANIFEST: account-manager/src-tauri/Cargo.toml
 
 defaults:
   run:
@@ -62,7 +65,7 @@ jobs:
     defaults:
       run:
         shell: bash
-        working-directory: account-manager
+        working-directory: .
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -83,13 +86,10 @@ jobs:
           rustc --version --verbose
           cargo --version --verbose
           cargo clippy --version
-      - name: Select native core features
-        if: matrix.mode == 'headless'
-        run: echo 'CORE_FEATURES=--no-default-features' >> "$GITHUB_ENV"
       - name: Refuse desktop dependencies in native core
         if: matrix.mode == 'headless'
         run: |
-          cargo tree --locked --manifest-path src-tauri/Cargo.toml --no-default-features \
+          cargo tree --locked -p coding-agent-manager --no-default-features \
             --edges normal,build,dev --prefix none --format '{p}' > headless-dependencies.txt
           python3 - <<'PY'
           from pathlib import Path
@@ -97,11 +97,30 @@ jobs:
           forbidden = sorted(name for name in names if name == 'tauri' or name.startswith(('tauri-', 'gtk', 'webkit')))
           assert not forbidden, forbidden
           PY
-      - name: Format
-        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
-      - name: Check all targets
-        run: cargo check --locked --manifest-path src-tauri/Cargo.toml ${CORE_FEATURES:-} --all-targets
-      - name: Clippy
-        run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml ${CORE_FEATURES:-} --all-targets -- -D warnings
-      - name: Test
-        run: cargo test --locked --manifest-path src-tauri/Cargo.toml ${CORE_FEATURES:-}
+      - name: Format headless core
+        if: matrix.mode == 'headless'
+        run: cargo fmt -p coding-agent-manager -- --check
+      - name: Check headless core
+        if: matrix.mode == 'headless'
+        run: cargo check --locked -p coding-agent-manager --no-default-features --all-targets
+      - name: Clippy headless core
+        if: matrix.mode == 'headless'
+        run: cargo clippy --locked -p coding-agent-manager --no-default-features --all-targets -- -D warnings
+      - name: Test headless core
+        if: matrix.mode == 'headless'
+        run: cargo test --locked -p coding-agent-manager --no-default-features
+      - name: Test headless core (desktop matrix)
+        if: matrix.mode == 'desktop'
+        run: cargo test --locked -p coding-agent-manager --no-default-features
+      - name: Format desktop shell
+        if: matrix.mode == 'desktop'
+        run: cargo fmt --manifest-path "${DESKTOP_MANIFEST}" --all -- --check
+      - name: Check desktop shell
+        if: matrix.mode == 'desktop'
+        run: cargo check --locked --manifest-path "${DESKTOP_MANIFEST}" --all-targets
+      - name: Clippy desktop shell
+        if: matrix.mode == 'desktop'
+        run: cargo clippy --locked --manifest-path "${DESKTOP_MANIFEST}" --all-targets -- -D warnings
+      - name: Test desktop shell
+        if: matrix.mode == 'desktop'
+        run: cargo test --locked --manifest-path "${DESKTOP_MANIFEST}" -p coding-agent-manager-desktop

@@ -27,12 +27,29 @@ exceptions = [
     # This is the repository's declared package license, not an allowance for
     # arbitrary AGPL dependencies.
     { allow = ["AGPL-3.0-or-later"], crate = "multi-agent-coding-orchestrator@0.3.0" },
+    # Owned headless CAM path dependency; GPL is declared in account-manager/src-tauri/Cargo.toml.
+    { allow = ["GPL-3.0-or-later"], crate = "coding-agent-manager@0.1.0" },
     # Reachable through the standards-complete Boon Draft 2020-12 test validator.
     { allow = ["MIT-0"], crate = "borrow-or-share@0.2.4" },
     # libz-sys embeds stock zlib when the static vendored build is selected.
     # Keep Zlib scoped to that crate; the clarification below verifies the
     # exact expression and license-file hashes for every resolved release.
     { allow = ["Zlib"], crate = "libz-sys" },
+    # reqwest -> rustls -> rustls-webpki; registry LICENSE (ISC-style, Brian Smith).
+    { allow = ["ISC"], crate = "rustls-webpki@0.103.14" },
+    { allow = ["ISC"], crate = "untrusted@0.9.0" },
+    # CAM-declared constant-time helper; registry LICENSE is standard BSD-3-Clause.
+    { allow = ["BSD-3-Clause"], crate = "subtle@2.6.1" },
+    # axum -> matchit; MIT in LICENSE, BSD-3-Clause in LICENSE.httprouter (Julien Schmidt).
+    { allow = ["BSD-3-Clause"], crate = "matchit@0.8.4" },
+    # directories -> dirs-sys -> option-ext; registry LICENSE.txt is MPL-2.0 full text.
+    { allow = ["MPL-2.0"], crate = "option-ext@0.2.0" },
+    # reqwest -> rustls-platform-verifier -> webpki-root-certs; registry LICENSE is CDLA-P 2.0.
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-root-certs@1.0.9" },
+    # reqwest rustls default crypto; registry LICENSE SPDX matches Cargo.toml.
+    { allow = ["ISC"], crate = "aws-lc-rs@1.18.0" },
+    # Build of aws-lc-rs; bundled upstream licenses (ISC/BSD/MIT/MIT-0) in crate LICENSE.
+    { allow = ["ISC", "BSD-3-Clause", "MIT-0"], crate = "aws-lc-sys@0.44.0" },
 ]
 
 [[licenses.clarify]]
@@ -61,19 +78,32 @@ external-default-features = "allow"
 allow = []
 allow-workspace = true
 deny = []
-skip = []
+skip = [
+    # digest 0.10 / dbus-secret-service (keyring crypto-rust) vs RustCrypto 0.2 (chacha20poly1305).
+    { name = "block-buffer", version = "=0.10.4", reason = "Pinned by digest 0.10.7 for argon2, sha2, and dbus-secret-service via keyring@3.6.3; chacha20poly1305@0.11 requires block-buffer 0.12." },
+    { name = "cipher", version = "=0.4.4", reason = "dbus-secret-service aes/cbc via keyring@3.6.3; CAM encrypted store uses cipher 0.5 through chacha20poly1305@0.11." },
+    { name = "crypto-common", version = "=0.1.7", reason = "digest 0.10 stack for keyring/argon2; chacha20poly1305 pulls crypto-common 0.2.2." },
+    { name = "cpufeatures", version = "=0.2.17", reason = "sha2/argon2/dbus-secret-service on digest 0.10; poly1305/chacha20 on cpufeatures 0.3." },
+    { name = "inout", version = "=0.1.4", reason = "cipher 0.4 inout for dbus-secret-service; cipher 0.5 inout 0.2 for chacha20poly1305." },
+    { name = "rand_core", version = "=0.6.4", reason = "password-hash/argon2 salt API; crypto-common 0.2 uses rand_core 0.10." },
+    # Three getrandom majors: CAM+argon2 (0.2), MACO libgit2/cc/boon builds (0.3), chacha20/tempfile (0.4).
+    { name = "getrandom", version = "=0.2.17", reason = "coding-agent-manager lists getrandom 0.2; argon2 password-hash uses rand_core 0.6." },
+    { name = "getrandom", version = "=0.4.3", reason = "crypto-common 0.2 for chacha20poly1305 and tempfile 3.27 dev/runtime paths." },
+    { name = "r-efi", version = "=5.3.0", reason = "Target getrandom 0.3.4 in libgit2-sys/cc/aws-lc-sys build graph." },
+    { name = "r-efi", version = "=6.0.0", reason = "Target getrandom 0.4.3 for crypto-common 0.2 and tempfile." },
+    # keyring@3.6.3 platform deps vs reqwest rustls-platform-verifier stack.
+    { name = "core-foundation", version = "=0.9.4", reason = "keyring apple-native; rustls-platform-verifier uses core-foundation 0.10." },
+    { name = "security-framework", version = "=2.11.1", reason = "keyring apple-native; rustls-native-certs uses security-framework 3.7." },
+    { name = "windows-sys", version = "=0.60.2", reason = "keyring windows-native; workspace root and tokio/clap use windows-sys 0.61.2." },
+]
 skip-tree = [
     { crate = "syn:>=2,<3", depth = 0, reason = "Newer serde_derive and clap_derive require syn 3 while the workspace and remaining proc-macro graph still require syn 2." },
 ]
 
 # The depth-zero syn 2 entry above is the sole scoped duplicate bridge; keep
-# `skip` empty and do not extend the exception beyond that major series. The dev path
-# `workspace -> tempfile -> getrandom` overlaps the native build path
-# `workspace -> git2 -> libgit2-sys -> cc -> jobserver -> getrandom`, so both
-# resolve to getrandom 0.3.4. That also removes the duplicate dev/target-only
-# hashbrown, r-efi, and wit-bindgen branches and eliminates foldhash 0.1.5
-# rather than granting its Zlib license a repository-wide allowance or a stale
-# per-crate exception.
+# `skip` entries version-exact. getrandom 0.3.4 remains the shared MACO build
+# path (git2/libgit2-sys, criterion/alloca, boon/ahash); 0.2 and 0.4 skips
+# cover CAM argon2/chacha20 and tempfile branches without a global allow.
 
 [sources]
 unknown-registry = "deny"

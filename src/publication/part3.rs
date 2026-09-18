@@ -295,10 +295,20 @@ impl GhCommandContext {
     }
 
     fn run(
+        self,
+        label: &str,
+        args: Vec<OsString>,
+        stdin: StdinMode,
+    ) -> Result<merge::RequiredCommandOutput> {
+        self.run_with_cancellation(label, args, stdin, None)
+    }
+
+    fn run_with_cancellation(
         mut self,
         label: &str,
         args: Vec<OsString>,
         stdin: StdinMode,
+        process_cancellation: Option<&crate::process_runner::ProcessCancellation>,
     ) -> Result<merge::RequiredCommandOutput> {
         let execution = (|| {
             if classify_gh_operation(&args, &stdin, &self.repository)?
@@ -306,16 +316,26 @@ impl GhCommandContext {
             {
                 bail!("human-authored gh mutations require the approved GitHub actor guard");
             }
-            self.run_inner(label, args, stdin)
+            self.run_inner(label, args, stdin, process_cancellation)
         })();
         self.finish(execution)
     }
 
     fn run_human_mutation(
+        self,
+        label: &str,
+        args: Vec<OsString>,
+        stdin: StdinMode,
+    ) -> Result<merge::RequiredCommandOutput> {
+        self.run_human_mutation_with_cancellation(label, args, stdin, None)
+    }
+
+    fn run_human_mutation_with_cancellation(
         mut self,
         label: &str,
         args: Vec<OsString>,
         stdin: StdinMode,
+        process_cancellation: Option<&crate::process_runner::ProcessCancellation>,
     ) -> Result<merge::RequiredCommandOutput> {
         let execution = (|| {
             if classify_gh_operation(&args, &stdin, &self.repository)?
@@ -327,7 +347,7 @@ impl GhCommandContext {
             execute_with_approved_github_actor(
                 binding,
                 || self.authenticated_github_actor(),
-                || self.run_inner(label, args, stdin),
+                || self.run_inner(label, args, stdin, process_cancellation),
             )
         })();
         self.finish(execution)
@@ -341,6 +361,7 @@ impl GhCommandContext {
                 .map(OsString::from)
                 .collect(),
             StdinMode::Null,
+            None,
         )?;
         github_actor_login_from_output(output)
     }
@@ -368,6 +389,7 @@ impl GhCommandContext {
         label: &str,
         args: Vec<OsString>,
         stdin: StdinMode,
+        process_cancellation: Option<&crate::process_runner::ProcessCancellation>,
     ) -> Result<merge::RequiredCommandOutput> {
         self.runtime_directory
             .verify_identity()
@@ -375,18 +397,35 @@ impl GhCommandContext {
         verify_private_config_files(&self.config_files)?;
         validate_gh_environment(&self.environment, self.runtime_directory.path())?;
         validate_gh_operation(&args, &stdin, &self.repository)?;
-        let output = merge::run_required_network_direct(
-            label,
-            merge::resolve_trusted_executable("gh")?,
-            args,
-            self.runtime_directory.path(),
-            self.environment.clone(),
-            stdin,
-            merge::NETWORK_PROCESS_TIMEOUT,
-            GH_CAPTURE_LIMIT_BYTES,
-            GH_STDIN_LIMIT_BYTES,
-            self.profile.clone(),
-        )
+        let program = merge::resolve_trusted_executable("gh")?;
+        let environment = self.environment.clone();
+        let output = match process_cancellation {
+            None => merge::run_required_network_direct(
+                label,
+                program,
+                args,
+                self.runtime_directory.path(),
+                environment,
+                stdin,
+                merge::NETWORK_PROCESS_TIMEOUT,
+                GH_CAPTURE_LIMIT_BYTES,
+                GH_STDIN_LIMIT_BYTES,
+                self.profile.clone(),
+            ),
+            Some(cancellation) => merge::run_required_network_direct_cancellable(
+                label,
+                program,
+                args,
+                self.runtime_directory.path(),
+                environment,
+                stdin,
+                merge::NETWORK_PROCESS_TIMEOUT,
+                GH_CAPTURE_LIMIT_BYTES,
+                GH_STDIN_LIMIT_BYTES,
+                self.profile.clone(),
+                cancellation,
+            ),
+        }
         .map_err(|error| {
             let mut message = format!("{error:#}");
             for private in [self.token.as_str(), self.token.basic_str()]
@@ -1065,15 +1104,29 @@ fn github_pr_receipt_from_json(value: &serde_json::Value) -> Result<GithubPrResu
     })
 }
 
-fn cli_github_pr_create(
-    worktree_path: &Path,
-    branch: &str,
-    base: &str,
-    title: &str,
-    body: &str,
+#[derive(Debug)]
+struct CliGithubPrCreateRequest<'a> {
+    worktree_path: &'a Path,
+    branch: &'a str,
+    base: &'a str,
+    title: &'a str,
+    body: &'a str,
     draft: bool,
-    repository: &GithubRepositoryIdentity,
-) -> Result<GithubCreateOutput> {
+    repository: &'a GithubRepositoryIdentity,
+    process_cancellation: Option<&'a crate::process_runner::ProcessCancellation>,
+}
+
+fn cli_github_pr_create(request: CliGithubPrCreateRequest<'_>) -> Result<GithubCreateOutput> {
+    let CliGithubPrCreateRequest {
+        worktree_path,
+        branch,
+        base,
+        title,
+        body,
+        draft,
+        repository,
+        process_cancellation,
+    } = request;
     let context = GhCommandContext::create(worktree_path, repository)?;
     let mut args = [
         "pr",
@@ -1095,10 +1148,11 @@ fn cli_github_pr_create(
     if draft {
         args.push(OsString::from("--draft"));
     }
-    let output = context.run_human_mutation(
+    let output = context.run_human_mutation_with_cancellation(
         "gh pr create",
         args,
         StdinMode::Bytes(body.as_bytes().to_vec()),
+        process_cancellation,
     )?;
     Ok(GithubCreateOutput {
         stdout: output.stdout,
