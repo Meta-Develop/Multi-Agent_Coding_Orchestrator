@@ -7,8 +7,8 @@ use time::OffsetDateTime;
 
 use crate::account_authority::{
     AccountObserveRequest, AccountObserveResult, AuthObservation, CategoryObservation,
-    ModelsObservation, ObserveCategory, ObservationError, ObservationErrorKind,
-    QuotaObservation, StoredAccountRegistry,
+    ModelsObservation, ObservationError, ObservationErrorKind, ObserveCategory, QuotaObservation,
+    StoredAccountRegistry,
 };
 use crate::error::{Error, Result};
 use crate::storage::CredentialStore;
