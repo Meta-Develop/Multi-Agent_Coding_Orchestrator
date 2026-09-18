@@ -248,6 +248,17 @@ impl<T: CoordinationAdmissionTransport + 'static> PermitCache<T> {
         Ok(())
     }
 
+    fn contains(&self, binding: &RemoteOwnerBinding) -> bool {
+        let Ok(owner) = binding.owner() else {
+            return false;
+        };
+        let key = Self::owner_key(&owner);
+        self.permits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&key)
+    }
+
     fn with_permit<R>(
         &self,
         binding: &RemoteOwnerBinding,
@@ -300,6 +311,16 @@ impl<T: CoordinationAdmissionTransport + 'static> AdmissionBackend<T> {
         let binding = Self::binding_from_owner(permit.owner());
         self.cache.store(permit)?;
         Ok(binding)
+    }
+
+    fn ensure_cached_scope_permit(
+        &self,
+        binding: &RemoteOwnerBinding,
+    ) -> Result<CoordinationAdmissionResult<()>> {
+        if self.cache.contains(binding) {
+            return Ok(CoordinationAdmissionResult::Ready(()));
+        }
+        self.resume_permit(binding)
     }
 }
 
@@ -358,6 +379,11 @@ impl<T: CoordinationAdmissionTransport + 'static> RemoteCoordinationBackend
     }
 
     fn heartbeat(&self, binding: &RemoteOwnerBinding) -> Result<CoordinationAdmissionResult<()>> {
+        if !self.cache.contains(binding) {
+            // `resume_scope_permit` performs the required fresh heartbeat CAS when restoring
+            // work authority on a new store handle.
+            return self.resume_permit(binding);
+        }
         self.cache.with_permit(binding, |permit| {
             let outcome = self.service.heartbeat(permit)?;
             Ok(match outcome {
@@ -374,6 +400,12 @@ impl<T: CoordinationAdmissionTransport + 'static> RemoteCoordinationBackend
         binding: &RemoteOwnerBinding,
         reason: &str,
     ) -> Result<CoordinationAdmissionResult<()>> {
+        match self.ensure_cached_scope_permit(binding)? {
+            CoordinationAdmissionResult::Ready(()) => {}
+            CoordinationAdmissionResult::Refused(reason) => {
+                return Ok(CoordinationAdmissionResult::Refused(reason));
+            }
+        }
         let permit = self.cache.remove(binding)?;
         let outcome = self.service.release(permit, reason)?;
         Ok(match outcome {
@@ -413,6 +445,15 @@ impl<T: CoordinationAdmissionTransport + 'static> RemoteCoordinationBackend
     }
 
     fn lease_cancellation(&self, binding: &RemoteOwnerBinding) -> Result<ProcessCancellation> {
+        match self.ensure_cached_scope_permit(binding)? {
+            CoordinationAdmissionResult::Ready(()) => {}
+            CoordinationAdmissionResult::Refused(reason) => {
+                bail!(
+                    "remote scope permit cannot be restored for work lease: {}",
+                    format_coordination_admission_refusal(&reason)
+                );
+            }
+        }
         self.cache
             .with_permit(binding, |permit| Ok(permit.cancellation().clone()))
     }
@@ -422,6 +463,12 @@ impl<T: CoordinationAdmissionTransport + 'static> RemoteCoordinationBackend
         binding: &RemoteOwnerBinding,
         publication_effect: PublicationEffectDescriptorV1,
     ) -> Result<CoordinationAdmissionResult<CoordinationSharedEffectPermit>> {
+        match self.ensure_cached_scope_permit(binding)? {
+            CoordinationAdmissionResult::Ready(()) => {}
+            CoordinationAdmissionResult::Refused(reason) => {
+                return Ok(CoordinationAdmissionResult::Refused(reason));
+            }
+        }
         self.cache.with_permit(binding, |permit| {
             self.service
                 .reserve_bound_shared_effect(permit, publication_effect)
@@ -434,6 +481,12 @@ impl<T: CoordinationAdmissionTransport + 'static> RemoteCoordinationBackend
         shared: CoordinationSharedEffectPermit,
         reconciliation: EffectReconciliationReceipt,
     ) -> Result<CoordinationAdmissionResult<()>> {
+        match self.ensure_cached_scope_permit(binding)? {
+            CoordinationAdmissionResult::Ready(()) => {}
+            CoordinationAdmissionResult::Refused(reason) => {
+                return Ok(CoordinationAdmissionResult::Refused(reason));
+            }
+        }
         self.cache.with_permit(binding, |permit| {
             self.service
                 .complete_bound_shared_effect(permit, shared, reconciliation)
@@ -469,6 +522,8 @@ impl RemoteCoordination {
         }
     }
 
+    /// Explicitly resume persisted bindings after local admission (for example revalidation).
+    /// `SyncStore` open does not call this; permits restore on first admitted use per binding.
     pub(crate) fn bootstrap_existing_bindings(
         &self,
         bindings: &[AuthenticatedClaimRemoteOwner],
@@ -1141,7 +1196,7 @@ mod tests {
     }
 
     #[test]
-    fn reopened_store_rehydrates_remote_permit_without_foreign_wal() {
+    fn reopened_store_restores_remote_permit_on_explicit_work_lease() {
         let temp = init_repo();
         let sim = SimTransport::new(temp.path().to_path_buf());
         let store = open_sync_with_sim_remote(temp.path(), sim.shared_clone()).expect("open");
@@ -1150,12 +1205,75 @@ mod tests {
             .expect("claim")
             .claim;
         drop(store);
+        let journal_before_reopen = sim.journal_entries().len();
         let reopened = open_sync_with_sim_remote(temp.path(), sim.shared_clone()).expect("reopen");
+        assert_eq!(
+            sim.journal_entries().len(),
+            journal_before_reopen,
+            "reopen must not resume every persisted binding"
+        );
+        let journal_before_lease = sim.journal_entries().len();
         let lease = reopened
             .remote_work_lease(claim.token)
             .expect("lease")
             .expect("remote lease");
         assert!(!lease.cancellation().is_cancelled());
+        assert!(
+            sim.journal_entries().len() > journal_before_lease,
+            "explicit work lease must restore the requested binding with a fresh heartbeat"
+        );
+    }
+
+    #[test]
+    fn reopened_store_refuses_wrong_owner_heartbeat_without_constructor_remote_mutation() {
+        let temp = init_repo();
+        let sim = SimTransport::new(temp.path().to_path_buf());
+        let store = open_sync_with_sim_remote(temp.path(), sim.shared_clone()).expect("open");
+        let claim = store
+            .claim_paths_with_timing("agent-a", ["src/a.rs"], ClaimTiming::default())
+            .expect("claim")
+            .claim;
+        let liveness_before = store.liveness_snapshot().expect("liveness")[0]
+            .heartbeat_unix_seconds
+            .expect("initialized heartbeat");
+        drop(store);
+        let journal_before_reopen = sim.journal_entries().len();
+        let reopened = open_sync_with_sim_remote(temp.path(), sim.shared_clone()).expect("reopen");
+        assert_eq!(
+            sim.journal_entries().len(),
+            journal_before_reopen,
+            "constructor reopen must not mutate remote journal"
+        );
+        let error = reopened
+            .heartbeat_at(claim.token, "agent-b", None, liveness_before + 1)
+            .expect_err("wrong local owner after reopen");
+        assert!(
+            format!("{error:#}").contains("does not exactly match owner"),
+            "{error:#}"
+        );
+        assert_eq!(sim.journal_entries().len(), journal_before_reopen);
+        assert_eq!(
+            reopened
+                .liveness_snapshot()
+                .expect("liveness after refusal")[0]
+                .heartbeat_unix_seconds,
+            Some(liveness_before)
+        );
+        let journal_before_owner = sim.journal_entries().len();
+        reopened
+            .heartbeat_at(claim.token, "agent-a", None, liveness_before + 1)
+            .expect("exact owner heartbeat after reopen");
+        assert!(
+            sim.journal_entries().len() > journal_before_owner,
+            "admitted owner heartbeat must restore permit and mutate journal"
+        );
+        assert_eq!(
+            reopened
+                .liveness_snapshot_at(liveness_before + 1)
+                .expect("liveness after owner heartbeat")[0]
+                .heartbeat_unix_seconds,
+            Some(liveness_before + 1)
+        );
     }
 
     #[test]

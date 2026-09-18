@@ -25,13 +25,14 @@ use super::{
     account_id_is_safe, binary_on_path, home_dir, managed_account_dir, ActivationMechanism,
     LaunchSpec, ManagedAccountPlan, ProviderAdapter, StoredAccountRegistry,
 };
+use crate::account_authority::{AuthObservation, CategoryObservation};
 use crate::error::{Error, Result};
 use crate::fsx;
 use crate::model::{
     Account, AuthKind, InstallState, Maturity, ProviderCapability, ProviderDescriptor,
     StoredAccountMaterial, StoredAccountMetadata, StoredAccountState,
 };
-use crate::storage::Secret;
+use crate::storage::{CredentialStore, Secret, SecretRef};
 
 const PROVIDER_ID: &str = "gemini-cli";
 const API_KEY_ENV: &str = "GEMINI_API_KEY";
@@ -745,6 +746,58 @@ impl ProviderAdapter for GeminiCliAdapter {
         // Published limits do not establish a local usage signal; none was
         // observed (`docs/research/gemini-cli.md` section 6).
         Ok(Vec::new())
+    }
+
+    fn observe_auth_for_account(
+        &self,
+        account: &StoredAccountMetadata,
+        credential_store: Option<&dyn CredentialStore>,
+    ) -> Result<CategoryObservation<AuthObservation>> {
+        if let Err(error) = self.validate_metadata(account) {
+            return Ok(CategoryObservation::failed(
+                super::observe::observation_error_from_core(&error),
+            ));
+        }
+        match (account.auth_kind, account.material) {
+            (AuthKind::ApiKey, StoredAccountMaterial::CredentialStore) => {
+                let Some(store) = credential_store else {
+                    return Ok(CategoryObservation::unknown());
+                };
+                let key = SecretRef::for_account(PROVIDER_ID, &account.id);
+                match store.get(&key)? {
+                    Some(_) => Ok(CategoryObservation::observed(AuthObservation {
+                        auth_kind: AuthKind::ApiKey,
+                        masked_identity: None,
+                        expires_at: None,
+                    })),
+                    None => Ok(CategoryObservation::unknown()),
+                }
+            }
+            (AuthKind::OAuth, StoredAccountMaterial::VendorHome) => {
+                let home = match self.managed_home(account) {
+                    Ok(home) => home,
+                    Err(error) => {
+                        return Ok(CategoryObservation::failed(
+                            super::observe::observation_error_from_core(&error),
+                        ));
+                    }
+                };
+                if !live_oauth_creds_present(&home) {
+                    return Ok(CategoryObservation::unknown());
+                }
+                if let Err(error) = validate_oauth_creds(&home) {
+                    return Ok(CategoryObservation::failed(
+                        super::observe::observation_error_from_core(&error),
+                    ));
+                }
+                Ok(CategoryObservation::observed(AuthObservation {
+                    auth_kind: AuthKind::OAuth,
+                    masked_identity: masked_active_email(&google_accounts_path(&home)),
+                    expires_at: self.stored_oauth_expiry(account),
+                }))
+            }
+            _ => Ok(CategoryObservation::unavailable()),
+        }
     }
 }
 
