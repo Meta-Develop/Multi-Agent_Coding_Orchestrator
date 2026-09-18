@@ -201,14 +201,19 @@ mod tests {
         assert_eq!(error, SocketPathError::UnsupportedPlatform);
     }
 
+    /// Owner-only temporary root plus its canonical path. macOS places
+    /// `$TMPDIR` under `/var`, a symlink to `/private/var`, so tests must
+    /// build fixture paths from the resolved root or the ancestry check
+    /// correctly rejects the symlinked component before reaching the fixture.
     #[cfg(unix)]
-    fn private_tempdir() -> tempfile::TempDir {
+    fn private_tempdir() -> (tempfile::TempDir, std::path::PathBuf) {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().expect("tempdir");
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("chmod tempdir");
-        dir
+        let canonical = fs::canonicalize(dir.path()).expect("canonical tempdir");
+        (dir, canonical)
     }
 
     #[cfg(unix)]
@@ -223,8 +228,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn owner_only_socket_path_is_accepted() {
-        let root = private_tempdir();
-        let run = root.path().join("run");
+        let (_guard, root) = private_tempdir();
+        let run = root.join("run");
         owner_only_dir(&run);
         let socket = run.join("account.sock");
 
@@ -238,8 +243,8 @@ mod tests {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
-        let root = private_tempdir();
-        let open = root.path().join("open");
+        let (_guard, root) = private_tempdir();
+        let open = root.join("open");
         owner_only_dir(&open);
         fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).expect("chmod 0777");
         let socket = open.join("account.sock");
@@ -254,8 +259,8 @@ mod tests {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
-        let root = private_tempdir();
-        let group = root.path().join("group");
+        let (_guard, root) = private_tempdir();
+        let group = root.join("group");
         owner_only_dir(&group);
         fs::set_permissions(&group, fs::Permissions::from_mode(0o770)).expect("chmod 0770");
         let socket = group.join("account.sock");
@@ -267,10 +272,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlink_traversal_is_rejected() {
-        let root = private_tempdir();
-        let real = root.path().join("real");
+        let (_guard, root) = private_tempdir();
+        let real = root.join("real");
         owner_only_dir(&real);
-        let link = root.path().join("link");
+        let link = root.join("link");
         std::os::unix::fs::symlink(&real, &link).expect("symlink");
         let socket = link.join("account.sock");
 
