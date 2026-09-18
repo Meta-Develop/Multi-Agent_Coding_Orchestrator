@@ -23,9 +23,8 @@ use crate::model::{
 use crate::storage::{CredentialStore, Secret, SecretRef};
 
 pub use crate::account_authority::{
-    AuthObservation, CategoryObservation, ModelsObservation, ObserveCategory,
-    ObservationOutcome, QuotaObservation, SelectedAccountBinding, SelectedUseLease,
-    StoredAccountRegistry,
+    AuthObservation, CategoryObservation, ModelsObservation, ObservationOutcome, ObserveCategory,
+    QuotaObservation, SelectedAccountBinding, SelectedUseLease, StoredAccountRegistry,
 };
 
 pub mod observe;

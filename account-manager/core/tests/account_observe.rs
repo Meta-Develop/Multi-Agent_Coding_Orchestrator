@@ -1,6 +1,5 @@
 //! Hermetic `account.observe` contract: unknown quota without live accounts.
 
-use std::fs;
 use coding_agent_manager_lib::account_authority::{
     AccountObserveRequest, ObservationOutcome, StoredAccountRegistry,
 };
@@ -13,6 +12,7 @@ use coding_agent_manager_lib::providers::{
     add_managed_account, observe_selected_account, ObserveCategory,
 };
 use coding_agent_manager_lib::storage::{CredentialStore, Secret, SecretRef};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 const TEST_KEY: &str = "FAKE-gemini-key-0001";
@@ -39,10 +39,7 @@ impl CredentialStore for MemoryStore {
     }
 
     fn get(&self, _key: &SecretRef) -> coding_agent_manager_lib::error::Result<Option<Secret>> {
-        Ok(self
-            .bytes
-            .as_ref()
-            .map(|bytes| Secret::new(bytes.clone())))
+        Ok(self.bytes.as_ref().map(|bytes| Secret::new(bytes.clone())))
     }
 
     fn delete(&self, _key: &SecretRef) -> coding_agent_manager_lib::error::Result<()> {
@@ -50,7 +47,12 @@ impl CredentialStore for MemoryStore {
     }
 }
 
-fn gemini_fixture() -> (tempfile::TempDir, GeminiCliAdapter, StoredAccountRegistry, MemoryStore) {
+fn gemini_fixture() -> (
+    tempfile::TempDir,
+    GeminiCliAdapter,
+    StoredAccountRegistry,
+    MemoryStore,
+) {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path().join("home");
     let data = dir.path().join("data");
@@ -112,10 +114,7 @@ fn grok_fixture() -> (tempfile::TempDir, GrokCliAdapter, StoredAccountRegistry) 
     let data = dir.path().join("data");
     let cwd = dir.path().join("workspace");
     std::fs::create_dir_all(user_home.join(".grok")).expect("default grok home");
-    copy_tree(
-        &grok_fixture_path("default-home"),
-        &user_home.join(".grok"),
-    );
+    copy_tree(&grok_fixture_path("default-home"), &user_home.join(".grok"));
     std::fs::create_dir_all(&cwd).expect("workspace");
     let adapter = GrokCliAdapter::with_home(&user_home)
         .with_data_dir(&data)
@@ -152,7 +151,11 @@ fn gemini_observe_reports_unknown_quota_and_models_without_live_accounts() {
         &adapter,
         AccountObserveRequest {
             binding: binding.clone(),
-            categories: vec![ObserveCategory::Auth, ObserveCategory::Models, ObserveCategory::Quota],
+            categories: vec![
+                ObserveCategory::Auth,
+                ObserveCategory::Models,
+                ObserveCategory::Quota,
+            ],
         },
         Some(&store),
     )

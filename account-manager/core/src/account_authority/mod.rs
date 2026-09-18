@@ -15,8 +15,8 @@ pub use binding::SelectedAccountBinding;
 pub use incarnation::new_account_incarnation;
 pub use observe::{
     AccountObserveRequest, AccountObserveResult, AuthObservation, CategoryObservation,
-    ModelsObservation, ObserveCategory, ObservationError, ObservationErrorKind,
-    ObservationOutcome, QuotaObservation,
+    ModelsObservation, ObservationError, ObservationErrorKind, ObservationOutcome, ObserveCategory,
+    QuotaObservation,
 };
 pub use registry::StoredAccountRegistry;
 pub use use_lease::SelectedUseLease;
