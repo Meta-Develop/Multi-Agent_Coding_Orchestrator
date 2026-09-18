@@ -2,6 +2,8 @@ import { invoke } from '@tauri-apps/api/core'
 import type {
   AuthKind,
   LaunchedProcess,
+  LoginAccountBinding,
+  LoginStatus,
   ProviderAccountList,
   ProviderDescriptor,
   ProviderQuotaList,
@@ -88,4 +90,28 @@ export function startRelay(): Promise<RelayStatus> {
 
 export function stopRelay(): Promise<RelayStatus> {
   return invoke<RelayStatus>('stop_relay')
+}
+
+export function loginStart(input: {
+  providerId: string
+  accountId: string
+  label: string
+  authKind: AuthKind
+  idempotencyKey: string
+}): Promise<LoginStatus> {
+  return invoke<LoginStatus>('login_start', input)
+}
+
+export function loginStatus(input: {
+  handle: string
+  binding: LoginAccountBinding
+}): Promise<LoginStatus> {
+  return invoke<LoginStatus>('login_status', input)
+}
+
+export function loginCancel(input: {
+  handle: string
+  binding: LoginAccountBinding
+}): Promise<LoginStatus> {
+  return invoke<LoginStatus>('login_cancel', input)
 }

@@ -85,6 +85,80 @@ impl StoredAccountRegistry {
         })
     }
 
+    /// Acquire a shared pending-login lease after verifying the exact pending
+    /// incarnation under the registry file lock. Call before any managed-home
+    /// effect for that login attempt.
+    pub fn acquire_pending_login_lease(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        expected_incarnation: &str,
+        auth_kind: AuthKind,
+        material: StoredAccountMaterial,
+    ) -> Result<super::use_lease::PendingLoginLease> {
+        let _process = in_process_guard()?;
+        let _registry = RegistryFileLock::acquire(&self.path)?;
+        let document = self.read_document_under_lock()?;
+        verify_pending_login_target(
+            &document,
+            provider_id,
+            account_id,
+            expected_incarnation,
+            auth_kind,
+            material,
+        )?;
+        let binding = super::use_lease::PendingLoginBinding {
+            provider_id: provider_id.to_string(),
+            account_id: account_id.to_string(),
+            account_incarnation: expected_incarnation.to_string(),
+        };
+        super::use_lease::PendingLoginLease::acquire_while_registry_files_held(&self.path, &binding)
+    }
+
+    /// Atomically complete one pending account only when its incarnation and
+    /// lifecycle binding still match the login attempt that finished OAuth.
+    pub fn complete_pending_if_incarnation_matches(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        expected_incarnation: &str,
+        auth_kind: AuthKind,
+        material: StoredAccountMaterial,
+    ) -> Result<()> {
+        self.with_locked_mut(|document| {
+            let account = document
+                .accounts
+                .iter_mut()
+                .find(|account| account.provider_id == provider_id && account.id == account_id)
+                .ok_or_else(|| Error::UnknownAccount(account_id.to_string()))?;
+            if account.account_incarnation != expected_incarnation {
+                return Err(Error::StaleAccount {
+                    account_id: account_id.to_string(),
+                });
+            }
+            if account.state != StoredAccountState::Pending {
+                return Err(metadata_write_error(
+                    provider_id,
+                    format!("account `{account_id}` is not pending"),
+                ));
+            }
+            if account.is_selected {
+                return Err(metadata_write_error(
+                    provider_id,
+                    "login completion cannot change account selection",
+                ));
+            }
+            if account.auth_kind != auth_kind || account.material != material {
+                return Err(metadata_write_error(
+                    provider_id,
+                    "stored account metadata does not match the login attempt",
+                ));
+            }
+            account.state = StoredAccountState::Complete;
+            Ok(())
+        })
+    }
+
     pub fn add_with_secret(
         &self,
         provider_id: &str,
@@ -474,4 +548,133 @@ fn in_process_guard() -> Result<MutexGuard<'static, ()>> {
             "stored-account metadata lock is poisoned",
         ))
     })
+}
+
+fn verify_pending_login_target(
+    document: &StoredAccountsDocument,
+    provider_id: &str,
+    account_id: &str,
+    expected_incarnation: &str,
+    auth_kind: AuthKind,
+    material: StoredAccountMaterial,
+) -> Result<()> {
+    let account = document
+        .accounts
+        .iter()
+        .find(|account| account.provider_id == provider_id && account.id == account_id)
+        .ok_or_else(|| Error::UnknownAccount(account_id.to_string()))?;
+    if account.account_incarnation != expected_incarnation {
+        return Err(Error::StaleAccount {
+            account_id: account_id.to_string(),
+        });
+    }
+    if account.state != StoredAccountState::Pending {
+        return Err(metadata_write_error(
+            provider_id,
+            format!("account `{account_id}` is not pending"),
+        ));
+    }
+    if account.is_selected {
+        return Err(metadata_write_error(
+            provider_id,
+            "pending login cannot proceed for a selected account",
+        ));
+    }
+    if account.auth_kind != auth_kind || account.material != material {
+        return Err(metadata_write_error(
+            provider_id,
+            "stored account metadata does not match the login attempt",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod pending_login_tests {
+    use super::*;
+    use crate::model::AuthKind;
+
+    fn registry() -> (tempfile::TempDir, StoredAccountRegistry) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("stored-accounts.json");
+        (dir, StoredAccountRegistry::new(path))
+    }
+
+    #[test]
+    fn pending_login_lease_blocks_delete_until_released() {
+        let (_dir, registry) = registry();
+        let account = registry
+            .begin_add(
+                "gemini-cli",
+                "work",
+                "Work",
+                AuthKind::OAuth,
+                StoredAccountMaterial::VendorHome,
+            )
+            .expect("begin");
+        let lease = registry
+            .acquire_pending_login_lease(
+                "gemini-cli",
+                "work",
+                &account.account_incarnation,
+                AuthKind::OAuth,
+                StoredAccountMaterial::VendorHome,
+            )
+            .expect("lease");
+        assert!(registry.begin_delete("gemini-cli", "work").is_err());
+        drop(lease);
+        registry.begin_delete("gemini-cli", "work").expect("delete");
+    }
+
+    #[test]
+    fn stale_incarnation_completion_does_not_complete_replaced_row() {
+        let (_dir, registry) = registry();
+        let first = registry
+            .begin_add(
+                "gemini-cli",
+                "work",
+                "Work",
+                AuthKind::OAuth,
+                StoredAccountMaterial::VendorHome,
+            )
+            .expect("begin");
+        let old_incarnation = first.account_incarnation.clone();
+        registry.begin_delete("gemini-cli", "work").expect("delete");
+        registry
+            .finish_delete("gemini-cli", "work")
+            .expect("finish");
+        let second = registry
+            .begin_add(
+                "gemini-cli",
+                "work",
+                "Work",
+                AuthKind::OAuth,
+                StoredAccountMaterial::VendorHome,
+            )
+            .expect("readd");
+        assert_ne!(second.account_incarnation, old_incarnation);
+        assert!(matches!(
+            registry.complete_pending_if_incarnation_matches(
+                "gemini-cli",
+                "work",
+                &old_incarnation,
+                AuthKind::OAuth,
+                StoredAccountMaterial::VendorHome,
+            ),
+            Err(Error::StaleAccount { .. })
+        ));
+        registry
+            .complete_pending_if_incarnation_matches(
+                "gemini-cli",
+                "work",
+                &second.account_incarnation,
+                AuthKind::OAuth,
+                StoredAccountMaterial::VendorHome,
+            )
+            .expect("complete new");
+        let row = registry.account("gemini-cli", "work").expect("row");
+        assert_eq!(row.state, StoredAccountState::Complete);
+        assert_eq!(row.account_incarnation, second.account_incarnation);
+        assert!(!row.is_selected);
+    }
 }

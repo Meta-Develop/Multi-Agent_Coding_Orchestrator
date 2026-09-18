@@ -13,4 +13,4 @@ pub mod test_worker;
 pub use binding::SelectedAccountBinding;
 pub use incarnation::new_account_incarnation;
 pub use registry::StoredAccountRegistry;
-pub use use_lease::SelectedUseLease;
+pub use use_lease::{PendingLoginBinding, PendingLoginLease, SelectedUseLease};

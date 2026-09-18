@@ -176,3 +176,28 @@ export interface ProviderAccountList {
   accounts: Account[]
   outcome: AccountListOutcome
 }
+
+/** Closed login lifecycle states from the Rust login service (MACO §5). */
+export type LoginState =
+  | 'waiting-for-user'
+  | 'in-progress'
+  | 'ready'
+  | 'cancelled'
+  | 'failed'
+  | 'unknown'
+
+/** Account binding returned with every login handle; required on status/cancel. */
+export interface LoginAccountBinding {
+  providerId: ProviderId
+  accountId: string
+  accountIncarnation: string
+}
+
+/** Sanitized login status from `login_start` / `login_status` / `login_cancel`. */
+export interface LoginStatus {
+  handle: string
+  binding: LoginAccountBinding
+  state: LoginState
+  /** Present only for terminal failure; never contains secrets or raw vendor output. */
+  failureReason?: string
+}

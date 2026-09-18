@@ -17,6 +17,7 @@ pub mod account_authority;
 pub mod backup;
 pub mod error;
 pub mod fsx;
+pub mod login;
 pub mod model;
 pub mod paths;
 pub mod providers;

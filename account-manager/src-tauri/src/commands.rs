@@ -24,6 +24,12 @@ use crate::relay;
 use crate::router::{self, RouteError, RouteRuleField};
 use crate::storage;
 
+#[path = "login_commands.rs"]
+mod login_commands;
+
+use login_commands::build_managed_login_service;
+use tauri::Manager;
+
 /// Providers whose `list_accounts` inspects only an API key, not OAuth.
 ///
 /// Ceiling: this list is a stand-in for an adapter-reported inspect-scope,
@@ -291,7 +297,7 @@ pub fn launch_provider(provider_id: String) -> Result<LaunchedProcess> {
     Ok(process)
 }
 
-fn stored_account_registry() -> Result<StoredAccountRegistry> {
+pub(crate) fn stored_account_registry() -> Result<StoredAccountRegistry> {
     let dirs = crate::paths::project_dirs().ok_or_else(|| Error::ConfigRead {
         provider: "account-metadata".to_string(),
         reason: "the application data directory could not be resolved".to_string(),
@@ -550,6 +556,11 @@ pub async fn relay_status() -> Result<RelayStatus> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let login = build_managed_login_service(stored_account_registry()?);
+            app.manage(login);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             list_providers,
             list_accounts,
@@ -563,6 +574,9 @@ pub fn run() {
             start_relay,
             stop_relay,
             relay_status,
+            login_commands::login_start,
+            login_commands::login_status,
+            login_commands::login_cancel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Coding Agent Manager");
