@@ -1539,6 +1539,7 @@ struct RawPrCandidate {
     source_trust: GithubPrSourceTrust,
     head_repository: Option<String>,
     changed_files: Vec<PathBuf>,
+    assigned_path_limit_exceeded: bool,
     checks: Vec<GithubCheckSummary>,
     review_feedback: GithubReviewFeedbackSummary,
 }
@@ -6555,11 +6556,14 @@ fn issue_item(
     let mut privacy = privacy_scan(&raw.body, &config.privacy);
     extend_privacy_reasons(&mut privacy, "title", &raw.title, &config.privacy);
     let duplicate = duplicate_result(&source_key, duplicates);
+    let assigned_path_limit_exceeded = assigned_paths_exceed_limit(&raw.assigned_paths);
     let mut skip_reason = None;
     if !privacy.safe {
         skip_reason = Some("privacy_refused".to_string());
     } else if duplicate.duplicate {
         skip_reason = Some("duplicate".to_string());
+    } else if assigned_path_limit_exceeded {
+        skip_reason = Some(ASSIGNED_PATH_LIMIT_SKIP_REASON.to_string());
     }
     let selected = skip_reason.is_none();
     let title = sanitize_public_field(&raw.title, 512);
@@ -6572,6 +6576,15 @@ fn issue_item(
         .as_ref()
         .map(|value| sanitize_public_field(value, MAX_GITHUB_LOGIN_BYTES));
     let labels = sanitize_public_fields(&raw.labels, MAX_LABEL_BYTES);
+    let mut path_proposal = raw.path_proposal;
+    if assigned_path_limit_exceeded {
+        mark_path_proposal_assigned_path_limit(&mut path_proposal);
+    }
+    let assigned_paths = if assigned_path_limit_exceeded {
+        Vec::new()
+    } else {
+        normalize_or_default(raw.assigned_paths, config)?
+    };
     Ok(InboxItem {
         item_id: format!("issue-{}", raw.number),
         source_key,
@@ -6588,8 +6601,8 @@ fn issue_item(
             updated_at: Some(raw.updated_at),
             body_summary: privacy.body_summary.clone(),
             body_truncated: privacy.body_truncated,
-            assigned_paths: normalize_or_default(raw.assigned_paths, config)?,
-            path_proposal: raw.path_proposal,
+            assigned_paths,
+            path_proposal,
         }),
         pull_request: None,
         privacy,
@@ -6629,11 +6642,15 @@ fn pr_item(
     let mut privacy = privacy_scan(&raw.body, &config.privacy);
     extend_privacy_reasons(&mut privacy, "title", &raw.title, &config.privacy);
     let duplicate = duplicate_result(&source_key, duplicates);
+    let assigned_path_limit_exceeded = raw.assigned_path_limit_exceeded
+        || assigned_paths_exceed_limit(&raw.changed_files);
     let mut skip_reason = None;
     if !privacy.safe {
         skip_reason = Some("privacy_refused".to_string());
     } else if duplicate.duplicate {
         skip_reason = Some("duplicate".to_string());
+    } else if assigned_path_limit_exceeded {
+        skip_reason = Some(ASSIGNED_PATH_LIMIT_SKIP_REASON.to_string());
     }
     let selected = skip_reason.is_none();
     let title = sanitize_public_field(&raw.title, 512);
@@ -7118,6 +7135,7 @@ fn fake_pr_candidates(config: &InboxConfig) -> Vec<RawPrCandidate> {
         source_trust: GithubPrSourceTrust::TrustedTargetRepository,
         head_repository: Some("fake/maco/inbox".to_string()),
         changed_files: config.default_assigned_paths.clone(),
+        assigned_path_limit_exceeded: false,
         checks: vec![GithubCheckSummary {
             name: "fake-ci".to_string(),
             status: Some("completed".to_string()),
@@ -7283,7 +7301,11 @@ fn issue_path_proposal(
             } else {
                 proposal.paths
             };
-            (paths, proposal.diagnostics)
+            let mut diagnostics = proposal.diagnostics;
+            if assigned_paths_exceed_limit(&paths) {
+                mark_path_proposal_assigned_path_limit(&mut diagnostics);
+            }
+            (paths, diagnostics)
         }
         Err(_) => {
             let mut diagnostics = planning::TaskPathProposalDiagnostics {
@@ -7338,6 +7360,8 @@ fn raw_pr_from_value(
     };
     let (source_trust, head_repository) =
         github_pr_source_trust(object, &source_repository.selector)?;
+    let (changed_files, assigned_path_limit_exceeded) =
+        files_from_value(object.get("files"))?;
     Ok(RawPrCandidate {
         provider: InboxSourceProvider::Github,
         number,
@@ -7374,7 +7398,8 @@ fn raw_pr_from_value(
         is_draft,
         source_trust,
         head_repository,
-        changed_files: files_from_value(object.get("files"))?,
+        changed_files,
+        assigned_path_limit_exceeded,
         checks: checks_from_value(object.get("statusCheckRollup"))?,
         review_feedback: review_feedback_from_value(value)?,
     })
@@ -7459,8 +7484,16 @@ fn labels_from_value(value: Option<&Value>) -> Result<Vec<String>> {
     validate_labels(labels, "GitHub labels")
 }
 
-fn files_from_value(value: Option<&Value>) -> Result<Vec<PathBuf>> {
-    let values = optional_input_array(value, "GitHub changed files", MAX_GITHUB_FILES)?;
+fn files_from_value(value: Option<&Value>) -> Result<(Vec<PathBuf>, bool)> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok((Vec::new(), false));
+    };
+    let values = value
+        .as_array()
+        .with_context(|| "GitHub changed files must be an array or null")?;
+    if values.len() > MAX_GITHUB_FILES {
+        return Ok((Vec::new(), true));
+    }
     let mut files = Vec::with_capacity(values.len());
     for (index, file) in values.iter().enumerate() {
         let object = file
@@ -7478,7 +7511,7 @@ fn files_from_value(value: Option<&Value>) -> Result<Vec<PathBuf>> {
     }
     files.sort();
     files.dedup();
-    Ok(files)
+    Ok((files, false))
 }
 
 fn github_check_status_allows_absent_conclusion(status: Option<&str>) -> bool {
@@ -9187,6 +9220,7 @@ mod pr_intake_always_on_audit_tests {
             source_trust: GithubPrSourceTrust::TrustedTargetRepository,
             head_repository: Some("fake/maco/inbox".to_string()),
             changed_files: vec![PathBuf::from("src/feature.rs")],
+            assigned_path_limit_exceeded: false,
             checks: vec![GithubCheckSummary {
                 name: "ci".to_string(),
                 status: Some("completed".to_string()),
