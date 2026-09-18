@@ -71,13 +71,11 @@ pub(in crate::supervise) fn rollup_cost_per_accepted_task(
 }
 
 fn sum_five_bucket_cycle_cost(buckets: [u64; 5]) -> Result<u64> {
-    buckets
-        .into_iter()
-        .try_fold(0u64, |total, bucket| {
-            total
-                .checked_add(bucket)
-                .context("attempt cycle cost overflowed")
-        })
+    buckets.into_iter().try_fold(0u64, |total, bucket| {
+        total
+            .checked_add(bucket)
+            .context("attempt cycle cost overflowed")
+    })
 }
 
 #[cfg(test)]
@@ -127,7 +125,8 @@ mod tests {
 
     #[test]
     fn incomplete_rows_do_not_coerce_environment_none_to_zero() -> Result<()> {
-        let grok_only = rollup_cost_per_accepted_task(&[grok_verified_environment_unknown_accepted()])?;
+        let grok_only =
+            rollup_cost_per_accepted_task(&[grok_verified_environment_unknown_accepted()])?;
         assert_eq!(grok_only.incomplete_attempt_count, 1);
         assert_eq!(grok_only.complete_attempt_count, 0);
         assert_eq!(grok_only.complete_accepted_count, 0);
