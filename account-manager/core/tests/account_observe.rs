@@ -190,7 +190,7 @@ fn cursor_observe_refuses_stale_binding_without_auto_select() {
 }
 
 #[test]
-fn gemini_observe_reports_unknown_quota_and_models_without_live_accounts() {
+fn gemini_observe_reports_unknown_quota_and_models_without_invented_zeros() {
     let (_dir, adapter, registry, store) = gemini_fixture();
     registry
         .begin_add(
@@ -225,7 +225,14 @@ fn gemini_observe_reports_unknown_quota_and_models_without_live_accounts() {
 
     assert_eq!(result.binding, binding);
     let json = serde_json::to_string(&result).expect("json");
-    assert!(!json.contains("utilization"));
+    assert!(
+        !json.contains("utilization"),
+        "Gemini observe must not invent utilization: {json}"
+    );
+    assert!(
+        !json.contains("snapshots"),
+        "unknown quota must not serialize empty snapshots as observed zero: {json}"
+    );
 
     let quota = result.quota.expect("quota category");
     assert_eq!(quota.outcome, ObservationOutcome::Unknown);
@@ -239,7 +246,7 @@ fn gemini_observe_reports_unknown_quota_and_models_without_live_accounts() {
 }
 
 #[test]
-fn observe_refuses_stale_binding_without_auto_select() {
+fn gemini_observe_refuses_stale_binding_without_auto_select() {
     let (_dir, adapter, registry, store) = gemini_fixture();
     registry
         .begin_add(
