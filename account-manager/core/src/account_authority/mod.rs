@@ -5,6 +5,7 @@ mod binding;
 mod document;
 mod incarnation;
 mod lock;
+mod observe;
 mod registry;
 mod use_lease;
 
@@ -12,5 +13,10 @@ pub mod test_worker;
 
 pub use binding::SelectedAccountBinding;
 pub use incarnation::new_account_incarnation;
+pub use observe::{
+    AccountObserveRequest, AccountObserveResult, AuthObservation, CategoryObservation,
+    ModelsObservation, ObserveCategory, ObservationError, ObservationErrorKind,
+    ObservationOutcome, QuotaObservation,
+};
 pub use registry::StoredAccountRegistry;
 pub use use_lease::SelectedUseLease;
