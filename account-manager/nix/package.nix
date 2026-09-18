@@ -2,6 +2,10 @@
 #
 #   nix develop --command bash -lc 'npm ci && npm run tauri:build'
 #
+# The desktop shell compiles the shared `../core` crate via a path dependency;
+# `desktopCoreSrc` records that tree for flake consumers (hash-wrapped output
+# semantics are unchanged).
+#
 # Official GitHub installers are not published yet (M7 / FR-10). This
 # package is not a cargoHash/npmHash source build; it imports that binary
 # by content hash and wraps it for a Nix profile or Home Manager.
@@ -24,7 +28,9 @@
   makeDesktopItem,
   linuxLibs,
   iconDir,
+  desktopCoreSrc,
   unwrappedSha256,
+  ...
 }:
 
 let
@@ -58,6 +64,7 @@ stdenv.mkDerivation {
   version = "0.1.0";
 
   src = iconDir;
+  passthru.inTreeCore = desktopCoreSrc;
   dontConfigure = true;
   dontBuild = true;
   dontStrip = true;

@@ -3,6 +3,8 @@ name: Rust CI
 on:
   pull_request:
   push:
+    paths-ignore:
+      - maco-coordination.json
   workflow_dispatch:
 
 permissions:
@@ -46,6 +48,11 @@ jobs:
 
       - name: Allow systemd-executor userns on GitHub-hosted Ubuntu
         run: bash .github/scripts/configure-github-hosted-userns.sh
+
+      - name: Install Linux native build dependencies for headless CAM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libdbus-1-dev
 
       - name: Verify delegated Linux process startup
         run: bash .github/scripts/run-linux-all-tests-in-delegated-user-scope.sh /usr/bin/true
@@ -91,6 +98,11 @@ jobs:
 
       - name: Allow systemd-executor userns on GitHub-hosted Ubuntu
         run: bash .github/scripts/configure-github-hosted-userns.sh
+
+      - name: Install Linux native build dependencies for headless CAM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libdbus-1-dev
 
       - name: Verify delegated Linux process startup
         run: bash .github/scripts/run-linux-all-tests-in-delegated-user-scope.sh /usr/bin/true

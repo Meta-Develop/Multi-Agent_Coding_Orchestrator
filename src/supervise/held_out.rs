@@ -268,13 +268,16 @@ impl ParentValidationAuthority {
             bail!("held-out candidate differs from the parent-captured baseline or diff");
         }
         for index in 0..evidence.commands.len() {
-            match self.admit(&format!("held-out:{}", index), &context.cancellation) {
+            match self.admit(
+                &format!("held-out:{}", index),
+                preflight.managed_process_cancellation().cancellation(),
+            ) {
                 Ok(_) => {
                     evidence.commands[index].observation = crate::merge::held_out::run(
                         &preview,
                         &evidence.commands[index].argv,
                         self.deadline,
-                        &context.cancellation,
+                        preflight.managed_process_cancellation().cancellation(),
                     );
                 }
                 Err(_) => {
@@ -293,7 +296,10 @@ impl ParentValidationAuthority {
         }
         evidence.candidate_revalidated = after.binding == candidate.binding
             && Instant::now() < self.deadline
-            && !context.cancellation.is_cancelled();
+            && !preflight
+                .managed_process_cancellation()
+                .cancellation()
+                .is_cancelled();
         self.retain(&evidence)?;
         Ok(evidence)
     }
