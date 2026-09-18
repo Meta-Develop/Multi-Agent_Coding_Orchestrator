@@ -3,6 +3,8 @@ name: Minimum supported Rust version
 on:
   pull_request:
   push:
+    paths-ignore:
+      - maco-coordination.json
   workflow_dispatch:
 
 permissions:
