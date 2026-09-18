@@ -24,6 +24,9 @@ use crate::relay;
 use crate::router::{self, RouteError, RouteRuleField};
 use crate::storage;
 
+#[path = "observe_commands.rs"]
+mod observe_commands;
+
 /// Providers whose `list_accounts` inspects only an API key, not OAuth.
 ///
 /// Ceiling: this list is a stand-in for an adapter-reported inspect-scope,
@@ -175,7 +178,7 @@ fn path_from_reason(reason: &str) -> Option<String> {
     }
 }
 
-fn adapter_for(provider_id: &str) -> Result<Box<dyn providers::ProviderAdapter>> {
+pub(crate) fn adapter_for(provider_id: &str) -> Result<Box<dyn providers::ProviderAdapter>> {
     providers::find(provider_id).ok_or_else(|| Error::UnknownProvider(provider_id.to_string()))
 }
 
@@ -291,7 +294,7 @@ pub fn launch_provider(provider_id: String) -> Result<LaunchedProcess> {
     Ok(process)
 }
 
-fn stored_account_registry() -> Result<StoredAccountRegistry> {
+pub(crate) fn stored_account_registry() -> Result<StoredAccountRegistry> {
     let dirs = crate::paths::project_dirs().ok_or_else(|| Error::ConfigRead {
         provider: "account-metadata".to_string(),
         reason: "the application data directory could not be resolved".to_string(),
@@ -563,6 +566,7 @@ pub fn run() {
             start_relay,
             stop_relay,
             relay_status,
+            observe_commands::observe_account,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Coding Agent Manager");
