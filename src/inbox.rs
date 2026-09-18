@@ -6642,8 +6642,8 @@ fn pr_item(
     let mut privacy = privacy_scan(&raw.body, &config.privacy);
     extend_privacy_reasons(&mut privacy, "title", &raw.title, &config.privacy);
     let duplicate = duplicate_result(&source_key, duplicates);
-    let assigned_path_limit_exceeded = raw.assigned_path_limit_exceeded
-        || assigned_paths_exceed_limit(&raw.changed_files);
+    let assigned_path_limit_exceeded =
+        raw.assigned_path_limit_exceeded || assigned_paths_exceed_limit(&raw.changed_files);
     let mut skip_reason = None;
     if !privacy.safe {
         skip_reason = Some("privacy_refused".to_string());
@@ -7360,8 +7360,7 @@ fn raw_pr_from_value(
     };
     let (source_trust, head_repository) =
         github_pr_source_trust(object, &source_repository.selector)?;
-    let (changed_files, assigned_path_limit_exceeded) =
-        files_from_value(object.get("files"))?;
+    let (changed_files, assigned_path_limit_exceeded) = files_from_value(object.get("files"))?;
     Ok(RawPrCandidate {
         provider: InboxSourceProvider::Github,
         number,

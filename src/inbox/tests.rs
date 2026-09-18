@@ -702,11 +702,9 @@ fn github_pr_with_oversized_changed_files_is_skipped_and_scan_continues() {
     let mut oversized = valid_raw_pr_value();
     oversized["number"] = json!(9001);
     oversized["url"] = json!("https://github.example/acme/repo/pull/9001");
-    oversized["files"] = json!(
-        (0..MAX_ASSIGNED_PATHS + 1)
-            .map(|index| json!({"path": format!("src/file-{index}.rs")}))
-            .collect::<Vec<_>>()
-    );
+    oversized["files"] = json!((0..MAX_ASSIGNED_PATHS + 1)
+        .map(|index| json!({"path": format!("src/file-{index}.rs")}))
+        .collect::<Vec<_>>());
     let mut normal = valid_raw_pr_value();
     normal["number"] = json!(9002);
     normal["url"] = json!("https://github.example/acme/repo/pull/9002");
@@ -718,8 +716,8 @@ fn github_pr_with_oversized_changed_files_is_skipped_and_scan_continues() {
 
     let oversized_item = pr_item(oversized_raw, &config, &source, &BTreeMap::new())
         .expect("build oversized pr inbox item");
-    let normal_item =
-        pr_item(normal_raw, &config, &source, &BTreeMap::new()).expect("build normal pr inbox item");
+    let normal_item = pr_item(normal_raw, &config, &source, &BTreeMap::new())
+        .expect("build normal pr inbox item");
 
     let mut items = vec![oversized_item, normal_item];
     apply_scan_decisions(&mut items, config.selection.max_items);
@@ -762,8 +760,8 @@ fn github_issue_with_oversized_path_proposal_is_skipped_and_scan_continues() {
 
     let oversized_item = issue_item(oversized, &config, &source, &BTreeMap::new())
         .expect("build oversized issue inbox item");
-    let normal_item =
-        issue_item(normal, &config, &source, &BTreeMap::new()).expect("build normal issue inbox item");
+    let normal_item = issue_item(normal, &config, &source, &BTreeMap::new())
+        .expect("build normal issue inbox item");
 
     let mut items = vec![oversized_item, normal_item];
     apply_scan_decisions(&mut items, config.selection.max_items);
@@ -774,12 +772,14 @@ fn github_issue_with_oversized_path_proposal_is_skipped_and_scan_continues() {
         Some(ASSIGNED_PATH_LIMIT_SKIP_REASON)
     );
     assert!(!items[0].selected);
-    assert!(items[0]
-        .issue
-        .as_ref()
-        .expect("issue payload")
-        .path_proposal
-        .degraded);
+    assert!(
+        items[0]
+            .issue
+            .as_ref()
+            .expect("issue payload")
+            .path_proposal
+            .degraded
+    );
     assert!(items[1].selected);
     assert_eq!(paths, vec![PathBuf::from("README.md")]);
 }
