@@ -26,6 +26,8 @@ use crate::storage;
 
 #[path = "login_commands.rs"]
 mod login_commands;
+#[path = "observe_commands.rs"]
+mod observe_commands;
 
 use login_commands::build_managed_login_service;
 use tauri::Manager;
@@ -181,7 +183,7 @@ fn path_from_reason(reason: &str) -> Option<String> {
     }
 }
 
-fn adapter_for(provider_id: &str) -> Result<Box<dyn providers::ProviderAdapter>> {
+pub(crate) fn adapter_for(provider_id: &str) -> Result<Box<dyn providers::ProviderAdapter>> {
     providers::find(provider_id).ok_or_else(|| Error::UnknownProvider(provider_id.to_string()))
 }
 
@@ -577,6 +579,7 @@ pub fn run() {
             login_commands::login_start,
             login_commands::login_status,
             login_commands::login_cancel,
+            observe_commands::observe_account,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Coding Agent Manager");

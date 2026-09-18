@@ -1,5 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import type {
+  AccountObserveRequest,
+  AccountObserveResult,
   AuthKind,
   LaunchedProcess,
   LoginAccountBinding,
@@ -55,6 +57,13 @@ export function deleteAccount(
   accountId: string,
 ): Promise<void> {
   return invoke<void>('delete_account', { providerId, accountId })
+}
+
+/** Observes only the account named by `request.binding`; never auto-selects. */
+export function observeAccount(
+  request: AccountObserveRequest,
+): Promise<AccountObserveResult> {
+  return invoke<AccountObserveResult>('observe_account', { request })
 }
 
 /**

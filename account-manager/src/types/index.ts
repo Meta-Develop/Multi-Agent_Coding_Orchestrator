@@ -201,3 +201,60 @@ export interface LoginStatus {
   /** Present only for terminal failure; never contains secrets or raw vendor output. */
   failureReason?: string
 }
+
+/** Exact frozen selection binding for `observe_account` (MACO account.observe). */
+export interface SelectedAccountBinding {
+  providerId: ProviderId
+  accountId: string
+  accountIncarnation: string
+  selectionRevision: number
+}
+
+export type ObserveCategory = 'auth' | 'models' | 'quota'
+
+/** Closed observe request: binding plus explicit categories only. */
+export interface AccountObserveRequest {
+  binding: SelectedAccountBinding
+  categories: ObserveCategory[]
+}
+
+/** Account-scoped observation result; quota unknown omits utilization fields. */
+export interface AccountObserveResult {
+  binding: SelectedAccountBinding
+  observedAt: string
+  auth?: CategoryObservation<AuthObservation>
+  models?: CategoryObservation<ModelsObservation>
+  quota?: CategoryObservation<QuotaObservation>
+}
+
+export type ObservationOutcome =
+  | { kind: 'unknown' }
+  | { kind: 'stale' }
+  | { kind: 'unavailable' }
+  | { kind: 'failed'; error: ObservationError }
+  | { kind: 'observed' }
+
+export interface ObservationError {
+  kind: 'config-read' | 'credential-store-unavailable' | 'other'
+  message: string
+}
+
+export interface CategoryObservation<T> {
+  outcome: ObservationOutcome
+  content?: T
+}
+
+export interface AuthObservation {
+  authKind: AuthKind
+  maskedIdentity?: string
+  expiresAt?: string
+}
+
+export interface ModelsObservation {
+  modelIds: string[]
+}
+
+export interface QuotaObservation {
+  snapshots: QuotaSnapshot[]
+  planLabel?: string
+}
