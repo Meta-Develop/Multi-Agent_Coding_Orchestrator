@@ -3113,6 +3113,9 @@ pub struct CommandRunRecord {
     pub grok_stream_usage_evidence: Option<crate::runtime_adapter::grok::GrokStreamUsageEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grok_acp_parent_evidence: Option<crate::runtime_adapter::grok::GrokAcpParentEvidence>,
+    /// Parent-owned Codex model, effort, and usage evidence. Never accepted from child reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_parent_evidence: Option<crate::external_agent::CodexParentEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixed_version_probe_evidence:
         Option<crate::external_agent::EnvironmentFixedVersionProbeEvidence>,
@@ -3575,6 +3578,7 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         error: None,
         grok_stream_usage_evidence: None,
         grok_acp_parent_evidence: None,
+        codex_parent_evidence: None,
         fixed_version_probe_evidence: None,
     };
     let worker = WorkerReport {

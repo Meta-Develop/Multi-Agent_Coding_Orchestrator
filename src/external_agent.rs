@@ -59,10 +59,16 @@ use std::{
 
 #[path = "codex_app_server.rs"]
 pub(crate) mod codex_app_server;
+mod codex_parent_evidence;
 #[allow(dead_code, unused_imports)]
 pub(crate) mod executor;
 mod grok_steering;
 
+use codex_parent_evidence::{codex_parent_evidence_from_run, CodexParentEvidenceInputs};
+pub use codex_parent_evidence::{
+    CodexParentEvidence, CodexParentResolutionStatus, CodexParentResolvedField,
+    CodexParentTurnUsage, CodexServerRerouteEvidence,
+};
 use grok_steering::GrokAcpSteeringBridge;
 
 pub use crate::protected_path::SandboxDenialRetryability;
@@ -1570,6 +1576,10 @@ pub struct ExternalAgentRun {
     pub grok_stream_usage_evidence: Option<GrokStreamUsageEvidence>,
     /// Parent-owned Grok ACP stdio observation. Never accepted from child reports.
     pub grok_acp_parent_evidence: Option<GrokAcpParentEvidence>,
+    /// Parent-owned Codex model, effort, and usage observation derived from the captured
+    /// `codex exec --json` stream and the parent-owned Codex home rollout. Present only for
+    /// supervisor launches; never accepted from child reports.
+    pub codex_parent_evidence: Option<CodexParentEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -1623,6 +1633,7 @@ impl std::fmt::Debug for ExternalAgentRun {
                 &self.grok_stream_usage_evidence,
             )
             .field("grok_acp_parent_evidence", &self.grok_acp_parent_evidence)
+            .field("codex_parent_evidence", &self.codex_parent_evidence)
             .finish()
     }
 }
@@ -1837,6 +1848,8 @@ struct ExternalAgentRunWireRef<'a> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     grok_acp_parent_evidence: &'a Option<GrokAcpParentEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex_parent_evidence: &'a Option<CodexParentEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     managed_grok_selection: &'a Option<ManagedGrokAccountSelectionEvidence>,
 }
 
@@ -1880,6 +1893,8 @@ struct ExternalAgentRunWireOwned {
     #[serde(default)]
     grok_acp_parent_evidence: Option<GrokAcpParentEvidence>,
     #[serde(default)]
+    codex_parent_evidence: Option<CodexParentEvidence>,
+    #[serde(default)]
     managed_grok_selection: Option<ManagedGrokAccountSelectionEvidence>,
 }
 
@@ -1921,6 +1936,7 @@ impl Serialize for ExternalAgentRun {
             error: &self.error,
             grok_stream_usage_evidence: &self.grok_stream_usage_evidence,
             grok_acp_parent_evidence: &self.grok_acp_parent_evidence,
+            codex_parent_evidence: &self.codex_parent_evidence,
             managed_grok_selection: &self.stdout.run_metadata.managed_grok_selection,
         }
         .serialize(serializer)
@@ -1965,6 +1981,7 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
             output_last_message: None,
             grok_stream_usage_evidence: wire.grok_stream_usage_evidence,
             grok_acp_parent_evidence: wire.grok_acp_parent_evidence,
+            codex_parent_evidence: wire.codex_parent_evidence,
         })
     }
 }
@@ -2708,6 +2725,7 @@ fn run_external_agent_runtime(
         output_last_message: None,
         grok_stream_usage_evidence: None,
         grok_acp_parent_evidence: None,
+        codex_parent_evidence: None,
     };
 
     let mut codex_version = None;
@@ -3484,11 +3502,11 @@ fn run_external_agent_runtime(
                         }
                     }
                 }
-                match output_staging.reservation_mut() {
-                    Ok(staged_output) => record_completed_target(
+                match output_staging.completion_handles() {
+                    Ok(staging) => record_completed_target(
                         &mut report,
                         interactive.process,
-                        staged_output,
+                        staging,
                         &mut output_reservation,
                         &mut json_log_reservation,
                         &credential_redactor,
@@ -3577,11 +3595,11 @@ fn run_external_agent_runtime(
                         }
                     }
                 }
-                match output_staging.reservation_mut() {
-                    Ok(staged_output) => record_completed_target(
+                match output_staging.completion_handles() {
+                    Ok(staging) => record_completed_target(
                         &mut report,
                         interactive.process,
-                        staged_output,
+                        staging,
                         &mut output_reservation,
                         &mut json_log_reservation,
                         &credential_redactor,
@@ -3624,11 +3642,11 @@ fn run_external_agent_runtime(
         }
     } else {
         run_process_cancellable(process_spec, cancellation).map(|output| {
-            match output_staging.reservation_mut() {
-                Ok(staged_output) => record_completed_target(
+            match output_staging.completion_handles() {
+                Ok(staging) => record_completed_target(
                     &mut report,
                     output,
-                    staged_output,
+                    staging,
                     &mut output_reservation,
                     &mut json_log_reservation,
                     &credential_redactor,
@@ -4421,15 +4439,28 @@ fn runtime_adapter_captured_output(
     })
 }
 
+/// Parent-held handles into the private output staging root that target completion reads from
+/// and publishes through. Both are descriptors the parent opened before the unit ran.
+struct CompletedTargetStaging<'a> {
+    /// The staged raw output leaf the contained agent wrote its last message to.
+    output: &'a mut ReservedOutputFile,
+    /// The parent-owned Codex home, present only for supervisor launches.
+    codex_home: Option<&'a SecureOutputRoot>,
+}
+
 fn record_completed_target(
     report: &mut ExternalAgentRun,
     output: ProcessOutput,
-    staged_output: &mut ReservedOutputFile,
+    staging: CompletedTargetStaging<'_>,
     output_reservation: &mut ReservedOutputFile,
     json_log_reservation: &mut ReservedOutputFile,
     credential_redactor: &CredentialRedactor,
     context: CompletedTargetContext<'_>,
 ) {
+    let CompletedTargetStaging {
+        output: staged_output,
+        codex_home,
+    } = staging;
     let safety_verified = output.safety_evidence_verified();
     let target_completed_successfully = !output.timed_out
         && output.status.is_some_and(|status| status.success())
@@ -4479,6 +4510,21 @@ fn record_completed_target(
     } else if context.spec.invocation == ExternalAgentInvocation::Grok {
         report.grok_stream_usage_evidence =
             Some(grok_bounded_stdout_usage_evidence(&output.stdout));
+    } else if context.spec.invocation == ExternalAgentInvocation::CodexSupervisor {
+        // Codex evidence is derived only from parent-held captures: the stdout stream held by
+        // the runner and the rollout below the parent-owned Codex home. A truncated stream can
+        // no longer prove the run's shape, so it is withheld and resolves as invalid JSONL.
+        if let Some(codex_home) = codex_home {
+            let inputs = CodexParentEvidenceInputs {
+                codex_version: context.codex_version,
+                cwd: &context.spec.cwd,
+                requested_model: context.spec.model.as_deref(),
+                requested_effort: context.spec.reasoning_effort.as_deref(),
+            };
+            let stdout = (!output.stdout.is_truncated()).then(|| output.stdout.as_bytes());
+            report.codex_parent_evidence =
+                Some(codex_parent_evidence_from_run(&inputs, stdout, codex_home));
+        }
     }
     report.error = append_external_error(
         report.error.take(),
@@ -4633,6 +4679,7 @@ fn failed_external_run(
         output_last_message: None,
         grok_stream_usage_evidence: None,
         grok_acp_parent_evidence: None,
+        codex_parent_evidence: None,
     }
 }
 
@@ -4852,6 +4899,19 @@ impl ExternalOutputStaging {
             .create_child(OsStr::new(CODEX_HOME_STAGING_NAME))
             .context("failed to stage the parent-owned Codex home")?;
         Ok(self.codex_home.insert(home).path())
+    }
+
+    /// Borrows the staged output leaf together with the parent-owned Codex home (when staged)
+    /// so target completion can publish output and read the rollout from held descriptors.
+    fn completion_handles(&mut self) -> Result<CompletedTargetStaging<'_>> {
+        let output = self
+            .reservation
+            .as_mut()
+            .context("private output staging reservation was already cleaned")?;
+        Ok(CompletedTargetStaging {
+            output,
+            codex_home: self.codex_home.as_ref(),
+        })
     }
 
     fn path(&self) -> Result<&Path> {

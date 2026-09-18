@@ -1876,6 +1876,7 @@ pub(super) fn deterministic_fake_run(
         output_last_message: Some(output),
         grok_stream_usage_evidence: None,
         grok_acp_parent_evidence: None,
+        codex_parent_evidence: None,
     }
 }
 
@@ -2256,6 +2257,7 @@ pub(super) fn command_record_from_external_for_runtime(
         error: run.error.clone(),
         grok_stream_usage_evidence: run.grok_stream_usage_evidence.clone(),
         grok_acp_parent_evidence: run.grok_acp_parent_evidence.clone(),
+        codex_parent_evidence: run.codex_parent_evidence.clone(),
         fixed_version_probe_evidence: run.fixed_version_probe_evidence().cloned(),
     }
 }
@@ -2448,6 +2450,7 @@ mod grok_stream_usage_evidence {
                 },
             )),
             grok_acp_parent_evidence: None,
+            codex_parent_evidence: None,
         };
         let record = command_record_from_external_for_runtime(
             &external_run,

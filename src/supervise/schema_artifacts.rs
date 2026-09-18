@@ -2602,6 +2602,7 @@ fn remove_parent_process_usage_from_child_schema(schema: &mut serde_json::Value)
             {
                 properties.remove("grok_stream_usage_evidence");
                 properties.remove("grok_acp_parent_evidence");
+                properties.remove("codex_parent_evidence");
                 properties.remove("fixed_version_probe_evidence");
             }
             if let Some(required) = object
@@ -2610,6 +2611,7 @@ fn remove_parent_process_usage_from_child_schema(schema: &mut serde_json::Value)
             {
                 required.retain(|name| name != "grok_stream_usage_evidence");
                 required.retain(|name| name != "grok_acp_parent_evidence");
+                required.retain(|name| name != "codex_parent_evidence");
                 required.retain(|name| name != "fixed_version_probe_evidence");
             }
             for value in object.values_mut() {
@@ -3391,6 +3393,95 @@ fn grok_acp_parent_evidence_schema_value() -> serde_json::Value {
     })
 }
 
+/// Parent-owned Codex model, effort, and usage evidence. The resolved fields share the
+/// Grok `{"known": ...}` / `"unknown"` wire shape.
+fn codex_parent_evidence_schema_value() -> serde_json::Value {
+    let resolved_field = grok_acp_parent_resolved_field_schema_value();
+    json!({
+        "oneOf": [
+            {"type": "null"},
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                    "codex_version",
+                    "thread_id",
+                    "requested_model",
+                    "requested_effort",
+                    "rollout_model",
+                    "rollout_effort",
+                    "observed_model",
+                    "observed_effort",
+                    "server_rerouted_model",
+                    "model_mismatch",
+                    "turn_usage",
+                    "resolution_status"
+                ],
+                "properties": {
+                    "codex_version": {"type": ["string", "null"], "minLength": 1},
+                    "thread_id": {"type": ["string", "null"], "minLength": 1},
+                    "requested_model": {"type": ["string", "null"]},
+                    "requested_effort": {"type": ["string", "null"]},
+                    "rollout_model": resolved_field,
+                    "rollout_effort": resolved_field,
+                    "observed_model": resolved_field,
+                    "observed_effort": resolved_field,
+                    "server_rerouted_model": {
+                        "oneOf": [
+                            {"type": "null"},
+                            {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["from", "to"],
+                                "properties": {
+                                    "from": {"type": "string", "minLength": 1},
+                                    "to": {"type": "string", "minLength": 1}
+                                }
+                            }
+                        ]
+                    },
+                    "model_mismatch": {"type": "boolean"},
+                    "turn_usage": {
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["status", "reason"],
+                                "properties": {
+                                    "status": {"const": "unknown"},
+                                    "reason": {"type": "string"}
+                                }
+                            },
+                            {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": [
+                                    "status",
+                                    "input_tokens",
+                                    "output_tokens",
+                                    "cached_input_tokens",
+                                    "reasoning_output_tokens"
+                                ],
+                                "properties": {
+                                    "status": {"const": "known"},
+                                    "input_tokens": {"type": "integer", "minimum": 0},
+                                    "output_tokens": {"type": "integer", "minimum": 0},
+                                    "cached_input_tokens": {"type": "integer", "minimum": 0},
+                                    "reasoning_output_tokens": {"type": "integer", "minimum": 0}
+                                }
+                            }
+                        ]
+                    },
+                    "resolution_status": {
+                        "type": "string",
+                        "enum": crate::external_agent::CodexParentResolutionStatus::LABELS
+                    }
+                }
+            }
+        ]
+    })
+}
+
 fn grok_stream_usage_evidence_schema_value() -> serde_json::Value {
     json!({
         "oneOf": [
@@ -3471,6 +3562,7 @@ pub(super) fn command_run_record_schema_value() -> serde_json::Value {
             "error": {"type": ["string", "null"]},
             "grok_stream_usage_evidence": grok_stream_usage_evidence_schema_value(),
             "grok_acp_parent_evidence": grok_acp_parent_evidence_schema_value(),
+            "codex_parent_evidence": codex_parent_evidence_schema_value(),
             "fixed_version_probe_evidence": fixed_version_probe_evidence_schema_value()
         },
         "allOf": [command_environment_failure_outcome_schema_value()]
@@ -4399,6 +4491,7 @@ mod selection_schema_tests {
             error: Some("representative failure".to_string()),
             grok_stream_usage_evidence: None,
             grok_acp_parent_evidence: None,
+            codex_parent_evidence: None,
             fixed_version_probe_evidence: None,
         };
         let validation_result = ValidationResult {
@@ -4866,6 +4959,181 @@ mod selection_schema_tests {
             .validate(&invalid_status, index)
             .expect_err("invalid resolution_status must be rejected");
         Ok(())
+    }
+
+    fn codex_parent_evidence_schema_index() -> Result<(boon::Schemas, boon::SchemaIndex)> {
+        let schema = codex_parent_evidence_schema_value();
+        let schema_id = "https://example.invalid/codex-parent-evidence";
+        let mut compiler = boon::Compiler::new();
+        compiler.set_default_draft(boon::Draft::V2020_12);
+        compiler
+            .add_resource(schema_id, schema)
+            .expect("register Codex parent-evidence schema");
+        let mut schemas = boon::Schemas::new();
+        let index = compiler
+            .compile(schema_id, &mut schemas)
+            .expect("compile Codex parent-evidence schema");
+        Ok((schemas, index))
+    }
+
+    fn complete_codex_parent_evidence() -> crate::external_agent::CodexParentEvidence {
+        use crate::external_agent::{
+            CodexParentEvidence, CodexParentResolvedField, CodexParentTurnUsage,
+            CodexServerRerouteEvidence,
+        };
+        CodexParentEvidence {
+            codex_version: Some("0.144.4".to_string()),
+            thread_id: Some("0199a4b3-7f1e-7c2a-9d0e-3f4a5b6c7d8e".to_string()),
+            requested_model: Some("gpt-5-codex".to_string()),
+            requested_effort: Some("high".to_string()),
+            rollout_model: CodexParentResolvedField::Known("gpt-5-codex".to_string()),
+            rollout_effort: CodexParentResolvedField::Known("high".to_string()),
+            observed_model: CodexParentResolvedField::Known("gpt-5-codex-mini".to_string()),
+            observed_effort: CodexParentResolvedField::Known("high".to_string()),
+            server_rerouted_model: Some(CodexServerRerouteEvidence {
+                from: "gpt-5-codex".to_string(),
+                to: "gpt-5-codex-mini".to_string(),
+            }),
+            model_mismatch: true,
+            turn_usage: CodexParentTurnUsage::Known {
+                input_tokens: 1200,
+                output_tokens: 340,
+                cached_input_tokens: 800,
+                reasoning_output_tokens: 120,
+            },
+            resolution_status: "complete".to_string(),
+        }
+    }
+
+    fn unknown_codex_parent_evidence() -> crate::external_agent::CodexParentEvidence {
+        use crate::external_agent::{
+            CodexParentEvidence, CodexParentResolvedField, CodexParentTurnUsage,
+        };
+        CodexParentEvidence {
+            codex_version: None,
+            thread_id: None,
+            requested_model: None,
+            requested_effort: None,
+            rollout_model: CodexParentResolvedField::Unknown,
+            rollout_effort: CodexParentResolvedField::Unknown,
+            observed_model: CodexParentResolvedField::Unknown,
+            observed_effort: CodexParentResolvedField::Unknown,
+            server_rerouted_model: None,
+            model_mismatch: false,
+            turn_usage: CodexParentTurnUsage::Unknown {
+                reason: "the Codex stream was not valid JSONL".to_string(),
+            },
+            resolution_status: "jsonl_invalid".to_string(),
+        }
+    }
+
+    #[test]
+    fn codex_parent_evidence_schema_accepts_serialized_complete_and_unknown_shapes() -> Result<()> {
+        let (schemas, index) = codex_parent_evidence_schema_index()?;
+        schemas
+            .validate(&serde_json::Value::Null, index)
+            .expect("null Codex parent evidence must remain valid");
+
+        let complete = serde_json::to_value(complete_codex_parent_evidence())?;
+        assert_eq!(complete["rollout_model"], json!({"known": "gpt-5-codex"}));
+        assert_eq!(complete["turn_usage"]["status"], json!("known"));
+        schemas.validate(&complete, index).unwrap_or_else(|error| {
+            panic!("schema rejected complete CodexParentEvidence: {error:#}")
+        });
+        let restored: crate::external_agent::CodexParentEvidence =
+            serde_json::from_value(complete)?;
+        assert_eq!(restored, complete_codex_parent_evidence());
+
+        let unknown = serde_json::to_value(unknown_codex_parent_evidence())?;
+        assert_eq!(unknown["rollout_model"], json!("unknown"));
+        assert_eq!(unknown["turn_usage"]["status"], json!("unknown"));
+        schemas.validate(&unknown, index).unwrap_or_else(|error| {
+            panic!("schema rejected unknown CodexParentEvidence: {error:#}")
+        });
+
+        for status in crate::external_agent::CodexParentResolutionStatus::LABELS {
+            let mut labelled = unknown.clone();
+            labelled["resolution_status"] = json!(status);
+            schemas.validate(&labelled, index).unwrap_or_else(|error| {
+                panic!("schema rejected resolution_status {status}: {error:#}")
+            });
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn codex_parent_evidence_schema_refuses_extra_and_invalid_properties() -> Result<()> {
+        let (schemas, index) = codex_parent_evidence_schema_index()?;
+        let base = serde_json::to_value(complete_codex_parent_evidence())?;
+
+        let mut extra = base.clone();
+        extra["forged_extra_field"] = json!(true);
+        schemas
+            .validate(&extra, index)
+            .expect_err("extra Codex parent-evidence field must be rejected");
+        assert!(
+            serde_json::from_value::<crate::external_agent::CodexParentEvidence>(extra).is_err(),
+            "the wire type must deny unknown fields as well"
+        );
+
+        let mut invalid_status = base.clone();
+        invalid_status["resolution_status"] = json!("incomplete");
+        schemas
+            .validate(&invalid_status, index)
+            .expect_err("Grok-only resolution_status must be rejected");
+
+        let mut tagged_unknown = base.clone();
+        tagged_unknown["observed_model"] = json!({"unknown": null});
+        schemas
+            .validate(&tagged_unknown, index)
+            .expect_err("Unknown must not be an empty tagged object");
+
+        let mut partial_usage = base.clone();
+        partial_usage["turn_usage"] = json!({"status": "known", "input_tokens": 1});
+        schemas
+            .validate(&partial_usage, index)
+            .expect_err("known usage must carry every token counter");
+
+        let mut extra_usage = base.clone();
+        extra_usage["turn_usage"]["total_tokens"] = json!(1);
+        schemas
+            .validate(&extra_usage, index)
+            .expect_err("usage must not admit unmodelled counters");
+
+        let mut missing_field = base.clone();
+        missing_field
+            .as_object_mut()
+            .context("object")?
+            .remove("model_mismatch");
+        schemas
+            .validate(&missing_field, index)
+            .expect_err("every parent-owned field is required");
+
+        let mut half_reroute = base;
+        half_reroute["server_rerouted_model"] = json!({"from": "gpt-5-codex"});
+        schemas
+            .validate(&half_reroute, index)
+            .expect_err("a reroute needs both endpoints");
+        Ok(())
+    }
+
+    #[test]
+    fn command_run_record_schema_carries_optional_parent_only_codex_evidence() {
+        let command_schema = command_run_record_schema_value();
+        assert!(command_schema["properties"]
+            .get("codex_parent_evidence")
+            .is_some());
+        assert!(!command_schema["required"]
+            .as_array()
+            .expect("required array")
+            .iter()
+            .any(|name| name == "codex_parent_evidence"));
+
+        let mut child_schema = command_run_record_schema_value();
+        remove_parent_process_usage_from_child_schema(&mut child_schema);
+        assert!(child_schema["properties"]
+            .get("codex_parent_evidence")
+            .is_none());
     }
 
     #[test]

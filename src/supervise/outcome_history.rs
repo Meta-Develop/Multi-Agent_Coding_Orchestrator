@@ -2526,6 +2526,7 @@ mod tests {
             output_last_message: None,
             grok_stream_usage_evidence: None,
             grok_acp_parent_evidence: None,
+            codex_parent_evidence: None,
         }
     }
 

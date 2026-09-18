@@ -4457,6 +4457,7 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
                 output_last_message: Some(contents),
                 grok_stream_usage_evidence: None,
                 grok_acp_parent_evidence: None,
+                codex_parent_evidence: None,
             };
             injected_target_attempted(run)
         };

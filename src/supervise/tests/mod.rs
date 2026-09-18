@@ -964,6 +964,7 @@ fn injected_verified_run_without_journals(command: &ExternalAgentCommand) -> Ext
         output_last_message: fs::read(&command.output_last_message).ok(),
         grok_stream_usage_evidence: None,
         grok_acp_parent_evidence: None,
+        codex_parent_evidence: None,
     }
 }
 
@@ -1034,6 +1035,7 @@ fn injected_command_record() -> CommandRunRecord {
         error: None,
         grok_stream_usage_evidence: None,
         grok_acp_parent_evidence: None,
+        codex_parent_evidence: None,
         fixed_version_probe_evidence: None,
     }
 }
