@@ -1,5 +1,6 @@
 //! Hermetic `account.observe` contract: unknown quota without live accounts.
 
+#[allow(dead_code)]
 mod common;
 
 use coding_agent_manager_lib::account_authority::{
