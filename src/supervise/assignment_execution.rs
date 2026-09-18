@@ -4555,6 +4555,7 @@ fn execute_supervisor_assignment_inner(
                         requested_effort.as_deref(),
                         context.execution_runtime == SupervisorExecutionRuntime::Verified,
                         false,
+                        context.execution_runtime,
                         None,
                         Some(attempt_parent_phase_continuation_from_count(
                             completed_parent_review_cycles,
@@ -4592,6 +4593,7 @@ fn execute_supervisor_assignment_inner(
                         requested_effort.as_deref(),
                         context.execution_runtime == SupervisorExecutionRuntime::Verified,
                         false,
+                        context.execution_runtime,
                         Some(&attempt_external_run),
                         Some(attempt_parent_phase_continuation_from_count(
                             completed_parent_review_cycles,
@@ -4613,6 +4615,7 @@ fn execute_supervisor_assignment_inner(
                 requested_effort.as_deref(),
                 context.execution_runtime == SupervisorExecutionRuntime::Verified,
                 matches!(&disposition, ChildAttemptDisposition::Retry),
+                context.execution_runtime,
                 Some(&attempt_external_run),
                 Some(attempt_parent_phase_continuation_from_count(
                     completed_parent_review_cycles,
@@ -6425,6 +6428,7 @@ mod decomposition_tests {
             Some("high"),
             true,
             false,
+            SupervisorExecutionRuntime::Verified,
             Some(&attempt_external_run),
             Some(attempt_parent_phase_continuation_from_count(Some(0))),
         )
@@ -6560,12 +6564,14 @@ mod decomposition_tests {
             ParentAuditorGateDisposition::Complete { .. } => {}
             ParentAuditorGateDisposition::Retry => panic!("unexpected parent auditor retry"),
         }
-        persist_worker_attempt_review_cost(
+        let mut completed_parent_review_cycles = Some(0);
+        finalize_parent_review_cycle_attribution_for_worker_attempt(
             &artifacts,
             &review_cost_binding,
             &mut terminal_attempt_outcome,
+            &mut completed_parent_review_cycles,
         )
-        .expect("persist review cost on complete path");
+        .expect("finalize review cost on complete path");
         assert_eq!(
             terminal_attempt_outcome.costs.review_cost_microunits,
             Some(REVIEW_COST_MICROUNITS)
