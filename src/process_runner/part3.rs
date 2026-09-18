@@ -185,6 +185,7 @@ struct SystemdUnit {
     pending_environment: Option<EnvironmentMode>,
     pending_runtime_files: Vec<PrivateRuntimeFile>,
     runtime_file_paths: Vec<PathBuf>,
+    staged_codex_home: Option<PathBuf>,
     target_program_path: Option<PathBuf>,
     sandbox: Option<ResolvedSystemdSandbox>,
     sandbox_verified: bool,
@@ -474,6 +475,7 @@ impl SystemdUnit {
             pending_environment: None,
             pending_runtime_files: Vec::new(),
             runtime_file_paths: Vec::new(),
+            staged_codex_home: None,
             target_program_path: None,
             sandbox: None,
             sandbox_verified: false,
@@ -488,9 +490,19 @@ impl SystemdUnit {
     }
 
     fn build_command(&mut self, spec: &ProcessSpec) -> std::io::Result<Command> {
+        if let Some(home) = spec.staged_codex_home.as_deref() {
+            validate_systemd_path_syntax(home, "staged Codex home")?;
+            if !home.is_absolute() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "staged Codex home must be absolute",
+                ));
+            }
+        }
         let target_environment = if spec.private_runtime_home
             || spec.private_runtime_codex_home
             || spec.private_runtime_grok_home
+            || spec.staged_codex_home.is_some()
         {
             environment_with_private_runtime_home(
                 &spec.environment,
@@ -498,11 +510,22 @@ impl SystemdUnit {
                 spec.private_runtime_home,
                 spec.private_runtime_codex_home,
                 spec.private_runtime_grok_home,
+                spec.staged_codex_home.as_deref(),
             )?
         } else {
             spec.environment.clone()
         };
         let mut private_runtime_files = spec.private_runtime_files.clone();
+        if spec.staged_codex_home.is_none()
+            && private_runtime_files.iter().any(|file| {
+                file.destination == PrivateRuntimeFileDestination::StagedCodexHome
+            })
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a staged Codex home file requires a staged Codex home",
+            ));
+        }
         let pinned_launch = if let Some(pinned) = &spec.pinned_direct {
             pinned.validate_command(&spec.command)?;
             let ProcessCommand::Direct { args, .. } = &spec.command else {
@@ -520,6 +543,7 @@ impl SystemdUnit {
             private_runtime_files.push(PrivateRuntimeFile {
                 name: PINNED_EXEC_DESCRIPTOR_NAME.to_string(),
                 bytes,
+                destination: PrivateRuntimeFileDestination::RuntimeDirectory,
             });
             Some((helper, digest))
         } else {
@@ -527,12 +551,17 @@ impl SystemdUnit {
         };
         validate_private_runtime_files(&private_runtime_files)?;
         self.pending_runtime_files = private_runtime_files;
+        self.staged_codex_home = spec.staged_codex_home.clone();
         self.pending_environment = Some(if pinned_launch.is_some() {
             EnvironmentMode::ClearAndSet(BTreeMap::new())
         } else {
             target_environment
         });
         let mut sandbox = resolve_systemd_sandbox(spec)?;
+        if let (Some(home), Some(sandbox)) = (spec.staged_codex_home.as_deref(), sandbox.as_ref())
+        {
+            sandbox.validate_staged_codex_home(home)?;
+        }
         let target_current_dir = sandbox
             .as_ref()
             .map_or(spec.current_dir.as_path(), |sandbox| {
@@ -761,7 +790,21 @@ impl SystemdUnit {
                 && !self.environment_published
             {
                 for private_file in std::mem::take(&mut self.pending_runtime_files) {
-                    let path = self.runtime_dir.join(&private_file.name);
+                    let path = match private_file.destination {
+                        PrivateRuntimeFileDestination::RuntimeDirectory => {
+                            self.runtime_dir.join(&private_file.name)
+                        }
+                        PrivateRuntimeFileDestination::StagedCodexHome => self
+                            .staged_codex_home
+                            .as_ref()
+                            .ok_or_else(|| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    "staged Codex home file was pending without a staged home",
+                                )
+                            })?
+                            .join(&private_file.name),
+                    };
                     self.runtime_file_paths.push(path.clone());
                     publish_private_runtime_file(&path, &private_file.bytes)?;
                 }
@@ -1504,6 +1547,7 @@ fn environment_with_private_runtime_home(
     set_home: bool,
     set_codex_home: bool,
     set_grok_home: bool,
+    staged_codex_home: Option<&Path>,
 ) -> std::io::Result<EnvironmentMode> {
     let runtime_dir = runtime_dir.to_str().ok_or_else(|| {
         std::io::Error::new(
@@ -1514,6 +1558,25 @@ fn environment_with_private_runtime_home(
             ),
         )
     })?;
+    if set_codex_home && staged_codex_home.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "private RuntimeDirectory CODEX_HOME and a staged Codex home are mutually exclusive",
+        ));
+    }
+    let staged_codex_home = staged_codex_home
+        .map(|home| {
+            home.to_str().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "staged Codex home is not valid UTF-8: {}",
+                        home.display()
+                    ),
+                )
+            })
+        })
+        .transpose()?;
     let (clear, mut values) = match mode {
         EnvironmentMode::Inherit => (false, BTreeMap::new()),
         EnvironmentMode::InheritAndSet(values) => (false, values.clone()),
@@ -1525,6 +1588,8 @@ fn environment_with_private_runtime_home(
     }
     if set_codex_home {
         values.insert("CODEX_HOME".to_string(), runtime_dir.to_string());
+    } else if let Some(home) = staged_codex_home {
+        values.insert("CODEX_HOME".to_string(), home.to_string());
     }
     if set_grok_home {
         values.insert("GROK_HOME".to_string(), runtime_dir.to_string());

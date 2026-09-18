@@ -3867,6 +3867,132 @@ fn private_output_staging_redacts_atomic_publication_and_cleans_up() -> Result<(
 
 #[cfg(target_os = "linux")]
 #[test]
+fn staged_codex_home_lives_below_output_staging_and_is_removed_with_it() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    let runtime_root = temp.path().join("private-runtime");
+    for path in [&workspace, &runtime_root] {
+        fs::create_dir(path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+
+    let mut staging = ExternalOutputStaging::create_under(&runtime_root, &workspace)?;
+    let staging_root = staging.root_path().to_path_buf();
+    let codex_home = staging.stage_codex_home()?.to_path_buf();
+    assert_eq!(codex_home, staging_root.join(CODEX_HOME_STAGING_NAME));
+    assert_eq!(
+        fs::metadata(&codex_home)?.permissions().mode() & 0o777,
+        0o700
+    );
+    let second = staging
+        .stage_codex_home()
+        .expect_err("a staging root holds at most one Codex home");
+    assert!(second.to_string().contains("already holds"), "{second:#}");
+
+    // Everything the contained Codex writes below its home is removed with the staging root,
+    // including nested session directories created with a permissive umask.
+    let sessions = codex_home.join("sessions/2026/09/19");
+    fs::create_dir_all(&sessions)?;
+    fs::write(
+        sessions.join("rollout-2026-09-19T00-00-00-thread.jsonl"),
+        b"{}\n",
+    )?;
+    fs::write(codex_home.join("history.jsonl"), b"{}\n")?;
+    staging.cleanup()?;
+    assert!(!codex_home.exists());
+    assert!(!staging_root.exists());
+
+    let dropped = {
+        let mut staging = ExternalOutputStaging::create_under(&runtime_root, &workspace)?;
+        let codex_home = staging.stage_codex_home()?.to_path_buf();
+        fs::create_dir_all(codex_home.join("sessions"))?;
+        (staging.root_path().to_path_buf(), codex_home)
+    };
+    assert!(!dropped.1.exists());
+    assert!(!dropped.0.exists());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn supervisor_simulation_exposes_the_staged_codex_home_and_removes_it_after_exit() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    create_mandatory_control_roots(temp.path())?;
+    let observed_home = temp.path().join("observed-codex-home");
+    let agent = temp.path().join("fake-codex.sh");
+    fs::write(
+        &agent,
+        format!(
+            r#"#!/bin/sh
+set -eu
+report=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    report=$1
+  fi
+  shift
+done
+while IFS= read -r _line; do
+  :
+done
+printf '%s' "${{CODEX_HOME:-unset}}" > '{}'
+mkdir -p "$CODEX_HOME/sessions/2026/09/19"
+printf '{{}}\n' > "$CODEX_HOME/sessions/2026/09/19/rollout-2026-09-19T00-00-00-thread.jsonl"
+printf '{{"ok":true}}\n' > "$report"
+"#,
+            observed_home.display()
+        ),
+    )?;
+    fs::set_permissions(&agent, fs::Permissions::from_mode(0o755))?;
+    let prompt = temp.path().join("prompt.txt");
+    fs::write(&prompt, "observe the staged Codex home\n")?;
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+    let spec = ExternalAgentCommand::codex(
+        &agent,
+        temp.path(),
+        &prompt,
+        incoming.join("events.jsonl"),
+        incoming.join("report.json"),
+        Duration::from_secs(5),
+    );
+    assert_eq!(spec.invocation, ExternalAgentInvocation::CodexSupervisor);
+
+    let report = run_external_agent_nonpublishable_simulation(&spec);
+    assert!(report.simulation_succeeded(), "{report:?}");
+    assert_eq!(report.output_last_message(), Some(&b"{\"ok\":true}\n"[..]));
+
+    let codex_home = PathBuf::from(fs::read_to_string(&observed_home)?);
+    let runtime_root = crate::process_runner::trusted_linux_runtime_root()?;
+    assert_eq!(
+        codex_home.file_name().and_then(OsStr::to_str),
+        Some(CODEX_HOME_STAGING_NAME)
+    );
+    let staging_root = codex_home
+        .parent()
+        .expect("staged Codex home has a staging root");
+    assert_eq!(staging_root.parent(), Some(runtime_root.as_path()));
+    assert!(staging_root
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.starts_with(".maco-external-output-")));
+    assert!(!codex_home.starts_with(temp.path()));
+    assert!(
+        !codex_home.exists(),
+        "the staged Codex home must be removed with the staging root"
+    );
+    assert!(!staging_root.exists());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn bound_output_staging_is_created_under_the_reviewed_root() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -4240,6 +4366,7 @@ fn environment_preflight_uses_the_target_runtime_context() {
         ExternalAgentInvocation::CodexSupervisor,
         None,
         Some(&lifecycle),
+        None,
     );
 
     let mut expected_environment = environment.clone();
@@ -4249,10 +4376,52 @@ fn environment_preflight_uses_the_target_runtime_context() {
         prepared.environment,
         EnvironmentMode::ClearAndSet(expected_environment)
     );
-    assert_eq!(prepared.agent_lifecycle, Some(lifecycle));
+    assert_eq!(prepared.agent_lifecycle, Some(lifecycle.clone()));
     assert_eq!(prepared.side_effects, profile);
     assert!(prepared.private_runtime_home);
     assert!(prepared.private_runtime_codex_home);
+    assert!(prepared.staged_codex_home().is_none());
+
+    let staged_home = Path::new("/run/user/1000/.maco-external-output-1-1/codex-home");
+    let staged = with_external_runtime_context(
+        ProcessSpec::direct(
+            "supervisor target",
+            "/run/current-system/sw/bin/codex",
+            std::iter::empty::<&str>(),
+            "/workspace",
+            128,
+        ),
+        environment.clone(),
+        profile.clone(),
+        ExternalAgentInvocation::CodexSupervisor,
+        None,
+        Some(&lifecycle),
+        Some(staged_home),
+    );
+    assert!(staged.private_runtime_home);
+    assert!(
+        !staged.private_runtime_codex_home,
+        "a staged Codex home replaces the RuntimeDirectory CODEX_HOME"
+    );
+    assert_eq!(staged.staged_codex_home(), Some(staged_home));
+
+    let consultant = with_external_runtime_context(
+        ProcessSpec::direct(
+            "consultant target",
+            "/run/current-system/sw/bin/codex",
+            std::iter::empty::<&str>(),
+            "/workspace",
+            128,
+        ),
+        environment.clone(),
+        profile,
+        ExternalAgentInvocation::CodexConsultant,
+        None,
+        None,
+        None,
+    );
+    assert!(consultant.private_runtime_codex_home);
+    assert!(consultant.staged_codex_home().is_none());
 
     let grok = with_external_runtime_context(
         ProcessSpec::direct(
@@ -4267,9 +4436,14 @@ fn environment_preflight_uses_the_target_runtime_context() {
         ExternalAgentInvocation::Grok,
         None,
         None,
+        Some(staged_home),
     );
     assert!(grok.private_runtime_home);
     assert!(!grok.private_runtime_codex_home);
+    assert!(
+        grok.staged_codex_home().is_none(),
+        "non-Codex invocations ignore a staged Codex home"
+    );
 }
 
 #[test]
@@ -6609,6 +6783,7 @@ fn grok_live_launch_profile_binds_exact_credentials_and_normalized_home() -> Res
         environment.clone(),
         SideEffectConfinementProfile::ExternalGrok(profile),
         ExternalAgentInvocation::Grok,
+        None,
         None,
         None,
     );

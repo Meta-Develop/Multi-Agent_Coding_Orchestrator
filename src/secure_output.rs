@@ -33,7 +33,6 @@ use std::path::Component;
 #[cfg(unix)]
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChildSetupFault {
     None,
@@ -172,7 +171,6 @@ impl SecureOutputRoot {
     }
 
     /// Creates a private direct child and returns it as another descriptor-held root.
-    #[cfg(test)]
     pub(crate) fn create_child(&self, name: &OsStr) -> Result<Self> {
         self.create_child_impl(name, ChildSetupFault::None)
     }
@@ -187,7 +185,6 @@ impl SecureOutputRoot {
         self.create_child_impl(name, ChildSetupFault::AfterOpen)
     }
 
-    #[cfg(test)]
     fn create_child_impl(&self, name: &OsStr, _fault: ChildSetupFault) -> Result<Self> {
         #[cfg(unix)]
         {
@@ -453,8 +450,10 @@ impl SecureOutputRoot {
         }
     }
 
+    /// Re-walks the root path without following symlinks and requires the same private
+    /// directory inode that was captured when the root was opened.
     #[cfg(unix)]
-    fn verify_path_identity(&self) -> Result<()> {
+    pub(crate) fn verify_path_identity(&self) -> Result<()> {
         let reopened = open_existing_directory_tree(&self.path)
             .with_context(|| format!("secure output root path changed: {}", self.path.display()))?;
         let metadata = reopened.metadata()?;
@@ -466,7 +465,7 @@ impl SecureOutputRoot {
     }
 
     #[cfg(not(unix))]
-    fn verify_path_identity(&self) -> Result<()> {
+    pub(crate) fn verify_path_identity(&self) -> Result<()> {
         bail!("secure output capabilities are not implemented on this host")
     }
 }
@@ -903,7 +902,6 @@ fn openat_directory(parent: RawFd, name: &CString) -> std::io::Result<File> {
 }
 
 #[cfg(unix)]
-#[cfg(test)]
 fn created_directory_identity(parent: &File, name: &CString) -> Result<(u64, u64)> {
     // SAFETY: storage is initialized and the descriptor/name are valid.
     let mut metadata = unsafe { std::mem::zeroed::<libc::stat>() };
@@ -1279,7 +1277,6 @@ fn rebind_name_to_sentinel_for_test(parent: &File, name: &CString, sentinel: &Pa
 }
 
 #[cfg(unix)]
-#[cfg(test)]
 fn cleanup_created_directory(
     parent: &File,
     name: &CString,

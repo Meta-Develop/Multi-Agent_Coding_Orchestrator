@@ -1647,11 +1647,23 @@ impl StreamCapture {
     }
 }
 
+/// Where the strict Linux backend publishes a private runtime file once the unit's guardian is
+/// confirmed waiting for its environment.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivateRuntimeFileDestination {
+    /// The owner-private systemd RuntimeDirectory that also carries the environment file.
+    RuntimeDirectory,
+    /// The parent-owned Codex home selected with [`ProcessSpec::with_staged_codex_home`].
+    StagedCodexHome,
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Clone, PartialEq, Eq)]
 struct PrivateRuntimeFile {
     name: String,
     bytes: Vec<u8>,
+    destination: PrivateRuntimeFileDestination,
 }
 
 #[cfg(target_os = "linux")]
@@ -1664,6 +1676,7 @@ impl fmt::Debug for PrivateRuntimeFile {
                 "bytes",
                 &format_args!("<redacted:{} bytes>", self.bytes.len()),
             )
+            .field("destination", &self.destination)
             .finish()
     }
 }
@@ -1693,6 +1706,11 @@ pub struct ProcessSpec {
     /// Point GROK_HOME at the same owner-private RuntimeDirectory. Admitted host auth/config
     /// capabilities may be projected as read-only leaves below this otherwise writable home.
     pub private_runtime_grok_home: bool,
+    /// Point CODEX_HOME at a parent-owned directory that outlives the transient unit so the
+    /// parent can read Codex session evidence after exit. The caller must place it below a
+    /// root the unit already binds read-write; the strict Linux backend fails closed otherwise.
+    /// Mutually exclusive with `private_runtime_codex_home`.
+    staged_codex_home: Option<PathBuf>,
     #[cfg(target_os = "linux")]
     private_runtime_files: Vec<PrivateRuntimeFile>,
     pinned_direct: Option<PinnedDirectCommand>,
@@ -1781,6 +1799,7 @@ impl ProcessSpec {
             private_runtime_home: false,
             private_runtime_codex_home: false,
             private_runtime_grok_home: false,
+            staged_codex_home: None,
             #[cfg(target_os = "linux")]
             private_runtime_files: Vec::new(),
             pinned_direct: None,
@@ -1818,6 +1837,7 @@ impl ProcessSpec {
             private_runtime_home: false,
             private_runtime_codex_home: false,
             private_runtime_grok_home: false,
+            staged_codex_home: None,
             #[cfg(target_os = "linux")]
             private_runtime_files: Vec::new(),
             pinned_direct: None,
@@ -1943,6 +1963,21 @@ impl ProcessSpec {
         self
     }
 
+    /// Points CODEX_HOME at a parent-owned directory that survives unit teardown.
+    ///
+    /// The strict Linux backend requires the directory to sit below a root the unit already
+    /// binds read-write and refuses the launch otherwise. Other backends refuse it exactly like
+    /// the RuntimeDirectory-backed private homes.
+    pub(crate) fn with_staged_codex_home(mut self, home: impl Into<PathBuf>) -> Self {
+        self.staged_codex_home = Some(home.into());
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn staged_codex_home(&self) -> Option<&Path> {
+        self.staged_codex_home.as_deref()
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn with_private_runtime_file(
         mut self,
@@ -1952,6 +1987,23 @@ impl ProcessSpec {
         self.private_runtime_files.push(PrivateRuntimeFile {
             name: name.into(),
             bytes,
+            destination: PrivateRuntimeFileDestination::RuntimeDirectory,
+        });
+        self
+    }
+
+    /// Publishes a private file below the staged Codex home with the same late-publication and
+    /// post-exit removal lifecycle as [`ProcessSpec::with_private_runtime_file`].
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_staged_codex_home_file(
+        mut self,
+        name: impl Into<String>,
+        bytes: Vec<u8>,
+    ) -> Self {
+        self.private_runtime_files.push(PrivateRuntimeFile {
+            name: name.into(),
+            bytes,
+            destination: PrivateRuntimeFileDestination::StagedCodexHome,
         });
         self
     }
@@ -4247,6 +4299,7 @@ pub(crate) fn private_runtime_environment_for_test(
         spec.private_runtime_home,
         spec.private_runtime_codex_home,
         spec.private_runtime_grok_home,
+        spec.staged_codex_home.as_deref(),
     )
 }
 

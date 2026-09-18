@@ -2635,6 +2635,25 @@ fn run_external_agent_runtime(
     };
     let mut target_controls = protected_controls.clone();
     target_controls.writable_artifact_root = Some(output_staging.root_path().to_path_buf());
+    // Supervisor launches keep their Codex session state in a parent-owned home below the
+    // staging root so model, effort, and usage evidence survives unit teardown. Consultants
+    // stay on `--ephemeral` and the RuntimeDirectory home: they intentionally yield no rollout.
+    let staged_codex_home = if spec.invocation == ExternalAgentInvocation::CodexSupervisor {
+        match output_staging.stage_codex_home() {
+            Ok(path) => Some(path.to_path_buf()),
+            Err(error) => {
+                return failed_external_run(
+                    spec,
+                    started,
+                    command_display(&resolved_program, &[]),
+                    false,
+                    format!("failed to prepare the parent-owned Codex home: {error:#}"),
+                );
+            }
+        }
+    } else {
+        None
+    };
     // Duplex argv stays empty until the contained version probe matches the audited
     // app-server protocol. This remains a mandatory latent release gate even if
     // universal pre-action coverage becomes available in a future Codex protocol.
@@ -3337,6 +3356,7 @@ fn run_external_agent_runtime(
                 target_spec.invocation,
                 codex_auth.as_ref(),
                 agent_lifecycle.as_ref(),
+                staged_codex_home.as_deref(),
             )
         }
         #[cfg(test)]
@@ -3347,10 +3367,21 @@ fn run_external_agent_runtime(
                 process_spec = process_spec.with_agent_lifecycle(metadata.clone());
             }
             match assignment_messaging_launch_environment_overlay(spec) {
-                Ok(overlay) if !overlay.is_empty() => {
-                    process_spec.with_environment(EnvironmentMode::InheritAndSet(overlay))
+                Ok(mut overlay) => {
+                    // The simulation has no transient unit, so the staged home is exposed
+                    // through the inherited environment exactly where the unit would see it.
+                    if let Some(home) = staged_codex_home.as_deref() {
+                        overlay.insert(
+                            "CODEX_HOME".to_string(),
+                            home.to_string_lossy().into_owned(),
+                        );
+                    }
+                    if overlay.is_empty() {
+                        process_spec
+                    } else {
+                        process_spec.with_environment(EnvironmentMode::InheritAndSet(overlay))
+                    }
                 }
-                Ok(_) => process_spec,
                 Err(error) => {
                     report.duration_ms = duration_millis(started.elapsed());
                     record_external_error(
@@ -4650,11 +4681,18 @@ fn persist_machine_global_retention_receipt(
 struct ExternalOutputStaging {
     root_path: PathBuf,
     reservation: Option<ReservedOutputFile>,
+    /// Parent-owned `CODEX_HOME` for supervisor launches. It lives below the staging root so
+    /// the unit already binds it read-write, and it outlives the unit so the parent can read
+    /// the Codex rollout before the whole staging root is removed or quarantined.
+    codex_home: Option<SecureOutputRoot>,
     machine_global_retention: Option<ExternalMachineGlobalRetentionBinding>,
     bound_store: Option<MachineGlobalStore>,
     bound_root_reservation: Option<ReservedDirectory>,
     cleanup_completed: bool,
 }
+
+/// Name of the parent-owned Codex home below the private output staging root.
+const CODEX_HOME_STAGING_NAME: &str = "codex-home";
 
 enum ExternalOutputCleanup {
     Quarantined(RetentionOperation),
@@ -4706,6 +4744,7 @@ impl ExternalOutputStaging {
             Ok(reservation) => Ok(Self {
                 root_path,
                 reservation: Some(reservation),
+                codex_home: None,
                 machine_global_retention: Some(binding),
                 bound_store: Some(store),
                 bound_root_reservation: Some(root_reservation),
@@ -4776,6 +4815,7 @@ impl ExternalOutputStaging {
             Ok(reservation) => Ok(Self {
                 root_path,
                 reservation: Some(reservation),
+                codex_home: None,
                 machine_global_retention: None,
                 bound_store: None,
                 bound_root_reservation: None,
@@ -4797,6 +4837,21 @@ impl ExternalOutputStaging {
 
     fn root_path(&self) -> &Path {
         &self.root_path
+    }
+
+    /// Creates the parent-owned `CODEX_HOME` as a 0700 direct child of the staging root.
+    ///
+    /// The staging root is already bound read-write into the unit, so no additional sandbox
+    /// path is opened. The directory is removed with the staging root during cleanup.
+    fn stage_codex_home(&mut self) -> Result<&Path> {
+        if self.codex_home.is_some() {
+            bail!("private output staging already holds a Codex home");
+        }
+        let root = SecureOutputRoot::open_private(&self.root_path)?;
+        let home = root
+            .create_child(OsStr::new(CODEX_HOME_STAGING_NAME))
+            .context("failed to stage the parent-owned Codex home")?;
+        Ok(self.codex_home.insert(home).path())
     }
 
     fn path(&self) -> Result<&Path> {
@@ -4859,6 +4914,8 @@ impl ExternalOutputStaging {
         match outcome {
             GateOutcome::Allowed(operation) => {
                 self.reservation.take();
+                // The staged Codex home travels with the quarantined staging root.
+                self.codex_home.take();
                 self.bound_root_reservation.take();
                 self.bound_store.take();
                 self.cleanup_completed = true;
@@ -4873,6 +4930,9 @@ impl ExternalOutputStaging {
             reservation
                 .remove()
                 .context("failed to remove reserved raw output staging leaf")?;
+        }
+        if let Some(codex_home) = self.codex_home.take() {
+            remove_staged_codex_home(codex_home)?;
         }
         fs::remove_dir(&self.root_path).with_context(|| {
             format!(
@@ -4910,6 +4970,21 @@ impl Drop for ExternalOutputStaging {
             self.cleanup_completed = true;
         }
     }
+}
+
+/// Removes the parent-owned Codex home together with every session, log, and state file the
+/// contained Codex process wrote below it. The held directory identity is re-verified first so
+/// a rebound pathname can never redirect the recursive removal.
+fn remove_staged_codex_home(codex_home: SecureOutputRoot) -> Result<()> {
+    codex_home
+        .verify_path_identity()
+        .context("staged Codex home identity changed before removal")?;
+    fs::remove_dir_all(codex_home.path()).with_context(|| {
+        format!(
+            "failed to remove staged Codex home {}",
+            codex_home.path().display()
+        )
+    })
 }
 
 #[derive(Debug)]

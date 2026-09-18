@@ -231,6 +231,7 @@ fn run_fixed_version_probe(
     )
     .with_stdin(StdinMode::Null)
     .with_timeout(Some(timeout));
+    // Version probes keep the RuntimeDirectory Codex home: they yield no session evidence.
     let process_spec = with_external_runtime_context(
         process_spec,
         environment.clone(),
@@ -238,6 +239,7 @@ fn run_fixed_version_probe(
         ExternalAgentInvocation::CodexSupervisor,
         codex_auth,
         agent_lifecycle,
+        None,
     );
     let output = match run_process_cancellable(process_spec, cancellation) {
         Ok(output) => {
@@ -341,6 +343,12 @@ fn run_fixed_version_probe(
     })
 }
 
+/// Binds the verified external runtime context.
+///
+/// Codex invocations receive an owner-private `CODEX_HOME`. When the caller staged a
+/// parent-owned home (supervisor launches), `CODEX_HOME` points there and the auth file is
+/// published below it with the same late-publication lifecycle; otherwise the RuntimeDirectory
+/// home is used and destroyed with the unit.
 fn with_external_runtime_context(
     process_spec: ProcessSpec,
     environment: BTreeMap<String, String>,
@@ -348,25 +356,37 @@ fn with_external_runtime_context(
     invocation: ExternalAgentInvocation,
     codex_auth: Option<&ValidatedCodexAuth>,
     agent_lifecycle: Option<&AgentLaunchMetadata>,
+    staged_codex_home: Option<&Path>,
 ) -> ProcessSpec {
+    let codex_invocation = matches!(
+        invocation,
+        ExternalAgentInvocation::CodexSupervisor | ExternalAgentInvocation::CodexConsultant
+    );
+    let staged_codex_home = staged_codex_home.filter(|_| codex_invocation);
     let prepared = process_spec
         .with_environment(EnvironmentMode::ClearAndSet(environment))
         .with_private_runtime_home(true)
-        .with_private_runtime_codex_home(matches!(
-            invocation,
-            ExternalAgentInvocation::CodexSupervisor | ExternalAgentInvocation::CodexConsultant
-        ))
+        .with_private_runtime_codex_home(codex_invocation && staged_codex_home.is_none())
         .with_private_runtime_grok_home(invocation == ExternalAgentInvocation::Grok)
         .with_side_effect_confinement(side_effect_profile);
+    let prepared = match staged_codex_home {
+        Some(home) => prepared.with_staged_codex_home(home),
+        None => prepared,
+    };
     let prepared = match agent_lifecycle {
         Some(metadata) => prepared.with_agent_lifecycle(metadata.clone()),
         None => prepared,
     };
     #[cfg(target_os = "linux")]
     {
-        match codex_auth {
-            Some(auth) => prepared.with_private_runtime_file("auth.json", auth.bytes.clone()),
-            None => prepared,
+        match (codex_auth, staged_codex_home) {
+            (Some(auth), Some(_)) => {
+                prepared.with_staged_codex_home_file("auth.json", auth.bytes.clone())
+            }
+            (Some(auth), None) => {
+                prepared.with_private_runtime_file("auth.json", auth.bytes.clone())
+            }
+            (None, _) => prepared,
         }
     }
     #[cfg(not(target_os = "linux"))]
