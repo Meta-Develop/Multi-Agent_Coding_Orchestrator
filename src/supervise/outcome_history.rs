@@ -2498,6 +2498,7 @@ mod tests {
         });
         let mut recorded = fixture();
         recorded.run_id = run_id.as_str().to_string();
+        recorded.costs.environment_cost_microunits = None;
         persist_proven_no_parent_review_cycle_costs(&artifacts, &mut recorded)?;
         assert_eq!(recorded.costs.review_cost_microunits, Some(0));
         assert_eq!(recorded.costs.rereview_cost_microunits, Some(0));
