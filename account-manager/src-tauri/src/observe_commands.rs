@@ -25,12 +25,7 @@ pub(crate) fn observe_account_blocking(
         .filter(|account| account.material == StoredAccountMaterial::CredentialStore)
         .map(|_| storage::default_store())
         .transpose()?;
-    observe_selected_account(
-        &registry,
-        adapter.as_ref(),
-        request,
-        store.as_deref(),
-    )
+    observe_selected_account(&registry, adapter.as_ref(), request, store.as_deref())
 }
 
 #[cfg(test)]
@@ -64,19 +59,12 @@ mod tests {
             true
         }
 
-        fn put(
-            &self,
-            _key: &SecretRef,
-            _secret: &Secret,
-        ) -> crate::error::Result<()> {
+        fn put(&self, _key: &SecretRef, _secret: &Secret) -> crate::error::Result<()> {
             Ok(())
         }
 
         fn get(&self, _key: &SecretRef) -> crate::error::Result<Option<Secret>> {
-            Ok(self
-                .bytes
-                .as_ref()
-                .map(|bytes| Secret::new(bytes.clone())))
+            Ok(self.bytes.as_ref().map(|bytes| Secret::new(bytes.clone())))
         }
 
         fn delete(&self, _key: &SecretRef) -> crate::error::Result<()> {
@@ -175,6 +163,22 @@ mod tests {
         .expect_err("empty categories");
         assert!(matches!(&error, Error::ConfigRead { reason, .. }
             if reason.contains("at least one category")));
+    }
+
+    #[test]
+    fn ipc_refuses_duplicate_categories_fail_closed() {
+        let error = observe_account_blocking(AccountObserveRequest {
+            binding: SelectedAccountBinding {
+                provider_id: "gemini-cli".to_string(),
+                account_id: "work".to_string(),
+                account_incarnation: "0123456789abcdef0123456789abcdef".to_string(),
+                selection_revision: 1,
+            },
+            categories: vec![ObserveCategory::Quota, ObserveCategory::Quota],
+        })
+        .expect_err("duplicate categories");
+        assert!(matches!(&error, Error::ConfigRead { reason, .. }
+            if reason.contains("duplicates")));
     }
 
     #[test]
