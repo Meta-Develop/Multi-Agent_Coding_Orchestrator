@@ -23,8 +23,9 @@ use crate::model::{
 use crate::storage::{CredentialStore, Secret, SecretRef};
 
 pub use crate::account_authority::{
-    AuthObservation, CategoryObservation, ModelsObservation, ObservationOutcome, ObserveCategory,
-    QuotaObservation, SelectedAccountBinding, SelectedUseLease, StoredAccountRegistry,
+    AuthObservation, CategoryObservation, ModelsObservation, ObservationError,
+    ObservationErrorKind, ObservationOutcome, ObserveCategory, QuotaObservation,
+    SelectedAccountBinding, SelectedUseLease, StoredAccountRegistry,
 };
 
 pub mod observe;
@@ -305,11 +306,18 @@ pub trait ProviderAdapter: Send + Sync {
             payload.quota = Some(match self.quota_for_account(account) {
                 Ok(snapshots) if snapshots.is_empty() => CategoryObservation::unknown(),
                 Ok(snapshots) => {
-                    let plan_label = self.plan_label_for_account(account).unwrap_or(None);
-                    CategoryObservation::observed(QuotaObservation {
-                        snapshots,
-                        plan_label,
-                    })
+                    if let Some(message) = observe::invalid_quota_snapshot_message(&snapshots) {
+                        CategoryObservation::failed(ObservationError {
+                            kind: ObservationErrorKind::Other,
+                            message: message.to_string(),
+                        })
+                    } else {
+                        let plan_label = self.plan_label_for_account(account).unwrap_or(None);
+                        CategoryObservation::observed(QuotaObservation {
+                            snapshots,
+                            plan_label,
+                        })
+                    }
                 }
                 Err(Error::NotImplemented(_)) => CategoryObservation::unavailable(),
                 Err(error) => {
