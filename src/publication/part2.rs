@@ -2340,8 +2340,15 @@ impl PublicationGitContext {
         }
     }
 
-    fn run(mut self) -> Result<merge::RequiredCommandOutput> {
-        let execution = self.run_inner();
+    fn run(self) -> Result<merge::RequiredCommandOutput> {
+        self.run_with_cancellation(None)
+    }
+
+    fn run_with_cancellation(
+        mut self,
+        process_cancellation: Option<&crate::process_runner::ProcessCancellation>,
+    ) -> Result<merge::RequiredCommandOutput> {
+        let execution = self.run_inner(process_cancellation);
         let cleanup = self.close();
         match (execution, cleanup) {
             (Ok(output), Ok(())) => Ok(output),
@@ -2354,7 +2361,10 @@ impl PublicationGitContext {
         }
     }
 
-    fn run_inner(&self) -> Result<merge::RequiredCommandOutput> {
+    fn run_inner(
+        &self,
+        process_cancellation: Option<&crate::process_runner::ProcessCancellation>,
+    ) -> Result<merge::RequiredCommandOutput> {
         let label = self.operation.label();
         self.runtime_directory
             .verify_identity()
@@ -2367,18 +2377,37 @@ impl PublicationGitContext {
         validate_publication_git_operation(&operation)?;
         let args = self.command_args(operation);
         let output = match &self.boundary {
-            PublicationGitBoundary::Https(profile) => merge::run_required_network_direct(
-                label,
-                merge::resolve_trusted_executable("git")?,
-                args,
-                &self.directory,
-                self.environment.clone(),
-                StdinMode::Null,
-                merge::NETWORK_PROCESS_TIMEOUT,
-                GH_CAPTURE_LIMIT_BYTES,
-                0,
-                profile.clone(),
-            ),
+            PublicationGitBoundary::Https(profile) => {
+                let program = merge::resolve_trusted_executable("git")?;
+                let environment = self.environment.clone();
+                match process_cancellation {
+                    None => merge::run_required_network_direct(
+                        label,
+                        program,
+                        args,
+                        &self.directory,
+                        environment,
+                        StdinMode::Null,
+                        merge::NETWORK_PROCESS_TIMEOUT,
+                        GH_CAPTURE_LIMIT_BYTES,
+                        0,
+                        profile.clone(),
+                    ),
+                    Some(cancellation) => merge::run_required_network_direct_cancellable(
+                        label,
+                        program,
+                        args,
+                        &self.directory,
+                        environment,
+                        StdinMode::Null,
+                        merge::NETWORK_PROCESS_TIMEOUT,
+                        GH_CAPTURE_LIMIT_BYTES,
+                        0,
+                        profile.clone(),
+                        cancellation,
+                    ),
+                }
+            }
         };
         let mut output = output.map_err(|error| self.redact_error(error))?;
         self.runtime_directory
@@ -3035,6 +3064,8 @@ fn ensure_remote_expected_commit(
             remote_ref: &transaction.journal.remote_ref,
             expected_oid: &transaction.journal.expected_oid,
             source_guard: request.source.as_ref(),
+            invoke_authority: None,
+            process_cancellation: None,
         };
         let receipt =
             execute_external_effect_exactly_once(worktree_path, request.clone(), &mut provider)?;
@@ -3111,6 +3142,8 @@ struct GitPushExternalEffectProvider<'a> {
     remote_ref: &'a str,
     expected_oid: &'a str,
     source_guard: Option<&'a ExternalSourceGuard>,
+    invoke_authority: Option<&'a coordination_publication::PublicationCoordinationAdmission>,
+    process_cancellation: Option<&'a crate::process_runner::ProcessCancellation>,
 }
 
 impl GitPushExternalEffectProvider<'_> {
@@ -3170,11 +3203,15 @@ impl ExternalEffectProvider for GitPushExternalEffectProvider<'_> {
 
     fn invoke(&mut self, request: &ExternalEffectRequest) -> Result<ExternalEffectReceipt> {
         self.revalidate_source_full()?;
-        let output = push_git_commit_create_only(
+        if let Some(coordination) = self.invoke_authority {
+            coordination.assert_invoke_allowed_immediately_before_external_mutation()?;
+        }
+        let output = push_git_commit_create_only_with_cancellation(
             self.worktree_path,
             self.remote_url,
             self.remote_ref,
             self.expected_oid,
+            self.process_cancellation,
         )?;
         if !output.success {
             bail!("git push did not return success");
@@ -3217,9 +3254,18 @@ fn observe_remote_ref(
     remote_url: &str,
     remote_ref: &str,
 ) -> Result<Option<String>> {
+    observe_remote_ref_with_cancellation(worktree_path, remote_url, remote_ref, None)
+}
+
+fn observe_remote_ref_with_cancellation(
+    worktree_path: &Path,
+    remote_url: &str,
+    remote_ref: &str,
+    process_cancellation: Option<&crate::process_runner::ProcessCancellation>,
+) -> Result<Option<String>> {
     let operation = PublicationGitOperation::observe(remote_ref)?;
     let context = PublicationGitContext::create(worktree_path, remote_url, operation)?;
-    let output = context.run()?;
+    let output = context.run_with_cancellation(process_cancellation)?;
     if !output.success {
         bail!(
             "git ls-remote failed for {}: {}",
@@ -3258,9 +3304,25 @@ fn push_git_commit_create_only(
     remote_ref: &str,
     expected_oid: &str,
 ) -> Result<merge::RequiredCommandOutput> {
+    push_git_commit_create_only_with_cancellation(
+        worktree_path,
+        remote_url,
+        remote_ref,
+        expected_oid,
+        None,
+    )
+}
+
+fn push_git_commit_create_only_with_cancellation(
+    worktree_path: &Path,
+    remote_url: &str,
+    remote_ref: &str,
+    expected_oid: &str,
+    process_cancellation: Option<&crate::process_runner::ProcessCancellation>,
+) -> Result<merge::RequiredCommandOutput> {
     let operation = PublicationGitOperation::push_create_only(expected_oid, remote_ref)?;
     let context = PublicationGitContext::create(worktree_path, remote_url, operation)?;
-    context.run()
+    context.run_with_cancellation(process_cancellation)
 }
 
 fn reconcile_github_pr(
@@ -3275,6 +3337,8 @@ fn reconcile_github_pr(
             journal: transaction.journal.clone(),
             api: &mut api,
             source_guard: request.source.as_ref(),
+            invoke_authority: None,
+            process_cancellation: None,
         };
         let receipt =
             execute_external_effect_exactly_once(worktree_path, request.clone(), &mut provider)?;
@@ -3297,6 +3361,8 @@ struct GithubPrExternalEffectProvider<'a, A: GithubApi> {
     journal: PublicationTransactionJournal,
     api: &'a mut A,
     source_guard: Option<&'a ExternalSourceGuard>,
+    invoke_authority: Option<&'a coordination_publication::PublicationCoordinationAdmission>,
+    process_cancellation: Option<&'a crate::process_runner::ProcessCancellation>,
 }
 
 impl<A: GithubApi> GithubPrExternalEffectProvider<'_, A> {
@@ -3419,6 +3485,9 @@ impl<A: GithubApi> ExternalEffectProvider for GithubPrExternalEffectProvider<'_,
 
     fn invoke(&mut self, request: &ExternalEffectRequest) -> Result<ExternalEffectReceipt> {
         self.revalidate_bound_inputs(true)?;
+        if let Some(coordination) = self.invoke_authority {
+            coordination.assert_invoke_allowed_immediately_before_external_mutation()?;
+        }
         let repository = self.repository()?.clone();
         let title = self
             .journal
@@ -3438,6 +3507,7 @@ impl<A: GithubApi> ExternalEffectProvider for GithubPrExternalEffectProvider<'_,
             body,
             self.journal.draft,
             &repository,
+            self.process_cancellation,
         )?;
         if !output.stderr.is_empty() && output.stdout.is_empty() {
             bail!("GitHub PR provider returned no usable creation response");
@@ -3562,6 +3632,7 @@ fn reconcile_github_pr_with_api_and_remote_check(
         body,
         transaction.journal.draft,
         &github_repository,
+        None,
     )?;
     let hinted_url = first_non_empty_line(&String::from_utf8_lossy(&create.stdout));
 
@@ -3608,5 +3679,239 @@ fn reconcile_github_pr_with_api_and_remote_check(
         true,
         false,
         &mut remote_check,
+    )
+}
+
+pub(crate) fn ensure_remote_expected_commit_for_bundle(
+    worktree_path: &Path,
+    bundle: &mut PublicationCoordinationBundle,
+) -> Result<()> {
+    if bundle.coordination.is_selected_remote() {
+        ensure_remote_expected_commit_selected(worktree_path, bundle)
+    } else {
+        ensure_remote_expected_commit(worktree_path, &mut bundle.transaction)
+    }
+}
+
+pub(crate) fn ensure_github_remote_expected_commit_for_bundle(
+    worktree_path: &Path,
+    bundle: &mut PublicationCoordinationBundle,
+) -> Result<()> {
+    if bundle.coordination.is_selected_remote() {
+        require_remote_expected_base(
+            worktree_path,
+            &bundle.transaction,
+            "before publication ref creation",
+        )?;
+        ensure_remote_expected_commit_for_bundle(worktree_path, bundle)
+    } else {
+        ensure_github_remote_expected_commit(worktree_path, &mut bundle.transaction)
+    }
+}
+
+pub(crate) fn reconcile_github_pr_for_bundle(
+    worktree_path: &Path,
+    bundle: &mut PublicationCoordinationBundle,
+) -> Result<GithubPrResult> {
+    if bundle.coordination.is_selected_remote() {
+        reconcile_github_pr_selected(worktree_path, bundle)
+    } else {
+        reconcile_github_pr(worktree_path, &mut bundle.transaction)
+    }
+}
+
+fn ensure_remote_expected_commit_selected(
+    worktree_path: &Path,
+    bundle: &mut PublicationCoordinationBundle,
+) -> Result<()> {
+    use crate::sync_store::remote_coordination::RemotePublicationEffectAdmission;
+    if let Some(request) = bundle.transaction.push_effect_request.clone() {
+        bundle.coordination.assert_invoke_allowed()?;
+        let descriptor = publication_git_push_descriptor(&bundle.transaction, &request)?;
+        let RemotePublicationEffectAdmission::Reserved(reservation) = bundle
+            .coordination
+            .reserve_remote_publication_effect(descriptor)?
+        else {
+            bail!("selected remote publication requires a bound push effect reservation");
+        };
+        bundle.coordination.assert_invoke_allowed()?;
+        let managed_cancellation = bundle.coordination.managed_process_cancellation();
+        let source_guard = request.source.clone();
+        let mut provider = GitPushExternalEffectProvider {
+            worktree_path,
+            remote_url: &bundle.transaction.remote_url,
+            remote_ref: &bundle.transaction.journal.remote_ref,
+            expected_oid: &bundle.transaction.journal.expected_oid,
+            source_guard: source_guard.as_ref(),
+            invoke_authority: Some(&bundle.coordination),
+            process_cancellation: managed_cancellation,
+        };
+        let receipt =
+            execute_external_effect_exactly_once(worktree_path, request, &mut provider)?;
+        if receipt.provider_id != bundle.transaction.journal.expected_oid {
+            bail!("authenticated push receipt did not contain the expected remote OID");
+        }
+        bundle.transaction.journal.push_observed_oid = Some(receipt.provider_id);
+        bundle
+            .transaction
+            .advance_phase(PublicationTransactionPhase::PushObserved);
+        bundle.transaction.journal.last_error = None;
+        bundle.transaction.persist()?;
+        coordination_publication::complete_bound_publication_reservation(
+            worktree_path,
+            &mut bundle.coordination,
+            *reservation,
+        )?;
+        return Ok(());
+    }
+    bail!(
+        "selected remote publication requires a durable git push external-effect WAL binding"
+    );
+}
+
+fn reconcile_github_pr_selected(
+    worktree_path: &Path,
+    bundle: &mut PublicationCoordinationBundle,
+) -> Result<GithubPrResult> {
+    use crate::sync_store::remote_coordination::RemotePublicationEffectAdmission;
+    if let Some(request) = bundle.transaction.pr_effect_request.clone() {
+        bundle.coordination.assert_invoke_allowed()?;
+        let descriptor = publication_github_pr_descriptor(&bundle.transaction, &request)?;
+        let RemotePublicationEffectAdmission::Reserved(reservation) = bundle
+            .coordination
+            .reserve_remote_publication_effect(descriptor)?
+        else {
+            bail!("selected remote publication requires a bound PR effect reservation");
+        };
+        bundle.coordination.assert_invoke_allowed()?;
+        let managed_cancellation = bundle.coordination.managed_process_cancellation();
+        let source_guard = request.source.clone();
+        let mut api = CliGithubApi;
+        let mut provider = GithubPrExternalEffectProvider {
+            worktree_path,
+            remote_url: &bundle.transaction.remote_url,
+            journal: bundle.transaction.journal.clone(),
+            api: &mut api,
+            source_guard: source_guard.as_ref(),
+            invoke_authority: Some(&bundle.coordination),
+            process_cancellation: managed_cancellation,
+        };
+        let receipt =
+            execute_external_effect_exactly_once(worktree_path, request, &mut provider)?;
+        let result = provider.view_exact_receipt(&receipt)?;
+        let github = verify_github_receipt_with_remote_check(
+            worktree_path,
+            &mut bundle.transaction,
+            result,
+            true,
+            false,
+            |_, _, _| Ok(()),
+        )?;
+        coordination_publication::complete_bound_publication_reservation(
+            worktree_path,
+            &mut bundle.coordination,
+            *reservation,
+        )?;
+        return Ok(github);
+    }
+    bail!(
+        "selected remote publication requires a durable GitHub PR external-effect WAL binding"
+    );
+}
+
+fn publication_git_push_descriptor(
+    transaction: &PublicationTransaction,
+    request: &ExternalEffectRequest,
+) -> Result<coordination_effect::PublicationEffectDescriptorV1> {
+    use crate::publication::coordination_effect::{
+        GitPushPublicationEffectFieldsV1, PublicationEffectDescriptorBinding,
+        PublicationEffectDescriptorV1,
+        PublicationGitNetworkLocatorV1, git_push_remote_binding_digest,
+    };
+    let journal = &transaction.journal;
+    let locator = PublicationGitNetworkLocatorV1::try_new(&transaction.remote_url)?;
+    let binding_digest = git_push_remote_binding_digest(&journal.remote_name, &locator)?;
+    let base_oid = journal
+        .expected_base_oid
+        .as_deref()
+        .context("publication git push descriptor requires an exact reviewed base OID")?;
+    let fields = GitPushPublicationEffectFieldsV1::new(
+        &journal.remote_name,
+        locator,
+        &journal.remote_ref,
+        &journal.base,
+        base_oid,
+        &journal.expected_oid,
+        binding_digest,
+    )?;
+    PublicationEffectDescriptorV1::try_new_git_push(
+        PublicationEffectDescriptorBinding {
+            effect_id: request.effect_id.clone(),
+            transport_provider: request.transport_provider.clone(),
+            repository_selector: request.repository_selector.clone(),
+            repository_identity: request.repository_identity.clone(),
+            source_provenance_digest: request
+                .source
+                .as_ref()
+                .map(|source| source.provenance_digest.clone()),
+            target_digest: request.target_digest.clone(),
+            payload_digest: request.payload_digest.clone(),
+        },
+        fields,
+    )
+}
+
+fn publication_github_pr_descriptor(
+    transaction: &PublicationTransaction,
+    request: &ExternalEffectRequest,
+) -> Result<coordination_effect::PublicationEffectDescriptorV1> {
+    use crate::publication::coordination_effect::{
+        GithubPullRequestPublicationEffectFieldsV1, GithubPullRequestPublicationEffectIdentity,
+        PublicationEffectDescriptorBinding, PublicationEffectDescriptorV1,
+    };
+    let journal = &transaction.journal;
+    let repository = journal
+        .github_repository
+        .as_ref()
+        .context("GitHub PR publication descriptor requires repository identity")?;
+    let marker = journal
+        .pr_marker_nonce
+        .as_deref()
+        .context("GitHub PR publication descriptor requires effect marker nonce")?;
+    let expected_author = journal
+        .expected_pr_author
+        .as_deref()
+        .context("GitHub PR publication descriptor requires expected author")?;
+    let base_oid = journal
+        .expected_base_oid
+        .as_deref()
+        .context("GitHub PR publication descriptor requires exact base OID")?;
+    let fields = GithubPullRequestPublicationEffectFieldsV1::new(
+        GithubPullRequestPublicationEffectIdentity {
+            repository_owner: repository.owner.clone(),
+            repository_name: repository.name.clone(),
+            lookup_head_branch: journal.remote_branch.clone(),
+            base_branch: journal.base.clone(),
+            expected_base_oid: base_oid.to_string(),
+            expected_head_oid: journal.expected_oid.clone(),
+            draft: journal.draft,
+            expected_author: expected_author.to_string(),
+            marker: marker.to_string(),
+        },
+    )?;
+    PublicationEffectDescriptorV1::try_new_github_pull_request(
+        PublicationEffectDescriptorBinding {
+            effect_id: request.effect_id.clone(),
+            transport_provider: request.transport_provider.clone(),
+            repository_selector: request.repository_selector.clone(),
+            repository_identity: request.repository_identity.clone(),
+            source_provenance_digest: request
+                .source
+                .as_ref()
+                .map(|source| source.provenance_digest.clone()),
+            target_digest: request.target_digest.clone(),
+            payload_digest: request.payload_digest.clone(),
+        },
+        fields,
     )
 }

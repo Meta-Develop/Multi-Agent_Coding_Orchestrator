@@ -444,6 +444,12 @@ fn sanitized_grok_credential_validation_summary(error: &anyhow::Error) -> &'stat
         "Grok configuration source config.toml is unavailable",
         "Grok configuration source config.toml is not a regular file",
         "Grok configuration source config.toml identity changed",
+        "no complete account is selected for Coding Agent Manager provider",
+        "Coding Agent Manager selection for",
+        "Coding Agent Manager account",
+        "Coding Agent Manager data directory is unavailable",
+        "Coding Agent Manager Grok launch spec did not declare GROK_HOME",
+        "Coding Agent Manager account authority is busy",
     ]
     .into_iter()
     .find(|known| summary.contains(known))
@@ -481,6 +487,58 @@ fn insert_admitted_grok_home_environment(
 
 fn runtime_environment_passthrough_allowed(invocation: ExternalAgentInvocation, key: &str) -> bool {
     invocation != ExternalAgentInvocation::Grok || !matches!(key, "HOME" | "GROK_HOME")
+}
+
+pub(crate) fn extend_common_runtime_environment_with_assignment_messaging(
+    spec: &ExternalAgentCommand,
+    external_environment: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    let Some(launch) = spec.assignment_messaging_launch.as_ref() else {
+        return Ok(());
+    };
+    let identity = spec
+        .agent_lifecycle
+        .as_ref()
+        .context("assignment messaging launch requires external-agent lifecycle identity")?;
+    let pairs = launch
+        .environment_for(&identity.run_id, &identity.task_id)
+        .context("assignment messaging launch binding refused for lifecycle identity")?;
+    for (key, value) in pairs {
+        external_environment.insert(key, value);
+    }
+    Ok(())
+}
+
+/// Sealed loopback messaging endpoint/token only — for test simulation overlays that must not
+/// inherit arbitrary parent `MACO_*` variables.
+#[cfg(test)]
+pub(crate) fn assignment_messaging_launch_environment_overlay(
+    spec: &ExternalAgentCommand,
+) -> Result<BTreeMap<String, String>> {
+    use crate::messaging::transport::{ENV_MESSAGE_ENDPOINT, ENV_MESSAGE_TOKEN};
+
+    let Some(launch) = spec.assignment_messaging_launch.as_ref() else {
+        return Ok(BTreeMap::new());
+    };
+    let identity = spec
+        .agent_lifecycle
+        .as_ref()
+        .context("assignment messaging launch requires external-agent lifecycle identity")?;
+    let pairs = launch
+        .environment_for(&identity.run_id, &identity.task_id)
+        .context("assignment messaging launch binding refused for lifecycle identity")?;
+    let mut overlay = BTreeMap::new();
+    for (key, value) in pairs {
+        if key == ENV_MESSAGE_ENDPOINT || key == ENV_MESSAGE_TOKEN {
+            overlay.insert(key, value);
+        }
+    }
+    if overlay.len() != 2 {
+        bail!(
+            "sealed assignment messaging launch did not expose endpoint and bearer token for the bound lifecycle identity"
+        );
+    }
+    Ok(overlay)
 }
 
 fn environment_failure(
@@ -5584,6 +5642,17 @@ impl CredentialRedactor {
                     .and_then(|value| value.strip_suffix('"'))
                 {
                     add_sensitive_runtime_path_pattern(&mut patterns, escaped.as_bytes())?;
+                }
+            }
+        }
+        if let Some(token) = environment.get(crate::messaging::transport::MACO_MESSAGE_TOKEN_ENV) {
+            add_credential_pattern(&mut patterns, token.as_bytes())?;
+            if let Ok(quoted) = serde_json::to_string(token) {
+                if let Some(escaped) = quoted
+                    .strip_prefix('"')
+                    .and_then(|value| value.strip_suffix('"'))
+                {
+                    add_credential_pattern(&mut patterns, escaped.as_bytes())?;
                 }
             }
         }

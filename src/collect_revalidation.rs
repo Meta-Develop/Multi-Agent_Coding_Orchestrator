@@ -1,12 +1,17 @@
 use crate::{
+    process_runner::{compose_process_cancellations, ProcessCancellation},
     sync::ClaimToken,
     sync_store::{
-        lock_existing_authenticated_claims, persist_exact_owner_heartbeat_under_held_lock,
+        establish_revalidation_remote_leases, heartbeat_revalidation_remote_bindings,
+        invalidate_revalidation_remote_leases, lock_existing_authenticated_claims,
+        persist_exact_owner_heartbeat_under_held_lock, prepare_revalidation_remote_support,
         snapshot_lock_busy, ExistingClaimBindingRequest, ExistingClaimRevalidationError,
-        ExistingClaimsGuard, HeldClaimsPersist,
+        ExistingClaimsGuard, HeldClaimsPersist, RevalidationRemoteLease,
+        RevalidationRemotePrepareError, RevalidationRemoteSupport,
     },
     worktree::{WorktreeManager, WorktreeRecord},
 };
+use anyhow::{Context, Result};
 use git2::Oid;
 use std::{
     path::{Path, PathBuf},
@@ -73,11 +78,36 @@ pub(crate) enum RevalidationError {
     },
     #[error("guard-owned heartbeat worker panicked")]
     HeartbeatJoinPanic,
+    #[error(transparent)]
+    RemotePrepare(#[from] RevalidationRemotePrepareError),
+    #[error("remote work lease for agent '{agent_id}' was cancelled")]
+    RemoteLeaseCancelled { agent_id: String },
+    #[error("remote heartbeat for agent '{agent_id}' failed: {source}")]
+    RemoteHeartbeat {
+        agent_id: String,
+        #[source]
+        source: anyhow::Error,
+    },
 }
 
 struct HeartbeatWorker {
     stop_tx: mpsc::Sender<()>,
     join: JoinHandle<Result<(), RevalidationError>>,
+}
+
+#[derive(Debug)]
+struct RevalidationGuardRemote {
+    coordination: Arc<crate::sync_store::remote_coordination::RemoteCoordination>,
+    leases: Vec<RevalidationRemoteLease>,
+}
+
+struct GuardRemoteHeartbeat {
+    coordination: Arc<crate::sync_store::remote_coordination::RemoteCoordination>,
+    bindings: Vec<(
+        String,
+        crate::sync_store::remote_coordination::RemoteOwnerBinding,
+    )>,
+    leases: Vec<RevalidationRemoteLease>,
 }
 
 impl std::fmt::Debug for HeartbeatWorker {
@@ -99,6 +129,7 @@ pub(crate) struct RevalidationGuard {
     requests: Vec<RevalidationRequest>,
     verification: Mutex<()>,
     heartbeat: Mutex<Option<HeartbeatWorker>>,
+    remote: Option<RevalidationGuardRemote>,
 }
 
 impl RevalidationGuard {
@@ -107,11 +138,82 @@ impl RevalidationGuard {
             .verification
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(remote) = &self.remote {
+            for lease in &remote.leases {
+                if lease.lease.cancellation().is_cancelled() {
+                    return Err(RevalidationError::RemoteLeaseCancelled {
+                        agent_id: lease.agent_id.clone(),
+                    });
+                }
+            }
+            for lease in &remote.leases {
+                if let Err(_source) = heartbeat_revalidation_remote_bindings(
+                    &remote.coordination,
+                    std::slice::from_ref(&lease.binding),
+                ) {
+                    invalidate_revalidation_remote_leases(&remote.leases);
+                    return Err(RevalidationError::RemoteLeaseCancelled {
+                        agent_id: lease.agent_id.clone(),
+                    });
+                }
+            }
+        }
         self.claims.verify()?;
         for request in &self.requests {
             verify_worktree_snapshot(request)?;
         }
         Ok(())
+    }
+
+    /// Cancellation token bound to the live remote scope permit for one agent.
+    pub(crate) fn managed_process_remote_authority_cancellation(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<ProcessCancellation>> {
+        match &self.remote {
+            None => Ok(None),
+            Some(_) => self
+                .remote_work_cancellation(agent_id)
+                .cloned()
+                .with_context(|| {
+                    format!("remote revalidation guard has no live lease for agent '{agent_id}'")
+                })
+                .map(Some),
+        }
+    }
+
+    /// Managed child processes observe remote authority loss and optional operator
+    /// cancellation through the returned handle.
+    pub(crate) fn process_cancellation_for_managed_agent(
+        &self,
+        agent_id: &str,
+        operator: Option<&ProcessCancellation>,
+    ) -> Result<ProcessCancellation> {
+        let mut sources = Vec::new();
+        if let Some(remote) = self.managed_process_remote_authority_cancellation(agent_id)? {
+            sources.push(remote);
+        }
+        if let Some(operator) = operator {
+            sources.push(operator.clone());
+        }
+        Ok(if sources.is_empty() {
+            ProcessCancellation::new()
+        } else {
+            compose_process_cancellations(&sources)
+        })
+    }
+
+    /// ProcessSpec consumers observe remote authority loss through this handle.
+    pub(crate) fn remote_work_cancellation(&self, agent_id: &str) -> Option<&ProcessCancellation> {
+        self.remote
+            .as_ref()
+            .and_then(|remote| {
+                remote
+                    .leases
+                    .iter()
+                    .find(|lease| lease.agent_id == agent_id)
+            })
+            .map(|lease| lease.lease.cancellation())
     }
 
     pub(crate) fn start_guard_owned_heartbeat(&self) -> Result<(), RevalidationError> {
@@ -124,10 +226,19 @@ impl RevalidationGuard {
         }
         let persist = self.claims.persist_handle();
         let interval = heartbeat_interval_seconds(&persist)?;
+        let remote = self.remote.as_ref().map(|remote| GuardRemoteHeartbeat {
+            coordination: Arc::clone(&remote.coordination),
+            bindings: remote
+                .leases
+                .iter()
+                .map(|lease| (lease.agent_id.clone(), lease.binding.clone()))
+                .collect(),
+            leases: remote.leases.clone(),
+        });
         let (stop_tx, stop_rx) = mpsc::channel();
         let join = thread::Builder::new()
             .name("maco-guard-heartbeat".to_string())
-            .spawn(move || run_guard_owned_heartbeat(persist, stop_rx, interval))
+            .spawn(move || run_guard_owned_heartbeat(persist, remote, stop_rx, interval))
             .map_err(|source| RevalidationError::HeartbeatPersist {
                 source: anyhow::Error::from(source)
                     .context("failed to spawn guard-owned heartbeat worker"),
@@ -167,7 +278,30 @@ pub(crate) fn revalidate_existing_worker_batch(
     requests: Vec<RevalidationRequest>,
 ) -> Result<RevalidationGuard, RevalidationError> {
     validate_request_agents(&requests)?;
-    let claims = lock_existing_authenticated_claims(repo, claim_bindings(&requests))?;
+    let binding_requests = claim_bindings(&requests);
+    let remote_support = prepare_revalidation_remote_support(repo, &binding_requests)?;
+    let (remote_guard, prepared_bindings) = match remote_support {
+        RevalidationRemoteSupport::LocalOnly => (None, Vec::new()),
+        RevalidationRemoteSupport::Selected { remote, bindings } => {
+            let leases =
+                establish_revalidation_remote_leases(&remote, &bindings).map_err(|source| {
+                    RevalidationError::RemotePrepare(RevalidationRemotePrepareError::State(source))
+                })?;
+            (
+                Some(RevalidationGuardRemote {
+                    coordination: remote,
+                    leases,
+                }),
+                bindings,
+            )
+        }
+    };
+    let claims = lock_existing_authenticated_claims(repo, binding_requests)?;
+    if !prepared_bindings.is_empty() {
+        claims
+            .verify_remote_bindings_unchanged(&prepared_bindings)
+            .map_err(RevalidationError::Claims)?;
+    }
     for request in &requests {
         verify_worktree_snapshot(request)?;
     }
@@ -176,6 +310,7 @@ pub(crate) fn revalidate_existing_worker_batch(
         requests,
         verification: Mutex::new(()),
         heartbeat: Mutex::new(None),
+        remote: remote_guard,
     };
     guard.verify()?;
     Ok(guard)
@@ -378,8 +513,25 @@ fn current_unix_seconds() -> Result<u64, RevalidationError> {
         })
 }
 
+fn remote_heartbeat_tick(remote: &GuardRemoteHeartbeat) -> Result<(), RevalidationError> {
+    for (agent_id, binding) in &remote.bindings {
+        if let Err(source) = heartbeat_revalidation_remote_bindings(
+            &remote.coordination,
+            std::slice::from_ref(binding),
+        ) {
+            invalidate_revalidation_remote_leases(&remote.leases);
+            return Err(RevalidationError::RemoteHeartbeat {
+                agent_id: agent_id.clone(),
+                source,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn run_guard_owned_heartbeat(
     persist: Arc<Mutex<HeldClaimsPersist>>,
+    remote: Option<GuardRemoteHeartbeat>,
     stop_rx: mpsc::Receiver<()>,
     interval: u64,
 ) -> Result<(), RevalidationError> {
@@ -402,6 +554,9 @@ fn run_guard_owned_heartbeat(
                 Err(mpsc::TryRecvError::Empty) => {}
             }
             let now = current_unix_seconds()?;
+            if let Some(remote) = &remote {
+                remote_heartbeat_tick(remote)?;
+            }
             match persist_exact_owner_heartbeat_under_held_lock(&persist, now) {
                 Ok(()) => break,
                 Err(error) if snapshot_lock_busy(&error) => {
@@ -422,15 +577,17 @@ fn run_guard_owned_heartbeat(
 mod tests {
     use super::*;
     use crate::{
+        sync_store::remote_coordination::test_support::{open_sync_with_sim_remote, SimTransport},
         sync_store::{
             peek_liveness_without_claims_lock, persist_exact_owner_heartbeat_under_held_lock,
-            queue_heartbeat_persist_fault, ClaimTiming, HeartbeatPersistFault, SyncStore,
+            prepare_revalidation_remote_support, queue_heartbeat_persist_fault, ClaimTiming,
+            ExistingClaimBindingRequest, HeartbeatPersistFault, SyncStore,
         },
         worktree::{WorktreeCreateOptions, WorktreeManager},
     };
     use anyhow::{Context, Result};
     use git2::Signature;
-    use std::{fs, time::Duration};
+    use std::{collections::BTreeMap, fs, time::Duration};
     use tempfile::TempDir;
 
     struct Fixture {
@@ -872,6 +1029,206 @@ mod tests {
         Ok(())
     }
 
+    struct RemoteFixture {
+        inner: Fixture,
+        sim: SimTransport,
+        predecessor_owner: crate::publication::coordination_journal::CoordinationOwnerIdentity,
+    }
+
+    impl RemoteFixture {
+        fn new() -> Result<Self> {
+            Self::new_with_timing(ClaimTiming::default())
+        }
+
+        fn new_with_timing(timing: ClaimTiming) -> Result<Self> {
+            let temp = TempDir::new()?;
+            let repo_path = temp.path().join("repo");
+            WorktreeManager::init_repository(&repo_path, "main")?;
+            let repo = crate::git_repository::open(&repo_path)?;
+            commit_file(&repo, "README.md", "base\n")?;
+            let sim = SimTransport::new(repo_path.clone());
+            let store = open_sync_with_sim_remote(&repo_path, sim.shared_clone())?;
+            let manager = WorktreeManager::new(&repo_path);
+            let worktree = manager.create_for_test(WorktreeCreateOptions {
+                agent_id: "agent-a".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })?;
+            let head = current_head(&worktree.path)?;
+            let claim = store
+                .claim_paths_with_timing("agent-a", ["README.md"], timing)?
+                .claim;
+            let predecessor_owner = store
+                .inspect_remote_claim_owner(claim.token)?
+                .owner()
+                .clone();
+            Ok(Self {
+                inner: Fixture {
+                    _temp: temp,
+                    repo_path,
+                    manager,
+                    store,
+                    claim,
+                    worktree,
+                    head,
+                },
+                sim,
+                predecessor_owner,
+            })
+        }
+
+        fn guard(&self) -> Result<RevalidationGuard> {
+            Ok(revalidate_existing_worker_batch(
+                &self.inner.repo_path,
+                vec![self.inner.request()],
+            )?)
+        }
+
+        fn mint_successor_activation_nonce(&self, successor_run: &str) -> Result<String> {
+            crate::sync_store::remote_coordination::test_support::peer_remote_coordination(
+                self.sim.shared_clone(),
+            )
+            .mint_activation_nonce(successor_run)
+        }
+
+        fn remote_takeover_from_peer_host_with_nonce(
+            &self,
+            successor_agent: &str,
+            activation_nonce: &str,
+        ) -> Result<()> {
+            crate::sync_store::remote_coordination::test_support::sim_peer_remote_takeover_with_activation_nonce(
+                &self.sim,
+                self.predecessor_owner.clone(),
+                successor_agent,
+                &self.inner.claim.paths,
+                Some(activation_nonce),
+            )?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn revalidation_remote_guard_exposes_live_cancellation_handle() -> Result<()> {
+        let fixture = RemoteFixture::new()?;
+        let guard = fixture.guard()?;
+        let cancellation = guard
+            .remote_work_cancellation("agent-a")
+            .context("remote guard must expose cancellation")?;
+        assert!(!cancellation.is_cancelled());
+        guard.verify()?;
+        Ok(())
+    }
+
+    #[test]
+    fn revalidation_remote_stale_authority_fails_verify() -> Result<()> {
+        let fixture = RemoteFixture::new()?;
+        let successor_nonce = fixture.mint_successor_activation_nonce("agent-b")?;
+        let guard = fixture.guard()?;
+        fixture.remote_takeover_from_peer_host_with_nonce("agent-b", &successor_nonce)?;
+        let error = guard
+            .verify()
+            .expect_err("remote lease must be cancelled after takeover");
+        assert!(
+            matches!(error, RevalidationError::RemoteLeaseCancelled { .. }),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn revalidation_remote_missing_owner_binding_refuses_prepare() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let sim = SimTransport::new(fixture.repo_path.clone());
+        let remote = std::sync::Arc::new(
+            crate::sync_store::remote_coordination::RemoteCoordination::from_admission_service(
+                std::sync::Arc::new(
+                    crate::publication::coordination_admission::CoordinationAdmissionService::new(
+                        sim, None, None,
+                    ),
+                ),
+            ),
+        );
+        crate::sync_store::register_test_injected_remote_coordination(&fixture.repo_path, remote);
+        let error = prepare_revalidation_remote_support(
+            &fixture.repo_path,
+            &[ExistingClaimBindingRequest {
+                agent_id: fixture.claim.agent_id.clone(),
+                token: fixture.claim.token,
+                paths: fixture.claim.paths.clone(),
+            }],
+        )
+        .expect_err("local-only claim must not satisfy selected-remote prepare");
+        assert!(
+            matches!(
+                error,
+                crate::sync_store::RevalidationRemotePrepareError::MissingRemoteOwnerBinding { .. }
+            ),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn revalidation_remote_guard_heartbeat_unknown_invalidates_before_stop_or_ttl() -> Result<()> {
+        let timing = ClaimTiming::new(1, 3)?;
+        let fixture = RemoteFixture::new_with_timing(timing)?;
+        let before = heartbeat_row_for_agent(&fixture.inner.repo_path, "agent-a")?;
+        let guard = fixture.guard()?;
+        guard.verify()?;
+        let cancellation = guard
+            .remote_work_cancellation("agent-a")
+            .context("remote cancellation handle")?;
+        assert!(!cancellation.is_cancelled());
+        fixture.sim.arm_next_heartbeat_unknown();
+        guard.start_guard_owned_heartbeat()?;
+        std::thread::sleep(Duration::from_secs(2));
+        let verify_error = guard
+            .verify()
+            .expect_err("remote unknown must invalidate protected work immediately");
+        assert!(
+            matches!(verify_error, RevalidationError::RemoteLeaseCancelled { .. }),
+            "unexpected verify error: {verify_error}"
+        );
+        assert!(cancellation.is_cancelled());
+        let after = heartbeat_row_for_agent(&fixture.inner.repo_path, "agent-a")?;
+        assert_eq!(
+            after.heartbeat_unix_seconds, before.heartbeat_unix_seconds,
+            "local liveness must not advance after refused remote heartbeat"
+        );
+        let stop_error = guard
+            .stop_guard_owned_heartbeat()
+            .expect_err("worker must retain typed remote heartbeat failure");
+        assert!(
+            matches!(stop_error, RevalidationError::RemoteHeartbeat { .. }),
+            "unexpected stop error: {stop_error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn revalidation_remote_guard_heartbeat_orders_remote_before_local() -> Result<()> {
+        let timing = ClaimTiming::new(1, 3)?;
+        let fixture = RemoteFixture::new_with_timing(timing)?;
+        let successor_nonce = fixture.mint_successor_activation_nonce("agent-b")?;
+        let before = heartbeat_row_for_agent(&fixture.inner.repo_path, "agent-a")?;
+        let guard = fixture.guard()?;
+        guard.start_guard_owned_heartbeat()?;
+        fixture.remote_takeover_from_peer_host_with_nonce("agent-b", &successor_nonce)?;
+        std::thread::sleep(Duration::from_secs(2));
+        let stop_error = guard.stop_guard_owned_heartbeat().expect_err("remote loss");
+        assert!(
+            matches!(stop_error, RevalidationError::RemoteHeartbeat { .. }),
+            "unexpected stop error: {stop_error}"
+        );
+        let after = heartbeat_row_for_agent(&fixture.inner.repo_path, "agent-a")?;
+        assert_eq!(
+            after.heartbeat_unix_seconds, before.heartbeat_unix_seconds,
+            "local heartbeat must not advance after remote refusal"
+        );
+        Ok(())
+    }
+
     #[test]
     fn persist_exact_owner_heartbeat_under_held_lock_advances_and_preserves_identity() -> Result<()>
     {
@@ -921,6 +1278,92 @@ mod tests {
             &tree,
             &parent_refs,
         )?)
+    }
+
+    #[test]
+    fn managed_process_cancellation_propagates_operator_signal() -> Result<()> {
+        let operator = ProcessCancellation::new();
+        let scheduler = ProcessCancellation::new();
+        let effective = compose_process_cancellations(&[operator.clone(), scheduler.clone()]);
+        assert!(!effective.is_cancelled());
+        operator.cancel();
+        assert!(
+            effective.is_cancelled(),
+            "composed cancellation must observe operator cancel"
+        );
+        effective.cancel();
+        assert!(
+            operator.is_cancelled() && !scheduler.is_cancelled(),
+            "composed cancel must not mutate unrelated source handles"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn managed_process_cancellation_nested_composition_flattens_sources() {
+        let remote = ProcessCancellation::new();
+        let mid = compose_process_cancellations(std::slice::from_ref(&remote));
+        let outer = compose_process_cancellations(&[mid]);
+        remote.cancel();
+        assert!(outer.is_cancelled());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_process_cancellation_propagates_remote_authority_loss() -> Result<()> {
+        use crate::process_runner::{
+            run_process_cancellable, ContainmentPolicy, EnvironmentMode, ProcessSpec, Shell,
+        };
+        let timing = ClaimTiming::new(1, 3)?;
+        let fixture = RemoteFixture::new_with_timing(timing)?;
+        let successor_nonce = fixture.mint_successor_activation_nonce("agent-b")?;
+        let guard = fixture.guard()?;
+        guard.start_guard_owned_heartbeat()?;
+        let claim_paths = fixture.inner.claim.paths.clone();
+        let sim = fixture.sim.shared_clone();
+        let predecessor = fixture.predecessor_owner.clone();
+        let takeover = thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            crate::sync_store::remote_coordination::test_support::sim_peer_remote_takeover_with_activation_nonce(
+                &sim,
+                predecessor,
+                "agent-b",
+                &claim_paths,
+                Some(successor_nonce.as_str()),
+            )
+            .expect("peer takeover");
+        });
+        let cancellation = guard.process_cancellation_for_managed_agent("agent-a", None)?;
+        let run_result = run_process_cancellable(
+            ProcessSpec::shell(
+                "remote authority loss probe",
+                Shell::for_current_platform(),
+                "sleep 30",
+                fixture.inner.worktree.path.clone(),
+                4096,
+            )
+            .with_environment(EnvironmentMode::ClearAndSet(BTreeMap::from([(
+                "PATH".to_string(),
+                "/usr/bin:/bin".to_string(),
+            )])))
+            .with_containment(ContainmentPolicy::TrustedBestEffort),
+            &cancellation,
+        );
+        takeover.join().expect("takeover thread");
+        match run_result {
+            Err(crate::process_runner::ProcessRunError::Cancelled { .. }) => {}
+            Ok(output) => {
+                assert!(
+                    output
+                        .process_error
+                        .as_deref()
+                        .is_some_and(|message| message.to_ascii_lowercase().contains("cancel")),
+                    "managed process must observe remote authority loss, got {output:?}"
+                );
+            }
+            other => panic!("managed process must observe remote authority loss, got {other:?}"),
+        }
+        Ok(())
     }
 
     fn recursive_regular_bytes(

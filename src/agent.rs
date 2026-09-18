@@ -368,8 +368,8 @@ fn run_claimed_agent<P>(run: ClaimedAgentRun<'_, P>) -> Result<AgentRunReport>
 where
     P: LlmProvider,
 {
-    let capabilities = run.provider.capabilities();
     let worktree_path = run.selected.path().to_path_buf();
+    let capabilities = run.provider.capabilities();
     let prompt = build_prompt(
         &worktree_path,
         &run.agent_id,
@@ -385,12 +385,7 @@ where
             .context(format!("provider '{}' failed", run.provider.provider_id()))
     })?;
 
-    let mut patch_results = Vec::new();
-    let mut command_results = Vec::new();
-    let mut validation_results = Vec::new();
-    let mut execution_error = None;
-
-    let _revalidation = crate::collect_revalidation::revalidate_claimed_worker(
+    let revalidation = crate::collect_revalidation::revalidate_claimed_worker(
         &run.repo,
         &run.agent_id,
         run.claim.token,
@@ -403,7 +398,7 @@ where
             run.agent_id
         )
     })?;
-    _revalidation
+    revalidation
         .start_guard_owned_heartbeat()
         .with_context(|| {
             format!(
@@ -413,6 +408,36 @@ where
         })?;
     #[cfg(test)]
     run_agent_protected_stage_hook(AgentProtectedStage::Revalidation);
+
+    let process_cancellation = revalidation
+        .process_cancellation_for_managed_agent(&run.agent_id, None)
+        .with_context(|| {
+            format!(
+                "failed to bind managed-process cancellation for agent '{}'",
+                run.agent_id
+            )
+        })?;
+    let agent_id = run.agent_id.clone();
+    let report = run_claimed_agent_protected(run, response, process_cancellation)?;
+    revalidation
+        .stop_guard_owned_heartbeat()
+        .with_context(|| format!("guard-owned heartbeat failed for agent '{}'", agent_id))?;
+    Ok(report)
+}
+
+fn run_claimed_agent_protected<P>(
+    run: ClaimedAgentRun<'_, P>,
+    response: LlmResponse,
+    process_cancellation: crate::process_runner::ProcessCancellation,
+) -> Result<AgentRunReport>
+where
+    P: LlmProvider,
+{
+    let worktree_path = run.selected.path().to_path_buf();
+    let mut patch_results = Vec::new();
+    let mut command_results = Vec::new();
+    let mut validation_results = Vec::new();
+    let mut execution_error = None;
 
     for patch in &response.proposal.patches {
         let result = apply_proposed_patch(
@@ -454,8 +479,13 @@ where
             .iter()
             .filter(|command| command.purpose != CommandPurpose::Validate)
         {
-            let result =
-                run_proposed_command(&worktree_path, command, run.command_timeout, run.runtime);
+            let result = run_proposed_command(
+                &worktree_path,
+                command,
+                run.command_timeout,
+                run.runtime,
+                &process_cancellation,
+            );
             if !result.success && execution_error.is_none() {
                 execution_error = result.error.clone();
             }
@@ -474,8 +504,13 @@ where
             .iter()
             .filter(|command| command.purpose == CommandPurpose::Validate)
         {
-            let result =
-                run_proposed_command(&worktree_path, command, run.command_timeout, run.runtime);
+            let result = run_proposed_command(
+                &worktree_path,
+                command,
+                run.command_timeout,
+                run.runtime,
+                &process_cancellation,
+            );
             validations.push(validation_report_for_command(&result));
             if !result.success && execution_error.is_none() {
                 execution_error = result.error.clone();
@@ -494,6 +529,7 @@ where
                 validation,
                 run.command_timeout,
                 run.runtime,
+                &process_cancellation,
             );
             validations.push(validation_report_for_command(&result));
             if !result.success && execution_error.is_none() {
@@ -555,10 +591,6 @@ where
     let validation_failed = validation_results.iter().any(|result| !result.success);
     let success = execution_error.is_none() && boundary_error.is_none() && !validation_failed;
     let error = execution_error.or(boundary_error);
-
-    _revalidation
-        .stop_guard_owned_heartbeat()
-        .with_context(|| format!("guard-owned heartbeat failed for agent '{}'", run.agent_id))?;
 
     Ok(AgentRunReport {
         success,
@@ -963,6 +995,7 @@ fn run_proposed_command(
     command: &ProposedCommand,
     timeout: Duration,
     runtime: AgentExecutionRuntime,
+    cancellation: &crate::process_runner::ProcessCancellation,
 ) -> CommandExecutionReport {
     run_command(
         worktree_path,
@@ -973,6 +1006,7 @@ fn run_proposed_command(
             timeout,
         },
         runtime,
+        cancellation,
     )
 }
 
@@ -981,6 +1015,7 @@ fn run_validation_command(
     validation: &AgentValidationCommand,
     timeout: Duration,
     runtime: AgentExecutionRuntime,
+    cancellation: &crate::process_runner::ProcessCancellation,
 ) -> CommandExecutionReport {
     run_command(
         worktree_path,
@@ -991,6 +1026,7 @@ fn run_validation_command(
             timeout,
         },
         runtime,
+        cancellation,
     )
 }
 
@@ -998,6 +1034,7 @@ fn run_command(
     worktree_path: &Path,
     spec: CommandSpec,
     runtime: AgentExecutionRuntime,
+    cancellation: &crate::process_runner::ProcessCancellation,
 ) -> CommandExecutionReport {
     let normalized_cwd = match normalize_optional_working_directory(spec.working_directory.as_ref())
     {
@@ -1032,16 +1069,21 @@ fn run_command(
     )
     .with_environment(EnvironmentMode::ClearAndSet(sandbox_environment()))
     .with_timeout(Some(spec.timeout));
-    let result = run_process(match runtime {
-        AgentExecutionRuntime::Verified => process_spec
-            .with_private_runtime_home(true)
-            .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
-                StrictOfflineWorkspaceProfile::read_write(worktree_path),
-            )),
-        #[cfg(test)]
-        AgentExecutionRuntime::NonpublishableSimulation => process_spec
-            .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
-    });
+    let result = crate::process_runner::run_process_cancellable(
+        match runtime {
+            AgentExecutionRuntime::Verified => process_spec
+                .with_private_runtime_home(true)
+                .with_side_effect_confinement(
+                    SideEffectConfinementProfile::StrictOfflineWorkspace(
+                        StrictOfflineWorkspaceProfile::read_write(worktree_path),
+                    ),
+                ),
+            #[cfg(test)]
+            AgentExecutionRuntime::NonpublishableSimulation => process_spec
+                .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
+        },
+        cancellation,
+    );
 
     match result {
         Ok(output) => {

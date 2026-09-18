@@ -10,7 +10,7 @@
 //! official documentation, `[inferred]` reasoned but unconfirmed,
 //! `[unknown]` not yet established. Never upgrade a marker without evidence.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -23,8 +23,12 @@ use crate::model::{
 use crate::storage::{CredentialStore, Secret, SecretRef};
 
 pub use crate::account_authority::{
-    SelectedAccountBinding, SelectedUseLease, StoredAccountRegistry,
+    AuthObservation, CategoryObservation, ModelsObservation, ObservationOutcome, ObserveCategory,
+    QuotaObservation, SelectedAccountBinding, SelectedUseLease, StoredAccountRegistry,
 };
+
+pub mod observe;
+pub use observe::observe_selected_account;
 
 pub mod claude_code;
 pub mod codex_cli;
@@ -122,6 +126,28 @@ impl LaunchSpec {
         self.environment
             .iter()
             .any(|entry| matches!(entry, LaunchEnvironment::SetSecret { .. }))
+    }
+
+    /// Non-secret `SetPlain` environment mutations declared for a launch.
+    pub fn plain_environment(&self) -> Vec<(String, OsString)> {
+        self.environment
+            .iter()
+            .filter_map(|entry| match entry {
+                LaunchEnvironment::SetPlain { name, value } => Some((name.clone(), value.clone())),
+                LaunchEnvironment::SetSecret { .. } | LaunchEnvironment::Remove { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Inherited variables an adapter requires removing before launch.
+    pub fn environment_removals(&self) -> Vec<String> {
+        self.environment
+            .iter()
+            .filter_map(|entry| match entry {
+                LaunchEnvironment::Remove { name } => Some(name.clone()),
+                LaunchEnvironment::SetPlain { .. } | LaunchEnvironment::SetSecret { .. } => None,
+            })
+            .collect()
     }
 }
 
@@ -247,6 +273,66 @@ pub trait ProviderAdapter: Send + Sync {
     /// A plan name never implies that a numeric quota signal exists.
     fn plan_label(&self) -> Result<Option<String>> {
         Ok(None)
+    }
+
+    /// Account-scoped quota read. Defaults to the legacy provider-wide hook.
+    fn quota_for_account(&self, account: &StoredAccountMetadata) -> Result<Vec<QuotaSnapshot>> {
+        let _ = account;
+        self.quota()
+    }
+
+    /// Account-scoped plan label. Defaults to the legacy provider-wide hook.
+    fn plan_label_for_account(&self, account: &StoredAccountMetadata) -> Result<Option<String>> {
+        let _ = account;
+        self.plan_label()
+    }
+
+    /// Read-only observations for one stored account and explicit categories.
+    fn observe_account(
+        &self,
+        account: &StoredAccountMetadata,
+        categories: &BTreeSet<ObserveCategory>,
+        credential_store: Option<&dyn CredentialStore>,
+    ) -> Result<observe::AdapterObservePayload> {
+        let mut payload = observe::AdapterObservePayload::empty();
+        if categories.contains(&ObserveCategory::Auth) {
+            payload.auth = Some(self.observe_auth_for_account(account, credential_store)?);
+        }
+        if categories.contains(&ObserveCategory::Models) {
+            payload.models = Some(self.observe_models_for_account(account)?);
+        }
+        if categories.contains(&ObserveCategory::Quota) {
+            payload.quota = Some(match self.quota_for_account(account) {
+                Ok(snapshots) if snapshots.is_empty() => CategoryObservation::unknown(),
+                Ok(snapshots) => {
+                    let plan_label = self.plan_label_for_account(account).unwrap_or(None);
+                    CategoryObservation::observed(QuotaObservation {
+                        snapshots,
+                        plan_label,
+                    })
+                }
+                Err(Error::NotImplemented(_)) => CategoryObservation::unavailable(),
+                Err(error) => {
+                    CategoryObservation::failed(observe::observation_error_from_core(&error))
+                }
+            });
+        }
+        Ok(payload)
+    }
+
+    fn observe_auth_for_account(
+        &self,
+        _account: &StoredAccountMetadata,
+        _credential_store: Option<&dyn CredentialStore>,
+    ) -> Result<CategoryObservation<AuthObservation>> {
+        Ok(observe::auth_category_unavailable())
+    }
+
+    fn observe_models_for_account(
+        &self,
+        _account: &StoredAccountMetadata,
+    ) -> Result<CategoryObservation<ModelsObservation>> {
+        Ok(observe::models_category_default())
     }
 }
 

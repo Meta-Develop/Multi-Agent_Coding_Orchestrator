@@ -11,22 +11,27 @@ are described in [OAUTH_PROVENANCE.md](OAUTH_PROVENANCE.md).
 The application retains its [GPL-3.0-or-later license](../LICENSE), names, Tauri
 identifier, and existing data-directory identity:
 `ProjectDirs::from("dev", "metadevelop", "coding-agent-manager")`. This import
-does not migrate or duplicate credentials. `src-tauri/Cargo.lock` and
-`package-lock.json` remain independent of the orchestrator's dependencies.
-The scoped native dependency correction and remaining desktop audit warnings
-are recorded in [DEPENDENCY_AUDIT.md](DEPENDENCY_AUDIT.md).
+does not migrate or duplicate credentials. Headless `coding-agent-manager`
+(`account-manager/core`) is a MACO root workspace member; the repository root
+`Cargo.lock` resolves MACO and that crate. The desktop shell
+(`coding-agent-manager-desktop` under `src-tauri/`) keeps a separate
+`src-tauri/Cargo.lock` and path-depends on `../core` (one source tree, no copy).
+`package-lock.json` remains independent of MACO's Rust dependencies. The scoped
+native dependency correction and remaining desktop audit warnings are recorded in
+[DEPENDENCY_AUDIT.md](DEPENDENCY_AUDIT.md) (desktop lock only; root supply-chain
+CI does not waive them globally).
 
 ## Native core build
 
-Run these commands from `account-manager/` with Node 22 and the Rust toolchain
-in `rust-toolchain.toml`. Linux core builds need a C toolchain, `pkg-config`, and
-D-Bus development files for the existing Secret Service backend. GTK and WebKit
-are required only for desktop builds.
+Run these commands from the **MACO repository root** with Node 22 (desktop only)
+and the Rust toolchain in `rust-toolchain.toml`. Linux core builds need a C
+toolchain, `pkg-config`, and D-Bus development files for the existing Secret
+Service backend. GTK and WebKit are required only for desktop builds.
 
 ```bash
-cargo check --locked --manifest-path src-tauri/Cargo.toml --no-default-features --all-targets
-cargo clippy --locked --manifest-path src-tauri/Cargo.toml --no-default-features --all-targets -- -D warnings
-cargo test --locked --manifest-path src-tauri/Cargo.toml --no-default-features
+cargo check --locked -p coding-agent-manager --no-default-features --all-targets
+cargo clippy --locked -p coding-agent-manager --no-default-features --all-targets -- -D warnings
+cargo test --locked -p coding-agent-manager --no-default-features
 ```
 
 The resulting library exposes the existing provider, storage, launch, quota,
@@ -34,11 +39,19 @@ relay, and router modules without compiling Tauri. There is no headless account
 service or MACO invocation adapter in this unit. The proposed manual authority
 contract in [MACO_INTEGRATION.md](MACO_INTEGRATION.md) remains future work.
 
+Release packaging verifies headless tarballs with
+`cargo package --locked --workspace --no-default-features` at the repository
+root (see the root supply-chain workflow).
+
 ## Existing desktop build
 
-The `desktop` feature is enabled by default. It includes the Tauri commands,
-runtime, build helper, and `coding-agent-manager` binary. Packaged Tauri builds
-also enable `custom-protocol`, which retains the desktop feature.
+The desktop shell crate enables the `desktop` feature by default. It includes
+Tauri commands, runtime, build helper, and the `coding-agent-manager` binary.
+Packaged Tauri builds also enable `custom-protocol`, which retains the desktop
+feature. Command-module unit tests live in the shell crate; headless integration
+tests and goldens live under `core/`.
+
+From `account-manager/`:
 
 ```bash
 npm ci
@@ -47,10 +60,22 @@ npm run lint
 npm run format:check
 npm test
 npm run build
-cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
-cargo check --locked --manifest-path src-tauri/Cargo.toml --all-targets
-cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-cargo test --locked --manifest-path src-tauri/Cargo.toml
+```
+
+From the MACO repository root (desktop uses the standalone `src-tauri` manifest
+and lockfile):
+
+```bash
+cargo test --locked -p coding-agent-manager --no-default-features
+cargo fmt --locked --manifest-path account-manager/src-tauri/Cargo.toml --all -- --check
+cargo check --locked --manifest-path account-manager/src-tauri/Cargo.toml --all-targets
+cargo clippy --locked --manifest-path account-manager/src-tauri/Cargo.toml --all-targets -- -D warnings
+cargo test --locked --manifest-path account-manager/src-tauri/Cargo.toml -p coding-agent-manager-desktop
+```
+
+From `account-manager/`:
+
+```bash
 npm run tauri:dev
 ```
 

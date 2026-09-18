@@ -173,6 +173,29 @@ fn validate_config(mut config: InboxConfig) -> Result<InboxConfig> {
     Ok(config)
 }
 
+const ASSIGNED_PATH_LIMIT_SKIP_REASON: &str = "assigned_path_limit";
+
+fn assigned_paths_exceed_limit(paths: &[PathBuf]) -> bool {
+    paths.len() > MAX_ASSIGNED_PATHS
+}
+
+fn assigned_path_limit_note() -> String {
+    format!(
+        "inbox assigned paths exceed the {} path limit",
+        MAX_ASSIGNED_PATHS
+    )
+}
+
+fn mark_path_proposal_assigned_path_limit(
+    path_proposal: &mut planning::TaskPathProposalDiagnostics,
+) {
+    path_proposal.degraded = true;
+    let note = assigned_path_limit_note();
+    if !path_proposal.notes.iter().any(|existing| existing == &note) {
+        path_proposal.notes.push(note);
+    }
+}
+
 fn normalize_or_default(paths: Vec<PathBuf>, config: &InboxConfig) -> Result<Vec<PathBuf>> {
     let fallback = if config.default_assigned_paths.is_empty() {
         default_assigned_paths()

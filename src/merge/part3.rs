@@ -810,6 +810,7 @@ pub(crate) fn run_required_direct(
         SideEffectConfinementProfile::StrictOfflineWorkspace(profile),
         SideEffectConfinementProfileKind::StrictOfflineWorkspace,
         None,
+        None,
     )
 }
 
@@ -840,6 +841,7 @@ fn run_required_local_git_direct(
         SideEffectConfinementProfile::StrictOfflineWorkspace(profile),
         SideEffectConfinementProfileKind::StrictOfflineWorkspace,
         deadline_knobs,
+        None,
     )
 }
 
@@ -880,6 +882,49 @@ pub(crate) fn run_required_network_direct(
         SideEffectConfinementProfile::TrustedFixedNetwork(profile),
         SideEffectConfinementProfileKind::TrustedFixedNetwork,
         None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_required_network_direct_cancellable(
+    label: &str,
+    program: PathBuf,
+    args: Vec<OsString>,
+    current_dir: &Path,
+    environment: BTreeMap<String, String>,
+    stdin: StdinMode,
+    timeout: Duration,
+    capture_limit_bytes: usize,
+    stdin_limit_bytes: usize,
+    profile: TrustedFixedNetworkProfile,
+    process_cancellation: &ProcessCancellation,
+) -> Result<RequiredCommandOutput> {
+    validate_fixed_network_command(
+        label,
+        &program,
+        &args,
+        current_dir,
+        &environment,
+        &stdin,
+        timeout,
+        capture_limit_bytes,
+        stdin_limit_bytes,
+    )?;
+    run_required_direct_with_profile(
+        label,
+        program,
+        args,
+        current_dir,
+        environment,
+        stdin,
+        timeout,
+        capture_limit_bytes,
+        stdin_limit_bytes,
+        SideEffectConfinementProfile::TrustedFixedNetwork(profile),
+        SideEffectConfinementProfileKind::TrustedFixedNetwork,
+        None,
+        Some(process_cancellation),
     )
 }
 
@@ -897,19 +942,22 @@ fn run_required_direct_with_profile(
     profile: SideEffectConfinementProfile,
     expected_profile: SideEffectConfinementProfileKind,
     deadline_knobs: Option<(&str, &str)>,
+    process_cancellation: Option<&ProcessCancellation>,
 ) -> Result<RequiredCommandOutput> {
     if let StdinMode::Bytes(bytes) = &stdin {
         if bytes.len() > stdin_limit_bytes {
             bail!("{label} stdin exceeded the {stdin_limit_bytes}-byte safety limit");
         }
     }
-    let output = run_process(
-        ProcessSpec::direct(label, program, args, current_dir, capture_limit_bytes)
-            .with_environment(EnvironmentMode::ClearAndSet(environment))
-            .with_side_effect_confinement(profile)
-            .with_stdin(stdin)
-            .with_timeout(Some(timeout)),
-    )
+    let spec = ProcessSpec::direct(label, program, args, current_dir, capture_limit_bytes)
+        .with_environment(EnvironmentMode::ClearAndSet(environment))
+        .with_side_effect_confinement(profile)
+        .with_stdin(stdin)
+        .with_timeout(Some(timeout));
+    let output = match process_cancellation {
+        None => run_process(spec),
+        Some(cancellation) => run_process_cancellable(spec, cancellation),
+    }
     .with_context(|| format!("failed to run {label}"))?;
     require_verified_process_output_with_deadline_hint(
         label,
