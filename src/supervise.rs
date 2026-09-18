@@ -290,6 +290,7 @@ pub use scheduler::*;
 mod selection_bridge;
 use selection_bridge::*;
 
+mod environment_observation;
 mod outcome_history;
 mod prior_input;
 use outcome_history::*;
