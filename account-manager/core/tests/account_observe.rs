@@ -1,5 +1,7 @@
 //! Hermetic `account.observe` contract: unknown quota without live accounts.
 
+mod common;
+
 use std::fs;
 use coding_agent_manager_lib::account_authority::{
     AccountObserveRequest, ObservationOutcome, StoredAccountRegistry,
@@ -7,6 +9,7 @@ use coding_agent_manager_lib::account_authority::{
 use coding_agent_manager_lib::error::Error;
 use coding_agent_manager_lib::model::{AuthKind, StoredAccountMaterial};
 use coding_agent_manager_lib::paths::stored_accounts_path;
+use coding_agent_manager_lib::providers::codex_cli::CodexCliAdapter;
 use coding_agent_manager_lib::providers::gemini_cli::GeminiCliAdapter;
 use coding_agent_manager_lib::providers::{observe_selected_account, ObserveCategory};
 use coding_agent_manager_lib::storage::{CredentialStore, Secret, SecretRef};
@@ -71,6 +74,101 @@ fn gemini_fixture() -> (tempfile::TempDir, GeminiCliAdapter, StoredAccountRegist
         bytes: Some(TEST_KEY.as_bytes().to_vec()),
     };
     (dir, adapter, registry, store)
+}
+
+fn codex_fixture() -> (common::Fixture, CodexCliAdapter, StoredAccountRegistry) {
+    let fixture = common::Fixture::materialise();
+    let data = fixture.temp.path().join("data");
+    fs::create_dir_all(&data).expect("data dir");
+    let adapter = CodexCliAdapter::with_home(&fixture.home)
+        .with_data_dir(&data)
+        .with_tool_running(false);
+    let registry = StoredAccountRegistry::new(stored_accounts_path(&data));
+    (fixture, adapter, registry)
+}
+
+fn seed_codex_selected(registry: &StoredAccountRegistry) -> coding_agent_manager_lib::account_authority::SelectedAccountBinding {
+    registry
+        .begin_add(
+            "codex-cli",
+            "work",
+            "Work",
+            AuthKind::OAuth,
+            StoredAccountMaterial::VendorHome,
+        )
+        .expect("begin add");
+    registry
+        .complete_add("codex-cli", "work")
+        .expect("complete add");
+    registry
+        .select_complete_revision("codex-cli", "work", None)
+        .expect("select")
+}
+
+#[test]
+fn codex_observe_reports_unknown_quota_without_invented_utilization_or_zeros() {
+    let (_fixture, adapter, registry) = codex_fixture();
+    let binding = seed_codex_selected(&registry);
+
+    let result = observe_selected_account(
+        &registry,
+        &adapter,
+        AccountObserveRequest {
+            binding: binding.clone(),
+            categories: vec![
+                ObserveCategory::Auth,
+                ObserveCategory::Models,
+                ObserveCategory::Quota,
+            ],
+        },
+        None,
+    )
+    .expect("observe");
+
+    assert_eq!(result.binding, binding);
+    let json = serde_json::to_string(&result).expect("json");
+    assert!(
+        !json.contains("utilization"),
+        "Codex observe must not invent utilization: {json}"
+    );
+    assert!(
+        !json.contains("snapshots"),
+        "unknown quota must not serialize empty snapshot arrays as invented zeros: {json}"
+    );
+
+    let quota = result.quota.expect("quota category");
+    assert_eq!(quota.outcome, ObservationOutcome::Unknown);
+    assert!(quota.content.is_none());
+
+    let models = result.models.expect("models category");
+    assert_eq!(models.outcome, ObservationOutcome::Unknown);
+    assert!(models.content.is_none());
+
+    let auth = result.auth.expect("auth category");
+    assert_eq!(auth.outcome, ObservationOutcome::Unavailable);
+    assert!(auth.content.is_none());
+}
+
+#[test]
+fn codex_observe_refuses_stale_binding_without_auto_select() {
+    let (_fixture, adapter, registry) = codex_fixture();
+    let binding = seed_codex_selected(&registry);
+
+    let mut stale = binding.clone();
+    stale.selection_revision = binding.selection_revision.saturating_sub(1);
+
+    let error = observe_selected_account(
+        &registry,
+        &adapter,
+        AccountObserveRequest {
+            binding: stale,
+            categories: vec![ObserveCategory::Quota],
+        },
+        None,
+    )
+    .expect_err("stale binding must fail closed");
+
+    assert!(matches!(error, Error::StaleSelection { .. }));
 }
 
 #[test]
