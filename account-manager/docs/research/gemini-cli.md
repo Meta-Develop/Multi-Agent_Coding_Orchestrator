@@ -31,6 +31,19 @@ Pinned code evidence for every `[verified-source]` claim below:
 - https://raw.githubusercontent.com/google-gemini/gemini-cli/571851b1077a51cef757146ce13f9da887326bec/packages/cli/src/validateNonInterActiveAuth.ts
 - https://raw.githubusercontent.com/google-gemini/gemini-cli/571851b1077a51cef757146ce13f9da887326bec/packages/cli/src/gemini.tsx
 
+Pinned Code Assist entitlement evidence for §6a, same revision
+`571851b1077a51cef757146ce13f9da887326bec`:
+
+- https://raw.githubusercontent.com/google-gemini/gemini-cli/571851b1077a51cef757146ce13f9da887326bec/packages/core/src/code_assist/types.ts
+- https://raw.githubusercontent.com/google-gemini/gemini-cli/571851b1077a51cef757146ce13f9da887326bec/packages/core/src/code_assist/setup.ts
+- https://raw.githubusercontent.com/google-gemini/gemini-cli/571851b1077a51cef757146ce13f9da887326bec/packages/core/src/code_assist/server.ts
+- https://raw.githubusercontent.com/google-gemini/gemini-cli/571851b1077a51cef757146ce13f9da887326bec/packages/core/src/billing/billing.ts
+- https://raw.githubusercontent.com/google-gemini/gemini-cli/571851b1077a51cef757146ce13f9da887326bec/packages/core/src/config/config.ts
+- https://raw.githubusercontent.com/google-gemini/gemini-cli/571851b1077a51cef757146ce13f9da887326bec/docs/resources/quota-and-pricing.md
+- https://raw.githubusercontent.com/google-gemini/gemini-cli/571851b1077a51cef757146ce13f9da887326bec/docs/resources/faq.md
+
+The same `UserTierId` named constants, `LoadCodeAssistResponse` / `RetrieveUserQuotaResponse` field names, and the Google AI Pro row in `quota-and-pricing.md` were still present on official `main` commit `cfbcaa8df13ea4610bb379b377b56d62980c0032` (2026-09-18). That later tip is a second pin, not a second host observation.
+
 Additional compatibility, type, and documentation citations:
 
 - https://raw.githubusercontent.com/google-gemini/gemini-cli/v0.47.0/packages/core/src/config/storage.ts
@@ -217,6 +230,211 @@ the live tree. File-swap of the live `~/.gemini` tree remains
 `[unknown]`. Free-tier limits are documented as request-rate limits
 `[verified-docs]`, but no local signal was observed.
 
+## 6a. Google AI Pro / subscription entitlement
+
+This section is the #409 evidence record for Google AI Pro (and related
+Gemini subscription) entitlement through **the same Gemini CLI**. It does
+not replace §6. No adapter, cargo, or live-account change is implied.
+
+Existing Gemini OAuth files and a successful `oauth-personal` login do
+**not** establish Google AI Pro model access or quota. That matches
+`docs/MACO_INTEGRATION.md` §8. The local credential shapes in §3 have no
+subscription, plan, tier, or remaining-quota keys `[verified-source]`.
+`security.auth.selectedType` remains an auth **mode**, not a plan
+`[verified-source]`.
+
+### Official serving status
+
+Official Google developer documentation, last updated 2026-09-02 UTC when
+fetched on 2026-09-20, states that starting 2026-06-18 Gemini Code Assist
+IDE extensions **stopped serving** requests for Gemini Code Assist for
+individuals, Google AI Pro, and Google AI Ultra, and that this also
+applies to Gemini CLI. As part of that deprecation, Login with Google is
+no longer a way to access those consumer tiers in the IDE extensions or
+Gemini CLI `[verified-docs]`:
+
+- https://developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals
+- https://developers.google.com/gemini-code-assist/docs/deprecations
+
+The 2026-05-19 Google Developers Blog announcement gives the same
+2026-06-18 consumer cutoff and says Gemini Code Assist Standard or
+Enterprise licenses, and paid Gemini / Gemini Enterprise Agent Platform
+API keys, remain valid Gemini CLI paths `[verified-docs]`:
+
+- https://developers.googleblog.com/en/an-important-update-transitioning-gemini-cli-to-antigravity-cli/
+
+Those pages are official vendor prose. They are not Git-SHA pins. The
+consumer-account page recorded `Last updated 2026-09-02 UTC` on fetch.
+
+The official Gemini for Google Cloud quotas page, last updated
+2026-09-16 UTC when fetched on 2026-09-20, documents combined Gemini CLI
+/ agent-mode daily request limits only for Code Assist **Standard** and
+**Enterprise**. It does not name Google AI Pro or Ultra as a current
+Gemini CLI quota edition `[verified-docs]`:
+
+- https://developers.google.com/gemini-code-assist/resources/quotas
+
+Pinned Gemini CLI documentation at `571851b1077a51cef757146ce13f9da887326bec`
+still describes Google-account login as including Gemini Code Assist
+(Individual), Google AI Pro, and Google AI Ultra, and tells subscribers
+to confirm AI Pro / Ultra at https://one.google.com
+`[verified-docs]`. The same table and FAQ text remain on
+`cfbcaa8df13ea4610bb379b377b56d62980c0032`. That is a documentation
+conflict with the later official deprecation pages, not a local
+observation. Do not treat the pinned CLI table as proof that a current
+OAuth session still receives AI Pro.
+
+### Remote fields in the same CLI
+
+Google-account (`oauth-personal`) traffic uses the Code Assist private
+API at `https://cloudcode-pa.googleapis.com` / `v1internal`
+(`[verified-source]`; overridable with `CODE_ASSIST_ENDPOINT` /
+`CODE_ASSIST_API_VERSION`). Entitlement is requested after auth, not
+read from `oauth_creds.json`.
+
+`CodeAssistServer.loadCodeAssist` POSTs `loadCodeAssist` and deserialises
+`LoadCodeAssistResponse` `[verified-source]`:
+
+```jsonc
+{
+  "currentTier": { /* GeminiUserTier or null */ },
+  "allowedTiers": [ /* GeminiUserTier */ ],
+  "ineligibleTiers": [ /* IneligibleTier */ ],
+  "cloudaicompanionProject": "<redacted>",
+  "paidTier": { /* GeminiUserTier or null */ },
+}
+```
+
+`GeminiUserTier` key names `[verified-source]`:
+
+```jsonc
+{
+  "id": "<string>", // UserTierId
+  "name": "<string>",
+  "description": "<string>",
+  "userDefinedCloudaicompanionProject": false,
+  "isDefault": false,
+  "privacyNotice": {},
+  "hasAcceptedTos": false,
+  "hasOnboardedPreviously": false,
+  "availableCredits": [
+    {
+      "creditType": "GOOGLE_ONE_AI", // or "CREDIT_TYPE_UNSPECIFIED"
+      "creditAmount": "<string>", // int64 JSON string; no value recorded here
+    },
+  ],
+}
+```
+
+Named `UserTierId` constants in that source are only `free-tier`,
+`legacy-tier`, and `standard-tier`. The TypeScript type is those
+constants **or** `string`, and the comment says the listed IDs are a
+subset because the server list is updated often `[verified-source]`.
+There is **no** named `UserTierId` constant for Google AI Pro or Ultra
+at either pinned revision. Mapping any returned `id` or `name` onto
+"Google AI Pro" is therefore `[unknown]` until a live response is
+observed.
+
+`setupUser` prefers `paidTier.id` / `paidTier.name` over
+`currentTier.id` / `currentTier.name`, then falls back to
+`UserTierId.STANDARD` when both IDs are missing `[verified-source]`.
+That STANDARD fallback is a client default, not a vendor entitlement
+observation. On a VPC-SC `SECURITY_POLICY_VIOLATED` error,
+`loadCodeAssist` also synthesises `{ currentTier: { id: UserTierId.STANDARD } }`
+and does not call the server a second time `[verified-source]`. Treat a
+bare `standard-tier` id from those paths as untrusted for plan
+detection.
+
+Returned `UserData` (`projectId`, `userTier`, `userTierName`,
+`paidTier`, `hasOnboardedPreviously`) is cached in process memory
+(WeakMap + 30s TTL), not written under `.gemini` `[verified-source]`.
+`Config.getUserTier`, `getUserTierName`, and `getUserPaidTier` read that
+in-memory Code Assist server object `[verified-source]`.
+
+`G1_CREDIT_TYPE` is the string `GOOGLE_ONE_AI`. The billing helper sums
+`availableCredits` entries of that type. The type comment calls them
+"Google One AI credits". That is a **credit wallet** field, not a
+subscription-plan enum. Presence of `GOOGLE_ONE_AI` is not established
+as proof of Google AI Pro `[verified-source]`; whether a live account
+returns it is `[unknown]`.
+
+`CodeAssistServer.retrieveUserQuota` POSTs `retrieveUserQuota` with
+`{ project, userAgent? }` and deserialises `RetrieveUserQuotaResponse`
+`[verified-source]`:
+
+```jsonc
+{
+  "buckets": [
+    {
+      "remainingAmount": "<string>",
+      "remainingFraction": 0,
+      "resetTime": "<string>",
+      "tokenType": "<string>",
+      "modelId": "<string>",
+    },
+  ],
+}
+```
+
+`Config.refreshUserQuota` keeps `lastRetrievedQuota` and a
+`modelQuotas` map **in memory only**. `storage.ts` at this pin has no
+quota filename `[verified-source]`. When `remainingAmount` is present
+and `remainingFraction > 0`, the client **computes**
+`limit = round(remaining / remainingFraction)`. When `remainingAmount`
+is absent, the client sets `limit = 100` and scales remaining from the
+fraction `[verified-source]`. That `100` is a client placeholder, not a
+vendor field. A future Observed row must use the raw bucket fields
+(`remainingAmount`, `remainingFraction`, `resetTime`, `modelId`,
+`tokenType`) and must not publish that placeholder as quota.
+
+Official CLI docs say `/stats model` shows the current session's token
+usage and "the limits associated with your current quota"
+`[verified-docs]`. That command was not run here.
+
+### Can any field become Observed?
+
+This update did not sign in, call `loadCodeAssist` or
+`retrieveUserQuota`, or read a signed-in home. **No** subscription,
+plan, tier, or quota field is Observed in this note. Published daily
+request figures in the pinned CLI quota table and on the Cloud quotas
+page are catalog text `[verified-docs]`. They are not remaining-quota
+observations, and they are not repeated here as if they were measured.
+
+Fields that **can** become Observed later, without inventing numbers,
+if a live authenticated Code Assist call returns them and the values
+are recorded as received:
+
+| Field | RPC | Marker if observed live |
+| --------------------------------------------- | ------------------- | ----------------------- |
+| `paidTier.id`, `paidTier.name` | `loadCodeAssist` | `[verified-local]` |
+| `currentTier.id`, `currentTier.name` | `loadCodeAssist` | `[verified-local]` |
+| `allowedTiers[]` / `ineligibleTiers[]` `id` / `tierId` / `tierName` | `loadCodeAssist` | `[verified-local]` |
+| `availableCredits[].creditType` | `loadCodeAssist` | `[verified-local]` |
+| `availableCredits[].creditAmount` | `loadCodeAssist` or generate-content `remainingCredits` | `[verified-local]` |
+| `buckets[].remainingAmount` | `retrieveUserQuota` | `[verified-local]` |
+| `buckets[].remainingFraction` | `retrieveUserQuota` | `[verified-local]` |
+| `buckets[].resetTime` | `retrieveUserQuota` | `[verified-local]` |
+| `buckets[].modelId` | `retrieveUserQuota` | `[verified-local]` |
+| `buckets[].tokenType` | `retrieveUserQuota` | `[verified-local]` |
+
+Fields that **cannot** become Observed from material already in hand:
+
+| Candidate | Why it stays unobserved |
+| --------------------------------------------- | ----------------------- |
+| Any key in `oauth_creds.json` / `google_accounts.json` | No plan, tier, or quota keys `[verified-source]`. |
+| `security.auth.selectedType` | Auth mode only `[verified-source]`. |
+| Named `UserTierId` `free-tier` / `legacy-tier` / `standard-tier` | Client constants, not an AI Pro label `[verified-source]`. |
+| Client `UserTierId.STANDARD` fallback or VPC-SC stub | Synthesised locally `[verified-source]`. |
+| Client `modelQuotas.limit`, including `limit = 100` | Derived or invented in `refreshUserQuota` `[verified-source]`. |
+| Pinned CLI or Cloud published daily maxima | Catalog `[verified-docs]`, not an account reading. |
+| Google One "Manage subscription" confirmation | Official FAQ path `[verified-docs]`; not a CLI field; not fetched here. |
+
+Until a live `loadCodeAssist` / `retrieveUserQuota` response is
+recorded, Google AI Pro entitlement through Gemini CLI remains
+`[unknown]`. After the official 2026-06-18 consumer shutdown, that live
+call may fail rather than return an AI Pro tier. Either outcome still
+needs observation; do not infer it.
+
 ## 7. API surface and base-URL override
 
 Gemini `generateContent` format `[verified-docs]`. Google also publishes an
@@ -281,3 +499,13 @@ Still open:
 - Which `Credentials` keys actually appear on disk after a real sign-in?
 - Windows and macOS paths, confirmed on real hosts.
 - Local quota or usage signal, confirmed on a real host.
+- After the official 2026-06-18 consumer shutdown, does a current
+  Google-account `loadCodeAssist` or `retrieveUserQuota` call still
+  return a paid tier, or does it fail for AI Pro / Ultra / individual
+  accounts?
+- Which live `paidTier.id` / `paidTier.name` (if any) correspond to
+  Google AI Pro? Source has no named AI Pro `UserTierId`.
+- Does a live `retrieveUserQuota` bucket include `remainingAmount`, or
+  only `remainingFraction` (the client then invents `limit = 100`)?
+- Does `GOOGLE_ONE_AI` `availableCredits` appear on a real AI Pro
+  account, and is it a subscription proof or only a credit wallet?
