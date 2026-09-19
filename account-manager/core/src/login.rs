@@ -1,8 +1,8 @@
 //! Shared explicit login lifecycle for managed accounts (MACO integration §5).
 //!
-//! Step A covers Gemini OAuth only. Legacy synchronous `add_managed_account`
-//! remains unchanged; this service exposes `login.start` / `login.status` /
-//! `login.cancel` semantics for a future headless authority and Tauri consumer.
+//! Gemini and Codex OAuth share the handle / idempotency / cancel path.
+//! Claude and Cursor stay `NotImplemented`. Legacy synchronous
+//! `add_managed_account` remains unchanged.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -20,10 +20,81 @@ use crate::account_authority::PendingLoginLease;
 use crate::error::{Error, Result};
 use crate::model::{AuthKind, StoredAccountMetadata};
 use crate::providers::{
-    complete_managed_login_account, gemini_cli::GeminiCliAdapter,
-    gemini_cli::PreparedPendingOAuthHome, OAuthLoginRunError, ProviderAdapter,
+    complete_managed_login_account, codex_cli::CodexCliAdapter, gemini_cli::GeminiCliAdapter,
+    OAuthLoginRunError, PendingOAuthHomePlan, PreparedPendingOAuthHome, ProviderAdapter,
     StoredAccountRegistry, LOGIN_DEADLINE,
 };
+
+/// Adapter seams used by [`LoginService::start`]: identity, pending-home
+/// prepare, task clone, finish, and the existing OAuth run helper.
+pub(crate) trait PendingOAuthLogin: ProviderAdapter + Send + Sync + 'static {
+    fn prepare_pending_oauth_home(
+        &self,
+        account: &StoredAccountMetadata,
+    ) -> Result<PreparedPendingOAuthHome>;
+    fn clone_for_login_task(&self) -> Self
+    where
+        Self: Sized;
+    fn finish_pending_oauth_login(&self, home: &Path) -> Result<()>;
+    fn run_pending_oauth_login(
+        &self,
+        home: &Path,
+        plan: PendingOAuthHomePlan,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> impl std::future::Future<Output = std::result::Result<(), OAuthLoginRunError>> + Send;
+}
+
+impl PendingOAuthLogin for GeminiCliAdapter {
+    fn prepare_pending_oauth_home(
+        &self,
+        account: &StoredAccountMetadata,
+    ) -> Result<PreparedPendingOAuthHome> {
+        GeminiCliAdapter::prepare_pending_oauth_home(self, account)
+    }
+
+    fn clone_for_login_task(&self) -> Self {
+        GeminiCliAdapter::clone_for_login_task(self)
+    }
+
+    fn finish_pending_oauth_login(&self, home: &Path) -> Result<()> {
+        GeminiCliAdapter::finish_pending_oauth_login(self, home)
+    }
+
+    fn run_pending_oauth_login(
+        &self,
+        home: &Path,
+        plan: PendingOAuthHomePlan,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> impl std::future::Future<Output = std::result::Result<(), OAuthLoginRunError>> + Send {
+        GeminiCliAdapter::run_pending_oauth_login(self, home, plan, cancel)
+    }
+}
+
+impl PendingOAuthLogin for CodexCliAdapter {
+    fn prepare_pending_oauth_home(
+        &self,
+        account: &StoredAccountMetadata,
+    ) -> Result<PreparedPendingOAuthHome> {
+        CodexCliAdapter::prepare_pending_oauth_home(self, account)
+    }
+
+    fn clone_for_login_task(&self) -> Self {
+        CodexCliAdapter::clone_for_login_task(self)
+    }
+
+    fn finish_pending_oauth_login(&self, home: &Path) -> Result<()> {
+        CodexCliAdapter::finish_pending_oauth_login(self, home)
+    }
+
+    fn run_pending_oauth_login(
+        &self,
+        home: &Path,
+        plan: PendingOAuthHomePlan,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> impl std::future::Future<Output = std::result::Result<(), OAuthLoginRunError>> + Send {
+        CodexCliAdapter::run_pending_oauth_login(self, home, plan, cancel)
+    }
+}
 
 /// Opaque login handle. Never encodes provider or account identifiers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -146,12 +217,20 @@ impl LoginService {
         }
     }
 
-    /// Begin Gemini OAuth login for a new pending account, or replay an
-    /// idempotent start request.
+    /// Begin Gemini or Codex OAuth login for a new pending account, or
+    /// replay an idempotent start request.
     pub fn start(
         &self,
         request: LoginStartRequest,
         adapter: &GeminiCliAdapter,
+    ) -> Result<LoginStatus> {
+        self.start_pending_oauth(request, adapter)
+    }
+
+    pub(crate) fn start_pending_oauth<A: PendingOAuthLogin>(
+        &self,
+        request: LoginStartRequest,
+        adapter: &A,
     ) -> Result<LoginStatus> {
         validate_start_request(&request)?;
         if request.provider_id != adapter.id() {
@@ -160,7 +239,7 @@ impl LoginService {
         if request.auth_kind != AuthKind::OAuth {
             return Err(login_refused(
                 &request.provider_id,
-                "only Gemini OAuth login is supported in this release",
+                "only OAuth login is supported in this release",
             ));
         }
         let fingerprint = RequestFingerprint::from(&request);
@@ -284,7 +363,7 @@ impl LoginService {
         let adapter = adapter.clone_for_login_task();
         let op = Arc::clone(&operation);
         let task = self.runtime.spawn(async move {
-            run_gemini_oauth_task(
+            run_pending_oauth_task(
                 registry,
                 adapter,
                 PreparedPendingOAuthHome {
@@ -472,9 +551,9 @@ const FAILURE_LOGIN_PROVISION: &str = "login provisioning failed";
 const FAILURE_LOGIN_COMMIT: &str = "login finished but account completion failed";
 const FAILURE_LOGIN_INTERNAL: &str = "login failed for an internal reason";
 
-async fn run_gemini_oauth_task(
+async fn run_pending_oauth_task<A: PendingOAuthLogin>(
     registry: StoredAccountRegistry,
-    adapter: GeminiCliAdapter,
+    adapter: A,
     prepared: PreparedPendingOAuthHome,
     account: StoredAccountMetadata,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
@@ -521,8 +600,12 @@ async fn run_gemini_oauth_task(
     }
 }
 
-fn oauth_material_present(home: &Path) -> bool {
-    home.join(".gemini/oauth_creds.json").is_file()
+fn oauth_material_present(provider_id: &str, home: &Path) -> bool {
+    match provider_id {
+        "gemini-cli" => home.join(".gemini/oauth_creds.json").is_file(),
+        "codex-cli" => home.join("auth.json").is_file(),
+        _ => false,
+    }
 }
 
 enum ManagedLoginCommitOutcome {
@@ -548,7 +631,7 @@ fn commit_managed_login_after_oauth(
         account.material,
     ) {
         Ok(()) => ManagedLoginCommitOutcome::Ready,
-        Err(Error::StaleAccount { .. }) if oauth_material_present(home) => {
+        Err(Error::StaleAccount { .. }) if oauth_material_present(&account.provider_id, home) => {
             ManagedLoginCommitOutcome::OutcomeUnknown
         }
         Err(Error::StaleAccount { account_id }) => {
@@ -559,7 +642,9 @@ fn commit_managed_login_after_oauth(
                 FAILURE_LOGIN_COMMIT,
             ))
         }
-        Err(_) if oauth_material_present(home) => ManagedLoginCommitOutcome::OutcomeUnknown,
+        Err(_) if oauth_material_present(&account.provider_id, home) => {
+            ManagedLoginCommitOutcome::OutcomeUnknown
+        }
         Err(error) => {
             ManagedLoginCommitOutcome::Failed(sanitize_login_error(&error, FAILURE_LOGIN_COMMIT))
         }
@@ -584,7 +669,7 @@ fn validate_start_request(request: &LoginStartRequest) -> Result<()> {
             "idempotency key is missing or too long",
         ));
     }
-    if request.provider_id != "gemini-cli" {
+    if request.provider_id != "gemini-cli" && request.provider_id != "codex-cli" {
         return Err(Error::NotImplemented("login.start"));
     }
     Ok(())

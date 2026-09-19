@@ -21,13 +21,14 @@ use std::process::{Command, Stdio};
 
 use super::{
     account_id_is_safe, binary_on_path, home_dir, managed_account_dir, process_named_is_running,
-    ProviderAdapter,
+    ManagedAccountPlan, PendingOAuthHomePlan, PreparedPendingOAuthHome, ProviderAdapter,
 };
 use crate::backup::{BackupId, BackupStore};
 use crate::error::{Error, Result};
 use crate::fsx;
 use crate::model::{
     Account, AuthKind, InstallState, Maturity, ProviderCapability, ProviderDescriptor,
+    StoredAccountMaterial, StoredAccountMetadata, StoredAccountState,
 };
 use crate::paths;
 
@@ -62,6 +63,9 @@ pub struct CodexCliAdapter {
     /// browser against a real account (`docs/TESTING.md` §4). Tests pass a
     /// stub so a real login never runs.
     login_runner: Option<fn(&Path) -> std::io::Result<i32>>,
+    /// Hermetic login-service tests: honour cancel via async watch only.
+    #[doc(hidden)]
+    test_oauth_watch_cancel_driver: bool,
     #[cfg(test)]
     fault: SwitchFault,
 }
@@ -118,6 +122,137 @@ impl CodexCliAdapter {
     pub fn with_login_runner(mut self, runner: fn(&Path) -> std::io::Result<i32>) -> Self {
         self.login_runner = Some(runner);
         self
+    }
+
+    /// Async OAuth fixture for login-service cancellation tests.
+    #[doc(hidden)]
+    pub fn with_test_oauth_watch_cancel_driver(mut self) -> Self {
+        self.test_oauth_watch_cancel_driver = true;
+        self.login_runner = None;
+        self
+    }
+
+    /// Clone adapter configuration for a background login task.
+    pub(crate) fn clone_for_login_task(&self) -> Self {
+        Self {
+            home: self.home.clone(),
+            data_dir: self.data_dir.clone(),
+            injected_tool_running: self.injected_tool_running,
+            login_runner: self.login_runner,
+            test_oauth_watch_cancel_driver: self.test_oauth_watch_cancel_driver,
+            #[cfg(test)]
+            fault: self.fault,
+        }
+    }
+
+    fn validate_pending_oauth_account(&self, account: &StoredAccountMetadata) -> Result<()> {
+        if account.provider_id != self.id() {
+            return Err(Error::UnknownProvider(account.provider_id.clone()));
+        }
+        if !account_id_is_safe(&account.id) {
+            return Err(self.config_read(
+                "stored account metadata does not match the Codex lifecycle",
+            ));
+        }
+        if account.id == ON_DISK_ACCOUNT_ID {
+            return Err(self.config_read(
+                "account id is reserved for the live on-disk Codex identity",
+            ));
+        }
+        if account.state != StoredAccountState::Pending || account.is_selected {
+            return Err(self.config_read(
+                "only an unselected pending Codex account can begin OAuth login",
+            ));
+        }
+        if account.auth_kind != AuthKind::OAuth
+            || account.material != StoredAccountMaterial::VendorHome
+        {
+            return Err(self.config_read(
+                "Codex OAuth login requires an OAuth pending account",
+            ));
+        }
+        Ok(())
+    }
+
+    fn required_data_dir(&self) -> Result<PathBuf> {
+        let directory = self.resolved_data_dir().ok_or_else(|| {
+            self.config_write(
+                "application data directory is unavailable; cannot create a managed account",
+            )
+        })?;
+        if !directory.is_absolute() {
+            return Err(self.config_write(
+                "application data directory is not an absolute path",
+            ));
+        }
+        Ok(directory)
+    }
+
+    fn managed_oauth_home(&self, account: &StoredAccountMetadata) -> Result<PathBuf> {
+        Ok(managed_account_dir(
+            &self.required_data_dir()?,
+            self.id(),
+            &account.id,
+        ))
+    }
+
+    /// Prepare an isolated managed `CODEX_HOME` for a pending OAuth account.
+    pub(crate) fn prepare_pending_oauth_home(
+        &self,
+        account: &StoredAccountMetadata,
+    ) -> Result<PreparedPendingOAuthHome> {
+        self.validate_pending_oauth_account(account)?;
+        let home = self.managed_oauth_home(account)?;
+        let plan = match fs::symlink_metadata(home.join("auth.json")) {
+            Ok(_) => {
+                self.require_auth_json(&home)?;
+                PendingOAuthHomePlan::RecoveredExistingMarker
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                self.prepare_managed_dir(&home)?;
+                PendingOAuthHomePlan::NeedsInteractiveOAuth
+            }
+            Err(error) => {
+                return Err(self.config_write(format!(
+                    "managed auth.json cannot be inspected ({})",
+                    error.kind()
+                )));
+            }
+        };
+        Ok(PreparedPendingOAuthHome { path: home, plan })
+    }
+
+    /// Run `codex login` for a prepared managed `CODEX_HOME`.
+    pub(crate) async fn run_pending_oauth_login(
+        &self,
+        home: &Path,
+        plan: PendingOAuthHomePlan,
+        mut cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> std::result::Result<(), super::OAuthLoginRunError> {
+        if *cancel.borrow() {
+            return Err(super::OAuthLoginRunError::Cancelled);
+        }
+        if plan == PendingOAuthHomePlan::RecoveredExistingMarker {
+            return Ok(());
+        }
+        if self.test_oauth_watch_cancel_driver {
+            return super::gemini_oauth::run_test_oauth_cancelled_by_watch(&mut cancel).await;
+        }
+        let adapter = self.clone_for_login_task();
+        let home = home.to_path_buf();
+        let result = tokio::task::spawn_blocking(move || adapter.run_vendor_login(&home)).await;
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(super::OAuthLoginRunError::Failed(error)),
+            Err(_) => Err(super::OAuthLoginRunError::Failed(
+                self.config_write("Codex login task failed"),
+            )),
+        }
+    }
+
+    /// Validate vendor-issued `auth.json` after login succeeds.
+    pub(crate) fn finish_pending_oauth_login(&self, home: &Path) -> Result<()> {
+        self.require_auth_json(home)
     }
 
     #[cfg(test)]
@@ -1014,6 +1149,16 @@ impl ProviderAdapter for CodexCliAdapter {
             return Err(self.cleanup_failed_add(&dir, error));
         }
         Ok(())
+    }
+
+    fn managed_account_plan_for(&self, auth_kind: AuthKind) -> Option<ManagedAccountPlan> {
+        match auth_kind {
+            AuthKind::OAuth => Some(ManagedAccountPlan {
+                auth_kind: AuthKind::OAuth,
+                material: StoredAccountMaterial::VendorHome,
+            }),
+            AuthKind::ApiKey | AuthKind::Unknown => None,
+        }
     }
 
     fn delete_account(&self, account_id: &str) -> Result<()> {

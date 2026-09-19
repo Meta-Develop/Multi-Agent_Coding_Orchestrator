@@ -9,11 +9,19 @@ use tokio::runtime::Runtime;
 use crate::login::{LoginAccountBinding, LoginService, LoginStartRequest, LoginState};
 use crate::model::{AuthKind, StoredAccountState};
 use crate::paths;
-use crate::providers::{gemini_cli::GeminiCliAdapter, ProviderAdapter, StoredAccountRegistry};
+use crate::providers::{
+    codex_cli::CodexCliAdapter, gemini_cli::GeminiCliAdapter, ProviderAdapter,
+    StoredAccountRegistry,
+};
 
 use super::LoginStatus;
 
 const PROVIDER_ID: &str = "gemini-cli";
+const CODEX_PROVIDER_ID: &str = "codex-cli";
+const CODEX_AUTH_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/codex-cli/managed-oauth/auth.json"
+);
 
 fn oauth_adapter(
     completer: fn(&Path) -> crate::error::Result<()>,
@@ -97,6 +105,47 @@ fn start_request(account_id: &str, key: &str) -> LoginStartRequest {
         auth_kind: AuthKind::OAuth,
         idempotency_key: key.to_string(),
     }
+}
+
+fn codex_oauth_adapter(
+    runner: fn(&Path) -> std::io::Result<i32>,
+) -> (tempfile::TempDir, CodexCliAdapter, StoredAccountRegistry) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path().join("home");
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(home.join(".codex")).expect("home settings dir");
+    let adapter = CodexCliAdapter::with_home(&home)
+        .with_data_dir(&data)
+        .with_login_runner(runner);
+    let registry = StoredAccountRegistry::new(paths::stored_accounts_path(&data));
+    (dir, adapter, registry)
+}
+
+fn codex_cancel_driver_adapter() -> (tempfile::TempDir, CodexCliAdapter, StoredAccountRegistry) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path().join("home");
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(home.join(".codex")).expect("home settings dir");
+    let adapter = CodexCliAdapter::with_home(&home)
+        .with_data_dir(&data)
+        .with_test_oauth_watch_cancel_driver();
+    let registry = StoredAccountRegistry::new(paths::stored_accounts_path(&data));
+    (dir, adapter, registry)
+}
+
+fn codex_start_request(account_id: &str, key: &str) -> LoginStartRequest {
+    LoginStartRequest {
+        provider_id: CODEX_PROVIDER_ID.to_string(),
+        account_id: account_id.to_string(),
+        label: account_id.to_string(),
+        auth_kind: AuthKind::OAuth,
+        idempotency_key: key.to_string(),
+    }
+}
+
+fn write_codex_auth_fixture(home: &Path) -> std::io::Result<i32> {
+    std::fs::copy(CODEX_AUTH_FIXTURE, home.join("auth.json"))?;
+    Ok(0)
 }
 
 fn wait_for_state(
@@ -354,12 +403,53 @@ fn cancel_vs_ready_race_reports_ready_after_commit() {
 fn unsupported_provider_start_is_refused() {
     let (_dir, adapter, registry) = oauth_adapter(write_oauth_files);
     let (_runtime, service) = service(&registry);
-    let mut request = start_request("work", "key");
-    request.provider_id = "codex-cli".to_string();
-    assert!(matches!(
-        service.start(request, &adapter),
-        Err(crate::error::Error::NotImplemented(_))
-    ));
+    for provider_id in ["claude-code", "cursor"] {
+        let mut request = start_request("work", "key");
+        request.provider_id = provider_id.to_string();
+        assert!(
+            matches!(
+                service.start(request, &adapter),
+                Err(crate::error::Error::NotImplemented(_))
+            ),
+            "{provider_id} must stay NotImplemented"
+        );
+    }
+}
+
+#[test]
+fn codex_oauth_ready_completes_registry_row_without_changing_selection() {
+    let (_dir, adapter, registry) = codex_oauth_adapter(write_codex_auth_fixture);
+    let (runtime, service) = service(&registry);
+    let started = service
+        .start_pending_oauth(codex_start_request("work", "key-codex-ready"), &adapter)
+        .expect("start");
+    wait_for_state(&runtime, &service, &started, LoginState::Ready);
+    let row = registry
+        .account(CODEX_PROVIDER_ID, "work")
+        .expect("account");
+    assert_eq!(row.state, StoredAccountState::Complete);
+    assert!(!row.is_selected);
+    assert!(registry
+        .selected(CODEX_PROVIDER_ID)
+        .expect("selected")
+        .is_none());
+}
+
+#[test]
+fn codex_oauth_cancelled_login_confirmed_by_owned_async_oauth_fixture() {
+    let (_dir, adapter, registry) = codex_cancel_driver_adapter();
+    let (runtime, service) = service(&registry);
+    let started = service
+        .start_pending_oauth(codex_start_request("work", "key-codex-cancel"), &adapter)
+        .expect("start");
+    service
+        .cancel(&started.handle, &started.binding)
+        .expect("cancel");
+    wait_for_state(&runtime, &service, &started, LoginState::Cancelled);
+    let row = registry
+        .account(CODEX_PROVIDER_ID, "work")
+        .expect("pending");
+    assert_eq!(row.state, StoredAccountState::Pending);
 }
 
 #[test]

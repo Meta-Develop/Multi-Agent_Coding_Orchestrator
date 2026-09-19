@@ -40,6 +40,19 @@ pub mod grok_cli;
 
 pub(crate) use gemini_oauth::{OAuthLoginRunError, LOGIN_DEADLINE};
 
+/// Whether prepare already validated an existing managed OAuth marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingOAuthHomePlan {
+    NeedsInteractiveOAuth,
+    RecoveredExistingMarker,
+}
+
+/// Isolated managed home plus whether interactive OAuth still has to run.
+pub struct PreparedPendingOAuthHome {
+    pub path: PathBuf,
+    pub plan: PendingOAuthHomePlan,
+}
+
 /// How activating an account changes what the provider tool will use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivationMechanism {

@@ -825,11 +825,11 @@ fn login_start(
     auth_kind: AuthKind,
     idempotency_key: &str,
 ) -> AuthorityResponse {
-    if provider_id != "gemini-cli" {
+    if provider_id != "gemini-cli" && provider_id != "codex-cli" {
         return AuthorityResponse::error(
             request_id,
             ErrorCode::UnsupportedOperation,
-            "login.start is implemented for Gemini OAuth only",
+            "login.start is implemented for Gemini and Codex OAuth only",
         );
     }
     let Some(login) = ctx.login.as_ref() else {
