@@ -30,7 +30,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_exposes_the_five_initial_providers() {
+    fn registry_exposes_the_registered_providers() {
         let ids: Vec<_> = providers::registry()
             .iter()
             .map(|adapter| adapter.id())
@@ -42,7 +42,8 @@ mod tests {
                 "codex-cli",
                 "cursor",
                 "grok-cli",
-                "gemini-cli"
+                "gemini-cli",
+                "github-copilot",
             ]
         );
     }

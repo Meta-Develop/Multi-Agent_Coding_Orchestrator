@@ -28,6 +28,7 @@ use coding_agent_manager_lib::providers::claude_code::ClaudeCodeAdapter;
 use coding_agent_manager_lib::providers::codex_cli::CodexCliAdapter;
 use coding_agent_manager_lib::providers::cursor::CursorAdapter;
 use coding_agent_manager_lib::providers::gemini_cli::GeminiCliAdapter;
+use coding_agent_manager_lib::providers::github_copilot::GithubCopilotAdapter;
 use coding_agent_manager_lib::providers::grok_cli::GrokCliAdapter;
 use coding_agent_manager_lib::providers::{self, ActivationMechanism, ProviderAdapter};
 use tempfile::TempDir;
@@ -481,6 +482,7 @@ fn adapter_for_home(id: &str, home: impl Into<PathBuf>) -> Box<dyn ProviderAdapt
         "cursor" => Box::new(CursorAdapter::with_home(home)),
         "grok-cli" => Box::new(GrokCliAdapter::with_home(home)),
         "gemini-cli" => Box::new(GeminiCliAdapter::with_home(home)),
+        "github-copilot" => Box::new(GithubCopilotAdapter::with_home(home)),
         other => panic!(
             "`{other}` is in providers::registry() but adapter_contract.rs \
              has no with_home arm. Add one so the contract suite covers it; \

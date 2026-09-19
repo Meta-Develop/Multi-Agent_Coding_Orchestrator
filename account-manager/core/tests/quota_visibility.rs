@@ -10,15 +10,17 @@ use coding_agent_manager_lib::providers::claude_code::ClaudeCodeAdapter;
 use coding_agent_manager_lib::providers::codex_cli::CodexCliAdapter;
 use coding_agent_manager_lib::providers::cursor::CursorAdapter;
 use coding_agent_manager_lib::providers::gemini_cli::GeminiCliAdapter;
+use coding_agent_manager_lib::providers::github_copilot::GithubCopilotAdapter;
 use coding_agent_manager_lib::providers::grok_cli::GrokCliAdapter;
 use coding_agent_manager_lib::providers::{self, ProviderAdapter};
 
-const PROVIDER_IDS: [&str; 5] = [
+const PROVIDER_IDS: [&str; 6] = [
     "claude-code",
     "codex-cli",
     "cursor",
     "grok-cli",
     "gemini-cli",
+    "github-copilot",
 ];
 const CLAUDE_PLAN_LABEL: &str = "FAKE-CLAUDE-PLAN";
 const MALFORMED_MARKER: &str = "FAKE-CLAUDE-MALFORMED";
@@ -120,6 +122,7 @@ fn adapter_for_fixture(id: &str, root: &Path) -> Box<dyn ProviderAdapter> {
             root.join("system-defaults.json"),
             None,
         )),
+        "github-copilot" => Box::new(GithubCopilotAdapter::with_home(home)),
         other => {
             panic!("`{other}` is registered but quota_visibility.rs has no hermetic adapter arm")
         }
@@ -137,7 +140,10 @@ struct StagedFixture {
 impl StagedFixture {
     fn new(name: &str) -> Self {
         let temp = tempfile::tempdir().expect("quota fixture TempDir");
-        copy_tree(&fixture_root().join(name), temp.path());
+        let source = fixture_root().join(name);
+        if source.is_dir() {
+            copy_tree(&source, temp.path());
+        }
         fs::create_dir_all(temp.path().join("data")).expect("fixture data directory");
         fs::create_dir_all(temp.path().join("workspace")).expect("fixture workspace directory");
         Self { temp }
