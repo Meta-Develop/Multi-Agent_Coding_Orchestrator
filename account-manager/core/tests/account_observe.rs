@@ -404,6 +404,75 @@ fn claude_observe_reports_unknown_quota_without_inventing_zeros_from_local_hints
 }
 
 #[test]
+fn claude_observe_does_not_treat_local_credential_decoy_fields_as_observed_auth_or_quota() {
+    let (_dir, adapter, registry) = claude_fixture();
+    add_complete_claude(&registry, "work");
+    let binding = registry
+        .select_complete_revision("claude-code", "work", None)
+        .expect("select");
+
+    let result = observe_selected_account(
+        &registry,
+        &adapter,
+        AccountObserveRequest {
+            binding: binding.clone(),
+            categories: vec![
+                ObserveCategory::Auth,
+                ObserveCategory::Models,
+                ObserveCategory::Quota,
+            ],
+        },
+        None,
+    )
+    .expect("observe");
+
+    assert_eq!(result.binding, binding);
+    let json = serde_json::to_string(&result).expect("json");
+    assert!(
+        !json.contains("utilization"),
+        "observe must not invent numeric quota from local hints: {json}"
+    );
+    assert!(
+        !json.contains("snapshots"),
+        "unknown quota must not serialize empty snapshots as observed zero: {json}"
+    );
+    assert!(
+        !json.contains("rateLimitTier"),
+        "local credentials must not surface rate limit tier as observed quota: {json}"
+    );
+    assert!(
+        !json.contains("subscriptionType"),
+        "local credentials must not surface subscription type as observed auth: {json}"
+    );
+    assert!(
+        !json.contains("accessToken"),
+        "observe output must not leak local access tokens: {json}"
+    );
+    assert!(
+        !json.contains("refreshToken"),
+        "observe output must not leak local refresh tokens: {json}"
+    );
+    assert!(
+        !json.contains("cachedUsageUtilization"),
+        "local identity hints must not surface as observed quota: {json}"
+    );
+    assert!(
+        !json.contains("FAKE-"),
+        "observe output must not leak fixture secrets: {json}"
+    );
+
+    let quota = result.quota.expect("quota category");
+    assert_eq!(quota.outcome, ObservationOutcome::Unknown);
+    assert!(quota.content.is_none());
+
+    let models = result.models.expect("models category");
+    assert_eq!(models.outcome, ObservationOutcome::Unknown);
+
+    let auth = result.auth.expect("auth category");
+    assert_eq!(auth.outcome, ObservationOutcome::Unavailable);
+}
+
+#[test]
 fn claude_observe_refuses_stale_binding_without_auto_select() {
     let (_dir, adapter, registry) = claude_fixture();
     add_complete_claude(&registry, "work");
