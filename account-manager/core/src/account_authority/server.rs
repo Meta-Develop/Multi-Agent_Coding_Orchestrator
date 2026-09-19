@@ -115,6 +115,7 @@ impl LoginPort for GeminiLoginPort {
             "codex-cli" => self
                 .service
                 .start_pending_oauth(request, &CodexCliAdapter::default()),
+            // claude-code and cursor are allow-listed; neither has PendingOAuthLogin.
             _ => Err(Error::NotImplemented("login.start")),
         }
     }

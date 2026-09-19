@@ -4,22 +4,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use coding_agent_manager_lib::account_authority::{
-    authority_id_for, decode_request, dispatch, map_core_error, AuthorityContext, ErrorCode,
-    LoginPort, StoredAccountRegistry, ADVERTISED_OPERATIONS, PROTOCOL_VERSION,
+    authority_id_for, decode_request, dispatch, map_core_error, AuthorityContext,
+    AuthorityServerConfig, ErrorCode, LoginPort, StoredAccountRegistry, ADVERTISED_OPERATIONS,
+    PROTOCOL_VERSION,
 };
 #[cfg(not(unix))]
 use coding_agent_manager_lib::account_authority::{
-    listen, AuthorityServerConfig, ListenError, SafeSocketPath, SocketPathError,
+    listen, ListenError, SafeSocketPath, SocketPathError,
 };
 use coding_agent_manager_lib::error::Error;
 use coding_agent_manager_lib::login::{
-    LoginAccountBinding, LoginHandle, LoginStartRequest, LoginState, LoginStatus,
+    LoginAccountBinding, LoginHandle, LoginService, LoginStartRequest, LoginState, LoginStatus,
 };
 use coding_agent_manager_lib::model::{
     Account, AuthKind, InstallState, Maturity, ProviderDescriptor, StoredAccountMaterial,
 };
 use coding_agent_manager_lib::paths::stored_accounts_path;
-use coding_agent_manager_lib::providers::ProviderAdapter;
+use coding_agent_manager_lib::providers::{gemini_cli::GeminiCliAdapter, ProviderAdapter};
 
 struct ActivateProbeAdapter {
     activated: Arc<AtomicBool>,
@@ -242,7 +243,33 @@ fn dispatch_refuses_operation_prepare() {
 }
 
 #[test]
-fn dispatch_refuses_non_gemini_login_start() {
+fn dispatch_refuses_unknown_login_start() {
+    let (_dir, registry) = isolated_registry();
+    let login = Arc::new(FakeLogin::new());
+    let ctx = AuthorityContext::new(registry)
+        .without_registry_fallback()
+        .with_login(Arc::clone(&login) as Arc<dyn LoginPort>);
+    let body = serde_json::json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "requestId": "login",
+        "operation": "login.start",
+        "providerId": "grok-cli",
+        "accountId": "work",
+        "label": "Work",
+        "authKind": "oauth",
+        "idempotencyKey": "key-1"
+    });
+    let response = dispatch_json(&ctx, &body.to_string());
+    assert_eq!(response["error"]["code"], "unsupported-operation");
+    assert_eq!(
+        response["error"]["message"],
+        "login.start is implemented for Gemini, Codex, Claude, and Cursor only"
+    );
+    assert!(login.starts.lock().expect("starts").is_empty());
+}
+
+#[test]
+fn dispatch_accepts_claude_and_cursor_login_start() {
     let (_dir, registry) = isolated_registry();
     let login = Arc::new(FakeLogin::new());
     let ctx = AuthorityContext::new(registry)
@@ -257,15 +284,53 @@ fn dispatch_refuses_non_gemini_login_start() {
             "accountId": "work",
             "label": "Work",
             "authKind": "oauth",
-            "idempotencyKey": "key-1"
+            "idempotencyKey": format!("key-{provider_id}")
         });
         let response = dispatch_json(&ctx, &body.to_string());
+        assert!(response["error"].is_null(), "{provider_id}");
+        assert_eq!(response["result"]["handle"], "login-handle-1");
+        assert_eq!(response["result"]["state"], "waiting-for-user");
+        assert_eq!(
+            response["result"]["binding"]["providerId"], provider_id,
+            "{provider_id}"
+        );
+    }
+    assert_eq!(login.starts.lock().expect("starts").len(), 2);
+}
+
+#[test]
+fn production_login_port_leaves_claude_and_cursor_unimplemented() {
+    let (_dir, registry) = isolated_registry();
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let service = LoginService::new(
+        StoredAccountRegistry::new(registry.metadata_path().to_path_buf()),
+        runtime.handle().clone(),
+    );
+    let ctx = AuthorityContext::new(registry).without_registry_fallback();
+    let config = AuthorityServerConfig::new(ctx)
+        .expect("config")
+        .with_gemini_login(service, GeminiCliAdapter::default());
+    for provider_id in ["claude-code", "cursor"] {
+        let body = serde_json::json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "requestId": "login",
+            "operation": "login.start",
+            "providerId": provider_id,
+            "accountId": "work",
+            "label": "Work",
+            "authKind": "oauth",
+            "idempotencyKey": format!("key-{provider_id}")
+        });
+        let response = dispatch_json(&config.context, &body.to_string());
         assert_eq!(
             response["error"]["code"], "unsupported-operation",
             "{provider_id}"
         );
+        assert_eq!(
+            response["error"]["message"], "operation is not implemented",
+            "{provider_id}"
+        );
     }
-    assert!(login.starts.lock().expect("starts").is_empty());
 }
 
 #[test]

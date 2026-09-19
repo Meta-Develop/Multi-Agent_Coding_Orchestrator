@@ -400,7 +400,31 @@ fn cancel_vs_ready_race_reports_ready_after_commit() {
 }
 
 #[test]
+fn validate_start_request_accepts_gemini_codex_claude_and_cursor() {
+    for provider_id in ["gemini-cli", "codex-cli", "claude-code", "cursor"] {
+        let mut request = start_request("work", "key");
+        request.provider_id = provider_id.to_string();
+        assert!(
+            super::validate_start_request(&request).is_ok(),
+            "{provider_id} must be allow-listed"
+        );
+    }
+}
+
+#[test]
 fn unsupported_provider_start_is_refused() {
+    let (_dir, adapter, registry) = oauth_adapter(write_oauth_files);
+    let (_runtime, service) = service(&registry);
+    let mut request = start_request("work", "key");
+    request.provider_id = "grok-cli".to_string();
+    assert!(matches!(
+        service.start(request, &adapter),
+        Err(crate::error::Error::NotImplemented(_))
+    ));
+}
+
+#[test]
+fn claude_and_cursor_start_with_gemini_adapter_is_unknown_provider() {
     let (_dir, adapter, registry) = oauth_adapter(write_oauth_files);
     let (_runtime, service) = service(&registry);
     for provider_id in ["claude-code", "cursor"] {
@@ -409,9 +433,9 @@ fn unsupported_provider_start_is_refused() {
         assert!(
             matches!(
                 service.start(request, &adapter),
-                Err(crate::error::Error::NotImplemented(_))
+                Err(crate::error::Error::UnknownProvider(id)) if id == provider_id
             ),
-            "{provider_id} must stay NotImplemented"
+            "{provider_id} must not start Gemini OAuth"
         );
     }
 }

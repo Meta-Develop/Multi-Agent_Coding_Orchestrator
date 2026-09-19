@@ -1,7 +1,8 @@
 //! Shared explicit login lifecycle for managed accounts (MACO integration §5).
 //!
 //! Gemini and Codex OAuth share the handle / idempotency / cancel path.
-//! Claude and Cursor stay `NotImplemented`. Legacy synchronous
+//! Claude and Cursor are allow-listed on `login.start` and stay
+//! `NotImplemented` at the production port. Legacy synchronous
 //! `add_managed_account` remains unchanged.
 
 use std::collections::HashMap;
@@ -669,7 +670,11 @@ fn validate_start_request(request: &LoginStartRequest) -> Result<()> {
             "idempotency key is missing or too long",
         ));
     }
-    if request.provider_id != "gemini-cli" && request.provider_id != "codex-cli" {
+    if request.provider_id != "gemini-cli"
+        && request.provider_id != "codex-cli"
+        && request.provider_id != "claude-code"
+        && request.provider_id != "cursor"
+    {
         return Err(Error::NotImplemented("login.start"));
     }
     Ok(())
