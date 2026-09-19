@@ -143,14 +143,12 @@ impl ClaudeCodeAdapter {
             return Err(Error::UnknownProvider(account.provider_id.clone()));
         }
         if !account_id_is_safe(&account.id) {
-            return Err(
-                self.config_read("stored account metadata does not match the Claude Code lifecycle")
-            );
+            return Err(self
+                .config_read("stored account metadata does not match the Claude Code lifecycle"));
         }
         if account.id == ON_DISK_ACCOUNT_ID {
-            return Err(
-                self.config_read("account id is reserved for the live on-disk Claude Code identity")
-            );
+            return Err(self
+                .config_read("account id is reserved for the live on-disk Claude Code identity"));
         }
         if account.state != StoredAccountState::Pending || account.is_selected {
             return Err(self.config_read(

@@ -179,7 +179,10 @@ fn claude_start_request(account_id: &str, key: &str) -> LoginStartRequest {
 
 fn write_claude_oauth_fixture(home: &Path) -> std::io::Result<i32> {
     let src = Path::new(CLAUDE_OAUTH_FIXTURE);
-    std::fs::copy(src.join(".credentials.json"), home.join(".credentials.json"))?;
+    std::fs::copy(
+        src.join(".credentials.json"),
+        home.join(".credentials.json"),
+    )?;
     std::fs::copy(src.join(".claude.json"), home.join(".claude.json"))?;
     Ok(0)
 }

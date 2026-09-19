@@ -306,7 +306,10 @@ fn write_claude_managed_oauth(home: &std::path::Path) -> std::io::Result<i32> {
         "/tests/fixtures/claude-code/managed-oauth"
     );
     let src = std::path::Path::new(FIXTURE);
-    std::fs::copy(src.join(".credentials.json"), home.join(".credentials.json"))?;
+    std::fs::copy(
+        src.join(".credentials.json"),
+        home.join(".credentials.json"),
+    )?;
     std::fs::copy(src.join(".claude.json"), home.join(".claude.json"))?;
     Ok(0)
 }
