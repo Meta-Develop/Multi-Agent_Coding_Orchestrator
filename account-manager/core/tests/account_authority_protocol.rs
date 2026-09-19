@@ -248,6 +248,33 @@ fn dispatch_refuses_non_gemini_login_start() {
     let ctx = AuthorityContext::new(registry)
         .without_registry_fallback()
         .with_login(Arc::clone(&login) as Arc<dyn LoginPort>);
+    for provider_id in ["claude-code", "cursor"] {
+        let body = serde_json::json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "requestId": "login",
+            "operation": "login.start",
+            "providerId": provider_id,
+            "accountId": "work",
+            "label": "Work",
+            "authKind": "oauth",
+            "idempotencyKey": "key-1"
+        });
+        let response = dispatch_json(&ctx, &body.to_string());
+        assert_eq!(
+            response["error"]["code"], "unsupported-operation",
+            "{provider_id}"
+        );
+    }
+    assert!(login.starts.lock().expect("starts").is_empty());
+}
+
+#[test]
+fn dispatch_accepts_codex_cli_login_start() {
+    let (_dir, registry) = isolated_registry();
+    let login = Arc::new(FakeLogin::new());
+    let ctx = AuthorityContext::new(registry)
+        .without_registry_fallback()
+        .with_login(Arc::clone(&login) as Arc<dyn LoginPort>);
     let body = serde_json::json!({
         "protocolVersion": PROTOCOL_VERSION,
         "requestId": "login",
@@ -259,8 +286,10 @@ fn dispatch_refuses_non_gemini_login_start() {
         "idempotencyKey": "key-1"
     });
     let response = dispatch_json(&ctx, &body.to_string());
-    assert_eq!(response["error"]["code"], "unsupported-operation");
-    assert!(login.starts.lock().expect("starts").is_empty());
+    assert!(response["error"].is_null());
+    assert_eq!(response["result"]["handle"], "login-handle-1");
+    assert_eq!(response["result"]["state"], "waiting-for-user");
+    assert_eq!(login.starts.lock().expect("starts").len(), 1);
 }
 
 #[test]

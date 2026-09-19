@@ -13,7 +13,9 @@ use crate::account_authority::protocol::{
 };
 use crate::account_authority::protocol::{AuthorityContext, LoginPort};
 use crate::account_authority::{SafeSocketPath, SocketPathError};
+use crate::error::Error;
 use crate::login::LoginService;
+use crate::providers::codex_cli::CodexCliAdapter;
 use crate::providers::gemini_cli::GeminiCliAdapter;
 
 /// Operator configuration for one authority listener.
@@ -108,7 +110,13 @@ impl LoginPort for GeminiLoginPort {
         &self,
         request: crate::login::LoginStartRequest,
     ) -> crate::error::Result<crate::login::LoginStatus> {
-        self.service.start(request, &self.adapter)
+        match request.provider_id.as_str() {
+            "gemini-cli" => self.service.start(request, &self.adapter),
+            "codex-cli" => self
+                .service
+                .start_pending_oauth(request, &CodexCliAdapter::default()),
+            _ => Err(Error::NotImplemented("login.start")),
+        }
     }
 
     fn status(

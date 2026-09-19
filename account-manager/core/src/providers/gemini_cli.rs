@@ -23,7 +23,8 @@ use serde_json::{Map, Value};
 
 use super::{
     account_id_is_safe, binary_on_path, home_dir, managed_account_dir, ActivationMechanism,
-    LaunchSpec, ManagedAccountPlan, ProviderAdapter, StoredAccountRegistry,
+    LaunchSpec, ManagedAccountPlan, PendingOAuthHomePlan, PreparedPendingOAuthHome,
+    ProviderAdapter, StoredAccountRegistry,
 };
 use crate::account_authority::{AuthObservation, CategoryObservation};
 use crate::error::{Error, Result};
@@ -62,18 +63,6 @@ const OAUTH_REMOVED_AUTH_ENVIRONMENT: &[&str] = &[
 ];
 
 type OAuthCompleter = fn(&Path) -> Result<()>;
-
-/// Whether prepare already validated an existing managed OAuth marker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PendingOAuthHomePlan {
-    NeedsInteractiveOAuth,
-    RecoveredExistingMarker,
-}
-
-pub(crate) struct PreparedPendingOAuthHome {
-    pub path: PathBuf,
-    pub plan: PendingOAuthHomePlan,
-}
 
 /// `None` is production and reads process state. `Some` is a hermetic test
 /// context: every environment-derived value must come from injected fields.
