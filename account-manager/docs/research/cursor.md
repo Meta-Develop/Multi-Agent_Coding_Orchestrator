@@ -11,6 +11,8 @@
 
 | Path                                                  | Purpose                                        | Marker             |
 | ----------------------------------------------------- | ---------------------------------------------- | ------------------ |
+| `~/.cursor/cli-config.json`                           | Official global CLI settings (macOS/Linux)     | `[verified-docs]`  |
+| `%USERPROFILE%\.cursor\cli-config.json`               | Official global CLI settings (Windows)         | `[verified-docs]`  |
 | `~/.config/cursor/cli-config.json`                    | CLI settings — no credential material observed | `[verified-local]` |
 | `~/.cursor/agents/`                                   | Agent state                                    | `[verified-local]` |
 | `~/.cursor/projects/`                                 | Project state                                  | `[verified-local]` |
@@ -22,6 +24,39 @@
 | macOS Keychain `cursor-refresh-token`                 | Staff-named Keychain service                   | `[verified-docs]`  |
 | macOS Keychain `cursor-api-key`                       | Staff-named Keychain service                   | `[verified-docs]`  |
 | Default persist (Linux/Windows)                       | **Not found**                                  | `[unknown]`        |
+
+### Official configuration (2026-09-20)
+
+Official Agent CLI configuration page
+<https://cursor.com/docs/cli/reference/configuration> `[verified-docs]`:
+
+| Path or env                             | Purpose                                                                                    | Marker            |
+| --------------------------------------- | ------------------------------------------------------------------------------------------ | ----------------- |
+| `~/.cursor/cli-config.json`             | Global settings, macOS/Linux                                                               | `[verified-docs]` |
+| `%USERPROFILE%\.cursor\cli-config.json` | Global settings, Windows. Same page also writes `$env:USERPROFILE\.cursor\cli-config.json` | `[verified-docs]` |
+| `.cursor/cli.json` (project)            | Permissions only. All other CLI settings must be global                                    | `[verified-docs]` |
+| `CURSOR_CONFIG_DIR`                     | Custom settings directory path                                                             | `[verified-docs]` |
+| `XDG_CONFIG_HOME` (Linux/BSD)           | Settings file at `$XDG_CONFIG_HOME/cursor/cli-config.json`                                 | `[verified-docs]` |
+
+`CURSOR_CONFIG_DIR` and `XDG_CONFIG_HOME` relocate **settings**, not a named
+credential home. Isolated HOME relocation is still not officially documented
+(no `GROK_HOME` equivalent). That continues to block a write-safe isolated
+HOME `login.start` path.
+
+Official schema fields `[verified-docs]`: `version`, `editor.vimMode`,
+`permissions.*`, `channel`, `model`, `maxMode`, `hasChangedDefaultModel`,
+`notifications`, `hints`, `rewind`, `suggestNextPrompt`, `display.*`,
+`approvalMode`, `sandbox.*`, `network.useHttp1ForAgent`, `attribution.*`.
+Required fields on that page are `version` (current: `1`), `editor.vimMode`,
+`permissions.allow`, and `permissions.deny`. The page lists no credential,
+token, or `authInfo` fields. Third-party claims that `cli-config.json` holds
+`authInfo` stay unofficial and are not Observed.
+
+This note and the adapter record presence of the official regular file
+`~/.cursor/cli-config.json` as install evidence only; they do not read, parse,
+or log it. The adapter does not treat `$XDG_CONFIG_HOME/cursor/cli-config.json`
+or the locally observed `~/.config/cursor/cli-config.json` as install
+evidence. Default Linux and Windows persist targets remain `[unknown]`.
 
 ## 3. Credential format
 
@@ -60,7 +95,10 @@ and contains only settings `[verified-local]`:
 }
 ```
 
-No token, key, or session field appears anywhere in it.
+No token, key, or session field appears anywhere in it. Official 2026-09-20
+schema on the configuration page matches those setting groups, adds
+`channel`, `model`, and `maxMode`, and names `version` current `1`
+`[verified-docs]`. It still has no credential fields.
 
 ## 4. Authentication flow
 
@@ -127,8 +165,10 @@ cursor-user` and the same for `cursor-refresh-token` and `cursor-api-key`.
 - The 2026-07-20 and March 2026 CLI changelogs mention macOS Keychain
   failures at CLI startup and over SSH `[verified-docs]`. They do not name
   the Keychain service.
-- Configuration docs describe `cli-config.json` as CLI settings, not
-  credentials `[verified-docs]`.
+- Configuration docs name official settings paths and schema and describe
+  `cli-config.json` as CLI settings, not credentials `[verified-docs]`.
+  Official global path is `~/.cursor/cli-config.json`, not
+  `~/.config/cursor/cli-config.json`. See section 2.
 - SDK docs store `Cursor.auth.login()` keys in `~/.cursor/sdk/auth.json` and
   say that stored login does not read credentials from a local Cursor app
   installation `[verified-docs]`. That path is not the CLI persist location.
