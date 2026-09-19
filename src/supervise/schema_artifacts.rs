@@ -863,6 +863,7 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
                     "budget_degradations": budget_degradation_records_schema_value(),
                     "assignment_selection_ledger": assignment_selection_ledger_schema_value(),
                     "selection_decisions": selection_decisions_schema_value(),
+                    "accepted_task_cost": accepted_task_cost_schema_value(),
                     "usage": execution_usage_schema_value()
                 }
             }
@@ -1411,6 +1412,30 @@ fn process_observation_schema_value() -> serde_json::Value {
     json!({
         "type": "string",
         "enum": ["scheduler_observed", "not_retained", "not_process_observable"]
+    })
+}
+
+fn accepted_task_cost_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "incomplete_attempt_count",
+            "complete_attempt_count",
+            "complete_accepted_count",
+            "complete_total_cycle_cost_microunits",
+            "cost_per_accepted_task_microunits"
+        ],
+        "properties": {
+            "incomplete_attempt_count": {"type": "integer", "minimum": 0},
+            "complete_attempt_count": {"type": "integer", "minimum": 0},
+            "complete_accepted_count": {"type": "integer", "minimum": 0},
+            "complete_total_cycle_cost_microunits": {"type": "integer", "minimum": 0},
+            "cost_per_accepted_task_microunits": {
+                "type": ["integer", "null"],
+                "minimum": 0
+            }
+        }
     })
 }
 

@@ -2,14 +2,15 @@
 //!
 //! Attempts with any missing attributable bucket — including `environment_cost_microunits:
 //! None` on verified external launches — are incomplete and excluded from numeric rollup.
+//! Unknown terminal results are omitted from the average; they are not invented.
 //!
-//! Not yet consumed by the supervisor report path; the rollup is wired in a later slice.
-
-#![cfg_attr(not(test), allow(dead_code))]
+//! The supervisor final-report path records this rollup on
+//! `role_economics_profile.execution.accepted_task_cost`.
 
 use super::outcome_history::AttemptAttributableCosts;
 use crate::selection::OutcomeResult;
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::supervise) struct AttemptCostRecord {
@@ -17,13 +18,24 @@ pub(in crate::supervise) struct AttemptCostRecord {
     pub costs: AttemptAttributableCosts,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::supervise) struct AcceptedTaskCostRollup {
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptedTaskCostRollup {
     pub incomplete_attempt_count: u32,
     pub complete_attempt_count: u32,
     pub complete_accepted_count: u32,
     pub complete_total_cycle_cost_microunits: u64,
     pub cost_per_accepted_task_microunits: Option<u64>,
+}
+
+pub(in crate::supervise) fn attempt_cost_record(
+    costs: AttemptAttributableCosts,
+    result: Option<OutcomeResult>,
+) -> Option<AttemptCostRecord> {
+    Some(AttemptCostRecord {
+        result: result?,
+        costs,
+    })
 }
 
 pub(in crate::supervise) fn rollup_cost_per_accepted_task(
@@ -84,6 +96,7 @@ fn sum_five_bucket_cycle_cost(buckets: [u64; 5]) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::SupervisorExecutionMetadata;
     use super::*;
 
     fn fake_simulation_complete_accepted() -> AttemptCostRecord {
@@ -141,5 +154,46 @@ mod tests {
         assert_eq!(fake_only.incomplete_attempt_count, 0);
         assert_eq!(fake_only.complete_total_cycle_cost_microunits, 12);
         Ok(())
+    }
+
+    #[test]
+    fn unknown_terminal_result_is_omitted_not_invented() {
+        let costs = AttemptAttributableCosts {
+            execution_cost_microunits: Some(10),
+            review_cost_microunits: Some(2),
+            rework_cost_microunits: Some(0),
+            rereview_cost_microunits: Some(0),
+            environment_cost_microunits: Some(0),
+        };
+        assert_eq!(attempt_cost_record(costs.clone(), None), None);
+        let accepted = attempt_cost_record(costs, Some(OutcomeResult::Accepted))
+            .expect("known accepted result maps");
+        assert_eq!(accepted.result, OutcomeResult::Accepted);
+    }
+
+    #[test]
+    fn legacy_execution_metadata_without_accepted_task_cost_still_deserializes() {
+        let json = serde_json::json!({
+            "assignment_count": 0,
+            "started_assignment_count": 0,
+            "completed_assignment_count": 0,
+            "concurrency": {
+                "configured_max_concurrent_children": 1,
+                "policy_input_observation": "scheduler_observed",
+                "achieved_max_concurrent_children": 0,
+                "achieved_mean_concurrent_children": null,
+                "achieved_mean_observation": "not_process_observable"
+            },
+            "role_bindings": {},
+            "usage": {
+                "total_usage": null,
+                "total_cost_usd": null,
+                "usage_complete": false,
+                "observation": "not_process_observable"
+            }
+        });
+        let metadata: SupervisorExecutionMetadata =
+            serde_json::from_value(json).expect("legacy execution metadata deserializes");
+        assert!(metadata.accepted_task_cost.is_none());
     }
 }
