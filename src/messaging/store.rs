@@ -11,6 +11,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
+    ops::{Deref, DerefMut},
     path::{Component, Path, PathBuf},
 };
 
@@ -1279,7 +1280,7 @@ impl MessagingStore {
             return Err(StoreError::TailAnchorAlreadyExists { path: anchor_path });
         }
 
-        let mut file = binding
+        let file = binding
             .open_data(true)
             .map_err(|source| match source.kind() {
                 io::ErrorKind::AlreadyExists => StoreError::AlreadyExists { path: path.clone() },
@@ -1291,6 +1292,7 @@ impl MessagingStore {
             })?;
         validate_regular_single_link(&file, &path)?;
         acquire_data_lock(&file, &path)?;
+        let mut file = AcquiredDataLock::new(file);
         let initial_data_identity = file_identity(&file, &path)?;
         validate_named_file_identity(
             &binding,
@@ -1370,7 +1372,7 @@ impl MessagingStore {
         let mut store = Self {
             binding,
             path,
-            file,
+            file: file.into_inner(),
             data_identity,
             anchor_path,
             anchor_file,
@@ -1414,7 +1416,7 @@ impl MessagingStore {
             return Err(StoreError::Missing { path });
         }
         binding.validate_child_regular_before_open(&binding.data_name, &path)?;
-        let mut file = binding.open_data(false).map_err(|source| {
+        let file = binding.open_data(false).map_err(|source| {
             if source.kind() == io::ErrorKind::NotFound {
                 StoreError::Missing { path: path.clone() }
             } else {
@@ -1434,6 +1436,7 @@ impl MessagingStore {
             return Err(StoreError::NotRegularFile { path });
         }
         acquire_data_lock(&file, &path)?;
+        let mut file = AcquiredDataLock::new(file);
         validate_regular_single_link(&file, &path)?;
         let data_identity = file_identity(&file, &path)?;
         validate_named_file_identity(&binding, &binding.data_name, &path, &file, &data_identity)?;
@@ -1452,7 +1455,7 @@ impl MessagingStore {
             return Err(StoreError::EmptyJournal);
         }
 
-        run_after_journal_metadata_hook(&path);
+        run_after_journal_metadata_hook(&path, &file);
         let read_limit = expected_limits.max_journal_bytes.checked_add(1).ok_or(
             StoreError::JournalByteLimitExceeded {
                 actual: usize::MAX,
@@ -1465,7 +1468,7 @@ impl MessagingStore {
                 max: expected_limits.max_journal_bytes,
             })?;
         let mut bytes = Vec::with_capacity(file_bytes);
-        Read::by_ref(&mut file)
+        Read::by_ref(&mut *file)
             .take(read_limit)
             .read_to_end(&mut bytes)
             .map_err(|source| StoreError::Io {
@@ -1728,7 +1731,7 @@ impl MessagingStore {
         let mut store = Self {
             binding,
             path,
-            file,
+            file: file.into_inner(),
             data_identity,
             anchor_path,
             anchor_file,
@@ -2178,7 +2181,7 @@ impl MessagingStore {
 type AfterJournalSyncHook = Option<Box<dyn FnOnce(&Path)>>;
 
 #[cfg(test)]
-type AfterJournalMetadataHook = Option<Box<dyn FnOnce(&Path)>>;
+type AfterJournalMetadataHook = Option<Box<dyn FnOnce(&Path, &File)>>;
 
 #[cfg(test)]
 thread_local! {
@@ -2189,20 +2192,20 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn set_after_journal_metadata_hook(hook: impl FnOnce(&Path) + 'static) {
+fn set_after_journal_metadata_hook(hook: impl FnOnce(&Path, &File) + 'static) {
     AFTER_JOURNAL_METADATA_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
 #[cfg(test)]
-fn run_after_journal_metadata_hook(path: &Path) {
+fn run_after_journal_metadata_hook(path: &Path, file: &File) {
     let hook = AFTER_JOURNAL_METADATA_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
-        hook(path);
+        hook(path, file);
     }
 }
 
 #[cfg(not(test))]
-fn run_after_journal_metadata_hook(_path: &Path) {}
+fn run_after_journal_metadata_hook(_path: &Path, _file: &File) {}
 
 #[cfg(test)]
 fn set_after_journal_sync_hook(hook: impl FnOnce(&Path) + 'static) {
@@ -2231,6 +2234,46 @@ fn acquire_data_lock(file: &File, path: &Path) -> Result<(), StoreError> {
             path: path.to_path_buf(),
             source,
         }),
+    }
+}
+
+struct AcquiredDataLock {
+    file: Option<File>,
+}
+
+impl AcquiredDataLock {
+    fn new(file: File) -> Self {
+        Self { file: Some(file) }
+    }
+
+    fn into_inner(mut self) -> File {
+        self.file.take().expect("acquired data-file lock")
+    }
+}
+
+impl Deref for AcquiredDataLock {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        self.file.as_ref().expect("acquired data-file lock")
+    }
+}
+
+impl DerefMut for AcquiredDataLock {
+    fn deref_mut(&mut self) -> &mut File {
+        self.file.as_mut().expect("acquired data-file lock")
+    }
+}
+
+impl Drop for AcquiredDataLock {
+    fn drop(&mut self) {
+        // Same rationale as MessagingStore::Drop: Linux flock belongs to an
+        // open-file description, so a forked child can inherit a duplicate
+        // between fork and exec. Closing File without unlock leaves the lock
+        // held while that duplicate lives.
+        if let Some(file) = &self.file {
+            let _ = file.unlock();
+        }
     }
 }
 
@@ -4055,7 +4098,7 @@ mod tests {
         drop(store);
         let initial_bytes = fs::metadata(&path).expect("journal metadata").len() as usize;
         let grown_bytes = limits.max_journal_bytes + 128;
-        set_after_journal_metadata_hook(move |journal_path| {
+        set_after_journal_metadata_hook(move |journal_path, _file| {
             let growth = grown_bytes
                 .checked_sub(initial_bytes)
                 .expect("configured growth exceeds initial journal");
@@ -4420,6 +4463,54 @@ mod tests {
             Err(other) => panic!("limits mismatch must be reported, got error: {other:?}"),
             Ok(_) => panic!("limits mismatch must be reported, got an open store"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_open_unlocks_before_cloned_descriptor_closes() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("messages.jsonl");
+        let limits = test_limits();
+        let authority = authority();
+        let store = MessagingStore::create(
+            &path,
+            "broker-one",
+            authority.clone(),
+            limits.clone(),
+            integrity_key(),
+        )
+        .expect("create store");
+        drop(store);
+
+        let inherited = std::rc::Rc::new(std::cell::RefCell::new(None));
+        set_after_journal_metadata_hook({
+            let inherited = inherited.clone();
+            move |_journal_path, file| {
+                inherited
+                    .borrow_mut()
+                    .replace(file.try_clone().expect("clone locked data-file descriptor"));
+            }
+        });
+
+        let mut other_authority = authority.clone();
+        other_authority.insert("researcher".to_string(), RoleCategory::ReadOnlyResearcher);
+        match MessagingStore::open(&path, "broker", &other_authority, &limits, integrity_key()) {
+            Err(StoreError::AuthorityBindingMismatch) => {}
+            Err(other) => panic!("authority mismatch must be reported, got error: {other:?}"),
+            Ok(_) => panic!("authority mismatch must be reported, got an open store"),
+        }
+
+        let inherited_duplicate = inherited
+            .borrow_mut()
+            .take()
+            .expect("mismatching open cloned the locked data-file descriptor");
+        let reopened = MessagingStore::open(&path, "broker", &authority, &limits, integrity_key())
+            .expect("failed open unlocks while a cloned descriptor remains alive");
+        inherited_duplicate
+            .metadata()
+            .expect("cloned descriptor remains alive after reopen");
+        drop(inherited_duplicate);
+        drop(reopened);
     }
 
     fn write_records(path: &Path, records: &[JournalRecord]) {
