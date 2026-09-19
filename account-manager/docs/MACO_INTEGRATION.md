@@ -6,7 +6,7 @@ This document specifies work to implement and review. It does not advertise a
 working headless service, Codex launch adapter, or reset scheduler.
 
 **Repository packaging.** MACO and the headless `coding-agent-manager` core crate
-(`account-manager/core`, rlib only) share the root workspace and `Cargo.lock`, so
+(`account-manager/core`, rlib plus the `account-authority` binary) share the root workspace and `Cargo.lock`, so
 `cargo package --locked --workspace --no-default-features` verifies MACO plus core
 without registry publish. The Tauri shell (`coding-agent-manager-desktop` at
 `account-manager/src-tauri`) is a separate workspace with its own
@@ -36,7 +36,7 @@ confidence markers in [the research notes](research/README.md).
 | `providers/gemini_oauth.rs` and `providers/gemini_cli.rs`  | Native Google loopback OAuth and managed Gemini launch selection.                                                                                  | Integration lifecycle projections and verified subscription/model evidence. OAuth alone does not establish Google AI Pro entitlement.                              |
 | `commands.rs` and the Accounts UI                          | Manual account actions and asynchronous waiting for blocking login.                                                                                | Shared authority service calls and recoverable login progress. No common login status/cancel operation exists.                                                     |
 | `model.rs`, `ProviderAdapter::quota`, and Dashboard        | Sourced snapshots and distinct available/no-signal/failed outcomes.                                                                                | Every current adapter returns no numeric quota. Model discovery, quota persistence, and reset scheduling are absent.                                               |
-| `main.rs`, `lib.rs`, and `Cargo.toml`                      | Core logic lives in `account-manager/core` (`--no-default-features`); the desktop shell adds Tauri commands and the `coding-agent-manager` binary. | A headless authority service and shared service entry point; the core library does not implement them.                                                             |
+| `main.rs`, `lib.rs`, and `Cargo.toml`                      | Core logic lives in `account-manager/core` (`--no-default-features`); the desktop shell adds Tauri commands and the `coding-agent-manager` binary; core ships the `account-authority` listen binary. | A shared service entry point beyond the socket listen loop; MACO-side wiring remains separate.                                                                     |
 
 The relay is a separate interface. Its runtime targets do not consume managed
 account selection, and its ordered rules can advance after HTTP 429. The MACO
