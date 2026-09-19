@@ -297,19 +297,11 @@ read from `oauth_creds.json`.
 
 ```jsonc
 {
-  "currentTier": {
-    /* GeminiUserTier or null */
-  },
-  "allowedTiers": [
-    /* GeminiUserTier */
-  ],
-  "ineligibleTiers": [
-    /* IneligibleTier */
-  ],
+  "currentTier": {/* GeminiUserTier or null */},
+  "allowedTiers": [/* GeminiUserTier */],
+  "ineligibleTiers": [/* IneligibleTier */],
   "cloudaicompanionProject": "<redacted>",
-  "paidTier": {
-    /* GeminiUserTier or null */
-  },
+  "paidTier": {/* GeminiUserTier or null */},
 }
 ```
 
