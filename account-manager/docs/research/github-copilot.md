@@ -32,6 +32,13 @@ marker is `[verified-local]`. Application source for credential writes
 was not published in the inspected tree, so no `[verified-source]`
 credential-schema claim is made.
 
+A 2026-09-20 #409 catalog slice re-fetched the official CLI command
+reference and programmatic reference. That slice records the Supported
+models table and `--model` / `copilot help` strings as
+`[verified-docs]` catalog only. It did not run `copilot`, did not sign
+in, and did not change the detect-only adapter. Account-observed models
+stay `[unknown]`. See §6b.
+
 Pinned first-party packaging and docs-source files:
 
 - https://raw.githubusercontent.com/github/copilot-cli/d418dbf1061152afa17500cbc69478f8dce153d8/README.md
@@ -45,6 +52,7 @@ Official vendor documentation checked on 2026-09-20:
 - <https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/authenticate-copilot-cli>
 - <https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/troubleshoot-copilot-cli-auth>
 - <https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference>
+- <https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-programmatic-reference>
 - <https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference>
 - <https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/use-byok-models>
 - <https://docs.github.com/en/copilot/how-tos/use-copilot-for-common-tasks/use-copilot-in-the-cli>
@@ -372,7 +380,99 @@ outdated billing terminology `[verified-docs]`.
 
 No local quota or price file is documented `[unknown]`. Nothing
 machine-readable on disk has been observed. A write-safe quota or price
-adapter is `[unknown]`.
+adapter is `[unknown]`. Official supported-model catalog pages are
+recorded in §6b. Those pages are not account-observed entitlement and
+are not Observed models. Quota observe remains `[unknown]`.
+
+## 6b. Supported models catalog
+
+This section is the #409 evidence record for official Copilot CLI
+supported-model catalog pages. It does not replace §6. No adapter, Rust
+`observe_models`, `login.start`, `activate_account`, or MACO
+`role_models` change is implied. This update did not run a host probe,
+did not invoke `copilot`, and did not sign in. Official catalog prose is
+`[verified-docs]`. Nothing here is `[verified-local]`.
+
+**Refuse.** Do not treat the official Supported models table, `copilot
+help` / `--model` strings, or the interactive `/model` picker as
+Observed models. Catalog ≠ Observed. Do not copy vendor table slugs
+into the Rust adapter as Observed models. Do not hard-code those slugs
+as MACO `role_models`. Account-specific availability stays
+`[unknown]` until a signed-in host observation or a documented
+non-interactive models JSON exists. Inventing Observed models from
+these pages is out of scope.
+
+### Official catalog pages
+
+Fetched 2026-09-20. These URLs are official vendor prose, not Git-SHA
+pins and not a host observation:
+
+- https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference
+- https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-programmatic-reference
+
+The command-reference page publishes a **Supported models** table and
+says to use `--model=MODEL` or `COPILOT_MODEL`, including `auto`
+`[verified-docs]`. It also says: for a complete list of commands and
+options, run `copilot help` `[verified-docs]`. The programmatic page
+documents `--model` and `COPILOT_MODEL`, and says the complete option
+list is on the command reference or in `copilot help` `[verified-docs]`.
+Those `--model` strings are catalog slugs, not Observed entitlement.
+
+The vendor slugs in that table are **not** copied here as Observed
+models. They are catalog text only. They are not account-available
+models, not a signed-in picker result, and they must not be repeated
+into Rust as if they were measured.
+
+### Persist path is not a write-safe switch
+
+The programmatic page says a model selection can persist as the `model`
+key in `~/.copilot/settings.json` or `$COPILOT_HOME/settings.json`
+`[verified-docs]`. Documented precedence, highest to lowest
+`[verified-docs]`: custom-agent model, `--model`, `COPILOT_MODEL`, the
+`model` key, then the CLI default.
+
+`/model` and `/models` are an **interactive** picker
+`[verified-docs]`. `/model [--session|--global|--repo|--local]` can
+change the current session or persist (`--global` / `--repo`)
+`[verified-docs]`. That persist is an in-session slash command, not a
+documented non-interactive write API. A write-safe programmatic model
+switch is `[unknown]` from these pages alone. Do not implement one from
+this slice.
+
+The programmatic page also says to run `/model` in an interactive
+session to see model strings, and points at a broader "Supported AI
+models in GitHub Copilot" catalog page `[verified-docs]`. Those remain
+catalog. They are not a signed-in host observation.
+
+### Can any field become Observed?
+
+This update did not sign in, run `copilot help`, or open `/model`.
+**No** account-available model list is Observed in this note.
+
+A future Observed models row requires a live signed-in host
+observation, or a documented non-interactive models JSON, recorded as
+received. The official table and help strings are not that field
+`[verified-docs]`.
+
+Fields that **cannot** become Observed from material already in hand:
+
+| Candidate                        | Why unobserved                                  |
+| -------------------------------- | ----------------------------------------------- |
+| Supported models table           | Catalog `[verified-docs]`. **Not** entitlement. |
+| `copilot help` / `--model`       | Catalog strings. **Not** Observed.              |
+| `COPILOT_MODEL`                  | Catalog knob `[verified-docs]`.                 |
+| `/model` `/models`               | Interactive picker `[verified-docs]`.           |
+| `/model --global` persist        | **Not** a write-safe switch.                    |
+| `settings.json` `model`          | Persist path only.                              |
+| Slugs in adapter / `role_models` | Catalog ≠ Observed.                             |
+| Account availability             | **Not found**. `[unknown]`.                     |
+| Models JSON                      | **Not found**. `[unknown]`.                     |
+
+Until a signed-in observation or a documented non-interactive models
+JSON exists, Copilot Observed models remain `[unknown]`. The detect-only
+adapter stays detect-only. Do not implement `observe_models` from the
+table. Do not implement `login.start` or `activate_account` from this
+slice.
 
 ## 7. API surface and base-URL override
 
@@ -405,7 +505,7 @@ variables `[verified-docs]`. Environment variables:
   `COPILOT_PROVIDER_API_KEY`)
 - `COPILOT_PROVIDER_WIRE_API`, `COPILOT_PROVIDER_AZURE_API_VERSION`
 - `COPILOT_PROVIDER_MODEL_ID`, `COPILOT_PROVIDER_WIRE_MODEL`
-- `COPILOT_MODEL` (also `--model`)
+- `COPILOT_MODEL` (also `--model`; catalog knobs, see §6b)
 
 `openai` is documented as the OpenAI Chat Completions-compatible shape
 (OpenAI, Ollama, vLLM, and similar) `[verified-docs]`. Whether a
@@ -452,6 +552,13 @@ prove that override.
 - **Billing terminology is in motion.** Premium-request text still
   appears in older and packaging docs. Hard-coding a price or a quota
   counter from this note would go stale.
+- **Catalog models are not Observed entitlement.** The official
+  Supported models table and `copilot help` / `--model` strings are
+  vendor catalog pages `[verified-docs]`. Do not copy those slugs into
+  the adapter as Observed models or into MACO `role_models`. Account
+  availability stays `[unknown]`. `/model --global` / `--repo` persist
+  is interactive and is not a write-safe programmatic switch
+  `[unknown]`.
 
 ## 9. Open questions
 
@@ -469,6 +576,12 @@ prove that override.
   stable schema? Which counter (AI credits vs premium requests) does a
   given CLI version print? Vendor list prices change; what snapshot is
   safe for a dashboard?
+- **Models.** Official Supported models table and `copilot help` /
+  `--model` strings are catalog `[verified-docs]`. What models does a
+  signed-in host actually have? Is there a documented non-interactive
+  models JSON? Is there a write-safe programmatic model switch that is
+  not the interactive `/model --global` / `--repo` picker? Until one of
+  those exists, do not implement `observe_models` from the table.
 - **Write-safe adapter.** Is there any adapter write — isolated
   `COPILOT_HOME`, env-only launch, or a documented non-interactive
   account select — that is safe against a live default home and a
