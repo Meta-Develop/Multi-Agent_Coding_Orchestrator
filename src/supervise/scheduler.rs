@@ -6002,11 +6002,9 @@ mod selection_policy_tests {
         )> {
             let (temporary, repo) = super::initialized_repository();
             let plan = super::test_plan();
-            let catalog: RuntimeModelCatalogAcquisition =
-                Ok(super::super::super::test_runtime_model_catalog(
-                    &plan,
-                    SupervisorRuntime::Codex,
-                )?);
+            let catalog: RuntimeModelCatalogAcquisition = Ok(
+                super::super::super::test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)?,
+            );
             let admission = SupervisorAdmissionPolicyInput::resolve(
                 &repo,
                 1,
@@ -6053,9 +6051,9 @@ mod selection_policy_tests {
             let observation = account_observation_for_launch_runtime(SupervisorRuntime::Codex)?
                 .context("selected CAM binding must produce Some observation")?;
             assert_eq!(observation.binding.provider_id, "codex-cli");
-            let models = observation.models.context("models category")?;
+            let models = observation.models.as_ref().context("models category")?;
             assert_eq!(models.outcome, ObservationOutcome::Observed);
-            let quota = observation.quota.context("quota category")?;
+            let quota = observation.quota.as_ref().context("quota category")?;
             assert_eq!(quota.outcome, ObservationOutcome::Unknown);
             assert!(quota.content.is_none());
             let json = serde_json::to_string(&observation)?;
