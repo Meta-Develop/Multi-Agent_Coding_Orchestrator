@@ -54,25 +54,69 @@ No token, key, or session field appears anywhere in it.
 
 ## 4. Authentication flow
 
-- `cursor-agent login` uses a browser authentication flow. The documentation
-  does not identify its protocol, so the adapter reports that path as
-  `AuthKind::Unknown` `[verified-docs]`.
+- Official docs document browser login as `agent login` (this note's observed
+  binary is `cursor-agent`). The documentation still does not identify the
+  protocol, so the adapter reports that path as `AuthKind::Unknown`
+  `[verified-docs]`.
+- Set `NO_OPEN_BROWSER=1` to print the login URL without opening a browser
+  `[verified-docs]`.
+- `agent logout` signs out and clears stored authentication `[verified-docs]`.
 - The CLI also accepts an API key through `CURSOR_API_KEY` or `--api-key`
   `[verified-docs]`.
-- `cursor-agent status` reports whether the CLI is authenticated, account
-  information, and the current endpoint configuration `[verified-docs]`.
+- `agent status` (alias `whoami`) reports whether the CLI is authenticated,
+  account information, and the current endpoint configuration
+  `[verified-docs]`.
+- `agent status --format json` is a documented machine-readable status mode
+  `[verified-docs]`. The pages below do not specify that JSON schema
+  `[verified-docs]`.
 - Cursor says browser-login credentials are stored securely and locally, but
-  does not identify the store `[verified-docs]`.
+  does not identify a write-safe store path `[verified-docs]`.
 
-Official sources checked on 2026-08-20:
+Official sources re-checked on 2026-09-20. Canonical CLI pages now live under
+`cursor.com/docs`. The 2026-08-20 `docs.cursor.com/en/cli/reference/...` URLs
+no longer serve those pages.
 
-- <https://docs.cursor.com/en/cli/reference/authentication>
-- <https://docs.cursor.com/en/cli/reference/parameters>
+Primary persist pages:
 
-Since no credential file was found in either observed config location, the
-session most plausibly lives in the OS keyring or inside the editor's Electron
-storage (`Local Storage`, `Network/Cookies`, or a `Local State`-encrypted blob)
-`[inferred]`.
+- <https://cursor.com/docs/cli/reference/authentication>
+- <https://cursor.com/docs/cli/reference/parameters>
+
+Also checked for a persist path on 2026-09-20:
+
+- <https://cursor.com/docs/cli/reference/configuration>
+- <https://cursor.com/docs/cli/reference/output-format>
+- <https://cursor.com/docs/cli/overview>
+- <https://cursor.com/docs/cli/installation>
+- <https://cursor.com/docs/cli/using>
+- <https://cursor.com/docs/cli/headless>
+- <https://cursor.com/docs/cli/changelog>
+- <https://cursor.com/help/integrations/cli>
+- <https://cursor.com/docs/sdk/typescript>
+- Previously cited: <https://docs.cursor.com/en/cli/reference/authentication>
+- Previously cited: <https://docs.cursor.com/en/cli/reference/parameters>
+
+Related official statements that still do **not** name a write-safe persist
+path:
+
+- The 2026-08-11 CLI changelog says the Windows uninstaller can delete
+  `~/.cursor`, "the folder that stores CLI credentials" `[verified-docs]`.
+  That is a directory claim, not a file or keyring service name.
+- The 2026-06-29 CLI changelog documents `AGENT_CLI_CREDENTIAL_STORE=file` to
+  store credentials unencrypted in an owner-only file for sandboxes without
+  macOS Keychain `[verified-docs]`. It does not name that file.
+- The 2026-07-20 and March 2026 CLI changelogs mention macOS Keychain
+  failures at CLI startup and over SSH `[verified-docs]`. They do not name
+  the Keychain service.
+- Configuration docs describe `cli-config.json` as CLI settings, not
+  credentials `[verified-docs]`.
+- SDK docs store `Cursor.auth.login()` keys in `~/.cursor/sdk/auth.json` and
+  say that stored login does not read credentials from a local Cursor app
+  installation `[verified-docs]`. That path is not the CLI persist location.
+
+macOS Keychain involvement is therefore `[verified-docs]`. The exact persist
+target (file path or keyring service name, including Linux and Windows)
+remains `[unknown]`. An Electron Local Storage / `Network/Cookies` /
+`Local State` guess is still `[inferred]` and is **not write-safe**.
 
 ## 5. Account switching mechanics
 
@@ -122,10 +166,17 @@ schema was not inspected; it tracks code attribution rather than quota
 
 ## 9. Open questions
 
-- Where does `cursor-agent login` persist its session? This blocks switching.
+- Where does `cursor-agent login` persist its session (exact file path or
+  keyring service name)? This still blocks switching and live OAuth write
+  paths. Official 2026-09-20 docs still do not name a write-safe store.
+- What file does `AGENT_CLI_CREDENTIAL_STORE=file` write? Unnamed in the
+  2026-06-29 changelog.
 - Do the editor and the CLI share one credential?
-- Does a keyring entry exist, and under what service name?
+- Does a keyring entry exist under a documented service name? macOS Keychain
+  involvement is `[verified-docs]` (CLI changelog); the service name, and
+  stores on Linux/Windows, remain `[unknown]`.
 - Is there a supported multi-account mechanism already?
-- Does `cursor-agent status` offer a documented machine-readable output mode?
+- What is the schema of `agent status --format json`? The `--format json`
+  flag is documented `[verified-docs]`; the payload is not.
 - Does `cursor-agent status` make a network request when local authentication
   state is sufficient?
