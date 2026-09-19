@@ -50,7 +50,7 @@ use std::path::Path;
 type AccountObserveResult = coding_agent_manager_lib::account_authority::AccountObserveResult;
 #[cfg(not(target_os = "linux"))]
 #[derive(Clone, Debug)]
-enum AccountObserveResult {}
+pub(super) enum AccountObserveResult {}
 
 const AUTOMATIC_SELECTION_TASK_CLASS: &str = "localized_code_change";
 const JUDGMENT_SELECTION_TASK_CLASS: &str = "review_gate";
