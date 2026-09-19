@@ -2,7 +2,7 @@
 //!
 //! Framing matches [`coding_agent_manager_lib::account_authority::server`].
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -99,9 +99,7 @@ impl AuthoritySocketClient {
     }
 
     fn exchange(&self, request: Value) -> Result<AuthorityResponse> {
-        use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
-        use std::time::{Duration, Instant};
 
         let body = serde_json::to_vec(&request).context("encode CAM authority request")?;
         if body.is_empty() || body.len() > MAX_REQUEST_BYTES {
@@ -366,7 +364,6 @@ mod tests {
 
     #[test]
     fn framing_helpers_round_trip_payload() {
-        use std::io::{Read, Write};
         use std::os::unix::net::UnixListener;
         use std::time::Instant;
 
