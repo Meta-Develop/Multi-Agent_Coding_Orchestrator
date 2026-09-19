@@ -35,8 +35,10 @@ pub mod claude_code;
 pub mod codex_cli;
 pub mod cursor;
 pub mod gemini_cli;
-mod gemini_oauth;
+pub(crate) mod gemini_oauth;
 pub mod grok_cli;
+
+pub(crate) use gemini_oauth::{OAuthLoginRunError, LOGIN_DEADLINE};
 
 /// How activating an account changes what the provider tool will use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -524,6 +526,36 @@ pub fn add_managed_account_for(
         }
     }
     registry.complete_add(adapter.id(), account_id)
+}
+
+/// Complete a pending managed account after provider login succeeded.
+///
+/// Selection is unchanged. The caller must supply the exact incarnation frozen
+/// at login start; completion is atomic under the registry lock.
+pub fn complete_managed_login_account(
+    registry: &StoredAccountRegistry,
+    adapter: &dyn ProviderAdapter,
+    account_id: &str,
+    expected_incarnation: &str,
+    auth_kind: AuthKind,
+    material: StoredAccountMaterial,
+) -> Result<()> {
+    let plan = adapter
+        .managed_account_plan_for(auth_kind)
+        .ok_or(Error::NotImplemented("complete_managed_login_account"))?;
+    if material != plan.material || auth_kind != plan.auth_kind {
+        return Err(metadata_write_error(
+            adapter.id(),
+            "stored account metadata does not match the adapter lifecycle",
+        ));
+    }
+    registry.complete_pending_if_incarnation_matches(
+        adapter.id(),
+        account_id,
+        expected_incarnation,
+        auth_kind,
+        material,
+    )
 }
 
 /// Run the provider-neutral delete transaction while retaining vendor homes.

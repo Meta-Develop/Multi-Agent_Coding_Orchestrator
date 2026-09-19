@@ -24,8 +24,13 @@ use crate::relay;
 use crate::router::{self, RouteError, RouteRuleField};
 use crate::storage;
 
+#[path = "login_commands.rs"]
+mod login_commands;
 #[path = "observe_commands.rs"]
 mod observe_commands;
+
+use login_commands::build_managed_login_service;
+use tauri::Manager;
 
 /// Providers whose `list_accounts` inspects only an API key, not OAuth.
 ///
@@ -553,6 +558,11 @@ pub async fn relay_status() -> Result<RelayStatus> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let login = build_managed_login_service(stored_account_registry()?);
+            app.manage(login);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             list_providers,
             list_accounts,
@@ -566,6 +576,9 @@ pub fn run() {
             start_relay,
             stop_relay,
             relay_status,
+            login_commands::login_start,
+            login_commands::login_status,
+            login_commands::login_cancel,
             observe_commands::observe_account,
         ])
         .run(tauri::generate_context!())

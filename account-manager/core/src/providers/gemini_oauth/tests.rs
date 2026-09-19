@@ -570,3 +570,26 @@ fn settings_preserve_siblings_and_expiry_and_identity_helpers_fail_closed() {
     );
     assert!(mask_email("FAKE-invalid").is_none());
 }
+
+#[tokio::test]
+async fn managed_oauth_login_honors_operation_deadline() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let track = Arc::clone(&dropped);
+    struct DropTrack(Arc<AtomicBool>);
+    impl Drop for DropTrack {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let outcome = oauth_login_with_deadline(Duration::from_millis(50), async move {
+        let _track = DropTrack(track);
+        std::future::pending::<std::result::Result<(), OAuthLoginRunError>>().await
+    })
+    .await;
+    assert!(matches!(outcome, Err(OAuthLoginRunError::Cancelled)));
+    assert!(dropped.load(Ordering::SeqCst));
+}

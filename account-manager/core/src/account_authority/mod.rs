@@ -21,4 +21,4 @@ pub use observe::{
 };
 pub use registry::StoredAccountRegistry;
 pub use socket_path::{resolve_socket_path, SafeSocketPath, SocketPathError};
-pub use use_lease::SelectedUseLease;
+pub use use_lease::{PendingLoginBinding, PendingLoginLease, SelectedUseLease};

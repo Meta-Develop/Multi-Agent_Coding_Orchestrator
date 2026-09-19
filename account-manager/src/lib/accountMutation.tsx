@@ -2,6 +2,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useRef,
   useState,
@@ -9,12 +10,45 @@ import {
 } from 'react'
 import type { PendingKind } from '@/components/AccountActions'
 import {
+  OAUTH_LOGIN_POLL_INTERVAL_MS,
+  geminiOAuthCancelledMessage,
+  geminiOAuthFailedMessage,
+  geminiOAuthPollErrorMessage,
+  geminiOAuthProgressMessage,
+  geminiOAuthReadyMessage,
+  geminiOAuthUnknownMessage,
+  isActiveLoginState,
+  newIdempotencyKey,
+  shouldStopAutomaticPoll,
+  statusMatchesSession,
+} from '@/lib/oauthLoginLifecycle'
+import {
   activateAccount,
   addAccount,
   deleteAccount,
   launchProvider,
+  loginCancel,
+  loginStart,
+  loginStatus,
 } from '@/lib/tauri'
-import type { AuthKind, ProviderDescriptor } from '@/types'
+import type {
+  AuthKind,
+  LoginState,
+  LoginStatus,
+  ProviderDescriptor,
+} from '@/types'
+
+export interface GeminiOAuthLoginSession {
+  providerId: string
+  accountId: string
+  displayName: string
+  handle: string
+  binding: LoginStatus['binding']
+  idempotencyKey: string
+  cancelRequested: boolean
+  pollStopped: boolean
+  lastState: LoginState
+}
 
 export interface PendingConfirmation {
   providerId: string
@@ -32,6 +66,7 @@ interface AccountMutationValue {
   busy: boolean
   notice: Notice | null
   pending: PendingConfirmation | null
+  geminiOAuth: GeminiOAuthLoginSession | null
   /** Bumped after a successful command so a mounted page re-fetches. */
   listingEpoch: number
   requestPending: (pending: PendingConfirmation) => void
@@ -47,25 +82,316 @@ interface AccountMutationValue {
     provider: ProviderDescriptor,
     accountName: string,
   ) => Promise<boolean>
+  cancelGeminiOAuthLogin: () => void
+  checkGeminiOAuthLoginStatus: () => void
 }
 
 const AccountMutationContext = createContext<AccountMutationValue | null>(null)
 
+const GEMINI_PROVIDER_ID = 'gemini-cli'
+
 /**
  * Holds in-flight add/switch/delete across route changes. The Accounts
- * page unmounts when the sidebar is used; `add_account` can block for as
- * long as `codex login` takes in the launching terminal. That state has
- * to live here so a second sign-in cannot be started and so returning to
- * Accounts still shows the running operation. Unmounting is not
- * cancellation: this application cannot cancel a vendor login already
- * running in the terminal.
+ * page unmounts when the sidebar is used; vendor sign-in can block for a
+ * long time. Gemini OAuth uses the explicit core login lifecycle with
+ * bounded status polling instead of blocking `add_account`.
  */
 export function AccountMutationProvider({ children }: { children: ReactNode }) {
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<Notice | null>(null)
   const [pending, setPending] = useState<PendingConfirmation | null>(null)
+  const [geminiOAuth, setGeminiOAuth] =
+    useState<GeminiOAuthLoginSession | null>(null)
   const [listingEpoch, setListingEpoch] = useState(0)
   const busyRef = useRef(false)
+  const geminiOAuthRef = useRef<GeminiOAuthLoginSession | null>(null)
+  const idempotencyKeysRef = useRef<Map<string, string>>(new Map())
+  const pollInFlightRef = useRef(false)
+  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const pollGenerationRef = useRef(0)
+
+  geminiOAuthRef.current = geminiOAuth
+
+  const clearPollTimer = useCallback(() => {
+    if (pollTimerRef.current !== null) {
+      clearTimeout(pollTimerRef.current)
+      pollTimerRef.current = null
+    }
+  }, [])
+
+  const clearIdempotencyKey = useCallback(
+    (providerId: string, accountId: string) => {
+      idempotencyKeysRef.current.delete(`${providerId}:${accountId}`)
+    },
+    [],
+  )
+
+  const finishGeminiOAuthSession = useCallback(
+    (providerId: string, accountId: string) => {
+      clearPollTimer()
+      pollGenerationRef.current += 1
+      clearIdempotencyKey(providerId, accountId)
+      setGeminiOAuth(null)
+      busyRef.current = false
+      setBusy(false)
+    },
+    [clearIdempotencyKey, clearPollTimer],
+  )
+
+  const applyGeminiOAuthStatus = useCallback(
+    (status: LoginStatus, session: GeminiOAuthLoginSession) => {
+      if (!statusMatchesSession(status, session.handle, session.binding)) {
+        return
+      }
+
+      const nextSession: GeminiOAuthLoginSession = {
+        ...session,
+        lastState: status.state,
+      }
+      setGeminiOAuth(nextSession)
+
+      if (status.state === 'ready') {
+        setListingEpoch((epoch) => epoch + 1)
+        setNotice({
+          tone: 'success',
+          message: geminiOAuthReadyMessage(
+            session.accountId,
+            session.displayName,
+          ),
+        })
+        finishGeminiOAuthSession(session.providerId, session.accountId)
+        return
+      }
+
+      if (status.state === 'cancelled') {
+        setNotice({
+          tone: 'success',
+          message: geminiOAuthCancelledMessage(
+            session.accountId,
+            session.displayName,
+          ),
+        })
+        finishGeminiOAuthSession(session.providerId, session.accountId)
+        return
+      }
+
+      if (status.state === 'failed') {
+        setNotice({
+          tone: 'failure',
+          message: geminiOAuthFailedMessage(
+            session.accountId,
+            session.displayName,
+            status.failureReason,
+          ),
+        })
+        finishGeminiOAuthSession(session.providerId, session.accountId)
+        return
+      }
+
+      if (status.state === 'unknown') {
+        setGeminiOAuth({ ...nextSession, pollStopped: true })
+        busyRef.current = false
+        setBusy(false)
+        setNotice({
+          tone: 'failure',
+          message: geminiOAuthUnknownMessage(
+            session.accountId,
+            session.displayName,
+          ),
+        })
+        return
+      }
+
+      setNotice({
+        tone: 'progress',
+        message: geminiOAuthProgressMessage(
+          session.accountId,
+          session.displayName,
+          status.state,
+          session.cancelRequested,
+        ),
+      })
+    },
+    [finishGeminiOAuthSession],
+  )
+
+  const runPollTick = useCallback(
+    async (generation: number) => {
+      if (generation !== pollGenerationRef.current) {
+        return
+      }
+      const session = geminiOAuthRef.current
+      if (session === null || session.pollStopped) {
+        return
+      }
+      if (shouldStopAutomaticPoll(session.lastState)) {
+        return
+      }
+      if (pollInFlightRef.current) {
+        pollTimerRef.current = setTimeout(() => {
+          void runPollTick(generation)
+        }, OAUTH_LOGIN_POLL_INTERVAL_MS)
+        return
+      }
+      pollInFlightRef.current = true
+      try {
+        const status = await loginStatus({
+          handle: session.handle,
+          binding: session.binding,
+        })
+        if (generation !== pollGenerationRef.current) {
+          return
+        }
+        const current = geminiOAuthRef.current
+        if (current === null) {
+          return
+        }
+        applyGeminiOAuthStatus(status, current)
+        if (
+          generation === pollGenerationRef.current &&
+          geminiOAuthRef.current !== null &&
+          !geminiOAuthRef.current.pollStopped &&
+          isActiveLoginState(geminiOAuthRef.current.lastState)
+        ) {
+          pollTimerRef.current = setTimeout(() => {
+            void runPollTick(generation)
+          }, OAUTH_LOGIN_POLL_INTERVAL_MS)
+        }
+      } catch {
+        if (generation !== pollGenerationRef.current) {
+          return
+        }
+        const current = geminiOAuthRef.current
+        if (current === null) {
+          return
+        }
+        setGeminiOAuth({ ...current, pollStopped: true })
+        busyRef.current = false
+        setBusy(false)
+        setNotice({
+          tone: 'failure',
+          message: geminiOAuthPollErrorMessage(
+            current.accountId,
+            current.displayName,
+          ),
+        })
+      } finally {
+        pollInFlightRef.current = false
+      }
+    },
+    [applyGeminiOAuthStatus],
+  )
+
+  useEffect(() => {
+    const session = geminiOAuth
+    if (session === null || session.pollStopped) {
+      clearPollTimer()
+      return
+    }
+    if (shouldStopAutomaticPoll(session.lastState)) {
+      clearPollTimer()
+      return
+    }
+    const generation = pollGenerationRef.current
+    pollTimerRef.current = setTimeout(() => {
+      void runPollTick(generation)
+    }, OAUTH_LOGIN_POLL_INTERVAL_MS)
+    return () => {
+      clearPollTimer()
+    }
+  }, [
+    geminiOAuth?.handle,
+    geminiOAuth?.binding.accountIncarnation,
+    geminiOAuth?.pollStopped,
+    geminiOAuth?.lastState,
+    runPollTick,
+    clearPollTimer,
+    geminiOAuth,
+  ])
+
+  useEffect(() => {
+    return () => {
+      pollGenerationRef.current += 1
+      clearPollTimer()
+    }
+  }, [clearPollTimer])
+
+  const startGeminiOAuthLogin = useCallback(
+    async (
+      provider: ProviderDescriptor,
+      accountId: string,
+    ): Promise<boolean> => {
+      const existing = geminiOAuthRef.current
+      if (existing !== null && isActiveLoginState(existing.lastState)) {
+        return false
+      }
+      if (existing !== null) {
+        clearPollTimer()
+        pollGenerationRef.current += 1
+        setGeminiOAuth(null)
+      }
+
+      const idempotencyMapKey = `${provider.id}:${accountId}`
+      let idempotencyKey = idempotencyKeysRef.current.get(idempotencyMapKey)
+      if (idempotencyKey === undefined) {
+        idempotencyKey = newIdempotencyKey()
+        idempotencyKeysRef.current.set(idempotencyMapKey, idempotencyKey)
+      }
+
+      busyRef.current = true
+      setPending(null)
+      setBusy(true)
+      pollGenerationRef.current += 1
+      clearPollTimer()
+      setNotice({
+        tone: 'progress',
+        message: geminiOAuthProgressMessage(
+          accountId,
+          provider.displayName,
+          'waiting-for-user',
+          false,
+        ),
+      })
+
+      try {
+        const status = await loginStart({
+          providerId: provider.id,
+          accountId,
+          label: accountId,
+          authKind: 'oauth',
+          idempotencyKey,
+        })
+        const session: GeminiOAuthLoginSession = {
+          providerId: provider.id,
+          accountId,
+          displayName: provider.displayName,
+          handle: status.handle,
+          binding: status.binding,
+          idempotencyKey,
+          cancelRequested: false,
+          pollStopped: false,
+          lastState: status.state,
+        }
+        setGeminiOAuth(session)
+        applyGeminiOAuthStatus(status, session)
+        return status.state === 'ready'
+      } catch (cause: unknown) {
+        clearIdempotencyKey(provider.id, accountId)
+        setNotice({
+          tone: 'failure',
+          message: geminiOAuthFailedMessage(
+            accountId,
+            provider.displayName,
+            commandErrorMessage(cause),
+          ),
+        })
+        busyRef.current = false
+        setBusy(false)
+        return false
+      }
+    },
+    [applyGeminiOAuthStatus, clearIdempotencyKey, clearPollTimer],
+  )
 
   const requestPending = useCallback((next: PendingConfirmation) => {
     if (busyRef.current) return
@@ -86,6 +412,13 @@ export function AccountMutationProvider({ children }: { children: ReactNode }) {
     ): Promise<boolean> => {
       if (busyRef.current) {
         return false
+      }
+      if (
+        kind === 'add' &&
+        provider.id === GEMINI_PROVIDER_ID &&
+        authKind === 'oauth'
+      ) {
+        return startGeminiOAuthLogin(provider, accountId)
       }
       busyRef.current = true
       setPending(null)
@@ -133,8 +466,88 @@ export function AccountMutationProvider({ children }: { children: ReactNode }) {
         setBusy(false)
       }
     },
-    [],
+    [startGeminiOAuthLogin],
   )
+
+  const cancelGeminiOAuthLogin = useCallback(() => {
+    const session = geminiOAuthRef.current
+    if (session === null) {
+      return
+    }
+    setGeminiOAuth({ ...session, cancelRequested: true })
+    setNotice({
+      tone: 'progress',
+      message: geminiOAuthProgressMessage(
+        session.accountId,
+        session.displayName,
+        session.lastState,
+        true,
+      ),
+    })
+    void loginCancel({
+      handle: session.handle,
+      binding: session.binding,
+    })
+      .then((status) => {
+        const current = geminiOAuthRef.current
+        if (current === null) {
+          return
+        }
+        applyGeminiOAuthStatus(status, current)
+      })
+      .catch(() => {
+        const current = geminiOAuthRef.current
+        if (current === null) {
+          return
+        }
+        setGeminiOAuth({ ...current, pollStopped: true })
+        busyRef.current = false
+        setBusy(false)
+        setNotice({
+          tone: 'failure',
+          message: geminiOAuthPollErrorMessage(
+            current.accountId,
+            current.displayName,
+          ),
+        })
+      })
+  }, [applyGeminiOAuthStatus])
+
+  const checkGeminiOAuthLoginStatus = useCallback(() => {
+    const session = geminiOAuthRef.current
+    if (session === null) {
+      return
+    }
+    void loginStatus({
+      handle: session.handle,
+      binding: session.binding,
+    })
+      .then((status) => {
+        const current = geminiOAuthRef.current
+        if (current === null) {
+          return
+        }
+        const resumed: GeminiOAuthLoginSession = {
+          ...current,
+          pollStopped: false,
+        }
+        setGeminiOAuth(resumed)
+        applyGeminiOAuthStatus(status, resumed)
+      })
+      .catch(() => {
+        const current = geminiOAuthRef.current
+        if (current === null) {
+          return
+        }
+        setNotice({
+          tone: 'failure',
+          message: geminiOAuthPollErrorMessage(
+            current.accountId,
+            current.displayName,
+          ),
+        })
+      })
+  }, [applyGeminiOAuthStatus])
 
   const runLaunch = useCallback(
     async (
@@ -179,21 +592,27 @@ export function AccountMutationProvider({ children }: { children: ReactNode }) {
       busy,
       notice,
       pending,
+      geminiOAuth,
       listingEpoch,
       requestPending,
       cancelPending,
       runMutation,
       runLaunch,
+      cancelGeminiOAuthLogin,
+      checkGeminiOAuthLoginStatus,
     }),
     [
       busy,
       notice,
       pending,
+      geminiOAuth,
       listingEpoch,
       requestPending,
       cancelPending,
       runMutation,
       runLaunch,
+      cancelGeminiOAuthLogin,
+      checkGeminiOAuthLoginStatus,
     ],
   )
 
@@ -216,29 +635,64 @@ export function useAccountMutation(): AccountMutationValue {
 
 /** Visible from every page so a running mutation is not an Accounts-only fact. */
 export function MutationNotice() {
-  const { notice } = useAccountMutation()
+  const {
+    notice,
+    geminiOAuth,
+    cancelGeminiOAuthLogin,
+    checkGeminiOAuthLoginStatus,
+  } = useAccountMutation()
   if (notice === null) {
     return null
   }
+  const showOAuthActions =
+    geminiOAuth !== null &&
+    (isActiveLoginState(geminiOAuth.lastState) ||
+      geminiOAuth.pollStopped ||
+      geminiOAuth.lastState === 'unknown')
   return (
-    <p
-      key={notice.message}
-      role={notice.tone === 'failure' ? 'alert' : 'status'}
-      className={noticeClass(notice.tone)}
-    >
-      {notice.message}
-    </p>
+    <div className="mb-4">
+      <p
+        key={notice.message}
+        role={notice.tone === 'failure' ? 'alert' : 'status'}
+        className={noticeClass(notice.tone)}
+      >
+        {notice.message}
+      </p>
+      {showOAuthActions && (
+        <div className="mt-2 flex flex-wrap gap-2">
+          {isActiveLoginState(geminiOAuth.lastState) &&
+            !geminiOAuth.cancelRequested && (
+              <button
+                type="button"
+                className="btn"
+                onClick={cancelGeminiOAuthLogin}
+              >
+                Cancel sign-in
+              </button>
+            )}
+          {(geminiOAuth.pollStopped || geminiOAuth.lastState === 'unknown') && (
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={checkGeminiOAuthLoginStatus}
+            >
+              Check status
+            </button>
+          )}
+        </div>
+      )}
+    </div>
   )
 }
 
 function noticeClass(tone: Notice['tone']): string {
   if (tone === 'failure') {
-    return 'mb-4 rounded-md border border-border-subtle p-3 text-sm'
+    return 'rounded-md border border-border-subtle p-3 text-sm'
   }
   if (tone === 'progress') {
-    return 'mb-4 rounded-md border border-border-subtle bg-surface-raised p-3 text-sm'
+    return 'rounded-md border border-border-subtle bg-surface-raised p-3 text-sm'
   }
-  return 'mb-4 text-sm text-ink-muted'
+  return 'text-sm text-ink-muted'
 }
 
 function progressMessage(

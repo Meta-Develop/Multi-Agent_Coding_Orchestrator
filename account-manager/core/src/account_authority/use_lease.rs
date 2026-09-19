@@ -19,6 +19,36 @@ pub struct SelectedUseLease {
     file: fs::File,
 }
 
+/// Shared cross-process guard for an in-flight pending-account login on one exact
+/// incarnation. Uses the same on-disk lease machinery as [`SelectedUseLease`].
+pub struct PendingLoginLease {
+    _lease: SelectedUseLease,
+}
+
+/// Identity frozen when a pending login lease is acquired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingLoginBinding {
+    pub provider_id: String,
+    pub account_id: String,
+    pub account_incarnation: String,
+}
+
+impl PendingLoginLease {
+    pub(crate) fn acquire_while_registry_files_held(
+        metadata_path: &Path,
+        binding: &PendingLoginBinding,
+    ) -> Result<Self> {
+        let selected = SelectedAccountBinding {
+            provider_id: binding.provider_id.clone(),
+            account_id: binding.account_id.clone(),
+            account_incarnation: binding.account_incarnation.clone(),
+            selection_revision: 0,
+        };
+        SelectedUseLease::acquire_while_registry_held(metadata_path, &selected)
+            .map(|lease| Self { _lease: lease })
+    }
+}
+
 impl SelectedUseLease {
     /// Acquire a shared lease after the caller already holds the registry lock.
     pub(crate) fn acquire_while_registry_held(

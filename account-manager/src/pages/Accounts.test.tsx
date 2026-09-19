@@ -1,8 +1,9 @@
-import { render, screen, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { createMemoryRouter, RouterProvider } from 'react-router-dom'
 import { invoke } from '@tauri-apps/api/core'
-import { describe, expect, it, vi } from 'vitest'
+import { OAUTH_LOGIN_POLL_INTERVAL_MS } from '@/lib/oauthLoginLifecycle'
+import { describe, expect, it, afterEach, vi } from 'vitest'
 import App from '@/App'
 import Dashboard from '@/pages/Dashboard'
 import Accounts from '@/pages/Accounts'
@@ -13,6 +14,8 @@ import Settings from '@/pages/Settings'
 import type {
   Account,
   LaunchedProcess,
+  LoginAccountBinding,
+  LoginStatus,
   ProviderAccountList,
   ProviderDescriptor,
 } from '@/types'
@@ -782,11 +785,11 @@ describe('Accounts page', () => {
 
   it('offers Gemini Google sign-in and sends oauth without a password field', async () => {
     const user = userEvent.setup()
-    const add = vi.fn(async () => undefined)
+    const loginStart = vi.fn(async () => geminiLoginStatus('waiting-for-user'))
     stubInvoke({
       providers: [launchProviderDescriptor('gemini-cli', 'Gemini CLI')],
       listings: [listing('gemini-cli')],
-      add,
+      loginStart,
     })
     renderApp()
 
@@ -808,12 +811,20 @@ describe('Accounts page', () => {
       screen.getByRole('button', { name: 'Sign in to Gemini CLI' }),
     )
 
-    expect(add).toHaveBeenCalledWith('gemini-cli', 'work', 'oauth')
-    expect(callsOf('add_account').at(-1)?.[1]).toEqual({
+    expect(loginStart).toHaveBeenCalledWith(
+      'gemini-cli',
+      'work',
+      'oauth',
+      expect.any(String),
+    )
+    expect(callsOf('login_start').at(-1)?.[1]).toEqual({
       providerId: 'gemini-cli',
       accountId: 'work',
+      label: 'work',
       authKind: 'oauth',
+      idempotencyKey: expect.any(String),
     })
+    expect(callsOf('add_account')).toHaveLength(0)
   })
 
   it('imports a Gemini API key as a secondary path and sends no key through IPC', async () => {
@@ -976,7 +987,182 @@ describe('Accounts page', () => {
     )
     expect(remove).toHaveBeenCalledWith('gemini-cli', 'work')
   })
+
+  describe('Gemini OAuth login lifecycle', () => {
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it('polls from waiting to ready without activating an account', async () => {
+      let statusCalls = 0
+      stubInvoke({
+        providers: [launchProviderDescriptor('gemini-cli', 'Gemini CLI')],
+        listings: [listing('gemini-cli')],
+        loginStart: async () => geminiLoginStatus('waiting-for-user'),
+        loginStatus: async () => {
+          statusCalls += 1
+          return geminiLoginStatus(statusCalls >= 2 ? 'ready' : 'in-progress')
+        },
+      })
+      const nickname = await mountGeminiAccountsNicknameField()
+      vi.useFakeTimers()
+      await submitGeminiOAuthSignIn(nickname)
+      expect(callsOf('login_start')).toHaveLength(1)
+      await advanceOAuthPollTimers(OAUTH_LOGIN_POLL_INTERVAL_MS * 2)
+
+      expect(screen.getByText(/Added work to Gemini CLI/i)).toHaveTextContent(
+        /nothing was activated automatically/i,
+      )
+      expect(callsOf('activate_account')).toHaveLength(0)
+      expect(callsOf('list_accounts').length).toBeGreaterThan(1)
+    })
+
+    it('keeps progress visible after cancel is requested until core reports cancelled', async () => {
+      let statusPolls = 0
+      stubInvoke({
+        providers: [launchProviderDescriptor('gemini-cli', 'Gemini CLI')],
+        listings: [listing('gemini-cli')],
+        loginStart: async () => geminiLoginStatus('waiting-for-user'),
+        loginCancel: async () => geminiLoginStatus('in-progress'),
+        loginStatus: async () => {
+          statusPolls += 1
+          return geminiLoginStatus(
+            statusPolls >= 3 ? 'cancelled' : 'in-progress',
+          )
+        },
+      })
+      const nickname = await mountGeminiAccountsNicknameField()
+      vi.useFakeTimers()
+      await submitGeminiOAuthSignIn(nickname)
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel sign-in' }))
+      await flushReactUpdates()
+      expect(screen.getByRole('status')).toHaveTextContent(
+        /Cancelling sign-in/i,
+      )
+      expect(callsOf('login_cancel')).toHaveLength(1)
+      await advanceOAuthPollTimers(OAUTH_LOGIN_POLL_INTERVAL_MS * 3)
+      expect(
+        screen.getByText(/Sign-in to Gemini CLI as work was cancelled/i),
+      ).toBeInTheDocument()
+    })
+
+    it('ignores stale status responses for a different binding', async () => {
+      stubInvoke({
+        providers: [launchProviderDescriptor('gemini-cli', 'Gemini CLI')],
+        listings: [listing('gemini-cli')],
+        loginStart: async () => geminiLoginStatus('waiting-for-user'),
+        loginStatus: async () =>
+          geminiLoginStatus('ready', {
+            handle: 'stale-handle',
+            binding: {
+              providerId: 'gemini-cli',
+              accountId: 'work',
+              accountIncarnation: 'wrong-incarnation',
+            },
+          }),
+      })
+      const nickname = await mountGeminiAccountsNicknameField()
+      vi.useFakeTimers()
+      await submitGeminiOAuthSignIn(nickname)
+      await advanceOAuthPollTimers(OAUTH_LOGIN_POLL_INTERVAL_MS)
+      expect(screen.queryByText(/Added work/i)).not.toBeInTheDocument()
+      expect(callsOf('activate_account')).toHaveLength(0)
+    })
+
+    it('surfaces unknown outcomes with Check status and no auto activation', async () => {
+      stubInvoke({
+        providers: [launchProviderDescriptor('gemini-cli', 'Gemini CLI')],
+        listings: [listing('gemini-cli')],
+        loginStart: async () => geminiLoginStatus('waiting-for-user'),
+        loginStatus: async () => geminiLoginStatus('unknown'),
+      })
+      const nickname = await mountGeminiAccountsNicknameField()
+      vi.useFakeTimers()
+      await submitGeminiOAuthSignIn(nickname)
+      await advanceOAuthPollTimers(OAUTH_LOGIN_POLL_INTERVAL_MS)
+      expect(screen.getByRole('alert')).toHaveTextContent(
+        /outcome for Gemini CLI as work is unknown/i,
+      )
+      expect(
+        screen.getByRole('button', { name: 'Check status' }),
+      ).toBeInTheDocument()
+      expect(callsOf('activate_account')).toHaveLength(0)
+    })
+
+    it('stops automatic polling after status errors and offers Check status', async () => {
+      stubInvoke({
+        providers: [launchProviderDescriptor('gemini-cli', 'Gemini CLI')],
+        listings: [listing('gemini-cli')],
+        loginStart: async () => geminiLoginStatus('waiting-for-user'),
+        loginStatus: async () => {
+          throw new Error('ipc unavailable')
+        },
+      })
+      const nickname = await mountGeminiAccountsNicknameField()
+      vi.useFakeTimers()
+      await submitGeminiOAuthSignIn(nickname)
+      await advanceOAuthPollTimers(OAUTH_LOGIN_POLL_INTERVAL_MS)
+      expect(screen.getByRole('alert')).toHaveTextContent(
+        /will not retry automatically/i,
+      )
+      expect(
+        screen.getByRole('button', { name: 'Check status' }),
+      ).toBeInTheDocument()
+      const statusCallsAfterFirstPoll = callsOf('login_status').length
+      await advanceOAuthPollTimers(OAUTH_LOGIN_POLL_INTERVAL_MS * 3)
+      expect(callsOf('login_status').length).toBe(statusCallsAfterFirstPoll)
+    })
+
+    it('still imports Gemini API keys through add_account', async () => {
+      const user = userEvent.setup()
+      const add = vi.fn(async () => undefined)
+      stubInvoke({
+        providers: [launchProviderDescriptor('gemini-cli', 'Gemini CLI')],
+        listings: [listing('gemini-cli')],
+        add,
+      })
+      renderApp()
+
+      await user.type(
+        await screen.findByRole('textbox', { name: 'Nickname' }),
+        'work',
+      )
+      await user.click(
+        screen.getByRole('button', {
+          name: 'Import API key for Gemini CLI',
+        }),
+      )
+      expect(add).toHaveBeenCalledWith('gemini-cli', 'work', 'api-key')
+      expect(callsOf('login_start')).toHaveLength(0)
+    })
+  })
 })
+
+async function flushReactUpdates() {
+  await act(async () => {
+    await Promise.resolve()
+    await Promise.resolve()
+  })
+}
+
+/** Mount Accounts with real timers so `findBy` can resolve listing load. */
+async function mountGeminiAccountsNicknameField() {
+  renderApp()
+  return screen.findByRole('textbox', { name: 'Nickname' })
+}
+
+/** Start Gemini OAuth after fake timers are active so poll `setTimeout`s are faked. */
+async function submitGeminiOAuthSignIn(nickname: HTMLElement) {
+  fireEvent.change(nickname, { target: { value: 'work' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Sign in to Gemini CLI' }))
+  await flushReactUpdates()
+}
+
+async function advanceOAuthPollTimers(totalMs: number) {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(totalMs)
+  })
+}
 
 function renderApp(path = '/accounts') {
   const router = createMemoryRouter(
@@ -1010,6 +1196,20 @@ function stubInvoke(options: {
   activate?: (providerId: string, accountId: string) => Promise<void>
   remove?: (providerId: string, accountId: string) => Promise<void>
   launch?: (providerId: string) => Promise<LaunchedProcess>
+  loginStart?: (
+    providerId: string,
+    accountId: string,
+    authKind: string,
+    idempotencyKey: string,
+  ) => Promise<LoginStatus>
+  loginStatus?: (input: {
+    handle: string
+    binding: LoginAccountBinding
+  }) => Promise<LoginStatus>
+  loginCancel?: (input: {
+    handle: string
+    binding: LoginAccountBinding
+  }) => Promise<LoginStatus>
 }) {
   const providers = options.providers ?? [provider()]
   vi.mocked(invoke).mockImplementation(async (command, args) => {
@@ -1017,6 +1217,9 @@ function stubInvoke(options: {
       providerId?: string | null
       accountId?: string
       authKind?: string
+      idempotencyKey?: string
+      handle?: string
+      binding?: LoginAccountBinding
     }
     switch (command) {
       case 'list_providers':
@@ -1055,6 +1258,32 @@ function stubInvoke(options: {
           return options.launch(payload.providerId ?? '')
         }
         throw new Error('launch was not stubbed')
+      case 'login_start':
+        if (options.loginStart) {
+          return options.loginStart(
+            payload.providerId ?? '',
+            payload.accountId ?? '',
+            payload.authKind ?? 'oauth',
+            payload.idempotencyKey ?? '',
+          )
+        }
+        return geminiLoginStatus('waiting-for-user')
+      case 'login_status':
+        if (options.loginStatus) {
+          return options.loginStatus({
+            handle: payload.handle ?? '',
+            binding: payload.binding ?? geminiBinding(),
+          })
+        }
+        return geminiLoginStatus('in-progress')
+      case 'login_cancel':
+        if (options.loginCancel) {
+          return options.loginCancel({
+            handle: payload.handle ?? '',
+            binding: payload.binding ?? geminiBinding(),
+          })
+        }
+        return geminiLoginStatus('cancelled')
       default:
         throw new Error(`unexpected command: ${String(command)}`)
     }
@@ -1130,6 +1359,29 @@ function account(partial: Partial<Account> & Pick<Account, 'id'>): Account {
     isStored: true,
     isIncomplete: false,
     expiresAt: null,
+    ...partial,
+  }
+}
+
+function geminiBinding(
+  partial: Partial<LoginAccountBinding> = {},
+): LoginAccountBinding {
+  return {
+    providerId: 'gemini-cli',
+    accountId: 'work',
+    accountIncarnation: 'incarnation-1',
+    ...partial,
+  }
+}
+
+function geminiLoginStatus(
+  state: LoginStatus['state'],
+  partial: Partial<LoginStatus> = {},
+): LoginStatus {
+  return {
+    handle: 'login-handle-1',
+    binding: geminiBinding(),
+    state,
     ...partial,
   }
 }

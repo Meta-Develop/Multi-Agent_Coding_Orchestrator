@@ -63,6 +63,18 @@ const OAUTH_REMOVED_AUTH_ENVIRONMENT: &[&str] = &[
 
 type OAuthCompleter = fn(&Path) -> Result<()>;
 
+/// Whether prepare already validated an existing managed OAuth marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingOAuthHomePlan {
+    NeedsInteractiveOAuth,
+    RecoveredExistingMarker,
+}
+
+pub(crate) struct PreparedPendingOAuthHome {
+    pub path: PathBuf,
+    pub plan: PendingOAuthHomePlan,
+}
+
 /// `None` is production and reads process state. `Some` is a hermetic test
 /// context: every environment-derived value must come from injected fields.
 struct InjectedContext {
@@ -82,6 +94,9 @@ pub struct GeminiCliAdapter {
     test_program: Option<PathBuf>,
     /// Test seam that writes isolated OAuth files and never opens a browser.
     oauth_completer: Option<OAuthCompleter>,
+    /// Hermetic login-service tests: honour cancel via async watch only.
+    #[doc(hidden)]
+    test_oauth_watch_cancel_driver: bool,
 }
 
 impl fmt::Debug for GeminiCliAdapter {
@@ -111,6 +126,7 @@ impl GeminiCliAdapter {
             home: Some(home),
             test_program: None,
             oauth_completer: None,
+            test_oauth_watch_cancel_driver: false,
         }
     }
 
@@ -137,12 +153,21 @@ impl GeminiCliAdapter {
             }),
             test_program: None,
             oauth_completer: None,
+            test_oauth_watch_cancel_driver: false,
         }
     }
 
     /// Complete isolated Google sign-in without a browser or the network.
     pub fn with_oauth_completer(mut self, completer: OAuthCompleter) -> Self {
         self.oauth_completer = Some(completer);
+        self
+    }
+
+    /// Async OAuth fixture for login-service cancellation tests.
+    #[doc(hidden)]
+    pub fn with_test_oauth_watch_cancel_driver(mut self) -> Self {
+        self.test_oauth_watch_cancel_driver = true;
+        self.oauth_completer = None;
         self
     }
 
@@ -154,6 +179,23 @@ impl GeminiCliAdapter {
             self.test_program = Some(program);
         }
         self
+    }
+
+    /// Clone adapter configuration for a background login task.
+    pub(crate) fn clone_for_login_task(&self) -> Self {
+        Self {
+            home: self.home.clone(),
+            injected: self.injected.as_ref().map(|context| InjectedContext {
+                data_dir: context.data_dir.clone(),
+                cwd: context.cwd.clone(),
+                system_settings_path: context.system_settings_path.clone(),
+                system_defaults_path: context.system_defaults_path.clone(),
+                api_key: context.api_key.clone(),
+            }),
+            test_program: self.test_program.clone(),
+            oauth_completer: self.oauth_completer,
+            test_oauth_watch_cancel_driver: self.test_oauth_watch_cancel_driver,
+        }
     }
 
     fn cwd(&self) -> Result<PathBuf> {
@@ -284,6 +326,84 @@ impl GeminiCliAdapter {
             ));
         }
         super::gemini_oauth::provision_managed_home(home)
+    }
+
+    /// Prepare an isolated managed home for a pending OAuth account.
+    pub(crate) fn prepare_pending_oauth_home(
+        &self,
+        account: &StoredAccountMetadata,
+    ) -> Result<PreparedPendingOAuthHome> {
+        self.validate_metadata(account)?;
+        if account.state != StoredAccountState::Pending || account.is_selected {
+            return Err(config_read(
+                "only an unselected pending Gemini account can begin OAuth login",
+            ));
+        }
+        if account.auth_kind != AuthKind::OAuth {
+            return Err(config_read(
+                "Gemini OAuth login requires an OAuth pending account",
+            ));
+        }
+        let home = self.managed_home(account)?;
+        ensure_private_managed_home(&self.required_data_dir()?, &home)?;
+        let plan = match fs::symlink_metadata(oauth_creds_path(&home)) {
+            Ok(_) => {
+                validate_oauth_creds(&home)?;
+                super::gemini_oauth::write_managed_oauth_settings(&home)?;
+                PendingOAuthHomePlan::RecoveredExistingMarker
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                PendingOAuthHomePlan::NeedsInteractiveOAuth
+            }
+            Err(error) => {
+                return Err(config_write(format!(
+                    "managed oauth_creds.json cannot be inspected ({})",
+                    error.kind()
+                )))
+            }
+        };
+        Ok(PreparedPendingOAuthHome { path: home, plan })
+    }
+
+    /// Run OAuth for a prepared managed home. Used by the shared login service.
+    pub(crate) async fn run_pending_oauth_login(
+        &self,
+        home: &Path,
+        plan: PendingOAuthHomePlan,
+        mut cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> std::result::Result<(), super::gemini_oauth::OAuthLoginRunError> {
+        if *cancel.borrow() {
+            return Err(super::gemini_oauth::OAuthLoginRunError::Cancelled);
+        }
+        if plan == PendingOAuthHomePlan::RecoveredExistingMarker {
+            return Ok(());
+        }
+        if self.test_oauth_watch_cancel_driver {
+            return super::gemini_oauth::run_test_oauth_cancelled_by_watch(&mut cancel).await;
+        }
+        if let Some(completer) = self.oauth_completer {
+            let home = home.to_path_buf();
+            let result = tokio::task::spawn_blocking(move || completer(&home)).await;
+            match result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(super::gemini_oauth::OAuthLoginRunError::Failed(error)),
+                Err(_) => Err(super::gemini_oauth::OAuthLoginRunError::Failed(
+                    config_write("Gemini OAuth completer task failed"),
+                )),
+            }
+        } else if self.injected.is_some() {
+            Err(super::gemini_oauth::OAuthLoginRunError::Failed(
+                config_write("hermetic Gemini OAuth requires an injected completer"),
+            ))
+        } else {
+            super::gemini_oauth::run_managed_oauth_login(home, cancel).await
+        }
+    }
+
+    /// Validate OAuth material and overlay managed settings after login succeeds.
+    pub(crate) fn finish_pending_oauth_login(&self, home: &Path) -> Result<()> {
+        validate_oauth_creds(home)?;
+        super::gemini_oauth::write_managed_oauth_settings(home)
     }
 
     fn provision_oauth_home(&self, account: &StoredAccountMetadata) -> Result<()> {
