@@ -923,12 +923,13 @@ fn login_start(
     if provider_id != "gemini-cli"
         && provider_id != "codex-cli"
         && provider_id != "claude-code"
+        && provider_id != "grok-cli"
         && provider_id != "cursor"
     {
         return AuthorityResponse::error(
             request_id,
             ErrorCode::UnsupportedOperation,
-            "login.start is implemented for Gemini, Codex, Claude, and Cursor only",
+            "login.start is implemented for Gemini, Codex, Claude, Grok, and Cursor only",
         );
     }
     let Some(login) = ctx.login.as_ref() else {

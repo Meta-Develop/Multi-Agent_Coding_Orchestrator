@@ -18,6 +18,7 @@ use crate::login::LoginService;
 use crate::providers::claude_code::ClaudeCodeAdapter;
 use crate::providers::codex_cli::CodexCliAdapter;
 use crate::providers::gemini_cli::GeminiCliAdapter;
+use crate::providers::grok_cli::GrokCliAdapter;
 
 /// Operator configuration for one authority listener.
 pub struct AuthorityServerConfig {
@@ -135,6 +136,9 @@ impl LoginPort for GeminiLoginPort {
                 .service
                 .start_pending_oauth(request, &CodexCliAdapter::default()),
             "claude-code" => self.service.start_pending_oauth(request, &self.claude),
+            "grok-cli" => self
+                .service
+                .start_pending_oauth(request, &GrokCliAdapter::default()),
             // cursor is allow-listed; PendingOAuthLogin is not implemented.
             _ => Err(Error::NotImplemented("login.start")),
         }

@@ -303,7 +303,7 @@ fn dispatch_refuses_unknown_login_start() {
         "protocolVersion": PROTOCOL_VERSION,
         "requestId": "login",
         "operation": "login.start",
-        "providerId": "grok-cli",
+        "providerId": "github-copilot",
         "accountId": "work",
         "label": "Work",
         "authKind": "oauth",
@@ -313,7 +313,7 @@ fn dispatch_refuses_unknown_login_start() {
     assert_eq!(response["error"]["code"], "unsupported-operation");
     assert_eq!(
         response["error"]["message"],
-        "login.start is implemented for Gemini, Codex, Claude, and Cursor only"
+        "login.start is implemented for Gemini, Codex, Claude, Grok, and Cursor only"
     );
     assert!(login.starts.lock().expect("starts").is_empty());
 }
@@ -441,6 +441,30 @@ fn dispatch_accepts_codex_cli_login_start() {
         "requestId": "login",
         "operation": "login.start",
         "providerId": "codex-cli",
+        "accountId": "work",
+        "label": "Work",
+        "authKind": "oauth",
+        "idempotencyKey": "key-1"
+    });
+    let response = dispatch_json(&ctx, &body.to_string());
+    assert!(response["error"].is_null());
+    assert_eq!(response["result"]["handle"], "login-handle-1");
+    assert_eq!(response["result"]["state"], "waiting-for-user");
+    assert_eq!(login.starts.lock().expect("starts").len(), 1);
+}
+
+#[test]
+fn dispatch_accepts_grok_cli_login_start() {
+    let (_dir, registry) = isolated_registry();
+    let login = Arc::new(FakeLogin::new());
+    let ctx = AuthorityContext::new(registry)
+        .without_registry_fallback()
+        .with_login(Arc::clone(&login) as Arc<dyn LoginPort>);
+    let body = serde_json::json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "requestId": "login",
+        "operation": "login.start",
+        "providerId": "grok-cli",
         "accountId": "work",
         "label": "Work",
         "authKind": "oauth",
