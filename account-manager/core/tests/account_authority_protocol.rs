@@ -261,8 +261,7 @@ fn dispatch_refuses_non_gemini_login_start() {
         });
         let response = dispatch_json(&ctx, &body.to_string());
         assert_eq!(
-            response["error"]["code"],
-            "unsupported-operation",
+            response["error"]["code"], "unsupported-operation",
             "{provider_id}"
         );
     }

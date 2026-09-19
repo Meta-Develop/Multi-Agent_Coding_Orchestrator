@@ -20,7 +20,7 @@ use crate::account_authority::PendingLoginLease;
 use crate::error::{Error, Result};
 use crate::model::{AuthKind, StoredAccountMetadata};
 use crate::providers::{
-    complete_managed_login_account, codex_cli::CodexCliAdapter, gemini_cli::GeminiCliAdapter,
+    codex_cli::CodexCliAdapter, complete_managed_login_account, gemini_cli::GeminiCliAdapter,
     OAuthLoginRunError, PendingOAuthHomePlan, PreparedPendingOAuthHome, ProviderAdapter,
     StoredAccountRegistry, LOGIN_DEADLINE,
 };

@@ -23,8 +23,8 @@ use serde_json::{Map, Value};
 
 use super::{
     account_id_is_safe, binary_on_path, home_dir, managed_account_dir, ActivationMechanism,
-    LaunchSpec, ManagedAccountPlan, PendingOAuthHomePlan, PreparedPendingOAuthHome, ProviderAdapter,
-    StoredAccountRegistry,
+    LaunchSpec, ManagedAccountPlan, PendingOAuthHomePlan, PreparedPendingOAuthHome,
+    ProviderAdapter, StoredAccountRegistry,
 };
 use crate::account_authority::{AuthObservation, CategoryObservation};
 use crate::error::{Error, Result};

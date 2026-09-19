@@ -150,26 +150,24 @@ impl CodexCliAdapter {
             return Err(Error::UnknownProvider(account.provider_id.clone()));
         }
         if !account_id_is_safe(&account.id) {
-            return Err(self.config_read(
-                "stored account metadata does not match the Codex lifecycle",
-            ));
+            return Err(
+                self.config_read("stored account metadata does not match the Codex lifecycle")
+            );
         }
         if account.id == ON_DISK_ACCOUNT_ID {
-            return Err(self.config_read(
-                "account id is reserved for the live on-disk Codex identity",
-            ));
+            return Err(
+                self.config_read("account id is reserved for the live on-disk Codex identity")
+            );
         }
         if account.state != StoredAccountState::Pending || account.is_selected {
-            return Err(self.config_read(
-                "only an unselected pending Codex account can begin OAuth login",
-            ));
+            return Err(
+                self.config_read("only an unselected pending Codex account can begin OAuth login")
+            );
         }
         if account.auth_kind != AuthKind::OAuth
             || account.material != StoredAccountMaterial::VendorHome
         {
-            return Err(self.config_read(
-                "Codex OAuth login requires an OAuth pending account",
-            ));
+            return Err(self.config_read("Codex OAuth login requires an OAuth pending account"));
         }
         Ok(())
     }
@@ -181,9 +179,7 @@ impl CodexCliAdapter {
             )
         })?;
         if !directory.is_absolute() {
-            return Err(self.config_write(
-                "application data directory is not an absolute path",
-            ));
+            return Err(self.config_write("application data directory is not an absolute path"));
         }
         Ok(directory)
     }
