@@ -1919,7 +1919,8 @@ fn run_concurrent_assignment_schedule(
                     context.assignment_schedule,
                     context.artifacts,
                 )?;
-                progress.commit_completed_selection_prefix(context.options.runtime, context.run_dir)?;
+                progress
+                    .commit_completed_selection_prefix(context.options.runtime, context.run_dir)?;
                 while active.len() < progress.budget_degradation.effective_fan_out {
                     if !progress.health_breaker.permits_admission() {
                         stop_scheduling = true;
@@ -1966,7 +1967,10 @@ fn run_concurrent_assignment_schedule(
                         pending.remove(&index);
                         progress.indexed_outcomes[index] =
                             Some(parked_preclaim_outcome(assignment, &preclaim));
-                        progress.commit_completed_selection_prefix(context.options.runtime, context.run_dir)?;
+                        progress.commit_completed_selection_prefix(
+                            context.options.runtime,
+                            context.run_dir,
+                        )?;
                         continue;
                     }
                     let Some(budget_policy) = progress.budget_degradation.assignment_policy(
@@ -2115,7 +2119,10 @@ fn run_concurrent_assignment_schedule(
                                 .as_ref()
                                 .context("spawn failure outcome disappeared")?;
                             record_completed_assignment_checkpoint(context, index, outcome)?;
-                            progress.commit_completed_selection_prefix(context.options.runtime, context.run_dir)?;
+                            progress.commit_completed_selection_prefix(
+                                context.options.runtime,
+                                context.run_dir,
+                            )?;
                             break;
                         }
                     }
@@ -5507,8 +5514,7 @@ mod selection_policy_tests {
             selection_decisions: retry_events.clone(),
             ..AssignmentExecutionOutcome::default()
         })];
-        controller
-            .commit_completed_selection_prefix(
+        controller.commit_completed_selection_prefix(
             &indexed_outcomes,
             SupervisorRuntime::Codex,
             Path::new("/nonexistent-maco-cpo-refresh"),
@@ -5740,8 +5746,7 @@ mod selection_policy_tests {
             selection_decisions: vec![completed[1].1.clone()],
             ..AssignmentExecutionOutcome::default()
         });
-        controller
-            .commit_completed_selection_prefix(
+        controller.commit_completed_selection_prefix(
             &indexed_outcomes,
             SupervisorRuntime::Codex,
             Path::new("/nonexistent-maco-cpo-refresh"),
@@ -5752,8 +5757,7 @@ mod selection_policy_tests {
             selection_decisions: vec![completed[0].1.clone()],
             ..AssignmentExecutionOutcome::default()
         });
-        controller
-            .commit_completed_selection_prefix(
+        controller.commit_completed_selection_prefix(
             &indexed_outcomes,
             SupervisorRuntime::Codex,
             Path::new("/nonexistent-maco-cpo-refresh"),
