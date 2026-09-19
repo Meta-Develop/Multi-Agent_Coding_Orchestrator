@@ -279,6 +279,75 @@ advertises work-proposal tool restrictions"
     assert!(!ADVERTISED_OPERATIONS.contains(&"operation.prepare"));
 }
 
+const OPERATION_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+fn operation_lifecycle_body(operation: &str) -> serde_json::Value {
+    serde_json::json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "requestId": operation,
+        "operation": operation,
+        "handle": "opaque-handle",
+        "digest": OPERATION_DIGEST,
+    })
+}
+
+#[test]
+fn decode_refuses_operation_lifecycle_without_closed_fields() {
+    for operation in ["operation.start", "operation.status", "operation.cancel"] {
+        let error = decode_request(
+            format!(
+                r#"{{"protocolVersion":1,"requestId":"{operation}","operation":"{operation}"}}"#
+            )
+            .as_bytes(),
+        )
+        .expect_err("missing lifecycle fields");
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert_eq!(error.request_id, operation);
+    }
+}
+
+#[test]
+fn decode_accepts_operation_lifecycle_handle_and_digest() {
+    for operation in ["operation.start", "operation.status", "operation.cancel"] {
+        decode_request(operation_lifecycle_body(operation).to_string().as_bytes())
+            .unwrap_or_else(|_| panic!("well-formed {operation} decodes"));
+    }
+}
+
+#[test]
+fn dispatch_refuses_well_formed_operation_lifecycle_until_advertised() {
+    let (_dir, registry) = isolated_registry();
+    let ctx = AuthorityContext::new(registry).without_registry_fallback();
+    for operation in ["operation.start", "operation.status", "operation.cancel"] {
+        let decoded = decode_request(operation_lifecycle_body(operation).to_string().as_bytes())
+            .expect("decode");
+        let response = serde_json::to_value(dispatch(&ctx, &decoded)).expect("json");
+        assert_eq!(response["error"]["code"], "unsupported-operation");
+        assert_eq!(
+            response["error"]["message"],
+            format!(
+                "{operation} is not advertised until a provider \
+advertises work-proposal tool restrictions"
+            )
+        );
+        assert!(response["result"].is_null());
+        assert!(!ADVERTISED_OPERATIONS.contains(&operation));
+    }
+}
+
+#[test]
+fn operation_lifecycle_operations_stay_unadvertised() {
+    assert_eq!(ADVERTISED_OPERATIONS.len(), 8);
+    for operation in [
+        "operation.prepare",
+        "operation.start",
+        "operation.status",
+        "operation.cancel",
+    ] {
+        assert!(!ADVERTISED_OPERATIONS.contains(&operation));
+    }
+}
+
 #[test]
 fn decode_refuses_operation_prepare_with_unknown_kind_or_digest() {
     let mut kind = operation_prepare_body();

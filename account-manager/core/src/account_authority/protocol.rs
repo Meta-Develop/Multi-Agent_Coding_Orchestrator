@@ -15,8 +15,8 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::account_authority::{
-    AccountObserveRequest, ObservationError, ObservationErrorKind, SelectedAccountBinding,
-    StoredAccountRegistry,
+    AccountObserveRequest, ObservationError, ObservationErrorKind, OperationHandle,
+    SelectedAccountBinding, StoredAccountRegistry,
 };
 use crate::error::Error;
 use crate::login::{LoginAccountBinding, LoginHandle, LoginStartRequest, LoginStatus};
@@ -296,6 +296,18 @@ pub enum DecodedOperation {
         admission_requirements: Vec<String>,
         idempotency_key: String,
     },
+    OperationStart {
+        handle: OperationHandle,
+        digest: String,
+    },
+    OperationStatus {
+        handle: OperationHandle,
+        digest: String,
+    },
+    OperationCancel {
+        handle: OperationHandle,
+        digest: String,
+    },
     Unsupported {
         operation: String,
     },
@@ -355,6 +367,13 @@ struct OperationPrepareParams {
     caller_policy_digest: String,
     admission_requirements: Vec<String>,
     idempotency_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OperationHandleDigestParams {
+    handle: OperationHandle,
+    digest: String,
 }
 
 /// Opaque hex SHA-256 of the canonical `stored-accounts.json` path.
@@ -589,6 +608,26 @@ fn decode_operation(
                 idempotency_key: parsed.idempotency_key,
             }
         }
+        "operation.start" | "operation.status" | "operation.cancel" => {
+            let parsed: OperationHandleDigestParams = parse_params(&request_id, params)?;
+            require_binding_digest(&request_id, &parsed.digest)?;
+            let decoded = match operation.as_str() {
+                "operation.start" => DecodedOperation::OperationStart {
+                    handle: parsed.handle,
+                    digest: parsed.digest,
+                },
+                "operation.status" => DecodedOperation::OperationStatus {
+                    handle: parsed.handle,
+                    digest: parsed.digest,
+                },
+                "operation.cancel" => DecodedOperation::OperationCancel {
+                    handle: parsed.handle,
+                    digest: parsed.digest,
+                },
+                _ => unreachable!("matched operation lifecycle branch"),
+            };
+            decoded
+        }
         _ => DecodedOperation::Unsupported { operation },
     };
     Ok(DecodedRequest {
@@ -637,11 +676,7 @@ fn require_nonempty_field(
 }
 
 fn require_policy_digest(request_id: &str, digest: &str) -> Result<(), ProtocolFailure> {
-    if digest.len() == 64
-        && digest
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-    {
+    if is_lowercase_sha256_hex(digest) {
         Ok(())
     } else {
         Err(ProtocolFailure::new(
@@ -650,6 +685,25 @@ fn require_policy_digest(request_id: &str, digest: &str) -> Result<(), ProtocolF
             "callerPolicyDigest must be a lowercase SHA-256 hex digest",
         ))
     }
+}
+
+fn require_binding_digest(request_id: &str, digest: &str) -> Result<(), ProtocolFailure> {
+    if is_lowercase_sha256_hex(digest) {
+        Ok(())
+    } else {
+        Err(ProtocolFailure::new(
+            request_id,
+            ErrorCode::InvalidRequest,
+            "digest must be a lowercase SHA-256 hex digest",
+        ))
+    }
+}
+
+fn is_lowercase_sha256_hex(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn parse_params<T: for<'de> Deserialize<'de>>(
@@ -713,18 +767,35 @@ pub fn dispatch(ctx: &AuthorityContext, request: &DecodedRequest) -> AuthorityRe
         DecodedOperation::LoginCancel { handle, binding } => {
             login_cancel(ctx, &request.request_id, handle, binding)
         }
-        DecodedOperation::OperationPrepare { .. } => AuthorityResponse::error(
-            request.request_id.clone(),
-            ErrorCode::UnsupportedOperation,
-            "operation.prepare is not advertised until a provider \
-advertises work-proposal tool restrictions",
-        ),
+        DecodedOperation::OperationPrepare { .. } => {
+            refuse_unadvertised_operation_lifecycle(&request.request_id, "operation.prepare")
+        }
+        DecodedOperation::OperationStart { .. } => {
+            refuse_unadvertised_operation_lifecycle(&request.request_id, "operation.start")
+        }
+        DecodedOperation::OperationStatus { .. } => {
+            refuse_unadvertised_operation_lifecycle(&request.request_id, "operation.status")
+        }
+        DecodedOperation::OperationCancel { .. } => {
+            refuse_unadvertised_operation_lifecycle(&request.request_id, "operation.cancel")
+        }
         DecodedOperation::Unsupported { operation } => AuthorityResponse::error(
             request.request_id.clone(),
             ErrorCode::UnsupportedOperation,
             format!("operation `{operation}` is not advertised"),
         ),
     }
+}
+
+fn refuse_unadvertised_operation_lifecycle(request_id: &str, operation: &str) -> AuthorityResponse {
+    AuthorityResponse::error(
+        request_id,
+        ErrorCode::UnsupportedOperation,
+        format!(
+            "{operation} is not advertised until a provider \
+advertises work-proposal tool restrictions"
+        ),
+    )
 }
 
 fn describe(ctx: &AuthorityContext, request_id: &str) -> AuthorityResponse {
