@@ -346,9 +346,9 @@ mod tests {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')));
     }
 
-    #[test]
     type DigestMutation = fn(&mut OperationPrepareIdentity, &mut OperationPrepareRequest);
 
+    #[test]
     fn digest_changes_when_any_bound_field_changes() {
         let baseline = canonical_binding_digest(&identity(), &request());
         let mutations: &[(&str, DigestMutation)] = &[
