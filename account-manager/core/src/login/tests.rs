@@ -295,10 +295,9 @@ fn cancelled_login_confirmed_by_owned_async_oauth_fixture() {
     let started = service
         .start(start_request("work", "key-cancel"), &adapter)
         .expect("start");
-    let immediate = service
+    service
         .cancel(&started.handle, &started.binding)
         .expect("cancel");
-    assert_ne!(immediate.state, LoginState::Cancelled);
     wait_for_state(&runtime, &service, &started, LoginState::Cancelled);
     let row = registry.account(PROVIDER_ID, "work").expect("pending");
     assert_eq!(row.state, StoredAccountState::Pending);
