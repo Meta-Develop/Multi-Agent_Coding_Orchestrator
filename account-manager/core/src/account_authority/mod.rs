@@ -6,6 +6,7 @@ mod document;
 mod incarnation;
 mod lock;
 mod observe;
+mod operation;
 mod protocol;
 mod registry;
 mod server;
@@ -23,6 +24,10 @@ pub use observe::{
     validate_observed_models, AccountObserveRequest, AccountObserveResult, AuthObservation,
     CategoryObservation, ModelsObservation, ObservationError, ObservationErrorKind,
     ObservationOutcome, ObserveCategory, ObservedModel, QuotaObservation,
+};
+pub use operation::{
+    canonical_binding_digest, OperationHandle, OperationPrepareIdentity, OperationPrepareRequest,
+    PreparedOperation, PreparedOperationState, PreparedOperationStore,
 };
 pub use protocol::{
     authority_id_for, decode_request, dispatch, map_core_error, AuthorityContext,
