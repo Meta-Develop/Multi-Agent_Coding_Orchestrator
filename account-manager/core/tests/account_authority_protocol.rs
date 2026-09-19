@@ -303,7 +303,7 @@ fn dispatch_refuses_unknown_login_start() {
         "protocolVersion": PROTOCOL_VERSION,
         "requestId": "login",
         "operation": "login.start",
-        "providerId": "github-copilot",
+        "providerId": "not-a-provider",
         "accountId": "work",
         "label": "Work",
         "authKind": "oauth",
@@ -313,7 +313,7 @@ fn dispatch_refuses_unknown_login_start() {
     assert_eq!(response["error"]["code"], "unsupported-operation");
     assert_eq!(
         response["error"]["message"],
-        "login.start is implemented for Gemini, Codex, Claude, Grok, and Cursor only"
+        "login.start is implemented for Gemini, Codex, Claude, Grok, Cursor, and GitHub Copilot only"
     );
     assert!(login.starts.lock().expect("starts").is_empty());
 }
@@ -325,7 +325,7 @@ fn dispatch_accepts_claude_and_cursor_login_start() {
     let ctx = AuthorityContext::new(registry)
         .without_registry_fallback()
         .with_login(Arc::clone(&login) as Arc<dyn LoginPort>);
-    for provider_id in ["claude-code", "cursor"] {
+    for provider_id in ["claude-code", "cursor", "github-copilot"] {
         let body = serde_json::json!({
             "protocolVersion": PROTOCOL_VERSION,
             "requestId": "login",
@@ -345,7 +345,7 @@ fn dispatch_accepts_claude_and_cursor_login_start() {
             "{provider_id}"
         );
     }
-    assert_eq!(login.starts.lock().expect("starts").len(), 2);
+    assert_eq!(login.starts.lock().expect("starts").len(), 3);
 }
 
 fn write_claude_managed_oauth(home: &std::path::Path) -> std::io::Result<i32> {
@@ -403,7 +403,7 @@ fn production_login_port_starts_claude_code() {
 }
 
 #[test]
-fn production_login_port_leaves_cursor_unimplemented() {
+fn production_login_port_leaves_cursor_and_github_copilot_unimplemented() {
     let (_dir, registry) = isolated_registry();
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let service = LoginService::new(
@@ -414,19 +414,29 @@ fn production_login_port_leaves_cursor_unimplemented() {
     let config = AuthorityServerConfig::new(ctx)
         .expect("config")
         .with_gemini_login(service, GeminiCliAdapter::default());
-    let body = serde_json::json!({
-        "protocolVersion": PROTOCOL_VERSION,
-        "requestId": "login",
-        "operation": "login.start",
-        "providerId": "cursor",
-        "accountId": "work",
-        "label": "Work",
-        "authKind": "oauth",
-        "idempotencyKey": "key-cursor"
-    });
-    let response = dispatch_json(&config.context, &body.to_string());
-    assert_eq!(response["error"]["code"], "unsupported-operation");
-    assert_eq!(response["error"]["message"], "operation is not implemented");
+    for provider_id in ["cursor", "github-copilot"] {
+        let body = serde_json::json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "requestId": "login",
+            "operation": "login.start",
+            "providerId": provider_id,
+            "accountId": "work",
+            "label": "Work",
+            "authKind": "oauth",
+            "idempotencyKey": format!("key-{provider_id}")
+        });
+        let response = dispatch_json(&config.context, &body.to_string());
+        assert_eq!(
+            response["error"]["code"],
+            "unsupported-operation",
+            "{provider_id}"
+        );
+        assert_eq!(
+            response["error"]["message"],
+            "operation is not implemented",
+            "{provider_id}"
+        );
+    }
 }
 
 #[test]
