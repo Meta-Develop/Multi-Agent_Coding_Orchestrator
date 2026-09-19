@@ -180,6 +180,7 @@ pub(super) fn worker_attempt_proven_no_environment_native_spend(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn record_child_attempt_outcome(
     artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
     run_id: &RunId,
