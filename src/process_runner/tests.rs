@@ -1811,6 +1811,65 @@ fn protected_alias_scan_ignores_special_entries_but_preserves_writable_checks() 
 
 #[cfg(target_os = "linux")]
 #[test]
+fn sandbox_scan_skips_child_entries_that_vanish_but_keeps_root_and_other_errors_closed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().join("agents");
+    fs::create_dir_all(&root).expect("scan root");
+    let vanished_child = root.join(".registry.json.15060327109825322443.tmp");
+    let vanished_dir = root.join("gone");
+
+    // A listed child that disappeared before `lstat` / `read_dir` is skipped, not fatal.
+    assert!(
+        inspect_sandbox_entry(&vanished_child, &root)
+            .expect("vanished child entry is tolerated")
+            .is_none(),
+        "vanished child must yield no metadata"
+    );
+    assert!(
+        enumerate_sandbox_directory(&vanished_dir, &root)
+            .expect("vanished child directory is tolerated")
+            .is_none(),
+        "vanished child directory must yield no listing"
+    );
+
+    // The scan root itself must exist.
+    let missing_root = temp.path().join("missing-root");
+    let error = inspect_sandbox_entry(&missing_root, &missing_root)
+        .expect_err("missing scan root stays fail-closed");
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    assert!(error
+        .to_string()
+        .contains("failed to inspect sandbox entry"));
+    let error = enumerate_sandbox_directory(&missing_root, &missing_root)
+        .expect_err("missing scan root directory stays fail-closed");
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    assert!(error
+        .to_string()
+        .contains("failed to enumerate sandbox directory"));
+
+    // Any other error kind on a child still refuses the launch.
+    let file_not_dir = root.join("plain.txt");
+    fs::write(&file_not_dir, "x").expect("plain file");
+    let error = enumerate_sandbox_directory(&file_not_dir, &root)
+        .expect_err("non-directory child enumeration is not a vanished entry");
+    assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+
+    // Whole-tree scans still succeed over a tree that only lost a temp file mid-flight
+    // (simulated here by a tree with no such file), and still reject a present socket.
+    let mut remaining = MAX_SANDBOX_ENTRY_SCAN;
+    let mut writable_links = BTreeMap::new();
+    scan_sandbox_tree(&root, true, &mut remaining, &mut writable_links)
+        .expect("plain tree scans clean");
+    std::os::unix::net::UnixListener::bind(root.join("live.sock")).expect("socket fixture");
+    let mut remaining = MAX_SANDBOX_ENTRY_SCAN;
+    let mut writable_links = BTreeMap::new();
+    let error = scan_sandbox_tree(&root, true, &mut remaining, &mut writable_links)
+        .expect_err("present socket still refused");
+    assert!(error.to_string().contains("socket, FIFO, or device node"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn external_codex_legitimate_exact_file_exception_is_not_protected_read_only() {
     let temp = tempfile::tempdir().expect("tempdir");
     let workspace = temp.path().join("worktree");

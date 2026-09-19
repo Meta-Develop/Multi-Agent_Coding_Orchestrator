@@ -11,6 +11,7 @@ use crate::account_authority::{
     StoredAccountRegistry,
 };
 use crate::error::{Error, Result};
+use crate::model::QuotaSnapshot;
 use crate::storage::CredentialStore;
 
 use super::ProviderAdapter;
@@ -85,6 +86,30 @@ pub(crate) fn auth_category_unavailable() -> CategoryObservation<AuthObservation
     CategoryObservation::unavailable()
 }
 
+/// Fail closed before quota snapshots become `Observed` content (FR-5, NFR-8).
+pub(crate) fn invalid_quota_snapshot_message(snapshots: &[QuotaSnapshot]) -> Option<&'static str> {
+    for snapshot in snapshots {
+        if !snapshot.utilization.is_finite() || !(0.0..=1.0).contains(&snapshot.utilization) {
+            return Some("adapter returned quota utilization outside 0..=1");
+        }
+        if !is_rfc3339_timestamp(&snapshot.captured_at) {
+            return Some("adapter returned quota with invalid capturedAt");
+        }
+        if snapshot
+            .resets_at
+            .as_deref()
+            .is_some_and(|resets_at| !is_rfc3339_timestamp(resets_at))
+        {
+            return Some("adapter returned quota with invalid resetsAt");
+        }
+    }
+    None
+}
+
+pub(crate) fn is_rfc3339_timestamp(timestamp: &str) -> bool {
+    OffsetDateTime::parse(timestamp, &Rfc3339).is_ok()
+}
+
 pub(crate) fn observation_error_from_core(error: &Error) -> ObservationError {
     let kind = match error {
         Error::ConfigRead { .. } => ObservationErrorKind::ConfigRead,
@@ -100,11 +125,15 @@ pub(crate) fn observation_error_from_core(error: &Error) -> ObservationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account_authority::ObservationOutcome;
     use crate::model::{
-        AuthKind, StoredAccountMaterial, StoredAccountMetadata, StoredAccountState,
+        AuthKind, QuotaSnapshot, QuotaSource, StoredAccountMaterial, StoredAccountMetadata,
+        StoredAccountState,
     };
 
     struct StubAdapter;
+
+    struct InvalidQuotaResetsAdapter;
 
     impl ProviderAdapter for StubAdapter {
         fn id(&self) -> &'static str {
@@ -134,8 +163,49 @@ mod tests {
         fn quota_for_account(
             &self,
             _account: &StoredAccountMetadata,
-        ) -> Result<Vec<crate::model::QuotaSnapshot>> {
+        ) -> Result<Vec<QuotaSnapshot>> {
             Ok(Vec::new())
+        }
+    }
+
+    impl ProviderAdapter for InvalidQuotaResetsAdapter {
+        fn id(&self) -> &'static str {
+            "invalid-quota"
+        }
+
+        fn descriptor(&self) -> crate::model::ProviderDescriptor {
+            unimplemented!("not used in observe unit tests")
+        }
+
+        fn config_paths(&self) -> Vec<std::path::PathBuf> {
+            Vec::new()
+        }
+
+        fn detect(&self) -> crate::model::InstallState {
+            crate::model::InstallState::Unknown
+        }
+
+        fn list_accounts(&self) -> Result<Vec<crate::model::Account>> {
+            Ok(Vec::new())
+        }
+
+        fn activate_account(&self, _account_id: &str) -> Result<()> {
+            Err(Error::NotImplemented("activate"))
+        }
+
+        fn quota_for_account(
+            &self,
+            _account: &StoredAccountMetadata,
+        ) -> Result<Vec<QuotaSnapshot>> {
+            Ok(vec![QuotaSnapshot {
+                account_id: "work".to_string(),
+                model: None,
+                utilization: 0.42,
+                window_label: None,
+                resets_at: Some("not-rfc3339".to_string()),
+                captured_at: "2030-01-01T00:00:00Z".to_string(),
+                source: QuotaSource::LocalFile,
+            }])
         }
     }
 
@@ -159,5 +229,22 @@ mod tests {
             .quota_for_account(&fixture_account())
             .expect("quota read");
         assert!(snapshots.is_empty());
+    }
+
+    #[test]
+    fn invalid_quota_resets_at_fails_closed_without_invented_utilization() {
+        use std::collections::BTreeSet;
+
+        let adapter = InvalidQuotaResetsAdapter;
+        let categories = BTreeSet::from([ObserveCategory::Quota]);
+        let payload = adapter
+            .observe_account(&fixture_account(), &categories, None)
+            .expect("observe payload");
+        let quota = payload.quota.expect("quota category");
+        assert_ne!(quota.outcome, ObservationOutcome::Observed);
+        assert!(quota.content.is_none());
+        let json = serde_json::to_string(&quota).expect("json");
+        assert!(!json.contains("utilization"));
+        assert!(!json.contains("0.42"));
     }
 }
