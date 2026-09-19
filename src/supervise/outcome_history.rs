@@ -3069,7 +3069,8 @@ mod tests {
     }
 
     #[test]
-    fn record_child_attempt_outcome_retains_parent_codex_identity_and_execution_cost() -> Result<()> {
+    fn record_child_attempt_outcome_retains_parent_codex_identity_and_execution_cost() -> Result<()>
+    {
         let (temp, repo) = super::super::tests::injected_repository();
         let external_run = parent_run_with_codex_evidence(
             &temp,
