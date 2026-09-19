@@ -14,7 +14,8 @@ permissions:
 
 concurrency:
   group: supply-chain-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Keep default-branch runs when a later commit starts; cancel only superseded pull_request runs.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
