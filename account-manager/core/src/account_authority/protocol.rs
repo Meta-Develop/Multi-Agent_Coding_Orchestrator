@@ -637,7 +637,10 @@ fn require_nonempty_field(
 }
 
 fn require_policy_digest(request_id: &str, digest: &str) -> Result<(), ProtocolFailure> {
-    if digest.len() == 64 && digest.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    if digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
     {
         Ok(())
     } else {
