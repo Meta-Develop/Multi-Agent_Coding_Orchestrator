@@ -3752,6 +3752,7 @@ pub(super) fn initialize_supervisor_selection_from_prepared_metadata(
                 plan_metadata.resolved_objective_profile.as_ref(),
                 quota,
                 frozen_history.as_ref(),
+                None,
             )?;
             if resolution.selection_preflight_failure.is_none() {
                 bind_selected_assignment_runtimes(plan, &resolution.decisions)?;

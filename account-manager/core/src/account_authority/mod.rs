@@ -20,9 +20,9 @@ pub mod test_worker;
 pub use binding::SelectedAccountBinding;
 pub use incarnation::new_account_incarnation;
 pub use observe::{
-    AccountObserveRequest, AccountObserveResult, AuthObservation, CategoryObservation,
-    ModelsObservation, ObservationError, ObservationErrorKind, ObservationOutcome, ObserveCategory,
-    QuotaObservation,
+    validate_observed_models, AccountObserveRequest, AccountObserveResult, AuthObservation,
+    CategoryObservation, ModelsObservation, ObservationError, ObservationErrorKind,
+    ObservationOutcome, ObserveCategory, ObservedModel, QuotaObservation,
 };
 pub use protocol::{
     authority_id_for, decode_request, dispatch, map_core_error, AuthorityContext,
