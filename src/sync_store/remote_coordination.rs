@@ -755,6 +755,45 @@ pub(crate) mod test_support {
         heartbeat_unknown_once: bool,
     }
 
+    /// Seconds between simulated provider timestamps once the fixed schedule is exhausted.
+    const SIM_CLOCK_STEP_SECONDS: u64 = 60;
+
+    impl SimState {
+        /// Provider timestamp for the next applied entry. The clock is strictly monotonic
+        /// after the fixed schedule: every further entry advances by
+        /// `SIM_CLOCK_STEP_SECONDS`, so concurrent heartbeats can consume any number of
+        /// slots without a later takeover ever observing a clock at or before the
+        /// predecessor heartbeat.
+        fn next_timestamp(&mut self) -> String {
+            let index = self.time_index;
+            self.time_index += 1;
+            if let Some(scheduled) = self.times.get(index) {
+                return (*scheduled).to_string();
+            }
+            let last = self.times.last().copied().unwrap_or(T0);
+            let steps = (index - self.times.len() + 1) as u64;
+            let base_seconds = rfc3339_utc_seconds_of_day(last);
+            let total = (base_seconds + steps * SIM_CLOCK_STEP_SECONDS).min(86_399);
+            format!(
+                "{}T{:02}:{:02}:{:02}Z",
+                &last[..10],
+                total / 3_600,
+                (total % 3_600) / 60,
+                total % 60
+            )
+        }
+    }
+
+    fn rfc3339_utc_seconds_of_day(timestamp: &str) -> u64 {
+        let field = |range: std::ops::Range<usize>| -> u64 {
+            timestamp
+                .get(range)
+                .and_then(|value| value.parse::<u64>().ok())
+                .expect("sim schedule timestamps are fixed RFC3339 UTC literals")
+        };
+        field(11..13) * 3_600 + field(14..16) * 60 + field(17..19)
+    }
+
     impl SimTransport {
         pub(crate) fn new(worktree: PathBuf) -> Self {
             let config = journal_config();
@@ -781,9 +820,11 @@ pub(crate) mod test_support {
             }
         }
 
+        /// Jump the simulated provider clock to the final scheduled time. Never rewinds:
+        /// entries that already ran past the schedule keep their later times.
         pub(crate) fn advance_provider_clock(&self) {
             let mut state = self.state.lock().expect("lock");
-            state.time_index = state.times.len() - 1;
+            state.time_index = state.time_index.max(state.times.len() - 1);
         }
 
         pub(crate) fn arm_next_heartbeat_unknown(&self) {
@@ -793,6 +834,11 @@ pub(crate) mod test_support {
         #[cfg(test)]
         pub(crate) fn journal_entries(&self) -> Vec<VerifiedJournalEntry> {
             self.state.lock().expect("lock").entries.clone()
+        }
+
+        #[cfg(test)]
+        pub(crate) fn next_timestamp_for_test(&self) -> String {
+            self.state.lock().expect("lock").next_timestamp()
         }
 
         /// Peer-host takeover via shared sim journal only (no pending-intent WAL).
@@ -932,8 +978,7 @@ pub(crate) mod test_support {
                     evidence: "simulated remote heartbeat unknown before permit ttl".to_string(),
                 });
             }
-            let timestamp = state.times.get(state.time_index).copied().unwrap_or(T30);
-            state.time_index += 1;
+            let timestamp = state.next_timestamp();
             let commit = format!("{:02x}{:0>38}", state.next_commit, 0);
             state.next_commit += 1;
             let comment_id = format!("c{}", state.entries.len());
@@ -1151,6 +1196,29 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         WorktreeManager::init_repository(temp.path(), "main").expect("init");
         temp
+    }
+
+    #[test]
+    fn sim_provider_clock_never_rewinds_and_keeps_increasing_past_schedule() {
+        let sim = SimTransport::new(std::path::PathBuf::from("unused"));
+        let scheduled: Vec<String> = (0..6).map(|_| sim.next_timestamp_for_test()).collect();
+        assert_eq!(scheduled[0], "2026-08-16T00:00:00Z");
+        assert_eq!(scheduled[5], "2026-08-16T00:02:00Z");
+
+        // Past the fixed schedule every entry moves strictly forward instead of rewinding.
+        let beyond_a = sim.next_timestamp_for_test();
+        let beyond_b = sim.next_timestamp_for_test();
+        assert_eq!(beyond_a, "2026-08-16T00:03:00Z");
+        assert_eq!(beyond_b, "2026-08-16T00:04:00Z");
+
+        // Advancing after the schedule was consumed must not hand out an earlier time.
+        sim.advance_provider_clock();
+        assert_eq!(sim.next_timestamp_for_test(), "2026-08-16T00:05:00Z");
+
+        // Advancing a fresh clock still jumps straight to the final scheduled time.
+        let fresh = SimTransport::new(std::path::PathBuf::from("unused"));
+        fresh.advance_provider_clock();
+        assert_eq!(fresh.next_timestamp_for_test(), "2026-08-16T00:02:00Z");
     }
 
     #[test]

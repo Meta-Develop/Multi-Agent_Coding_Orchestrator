@@ -1744,6 +1744,50 @@ fn minimize_sandbox_roots(roots: &mut Vec<PathBuf>) {
     *roots = minimal;
 }
 
+/// `lstat` one entry of a sandbox tree scan.
+///
+/// Returns `Ok(None)` for a child entry that disappeared between `read_dir` and `lstat`,
+/// such as the temporary file of an atomic rename performed by a concurrent MACO
+/// process (`.registry.json.<nonce>.tmp`). An entry that no longer exists cannot be
+/// mounted into or inherited by the sandbox, so refusing the launch for it would only
+/// turn unrelated concurrent activity into a spurious containment failure. The scan
+/// root itself must exist; every other error stays fail-closed.
+#[cfg(target_os = "linux")]
+fn inspect_sandbox_entry(path: &Path, root: &Path) -> std::io::Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && path != root => Ok(None),
+        Err(error) => Err(std::io::Error::new(
+            error.kind(),
+            format!(
+                "failed to inspect sandbox entry {}: {error}",
+                path.display()
+            ),
+        )),
+    }
+}
+
+/// `read_dir` one directory of a sandbox tree scan, with the same vanished-entry rule as
+/// [`inspect_sandbox_entry`]: a child directory removed after it was listed yields
+/// `Ok(None)`; the scan root and every other error stay fail-closed.
+#[cfg(target_os = "linux")]
+fn enumerate_sandbox_directory(
+    path: &Path,
+    root: &Path,
+) -> std::io::Result<Option<fs::ReadDir>> {
+    match fs::read_dir(path) {
+        Ok(entries) => Ok(Some(entries)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && path != root => Ok(None),
+        Err(error) => Err(std::io::Error::new(
+            error.kind(),
+            format!(
+                "failed to enumerate sandbox directory {}: {error}",
+                path.display()
+            ),
+        )),
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn scan_sandbox_regular_files(
     root: &Path,
@@ -1765,15 +1809,9 @@ fn scan_sandbox_regular_files(
             ));
         }
         *remaining -= 1;
-        let metadata = fs::symlink_metadata(&path).map_err(|error| {
-            std::io::Error::new(
-                error.kind(),
-                format!(
-                    "failed to inspect sandbox entry {}: {error}",
-                    path.display()
-                ),
-            )
-        })?;
+        let Some(metadata) = inspect_sandbox_entry(&path, root)? else {
+            continue;
+        };
         if metadata.dev() != root_device {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -1788,15 +1826,10 @@ fn scan_sandbox_regular_files(
             continue;
         }
         if file_type.is_dir() {
-            for entry in fs::read_dir(&path).map_err(|error| {
-                std::io::Error::new(
-                    error.kind(),
-                    format!(
-                        "failed to enumerate sandbox directory {}: {error}",
-                        path.display()
-                    ),
-                )
-            })? {
+            let Some(entries) = enumerate_sandbox_directory(&path, root)? else {
+                continue;
+            };
+            for entry in entries {
                 pending.push(entry?.path());
             }
         } else if file_type.is_file() {
@@ -1835,15 +1868,9 @@ fn scan_sandbox_tree(
             ));
         }
         *remaining -= 1;
-        let metadata = fs::symlink_metadata(&path).map_err(|error| {
-            std::io::Error::new(
-                error.kind(),
-                format!(
-                    "failed to inspect sandbox entry {}: {error}",
-                    path.display()
-                ),
-            )
-        })?;
+        let Some(metadata) = inspect_sandbox_entry(&path, root)? else {
+            continue;
+        };
         let file_type = metadata.file_type();
         if metadata.dev() != root_device {
             return Err(std::io::Error::new(
@@ -1885,15 +1912,10 @@ fn scan_sandbox_tree(
             continue;
         }
         if file_type.is_dir() {
-            for entry in fs::read_dir(&path).map_err(|error| {
-                std::io::Error::new(
-                    error.kind(),
-                    format!(
-                        "failed to enumerate sandbox directory {}: {error}",
-                        path.display()
-                    ),
-                )
-            })? {
+            let Some(entries) = enumerate_sandbox_directory(&path, root)? else {
+                continue;
+            };
+            for entry in entries {
                 pending.push(entry?.path());
             }
             continue;
