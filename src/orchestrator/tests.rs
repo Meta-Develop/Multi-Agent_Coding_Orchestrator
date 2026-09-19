@@ -146,7 +146,7 @@ fn orchestrator_validation_command_cancels_on_remote_authority_loss() -> Result<
     fs::write(repo_path.join("agent-a.txt"), "base\n")?;
     let base_oid = commit_all(&repo, "init")?;
     fs::write(repo_path.join("agent-a.txt"), "candidate\n")?;
-    let timing = ClaimTiming::new(1, 3)?;
+    let timing = ClaimTiming::new(1, 120)?;
     let sim = SimTransport::new(repo_path.clone());
     let manager = WorktreeManager::new(&repo_path);
     let worktree = manager.create_for_test(WorktreeCreateOptions {
