@@ -1878,33 +1878,38 @@ mod tests {
         ])
     }
 
-    fn trusted_codex_parent_evidence(
-        requested_model: Option<&str>,
-        requested_effort: Option<&str>,
-        rollout_model: &str,
-        rollout_effort: &str,
-        observed_model: &str,
-        observed_effort: &str,
+    struct TrustedCodexParentEvidenceInput<'a> {
+        requested_model: Option<&'a str>,
+        requested_effort: Option<&'a str>,
+        rollout_model: &'a str,
+        rollout_effort: &'a str,
+        observed_model: &'a str,
+        observed_effort: &'a str,
         server_rerouted: Option<CodexServerRerouteEvidence>,
         usage: CodexParentTurnUsage,
-        resolution_status: &str,
+        resolution_status: &'a str,
+    }
+
+    fn trusted_codex_parent_evidence(
+        input: TrustedCodexParentEvidenceInput<'_>,
     ) -> CodexParentEvidence {
-        let model_mismatch = requested_model
-            .map(|requested| requested != observed_model)
+        let model_mismatch = input
+            .requested_model
+            .map(|requested| requested != input.observed_model)
             .unwrap_or(false);
         CodexParentEvidence {
             codex_version: Some("0.144.4".to_string()),
             thread_id: Some("parent-codex-thread".to_string()),
-            requested_model: requested_model.map(str::to_string),
-            requested_effort: requested_effort.map(str::to_string),
-            rollout_model: CodexParentResolvedField::Known(rollout_model.to_string()),
-            rollout_effort: CodexParentResolvedField::Known(rollout_effort.to_string()),
-            observed_model: CodexParentResolvedField::Known(observed_model.to_string()),
-            observed_effort: CodexParentResolvedField::Known(observed_effort.to_string()),
-            server_rerouted_model: server_rerouted,
+            requested_model: input.requested_model.map(str::to_string),
+            requested_effort: input.requested_effort.map(str::to_string),
+            rollout_model: CodexParentResolvedField::Known(input.rollout_model.to_string()),
+            rollout_effort: CodexParentResolvedField::Known(input.rollout_effort.to_string()),
+            observed_model: CodexParentResolvedField::Known(input.observed_model.to_string()),
+            observed_effort: CodexParentResolvedField::Known(input.observed_effort.to_string()),
+            server_rerouted_model: input.server_rerouted,
             model_mismatch,
-            turn_usage: usage,
-            resolution_status: resolution_status.to_string(),
+            turn_usage: input.usage,
+            resolution_status: input.resolution_status.to_string(),
         }
     }
 
@@ -2814,15 +2819,17 @@ mod tests {
 
         let mut codex_parent_run = minimal_external_run_for_proven_environment_helper();
         codex_parent_run.codex_parent_evidence = Some(trusted_codex_parent_evidence(
-            Some("gpt-5.6-sol"),
-            Some("high"),
-            "gpt-5.6-sol",
-            "high",
-            "gpt-5.6-sol",
-            "high",
-            None,
-            known_codex_usage(1_000_000, 1_000_000),
-            "complete",
+            TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-sol",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: known_codex_usage(1_000_000, 1_000_000),
+                resolution_status: "complete",
+            },
         ));
         assert!(!super::worker_attempt_proven_no_environment_native_spend(
             SupervisorExecutionRuntime::NonpublishableSimulation,
@@ -3075,17 +3082,17 @@ mod tests {
         let external_run = parent_run_with_codex_evidence(
             &temp,
             &repo,
-            trusted_codex_parent_evidence(
-                Some("gpt-5.6-sol"),
-                Some("high"),
-                "gpt-5.6-sol",
-                "high",
-                "gpt-5.6-sol",
-                "high",
-                None,
-                known_codex_usage(1_000_000, 1_000_000),
-                "complete",
-            ),
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-sol",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: known_codex_usage(1_000_000, 1_000_000),
+                resolution_status: "complete",
+            }),
         );
         let recorded = record_codex_attempt(
             external_run,
@@ -3115,17 +3122,17 @@ mod tests {
         let external_run = parent_run_with_codex_evidence(
             &temp,
             &repo,
-            trusted_codex_parent_evidence(
-                Some("gpt-5.6-sol"),
-                Some("high"),
-                "gpt-5.6-sol",
-                "high",
-                "gpt-5.6-sol",
-                "high",
-                None,
-                known_codex_usage(1_000_000, 1_000_000),
-                "rollout_missing",
-            ),
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-sol",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: known_codex_usage(1_000_000, 1_000_000),
+                resolution_status: "rollout_missing",
+            }),
         );
         let recorded = record_codex_attempt(
             external_run,
@@ -3146,17 +3153,17 @@ mod tests {
         let external_run = parent_run_with_codex_evidence(
             &temp,
             &repo,
-            trusted_codex_parent_evidence(
-                Some("gpt-5.6-sol"),
-                Some("high"),
-                "gpt-5.6-sol",
-                "high",
-                "gpt-5.6-luna",
-                "high",
-                None,
-                known_codex_usage(1_000_000, 1_000_000),
-                "complete",
-            ),
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-luna",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: known_codex_usage(1_000_000, 1_000_000),
+                resolution_status: "complete",
+            }),
         );
         let recorded = record_codex_attempt(
             external_run,
@@ -3184,20 +3191,20 @@ mod tests {
         let external_run = parent_run_with_codex_evidence(
             &temp,
             &repo,
-            trusted_codex_parent_evidence(
-                Some("gpt-5.6-sol"),
-                Some("high"),
-                "gpt-5-codex",
-                "high",
-                "gpt-5.6-luna",
-                "high",
-                Some(CodexServerRerouteEvidence {
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5-codex",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-luna",
+                observed_effort: "high",
+                server_rerouted: Some(CodexServerRerouteEvidence {
                     from: "gpt-5.6-sol".to_string(),
                     to: "gpt-5.6-luna".to_string(),
                 }),
-                known_codex_usage(1_000_000, 1_000_000),
-                "complete",
-            ),
+                usage: known_codex_usage(1_000_000, 1_000_000),
+                resolution_status: "complete",
+            }),
         );
         let recorded = record_codex_attempt(
             external_run,
@@ -3226,17 +3233,17 @@ mod tests {
         let external_run = parent_run_with_codex_evidence(
             &temp,
             &repo,
-            trusted_codex_parent_evidence(
-                Some("gpt-5.6-sol"),
-                Some("high"),
-                "gpt-5.6-sol",
-                "high",
-                "gpt-5.6-sol",
-                "high",
-                None,
-                known_codex_usage(1_000_000, 1_000_000),
-                "complete",
-            ),
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-sol",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: known_codex_usage(1_000_000, 1_000_000),
+                resolution_status: "complete",
+            }),
         );
         let luna_only = BTreeMap::from([(
             "gpt-5.6-luna".to_string(),
@@ -3270,19 +3277,19 @@ mod tests {
         let external_run = parent_run_with_codex_evidence(
             &temp,
             &repo,
-            trusted_codex_parent_evidence(
-                Some("gpt-5.6-sol"),
-                Some("high"),
-                "gpt-5.6-sol",
-                "high",
-                "gpt-5.6-sol",
-                "high",
-                None,
-                CodexParentTurnUsage::Unknown {
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-sol",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: CodexParentTurnUsage::Unknown {
                     reason: "turn.completed usage was 0/0".to_string(),
                 },
-                "complete",
-            ),
+                resolution_status: "complete",
+            }),
         );
         let recorded = record_codex_attempt(
             external_run,
@@ -3305,17 +3312,17 @@ mod tests {
         let external_run = parent_run_with_codex_evidence(
             &temp,
             &repo,
-            trusted_codex_parent_evidence(
-                Some("gpt-5.6-sol"),
-                Some("high"),
-                "gpt-5.6-sol",
-                "high",
-                "gpt-5.6-sol",
-                "high",
-                None,
-                known_codex_usage(1_000_000, 1_000_000),
-                "complete",
-            ),
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-sol",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: known_codex_usage(1_000_000, 1_000_000),
+                resolution_status: "complete",
+            }),
         );
         let recorded = record_codex_attempt(
             external_run,
@@ -3336,17 +3343,17 @@ mod tests {
         let external_run = parent_run_with_codex_evidence(
             &temp,
             &repo,
-            trusted_codex_parent_evidence(
-                Some("gpt-5.6-sol"),
-                Some("high"),
-                "gpt-5.6-sol",
-                "high",
-                "gpt-5.6-sol",
-                "high",
-                None,
-                known_codex_usage(1_000_000, 1_000_000),
-                "complete",
-            ),
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-sol",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: known_codex_usage(1_000_000, 1_000_000),
+                resolution_status: "complete",
+            }),
         );
         let recorded = record_codex_attempt(
             external_run,
