@@ -4702,6 +4702,7 @@ fn execute_supervisor_assignment_inner(
                 )),
                 account_observe,
             )?;
+            active_budget_policy.refresh_observed_accepted_task_cost(artifacts.run_dir());
             match disposition {
                 ChildAttemptDisposition::Retry => {
                     persist_proven_worker_attempt_bypassed_parent_review(

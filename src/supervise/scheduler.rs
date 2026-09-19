@@ -1,5 +1,8 @@
+use std::path::Path;
+
 use super::accepted_task_cost::{
-    attempt_cost_record, rollup_cost_per_accepted_task, AttemptCostRecord,
+    attempt_cost_record, observed_cost_per_accepted_task_microunits, rollup_cost_per_accepted_task,
+    AttemptCostRecord,
 };
 use super::environment_observation::AccountObserveOutcomeKind;
 use super::*;
@@ -645,6 +648,15 @@ impl AssignmentBudgetPolicy {
         self.selector_state
             .as_ref()
             .and_then(SupervisorAutomaticSelectionState::account_observe_environment_decision)
+    }
+
+    pub(super) fn refresh_observed_accepted_task_cost(&mut self, run_dir: &Path) {
+        let rollup = this_run_accepted_task_cost(&load_this_run_attempt_cost_rows(run_dir), &[]);
+        if let Some(state) = self.selector_state.as_mut() {
+            state.set_observed_accepted_task_cost(observed_cost_per_accepted_task_microunits(
+                rollup.as_ref(),
+            ));
+        }
     }
 
     #[cfg(test)]

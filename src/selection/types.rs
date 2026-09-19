@@ -464,6 +464,9 @@ pub struct DynamicSignals {
     pub previous_choice: Option<CandidateKey>,
     pub previous_catalog_digest: Option<String>,
     pub environment_rejections: Vec<EnvironmentRejectionState>,
+    /// In-process observed CPO from a complete rollup. Absent on the wire.
+    #[serde(skip)]
+    pub observed_cost_per_accepted_task_microunits: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

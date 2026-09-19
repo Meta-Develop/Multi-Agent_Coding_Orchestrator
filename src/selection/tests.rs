@@ -190,6 +190,7 @@ pub(crate) fn base_input() -> SelectionInput {
             previous_choice: None,
             previous_catalog_digest: None,
             environment_rejections: Vec::new(),
+            observed_cost_per_accepted_task_microunits: None,
         },
         debug_override: None,
         operational_observations: None,
@@ -1490,6 +1491,61 @@ fn retry_degrade_and_catalog_change_are_provenance_triggers() {
         .expect("previous choice evaluation");
     assert_eq!(stay.switch_transition, ContextSwitchTransition::Stay);
     assert_eq!(stay.switch_cost_microunits, 0);
+}
+
+#[test]
+fn complete_observed_cpo_overrides_only_previous_choice_expected_cost() {
+    let initial = select(&base_input()).expect("initial decision");
+    let previous = initial
+        .choice
+        .as_ref()
+        .map(|choice| choice.candidate.clone())
+        .expect("initial choice");
+    let catalog_expected = initial
+        .candidate_set
+        .iter()
+        .find(|evaluation| evaluation.candidate == previous)
+        .and_then(|evaluation| evaluation.score.as_ref())
+        .map(|score| score.expected_total_cost_per_accepted_task_microunits)
+        .expect("catalog expected cost");
+
+    let mut unchanged = base_input();
+    unchanged.signals.previous_choice = Some(previous.clone());
+    unchanged.signals.previous_catalog_digest = Some(initial.input_digests.catalogs.value.clone());
+    let none_decision = select(&unchanged).expect("none observed CPO");
+    let none_expected = none_decision
+        .candidate_set
+        .iter()
+        .find(|evaluation| evaluation.candidate == previous)
+        .and_then(|evaluation| evaluation.score.as_ref())
+        .map(|score| score.expected_total_cost_per_accepted_task_microunits)
+        .expect("none observed expected cost");
+    assert_eq!(none_expected, catalog_expected);
+
+    let mut observed = unchanged;
+    observed.signals.observed_cost_per_accepted_task_microunits = Some(9_000_001);
+    let observed_decision = select(&observed).expect("observed CPO");
+    let previous_score = observed_decision
+        .candidate_set
+        .iter()
+        .find(|evaluation| evaluation.candidate == previous)
+        .and_then(|evaluation| evaluation.score.as_ref())
+        .expect("previous choice score");
+    assert_eq!(
+        previous_score.expected_total_cost_per_accepted_task_microunits,
+        9_000_001
+    );
+    for evaluation in &observed_decision.candidate_set {
+        if evaluation.candidate == previous {
+            continue;
+        }
+        if let Some(score) = evaluation.score.as_ref() {
+            assert_ne!(
+                score.expected_total_cost_per_accepted_task_microunits,
+                9_000_001
+            );
+        }
+    }
 }
 
 #[test]

@@ -600,6 +600,7 @@ pub(super) struct SupervisorAutomaticSelectionState {
     quota_context: Option<LiveQuotaSelectionContext>,
     quota_ledger: Option<RunBudgetLedger>,
     account_observation: Option<AccountObserveResult>,
+    observed_cost_per_accepted_task_microunits: Option<u64>,
 }
 
 impl PartialEq for SupervisorAutomaticSelectionState {
@@ -607,6 +608,8 @@ impl PartialEq for SupervisorAutomaticSelectionState {
         self.decisions == other.decisions
             && self.advertised == other.advertised
             && self.quota_context == other.quota_context
+            && self.observed_cost_per_accepted_task_microunits
+                == other.observed_cost_per_accepted_task_microunits
     }
 }
 
@@ -729,6 +732,7 @@ pub(crate) fn select_executable_review_auditor(
             previous_choice: None,
             previous_catalog_digest: None,
             environment_rejections: Vec::new(),
+            observed_cost_per_accepted_task_microunits: None,
         },
         debug_override: None,
         operational_observations: None,
@@ -935,6 +939,7 @@ pub(super) fn initialize_supervisor_selection_with_history(
                 previous_choice: None,
                 previous_catalog_digest: None,
                 environment_rejections: Vec::new(),
+                observed_cost_per_accepted_task_microunits: None,
             },
             debug_override,
             history,
@@ -1078,7 +1083,12 @@ impl SupervisorAutomaticSelectionState {
             quota_context,
             quota_ledger,
             account_observation,
+            observed_cost_per_accepted_task_microunits: None,
         })
+    }
+
+    pub(super) fn set_observed_accepted_task_cost(&mut self, cost: Option<u64>) {
+        self.observed_cost_per_accepted_task_microunits = cost;
     }
 
     pub(super) fn account_observe_environment_decision(
@@ -1289,6 +1299,8 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
             .filter(|rejection| rejection.role == role)
             .map(|rejection| rejection.rejection.clone())
             .collect();
+        input.signals.observed_cost_per_accepted_task_microunits =
+            state.observed_cost_per_accepted_task_microunits;
         if let Some(quota_context) = &state.quota_context {
             let source_runtime = input
                 .signals
@@ -4262,6 +4274,7 @@ mod tests {
                 previous_choice: None,
                 previous_catalog_digest: None,
                 environment_rejections: Vec::new(),
+                observed_cost_per_accepted_task_microunits: None,
             },
             debug_override: None,
             history: None,
@@ -6149,6 +6162,7 @@ mod tests {
                 previous_choice: None,
                 previous_catalog_digest: None,
                 environment_rejections: Vec::new(),
+                observed_cost_per_accepted_task_microunits: None,
             },
             debug_override: None,
             history: None,
@@ -7410,6 +7424,7 @@ mod tests {
                 previous_choice: None,
                 previous_catalog_digest: None,
                 environment_rejections: Vec::new(),
+                observed_cost_per_accepted_task_microunits: None,
             },
             debug_override: None,
             history: None,
@@ -7693,6 +7708,7 @@ mod tests {
                 previous_choice: None,
                 previous_catalog_digest: None,
                 environment_rejections: Vec::new(),
+                observed_cost_per_accepted_task_microunits: None,
             },
             debug_override: None,
             history: None,

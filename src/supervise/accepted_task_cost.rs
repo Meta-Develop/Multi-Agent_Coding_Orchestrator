@@ -86,6 +86,15 @@ pub(in crate::supervise) fn rollup_cost_per_accepted_task(
     })
 }
 
+/// Numeric CPO for the next selection only when the rollup already computed one.
+///
+/// Incomplete or absent rollups stay `None`. This never invents a zero.
+pub(in crate::supervise) fn observed_cost_per_accepted_task_microunits(
+    rollup: Option<&AcceptedTaskCostRollup>,
+) -> Option<u64> {
+    rollup.and_then(|rollup| rollup.cost_per_accepted_task_microunits)
+}
+
 fn sum_five_bucket_cycle_cost(buckets: [u64; 5]) -> Result<u64> {
     buckets.into_iter().try_fold(0u64, |total, bucket| {
         total
@@ -195,5 +204,22 @@ mod tests {
         let metadata: SupervisorExecutionMetadata =
             serde_json::from_value(json).expect("legacy execution metadata deserializes");
         assert!(metadata.accepted_task_cost.is_none());
+    }
+
+    #[test]
+    fn observed_cpo_for_selection_stays_none_until_complete() -> Result<()> {
+        assert_eq!(observed_cost_per_accepted_task_microunits(None), None);
+        let incomplete =
+            rollup_cost_per_accepted_task(&[grok_verified_environment_unknown_accepted()])?;
+        assert_eq!(
+            observed_cost_per_accepted_task_microunits(Some(&incomplete)),
+            None
+        );
+        let complete = rollup_cost_per_accepted_task(&[fake_simulation_complete_accepted()])?;
+        assert_eq!(
+            observed_cost_per_accepted_task_microunits(Some(&complete)),
+            Some(12)
+        );
+        Ok(())
     }
 }

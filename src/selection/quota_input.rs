@@ -299,6 +299,7 @@ mod tests {
                 previous_choice: None,
                 previous_catalog_digest: None,
                 environment_rejections: Vec::new(),
+                observed_cost_per_accepted_task_microunits: None,
             },
             debug_override: None,
             operational_observations: None,

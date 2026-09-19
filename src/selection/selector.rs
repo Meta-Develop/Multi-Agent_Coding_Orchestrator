@@ -1098,6 +1098,13 @@ fn evaluate_candidate(
                         );
                     }
                     expected_cost = expected_cost_per_accepted(class_fit, &ledger)?;
+                    if input.signals.previous_choice.as_ref() == Some(&candidate) {
+                        if let Some(observed) =
+                            input.signals.observed_cost_per_accepted_task_microunits
+                        {
+                            expected_cost = observed;
+                        }
+                    }
                     expected_retry_rework_cost = expected_cost_component_per_accepted(
                         class_fit.rework_cost_microunits,
                         ledger.rework_cost_microunits,
