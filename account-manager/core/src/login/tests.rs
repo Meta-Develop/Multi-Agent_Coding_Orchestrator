@@ -486,7 +486,13 @@ fn cancel_vs_ready_race_reports_ready_after_commit() {
 
 #[test]
 fn validate_start_request_accepts_gemini_codex_claude_grok_and_cursor() {
-    for provider_id in ["gemini-cli", "codex-cli", "claude-code", "grok-cli", "cursor"] {
+    for provider_id in [
+        "gemini-cli",
+        "codex-cli",
+        "claude-code",
+        "grok-cli",
+        "cursor",
+    ] {
         let mut request = start_request("work", "key");
         request.provider_id = provider_id.to_string();
         assert!(
@@ -588,9 +594,7 @@ fn grok_oauth_ready_completes_registry_row_without_changing_selection() {
         .start_pending_oauth(grok_start_request("work", "key-grok-ready"), &adapter)
         .expect("start");
     wait_for_state(&runtime, &service, &started, LoginState::Ready);
-    let row = registry
-        .account(GROK_PROVIDER_ID, "work")
-        .expect("account");
+    let row = registry.account(GROK_PROVIDER_ID, "work").expect("account");
     assert_eq!(row.state, StoredAccountState::Complete);
     assert!(!row.is_selected);
     assert!(registry
@@ -610,9 +614,7 @@ fn grok_oauth_cancelled_login_confirmed_by_owned_async_oauth_fixture() {
         .cancel(&started.handle, &started.binding)
         .expect("cancel");
     wait_for_state(&runtime, &service, &started, LoginState::Cancelled);
-    let row = registry
-        .account(GROK_PROVIDER_ID, "work")
-        .expect("pending");
+    let row = registry.account(GROK_PROVIDER_ID, "work").expect("pending");
     assert_eq!(row.state, StoredAccountState::Pending);
 }
 
