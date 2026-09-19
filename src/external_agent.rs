@@ -274,6 +274,8 @@ pub struct ExternalAgentCommand {
     /// Ephemeral assignment messaging IPC capability for this launch only. Never serialized into
     /// task artifacts or argv.
     assignment_messaging_launch: Option<AssignmentMessagingLaunch>,
+    /// Pinned headless CAM authority socket for nested MACO supervise/agent launches only.
+    cam_authority_socket_pin: Option<String>,
 }
 
 const ASSIGNMENT_MESSAGING_PROTOCOL_PROMPT_APPENDIX: &str = r#"
@@ -1107,6 +1109,7 @@ impl ExternalAgentCommand {
             assignment_process_launch_duty: None,
             assignment_mechanical_executor_duty: None,
             assignment_messaging_launch: None,
+            cam_authority_socket_pin: None,
         }
     }
 
@@ -1148,6 +1151,7 @@ impl ExternalAgentCommand {
             assignment_process_launch_duty: None,
             assignment_mechanical_executor_duty: None,
             assignment_messaging_launch: None,
+            cam_authority_socket_pin: None,
         }
     }
 
@@ -1189,6 +1193,7 @@ impl ExternalAgentCommand {
             assignment_process_launch_duty: None,
             assignment_mechanical_executor_duty: None,
             assignment_messaging_launch: None,
+            cam_authority_socket_pin: None,
         }
     }
 
@@ -1522,6 +1527,19 @@ impl ExternalAgentCommand {
     pub(crate) fn with_assignment_messaging(mut self, launch: AssignmentMessagingLaunch) -> Self {
         self.assignment_messaging_launch = Some(launch);
         self
+    }
+
+    pub(crate) fn with_cam_authority_socket_pin(
+        mut self,
+        pin: Option<String>,
+    ) -> ExternalAgentCommand {
+        self.cam_authority_socket_pin = pin.filter(|value| !value.is_empty());
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cam_authority_socket_pin(&self) -> Option<&str> {
+        self.cam_authority_socket_pin.as_deref()
     }
 
     #[cfg(test)]
@@ -3160,6 +3178,12 @@ fn run_external_agent_runtime(
         );
         return report;
     }
+    if let Some(pin) = spec.cam_authority_socket_pin.as_deref() {
+        external_environment.insert(
+            crate::supervise::cam_authority_child_env::CAM_AUTHORITY_SOCKET_ENV.to_string(),
+            pin.to_string(),
+        );
+    }
     let credential_redactor =
         match CredentialRedactor::from_runtime(&external_environment, codex_auth.as_ref()) {
             Ok(redactor) => redactor,
@@ -3392,6 +3416,13 @@ fn run_external_agent_runtime(
                         overlay.insert(
                             "CODEX_HOME".to_string(),
                             home.to_string_lossy().into_owned(),
+                        );
+                    }
+                    if let Some(pin) = spec.cam_authority_socket_pin.as_deref() {
+                        overlay.insert(
+                            crate::supervise::cam_authority_child_env::CAM_AUTHORITY_SOCKET_ENV
+                                .to_string(),
+                            pin.to_string(),
                         );
                     }
                     if overlay.is_empty() {
