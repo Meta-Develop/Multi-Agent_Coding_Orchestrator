@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use coding_agent_manager_lib::account_authority::{
