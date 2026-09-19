@@ -290,6 +290,7 @@ pub use scheduler::*;
 mod selection_bridge;
 use selection_bridge::*;
 
+mod accepted_task_cost;
 mod environment_observation;
 mod outcome_history;
 mod prior_input;
