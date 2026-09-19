@@ -27,8 +27,7 @@ pub struct AuthorityServerConfig {
 pub enum PeerPolicy {
     /// Require `uid == euid` via `SO_PEERCRED` / `getpeereid`.
     EffectiveUid,
-    /// Test-only: treat every peer as unauthorized.
-    #[doc(hidden)]
+    /// Treat every peer as unauthorized; for tests only.
     DenyAll,
 }
 
