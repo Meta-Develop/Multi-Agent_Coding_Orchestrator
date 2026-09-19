@@ -4631,6 +4631,7 @@ fn execute_supervisor_assignment_inner(
                         false,
                         context.execution_runtime,
                         None,
+                        &plan.model_pricing,
                         Some(attempt_parent_phase_continuation_from_count(
                             completed_parent_review_cycles,
                         )),
@@ -4669,6 +4670,7 @@ fn execute_supervisor_assignment_inner(
                         false,
                         context.execution_runtime,
                         Some(&attempt_external_run),
+                        &plan.model_pricing,
                         Some(attempt_parent_phase_continuation_from_count(
                             completed_parent_review_cycles,
                         )),
@@ -4691,6 +4693,7 @@ fn execute_supervisor_assignment_inner(
                 matches!(&disposition, ChildAttemptDisposition::Retry),
                 context.execution_runtime,
                 Some(&attempt_external_run),
+                &plan.model_pricing,
                 Some(attempt_parent_phase_continuation_from_count(
                     completed_parent_review_cycles,
                 )),
@@ -6517,6 +6520,7 @@ mod decomposition_tests {
             false,
             SupervisorExecutionRuntime::Verified,
             Some(&attempt_external_run),
+            &plan.model_pricing,
             Some(attempt_parent_phase_continuation_from_count(Some(0))),
         )
         .expect("record worker attempt outcome");
