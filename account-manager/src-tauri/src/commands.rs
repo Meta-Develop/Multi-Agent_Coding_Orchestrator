@@ -266,7 +266,7 @@ pub fn delete_account(provider_id: String, account_id: String) -> Result<()> {
     let store = (account.material == crate::model::StoredAccountMaterial::CredentialStore)
         .then(storage::default_store)
         .transpose()?;
-    providers::delete_managed_account(&registry, adapter.as_ref(), &account_id, store.as_deref())
+    providers::delete_managed_account(registry, adapter.as_ref(), &account_id, store.as_deref())
 }
 
 /// Start a provider tool with the environment of its selected stored account.

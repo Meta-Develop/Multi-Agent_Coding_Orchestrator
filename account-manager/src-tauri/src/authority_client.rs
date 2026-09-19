@@ -2,8 +2,6 @@
 //!
 //! Framing matches [`coding_agent_manager_core::account_authority::server`].
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use crate::account_authority::{SocketPathError, StoredAccountRegistry};
 use crate::error::{Error, Result};
 use crate::providers::{self, ProviderAdapter};
@@ -23,11 +21,14 @@ use serde_json::{json, Value};
 #[cfg(unix)]
 use std::path::Path;
 #[cfg(unix)]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(unix)]
 use std::sync::{Arc, Mutex};
 
 /// Environment variable naming the headless authority Unix socket path.
 pub const CAM_ACCOUNT_AUTHORITY_SOCKET_ENV: &str = "CAM_ACCOUNT_AUTHORITY_SOCKET";
 
+#[cfg(unix)]
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Either the in-process registry or a remote authority socket client.
@@ -83,6 +84,7 @@ fn connect_remote_authority(configured: &str) -> Result<AccountAuthority> {
     }
 }
 
+#[cfg(unix)]
 fn external_registry_error() -> Error {
     Error::ConfigRead {
         provider: "account-authority".to_string(),
@@ -435,6 +437,7 @@ fn required_string_field(value: &Value, field: &str) -> Result<String> {
         .ok_or_else(|| authority_decode_error(&format!("authority response missing `{field}`")))
 }
 
+#[cfg(unix)]
 fn authority_io_error(reason: &str) -> Error {
     Error::ConfigRead {
         provider: "account-authority".to_string(),
@@ -442,6 +445,7 @@ fn authority_io_error(reason: &str) -> Error {
     }
 }
 
+#[cfg(unix)]
 fn authority_decode_error(reason: &str) -> Error {
     Error::ConfigRead {
         provider: "account-authority".to_string(),
@@ -449,6 +453,7 @@ fn authority_decode_error(reason: &str) -> Error {
     }
 }
 
+#[cfg(unix)]
 fn next_request_id() -> String {
     let id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     format!("cam-desktop-{id}")
