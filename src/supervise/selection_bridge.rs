@@ -3571,9 +3571,9 @@ pub(super) fn selector_effort_as_str(effort: SelectorEffort) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     #[cfg(target_os = "linux")]
     use super::super::environment_observation::environment_cost_microunits_from_account_observe;
+    use super::*;
     #[cfg(target_os = "linux")]
     use coding_agent_manager_lib::account_authority::{
         CategoryObservation, ObservationError, ObservationErrorKind, SelectedAccountBinding,
