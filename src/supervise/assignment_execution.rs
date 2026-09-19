@@ -8504,6 +8504,12 @@ done
 
         assert!(store.release("repair-agent", claim.token)?);
         fs::remove_file(staging_root.join("last-message.raw"))?;
+        // Parent-owned Codex home lives under the same staging root and is not
+        // removed while the active claim blocks cleanup.
+        let staged_codex_home = staging_root.join("codex-home");
+        if staged_codex_home.exists() {
+            fs::remove_dir_all(&staged_codex_home)?;
+        }
         fs::remove_dir(staging_root)?;
         Ok(())
     }
