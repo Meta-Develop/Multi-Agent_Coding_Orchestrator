@@ -347,12 +347,11 @@ mod tests {
     }
 
     #[test]
+    type DigestMutation = fn(&mut OperationPrepareIdentity, &mut OperationPrepareRequest);
+
     fn digest_changes_when_any_bound_field_changes() {
         let baseline = canonical_binding_digest(&identity(), &request());
-        let mutations: &[(
-            &str,
-            fn(&mut OperationPrepareIdentity, &mut OperationPrepareRequest),
-        )] = &[
+        let mutations: &[(&str, DigestMutation)] = &[
             ("authorityId", |identity, _| {
                 identity.authority_id.push('b');
             }),
