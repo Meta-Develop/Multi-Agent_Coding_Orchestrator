@@ -1171,7 +1171,7 @@ mod tests {
 
     #[test]
     fn revalidation_remote_guard_heartbeat_unknown_invalidates_before_stop_or_ttl() -> Result<()> {
-        let timing = ClaimTiming::new(1, 3)?;
+        let timing = ClaimTiming::new(1, 120)?;
         let fixture = RemoteFixture::new_with_timing(timing)?;
         let before = heartbeat_row_for_agent(&fixture.inner.repo_path, "agent-a")?;
         let guard = fixture.guard()?;
@@ -1208,7 +1208,7 @@ mod tests {
 
     #[test]
     fn revalidation_remote_guard_heartbeat_orders_remote_before_local() -> Result<()> {
-        let timing = ClaimTiming::new(1, 3)?;
+        let timing = ClaimTiming::new(1, 120)?;
         let fixture = RemoteFixture::new_with_timing(timing)?;
         let successor_nonce = fixture.mint_successor_activation_nonce("agent-b")?;
         let before = heartbeat_row_for_agent(&fixture.inner.repo_path, "agent-a")?;
@@ -1314,7 +1314,7 @@ mod tests {
         use crate::process_runner::{
             run_process_cancellable, ContainmentPolicy, EnvironmentMode, ProcessSpec, Shell,
         };
-        let timing = ClaimTiming::new(1, 3)?;
+        let timing = ClaimTiming::new(1, 120)?;
         let fixture = RemoteFixture::new_with_timing(timing)?;
         let successor_nonce = fixture.mint_successor_activation_nonce("agent-b")?;
         let guard = fixture.guard()?;

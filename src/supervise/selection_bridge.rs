@@ -47,7 +47,8 @@ use std::path::Path;
 /// Account observation is a Linux-only CAM type. Non-Linux keeps
 /// `account_observation=None` and the advertised-catalog path.
 #[cfg(target_os = "linux")]
-type AccountObserveResult = coding_agent_manager_lib::account_authority::AccountObserveResult;
+pub(super) type AccountObserveResult =
+    coding_agent_manager_lib::account_authority::AccountObserveResult;
 #[cfg(not(target_os = "linux"))]
 #[derive(Clone, Debug)]
 pub(super) enum AccountObserveResult {}
