@@ -26,10 +26,6 @@ const CLAUDE_FIXTURE_ROOT: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/claude-code");
 const CURSOR_FIXTURE_HOME: &str =
     concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cursor/home");
-const GITHUB_COPILOT_FIXTURE_HOME: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/github-copilot/home"
-);
 
 const TEST_KEY: &str = "FAKE-gemini-key-0001";
 
@@ -113,7 +109,8 @@ fn github_copilot_fixture() -> (
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path().join("home");
     let data = dir.path().join("data");
-    copy_tree(Path::new(GITHUB_COPILOT_FIXTURE_HOME), &home);
+    fs::create_dir_all(home.join(".copilot")).expect("home copilot dir");
+    fs::write(home.join(".copilot/settings.json"), r"{}").expect("settings");
     let adapter = GithubCopilotAdapter::with_home(&home);
     let registry = StoredAccountRegistry::new(stored_accounts_path(&data));
     (dir, adapter, registry)
