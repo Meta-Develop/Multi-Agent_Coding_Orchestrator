@@ -19,16 +19,19 @@ use crate::model::{
 use crate::providers;
 use crate::providers::claude_code::ClaudeCodeAdapter;
 use crate::providers::codex_cli::CodexCliAdapter;
-use crate::providers::{ActivationMechanism, ProviderAdapter, StoredAccountRegistry};
+use crate::providers::{ActivationMechanism, ProviderAdapter};
 use crate::relay;
 use crate::router::{self, RouteError, RouteRuleField};
 use crate::storage;
 
+#[path = "authority_client.rs"]
+mod authority_client;
 #[path = "login_commands.rs"]
 mod login_commands;
 #[path = "observe_commands.rs"]
 mod observe_commands;
 
+use authority_client::{account_authority, select_launch_account, AccountAuthority};
 use login_commands::build_managed_login_service;
 use tauri::Manager;
 
@@ -223,8 +226,9 @@ fn add_account_blocking(
     let store = (plan.material == crate::model::StoredAccountMaterial::CredentialStore)
         .then(storage::default_store)
         .transpose()?;
+    let authority = account_authority()?;
     providers::add_managed_account_for(
-        &stored_account_registry()?,
+        authority.in_process_registry()?,
         adapter.as_ref(),
         &account_id,
         &account_id,
@@ -242,11 +246,9 @@ pub fn activate_account(provider_id: String, account_id: String) -> Result<()> {
     let adapter = adapter_for(&provider_id)?;
     match adapter.activation_mechanism() {
         ActivationMechanism::ToolConfiguration => adapter.activate_account(&account_id),
-        ActivationMechanism::LaunchEnvironment => providers::select_launch_account(
-            &stored_account_registry()?,
-            adapter.as_ref(),
-            &account_id,
-        ),
+        ActivationMechanism::LaunchEnvironment => {
+            select_launch_account(&account_authority()?, adapter.as_ref(), &account_id)
+        }
     }
 }
 
@@ -258,7 +260,8 @@ pub fn delete_account(provider_id: String, account_id: String) -> Result<()> {
     if adapter.managed_account_plan().is_none() {
         return adapter.delete_account(&account_id);
     }
-    let registry = stored_account_registry()?;
+    let authority = account_authority()?;
+    let registry = authority.in_process_registry()?;
     let account = registry.account(&provider_id, &account_id)?;
     let store = (account.material == crate::model::StoredAccountMaterial::CredentialStore)
         .then(storage::default_store)
@@ -277,9 +280,16 @@ pub fn launch_provider(provider_id: String) -> Result<LaunchedProcess> {
     if adapter.activation_mechanism() != ActivationMechanism::LaunchEnvironment {
         return Err(Error::NotImplemented("launch_provider"));
     }
-    let account = stored_account_registry()?
-        .selected(&provider_id)?
-        .ok_or_else(|| Error::UnknownAccount(provider_id.clone()))?;
+    let authority = account_authority()?;
+    let account = match &authority {
+        AccountAuthority::InProcess(registry) => registry
+            .selected(&provider_id)?
+            .ok_or_else(|| Error::NoSelectedAccount(provider_id.clone()))?,
+        #[cfg(unix)]
+        AccountAuthority::Remote(client) => client
+            .selected_metadata(&provider_id)?
+            .ok_or_else(|| Error::NoSelectedAccount(provider_id.clone()))?,
+    };
     let spec = providers::launch_spec_for(adapter.as_ref(), &account)?;
     let store = spec
         .requires_credential()
@@ -297,16 +307,6 @@ pub fn launch_provider(provider_id: String) -> Result<LaunchedProcess> {
         let _ = child.wait();
     });
     Ok(process)
-}
-
-pub(crate) fn stored_account_registry() -> Result<StoredAccountRegistry> {
-    let dirs = crate::paths::project_dirs().ok_or_else(|| Error::ConfigRead {
-        provider: "account-metadata".to_string(),
-        reason: "the application data directory could not be resolved".to_string(),
-    })?;
-    Ok(StoredAccountRegistry::new(
-        crate::paths::stored_accounts_path(dirs.data_dir()),
-    ))
 }
 
 /// One honest quota result for every registered provider.
@@ -559,7 +559,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            let login = build_managed_login_service(stored_account_registry()?);
+            let login = build_managed_login_service(account_authority()?);
             app.manage(login);
             Ok(())
         })
