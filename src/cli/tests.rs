@@ -9,6 +9,44 @@ use git2::Signature;
 use super::*;
 
 static MERGE_LOCAL_GIT_TIMEOUT_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+static CAM_AUTHORITY_SOCKET_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+
+struct CamAuthoritySocketEnvironmentGuard {
+    _lock: MutexGuard<'static, ()>,
+    previous: Option<OsString>,
+}
+
+impl CamAuthoritySocketEnvironmentGuard {
+    fn install_unset() -> Self {
+        let lock = CAM_AUTHORITY_SOCKET_ENVIRONMENT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = std::env::var_os(CAM_AUTHORITY_SOCKET_ENV);
+        // SAFETY: this guard serializes CLI parser tests that observe this process-global variable.
+        unsafe { std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV) };
+        Self {
+            _lock: lock,
+            previous,
+        }
+    }
+
+    fn set(&self, value: &str) {
+        // SAFETY: the guard holds the environment lock for its entire lifetime.
+        unsafe { std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, value) };
+    }
+}
+
+impl Drop for CamAuthoritySocketEnvironmentGuard {
+    fn drop(&mut self) {
+        // SAFETY: restoration occurs while the guard still holds the environment lock.
+        unsafe {
+            match &self.previous {
+                Some(previous) => std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, previous),
+                None => std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV),
+            }
+        }
+    }
+}
 
 fn inbox_intake_args(argv: &[&str]) -> IntakeInboxArgs {
     let parsed = Cli::try_parse_from(argv).expect("inbox intake arguments should parse");
@@ -2084,6 +2122,122 @@ fn supervise_resume_accepts_run_identity_and_query_output_options() {
     assert_eq!(resume.run_id, "interrupted-run");
     assert_eq!(resume.repo, PathBuf::from("repo"));
     assert!(resume.json);
+    assert_eq!(resume.cam_authority_socket, None);
+}
+
+#[test]
+fn supervise_run_cam_authority_socket_flag_sets_option() {
+    let _guard = CamAuthoritySocketEnvironmentGuard::install_unset();
+    let parsed = Cli::try_parse_from([
+        "maco",
+        "supervise",
+        "run",
+        "plan.json",
+        "--machine-global-config",
+        "/tmp/maco-machine-global.json",
+        "--machine-global-runtime-root-id",
+        "runtime",
+        "--cam-authority-socket",
+        "/tmp/maco-authority.sock",
+    ])
+    .expect("supervise run with cam authority socket should parse");
+    let Command::Supervise(SuperviseCommand {
+        command: SuperviseSubcommand::Run(args),
+    }) = parsed.command
+    else {
+        panic!("expected supervise run command");
+    };
+    assert_eq!(
+        args.cam_authority_socket.as_deref(),
+        Some("/tmp/maco-authority.sock")
+    );
+}
+
+#[test]
+fn supervise_resume_cam_authority_socket_flag_sets_option() {
+    let _guard = CamAuthoritySocketEnvironmentGuard::install_unset();
+    let parsed = Cli::try_parse_from([
+        "maco",
+        "supervise",
+        "resume",
+        "interrupted-run",
+        "--cam-authority-socket",
+        "/tmp/maco-authority.sock",
+    ])
+    .expect("supervise resume with cam authority socket should parse");
+    let Command::Supervise(SuperviseCommand {
+        command: SuperviseSubcommand::Resume(args),
+    }) = parsed.command
+    else {
+        panic!("expected supervise resume command");
+    };
+    assert_eq!(
+        args.cam_authority_socket.as_deref(),
+        Some("/tmp/maco-authority.sock")
+    );
+}
+
+#[test]
+fn supervise_cam_authority_socket_reads_env_alias() {
+    let guard = CamAuthoritySocketEnvironmentGuard::install_unset();
+    guard.set("/tmp/maco-authority-from-env.sock");
+    let parsed = Cli::try_parse_from(["maco", "supervise", "resume", "interrupted-run"])
+        .expect("supervise resume should inherit cam authority socket from env");
+    let Command::Supervise(SuperviseCommand {
+        command: SuperviseSubcommand::Resume(args),
+    }) = parsed.command
+    else {
+        panic!("expected supervise resume command");
+    };
+    assert_eq!(
+        args.cam_authority_socket.as_deref(),
+        Some("/tmp/maco-authority-from-env.sock")
+    );
+}
+
+#[test]
+fn supervise_cam_authority_socket_missing_stays_none() {
+    let _guard = CamAuthoritySocketEnvironmentGuard::install_unset();
+    let parsed = Cli::try_parse_from([
+        "maco",
+        "supervise",
+        "run",
+        "plan.json",
+        "--machine-global-config",
+        "/tmp/maco-machine-global.json",
+        "--machine-global-runtime-root-id",
+        "runtime",
+    ])
+    .expect("supervise run without cam authority socket should parse");
+    let Command::Supervise(SuperviseCommand {
+        command: SuperviseSubcommand::Run(args),
+    }) = parsed.command
+    else {
+        panic!("expected supervise run command");
+    };
+    assert_eq!(args.cam_authority_socket, None);
+}
+
+#[test]
+fn pin_cam_authority_socket_rejects_explicit_empty_value() {
+    let _guard = CamAuthoritySocketEnvironmentGuard::install_unset();
+    let error = pin_cam_authority_socket(Some("")).expect_err("empty socket must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("--cam-authority-socket must not be empty"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn pin_cam_authority_socket_pins_trimmed_path() {
+    let _guard = CamAuthoritySocketEnvironmentGuard::install_unset();
+    pin_cam_authority_socket(Some("  /tmp/maco-authority.sock  ")).expect("trimmed socket pins");
+    assert_eq!(
+        std::env::var(CAM_AUTHORITY_SOCKET_ENV).expect("pinned env"),
+        "/tmp/maco-authority.sock"
+    );
 }
 
 #[test]

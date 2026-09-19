@@ -190,6 +190,23 @@ fn is_explicit_cli_subcommand(argument: &OsStr) -> bool {
         })
 }
 
+const CAM_AUTHORITY_SOCKET_ENV: &str = "MACO_CAM_AUTHORITY_SOCKET";
+
+/// Pins `MACO_CAM_AUTHORITY_SOCKET` on this process when supervise run/resume supplies a
+/// non-empty socket path via `--cam-authority-socket` or the same-named environment variable.
+fn pin_cam_authority_socket(value: Option<&str>) -> Result<()> {
+    let Some(raw) = value else {
+        return Ok(());
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("--cam-authority-socket must not be empty");
+    }
+    // SAFETY: supervise CLI entry pins process environment before supervised worker threads start.
+    unsafe { std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, trimmed) };
+    Ok(())
+}
+
 fn resolve_supervise_machine_global_binding(
     routed_literal: bool,
     config: Option<PathBuf>,
@@ -1045,6 +1062,7 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
             print_query_report(&plan, json)
         }
         SuperviseSubcommand::Run(args) => {
+            pin_cam_authority_socket(args.cam_authority_socket.as_deref())?;
             let routed_literal = args.literal_goal.is_some();
             let (machine_global_config, machine_global_runtime_root_id) =
                 resolve_supervise_machine_global_binding(
@@ -1274,6 +1292,7 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
             print_query_report(&report, args.json)
         }
         SuperviseSubcommand::Resume(args) => {
+            pin_cam_authority_socket(args.cam_authority_socket.as_deref())?;
             let report = supervise::resume_supervisor_run(args.repo, RunId::new(&args.run_id)?)?;
             print_query_report(&report, args.json)?;
             if !report.success {
@@ -1701,6 +1720,9 @@ struct RunSuperviseArgs {
         requires = "machine_global_config"
     )]
     machine_global_runtime_root_id: Option<String>,
+    /// Unix socket path for the headless CAM authority service.
+    #[arg(long, env = "MACO_CAM_AUTHORITY_SOCKET")]
+    cam_authority_socket: Option<String>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -1760,6 +1782,9 @@ struct ResumeSuperviseArgs {
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
+    /// Unix socket path for the headless CAM authority service.
+    #[arg(long, env = "MACO_CAM_AUTHORITY_SOCKET")]
+    cam_authority_socket: Option<String>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
