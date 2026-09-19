@@ -1,6 +1,7 @@
 use super::accepted_task_cost::{
     attempt_cost_record, rollup_cost_per_accepted_task, AttemptCostRecord,
 };
+use super::environment_observation::AccountObserveOutcomeKind;
 use super::*;
 use crate::selection::OutcomeResult;
 
@@ -636,6 +637,14 @@ impl AssignmentBudgetPolicy {
 
     pub(super) fn selected_runtime_for(&self, role: AgentRole) -> Option<SupervisorRuntime> {
         self.selector_runtime_overrides.get(&role).copied()
+    }
+
+    pub(super) fn account_observe_environment_decision(
+        &self,
+    ) -> Option<(AccountObserveOutcomeKind, Option<u64>)> {
+        self.selector_state
+            .as_ref()
+            .and_then(SupervisorAutomaticSelectionState::account_observe_environment_decision)
     }
 
     #[cfg(test)]
