@@ -427,13 +427,11 @@ fn production_login_port_leaves_cursor_and_github_copilot_unimplemented() {
         });
         let response = dispatch_json(&config.context, &body.to_string());
         assert_eq!(
-            response["error"]["code"],
-            "unsupported-operation",
+            response["error"]["code"], "unsupported-operation",
             "{provider_id}"
         );
         assert_eq!(
-            response["error"]["message"],
-            "operation is not implemented",
+            response["error"]["message"], "operation is not implemented",
             "{provider_id}"
         );
     }
