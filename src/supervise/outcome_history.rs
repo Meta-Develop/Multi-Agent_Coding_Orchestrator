@@ -465,11 +465,21 @@ fn dated_plan_token_cost_microunits(
     Some(rounded as u64)
 }
 
-fn attributable_parent_auditor_cost_microunits(external_run: &ExternalAgentRun) -> Option<u64> {
-    external_run
-        .grok_acp_parent_evidence
-        .as_ref()
-        .and_then(attributable_execution_cost_microunits)
+fn attributable_parent_auditor_cost_microunits(
+    external_run: &ExternalAgentRun,
+    dated_plan_pricing: &BTreeMap<String, ModelPricing>,
+) -> Option<u64> {
+    match (
+        external_run.grok_acp_parent_evidence.as_ref(),
+        external_run.codex_parent_evidence.as_ref(),
+    ) {
+        (Some(_), Some(_)) => None,
+        (Some(parent_evidence), None) => attributable_execution_cost_microunits(parent_evidence),
+        (None, Some(parent_evidence)) => {
+            attributable_codex_execution_cost_microunits(parent_evidence, dated_plan_pricing)
+        }
+        (None, None) => None,
+    }
 }
 
 /// Parent-owned review dispatch costs for one worker attempt on one assignment.
@@ -543,9 +553,13 @@ impl ParentWorkerAttemptReviewCostBinding {
             && self.parent_auditor_invocations == self.planned_lens_count
     }
 
-    pub(super) fn observe_parent_auditor_external_run(&mut self, external_run: &ExternalAgentRun) {
+    pub(super) fn observe_parent_auditor_external_run(
+        &mut self,
+        external_run: &ExternalAgentRun,
+        dated_plan_pricing: &BTreeMap<String, ModelPricing>,
+    ) {
         self.parent_auditor_invocations += 1;
-        let addend = attributable_parent_auditor_cost_microunits(external_run);
+        let addend = attributable_parent_auditor_cost_microunits(external_run, dated_plan_pricing);
         self.total_microunits = match (self.total_microunits, addend) {
             (_, None) => None,
             (None, Some(microunits)) if self.parent_auditor_invocations == 1 => Some(microunits),
@@ -2028,6 +2042,69 @@ mod tests {
         Ok(recorded)
     }
 
+    fn persist_parent_auditor_review_cost(
+        run_name: &str,
+        worker_attempt: usize,
+        review_cycle_slot: ParentDispatchedReviewCycleSlot,
+        external_run: &ExternalAgentRun,
+        dated_plan_pricing: &BTreeMap<String, ModelPricing>,
+        parent_phase_continuation: Option<AttemptParentPhaseContinuation>,
+    ) -> Result<AttemptOutcomeEvidence> {
+        let (_temp, repo) = super::super::tests::injected_repository();
+        let run_id = RunId::new(run_name)?;
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "maco-supervise",
+        )?;
+        let mut journal = None;
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let initial = grok_worker_selection_event();
+        let mut recorded = record_child_attempt_outcome(
+            &artifacts,
+            &run_id,
+            "assignment-1",
+            worker_attempt,
+            AgentRole::Worker,
+            &[],
+            std::slice::from_ref(&initial),
+            "grok",
+            Some("grok-code-fast-1"),
+            Some("high"),
+            true,
+            false,
+            SupervisorExecutionRuntime::Verified,
+            None,
+            &BTreeMap::new(),
+            parent_phase_continuation,
+        )?;
+        let mut binding = ParentWorkerAttemptReviewCostBinding::bind(
+            "assignment-1",
+            worker_attempt,
+            review_cycle_slot,
+        );
+        binding.begin_stacked_parent_review_lenses(1);
+        binding.observe_parent_auditor_external_run(external_run, dated_plan_pricing);
+        persist_worker_attempt_review_cost(&artifacts, &binding, &mut recorded)?;
+        let relative = PathBuf::from(format!(
+            "selection-attempts/assignment-1.attempt-{worker_attempt}.json"
+        ));
+        let stored: AttemptOutcomeEvidence = serde_json::from_slice(&std::fs::read(
+            repo.join(RunArtifactFamily::Supervise.run_root())
+                .join(run_id.as_str())
+                .join(&relative),
+        )?)?;
+        assert_eq!(stored, recorded);
+        Ok(recorded)
+    }
+
     fn injected_parent_command(
         temp: &tempfile::TempDir,
         repo: &Path,
@@ -2289,12 +2366,14 @@ mod tests {
             ParentDispatchedReviewCycleSlot::FirstCycle,
         );
         binding.begin_stacked_parent_review_lenses(2);
-        binding.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
-            &temp, &repo, 11, 1_100_000,
-        ));
-        binding.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
-            &temp, &repo, 29, 2_900_000,
-        ));
+        binding.observe_parent_auditor_external_run(
+            &parent_auditor_run_with_trusted_acp_on(&temp, &repo, 11, 1_100_000),
+            &BTreeMap::new(),
+        );
+        binding.observe_parent_auditor_external_run(
+            &parent_auditor_run_with_trusted_acp_on(&temp, &repo, 29, 2_900_000),
+            &BTreeMap::new(),
+        );
         assert_eq!(binding.parent_auditor_invocation_count(), 2);
         assert_eq!(binding.review_total_microunits(), Some(40));
         assert!(binding.parent_review_dispatch_set_complete_for_test());
@@ -2310,9 +2389,10 @@ mod tests {
             ParentDispatchedReviewCycleSlot::FirstCycle,
         );
         binding.begin_stacked_parent_review_lenses(2);
-        binding.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
-            &temp, &repo, 7, 700_000,
-        ));
+        binding.observe_parent_auditor_external_run(
+            &parent_auditor_run_with_trusted_acp_on(&temp, &repo, 7, 700_000),
+            &BTreeMap::new(),
+        );
         binding.record_parent_auditor_lens_undispatched();
         assert!(binding.parent_review_cycle_actually_dispatched());
         assert!(!binding.parent_review_dispatch_set_complete_for_test());
@@ -2341,16 +2421,17 @@ mod tests {
             ParentDispatchedReviewCycleSlot::FirstCycle,
         );
         binding.begin_stacked_parent_review_lenses(2);
-        binding.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
-            &temp, &repo, 5, 500_000,
-        ));
+        binding.observe_parent_auditor_external_run(
+            &parent_auditor_run_with_trusted_acp_on(&temp, &repo, 5, 500_000),
+            &BTreeMap::new(),
+        );
         let mut incomplete = parent_auditor_run_with_trusted_acp_on(&temp, &repo, 0, 0);
         incomplete
             .grok_acp_parent_evidence
             .as_mut()
             .expect("parent evidence")
             .resolution_status = "incomplete".to_string();
-        binding.observe_parent_auditor_external_run(&incomplete);
+        binding.observe_parent_auditor_external_run(&incomplete, &BTreeMap::new());
         assert_eq!(binding.parent_auditor_invocation_count(), 2);
         assert!(binding.review_total_microunits().is_none());
     }
@@ -2375,7 +2456,7 @@ mod tests {
         );
         binding.begin_stacked_parent_review_lenses(dispatch_count);
         for _ in 0..dispatch_count {
-            binding.observe_parent_auditor_external_run(&run);
+            binding.observe_parent_auditor_external_run(&run, &BTreeMap::new());
         }
         assert_eq!(binding.parent_auditor_invocation_count(), dispatch_count);
         assert!(binding.review_total_microunits().is_none());
@@ -2402,15 +2483,18 @@ mod tests {
         first.begin_stacked_parent_review_lenses(1);
         second.begin_stacked_parent_review_lenses(1);
         other.begin_stacked_parent_review_lenses(1);
-        first.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
-            &temp, &repo, 11, 1_100_000,
-        ));
-        second.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
-            &temp, &repo, 22, 2_200_000,
-        ));
-        other.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
-            &temp, &repo, 33, 3_300_000,
-        ));
+        first.observe_parent_auditor_external_run(
+            &parent_auditor_run_with_trusted_acp_on(&temp, &repo, 11, 1_100_000),
+            &BTreeMap::new(),
+        );
+        second.observe_parent_auditor_external_run(
+            &parent_auditor_run_with_trusted_acp_on(&temp, &repo, 22, 2_200_000),
+            &BTreeMap::new(),
+        );
+        other.observe_parent_auditor_external_run(
+            &parent_auditor_run_with_trusted_acp_on(&temp, &repo, 33, 3_300_000),
+            &BTreeMap::new(),
+        );
         assert_eq!(first.review_total_microunits(), Some(11));
         assert_eq!(second.review_total_microunits(), Some(22));
         assert_eq!(other.review_total_microunits(), Some(33));
@@ -2459,9 +2543,10 @@ mod tests {
             ParentDispatchedReviewCycleSlot::FirstCycle,
         );
         binding.begin_stacked_parent_review_lenses(2);
-        binding.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
-            &temp, &repo, 50, 5_000_000,
-        ));
+        binding.observe_parent_auditor_external_run(
+            &parent_auditor_run_with_trusted_acp_on(&temp, &repo, 50, 5_000_000),
+            &BTreeMap::new(),
+        );
         binding.record_parent_auditor_lens_undispatched();
         assert!(!binding.parent_review_dispatch_set_complete_for_test());
         persist_worker_attempt_review_cost(&artifacts, &binding, &mut recorded)?;
@@ -2518,9 +2603,10 @@ mod tests {
             ParentDispatchedReviewCycleSlot::FirstCycle,
         );
         binding.begin_stacked_parent_review_lenses(1);
-        binding.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
-            &temp, &repo, 1, 100_000,
-        ));
+        binding.observe_parent_auditor_external_run(
+            &parent_auditor_run_with_trusted_acp_on(&temp, &repo, 1, 100_000),
+            &BTreeMap::new(),
+        );
         let error = persist_worker_attempt_review_cost(&artifacts, &binding, &mut recorded)
             .expect_err("binding mismatch must fail closed");
         assert!(error.to_string().contains("does not match attempt record"));
@@ -2580,9 +2666,10 @@ mod tests {
             ParentDispatchedReviewCycleSlot::FirstCycle,
         );
         binding.begin_stacked_parent_review_lenses(1);
-        binding.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
-            &temp, &repo, 17, 1_700_000,
-        ));
+        binding.observe_parent_auditor_external_run(
+            &parent_auditor_run_with_trusted_acp_on(&temp, &repo, 17, 1_700_000),
+            &BTreeMap::new(),
+        );
         persist_worker_attempt_review_cost(&artifacts, &binding, &mut recorded)?;
         let stored: AttemptOutcomeEvidence = serde_json::from_slice(&std::fs::read(
             repo.join(RunArtifactFamily::Supervise.run_root())
@@ -2650,6 +2737,7 @@ mod tests {
         review_binding.begin_stacked_parent_review_lenses(1);
         review_binding.observe_parent_auditor_external_run(
             &parent_auditor_run_with_trusted_acp_on(&temp, &repo, 9, 900_000),
+            &BTreeMap::new(),
         );
         persist_worker_attempt_review_cost(&artifacts, &review_binding, &mut recorded)?;
         record_parent_auditor_retry(&artifacts, &recorded)?;
@@ -2714,9 +2802,10 @@ mod tests {
             ParentDispatchedReviewCycleSlot::SubsequentCycle,
         );
         binding.begin_stacked_parent_review_lenses(1);
-        binding.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
-            &temp, &repo, 31, 3_100_000,
-        ));
+        binding.observe_parent_auditor_external_run(
+            &parent_auditor_run_with_trusted_acp_on(&temp, &repo, 31, 3_100_000),
+            &BTreeMap::new(),
+        );
         persist_worker_attempt_review_cost(&artifacts, &binding, &mut recorded)?;
         assert_eq!(recorded.costs.review_cost_microunits, Some(0));
         assert_eq!(recorded.costs.rereview_cost_microunits, Some(31));
@@ -2766,9 +2855,10 @@ mod tests {
             review_cycle_slot_from_continuation(recorded.parent_phase_continuation.as_ref()),
         );
         binding.begin_stacked_parent_review_lenses(1);
-        binding.observe_parent_auditor_external_run(&parent_auditor_run_with_trusted_acp_on(
-            &temp, &repo, 9, 900_000,
-        ));
+        binding.observe_parent_auditor_external_run(
+            &parent_auditor_run_with_trusted_acp_on(&temp, &repo, 9, 900_000),
+            &BTreeMap::new(),
+        );
         persist_worker_attempt_review_cost(&artifacts, &binding, &mut recorded)?;
         assert!(recorded.costs.review_cost_microunits.is_none());
         assert!(recorded.costs.rereview_cost_microunits.is_none());
@@ -3489,6 +3579,320 @@ mod tests {
         )?;
         assert_eq!(recorded.costs.execution_cost_microunits, Some(0));
         assert_eq!(recorded.costs.rework_cost_microunits, Some(5_000_000));
+        assert!(recorded.costs.environment_cost_microunits.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn complete_codex_parent_auditor_plan_price_records_review() -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let external_run = parent_run_with_codex_evidence(
+            &temp,
+            &repo,
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-sol",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: known_codex_usage(1_000_000, 1_000_000),
+                resolution_status: "complete",
+            }),
+        );
+        let recorded = persist_parent_auditor_review_cost(
+            "codex-parent-auditor-review-complete",
+            1,
+            ParentDispatchedReviewCycleSlot::FirstCycle,
+            &external_run,
+            &dated_codex_plan_pricing(),
+            None,
+        )?;
+        assert_eq!(recorded.costs.review_cost_microunits, Some(5_000_000));
+        assert_eq!(recorded.costs.rereview_cost_microunits, Some(0));
+        assert!(recorded.costs.environment_cost_microunits.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_or_missing_codex_parent_auditor_usage_cannot_promote_review() -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let incomplete = parent_run_with_codex_evidence(
+            &temp,
+            &repo,
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-sol",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: known_codex_usage(1_000_000, 1_000_000),
+                resolution_status: "rollout_missing",
+            }),
+        );
+        let incomplete_recorded = persist_parent_auditor_review_cost(
+            "codex-parent-auditor-review-incomplete",
+            1,
+            ParentDispatchedReviewCycleSlot::FirstCycle,
+            &incomplete,
+            &dated_codex_plan_pricing(),
+            None,
+        )?;
+        assert!(incomplete_recorded.costs.review_cost_microunits.is_none());
+        assert!(incomplete_recorded.costs.rereview_cost_microunits.is_none());
+        assert!(incomplete_recorded
+            .costs
+            .environment_cost_microunits
+            .is_none());
+
+        let missing_usage = parent_run_with_codex_evidence(
+            &temp,
+            &repo,
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-sol",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: CodexParentTurnUsage::Unknown {
+                    reason: "turn.completed usage was absent".to_string(),
+                },
+                resolution_status: "complete",
+            }),
+        );
+        let missing_recorded = persist_parent_auditor_review_cost(
+            "codex-parent-auditor-review-missing-usage",
+            1,
+            ParentDispatchedReviewCycleSlot::FirstCycle,
+            &missing_usage,
+            &dated_codex_plan_pricing(),
+            None,
+        )?;
+        assert!(missing_recorded.costs.review_cost_microunits.is_none());
+        assert!(missing_recorded.costs.rereview_cost_microunits.is_none());
+        assert!(missing_recorded.costs.environment_cost_microunits.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn observed_requested_codex_parent_auditor_mismatch_is_not_priced_from_requested() -> Result<()>
+    {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let external_run = parent_run_with_codex_evidence(
+            &temp,
+            &repo,
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-luna",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: known_codex_usage(1_000_000, 1_000_000),
+                resolution_status: "complete",
+            }),
+        );
+        let recorded = persist_parent_auditor_review_cost(
+            "codex-parent-auditor-review-mismatch",
+            1,
+            ParentDispatchedReviewCycleSlot::FirstCycle,
+            &external_run,
+            &dated_codex_plan_pricing(),
+            None,
+        )?;
+        assert_eq!(recorded.costs.review_cost_microunits, Some(1_000_000));
+        assert_ne!(recorded.costs.review_cost_microunits, Some(5_000_000));
+        assert_eq!(recorded.costs.rereview_cost_microunits, Some(0));
+        assert!(recorded.costs.environment_cost_microunits.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn codex_parent_auditor_reroute_prices_observed_target_not_requested_or_rollout() -> Result<()>
+    {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let external_run = parent_run_with_codex_evidence(
+            &temp,
+            &repo,
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5-codex",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-luna",
+                observed_effort: "high",
+                server_rerouted: Some(CodexServerRerouteEvidence {
+                    from: "gpt-5.6-sol".to_string(),
+                    to: "gpt-5.6-luna".to_string(),
+                }),
+                usage: known_codex_usage(1_000_000, 1_000_000),
+                resolution_status: "complete",
+            }),
+        );
+        let recorded = persist_parent_auditor_review_cost(
+            "codex-parent-auditor-review-reroute",
+            1,
+            ParentDispatchedReviewCycleSlot::FirstCycle,
+            &external_run,
+            &dated_codex_plan_pricing(),
+            None,
+        )?;
+        assert_eq!(recorded.costs.review_cost_microunits, Some(1_000_000));
+        assert_ne!(recorded.costs.review_cost_microunits, Some(5_000_000));
+        assert_ne!(recorded.costs.review_cost_microunits, Some(200_000));
+        assert!(recorded.costs.environment_cost_microunits.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn unpriced_codex_parent_auditor_model_leaves_review_none() -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let external_run = parent_run_with_codex_evidence(
+            &temp,
+            &repo,
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-sol",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: known_codex_usage(1_000_000, 1_000_000),
+                resolution_status: "complete",
+            }),
+        );
+        let luna_only = BTreeMap::from([(
+            "gpt-5.6-luna".to_string(),
+            ModelPricing {
+                input_usd_per_million_tokens: 2.0,
+                output_usd_per_million_tokens: 8.0,
+            },
+        )]);
+        let recorded = persist_parent_auditor_review_cost(
+            "codex-parent-auditor-review-unpriced",
+            1,
+            ParentDispatchedReviewCycleSlot::FirstCycle,
+            &external_run,
+            &luna_only,
+            None,
+        )?;
+        assert!(recorded.costs.review_cost_microunits.is_none());
+        assert!(recorded.costs.rereview_cost_microunits.is_none());
+        assert!(recorded.costs.environment_cost_microunits.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn zero_zero_codex_parent_auditor_usage_is_unknown_not_zero_review() -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let external_run = parent_run_with_codex_evidence(
+            &temp,
+            &repo,
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-sol",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: CodexParentTurnUsage::Unknown {
+                    reason: "turn.completed usage was 0/0".to_string(),
+                },
+                resolution_status: "complete",
+            }),
+        );
+        let recorded = persist_parent_auditor_review_cost(
+            "codex-parent-auditor-review-zero-zero",
+            1,
+            ParentDispatchedReviewCycleSlot::FirstCycle,
+            &external_run,
+            &dated_codex_plan_pricing(),
+            None,
+        )?;
+        assert!(recorded.costs.review_cost_microunits.is_none());
+        assert_ne!(recorded.costs.review_cost_microunits, Some(0));
+        assert!(recorded.costs.rereview_cost_microunits.is_none());
+        assert!(recorded.costs.environment_cost_microunits.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn both_grok_and_codex_parent_auditor_evidence_leaves_review_none() -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let mut external_run = parent_run_with_codex_evidence(
+            &temp,
+            &repo,
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-sol",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: known_codex_usage(1_000_000, 1_000_000),
+                resolution_status: "complete",
+            }),
+        );
+        external_run.grok_acp_parent_evidence = Some(trusted_grok_acp_parent_evidence(
+            "grok-code-fast-1",
+            "high",
+            GrokAcpNativeCostEquivalent::Known {
+                cost_usd_ticks: 1_700_000,
+                microunits: 17,
+            },
+        ));
+        let recorded = persist_parent_auditor_review_cost(
+            "codex-parent-auditor-review-both-evidence",
+            1,
+            ParentDispatchedReviewCycleSlot::FirstCycle,
+            &external_run,
+            &dated_codex_plan_pricing(),
+            None,
+        )?;
+        assert!(recorded.costs.review_cost_microunits.is_none());
+        assert_ne!(recorded.costs.review_cost_microunits, Some(17));
+        assert_ne!(recorded.costs.review_cost_microunits, Some(5_000_000));
+        assert!(recorded.costs.environment_cost_microunits.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn later_codex_parent_auditor_cycle_persists_rereview_not_review() -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let external_run = parent_run_with_codex_evidence(
+            &temp,
+            &repo,
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-sol",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: known_codex_usage(1_000_000, 1_000_000),
+                resolution_status: "complete",
+            }),
+        );
+        let recorded = persist_parent_auditor_review_cost(
+            "codex-parent-auditor-rereview-cycle",
+            2,
+            ParentDispatchedReviewCycleSlot::SubsequentCycle,
+            &external_run,
+            &dated_codex_plan_pricing(),
+            Some(attempt_parent_phase_continuation_from_count(Some(1))),
+        )?;
+        assert_eq!(recorded.costs.review_cost_microunits, Some(0));
+        assert_eq!(recorded.costs.rereview_cost_microunits, Some(5_000_000));
         assert!(recorded.costs.environment_cost_microunits.is_none());
         Ok(())
     }

@@ -3731,6 +3731,7 @@ struct ParentAuditorDispatchFrame<'a> {
     journal_parent_id: &'a str,
     auditor_attempt: usize,
     review_cost_binding: &'a mut ParentWorkerAttemptReviewCostBinding,
+    dated_plan_pricing: &'a BTreeMap<String, ModelPricing>,
 }
 
 fn dispatch_and_collect_parent_auditor(
@@ -3743,6 +3744,7 @@ fn dispatch_and_collect_parent_auditor(
 ) -> Result<ParentAuditorCollection> {
     let journal_parent_id = frame.journal_parent_id;
     let auditor_attempt = frame.auditor_attempt;
+    let dated_plan_pricing = frame.dated_plan_pricing;
     let review_cost_binding = &mut frame.review_cost_binding;
     let AssignmentExecutionContext {
         repo,
@@ -3902,7 +3904,7 @@ fn dispatch_and_collect_parent_auditor(
             return Err(error).context("failed to produce deterministic parent auditor output");
         }
     };
-    review_cost_binding.observe_parent_auditor_external_run(&auditor_run);
+    review_cost_binding.observe_parent_auditor_external_run(&auditor_run, dated_plan_pricing);
     let auditor_environment_blocked = auditor_run.environment_blocked();
     outcome
         .gate_denials
@@ -5054,6 +5056,7 @@ fn execute_supervisor_assignment_inner(
                     journal_parent_id,
                     auditor_attempt,
                     review_cost_binding: &mut review_cost_binding,
+                    dated_plan_pricing: &active_plan.model_pricing,
                 };
                 match dispatch_and_collect_parent_auditor(
                     context,
@@ -6163,6 +6166,7 @@ mod decomposition_tests {
             journal_parent_id: options.run_id.as_str(),
             auditor_attempt,
             review_cost_binding: &mut review_cost_binding,
+            dated_plan_pricing: &plan.model_pricing,
         };
         let auditor_collection = dispatch_and_collect_parent_auditor(
             &context,
@@ -6632,6 +6636,7 @@ mod decomposition_tests {
             journal_parent_id: options.run_id.as_str(),
             auditor_attempt,
             review_cost_binding: &mut review_cost_binding,
+            dated_plan_pricing: &plan.model_pricing,
         };
         dispatch_and_collect_parent_auditor(
             &grok_context,
