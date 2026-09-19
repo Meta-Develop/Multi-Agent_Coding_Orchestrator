@@ -17,9 +17,19 @@
 | `~/.cursor/extensions/`, `plugins/`, `skills-cursor/` | Editor and CLI extensions                      | `[verified-local]` |
 | `~/.cursor/ai-tracking/ai-code-tracking.db`           | Local SQLite tracking database                 | `[verified-local]` |
 | `~/.cursor/argv.json`                                 | Electron launch arguments                      | `[verified-local]` |
-| Credential store                                      | **Not found**                                  | `[unknown]`        |
+| `~/.cursor/auth.json`                                 | File store (`AGENT_CLI_CREDENTIAL_STORE=file`) | `[verified-docs]`  |
+| macOS Keychain `cursor-access-token`                  | Staff-named Keychain service                   | `[verified-docs]`  |
+| macOS Keychain `cursor-refresh-token`                 | Staff-named Keychain service                   | `[verified-docs]`  |
+| macOS Keychain `cursor-api-key`                       | Staff-named Keychain service                   | `[verified-docs]`  |
+| Default persist (Linux/Windows)                       | **Not found**                                  | `[unknown]`        |
 
 ## 3. Credential format
+
+The file-store document at `~/.cursor/auth.json` is named `[verified-docs]`
+when `AGENT_CLI_CREDENTIAL_STORE=file`. Its schema is `[unknown]`. This note
+and the adapter record presence of that regular file only; they do not read,
+parse, or log it. An empty `~/.cursor` directory or a missing file is not
+credentials.
 
 `~/.config/cursor/cli-config.json` was inspected in full at the key-name level
 and contains only settings `[verified-local]`:
@@ -95,15 +105,25 @@ Also checked for a persist path on 2026-09-20:
 - Previously cited: <https://docs.cursor.com/en/cli/reference/authentication>
 - Previously cited: <https://docs.cursor.com/en/cli/reference/parameters>
 
-Related official statements that still do **not** name a write-safe persist
-path:
+Related official persist statements:
 
 - The 2026-08-11 CLI changelog says the Windows uninstaller can delete
   `~/.cursor`, "the folder that stores CLI credentials" `[verified-docs]`.
-  That is a directory claim, not a file or keyring service name.
+  That is a directory claim, not a default-persist file or keyring service
+  name.
 - The 2026-06-29 CLI changelog documents `AGENT_CLI_CREDENTIAL_STORE=file` to
   store credentials unencrypted in an owner-only file for sandboxes without
   macOS Keychain `[verified-docs]`. It does not name that file.
+- Cursor forum staff (Mohit, 2026-08-04) named the file-store path and the
+  macOS Keychain services `[verified-docs]`. After
+  `export AGENT_CLI_CREDENTIAL_STORE=file` and `agent login`, "Tokens land
+  in `~/.cursor/auth.json` with restricted permissions." Keychain cleanup
+  uses `security delete-generic-password -s cursor-access-token -a
+cursor-user` and the same for `cursor-refresh-token` and `cursor-api-key`.
+  Source:
+  <https://forum.cursor.com/t/errsecitemnotfound-couldnt-find-your-saved-login-in-the-macos-keychain/167325>
+  The thread is a macOS Keychain bug. The named `~/.cursor/auth.json` is
+  the file-store path, not proof of Linux or Windows default persist.
 - The 2026-07-20 and March 2026 CLI changelogs mention macOS Keychain
   failures at CLI startup and over SSH `[verified-docs]`. They do not name
   the Keychain service.
@@ -113,10 +133,14 @@ path:
   say that stored login does not read credentials from a local Cursor app
   installation `[verified-docs]`. That path is not the CLI persist location.
 
-macOS Keychain involvement is therefore `[verified-docs]`. The exact persist
-target (file path or keyring service name, including Linux and Windows)
-remains `[unknown]`. An Electron Local Storage / `Network/Cookies` /
+File-store path `~/.cursor/auth.json` is therefore `[verified-docs]` when
+`AGENT_CLI_CREDENTIAL_STORE=file`. macOS Keychain service names
+`cursor-access-token`, `cursor-refresh-token`, and `cursor-api-key` are
+`[verified-docs]`. Default Linux and Windows persist targets remain
+`[unknown]`. An Electron Local Storage / `Network/Cookies` /
 `Local State` guess is still `[inferred]` and is **not write-safe**.
+Isolated HOME relocation is not officially documented (no `GROK_HOME`
+equivalent). Naming these stores does not make switch write-safe.
 
 ## 5. Account switching mechanics
 
@@ -136,8 +160,10 @@ This path lists only the CLI identity. Whether the editor and CLI authenticate
 independently remains `[unknown]`, so an editor installation without
 `cursor-agent` has no evidence-backed account source.
 
-Switching is `[unknown]`, and deliberately so. Until the store is found, the
-Cursor adapter must remain **read-only** and must not implement
+Switching is `[unknown]`, and deliberately so. Naming the file-store path
+and the macOS Keychain services does not make a write-safe switch. Isolated
+HOME relocation is not officially documented (no `GROK_HOME` equivalent).
+The Cursor adapter must remain **read-only** and must not implement
 `activate_account`.
 
 This is a design position, not a gap to be filled by guessing. Writing a switch
@@ -166,15 +192,14 @@ schema was not inspected; it tracks code attribution rather than quota
 
 ## 9. Open questions
 
-- Where does `cursor-agent login` persist its session (exact file path or
-  keyring service name)? This still blocks switching and live OAuth write
-  paths. Official 2026-09-20 docs still do not name a write-safe store.
-- What file does `AGENT_CLI_CREDENTIAL_STORE=file` write? Unnamed in the
-  2026-06-29 changelog.
+- Where does default `cursor-agent login` persist on Linux and Windows
+  (exact file path or keyring service name)? File-store path
+  `~/.cursor/auth.json` is named only when `AGENT_CLI_CREDENTIAL_STORE=file`
+  `[verified-docs]`. macOS Keychain service names are named
+  `[verified-docs]`. Default Linux/Windows persist remains `[unknown]`. This
+  still blocks switching and live OAuth write paths. Official 2026-09-20
+  docs still do not name a write-safe store.
 - Do the editor and the CLI share one credential?
-- Does a keyring entry exist under a documented service name? macOS Keychain
-  involvement is `[verified-docs]` (CLI changelog); the service name, and
-  stores on Linux/Windows, remain `[unknown]`.
 - Is there a supported multi-account mechanism already?
 - What is the schema of `agent status --format json`? The `--format json`
   flag is documented `[verified-docs]`; the payload is not.

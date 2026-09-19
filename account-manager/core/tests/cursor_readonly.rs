@@ -85,10 +85,29 @@ fn every_reported_config_path_stays_under_the_injected_home() {
     let home = staged_home();
     let paths = CursorAdapter::with_home(home.path()).config_paths();
 
-    assert_eq!(paths.len(), 2);
+    assert_eq!(paths.len(), 3);
     assert!(paths.iter().all(|path| path.starts_with(home.path())));
     assert!(paths.contains(&home.path().join(".config/cursor/cli-config.json")));
     assert!(paths.contains(&home.path().join(".cursor")));
+    assert!(paths.contains(&home.path().join(".cursor/auth.json")));
+}
+
+#[test]
+fn file_store_auth_json_detects_without_listing_an_account() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let auth = home.path().join(".cursor").join("auth.json");
+    fs::create_dir_all(auth.parent().expect("parent")).expect("mkdir .cursor");
+    fs::write(&auth, br#"{"access_token":"FAKE-access-token-0001"}"#).expect("write auth.json");
+    let adapter = CursorAdapter::with_home(home.path());
+
+    assert_eq!(adapter.detect(), InstallState::Installed);
+    let accounts = adapter
+        .list_accounts()
+        .expect("auth.json must not be parsed as identity");
+    assert!(
+        accounts.is_empty(),
+        "file-store presence is not an Observed account"
+    );
 }
 
 fn staged_home() -> tempfile::TempDir {
