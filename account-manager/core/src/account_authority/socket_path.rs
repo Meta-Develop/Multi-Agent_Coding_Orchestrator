@@ -2,7 +2,7 @@
 //!
 //! Endpoint traversal rejects symlink components, group- or world-writable
 //! ancestors, and inodes owned by neither the caller nor root. Bind/listen is
-//! out of scope. Non-Unix platforms return
+//! owned by [`super::server`]. Non-Unix platforms return
 //! [`SocketPathError::UnsupportedPlatform`] without panicking.
 //!
 //! A root-owned sticky directory (the usual `/tmp` mode) is the only writable
@@ -34,6 +34,14 @@ impl SafeSocketPath {
 impl AsRef<Path> for SafeSocketPath {
     fn as_ref(&self) -> &Path {
         self.as_path()
+    }
+}
+
+#[cfg(not(unix))]
+impl SafeSocketPath {
+    /// Placeholder so [`super::listen`] can refuse without a Unix ancestry check.
+    pub fn unsupported_platform() -> Self {
+        Self(PathBuf::from(r"C:\unused\account.sock"))
     }
 }
 

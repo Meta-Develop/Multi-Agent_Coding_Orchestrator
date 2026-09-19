@@ -231,6 +231,10 @@ impl StoredAccountRegistry {
         self.with_locked(|document| Ok(selected_binding_from_document(document, provider_id)))
     }
 
+    pub fn selection_revision(&self, provider_id: &str) -> Result<u64> {
+        self.with_locked(|document| Ok(selection_revision_for(document, provider_id)))
+    }
+
     pub fn complete(&self, provider_id: &str, account_id: &str) -> Result<StoredAccountMetadata> {
         self.load()?
             .into_iter()
