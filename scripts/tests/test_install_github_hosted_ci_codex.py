@@ -68,6 +68,19 @@ class InstallGithubHostedCiCodexGuardTests(unittest.TestCase):
         self.assertIn('validate-tar "${archive}" "${archive_member}"', self.source)
         self.assertNotIn("--wildcards", self.source)
         self.assertNotIn("--strip-components", self.source)
+        curl_lines = [
+            line.strip()
+            for line in self.source.splitlines()
+            if line.lstrip().startswith("curl ")
+        ]
+        self.assertEqual(len(curl_lines), 1)
+        curl_line = curl_lines[0]
+        self.assertIn("-fsSL", curl_line)
+        self.assertIn("--proto '=https'", curl_line)
+        self.assertIn("--tlsv1.2", curl_line)
+        self.assertIn("--retry-all-errors", curl_line)
+        self.assertRegex(curl_line, r"--retry[ =][1-9]")
+        self.assertRegex(curl_line, r"--retry-delay[ =][0-9]")
 
     def test_already_installed_codex_does_not_skip_bundled_bwrap(self) -> None:
         codex_marker = 'install_github_hosted_ci_codex_install_verified_artifact \\\n  "${codex_extracted}"'
