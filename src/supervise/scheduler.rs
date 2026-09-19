@@ -1,5 +1,14 @@
 use super::*;
 
+#[cfg(target_os = "linux")]
+use coding_agent_manager_lib::account_authority::{
+    AccountObserveRequest, ObserveCategory, StoredAccountRegistry,
+};
+#[cfg(target_os = "linux")]
+use coding_agent_manager_lib::paths::{project_dirs, stored_accounts_path};
+#[cfg(target_os = "linux")]
+use coding_agent_manager_lib::providers::observe_selected_account;
+
 mod preclaim;
 use preclaim::{
     evaluate_preclaim_viability, parked_preclaim_outcome, persist_preclaim_decision,
@@ -3708,6 +3717,121 @@ pub(super) struct PreparedSupervisorSelectionRequest<'a> {
     pub(super) quota: SupervisorQuotaSelectionInput<'a>,
 }
 
+#[cfg(target_os = "linux")]
+fn cam_provider_id_for_supervisor_runtime(runtime: SupervisorRuntime) -> Option<&'static str> {
+    match runtime {
+        SupervisorRuntime::Grok => Some("grok-cli"),
+        SupervisorRuntime::Codex => Some("codex-cli"),
+        SupervisorRuntime::GeminiCli => Some("gemini-cli"),
+        SupervisorRuntime::ClaudeCode => Some("claude-code"),
+        SupervisorRuntime::Cursor => Some("cursor"),
+        SupervisorRuntime::Fake => None,
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+struct CamObserveTestHarness {
+    registry: StoredAccountRegistry,
+    adapter: Box<dyn coding_agent_manager_lib::providers::ProviderAdapter>,
+    _root: tempfile::TempDir,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+struct CamObserveTestGuard {
+    previous: Option<CamObserveTestHarness>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static CAM_OBSERVE_TEST_OVERRIDE: RefCell<Option<CamObserveTestHarness>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn activate_cam_observe_test_harness(harness: CamObserveTestHarness) -> CamObserveTestGuard {
+    let previous = CAM_OBSERVE_TEST_OVERRIDE.with(|cell| cell.borrow_mut().replace(harness));
+    CamObserveTestGuard { previous }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for CamObserveTestGuard {
+    fn drop(&mut self) {
+        CAM_OBSERVE_TEST_OVERRIDE.with(|cell| {
+            *cell.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn observe_selected_cam_binding(
+    registry: &StoredAccountRegistry,
+    adapter: &dyn coding_agent_manager_lib::providers::ProviderAdapter,
+    provider_id: &str,
+) -> Result<Option<AccountObserveResult>> {
+    let binding = match registry.selected_binding(provider_id) {
+        Ok(None) => return Ok(None),
+        Ok(Some(binding)) => binding,
+        Err(error) => {
+            return Err(anyhow!(
+                "failed to read Coding Agent Manager selection for `{provider_id}`: {error}"
+            ));
+        }
+    };
+    observe_selected_account(
+        registry,
+        adapter,
+        AccountObserveRequest {
+            binding,
+            categories: vec![ObserveCategory::Models, ObserveCategory::Quota],
+        },
+        None,
+    )
+    .map(Some)
+    .map_err(|error| {
+        anyhow!(
+            "failed to observe selected Coding Agent Manager account for `{provider_id}`: {error}"
+        )
+    })
+}
+
+fn account_observation_for_launch_runtime(
+    runtime: SupervisorRuntime,
+) -> Result<Option<AccountObserveResult>> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = runtime;
+        return Ok(None);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Some(provider_id) = cam_provider_id_for_supervisor_runtime(runtime) else {
+            return Ok(None);
+        };
+        #[cfg(test)]
+        {
+            if let Some(result) = CAM_OBSERVE_TEST_OVERRIDE.with(|cell| {
+                cell.borrow().as_ref().map(|harness| {
+                    observe_selected_cam_binding(
+                        &harness.registry,
+                        harness.adapter.as_ref(),
+                        provider_id,
+                    )
+                })
+            }) {
+                return result;
+            }
+        }
+        let Some(data_dir) = project_dirs().map(|dirs| dirs.data_dir().to_path_buf()) else {
+            return Ok(None);
+        };
+        let registry = StoredAccountRegistry::new(stored_accounts_path(&data_dir));
+        let adapter = coding_agent_manager_lib::providers::find(provider_id).ok_or_else(|| {
+            anyhow!("Coding Agent Manager provider `{provider_id}` is not registered")
+        })?;
+        observe_selected_cam_binding(&registry, adapter.as_ref(), provider_id)
+    }
+}
+
 pub(super) fn initialize_supervisor_selection_from_prepared_metadata(
     plan: &mut SupervisorPlan,
     plan_metadata: &mut SupervisorPlanMetadata,
@@ -3743,6 +3867,7 @@ pub(super) fn initialize_supervisor_selection_from_prepared_metadata(
             let frozen_history = current_run
                 .map(|run| load_frozen_outcome_history(repo, run))
                 .transpose()?;
+            let account_observation = account_observation_for_launch_runtime(runtime)?;
             let resolution = initialize_supervisor_selection_with_history(
                 plan,
                 runtime,
@@ -3752,7 +3877,7 @@ pub(super) fn initialize_supervisor_selection_from_prepared_metadata(
                 plan_metadata.resolved_objective_profile.as_ref(),
                 quota,
                 frozen_history.as_ref(),
-                None,
+                account_observation.as_ref(),
             )?;
             if resolution.selection_preflight_failure.is_none() {
                 bind_selected_assignment_runtimes(plan, &resolution.decisions)?;
@@ -5714,6 +5839,343 @@ mod selection_policy_tests {
         );
         assert_eq!(persisted_ledger.entries, *ledger);
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    mod account_observe_wire {
+        use super::*;
+        use coding_agent_manager_lib::account_authority::{
+            CategoryObservation, ModelsObservation, ObservationOutcome, ObservedModel,
+        };
+        use coding_agent_manager_lib::error::Error as CamError;
+        use coding_agent_manager_lib::model::{
+            Account, AuthKind, InstallState, Maturity, ProviderDescriptor, QuotaSnapshot,
+            StoredAccountMaterial, StoredAccountMetadata,
+        };
+        use coding_agent_manager_lib::paths::stored_accounts_path;
+        use coding_agent_manager_lib::providers::ProviderAdapter;
+
+        enum SchedulerObserveStubMode {
+            ObservedModels,
+            ObserveError,
+        }
+
+        struct SchedulerObserveStub {
+            id: &'static str,
+            mode: SchedulerObserveStubMode,
+        }
+
+        impl ProviderAdapter for SchedulerObserveStub {
+            fn id(&self) -> &'static str {
+                self.id
+            }
+
+            fn descriptor(&self) -> ProviderDescriptor {
+                ProviderDescriptor {
+                    id: self.id.to_string(),
+                    display_name: self.id.to_string(),
+                    vendor: "test".to_string(),
+                    auth_kinds: vec![AuthKind::OAuth],
+                    maturity: Maturity::Experimental,
+                    install_state: InstallState::Unknown,
+                    capabilities: Vec::new(),
+                }
+            }
+
+            fn config_paths(&self) -> Vec<PathBuf> {
+                Vec::new()
+            }
+
+            fn detect(&self) -> InstallState {
+                InstallState::Unknown
+            }
+
+            fn list_accounts(&self) -> coding_agent_manager_lib::error::Result<Vec<Account>> {
+                Ok(Vec::new())
+            }
+
+            fn activate_account(
+                &self,
+                _account_id: &str,
+            ) -> coding_agent_manager_lib::error::Result<()> {
+                Err(CamError::NotImplemented("activate"))
+            }
+
+            fn quota_for_account(
+                &self,
+                _account: &StoredAccountMetadata,
+            ) -> coding_agent_manager_lib::error::Result<Vec<QuotaSnapshot>> {
+                Ok(Vec::new())
+            }
+
+            fn observe_models_for_account(
+                &self,
+                _account: &StoredAccountMetadata,
+            ) -> coding_agent_manager_lib::error::Result<CategoryObservation<ModelsObservation>>
+            {
+                match self.mode {
+                    SchedulerObserveStubMode::ObservedModels => {
+                        Ok(CategoryObservation::observed(ModelsObservation {
+                            models: vec![ObservedModel {
+                                model_id: FRONTIER_PROFILE_MODEL.to_string(),
+                                supported_efforts: Some(vec![
+                                    "high".to_string(),
+                                    "xhigh".to_string(),
+                                ]),
+                                default_effort: Some("high".to_string()),
+                            }],
+                        }))
+                    }
+                    SchedulerObserveStubMode::ObserveError => Err(CamError::ConfigRead {
+                        provider: self.id.to_string(),
+                        reason: "scheduler observe stub refused models".to_string(),
+                    }),
+                }
+            }
+        }
+
+        fn isolated_registry() -> (tempfile::TempDir, StoredAccountRegistry) {
+            let root = tempfile::tempdir().expect("isolated CAM data dir");
+            let data_dir = root.path().join("data");
+            let registry = StoredAccountRegistry::new(stored_accounts_path(&data_dir));
+            (root, registry)
+        }
+
+        fn seed_complete_account(registry: &StoredAccountRegistry, selected: bool) {
+            registry
+                .begin_add(
+                    "codex-cli",
+                    "work",
+                    "Work",
+                    AuthKind::OAuth,
+                    StoredAccountMaterial::VendorHome,
+                )
+                .expect("begin add");
+            registry
+                .complete_add("codex-cli", "work")
+                .expect("complete add");
+            if selected {
+                registry
+                    .select_complete_revision("codex-cli", "work", None)
+                    .expect("select complete account");
+            }
+        }
+
+        fn activate_stub(selected: bool, mode: SchedulerObserveStubMode) -> CamObserveTestGuard {
+            let (root, registry) = isolated_registry();
+            if selected {
+                seed_complete_account(&registry, true);
+            }
+            activate_cam_observe_test_harness(CamObserveTestHarness {
+                registry,
+                adapter: Box::new(SchedulerObserveStub {
+                    id: "codex-cli",
+                    mode,
+                }),
+                _root: root,
+            })
+        }
+
+        fn prepared_codex_request<'a>(
+            repo: &'a Path,
+            catalog: &'a RuntimeModelCatalogAcquisition,
+            admission: &'a SupervisorAdmissionPolicyInput,
+        ) -> PreparedSupervisorSelectionRequest<'a> {
+            PreparedSupervisorSelectionRequest {
+                repo,
+                current_run: None,
+                runtime: SupervisorRuntime::Codex,
+                execution_runtime: SupervisorExecutionRuntime::Verified,
+                runtime_model_catalog: catalog,
+                admission_policy_input: admission,
+                quota: SupervisorQuotaSelectionInput::default(),
+            }
+        }
+
+        fn prepared_selection_fixture() -> Result<(
+            tempfile::TempDir,
+            PathBuf,
+            RuntimeModelCatalogAcquisition,
+            SupervisorAdmissionPolicyInput,
+            SupervisorPlan,
+            SupervisorPlanMetadata,
+        )> {
+            let (temporary, repo) = super::initialized_repository();
+            let plan = super::test_plan();
+            let catalog: RuntimeModelCatalogAcquisition =
+                Ok(super::super::super::test_runtime_model_catalog(
+                    &plan,
+                    SupervisorRuntime::Codex,
+                )?);
+            let admission = SupervisorAdmissionPolicyInput::resolve(
+                &repo,
+                1,
+                SupervisorAdmissionConfig::default(),
+                SupervisorAdmissionConfig::default(),
+            )?;
+            let mut plan_metadata = SupervisorPlanMetadata::default();
+            plan_metadata.resolved_objective_profile =
+                Some(super::default_resolved_objective_profile()?);
+            Ok((temporary, repo, catalog, admission, plan, plan_metadata))
+        }
+
+        #[test]
+        fn cam_provider_id_maps_supervisor_runtime_and_fake_stays_none() {
+            assert_eq!(
+                cam_provider_id_for_supervisor_runtime(SupervisorRuntime::Grok),
+                Some("grok-cli")
+            );
+            assert_eq!(
+                cam_provider_id_for_supervisor_runtime(SupervisorRuntime::Codex),
+                Some("codex-cli")
+            );
+            assert_eq!(
+                cam_provider_id_for_supervisor_runtime(SupervisorRuntime::GeminiCli),
+                Some("gemini-cli")
+            );
+            assert_eq!(
+                cam_provider_id_for_supervisor_runtime(SupervisorRuntime::ClaudeCode),
+                Some("claude-code")
+            );
+            assert_eq!(
+                cam_provider_id_for_supervisor_runtime(SupervisorRuntime::Cursor),
+                Some("cursor")
+            );
+            assert_eq!(
+                cam_provider_id_for_supervisor_runtime(SupervisorRuntime::Fake),
+                None
+            );
+        }
+
+        #[test]
+        fn scheduler_account_observe_admits_observed_models() -> Result<()> {
+            let _guard = activate_stub(true, SchedulerObserveStubMode::ObservedModels);
+            let observation = account_observation_for_launch_runtime(SupervisorRuntime::Codex)?
+                .context("selected CAM binding must produce Some observation")?;
+            assert_eq!(observation.binding.provider_id, "codex-cli");
+            let models = observation.models.context("models category")?;
+            assert_eq!(models.outcome, ObservationOutcome::Observed);
+            let quota = observation.quota.context("quota category")?;
+            assert_eq!(quota.outcome, ObservationOutcome::Unknown);
+            assert!(quota.content.is_none());
+            let json = serde_json::to_string(&observation)?;
+            assert!(!json.contains("utilization"));
+
+            let (temporary, repo, catalog, admission, mut plan, mut plan_metadata) =
+                prepared_selection_fixture()?;
+            let resolution = initialize_supervisor_selection_from_prepared_metadata(
+                &mut plan,
+                &mut plan_metadata,
+                prepared_codex_request(&repo, &catalog, &admission),
+            )?;
+            assert!(resolution.selection_preflight_failure.is_none());
+            let worker = resolution
+                .decisions
+                .iter()
+                .find(|event| event.role == AgentRole::Worker)
+                .context("worker decision")?;
+            assert_eq!(worker.provenance.normalized_input.catalogs.len(), 1);
+            assert!(worker.provenance.normalized_input.catalogs[0]
+                .revision
+                .starts_with("account-observe-sha256:"));
+            assert_eq!(
+                worker.provenance.normalized_input.catalogs[0].models.len(),
+                1
+            );
+            assert_eq!(
+                worker.provenance.normalized_input.catalogs[0].models[0].model,
+                FRONTIER_PROFILE_MODEL
+            );
+            let choice = worker
+                .provenance
+                .choice
+                .as_ref()
+                .context("observed worker choice")?;
+            assert_eq!(choice.candidate.model, FRONTIER_PROFILE_MODEL);
+            let pool = worker
+                .provenance
+                .normalized_input
+                .pools
+                .iter()
+                .find(|pool| pool.runtime == "codex")
+                .context("codex pool")?;
+            assert!(!pool.entitlement_bounded);
+            assert_eq!(pool.marginal_cost_microunits, 0);
+            drop(temporary);
+            Ok(())
+        }
+
+        #[test]
+        fn scheduler_account_observe_missing_selection_stays_none() -> Result<()> {
+            let (root, registry) = isolated_registry();
+            seed_complete_account(&registry, false);
+            let _guard = activate_cam_observe_test_harness(CamObserveTestHarness {
+                registry,
+                adapter: Box::new(SchedulerObserveStub {
+                    id: "codex-cli",
+                    mode: SchedulerObserveStubMode::ObservedModels,
+                }),
+                _root: root,
+            });
+            assert!(account_observation_for_launch_runtime(SupervisorRuntime::Codex)?.is_none());
+            assert!(account_observation_for_launch_runtime(SupervisorRuntime::Fake)?.is_none());
+
+            let (temporary, repo, catalog, admission, mut plan, mut plan_metadata) =
+                prepared_selection_fixture()?;
+            let resolution = initialize_supervisor_selection_from_prepared_metadata(
+                &mut plan,
+                &mut plan_metadata,
+                prepared_codex_request(&repo, &catalog, &admission),
+            )?;
+            assert!(resolution.selection_preflight_failure.is_none());
+            let worker = resolution
+                .decisions
+                .iter()
+                .find(|event| event.role == AgentRole::Worker)
+                .context("worker decision")?;
+            assert!(worker
+                .provenance
+                .normalized_input
+                .catalogs
+                .iter()
+                .all(|catalog| !catalog.revision.starts_with("account-observe")));
+            let pool = worker
+                .provenance
+                .normalized_input
+                .pools
+                .iter()
+                .find(|pool| pool.runtime == "codex")
+                .context("codex pool")?;
+            assert!(pool.entitlement_bounded);
+            assert!(pool.admission_provenance.contains("unavailable"));
+            drop(temporary);
+            Ok(())
+        }
+
+        #[test]
+        fn scheduler_account_observe_error_fails_closed() -> Result<()> {
+            let _guard = activate_stub(true, SchedulerObserveStubMode::ObserveError);
+            let error = account_observation_for_launch_runtime(SupervisorRuntime::Codex)
+                .expect_err("observe error must fail closed");
+            assert!(error
+                .to_string()
+                .contains("failed to observe selected Coding Agent Manager account"));
+
+            let (temporary, repo, catalog, admission, mut plan, mut plan_metadata) =
+                prepared_selection_fixture()?;
+            let error = initialize_supervisor_selection_from_prepared_metadata(
+                &mut plan,
+                &mut plan_metadata,
+                prepared_codex_request(&repo, &catalog, &admission),
+            )
+            .expect_err("scheduler observe error must not fall back to advertised catalogs");
+            assert!(error
+                .to_string()
+                .contains("failed to observe selected Coding Agent Manager account"));
+            assert!(plan.role_models.is_empty());
+            drop(temporary);
+            Ok(())
+        }
     }
 }
 
