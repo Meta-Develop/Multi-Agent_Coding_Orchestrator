@@ -559,8 +559,7 @@ impl ParentWorkerAttemptReviewCostBinding {
         dated_plan_pricing: &BTreeMap<String, ModelPricing>,
     ) {
         self.parent_auditor_invocations += 1;
-        let addend =
-            attributable_parent_auditor_cost_microunits(external_run, dated_plan_pricing);
+        let addend = attributable_parent_auditor_cost_microunits(external_run, dated_plan_pricing);
         self.total_microunits = match (self.total_microunits, addend) {
             (_, None) => None,
             (None, Some(microunits)) if self.parent_auditor_invocations == 1 => Some(microunits),
@@ -3644,7 +3643,10 @@ mod tests {
         )?;
         assert!(incomplete_recorded.costs.review_cost_microunits.is_none());
         assert!(incomplete_recorded.costs.rereview_cost_microunits.is_none());
-        assert!(incomplete_recorded.costs.environment_cost_microunits.is_none());
+        assert!(incomplete_recorded
+            .costs
+            .environment_cost_microunits
+            .is_none());
 
         let missing_usage = parent_run_with_codex_evidence(
             &temp,
@@ -3678,8 +3680,8 @@ mod tests {
     }
 
     #[test]
-    fn observed_requested_codex_parent_auditor_mismatch_is_not_priced_from_requested(
-    ) -> Result<()> {
+    fn observed_requested_codex_parent_auditor_mismatch_is_not_priced_from_requested() -> Result<()>
+    {
         let (temp, repo) = super::super::tests::injected_repository();
         let external_run = parent_run_with_codex_evidence(
             &temp,
@@ -3712,8 +3714,8 @@ mod tests {
     }
 
     #[test]
-    fn codex_parent_auditor_reroute_prices_observed_target_not_requested_or_rollout(
-    ) -> Result<()> {
+    fn codex_parent_auditor_reroute_prices_observed_target_not_requested_or_rollout() -> Result<()>
+    {
         let (temp, repo) = super::super::tests::injected_repository();
         let external_run = parent_run_with_codex_evidence(
             &temp,
