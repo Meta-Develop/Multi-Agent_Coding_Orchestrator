@@ -769,10 +769,8 @@ fn supervise_run_requires_complete_machine_global_binding() {
         "runtime",
     ])
     .expect("complete supervise machine-global binding should parse");
-    let Command::Supervise(SuperviseCommand {
-        command: SuperviseSubcommand::Run(complete),
-    }) = complete.command
-    else {
+    let supervise = expect_supervise_command(complete.command);
+    let SuperviseSubcommand::Run(complete) = supervise.command else {
         panic!("expected supervise run command");
     };
     assert_eq!(
@@ -1731,10 +1729,8 @@ fn supervise_plan_requires_exactly_one_positional_or_goal_source() {
     let positional =
         Cli::try_parse_from(["maco", "supervise", "plan", "task.txt", "--repo", "repo"])
             .expect("positional task source should parse");
-    let Command::Supervise(SuperviseCommand {
-        command: SuperviseSubcommand::Plan(positional),
-    }) = positional.command
-    else {
+    let supervise = expect_supervise_command(positional.command);
+    let SuperviseSubcommand::Plan(positional) = supervise.command else {
         panic!("expected supervise plan command");
     };
     assert_eq!(positional.task_file, Some(PathBuf::from("task.txt")));
@@ -1743,10 +1739,8 @@ fn supervise_plan_requires_exactly_one_positional_or_goal_source() {
 
     let from_goal = Cli::try_parse_from(["maco", "supervise", "plan", "--from-goal", "goal.md"])
         .expect("--from-goal source should parse");
-    let Command::Supervise(SuperviseCommand {
-        command: SuperviseSubcommand::Plan(from_goal),
-    }) = from_goal.command
-    else {
+    let supervise = expect_supervise_command(from_goal.command);
+    let SuperviseSubcommand::Plan(from_goal) = supervise.command else {
         panic!("expected supervise plan command");
     };
     assert_eq!(from_goal.task_file, None);
@@ -1775,10 +1769,8 @@ fn supervise_run_requires_exactly_one_plan_or_goal_source() {
     let mut positional = vec!["maco", "supervise", "run", "plan.json"];
     positional.extend(retention);
     let positional = Cli::try_parse_from(positional).expect("positional source must parse");
-    let Command::Supervise(SuperviseCommand {
-        command: SuperviseSubcommand::Run(args),
-    }) = positional.command
-    else {
+    let supervise = expect_supervise_command(positional.command);
+    let SuperviseSubcommand::Run(args) = supervise.command else {
         panic!("expected supervise run command");
     };
     assert_eq!(args.supervisor_plan, Some(PathBuf::from("plan.json")));
@@ -1787,10 +1779,8 @@ fn supervise_run_requires_exactly_one_plan_or_goal_source() {
     let mut from_goal = vec!["maco", "supervise", "run", "--from-goal", "goal.md"];
     from_goal.extend(retention);
     let from_goal = Cli::try_parse_from(from_goal).expect("goal source must parse");
-    let Command::Supervise(SuperviseCommand {
-        command: SuperviseSubcommand::Run(args),
-    }) = from_goal.command
-    else {
+    let supervise = expect_supervise_command(from_goal.command);
+    let SuperviseSubcommand::Run(args) = supervise.command else {
         panic!("expected supervise run command");
     };
     assert_eq!(args.supervisor_plan, None);
@@ -1842,10 +1832,8 @@ fn supervise_admission_flags_parse_and_reject_zero() {
         "runtime",
     ])
     .expect("positive admission flags parse");
-    let Command::Supervise(SuperviseCommand {
-        command: SuperviseSubcommand::Run(args),
-    }) = parsed.command
-    else {
+    let supervise = expect_supervise_command(parsed.command);
+    let SuperviseSubcommand::Run(args) = supervise.command else {
         panic!("expected supervise run command");
     };
     assert_eq!(args.max_concurrent_children.configured_limit(), Some(12));
@@ -1897,10 +1885,8 @@ fn supervise_parses_repository_local_quota_config() {
         "runtime",
     ]);
     let parsed = Cli::try_parse_from(argv).expect("quota config must parse");
-    let Command::Supervise(SuperviseCommand {
-        command: SuperviseSubcommand::Run(args),
-    }) = parsed.command
-    else {
+    let supervise = expect_supervise_command(parsed.command);
+    let SuperviseSubcommand::Run(args) = supervise.command else {
         panic!("expected supervise run command");
     };
     assert_eq!(
@@ -1978,10 +1964,8 @@ fn supervise_budget_flags_parse_validate_and_bind_hard_limits() {
     ];
     argv.extend(retention);
     let parsed = Cli::try_parse_from(argv).expect("budget flags must parse");
-    let Command::Supervise(SuperviseCommand {
-        command: SuperviseSubcommand::Run(args),
-    }) = parsed.command
-    else {
+    let supervise = expect_supervise_command(parsed.command);
+    let SuperviseSubcommand::Run(args) = supervise.command else {
         panic!("expected supervise run command");
     };
     let budget = args.budget;
@@ -2034,10 +2018,8 @@ fn supervise_budget_flags_parse_validate_and_bind_hard_limits() {
     ];
     argv.extend(retention);
     let parsed = Cli::try_parse_from(argv).expect("rolling budget flags must parse");
-    let Command::Supervise(SuperviseCommand {
-        command: SuperviseSubcommand::Run(args),
-    }) = parsed.command
-    else {
+    let supervise = expect_supervise_command(parsed.command);
+    let SuperviseSubcommand::Run(args) = supervise.command else {
         panic!("expected supervise run command");
     };
     let rolling = args
@@ -2081,10 +2063,8 @@ fn supervise_run_accepts_only_canonical_parent_nodes() {
     ];
     valid.extend(retention);
     let parsed = Cli::try_parse_from(valid).expect("parent node must parse");
-    let Command::Supervise(SuperviseCommand {
-        command: SuperviseSubcommand::Run(args),
-    }) = parsed.command
-    else {
+    let supervise = expect_supervise_command(parsed.command);
+    let SuperviseSubcommand::Run(args) = supervise.command else {
         panic!("expected supervise run command");
     };
     assert_eq!(args.parent_node.as_deref(), Some("driver-root"));
@@ -2113,10 +2093,8 @@ fn supervise_resume_accepts_run_identity_and_query_output_options() {
         "--json",
     ])
     .expect("supervise resume should parse");
-    let Command::Supervise(SuperviseCommand {
-        command: SuperviseSubcommand::Resume(resume),
-    }) = parsed.command
-    else {
+    let supervise = expect_supervise_command(parsed.command);
+    let SuperviseSubcommand::Resume(resume) = supervise.command else {
         panic!("expected supervise resume command");
     };
     assert_eq!(resume.run_id, "interrupted-run");
@@ -2141,10 +2119,8 @@ fn supervise_run_cam_authority_socket_flag_sets_option() {
         "/tmp/maco-authority.sock",
     ])
     .expect("supervise run with cam authority socket should parse");
-    let Command::Supervise(SuperviseCommand {
-        command: SuperviseSubcommand::Run(args),
-    }) = parsed.command
-    else {
+    let supervise = expect_supervise_command(parsed.command);
+    let SuperviseSubcommand::Run(args) = supervise.command else {
         panic!("expected supervise run command");
     };
     assert_eq!(
@@ -2165,10 +2141,8 @@ fn supervise_resume_cam_authority_socket_flag_sets_option() {
         "/tmp/maco-authority.sock",
     ])
     .expect("supervise resume with cam authority socket should parse");
-    let Command::Supervise(SuperviseCommand {
-        command: SuperviseSubcommand::Resume(args),
-    }) = parsed.command
-    else {
+    let supervise = expect_supervise_command(parsed.command);
+    let SuperviseSubcommand::Resume(args) = supervise.command else {
         panic!("expected supervise resume command");
     };
     assert_eq!(
@@ -2183,10 +2157,8 @@ fn supervise_cam_authority_socket_reads_env_alias() {
     guard.set("/tmp/maco-authority-from-env.sock");
     let parsed = Cli::try_parse_from(["maco", "supervise", "resume", "interrupted-run"])
         .expect("supervise resume should inherit cam authority socket from env");
-    let Command::Supervise(SuperviseCommand {
-        command: SuperviseSubcommand::Resume(args),
-    }) = parsed.command
-    else {
+    let supervise = expect_supervise_command(parsed.command);
+    let SuperviseSubcommand::Resume(args) = supervise.command else {
         panic!("expected supervise resume command");
     };
     assert_eq!(
@@ -2209,10 +2181,8 @@ fn supervise_cam_authority_socket_missing_stays_none() {
         "runtime",
     ])
     .expect("supervise run without cam authority socket should parse");
-    let Command::Supervise(SuperviseCommand {
-        command: SuperviseSubcommand::Run(args),
-    }) = parsed.command
-    else {
+    let supervise = expect_supervise_command(parsed.command);
+    let SuperviseSubcommand::Run(args) = supervise.command else {
         panic!("expected supervise run command");
     };
     assert_eq!(args.cam_authority_socket, None);
@@ -2259,10 +2229,8 @@ fn supervise_reaudit_requires_authenticated_source_scope_and_cleanup_binding() {
         "--json",
     ])
     .expect("complete supervise re-audit command should parse");
-    let Command::Supervise(SuperviseCommand {
-        command: SuperviseSubcommand::Reaudit(reaudit),
-    }) = parsed.command
-    else {
+    let supervise = expect_supervise_command(parsed.command);
+    let SuperviseSubcommand::Reaudit(reaudit) = supervise.command else {
         panic!("expected supervise re-audit command");
     };
     assert_eq!(reaudit.source_run_id, "source-run");

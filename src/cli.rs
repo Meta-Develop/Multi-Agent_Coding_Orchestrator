@@ -377,7 +377,7 @@ enum Command {
     /// Run local orchestration plans.
     Orchestrate(OrchestrateCommand),
     /// Run opt-in supervisor-of-orchestrators plans for supported runtimes.
-    Supervise(SuperviseCommand),
+    Supervise(Box<SuperviseCommand>),
     /// Ask a read-only cross-runtime consultant for advice.
     Consult(ConsultCommand),
     /// Scan and react to safe GitHub issue and pull request inbox items.
@@ -4756,6 +4756,14 @@ mod steering_commands;
 use steering_commands::SteerCommand;
 
 #[cfg(test)]
+fn expect_supervise_command(command: Command) -> SuperviseCommand {
+    let Command::Supervise(supervise) = command else {
+        panic!("expected supervise command");
+    };
+    *supervise
+}
+
+#[cfg(test)]
 mod cli_integration_tests {
     use super::*;
 
@@ -5096,10 +5104,8 @@ mod cli_integration_tests {
 
     fn supervise_run_args(argv: &[&str]) -> RunSuperviseArgs {
         let parsed = Cli::try_parse_from(argv).expect("supervise run arguments should parse");
-        let Command::Supervise(SuperviseCommand {
-            command: SuperviseSubcommand::Run(args),
-        }) = parsed.command
-        else {
+        let supervise = expect_supervise_command(parsed.command);
+        let SuperviseSubcommand::Run(args) = supervise.command else {
             panic!("expected supervise run command");
         };
         args
