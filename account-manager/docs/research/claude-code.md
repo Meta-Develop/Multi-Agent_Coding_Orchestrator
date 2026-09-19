@@ -171,10 +171,112 @@ files entirely `[verified-docs]`.
 
 ## 6. Quota and usage signals
 
-`rateLimitTier` names the tier but is not a counter `[verified-local]`. Usage
-utilisation appears in client-side caches under keys such as
-`cachedUsageUtilization` in `~/.claude.json` `[verified-local]`, but whether
-that is stable, documented, or safe to depend on is `[unknown]`.
+`rateLimitTier` names the tier but is not a counter `[verified-local]`.
+
+This section records official 2026-09-20 Claude Code 5-hour / 7-day window
+_surfaces_. It does not establish Observed utilization, `resetsAt`, or
+price. Claude `account.observe` quota stays unknown. `reset-probe` and
+`operation.prepare` stay unadvertised.
+
+Official pages re-fetched 2026-09-20 (vendor prose, not a host probe and
+not Observed CAM JSON):
+
+- <https://code.claude.com/docs/en/statusline>
+- <https://code.claude.com/docs/en/costs>
+- <https://code.claude.com/docs/en/errors>
+
+### Statusline `rate_limits`
+
+The statusline command receives session JSON on stdin. Official docs name
+these window fields `[verified-docs]`
+(<https://code.claude.com/docs/en/statusline>):
+
+- `rate_limits.five_hour.used_percentage` and
+  `rate_limits.seven_day.used_percentage`: percentage of the 5-hour or
+  7-day rate limit consumed, from 0 to 100.
+- `rate_limits.five_hour.resets_at` and
+  `rate_limits.seven_day.resets_at`: Unix epoch seconds when that window
+  resets.
+- Optional `rate_limits.spend_limit.used_percentage` and
+  `rate_limits.spend_limit.resets_at`: behind a Claude apps gateway, the
+  percentage used of the spend limit that applies to you, and the Unix
+  epoch seconds when its period resets. The percentage runs from 0 to
+  100, or above 100 once you exceed the limit. Requires Claude Code
+  v2.1.251 or later.
+
+The same page describes `five_hour` as a rolling window and `seven_day`
+as a weekly window `[verified-docs]`
+(<https://code.claude.com/docs/en/statusline>).
+
+Presence `[verified-docs]`
+(<https://code.claude.com/docs/en/statusline>):
+
+- The `rate_limits` object appears only for claude.ai Pro and Max
+  subscribers, or behind a Claude apps gateway that sets a spend limit,
+  and only after the first API response in the session.
+- Each window (`five_hour`, `seven_day`, `spend_limit`) may be
+  independently absent.
+- Claude Code drops a window once its `resets_at` time passes.
+- Absence is not zero. A missing object or window is not
+  `utilization = 0`.
+
+That JSON is statusline script stdin, not non-interactive Observed quota.
+Do not parse these fields into CAM Observed utilization, `resetsAt`, or
+price.
+
+### Interactive `/usage`
+
+`/usage` is an interactive plan-bar and session-cost screen, not
+non-interactive Observed JSON `[verified-docs]`
+(<https://code.claude.com/docs/en/costs>).
+
+- The Session block's `Total cost` is computed locally from token counts
+  at list price, unless a managed `modelPricing` table is in effect. The
+  official page calls the figure an estimate and points at the Claude
+  Console Usage page for authoritative billing. Session `Total cost` is
+  catalog / estimate, not Observed billed USD.
+- Claude Max and Pro subscribers have usage included in their
+  subscription, so the session cost figure is not a billing counter.
+  Subscribers see plan usage bars, activity stats, and a usage breakdown
+  on the same interactive screen.
+- When the usage-request fails, most often because the usage endpoint is
+  rate limited, `/usage` may show the last usage bars loaded on that
+  machine within the past 60 minutes, with a `Showing last-known usage`
+  note. Those last-known bars are stale, not Observed.
+
+### Teams and Enterprise windows
+
+On Claude for Teams and Enterprise plans, each member's Claude Code
+usage draws from a per-seat allowance that resets on a rolling five-hour
+window and a weekly window `[verified-docs]`
+(<https://code.claude.com/docs/en/costs>). The allowance is shared with
+Claude chat and Cowork. The errors page names the corresponding
+interactive messages `You've hit your session limit` and
+`You've hit your weekly limit` `[verified-docs]`
+(<https://code.claude.com/docs/en/errors>). Those messages are vendor UI,
+not Observed CAM quota.
+
+### Vendor wait is not CAM `reset-probe`
+
+On Claude Code v2.1.234 or later, an interactive session signed in with
+a claude.ai subscription can wait and continue the interrupted task
+after the plan window resets. Developers can pick that wait from
+`/rate-limit-options`. Fleet control is the managed setting
+`autoContinueAtUsageLimit` `[verified-docs]`
+(<https://code.claude.com/docs/en/costs>). The errors page describes the
+same vendor wait line,
+`Usage limit reached · continuing automatically at 3:45pm · esc to cancel`
+`[verified-docs]` (<https://code.claude.com/docs/en/errors>). That is
+Claude waiting on its own reset, not CAM `reset-probe`. Do not advertise
+`reset-probe` or `operation.prepare` from this note.
+
+### Local caches stay `[unknown]`
+
+Usage utilisation appears in client-side caches under keys such as
+`cachedUsageUtilization` in `~/.claude.json` `[verified-local]`, but
+whether that is stable, documented, or safe to depend on is `[unknown]`.
+Do not parse `cachedUsageUtilization` or other `~/.claude.json` caches
+as Observed quota.
 
 ## 7. API surface and base-URL override
 
@@ -193,8 +295,30 @@ override is honoured under plan authentication rather than an API key is
   third-party switch that races a running Claude process can still produce a
   mutually inconsistent pair even if each individual replacement is atomic
   `[verified-local]`.
+- Official statusline `rate_limits` and interactive `/usage` are vendor
+  surfaces, not CAM Observed quota `[verified-docs]`
+  (<https://code.claude.com/docs/en/statusline>,
+  <https://code.claude.com/docs/en/costs>). Treating a missing window as
+  zero, treating session `Total cost` as Observed billed USD, or treating
+  last-known `/usage` bars as live Observed would invent quota.
+- Do not parse `cachedUsageUtilization` or other `~/.claude.json` caches as
+  Observed quota. Those keys remain `[unknown]`.
+- Vendor `autoContinueAtUsageLimit` and `/rate-limit-options` are Claude
+  waiting on its own reset `[verified-docs]`
+  (<https://code.claude.com/docs/en/costs>). They are not CAM
+  `reset-probe`. This note does not advertise `reset-probe` or
+  `operation.prepare`.
 
 ## 9. Open questions
 
-- Are `cachedUsageUtilization` and related keys a dependable quota source?
+- Are `cachedUsageUtilization` and related `~/.claude.json` cache keys a
+  dependable quota source? Still `[unknown]`. Do not parse them as
+  Observed quota.
+- Official 2026-09-20 pages name statusline stdin `rate_limits` and
+  interactive `/usage` only
+  (<https://code.claude.com/docs/en/statusline>,
+  <https://code.claude.com/docs/en/costs>,
+  <https://code.claude.com/docs/en/errors>). They do not publish a
+  non-interactive Observed quota JSON. Observed utilization, `resetsAt`,
+  and price remain absent. Claude `account.observe` quota stays unknown.
 - Windows and macOS paths, confirmed on real hosts.
