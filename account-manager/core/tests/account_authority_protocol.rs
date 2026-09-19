@@ -291,8 +291,7 @@ fn dispatch_accepts_claude_and_cursor_login_start() {
         assert_eq!(response["result"]["handle"], "login-handle-1");
         assert_eq!(response["result"]["state"], "waiting-for-user");
         assert_eq!(
-            response["result"]["binding"]["providerId"],
-            provider_id,
+            response["result"]["binding"]["providerId"], provider_id,
             "{provider_id}"
         );
     }
