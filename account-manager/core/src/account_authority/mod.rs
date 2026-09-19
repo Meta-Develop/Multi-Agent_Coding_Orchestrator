@@ -15,9 +15,9 @@ pub mod test_worker;
 pub use binding::SelectedAccountBinding;
 pub use incarnation::new_account_incarnation;
 pub use observe::{
-    AccountObserveRequest, AccountObserveResult, AuthObservation, CategoryObservation,
-    ModelsObservation, ObservationError, ObservationErrorKind, ObservationOutcome, ObserveCategory,
-    QuotaObservation,
+    validate_observed_models, AccountObserveRequest, AccountObserveResult, AuthObservation,
+    CategoryObservation, ModelsObservation, ObservationError, ObservationErrorKind,
+    ObservationOutcome, ObserveCategory, ObservedModel, QuotaObservation,
 };
 pub use registry::StoredAccountRegistry;
 pub use socket_path::{resolve_socket_path, SafeSocketPath, SocketPathError};

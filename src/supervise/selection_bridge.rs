@@ -37,6 +37,10 @@ use crate::selection::{
     ReasoningEffort as SelectorEffort, RiskLevel, RuntimeCatalog, RuntimePoolState, SelectionInput,
     SelectionProvenance, TaskHorizon, TaskProfile, TypedAxisObservation, TypedObservationKind,
 };
+use coding_agent_manager_lib::account_authority::{
+    validate_observed_models, AccountObserveResult, ModelsObservation, ObservationOutcome,
+    ObservedModel, QuotaObservation,
+};
 use std::path::Path;
 
 const AUTOMATIC_SELECTION_TASK_CLASS: &str = "localized_code_change";
@@ -584,6 +588,7 @@ pub(super) struct SupervisorAutomaticSelectionState {
     advertised: AdvertisedCatalogSet,
     quota_context: Option<LiveQuotaSelectionContext>,
     quota_ledger: Option<RunBudgetLedger>,
+    account_observation: Option<AccountObserveResult>,
 }
 
 impl PartialEq for SupervisorAutomaticSelectionState {
@@ -825,6 +830,7 @@ pub(super) fn initialize_supervisor_selection_with_quota(
         resolved_objective_profile,
         quota,
         None,
+        None,
     )
 }
 
@@ -838,6 +844,7 @@ pub(super) fn initialize_supervisor_selection_with_history(
     resolved_objective_profile: Option<&ResolvedObjectiveProfile>,
     quota: SupervisorQuotaSelectionInput<'_>,
     history: Option<&FrozenOutcomeHistory>,
+    account_observation: Option<&AccountObserveResult>,
 ) -> Result<SupervisorSelectionResolution> {
     if runtime == SupervisorRuntime::Fake {
         return Ok(SupervisorSelectionResolution {
@@ -864,7 +871,10 @@ pub(super) fn initialize_supervisor_selection_with_history(
     // overrides so launch and persisted evidence share one complete decision
     // set.
     let roles = all_selector_roles().to_vec();
-    if runtime == SupervisorRuntime::Cursor && advertised.cursor.is_none() {
+    if runtime == SupervisorRuntime::Cursor
+        && advertised.cursor.is_none()
+        && account_observation.is_none()
+    {
         let role = roles.first().copied().unwrap_or(AgentRole::Worker);
         let detail = advertised
             .cursor_evidence_gap
@@ -907,6 +917,7 @@ pub(super) fn initialize_supervisor_selection_with_history(
             resolved_objective_profile: &resolved_objective_profile,
             quota_context,
             quota_ledger,
+            account_observation,
             signals: DynamicSignals {
                 retry_count: 0,
                 budget_signal: BudgetSignal::Continue,
@@ -998,6 +1009,7 @@ pub(super) fn initialize_supervisor_selection_with_history(
                 advertised.clone(),
                 quota_context.cloned(),
                 quota_ledger.cloned(),
+                account_observation.cloned(),
             )
         })
         .transpose()?;
@@ -1019,6 +1031,7 @@ impl SupervisorAutomaticSelectionState {
         advertised: AdvertisedCatalogSet,
         quota_context: Option<LiveQuotaSelectionContext>,
         quota_ledger: Option<RunBudgetLedger>,
+        account_observation: Option<AccountObserveResult>,
     ) -> Result<Self> {
         let mut by_role = BTreeMap::new();
         for decision in decisions {
@@ -1053,6 +1066,7 @@ impl SupervisorAutomaticSelectionState {
             advertised,
             quota_context,
             quota_ledger,
+            account_observation,
         })
     }
 
@@ -1228,6 +1242,7 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
             &advertised,
             &input.task,
             &input.priors,
+            state.account_observation.as_ref(),
         )?;
         input.constraints.allowed_runtimes = constructed
             .iter()
@@ -1436,6 +1451,7 @@ struct SelectionInputForRoleArgs<'a> {
     resolved_objective_profile: &'a ResolvedObjectiveProfile,
     quota_context: Option<&'a LiveQuotaSelectionContext>,
     quota_ledger: Option<&'a RunBudgetLedger>,
+    account_observation: Option<&'a AccountObserveResult>,
     signals: DynamicSignals,
     debug_override: Option<DebugOverride>,
     history: Option<&'a FrozenOutcomeHistory>,
@@ -1593,6 +1609,7 @@ fn selection_input_for_role(args: SelectionInputForRoleArgs<'_>) -> Result<Selec
         resolved_objective_profile,
         quota_context,
         quota_ledger,
+        account_observation,
         signals,
         debug_override,
         history,
@@ -1603,43 +1620,21 @@ fn selection_input_for_role(args: SelectionInputForRoleArgs<'_>) -> Result<Selec
         .map(|snapshot| snapshot.outcomes_for(&task))
         .unwrap_or_default();
     let runtime_name = runtime_name(runtime);
-    let catalogs = constructed_selection_catalogs(runtime, catalog, advertised, &task, &priors)?;
+    let catalogs = constructed_selection_catalogs(
+        runtime,
+        catalog,
+        advertised,
+        &task,
+        &priors,
+        account_observation,
+    )?;
     let profile = priors
         .objective_profiles
         .first()
         .context("built-in selector data has no objective profile")?;
     let profile_name = profile.name.clone();
     let profile_version = profile.version;
-    let capacity = u64::try_from(admission.provider_inflight_bound)
-        .context("provider inflight bound does not fit selector pool units")?;
-    let admission_bytes = serde_json::to_vec(admission)
-        .context("failed to normalize supervisor admission input for selection")?;
-    let primary_pool = RuntimePoolState {
-        runtime: runtime_name.to_string(),
-        admission_open: admission.resolved_bound > 0,
-        pool_reference: None,
-        pool_kind: None,
-        entitlement_bounded: true,
-        entitlement_capacity_units: capacity,
-        entitlement_remaining_units: capacity,
-        pool_pressure_basis_points: 0,
-        observed_consumption_units: 0,
-        marginal_cost_microunits: 0,
-        exhausted: false,
-        exhaustion_behavior: None,
-        authorized_alternatives: Vec::new(),
-        observation_revision: format!(
-            "supervisor-admission-sha256:{}",
-            crate::artifacts::state_auth::sha256_hex(&admission_bytes)
-        ),
-        observation_source: None,
-        admission_provenance: "supervisor admission supplies a bounded active-runtime inflight pool; external account quota and marginal-price observations were unavailable"
-            .to_string(),
-        failover_provenance: Some(
-            "advertised runtime catalogs participate in selection; launch uses the selected pair"
-                .to_string(),
-        ),
-    };
+    let primary_pool = primary_pool_for_selection(runtime_name, admission, account_observation)?;
     let pools = pools_for_constructed_catalogs(&catalogs, runtime_name, primary_pool);
     let allowed_runtimes = catalogs
         .iter()
@@ -1779,7 +1774,11 @@ fn constructed_selection_catalogs(
     advertised: &AdvertisedCatalogSet,
     task: &TaskProfile,
     priors: &selection::PriorDataset,
+    account_observation: Option<&AccountObserveResult>,
 ) -> Result<Vec<RuntimeCatalog>> {
+    if let Some(observation) = account_observation {
+        return catalogs_from_account_observation(observation, runtime, task, priors);
+    }
     let primary = if runtime == SupervisorRuntime::Cursor {
         if let Some(observation) = &advertised.cursor {
             runtime_catalog_from_advertised_slugs(
@@ -1839,6 +1838,285 @@ fn constructed_selection_catalogs(
         }
     }
     Ok(catalogs)
+}
+
+fn runtime_from_account_provider(provider_id: &str) -> Result<&'static str> {
+    match provider_id {
+        "grok-cli" => Ok("grok"),
+        "cursor" => Ok("cursor"),
+        "codex-cli" => Ok("codex"),
+        "claude-code" => Ok("claude-code"),
+        "gemini-cli" => Ok("gemini-cli"),
+        _ => {
+            bail!("account observation provider '{provider_id}' has no fail-closed runtime mapping")
+        }
+    }
+}
+
+fn catalogs_from_account_observation(
+    observation: &AccountObserveResult,
+    selected_runtime: SupervisorRuntime,
+    task: &TaskProfile,
+    priors: &selection::PriorDataset,
+) -> Result<Vec<RuntimeCatalog>> {
+    let mapped = runtime_from_account_provider(&observation.binding.provider_id)?;
+    if mapped != runtime_name(selected_runtime) {
+        bail!(
+            "account observation provider '{}' maps to runtime '{mapped}' which does not match selected runtime '{}'",
+            observation.binding.provider_id,
+            runtime_name(selected_runtime)
+        );
+    }
+    match observation.models.as_ref() {
+        Some(category) if matches!(category.outcome, ObservationOutcome::Stale) => {
+            bail!("stale account observation binding never admits models");
+        }
+        Some(category) if matches!(category.outcome, ObservationOutcome::Observed) => {
+            let content = category.content.as_ref().with_context(|| {
+                format!(
+                    "Observed models category for provider '{}' is missing content",
+                    observation.binding.provider_id
+                )
+            })?;
+            validate_observed_models(content).map_err(|error| {
+                anyhow!("account observation models failed validation: {error}")
+            })?;
+            Ok(vec![runtime_catalog_from_observed_models(
+                mapped,
+                content,
+                observation.observed_at.clone(),
+                task,
+                priors,
+            )?])
+        }
+        _ => Ok(vec![RuntimeCatalog {
+            runtime: mapped.to_string(),
+            revision: format!(
+                "account-observe-models-unobserved-sha256:{}",
+                crate::artifacts::state_auth::sha256_hex(observation.observed_at.as_bytes())
+            ),
+            advertised_at: observation.observed_at.clone(),
+            models: Vec::new(),
+        }]),
+    }
+}
+
+fn runtime_catalog_from_observed_models(
+    runtime: &str,
+    observed: &ModelsObservation,
+    advertised_at: String,
+    task: &TaskProfile,
+    priors: &selection::PriorDataset,
+) -> Result<RuntimeCatalog> {
+    let mut models = Vec::new();
+    for observed_model in &observed.models {
+        if let Some(catalog_model) =
+            catalog_model_from_observed(runtime, observed_model, task, priors)
+        {
+            models.push(catalog_model);
+        }
+    }
+    models.sort_by(|left, right| left.model.cmp(&right.model));
+    let revision_material =
+        serde_json::to_vec(&models).context("failed to normalize account-observed catalog")?;
+    Ok(RuntimeCatalog {
+        runtime: runtime.to_string(),
+        revision: format!(
+            "account-observe-sha256:{}",
+            crate::artifacts::state_auth::sha256_hex(&revision_material)
+        ),
+        advertised_at,
+        models,
+    })
+}
+
+fn catalog_model_from_observed(
+    runtime: &str,
+    observed: &ObservedModel,
+    task: &TaskProfile,
+    priors: &selection::PriorDataset,
+) -> Option<CatalogModel> {
+    let mut supported_efforts = Vec::new();
+    if let Some(raw_efforts) = &observed.supported_efforts {
+        for effort in raw_efforts {
+            supported_efforts.push(selector_effort_from_str(effort)?);
+        }
+    }
+    supported_efforts.sort();
+    supported_efforts.dedup();
+    if supported_efforts.is_empty() {
+        return None;
+    }
+    let capabilities = priors
+        .models
+        .iter()
+        .find(|prior| prior.runtime == runtime && prior.model == observed.model_id)
+        .map(|prior| capabilities_from_prior(prior, task))
+        .unwrap_or_else(|| CandidateCapabilities {
+            task_classes: BTreeSet::new(),
+            authority_roles: BTreeSet::new(),
+            boundedness: [
+                Boundedness::TightlyBounded,
+                Boundedness::Bounded,
+                Boundedness::CrossCutting,
+            ]
+            .into_iter()
+            .collect(),
+            maximum_risk: RiskLevel::Critical,
+            maximum_context: ContextSize::Long,
+            maximum_horizon: TaskHorizon::Long,
+            long_context: false,
+        });
+    Some(CatalogModel {
+        model: observed.model_id.clone(),
+        available: true,
+        supported_efforts,
+        capabilities,
+    })
+}
+
+fn capabilities_from_prior(
+    prior: &selection::ModelPrior,
+    task: &TaskProfile,
+) -> CandidateCapabilities {
+    let mut authority_roles = prior
+        .authority_evidence
+        .iter()
+        .map(|evidence| evidence.role)
+        .collect::<BTreeSet<_>>();
+    if !prior.class_fit.is_empty() {
+        authority_roles.insert(AuthorityRole::TerminalLeaf);
+    }
+    if !prior.strong_gate_fallback_efforts.is_empty()
+        && !prior
+            .prohibited_authority_roles
+            .contains(&task.authority_role)
+    {
+        authority_roles.insert(task.authority_role);
+    }
+    CandidateCapabilities {
+        task_classes: prior
+            .class_fit
+            .iter()
+            .map(|class_fit| class_fit.task_class.clone())
+            .collect(),
+        authority_roles,
+        boundedness: [
+            Boundedness::TightlyBounded,
+            Boundedness::Bounded,
+            Boundedness::CrossCutting,
+        ]
+        .into_iter()
+        .collect(),
+        maximum_risk: RiskLevel::Critical,
+        maximum_context: ContextSize::Long,
+        maximum_horizon: TaskHorizon::Long,
+        long_context: prior.long_context_eligible,
+    }
+}
+
+fn primary_pool_for_selection(
+    runtime_name: &str,
+    admission: &SupervisorAdmissionPolicyInput,
+    account_observation: Option<&AccountObserveResult>,
+) -> Result<RuntimePoolState> {
+    if let Some(observation) = account_observation {
+        return account_observation_primary_pool(runtime_name, admission, observation);
+    }
+    let capacity = u64::try_from(admission.provider_inflight_bound)
+        .context("provider inflight bound does not fit selector pool units")?;
+    let admission_bytes = serde_json::to_vec(admission)
+        .context("failed to normalize supervisor admission input for selection")?;
+    Ok(RuntimePoolState {
+        runtime: runtime_name.to_string(),
+        admission_open: admission.resolved_bound > 0,
+        pool_reference: None,
+        pool_kind: None,
+        entitlement_bounded: true,
+        entitlement_capacity_units: capacity,
+        entitlement_remaining_units: capacity,
+        pool_pressure_basis_points: 0,
+        observed_consumption_units: 0,
+        marginal_cost_microunits: 0,
+        exhausted: false,
+        exhaustion_behavior: None,
+        authorized_alternatives: Vec::new(),
+        observation_revision: format!(
+            "supervisor-admission-sha256:{}",
+            crate::artifacts::state_auth::sha256_hex(&admission_bytes)
+        ),
+        observation_source: None,
+        admission_provenance: "supervisor admission supplies a bounded active-runtime inflight pool; external account quota and marginal-price observations were unavailable"
+            .to_string(),
+        failover_provenance: Some(
+            "advertised runtime catalogs participate in selection; launch uses the selected pair"
+                .to_string(),
+        ),
+    })
+}
+
+fn account_observation_primary_pool(
+    runtime_name: &str,
+    admission: &SupervisorAdmissionPolicyInput,
+    observation: &AccountObserveResult,
+) -> Result<RuntimePoolState> {
+    let observation_bytes = serde_json::to_vec(observation)
+        .context("failed to normalize account observation for selection")?;
+    let (pressure, provenance) = match observation.quota.as_ref() {
+        Some(category) if matches!(category.outcome, ObservationOutcome::Observed) => {
+            let pressure = category
+                .content
+                .as_ref()
+                .map(observed_quota_pressure_basis_points)
+                .unwrap_or(0);
+            (
+                pressure,
+                "account observation supplies utilization as pool pressure only; unit remaining, consumption, and marginal price were not projected",
+            )
+        }
+        _ => (
+            0,
+            "supervisor admission supplies a bounded active-runtime inflight pool; account observation did not supply Observed quota utilization, remaining, consumption, or marginal price",
+        ),
+    };
+    Ok(RuntimePoolState {
+        runtime: runtime_name.to_string(),
+        admission_open: admission.resolved_bound > 0,
+        pool_reference: None,
+        pool_kind: None,
+        entitlement_bounded: false,
+        entitlement_capacity_units: 0,
+        entitlement_remaining_units: 0,
+        pool_pressure_basis_points: pressure,
+        observed_consumption_units: 0,
+        marginal_cost_microunits: 0,
+        exhausted: false,
+        exhaustion_behavior: None,
+        authorized_alternatives: Vec::new(),
+        observation_revision: format!(
+            "account-observe-sha256:{}",
+            crate::artifacts::state_auth::sha256_hex(&observation_bytes)
+        ),
+        observation_source: None,
+        admission_provenance: provenance.to_string(),
+        failover_provenance: None,
+    })
+}
+
+fn observed_quota_pressure_basis_points(quota: &QuotaObservation) -> u16 {
+    quota
+        .snapshots
+        .iter()
+        .map(|snapshot| {
+            let scaled = (f64::from(snapshot.utilization) * 10_000.0).round();
+            if scaled.is_finite() {
+                scaled.clamp(0.0, 10_000.0) as u16
+            } else {
+                0
+            }
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn runtime_catalog_from_unavailable_priors(
@@ -3242,6 +3520,9 @@ pub(super) fn selector_effort_as_str(effort: SelectorEffort) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coding_agent_manager_lib::account_authority::{
+        CategoryObservation, SelectedAccountBinding,
+    };
 
     fn default_resolved_profile() -> ResolvedObjectiveProfile {
         ResolvedObjectiveProfile {
@@ -3919,6 +4200,7 @@ mod tests {
             resolved_objective_profile: &resolved_profile,
             quota_context: Some(&quota_context),
             quota_ledger: Some(&quota_ledger),
+            account_observation: None,
             signals: DynamicSignals {
                 retry_count: 0,
                 budget_signal: BudgetSignal::Continue,
@@ -5754,6 +6036,7 @@ mod tests {
             &advertised,
             &task_profile_for_role(AgentRole::Worker),
             &priors,
+            None,
         )?;
 
         assert_eq!(catalogs.len(), 1);
@@ -5778,6 +6061,7 @@ mod tests {
             &advertised,
             &task_profile_for_role(AgentRole::Worker),
             &priors,
+            None,
         )?;
 
         assert_eq!(catalogs.len(), 1);
@@ -5803,6 +6087,7 @@ mod tests {
             resolved_objective_profile: &resolved,
             quota_context: None,
             quota_ledger: None,
+            account_observation: None,
             signals: DynamicSignals {
                 retry_count: 0,
                 budget_signal: BudgetSignal::Continue,
@@ -7007,6 +7292,297 @@ mod tests {
             other => bail!("expected scored objective evidence, got {other:?}"),
         }
         reset_live_switch_cost_session();
+        Ok(())
+    }
+
+    fn test_account_binding(provider_id: &str) -> SelectedAccountBinding {
+        SelectedAccountBinding {
+            provider_id: provider_id.to_string(),
+            account_id: "work".to_string(),
+            account_incarnation: "0123456789abcdef0123456789abcdef".to_string(),
+            selection_revision: 1,
+        }
+    }
+
+    fn account_observe_result(
+        provider_id: &str,
+        models: CategoryObservation<ModelsObservation>,
+        quota: Option<CategoryObservation<QuotaObservation>>,
+    ) -> AccountObserveResult {
+        AccountObserveResult {
+            binding: test_account_binding(provider_id),
+            observed_at: "2026-09-19T00:00:00Z".to_string(),
+            auth: None,
+            models: Some(models),
+            quota,
+        }
+    }
+
+    fn observed_sol_high_xhigh() -> CategoryObservation<ModelsObservation> {
+        CategoryObservation::observed(ModelsObservation {
+            models: vec![ObservedModel {
+                model_id: FRONTIER_PROFILE_MODEL.to_string(),
+                supported_efforts: Some(vec!["high".to_string(), "xhigh".to_string()]),
+                default_effort: Some("high".to_string()),
+            }],
+        })
+    }
+
+    fn selection_input_with_account_observation(
+        observation: &AccountObserveResult,
+        advertised: &AdvertisedCatalogSet,
+    ) -> Result<SelectionInput> {
+        let catalog = codex_catalog()?;
+        let admission = test_admission();
+        let resolved = default_resolved_profile();
+        selection_input_for_role(SelectionInputForRoleArgs {
+            role: AgentRole::Worker,
+            runtime: SupervisorRuntime::Codex,
+            catalog: &catalog,
+            advertised,
+            admission: &admission,
+            resolved_objective_profile: &resolved,
+            quota_context: None,
+            quota_ledger: None,
+            account_observation: Some(observation),
+            signals: DynamicSignals {
+                retry_count: 0,
+                budget_signal: BudgetSignal::Continue,
+                previous_choice: None,
+                previous_catalog_digest: None,
+                environment_rejections: Vec::new(),
+            },
+            debug_override: None,
+            history: None,
+        })
+    }
+
+    #[test]
+    fn account_observe_admits_only_observed_model_and_effort() -> Result<()> {
+        let observation = account_observe_result(
+            "codex-cli",
+            observed_sol_high_xhigh(),
+            Some(CategoryObservation::unknown()),
+        );
+        let advertised = advertised_with_cursor(captured_cursor_observation()?);
+        let input = selection_input_with_account_observation(&observation, &advertised)?;
+        assert_eq!(input.catalogs.len(), 1);
+        assert_eq!(input.catalogs[0].runtime, "codex");
+        assert_eq!(input.catalogs[0].models.len(), 1);
+        assert_eq!(input.catalogs[0].models[0].model, FRONTIER_PROFILE_MODEL);
+        assert_eq!(
+            input.catalogs[0].models[0].supported_efforts,
+            vec![SelectorEffort::High, SelectorEffort::Xhigh]
+        );
+        assert!(input
+            .catalogs
+            .iter()
+            .all(|catalog| catalog.runtime != "cursor"));
+        let decision = selection::select(&input)?;
+        let choice = decision.choice.as_ref().context("observed worker choice")?;
+        assert_eq!(choice.candidate.runtime, "codex");
+        assert_eq!(choice.candidate.model, FRONTIER_PROFILE_MODEL);
+        assert!(matches!(
+            choice.candidate.effort,
+            SelectorEffort::High | SelectorEffort::Xhigh
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn account_observe_unknown_models_fail_closed() -> Result<()> {
+        let observation = account_observe_result(
+            "codex-cli",
+            CategoryObservation::unknown(),
+            Some(CategoryObservation::unknown()),
+        );
+        let advertised = advertised_with_cursor(captured_cursor_observation()?);
+        let mut plan = test_plan();
+        let resolution = super::initialize_supervisor_selection_with_history(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &codex_catalog()?,
+            &test_admission(),
+            &advertised,
+            Some(&default_resolved_profile()),
+            SupervisorQuotaSelectionInput::default(),
+            None,
+            Some(&observation),
+        )?;
+        let failure = resolution
+            .selection_preflight_failure
+            .context("unknown models must fail closed")?;
+        assert_eq!(
+            failure.kind,
+            SupervisorSelectionPreflightFailureKind::FailClosed
+        );
+        assert!(plan.role_models.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn account_observe_does_not_fill_efforts_from_priors() -> Result<()> {
+        let observation = account_observe_result(
+            "codex-cli",
+            CategoryObservation::observed(ModelsObservation {
+                models: vec![ObservedModel {
+                    model_id: FRONTIER_PROFILE_MODEL.to_string(),
+                    supported_efforts: Some(vec!["high".to_string()]),
+                    default_effort: None,
+                }],
+            }),
+            Some(CategoryObservation::unknown()),
+        );
+        let input =
+            selection_input_with_account_observation(&observation, &AdvertisedCatalogSet::empty())?;
+        let listed = input
+            .catalogs
+            .iter()
+            .find(|catalog| catalog.runtime == "codex")
+            .and_then(|catalog| {
+                catalog
+                    .models
+                    .iter()
+                    .find(|model| model.model == FRONTIER_PROFILE_MODEL)
+            })
+            .context("observed sol catalog row")?;
+        assert_eq!(listed.supported_efforts, vec![SelectorEffort::High]);
+        assert!(!listed.supported_efforts.contains(&SelectorEffort::Xhigh));
+        Ok(())
+    }
+
+    #[test]
+    fn account_observe_unknown_quota_does_not_invent_zeros_or_price() -> Result<()> {
+        let observation = account_observe_result(
+            "codex-cli",
+            observed_sol_high_xhigh(),
+            Some(CategoryObservation::unknown()),
+        );
+        let input =
+            selection_input_with_account_observation(&observation, &AdvertisedCatalogSet::empty())?;
+        let pool = input
+            .pools
+            .iter()
+            .find(|pool| pool.runtime == "codex")
+            .context("codex pool")?;
+        assert!(!pool.entitlement_bounded);
+        assert_eq!(pool.entitlement_capacity_units, 0);
+        assert_eq!(pool.entitlement_remaining_units, 0);
+        assert_eq!(pool.pool_pressure_basis_points, 0);
+        assert_eq!(pool.marginal_cost_microunits, 0);
+        assert!(pool.observation_source.is_none());
+        assert!(input.quota_source.is_none());
+        assert!(!pool.admission_provenance.contains("unavailable"));
+        assert!(input
+            .operational_observations
+            .as_ref()
+            .is_some_and(|observations| observations.quota.is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn account_observe_observed_quota_projects_utilization_without_price() -> Result<()> {
+        let observation = account_observe_result(
+            "codex-cli",
+            observed_sol_high_xhigh(),
+            Some(CategoryObservation::observed(QuotaObservation {
+                snapshots: vec![coding_agent_manager_lib::model::QuotaSnapshot {
+                    account_id: "work".to_string(),
+                    model: None,
+                    utilization: 0.25,
+                    window_label: Some("5h".to_string()),
+                    resets_at: None,
+                    captured_at: "2026-09-19T00:00:00Z".to_string(),
+                    source: coding_agent_manager_lib::model::QuotaSource::LocalFile,
+                }],
+                plan_label: None,
+            })),
+        );
+        let input =
+            selection_input_with_account_observation(&observation, &AdvertisedCatalogSet::empty())?;
+        let pool = input
+            .pools
+            .iter()
+            .find(|pool| pool.runtime == "codex")
+            .context("codex pool")?;
+        assert!(!pool.entitlement_bounded);
+        assert_eq!(pool.entitlement_capacity_units, 0);
+        assert_eq!(pool.entitlement_remaining_units, 0);
+        assert_eq!(pool.pool_pressure_basis_points, 2_500);
+        assert_eq!(pool.marginal_cost_microunits, 0);
+        assert!(pool.admission_provenance.contains("pressure only"));
+        assert!(!pool.admission_provenance.contains("unavailable"));
+        Ok(())
+    }
+
+    #[test]
+    fn account_observe_binding_runtime_mismatch_fail_closed() -> Result<()> {
+        let observation = account_observe_result(
+            "grok-cli",
+            CategoryObservation::observed(ModelsObservation {
+                models: vec![ObservedModel {
+                    model_id: "grok-4.6".to_string(),
+                    supported_efforts: Some(vec!["high".to_string()]),
+                    default_effort: None,
+                }],
+            }),
+            Some(CategoryObservation::unknown()),
+        );
+        let error =
+            selection_input_with_account_observation(&observation, &AdvertisedCatalogSet::empty())
+                .expect_err("provider/runtime mismatch must fail closed");
+        assert!(error
+            .to_string()
+            .contains("does not match selected runtime"));
+        Ok(())
+    }
+
+    #[test]
+    fn account_observe_none_keeps_advertised_catalog_path() -> Result<()> {
+        let advertised = advertised_with_grok(discover_grok_observation(CAPTURED_GROK_CATALOG)?);
+        let priors = selector_priors_with_terminal_worker_economics()?;
+        let catalogs = constructed_selection_catalogs(
+            SupervisorRuntime::Grok,
+            &RuntimeModelCatalog::OperatorDeclared,
+            &advertised,
+            &task_profile_for_role(AgentRole::Worker),
+            &priors,
+            None,
+        )?;
+        assert_eq!(catalogs.len(), 1);
+        assert!(catalogs[0].revision.starts_with("grok-advertised-sha256:"));
+        let catalog = RuntimeModelCatalog::OperatorDeclared;
+        let admission = test_admission();
+        let resolved = default_resolved_profile();
+        let input = selection_input_for_role(SelectionInputForRoleArgs {
+            role: AgentRole::Worker,
+            runtime: SupervisorRuntime::Grok,
+            catalog: &catalog,
+            advertised: &advertised,
+            admission: &admission,
+            resolved_objective_profile: &resolved,
+            quota_context: None,
+            quota_ledger: None,
+            account_observation: None,
+            signals: DynamicSignals {
+                retry_count: 0,
+                budget_signal: BudgetSignal::Continue,
+                previous_choice: None,
+                previous_catalog_digest: None,
+                environment_rejections: Vec::new(),
+            },
+            debug_override: None,
+            history: None,
+        })?;
+        assert!(input.catalogs[0]
+            .revision
+            .starts_with("grok-advertised-sha256:"));
+        assert!(input.pools[0].admission_provenance.contains("unavailable"));
+        assert!(input.pools[0].entitlement_bounded);
+        assert_eq!(
+            input.pools[0].entitlement_remaining_units,
+            input.pools[0].entitlement_capacity_units
+        );
         Ok(())
     }
 }

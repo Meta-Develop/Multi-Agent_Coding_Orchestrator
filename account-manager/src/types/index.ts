@@ -250,8 +250,14 @@ export interface AuthObservation {
   expiresAt?: string
 }
 
+export interface ObservedModel {
+  modelId: string
+  supportedEfforts?: string[]
+  defaultEffort?: string
+}
+
 export interface ModelsObservation {
-  modelIds: string[]
+  models: ObservedModel[]
 }
 
 export interface QuotaObservation {
