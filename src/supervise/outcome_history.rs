@@ -30,7 +30,7 @@ pub(super) struct AttemptSelectionBinding {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct AttemptAttributableCosts {
+pub(in crate::supervise) struct AttemptAttributableCosts {
     pub execution_cost_microunits: Option<u64>,
     pub review_cost_microunits: Option<u64>,
     pub rework_cost_microunits: Option<u64>,
@@ -39,7 +39,7 @@ pub(super) struct AttemptAttributableCosts {
 }
 
 impl AttemptAttributableCosts {
-    fn complete(&self) -> Option<[u64; 5]> {
+    pub(in crate::supervise) fn complete(&self) -> Option<[u64; 5]> {
         Some([
             self.execution_cost_microunits?,
             self.review_cost_microunits?,

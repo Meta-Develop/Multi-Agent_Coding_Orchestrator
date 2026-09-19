@@ -4407,17 +4407,19 @@ mod tests {
 
         let mut other_authority = authority.clone();
         other_authority.insert("researcher".to_string(), RoleCategory::ReadOnlyResearcher);
-        assert!(matches!(
-            MessagingStore::open(&path, "broker", &other_authority, &limits, integrity_key(),),
-            Err(StoreError::AuthorityBindingMismatch)
-        ));
+        match MessagingStore::open(&path, "broker", &other_authority, &limits, integrity_key()) {
+            Err(StoreError::AuthorityBindingMismatch) => {}
+            Err(other) => panic!("authority mismatch must be reported, got error: {other:?}"),
+            Ok(_) => panic!("authority mismatch must be reported, got an open store"),
+        }
 
         let mut other_limits = limits.clone();
         other_limits.max_messages += 1;
-        assert!(matches!(
-            MessagingStore::open(&path, "broker", &authority, &other_limits, integrity_key(),),
-            Err(StoreError::LimitsMismatch)
-        ));
+        match MessagingStore::open(&path, "broker", &authority, &other_limits, integrity_key()) {
+            Err(StoreError::LimitsMismatch) => {}
+            Err(other) => panic!("limits mismatch must be reported, got error: {other:?}"),
+            Ok(_) => panic!("limits mismatch must be reported, got an open store"),
+        }
     }
 
     fn write_records(path: &Path, records: &[JournalRecord]) {
