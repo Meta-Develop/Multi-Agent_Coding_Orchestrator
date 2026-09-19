@@ -232,6 +232,27 @@ fn grok_fixture() -> (tempfile::TempDir, GrokCliAdapter, StoredAccountRegistry) 
     (dir, adapter, registry)
 }
 
+fn grok_decoy_auth_fixture() -> (tempfile::TempDir, GrokCliAdapter, StoredAccountRegistry) {
+    let (dir, adapter, registry) = grok_fixture();
+    fs::write(
+        dir.path().join("user-home/.grok/auth.json"),
+        r#"{
+  "https://auth.example.invalid::FAKE-client-managed": {
+    "auth_mode": "FAKE-web-login",
+    "email": "FAKE-managed@example.invalid",
+    "oidc_client_id": "FAKE-client-managed",
+    "oidc_issuer": "https://auth.example.invalid",
+    "refresh_token": "FAKE-managed-refresh",
+    "paidTier": "FAKE-grok-paid-0001",
+    "billedUsd": 99.99,
+    "has_grok_code_access": true
+  }
+}"#,
+    )
+    .expect("write decoy auth.json");
+    (dir, adapter, registry)
+}
+
 fn claude_fixture() -> (tempfile::TempDir, ClaudeCodeAdapter, StoredAccountRegistry) {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = dir.path().join("home");
@@ -698,6 +719,67 @@ fn grok_observe_reports_unknown_quota_and_models_without_numeric_signals() {
     assert!(
         !json.contains(r#""snapshots":[]"#),
         "empty quota must be unknown, not an observed empty snapshot list"
+    );
+
+    let quota = result.quota.expect("quota category");
+    assert_eq!(quota.outcome, ObservationOutcome::Unknown);
+    assert!(quota.content.is_none());
+
+    let models = result.models.expect("models category");
+    assert_eq!(models.outcome, ObservationOutcome::Unknown);
+    assert!(models.content.is_none());
+
+    let auth = result.auth.expect("auth category");
+    assert_eq!(auth.outcome, ObservationOutcome::Unavailable);
+}
+
+#[test]
+fn grok_observe_does_not_treat_auth_json_decoy_fields_as_observed_auth_or_quota() {
+    let (_dir, adapter, registry) = grok_decoy_auth_fixture();
+    let binding = registry
+        .select_complete_revision("grok-cli", GROK_ACCOUNT, None)
+        .expect("select");
+
+    let result = observe_selected_account(
+        &registry,
+        &adapter,
+        AccountObserveRequest {
+            binding: binding.clone(),
+            categories: vec![
+                ObserveCategory::Auth,
+                ObserveCategory::Models,
+                ObserveCategory::Quota,
+            ],
+        },
+        None,
+    )
+    .expect("observe");
+
+    assert_eq!(result.binding, binding);
+    let json = serde_json::to_string(&result).expect("json");
+    assert!(
+        !json.contains("utilization"),
+        "Grok observe must not invent utilization from auth.json decoys"
+    );
+    assert!(
+        !json.contains(r#""snapshots":[]"#),
+        "empty quota must be unknown, not an observed empty snapshot list"
+    );
+    assert!(
+        !json.contains("paidTier"),
+        "auth.json paidTier decoy must not appear in observe output"
+    );
+    assert!(
+        !json.contains("billedUsd"),
+        "auth.json billedUsd decoy must not appear in observe output"
+    );
+    assert!(
+        !json.contains("refresh_token"),
+        "auth.json refresh_token must not leak into observe output"
+    );
+    assert!(
+        !json.contains("FAKE-"),
+        "fixture token prefixes must not leak into observe output"
     );
 
     let quota = result.quota.expect("quota category");
