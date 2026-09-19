@@ -6,7 +6,7 @@ mod common;
 use coding_agent_manager_lib::account_authority::{
     AccountObserveRequest, ObservationOutcome, StoredAccountRegistry,
 };
-use coding_agent_manager_lib::error::Error;
+use coding_agent_manager_lib::error::{Error, Result};
 use coding_agent_manager_lib::model::{AuthKind, StoredAccountMaterial};
 use coding_agent_manager_lib::paths::stored_accounts_path;
 use coding_agent_manager_lib::providers::claude_code::ClaudeCodeAdapter;
@@ -16,7 +16,7 @@ use coding_agent_manager_lib::providers::gemini_cli::GeminiCliAdapter;
 use coding_agent_manager_lib::providers::github_copilot::GithubCopilotAdapter;
 use coding_agent_manager_lib::providers::grok_cli::GrokCliAdapter;
 use coding_agent_manager_lib::providers::{
-    add_managed_account, observe_selected_account, ObserveCategory,
+    add_managed_account, add_managed_account_for, observe_selected_account, ObserveCategory,
 };
 use coding_agent_manager_lib::storage::{CredentialStore, Secret, SecretRef};
 use std::fs;
@@ -89,6 +89,46 @@ fn gemini_fixture() -> (
         bytes: Some(TEST_KEY.as_bytes().to_vec()),
     };
     (dir, adapter, registry, store)
+}
+
+fn write_isolated_oauth(home: &Path) -> Result<()> {
+    fs::create_dir_all(home.join(".gemini")).expect("oauth dir");
+    fs::write(
+        home.join(".gemini/oauth_creds.json"),
+        br#"{"access_token":"FAKE-gemini-oauth-access-0001","refresh_token":"FAKE-gemini-oauth-refresh-0001","expiry_date":1700000000000,"token_type":"Bearer"}"#,
+    )
+    .expect("creds");
+    fs::write(
+        home.join(".gemini/google_accounts.json"),
+        br#"{"active":"FAKE-user-0001@example.invalid","old":["FAKE-old-0002@example.invalid"]}"#,
+    )
+    .expect("accounts");
+    Ok(())
+}
+
+fn gemini_oauth_fixture() -> (tempfile::TempDir, GeminiCliAdapter, StoredAccountRegistry) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path().join("home");
+    let data = dir.path().join("data");
+    let cwd = dir.path().join("workspace");
+    fs::create_dir_all(home.join(".gemini")).expect("home gemini dir");
+    fs::create_dir_all(cwd.join(".gemini")).expect("workspace gemini dir");
+    fs::write(
+        home.join(".gemini/settings.json"),
+        r#"{"security":{"auth":{"selectedType":"oauth-personal"}}}"#,
+    )
+    .expect("settings");
+    let adapter = GeminiCliAdapter::with_test_context(
+        home,
+        data.clone(),
+        cwd,
+        dir.path().join("system/settings.json"),
+        dir.path().join("system/system-defaults.json"),
+        None,
+    )
+    .with_oauth_completer(write_isolated_oauth);
+    let registry = StoredAccountRegistry::new(stored_accounts_path(&data));
+    (dir, adapter, registry)
 }
 
 fn cursor_fixture() -> (tempfile::TempDir, CursorAdapter, StoredAccountRegistry) {
@@ -497,6 +537,87 @@ fn gemini_observe_reports_unknown_quota_and_models_without_invented_zeros() {
     assert!(
         !json.contains("snapshots"),
         "unknown quota must not serialize empty snapshots as observed zero: {json}"
+    );
+
+    let quota = result.quota.expect("quota category");
+    assert_eq!(quota.outcome, ObservationOutcome::Unknown);
+    assert!(quota.content.is_none());
+
+    let models = result.models.expect("models category");
+    assert_eq!(models.outcome, ObservationOutcome::Unknown);
+
+    let auth = result.auth.expect("auth category");
+    assert_eq!(auth.outcome, ObservationOutcome::Observed);
+}
+
+#[test]
+fn gemini_oauth_observe_does_not_invent_ai_pro_entitlement_from_local_files() {
+    let (_dir, adapter, registry) = gemini_oauth_fixture();
+    add_managed_account_for(
+        &registry,
+        &adapter,
+        "work",
+        "Work",
+        None,
+        Some(AuthKind::OAuth),
+    )
+    .expect("oauth add");
+    let binding = registry
+        .select_complete_revision("gemini-cli", "work", None)
+        .expect("select");
+
+    let result = observe_selected_account(
+        &registry,
+        &adapter,
+        AccountObserveRequest {
+            binding: binding.clone(),
+            categories: vec![
+                ObserveCategory::Auth,
+                ObserveCategory::Models,
+                ObserveCategory::Quota,
+            ],
+        },
+        None,
+    )
+    .expect("observe");
+
+    assert_eq!(result.binding, binding);
+    let json = serde_json::to_string(&result).expect("json");
+    assert!(
+        !json.contains("utilization"),
+        "Gemini OAuth observe must not invent utilization: {json}"
+    );
+    assert!(
+        !json.contains("snapshots"),
+        "unknown quota must not serialize empty snapshots as observed zero: {json}"
+    );
+    assert!(
+        !json.contains("paidTier"),
+        "local OAuth files must not invent paid tier: {json}"
+    );
+    assert!(
+        !json.contains("aiPro"),
+        "local OAuth files must not invent AI Pro entitlement: {json}"
+    );
+    assert!(
+        !json.contains("Google AI Pro"),
+        "local OAuth files must not invent Google AI Pro: {json}"
+    );
+    assert!(
+        !json.contains("Google AI Ultra"),
+        "local OAuth files must not invent Google AI Ultra: {json}"
+    );
+    assert!(
+        !json.contains("FAKE-"),
+        "observe output must not leak fixture secrets: {json}"
+    );
+    assert!(
+        !json.contains("FAKE-user-0001@example.invalid"),
+        "observe output must not leak fixture email: {json}"
+    );
+    assert!(
+        !json.contains("FAKE-old-0002@example.invalid"),
+        "observe output must not leak fixture email: {json}"
     );
 
     let quota = result.quota.expect("quota category");
