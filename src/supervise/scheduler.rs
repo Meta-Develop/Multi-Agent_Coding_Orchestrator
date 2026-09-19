@@ -6011,9 +6011,10 @@ mod selection_policy_tests {
                 SupervisorAdmissionConfig::default(),
                 SupervisorAdmissionConfig::default(),
             )?;
-            let mut plan_metadata = SupervisorPlanMetadata::default();
-            plan_metadata.resolved_objective_profile =
-                Some(super::default_resolved_objective_profile()?);
+            let plan_metadata = SupervisorPlanMetadata {
+                resolved_objective_profile: Some(super::default_resolved_objective_profile()?),
+                ..SupervisorPlanMetadata::default()
+            };
             Ok((temporary, repo, catalog, admission, plan, plan_metadata))
         }
 
