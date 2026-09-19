@@ -243,9 +243,8 @@ fn replay_or_refuse(
 
 fn new_operation_handle() -> Result<OperationHandle> {
     let mut bytes = [0u8; 24];
-    getrandom::getrandom(&mut bytes).map_err(|_| {
-        prepare_refused("account-metadata", "operation handle entropy unavailable")
-    })?;
+    getrandom::getrandom(&mut bytes)
+        .map_err(|_| prepare_refused("account-metadata", "operation handle entropy unavailable"))?;
     Ok(OperationHandle(URL_SAFE_NO_PAD.encode(bytes)))
 }
 
@@ -383,8 +382,7 @@ mod tests {
             ("context", |_, request| request.context.push('x')),
             ("callerPolicyDigest", |_, request| {
                 request.caller_policy_digest =
-                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                        .to_string();
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
             }),
             ("admission item", |_, request| {
                 request.admission_requirements[0].push('x');
