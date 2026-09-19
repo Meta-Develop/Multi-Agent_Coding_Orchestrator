@@ -483,9 +483,16 @@ impl SchedulerProgress {
             .with_context(|| format!("missing prepared pre-claim decision at index {index}"))
     }
 
-    fn commit_completed_selection_prefix(&mut self, runtime: SupervisorRuntime) -> Result<()> {
-        self.budget_degradation
-            .commit_completed_selection_prefix(&self.indexed_outcomes, runtime)
+    fn commit_completed_selection_prefix(
+        &mut self,
+        runtime: SupervisorRuntime,
+        run_dir: &Path,
+    ) -> Result<()> {
+        self.budget_degradation.commit_completed_selection_prefix(
+            &self.indexed_outcomes,
+            runtime,
+            run_dir,
+        )
     }
 }
 
@@ -650,8 +657,13 @@ impl AssignmentBudgetPolicy {
             .and_then(SupervisorAutomaticSelectionState::account_observe_environment_decision)
     }
 
-    pub(super) fn refresh_observed_accepted_task_cost(&mut self, run_dir: &Path) {
-        let rollup = this_run_accepted_task_cost(&load_this_run_attempt_cost_rows(run_dir), &[]);
+    pub(super) fn refresh_observed_accepted_task_cost(
+        &mut self,
+        run_dir: &Path,
+        reports: &[OrchestratorReviewReport],
+    ) {
+        let rollup =
+            this_run_accepted_task_cost(&load_this_run_attempt_cost_rows(run_dir), reports);
         if let Some(state) = self.selector_state.as_mut() {
             state.set_observed_accepted_task_cost(observed_cost_per_accepted_task_microunits(
                 rollup.as_ref(),
@@ -768,6 +780,7 @@ impl BudgetDegradationController {
         &mut self,
         indexed_outcomes: &[Option<AssignmentExecutionOutcome>],
         runtime: SupervisorRuntime,
+        run_dir: &Path,
     ) -> Result<()> {
         while let Some(Some(outcome)) = indexed_outcomes.get(self.next_selection_commit_index) {
             self.policy
@@ -783,6 +796,13 @@ impl BudgetDegradationController {
                 .checked_add(1)
                 .context("automatic-selection schedule commit index overflowed")?;
         }
+        let reports = indexed_outcomes
+            .iter()
+            .take(self.next_selection_commit_index)
+            .filter_map(|slot| slot.as_ref().and_then(|outcome| outcome.report.clone()))
+            .collect::<Vec<_>>();
+        self.policy
+            .refresh_observed_accepted_task_cost(run_dir, &reports);
         Ok(())
     }
 
@@ -1699,7 +1719,7 @@ fn run_serial_assignment_schedule(
             context.assignment_schedule,
             context.artifacts,
         )?;
-        progress.commit_completed_selection_prefix(context.options.runtime)?;
+        progress.commit_completed_selection_prefix(context.options.runtime, context.run_dir)?;
         if pending.is_empty() {
             break;
         }
@@ -1747,7 +1767,7 @@ fn run_serial_assignment_schedule(
         if !preclaim.allows_path_claim() {
             pending.remove(&index);
             progress.indexed_outcomes[index] = Some(parked_preclaim_outcome(assignment, &preclaim));
-            progress.commit_completed_selection_prefix(context.options.runtime)?;
+            progress.commit_completed_selection_prefix(context.options.runtime, context.run_dir)?;
             continue;
         }
         let Some(budget_policy) =
@@ -1834,7 +1854,7 @@ fn run_serial_assignment_schedule(
         let abort = outcome.requires_scheduler_abort();
         let budget_stopped = outcome.budget_dispatch_stopped;
         progress.indexed_outcomes[index] = Some(outcome);
-        progress.commit_completed_selection_prefix(context.options.runtime)?;
+        progress.commit_completed_selection_prefix(context.options.runtime, context.run_dir)?;
         if abort || budget_stopped {
             progress.budget_prevented_dispatch |= budget_stopped;
             if !pending.is_empty()
@@ -1899,7 +1919,7 @@ fn run_concurrent_assignment_schedule(
                     context.assignment_schedule,
                     context.artifacts,
                 )?;
-                progress.commit_completed_selection_prefix(context.options.runtime)?;
+                progress.commit_completed_selection_prefix(context.options.runtime, context.run_dir)?;
                 while active.len() < progress.budget_degradation.effective_fan_out {
                     if !progress.health_breaker.permits_admission() {
                         stop_scheduling = true;
@@ -1946,7 +1966,7 @@ fn run_concurrent_assignment_schedule(
                         pending.remove(&index);
                         progress.indexed_outcomes[index] =
                             Some(parked_preclaim_outcome(assignment, &preclaim));
-                        progress.commit_completed_selection_prefix(context.options.runtime)?;
+                        progress.commit_completed_selection_prefix(context.options.runtime, context.run_dir)?;
                         continue;
                     }
                     let Some(budget_policy) = progress.budget_degradation.assignment_policy(
@@ -2072,8 +2092,10 @@ fn run_concurrent_assignment_schedule(
                                     );
                                     progress.indexed_outcomes[active_index] = Some(outcome);
                                 }
-                                progress
-                                    .commit_completed_selection_prefix(context.options.runtime)?;
+                                progress.commit_completed_selection_prefix(
+                                    context.options.runtime,
+                                    context.run_dir,
+                                )?;
                                 return Err(error).context(format!(
                                     "supervisor assignment '{}' ended before committing or declining budget admission",
                                     assignment.id
@@ -2093,7 +2115,7 @@ fn run_concurrent_assignment_schedule(
                                 .as_ref()
                                 .context("spawn failure outcome disappeared")?;
                             record_completed_assignment_checkpoint(context, index, outcome)?;
-                            progress.commit_completed_selection_prefix(context.options.runtime)?;
+                            progress.commit_completed_selection_prefix(context.options.runtime, context.run_dir)?;
                             break;
                         }
                     }
@@ -2163,7 +2185,7 @@ fn run_concurrent_assignment_schedule(
                 }
             }
             progress.indexed_outcomes[completed_index] = Some(outcome);
-            progress.commit_completed_selection_prefix(context.options.runtime)?;
+            progress.commit_completed_selection_prefix(context.options.runtime, context.run_dir)?;
         }
 
         for (index, handle) in active {
@@ -2177,7 +2199,7 @@ fn run_concurrent_assignment_schedule(
             record_completed_assignment_checkpoint(context, index, &outcome)?;
             release_concurrent_assignment(&mut outcome, context.sync_store, context.semantic_store);
             progress.indexed_outcomes[index] = Some(outcome);
-            progress.commit_completed_selection_prefix(context.options.runtime)?;
+            progress.commit_completed_selection_prefix(context.options.runtime, context.run_dir)?;
         }
         Ok(())
     })
@@ -4785,6 +4807,47 @@ mod selection_policy_tests {
 
     const SELECTOR_TEST_TARGET: &str = "tests/selector.rs";
 
+    fn accepted_review_report(assignment_id: &str) -> OrchestratorReviewReport {
+        OrchestratorReviewReport {
+            id: assignment_id.to_string(),
+            role: AgentRole::Worker,
+            assigned_paths: Vec::new(),
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            claim_token: None,
+            semantic_intent_token: None,
+            commands_run: Vec::new(),
+            environment_failures: Vec::new(),
+            files_changed: Vec::new(),
+            validation_results: Vec::new(),
+            findings: Vec::new(),
+            field_guide_entries: Vec::new(),
+            worker_reports: Vec::new(),
+            audit_reports: Vec::new(),
+            review_lens_aggregate: None,
+            decomposition_completions: Vec::new(),
+            licensed_breakage_review: None,
+            generated_follow_up_tasks: Vec::new(),
+            gate_denials: Vec::new(),
+            gate_correction_outcomes: Vec::new(),
+            accepted: true,
+            rejected: false,
+            status: ReviewStatus::Succeeded,
+            remaining_risk: String::new(),
+            next_safe_action: String::new(),
+        }
+    }
+
+    fn complete_attempt_costs() -> AttemptAttributableCosts {
+        AttemptAttributableCosts {
+            execution_cost_microunits: Some(10),
+            review_cost_microunits: Some(2),
+            rework_cost_microunits: Some(0),
+            rereview_cost_microunits: Some(0),
+            environment_cost_microunits: Some(0),
+        }
+    }
+
     fn test_plan() -> SupervisorPlan {
         SupervisorPlan {
             version: SUPERVISOR_SCHEMA_VERSION,
@@ -5445,7 +5508,11 @@ mod selection_policy_tests {
             ..AssignmentExecutionOutcome::default()
         })];
         controller
-            .commit_completed_selection_prefix(&indexed_outcomes, SupervisorRuntime::Codex)?;
+            .commit_completed_selection_prefix(
+            &indexed_outcomes,
+            SupervisorRuntime::Codex,
+            Path::new("/nonexistent-maco-cpo-refresh"),
+        )?;
 
         let continue_plan = controller.policy.apply(&plan);
         assert_eq!(
@@ -5492,6 +5559,95 @@ mod selection_policy_tests {
         assert_eq!(
             later_events[0].primary_cause,
             SupervisorSelectionEventCause::BudgetDegrade
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn this_run_cpo_infers_accepted_from_report_when_parent_result_is_absent() {
+        let rows = [ThisRunAttemptCostRow {
+            assignment_id: "assignment-1".to_string(),
+            attempt: 1,
+            parent_result: None,
+            costs: complete_attempt_costs(),
+        }];
+        assert_eq!(
+            observed_cost_per_accepted_task_microunits(
+                this_run_accepted_task_cost(&rows, &[]).as_ref()
+            ),
+            None
+        );
+        let rollup = this_run_accepted_task_cost(&rows, &[accepted_review_report("assignment-1")])
+            .expect("complete accepted rollup");
+        assert_eq!(
+            observed_cost_per_accepted_task_microunits(Some(&rollup)),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn commit_prefix_feeds_complete_cpo_into_shared_policy_reselect() -> Result<()> {
+        let (catalog, state, _, _) = automatic_selection_fixture()?;
+        let mut controller = BudgetDegradationController::new_with_selection_state(
+            2,
+            Some(state),
+            SupervisorRuntime::Codex,
+        )?;
+        let run_dir = tempfile::TempDir::new()?;
+        let attempts = run_dir.path().join("selection-attempts");
+        std::fs::create_dir_all(&attempts)?;
+        let evidence = AttemptOutcomeEvidence {
+            version: 1,
+            run_id: "cpo-refresh".to_string(),
+            assignment_id: "assignment-1".to_string(),
+            attempt: 1,
+            verified_execution: false,
+            selection: None,
+            requested_runtime: "codex".to_string(),
+            requested_model: None,
+            requested_effort: None,
+            observed_candidate: None,
+            parent_result: None,
+            parent_cause: None,
+            failure_class: None,
+            costs: complete_attempt_costs(),
+            parent_phase_continuation: None,
+        };
+        std::fs::write(
+            attempts.join("assignment-1.attempt-1.json"),
+            serde_json::to_vec(&evidence)?,
+        )?;
+        let indexed_outcomes = vec![Some(AssignmentExecutionOutcome {
+            report: Some(accepted_review_report("assignment-1")),
+            ..AssignmentExecutionOutcome::default()
+        })];
+        controller.commit_completed_selection_prefix(
+            &indexed_outcomes,
+            SupervisorRuntime::Codex,
+            run_dir.path(),
+        )?;
+
+        let mut later_policy = controller.policy.clone();
+        let later_events = later_policy.reselect(
+            SupervisorRuntime::Codex,
+            &catalog,
+            SelectorReselectionRequest {
+                roles: &[AgentRole::Worker],
+                assignment_id: Some("later-assignment"),
+                attempt: 0,
+                primary_cause: SupervisorSelectionEventCause::BudgetDegrade,
+                retry_count: 0,
+                budget_signal: crate::selection::BudgetSignal::Degrade,
+                environment_rejections: &[],
+            },
+        )?;
+        assert_eq!(
+            later_events[0]
+                .provenance
+                .normalized_input
+                .signals
+                .observed_cost_per_accepted_task_microunits,
+            Some(12)
         );
         Ok(())
     }
@@ -5585,7 +5741,11 @@ mod selection_policy_tests {
             ..AssignmentExecutionOutcome::default()
         });
         controller
-            .commit_completed_selection_prefix(&indexed_outcomes, SupervisorRuntime::Codex)?;
+            .commit_completed_selection_prefix(
+            &indexed_outcomes,
+            SupervisorRuntime::Codex,
+            Path::new("/nonexistent-maco-cpo-refresh"),
+        )?;
         assert_eq!(controller.next_selection_commit_index, 0);
 
         indexed_outcomes[0] = Some(AssignmentExecutionOutcome {
@@ -5593,7 +5753,11 @@ mod selection_policy_tests {
             ..AssignmentExecutionOutcome::default()
         });
         controller
-            .commit_completed_selection_prefix(&indexed_outcomes, SupervisorRuntime::Codex)?;
+            .commit_completed_selection_prefix(
+            &indexed_outcomes,
+            SupervisorRuntime::Codex,
+            Path::new("/nonexistent-maco-cpo-refresh"),
+        )?;
         assert_eq!(controller.next_selection_commit_index, 2);
         assert_eq!(
             controller
