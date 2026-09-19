@@ -230,18 +230,66 @@ fn decode_unknown_duplicate_and_version_are_refused() {
     assert_eq!(version.request_id, "r2");
 }
 
+fn operation_prepare_body() -> serde_json::Value {
+    serde_json::json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "requestId": "prep",
+        "operation": "operation.prepare",
+        "binding": {
+            "providerId": "gemini-cli",
+            "accountId": "work",
+            "accountIncarnation": "inc-1",
+            "selectionRevision": 1
+        },
+        "operationKind": "work-proposal",
+        "modelId": "gemini-2.5-pro",
+        "reasoningEffort": "high",
+        "prompt": "propose the next edit",
+        "context": "",
+        "callerPolicyDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "admissionRequirements": [],
+        "idempotencyKey": "prep-1"
+    })
+}
+
 #[test]
-fn dispatch_refuses_operation_prepare() {
-    let (_dir, registry) = isolated_registry();
-    let ctx = AuthorityContext::new(registry).without_registry_fallback();
-    let decoded = decode_request(
+fn decode_refuses_operation_prepare_without_closed_fields() {
+    let error = decode_request(
         br#"{"protocolVersion":1,"requestId":"prep","operation":"operation.prepare"}"#,
     )
-    .expect("decode unsupported op");
+    .expect_err("missing prepare fields");
+    assert_eq!(error.code, ErrorCode::InvalidRequest);
+    assert_eq!(error.request_id, "prep");
+}
+
+#[test]
+fn dispatch_refuses_well_formed_operation_prepare_until_advertised() {
+    let (_dir, registry) = isolated_registry();
+    let ctx = AuthorityContext::new(registry).without_registry_fallback();
+    let decoded = decode_request(operation_prepare_body().to_string().as_bytes())
+        .expect("well-formed prepare decodes");
     let response = serde_json::to_value(dispatch(&ctx, &decoded)).expect("json");
     assert_eq!(response["error"]["code"], "unsupported-operation");
+    assert_eq!(
+        response["error"]["message"],
+        "operation.prepare is not advertised until a provider \
+advertises work-proposal tool restrictions"
+    );
     assert!(response["result"].is_null());
     assert!(!ADVERTISED_OPERATIONS.contains(&"operation.prepare"));
+}
+
+#[test]
+fn decode_refuses_operation_prepare_with_unknown_kind_or_digest() {
+    let mut kind = operation_prepare_body();
+    kind["operationKind"] = serde_json::json!("reset-probe");
+    let kind_error = decode_request(kind.to_string().as_bytes()).expect_err("kind");
+    assert_eq!(kind_error.code, ErrorCode::InvalidRequest);
+
+    let mut digest = operation_prepare_body();
+    digest["callerPolicyDigest"] = serde_json::json!("not-a-digest");
+    let digest_error = decode_request(digest.to_string().as_bytes()).expect_err("digest");
+    assert_eq!(digest_error.code, ErrorCode::InvalidRequest);
 }
 
 #[test]

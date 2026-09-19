@@ -285,6 +285,17 @@ pub enum DecodedOperation {
         handle: LoginHandle,
         binding: LoginAccountBinding,
     },
+    OperationPrepare {
+        binding: SelectedAccountBinding,
+        operation_kind: String,
+        model_id: String,
+        reasoning_effort: String,
+        prompt: String,
+        context: String,
+        caller_policy_digest: String,
+        admission_requirements: Vec<String>,
+        idempotency_key: String,
+    },
     Unsupported {
         operation: String,
     },
@@ -330,6 +341,20 @@ struct LoginStartParams {
 struct LoginHandleParams {
     handle: LoginHandle,
     binding: LoginAccountBinding,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OperationPrepareParams {
+    binding: SelectedAccountBinding,
+    operation_kind: String,
+    model_id: String,
+    reasoning_effort: String,
+    prompt: String,
+    context: String,
+    caller_policy_digest: String,
+    admission_requirements: Vec<String>,
+    idempotency_key: String,
 }
 
 /// Opaque hex SHA-256 of the canonical `stored-accounts.json` path.
@@ -544,6 +569,26 @@ fn decode_operation(
                 binding: parsed.binding,
             }
         }
+        "operation.prepare" => {
+            let parsed: OperationPrepareParams = parse_params(&request_id, params)?;
+            require_work_proposal_kind(&request_id, &parsed.operation_kind)?;
+            require_nonempty_field(&request_id, "modelId", &parsed.model_id)?;
+            require_nonempty_field(&request_id, "reasoningEffort", &parsed.reasoning_effort)?;
+            require_nonempty_field(&request_id, "prompt", &parsed.prompt)?;
+            require_policy_digest(&request_id, &parsed.caller_policy_digest)?;
+            require_nonempty_field(&request_id, "idempotencyKey", &parsed.idempotency_key)?;
+            DecodedOperation::OperationPrepare {
+                binding: parsed.binding,
+                operation_kind: parsed.operation_kind,
+                model_id: parsed.model_id,
+                reasoning_effort: parsed.reasoning_effort,
+                prompt: parsed.prompt,
+                context: parsed.context,
+                caller_policy_digest: parsed.caller_policy_digest,
+                admission_requirements: parsed.admission_requirements,
+                idempotency_key: parsed.idempotency_key,
+            }
+        }
         _ => DecodedOperation::Unsupported { operation },
     };
     Ok(DecodedRequest {
@@ -560,6 +605,50 @@ fn require_empty_params(request_id: &str, params: &Value) -> Result<(), Protocol
             ErrorCode::InvalidRequest,
             "authority.describe does not accept fields other than the envelope",
         )),
+    }
+}
+
+fn require_work_proposal_kind(request_id: &str, kind: &str) -> Result<(), ProtocolFailure> {
+    if kind == "work-proposal" {
+        Ok(())
+    } else {
+        Err(ProtocolFailure::new(
+            request_id,
+            ErrorCode::InvalidRequest,
+            "operation.prepare kind must be work-proposal",
+        ))
+    }
+}
+
+fn require_nonempty_field(
+    request_id: &str,
+    field: &str,
+    value: &str,
+) -> Result<(), ProtocolFailure> {
+    if !value.is_empty() {
+        Ok(())
+    } else {
+        Err(ProtocolFailure::new(
+            request_id,
+            ErrorCode::InvalidRequest,
+            format!("{field} must be a non-empty string"),
+        ))
+    }
+}
+
+fn require_policy_digest(request_id: &str, digest: &str) -> Result<(), ProtocolFailure> {
+    if digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        Ok(())
+    } else {
+        Err(ProtocolFailure::new(
+            request_id,
+            ErrorCode::InvalidRequest,
+            "callerPolicyDigest must be a lowercase SHA-256 hex digest",
+        ))
     }
 }
 
@@ -624,6 +713,12 @@ pub fn dispatch(ctx: &AuthorityContext, request: &DecodedRequest) -> AuthorityRe
         DecodedOperation::LoginCancel { handle, binding } => {
             login_cancel(ctx, &request.request_id, handle, binding)
         }
+        DecodedOperation::OperationPrepare { .. } => AuthorityResponse::error(
+            request.request_id.clone(),
+            ErrorCode::UnsupportedOperation,
+            "operation.prepare is not advertised until a provider \
+advertises work-proposal tool restrictions",
+        ),
         DecodedOperation::Unsupported { operation } => AuthorityResponse::error(
             request.request_id.clone(),
             ErrorCode::UnsupportedOperation,
