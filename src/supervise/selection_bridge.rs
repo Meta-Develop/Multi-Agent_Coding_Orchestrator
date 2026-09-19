@@ -4,6 +4,7 @@
 //! is translated into selector input. The selector remains deterministic and
 //! cannot inspect the host, clock, catalog, or supervisor plan directly.
 
+use super::environment_observation::AccountObserveOutcomeKind;
 use super::*;
 use crate::objective_profile::ResolvedObjectiveProfile;
 use crate::optimizer::action::{
@@ -1080,6 +1081,21 @@ impl SupervisorAutomaticSelectionState {
         })
     }
 
+    pub(super) fn account_observe_environment_decision(
+        &self,
+    ) -> Option<(AccountObserveOutcomeKind, Option<u64>)> {
+        let observation = self.account_observation.as_ref();
+        #[cfg(target_os = "linux")]
+        {
+            observation.map(account_observe_environment_decision)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = observation;
+            None
+        }
+    }
+
     pub(super) fn executable_bindings(
         &self,
         runtime: SupervisorRuntime,
@@ -1864,6 +1880,21 @@ fn runtime_from_account_provider(provider_id: &str) -> Result<&'static str> {
             bail!("account observation provider '{provider_id}' has no fail-closed runtime mapping")
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn account_observe_environment_decision(
+    observation: &AccountObserveResult,
+) -> (AccountObserveOutcomeKind, Option<u64>) {
+    let kind = match observation.quota.as_ref().map(|category| &category.outcome) {
+        Some(ObservationOutcome::Observed) => AccountObserveOutcomeKind::Observed,
+        Some(ObservationOutcome::Stale) => AccountObserveOutcomeKind::Stale,
+        Some(ObservationOutcome::Unavailable) => AccountObserveOutcomeKind::Unavailable,
+        Some(ObservationOutcome::Failed { .. }) => AccountObserveOutcomeKind::Failed,
+        Some(ObservationOutcome::Unknown) | None => AccountObserveOutcomeKind::Unknown,
+    };
+    // Quota utilization is a 0..=1 pressure signal, not environment spend.
+    (kind, None)
 }
 
 #[cfg(target_os = "linux")]
@@ -3542,8 +3573,10 @@ pub(super) fn selector_effort_as_str(effort: SelectorEffort) -> &'static str {
 mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
+    use super::super::environment_observation::environment_cost_microunits_from_account_observe;
+    #[cfg(target_os = "linux")]
     use coding_agent_manager_lib::account_authority::{
-        CategoryObservation, SelectedAccountBinding,
+        CategoryObservation, ObservationError, ObservationErrorKind, SelectedAccountBinding,
     };
 
     fn default_resolved_profile() -> ResolvedObjectiveProfile {
@@ -7543,6 +7576,64 @@ mod tests {
         assert_eq!(pool.marginal_cost_microunits, 0);
         assert!(pool.admission_provenance.contains("pressure only"));
         assert!(!pool.admission_provenance.contains("unavailable"));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn account_observe_quota_does_not_become_environment_microunits() -> Result<()> {
+        let observed_zero = account_observe_result(
+            "codex-cli",
+            observed_sol_high_xhigh(),
+            Some(CategoryObservation::observed(QuotaObservation {
+                snapshots: vec![coding_agent_manager_lib::model::QuotaSnapshot {
+                    account_id: "work".to_string(),
+                    model: None,
+                    utilization: 0.0,
+                    window_label: Some("5h".to_string()),
+                    resets_at: None,
+                    captured_at: "2026-09-19T00:00:00Z".to_string(),
+                    source: coding_agent_manager_lib::model::QuotaSource::LocalFile,
+                }],
+                plan_label: None,
+            })),
+        );
+        let (kind, microunits) = account_observe_environment_decision(&observed_zero);
+        assert_eq!(kind, AccountObserveOutcomeKind::Observed);
+        assert_eq!(microunits, None);
+        assert_eq!(
+            environment_cost_microunits_from_account_observe(kind, microunits),
+            None
+        );
+
+        let unknown = account_observe_result(
+            "codex-cli",
+            observed_sol_high_xhigh(),
+            Some(CategoryObservation::unknown()),
+        );
+        let (kind, microunits) = account_observe_environment_decision(&unknown);
+        assert_eq!(kind, AccountObserveOutcomeKind::Unknown);
+        assert_eq!(microunits, None);
+        assert_eq!(
+            environment_cost_microunits_from_account_observe(kind, Some(0)),
+            None
+        );
+
+        let failed = account_observe_result(
+            "codex-cli",
+            observed_sol_high_xhigh(),
+            Some(CategoryObservation::failed(ObservationError {
+                kind: ObservationErrorKind::Other,
+                message: "quota inspect failed".to_string(),
+            })),
+        );
+        let (kind, microunits) = account_observe_environment_decision(&failed);
+        assert_eq!(kind, AccountObserveOutcomeKind::Failed);
+        assert_eq!(microunits, None);
+        assert_eq!(
+            environment_cost_microunits_from_account_observe(kind, Some(0)),
+            None
+        );
         Ok(())
     }
 

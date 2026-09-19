@@ -2,6 +2,9 @@
 //! The artifact store supplies the only authenticity boundary. A digest here is
 //! replay provenance, not an independent signature or a source of authority.
 
+use super::environment_observation::{
+    environment_cost_microunits_from_account_observe, AccountObserveOutcomeKind,
+};
 use super::*;
 use crate::external_agent::{
     CodexParentEvidence, CodexParentResolutionStatus, CodexParentTurnUsage, ExternalAgentRun,
@@ -195,6 +198,47 @@ pub(super) fn record_child_attempt_outcome(
     dated_plan_pricing: &BTreeMap<String, ModelPricing>,
     parent_phase_continuation: Option<AttemptParentPhaseContinuation>,
 ) -> Result<AttemptOutcomeEvidence> {
+    record_child_attempt_outcome_with_account_observe(
+        artifacts,
+        run_id,
+        assignment_id,
+        attempt,
+        role,
+        events,
+        initial_events,
+        requested_runtime,
+        requested_model,
+        requested_effort,
+        verified_execution,
+        retried,
+        execution_runtime,
+        external_run,
+        dated_plan_pricing,
+        parent_phase_continuation,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn record_child_attempt_outcome_with_account_observe(
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    run_id: &RunId,
+    assignment_id: &str,
+    attempt: usize,
+    role: AgentRole,
+    events: &[SupervisorSelectionEvent],
+    initial_events: &[SupervisorSelectionEvent],
+    requested_runtime: &str,
+    requested_model: Option<&str>,
+    requested_effort: Option<&str>,
+    verified_execution: bool,
+    retried: bool,
+    execution_runtime: SupervisorExecutionRuntime,
+    external_run: Option<&ExternalAgentRun>,
+    dated_plan_pricing: &BTreeMap<String, ModelPricing>,
+    parent_phase_continuation: Option<AttemptParentPhaseContinuation>,
+    account_observe: Option<(AccountObserveOutcomeKind, Option<u64>)>,
+) -> Result<AttemptOutcomeEvidence> {
     let selection =
         selection_binding_for_attempt(role, assignment_id, attempt, events, initial_events);
     let frozen_catalogs =
@@ -204,6 +248,9 @@ pub(super) fn record_child_attempt_outcome(
         parent_attempt_observation(external_run, frozen_catalogs, dated_plan_pricing);
     let (execution_cost_microunits, rework_cost_microunits) =
         classify_worker_observed_spend(attempt, worker_observed_microunits);
+    let environment_cost_microunits = account_observe.and_then(|(kind, microunits)| {
+        environment_cost_microunits_from_account_observe(kind, microunits)
+    });
     let mut evidence = AttemptOutcomeEvidence {
         version: ATTEMPT_EVIDENCE_VERSION,
         run_id: run_id.as_str().to_string(),
@@ -221,6 +268,7 @@ pub(super) fn record_child_attempt_outcome(
         costs: AttemptAttributableCosts {
             execution_cost_microunits,
             rework_cost_microunits,
+            environment_cost_microunits,
             ..AttemptAttributableCosts::default()
         },
         parent_phase_continuation,
@@ -2909,6 +2957,81 @@ mod tests {
             None,
         )?;
         assert_eq!(recorded.costs.environment_cost_microunits, Some(0));
+        Ok(())
+    }
+
+    fn record_verified_attempt_with_account_observe(
+        run_name: &str,
+        account_observe: Option<(AccountObserveOutcomeKind, Option<u64>)>,
+    ) -> Result<AttemptOutcomeEvidence> {
+        let (_temp, repo) = super::super::tests::injected_repository();
+        let run_id = RunId::new(run_name)?;
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "maco-supervise",
+        )?;
+        let mut journal = None;
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        record_child_attempt_outcome_with_account_observe(
+            &artifacts,
+            &run_id,
+            "assignment-1",
+            1,
+            AgentRole::Worker,
+            &[],
+            &[],
+            "grok",
+            Some("grok-code-fast-1"),
+            Some("high"),
+            true,
+            false,
+            SupervisorExecutionRuntime::Verified,
+            None,
+            &BTreeMap::new(),
+            None,
+            account_observe,
+        )
+    }
+
+    #[test]
+    fn failed_or_unknown_account_observe_cannot_become_environment_zero() -> Result<()> {
+        for (run_name, kind, number) in [
+            (
+                "failed-observe-supplied-zero",
+                AccountObserveOutcomeKind::Failed,
+                Some(0),
+            ),
+            (
+                "unknown-observe-supplied-zero",
+                AccountObserveOutcomeKind::Unknown,
+                Some(0),
+            ),
+        ] {
+            let recorded =
+                record_verified_attempt_with_account_observe(run_name, Some((kind, number)))?;
+            assert!(
+                recorded.costs.environment_cost_microunits.is_none(),
+                "{kind:?} with {number:?} must stay None"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn observed_account_observe_without_a_number_stays_none() -> Result<()> {
+        let recorded = record_verified_attempt_with_account_observe(
+            "observed-observe-missing-number",
+            Some((AccountObserveOutcomeKind::Observed, None)),
+        )?;
+        assert!(recorded.costs.environment_cost_microunits.is_none());
         Ok(())
     }
 

@@ -4606,6 +4606,7 @@ fn execute_supervisor_assignment_inner(
             };
             let attempted_launch_model_provenance = prepared.model_provenance.clone();
             let requested_effort = prepared.command.reasoning_effort.clone();
+            let account_observe = active_budget_policy.account_observe_environment_decision();
             let collected = match dispatch_and_collect_child_attempt(
                 context,
                 outcome,
@@ -4616,7 +4617,7 @@ fn execute_supervisor_assignment_inner(
             ) {
                 Ok(collected) => collected,
                 Err(error) => {
-                    record_child_attempt_outcome(
+                    record_child_attempt_outcome_with_account_observe(
                         artifacts,
                         &options.run_id,
                         &assignment.id,
@@ -4635,6 +4636,7 @@ fn execute_supervisor_assignment_inner(
                         Some(attempt_parent_phase_continuation_from_count(
                             completed_parent_review_cycles,
                         )),
+                        account_observe,
                     )?;
                     return Err(error);
                 }
@@ -4655,7 +4657,7 @@ fn execute_supervisor_assignment_inner(
             ) {
                 Ok(disposition) => disposition,
                 Err(error) => {
-                    record_child_attempt_outcome(
+                    record_child_attempt_outcome_with_account_observe(
                         artifacts,
                         &options.run_id,
                         &assignment.id,
@@ -4674,11 +4676,12 @@ fn execute_supervisor_assignment_inner(
                         Some(attempt_parent_phase_continuation_from_count(
                             completed_parent_review_cycles,
                         )),
+                        account_observe,
                     )?;
                     return Err(error);
                 }
             };
-            let mut recorded_attempt = record_child_attempt_outcome(
+            let mut recorded_attempt = record_child_attempt_outcome_with_account_observe(
                 artifacts,
                 &options.run_id,
                 &assignment.id,
@@ -4697,6 +4700,7 @@ fn execute_supervisor_assignment_inner(
                 Some(attempt_parent_phase_continuation_from_count(
                     completed_parent_review_cycles,
                 )),
+                account_observe,
             )?;
             match disposition {
                 ChildAttemptDisposition::Retry => {
@@ -6505,7 +6509,7 @@ mod decomposition_tests {
             ChildAttemptDisposition::Retry => panic!("unexpected child retry"),
         };
         *child_report_for_runner.lock().expect("child report lock") = child_report.clone();
-        let mut terminal_attempt_outcome = record_child_attempt_outcome(
+        let mut terminal_attempt_outcome = record_child_attempt_outcome_with_account_observe(
             &artifacts,
             &options.run_id,
             &assignment.id,
@@ -6522,6 +6526,9 @@ mod decomposition_tests {
             Some(&attempt_external_run),
             &plan.model_pricing,
             Some(attempt_parent_phase_continuation_from_count(Some(0))),
+            child_context
+                .budget_policy
+                .account_observe_environment_decision(),
         )
         .expect("record worker attempt outcome");
         let execution_cost_before_persist =

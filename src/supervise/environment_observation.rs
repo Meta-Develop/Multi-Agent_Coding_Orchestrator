@@ -6,8 +6,6 @@
 //! path in `outcome_history`; this helper never invents zero for a missing
 //! number.
 
-#![cfg_attr(not(test), allow(dead_code))]
-
 /// Parent-owned account observe outcome used to decide environment cost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AccountObserveOutcomeKind {
