@@ -11,7 +11,7 @@ use crate::model::{AuthKind, StoredAccountState};
 use crate::paths;
 use crate::providers::{
     claude_code::ClaudeCodeAdapter, codex_cli::CodexCliAdapter, gemini_cli::GeminiCliAdapter,
-    ProviderAdapter, StoredAccountRegistry,
+    grok_cli::GrokCliAdapter, ProviderAdapter, StoredAccountRegistry,
 };
 
 use super::LoginStatus;
@@ -26,6 +26,11 @@ const CLAUDE_PROVIDER_ID: &str = "claude-code";
 const CLAUDE_OAUTH_FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/claude-code/managed-oauth"
+);
+const GROK_PROVIDER_ID: &str = "grok-cli";
+const GROK_AUTH_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/grok/valid-auth.json"
 );
 
 fn oauth_adapter(
@@ -184,6 +189,47 @@ fn write_claude_oauth_fixture(home: &Path) -> std::io::Result<i32> {
         home.join(".credentials.json"),
     )?;
     std::fs::copy(src.join(".claude.json"), home.join(".claude.json"))?;
+    Ok(0)
+}
+
+fn grok_oauth_adapter(
+    runner: fn(&Path) -> std::io::Result<i32>,
+) -> (tempfile::TempDir, GrokCliAdapter, StoredAccountRegistry) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path().join("home");
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(home.join(".grok")).expect("home settings dir");
+    let adapter = GrokCliAdapter::with_home(&home)
+        .with_data_dir(&data)
+        .with_login_runner(runner);
+    let registry = StoredAccountRegistry::new(paths::stored_accounts_path(&data));
+    (dir, adapter, registry)
+}
+
+fn grok_cancel_driver_adapter() -> (tempfile::TempDir, GrokCliAdapter, StoredAccountRegistry) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path().join("home");
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(home.join(".grok")).expect("home settings dir");
+    let adapter = GrokCliAdapter::with_home(&home)
+        .with_data_dir(&data)
+        .with_test_oauth_watch_cancel_driver();
+    let registry = StoredAccountRegistry::new(paths::stored_accounts_path(&data));
+    (dir, adapter, registry)
+}
+
+fn grok_start_request(account_id: &str, key: &str) -> LoginStartRequest {
+    LoginStartRequest {
+        provider_id: GROK_PROVIDER_ID.to_string(),
+        account_id: account_id.to_string(),
+        label: account_id.to_string(),
+        auth_kind: AuthKind::OAuth,
+        idempotency_key: key.to_string(),
+    }
+}
+
+fn write_grok_auth_fixture(home: &Path) -> std::io::Result<i32> {
+    std::fs::copy(GROK_AUTH_FIXTURE, home.join("auth.json"))?;
     Ok(0)
 }
 
@@ -439,8 +485,8 @@ fn cancel_vs_ready_race_reports_ready_after_commit() {
 }
 
 #[test]
-fn validate_start_request_accepts_gemini_codex_claude_and_cursor() {
-    for provider_id in ["gemini-cli", "codex-cli", "claude-code", "cursor"] {
+fn validate_start_request_accepts_gemini_codex_claude_grok_and_cursor() {
+    for provider_id in ["gemini-cli", "codex-cli", "claude-code", "grok-cli", "cursor"] {
         let mut request = start_request("work", "key");
         request.provider_id = provider_id.to_string();
         assert!(
@@ -455,7 +501,7 @@ fn unsupported_provider_start_is_refused() {
     let (_dir, adapter, registry) = oauth_adapter(write_oauth_files);
     let (_runtime, service) = service(&registry);
     let mut request = start_request("work", "key");
-    request.provider_id = "grok-cli".to_string();
+    request.provider_id = "github-copilot".to_string();
     assert!(matches!(
         service.start(request, &adapter),
         Err(crate::error::Error::NotImplemented(_))
@@ -463,10 +509,10 @@ fn unsupported_provider_start_is_refused() {
 }
 
 #[test]
-fn claude_and_cursor_start_with_gemini_adapter_is_unknown_provider() {
+fn claude_cursor_and_grok_start_with_gemini_adapter_is_unknown_provider() {
     let (_dir, adapter, registry) = oauth_adapter(write_oauth_files);
     let (_runtime, service) = service(&registry);
-    for provider_id in ["claude-code", "cursor"] {
+    for provider_id in ["claude-code", "cursor", "grok-cli"] {
         let mut request = start_request("work", "key");
         request.provider_id = provider_id.to_string();
         assert!(
@@ -530,6 +576,42 @@ fn codex_oauth_cancelled_login_confirmed_by_owned_async_oauth_fixture() {
     wait_for_state(&runtime, &service, &started, LoginState::Cancelled);
     let row = registry
         .account(CODEX_PROVIDER_ID, "work")
+        .expect("pending");
+    assert_eq!(row.state, StoredAccountState::Pending);
+}
+
+#[test]
+fn grok_oauth_ready_completes_registry_row_without_changing_selection() {
+    let (_dir, adapter, registry) = grok_oauth_adapter(write_grok_auth_fixture);
+    let (runtime, service) = service(&registry);
+    let started = service
+        .start_pending_oauth(grok_start_request("work", "key-grok-ready"), &adapter)
+        .expect("start");
+    wait_for_state(&runtime, &service, &started, LoginState::Ready);
+    let row = registry
+        .account(GROK_PROVIDER_ID, "work")
+        .expect("account");
+    assert_eq!(row.state, StoredAccountState::Complete);
+    assert!(!row.is_selected);
+    assert!(registry
+        .selected(GROK_PROVIDER_ID)
+        .expect("selected")
+        .is_none());
+}
+
+#[test]
+fn grok_oauth_cancelled_login_confirmed_by_owned_async_oauth_fixture() {
+    let (_dir, adapter, registry) = grok_cancel_driver_adapter();
+    let (runtime, service) = service(&registry);
+    let started = service
+        .start_pending_oauth(grok_start_request("work", "key-grok-cancel"), &adapter)
+        .expect("start");
+    service
+        .cancel(&started.handle, &started.binding)
+        .expect("cancel");
+    wait_for_state(&runtime, &service, &started, LoginState::Cancelled);
+    let row = registry
+        .account(GROK_PROVIDER_ID, "work")
         .expect("pending");
     assert_eq!(row.state, StoredAccountState::Pending);
 }
