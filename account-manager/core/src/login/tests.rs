@@ -485,13 +485,14 @@ fn cancel_vs_ready_race_reports_ready_after_commit() {
 }
 
 #[test]
-fn validate_start_request_accepts_gemini_codex_claude_grok_and_cursor() {
+fn validate_start_request_accepts_gemini_codex_claude_grok_cursor_and_github_copilot() {
     for provider_id in [
         "gemini-cli",
         "codex-cli",
         "claude-code",
         "grok-cli",
         "cursor",
+        "github-copilot",
     ] {
         let mut request = start_request("work", "key");
         request.provider_id = provider_id.to_string();
@@ -503,15 +504,16 @@ fn validate_start_request_accepts_gemini_codex_claude_grok_and_cursor() {
 }
 
 #[test]
-fn unsupported_provider_start_is_refused() {
+fn github_copilot_login_start_is_not_implemented() {
     let (_dir, adapter, registry) = oauth_adapter(write_oauth_files);
     let (_runtime, service) = service(&registry);
     let mut request = start_request("work", "key");
     request.provider_id = "github-copilot".to_string();
-    assert!(matches!(
-        service.start(request, &adapter),
-        Err(crate::error::Error::NotImplemented(_))
-    ));
+    let error = service.start(request, &adapter).expect_err("start");
+    assert!(
+        matches!(error, crate::error::Error::NotImplemented("login.start")),
+        "github-copilot login.start must be NotImplemented, not {error:?}"
+    );
 }
 
 #[test]

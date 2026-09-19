@@ -920,16 +920,20 @@ fn login_start(
     auth_kind: AuthKind,
     idempotency_key: &str,
 ) -> AuthorityResponse {
-    if provider_id != "gemini-cli"
-        && provider_id != "codex-cli"
-        && provider_id != "claude-code"
-        && provider_id != "grok-cli"
-        && provider_id != "cursor"
+    if ![
+        "gemini-cli",
+        "codex-cli",
+        "claude-code",
+        "grok-cli",
+        "cursor",
+        "github-copilot",
+    ]
+    .contains(&provider_id)
     {
         return AuthorityResponse::error(
             request_id,
             ErrorCode::UnsupportedOperation,
-            "login.start is implemented for Gemini, Codex, Claude, Grok, and Cursor only",
+            "login.start is implemented for Gemini, Codex, Claude, Grok, Cursor, and GitHub Copilot only",
         );
     }
     let Some(login) = ctx.login.as_ref() else {

@@ -1,8 +1,8 @@
 //! Shared explicit login lifecycle for managed accounts (MACO integration §5).
 //!
 //! Gemini, Codex, Claude, and Grok OAuth share the handle / idempotency /
-//! cancel path. Cursor stays allow-listed on `login.start` and
-//! `NotImplemented` at the production port. Legacy synchronous
+//! cancel path. Cursor and GitHub Copilot stay allow-listed on `login.start`
+//! and `NotImplemented` at the production port. Legacy synchronous
 //! `add_managed_account` remains unchanged.
 
 use std::collections::HashMap;
@@ -287,6 +287,10 @@ impl LoginService {
         adapter: &A,
     ) -> Result<LoginStatus> {
         validate_start_request(&request)?;
+        // github-copilot is allow-listed; PendingOAuthLogin is not implemented.
+        if request.provider_id == "github-copilot" {
+            return Err(Error::NotImplemented("login.start"));
+        }
         if request.provider_id != adapter.id() {
             return Err(Error::UnknownProvider(request.provider_id));
         }
@@ -725,11 +729,15 @@ fn validate_start_request(request: &LoginStartRequest) -> Result<()> {
             "idempotency key is missing or too long",
         ));
     }
-    if request.provider_id != "gemini-cli"
-        && request.provider_id != "codex-cli"
-        && request.provider_id != "claude-code"
-        && request.provider_id != "grok-cli"
-        && request.provider_id != "cursor"
+    if ![
+        "gemini-cli",
+        "codex-cli",
+        "claude-code",
+        "grok-cli",
+        "cursor",
+        "github-copilot",
+    ]
+    .contains(&request.provider_id.as_str())
     {
         return Err(Error::NotImplemented("login.start"));
     }

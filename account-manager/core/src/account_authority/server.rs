@@ -139,7 +139,8 @@ impl LoginPort for GeminiLoginPort {
             "grok-cli" => self
                 .service
                 .start_pending_oauth(request, &GrokCliAdapter::default()),
-            // cursor is allow-listed; PendingOAuthLogin is not implemented.
+            // cursor and github-copilot are allow-listed; PendingOAuthLogin
+            // is not implemented.
             _ => Err(Error::NotImplemented("login.start")),
         }
     }
