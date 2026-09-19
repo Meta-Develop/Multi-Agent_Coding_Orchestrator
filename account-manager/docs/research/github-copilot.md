@@ -53,6 +53,8 @@ Official vendor documentation checked on 2026-09-20:
 - <https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/troubleshoot-copilot-cli-auth>
 - <https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference>
 - <https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-programmatic-reference>
+- <https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/allowing-tools>
+- <https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/configure-copilot-cli>
 - <https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference>
 - <https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/use-byok-models>
 - <https://docs.github.com/en/copilot/how-tos/use-copilot-for-common-tasks/use-copilot-in-the-cli>
@@ -474,6 +476,113 @@ adapter stays detect-only. Do not implement `observe_models` from the
 table. Do not implement `login.start` or `activate_account` from this
 slice.
 
+## 6c. CLI write-tool policy (vendor session)
+
+This section is the #409 evidence record for official Copilot CLI tool
+permission surfaces. It separates **vendor session policy** (what the
+`copilot` process may do when a human or script starts it) from **CAM
+write-safe adapter** behavior (isolated homes, credential files,
+keychain, `activate_account`). Official prose below is `[verified-docs]`.
+Nothing here is `[verified-local]`. This slice did not run `copilot`,
+did not sign in, and did not change the detect-only adapter.
+
+**Refuse.** A write-safe Copilot adapter remains `[unknown]`. These
+flags and files govern the Copilot CLI session only. They are not
+documented as CAM `activate_account`, credential-file, or keychain write
+APIs. Do not treat `--allow-tool=write` (or any `--allow-tool` grant) as
+Observed write-safe for the account manager. Do not enable adapter
+writes, `login.start`, or `activate_account` from this slice.
+
+Fetched 2026-09-20:
+
+- https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/allowing-tools
+- https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/configure-copilot-cli
+- https://docs.github.com/en/copilot/concepts/agents/copilot-cli/about-copilot-cli
+- https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-programmatic-reference
+
+### Default approval behavior
+
+Read-only operations—searching the codebase, reading files, and running
+read-only shell commands—are allowed automatically `[verified-docs]`.
+Tools that can modify the system need explicit approval before use
+`[verified-docs]`. That includes destructive or mutating shell commands,
+file writes, and URL access (web fetch and network shell commands)
+`[verified-docs]`.
+
+### Session flags vs persisted approvals
+
+`--allow-tool` and `--deny-tool` apply **only to the current session**
+and are **not** written to `permissions-config.json` `[verified-docs]`.
+Deny rules take precedence over allow rules, including when
+`--allow-all` is set and when a matching approval is already saved in
+`permissions-config.json` `[verified-docs]`.
+
+Location-scoped tool approvals chosen at prompts (for example “don’t ask
+again in this repo”) persist in `~/.copilot/permissions-config.json`
+(or under `$COPILOT_HOME`); see §2 `[verified-docs]`. Permanent URL
+approvals persist as domains in the `allowedUrls` list in
+`settings.json` (default `~/.copilot/settings.json`), across sessions
+and locations `[verified-docs]`.
+
+### Tool kinds, `--deny-tool=write`, and path filters
+
+The programmatic reference lists tool **kinds** for `--allow-tool` /
+`--deny-tool` `[verified-docs]`: `shell`, `write`, `read`, `url`,
+`memory`, and MCP servers (identifier = configured MCP server name, for
+example `github`).
+
+`--deny-tool=write` denies all file-writing operations (non-shell write
+tools) `[verified-docs]`. `--allow-tool='write(path)'` uses catalog
+syntax to allow writes only for paths matching the filter—for example
+`write(.github/copilot-instructions.md)` or `write(README.md)` for
+paths ending in `/README.md` `[verified-docs]`. Shell file mutation
+remains under `shell(...)`, not the `write` kind `[verified-docs]`.
+
+### Model-visible tool sets
+
+`--available-tools` restricts the model to only the listed tools; all
+others are unavailable `[verified-docs]`. `--excluded-tools` removes
+specific tools from the default set `[verified-docs]`. If both are used,
+the CLI applies the `--available-tools` allowlist and ignores
+`--excluded-tools` `[verified-docs]`. A tool not in the available set
+cannot be used even if `--allow-tool` names it `[verified-docs]`.
+
+### Permissive modes and reset
+
+`--allow-all` and its alias `--yolo` are equivalent to
+`--allow-all-tools`, `--allow-all-paths`, and `--allow-all-urls` at
+startup `[verified-docs]`. Interactive `/allow-all` or `/yolo` enables
+the same within a session without restart `[verified-docs]`.
+
+The `/reset-allowed-tools` slash command revokes permissions granted
+during the current interactive session (prompts and in-session
+`/allow-all` / `/yolo`) and **clears saved tool approvals for the
+current location** from `permissions-config.json`, returning toward
+startup flags or defaults `[verified-docs]`.
+
+### Environment catalog (not CAM authority)
+
+`COPILOT_ALLOW_ALL=true` means full permissions in the programmatic
+reference environment-variable table `[verified-docs]`. That is **catalog
+env** for how to start a permissive `copilot` child process. It is **not**
+Observed CAM authority and does not establish a write-safe adapter path.
+
+### Separation from CAM write-safe adapter
+
+| Surface                                | Role                                 | CAM adapter?         |
+| -------------------------------------- | ------------------------------------ | -------------------- |
+| `--allow-tool` / `--deny-tool`         | Session-only vendor tool policy      | No `[verified-docs]` |
+| `permissions-config.json`              | Saved location-scoped tool approvals | No `[verified-docs]` |
+| `settings.json` `allowedUrls`          | Persisted URL allowlist              | No `[verified-docs]` |
+| `--allow-all` / `/reset-allowed-tools` | Session permissive / reset           | No `[verified-docs]` |
+| `COPILOT_ALLOW_ALL`                    | Catalog env for permissive launch    | No `[verified-docs]` |
+| Credential / account switch            | §3–§5                                | `[unknown]`          |
+
+Until signed-in host observation or published application source closes
+credential and switch questions, the Copilot adapter stays **detect-only**
+for stores and **must not** implement `activate_account` or credential
+writes from these vendor tool flags.
+
 ## 7. API surface and base-URL override
 
 GitHub-hosted Copilot traffic uses GitHub Copilot service hosts, not a
@@ -582,11 +691,12 @@ prove that override.
   models JSON? Is there a write-safe programmatic model switch that is
   not the interactive `/model --global` / `--repo` picker? Until one of
   those exists, do not implement `observe_models` from the table.
-- **Write-safe adapter.** Is there any adapter write — isolated
-  `COPILOT_HOME`, env-only launch, or a documented non-interactive
-  account select — that is safe against a live default home and a
-  running `copilot` process? Until that is proven, do not implement
-  credential-file or keychain writes.
+- **Write-safe adapter.** Vendor CLI tool flags and
+  `permissions-config.json` are catalog session policy (§6c). Is there
+  any **CAM** adapter write — isolated `COPILOT_HOME`, env-only
+  launch, or a documented non-interactive account select — that is safe
+  against a live default home and a running `copilot` process? Until
+  that is proven, do not implement credential-file or keychain writes.
 - Does plaintext `config.json` appear in the runtime credential
   check order, and under what `storeTokenPlaintext` / prompt outcome?
 - Do the IDE and Copilot CLI share one GitHub OAuth grant?
