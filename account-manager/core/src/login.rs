@@ -1,9 +1,9 @@
 //! Shared explicit login lifecycle for managed accounts (MACO integration §5).
 //!
-//! Gemini and Codex OAuth share the handle / idempotency / cancel path.
-//! Claude and Cursor are allow-listed on `login.start` and stay
-//! `NotImplemented` at the production port. Legacy synchronous
-//! `add_managed_account` remains unchanged.
+//! Gemini, Codex, and Claude OAuth share the handle / idempotency / cancel
+//! path. Cursor stays allow-listed on `login.start` and `NotImplemented` at
+//! the production port. Legacy synchronous `add_managed_account` remains
+//! unchanged.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -21,9 +21,9 @@ use crate::account_authority::PendingLoginLease;
 use crate::error::{Error, Result};
 use crate::model::{AuthKind, StoredAccountMetadata};
 use crate::providers::{
-    codex_cli::CodexCliAdapter, complete_managed_login_account, gemini_cli::GeminiCliAdapter,
-    OAuthLoginRunError, PendingOAuthHomePlan, PreparedPendingOAuthHome, ProviderAdapter,
-    StoredAccountRegistry, LOGIN_DEADLINE,
+    claude_code::ClaudeCodeAdapter, codex_cli::CodexCliAdapter, complete_managed_login_account,
+    gemini_cli::GeminiCliAdapter, OAuthLoginRunError, PendingOAuthHomePlan,
+    PreparedPendingOAuthHome, ProviderAdapter, StoredAccountRegistry, LOGIN_DEADLINE,
 };
 
 /// Adapter seams used by [`LoginService::start`]: identity, pending-home
@@ -94,6 +94,32 @@ impl PendingOAuthLogin for CodexCliAdapter {
         cancel: tokio::sync::watch::Receiver<bool>,
     ) -> impl std::future::Future<Output = std::result::Result<(), OAuthLoginRunError>> + Send {
         CodexCliAdapter::run_pending_oauth_login(self, home, plan, cancel)
+    }
+}
+
+impl PendingOAuthLogin for ClaudeCodeAdapter {
+    fn prepare_pending_oauth_home(
+        &self,
+        account: &StoredAccountMetadata,
+    ) -> Result<PreparedPendingOAuthHome> {
+        ClaudeCodeAdapter::prepare_pending_oauth_home(self, account)
+    }
+
+    fn clone_for_login_task(&self) -> Self {
+        ClaudeCodeAdapter::clone_for_login_task(self)
+    }
+
+    fn finish_pending_oauth_login(&self, home: &Path) -> Result<()> {
+        ClaudeCodeAdapter::finish_pending_oauth_login(self, home)
+    }
+
+    fn run_pending_oauth_login(
+        &self,
+        home: &Path,
+        plan: PendingOAuthHomePlan,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> impl std::future::Future<Output = std::result::Result<(), OAuthLoginRunError>> + Send {
+        ClaudeCodeAdapter::run_pending_oauth_login(self, home, plan, cancel)
     }
 }
 
@@ -218,8 +244,8 @@ impl LoginService {
         }
     }
 
-    /// Begin Gemini or Codex OAuth login for a new pending account, or
-    /// replay an idempotent start request.
+    /// Begin Gemini, Codex, or Claude OAuth login for a new pending account,
+    /// or replay an idempotent start request.
     pub fn start(
         &self,
         request: LoginStartRequest,
@@ -605,6 +631,7 @@ fn oauth_material_present(provider_id: &str, home: &Path) -> bool {
     match provider_id {
         "gemini-cli" => home.join(".gemini/oauth_creds.json").is_file(),
         "codex-cli" => home.join("auth.json").is_file(),
+        "claude-code" => home.join(".credentials.json").is_file(),
         _ => false,
     }
 }

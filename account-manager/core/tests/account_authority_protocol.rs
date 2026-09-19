@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use coding_agent_manager_lib::account_authority::{
     authority_id_for, decode_request, dispatch, map_core_error, AuthorityContext,
-    AuthorityServerConfig, ErrorCode, LoginPort, StoredAccountRegistry, ADVERTISED_OPERATIONS,
-    PROTOCOL_VERSION,
+    AuthorityServerConfig, ErrorCode, GeminiLoginPort, LoginPort, StoredAccountRegistry,
+    ADVERTISED_OPERATIONS, PROTOCOL_VERSION,
 };
 #[cfg(not(unix))]
 use coding_agent_manager_lib::account_authority::{
@@ -20,7 +20,9 @@ use coding_agent_manager_lib::model::{
     Account, AuthKind, InstallState, Maturity, ProviderDescriptor, StoredAccountMaterial,
 };
 use coding_agent_manager_lib::paths::stored_accounts_path;
-use coding_agent_manager_lib::providers::{gemini_cli::GeminiCliAdapter, ProviderAdapter};
+use coding_agent_manager_lib::providers::{
+    claude_code::ClaudeCodeAdapter, gemini_cli::GeminiCliAdapter, ProviderAdapter,
+};
 
 struct ActivateProbeAdapter {
     activated: Arc<AtomicBool>,
@@ -298,8 +300,59 @@ fn dispatch_accepts_claude_and_cursor_login_start() {
     assert_eq!(login.starts.lock().expect("starts").len(), 2);
 }
 
+fn write_claude_managed_oauth(home: &std::path::Path) -> std::io::Result<i32> {
+    const FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/claude-code/managed-oauth"
+    );
+    let src = std::path::Path::new(FIXTURE);
+    std::fs::copy(src.join(".credentials.json"), home.join(".credentials.json"))?;
+    std::fs::copy(src.join(".claude.json"), home.join(".claude.json"))?;
+    Ok(0)
+}
+
 #[test]
-fn production_login_port_leaves_claude_and_cursor_unimplemented() {
+fn production_login_port_starts_claude_code() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path().join("home");
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(home.join(".claude")).expect("home");
+    std::fs::create_dir_all(&data).expect("data");
+    let claude = ClaudeCodeAdapter::with_home(&home)
+        .with_data_dir(&data)
+        .with_login_runner(write_claude_managed_oauth);
+    let registry = StoredAccountRegistry::new(stored_accounts_path(&data));
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let service = LoginService::new(
+        StoredAccountRegistry::new(registry.metadata_path().to_path_buf()),
+        runtime.handle().clone(),
+    );
+    let ctx = AuthorityContext::new(registry).without_registry_fallback();
+    let config = AuthorityServerConfig::new(ctx)
+        .expect("config")
+        .with_login_port(Arc::new(GeminiLoginPort::new(
+            service,
+            GeminiCliAdapter::default(),
+            claude,
+        )));
+    let body = serde_json::json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "requestId": "login",
+        "operation": "login.start",
+        "providerId": "claude-code",
+        "accountId": "work",
+        "label": "Work",
+        "authKind": "oauth",
+        "idempotencyKey": "key-claude-code"
+    });
+    let response = dispatch_json(&config.context, &body.to_string());
+    assert!(response["error"].is_null(), "{response}");
+    assert_eq!(response["result"]["state"], "waiting-for-user");
+    assert_eq!(response["result"]["binding"]["providerId"], "claude-code");
+}
+
+#[test]
+fn production_login_port_leaves_cursor_unimplemented() {
     let (_dir, registry) = isolated_registry();
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let service = LoginService::new(
@@ -310,27 +363,19 @@ fn production_login_port_leaves_claude_and_cursor_unimplemented() {
     let config = AuthorityServerConfig::new(ctx)
         .expect("config")
         .with_gemini_login(service, GeminiCliAdapter::default());
-    for provider_id in ["claude-code", "cursor"] {
-        let body = serde_json::json!({
-            "protocolVersion": PROTOCOL_VERSION,
-            "requestId": "login",
-            "operation": "login.start",
-            "providerId": provider_id,
-            "accountId": "work",
-            "label": "Work",
-            "authKind": "oauth",
-            "idempotencyKey": format!("key-{provider_id}")
-        });
-        let response = dispatch_json(&config.context, &body.to_string());
-        assert_eq!(
-            response["error"]["code"], "unsupported-operation",
-            "{provider_id}"
-        );
-        assert_eq!(
-            response["error"]["message"], "operation is not implemented",
-            "{provider_id}"
-        );
-    }
+    let body = serde_json::json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "requestId": "login",
+        "operation": "login.start",
+        "providerId": "cursor",
+        "accountId": "work",
+        "label": "Work",
+        "authKind": "oauth",
+        "idempotencyKey": "key-cursor"
+    });
+    let response = dispatch_json(&config.context, &body.to_string());
+    assert_eq!(response["error"]["code"], "unsupported-operation");
+    assert_eq!(response["error"]["message"], "operation is not implemented");
 }
 
 #[test]

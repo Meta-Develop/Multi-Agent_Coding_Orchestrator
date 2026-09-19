@@ -10,8 +10,8 @@ use crate::login::{LoginAccountBinding, LoginService, LoginStartRequest, LoginSt
 use crate::model::{AuthKind, StoredAccountState};
 use crate::paths;
 use crate::providers::{
-    codex_cli::CodexCliAdapter, gemini_cli::GeminiCliAdapter, ProviderAdapter,
-    StoredAccountRegistry,
+    claude_code::ClaudeCodeAdapter, codex_cli::CodexCliAdapter, gemini_cli::GeminiCliAdapter,
+    ProviderAdapter, StoredAccountRegistry,
 };
 
 use super::LoginStatus;
@@ -21,6 +21,11 @@ const CODEX_PROVIDER_ID: &str = "codex-cli";
 const CODEX_AUTH_FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/codex-cli/managed-oauth/auth.json"
+);
+const CLAUDE_PROVIDER_ID: &str = "claude-code";
+const CLAUDE_OAUTH_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/claude-code/managed-oauth"
 );
 
 fn oauth_adapter(
@@ -145,6 +150,37 @@ fn codex_start_request(account_id: &str, key: &str) -> LoginStartRequest {
 
 fn write_codex_auth_fixture(home: &Path) -> std::io::Result<i32> {
     std::fs::copy(CODEX_AUTH_FIXTURE, home.join("auth.json"))?;
+    Ok(0)
+}
+
+fn claude_oauth_adapter(
+    runner: fn(&Path) -> std::io::Result<i32>,
+) -> (tempfile::TempDir, ClaudeCodeAdapter, StoredAccountRegistry) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path().join("home");
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(home.join(".claude")).expect("home config dir");
+    let adapter = ClaudeCodeAdapter::with_home(&home)
+        .with_data_dir(&data)
+        .with_login_runner(runner);
+    let registry = StoredAccountRegistry::new(paths::stored_accounts_path(&data));
+    (dir, adapter, registry)
+}
+
+fn claude_start_request(account_id: &str, key: &str) -> LoginStartRequest {
+    LoginStartRequest {
+        provider_id: CLAUDE_PROVIDER_ID.to_string(),
+        account_id: account_id.to_string(),
+        label: account_id.to_string(),
+        auth_kind: AuthKind::OAuth,
+        idempotency_key: key.to_string(),
+    }
+}
+
+fn write_claude_oauth_fixture(home: &Path) -> std::io::Result<i32> {
+    let src = Path::new(CLAUDE_OAUTH_FIXTURE);
+    std::fs::copy(src.join(".credentials.json"), home.join(".credentials.json"))?;
+    std::fs::copy(src.join(".claude.json"), home.join(".claude.json"))?;
     Ok(0)
 }
 
@@ -438,6 +474,25 @@ fn claude_and_cursor_start_with_gemini_adapter_is_unknown_provider() {
             "{provider_id} must not start Gemini OAuth"
         );
     }
+}
+
+#[test]
+fn claude_oauth_ready_completes_registry_row_without_changing_selection() {
+    let (_dir, adapter, registry) = claude_oauth_adapter(write_claude_oauth_fixture);
+    let (runtime, service) = service(&registry);
+    let started = service
+        .start_pending_oauth(claude_start_request("work", "key-claude-ready"), &adapter)
+        .expect("start");
+    wait_for_state(&runtime, &service, &started, LoginState::Ready);
+    let row = registry
+        .account(CLAUDE_PROVIDER_ID, "work")
+        .expect("account");
+    assert_eq!(row.state, StoredAccountState::Complete);
+    assert!(!row.is_selected);
+    assert!(registry
+        .selected(CLAUDE_PROVIDER_ID)
+        .expect("selected")
+        .is_none());
 }
 
 #[test]

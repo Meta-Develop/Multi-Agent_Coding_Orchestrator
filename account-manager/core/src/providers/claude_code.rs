@@ -54,13 +54,14 @@ use serde_json::{Map, Value};
 
 use super::{
     account_id_is_safe, binary_on_path, home_dir, managed_account_dir, process_named_is_running,
-    ProviderAdapter,
+    ManagedAccountPlan, PendingOAuthHomePlan, PreparedPendingOAuthHome, ProviderAdapter,
 };
 use crate::backup::BackupStore;
 use crate::error::{Error, Result};
 use crate::fsx;
 use crate::model::{
     Account, AuthKind, InstallState, Maturity, ProviderCapability, ProviderDescriptor,
+    StoredAccountMaterial, StoredAccountMetadata, StoredAccountState,
 };
 use crate::paths;
 use claude_switch::{ACCOUNT_KEY, OAUTH_KEY};
@@ -123,6 +124,124 @@ impl ClaudeCodeAdapter {
     pub fn with_login_runner(mut self, runner: fn(&Path) -> std::io::Result<i32>) -> Self {
         self.login_runner = Some(runner);
         self
+    }
+
+    /// Clone adapter configuration for a background login task.
+    pub(crate) fn clone_for_login_task(&self) -> Self {
+        Self {
+            home: self.home.clone(),
+            data_dir: self.data_dir.clone(),
+            injected_tool_running: self.injected_tool_running,
+            login_runner: self.login_runner,
+            #[cfg(test)]
+            fault: self.fault,
+        }
+    }
+
+    fn validate_pending_oauth_account(&self, account: &StoredAccountMetadata) -> Result<()> {
+        if account.provider_id != self.id() {
+            return Err(Error::UnknownProvider(account.provider_id.clone()));
+        }
+        if !account_id_is_safe(&account.id) {
+            return Err(
+                self.config_read("stored account metadata does not match the Claude Code lifecycle")
+            );
+        }
+        if account.id == ON_DISK_ACCOUNT_ID {
+            return Err(
+                self.config_read("account id is reserved for the live on-disk Claude Code identity")
+            );
+        }
+        if account.state != StoredAccountState::Pending || account.is_selected {
+            return Err(self.config_read(
+                "only an unselected pending Claude Code account can begin OAuth login",
+            ));
+        }
+        if account.auth_kind != AuthKind::OAuth
+            || account.material != StoredAccountMaterial::VendorHome
+        {
+            return Err(
+                self.config_read("Claude Code OAuth login requires an OAuth pending account")
+            );
+        }
+        Ok(())
+    }
+
+    fn required_data_dir(&self) -> Result<PathBuf> {
+        let directory = self.resolved_data_dir().ok_or_else(|| {
+            self.config_write(
+                "application data directory is unavailable; cannot create a managed account",
+            )
+        })?;
+        if !directory.is_absolute() {
+            return Err(self.config_write("application data directory is not an absolute path"));
+        }
+        Ok(directory)
+    }
+
+    fn managed_oauth_home(&self, account: &StoredAccountMetadata) -> Result<PathBuf> {
+        Ok(managed_account_dir(
+            &self.required_data_dir()?,
+            self.id(),
+            &account.id,
+        ))
+    }
+
+    /// Prepare an isolated `CLAUDE_CONFIG_DIR` for a pending OAuth account.
+    pub(crate) fn prepare_pending_oauth_home(
+        &self,
+        account: &StoredAccountMetadata,
+    ) -> Result<PreparedPendingOAuthHome> {
+        self.validate_pending_oauth_account(account)?;
+        let home = self.managed_oauth_home(account)?;
+        let credentials = claude_switch::stored_paths(&home).credentials;
+        let plan = match fs::symlink_metadata(&credentials) {
+            Ok(_) => {
+                self.require_managed_identity(&home)?;
+                PendingOAuthHomePlan::RecoveredExistingMarker
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                self.prepare_managed_dir(&home)?;
+                PendingOAuthHomePlan::NeedsInteractiveOAuth
+            }
+            Err(error) => {
+                return Err(self.config_write(format!(
+                    "managed .credentials.json cannot be inspected ({})",
+                    error.kind()
+                )));
+            }
+        };
+        Ok(PreparedPendingOAuthHome { path: home, plan })
+    }
+
+    /// Run `claude auth login` for a prepared isolated config directory.
+    pub(crate) async fn run_pending_oauth_login(
+        &self,
+        home: &Path,
+        plan: PendingOAuthHomePlan,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> std::result::Result<(), super::OAuthLoginRunError> {
+        if *cancel.borrow() {
+            return Err(super::OAuthLoginRunError::Cancelled);
+        }
+        if plan == PendingOAuthHomePlan::RecoveredExistingMarker {
+            return Ok(());
+        }
+        let adapter = self.clone_for_login_task();
+        let home = home.to_path_buf();
+        let result = tokio::task::spawn_blocking(move || adapter.run_vendor_login(&home)).await;
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(super::OAuthLoginRunError::Failed(error)),
+            Err(_) => Err(super::OAuthLoginRunError::Failed(
+                self.config_write("Claude Code login task failed"),
+            )),
+        }
+    }
+
+    /// Validate the vendor-issued identity pair after login succeeds.
+    pub(crate) fn finish_pending_oauth_login(&self, home: &Path) -> Result<()> {
+        self.require_managed_identity(home)
     }
 
     #[cfg(test)]
@@ -896,6 +1015,16 @@ impl ProviderAdapter for ClaudeCodeAdapter {
             return Err(self.cleanup_failed_add(&dir, error));
         }
         Ok(())
+    }
+
+    fn managed_account_plan_for(&self, auth_kind: AuthKind) -> Option<ManagedAccountPlan> {
+        match auth_kind {
+            AuthKind::OAuth => Some(ManagedAccountPlan {
+                auth_kind: AuthKind::OAuth,
+                material: StoredAccountMaterial::VendorHome,
+            }),
+            AuthKind::ApiKey | AuthKind::Unknown => None,
+        }
     }
 
     fn delete_account(&self, account_id: &str) -> Result<()> {

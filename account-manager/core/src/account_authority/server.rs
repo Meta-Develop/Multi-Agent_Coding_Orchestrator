@@ -15,6 +15,7 @@ use crate::account_authority::protocol::{AuthorityContext, LoginPort};
 use crate::account_authority::{SafeSocketPath, SocketPathError};
 use crate::error::Error;
 use crate::login::LoginService;
+use crate::providers::claude_code::ClaudeCodeAdapter;
 use crate::providers::codex_cli::CodexCliAdapter;
 use crate::providers::gemini_cli::GeminiCliAdapter;
 
@@ -46,9 +47,11 @@ impl AuthorityServerConfig {
     }
 
     pub fn with_gemini_login(mut self, service: LoginService, adapter: GeminiCliAdapter) -> Self {
-        self.context = self
-            .context
-            .with_login(Arc::new(GeminiLoginPort { service, adapter }));
+        self.context = self.context.with_login(Arc::new(GeminiLoginPort::new(
+            service,
+            adapter,
+            ClaudeCodeAdapter::default(),
+        )));
         self
     }
 
@@ -103,6 +106,22 @@ impl AuthorityServerConfig {
 pub struct GeminiLoginPort {
     service: LoginService,
     adapter: GeminiCliAdapter,
+    claude: ClaudeCodeAdapter,
+}
+
+impl GeminiLoginPort {
+    /// Construct the production port with explicit Gemini and Claude adapters.
+    pub fn new(
+        service: LoginService,
+        adapter: GeminiCliAdapter,
+        claude: ClaudeCodeAdapter,
+    ) -> Self {
+        Self {
+            service,
+            adapter,
+            claude,
+        }
+    }
 }
 
 impl LoginPort for GeminiLoginPort {
@@ -115,7 +134,8 @@ impl LoginPort for GeminiLoginPort {
             "codex-cli" => self
                 .service
                 .start_pending_oauth(request, &CodexCliAdapter::default()),
-            // claude-code and cursor are allow-listed; neither has PendingOAuthLogin.
+            "claude-code" => self.service.start_pending_oauth(request, &self.claude),
+            // cursor is allow-listed; PendingOAuthLogin is not implemented.
             _ => Err(Error::NotImplemented("login.start")),
         }
     }
