@@ -3,7 +3,10 @@
 //! replay provenance, not an independent signature or a source of authority.
 
 use super::*;
-use crate::external_agent::ExternalAgentRun;
+use crate::external_agent::{
+    CodexParentEvidence, CodexParentResolutionStatus, CodexParentTurnUsage, ExternalAgentRun,
+};
+use crate::llm::provider::ModelPricing;
 use crate::runtime_adapter::grok::{
     GrokAcpNativeCostEquivalent, GrokAcpParentEvidence, GrokAcpParentResolvedField,
 };
@@ -16,6 +19,8 @@ use std::sync::Mutex;
 
 const ATTEMPT_EVIDENCE_VERSION: u32 = 1;
 const ATTEMPT_EVIDENCE_DIR: &str = "selection-attempts";
+const DATED_PLAN_COST_MICROUNITS_PER_USD: f64 = 100_000.0;
+const DATED_PLAN_TOKENS_PER_MILLION: f64 = 1_000_000.0;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -144,7 +149,8 @@ pub(super) enum ParentDispatchedReviewCycleSlot {
 
 /// True when the attempt is nonpublishable simulation or deterministic fake
 /// runtime, the collected run has no verified external child process tree, and
-/// parent-observed Grok ACP spend is absent (environment-native spend unproven).
+/// parent-observed Grok ACP or Codex spend is absent (environment-native spend
+/// unproven).
 pub(super) fn worker_attempt_proven_no_environment_native_spend(
     execution_runtime: SupervisorExecutionRuntime,
     requested_runtime: &str,
@@ -162,7 +168,7 @@ pub(super) fn worker_attempt_proven_no_environment_native_spend(
     match external_run {
         None => requested_runtime == "fake",
         Some(run) => {
-            if run.grok_acp_parent_evidence.is_some() {
+            if run.grok_acp_parent_evidence.is_some() || run.codex_parent_evidence.is_some() {
                 return false;
             }
             run.process_tree.is_none()
@@ -186,6 +192,7 @@ pub(super) fn record_child_attempt_outcome(
     retried: bool,
     execution_runtime: SupervisorExecutionRuntime,
     external_run: Option<&ExternalAgentRun>,
+    dated_plan_pricing: &BTreeMap<String, ModelPricing>,
     parent_phase_continuation: Option<AttemptParentPhaseContinuation>,
 ) -> Result<AttemptOutcomeEvidence> {
     let selection =
@@ -194,7 +201,7 @@ pub(super) fn record_child_attempt_outcome(
         selection_event_for_attempt(role, assignment_id, attempt, events, initial_events)
             .map(|event| event.provenance.normalized_input.catalogs.as_slice());
     let (observed_candidate, worker_observed_microunits) =
-        parent_attempt_observation(external_run, frozen_catalogs);
+        parent_attempt_observation(external_run, frozen_catalogs, dated_plan_pricing);
     let (execution_cost_microunits, rework_cost_microunits) =
         classify_worker_observed_spend(attempt, worker_observed_microunits);
     let mut evidence = AttemptOutcomeEvidence {
@@ -265,20 +272,49 @@ fn selection_event_for_attempt<'a>(
 fn parent_attempt_observation(
     external_run: Option<&ExternalAgentRun>,
     frozen_catalogs: Option<&[RuntimeCatalog]>,
+    dated_plan_pricing: &BTreeMap<String, ModelPricing>,
 ) -> (Option<CandidateKey>, Option<u64>) {
     let Some(external_run) = external_run else {
         return (None, None);
     };
-    let Some(parent_evidence) = external_run.grok_acp_parent_evidence.as_ref() else {
-        return (None, None);
-    };
-    let observed_candidate =
-        complete_grok_acp_session(parent_evidence).and_then(|(model, effort)| {
-            frozen_catalogs
-                .and_then(|catalogs| candidate_key_from_admitted_catalogs(catalogs, model, effort))
-        });
-    let execution_cost_microunits = attributable_execution_cost_microunits(parent_evidence);
-    (observed_candidate, execution_cost_microunits)
+    match (
+        external_run.grok_acp_parent_evidence.as_ref(),
+        external_run.codex_parent_evidence.as_ref(),
+    ) {
+        (Some(_), Some(_)) => (None, None),
+        (Some(parent_evidence), None) => {
+            let observed_candidate =
+                complete_grok_acp_session(parent_evidence).and_then(|(model, effort)| {
+                    frozen_catalogs.and_then(|catalogs| {
+                        candidate_key_from_admitted_catalogs(catalogs, model, effort)
+                    })
+                });
+            let execution_cost_microunits = attributable_execution_cost_microunits(parent_evidence);
+            (observed_candidate, execution_cost_microunits)
+        }
+        (None, Some(parent_evidence)) => {
+            let observed_candidate =
+                complete_codex_session(parent_evidence).and_then(|(model, effort)| {
+                    frozen_catalogs.and_then(|catalogs| {
+                        candidate_key_from_admitted_catalogs(catalogs, model, effort)
+                    })
+                });
+            let execution_cost_microunits =
+                attributable_codex_execution_cost_microunits(parent_evidence, dated_plan_pricing);
+            (observed_candidate, execution_cost_microunits)
+        }
+        (None, None) => (None, None),
+    }
+}
+
+fn complete_codex_session(evidence: &CodexParentEvidence) -> Option<(&str, ReasoningEffort)> {
+    if evidence.resolution_status != CodexParentResolutionStatus::Complete.label() {
+        return None;
+    }
+    let model = evidence.observed_model.known()?;
+    let effort_label = evidence.observed_effort.known()?;
+    let effort = reasoning_effort_from_observed_label(effort_label)?;
+    Some((model, effort))
 }
 
 fn complete_grok_acp_session(evidence: &GrokAcpParentEvidence) -> Option<(&str, ReasoningEffort)> {
@@ -335,6 +371,49 @@ fn attributable_execution_cost_microunits(evidence: &GrokAcpParentEvidence) -> O
         GrokAcpNativeCostEquivalent::Known { microunits, .. } => Some(*microunits),
         GrokAcpNativeCostEquivalent::Unknown { .. } => None,
     }
+}
+
+fn attributable_codex_execution_cost_microunits(
+    evidence: &CodexParentEvidence,
+    dated_plan_pricing: &BTreeMap<String, ModelPricing>,
+) -> Option<u64> {
+    let (model, _) = complete_codex_session(evidence)?;
+    let CodexParentTurnUsage::Known {
+        input_tokens,
+        output_tokens,
+        ..
+    } = &evidence.turn_usage
+    else {
+        return None;
+    };
+    let pricing = dated_plan_pricing.get(model).copied()?;
+    if !pricing.is_valid() {
+        return None;
+    }
+    dated_plan_token_cost_microunits(pricing, *input_tokens, *output_tokens)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn dated_plan_token_cost_microunits(
+    pricing: ModelPricing,
+    input_tokens: u64,
+    output_tokens: u64,
+) -> Option<u64> {
+    let usd = (input_tokens as f64 * pricing.input_usd_per_million_tokens
+        + output_tokens as f64 * pricing.output_usd_per_million_tokens)
+        / DATED_PLAN_TOKENS_PER_MILLION;
+    if !usd.is_finite() || usd < 0.0 {
+        return None;
+    }
+    let microunits = usd * DATED_PLAN_COST_MICROUNITS_PER_USD;
+    if !microunits.is_finite() || microunits < 0.0 {
+        return None;
+    }
+    let rounded = microunits.round();
+    if !rounded.is_finite() || rounded < 0.0 || rounded > u64::MAX as f64 {
+        return None;
+    }
+    Some(rounded as u64)
 }
 
 fn attributable_parent_auditor_cost_microunits(external_run: &ExternalAgentRun) -> Option<u64> {
@@ -1097,6 +1176,10 @@ pub(super) fn test_trusted_grok_parent_auditor_external_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::external_agent::{
+        CodexParentEvidence, CodexParentResolvedField, CodexParentTurnUsage,
+        CodexServerRerouteEvidence,
+    };
     use crate::selection::{
         AuthorityRole, Boundedness, ContextSize, ReasoningEffort, RiskLevel, TaskHorizon,
     };
@@ -1739,6 +1822,163 @@ mod tests {
         }
     }
 
+    fn codex_worker_selection_event() -> SupervisorSelectionEvent {
+        let decision = crate::selection::select(&crate::selection::selection_test_base_input())
+            .expect("fixture selector decision");
+        let codex_candidate = CandidateKey {
+            runtime: "codex".to_string(),
+            model: "gpt-5.6-sol".to_string(),
+            effort: ReasoningEffort::High,
+        };
+        let mut provenance = decision;
+        if let Some(choice) = provenance.choice.as_mut() {
+            choice.candidate = codex_candidate.clone();
+        }
+        SupervisorSelectionEvent {
+            assignment_id: None,
+            attempt: 0,
+            role: AgentRole::Worker,
+            primary_cause: SupervisorSelectionEventCause::Initial,
+            provenance,
+        }
+    }
+
+    fn known_codex_usage(input_tokens: u64, output_tokens: u64) -> CodexParentTurnUsage {
+        CodexParentTurnUsage::Known {
+            input_tokens,
+            output_tokens,
+            cached_input_tokens: 400_000,
+            reasoning_output_tokens: 200_000,
+        }
+    }
+
+    fn dated_codex_plan_pricing() -> BTreeMap<String, ModelPricing> {
+        BTreeMap::from([
+            (
+                "gpt-5.6-sol".to_string(),
+                ModelPricing {
+                    input_usd_per_million_tokens: 10.0,
+                    output_usd_per_million_tokens: 40.0,
+                },
+            ),
+            (
+                "gpt-5.6-luna".to_string(),
+                ModelPricing {
+                    input_usd_per_million_tokens: 2.0,
+                    output_usd_per_million_tokens: 8.0,
+                },
+            ),
+            (
+                "gpt-5-codex".to_string(),
+                ModelPricing {
+                    input_usd_per_million_tokens: 1.0,
+                    output_usd_per_million_tokens: 1.0,
+                },
+            ),
+        ])
+    }
+
+    struct TrustedCodexParentEvidenceInput<'a> {
+        requested_model: Option<&'a str>,
+        requested_effort: Option<&'a str>,
+        rollout_model: &'a str,
+        rollout_effort: &'a str,
+        observed_model: &'a str,
+        observed_effort: &'a str,
+        server_rerouted: Option<CodexServerRerouteEvidence>,
+        usage: CodexParentTurnUsage,
+        resolution_status: &'a str,
+    }
+
+    fn trusted_codex_parent_evidence(
+        input: TrustedCodexParentEvidenceInput<'_>,
+    ) -> CodexParentEvidence {
+        let model_mismatch = input
+            .requested_model
+            .map(|requested| requested != input.observed_model)
+            .unwrap_or(false);
+        CodexParentEvidence {
+            codex_version: Some("0.144.4".to_string()),
+            thread_id: Some("parent-codex-thread".to_string()),
+            requested_model: input.requested_model.map(str::to_string),
+            requested_effort: input.requested_effort.map(str::to_string),
+            rollout_model: CodexParentResolvedField::Known(input.rollout_model.to_string()),
+            rollout_effort: CodexParentResolvedField::Known(input.rollout_effort.to_string()),
+            observed_model: CodexParentResolvedField::Known(input.observed_model.to_string()),
+            observed_effort: CodexParentResolvedField::Known(input.observed_effort.to_string()),
+            server_rerouted_model: input.server_rerouted,
+            model_mismatch,
+            turn_usage: input.usage,
+            resolution_status: input.resolution_status.to_string(),
+        }
+    }
+
+    fn parent_run_with_codex_evidence(
+        temp: &tempfile::TempDir,
+        repo: &Path,
+        evidence: CodexParentEvidence,
+    ) -> ExternalAgentRun {
+        let mut external_run =
+            super::super::tests::injected_verified_run(&injected_parent_command(temp, repo));
+        external_run.codex_parent_evidence = Some(evidence);
+        external_run
+    }
+
+    fn record_codex_attempt(
+        external_run: ExternalAgentRun,
+        run_name: &str,
+        attempt: usize,
+        requested_model: &str,
+        dated_plan_pricing: &BTreeMap<String, ModelPricing>,
+        parent_phase_continuation: Option<AttemptParentPhaseContinuation>,
+    ) -> Result<AttemptOutcomeEvidence> {
+        let (_temp, repo) = super::super::tests::injected_repository();
+        let run_id = RunId::new(run_name)?;
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "maco-supervise",
+        )?;
+        let mut journal = None;
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let initial = codex_worker_selection_event();
+        let recorded = record_child_attempt_outcome(
+            &artifacts,
+            &run_id,
+            "assignment-1",
+            attempt,
+            AgentRole::Worker,
+            &[],
+            std::slice::from_ref(&initial),
+            "codex",
+            Some(requested_model),
+            Some("high"),
+            true,
+            false,
+            SupervisorExecutionRuntime::Verified,
+            Some(&external_run),
+            dated_plan_pricing,
+            parent_phase_continuation,
+        )?;
+        let relative = PathBuf::from(format!(
+            "selection-attempts/assignment-1.attempt-{attempt}.json"
+        ));
+        let stored: AttemptOutcomeEvidence = serde_json::from_slice(&std::fs::read(
+            repo.join(RunArtifactFamily::Supervise.run_root())
+                .join(run_id.as_str())
+                .join(&relative),
+        )?)?;
+        assert_eq!(stored, recorded);
+        Ok(recorded)
+    }
+
     fn injected_parent_command(
         temp: &tempfile::TempDir,
         repo: &Path,
@@ -1789,6 +2029,7 @@ mod tests {
             false,
             SupervisorExecutionRuntime::Verified,
             external_run.as_ref(),
+            &BTreeMap::new(),
             None,
         )?;
         let relative = PathBuf::from("selection-attempts/assignment-1.attempt-1.json");
@@ -1885,6 +2126,7 @@ mod tests {
             false,
             SupervisorExecutionRuntime::Verified,
             Some(&external_run),
+            &BTreeMap::new(),
             Some(attempt_parent_phase_continuation_from_count(Some(0))),
         )?;
         assert_eq!(recorded.costs.execution_cost_microunits, Some(0));
@@ -2159,6 +2401,7 @@ mod tests {
             false,
             SupervisorExecutionRuntime::Verified,
             None,
+            &BTreeMap::new(),
             None,
         )?;
         let mut binding = ParentWorkerAttemptReviewCostBinding::bind(
@@ -2217,6 +2460,7 @@ mod tests {
             false,
             SupervisorExecutionRuntime::Verified,
             None,
+            &BTreeMap::new(),
             None,
         )?;
         let mut binding = ParentWorkerAttemptReviewCostBinding::bind(
@@ -2278,6 +2522,7 @@ mod tests {
             false,
             SupervisorExecutionRuntime::Verified,
             Some(&external_run),
+            &BTreeMap::new(),
             None,
         )?;
         let mut binding = ParentWorkerAttemptReviewCostBinding::bind(
@@ -2345,6 +2590,7 @@ mod tests {
             false,
             SupervisorExecutionRuntime::Verified,
             Some(&external_run),
+            &BTreeMap::new(),
             None,
         )?;
         let mut review_binding = ParentWorkerAttemptReviewCostBinding::bind(
@@ -2410,6 +2656,7 @@ mod tests {
             false,
             SupervisorExecutionRuntime::Verified,
             None,
+            &BTreeMap::new(),
             Some(attempt_parent_phase_continuation_from_count(Some(1))),
         )?;
         let mut binding = ParentWorkerAttemptReviewCostBinding::bind(
@@ -2461,6 +2708,7 @@ mod tests {
             false,
             SupervisorExecutionRuntime::Verified,
             None,
+            &BTreeMap::new(),
             None,
         )?;
         let mut binding = ParentWorkerAttemptReviewCostBinding::bind(
@@ -2568,6 +2816,27 @@ mod tests {
             Some(&grok_parent_run),
             None,
         ));
+
+        let mut codex_parent_run = minimal_external_run_for_proven_environment_helper();
+        codex_parent_run.codex_parent_evidence = Some(trusted_codex_parent_evidence(
+            TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-sol",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: known_codex_usage(1_000_000, 1_000_000),
+                resolution_status: "complete",
+            },
+        ));
+        assert!(!super::worker_attempt_proven_no_environment_native_spend(
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            "fake",
+            Some(&codex_parent_run),
+            None,
+        ));
     }
 
     #[test]
@@ -2636,6 +2905,7 @@ mod tests {
             false,
             SupervisorExecutionRuntime::NonpublishableSimulation,
             Some(&fake_run),
+            &BTreeMap::new(),
             None,
         )?;
         assert_eq!(recorded.costs.environment_cost_microunits, Some(0));
@@ -2713,6 +2983,7 @@ mod tests {
             true,
             SupervisorExecutionRuntime::Verified,
             Some(&first_run),
+            &BTreeMap::new(),
             Some(attempt_parent_phase_continuation_from_count(Some(0))),
         )?;
         let accepted = record_child_attempt_outcome(
@@ -2730,6 +3001,7 @@ mod tests {
             false,
             SupervisorExecutionRuntime::Verified,
             Some(&second_run),
+            &BTreeMap::new(),
             Some(attempt_parent_phase_continuation_from_count(Some(1))),
         )?;
         let execution_total = rejected.costs.execution_cost_microunits.unwrap()
@@ -2799,6 +3071,300 @@ mod tests {
         persist_proven_worker_attempt_bypassed_parent_review(&artifacts, &mut recorded)?;
         assert_eq!(recorded.costs.review_cost_microunits, Some(0));
         assert_eq!(recorded.costs.rereview_cost_microunits, Some(0));
+        assert!(recorded.costs.environment_cost_microunits.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn record_child_attempt_outcome_retains_parent_codex_identity_and_execution_cost() -> Result<()>
+    {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let external_run = parent_run_with_codex_evidence(
+            &temp,
+            &repo,
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-sol",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: known_codex_usage(1_000_000, 1_000_000),
+                resolution_status: "complete",
+            }),
+        );
+        let recorded = record_codex_attempt(
+            external_run,
+            "parent-codex-outcome-record",
+            1,
+            "gpt-5.6-sol",
+            &dated_codex_plan_pricing(),
+            None,
+        )?;
+        let observed = recorded
+            .observed_candidate
+            .as_ref()
+            .expect("mapped observed Codex candidate");
+        assert_eq!(observed.runtime, "codex");
+        assert_eq!(observed.model, "gpt-5.6-sol");
+        assert_eq!(observed.effort, ReasoningEffort::High);
+        assert_eq!(recorded.costs.execution_cost_microunits, Some(5_000_000));
+        assert_eq!(recorded.costs.rework_cost_microunits, Some(0));
+        assert!(recorded.costs.environment_cost_microunits.is_none());
+        assert!(project_numeric_row(&recorded).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_parent_codex_rollout_missing_cannot_promote_identity_or_cost() -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let external_run = parent_run_with_codex_evidence(
+            &temp,
+            &repo,
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-sol",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: known_codex_usage(1_000_000, 1_000_000),
+                resolution_status: "rollout_missing",
+            }),
+        );
+        let recorded = record_codex_attempt(
+            external_run,
+            "parent-codex-rollout-missing-record",
+            1,
+            "gpt-5.6-sol",
+            &dated_codex_plan_pricing(),
+            None,
+        )?;
+        assert!(recorded.observed_candidate.is_none());
+        assert!(recorded.costs.execution_cost_microunits.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn observed_requested_codex_mismatch_is_recorded_but_not_numeric_eligible() -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let external_run = parent_run_with_codex_evidence(
+            &temp,
+            &repo,
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-luna",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: known_codex_usage(1_000_000, 1_000_000),
+                resolution_status: "complete",
+            }),
+        );
+        let recorded = record_codex_attempt(
+            external_run,
+            "parent-codex-mismatch-record",
+            1,
+            "gpt-5.6-sol",
+            &dated_codex_plan_pricing(),
+            None,
+        )?;
+        assert_eq!(
+            recorded
+                .observed_candidate
+                .as_ref()
+                .map(|key| key.model.as_str()),
+            Some("gpt-5.6-luna")
+        );
+        assert_eq!(recorded.costs.execution_cost_microunits, Some(1_000_000));
+        assert!(project_numeric_row(&recorded).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn parent_codex_reroute_prices_observed_target_not_requested_or_rollout() -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let external_run = parent_run_with_codex_evidence(
+            &temp,
+            &repo,
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5-codex",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-luna",
+                observed_effort: "high",
+                server_rerouted: Some(CodexServerRerouteEvidence {
+                    from: "gpt-5.6-sol".to_string(),
+                    to: "gpt-5.6-luna".to_string(),
+                }),
+                usage: known_codex_usage(1_000_000, 1_000_000),
+                resolution_status: "complete",
+            }),
+        );
+        let recorded = record_codex_attempt(
+            external_run,
+            "parent-codex-reroute-record",
+            1,
+            "gpt-5.6-sol",
+            &dated_codex_plan_pricing(),
+            None,
+        )?;
+        assert_eq!(
+            recorded
+                .observed_candidate
+                .as_ref()
+                .map(|key| key.model.as_str()),
+            Some("gpt-5.6-luna")
+        );
+        assert_eq!(recorded.costs.execution_cost_microunits, Some(1_000_000));
+        assert_ne!(recorded.costs.execution_cost_microunits, Some(5_000_000));
+        assert_ne!(recorded.costs.execution_cost_microunits, Some(200_000));
+        Ok(())
+    }
+
+    #[test]
+    fn unpriced_parent_codex_model_leaves_execution_cost_none() -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let external_run = parent_run_with_codex_evidence(
+            &temp,
+            &repo,
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-sol",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: known_codex_usage(1_000_000, 1_000_000),
+                resolution_status: "complete",
+            }),
+        );
+        let luna_only = BTreeMap::from([(
+            "gpt-5.6-luna".to_string(),
+            ModelPricing {
+                input_usd_per_million_tokens: 2.0,
+                output_usd_per_million_tokens: 8.0,
+            },
+        )]);
+        let recorded = record_codex_attempt(
+            external_run,
+            "parent-codex-unpriced-record",
+            1,
+            "gpt-5.6-sol",
+            &luna_only,
+            None,
+        )?;
+        assert_eq!(
+            recorded
+                .observed_candidate
+                .as_ref()
+                .map(|key| key.model.as_str()),
+            Some("gpt-5.6-sol")
+        );
+        assert!(recorded.costs.execution_cost_microunits.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn zero_zero_codex_usage_is_unknown_not_zero_cost() -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let external_run = parent_run_with_codex_evidence(
+            &temp,
+            &repo,
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-sol",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: CodexParentTurnUsage::Unknown {
+                    reason: "turn.completed usage was 0/0".to_string(),
+                },
+                resolution_status: "complete",
+            }),
+        );
+        let recorded = record_codex_attempt(
+            external_run,
+            "parent-codex-zero-zero-usage-record",
+            1,
+            "gpt-5.6-sol",
+            &dated_codex_plan_pricing(),
+            None,
+        )?;
+        assert!(recorded.observed_candidate.is_some());
+        assert!(recorded.costs.execution_cost_microunits.is_none());
+        assert_ne!(recorded.costs.execution_cost_microunits, Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn record_child_attempt_outcome_leaves_environment_none_for_trusted_codex_parent_run(
+    ) -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let external_run = parent_run_with_codex_evidence(
+            &temp,
+            &repo,
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-sol",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: known_codex_usage(1_000_000, 1_000_000),
+                resolution_status: "complete",
+            }),
+        );
+        let recorded = record_codex_attempt(
+            external_run,
+            "trusted-codex-environment-none",
+            1,
+            "gpt-5.6-sol",
+            &dated_codex_plan_pricing(),
+            None,
+        )?;
+        assert_eq!(recorded.costs.execution_cost_microunits, Some(5_000_000));
+        assert!(recorded.costs.environment_cost_microunits.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn worker_retry_codex_observed_spend_attributes_to_rework_not_execution() -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let external_run = parent_run_with_codex_evidence(
+            &temp,
+            &repo,
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-sol",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: known_codex_usage(1_000_000, 1_000_000),
+                resolution_status: "complete",
+            }),
+        );
+        let recorded = record_codex_attempt(
+            external_run,
+            "worker-codex-rework-phase",
+            2,
+            "gpt-5.6-sol",
+            &dated_codex_plan_pricing(),
+            Some(attempt_parent_phase_continuation_from_count(Some(0))),
+        )?;
+        assert_eq!(recorded.costs.execution_cost_microunits, Some(0));
+        assert_eq!(recorded.costs.rework_cost_microunits, Some(5_000_000));
         assert!(recorded.costs.environment_cost_microunits.is_none());
         Ok(())
     }
