@@ -517,6 +517,30 @@ mod tests {
     }
 
     #[test]
+    fn detect_not_installed_when_only_ai_code_tracking_database_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(
+            &dir.path()
+                .join(".cursor")
+                .join("ai-tracking")
+                .join("ai-code-tracking.db"),
+            b"",
+        );
+        let adapter = CursorAdapter::with_home(dir.path());
+        assert_eq!(adapter.detect(), InstallState::NotInstalled);
+        let accounts = adapter.list_accounts().expect("list_accounts");
+        assert!(
+            accounts.is_empty(),
+            "ai-code-tracking.db is attribution tracking, not account identity"
+        );
+        let quota = adapter.quota().expect("quota");
+        assert!(
+            quota.is_empty(),
+            "ai-code-tracking.db must not be treated as Observed quota"
+        );
+    }
+
+    #[test]
     fn auth_json_presence_is_not_an_observed_account() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_file(
