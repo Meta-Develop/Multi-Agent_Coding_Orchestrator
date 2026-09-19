@@ -8,19 +8,25 @@
 //! - `~/.cursor/` [verified-local] — `agents/`, `projects/`, `extensions/`,
 //!   `skills-cursor/`, `ai-tracking/ai-code-tracking.db`, `argv.json`.
 //!
-//! The credential location is **`[unknown]`**: nothing credential-shaped was
-//! observed in either directory, which suggests the session token lives in the
-//! OS keyring or inside the editor's Electron storage.
+//! File-store path `~/.cursor/auth.json` is [verified-docs] when
+//! `AGENT_CLI_CREDENTIAL_STORE=file`. Presence of that regular file is
+//! install evidence (same grain as Copilot `~/.copilot/config.json`). This
+//! adapter never reads, parses, or logs it. An empty `~/.cursor` directory
+//! or a missing file is not credentials.
+//!
+//! macOS Keychain service names `cursor-access-token`,
+//! `cursor-refresh-token`, and `cursor-api-key` are [verified-docs]. Default
+//! Linux/Windows persist remains [unknown]. Isolated HOME relocation is not
+//! officially documented (no `GROK_HOME` equivalent). Switching stays
+//! [unknown]; this adapter stays read-only.
 //!
 //! Cursor documents `cursor-agent status` as a read-only authentication check
 //! that displays account information [verified-docs]. `list_accounts` uses
-//! that vendor surface instead of reading the unknown credential store. The
-//! text markers it recognizes remain [inferred], so an unfamiliar response is
-//! an error rather than evidence that no account is configured.
+//! that vendor surface instead of treating `auth.json` as an account identity.
+//! The text markers it recognizes remain [inferred], so an unfamiliar
+//! response is an error rather than evidence that no account is configured.
 //!
-//! TODO(research): establish where `cursor-agent login` persists its session
-//! before writing any switching logic. Until then this adapter must stay
-//! read-only. See `docs/research/cursor.md`.
+//! See `docs/research/cursor.md`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -96,6 +102,17 @@ fn injected_binary(home: &Path, binary: &str) -> Option<PathBuf> {
     }
 
     None
+}
+
+fn file_store_auth_json(home: &Path) -> PathBuf {
+    home.join(".cursor").join("auth.json")
+}
+
+/// Presence only. Never reads, parses, or logs the file. A directory or
+/// missing path is not file-store evidence.
+fn is_regular_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.file_type().is_file())
 }
 
 fn binary_on_path_for_platform(binary: &str) -> bool {
@@ -182,7 +199,8 @@ impl ProviderAdapter for CursorAdapter {
             // do not promote it to OAuth without evidence (NFR-8).
             auth_kinds: vec![AuthKind::Unknown, AuthKind::ApiKey],
             // The CLI account can be listed through `cursor-agent status`, but
-            // no credential-store or mutation path is established (NFR-8).
+            // no write-safe credential-store or mutation path is established
+            // (NFR-8). File-store presence is detect-only.
             maturity: Maturity::Experimental,
             install_state: self.detect(),
             capabilities: Vec::new(),
@@ -196,6 +214,7 @@ impl ProviderAdapter for CursorAdapter {
         vec![
             home.join(".config").join("cursor").join("cli-config.json"),
             home.join(".cursor"),
+            file_store_auth_json(&home),
         ]
     }
 
@@ -207,6 +226,7 @@ impl ProviderAdapter for CursorAdapter {
                     .join("cursor")
                     .join("cli-config.json")
                     .is_file()
+                || is_regular_file(&file_store_auth_json(&home))
         });
         let has_binary = match self.home.as_deref() {
             Some(home) => {
@@ -286,6 +306,15 @@ impl ProviderAdapter for CursorAdapter {
 mod tests {
     use super::ProviderAdapter;
     use super::*;
+    use std::fs;
+    use std::path::Path;
+
+    fn write_file(path: &Path, contents: &[u8]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("mkdir");
+        }
+        fs::write(path, contents).expect("write");
+    }
 
     #[test]
     fn with_home_resolves_config_paths_under_the_injected_root() {
@@ -293,11 +322,23 @@ mod tests {
         let adapter = CursorAdapter::with_home(dir.path());
         let paths = adapter.config_paths();
 
-        assert!(
-            !paths.is_empty(),
-            "config_paths must not go silent under an injected home"
+        assert_eq!(
+            paths,
+            vec![
+                dir.path()
+                    .join(".config")
+                    .join("cursor")
+                    .join("cli-config.json"),
+                dir.path().join(".cursor"),
+                dir.path().join(".cursor").join("auth.json"),
+            ]
         );
         for path in paths {
+            assert!(
+                path.is_absolute(),
+                "{path} must be absolute",
+                path = path.display()
+            );
             assert!(
                 path.starts_with(dir.path()),
                 "{path} escaped the injected home {home}",
@@ -341,5 +382,84 @@ mod tests {
             CursorStatus::LoggedOut
         );
         assert_eq!(parse_status("unexpected response"), CursorStatus::Unknown);
+    }
+
+    #[test]
+    fn file_store_auth_json_must_be_a_regular_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth = file_store_auth_json(dir.path());
+        assert!(!is_regular_file(&auth), "missing path is not a regular file");
+
+        fs::create_dir_all(&auth).expect("mkdir auth.json as directory");
+        assert!(
+            !is_regular_file(&auth),
+            "a directory named auth.json is not file-store presence"
+        );
+
+        fs::remove_dir(&auth).expect("rmdir");
+        write_file(&auth, b"");
+        assert!(
+            is_regular_file(&auth),
+            "an empty regular file is enough presence"
+        );
+    }
+
+    #[test]
+    fn detect_installed_when_file_store_auth_json_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(
+            &file_store_auth_json(dir.path()),
+            br#"{"access_token":"FAKE-access-token-0001"}"#,
+        );
+        let adapter = CursorAdapter::with_home(dir.path());
+        assert_eq!(adapter.detect(), InstallState::Installed);
+    }
+
+    #[test]
+    fn detect_not_installed_on_empty_home() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adapter = CursorAdapter::with_home(dir.path());
+        assert_eq!(adapter.detect(), InstallState::NotInstalled);
+    }
+
+    #[test]
+    fn empty_cursor_directory_is_not_credentials() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join(".cursor")).expect("mkdir .cursor");
+        let adapter = CursorAdapter::with_home(dir.path());
+        let accounts = adapter.list_accounts().expect("list_accounts");
+        assert!(
+            accounts.is_empty(),
+            "an empty ~/.cursor directory is not an Observed account"
+        );
+    }
+
+    #[test]
+    fn auth_json_presence_is_not_an_observed_account() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(
+            &file_store_auth_json(dir.path()),
+            b"not-json FAKE-access-token-0001",
+        );
+        let adapter = CursorAdapter::with_home(dir.path());
+        assert_eq!(adapter.detect(), InstallState::Installed);
+        let accounts = adapter.list_accounts().expect("list_accounts");
+        assert!(
+            accounts.is_empty(),
+            "auth.json presence is install evidence, not account identity"
+        );
+    }
+
+    #[test]
+    fn activate_account_is_not_implemented() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adapter = CursorAdapter::with_home(dir.path());
+        let error = adapter
+            .activate_account("any")
+            .expect_err("activate_account");
+        assert!(matches!(
+            error,
+            Error::NotImplemented("cursor::activate_account")
+        ));
     }
 }
