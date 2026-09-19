@@ -297,11 +297,19 @@ read from `oauth_creds.json`.
 
 ```jsonc
 {
-  "currentTier": { /* GeminiUserTier or null */ },
-  "allowedTiers": [ /* GeminiUserTier */ ],
-  "ineligibleTiers": [ /* IneligibleTier */ ],
+  "currentTier": {
+    /* GeminiUserTier or null */
+  },
+  "allowedTiers": [
+    /* GeminiUserTier */
+  ],
+  "ineligibleTiers": [
+    /* IneligibleTier */
+  ],
   "cloudaicompanionProject": "<redacted>",
-  "paidTier": { /* GeminiUserTier or null */ },
+  "paidTier": {
+    /* GeminiUserTier or null */
+  },
 }
 ```
 
@@ -404,30 +412,30 @@ Fields that **can** become Observed later, without inventing numbers,
 if a live authenticated Code Assist call returns them and the values
 are recorded as received:
 
-| Field | RPC | Marker if observed live |
-| --------------------------------------------- | ------------------- | ----------------------- |
-| `paidTier.id`, `paidTier.name` | `loadCodeAssist` | `[verified-local]` |
-| `currentTier.id`, `currentTier.name` | `loadCodeAssist` | `[verified-local]` |
-| `allowedTiers[]` / `ineligibleTiers[]` `id` / `tierId` / `tierName` | `loadCodeAssist` | `[verified-local]` |
-| `availableCredits[].creditType` | `loadCodeAssist` | `[verified-local]` |
-| `availableCredits[].creditAmount` | `loadCodeAssist` or generate-content `remainingCredits` | `[verified-local]` |
-| `buckets[].remainingAmount` | `retrieveUserQuota` | `[verified-local]` |
-| `buckets[].remainingFraction` | `retrieveUserQuota` | `[verified-local]` |
-| `buckets[].resetTime` | `retrieveUserQuota` | `[verified-local]` |
-| `buckets[].modelId` | `retrieveUserQuota` | `[verified-local]` |
-| `buckets[].tokenType` | `retrieveUserQuota` | `[verified-local]` |
+| Field                                                               | RPC                                                     | Marker if observed live |
+| ------------------------------------------------------------------- | ------------------------------------------------------- | ----------------------- |
+| `paidTier.id`, `paidTier.name`                                      | `loadCodeAssist`                                        | `[verified-local]`      |
+| `currentTier.id`, `currentTier.name`                                | `loadCodeAssist`                                        | `[verified-local]`      |
+| `allowedTiers[]` / `ineligibleTiers[]` `id` / `tierId` / `tierName` | `loadCodeAssist`                                        | `[verified-local]`      |
+| `availableCredits[].creditType`                                     | `loadCodeAssist`                                        | `[verified-local]`      |
+| `availableCredits[].creditAmount`                                   | `loadCodeAssist` or generate-content `remainingCredits` | `[verified-local]`      |
+| `buckets[].remainingAmount`                                         | `retrieveUserQuota`                                     | `[verified-local]`      |
+| `buckets[].remainingFraction`                                       | `retrieveUserQuota`                                     | `[verified-local]`      |
+| `buckets[].resetTime`                                               | `retrieveUserQuota`                                     | `[verified-local]`      |
+| `buckets[].modelId`                                                 | `retrieveUserQuota`                                     | `[verified-local]`      |
+| `buckets[].tokenType`                                               | `retrieveUserQuota`                                     | `[verified-local]`      |
 
 Fields that **cannot** become Observed from material already in hand:
 
-| Candidate | Why it stays unobserved |
-| --------------------------------------------- | ----------------------- |
-| Any key in `oauth_creds.json` / `google_accounts.json` | No plan, tier, or quota keys `[verified-source]`. |
-| `security.auth.selectedType` | Auth mode only `[verified-source]`. |
-| Named `UserTierId` `free-tier` / `legacy-tier` / `standard-tier` | Client constants, not an AI Pro label `[verified-source]`. |
-| Client `UserTierId.STANDARD` fallback or VPC-SC stub | Synthesised locally `[verified-source]`. |
-| Client `modelQuotas.limit`, including `limit = 100` | Derived or invented in `refreshUserQuota` `[verified-source]`. |
-| Pinned CLI or Cloud published daily maxima | Catalog `[verified-docs]`, not an account reading. |
-| Google One "Manage subscription" confirmation | Official FAQ path `[verified-docs]`; not a CLI field; not fetched here. |
+| Candidate                                                        | Why it stays unobserved                                                 |
+| ---------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| Any key in `oauth_creds.json` / `google_accounts.json`           | No plan, tier, or quota keys `[verified-source]`.                       |
+| `security.auth.selectedType`                                     | Auth mode only `[verified-source]`.                                     |
+| Named `UserTierId` `free-tier` / `legacy-tier` / `standard-tier` | Client constants, not an AI Pro label `[verified-source]`.              |
+| Client `UserTierId.STANDARD` fallback or VPC-SC stub             | Synthesised locally `[verified-source]`.                                |
+| Client `modelQuotas.limit`, including `limit = 100`              | Derived or invented in `refreshUserQuota` `[verified-source]`.          |
+| Pinned CLI or Cloud published daily maxima                       | Catalog `[verified-docs]`, not an account reading.                      |
+| Google One "Manage subscription" confirmation                    | Official FAQ path `[verified-docs]`; not a CLI field; not fetched here. |
 
 Until a live `loadCodeAssist` / `retrieveUserQuota` response is
 recorded, Google AI Pro entitlement through Gemini CLI remains
