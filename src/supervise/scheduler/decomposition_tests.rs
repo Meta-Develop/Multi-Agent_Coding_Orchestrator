@@ -1911,6 +1911,7 @@ fn test_report_construction(
         environment_failures: Vec::new(),
         sandbox_denials: Vec::new(),
         collected: CollectedAssignmentOutcomes::default(),
+        this_run_attempt_rows: Vec::new(),
         bloated_file_flags: Vec::new(),
         decomposition_candidates: Vec::new(),
         assignment_traceability: Vec::new(),
@@ -4180,5 +4181,113 @@ fn persist_releases_terminal_claims_without_checkpoint_writer() {
     assert!(
         released.load(std::sync::atomic::Ordering::SeqCst),
         "terminal release must run even when checkpoint finalization is unavailable"
+    );
+}
+
+fn fake_simulation_complete_accepted_row(assignment_id: &str) -> ThisRunAttemptCostRow {
+    ThisRunAttemptCostRow {
+        assignment_id: assignment_id.to_string(),
+        attempt: 1,
+        parent_result: Some(OutcomeResult::Accepted),
+        costs: AttemptAttributableCosts {
+            execution_cost_microunits: Some(10),
+            review_cost_microunits: Some(2),
+            rework_cost_microunits: Some(0),
+            rereview_cost_microunits: Some(0),
+            environment_cost_microunits: Some(0),
+        },
+    }
+}
+
+fn grok_verified_environment_unknown_accepted_row(assignment_id: &str) -> ThisRunAttemptCostRow {
+    ThisRunAttemptCostRow {
+        assignment_id: assignment_id.to_string(),
+        attempt: 1,
+        parent_result: Some(OutcomeResult::Accepted),
+        costs: AttemptAttributableCosts {
+            execution_cost_microunits: Some(500),
+            review_cost_microunits: Some(50),
+            rework_cost_microunits: Some(0),
+            rereview_cost_microunits: Some(0),
+            environment_cost_microunits: None,
+        },
+    }
+}
+
+fn accepted_task_cost_from_report(report: &SupervisorFinalReport) -> &AcceptedTaskCostRollup {
+    report
+        .role_economics_profile
+        .as_ref()
+        .and_then(|profile| profile.execution.as_ref())
+        .and_then(|execution| execution.accepted_task_cost.as_ref())
+        .expect("final report records accepted_task_cost")
+}
+
+#[test]
+fn finalize_records_complete_only_accepted_task_rollup() {
+    let plan = test_plan(vec![test_assignment("complete-child", "README.md")]);
+    let mut construction = test_report_construction(
+        &plan,
+        RunId::new("complete-only-accepted-task-rollup").expect("run id"),
+    );
+    construction.this_run_attempt_rows =
+        vec![fake_simulation_complete_accepted_row("complete-child")];
+    let report = build_supervisor_final_report(construction);
+    let rollup = accepted_task_cost_from_report(&report);
+
+    assert_eq!(rollup.incomplete_attempt_count, 0);
+    assert_eq!(rollup.complete_attempt_count, 1);
+    assert_eq!(rollup.complete_accepted_count, 1);
+    assert_eq!(rollup.complete_total_cycle_cost_microunits, 12);
+    assert_eq!(rollup.cost_per_accepted_task_microunits, Some(12));
+}
+
+#[test]
+fn finalize_counts_environment_none_as_incomplete_and_leaves_average_none() {
+    let plan = test_plan(vec![test_assignment("native-child", "README.md")]);
+    let mut construction = test_report_construction(
+        &plan,
+        RunId::new("environment-none-incomplete-average").expect("run id"),
+    );
+    construction.this_run_attempt_rows = vec![grok_verified_environment_unknown_accepted_row(
+        "native-child",
+    )];
+    let report = build_supervisor_final_report(construction);
+    let rollup = accepted_task_cost_from_report(&report);
+
+    assert_eq!(rollup.incomplete_attempt_count, 1);
+    assert_eq!(rollup.complete_attempt_count, 0);
+    assert_eq!(rollup.complete_accepted_count, 0);
+    assert_eq!(rollup.complete_total_cycle_cost_microunits, 0);
+    assert_eq!(rollup.cost_per_accepted_task_microunits, None);
+}
+
+#[test]
+fn finalize_does_not_coerce_environment_none_to_zero() {
+    let plan = test_plan(vec![
+        test_assignment("complete-child", "README.md"),
+        test_assignment("native-child", "src/lib.rs"),
+    ]);
+    let mut construction = test_report_construction(
+        &plan,
+        RunId::new("mixed-complete-and-environment-none").expect("run id"),
+    );
+    construction.this_run_attempt_rows = vec![
+        fake_simulation_complete_accepted_row("complete-child"),
+        grok_verified_environment_unknown_accepted_row("native-child"),
+    ];
+    let report = build_supervisor_final_report(construction);
+    let rollup = accepted_task_cost_from_report(&report);
+
+    assert_eq!(rollup.incomplete_attempt_count, 1);
+    assert_eq!(rollup.complete_attempt_count, 1);
+    assert_eq!(rollup.complete_accepted_count, 1);
+    assert_eq!(rollup.complete_total_cycle_cost_microunits, 12);
+    assert_eq!(rollup.cost_per_accepted_task_microunits, Some(12));
+    assert_ne!(rollup.cost_per_accepted_task_microunits, Some(0));
+    assert_ne!(
+        rollup.complete_total_cycle_cost_microunits,
+        12 + 550,
+        "environment None must not become a zero bucket in the average"
     );
 }

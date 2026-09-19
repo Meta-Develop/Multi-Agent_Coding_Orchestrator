@@ -14139,6 +14139,42 @@
         "execution": {
           "additionalProperties": false,
           "properties": {
+            "accepted_task_cost": {
+              "additionalProperties": false,
+              "properties": {
+                "complete_accepted_count": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "complete_attempt_count": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "complete_total_cycle_cost_microunits": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "cost_per_accepted_task_microunits": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "incomplete_attempt_count": {
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "incomplete_attempt_count",
+                "complete_attempt_count",
+                "complete_accepted_count",
+                "complete_total_cycle_cost_microunits",
+                "cost_per_accepted_task_microunits"
+              ],
+              "type": "object"
+            },
             "assignment_count": {
               "minimum": 0,
               "type": "integer"

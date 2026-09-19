@@ -291,6 +291,7 @@ mod selection_bridge;
 use selection_bridge::*;
 
 mod accepted_task_cost;
+pub use accepted_task_cost::AcceptedTaskCostRollup;
 mod environment_observation;
 mod outcome_history;
 mod prior_input;
@@ -1420,6 +1421,10 @@ pub struct SupervisorExecutionMetadata {
     /// eligibility gaps. Older reports omit this field.
     #[serde(default)]
     pub assignment_selection_ledger: Vec<AssignmentSelectionLedgerEntry>,
+    /// This-run complete-only accepted-task cost rollup. Older reports omit
+    /// this field and deserialize to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_task_cost: Option<AcceptedTaskCostRollup>,
     pub usage: SupervisorExecutionUsageReport,
 }
 

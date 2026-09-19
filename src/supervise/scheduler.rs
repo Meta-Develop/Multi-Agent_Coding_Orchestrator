@@ -1,4 +1,8 @@
+use super::accepted_task_cost::{
+    attempt_cost_record, rollup_cost_per_accepted_task, AttemptCostRecord,
+};
 use super::*;
+use crate::selection::OutcomeResult;
 
 mod preclaim;
 use preclaim::{
@@ -2215,6 +2219,7 @@ struct SupervisorFinalReportConstruction<'context> {
     environment_failures: Vec<EnvironmentFailure>,
     sandbox_denials: Vec<SandboxDenialEvidence>,
     collected: CollectedAssignmentOutcomes,
+    this_run_attempt_rows: Vec<ThisRunAttemptCostRow>,
     bloated_file_flags: Vec<BloatedFileFlag>,
     decomposition_candidates: Vec<DecompositionCompletion>,
     assignment_traceability: Vec<AssignmentTraceability>,
@@ -2497,6 +2502,128 @@ fn supervisor_execution_usage_report(
     }
 }
 
+const THIS_RUN_ATTEMPT_EVIDENCE_MAX_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThisRunAttemptCostRow {
+    assignment_id: String,
+    attempt: usize,
+    parent_result: Option<OutcomeResult>,
+    costs: AttemptAttributableCosts,
+}
+
+fn load_this_run_attempt_cost_rows(run_dir: &Path) -> Vec<ThisRunAttemptCostRow> {
+    let attempts_dir = run_dir.join("selection-attempts");
+    let entries = match std::fs::read_dir(&attempts_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    let mut rows = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some((assignment, ordinal)) = name
+            .strip_suffix(".json")
+            .and_then(|name| name.rsplit_once(".attempt-"))
+        else {
+            continue;
+        };
+        let Ok(ordinal) = ordinal.parse::<usize>() else {
+            continue;
+        };
+        let Ok(bytes) =
+            read_bounded_regular_file_nofollow(&path, THIS_RUN_ATTEMPT_EVIDENCE_MAX_BYTES)
+        else {
+            continue;
+        };
+        let Ok(evidence) = serde_json::from_slice::<AttemptOutcomeEvidence>(&bytes) else {
+            continue;
+        };
+        if evidence.attempt == 0
+            || evidence.attempt != ordinal
+            || evidence.assignment_id != assignment
+        {
+            continue;
+        }
+        rows.push(ThisRunAttemptCostRow {
+            assignment_id: evidence.assignment_id,
+            attempt: evidence.attempt,
+            parent_result: evidence.parent_result,
+            costs: evidence.costs,
+        });
+    }
+    rows.sort_by(|left, right| {
+        (&left.assignment_id, left.attempt).cmp(&(&right.assignment_id, right.attempt))
+    });
+    rows
+}
+
+fn resolve_this_run_terminal_result(
+    row: &ThisRunAttemptCostRow,
+    last_attempt: Option<usize>,
+    reports: &[OrchestratorReviewReport],
+) -> Option<OutcomeResult> {
+    if let Some(result) = row.parent_result {
+        return Some(result);
+    }
+    if last_attempt != Some(row.attempt) {
+        return None;
+    }
+    let matches = reports
+        .iter()
+        .filter(|item| item.id == row.assignment_id)
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return None;
+    }
+    matches.first().and_then(|item| {
+        if item.accepted && !item.rejected {
+            Some(OutcomeResult::Accepted)
+        } else if item.rejected && !item.accepted {
+            Some(OutcomeResult::Rejected)
+        } else {
+            None
+        }
+    })
+}
+
+fn this_run_attempt_cost_records(
+    rows: &[ThisRunAttemptCostRow],
+    reports: &[OrchestratorReviewReport],
+) -> Vec<AttemptCostRecord> {
+    let mut last_attempt = BTreeMap::<&str, usize>::new();
+    for row in rows {
+        last_attempt
+            .entry(row.assignment_id.as_str())
+            .and_modify(|last| *last = (*last).max(row.attempt))
+            .or_insert(row.attempt);
+    }
+    rows.iter()
+        .filter_map(|row| {
+            attempt_cost_record(
+                row.costs.clone(),
+                resolve_this_run_terminal_result(
+                    row,
+                    last_attempt.get(row.assignment_id.as_str()).copied(),
+                    reports,
+                ),
+            )
+        })
+        .collect()
+}
+
+fn this_run_accepted_task_cost(
+    rows: &[ThisRunAttemptCostRow],
+    reports: &[OrchestratorReviewReport],
+) -> Option<AcceptedTaskCostRollup> {
+    rollup_cost_per_accepted_task(&this_run_attempt_cost_records(rows, reports)).ok()
+}
+
 fn build_supervisor_final_report(
     construction: SupervisorFinalReportConstruction<'_>,
 ) -> SupervisorFinalReport {
@@ -2527,6 +2654,7 @@ fn build_supervisor_final_report(
         environment_failures,
         sandbox_denials,
         mut collected,
+        this_run_attempt_rows,
         bloated_file_flags,
         decomposition_candidates,
         assignment_traceability,
@@ -2668,6 +2796,10 @@ fn build_supervisor_final_report(
         budget_degradations,
         selection_decisions: selection_decisions.clone(),
         assignment_selection_ledger,
+        accepted_task_cost: this_run_accepted_task_cost(
+            &this_run_attempt_rows,
+            &collected.orchestrator_reports,
+        ),
         usage: supervisor_execution_usage_report(total_usage, total_cost_usd, usage_complete),
     });
     SupervisorFinalReport {
@@ -3864,6 +3996,7 @@ fn persist_supervisor_predispatch_failure(
         environment_failures,
         sandbox_denials: Vec::new(),
         collected,
+        this_run_attempt_rows: load_this_run_attempt_cost_rows(artifact_writer.run_dir()),
         bloated_file_flags: Vec::new(),
         decomposition_candidates: Vec::new(),
         assignment_traceability: Vec::new(),
@@ -4418,6 +4551,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         environment_failures,
         sandbox_denials,
         collected,
+        this_run_attempt_rows: load_this_run_attempt_cost_rows(artifact_writer.run_dir()),
         bloated_file_flags,
         decomposition_candidates,
         assignment_traceability,
