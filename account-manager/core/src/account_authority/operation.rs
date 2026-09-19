@@ -1,7 +1,8 @@
 //! Durable `operation.prepare` records for the account-authority library.
 //!
-//! This module records prepared intent only. It does not start, status, or
-//! cancel an operation, and it does not advertise `operation.prepare`.
+//! This module records prepared intent and durable start/status/cancel state
+//! transitions in-library only. It does not advertise `operation.prepare`,
+//! `operation.start`, `operation.status`, or `operation.cancel`.
 //! Callers pass already-decoded typed fields; this module does not parse JSON.
 //!
 //! The digest is an integrity join, not a quality certificate or proof of
@@ -78,11 +79,13 @@ pub struct OperationPrepareIdentity {
 #[serde(transparent)]
 pub struct OperationHandle(String);
 
-/// Recorded prepare state. This slice stores `prepared` only.
+/// Recorded operation state for this in-library slice.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PreparedOperationState {
     Prepared,
+    Running,
+    Cancelled,
 }
 
 /// Durable prepared-operation record: opaque handle, binding digest, state.
@@ -101,6 +104,7 @@ pub struct PreparedOperationStore {
 
 struct StoreInner {
     by_key: HashMap<String, PreparedOperation>,
+    by_handle: HashMap<OperationHandle, String>,
 }
 
 impl PreparedOperationStore {
@@ -108,6 +112,7 @@ impl PreparedOperationStore {
         Self {
             inner: Mutex::new(StoreInner {
                 by_key: HashMap::new(),
+                by_handle: HashMap::new(),
             }),
         }
     }
@@ -141,9 +146,53 @@ impl PreparedOperationStore {
             return replay_or_refuse(row, &record.digest, &request.binding.provider_id);
         }
         inner
+            .by_handle
+            .insert(record.handle.clone(), request.idempotency_key.clone());
+        inner
             .by_key
             .insert(request.idempotency_key.clone(), record.clone());
         Ok(record)
+    }
+
+    /// Transition `prepared` → `running`. Does not launch providers.
+    pub fn start(&self, handle: &OperationHandle, digest: &str) -> Result<PreparedOperation> {
+        let mut inner = self.inner.lock().expect("prepared-operation lock");
+        let row = lookup_row_mut(&mut inner, handle, digest)?;
+        match row.state {
+            PreparedOperationState::Prepared => {
+                row.state = PreparedOperationState::Running;
+            }
+            PreparedOperationState::Running => {
+                return Err(operation_refused(
+                    "account-metadata",
+                    "operation is already running",
+                ));
+            }
+            PreparedOperationState::Cancelled => {
+                return Err(operation_refused(
+                    "account-metadata",
+                    "operation was cancelled",
+                ));
+            }
+        }
+        Ok(row.clone())
+    }
+
+    /// Return the durable state for `handle` without inventing execution evidence.
+    pub fn status(&self, handle: &OperationHandle, digest: &str) -> Result<PreparedOperationState> {
+        let inner = self.inner.lock().expect("prepared-operation lock");
+        let row = lookup_row_ref(&inner, handle, digest)?;
+        Ok(row.state.clone())
+    }
+
+    /// Transition `prepared` or `running` → `cancelled`. Already-cancelled is idempotent.
+    pub fn cancel(&self, handle: &OperationHandle, digest: &str) -> Result<PreparedOperation> {
+        let mut inner = self.inner.lock().expect("prepared-operation lock");
+        let row = lookup_row_mut(&mut inner, handle, digest)?;
+        if row.state != PreparedOperationState::Cancelled {
+            row.state = PreparedOperationState::Cancelled;
+        }
+        Ok(row.clone())
     }
 
     #[cfg(test)]
@@ -253,6 +302,55 @@ fn prepare_refused(provider: &str, reason: impl Into<String>) -> Error {
         provider: provider.to_string(),
         reason: reason.into(),
     }
+}
+
+fn operation_refused(provider: &str, reason: impl Into<String>) -> Error {
+    prepare_refused(provider, reason)
+}
+
+fn lookup_row_ref<'a>(
+    inner: &'a StoreInner,
+    handle: &OperationHandle,
+    digest: &str,
+) -> Result<&'a PreparedOperation> {
+    let key = inner
+        .by_handle
+        .get(handle)
+        .ok_or_else(|| operation_refused("account-metadata", "unknown operation handle"))?;
+    let row = inner
+        .by_key
+        .get(key)
+        .ok_or_else(|| operation_refused("account-metadata", "unknown operation handle"))?;
+    if row.digest != digest {
+        return Err(operation_refused(
+            "account-metadata",
+            "operation handle does not match the supplied binding digest",
+        ));
+    }
+    Ok(row)
+}
+
+fn lookup_row_mut<'a>(
+    inner: &'a mut StoreInner,
+    handle: &OperationHandle,
+    digest: &str,
+) -> Result<&'a mut PreparedOperation> {
+    let key = inner
+        .by_handle
+        .get(handle)
+        .cloned()
+        .ok_or_else(|| operation_refused("account-metadata", "unknown operation handle"))?;
+    let row = inner
+        .by_key
+        .get_mut(&key)
+        .ok_or_else(|| operation_refused("account-metadata", "unknown operation handle"))?;
+    if row.digest != digest {
+        return Err(operation_refused(
+            "account-metadata",
+            "operation handle does not match the supplied binding digest",
+        ));
+    }
+    Ok(row)
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -481,10 +579,97 @@ mod tests {
         );
     }
 
+    fn prepared_record() -> PreparedOperation {
+        PreparedOperationStore::new()
+            .prepare(&identity(), &request())
+            .expect("prepare")
+    }
+
     #[test]
-    fn persist_does_not_advertise_or_dispatch_operation_prepare() {
+    fn start_transitions_prepared_to_running() {
+        let store = PreparedOperationStore::new();
+        let prepared = store.prepare(&identity(), &request()).expect("prepare");
+        let started = store
+            .start(&prepared.handle, &prepared.digest)
+            .expect("start");
+        assert_eq!(started.state, PreparedOperationState::Running);
+        assert_eq!(
+            store
+                .status(&prepared.handle, &prepared.digest)
+                .expect("status"),
+            PreparedOperationState::Running
+        );
+    }
+
+    #[test]
+    fn cancel_is_idempotent_from_cancelled() {
+        let store = PreparedOperationStore::new();
+        let prepared = store.prepare(&identity(), &request()).expect("prepare");
+        let cancelled = store
+            .cancel(&prepared.handle, &prepared.digest)
+            .expect("cancel");
+        assert_eq!(cancelled.state, PreparedOperationState::Cancelled);
+        let again = store
+            .cancel(&prepared.handle, &prepared.digest)
+            .expect("idempotent cancel");
+        assert_eq!(again.state, PreparedOperationState::Cancelled);
+    }
+
+    #[test]
+    fn cancel_from_running_sets_cancelled() {
+        let store = PreparedOperationStore::new();
+        let prepared = store.prepare(&identity(), &request()).expect("prepare");
+        store
+            .start(&prepared.handle, &prepared.digest)
+            .expect("start");
+        let cancelled = store
+            .cancel(&prepared.handle, &prepared.digest)
+            .expect("cancel");
+        assert_eq!(cancelled.state, PreparedOperationState::Cancelled);
+    }
+
+    #[test]
+    fn unknown_handle_refused_without_new_row() {
+        let store = PreparedOperationStore::new();
+        store.prepare(&identity(), &request()).expect("prepare");
+        let handle = OperationHandle("missing-handle".to_string());
+        let digest = canonical_binding_digest(&identity(), &request());
+        assert!(matches!(
+            store.start(&handle, &digest),
+            Err(Error::ConfigWrite { reason, .. }) if reason == "unknown operation handle"
+        ));
+        assert_eq!(store.row_count(), 1);
+    }
+
+    #[test]
+    fn digest_mismatch_refused_without_state_change() {
+        let store = PreparedOperationStore::new();
+        let prepared = store.prepare(&identity(), &request()).expect("prepare");
+        let wrong = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        assert!(matches!(
+            store.start(&prepared.handle, wrong),
+            Err(Error::ConfigWrite { reason, .. })
+                if reason == "operation handle does not match the supplied binding digest"
+        ));
+        assert_eq!(
+            store
+                .status(&prepared.handle, &prepared.digest)
+                .expect("status"),
+            PreparedOperationState::Prepared
+        );
+    }
+
+    #[test]
+    fn persist_does_not_advertise_or_dispatch_operation_lifecycle() {
         assert_eq!(ADVERTISED_OPERATIONS.len(), 8);
-        assert!(!ADVERTISED_OPERATIONS.contains(&"operation.prepare"));
+        for name in [
+            "operation.prepare",
+            "operation.start",
+            "operation.status",
+            "operation.cancel",
+        ] {
+            assert!(!ADVERTISED_OPERATIONS.contains(&name));
+        }
         assert!(!ADVERTISED_OPERATIONS
             .iter()
             .any(|name| name.starts_with("operation.")));
@@ -502,5 +687,28 @@ mod tests {
 advertises work-proposal tool restrictions"
         );
         assert!(response.result.is_none());
+
+        let prepared = prepared_record();
+        for operation in ["operation.start", "operation.status", "operation.cancel"] {
+            let body = serde_json::json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "requestId": operation,
+                "operation": operation,
+                "handle": prepared.handle.0,
+                "digest": prepared.digest,
+            });
+            let decoded = decode_request(body.to_string().as_bytes()).expect("decode");
+            let response = dispatch(&ctx, &decoded);
+            let error = response.error.expect("unsupported");
+            assert_eq!(error.code, ErrorCode::UnsupportedOperation);
+            assert_eq!(
+                error.message,
+                format!(
+                    "{operation} is not advertised until a provider \
+advertises work-proposal tool restrictions"
+                )
+            );
+            assert!(response.result.is_none());
+        }
     }
 }
