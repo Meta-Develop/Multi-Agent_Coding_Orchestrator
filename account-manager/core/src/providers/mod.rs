@@ -36,6 +36,7 @@ pub mod codex_cli;
 pub mod cursor;
 pub mod gemini_cli;
 pub(crate) mod gemini_oauth;
+pub mod github_copilot;
 pub mod grok_cli;
 
 pub(crate) use gemini_oauth::{OAuthLoginRunError, LOGIN_DEADLINE};
@@ -655,6 +656,7 @@ pub fn registry() -> Vec<Box<dyn ProviderAdapter>> {
         Box::new(cursor::CursorAdapter::default()),
         Box::new(grok_cli::GrokCliAdapter::default()),
         Box::new(gemini_cli::GeminiCliAdapter::default()),
+        Box::new(github_copilot::GithubCopilotAdapter::default()),
     ]
 }
 
