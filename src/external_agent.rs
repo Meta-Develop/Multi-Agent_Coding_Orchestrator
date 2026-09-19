@@ -59,10 +59,16 @@ use std::{
 
 #[path = "codex_app_server.rs"]
 pub(crate) mod codex_app_server;
+mod codex_parent_evidence;
 #[allow(dead_code, unused_imports)]
 pub(crate) mod executor;
 mod grok_steering;
 
+use codex_parent_evidence::{codex_parent_evidence_from_run, CodexParentEvidenceInputs};
+pub use codex_parent_evidence::{
+    CodexParentEvidence, CodexParentResolutionStatus, CodexParentResolvedField,
+    CodexParentTurnUsage, CodexServerRerouteEvidence,
+};
 use grok_steering::GrokAcpSteeringBridge;
 
 pub use crate::protected_path::SandboxDenialRetryability;
@@ -1570,6 +1576,10 @@ pub struct ExternalAgentRun {
     pub grok_stream_usage_evidence: Option<GrokStreamUsageEvidence>,
     /// Parent-owned Grok ACP stdio observation. Never accepted from child reports.
     pub grok_acp_parent_evidence: Option<GrokAcpParentEvidence>,
+    /// Parent-owned Codex model, effort, and usage observation derived from the captured
+    /// `codex exec --json` stream and the parent-owned Codex home rollout. Present only for
+    /// supervisor launches; never accepted from child reports.
+    pub codex_parent_evidence: Option<CodexParentEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -1623,6 +1633,7 @@ impl std::fmt::Debug for ExternalAgentRun {
                 &self.grok_stream_usage_evidence,
             )
             .field("grok_acp_parent_evidence", &self.grok_acp_parent_evidence)
+            .field("codex_parent_evidence", &self.codex_parent_evidence)
             .finish()
     }
 }
@@ -1837,6 +1848,8 @@ struct ExternalAgentRunWireRef<'a> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     grok_acp_parent_evidence: &'a Option<GrokAcpParentEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex_parent_evidence: &'a Option<CodexParentEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     managed_grok_selection: &'a Option<ManagedGrokAccountSelectionEvidence>,
 }
 
@@ -1880,6 +1893,8 @@ struct ExternalAgentRunWireOwned {
     #[serde(default)]
     grok_acp_parent_evidence: Option<GrokAcpParentEvidence>,
     #[serde(default)]
+    codex_parent_evidence: Option<CodexParentEvidence>,
+    #[serde(default)]
     managed_grok_selection: Option<ManagedGrokAccountSelectionEvidence>,
 }
 
@@ -1921,6 +1936,7 @@ impl Serialize for ExternalAgentRun {
             error: &self.error,
             grok_stream_usage_evidence: &self.grok_stream_usage_evidence,
             grok_acp_parent_evidence: &self.grok_acp_parent_evidence,
+            codex_parent_evidence: &self.codex_parent_evidence,
             managed_grok_selection: &self.stdout.run_metadata.managed_grok_selection,
         }
         .serialize(serializer)
@@ -1965,6 +1981,7 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
             output_last_message: None,
             grok_stream_usage_evidence: wire.grok_stream_usage_evidence,
             grok_acp_parent_evidence: wire.grok_acp_parent_evidence,
+            codex_parent_evidence: wire.codex_parent_evidence,
         })
     }
 }
@@ -2635,6 +2652,25 @@ fn run_external_agent_runtime(
     };
     let mut target_controls = protected_controls.clone();
     target_controls.writable_artifact_root = Some(output_staging.root_path().to_path_buf());
+    // Supervisor launches keep their Codex session state in a parent-owned home below the
+    // staging root so model, effort, and usage evidence survives unit teardown. Consultants
+    // stay on `--ephemeral` and the RuntimeDirectory home: they intentionally yield no rollout.
+    let staged_codex_home = if spec.invocation == ExternalAgentInvocation::CodexSupervisor {
+        match output_staging.stage_codex_home() {
+            Ok(path) => Some(path.to_path_buf()),
+            Err(error) => {
+                return failed_external_run(
+                    spec,
+                    started,
+                    command_display(&resolved_program, &[]),
+                    false,
+                    format!("failed to prepare the parent-owned Codex home: {error:#}"),
+                );
+            }
+        }
+    } else {
+        None
+    };
     // Duplex argv stays empty until the contained version probe matches the audited
     // app-server protocol. This remains a mandatory latent release gate even if
     // universal pre-action coverage becomes available in a future Codex protocol.
@@ -2689,6 +2725,7 @@ fn run_external_agent_runtime(
         output_last_message: None,
         grok_stream_usage_evidence: None,
         grok_acp_parent_evidence: None,
+        codex_parent_evidence: None,
     };
 
     let mut codex_version = None;
@@ -3337,6 +3374,7 @@ fn run_external_agent_runtime(
                 target_spec.invocation,
                 codex_auth.as_ref(),
                 agent_lifecycle.as_ref(),
+                staged_codex_home.as_deref(),
             )
         }
         #[cfg(test)]
@@ -3347,10 +3385,21 @@ fn run_external_agent_runtime(
                 process_spec = process_spec.with_agent_lifecycle(metadata.clone());
             }
             match assignment_messaging_launch_environment_overlay(spec) {
-                Ok(overlay) if !overlay.is_empty() => {
-                    process_spec.with_environment(EnvironmentMode::InheritAndSet(overlay))
+                Ok(mut overlay) => {
+                    // The simulation has no transient unit, so the staged home is exposed
+                    // through the inherited environment exactly where the unit would see it.
+                    if let Some(home) = staged_codex_home.as_deref() {
+                        overlay.insert(
+                            "CODEX_HOME".to_string(),
+                            home.to_string_lossy().into_owned(),
+                        );
+                    }
+                    if overlay.is_empty() {
+                        process_spec
+                    } else {
+                        process_spec.with_environment(EnvironmentMode::InheritAndSet(overlay))
+                    }
                 }
-                Ok(_) => process_spec,
                 Err(error) => {
                     report.duration_ms = duration_millis(started.elapsed());
                     record_external_error(
@@ -3453,11 +3502,11 @@ fn run_external_agent_runtime(
                         }
                     }
                 }
-                match output_staging.reservation_mut() {
-                    Ok(staged_output) => record_completed_target(
+                match output_staging.completion_handles() {
+                    Ok(staging) => record_completed_target(
                         &mut report,
                         interactive.process,
-                        staged_output,
+                        staging,
                         &mut output_reservation,
                         &mut json_log_reservation,
                         &credential_redactor,
@@ -3546,11 +3595,11 @@ fn run_external_agent_runtime(
                         }
                     }
                 }
-                match output_staging.reservation_mut() {
-                    Ok(staged_output) => record_completed_target(
+                match output_staging.completion_handles() {
+                    Ok(staging) => record_completed_target(
                         &mut report,
                         interactive.process,
-                        staged_output,
+                        staging,
                         &mut output_reservation,
                         &mut json_log_reservation,
                         &credential_redactor,
@@ -3593,11 +3642,11 @@ fn run_external_agent_runtime(
         }
     } else {
         run_process_cancellable(process_spec, cancellation).map(|output| {
-            match output_staging.reservation_mut() {
-                Ok(staged_output) => record_completed_target(
+            match output_staging.completion_handles() {
+                Ok(staging) => record_completed_target(
                     &mut report,
                     output,
-                    staged_output,
+                    staging,
                     &mut output_reservation,
                     &mut json_log_reservation,
                     &credential_redactor,
@@ -4390,15 +4439,28 @@ fn runtime_adapter_captured_output(
     })
 }
 
+/// Parent-held handles into the private output staging root that target completion reads from
+/// and publishes through. Both are descriptors the parent opened before the unit ran.
+struct CompletedTargetStaging<'a> {
+    /// The staged raw output leaf the contained agent wrote its last message to.
+    output: &'a mut ReservedOutputFile,
+    /// The parent-owned Codex home, present only for supervisor launches.
+    codex_home: Option<&'a SecureOutputRoot>,
+}
+
 fn record_completed_target(
     report: &mut ExternalAgentRun,
     output: ProcessOutput,
-    staged_output: &mut ReservedOutputFile,
+    staging: CompletedTargetStaging<'_>,
     output_reservation: &mut ReservedOutputFile,
     json_log_reservation: &mut ReservedOutputFile,
     credential_redactor: &CredentialRedactor,
     context: CompletedTargetContext<'_>,
 ) {
+    let CompletedTargetStaging {
+        output: staged_output,
+        codex_home,
+    } = staging;
     let safety_verified = output.safety_evidence_verified();
     let target_completed_successfully = !output.timed_out
         && output.status.is_some_and(|status| status.success())
@@ -4448,6 +4510,21 @@ fn record_completed_target(
     } else if context.spec.invocation == ExternalAgentInvocation::Grok {
         report.grok_stream_usage_evidence =
             Some(grok_bounded_stdout_usage_evidence(&output.stdout));
+    } else if context.spec.invocation == ExternalAgentInvocation::CodexSupervisor {
+        // Codex evidence is derived only from parent-held captures: the stdout stream held by
+        // the runner and the rollout below the parent-owned Codex home. A truncated stream can
+        // no longer prove the run's shape, so it is withheld and resolves as invalid JSONL.
+        if let Some(codex_home) = codex_home {
+            let inputs = CodexParentEvidenceInputs {
+                codex_version: context.codex_version,
+                cwd: &context.spec.cwd,
+                requested_model: context.spec.model.as_deref(),
+                requested_effort: context.spec.reasoning_effort.as_deref(),
+            };
+            let stdout = (!output.stdout.is_truncated()).then(|| output.stdout.as_bytes());
+            report.codex_parent_evidence =
+                Some(codex_parent_evidence_from_run(&inputs, stdout, codex_home));
+        }
     }
     report.error = append_external_error(
         report.error.take(),
@@ -4602,6 +4679,7 @@ fn failed_external_run(
         output_last_message: None,
         grok_stream_usage_evidence: None,
         grok_acp_parent_evidence: None,
+        codex_parent_evidence: None,
     }
 }
 
@@ -4650,11 +4728,18 @@ fn persist_machine_global_retention_receipt(
 struct ExternalOutputStaging {
     root_path: PathBuf,
     reservation: Option<ReservedOutputFile>,
+    /// Parent-owned `CODEX_HOME` for supervisor launches. It lives below the staging root so
+    /// the unit already binds it read-write, and it outlives the unit so the parent can read
+    /// the Codex rollout before the whole staging root is removed or quarantined.
+    codex_home: Option<SecureOutputRoot>,
     machine_global_retention: Option<ExternalMachineGlobalRetentionBinding>,
     bound_store: Option<MachineGlobalStore>,
     bound_root_reservation: Option<ReservedDirectory>,
     cleanup_completed: bool,
 }
+
+/// Name of the parent-owned Codex home below the private output staging root.
+const CODEX_HOME_STAGING_NAME: &str = "codex-home";
 
 enum ExternalOutputCleanup {
     Quarantined(RetentionOperation),
@@ -4706,6 +4791,7 @@ impl ExternalOutputStaging {
             Ok(reservation) => Ok(Self {
                 root_path,
                 reservation: Some(reservation),
+                codex_home: None,
                 machine_global_retention: Some(binding),
                 bound_store: Some(store),
                 bound_root_reservation: Some(root_reservation),
@@ -4776,6 +4862,7 @@ impl ExternalOutputStaging {
             Ok(reservation) => Ok(Self {
                 root_path,
                 reservation: Some(reservation),
+                codex_home: None,
                 machine_global_retention: None,
                 bound_store: None,
                 bound_root_reservation: None,
@@ -4797,6 +4884,34 @@ impl ExternalOutputStaging {
 
     fn root_path(&self) -> &Path {
         &self.root_path
+    }
+
+    /// Creates the parent-owned `CODEX_HOME` as a 0700 direct child of the staging root.
+    ///
+    /// The staging root is already bound read-write into the unit, so no additional sandbox
+    /// path is opened. The directory is removed with the staging root during cleanup.
+    fn stage_codex_home(&mut self) -> Result<&Path> {
+        if self.codex_home.is_some() {
+            bail!("private output staging already holds a Codex home");
+        }
+        let root = SecureOutputRoot::open_private(&self.root_path)?;
+        let home = root
+            .create_child(OsStr::new(CODEX_HOME_STAGING_NAME))
+            .context("failed to stage the parent-owned Codex home")?;
+        Ok(self.codex_home.insert(home).path())
+    }
+
+    /// Borrows the staged output leaf together with the parent-owned Codex home (when staged)
+    /// so target completion can publish output and read the rollout from held descriptors.
+    fn completion_handles(&mut self) -> Result<CompletedTargetStaging<'_>> {
+        let output = self
+            .reservation
+            .as_mut()
+            .context("private output staging reservation was already cleaned")?;
+        Ok(CompletedTargetStaging {
+            output,
+            codex_home: self.codex_home.as_ref(),
+        })
     }
 
     fn path(&self) -> Result<&Path> {
@@ -4859,6 +4974,8 @@ impl ExternalOutputStaging {
         match outcome {
             GateOutcome::Allowed(operation) => {
                 self.reservation.take();
+                // The staged Codex home travels with the quarantined staging root.
+                self.codex_home.take();
                 self.bound_root_reservation.take();
                 self.bound_store.take();
                 self.cleanup_completed = true;
@@ -4873,6 +4990,9 @@ impl ExternalOutputStaging {
             reservation
                 .remove()
                 .context("failed to remove reserved raw output staging leaf")?;
+        }
+        if let Some(codex_home) = self.codex_home.take() {
+            remove_staged_codex_home(codex_home)?;
         }
         fs::remove_dir(&self.root_path).with_context(|| {
             format!(
@@ -4910,6 +5030,21 @@ impl Drop for ExternalOutputStaging {
             self.cleanup_completed = true;
         }
     }
+}
+
+/// Removes the parent-owned Codex home together with every session, log, and state file the
+/// contained Codex process wrote below it. The held directory identity is re-verified first so
+/// a rebound pathname can never redirect the recursive removal.
+fn remove_staged_codex_home(codex_home: SecureOutputRoot) -> Result<()> {
+    codex_home
+        .verify_path_identity()
+        .context("staged Codex home identity changed before removal")?;
+    fs::remove_dir_all(codex_home.path()).with_context(|| {
+        format!(
+            "failed to remove staged Codex home {}",
+            codex_home.path().display()
+        )
+    })
 }
 
 #[derive(Debug)]

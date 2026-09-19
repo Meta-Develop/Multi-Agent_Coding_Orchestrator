@@ -3867,6 +3867,577 @@ fn private_output_staging_redacts_atomic_publication_and_cleans_up() -> Result<(
 
 #[cfg(target_os = "linux")]
 #[test]
+fn staged_codex_home_lives_below_output_staging_and_is_removed_with_it() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    let runtime_root = temp.path().join("private-runtime");
+    for path in [&workspace, &runtime_root] {
+        fs::create_dir(path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+
+    let mut staging = ExternalOutputStaging::create_under(&runtime_root, &workspace)?;
+    let staging_root = staging.root_path().to_path_buf();
+    let codex_home = staging.stage_codex_home()?.to_path_buf();
+    assert_eq!(codex_home, staging_root.join(CODEX_HOME_STAGING_NAME));
+    assert_eq!(
+        fs::metadata(&codex_home)?.permissions().mode() & 0o777,
+        0o700
+    );
+    let second = staging
+        .stage_codex_home()
+        .expect_err("a staging root holds at most one Codex home");
+    assert!(second.to_string().contains("already holds"), "{second:#}");
+
+    // Everything the contained Codex writes below its home is removed with the staging root,
+    // including nested session directories created with a permissive umask.
+    let sessions = codex_home.join("sessions/2026/09/19");
+    fs::create_dir_all(&sessions)?;
+    fs::write(
+        sessions.join("rollout-2026-09-19T00-00-00-thread.jsonl"),
+        b"{}\n",
+    )?;
+    fs::write(codex_home.join("history.jsonl"), b"{}\n")?;
+    staging.cleanup()?;
+    assert!(!codex_home.exists());
+    assert!(!staging_root.exists());
+
+    let dropped = {
+        let mut staging = ExternalOutputStaging::create_under(&runtime_root, &workspace)?;
+        let codex_home = staging.stage_codex_home()?.to_path_buf();
+        fs::create_dir_all(codex_home.join("sessions"))?;
+        (staging.root_path().to_path_buf(), codex_home)
+    };
+    assert!(!dropped.1.exists());
+    assert!(!dropped.0.exists());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn supervisor_simulation_exposes_the_staged_codex_home_and_removes_it_after_exit() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    create_mandatory_control_roots(temp.path())?;
+    let observed_home = temp.path().join("observed-codex-home");
+    let agent = temp.path().join("fake-codex.sh");
+    fs::write(
+        &agent,
+        format!(
+            r#"#!/bin/sh
+set -eu
+report=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    report=$1
+  fi
+  shift
+done
+while IFS= read -r _line; do
+  :
+done
+printf '%s' "${{CODEX_HOME:-unset}}" > '{}'
+mkdir -p "$CODEX_HOME/sessions/2026/09/19"
+printf '{{}}\n' > "$CODEX_HOME/sessions/2026/09/19/rollout-2026-09-19T00-00-00-thread.jsonl"
+printf '{{"ok":true}}\n' > "$report"
+"#,
+            observed_home.display()
+        ),
+    )?;
+    fs::set_permissions(&agent, fs::Permissions::from_mode(0o755))?;
+    let prompt = temp.path().join("prompt.txt");
+    fs::write(&prompt, "observe the staged Codex home\n")?;
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+    let spec = ExternalAgentCommand::codex(
+        &agent,
+        temp.path(),
+        &prompt,
+        incoming.join("events.jsonl"),
+        incoming.join("report.json"),
+        Duration::from_secs(5),
+    );
+    assert_eq!(spec.invocation, ExternalAgentInvocation::CodexSupervisor);
+
+    let report = run_external_agent_nonpublishable_simulation(&spec);
+    assert!(report.simulation_succeeded(), "{report:?}");
+    assert_eq!(report.output_last_message(), Some(&b"{\"ok\":true}\n"[..]));
+
+    let codex_home = PathBuf::from(fs::read_to_string(&observed_home)?);
+    let runtime_root = crate::process_runner::trusted_linux_runtime_root()?;
+    assert_eq!(
+        codex_home.file_name().and_then(OsStr::to_str),
+        Some(CODEX_HOME_STAGING_NAME)
+    );
+    let staging_root = codex_home
+        .parent()
+        .expect("staged Codex home has a staging root");
+    assert_eq!(staging_root.parent(), Some(runtime_root.as_path()));
+    assert!(staging_root
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.starts_with(".maco-external-output-")));
+    assert!(!codex_home.starts_with(temp.path()));
+    assert!(
+        !codex_home.exists(),
+        "the staged Codex home must be removed with the staging root"
+    );
+    assert!(!staging_root.exists());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+mod codex_parent_evidence_simulation {
+    use super::*;
+    use crate::external_agent::{
+        CodexParentEvidence, CodexParentResolvedField, CodexParentTurnUsage,
+        CodexServerRerouteEvidence,
+    };
+    use std::os::unix::fs::PermissionsExt;
+
+    const THREAD: &str = "0199a4b3-7f1e-7c2a-9d0e-3f4a5b6c7d8e";
+    const ROLLOUT_NAME: &str =
+        "rollout-2026-09-19T07-00-00-0199a4b3-7f1e-7c2a-9d0e-3f4a5b6c7d8e.jsonl";
+    const REQUESTED_MODEL: &str = "gpt-5-codex";
+    const REQUESTED_EFFORT: &str = "high";
+
+    fn thread_started() -> String {
+        format!(r#"{{"type":"thread.started","thread_id":"{THREAD}"}}"#)
+    }
+
+    fn turn_completed(input: u64, output: u64) -> String {
+        format!(
+            r#"{{"type":"turn.completed","usage":{{"input_tokens":{input},"cached_input_tokens":3,"output_tokens":{output},"reasoning_output_tokens":2}}}}"#
+        )
+    }
+
+    fn session_meta(cwd: &Path) -> String {
+        format!(
+            r#"{{"timestamp":"2026-09-19T07:00:00.000Z","type":"session_meta","payload":{{"id":"{THREAD}","timestamp":"2026-09-19T07:00:00.000Z","cwd":"{}","originator":"codex_exec","cli_version":"0.144.4","source":"exec"}}}}"#,
+            cwd.display()
+        )
+    }
+
+    fn turn_context(cwd: &Path, model: &str, effort: Option<&str>) -> String {
+        let effort = effort.map_or("null".to_string(), |effort| format!("\"{effort}\""));
+        format!(
+            r#"{{"timestamp":"2026-09-19T07:00:01.000Z","type":"turn_context","payload":{{"turn_id":"turn-1","cwd":"{}","approval_policy":"never","sandbox_policy":{{"type":"workspace-write"}},"model":"{model}","effort":{effort},"summary":"auto"}}}}"#,
+            cwd.display()
+        )
+    }
+
+    struct FakeCodexFixture<'a> {
+        stream: Vec<String>,
+        rollout: Option<(&'a str, Vec<String>)>,
+    }
+
+    /// Runs a fake `codex` that replays `stream` on stdout and writes `rollout` below
+    /// `$CODEX_HOME/sessions/2026/09/19/`, exactly like the real CLI would.
+    fn run_fake_codex_supervisor(
+        temp: &Path,
+        fixture: FakeCodexFixture<'_>,
+    ) -> Result<ExternalAgentRun> {
+        create_mandatory_control_roots(temp)?;
+        let mut script = String::from(
+            r#"#!/bin/sh
+set -eu
+report=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    report=$1
+  fi
+  shift
+done
+while IFS= read -r _line; do
+  :
+done
+"#,
+        );
+        if let Some((name, lines)) = &fixture.rollout {
+            script.push_str("mkdir -p \"$CODEX_HOME/sessions/2026/09/19\"\n");
+            script.push_str(&format!(
+                "cat > \"$CODEX_HOME/sessions/2026/09/19/{name}\" <<'MACO_ROLLOUT'\n"
+            ));
+            for line in lines {
+                script.push_str(line);
+                script.push('\n');
+            }
+            script.push_str("MACO_ROLLOUT\n");
+        }
+        script.push_str("printf '{\"ok\":true}\\n' > \"$report\"\n");
+        script.push_str("cat <<'MACO_STREAM'\n");
+        for line in &fixture.stream {
+            script.push_str(line);
+            script.push('\n');
+        }
+        script.push_str("MACO_STREAM\n");
+        let agent = temp.join("fake-codex.sh");
+        fs::write(&agent, script)?;
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o755))?;
+        let prompt = temp.join("prompt.txt");
+        fs::write(&prompt, "capture parent evidence\n")?;
+        let incoming = temp.join("incoming");
+        fs::create_dir(&incoming)?;
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+        let mut spec = ExternalAgentCommand::codex(
+            &agent,
+            temp,
+            &prompt,
+            incoming.join("events.jsonl"),
+            incoming.join("report.json"),
+            Duration::from_secs(5),
+        );
+        spec.model = Some(REQUESTED_MODEL.to_string());
+        spec.reasoning_effort = Some(REQUESTED_EFFORT.to_string());
+        let report = run_external_agent_nonpublishable_simulation(&spec);
+        assert!(report.simulation_succeeded(), "{report:?}");
+        Ok(report)
+    }
+
+    fn evidence(report: &ExternalAgentRun) -> &CodexParentEvidence {
+        report
+            .codex_parent_evidence
+            .as_ref()
+            .expect("supervisor launches always carry parent-owned Codex evidence")
+    }
+
+    fn known(value: &str) -> CodexParentResolvedField {
+        CodexParentResolvedField::Known(value.to_string())
+    }
+
+    #[test]
+    fn complete_evidence_is_captured_from_stream_and_parent_owned_rollout() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let cwd = temp.path();
+        let report = run_fake_codex_supervisor(
+            cwd,
+            FakeCodexFixture {
+                stream: vec![
+                    thread_started(),
+                    r#"{"type":"turn.started"}"#.to_string(),
+                    turn_completed(10, 4),
+                    turn_completed(120, 40),
+                ],
+                rollout: Some((
+                    ROLLOUT_NAME,
+                    vec![
+                        session_meta(cwd),
+                        turn_context(cwd, REQUESTED_MODEL, Some(REQUESTED_EFFORT)),
+                        turn_context(cwd, REQUESTED_MODEL, Some(REQUESTED_EFFORT)),
+                    ],
+                )),
+            },
+        )?;
+        assert_eq!(
+            evidence(&report),
+            &CodexParentEvidence {
+                codex_version: None,
+                thread_id: Some(THREAD.to_string()),
+                requested_model: Some(REQUESTED_MODEL.to_string()),
+                requested_effort: Some(REQUESTED_EFFORT.to_string()),
+                rollout_model: known(REQUESTED_MODEL),
+                rollout_effort: known(REQUESTED_EFFORT),
+                observed_model: known(REQUESTED_MODEL),
+                observed_effort: known(REQUESTED_EFFORT),
+                server_rerouted_model: None,
+                model_mismatch: false,
+                turn_usage: CodexParentTurnUsage::Known {
+                    input_tokens: 120,
+                    output_tokens: 40,
+                    cached_input_tokens: 3,
+                    reasoning_output_tokens: 2,
+                },
+                resolution_status: "complete".to_string(),
+            }
+        );
+
+        // The evidence survives the public wire and is never child-reportable state.
+        let serialized = serde_json::to_value(&report)?;
+        assert_eq!(
+            serialized["codex_parent_evidence"]["resolution_status"],
+            serde_json::json!("complete")
+        );
+        let restored: ExternalAgentRun = serde_json::from_value(serialized)?;
+        assert_eq!(restored.codex_parent_evidence, report.codex_parent_evidence);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_rollout_resolves_as_rollout_missing_with_unknown_model() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let report = run_fake_codex_supervisor(
+            temp.path(),
+            FakeCodexFixture {
+                stream: vec![thread_started(), turn_completed(10, 4)],
+                rollout: None,
+            },
+        )?;
+        let evidence = evidence(&report);
+        assert_eq!(evidence.resolution_status, "rollout_missing");
+        assert_eq!(evidence.thread_id.as_deref(), Some(THREAD));
+        assert_eq!(evidence.rollout_model, CodexParentResolvedField::Unknown);
+        assert_eq!(evidence.observed_model, CodexParentResolvedField::Unknown);
+        assert_eq!(evidence.observed_effort, CodexParentResolvedField::Unknown);
+        assert!(!evidence.model_mismatch);
+        assert!(matches!(
+            evidence.turn_usage,
+            CodexParentTurnUsage::Known {
+                input_tokens: 10,
+                output_tokens: 4,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn turn_context_without_effort_is_ambiguous_but_keeps_the_model() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let cwd = temp.path();
+        let report = run_fake_codex_supervisor(
+            cwd,
+            FakeCodexFixture {
+                stream: vec![thread_started(), turn_completed(10, 4)],
+                rollout: Some((
+                    ROLLOUT_NAME,
+                    vec![session_meta(cwd), turn_context(cwd, REQUESTED_MODEL, None)],
+                )),
+            },
+        )?;
+        let evidence = evidence(&report);
+        assert_eq!(evidence.resolution_status, "ambiguous");
+        assert_eq!(evidence.rollout_model, known(REQUESTED_MODEL));
+        assert_eq!(evidence.rollout_effort, CodexParentResolvedField::Unknown);
+        assert_eq!(evidence.observed_effort, CodexParentResolvedField::Unknown);
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_turn_context_models_are_ambiguous() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let cwd = temp.path();
+        let report = run_fake_codex_supervisor(
+            cwd,
+            FakeCodexFixture {
+                stream: vec![thread_started(), turn_completed(10, 4)],
+                rollout: Some((
+                    ROLLOUT_NAME,
+                    vec![
+                        session_meta(cwd),
+                        turn_context(cwd, REQUESTED_MODEL, Some(REQUESTED_EFFORT)),
+                        turn_context(cwd, "gpt-5-codex-mini", Some(REQUESTED_EFFORT)),
+                    ],
+                )),
+            },
+        )?;
+        let evidence = evidence(&report);
+        assert_eq!(evidence.resolution_status, "ambiguous");
+        assert_eq!(evidence.rollout_model, CodexParentResolvedField::Unknown);
+        assert_eq!(evidence.observed_model, CodexParentResolvedField::Unknown);
+        assert_eq!(evidence.rollout_effort, known(REQUESTED_EFFORT));
+        Ok(())
+    }
+
+    #[test]
+    fn rollout_file_thread_id_mismatch_is_reported() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let cwd = temp.path();
+        let report = run_fake_codex_supervisor(
+            cwd,
+            FakeCodexFixture {
+                stream: vec![thread_started(), turn_completed(10, 4)],
+                rollout: Some((
+                    "rollout-2026-09-19T07-00-00-another-thread.jsonl",
+                    vec![
+                        session_meta(cwd),
+                        turn_context(cwd, REQUESTED_MODEL, Some(REQUESTED_EFFORT)),
+                    ],
+                )),
+            },
+        )?;
+        let evidence = evidence(&report);
+        assert_eq!(evidence.resolution_status, "thread_id_mismatch");
+        assert_eq!(evidence.rollout_model, CodexParentResolvedField::Unknown);
+        Ok(())
+    }
+
+    #[test]
+    fn all_zero_usage_resolves_as_usage_unavailable() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let cwd = temp.path();
+        let report = run_fake_codex_supervisor(
+            cwd,
+            FakeCodexFixture {
+                stream: vec![
+                    thread_started(),
+                    r#"{"type":"turn.completed","usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}}"#.to_string(),
+                ],
+                rollout: Some((
+                    ROLLOUT_NAME,
+                    vec![
+                        session_meta(cwd),
+                        turn_context(cwd, REQUESTED_MODEL, Some(REQUESTED_EFFORT)),
+                    ],
+                )),
+            },
+        )?;
+        let evidence = evidence(&report);
+        assert_eq!(evidence.resolution_status, "usage_unavailable");
+        assert!(matches!(
+            evidence.turn_usage,
+            CodexParentTurnUsage::Unknown { .. }
+        ));
+        assert_eq!(evidence.rollout_model, known(REQUESTED_MODEL));
+        assert_eq!(evidence.rollout_effort, known(REQUESTED_EFFORT));
+        Ok(())
+    }
+
+    #[test]
+    fn turn_failed_takes_priority_over_a_readable_rollout() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let cwd = temp.path();
+        let report = run_fake_codex_supervisor(
+            cwd,
+            FakeCodexFixture {
+                stream: vec![
+                    thread_started(),
+                    turn_completed(10, 4),
+                    r#"{"type":"turn.failed","error":{"message":"provider unavailable"}}"#
+                        .to_string(),
+                ],
+                rollout: Some((
+                    ROLLOUT_NAME,
+                    vec![
+                        session_meta(cwd),
+                        turn_context(cwd, REQUESTED_MODEL, Some(REQUESTED_EFFORT)),
+                    ],
+                )),
+            },
+        )?;
+        let evidence = evidence(&report);
+        assert_eq!(evidence.resolution_status, "turn_failed");
+        assert!(matches!(
+            evidence.turn_usage,
+            CodexParentTurnUsage::Unknown { .. }
+        ));
+        assert_eq!(evidence.rollout_model, known(REQUESTED_MODEL));
+        Ok(())
+    }
+
+    #[test]
+    fn server_reroute_defines_the_observed_model_and_flags_a_mismatch() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let cwd = temp.path();
+        let report = run_fake_codex_supervisor(
+            cwd,
+            FakeCodexFixture {
+                stream: vec![
+                    thread_started(),
+                    r#"{"type":"item.completed","item":{"id":"item_0","type":"error","message":"model rerouted: gpt-5-codex -> gpt-5-codex-mini (capacity)"}}"#.to_string(),
+                    turn_completed(10, 4),
+                ],
+                rollout: Some((
+                    ROLLOUT_NAME,
+                    vec![
+                        session_meta(cwd),
+                        turn_context(cwd, REQUESTED_MODEL, Some(REQUESTED_EFFORT)),
+                    ],
+                )),
+            },
+        )?;
+        let evidence = evidence(&report);
+        assert_eq!(evidence.resolution_status, "complete");
+        assert_eq!(evidence.rollout_model, known(REQUESTED_MODEL));
+        assert_eq!(evidence.observed_model, known("gpt-5-codex-mini"));
+        assert_eq!(
+            evidence.server_rerouted_model,
+            Some(CodexServerRerouteEvidence {
+                from: REQUESTED_MODEL.to_string(),
+                to: "gpt-5-codex-mini".to_string(),
+            })
+        );
+        assert!(evidence.model_mismatch);
+        Ok(())
+    }
+
+    #[test]
+    fn consultant_launches_carry_no_codex_parent_evidence() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let supervisor_repo = temp.path().join("supervisor-repo");
+        let repo = temp.path().join("child-worktree");
+        for path in [&supervisor_repo, &repo] {
+            git2::Repository::init(path)?;
+            create_mandatory_control_roots(path)?;
+            chmod_fixture_control_roots(path)?;
+        }
+        let agent = repo.join("fake-codex.sh");
+        fs::write(
+            &agent,
+            format!(
+                r#"#!/bin/sh
+set -eu
+report=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    report=$1
+  fi
+  shift
+done
+while IFS= read -r _line; do
+  :
+done
+printf '{{"ok":true}}\n' > "$report"
+printf '%s\n' '{}' '{}'
+"#,
+                thread_started(),
+                turn_completed(10, 4)
+            ),
+        )?;
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o755))?;
+        let prompt = repo.join("prompt.txt");
+        fs::write(&prompt, "consult\n")?;
+        let incoming = repo.join("incoming");
+        fs::create_dir(&incoming)?;
+        fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+        // Consultant launches only run under an admitted consult process grant.
+        let grant = crate::mutation_taxonomy::admit_consult_codex_process_intent(
+            "consult-run",
+            "consult-run",
+            1,
+            Path::new("codex"),
+            None,
+            crate::mutation_taxonomy::CONSULTANT_PROCESS_DUTY,
+        )?;
+        let spec = ExternalAgentCommand::codex_read_only_consultant(
+            &agent,
+            &repo,
+            &prompt,
+            incoming.join("events.jsonl"),
+            incoming.join("report.json"),
+            Duration::from_secs(5),
+        )
+        .with_agent_lifecycle(&supervisor_repo, "researcher", "consult-run", "consult-run")
+        .with_assignment_process_launch(AssignmentProcessLaunchKind::ConsultCodex, grant);
+        assert_eq!(spec.invocation, ExternalAgentInvocation::CodexConsultant);
+        let report = run_external_agent_nonpublishable_simulation(&spec);
+        assert!(report.simulation_succeeded(), "{report:?}");
+        assert!(
+            report.codex_parent_evidence.is_none(),
+            "consultants stay on --ephemeral and yield no parent-owned Codex evidence"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn bound_output_staging_is_created_under_the_reviewed_root() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -4240,6 +4811,7 @@ fn environment_preflight_uses_the_target_runtime_context() {
         ExternalAgentInvocation::CodexSupervisor,
         None,
         Some(&lifecycle),
+        None,
     );
 
     let mut expected_environment = environment.clone();
@@ -4249,10 +4821,52 @@ fn environment_preflight_uses_the_target_runtime_context() {
         prepared.environment,
         EnvironmentMode::ClearAndSet(expected_environment)
     );
-    assert_eq!(prepared.agent_lifecycle, Some(lifecycle));
+    assert_eq!(prepared.agent_lifecycle, Some(lifecycle.clone()));
     assert_eq!(prepared.side_effects, profile);
     assert!(prepared.private_runtime_home);
     assert!(prepared.private_runtime_codex_home);
+    assert!(prepared.staged_codex_home().is_none());
+
+    let staged_home = Path::new("/run/user/1000/.maco-external-output-1-1/codex-home");
+    let staged = with_external_runtime_context(
+        ProcessSpec::direct(
+            "supervisor target",
+            "/run/current-system/sw/bin/codex",
+            std::iter::empty::<&str>(),
+            "/workspace",
+            128,
+        ),
+        environment.clone(),
+        profile.clone(),
+        ExternalAgentInvocation::CodexSupervisor,
+        None,
+        Some(&lifecycle),
+        Some(staged_home),
+    );
+    assert!(staged.private_runtime_home);
+    assert!(
+        !staged.private_runtime_codex_home,
+        "a staged Codex home replaces the RuntimeDirectory CODEX_HOME"
+    );
+    assert_eq!(staged.staged_codex_home(), Some(staged_home));
+
+    let consultant = with_external_runtime_context(
+        ProcessSpec::direct(
+            "consultant target",
+            "/run/current-system/sw/bin/codex",
+            std::iter::empty::<&str>(),
+            "/workspace",
+            128,
+        ),
+        environment.clone(),
+        profile,
+        ExternalAgentInvocation::CodexConsultant,
+        None,
+        None,
+        None,
+    );
+    assert!(consultant.private_runtime_codex_home);
+    assert!(consultant.staged_codex_home().is_none());
 
     let grok = with_external_runtime_context(
         ProcessSpec::direct(
@@ -4267,9 +4881,14 @@ fn environment_preflight_uses_the_target_runtime_context() {
         ExternalAgentInvocation::Grok,
         None,
         None,
+        Some(staged_home),
     );
     assert!(grok.private_runtime_home);
     assert!(!grok.private_runtime_codex_home);
+    assert!(
+        grok.staged_codex_home().is_none(),
+        "non-Codex invocations ignore a staged Codex home"
+    );
 }
 
 #[test]
@@ -6208,6 +6827,7 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
             output_last_message: None,
             grok_stream_usage_evidence: None,
             grok_acp_parent_evidence: None,
+            codex_parent_evidence: None,
         };
         let side_effects = if command.invocation == ExternalAgentInvocation::Grok {
             SideEffectConfinementEvidence::Verified(SideEffectConfinementProfileKind::ExternalGrok)
@@ -6231,7 +6851,10 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
         record_completed_target(
             &mut report,
             output,
-            &mut staged_output,
+            CompletedTargetStaging {
+                output: &mut staged_output,
+                codex_home: None,
+            },
             &mut output_reservation,
             &mut json_log_reservation,
             &CredentialRedactor::default(),
@@ -6611,6 +7234,7 @@ fn grok_live_launch_profile_binds_exact_credentials_and_normalized_home() -> Res
         ExternalAgentInvocation::Grok,
         None,
         None,
+        None,
     );
     assert_eq!(
         prepared.environment,
@@ -6911,6 +7535,7 @@ fn external_errors_are_composed_and_success_requires_verified_empty_containment(
         output_last_message: None,
         grok_stream_usage_evidence: None,
         grok_acp_parent_evidence: None,
+        codex_parent_evidence: None,
     };
     assert!(!report.succeeded());
     report.process_tree = Some(ProcessTreeEvidence::TrustedBestEffort(
@@ -7073,6 +7698,7 @@ fn verified_nonzero_target_retains_permission_and_containment_evidence() -> Resu
         output_last_message: None,
         grok_stream_usage_evidence: None,
         grok_acp_parent_evidence: None,
+        codex_parent_evidence: None,
     };
     let output = ProcessOutput {
         status: Some(ExitStatus::from_raw(7 << 8)),
@@ -7092,7 +7718,10 @@ fn verified_nonzero_target_retains_permission_and_containment_evidence() -> Resu
     record_completed_target(
         &mut report,
         output,
-        &mut staged_output,
+        CompletedTargetStaging {
+            output: &mut staged_output,
+            codex_home: None,
+        },
         &mut output_reservation,
         &mut json_log_reservation,
         &credential_redactor,

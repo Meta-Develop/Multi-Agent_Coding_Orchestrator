@@ -1488,6 +1488,111 @@ fn external_codex_writable_workspace_resolves_nested_read_only_controls() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn staged_codex_home_replaces_runtime_directory_codex_home_in_environment() {
+    let runtime_dir = Path::new("/run/user/1000/maco-process-1-1");
+    let staged_home = Path::new("/run/user/1000/.maco-external-output-1-1/codex-home");
+    let spec = ProcessSpec::direct(
+        "staged Codex home",
+        PathBuf::from("/bin/true"),
+        Vec::<OsString>::new(),
+        "/workspace",
+        128,
+    )
+    .with_environment(EnvironmentMode::ClearAndSet(BTreeMap::new()))
+    .with_private_runtime_home(true)
+    .with_staged_codex_home(staged_home);
+    assert_eq!(spec.staged_codex_home(), Some(staged_home));
+
+    let EnvironmentMode::ClearAndSet(values) =
+        private_runtime_environment_for_test(&spec, runtime_dir).expect("staged environment")
+    else {
+        panic!("cleared environment must stay cleared");
+    };
+    assert_eq!(values.get("HOME").map(String::as_str), runtime_dir.to_str());
+    assert_eq!(
+        values.get("TMPDIR").map(String::as_str),
+        runtime_dir.to_str()
+    );
+    assert_eq!(
+        values.get("CODEX_HOME").map(String::as_str),
+        staged_home.to_str(),
+        "CODEX_HOME must point at the parent-owned staged home"
+    );
+
+    let conflicting = spec.clone().with_private_runtime_codex_home(true);
+    let error = private_runtime_environment_for_test(&conflicting, runtime_dir)
+        .expect_err("RuntimeDirectory and staged Codex homes are mutually exclusive");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+
+    let runtime_only = ProcessSpec::direct(
+        "runtime Codex home",
+        PathBuf::from("/bin/true"),
+        Vec::<OsString>::new(),
+        "/workspace",
+        128,
+    )
+    .with_environment(EnvironmentMode::ClearAndSet(BTreeMap::new()))
+    .with_private_runtime_codex_home(true);
+    let EnvironmentMode::ClearAndSet(values) =
+        private_runtime_environment_for_test(&runtime_only, runtime_dir)
+            .expect("runtime environment")
+    else {
+        panic!("cleared environment must stay cleared");
+    };
+    assert_eq!(
+        values.get("CODEX_HOME").map(String::as_str),
+        runtime_dir.to_str()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn staged_codex_home_must_sit_below_a_bound_read_write_root() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("worktree");
+    let staging_root = temp.path().join("staging");
+    let staged_home = staging_root.join("codex-home");
+    let stray_home = temp.path().join("stray-home");
+    for directory in [&workspace, &staging_root, &staged_home, &stray_home] {
+        fs::create_dir(directory).expect("sandbox fixture directory");
+    }
+
+    let profile =
+        ExternalCodexProfile::read_write(&workspace).with_writable_artifact_root(&staging_root);
+    let spec = ProcessSpec::direct(
+        "external Codex staged home",
+        PathBuf::from("/bin/true"),
+        Vec::<OsString>::new(),
+        &workspace,
+        128,
+    )
+    .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(profile));
+    let sandbox = resolve_systemd_sandbox(&spec)
+        .expect("resolve ExternalCodex sandbox")
+        .expect("workspace sandbox");
+
+    sandbox
+        .validate_staged_codex_home(&staged_home)
+        .expect("a staged home below the writable artifact root is admitted");
+    for rejected in [stray_home.as_path(), staging_root.as_path()] {
+        let error = sandbox
+            .validate_staged_codex_home(rejected)
+            .expect_err("a staged home outside or equal to a bound root must be refused");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "{error}"
+        );
+    }
+    let missing = staging_root.join("missing-home");
+    assert!(
+        sandbox.validate_staged_codex_home(&missing).is_err(),
+        "a missing staged home must be refused"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn external_codex_exact_writable_root_rejects_hardlink_alias_outside_exception() {
     let temp = tempfile::tempdir().expect("tempdir");
     let workspace = temp.path().join("worktree");

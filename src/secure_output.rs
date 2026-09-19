@@ -22,7 +22,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     os::{
         fd::{AsRawFd, FromRawFd, RawFd},
-        unix::ffi::OsStrExt,
+        unix::ffi::{OsStrExt, OsStringExt},
     },
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -33,7 +33,6 @@ use std::path::Component;
 #[cfg(unix)]
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChildSetupFault {
     None,
@@ -65,6 +64,34 @@ pub(crate) struct SecureOutputRoot {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+}
+
+/// Bounds for [`SecureOutputRoot::collect_regular_files`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CollectLimits {
+    /// Maximum directory nesting below the requested subtree (`0` collects only its direct
+    /// regular children).
+    pub(crate) max_depth: usize,
+    /// Maximum number of directory entries visited across the whole walk.
+    pub(crate) max_entries: usize,
+    /// Maximum number of regular files read.
+    pub(crate) max_files: usize,
+    /// Maximum size of any single regular file.
+    pub(crate) max_file_bytes: usize,
+}
+
+/// A regular file read through [`SecureOutputRoot::collect_regular_files`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CollectedRegularFile {
+    /// Path relative to the secure root (display and name matching only).
+    pub(crate) relative_path: PathBuf,
+    pub(crate) bytes: Vec<u8>,
+}
+
+#[cfg(unix)]
+struct CollectBudget {
+    remaining_entries: usize,
+    remaining_files: usize,
 }
 
 /// A newly reserved output leaf. The descriptor is the capability; `path` is display-only.
@@ -172,7 +199,6 @@ impl SecureOutputRoot {
     }
 
     /// Creates a private direct child and returns it as another descriptor-held root.
-    #[cfg(test)]
     pub(crate) fn create_child(&self, name: &OsStr) -> Result<Self> {
         self.create_child_impl(name, ChildSetupFault::None)
     }
@@ -187,7 +213,6 @@ impl SecureOutputRoot {
         self.create_child_impl(name, ChildSetupFault::AfterOpen)
     }
 
-    #[cfg(test)]
     fn create_child_impl(&self, name: &OsStr, _fault: ChildSetupFault) -> Result<Self> {
         #[cfg(unix)]
         {
@@ -297,6 +322,68 @@ impl SecureOutputRoot {
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Reads every regular file below the child-written subtree `relative_dir`.
+    ///
+    /// The walk is descriptor-relative from the held root: every component is opened with
+    /// `O_NOFOLLOW`, so a symlink planted anywhere in the subtree fails the walk instead of
+    /// being followed. Entries must be owned by the effective user, files must be single-link
+    /// regular files, and depth, entry count, and file size are bounded. Child-created
+    /// directories and files keep whatever mode the child chose; only the root stays `0700`.
+    /// A missing `relative_dir` yields an empty collection.
+    pub(crate) fn collect_regular_files(
+        &self,
+        relative_dir: &Path,
+        limits: CollectLimits,
+    ) -> Result<Vec<CollectedRegularFile>> {
+        #[cfg(unix)]
+        {
+            self.verify_path_identity()?;
+            let mut current = self.directory.try_clone()?;
+            let mut relative = PathBuf::new();
+            for component in relative_dir.components() {
+                let Component::Normal(part) = component else {
+                    bail!("secure output subtree must be a plain relative path");
+                };
+                let name = leaf_cstring(part)?;
+                match openat_directory(current.as_raw_fd(), &name) {
+                    Ok(next) => current = next,
+                    Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                        return Ok(Vec::new());
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "failed to open secure output subtree {}",
+                                self.path.join(relative_dir).display()
+                            )
+                        });
+                    }
+                }
+                relative.push(part);
+            }
+            let mut budget = CollectBudget {
+                remaining_entries: limits.max_entries,
+                remaining_files: limits.max_files,
+            };
+            let mut collected = Vec::new();
+            collect_regular_files_below(
+                &current,
+                &relative,
+                0,
+                limits,
+                &mut budget,
+                &mut collected,
+            )?;
+            self.verify_path_identity()?;
+            Ok(collected)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (relative_dir, limits);
+            bail!("secure output capabilities are not implemented on this host")
+        }
     }
 
     /// Refuses a parent output root located inside a child-writable workspace.
@@ -453,8 +540,10 @@ impl SecureOutputRoot {
         }
     }
 
+    /// Re-walks the root path without following symlinks and requires the same private
+    /// directory inode that was captured when the root was opened.
     #[cfg(unix)]
-    fn verify_path_identity(&self) -> Result<()> {
+    pub(crate) fn verify_path_identity(&self) -> Result<()> {
         let reopened = open_existing_directory_tree(&self.path)
             .with_context(|| format!("secure output root path changed: {}", self.path.display()))?;
         let metadata = reopened.metadata()?;
@@ -466,7 +555,7 @@ impl SecureOutputRoot {
     }
 
     #[cfg(not(unix))]
-    fn verify_path_identity(&self) -> Result<()> {
+    pub(crate) fn verify_path_identity(&self) -> Result<()> {
         bail!("secure output capabilities are not implemented on this host")
     }
 }
@@ -903,7 +992,227 @@ fn openat_directory(parent: RawFd, name: &CString) -> std::io::Result<File> {
 }
 
 #[cfg(unix)]
-#[cfg(test)]
+fn collect_regular_files_below(
+    directory: &File,
+    relative: &Path,
+    depth: usize,
+    limits: CollectLimits,
+    budget: &mut CollectBudget,
+    collected: &mut Vec<CollectedRegularFile>,
+) -> Result<()> {
+    // SAFETY: `geteuid` has no preconditions and does not access Rust memory.
+    let effective_uid = unsafe { libc::geteuid() };
+    for entry in list_directory_entries(directory, budget)? {
+        let name = leaf_cstring(&entry)?;
+        let entry_path = relative.join(&entry);
+        let stat = named_leaf_stat(directory, &name).with_context(|| {
+            format!(
+                "failed to stat secure output entry {}",
+                entry_path.display()
+            )
+        })?;
+        if stat.st_uid != effective_uid {
+            bail!(
+                "secure output entry {} is not owned by the effective user",
+                entry_path.display()
+            );
+        }
+        match stat.st_mode & libc::S_IFMT {
+            libc::S_IFDIR => {
+                if depth >= limits.max_depth {
+                    bail!(
+                        "secure output subtree {} exceeds the nesting limit",
+                        entry_path.display()
+                    );
+                }
+                let child = openat_directory(directory.as_raw_fd(), &name).with_context(|| {
+                    format!(
+                        "failed to open secure output directory {}",
+                        entry_path.display()
+                    )
+                })?;
+                let child_stat = fstat_file(&child)?;
+                if stat_identity(&child_stat) != stat_identity(&stat) {
+                    bail!(
+                        "secure output directory {} changed identity while being opened",
+                        entry_path.display()
+                    );
+                }
+                collect_regular_files_below(
+                    &child,
+                    &entry_path,
+                    depth.saturating_add(1),
+                    limits,
+                    budget,
+                    collected,
+                )?;
+            }
+            libc::S_IFREG => {
+                if stat.st_nlink != 1 {
+                    bail!(
+                        "secure output file {} must be a single-link regular file",
+                        entry_path.display()
+                    );
+                }
+                budget.remaining_files = budget
+                    .remaining_files
+                    .checked_sub(1)
+                    .context("secure output collection exceeded its file budget")?;
+                let bytes = read_named_regular_file(directory, &name, &stat, limits.max_file_bytes)
+                    .with_context(|| {
+                        format!("failed to read secure output file {}", entry_path.display())
+                    })?;
+                collected.push(CollectedRegularFile {
+                    relative_path: entry_path,
+                    bytes,
+                });
+            }
+            _ => bail!(
+                "secure output entry {} is neither a directory nor a regular file",
+                entry_path.display()
+            ),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_named_regular_file(
+    parent: &File,
+    name: &CString,
+    expected: &libc::stat,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    // SAFETY: descriptor and NUL-terminated name remain valid for the call.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: `openat` returned an owned descriptor.
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let opened = fstat_file(&file)?;
+    if (opened.st_mode & libc::S_IFMT) != libc::S_IFREG
+        || stat_identity(&opened) != stat_identity(expected)
+        || opened.st_nlink != 1
+    {
+        bail!("regular file changed identity while being opened");
+    }
+    let length = u64::try_from(opened.st_size).unwrap_or(u64::MAX);
+    if length > max_bytes as u64 {
+        bail!("file exceeds the configured {max_bytes} byte limit");
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    Read::by_ref(&mut file)
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        bail!("file grew beyond the configured {max_bytes} byte limit while being read");
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn fstat_file(file: &File) -> Result<libc::stat> {
+    // SAFETY: storage is initialized and the descriptor is valid.
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(file.as_raw_fd(), &mut stat) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to stat held descriptor");
+    }
+    Ok(stat)
+}
+
+#[cfg(unix)]
+struct DirectoryStream(*mut libc::DIR);
+
+#[cfg(unix)]
+impl Drop for DirectoryStream {
+    fn drop(&mut self) {
+        // SAFETY: the stream was returned by `fdopendir` and is closed exactly once here.
+        unsafe { libc::closedir(self.0) };
+    }
+}
+
+/// Lists the entries of a held directory through an independent descriptor. Names are
+/// returned sorted so callers see a deterministic order.
+#[cfg(unix)]
+fn list_directory_entries(
+    directory: &File,
+    budget: &mut CollectBudget,
+) -> Result<Vec<std::ffi::OsString>> {
+    // SAFETY: the descriptor and the constant name remain valid for the call.
+    let stream_fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if stream_fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to open an independent secure output directory stream");
+    }
+    // SAFETY: `fdopendir` takes ownership of the descriptor on success.
+    let raw_stream = unsafe { libc::fdopendir(stream_fd) };
+    if raw_stream.is_null() {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: `fdopendir` did not take ownership on failure.
+        unsafe { libc::close(stream_fd) };
+        return Err(error).context("failed to open secure output directory stream");
+    }
+    let stream = DirectoryStream(raw_stream);
+    let mut entries = Vec::new();
+    loop {
+        clear_thread_errno()?;
+        // SAFETY: the stream is open until `stream` drops.
+        let raw = unsafe { libc::readdir(stream.0) };
+        if raw.is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error().unwrap_or(0) != 0 {
+                return Err(error).context("failed while reading secure output directory");
+            }
+            break;
+        }
+        // SAFETY: `readdir` returns a dirent whose `d_name` is NUL-terminated.
+        let name = unsafe { std::ffi::CStr::from_ptr((*raw).d_name.as_ptr()) };
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        budget.remaining_entries = budget
+            .remaining_entries
+            .checked_sub(1)
+            .context("secure output collection exceeded its entry budget")?;
+        entries.push(std::ffi::OsString::from_vec(name.to_bytes().to_vec()));
+    }
+    entries.sort();
+    Ok(entries)
+}
+
+#[cfg(target_os = "linux")]
+fn clear_thread_errno() -> Result<()> {
+    // SAFETY: `__errno_location` returns the calling thread's errno slot.
+    unsafe { *libc::__errno_location() = 0 };
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn clear_thread_errno() -> Result<()> {
+    // SAFETY: `__error` returns the calling thread's errno slot.
+    unsafe { *libc::__error() = 0 };
+    Ok(())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn clear_thread_errno() -> Result<()> {
+    bail!("directory iteration is unsupported for this Unix errno ABI")
+}
+
+#[cfg(unix)]
 fn created_directory_identity(parent: &File, name: &CString) -> Result<(u64, u64)> {
     // SAFETY: storage is initialized and the descriptor/name are valid.
     let mut metadata = unsafe { std::mem::zeroed::<libc::stat>() };
@@ -1279,7 +1588,6 @@ fn rebind_name_to_sentinel_for_test(parent: &File, name: &CString, sentinel: &Pa
 }
 
 #[cfg(unix)]
-#[cfg(test)]
 fn cleanup_created_directory(
     parent: &File,
     name: &CString,
@@ -1529,6 +1837,111 @@ mod tests {
         let workspace = root.path().join("child-workspace");
         std::fs::create_dir(&workspace)?;
         assert!(root.reject_inside(&workspace).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    const COLLECT_LIMITS: CollectLimits = CollectLimits {
+        max_depth: 3,
+        max_entries: 64,
+        max_files: 8,
+        max_file_bytes: 64,
+    };
+
+    #[test]
+    #[cfg(unix)]
+    fn collect_regular_files_reads_nested_child_written_tree_in_sorted_order() -> Result<()> {
+        let temp = tempdir()?;
+        let root = SecureOutputRoot::open_or_create(&temp.path().join("root"))?;
+        assert!(root
+            .collect_regular_files(Path::new("sessions"), COLLECT_LIMITS)?
+            .is_empty());
+
+        // Child-created directories and files keep the child's (non-private) modes.
+        let day = root.path().join("sessions/2026/09/19");
+        std::fs::create_dir_all(&day)?;
+        std::fs::write(day.join("rollout-b.jsonl"), b"b")?;
+        std::fs::write(day.join("rollout-a.jsonl"), b"a")?;
+        std::fs::write(root.path().join("sessions/2026/index.txt"), b"idx")?;
+        std::fs::set_permissions(&day, std::fs::Permissions::from_mode(0o755))?;
+
+        let collected = root.collect_regular_files(Path::new("sessions"), COLLECT_LIMITS)?;
+        let listing = collected
+            .iter()
+            .map(|file| {
+                (
+                    file.relative_path.to_string_lossy().into_owned(),
+                    file.bytes.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            listing,
+            vec![
+                (
+                    "sessions/2026/09/19/rollout-a.jsonl".to_string(),
+                    b"a".to_vec()
+                ),
+                (
+                    "sessions/2026/09/19/rollout-b.jsonl".to_string(),
+                    b"b".to_vec()
+                ),
+                ("sessions/2026/index.txt".to_string(), b"idx".to_vec()),
+            ]
+        );
+
+        let shallow = CollectLimits {
+            max_depth: 2,
+            ..COLLECT_LIMITS
+        };
+        assert!(root
+            .collect_regular_files(Path::new("sessions"), shallow)
+            .is_err());
+        assert!(root
+            .collect_regular_files(Path::new("../root/sessions"), COLLECT_LIMITS)
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn collect_regular_files_refuses_symlinks_hardlinks_and_oversized_files() -> Result<()> {
+        let temp = tempdir()?;
+        let root = SecureOutputRoot::open_or_create(&temp.path().join("root"))?;
+        let sessions = root.path().join("sessions");
+        std::fs::create_dir(&sessions)?;
+        let secret = temp.path().join("secret.txt");
+        std::fs::write(&secret, b"outside")?;
+
+        symlink(&secret, sessions.join("rollout-link.jsonl"))?;
+        let error = root
+            .collect_regular_files(Path::new("sessions"), COLLECT_LIMITS)
+            .expect_err("a symlinked leaf must fail the walk");
+        assert!(!format!("{error:#}").contains("outside"));
+        std::fs::remove_file(sessions.join("rollout-link.jsonl"))?;
+
+        symlink(temp.path(), sessions.join("escape"))?;
+        assert!(root
+            .collect_regular_files(Path::new("sessions"), COLLECT_LIMITS)
+            .is_err());
+        std::fs::remove_file(sessions.join("escape"))?;
+
+        std::fs::hard_link(&secret, sessions.join("rollout-hard.jsonl"))?;
+        assert!(root
+            .collect_regular_files(Path::new("sessions"), COLLECT_LIMITS)
+            .is_err());
+        std::fs::remove_file(sessions.join("rollout-hard.jsonl"))?;
+
+        std::fs::write(sessions.join("rollout-big.jsonl"), vec![b'x'; 65])?;
+        assert!(root
+            .collect_regular_files(Path::new("sessions"), COLLECT_LIMITS)
+            .is_err());
+        std::fs::remove_file(sessions.join("rollout-big.jsonl"))?;
+
+        std::fs::write(sessions.join("rollout-ok.jsonl"), b"ok")?;
+        let collected = root.collect_regular_files(Path::new("sessions"), COLLECT_LIMITS)?;
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].bytes, b"ok");
         Ok(())
     }
 

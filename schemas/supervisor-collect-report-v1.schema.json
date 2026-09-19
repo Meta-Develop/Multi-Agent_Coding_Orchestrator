@@ -1482,6 +1482,236 @@
           }
         ],
         "properties": {
+          "codex_parent_evidence": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "codex_version": {
+                    "minLength": 1,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "model_mismatch": {
+                    "type": "boolean"
+                  },
+                  "observed_effort": {
+                    "oneOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "known": {
+                            "minLength": 1,
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "known"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "const": "unknown",
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "observed_model": {
+                    "oneOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "known": {
+                            "minLength": 1,
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "known"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "const": "unknown",
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "requested_effort": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "requested_model": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "resolution_status": {
+                    "enum": [
+                      "complete",
+                      "rollout_missing",
+                      "thread_id_mismatch",
+                      "ambiguous",
+                      "turn_failed",
+                      "usage_unavailable",
+                      "version_mismatch",
+                      "jsonl_invalid"
+                    ],
+                    "type": "string"
+                  },
+                  "rollout_effort": {
+                    "oneOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "known": {
+                            "minLength": 1,
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "known"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "const": "unknown",
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "rollout_model": {
+                    "oneOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "known": {
+                            "minLength": 1,
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "known"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "const": "unknown",
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "server_rerouted_model": {
+                    "oneOf": [
+                      {
+                        "type": "null"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "from": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "to": {
+                            "minLength": 1,
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "from",
+                          "to"
+                        ],
+                        "type": "object"
+                      }
+                    ]
+                  },
+                  "thread_id": {
+                    "minLength": 1,
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "turn_usage": {
+                    "oneOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "reason": {
+                            "type": "string"
+                          },
+                          "status": {
+                            "const": "unknown"
+                          }
+                        },
+                        "required": [
+                          "status",
+                          "reason"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "cached_input_tokens": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "input_tokens": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "output_tokens": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "reasoning_output_tokens": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "status": {
+                            "const": "known"
+                          }
+                        },
+                        "required": [
+                          "status",
+                          "input_tokens",
+                          "output_tokens",
+                          "cached_input_tokens",
+                          "reasoning_output_tokens"
+                        ],
+                        "type": "object"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "codex_version",
+                  "thread_id",
+                  "requested_model",
+                  "requested_effort",
+                  "rollout_model",
+                  "rollout_effort",
+                  "observed_model",
+                  "observed_effort",
+                  "server_rerouted_model",
+                  "model_mismatch",
+                  "turn_usage",
+                  "resolution_status"
+                ],
+                "type": "object"
+              }
+            ]
+          },
           "command": {
             "items": {
               "type": "string"
@@ -5368,6 +5598,236 @@
                       }
                     ],
                     "properties": {
+                      "codex_parent_evidence": {
+                        "oneOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "codex_version": {
+                                "minLength": 1,
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "model_mismatch": {
+                                "type": "boolean"
+                              },
+                              "observed_effort": {
+                                "oneOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "known": {
+                                        "minLength": 1,
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "known"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "const": "unknown",
+                                    "type": "string"
+                                  }
+                                ]
+                              },
+                              "observed_model": {
+                                "oneOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "known": {
+                                        "minLength": 1,
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "known"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "const": "unknown",
+                                    "type": "string"
+                                  }
+                                ]
+                              },
+                              "requested_effort": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "requested_model": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "resolution_status": {
+                                "enum": [
+                                  "complete",
+                                  "rollout_missing",
+                                  "thread_id_mismatch",
+                                  "ambiguous",
+                                  "turn_failed",
+                                  "usage_unavailable",
+                                  "version_mismatch",
+                                  "jsonl_invalid"
+                                ],
+                                "type": "string"
+                              },
+                              "rollout_effort": {
+                                "oneOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "known": {
+                                        "minLength": 1,
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "known"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "const": "unknown",
+                                    "type": "string"
+                                  }
+                                ]
+                              },
+                              "rollout_model": {
+                                "oneOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "known": {
+                                        "minLength": 1,
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "known"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "const": "unknown",
+                                    "type": "string"
+                                  }
+                                ]
+                              },
+                              "server_rerouted_model": {
+                                "oneOf": [
+                                  {
+                                    "type": "null"
+                                  },
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "from": {
+                                        "minLength": 1,
+                                        "type": "string"
+                                      },
+                                      "to": {
+                                        "minLength": 1,
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "from",
+                                      "to"
+                                    ],
+                                    "type": "object"
+                                  }
+                                ]
+                              },
+                              "thread_id": {
+                                "minLength": 1,
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "turn_usage": {
+                                "oneOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "reason": {
+                                        "type": "string"
+                                      },
+                                      "status": {
+                                        "const": "unknown"
+                                      }
+                                    },
+                                    "required": [
+                                      "status",
+                                      "reason"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "cached_input_tokens": {
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "input_tokens": {
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "output_tokens": {
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "reasoning_output_tokens": {
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "status": {
+                                        "const": "known"
+                                      }
+                                    },
+                                    "required": [
+                                      "status",
+                                      "input_tokens",
+                                      "output_tokens",
+                                      "cached_input_tokens",
+                                      "reasoning_output_tokens"
+                                    ],
+                                    "type": "object"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "codex_version",
+                              "thread_id",
+                              "requested_model",
+                              "requested_effort",
+                              "rollout_model",
+                              "rollout_effort",
+                              "observed_model",
+                              "observed_effort",
+                              "server_rerouted_model",
+                              "model_mismatch",
+                              "turn_usage",
+                              "resolution_status"
+                            ],
+                            "type": "object"
+                          }
+                        ]
+                      },
                       "command": {
                         "items": {
                           "type": "string"
@@ -6932,6 +7392,236 @@
                 }
               ],
               "properties": {
+                "codex_parent_evidence": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "codex_version": {
+                          "minLength": 1,
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "model_mismatch": {
+                          "type": "boolean"
+                        },
+                        "observed_effort": {
+                          "oneOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "known": {
+                                  "minLength": 1,
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "known"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "const": "unknown",
+                              "type": "string"
+                            }
+                          ]
+                        },
+                        "observed_model": {
+                          "oneOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "known": {
+                                  "minLength": 1,
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "known"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "const": "unknown",
+                              "type": "string"
+                            }
+                          ]
+                        },
+                        "requested_effort": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "requested_model": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "resolution_status": {
+                          "enum": [
+                            "complete",
+                            "rollout_missing",
+                            "thread_id_mismatch",
+                            "ambiguous",
+                            "turn_failed",
+                            "usage_unavailable",
+                            "version_mismatch",
+                            "jsonl_invalid"
+                          ],
+                          "type": "string"
+                        },
+                        "rollout_effort": {
+                          "oneOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "known": {
+                                  "minLength": 1,
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "known"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "const": "unknown",
+                              "type": "string"
+                            }
+                          ]
+                        },
+                        "rollout_model": {
+                          "oneOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "known": {
+                                  "minLength": 1,
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "known"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "const": "unknown",
+                              "type": "string"
+                            }
+                          ]
+                        },
+                        "server_rerouted_model": {
+                          "oneOf": [
+                            {
+                              "type": "null"
+                            },
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "from": {
+                                  "minLength": 1,
+                                  "type": "string"
+                                },
+                                "to": {
+                                  "minLength": 1,
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "from",
+                                "to"
+                              ],
+                              "type": "object"
+                            }
+                          ]
+                        },
+                        "thread_id": {
+                          "minLength": 1,
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "turn_usage": {
+                          "oneOf": [
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "reason": {
+                                  "type": "string"
+                                },
+                                "status": {
+                                  "const": "unknown"
+                                }
+                              },
+                              "required": [
+                                "status",
+                                "reason"
+                              ],
+                              "type": "object"
+                            },
+                            {
+                              "additionalProperties": false,
+                              "properties": {
+                                "cached_input_tokens": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "input_tokens": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "output_tokens": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "reasoning_output_tokens": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "status": {
+                                  "const": "known"
+                                }
+                              },
+                              "required": [
+                                "status",
+                                "input_tokens",
+                                "output_tokens",
+                                "cached_input_tokens",
+                                "reasoning_output_tokens"
+                              ],
+                              "type": "object"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "codex_version",
+                        "thread_id",
+                        "requested_model",
+                        "requested_effort",
+                        "rollout_model",
+                        "rollout_effort",
+                        "observed_model",
+                        "observed_effort",
+                        "server_rerouted_model",
+                        "model_mismatch",
+                        "turn_usage",
+                        "resolution_status"
+                      ],
+                      "type": "object"
+                    }
+                  ]
+                },
                 "command": {
                   "items": {
                     "type": "string"
@@ -11067,6 +11757,236 @@
                       }
                     ],
                     "properties": {
+                      "codex_parent_evidence": {
+                        "oneOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "codex_version": {
+                                "minLength": 1,
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "model_mismatch": {
+                                "type": "boolean"
+                              },
+                              "observed_effort": {
+                                "oneOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "known": {
+                                        "minLength": 1,
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "known"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "const": "unknown",
+                                    "type": "string"
+                                  }
+                                ]
+                              },
+                              "observed_model": {
+                                "oneOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "known": {
+                                        "minLength": 1,
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "known"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "const": "unknown",
+                                    "type": "string"
+                                  }
+                                ]
+                              },
+                              "requested_effort": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "requested_model": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "resolution_status": {
+                                "enum": [
+                                  "complete",
+                                  "rollout_missing",
+                                  "thread_id_mismatch",
+                                  "ambiguous",
+                                  "turn_failed",
+                                  "usage_unavailable",
+                                  "version_mismatch",
+                                  "jsonl_invalid"
+                                ],
+                                "type": "string"
+                              },
+                              "rollout_effort": {
+                                "oneOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "known": {
+                                        "minLength": 1,
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "known"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "const": "unknown",
+                                    "type": "string"
+                                  }
+                                ]
+                              },
+                              "rollout_model": {
+                                "oneOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "known": {
+                                        "minLength": 1,
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "known"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "const": "unknown",
+                                    "type": "string"
+                                  }
+                                ]
+                              },
+                              "server_rerouted_model": {
+                                "oneOf": [
+                                  {
+                                    "type": "null"
+                                  },
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "from": {
+                                        "minLength": 1,
+                                        "type": "string"
+                                      },
+                                      "to": {
+                                        "minLength": 1,
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "from",
+                                      "to"
+                                    ],
+                                    "type": "object"
+                                  }
+                                ]
+                              },
+                              "thread_id": {
+                                "minLength": 1,
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "turn_usage": {
+                                "oneOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "reason": {
+                                        "type": "string"
+                                      },
+                                      "status": {
+                                        "const": "unknown"
+                                      }
+                                    },
+                                    "required": [
+                                      "status",
+                                      "reason"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "cached_input_tokens": {
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "input_tokens": {
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "output_tokens": {
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "reasoning_output_tokens": {
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "status": {
+                                        "const": "known"
+                                      }
+                                    },
+                                    "required": [
+                                      "status",
+                                      "input_tokens",
+                                      "output_tokens",
+                                      "cached_input_tokens",
+                                      "reasoning_output_tokens"
+                                    ],
+                                    "type": "object"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "codex_version",
+                              "thread_id",
+                              "requested_model",
+                              "requested_effort",
+                              "rollout_model",
+                              "rollout_effort",
+                              "observed_model",
+                              "observed_effort",
+                              "server_rerouted_model",
+                              "model_mismatch",
+                              "turn_usage",
+                              "resolution_status"
+                            ],
+                            "type": "object"
+                          }
+                        ]
+                      },
                       "command": {
                         "items": {
                           "type": "string"

@@ -775,6 +775,7 @@ impl PreparedProcessTree {
                 if spec.private_runtime_home
                     || spec.private_runtime_codex_home
                     || spec.private_runtime_grok_home
+                    || spec.staged_codex_home.is_some()
                 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Unsupported,
@@ -793,6 +794,7 @@ impl PreparedProcessTree {
                 if spec.private_runtime_home
                     || spec.private_runtime_codex_home
                     || spec.private_runtime_grok_home
+                    || spec.staged_codex_home.is_some()
                 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Unsupported,
@@ -811,6 +813,7 @@ impl PreparedProcessTree {
                 if spec.private_runtime_home
                     || spec.private_runtime_codex_home
                     || spec.private_runtime_grok_home
+                    || spec.staged_codex_home.is_some()
                 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Unsupported,
@@ -1389,6 +1392,37 @@ impl ResolvedSystemdSandbox {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "isolated reviewer runtime helper vector exceeds its safety bound",
+            ));
+        }
+        Ok(())
+    }
+
+    /// A staged Codex home is only usable when the unit already binds its parent root
+    /// read-write; otherwise the sandbox would silently hide the parent's evidence directory.
+    fn validate_staged_codex_home(&self, home: &Path) -> std::io::Result<()> {
+        let canonical = canonical_sandbox_directory(home, "staged Codex home")?;
+        if self
+            .hidden_roots
+            .iter()
+            .any(|hidden| canonical.starts_with(hidden) || hidden.starts_with(&canonical))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "staged Codex home overlaps an inaccessible sandbox root",
+            ));
+        }
+        let inside_writable_root = self
+            .writable_artifact_roots
+            .iter()
+            .chain(self.visible_read_write_roots.iter())
+            .any(|root| canonical.starts_with(root) && canonical != *root);
+        if !inside_writable_root {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "staged Codex home {} is not below a read-write root bound into the unit",
+                    canonical.display()
+                ),
             ));
         }
         Ok(())
