@@ -1,9 +1,9 @@
 //! Shared explicit login lifecycle for managed accounts (MACO integration §5).
 //!
-//! Gemini, Codex, and Claude OAuth share the handle / idempotency / cancel
-//! path. Cursor stays allow-listed on `login.start` and `NotImplemented` at
-//! the production port. Legacy synchronous `add_managed_account` remains
-//! unchanged.
+//! Gemini, Codex, Claude, and Grok OAuth share the handle / idempotency /
+//! cancel path. Cursor stays allow-listed on `login.start` and
+//! `NotImplemented` at the production port. Legacy synchronous
+//! `add_managed_account` remains unchanged.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -22,8 +22,9 @@ use crate::error::{Error, Result};
 use crate::model::{AuthKind, StoredAccountMetadata};
 use crate::providers::{
     claude_code::ClaudeCodeAdapter, codex_cli::CodexCliAdapter, complete_managed_login_account,
-    gemini_cli::GeminiCliAdapter, OAuthLoginRunError, PendingOAuthHomePlan,
-    PreparedPendingOAuthHome, ProviderAdapter, StoredAccountRegistry, LOGIN_DEADLINE,
+    gemini_cli::GeminiCliAdapter, grok_cli::GrokCliAdapter, OAuthLoginRunError,
+    PendingOAuthHomePlan, PreparedPendingOAuthHome, ProviderAdapter, StoredAccountRegistry,
+    LOGIN_DEADLINE,
 };
 
 /// Adapter seams used by [`LoginService::start`]: identity, pending-home
@@ -120,6 +121,32 @@ impl PendingOAuthLogin for ClaudeCodeAdapter {
         cancel: tokio::sync::watch::Receiver<bool>,
     ) -> impl std::future::Future<Output = std::result::Result<(), OAuthLoginRunError>> + Send {
         ClaudeCodeAdapter::run_pending_oauth_login(self, home, plan, cancel)
+    }
+}
+
+impl PendingOAuthLogin for GrokCliAdapter {
+    fn prepare_pending_oauth_home(
+        &self,
+        account: &StoredAccountMetadata,
+    ) -> Result<PreparedPendingOAuthHome> {
+        GrokCliAdapter::prepare_pending_oauth_home(self, account)
+    }
+
+    fn clone_for_login_task(&self) -> Self {
+        GrokCliAdapter::clone_for_login_task(self)
+    }
+
+    fn finish_pending_oauth_login(&self, home: &Path) -> Result<()> {
+        GrokCliAdapter::finish_pending_oauth_login(self, home)
+    }
+
+    fn run_pending_oauth_login(
+        &self,
+        home: &Path,
+        plan: PendingOAuthHomePlan,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> impl std::future::Future<Output = std::result::Result<(), OAuthLoginRunError>> + Send {
+        GrokCliAdapter::run_pending_oauth_login(self, home, plan, cancel)
     }
 }
 
@@ -244,8 +271,8 @@ impl LoginService {
         }
     }
 
-    /// Begin Gemini, Codex, or Claude OAuth login for a new pending account,
-    /// or replay an idempotent start request.
+    /// Begin Gemini, Codex, Claude, or Grok OAuth login for a new pending
+    /// account, or replay an idempotent start request.
     pub fn start(
         &self,
         request: LoginStartRequest,
@@ -632,6 +659,7 @@ fn oauth_material_present(provider_id: &str, home: &Path) -> bool {
         "gemini-cli" => home.join(".gemini/oauth_creds.json").is_file(),
         "codex-cli" => home.join("auth.json").is_file(),
         "claude-code" => home.join(".credentials.json").is_file(),
+        "grok-cli" => home.join("auth.json").is_file(),
         _ => false,
     }
 }
@@ -700,6 +728,7 @@ fn validate_start_request(request: &LoginStartRequest) -> Result<()> {
     if request.provider_id != "gemini-cli"
         && request.provider_id != "codex-cli"
         && request.provider_id != "claude-code"
+        && request.provider_id != "grok-cli"
         && request.provider_id != "cursor"
     {
         return Err(Error::NotImplemented("login.start"));

@@ -47,7 +47,8 @@ use zeroize::Zeroizing;
 
 use super::{
     account_id_is_safe, binary_on_path, home_dir, managed_account_dir, ActivationMechanism,
-    LaunchSpec, ManagedAccountPlan, ProviderAdapter, StoredAccountRegistry,
+    LaunchSpec, ManagedAccountPlan, PendingOAuthHomePlan, PreparedPendingOAuthHome,
+    ProviderAdapter, StoredAccountRegistry,
 };
 use crate::error::{Error, Result};
 use crate::model::{
@@ -86,6 +87,9 @@ pub struct GrokCliAdapter {
     /// Test seam for interactive login. Production always inherits stdio and
     /// starts the fixed `grok login` command itself.
     login_runner: Option<LoginRunner>,
+    /// Hermetic login-service tests: honour cancel via async watch only.
+    #[doc(hidden)]
+    test_oauth_watch_cancel_driver: bool,
 }
 
 impl GrokCliAdapter {
@@ -119,6 +123,95 @@ impl GrokCliAdapter {
     pub fn with_login_runner(mut self, runner: LoginRunner) -> Self {
         self.login_runner = Some(runner);
         self
+    }
+
+    /// Async OAuth fixture for login-service cancellation tests.
+    #[doc(hidden)]
+    pub fn with_test_oauth_watch_cancel_driver(mut self) -> Self {
+        self.test_oauth_watch_cancel_driver = true;
+        self.login_runner = None;
+        self
+    }
+
+    /// Clone adapter configuration for a background login task.
+    pub(crate) fn clone_for_login_task(&self) -> Self {
+        Self {
+            home: self.home.clone(),
+            data_dir: self.data_dir.clone(),
+            working_directory: self.working_directory.clone(),
+            program: self.program.clone(),
+            login_runner: self.login_runner,
+            test_oauth_watch_cancel_driver: self.test_oauth_watch_cancel_driver,
+        }
+    }
+
+    fn validate_pending_oauth_account(&self, account: &StoredAccountMetadata) -> Result<()> {
+        validate_managed_metadata(account)?;
+        if account.state != StoredAccountState::Pending || account.is_selected {
+            return Err(config_write(
+                "only an unselected pending Grok account can begin OAuth login",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Prepare an isolated managed `GROK_HOME` for a pending OAuth account.
+    pub(crate) fn prepare_pending_oauth_home(
+        &self,
+        account: &StoredAccountMetadata,
+    ) -> Result<PreparedPendingOAuthHome> {
+        self.validate_pending_oauth_account(account)?;
+        let home = self.managed_home(account)?;
+        let plan = match fs::symlink_metadata(home.join("auth.json")) {
+            Ok(_) => {
+                validate_auth_json(&home)?;
+                PendingOAuthHomePlan::RecoveredExistingMarker
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                ensure_private_managed_home(&self.resolved_data_dir()?, &home)?;
+                PendingOAuthHomePlan::NeedsInteractiveOAuth
+            }
+            Err(error) => {
+                return Err(config_write(format!(
+                    "managed auth.json cannot be inspected ({})",
+                    error.kind()
+                )));
+            }
+        };
+        Ok(PreparedPendingOAuthHome { path: home, plan })
+    }
+
+    /// Run `grok login` for a prepared managed `GROK_HOME`.
+    pub(crate) async fn run_pending_oauth_login(
+        &self,
+        home: &Path,
+        plan: PendingOAuthHomePlan,
+        mut cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> std::result::Result<(), super::OAuthLoginRunError> {
+        if *cancel.borrow() {
+            return Err(super::OAuthLoginRunError::Cancelled);
+        }
+        if plan == PendingOAuthHomePlan::RecoveredExistingMarker {
+            return Ok(());
+        }
+        if self.test_oauth_watch_cancel_driver {
+            return super::gemini_oauth::run_test_oauth_cancelled_by_watch(&mut cancel).await;
+        }
+        let adapter = self.clone_for_login_task();
+        let home = home.to_path_buf();
+        let result = tokio::task::spawn_blocking(move || adapter.run_login(&home)).await;
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(super::OAuthLoginRunError::Failed(error)),
+            Err(_) => Err(super::OAuthLoginRunError::Failed(config_write(
+                "Grok login task failed",
+            ))),
+        }
+    }
+
+    /// Validate vendor-issued `auth.json` after login succeeds.
+    pub(crate) fn finish_pending_oauth_login(&self, home: &Path) -> Result<()> {
+        validate_auth_json(home)
     }
 
     fn grok_home(&self) -> Option<PathBuf> {
