@@ -111,8 +111,7 @@ fn file_store_auth_json(home: &Path) -> PathBuf {
 /// Presence only. Never reads, parses, or logs the file. A directory or
 /// missing path is not file-store evidence.
 fn is_regular_file(path: &Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .is_ok_and(|metadata| metadata.file_type().is_file())
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
 }
 
 fn binary_on_path_for_platform(binary: &str) -> bool {
@@ -388,7 +387,10 @@ mod tests {
     fn file_store_auth_json_must_be_a_regular_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let auth = file_store_auth_json(dir.path());
-        assert!(!is_regular_file(&auth), "missing path is not a regular file");
+        assert!(
+            !is_regular_file(&auth),
+            "missing path is not a regular file"
+        );
 
         fs::create_dir_all(&auth).expect("mkdir auth.json as directory");
         assert!(

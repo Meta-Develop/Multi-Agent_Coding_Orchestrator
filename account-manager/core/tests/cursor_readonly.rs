@@ -97,8 +97,7 @@ fn file_store_auth_json_detects_without_listing_an_account() {
     let home = tempfile::tempdir().expect("tempdir");
     let auth = home.path().join(".cursor").join("auth.json");
     fs::create_dir_all(auth.parent().expect("parent")).expect("mkdir .cursor");
-    fs::write(&auth, br#"{"access_token":"FAKE-access-token-0001"}"#)
-        .expect("write auth.json");
+    fs::write(&auth, br#"{"access_token":"FAKE-access-token-0001"}"#).expect("write auth.json");
     let adapter = CursorAdapter::with_home(home.path());
 
     assert_eq!(adapter.detect(), InstallState::Installed);
