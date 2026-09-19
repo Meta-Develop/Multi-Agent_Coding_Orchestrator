@@ -37,11 +37,20 @@ use crate::selection::{
     ReasoningEffort as SelectorEffort, RiskLevel, RuntimeCatalog, RuntimePoolState, SelectionInput,
     SelectionProvenance, TaskHorizon, TaskProfile, TypedAxisObservation, TypedObservationKind,
 };
+#[cfg(target_os = "linux")]
 use coding_agent_manager_lib::account_authority::{
-    validate_observed_models, AccountObserveResult, ModelsObservation, ObservationOutcome,
-    ObservedModel, QuotaObservation,
+    validate_observed_models, ModelsObservation, ObservationOutcome, ObservedModel,
+    QuotaObservation,
 };
 use std::path::Path;
+
+/// Account observation is a Linux-only CAM type. Non-Linux keeps
+/// `account_observation=None` and the advertised-catalog path.
+#[cfg(target_os = "linux")]
+type AccountObserveResult = coding_agent_manager_lib::account_authority::AccountObserveResult;
+#[cfg(not(target_os = "linux"))]
+#[derive(Clone, Debug)]
+enum AccountObserveResult {}
 
 const AUTOMATIC_SELECTION_TASK_CLASS: &str = "localized_code_change";
 const JUDGMENT_SELECTION_TASK_CLASS: &str = "review_gate";
@@ -1768,6 +1777,7 @@ fn apply_live_quota_selection_input(
     Ok(())
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 fn constructed_selection_catalogs(
     runtime: SupervisorRuntime,
     catalog: &RuntimeModelCatalog,
@@ -1776,6 +1786,7 @@ fn constructed_selection_catalogs(
     priors: &selection::PriorDataset,
     account_observation: Option<&AccountObserveResult>,
 ) -> Result<Vec<RuntimeCatalog>> {
+    #[cfg(target_os = "linux")]
     if let Some(observation) = account_observation {
         return catalogs_from_account_observation(observation, runtime, task, priors);
     }
@@ -1840,6 +1851,7 @@ fn constructed_selection_catalogs(
     Ok(catalogs)
 }
 
+#[cfg(target_os = "linux")]
 fn runtime_from_account_provider(provider_id: &str) -> Result<&'static str> {
     match provider_id {
         "grok-cli" => Ok("grok"),
@@ -1853,6 +1865,7 @@ fn runtime_from_account_provider(provider_id: &str) -> Result<&'static str> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn catalogs_from_account_observation(
     observation: &AccountObserveResult,
     selected_runtime: SupervisorRuntime,
@@ -1901,6 +1914,7 @@ fn catalogs_from_account_observation(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn runtime_catalog_from_observed_models(
     runtime: &str,
     observed: &ModelsObservation,
@@ -1930,6 +1944,7 @@ fn runtime_catalog_from_observed_models(
     })
 }
 
+#[cfg(target_os = "linux")]
 fn catalog_model_from_observed(
     runtime: &str,
     observed: &ObservedModel,
@@ -1975,6 +1990,7 @@ fn catalog_model_from_observed(
     })
 }
 
+#[cfg(target_os = "linux")]
 fn capabilities_from_prior(
     prior: &selection::ModelPrior,
     task: &TaskProfile,
@@ -2015,11 +2031,13 @@ fn capabilities_from_prior(
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 fn primary_pool_for_selection(
     runtime_name: &str,
     admission: &SupervisorAdmissionPolicyInput,
     account_observation: Option<&AccountObserveResult>,
 ) -> Result<RuntimePoolState> {
+    #[cfg(target_os = "linux")]
     if let Some(observation) = account_observation {
         return account_observation_primary_pool(runtime_name, admission, observation);
     }
@@ -2055,6 +2073,7 @@ fn primary_pool_for_selection(
     })
 }
 
+#[cfg(target_os = "linux")]
 fn account_observation_primary_pool(
     runtime_name: &str,
     admission: &SupervisorAdmissionPolicyInput,
@@ -2103,6 +2122,7 @@ fn account_observation_primary_pool(
     })
 }
 
+#[cfg(target_os = "linux")]
 fn observed_quota_pressure_basis_points(quota: &QuotaObservation) -> u16 {
     quota
         .snapshots
@@ -3520,6 +3540,7 @@ pub(super) fn selector_effort_as_str(effort: SelectorEffort) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use coding_agent_manager_lib::account_authority::{
         CategoryObservation, SelectedAccountBinding,
     };
@@ -7295,6 +7316,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     fn test_account_binding(provider_id: &str) -> SelectedAccountBinding {
         SelectedAccountBinding {
             provider_id: provider_id.to_string(),
@@ -7304,6 +7326,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn account_observe_result(
         provider_id: &str,
         models: CategoryObservation<ModelsObservation>,
@@ -7318,6 +7341,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn observed_sol_high_xhigh() -> CategoryObservation<ModelsObservation> {
         CategoryObservation::observed(ModelsObservation {
             models: vec![ObservedModel {
@@ -7328,6 +7352,7 @@ mod tests {
         })
     }
 
+    #[cfg(target_os = "linux")]
     fn selection_input_with_account_observation(
         observation: &AccountObserveResult,
         advertised: &AdvertisedCatalogSet,
@@ -7357,6 +7382,7 @@ mod tests {
         })
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn account_observe_admits_only_observed_model_and_effort() -> Result<()> {
         let observation = account_observe_result(
@@ -7389,6 +7415,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn account_observe_unknown_models_fail_closed() -> Result<()> {
         let observation = account_observe_result(
@@ -7420,6 +7447,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn account_observe_does_not_fill_efforts_from_priors() -> Result<()> {
         let observation = account_observe_result(
@@ -7451,6 +7479,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn account_observe_unknown_quota_does_not_invent_zeros_or_price() -> Result<()> {
         let observation = account_observe_result(
@@ -7480,6 +7509,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn account_observe_observed_quota_projects_utilization_without_price() -> Result<()> {
         let observation = account_observe_result(
@@ -7515,6 +7545,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn account_observe_binding_runtime_mismatch_fail_closed() -> Result<()> {
         let observation = account_observe_result(
