@@ -54,7 +54,7 @@ ensure_authenticated_archive() {
       die "refusing: cached archive SHA256 does not match pinned release asset"
     return 0
   fi
-  curl -fsSL --proto '=https' --tlsv1.2 -o "${archive}" "${download_url}"
+  curl -fsSL --proto '=https' --tlsv1.2 --retry 5 --retry-delay 2 --retry-all-errors -o "${archive}" "${download_url}"
   [[ "$(stat -c '%s' "${archive}")" == "${expected_bytes}" ]] || \
     die "refusing: downloaded archive size does not match pinned release asset"
   printf '%s  %s\n' "${expected_sha256}" "${archive}" | sha256sum -c --status || \
