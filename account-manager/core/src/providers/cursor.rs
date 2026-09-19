@@ -5,14 +5,35 @@
 //! - `~/.config/cursor/cli-config.json` [verified-local] — CLI settings only:
 //!   `version`, `editor`, `display`, `permissions`, `approvalMode`, `sandbox`,
 //!   `network`, `attribution`. No credential material was present in it.
+//!   Official 2026-09-20 global path is `~/.cursor/cli-config.json`
+//!   [verified-docs]. This adapter does not treat the local XDG-style path as
+//!   install evidence.
 //! - `~/.cursor/` [verified-local] — `agents/`, `projects/`, `extensions/`,
 //!   `skills-cursor/`, `ai-tracking/ai-code-tracking.db`, `argv.json`.
 //!
+//! Official configuration [verified-docs]
+//! (https://cursor.com/docs/cli/reference/configuration):
+//!
+//! - Global macOS/Linux: `~/.cursor/cli-config.json`
+//! - Global Windows: `%USERPROFILE%\.cursor\cli-config.json`
+//! - Project: `.cursor/cli.json` (permissions only)
+//! - `CURSOR_CONFIG_DIR` / `XDG_CONFIG_HOME` relocate settings, not a named
+//!   credential home. Isolated HOME / login.start remain blocked (no
+//!   `GROK_HOME` equivalent).
+//!
+//! Official schema fields are settings only: `version`, `editor.vimMode`,
+//! `permissions.*`, `channel`, `model`, `maxMode`, `hasChangedDefaultModel`,
+//! `notifications`, `hints`, `rewind`, `suggestNextPrompt`, `display.*`,
+//! `approvalMode`, `sandbox.*`, `network.useHttp1ForAgent`, `attribution.*`.
+//! No credential, token, or authInfo fields. Third-party authInfo-in-cli-config
+//! claims stay unofficial.
+//!
 //! File-store path `~/.cursor/auth.json` is [verified-docs] when
-//! `AGENT_CLI_CREDENTIAL_STORE=file`. Presence of that regular file is
-//! install evidence (same grain as Copilot `~/.copilot/config.json`). This
-//! adapter never reads, parses, or logs it. An empty `~/.cursor` directory
-//! or a missing file is not credentials.
+//! `AGENT_CLI_CREDENTIAL_STORE=file`. Presence of that regular file, or of
+//! official `~/.cursor/cli-config.json`, is install evidence (same grain as
+//! Copilot `~/.copilot/config.json`). This adapter never reads, parses, or
+//! logs either file. An empty `~/.cursor` directory or a missing file is not
+//! credentials and is not install evidence.
 //!
 //! macOS Keychain service names `cursor-access-token`,
 //! `cursor-refresh-token`, and `cursor-api-key` are [verified-docs]. Default
@@ -22,9 +43,10 @@
 //!
 //! Cursor documents `cursor-agent status` as a read-only authentication check
 //! that displays account information [verified-docs]. `list_accounts` uses
-//! that vendor surface instead of treating `auth.json` as an account identity.
-//! The text markers it recognizes remain [inferred], so an unfamiliar
-//! response is an error rather than evidence that no account is configured.
+//! that vendor surface instead of treating `auth.json` or `cli-config.json` as
+//! an account identity. The text markers it recognizes remain [inferred], so
+//! an unfamiliar response is an error rather than evidence that no account is
+//! configured.
 //!
 //! See `docs/research/cursor.md`.
 
@@ -108,8 +130,12 @@ fn file_store_auth_json(home: &Path) -> PathBuf {
     home.join(".cursor").join("auth.json")
 }
 
+fn official_cli_config_json(home: &Path) -> PathBuf {
+    home.join(".cursor").join("cli-config.json")
+}
+
 /// Presence only. Never reads, parses, or logs the file. A directory or
-/// missing path is not file-store evidence.
+/// missing path is not install evidence.
 fn is_regular_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
 }
@@ -199,7 +225,7 @@ impl ProviderAdapter for CursorAdapter {
             auth_kinds: vec![AuthKind::Unknown, AuthKind::ApiKey],
             // The CLI account can be listed through `cursor-agent status`, but
             // no write-safe credential-store or mutation path is established
-            // (NFR-8). File-store presence is detect-only.
+            // (NFR-8). File-store and official cli-config presence is detect-only.
             maturity: Maturity::Experimental,
             install_state: self.detect(),
             capabilities: Vec::new(),
@@ -219,13 +245,8 @@ impl ProviderAdapter for CursorAdapter {
 
     fn detect(&self) -> InstallState {
         let has_config = self.resolved_home().is_some_and(|home| {
-            home.join(".cursor").is_dir()
-                || home
-                    .join(".config")
-                    .join("cursor")
-                    .join("cli-config.json")
-                    .is_file()
-                || is_regular_file(&file_store_auth_json(&home))
+            is_regular_file(&file_store_auth_json(&home))
+                || is_regular_file(&official_cli_config_json(&home))
         });
         let has_binary = match self.home.as_deref() {
             Some(home) => {
@@ -429,11 +450,70 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         fs::create_dir_all(dir.path().join(".cursor")).expect("mkdir .cursor");
         let adapter = CursorAdapter::with_home(dir.path());
+        assert_eq!(adapter.detect(), InstallState::NotInstalled);
         let accounts = adapter.list_accounts().expect("list_accounts");
         assert!(
             accounts.is_empty(),
             "an empty ~/.cursor directory is not an Observed account"
         );
+    }
+
+    #[test]
+    fn official_cli_config_json_must_be_a_regular_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = official_cli_config_json(dir.path());
+        assert!(
+            !is_regular_file(&config),
+            "missing path is not a regular file"
+        );
+
+        fs::create_dir_all(&config).expect("mkdir cli-config.json as directory");
+        assert!(
+            !is_regular_file(&config),
+            "a directory named cli-config.json is not settings presence"
+        );
+
+        fs::remove_dir(&config).expect("rmdir");
+        write_file(&config, b"");
+        assert!(
+            is_regular_file(&config),
+            "an empty regular file is enough presence"
+        );
+    }
+
+    #[test]
+    fn detect_installed_when_official_cli_config_json_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(&official_cli_config_json(dir.path()), b"");
+        let adapter = CursorAdapter::with_home(dir.path());
+        assert_eq!(adapter.detect(), InstallState::Installed);
+    }
+
+    #[test]
+    fn official_cli_config_json_presence_is_not_an_observed_account() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(&official_cli_config_json(dir.path()), b"");
+        let adapter = CursorAdapter::with_home(dir.path());
+        assert_eq!(adapter.detect(), InstallState::Installed);
+        let accounts = adapter.list_accounts().expect("list_accounts");
+        assert!(
+            accounts.is_empty(),
+            "cli-config.json presence is install evidence, not account identity"
+        );
+    }
+
+    #[test]
+    fn config_cursor_cli_config_json_is_not_official_install_presence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_file(
+            &dir.path()
+                .join(".config")
+                .join("cursor")
+                .join("cli-config.json"),
+            b"{}",
+        );
+        let adapter = CursorAdapter::with_home(dir.path());
+        assert_eq!(adapter.detect(), InstallState::NotInstalled);
     }
 
     #[test]

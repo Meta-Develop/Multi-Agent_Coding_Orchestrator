@@ -1,0 +1,7 @@
+{
+  "version": 0,
+  "permissions": {
+    "allow": ["FAKE-fixture-command-0001"],
+    "deny": []
+  }
+}
