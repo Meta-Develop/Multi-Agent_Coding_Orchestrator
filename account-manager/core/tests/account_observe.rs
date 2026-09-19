@@ -141,6 +141,22 @@ fn cursor_fixture() -> (tempfile::TempDir, CursorAdapter, StoredAccountRegistry)
     (dir, adapter, registry)
 }
 
+fn cursor_file_store_fixture() -> (tempfile::TempDir, CursorAdapter, StoredAccountRegistry) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path().join("home");
+    let data = dir.path().join("data");
+    copy_tree(Path::new(CURSOR_FIXTURE_HOME), &home);
+    fs::create_dir_all(home.join(".cursor")).expect("cursor dir");
+    fs::write(
+        home.join(".cursor/auth.json"),
+        br#"{"access_token":"FAKE-cursor-file-store-0001"}"#,
+    )
+    .expect("auth.json");
+    let adapter = CursorAdapter::with_home(&home);
+    let registry = StoredAccountRegistry::new(stored_accounts_path(&data));
+    (dir, adapter, registry)
+}
+
 fn github_copilot_fixture() -> (
     tempfile::TempDir,
     GithubCopilotAdapter,
@@ -310,6 +326,58 @@ fn cursor_observe_reports_unknown_quota_without_invented_utilization() {
     let json = serde_json::to_string(&result).expect("json");
     assert!(!json.contains("utilization"));
     assert!(!json.contains(r#""snapshots":[]"#));
+
+    let quota = result.quota.expect("quota category");
+    assert_eq!(quota.outcome, ObservationOutcome::Unknown);
+    assert!(quota.content.is_none());
+
+    let models = result.models.expect("models category");
+    assert_eq!(models.outcome, ObservationOutcome::Unknown);
+
+    let auth = result.auth.expect("auth category");
+    assert_eq!(auth.outcome, ObservationOutcome::Unavailable);
+}
+
+#[test]
+fn cursor_observe_does_not_treat_file_store_auth_json_as_observed_auth_or_quota() {
+    let (_dir, adapter, registry) = cursor_file_store_fixture();
+    registry
+        .begin_add(
+            "cursor",
+            "work",
+            "Work",
+            AuthKind::Unknown,
+            StoredAccountMaterial::VendorHome,
+        )
+        .expect("begin add");
+    registry
+        .complete_add("cursor", "work")
+        .expect("complete add");
+    let binding = registry
+        .select_complete_revision("cursor", "work", None)
+        .expect("select");
+
+    let result = observe_selected_account(
+        &registry,
+        &adapter,
+        AccountObserveRequest {
+            binding: binding.clone(),
+            categories: vec![
+                ObserveCategory::Auth,
+                ObserveCategory::Models,
+                ObserveCategory::Quota,
+            ],
+        },
+        None,
+    )
+    .expect("observe");
+
+    assert_eq!(result.binding, binding);
+    let json = serde_json::to_string(&result).expect("json");
+    assert!(!json.contains("utilization"));
+    assert!(!json.contains(r#""snapshots":[]"#));
+    assert!(!json.contains("access_token"));
+    assert!(!json.contains("FAKE-"));
 
     let quota = result.quota.expect("quota category");
     assert_eq!(quota.outcome, ObservationOutcome::Unknown);
