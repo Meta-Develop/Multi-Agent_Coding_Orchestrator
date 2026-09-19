@@ -17,7 +17,7 @@
 | `~/.cursor/extensions/`, `plugins/`, `skills-cursor/` | Editor and CLI extensions                      | `[verified-local]` |
 | `~/.cursor/ai-tracking/ai-code-tracking.db`           | Local SQLite tracking database                 | `[verified-local]` |
 | `~/.cursor/argv.json`                                 | Electron launch arguments                      | `[verified-local]` |
-| Credential store                                      | **Not found** — no write-safe path as of 2026-09-20 | `[unknown]`        |
+| Credential store                                      | **Not found**                                  | `[unknown]`        |
 
 ## 3. Credential format
 
