@@ -308,6 +308,51 @@ fn delegated_user_manager_cgroup_detection_remains_exact() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn vanished_cgroup_enodev_is_absent_not_a_stuck_owner() {
+    assert_eq!(
+        cgroup_populated_from_events_read(Err(std::io::Error::from_raw_os_error(libc::ENODEV)))
+            .expect("ENODEV after transient-unit teardown is a vanished cgroup"),
+        None,
+        "ENODEV must not remain a rollback inspect error that fail-closed abort treats as a stuck owner"
+    );
+    assert_eq!(
+        cgroup_populated_from_events_read(Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "missing cgroup.events",
+        )))
+        .expect("NotFound is a vanished cgroup"),
+        None
+    );
+
+    let missing = tempfile::tempdir().expect("tempdir");
+    assert_eq!(
+        cgroup_populated(&missing.path().join("already-collected"))
+            .expect("missing cgroup directory is vanished"),
+        None
+    );
+
+    let timed_out = cgroup_populated_from_events_read(Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "cgroup inspect timed out",
+    )))
+    .expect_err("TimedOut stays fail-closed");
+    assert_eq!(timed_out.kind(), std::io::ErrorKind::TimedOut);
+
+    let invalid = cgroup_populated_from_events_read(Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "corrupt cgroup.events",
+    )))
+    .expect_err("InvalidData stays fail-closed");
+    assert_eq!(invalid.kind(), std::io::ErrorKind::InvalidData);
+
+    let permission =
+        cgroup_populated_from_events_read(Err(std::io::Error::from_raw_os_error(libc::EACCES)))
+            .expect_err("permission errors stay fail-closed");
+    assert_eq!(permission.kind(), std::io::ErrorKind::PermissionDenied);
+}
+
 #[cfg(unix)]
 fn assert_process_not_executable(pid: &str, context: &str) {
     let process_state = Command::new("ps")

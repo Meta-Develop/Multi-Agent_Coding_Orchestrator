@@ -1473,10 +1473,19 @@ fn delegated_systemd_user_manager_cgroup(contents: &str) -> std::io::Result<Path
 }
 
 #[cfg(target_os = "linux")]
-fn cgroup_populated(path: &Path) -> std::io::Result<Option<bool>> {
-    let events = match fs::read_to_string(path.join("cgroup.events")) {
+fn vanished_cgroup_inspect_error(error: &std::io::Error) -> bool {
+    // ENOENT already arrives as NotFound. ENODEV is the cgroupfs inspect error after a
+    // transient unit has already been collected; it is absence, not a live owner.
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ENODEV)
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_populated_from_events_read(
+    events: std::io::Result<String>,
+) -> std::io::Result<Option<bool>> {
+    let events = match events {
         Ok(events) => events,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if vanished_cgroup_inspect_error(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
     events
@@ -1498,6 +1507,11 @@ fn cgroup_populated(path: &Path) -> std::io::Result<Option<bool>> {
                 "cgroup.events omitted populated state",
             )
         })
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_populated(path: &Path) -> std::io::Result<Option<bool>> {
+    cgroup_populated_from_events_read(fs::read_to_string(path.join("cgroup.events")))
 }
 
 #[cfg(unix)]
