@@ -197,11 +197,11 @@ fn dispatch_json(ctx: &AuthorityContext, json: &str) -> serde_json::Value {
 fn unix_authority_listen_is_unsupported_on_this_platform() {
     let (_dir, registry) = isolated_registry();
     let config = AuthorityServerConfig::new(AuthorityContext::new(registry)).expect("config");
-    let error = listen(SafeSocketPath::unsupported_platform(), config).expect_err("listen");
-    assert!(matches!(
-        error,
-        ListenError::SocketPath(SocketPathError::UnsupportedPlatform)
-    ));
+    match listen(SafeSocketPath::unsupported_platform(), config) {
+        Err(ListenError::SocketPath(SocketPathError::UnsupportedPlatform)) => {}
+        Err(error) => panic!("unexpected listen error: {error:?}"),
+        Ok(_) => panic!("expected listen to fail on this platform"),
+    }
 }
 
 #[test]
@@ -682,9 +682,11 @@ mod unix {
         let path = resolve_socket_path(&socket).expect("safe");
         let (_dir, registry) = isolated_registry();
         let ctx = AuthorityContext::new(registry).without_registry_fallback();
-        let error = listen(path, AuthorityServerConfig::new(ctx).expect("config"))
-            .expect_err("not a socket");
-        assert!(matches!(error, ListenError::NotASocket));
+        match listen(path, AuthorityServerConfig::new(ctx).expect("config")) {
+            Err(ListenError::NotASocket) => {}
+            Err(error) => panic!("unexpected listen error: {error:?}"),
+            Ok(_) => panic!("expected NotASocket"),
+        }
         assert_eq!(fs::read(&socket).expect("kept"), b"not-a-socket");
         drop(guard);
     }
