@@ -338,7 +338,15 @@ mod tests {
             binding: evidence.candidate.clone().unwrap(),
             changed_paths: vec!["README.md".into()],
         };
-        let lenses = default_supervisor_review_lenses();
+        let lenses = vec![ReviewLensConfig {
+            id: "parent-acceptance".to_string(),
+            backend: ReviewLensBackendConfig::Model {
+                backend_id: "openai".to_string(),
+                model: DEFAULT_PROFILE_MODEL.to_string(),
+                reasoning_effort: Some("xhigh".to_string()),
+            },
+            information_scope: ReviewInformationScope::FullChildTranscript,
+        }];
         let request =
             |evidence: &HeldOutCandidateEvidence| -> Result<crate::review::ReviewLensRequest> {
                 let bindings = assignment_execution::supervisor_review_lens_binding_material(

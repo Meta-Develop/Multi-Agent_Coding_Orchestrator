@@ -1172,22 +1172,40 @@ fn default_stacked_uncorrelated_review_lenses_return_three_distinct_scopes() {
 }
 
 #[test]
-fn default_supervisor_review_lenses_remain_single_parent_acceptance_lens() {
+fn default_supervisor_review_lenses_are_the_stacked_uncorrelated_scopes() {
     let lenses = default_supervisor_review_lenses();
-    assert_eq!(lenses.len(), 1);
+    assert_eq!(lenses, default_stacked_uncorrelated_review_lenses());
+    assert_eq!(lenses.len(), 3);
     assert_eq!(lenses[0].id, "parent-acceptance");
     assert_eq!(
         lenses[0].information_scope,
         ReviewInformationScope::FullChildTranscript
     );
+    assert_eq!(lenses[0].backend.reasoning_effort(), Some("xhigh"));
+    assert_eq!(lenses[1].id, "output-only");
     assert_eq!(
-        lenses[0].backend,
-        ReviewLensBackendConfig::Model {
-            backend_id: "openai".to_string(),
-            model: DEFAULT_PROFILE_MODEL.to_string(),
-            reasoning_effort: Some("xhigh".to_string()),
-        }
+        lenses[1].information_scope,
+        ReviewInformationScope::OutputReportOnly
     );
+    assert_eq!(lenses[1].backend.reasoning_effort(), Some("high"));
+    assert_eq!(lenses[2].id, "diff-only");
+    assert_eq!(
+        lenses[2].information_scope,
+        ReviewInformationScope::DiffOnly
+    );
+    assert_eq!(lenses[2].backend.reasoning_effort(), Some("high"));
+
+    let omitted = parse_supervisor_plan_with_consultant(
+        std::str::from_utf8(&bounded_loader_plan_json()).expect("utf8 plan"),
+    )
+    .expect("omitted review_lenses deserialize the stacked default");
+    assert_eq!(omitted.plan.review_lenses, lenses);
+    assert_eq!(
+        omitted.plan.review_aggregation_policy,
+        ReviewAggregationPolicy::AllMustAccept
+    );
+    validate_legacy_supervisor_plan(omitted.plan)
+        .expect("omitted-lens plan validates as the three-scope stack");
 }
 
 #[test]
@@ -3889,6 +3907,7 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
     )
     .expect("base plan")
     .plan;
+    plan.review_lenses = single_parent_acceptance_review_lenses();
     plan.model_pricing = BTreeMap::from([
         (
             "planner-model".to_string(),
@@ -4254,11 +4273,12 @@ fn final_usage_evidence_preserves_rejected_and_active_auditor_models() {
 
 #[test]
 fn empty_process_usage_has_no_synthetic_supervisor_or_worker_totals() {
-    let plan = parse_supervisor_plan_with_consultant(
+    let mut plan = parse_supervisor_plan_with_consultant(
         std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),
     )
     .expect("base plan")
     .plan;
+    plan.review_lenses = single_parent_acceptance_review_lenses();
     let RoleUsageAggregation {
         reports: by_role,
         lens_reports,

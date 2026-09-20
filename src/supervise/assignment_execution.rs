@@ -5338,6 +5338,7 @@ mod decomposition_tests {
     use super::super::scheduler::{
         assignment_budget_policy_for_test, AssignmentBudgetPolicyRequest,
     };
+    use super::super::tests::single_parent_acceptance_review_lenses;
     use super::*;
     #[cfg(target_os = "linux")]
     use crate::external_agent::run_external_agent_nonpublishable_simulation;
@@ -6905,7 +6906,7 @@ mod decomposition_tests {
             licensed_breakage: None,
             notes: None,
         };
-        let mut lenses = default_supervisor_review_lenses();
+        let mut lenses = single_parent_acceptance_review_lenses();
         let second_lens = lenses[0].clone();
         lenses.push(ReviewLensConfig {
             id: "parent-acceptance-followup".to_string(),
@@ -10271,6 +10272,7 @@ done
     #[test]
     fn auditor_runtime_override_preserves_active_heterogeneous_lens_contract() -> Result<()> {
         let mut plan = valid_child_plan_with_nested_worker()?;
+        plan.review_lenses = single_parent_acceptance_review_lenses();
         let (initial_model, initial_effort) = match &plan.review_lenses[0].backend {
             ReviewLensBackendConfig::Model {
                 model,

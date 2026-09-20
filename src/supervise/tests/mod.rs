@@ -379,6 +379,18 @@ fn injected_named_assignment(id: &str, path: &str) -> OrchestratorAssignment {
     }
 }
 
+pub(crate) fn single_parent_acceptance_review_lenses() -> Vec<ReviewLensConfig> {
+    vec![ReviewLensConfig {
+        id: "parent-acceptance".to_string(),
+        backend: ReviewLensBackendConfig::Model {
+            backend_id: "openai".to_string(),
+            model: DEFAULT_PROFILE_MODEL.to_string(),
+            reasoning_effort: Some("xhigh".to_string()),
+        },
+        information_scope: ReviewInformationScope::FullChildTranscript,
+    }]
+}
+
 fn injected_multi_plan(
     assignments: Vec<OrchestratorAssignment>,
     max_child_retries: u8,
@@ -395,7 +407,7 @@ fn injected_multi_plan(
         semantic_coordination: SemanticCoordinationMode::Off,
         role_models: BTreeMap::new(),
         model_pricing: BTreeMap::new(),
-        review_lenses: default_supervisor_review_lenses(),
+        review_lenses: single_parent_acceptance_review_lenses(),
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments,
     }
@@ -437,7 +449,7 @@ fn injected_plan(assignment: OrchestratorAssignment, max_child_retries: u8) -> S
         semantic_coordination: SemanticCoordinationMode::Off,
         role_models: BTreeMap::new(),
         model_pricing: BTreeMap::new(),
-        review_lenses: default_supervisor_review_lenses(),
+        review_lenses: single_parent_acceptance_review_lenses(),
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments: vec![assignment],
     }
