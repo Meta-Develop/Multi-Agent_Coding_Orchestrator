@@ -22,6 +22,9 @@ use std::sync::Mutex;
 
 const ATTEMPT_EVIDENCE_VERSION: u32 = 1;
 const ATTEMPT_EVIDENCE_DIR: &str = "selection-attempts";
+const PARENT_AUTHORIZED_RETRY_CAUSE: &str = "parent_authorized_retry";
+const PARENT_AUDITOR_AUTHORIZED_RETRY_CAUSE: &str = "parent_auditor_authorized_retry";
+const FINAL_PARENT_ASSIGNMENT_REVIEW_CAUSE: &str = "final_parent_assignment_review";
 const DATED_PLAN_COST_MICROUNITS_PER_USD: f64 = 100_000.0;
 const DATED_PLAN_TOKENS_PER_MILLION: f64 = 1_000_000.0;
 
@@ -73,8 +76,10 @@ pub(super) struct AttemptOutcomeEvidence {
     /// A configured launch is a request. Only provider/session evidence may set
     /// this field; current supervisor telemetry cannot resolve it.
     pub observed_candidate: Option<CandidateKey>,
-    /// A retry is a parent decision. Terminal acceptance is established from
-    /// the authenticated final assignment report when history is loaded.
+    /// A retry is a parent decision (`Rejected` + retry cause). Terminal accept
+    /// is stamped by the parent as `Accepted` with
+    /// `final_parent_assignment_review`. Frozen history still infers a missing
+    /// terminal result from a prior run's authenticated final assignment report.
     pub parent_result: Option<OutcomeResult>,
     pub parent_cause: Option<String>,
     pub failure_class: Option<FailureClass>,
@@ -264,7 +269,7 @@ pub(super) fn record_child_attempt_outcome_with_account_observe(
         requested_effort: requested_effort.map(str::to_string),
         observed_candidate,
         parent_result: retried.then_some(OutcomeResult::Rejected),
-        parent_cause: retried.then(|| "parent_authorized_retry".to_string()),
+        parent_cause: retried.then(|| PARENT_AUTHORIZED_RETRY_CAUSE.to_string()),
         failure_class: None,
         costs: AttemptAttributableCosts {
             execution_cost_microunits,
@@ -908,8 +913,56 @@ pub(super) fn record_parent_auditor_retry(
 ) -> Result<()> {
     let mut rejected = original.clone();
     rejected.parent_result = Some(OutcomeResult::Rejected);
-    rejected.parent_cause = Some("parent_auditor_authorized_retry".to_string());
+    rejected.parent_cause = Some(PARENT_AUDITOR_AUTHORIZED_RETRY_CAUSE.to_string());
     write_attempt_evidence(artifacts, &rejected)
+}
+
+fn apply_parent_terminal_assignment_result(
+    original: &AttemptOutcomeEvidence,
+    result: OutcomeResult,
+    failure_class: Option<FailureClass>,
+) -> Result<AttemptOutcomeEvidence> {
+    if original.parent_result.is_some() {
+        bail!("terminal assignment stamp refuses to overwrite an existing parent_result");
+    }
+    match result {
+        OutcomeResult::Accepted | OutcomeResult::Rejected => {}
+        OutcomeResult::Blocked => {
+            bail!("terminal assignment stamp refuses Blocked; persist only Accepted or Rejected");
+        }
+    }
+    let mut stamped = original.clone();
+    stamped.parent_result = Some(result);
+    stamped.parent_cause = Some(FINAL_PARENT_ASSIGNMENT_REVIEW_CAUSE.to_string());
+    stamped.failure_class = failure_class;
+    Ok(stamped)
+}
+
+/// Rewrite this-run attempt evidence after the parent reaches a terminal
+/// assignment result. Keeps costs and selection binding; does not invent costs.
+pub(super) fn record_parent_terminal_assignment_result(
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    original: &AttemptOutcomeEvidence,
+    result: OutcomeResult,
+    failure_class: Option<FailureClass>,
+) -> Result<AttemptOutcomeEvidence> {
+    let stamped = apply_parent_terminal_assignment_result(original, result, failure_class)?;
+    write_attempt_evidence(artifacts, &stamped)?;
+    Ok(stamped)
+}
+
+fn parent_result_is_live_authenticated_stamp(row: &AttemptOutcomeEvidence) -> bool {
+    match (row.parent_result, row.parent_cause.as_deref()) {
+        (
+            Some(OutcomeResult::Rejected),
+            Some(PARENT_AUTHORIZED_RETRY_CAUSE | PARENT_AUDITOR_AUTHORIZED_RETRY_CAUSE),
+        ) => true,
+        (
+            Some(OutcomeResult::Accepted | OutcomeResult::Rejected),
+            Some(FINAL_PARENT_ASSIGNMENT_REVIEW_CAUSE),
+        ) => true,
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1105,12 +1158,7 @@ pub(super) fn load_frozen_outcome_history(
                 || final_assignments
                     .first()
                     .is_some_and(|item| item.role != binding.role)
-                || (row.parent_result.is_some()
-                    && (row.parent_result != Some(OutcomeResult::Rejected)
-                        || !matches!(
-                            row.parent_cause.as_deref(),
-                            Some("parent_authorized_retry" | "parent_auditor_authorized_retry")
-                        )))
+                || (row.parent_result.is_some() && !parent_result_is_live_authenticated_stamp(&row))
             {
                 exclusions.push(format!("{}:ambiguous_or_unreviewed_result", source));
                 continue;
@@ -1131,7 +1179,7 @@ pub(super) fn load_frozen_outcome_history(
                 });
                 row.parent_cause = row
                     .parent_result
-                    .map(|_| "final_parent_assignment_review".to_string());
+                    .map(|_| FINAL_PARENT_ASSIGNMENT_REVIEW_CAUSE.to_string());
             }
             sources.push(source.clone());
             let key = (row.run_id.clone(), row.assignment_id.clone(), row.attempt);
@@ -1354,7 +1402,7 @@ mod tests {
             requested_effort: Some("high".to_string()),
             observed_candidate: Some(candidate),
             parent_result: Some(OutcomeResult::Accepted),
-            parent_cause: Some("final_parent_assignment_review".to_string()),
+            parent_cause: Some(FINAL_PARENT_ASSIGNMENT_REVIEW_CAUSE.to_string()),
             failure_class: None,
             costs: AttemptAttributableCosts {
                 execution_cost_microunits: Some(5),
@@ -1373,6 +1421,7 @@ mod tests {
         DebugOverride,
         AssignmentDegrade,
         AuditorRetry,
+        TerminalAccept,
     }
 
     fn write_authenticated_fixture(
@@ -1426,7 +1475,9 @@ mod tests {
             attempt: 0,
             role: AgentRole::Worker,
             primary_cause: match mode {
-                AuthenticatedFixtureMode::Initial | AuthenticatedFixtureMode::AuditorRetry => {
+                AuthenticatedFixtureMode::Initial
+                | AuthenticatedFixtureMode::AuditorRetry
+                | AuthenticatedFixtureMode::TerminalAccept => {
                     SupervisorSelectionEventCause::Initial
                 }
                 AuthenticatedFixtureMode::DebugOverride => {
@@ -1493,7 +1544,11 @@ mod tests {
         )?;
         if mode == AuthenticatedFixtureMode::AuditorRetry {
             evidence.parent_result = Some(OutcomeResult::Rejected);
-            evidence.parent_cause = Some("parent_auditor_authorized_retry".to_string());
+            evidence.parent_cause = Some(PARENT_AUDITOR_AUTHORIZED_RETRY_CAUSE.to_string());
+        }
+        if mode == AuthenticatedFixtureMode::TerminalAccept {
+            evidence.parent_result = Some(OutcomeResult::Accepted);
+            evidence.parent_cause = Some(FINAL_PARENT_ASSIGNMENT_REVIEW_CAUSE.to_string());
         }
         writer.write_json(
             Path::new("selection-attempts/assignment-1.attempt-1.json"),
@@ -1943,6 +1998,284 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].attempt_id, "run-1:assignment-1:1");
         assert_eq!(rows[0].result, OutcomeResult::Accepted);
+        Ok(())
+    }
+
+    fn automatic_selector_for_this_run() -> Result<(
+        RuntimeModelCatalog,
+        SupervisorAutomaticSelectionState,
+        CandidateKey,
+        TaskProfile,
+    )> {
+        let priors = crate::selection::built_in_prior_dataset()?;
+        let catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(
+            priors
+                .models
+                .iter()
+                .filter(|prior| prior.runtime == "codex")
+                .map(|prior| prior.model.clone()),
+        )?);
+        let admission = SupervisorAdmissionPolicyInput {
+            entrypoint_bound: 1,
+            plan: SupervisorAdmissionConfig::default(),
+            cli: SupervisorAdmissionConfig::default(),
+            effective: SupervisorAdmissionConfig::default(),
+            provider_inflight_bound: 1,
+            provider_inflight_source: AdmissionInputSource::ConservativeDefault,
+            quota_inflight_bound: None,
+            quota_inflight_source: None,
+            quota_config_path: None,
+            host: SupervisorHostResourcePolicyInput {
+                memory_available_mib: None,
+                memory_available_source: AdmissionInputSource::ConservativeDefault,
+                memory_per_child_mib: DEFAULT_HOST_MEMORY_PER_CHILD_MIB,
+                memory_bound: None,
+                fd_available: None,
+                fd_available_source: AdmissionInputSource::ConservativeDefault,
+                fds_per_child: DEFAULT_HOST_FDS_PER_CHILD,
+                fd_bound: None,
+                disk_available_mib: None,
+                disk_available_source: AdmissionInputSource::ConservativeDefault,
+                disk_per_child_mib: DEFAULT_HOST_DISK_PER_CHILD_MIB,
+                disk_bound: None,
+                fallback_children: DEFAULT_HOST_FALLBACK_CHILDREN,
+                resolved_bound: 1,
+            },
+            resolved_bound: 1,
+        };
+        let mut plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "this-run accepted persist fixture".to_string(),
+            task_file: None,
+            max_depth: MIN_SUPERVISOR_DEPTH,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+            assignments: Vec::new(),
+        };
+        let resolved = ResolvedObjectiveProfile {
+            profile: crate::objective_profile::default_objective_profile().binding()?,
+            source: crate::objective_profile::ObjectiveProfileSource::BuiltIn,
+        };
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &admission,
+            &AdvertisedCatalogSet::empty(),
+            Some(&resolved),
+        )?;
+        let state = resolution
+            .automatic_state
+            .context("automatic selector state")?;
+        let worker = resolution
+            .decisions
+            .iter()
+            .find(|event| event.role == AgentRole::Worker)
+            .context("worker decision")?;
+        let candidate = worker
+            .provenance
+            .choice
+            .as_ref()
+            .context("worker choice")?
+            .candidate
+            .clone();
+        Ok((
+            catalog,
+            state,
+            candidate,
+            worker.provenance.normalized_input.task.clone(),
+        ))
+    }
+
+    fn posterior_quality_for(
+        reselection: &SupervisorReselection,
+        candidate: &CandidateKey,
+    ) -> Result<u16> {
+        reselection
+            .decisions
+            .first()
+            .context("reselect decision")?
+            .1
+            .candidate_set
+            .iter()
+            .find(|item| item.candidate == *candidate)
+            .and_then(|item| item.score.as_ref())
+            .map(|score| score.posterior_quality_basis_points)
+            .context("candidate posterior quality")
+    }
+
+    fn unset_terminal_parent_result(
+        mut evidence: AttemptOutcomeEvidence,
+    ) -> AttemptOutcomeEvidence {
+        evidence.parent_result = None;
+        evidence.parent_cause = None;
+        evidence.failure_class = None;
+        evidence
+    }
+
+    #[test]
+    fn record_parent_terminal_accept_preserves_costs_and_selection() -> Result<()> {
+        let original = unset_terminal_parent_result(fixture());
+        let stamped =
+            apply_parent_terminal_assignment_result(&original, OutcomeResult::Accepted, None)?;
+        assert_eq!(stamped.parent_result, Some(OutcomeResult::Accepted));
+        assert_eq!(
+            stamped.parent_cause.as_deref(),
+            Some(FINAL_PARENT_ASSIGNMENT_REVIEW_CAUSE)
+        );
+        assert_eq!(stamped.failure_class, None);
+        assert_eq!(stamped.costs, original.costs);
+        assert_eq!(stamped.selection, original.selection);
+        assert_eq!(stamped.observed_candidate, original.observed_candidate);
+        Ok(())
+    }
+
+    #[test]
+    fn record_parent_terminal_model_quality_reject_stamps_failure_class() -> Result<()> {
+        let original = unset_terminal_parent_result(fixture());
+        let stamped = apply_parent_terminal_assignment_result(
+            &original,
+            OutcomeResult::Rejected,
+            Some(FailureClass::ModelQuality),
+        )?;
+        assert_eq!(stamped.parent_result, Some(OutcomeResult::Rejected));
+        assert_eq!(
+            stamped.parent_cause.as_deref(),
+            Some(FINAL_PARENT_ASSIGNMENT_REVIEW_CAUSE)
+        );
+        assert_eq!(stamped.failure_class, Some(FailureClass::ModelQuality));
+        assert_eq!(stamped.costs, original.costs);
+        Ok(())
+    }
+
+    #[test]
+    fn record_parent_terminal_result_refuses_overwrite_and_blocked() {
+        let overwrite =
+            apply_parent_terminal_assignment_result(&fixture(), OutcomeResult::Accepted, None)
+                .expect_err("existing parent_result must not be overwritten");
+        assert!(overwrite
+            .to_string()
+            .contains("refuses to overwrite an existing parent_result"));
+        let blocked = apply_parent_terminal_assignment_result(
+            &unset_terminal_parent_result(fixture()),
+            OutcomeResult::Blocked,
+            None,
+        )
+        .expect_err("Blocked must stay fail-closed");
+        assert!(blocked.to_string().contains("refuses Blocked"));
+    }
+
+    #[test]
+    fn this_run_terminal_accept_moves_reselect_posterior() -> Result<()> {
+        let (catalog, state, candidate, task) = automatic_selector_for_this_run()?;
+        let temp = tempfile::TempDir::new()?;
+        let attempts = temp.path().join(ATTEMPT_EVIDENCE_DIR);
+        std::fs::create_dir_all(&attempts)?;
+        let mut evidence = unset_terminal_parent_result(fixture());
+        evidence.run_id = "this-run-terminal-accept".to_string();
+        evidence.selection = Some(AttemptSelectionBinding {
+            role: AgentRole::Worker,
+            event_assignment_id: None,
+            event_attempt: 0,
+            normalized_input_sha256: "this-run-digest".to_string(),
+            task,
+            requested_candidate: candidate.clone(),
+        });
+        evidence.requested_runtime = candidate.runtime.clone();
+        evidence.requested_model = Some(candidate.model.clone());
+        evidence.requested_effort = Some(selector_effort_as_str(candidate.effort).to_string());
+        evidence.observed_candidate = Some(candidate.clone());
+        let stamped =
+            apply_parent_terminal_assignment_result(&evidence, OutcomeResult::Accepted, None)?;
+        std::fs::write(
+            attempts.join("assignment-1.attempt-1.json"),
+            serde_json::to_vec(&stamped)?,
+        )?;
+        let rows = load_this_run_outcome_records(temp.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].result, OutcomeResult::Accepted);
+        assert_eq!(rows[0].candidate, candidate);
+
+        let mut baseline_state = state.clone();
+        let baseline = reselect_roles_from_supplied_catalog_snapshot(
+            &mut baseline_state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::Worker],
+            1,
+            crate::selection::BudgetSignal::Continue,
+            &[],
+        )?;
+        let baseline_quality = posterior_quality_for(&baseline, &candidate)?;
+        assert!(baseline.decisions[0].1.normalized_input.outcomes.is_empty());
+
+        let mut accepted_state = state;
+        accepted_state.set_this_run_outcomes(rows);
+        let accepted_reselect = reselect_roles_from_supplied_catalog_snapshot(
+            &mut accepted_state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::Worker],
+            1,
+            crate::selection::BudgetSignal::Continue,
+            &[],
+        )?;
+        assert_ne!(
+            baseline_quality,
+            posterior_quality_for(&accepted_reselect, &candidate)?
+        );
+        assert_eq!(
+            accepted_reselect.decisions[0]
+                .1
+                .normalized_input
+                .outcomes
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_terminal_accept_projects_in_later_run_and_skips_current_run() -> Result<()> {
+        let (_temp, repo) = super::super::tests::injected_repository();
+        write_authenticated_fixture(
+            &repo,
+            "persisted-accept-history",
+            true,
+            false,
+            false,
+            false,
+            AuthenticatedFixtureMode::TerminalAccept,
+        )?;
+        write_authenticated_fixture(
+            &repo,
+            "current-stamped-run",
+            true,
+            false,
+            false,
+            false,
+            AuthenticatedFixtureMode::TerminalAccept,
+        )?;
+        let current = RunId::new("current-stamped-run")?;
+        let frozen = load_frozen_outcome_history(&repo, &current)?;
+        assert_eq!(frozen.rows.len(), 1);
+        assert_eq!(
+            frozen.rows[0].attempt_id,
+            "persisted-accept-history:assignment-1:1"
+        );
+        assert_eq!(frozen.rows[0].result, OutcomeResult::Accepted);
+        assert!(!frozen
+            .provenance
+            .source_digests
+            .iter()
+            .any(|source| source.starts_with("current-stamped-run:")));
         Ok(())
     }
 
