@@ -99,7 +99,10 @@ The current implementation covers a local-first command-line slice:
   `--role-category` stamps every assignment (and nested worker assignment) as
   `selection_source=operator_override`; omitting it keeps automatic selection
   derived from the plan role. Resume of an existing run refuses a new
-  `--role-category`. The command selects the Codex runtime by default. Normalized planning-phase Codex
+  `--role-category`. A loadable plan sniffs `assignment.runtime` and otherwise
+  defaults to Codex; `--from-goal`, `--literal-goal`, missing, and unparsable
+  plans require explicit `--runtime`. Bare `maco <instruction>` injects
+  `--runtime codex`. Normalized planning-phase Codex
   children receive a read-only workspace and read-only access to their own Git
   worktree metadata in both the outer systemd containment and inner Codex
   permission profile. Only their exact private final-message staging root is
@@ -3337,7 +3340,7 @@ cargo run -- supervise run supervisor-plan.json --repo . --run-id supervise-role
   --machine-global-runtime-root-id runtime --json
 # Decompose the goal and execute that same validated plan through the live gates:
 cargo run -- supervise run --from-goal goal.md --repo . \
-  --run-id supervise-goal-demo --codex-bin codex \
+  --run-id supervise-goal-demo --runtime codex --codex-bin codex \
   --machine-global-config /exact/path/to/machine-global.json \
   --machine-global-runtime-root-id runtime --json
 # Explicit serial opt-out:
@@ -3777,11 +3780,14 @@ The shipped spine is `maco <instruction>`, `maco supervise run`, and
 `supervise run` accepts a positional task/plan or decomposes
 `--from-goal <file>` through the same planner as `supervise plan`, then
 executes the validated plan through the live supervisor gates. Pass
-`--runtime fake` for the deterministic in-process Fake runtime. Omitting
-`--runtime` sniffs the plan assignment runtime and otherwise defaults to
-Codex; omitting `--codex-bin` does not select Fake. A bare
-`maco <instruction>` inherits that sniff and treats extra words as goal
-text, so stay local with `supervise run --literal-goal ... --runtime fake`.
+`--runtime fake` for the deterministic in-process Fake runtime. A bare
+`maco <instruction>` is an explicit live Codex launch: the rewriter injects
+`--runtime codex` after `--literal-goal` and treats extra words as goal
+text. Omitting `--runtime` on `supervise run` sniffs a loadable plan
+assignment runtime and otherwise fail-closes, naming `--runtime`; it does
+not silently choose Codex for `--literal-goal` or `--from-goal`. Omitting
+`--codex-bin` does not select Fake. Stay local with
+`supervise run --literal-goal ... --runtime fake`.
 Explicit `supervise run` must name the reviewed machine-global
 configuration and runtime root used by supervise output-staging cleanup;
 `maco <instruction>` resolves the default machine-global binding when those

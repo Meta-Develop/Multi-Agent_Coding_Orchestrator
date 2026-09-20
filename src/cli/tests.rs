@@ -2321,3 +2321,176 @@ fn supervise_reaudit_requires_authenticated_source_scope_and_cleanup_binding() {
         Cli::try_parse_from(["maco", "supervise", "re-audit", "source-run", "child-a",]).is_err()
     );
 }
+
+fn sniff_fixture_repo() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("src");
+    fs::write(repo.join("README.md"), "hello\n").expect("readme");
+    git2::Repository::init(&repo).expect("init repository");
+    (temp, repo)
+}
+
+fn write_sniff_plan(path: &Path, runtime: Option<&str>) {
+    let mut assignment = serde_json::json!({
+        "id": "child-a",
+        "phase": "execution",
+        "assigned_paths": ["README.md"],
+        "worker_assignments": []
+    });
+    if let Some(runtime) = runtime {
+        assignment["runtime"] = serde_json::json!(runtime);
+    }
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "task": "sniff fixture",
+            "assignments": [assignment]
+        }))
+        .expect("serialize sniff plan"),
+    )
+    .expect("write sniff plan");
+}
+
+fn write_cited_sniff_plan(path: &Path) {
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "task": "decision-ref sniff fixture",
+            "max_depth": 2,
+            "max_child_assignments": 1,
+            "assignments": [{
+                "id": "child-a",
+                "phase": "execution",
+                "role": "child_orchestrator",
+                "assigned_paths": ["README.md"],
+                "worker_assignments": [],
+                "decision_refs": [{
+                    "question_key": "api.transport",
+                    "expected_resolution": "Use HTTP"
+                }]
+            }],
+            "assignment_schedule": [{
+                "assignment_id": "child-a",
+                "depth": 2,
+                "flattened_index": 0
+            }]
+        }))
+        .expect("serialize cited sniff plan"),
+    )
+    .expect("write cited sniff plan");
+}
+
+#[test]
+fn sniff_loadable_plan_without_assignment_runtime_defaults_codex() {
+    let (_temp, repo) = sniff_fixture_repo();
+    let plan = repo.join("plan.json");
+    write_sniff_plan(&plan, None);
+    assert_eq!(
+        sniff_supervise_runtime_from_plan(&plan, &repo).expect("loadable plan sniffs"),
+        supervise::SupervisorRuntime::Codex
+    );
+}
+
+#[test]
+fn sniff_loadable_plan_with_assignment_runtime_uses_plan_runtime() {
+    let (_temp, repo) = sniff_fixture_repo();
+    let plan = repo.join("plan.json");
+    write_sniff_plan(&plan, Some("grok"));
+    assert_eq!(
+        sniff_supervise_runtime_from_plan(&plan, &repo).expect("plan runtime sniffs"),
+        supervise::SupervisorRuntime::Grok
+    );
+}
+
+#[test]
+fn sniff_missing_and_unparsable_plans_require_runtime() {
+    let (_temp, repo) = sniff_fixture_repo();
+    let missing = sniff_supervise_runtime_from_plan(&repo.join("missing.json"), &repo)
+        .expect_err("missing plan must fail closed");
+    assert_eq!(missing.to_string(), SUPERVISE_SNIFF_RUNTIME_REQUIRED);
+
+    let unparsable = repo.join("goal.md");
+    fs::write(&unparsable, "Update README.md.\n").expect("write unparsable plan");
+    let error = sniff_supervise_runtime_from_plan(&unparsable, &repo)
+        .expect_err("unparsable plan must fail closed");
+    assert_eq!(error.to_string(), SUPERVISE_SNIFF_RUNTIME_REQUIRED);
+}
+
+#[test]
+fn sniff_literal_instruction_sentinel_requires_runtime() {
+    let (_temp, repo) = sniff_fixture_repo();
+    let error = sniff_supervise_runtime_from_plan(Path::new("<literal-instruction>"), &repo)
+        .expect_err("literal sentinel must fail closed");
+    assert_eq!(error.to_string(), SUPERVISE_SNIFF_RUNTIME_REQUIRED);
+}
+
+#[test]
+fn sniff_decision_ref_load_error_is_not_a_runtime_fallback() {
+    let (_temp, repo) = sniff_fixture_repo();
+    let plan = repo.join("cited.json");
+    write_cited_sniff_plan(&plan);
+    let error = sniff_supervise_runtime_from_plan(&plan, &repo)
+        .expect_err("cited plan without a store must stay a DecisionRef error");
+    assert!(
+        decision_ref_error_in_chain(&error),
+        "DecisionRef must remain in the error chain: {error:#}"
+    );
+    assert_ne!(error.to_string(), SUPERVISE_SNIFF_RUNTIME_REQUIRED);
+    assert!(
+        format!("{error:#}").contains("decision store is missing"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn route_literal_instruction_args_injects_explicit_codex_runtime() {
+    let routed = route_literal_instruction_args(["maco", "Update README.md"]);
+    assert_eq!(
+        routed,
+        [
+            OsString::from("maco"),
+            OsString::from("supervise"),
+            OsString::from("run"),
+            OsString::from("--literal-goal"),
+            OsString::from("Update README.md"),
+            OsString::from("--runtime"),
+            OsString::from("codex"),
+        ]
+    );
+
+    let forced =
+        route_literal_instruction_args(["maco", "--", "supervise", "is quoted instruction text"]);
+    assert_eq!(
+        forced,
+        [
+            OsString::from("maco"),
+            OsString::from("supervise"),
+            OsString::from("run"),
+            OsString::from("--literal-goal"),
+            OsString::from("supervise is quoted instruction text"),
+            OsString::from("--runtime"),
+            OsString::from("codex"),
+        ]
+    );
+
+    let parsed = Cli::try_parse_from(routed).expect("routed literal must parse");
+    let supervise = expect_supervise_command(parsed.command);
+    let SuperviseSubcommand::Run(args) = supervise.command else {
+        panic!("expected supervise run");
+    };
+    assert_eq!(args.runtime, Some(supervise::SupervisorRuntime::Codex));
+    assert_eq!(args.literal_goal.as_deref(), Some("Update README.md"));
+
+    assert_eq!(
+        route_literal_instruction_args(["maco", "supervise", "status", "run-id"]),
+        [
+            OsString::from("maco"),
+            OsString::from("supervise"),
+            OsString::from("status"),
+            OsString::from("run-id"),
+        ]
+    );
+}

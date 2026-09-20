@@ -136,7 +136,9 @@ pub struct Cli {
 /// instruction whose first word is an explicit subcommand name or looks like
 /// an option. Every routed argument is joined with one ASCII space and passed
 /// as one literal goal/spec, so option-shaped words after the first instruction
-/// word remain instruction text rather than becoming MACO options.
+/// word remain instruction text rather than becoming MACO options. The rewriter
+/// injects `--runtime codex` after `--literal-goal` so a bare
+/// `maco <instruction>` is an explicit live Codex launch.
 pub fn route_literal_instruction_args<I, T>(args: I) -> Vec<OsString>
 where
     I: IntoIterator<Item = T>,
@@ -173,6 +175,8 @@ where
         OsString::from("run"),
         OsString::from("--literal-goal"),
         instruction,
+        OsString::from("--runtime"),
+        OsString::from("codex"),
     ]
 }
 
@@ -4749,6 +4753,14 @@ fn execute_eval_harness_v2_operator_path(
     serde_json::to_value(results).context("failed to serialize eval-harness v2 result")
 }
 
+const SUPERVISE_SNIFF_RUNTIME_REQUIRED: &str =
+    "supervise run has no loadable plan at sniff time; pass --runtime";
+
+/// Resolve the omitted `--runtime` default from a loadable supervisor plan.
+///
+/// A loaded assignment that omits `runtime` still defaults to Codex. Missing,
+/// unparsable, `--from-goal`, and `--literal-goal` plans fail closed and require
+/// an explicit `--runtime`. DecisionRef load errors stay DecisionRef errors.
 fn sniff_supervise_runtime_from_plan(
     plan_file: &Path,
     repo: &Path,
@@ -4760,7 +4772,7 @@ fn sniff_supervise_runtime_from_plan(
             .and_then(|assignment| assignment.runtime)
             .unwrap_or(supervise::SupervisorRuntime::Codex)),
         Err(error) if decision_ref_error_in_chain(&error) => Err(error),
-        Err(_) => Ok(supervise::SupervisorRuntime::Codex),
+        Err(error) => Err(error.context(SUPERVISE_SNIFF_RUNTIME_REQUIRED)),
     }
 }
 
@@ -5137,6 +5149,41 @@ mod cli_integration_tests {
         "--machine-global-runtime-root-id",
         "runtime",
     ];
+
+    #[test]
+    fn supervise_run_parses_explicit_runtime_overrides_for_literal_and_goal_sources() {
+        let literal = supervise_run_args(&[
+            "maco",
+            "supervise",
+            "run",
+            "--literal-goal",
+            "Update README.md",
+            "--runtime",
+            "fake",
+            LAUNCH_RETENTION[0],
+            LAUNCH_RETENTION[1],
+            LAUNCH_RETENTION[2],
+            LAUNCH_RETENTION[3],
+        ]);
+        assert_eq!(literal.runtime, Some(supervise::SupervisorRuntime::Fake));
+        assert_eq!(literal.literal_goal.as_deref(), Some("Update README.md"));
+
+        let from_goal = supervise_run_args(&[
+            "maco",
+            "supervise",
+            "run",
+            "--from-goal",
+            "goal.md",
+            "--runtime",
+            "grok",
+            LAUNCH_RETENTION[0],
+            LAUNCH_RETENTION[1],
+            LAUNCH_RETENTION[2],
+            LAUNCH_RETENTION[3],
+        ]);
+        assert_eq!(from_goal.runtime, Some(supervise::SupervisorRuntime::Grok));
+        assert_eq!(from_goal.from_goal, Some(PathBuf::from("goal.md")));
+    }
 
     #[test]
     fn supervise_role_category_override_defaults_to_automatic() {

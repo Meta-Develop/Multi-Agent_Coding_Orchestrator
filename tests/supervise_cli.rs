@@ -1704,6 +1704,84 @@ fn supervise_run_help_documents_auto_concurrency_default() -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn supervise_run_without_loadable_plan_requires_runtime() -> Result<()> {
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+
+    let literal = run_failure_stderr(&[
+        "supervise",
+        "run",
+        "--literal-goal",
+        "Update README.md without touching Rust.",
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "literal-no-runtime",
+        "--json",
+    ])?;
+    assert!(
+        literal.contains("--runtime"),
+        "literal-goal sniff must name --runtime: {literal}"
+    );
+    assert!(!repo_path.join(".maco/o2/runs/literal-no-runtime").exists());
+
+    let goal_path = temp.path().join("run-goal.md");
+    fs::write(&goal_path, "Update README.md.\n")?;
+    let from_goal = run_failure_stderr(&[
+        "supervise",
+        "run",
+        "--from-goal",
+        path_str(&goal_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "from-goal-no-runtime",
+        "--json",
+    ])?;
+    assert!(
+        from_goal.contains("--runtime"),
+        "from-goal sniff must name --runtime: {from_goal}"
+    );
+    assert!(!repo_path
+        .join(".maco/o2/runs/from-goal-no-runtime")
+        .exists());
+
+    let missing = run_failure_stderr(&[
+        "supervise",
+        "run",
+        path_str(&temp.path().join("missing-plan.json"))?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "missing-plan-no-runtime",
+        "--json",
+    ])?;
+    assert!(
+        missing.contains("--runtime"),
+        "missing plan sniff must name --runtime: {missing}"
+    );
+
+    let unparsable = temp.path().join("not-a-plan.txt");
+    fs::write(&unparsable, "this is not a supervisor plan\n")?;
+    let unparsable_error = run_failure_stderr(&[
+        "supervise",
+        "run",
+        path_str(&unparsable)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "unparsable-plan-no-runtime",
+        "--json",
+    ])?;
+    assert!(
+        unparsable_error.contains("--runtime"),
+        "unparsable plan sniff must name --runtime: {unparsable_error}"
+    );
+    Ok(())
+}
+
 #[test]
 fn supervise_help_is_runtime_neutral() -> Result<()> {
     let top = Command::new(BIN).args(["--help"]).output()?;
