@@ -952,17 +952,16 @@ pub(super) fn record_parent_terminal_assignment_result(
 }
 
 fn parent_result_is_live_authenticated_stamp(row: &AttemptOutcomeEvidence) -> bool {
-    match (row.parent_result, row.parent_cause.as_deref()) {
+    matches!(
+        (row.parent_result, row.parent_cause.as_deref()),
         (
             Some(OutcomeResult::Rejected),
             Some(PARENT_AUTHORIZED_RETRY_CAUSE | PARENT_AUDITOR_AUTHORIZED_RETRY_CAUSE),
-        ) => true,
-        (
+        ) | (
             Some(OutcomeResult::Accepted | OutcomeResult::Rejected),
             Some(FINAL_PARENT_ASSIGNMENT_REVIEW_CAUSE),
-        ) => true,
-        _ => false,
-    }
+        )
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
