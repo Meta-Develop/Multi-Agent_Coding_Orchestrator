@@ -230,9 +230,10 @@ pub(super) fn run_generated_follow_up_cascade(
         whole_primary_baseline_sha256: primary_baseline.clone(),
         machine_global_retention: retained_binding,
     })?;
-    let bounds = GeneratedFollowUpQueueBounds::from_validated_source_plan_and_tasks(
+    let bounds = GeneratedFollowUpQueueBounds::from_validated_source_plan_and_tasks_in_repo(
         &source_loaded.plan,
         &source_report.generated_follow_up_tasks,
+        Some(repo),
     )?;
     let mut queue = GeneratedFollowUpQueue::create_or_open(authenticator, source, bounds)?;
     #[cfg(test)]

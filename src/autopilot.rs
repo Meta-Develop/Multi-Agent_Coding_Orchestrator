@@ -1708,8 +1708,9 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         &supervisor_plan,
     )?;
     let supervisor_plan_path = run_dir.join(&supervisor_plan_relative);
-    let effective_supervisor_plan = supervise::load_supervisor_plan_file(&supervisor_plan_path)
-        .context("failed to verify the effective autopilot supervisor profile")?;
+    let effective_supervisor_plan =
+        supervise::load_supervisor_plan_file_in_repo(&supervisor_plan_path, &repo)
+            .context("failed to verify the effective autopilot supervisor profile")?;
     let authority_plan = autopilot_authority_plan(
         &plan,
         &supervisor_plan,

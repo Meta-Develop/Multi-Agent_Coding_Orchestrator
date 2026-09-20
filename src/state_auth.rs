@@ -338,6 +338,10 @@ impl RepositoryAuthenticator {
         &self.state_root
     }
 
+    pub(crate) fn common_dir(&self) -> &Path {
+        self.common_root.path()
+    }
+
     pub(crate) fn verify_repository_binding(&self, expected: &RepositoryAuthBinding) -> Result<()> {
         validate_repository_binding(expected)?;
         self.verify()?;

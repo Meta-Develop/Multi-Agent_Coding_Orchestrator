@@ -248,7 +248,13 @@ fn supervisor_plan_and_consultant_from_goal_spec(
 ) -> Result<LoadedSupervisorPlan> {
     let proposal = planning::propose_task_decomposition(repo, goal, spec)
         .context("failed to decompose goal/spec into repository workstreams")?;
-    supervisor_plan_and_consultant_from_goal_spec_proposal(goal, spec, task_file, proposal)
+    supervisor_plan_and_consultant_from_goal_spec_proposal(
+        goal,
+        spec,
+        task_file,
+        proposal,
+        Some(repo),
+    )
 }
 
 /// Lowers an already validated planning session into the ordinary supervisor
@@ -262,7 +268,10 @@ pub fn supervisor_plan_from_task_planning_session(
     spec: &str,
     session: &planning::TaskPlanningSession,
 ) -> Result<SupervisorPlan> {
-    Ok(supervisor_plan_and_consultant_from_task_planning_session(goal, spec, None, session)?.plan)
+    Ok(
+        supervisor_plan_and_consultant_from_task_planning_session(goal, spec, None, session, None)?
+            .plan,
+    )
 }
 
 /// Applies the heuristic feedback re-plan hook and lowers the revised remaining
@@ -277,8 +286,15 @@ pub fn supervisor_plan_from_feedback_replan(
     let repo = discover_repo_root(repo.as_ref())?;
     planning::replan_task_decomposition_from_feedback(&repo, session, feedback)
         .context("failed to re-plan remaining work from execution feedback")?;
-    supervisor_plan_from_task_planning_session(goal, spec, session)
-        .context("failed to lower the feedback re-plan into a supervisor plan")
+    supervisor_plan_and_consultant_from_task_planning_session(
+        goal,
+        spec,
+        None,
+        session,
+        Some(&repo),
+    )
+    .map(|loaded| loaded.plan)
+    .context("failed to lower the feedback re-plan into a supervisor plan")
 }
 
 /// Lowers an already validated planning session into the normalized,
@@ -289,7 +305,7 @@ pub fn supervisor_plan_document_from_task_planning_session(
     session: &planning::TaskPlanningSession,
 ) -> Result<Value> {
     let loaded =
-        supervisor_plan_and_consultant_from_task_planning_session(goal, spec, None, session)?;
+        supervisor_plan_and_consultant_from_task_planning_session(goal, spec, None, session, None)?;
     supervisor_plan_value(
         &loaded.plan,
         &loaded.consultant,
@@ -303,6 +319,7 @@ fn supervisor_plan_and_consultant_from_task_planning_session(
     spec: &str,
     task_file: Option<PathBuf>,
     session: &planning::TaskPlanningSession,
+    repo: Option<&Path>,
 ) -> Result<LoadedSupervisorPlan> {
     match session.source() {
         planning::TaskPlanningSource::Heuristic => {
@@ -314,10 +331,13 @@ fn supervisor_plan_and_consultant_from_task_planning_session(
                 spec,
                 task_file,
                 session.proposal().clone(),
+                repo,
             )
         }
         planning::TaskPlanningSource::Provider => {
-            supervisor_plan_and_consultant_from_provider_session(goal, spec, task_file, session)
+            supervisor_plan_and_consultant_from_provider_session(
+                goal, spec, task_file, session, repo,
+            )
         }
     }
 }
@@ -327,6 +347,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
     spec: &str,
     task_file: Option<PathBuf>,
     proposal: planning::TaskDecompositionProposal,
+    repo: Option<&Path>,
 ) -> Result<LoadedSupervisorPlan> {
     if proposal.assignments.is_empty() {
         bail!("{}", empty_goal_spec_workstream_message(&proposal));
@@ -500,7 +521,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         path_proposal: proposal.diagnostics.clone(),
         router: SupervisorRouterConfig::default(),
     };
-    let (plan, plan_metadata) = validate_supervisor_plan(plan, metadata)?;
+    let (plan, plan_metadata) = validate_supervisor_plan_in_repo(plan, metadata, repo)?;
     Ok(LoadedSupervisorPlan {
         plan,
         consultant: SupervisorConsultantPlan::default(),
@@ -1189,6 +1210,7 @@ fn supervisor_plan_and_consultant_from_provider_session(
     spec: &str,
     task_file: Option<PathBuf>,
     session: &planning::TaskPlanningSession,
+    repo: Option<&Path>,
 ) -> Result<LoadedSupervisorPlan> {
     let roots = session.provider_assignment_tree();
     if roots.is_empty() {
@@ -1251,7 +1273,7 @@ fn supervisor_plan_and_consultant_from_provider_session(
         path_proposal: session.proposal().diagnostics.clone(),
         router: SupervisorRouterConfig::default(),
     };
-    let (plan, plan_metadata) = validate_supervisor_plan(plan, metadata)
+    let (plan, plan_metadata) = validate_supervisor_plan_in_repo(plan, metadata, repo)
         .context("validated provider planning session could not be lowered safely")?;
     Ok(LoadedSupervisorPlan {
         plan,
@@ -1421,7 +1443,7 @@ pub fn bind_provider_task_planning_session_to_supervisor_run(
         bail!("supervisor execution binding requires a provider planning session and tree");
     }
     let loaded =
-        supervisor_plan_and_consultant_from_task_planning_session(goal, spec, None, session)?;
+        supervisor_plan_and_consultant_from_task_planning_session(goal, spec, None, session, None)?;
     let document = supervisor_plan_value(
         &loaded.plan,
         &loaded.consultant,
@@ -2680,6 +2702,13 @@ pub(crate) struct FrozenHeldOutProductionCallerPlan {
 pub(crate) fn freeze_held_out_production_caller_plan(
     plan_file: &Path,
 ) -> Result<FrozenHeldOutProductionCallerPlan> {
+    freeze_held_out_production_caller_plan_in_repo(plan_file, None)
+}
+
+pub(crate) fn freeze_held_out_production_caller_plan_in_repo(
+    plan_file: &Path,
+    repo: Option<&Path>,
+) -> Result<FrozenHeldOutProductionCallerPlan> {
     #[cfg(unix)]
     let caller_plan_bytes =
         BoundedRegularReader::read_tree_no_follow(plan_file, MAX_SUPERVISOR_INPUT_BYTES)
@@ -2703,12 +2732,13 @@ pub(crate) fn freeze_held_out_production_caller_plan(
             plan_file.display()
         )
     })?;
-    let loaded = parse_supervisor_plan_with_consultant(&contents).with_context(|| {
-        format!(
-            "failed to parse held-out production caller plan {}",
-            plan_file.display()
-        )
-    })?;
+    let loaded =
+        parse_supervisor_plan_with_consultant_in_repo(&contents, repo).with_context(|| {
+            format!(
+                "failed to parse held-out production caller plan {}",
+                plan_file.display()
+            )
+        })?;
     refuse_held_out_production_caller_plan(&loaded)?;
     let assignment = &loaded.plan.assignments[0];
     let caller_plan_sha256 = crate::artifacts::state_auth::sha256_hex(&caller_plan_bytes);
@@ -2727,6 +2757,14 @@ pub(crate) fn materialize_held_out_profile_effective_caller_plan(
     frozen: &FrozenHeldOutProductionCallerPlan,
     role_models: &BTreeMap<AgentRole, RoleModelSelection>,
 ) -> Result<Vec<u8>> {
+    materialize_held_out_profile_effective_caller_plan_in_repo(frozen, role_models, None)
+}
+
+pub(crate) fn materialize_held_out_profile_effective_caller_plan_in_repo(
+    frozen: &FrozenHeldOutProductionCallerPlan,
+    role_models: &BTreeMap<AgentRole, RoleModelSelection>,
+    repo: Option<&Path>,
+) -> Result<Vec<u8>> {
     let mut loaded = frozen.loaded.clone();
     loaded.plan.role_models = role_models.clone();
     for (role, selection) in &loaded.plan.role_models {
@@ -2734,7 +2772,8 @@ pub(crate) fn materialize_held_out_profile_effective_caller_plan(
             format!("profile role_models.{} fallback is invalid", role.as_str())
         })?;
     }
-    let (plan, plan_metadata) = validate_supervisor_plan(loaded.plan, loaded.plan_metadata)?;
+    let (plan, plan_metadata) =
+        validate_supervisor_plan_in_repo(loaded.plan, loaded.plan_metadata, repo)?;
     loaded.plan = plan;
     loaded.plan_metadata = plan_metadata;
     bind_assignment_role_categories(&mut loaded.plan);
@@ -2748,7 +2787,7 @@ pub(crate) fn materialize_held_out_profile_effective_caller_plan(
         .context("failed to serialize effective held-out caller plan")?;
     let effective_text = String::from_utf8(effective_bytes.clone())
         .context("effective held-out caller plan is not UTF-8")?;
-    let effective_loaded = parse_supervisor_plan_with_consultant(&effective_text)
+    let effective_loaded = parse_supervisor_plan_with_consultant_in_repo(&effective_text, repo)
         .context("effective held-out caller plan failed full-document validation")?;
     if effective_loaded.plan != loaded.plan
         || effective_loaded.consultant != loaded.consultant
@@ -5210,7 +5249,8 @@ mod decision_ref_live_reparse_tests {
     use super::*;
     #[cfg(unix)]
     use crate::artifacts::{ArtifactFileDisposition, ArtifactRunWriter, RunArtifactFamily};
-    use crate::decision_ref::DecisionRefError;
+    use crate::decision_claim::{DecisionRegistry, DecisionScope};
+    use crate::decision_ref::{check_decision_ref, DecisionRef, DecisionRefError};
     use crate::decision_store::{DecisionStore, DECISION_STORE_STATE_NAMESPACE};
     use std::fs;
 
@@ -5238,6 +5278,59 @@ mod decision_ref_live_reparse_tests {
             }]
         })
         .to_string()
+    }
+
+    fn empty_ref_assignment_plan_json() -> String {
+        serde_json::json!({
+            "version": 1,
+            "task": "decision-ref live re-parse fixture",
+            "max_depth": 2,
+            "max_child_assignments": 1,
+            "assignments": [{
+                "id": "child-a",
+                "phase": "execution",
+                "role": "child_orchestrator",
+                "assigned_paths": ["README.md"],
+                "worker_assignments": []
+            }],
+            "assignment_schedule": [{
+                "assignment_id": "child-a",
+                "depth": 2,
+                "flattened_index": 0
+            }]
+        })
+        .to_string()
+    }
+
+    fn write_plan(repo: &Path, name: &str, contents: &str) -> PathBuf {
+        let path = repo.join(name);
+        fs::write(&path, contents).expect("write plan");
+        path
+    }
+
+    fn resolved_registry() -> DecisionRegistry {
+        let registry = DecisionRegistry::new();
+        registry
+            .claim_open(
+                "api.transport",
+                "Which transport should the API use?",
+                "planner-a",
+            )
+            .expect("open claim");
+        registry
+            .resolve_claim(
+                "api.transport",
+                "planner-a",
+                "Use HTTP",
+                DecisionScope::new(
+                    ["api".to_string()],
+                    Vec::<String>::new(),
+                    Vec::<String>::new(),
+                )
+                .expect("scope"),
+            )
+            .expect("resolve claim");
+        registry
     }
 
     fn init_repo() -> (tempfile::TempDir, PathBuf) {
@@ -5360,6 +5453,85 @@ mod decision_ref_live_reparse_tests {
             is_store_query_failed(&error),
             "live in-repo wrapper must query the supplied repo: {error:#}"
         );
+    }
+
+    #[test]
+    fn empty_ref_held_out_freeze_and_autopilot_reload_do_not_create_a_store() {
+        let (_temp, repo) = init_repo();
+        let plan = write_plan(&repo, "empty-refs.json", &empty_ref_assignment_plan_json());
+
+        freeze_held_out_production_caller_plan_in_repo(&plan, Some(&repo))
+            .expect("empty-ref freeze must validate");
+        load_supervisor_plan_file_in_repo(&plan, &repo).expect("empty-ref autopilot reload");
+        assert!(DecisionStore::open_existing(&repo)
+            .expect("read-only query")
+            .is_none());
+        assert!(
+            !repo.join(".git").join("maco").exists(),
+            "empty-ref freeze and reload must not create decision-store state"
+        );
+    }
+
+    #[test]
+    fn cited_held_out_freeze_queries_open_existing() {
+        let (_temp, repo) = init_repo();
+        let plan = write_plan(&repo, "cited-freeze.json", &cited_assignment_plan_json());
+        let missing = freeze_held_out_production_caller_plan_in_repo(&plan, Some(&repo))
+            .expect_err("cited freeze without a store must fail closed");
+        assert!(
+            is_store_missing(&missing),
+            "cited freeze without a store must be StoreMissing: {missing:#}"
+        );
+
+        fs::create_dir_all(
+            repo.join(".git")
+                .join("maco")
+                .join("state")
+                .join(DECISION_STORE_STATE_NAMESPACE),
+        )
+        .expect("create malformed decision-store namespace");
+        let queried = freeze_held_out_production_caller_plan_in_repo(&plan, Some(&repo))
+            .expect_err("malformed store must be visible on freeze");
+        assert!(
+            is_store_query_failed(&queried),
+            "held-out freeze must query open_existing: {queried:#}"
+        );
+    }
+
+    #[test]
+    fn cited_autopilot_reload_queries_open_existing() {
+        let (_temp, repo) = init_repo();
+        let plan = write_plan(&repo, "cited-reload.json", &cited_assignment_plan_json());
+        let missing = load_supervisor_plan_file_in_repo(&plan, &repo)
+            .expect_err("cited reload without a store must fail closed");
+        assert!(
+            is_store_missing(&missing),
+            "cited autopilot reload without a store must be StoreMissing: {missing:#}"
+        );
+
+        fs::create_dir_all(
+            repo.join(".git")
+                .join("maco")
+                .join("state")
+                .join(DECISION_STORE_STATE_NAMESPACE),
+        )
+        .expect("create malformed decision-store namespace");
+        let queried = load_supervisor_plan_file_in_repo(&plan, &repo)
+            .expect_err("malformed store must be visible on reload");
+        assert!(
+            is_store_query_failed(&queried),
+            "autopilot reload must query open_existing: {queried:#}"
+        );
+    }
+
+    #[test]
+    fn cited_held_out_and_autopilot_refs_match_in_memory_resolved_record() {
+        let reference = DecisionRef::new("api.transport")
+            .expect("valid key")
+            .with_expected_resolution("Use HTTP")
+            .expect("valid resolution");
+        check_decision_ref(&resolved_registry(), &reference)
+            .expect("matching resolved record must admit the cited freeze and reload refs");
     }
 
     #[cfg(unix)]

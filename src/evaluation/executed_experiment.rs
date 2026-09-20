@@ -331,8 +331,11 @@ pub fn run_held_out_real_provider_experiment(
         &request.provider_plan,
         &request.source.source_repo,
     )?;
-    let frozen = supervise::freeze_held_out_production_caller_plan(&request.provider_plan)
-        .map_err(|error| anyhow!("held-out production caller plan is invalid: {error}"))?;
+    let frozen = supervise::freeze_held_out_production_caller_plan_in_repo(
+        &request.provider_plan,
+        Some(&request.source.source_repo),
+    )
+    .map_err(|error| anyhow!("held-out production caller plan is invalid: {error}"))?;
     let resolved_commit = experiment::resolve_held_out_explicit_source_baseline(&request.source)
         .map_err(|error| anyhow!("held-out explicit source baseline is invalid: {error}"))?;
     let runtime_allowlist = freeze_runtime_bindings_before_reservation(&request)?;

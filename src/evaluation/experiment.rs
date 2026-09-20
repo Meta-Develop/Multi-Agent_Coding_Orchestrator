@@ -1587,9 +1587,10 @@ impl IsolatedSuperviseState {
 
         let run_id = isolated_run_id(manifest, profile, repetition)?;
         let plan_file = workspace.path().join(format!("{}.json", run_id.as_str()));
-        let bytes = supervise::materialize_held_out_profile_effective_caller_plan(
+        let bytes = supervise::materialize_held_out_profile_effective_caller_plan_in_repo(
             frozen,
             &profile.role_models,
+            Some(&source.source_repo),
         )
         .map_err(|error| EvaluationError::FakeSuperviseExperiment {
             message: format!("failed to materialize effective held-out caller plan: {error:#}"),
