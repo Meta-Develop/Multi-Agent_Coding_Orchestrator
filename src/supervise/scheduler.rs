@@ -4821,6 +4821,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
 
 #[cfg(test)]
 mod selection_policy_tests {
+    use super::super::tests::single_parent_acceptance_review_lenses;
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -5344,6 +5345,7 @@ mod selection_policy_tests {
     #[test]
     fn admission_effort_bindings_use_the_active_budget_selection() {
         let mut plan = test_plan();
+        plan.review_lenses = single_parent_acceptance_review_lenses();
         let assignment = OrchestratorAssignment {
             id: "active-effort-assignment".to_string(),
             phase: AssignmentPhase::Execution,

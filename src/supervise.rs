@@ -719,6 +719,8 @@ pub struct SupervisorPlan {
     pub role_models: BTreeMap<AgentRole, RoleModelSelection>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub model_pricing: BTreeMap<String, ModelPricing>,
+    /// Omitted `review_lenses` deserialize as the stacked uncorrelated
+    /// production default: parent-acceptance, output-only, and diff-only.
     #[serde(default = "default_supervisor_review_lenses")]
     pub review_lenses: Vec<ReviewLensConfig>,
     #[serde(default)]
@@ -728,15 +730,7 @@ pub struct SupervisorPlan {
 }
 
 pub(crate) fn default_supervisor_review_lenses() -> Vec<ReviewLensConfig> {
-    vec![ReviewLensConfig {
-        id: "parent-acceptance".to_string(),
-        backend: ReviewLensBackendConfig::Model {
-            backend_id: "openai".to_string(),
-            model: DEFAULT_PROFILE_MODEL.to_string(),
-            reasoning_effort: Some("xhigh".to_string()),
-        },
-        information_scope: ReviewInformationScope::FullChildTranscript,
-    }]
+    default_stacked_uncorrelated_review_lenses()
 }
 
 pub(crate) fn default_stacked_uncorrelated_review_lenses() -> Vec<ReviewLensConfig> {
