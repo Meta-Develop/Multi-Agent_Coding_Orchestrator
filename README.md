@@ -1800,7 +1800,7 @@ is supplied, the run budget ledger also retains the original plan and CLI
 values under `run_budget.sources` so the override is visible independently of
 the composed `limits`.
 
-The same two commands also accept optional workspace rolling-quota ceilings:
+`maco supervise run` and `maco inbox run` also accept optional workspace rolling-quota ceilings:
 
 - `--max-rolling-tokens`
 - `--max-rolling-cost-usd`
@@ -3776,9 +3776,13 @@ The shipped spine is `maco <instruction>`, `maco supervise run`, and
 `maco inbox run`. A bare instruction routes into supervised goal/spec.
 `supervise run` accepts a positional task/plan or decomposes
 `--from-goal <file>` through the same planner as `supervise plan`, then
-executes the validated plan through the live supervisor gates. Omit
-`--codex-bin` / use `--runtime fake` for the deterministic in-process Fake
-runtime. Explicit `supervise run` must name the reviewed machine-global
+executes the validated plan through the live supervisor gates. Pass
+`--runtime fake` for the deterministic in-process Fake runtime. Omitting
+`--runtime` sniffs the plan assignment runtime and otherwise defaults to
+Codex; omitting `--codex-bin` does not select Fake. A bare
+`maco <instruction>` inherits that sniff and treats extra words as goal
+text, so stay local with `supervise run --literal-goal ... --runtime fake`.
+Explicit `supervise run` must name the reviewed machine-global
 configuration and runtime root used by supervise output-staging cleanup;
 `maco <instruction>` resolves the default machine-global binding when those
 flags are omitted. `inbox run` remains the fake-first reaction loop and
@@ -3826,9 +3830,14 @@ a live `autopilot run` recipe:
 ```
 
 ```bash
-cargo run -- "Update the README without touching Rust code."
+cargo run -- supervise run --literal-goal "Update the README without touching Rust code." \
+  --repo . \
+  --runtime fake \
+  --machine-global-config /etc/maco/machine-global.json \
+  --machine-global-runtime-root-id runtime --json
 cargo run -- supervise run --from-goal goal.md --repo . \
   --run-id readme-goal-demo \
+  --runtime fake \
   --machine-global-config /etc/maco/machine-global.json \
   --machine-global-runtime-root-id runtime --json
 cargo run -- inbox run --repo . --run-id inbox-demo --json
