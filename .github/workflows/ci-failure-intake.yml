@@ -89,29 +89,27 @@ jobs:
               core.notice(`Ignoring non-lifecycle conclusion: ${run.conclusion}`);
               return;
             }
-            if (run.conclusion === "cancelled") {
-              let tipSha;
-              try {
-                const { data: defaultBranch } = await github.rest.repos.getBranch({
-                  owner,
-                  repo,
-                  branch: repository.default_branch,
-                });
-                tipSha = defaultBranch.commit?.sha;
-              } catch {
-                core.setFailed("The default-branch tip SHA could not be read.");
-                return;
-              }
-              if (typeof tipSha !== "string" || !/^[0-9a-f]{40}$/i.test(tipSha)) {
-                core.setFailed("The default-branch tip SHA could not be read.");
-                return;
-              }
-              if (run.head_sha.toLowerCase() !== tipSha.toLowerCase()) {
-                core.notice(
-                  "Ignoring a cancelled workflow run that is no longer the default-branch tip.",
-                );
-                return;
-              }
+            let tipSha;
+            try {
+              const { data: defaultBranch } = await github.rest.repos.getBranch({
+                owner,
+                repo,
+                branch: repository.default_branch,
+              });
+              tipSha = defaultBranch.commit?.sha;
+            } catch {
+              core.setFailed("The default-branch tip SHA could not be read.");
+              return;
+            }
+            if (typeof tipSha !== "string" || !/^[0-9a-f]{40}$/i.test(tipSha)) {
+              core.setFailed("The default-branch tip SHA could not be read.");
+              return;
+            }
+            if (run.head_sha.toLowerCase() !== tipSha.toLowerCase()) {
+              core.notice(
+                "Ignoring a workflow run that is no longer the default-branch tip.",
+              );
+              return;
             }
 
             const serverUrl = new URL(context.serverUrl);
