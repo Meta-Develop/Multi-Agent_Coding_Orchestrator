@@ -3178,12 +3178,10 @@ fn run_external_agent_runtime(
         );
         return report;
     }
-    if let Some(pin) = spec.cam_authority_socket_pin.as_deref() {
-        external_environment.insert(
-            crate::supervise::cam_authority_child_env::CAM_AUTHORITY_SOCKET_ENV.to_string(),
-            pin.to_string(),
-        );
-    }
+    crate::supervise::cam_authority_child_env::insert_cam_authority_socket_into_launch_environment(
+        &mut external_environment,
+        spec.cam_authority_socket_pin.as_deref(),
+    );
     let credential_redactor =
         match CredentialRedactor::from_runtime(&external_environment, codex_auth.as_ref()) {
             Ok(redactor) => redactor,
@@ -3418,13 +3416,10 @@ fn run_external_agent_runtime(
                             home.to_string_lossy().into_owned(),
                         );
                     }
-                    if let Some(pin) = spec.cam_authority_socket_pin.as_deref() {
-                        overlay.insert(
-                            crate::supervise::cam_authority_child_env::CAM_AUTHORITY_SOCKET_ENV
-                                .to_string(),
-                            pin.to_string(),
-                        );
-                    }
+                    crate::supervise::cam_authority_child_env::insert_cam_authority_socket_into_launch_environment(
+                        &mut overlay,
+                        spec.cam_authority_socket_pin.as_deref(),
+                    );
                     if overlay.is_empty() {
                         process_spec
                     } else {
