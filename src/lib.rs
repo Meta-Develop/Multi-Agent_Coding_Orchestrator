@@ -16,6 +16,7 @@ pub mod consult;
 #[doc(hidden)]
 pub mod containment_probe;
 pub mod decision_claim;
+pub mod decision_ref;
 pub mod decision_store;
 pub mod eval_harness;
 pub mod evaluation;
