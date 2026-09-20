@@ -1254,6 +1254,9 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
             finish_with_merged_worktree_reap(&reap_repo, json, outcome)
         }
         SuperviseSubcommand::Reaudit(args) => {
+            let runtime = args
+                .runtime
+                .ok_or_else(|| anyhow::anyhow!(SUPERVISE_REAUDIT_RUNTIME_REQUIRED))?;
             let resolved = resolve_run_id_for_run(
                 &args.repo,
                 RunArtifactFamily::Supervise,
@@ -1267,14 +1270,13 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     assignment_id: args.assignment_id,
                     run_id: resolved.run_id.clone(),
                     codex_bin: args.runtime_bin.unwrap_or_else(|| {
-                        let runtime = args.runtime.unwrap_or(supervise::SupervisorRuntime::Codex);
                         if runtime.is_adapter_subprocess() {
                             PathBuf::from(runtime.default_binary())
                         } else {
                             args.codex_bin
                         }
                     }),
-                    runtime: args.runtime.unwrap_or(supervise::SupervisorRuntime::Codex),
+                    runtime,
                     allow_dirty_primary: args.allow_dirty_primary,
                     machine_global_retention: Some(MachineGlobalRetentionBinding {
                         config: args.machine_global_config,
@@ -4755,6 +4757,7 @@ fn execute_eval_harness_v2_operator_path(
 
 const SUPERVISE_SNIFF_RUNTIME_REQUIRED: &str =
     "supervise run has no loadable plan at sniff time; pass --runtime";
+const SUPERVISE_REAUDIT_RUNTIME_REQUIRED: &str = "supervise re-audit requires --runtime";
 
 /// Resolve the omitted `--runtime` default from a loadable supervisor plan.
 ///
