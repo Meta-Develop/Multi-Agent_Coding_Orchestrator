@@ -2316,9 +2316,47 @@ fn supervise_reaudit_requires_authenticated_source_scope_and_cleanup_binding() {
     );
     assert_eq!(reaudit.machine_global_runtime_root_id, "runtime");
     assert!(reaudit.json);
+    assert_eq!(reaudit.runtime, None);
 
     assert!(
         Cli::try_parse_from(["maco", "supervise", "re-audit", "source-run", "child-a",]).is_err()
+    );
+}
+
+#[test]
+fn supervise_reaudit_omitted_runtime_fails_closed_before_side_effects() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let untouched_repo = temp.path().join("untouched-repo");
+    let parsed = Cli::try_parse_from([
+        OsString::from("maco"),
+        OsString::from("supervise"),
+        OsString::from("re-audit"),
+        OsString::from("source-run"),
+        OsString::from("child-a"),
+        OsString::from("--run-id"),
+        OsString::from("destination-run"),
+        OsString::from("--repo"),
+        untouched_repo.clone().into_os_string(),
+        OsString::from("--machine-global-config"),
+        OsString::from("/tmp/maco-machine-global.json"),
+        OsString::from("--machine-global-runtime-root-id"),
+        OsString::from("runtime"),
+        OsString::from("--json"),
+    ])
+    .expect("complete supervise re-audit command should parse");
+    let supervise = expect_supervise_command(parsed.command);
+    let SuperviseSubcommand::Reaudit(reaudit) = &supervise.command else {
+        panic!("expected supervise re-audit command");
+    };
+    assert_eq!(reaudit.runtime, None);
+
+    let error = supervise
+        .run()
+        .expect_err("omitted --runtime must fail closed");
+    assert_eq!(error.to_string(), SUPERVISE_REAUDIT_RUNTIME_REQUIRED);
+    assert!(
+        !untouched_repo.exists(),
+        "omitted --runtime must refuse before repository or runtime side effects"
     );
 }
 
