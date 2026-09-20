@@ -6,7 +6,8 @@ use crate::model::StoredAccountMaterial;
 use crate::providers::observe_selected_account;
 use crate::storage;
 
-use super::{adapter_for, stored_account_registry};
+use super::adapter_for;
+use super::authority_client::{account_authority, AccountAuthority};
 
 /// Observe only the account named by `request.binding`; never auto-selects or rotates.
 #[tauri::command]
@@ -18,14 +19,19 @@ pub(crate) fn observe_account_blocking(
     request: AccountObserveRequest,
 ) -> Result<AccountObserveResult> {
     let adapter = adapter_for(&request.binding.provider_id)?;
-    let registry = stored_account_registry()?;
-    let store = registry
-        .account(&request.binding.provider_id, &request.binding.account_id)
-        .ok()
-        .filter(|account| account.material == StoredAccountMaterial::CredentialStore)
-        .map(|_| storage::default_store())
-        .transpose()?;
-    observe_selected_account(&registry, adapter.as_ref(), request, store.as_deref())
+    match account_authority()? {
+        AccountAuthority::InProcess(registry) => {
+            let store = registry
+                .account(&request.binding.provider_id, &request.binding.account_id)
+                .ok()
+                .filter(|account| account.material == StoredAccountMaterial::CredentialStore)
+                .map(|_| storage::default_store())
+                .transpose()?;
+            observe_selected_account(&registry, adapter.as_ref(), request, store.as_deref())
+        }
+        #[cfg(unix)]
+        AccountAuthority::Remote(client) => client.account_observe(request),
+    }
 }
 
 #[cfg(test)]

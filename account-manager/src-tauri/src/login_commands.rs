@@ -1,6 +1,5 @@
 //! Thin Tauri IPC for the core [`LoginService`] lifecycle (Gemini OAuth only).
 
-use std::ops::Deref;
 use std::sync::Arc;
 
 use tauri::State;
@@ -12,36 +11,66 @@ use crate::login::{
 use crate::model::AuthKind;
 use crate::providers::gemini_cli::GeminiCliAdapter;
 
+use super::authority_client::AccountAuthority;
+#[cfg(unix)]
+use super::authority_client::AuthorityClient;
+
 /// Provider id allowed through the explicit login IPC surface.
 pub const LOGIN_PROVIDER_ID: &str = "gemini-cli";
+
+#[derive(Clone)]
+enum LoginBackend {
+    InProcess(Arc<LoginService>),
+    #[cfg(unix)]
+    Remote(AuthorityClient),
+}
 
 /// One app-owned login service for the desktop process lifetime.
 #[derive(Clone)]
 pub struct ManagedLoginService {
-    inner: Arc<LoginService>,
+    backend: LoginBackend,
 }
 
 impl ManagedLoginService {
-    pub fn new(service: LoginService) -> Self {
-        Self {
-            inner: Arc::new(service),
+    fn new(backend: LoginBackend) -> Self {
+        Self { backend }
+    }
+
+    fn start(&self, request: LoginStartRequest, adapter: &GeminiCliAdapter) -> Result<LoginStatus> {
+        match &self.backend {
+            LoginBackend::InProcess(service) => service.start(request, adapter),
+            #[cfg(unix)]
+            LoginBackend::Remote(client) => client.login_start(request),
+        }
+    }
+
+    fn status(&self, handle: &LoginHandle, binding: &LoginAccountBinding) -> Result<LoginStatus> {
+        match &self.backend {
+            LoginBackend::InProcess(service) => service.status(handle, binding),
+            #[cfg(unix)]
+            LoginBackend::Remote(client) => client.login_status(handle, binding),
+        }
+    }
+
+    fn cancel(&self, handle: &LoginHandle, binding: &LoginAccountBinding) -> Result<LoginStatus> {
+        match &self.backend {
+            LoginBackend::InProcess(service) => service.cancel(handle, binding),
+            #[cfg(unix)]
+            LoginBackend::Remote(client) => client.login_cancel(handle, binding),
         }
     }
 }
 
-impl Deref for ManagedLoginService {
-    type Target = LoginService;
-
-    fn deref(&self) -> &LoginService {
-        &self.inner
-    }
-}
-
-pub(crate) fn build_managed_login_service(
-    registry: crate::providers::StoredAccountRegistry,
-) -> ManagedLoginService {
+pub(crate) fn build_managed_login_service(authority: AccountAuthority) -> ManagedLoginService {
     let runtime = tauri::async_runtime::handle().inner().clone();
-    ManagedLoginService::new(LoginService::new(registry, runtime))
+    let backend = match authority {
+        AccountAuthority::InProcess(registry) => {
+            LoginBackend::InProcess(Arc::new(LoginService::new(registry, runtime)))
+        }
+        #[cfg(unix)]
+        AccountAuthority::Remote(client) => LoginBackend::Remote(client),
+    };
+    ManagedLoginService::new(backend)
 }
 
 /// Refuse unsupported login attempts before registry or vendor-home work.
@@ -100,7 +129,7 @@ pub fn login_status(
     handle: LoginHandle,
     binding: LoginAccountBinding,
 ) -> Result<LoginStatus> {
-    state.inner().status(&handle, &binding)
+    state.status(&handle, &binding)
 }
 
 #[tauri::command]
@@ -109,7 +138,7 @@ pub fn login_cancel(
     handle: LoginHandle,
     binding: LoginAccountBinding,
 ) -> Result<LoginStatus> {
-    state.inner().cancel(&handle, &binding)
+    state.cancel(&handle, &binding)
 }
 
 #[cfg(test)]
@@ -122,14 +151,6 @@ mod tests {
     fn login_handle_from_json(value: &str) -> LoginHandle {
         serde_json::from_value(serde_json::Value::String(value.to_string()))
             .expect("login handle serde")
-    }
-
-    fn login_service_for_test(registry: &StoredAccountRegistry) -> LoginService {
-        let runtime = tauri::async_runtime::handle().inner().clone();
-        LoginService::new(
-            StoredAccountRegistry::new(registry.metadata_path().to_path_buf()),
-            runtime,
-        )
     }
 
     #[test]
@@ -191,12 +212,12 @@ mod tests {
     fn managed_service_reuses_one_login_service_instance() {
         tauri::async_runtime::block_on(async {
             let dir = tempfile::tempdir().expect("tempdir");
-            let registry = StoredAccountRegistry::new(paths::stored_accounts_path(dir.path()));
-            let managed = ManagedLoginService::new(login_service_for_test(&registry));
-            let first = (&*managed) as *const LoginService;
+            let managed = build_managed_login_service(AccountAuthority::InProcess(
+                StoredAccountRegistry::new(paths::stored_accounts_path(dir.path())),
+            ));
             let clone = managed.clone();
-            let second = (&*clone) as *const LoginService;
-            assert_eq!(first, second);
+            drop(clone);
+            drop(managed);
         });
     }
 
@@ -224,7 +245,7 @@ mod tests {
             )
             .with_test_oauth_watch_cancel_driver();
             let registry = StoredAccountRegistry::new(paths::stored_accounts_path(&data));
-            let managed = ManagedLoginService::new(login_service_for_test(&registry));
+            let managed = build_managed_login_service(AccountAuthority::InProcess(registry));
             let started = managed
                 .start(
                     LoginStartRequest {

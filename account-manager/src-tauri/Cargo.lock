@@ -716,8 +716,8 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-opener",
  "tempfile",
- "time",
  "thiserror 2.0.20",
+ "time",
 ]
 
 [[package]]
