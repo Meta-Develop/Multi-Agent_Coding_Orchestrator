@@ -21,7 +21,7 @@ use crate::{
     safe_state::FileIdentity,
     state_journal::{AuthenticatedStateJournal, JournalRecord, JournalSpec},
     supervise::{
-        validate_generated_follow_up_plan_document, AuthenticatedGeneratedFollowUpTerminal,
+        validate_generated_follow_up_plan_document_in_repo, AuthenticatedGeneratedFollowUpTerminal,
         GeneratedFollowUpDispatchStatus, GeneratedFollowUpTaskRecord, SupervisorPlan,
         LICENSED_BREAKAGE_CASCADE_DEPTH, MAX_LICENSED_BREAKAGE_DEPENDENTS,
     },
@@ -33,7 +33,10 @@ use graph::{
 };
 use lease::{LeaseEvent, LeaseIdentity, LeasePhase, LeaseProof, LeaseState, WorkerIdentity};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 pub(crate) const GENERATED_FOLLOW_UP_QUEUE_ROOT_NAME: &str =
     "authenticated-generated-follow-up-queues-v1";
@@ -339,6 +342,14 @@ impl GeneratedFollowUpQueueBounds {
         source_plan: &SupervisorPlan,
         tasks: &[GeneratedFollowUpTaskRecord],
     ) -> Result<Self> {
+        Self::from_validated_source_plan_and_tasks_in_repo(source_plan, tasks, None)
+    }
+
+    pub(crate) fn from_validated_source_plan_and_tasks_in_repo(
+        source_plan: &SupervisorPlan,
+        tasks: &[GeneratedFollowUpTaskRecord],
+        repo: Option<&Path>,
+    ) -> Result<Self> {
         if tasks.is_empty() {
             bail!("generated follow-up queue requires at least one validated task");
         }
@@ -369,7 +380,7 @@ impl GeneratedFollowUpQueueBounds {
         let mut validated_by_assignment = BTreeMap::<String, usize>::new();
         let mut represented_dependents = BTreeSet::<(String, String)>::new();
         for task in tasks {
-            canonical_validated_task_bytes(task)?;
+            canonical_validated_task_bytes(task, repo)?;
             let Some(dependents) = declared_by_assignment.get(&task.breaking_assignment_id) else {
                 bail!(
                     "generated follow-up task names a breaking assignment absent from the validated source plan"
@@ -1125,7 +1136,11 @@ impl GeneratedFollowUpQueue {
             };
             journal.append(created.phase(), None, &created)?;
         }
-        let snapshot = replay_queue_records(&journal_slot_id, journal.records())?;
+        let snapshot = replay_queue_records(
+            &journal_slot_id,
+            journal.records(),
+            Some(journal.authenticator().common_dir()),
+        )?;
         if !snapshot.source.has_same_execution_basis(&source) || snapshot.bounds != bounds {
             bail!("generated follow-up queue execution basis changed across create-or-open");
         }
@@ -1140,7 +1155,11 @@ impl GeneratedFollowUpQueue {
         verify_source_repository_binding(&authenticator, source)?;
         let journal_slot_id = queue_journal_slot_id(source)?;
         let journal = QueueJournal::open_instance(authenticator, &journal_slot_id)?;
-        let snapshot = replay_queue_records(&journal_slot_id, journal.records())?;
+        let snapshot = replay_queue_records(
+            &journal_slot_id,
+            journal.records(),
+            Some(journal.authenticator().common_dir()),
+        )?;
         if &snapshot.source != source {
             bail!("generated follow-up queue source identity changed across reopen");
         }
@@ -1183,7 +1202,11 @@ impl GeneratedFollowUpQueue {
             return Ok(None);
         }
         let journal = QueueJournal::open_instance(authenticator, &journal_slot_id)?;
-        let snapshot = replay_queue_records(&journal_slot_id, journal.records())?;
+        let snapshot = replay_queue_records(
+            &journal_slot_id,
+            journal.records(),
+            Some(journal.authenticator().common_dir()),
+        )?;
         if snapshot.source.source_supervisor_run_id() != source_supervisor_run_id
             || snapshot.source.source_normalized_plan_sha256() != source_normalized_plan_sha256
             || snapshot.source.repository_id() != repository_id
@@ -1198,7 +1221,11 @@ impl GeneratedFollowUpQueue {
     }
 
     pub(crate) fn replay_snapshot(&self) -> Result<GeneratedFollowUpQueueSnapshot> {
-        replay_queue_records(self.journal.instance_id(), self.journal.records())
+        replay_queue_records(
+            self.journal.instance_id(),
+            self.journal.records(),
+            Some(queue_decision_repo(self)),
+        )
     }
 
     pub(crate) fn summary(&self) -> GeneratedFollowUpQueueSummary {
@@ -1212,7 +1239,11 @@ impl GeneratedFollowUpQueue {
         &mut self,
         tasks: &[GeneratedFollowUpTaskRecord],
     ) -> Result<Vec<GeneratedFollowUpQueueEventData>> {
-        let prepared = prepare_enqueue_records(&self.snapshot.source, tasks)?;
+        let prepared = prepare_enqueue_records(
+            &self.snapshot.source,
+            tasks,
+            Some(queue_decision_repo(self)),
+        )?;
         if prepared.len() != self.snapshot.bounds.capacity {
             bail!(
                 "generated follow-up enqueue count {} does not match the validated capacity {}",
@@ -1708,7 +1739,11 @@ impl GeneratedFollowUpQueue {
         if self.journal.records().len() >= MAX_AUTHENTICATED_QUEUE_RECORDS {
             bail!("generated follow-up queue exhausted its authenticated record bound");
         }
-        let next = apply_queue_event(self.snapshot.clone(), &event)?;
+        let next = apply_queue_event(
+            self.snapshot.clone(),
+            &event,
+            Some(queue_decision_repo(self)),
+        )?;
         let event_data = queue_event_data(&self.snapshot, &event);
         self.journal
             .append(event.phase(), event.subject(), &event)?;
@@ -1720,6 +1755,7 @@ impl GeneratedFollowUpQueue {
 fn replay_queue_records(
     journal_slot_id: &str,
     records: &[JournalRecord],
+    repo: Option<&Path>,
 ) -> Result<GeneratedFollowUpQueueSnapshot> {
     let first = records
         .first()
@@ -1759,7 +1795,7 @@ fn replay_queue_records(
         if record.phase != event.phase() || record.subject.as_deref() != event.subject() {
             bail!("generated follow-up queue journal phase or subject is inconsistent");
         }
-        snapshot = apply_queue_event(snapshot, &event)?;
+        snapshot = apply_queue_event(snapshot, &event, repo)?;
     }
     Ok(snapshot)
 }
@@ -1767,6 +1803,7 @@ fn replay_queue_records(
 fn apply_queue_event(
     mut snapshot: GeneratedFollowUpQueueSnapshot,
     event: &QueueJournalEvent,
+    repo: Option<&Path>,
 ) -> Result<GeneratedFollowUpQueueSnapshot> {
     match event {
         QueueJournalEvent::Created { .. } => {
@@ -1776,7 +1813,8 @@ fn apply_queue_event(
             if snapshot.enqueue_committed {
                 bail!("generated follow-up queue cannot stage after enqueue commit");
             }
-            let expected_id = generated_follow_up_item_id(&snapshot.source, &item.task)?;
+            let expected_id =
+                generated_follow_up_item_id_in_repo(&snapshot.source, &item.task, repo)?;
             if item.item_id != expected_id {
                 bail!("generated follow-up item id does not match its immutable task record");
             }
@@ -2604,10 +2642,11 @@ fn require_phase(
 fn prepare_enqueue_records(
     source: &GeneratedFollowUpQueueSource,
     tasks: &[GeneratedFollowUpTaskRecord],
+    repo: Option<&Path>,
 ) -> Result<BTreeMap<String, ImmutableEnqueueRecord>> {
     let mut prepared = BTreeMap::new();
     for task in tasks {
-        let item_id = generated_follow_up_item_id(source, task)?;
+        let item_id = generated_follow_up_item_id_in_repo(source, task, repo)?;
         let item = ImmutableEnqueueRecord {
             item_id: item_id.clone(),
             task: task.clone(),
@@ -2626,8 +2665,16 @@ fn generated_follow_up_item_id(
     source: &GeneratedFollowUpQueueSource,
     task: &GeneratedFollowUpTaskRecord,
 ) -> Result<String> {
+    generated_follow_up_item_id_in_repo(source, task, None)
+}
+
+fn generated_follow_up_item_id_in_repo(
+    source: &GeneratedFollowUpQueueSource,
+    task: &GeneratedFollowUpTaskRecord,
+    repo: Option<&Path>,
+) -> Result<String> {
     source.validate()?;
-    let canonical_task = canonical_validated_task_bytes(task)?;
+    let canonical_task = canonical_validated_task_bytes(task, repo)?;
     let queue_instance_id = queue_instance_id(source)?;
     domain_separated_sha256(
         ITEM_ID_DOMAIN,
@@ -2635,8 +2682,11 @@ fn generated_follow_up_item_id(
     )
 }
 
-fn canonical_validated_task_bytes(task: &GeneratedFollowUpTaskRecord) -> Result<Vec<u8>> {
-    validate_generated_follow_up_task(task)?;
+fn canonical_validated_task_bytes(
+    task: &GeneratedFollowUpTaskRecord,
+    repo: Option<&Path>,
+) -> Result<Vec<u8>> {
+    validate_generated_follow_up_task(task, repo)?;
     let canonical = serde_json::to_vec(task)
         .context("failed to serialize generated follow-up task canonically")?;
     if canonical.len() > MAX_CANONICAL_TASK_BYTES {
@@ -2655,7 +2705,10 @@ fn canonical_validated_task_bytes(task: &GeneratedFollowUpTaskRecord) -> Result<
     Ok(canonical)
 }
 
-fn validate_generated_follow_up_task(task: &GeneratedFollowUpTaskRecord) -> Result<()> {
+fn validate_generated_follow_up_task(
+    task: &GeneratedFollowUpTaskRecord,
+    repo: Option<&Path>,
+) -> Result<()> {
     let plan = &task.supervisor_plan;
     let context = &plan.generated_follow_up;
     let assignment = plan
@@ -2680,11 +2733,26 @@ fn validate_generated_follow_up_task(task: &GeneratedFollowUpTaskRecord) -> Resu
         bail!("generated follow-up task provenance or cascade binding is invalid");
     }
 
-    let loaded = validate_generated_follow_up_plan_document(plan)?;
+    if repo.is_none()
+        && plan
+            .assignments
+            .iter()
+            .any(|assignment| !assignment.decision_refs.is_empty())
+    {
+        bail!(
+            "generated follow-up plan cites DecisionRefs but no repository path was resolved for DecisionStore admission"
+        );
+    }
+
+    let loaded = validate_generated_follow_up_plan_document_in_repo(plan, repo)?;
     if loaded != ordinary_plan_from_generated(plan) {
         bail!("ordinary supervisor plan loader changed the generated follow-up task");
     }
     Ok(())
+}
+
+fn queue_decision_repo(queue: &GeneratedFollowUpQueue) -> &Path {
+    queue.journal.authenticator().common_dir()
 }
 
 fn ordinary_plan_from_generated(
@@ -3232,6 +3300,9 @@ mod tests {
     use super::*;
     use crate::{
         artifacts::repository_auth_writer,
+        decision_claim::DecisionRegistry,
+        decision_ref::{check_decision_ref, DecisionRef, DecisionRefError},
+        decision_store::{DecisionStore, DECISION_STORE_STATE_NAMESPACE},
         merge::CandidateValidationBinding,
         orchestrator::SemanticCoordinationMode,
         review::{
@@ -3426,6 +3497,147 @@ mod tests {
             cascade_depth: LICENSED_BREAKAGE_CASCADE_DEPTH,
             dispatch_status: GeneratedFollowUpDispatchStatus::DeferredForPlannedRun,
             handoff,
+        }
+    }
+
+    fn cited_generated_task(suffix: &str) -> GeneratedFollowUpTaskRecord {
+        let mut task = generated_task(suffix);
+        task.supervisor_plan.assignments[0].decision_refs = vec![DecisionRef::new("api.transport")
+            .expect("valid key")
+            .with_expected_resolution("Use HTTP")
+            .expect("valid resolution")];
+        task
+    }
+
+    fn resolved_registry() -> DecisionRegistry {
+        let registry = DecisionRegistry::new();
+        registry
+            .claim_open(
+                "api.transport",
+                "Which transport should the API use?",
+                "planner-a",
+            )
+            .expect("open claim");
+        registry
+            .resolve_claim(
+                "api.transport",
+                "planner-a",
+                "Use HTTP",
+                crate::decision_claim::DecisionScope::new(
+                    ["api".to_string()],
+                    Vec::<String>::new(),
+                    Vec::<String>::new(),
+                )
+                .expect("scope"),
+            )
+            .expect("resolve claim");
+        registry
+    }
+
+    fn is_store_missing(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<DecisionRefError>()
+                .is_some_and(|error| *error == DecisionRefError::StoreMissing)
+                || cause.to_string().contains("decision store is missing")
+        })
+    }
+
+    fn is_store_query_failed(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<DecisionRefError>()
+                .is_some_and(|error| matches!(error, DecisionRefError::StoreQueryFailed { .. }))
+                || cause.to_string().contains("decision store query failed")
+        })
+    }
+
+    #[test]
+    fn cited_generated_follow_up_without_repo_path_is_explicit_error() {
+        let plan = licensed_source_plan(1);
+        let error = GeneratedFollowUpQueueBounds::from_validated_source_plan_and_tasks(
+            &plan,
+            &[cited_generated_task("01")],
+        )
+        .expect_err("cited generated plan without a repo path must not look like StoreMissing");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("no repository path was resolved"),
+            "queue layer must refuse cited plans without a resolved repo path: {message}"
+        );
+        assert!(
+            !is_store_missing(&error),
+            "unresolved queue repo path must not surface as StoreMissing: {message}"
+        );
+    }
+
+    #[test]
+    fn empty_ref_generated_follow_up_validates_without_creating_a_store() {
+        let (_temp, repo) = repository();
+        let plan = licensed_source_plan(1);
+        GeneratedFollowUpQueueBounds::from_validated_source_plan_and_tasks_in_repo(
+            &plan,
+            &[generated_task("01")],
+            Some(&repo),
+        )
+        .expect("empty refs must validate");
+        assert!(DecisionStore::open_existing(&repo)
+            .expect("read-only query")
+            .is_none());
+        assert!(
+            !repo.join(".git").join("maco").exists(),
+            "empty-ref generated follow-up validation must not create decision-store state"
+        );
+    }
+
+    #[test]
+    fn cited_generated_follow_up_in_repo_is_store_missing_without_store() {
+        let (_temp, repo) = repository();
+        let plan = licensed_source_plan(1);
+        let error = GeneratedFollowUpQueueBounds::from_validated_source_plan_and_tasks_in_repo(
+            &plan,
+            &[cited_generated_task("01")],
+            Some(&repo),
+        )
+        .expect_err("cited generated plan + repo without a store must fail closed");
+        assert!(
+            is_store_missing(&error),
+            "missing store must be StoreMissing: {error:#}"
+        );
+        assert!(DecisionStore::open_existing(&repo)
+            .expect("read-only query")
+            .is_none());
+    }
+
+    #[test]
+    fn cited_generated_follow_up_in_repo_queries_open_existing() {
+        let (_temp, repo) = repository();
+        fs::create_dir_all(
+            repo.join(".git")
+                .join("maco")
+                .join("state")
+                .join(DECISION_STORE_STATE_NAMESPACE),
+        )
+        .expect("create malformed decision-store namespace");
+        let plan = licensed_source_plan(1);
+        let error = GeneratedFollowUpQueueBounds::from_validated_source_plan_and_tasks_in_repo(
+            &plan,
+            &[cited_generated_task("01")],
+            Some(&repo),
+        )
+        .expect_err("malformed store must fail closed through the supplied repo");
+        assert!(
+            is_store_query_failed(&error),
+            "live queue validate must query open_existing on the supplied repo: {error:#}"
+        );
+    }
+
+    #[test]
+    fn cited_generated_follow_up_refs_match_in_memory_resolved_record() {
+        let task = cited_generated_task("01");
+        for reference in &task.supervisor_plan.assignments[0].decision_refs {
+            check_decision_ref(&resolved_registry(), reference)
+                .expect("matching resolved record must admit the cited generated follow-up refs");
         }
     }
 
@@ -3765,7 +3977,8 @@ mod tests {
         let mut queue =
             GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(2))
                 .expect("create queue");
-        let prepared = prepare_enqueue_records(&source, &tasks).expect("prepare batch");
+        let prepared =
+            prepare_enqueue_records(&source, &tasks, Some(&repo)).expect("prepare batch");
         let first = prepared.values().next().expect("first staged item").clone();
         queue
             .append_event(QueueJournalEvent::EnqueueStaged {
