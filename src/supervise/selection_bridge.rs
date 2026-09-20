@@ -35,8 +35,9 @@ use crate::selection::{
     self, AuthorityRole, Boundedness, BudgetSignal, CandidateCapabilities, CandidateKey,
     CandidateSwitchCostEvidence, CatalogModel, ContextSize, DebugOverride, DecisionStatus,
     DynamicSignals, LiveOperationalObservations, ObjectiveProfileRef, OperatorConstraints,
-    ReasoningEffort as SelectorEffort, RiskLevel, RuntimeCatalog, RuntimePoolState, SelectionInput,
-    SelectionProvenance, TaskHorizon, TaskProfile, TypedAxisObservation, TypedObservationKind,
+    OutcomeRecord, ReasoningEffort as SelectorEffort, RiskLevel, RuntimeCatalog, RuntimePoolState,
+    SelectionInput, SelectionProvenance, TaskHorizon, TaskProfile, TypedAxisObservation,
+    TypedObservationKind,
 };
 #[cfg(target_os = "linux")]
 use coding_agent_manager_lib::account_authority::{
@@ -601,6 +602,7 @@ pub(super) struct SupervisorAutomaticSelectionState {
     quota_ledger: Option<RunBudgetLedger>,
     account_observation: Option<AccountObserveResult>,
     observed_cost_per_accepted_task_microunits: Option<u64>,
+    this_run_outcomes: Vec<OutcomeRecord>,
 }
 
 impl PartialEq for SupervisorAutomaticSelectionState {
@@ -610,6 +612,7 @@ impl PartialEq for SupervisorAutomaticSelectionState {
             && self.quota_context == other.quota_context
             && self.observed_cost_per_accepted_task_microunits
                 == other.observed_cost_per_accepted_task_microunits
+            && self.this_run_outcomes == other.this_run_outcomes
     }
 }
 
@@ -1084,11 +1087,16 @@ impl SupervisorAutomaticSelectionState {
             quota_ledger,
             account_observation,
             observed_cost_per_accepted_task_microunits: None,
+            this_run_outcomes: Vec::new(),
         })
     }
 
     pub(super) fn set_observed_accepted_task_cost(&mut self, cost: Option<u64>) {
         self.observed_cost_per_accepted_task_microunits = cost;
+    }
+
+    pub(super) fn set_this_run_outcomes(&mut self, outcomes: Vec<OutcomeRecord>) {
+        self.this_run_outcomes = outcomes;
     }
 
     pub(super) fn account_observe_environment_decision(
@@ -1315,6 +1323,7 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
                 &source_runtime,
             )?;
         }
+        merge_this_run_outcomes_into_input(&mut input, &state.this_run_outcomes);
 
         let mut decision = select_with_live_switch_cost(&input).map_err(|error| {
             anyhow!(
@@ -1353,6 +1362,25 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
         runtime_overrides,
         decisions,
     })
+}
+
+fn merge_this_run_outcomes_into_input(
+    input: &mut SelectionInput,
+    this_run_outcomes: &[OutcomeRecord],
+) {
+    for outcome in this_run_outcomes {
+        if outcome.task != input.task {
+            continue;
+        }
+        if input
+            .outcomes
+            .iter()
+            .any(|existing| existing.attempt_id == outcome.attempt_id)
+        {
+            continue;
+        }
+        input.outcomes.push(outcome.clone());
+    }
 }
 
 fn role_for_task_profile(task: &TaskProfile) -> Result<AgentRole> {
@@ -5101,6 +5129,203 @@ mod tests {
                 Some(&runtime_from_name(&choice.candidate.runtime)?)
             );
         }
+        Ok(())
+    }
+
+    fn this_run_attempt_evidence(
+        candidate: &CandidateKey,
+        task: &TaskProfile,
+        result: crate::selection::OutcomeResult,
+        failure_class: Option<crate::selection::FailureClass>,
+    ) -> AttemptOutcomeEvidence {
+        AttemptOutcomeEvidence {
+            version: 1,
+            run_id: "this-run".to_string(),
+            assignment_id: "assignment-1".to_string(),
+            attempt: 1,
+            verified_execution: true,
+            selection: Some(AttemptSelectionBinding {
+                role: AgentRole::Worker,
+                event_assignment_id: None,
+                event_attempt: 0,
+                normalized_input_sha256: "this-run-digest".to_string(),
+                task: task.clone(),
+                requested_candidate: candidate.clone(),
+            }),
+            requested_runtime: candidate.runtime.clone(),
+            requested_model: Some(candidate.model.clone()),
+            requested_effort: Some(selector_effort_as_str(candidate.effort).to_string()),
+            observed_candidate: Some(candidate.clone()),
+            parent_result: Some(result),
+            parent_cause: Some("parent_terminal_result".to_string()),
+            failure_class,
+            costs: AttemptAttributableCosts {
+                execution_cost_microunits: Some(50_000),
+                review_cost_microunits: Some(10_000),
+                rework_cost_microunits: Some(0),
+                rereview_cost_microunits: Some(0),
+                environment_cost_microunits: Some(0),
+            },
+            parent_phase_continuation: None,
+        }
+    }
+
+    fn posterior_quality_for(
+        reselection: &SupervisorReselection,
+        candidate: &CandidateKey,
+    ) -> Result<u16> {
+        reselection
+            .decisions
+            .first()
+            .context("reselect decision")?
+            .1
+            .candidate_set
+            .iter()
+            .find(|item| item.candidate == *candidate)
+            .and_then(|item| item.score.as_ref())
+            .map(|score| score.posterior_quality_basis_points)
+            .context("candidate posterior quality")
+    }
+
+    #[test]
+    fn this_run_rejected_or_accepted_attempt_moves_reselect_posterior() -> Result<()> {
+        let (catalog, state) = automatic_state()?;
+        let worker = state
+            .decisions
+            .get(&AgentRole::Worker)
+            .context("worker decision")?;
+        let candidate = worker
+            .choice
+            .as_ref()
+            .context("worker choice")?
+            .candidate
+            .clone();
+        let task = worker.normalized_input.task.clone();
+
+        let mut baseline_state = state.clone();
+        let baseline = reselect_roles_from_supplied_catalog_snapshot(
+            &mut baseline_state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::Worker],
+            1,
+            BudgetSignal::Continue,
+            &[],
+        )?;
+        let baseline_quality = posterior_quality_for(&baseline, &candidate)?;
+        assert!(baseline.decisions[0].1.normalized_input.outcomes.is_empty());
+
+        let rejected = outcome_record_from_this_run_attempt(&this_run_attempt_evidence(
+            &candidate,
+            &task,
+            crate::selection::OutcomeResult::Rejected,
+            Some(crate::selection::FailureClass::ModelQuality),
+        ))
+        .context("rejected this-run outcome")?;
+        let mut rejected_state = state.clone();
+        rejected_state.set_this_run_outcomes(vec![rejected]);
+        let rejected_reselect = reselect_roles_from_supplied_catalog_snapshot(
+            &mut rejected_state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::Worker],
+            1,
+            BudgetSignal::Continue,
+            &[],
+        )?;
+        let rejected_quality = posterior_quality_for(&rejected_reselect, &candidate)?;
+        assert_ne!(baseline_quality, rejected_quality);
+        assert_eq!(
+            rejected_reselect.decisions[0]
+                .1
+                .normalized_input
+                .outcomes
+                .len(),
+            1
+        );
+
+        let accepted = outcome_record_from_this_run_attempt(&this_run_attempt_evidence(
+            &candidate,
+            &task,
+            crate::selection::OutcomeResult::Accepted,
+            None,
+        ))
+        .context("accepted this-run outcome")?;
+        let mut accepted_state = state;
+        accepted_state.set_this_run_outcomes(vec![accepted]);
+        let accepted_reselect = reselect_roles_from_supplied_catalog_snapshot(
+            &mut accepted_state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::Worker],
+            1,
+            BudgetSignal::Continue,
+            &[],
+        )?;
+        let accepted_quality = posterior_quality_for(&accepted_reselect, &candidate)?;
+        assert_ne!(baseline_quality, accepted_quality);
+        assert_eq!(
+            accepted_reselect.decisions[0]
+                .1
+                .normalized_input
+                .outcomes
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn this_run_cost_only_attempt_does_not_move_reselect_posterior() -> Result<()> {
+        let (catalog, mut state) = automatic_state()?;
+        let worker = state
+            .decisions
+            .get(&AgentRole::Worker)
+            .context("worker decision")?;
+        let candidate = worker
+            .choice
+            .as_ref()
+            .context("worker choice")?
+            .candidate
+            .clone();
+        let task = worker.normalized_input.task.clone();
+        let mut cost_only = this_run_attempt_evidence(
+            &candidate,
+            &task,
+            crate::selection::OutcomeResult::Accepted,
+            None,
+        );
+        cost_only.parent_result = None;
+        assert!(outcome_record_from_this_run_attempt(&cost_only).is_none());
+
+        let baseline = reselect_roles_from_supplied_catalog_snapshot(
+            &mut state.clone(),
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::Worker],
+            1,
+            BudgetSignal::Continue,
+            &[],
+        )?;
+        state.set_this_run_outcomes(this_run_outcome_records(std::slice::from_ref(&cost_only)));
+        let with_cost_only = reselect_roles_from_supplied_catalog_snapshot(
+            &mut state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::Worker],
+            1,
+            BudgetSignal::Continue,
+            &[],
+        )?;
+        assert_eq!(
+            posterior_quality_for(&baseline, &candidate)?,
+            posterior_quality_for(&with_cost_only, &candidate)?
+        );
+        assert!(with_cost_only.decisions[0]
+            .1
+            .normalized_input
+            .outcomes
+            .is_empty());
         Ok(())
     }
 
