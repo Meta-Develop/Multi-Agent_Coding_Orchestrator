@@ -3367,6 +3367,7 @@ mod tests {
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: Some("generated follow-up".to_string()),
+            decision_refs: Vec::new(),
         }];
         let review_lenses = vec![ReviewLensConfig {
             id: "parent-acceptance".to_string(),
@@ -3469,6 +3470,7 @@ mod tests {
                     dependents,
                 }),
                 notes: None,
+                decision_refs: Vec::new(),
             }],
         }
     }

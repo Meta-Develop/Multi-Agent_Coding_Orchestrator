@@ -4314,6 +4314,7 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         }],
     };
     let options = SupervisorRunOptions {

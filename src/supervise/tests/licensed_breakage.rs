@@ -76,7 +76,7 @@ fn inbox_pr_source_marker_refuses_generic_resume_before_follow_up_queue_or_dispa
         write_injected_usage(command, 0, 1);
         injected_verified_run(command)
     };
-    let loaded = load_supervisor_plan_file_with_consultant(&plan_file)
+    let loaded = load_supervisor_plan_file_with_consultant(&plan_file, None)
         .expect("load parent-owned source plan");
     let catalog = test_runtime_model_catalog(&loaded.plan, SupervisorRuntime::Codex)
         .expect("fixture runtime catalog");
@@ -229,6 +229,7 @@ fn licensed_follow_up_assignment_for_ordinal(ordinal: usize) -> OrchestratorAssi
         environment_requirements: Vec::new(),
         licensed_breakage: None,
         notes: None,
+        decision_refs: Vec::new(),
     }
 }
 
@@ -366,6 +367,7 @@ fn licensed_follow_up_assignment() -> OrchestratorAssignment {
         environment_requirements: Vec::new(),
         licensed_breakage: None,
         notes: None,
+        decision_refs: Vec::new(),
     }
 }
 
@@ -930,7 +932,7 @@ fn declared_scoped_breakage_passes_and_journals_dispatchable_follow_up_plan() {
         serde_json::to_vec_pretty(&task.supervisor_plan).expect("serialize generated plan"),
     )
     .expect("write generated plan directly");
-    let loaded = load_supervisor_plan_file_with_consultant(&follow_up_plan_path)
+    let loaded = load_supervisor_plan_file_with_consultant(&follow_up_plan_path, None)
         .expect("real supervise plan loader accepts generated plan without injected metadata");
     assert_eq!(loaded.plan, task.supervisor_plan.ordinary_plan());
     assert_eq!(loaded.consultant, task.supervisor_plan.consultant);
@@ -1143,7 +1145,7 @@ fn generated_follow_up_real_loader_rejects_stripped_required_section() {
     )
     .expect("write neutered plan");
 
-    let error = load_supervisor_plan_file_with_consultant(&neutered_path)
+    let error = load_supervisor_plan_file_with_consultant(&neutered_path, None)
         .expect_err("real supervise plan loader must reject a stripped required section");
     assert!(
         format!("{error:#}")

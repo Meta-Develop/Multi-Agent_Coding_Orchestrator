@@ -1759,6 +1759,7 @@ fn supervisor_required_optional_and_vector_paths_share_reversible_serialization(
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         }],
     };
     let value = serde_json::to_value(plan).expect("serialize plan paths");

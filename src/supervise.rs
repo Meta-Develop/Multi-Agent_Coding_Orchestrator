@@ -14,6 +14,7 @@ use crate::{
         ArtifactRecoveryFile, ArtifactRunReader, ArtifactRunWriter, ArtifactScratchDirectory,
         RunArtifactFamily,
     },
+    decision_ref::DecisionRef,
     external_agent::{
         catalog_preflight_grant_origin_mismatch_failure, codex_usage_from_jsonl,
         collect_and_import_managed_child_git_commit, load_codex_runtime_model_catalog_authorized,
@@ -252,6 +253,9 @@ pub(crate) fn live_quota_concurrency_bound(
 }
 mod plan_api;
 pub use plan_api::*;
+pub(crate) use plan_api::{
+    load_supervisor_plan_file_in_repo, validate_generated_follow_up_plan_document_in_repo,
+};
 mod model_policy;
 pub use model_policy::*;
 mod role_authority;
@@ -2017,6 +2021,10 @@ pub struct OrchestratorAssignment {
     pub licensed_breakage: Option<LicensedBreakageDeclaration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    /// Optional citations of resolved design decisions. Empty or omitted refs
+    /// do not require a DecisionStore and must not create one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decision_refs: Vec<DecisionRef>,
 }
 
 impl OrchestratorAssignment {
@@ -3272,7 +3280,7 @@ fn run_supervisor_plan_file_with_runner(
     let repo = discover_repo_root(&options.repo)?;
     let manager = WorktreeManager::new(&repo);
     let cleanliness = manager.acquire_repository_cleanliness()?;
-    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file, Some(&repo))?;
     let runtime_model_catalog = test_runtime_model_catalog(&loaded.plan, options.runtime)?;
     let serialized_runner = Mutex::new(external_runner);
     run_supervisor_plan_with_runner_and_creation(
@@ -3382,7 +3390,7 @@ fn run_supervisor_plan_file_cascade_with_cancellable_runner_and_gate(
     }
     let repo = discover_repo_root(&options.repo)?;
     let manager = WorktreeManager::new(&repo);
-    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file, Some(&repo))?;
     if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
         bail!("autopilot caller cancelled before exact injected loaded-plan dispatch");
     }
@@ -3475,7 +3483,7 @@ pub(crate) fn resume_supervisor_plan_file_cascade_with_runner(
     external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
 ) -> Result<SupervisorCascadeOutcome> {
     let repo = discover_repo_root(&options.repo)?;
-    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file, Some(&repo))?;
     let run_id = options.run_id.clone();
     let status = supervisor_status(&repo, run_id.clone())?;
     let source_report = match status.lifecycle {

@@ -396,6 +396,7 @@ mod tests {
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         }
     }
 

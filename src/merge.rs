@@ -11,8 +11,10 @@ pub use crate::merge_semantic::{
 };
 use crate::{
     artifacts::{
-        state_auth::sha256_hex, ArtifactFileDisposition, ArtifactRunWriter, RunArtifactFamily,
+        state_auth::sha256_hex, ArtifactFileDisposition, ArtifactRunReader, ArtifactRunWriter,
+        RunArtifactFamily,
     },
+    decision_ref::{check_required_decision_ref_in_store, DecisionRef},
     external_agent::{
         run_external_agent, ExternalAgentCommand, ExternalAgentInvocation,
         ExternalMachineGlobalRetentionBinding,
@@ -38,7 +40,8 @@ use crate::{
     },
     semantic_coord::{SemanticIntent, SemanticIntentStore},
     supervise::{
-        verified_megafile_decomposition_evidence, AgentRole, VerifiedMegafileDecompositionEvidence,
+        verified_megafile_decomposition_evidence, AgentRole, OrchestratorAssignment,
+        VerifiedMegafileDecompositionEvidence,
     },
     sync::{normalize_repo_relative_path, PathClaim},
     sync_store::SyncStore,
@@ -274,6 +277,116 @@ pub struct MergeArbitrationOptions {
     pub worktree_root: Option<PathBuf>,
     pub machine_global_config: PathBuf,
     pub machine_global_runtime_root_id: String,
+    /// Optional citations of resolved design decisions. Empty means do not
+    /// open or create a DecisionStore.
+    pub decision_refs: Vec<DecisionRef>,
+    /// Finalized Supervise run whose assignment `decision_refs` should be
+    /// honored. Distinct from `run_id`, which remains the fresh merge
+    /// arbitration artifact id. `None` means do not read run artifacts.
+    pub source_run_id: Option<RunId>,
+}
+
+/// Fail-closed DecisionRef check used by merge arbitration.
+///
+/// Empty `references` does not open or create a DecisionStore.
+pub fn check_merge_arbitration_decision_refs(
+    repo: impl AsRef<Path>,
+    references: &[DecisionRef],
+) -> Result<()> {
+    if references.is_empty() {
+        return Ok(());
+    }
+    for reference in references {
+        check_required_decision_ref_in_store(repo.as_ref(), Some(reference))?;
+    }
+    Ok(())
+}
+
+fn collect_merge_arbitration_decision_refs(
+    options: &MergeArbitrationOptions,
+) -> Result<Vec<DecisionRef>> {
+    let mut references = options.decision_refs.clone();
+    references.extend(assignment_decision_refs_from_run_artifacts(options)?);
+    let mut seen = BTreeSet::new();
+    Ok(references
+        .into_iter()
+        .filter(|reference| {
+            seen.insert((
+                reference.question_key().to_string(),
+                reference.expected_resolution().map(str::to_string),
+            ))
+        })
+        .collect())
+}
+
+fn assignment_decision_refs_from_run_artifacts(
+    options: &MergeArbitrationOptions,
+) -> Result<Vec<DecisionRef>> {
+    let Some(source_run_id) = options.source_run_id.as_ref() else {
+        return Ok(Vec::new());
+    };
+    if source_run_id == &options.run_id {
+        bail!(
+            "merge --source-run-id '{}' must differ from the fresh merge --run-id",
+            source_run_id.as_str()
+        );
+    }
+    let reader =
+        ArtifactRunReader::open(&options.repo, RunArtifactFamily::Supervise, source_run_id)
+            .with_context(|| {
+                format!(
+                    "source supervise run '{}' is unreadable for assignment decision_refs",
+                    source_run_id.as_str()
+                )
+            })?;
+    let bytes = reader
+        .read("assignments/supervisor-plan.json")
+        .with_context(|| {
+            format!(
+                "source supervise run '{}' is missing assignments/supervisor-plan.json",
+                source_run_id.as_str()
+            )
+        })?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .context("source supervise supervisor-plan.json is unparseable")?;
+    let side_ids = options
+        .sides
+        .iter()
+        .filter_map(|side| match side {
+            ArbitrationSideSpec::Agent { agent_id, .. } => Some(agent_id.as_str()),
+            ArbitrationSideSpec::Primary => None,
+        })
+        .collect::<BTreeSet<_>>();
+    assignment_decision_refs_from_plan_value(&value, &side_ids).with_context(|| {
+        format!(
+            "source supervise run '{}' assignment decision_refs could not be read",
+            source_run_id.as_str()
+        )
+    })
+}
+
+fn assignment_decision_refs_from_plan_value(
+    value: &Value,
+    side_ids: &BTreeSet<&str>,
+) -> Result<Vec<DecisionRef>> {
+    let assignments = value
+        .get("assignments")
+        .and_then(Value::as_array)
+        .context("source supervise supervisor-plan.json is missing assignments")?;
+    let mut references = Vec::new();
+    let mut matched = false;
+    for (index, raw) in assignments.iter().enumerate() {
+        let assignment: OrchestratorAssignment = serde_json::from_value(raw.clone())
+            .with_context(|| format!("source supervise plan assignment {index} is unparseable"))?;
+        if side_ids.contains(assignment.id.as_str()) {
+            matched = true;
+            references.extend(assignment.decision_refs);
+        }
+    }
+    if !matched {
+        bail!("source supervise plan has no assignment matching merge Agent side ids");
+    }
+    Ok(references)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -731,6 +844,10 @@ fn arbitrate_merge_with_environment(
 ) -> Result<MergeArbitrationReport> {
     let options = canonicalize_arbitration_options(options)?;
     let repo_root = discover_primary_repo_root(&options.repo)?;
+    let decision_refs = collect_merge_arbitration_decision_refs(&options)
+        .context("failed to collect merge arbitration decision_refs")?;
+    check_merge_arbitration_decision_refs(&repo_root, &decision_refs)
+        .context("merge arbitration decision_ref check failed")?;
     let mut writer = ArtifactRunWriter::reserve(
         &repo_root,
         RunArtifactFamily::Supervise,

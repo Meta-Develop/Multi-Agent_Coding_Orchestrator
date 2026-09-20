@@ -2307,7 +2307,20 @@ fn orchestrator_assignment_schema_value() -> serde_json::Value {
             "worker_assignments": {"type": "array", "items": worker_assignment_schema_value()},
             "environment_requirements": {"type": "array", "items": environment_requirement_schema_value()},
             "licensed_breakage": licensed_breakage_declaration_schema_value(),
-            "notes": {"type": "string"}
+            "notes": {"type": "string"},
+            "decision_refs": {
+                "type": "array",
+                "description": "Optional citations of resolved DecisionRecord question keys. Non-empty citations load an existing DecisionStore and fail closed on missing, stale, open, or superseded records. Omitted or empty citations do not require a store.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["question_key"],
+                    "properties": {
+                        "question_key": {"type": "string", "minLength": 1},
+                        "expected_resolution": {"type": "string", "minLength": 1}
+                    }
+                }
+            }
         }
     })
 }

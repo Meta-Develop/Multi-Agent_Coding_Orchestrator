@@ -380,6 +380,7 @@ fn injected_direct_worker_assignment() -> OrchestratorAssignment {
         environment_requirements: Vec::new(),
         licensed_breakage: None,
         notes: None,
+        decision_refs: Vec::new(),
     }
 }
 

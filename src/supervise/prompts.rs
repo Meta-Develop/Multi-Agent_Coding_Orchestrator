@@ -1756,6 +1756,7 @@ mod regression_tests {
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         };
         let plan = SupervisorPlan {
             version: SUPERVISOR_SCHEMA_VERSION,
@@ -1925,6 +1926,7 @@ mod regression_tests {
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         };
         let plan = SupervisorPlan {
             version: SUPERVISOR_SCHEMA_VERSION,
@@ -2035,6 +2037,7 @@ mod regression_tests {
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         };
         let plan = SupervisorPlan {
             version: SUPERVISOR_SCHEMA_VERSION,
@@ -2195,6 +2198,7 @@ mod regression_tests {
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         };
         let mut plan = SupervisorPlan {
             version: SUPERVISOR_SCHEMA_VERSION,
@@ -2293,6 +2297,7 @@ mod regression_tests {
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         };
         let mut plan = SupervisorPlan {
             version: SUPERVISOR_SCHEMA_VERSION,
@@ -2664,6 +2669,7 @@ mod regression_tests {
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         };
         let diff_lens = ReviewLensConfig {
             id: "diff-security".to_string(),
@@ -2827,6 +2833,7 @@ mod regression_tests {
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         };
         let lens = ReviewLensConfig {
             id: "bounded-output".to_string(),

@@ -209,6 +209,7 @@ fn omitted_profile_preserves_legacy_supervisor_plan_bytes() {
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: Some("autopilot attempt 1".to_string()),
+            decision_refs: Vec::new(),
         }],
     };
 
@@ -840,6 +841,7 @@ fn licensed_autopilot_supervisor_plan() -> (Value, LicensedBreakageDeclaration, 
             environment_requirements: Vec::new(),
             licensed_breakage: Some(declaration.clone()),
             notes: None,
+            decision_refs: Vec::new(),
         }],
     };
     (

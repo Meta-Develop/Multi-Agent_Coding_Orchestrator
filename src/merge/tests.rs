@@ -222,7 +222,148 @@ fn fake_arbitration_options(repo: &Path, run_id: &str) -> MergeArbitrationOption
         worktree_root: None,
         machine_global_config: repo.join("unused-machine-global.json"),
         machine_global_runtime_root_id: "runtime".to_string(),
+        decision_refs: Vec::new(),
+        source_run_id: None,
     }
+}
+
+fn matching_source_assignment_plan_json() -> serde_json::Value {
+    serde_json::json!({
+        "assignments": [{
+            "id": "agent-a",
+            "phase": "execution",
+            "role": "child_orchestrator",
+            "assigned_paths": ["shared.txt"],
+            "worker_assignments": [],
+            "decision_refs": [{
+                "question_key": "api.transport",
+                "expected_resolution": "Use HTTP"
+            }]
+        }]
+    })
+}
+
+#[test]
+fn source_supervise_assignment_refs_match_agent_sides_for_unused_merge_run_id() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    git2::Repository::init(temp.path()).expect("init repo");
+    let options = fake_arbitration_options(temp.path(), "fresh-merge-id");
+    let side_ids = options
+        .sides
+        .iter()
+        .filter_map(|side| match side {
+            ArbitrationSideSpec::Agent { agent_id, .. } => Some(agent_id.as_str()),
+            ArbitrationSideSpec::Primary => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let references = assignment_decision_refs_from_plan_value(
+        &matching_source_assignment_plan_json(),
+        &side_ids,
+    )
+    .expect("matching source assignment refs must be collected");
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0].question_key(), "api.transport");
+    assert_eq!(references[0].expected_resolution(), Some("Use HTTP"));
+    assert_ne!(options.run_id.as_str(), "source-supervise");
+    assert!(
+        ArtifactRunReader::open(temp.path(), RunArtifactFamily::Supervise, &options.run_id)
+            .is_err(),
+        "merge run_id must stay a distinct unused arbitration id"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn source_supervise_assignment_refs_are_collected_from_finalized_source_run() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    git2::Repository::init(temp.path()).expect("init repo");
+    let run_id = RunId::new("source-supervise").expect("source run id");
+    let mut writer = ArtifactRunWriter::reserve(
+        temp.path(),
+        RunArtifactFamily::Supervise,
+        run_id,
+        "merge-decision-ref-test",
+    )
+    .expect("reserve source supervise run");
+    writer
+        .write_bytes(
+            "assignments/supervisor-plan.json",
+            matching_source_assignment_plan_json()
+                .to_string()
+                .as_bytes(),
+            ArtifactFileDisposition::PrivateEvidence,
+        )
+        .expect("write source supervisor plan");
+    writer
+        .write_bytes(
+            RunArtifactFamily::Supervise.final_report_relative_path(),
+            br#"{"test":true}"#,
+            ArtifactFileDisposition::PrivateEvidence,
+        )
+        .expect("write source final report");
+    writer
+        .finalize(
+            RunArtifactFamily::Supervise.final_report_relative_path(),
+            false,
+        )
+        .expect("finalize source supervise run");
+
+    let mut options = fake_arbitration_options(temp.path(), "fresh-merge-id");
+    options.source_run_id = Some(RunId::new("source-supervise").expect("source run id"));
+    let references = collect_merge_arbitration_decision_refs(&options)
+        .expect("matching source assignment refs must be collected");
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0].question_key(), "api.transport");
+    assert_eq!(references[0].expected_resolution(), Some("Use HTTP"));
+}
+
+#[test]
+fn source_run_id_equal_to_merge_run_id_fails_closed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    git2::Repository::init(temp.path()).expect("init repo");
+    let mut options = fake_arbitration_options(temp.path(), "same-id");
+    options.source_run_id = Some(options.run_id.clone());
+    let error = collect_merge_arbitration_decision_refs(&options)
+        .expect_err("source_run_id must stay distinct from merge run_id");
+    assert!(
+        format!("{error:#}").contains("must differ"),
+        "distinct-id refusal must be named: {error:#}"
+    );
+}
+
+#[test]
+fn unreadable_source_run_id_fails_closed_before_merge_reserve() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    git2::Repository::init(temp.path()).expect("init repo");
+    let mut options = fake_arbitration_options(temp.path(), "fresh-merge-id");
+    options.source_run_id = Some(RunId::new("missing-source").expect("missing source run id"));
+    let error = collect_merge_arbitration_decision_refs(&options)
+        .expect_err("unreadable source_run_id must fail closed");
+    assert!(
+        format!("{error:#}").contains("unreadable"),
+        "unreadable source run must be named: {error:#}"
+    );
+}
+
+#[test]
+fn missing_source_run_id_without_cli_refs_stays_empty_and_creates_no_store() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    git2::Repository::init(temp.path()).expect("init repo");
+    let options = fake_arbitration_options(temp.path(), "fresh-merge-id");
+    let references = collect_merge_arbitration_decision_refs(&options)
+        .expect("absent source_run_id must not read merge run artifacts");
+    assert!(references.is_empty());
+    check_merge_arbitration_decision_refs(temp.path(), &references)
+        .expect("empty refs must not require a store");
+    assert!(
+        crate::decision_store::DecisionStore::open_existing(temp.path())
+            .expect("read-only query")
+            .is_none()
+    );
+    assert!(
+        !temp.path().join(".git").join("maco").exists(),
+        "empty assignment refs must not create Git-common decision-store state"
+    );
 }
 
 #[test]

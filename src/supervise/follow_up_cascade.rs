@@ -342,12 +342,15 @@ pub(super) fn run_generated_follow_up_cascade(
                     &item_id,
                 )?));
             }
-            let effective = validate_generated_follow_up_plan_document(&task.supervisor_plan)?;
+            let effective = validate_generated_follow_up_plan_document_in_repo(
+                &task.supervisor_plan,
+                Some(repo),
+            )?;
             let plan_file = generated_plan_file(repo, &task.supervisor_plan)?;
             #[cfg(test)]
             run_before_generated_follow_up_plan_load_hook(plan_file.path());
             let Some(reloaded) =
-                load_exact_generated_plan_file(plan_file.path(), &task.supervisor_plan)?
+                load_exact_generated_plan_file(plan_file.path(), &task.supervisor_plan, repo)?
             else {
                 return Ok(FollowUpPreparation::Refused(permission_expansion_denial(
                     &item_id,
@@ -852,7 +855,7 @@ pub(crate) fn generated_follow_up_dispatch_evidence_after_cascade_error(
                     .context("finalized cascade source has no authenticated normalized plan")?;
                 let plan_text = String::from_utf8(plan_bytes)
                     .context("authenticated cascade source plan is not UTF-8")?;
-                let loaded = parse_supervisor_plan_with_consultant(&plan_text)?;
+                let loaded = parse_supervisor_plan_with_consultant_in_repo(&plan_text, Some(repo))?;
                 (
                     normalized_supervisor_plan_sha256(
                         &loaded.plan,
@@ -922,8 +925,8 @@ pub(crate) fn generated_follow_up_dispatch_evidence_after_cascade_error(
     }
 }
 
-pub(crate) fn normalized_supervisor_plan_file_sha256(path: &Path) -> Result<String> {
-    let loaded = load_supervisor_plan_file_with_consultant(path)?;
+pub(crate) fn normalized_supervisor_plan_file_sha256(path: &Path, repo: &Path) -> Result<String> {
+    let loaded = load_supervisor_plan_file_with_consultant(path, Some(repo))?;
     normalized_supervisor_plan_sha256(
         &loaded.plan,
         &loaded.consultant,
@@ -1440,7 +1443,8 @@ fn verify_authenticated_source_basis(
         .context("generated follow-up source has no authenticated normalized plan")?;
     let plan_text = String::from_utf8(plan_bytes)
         .context("authenticated generated follow-up source plan is not UTF-8")?;
-    let authenticated_loaded = parse_supervisor_plan_with_consultant(&plan_text)?;
+    let authenticated_loaded =
+        parse_supervisor_plan_with_consultant_in_repo(&plan_text, Some(repo))?;
     let authenticated_sha256 = normalized_supervisor_plan_sha256(
         &authenticated_loaded.plan,
         &authenticated_loaded.consultant,
@@ -1472,8 +1476,8 @@ fn authenticated_subordinate_plan_matches(
         .context("generated follow-up subordinate has no authenticated normalized plan")?;
     let plan_text = String::from_utf8(plan_bytes)
         .context("authenticated generated follow-up subordinate plan is not UTF-8")?;
-    let loaded = parse_supervisor_plan_with_consultant(&plan_text)?;
-    loaded_generated_plan_matches(&loaded, queued)
+    let loaded = parse_supervisor_plan_with_consultant_in_repo(&plan_text, Some(repo))?;
+    loaded_generated_plan_matches(&loaded, queued, Some(repo))
 }
 
 fn generated_plan_file(
@@ -1494,9 +1498,10 @@ fn generated_plan_file(
 fn load_exact_generated_plan_file(
     path: &Path,
     generated: &GeneratedFollowUpSupervisorPlan,
+    repo: &Path,
 ) -> Result<Option<LoadedSupervisorPlan>> {
-    let loaded = load_supervisor_plan_file_with_consultant(path)?;
-    if !loaded_generated_plan_matches(&loaded, generated)? {
+    let loaded = load_supervisor_plan_file_with_consultant(path, Some(repo))?;
+    if !loaded_generated_plan_matches(&loaded, generated, Some(repo))? {
         return Ok(None);
     }
     Ok(Some(loaded))
@@ -1505,10 +1510,11 @@ fn load_exact_generated_plan_file(
 fn loaded_generated_plan_matches(
     loaded: &LoadedSupervisorPlan,
     generated: &GeneratedFollowUpSupervisorPlan,
+    repo: Option<&Path>,
 ) -> Result<bool> {
     let encoded = serde_json::to_string(generated)
         .context("failed to encode the immutable queued generated follow-up plan")?;
-    let expected = parse_supervisor_plan_with_consultant(&encoded)
+    let expected = parse_supervisor_plan_with_consultant_in_repo(&encoded, repo)
         .context("immutable queued generated follow-up plan no longer parses")?;
     Ok(loaded == &expected)
 }

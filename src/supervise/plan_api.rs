@@ -222,7 +222,7 @@ pub(super) fn supervisor_plan_and_consultant_from_task_file(
     let task_file = task_file.as_ref();
     let task = read_supervisor_input(task_file, "task file")?;
     if serde_json::from_str::<Value>(&task).is_ok() {
-        return parse_supervisor_plan_with_consultant(&task)
+        return parse_supervisor_plan_with_consultant_in_repo(&task, Some(&repo))
             .with_context(|| format!("failed to parse supervisor plan {}", task_file.display()));
     }
 
@@ -397,6 +397,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
                         .to_string(),
                 )
             }),
+            decision_refs: Vec::new(),
         });
         assignment_schedule.push(AssignmentScheduleEntry {
             assignment_id: planning_id.clone(),
@@ -457,6 +458,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
                     "Execution child admitted only after read-only planning root '{planning_id}' succeeds"
                 ))
             }),
+            decision_refs: Vec::new(),
         });
         assignment_schedule.push(AssignmentScheduleEntry {
             assignment_id: assignment.id,
@@ -1328,6 +1330,7 @@ fn lower_provider_assignment_tree(
         environment_requirements: Vec::new(),
         licensed_breakage: None,
         notes: None,
+        decision_refs: Vec::new(),
     });
     assignment_schedule.push(AssignmentScheduleEntry {
         assignment_id: node.id.clone(),
@@ -1480,7 +1483,7 @@ pub fn task_execution_feedback_from_authenticated_supervisor_run(
         .context("authenticated provider supervisor run has no normalized supervisor plan")?;
     let plan_text = String::from_utf8(plan_bytes)
         .context("authenticated provider supervisor plan is not UTF-8")?;
-    let persisted = parse_supervisor_plan_with_consultant(&plan_text)
+    let persisted = parse_supervisor_plan_with_consultant_in_repo(&plan_text, Some(&repo))
         .context("authenticated provider supervisor plan is invalid")?;
     let persisted_document = supervisor_plan_value(
         &persisted.plan,
@@ -1822,15 +1825,23 @@ fn normalized_report_fragment_ids(
 }
 
 pub fn load_supervisor_plan_file(path: impl AsRef<Path>) -> Result<SupervisorPlan> {
-    Ok(load_supervisor_plan_file_with_consultant(path)?.plan)
+    Ok(load_supervisor_plan_file_with_consultant(path, None)?.plan)
+}
+
+pub(crate) fn load_supervisor_plan_file_in_repo(
+    path: impl AsRef<Path>,
+    repo: impl AsRef<Path>,
+) -> Result<SupervisorPlan> {
+    Ok(load_supervisor_plan_file_with_consultant(path, Some(repo.as_ref()))?.plan)
 }
 
 pub(super) fn load_supervisor_plan_file_with_consultant(
     path: impl AsRef<Path>,
+    repo: Option<&Path>,
 ) -> Result<LoadedSupervisorPlan> {
     let path = path.as_ref();
     let contents = read_supervisor_input(path, "supervisor plan")?;
-    parse_supervisor_plan_with_consultant(&contents)
+    parse_supervisor_plan_with_consultant_in_repo(&contents, repo)
         .with_context(|| format!("failed to parse supervisor plan {}", path.display()))
 }
 
@@ -1847,6 +1858,13 @@ fn read_supervisor_input(path: &Path, label: &str) -> Result<String> {
 pub(super) fn parse_supervisor_plan_with_consultant(
     contents: &str,
 ) -> Result<LoadedSupervisorPlan> {
+    parse_supervisor_plan_with_consultant_in_repo(contents, None)
+}
+
+pub(super) fn parse_supervisor_plan_with_consultant_in_repo(
+    contents: &str,
+    repo: Option<&Path>,
+) -> Result<LoadedSupervisorPlan> {
     let value: Value = serde_json::from_str(contents).context("supervisor plan is not JSON")?;
     let consultant = consultant_from_plan_value(&value)?;
     let mut plan: SupervisorPlan =
@@ -1858,7 +1876,7 @@ pub(super) fn parse_supervisor_plan_with_consultant(
     }
     let plan_metadata = supervisor_plan_metadata_from_value(&value, plan.max_depth)?;
     plan.assignments = assignments_from_plan_value(&value)?;
-    let (mut plan, plan_metadata) = validate_supervisor_plan(plan, plan_metadata)?;
+    let (mut plan, plan_metadata) = validate_supervisor_plan_in_repo(plan, plan_metadata, repo)?;
     bind_assignment_role_categories(&mut plan);
     let assignment_metadata = assignment_metadata_from_plan_value(&value, &plan)?;
     validate_consultant_plan(&consultant)?;
@@ -1873,9 +1891,16 @@ pub(super) fn parse_supervisor_plan_with_consultant(
 pub(crate) fn validate_generated_follow_up_plan_document(
     generated: &GeneratedFollowUpSupervisorPlan,
 ) -> Result<SupervisorPlan> {
+    validate_generated_follow_up_plan_document_in_repo(generated, None)
+}
+
+pub(crate) fn validate_generated_follow_up_plan_document_in_repo(
+    generated: &GeneratedFollowUpSupervisorPlan,
+    repo: Option<&Path>,
+) -> Result<SupervisorPlan> {
     let serialized =
         serde_json::to_string(generated).context("failed to serialize generated follow-up plan")?;
-    let loaded = parse_supervisor_plan_with_consultant(&serialized)
+    let loaded = parse_supervisor_plan_with_consultant_in_repo(&serialized, repo)
         .context("generated follow-up plan failed the ordinary full-document loader")?;
     if loaded.plan != generated.ordinary_plan()
         || loaded.consultant != generated.consultant
@@ -2607,7 +2632,7 @@ pub(crate) fn run_held_out_fake_experiment(
         bail!("the held-out experiment entrypoint supports only nonpublishable Fake generation");
     }
     let repo = discover_repo_root(&options.repo)?;
-    let mut loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    let mut loaded = load_supervisor_plan_file_with_consultant(&options.plan_file, Some(&repo))?;
     validate_execution_target_pre_dispatch(&loaded, false)?;
     if loaded.plan_metadata.execution_target.is_some()
         || loaded.plan.assignments.len() != 1
@@ -3019,7 +3044,7 @@ fn run_held_out_production_experiment_with_runner(
         bail!("held-out production frozen runtime allowlist must start with the parent runtime");
     }
     let repo = discover_repo_root(&options.repo)?;
-    let mut loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    let mut loaded = load_supervisor_plan_file_with_consultant(&options.plan_file, Some(&repo))?;
     refuse_held_out_production_caller_plan(&loaded)?;
     if loaded.plan.assignments[0].id != authority.binding.assignment_id
         || options.run_id.as_str() != authority.binding.supervisor_run_id
@@ -3086,7 +3111,10 @@ pub(crate) fn run_fake_supervisor_plan_file_for_test(
         bail!("hermetic test plan-file execution requires the Fake runtime");
     }
     validate_max_concurrent_children(1)?;
-    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    let loaded = load_supervisor_plan_file_with_consultant(
+        &options.plan_file,
+        Some(options.repo.as_path()),
+    )?;
     validate_execution_target_pre_dispatch(&loaded, false)?;
     let runtime_model_catalog = test_runtime_model_catalog(&loaded.plan, options.runtime)?;
     let no_external_runner = |_command: &ExternalAgentCommand,
@@ -3287,7 +3315,7 @@ pub fn resume_supervisor_plan_file_cascade_with_concurrency_policy(
     concurrency_policy: SupervisorConcurrencyPolicy,
 ) -> Result<SupervisorCascadeOutcome> {
     let repo = discover_repo_root(&options.repo)?;
-    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file, Some(&repo))?;
     validate_execution_target_pre_dispatch(&loaded, false)?;
     resume_generated_follow_up_cascade(repo, loaded, options, concurrency_policy)
 }
@@ -3501,7 +3529,7 @@ fn run_supervisor_plan_file_cascade_with_gate(
     let max_concurrent_children = concurrency_policy.resolve(HostProcessCapacity::measured());
     validate_max_concurrent_children(max_concurrent_children)?;
     let repo = discover_repo_root(&options.repo)?;
-    let mut loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    let mut loaded = load_supervisor_plan_file_with_consultant(&options.plan_file, Some(&repo))?;
     apply_objective_profile_override(&mut loaded, objective_profile_override);
     validate_execution_target_pre_dispatch(&loaded, allow_primary_worktree)?;
     if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
@@ -3755,7 +3783,8 @@ pub(super) fn evidence_only_reaudit_plan_from_source(
         .context("authenticated source run has no normalized supervisor plan")?;
     let source_plan_text = String::from_utf8(source_plan_bytes)
         .context("authenticated source supervisor plan is not UTF-8")?;
-    let source_loaded = parse_supervisor_plan_with_consultant(&source_plan_text)?;
+    let source_loaded =
+        parse_supervisor_plan_with_consultant_in_repo(&source_plan_text, Some(repo))?;
     let source_assignment = source_loaded
         .plan
         .assignments
@@ -3834,7 +3863,7 @@ pub(super) fn evidence_only_reaudit_plan_from_source(
         path_proposal: source_loaded.plan_metadata.path_proposal.clone(),
         router: source_loaded.plan_metadata.router.clone(),
     };
-    let (plan, plan_metadata) = validate_supervisor_plan(plan, plan_metadata)?;
+    let (plan, plan_metadata) = validate_supervisor_plan_in_repo(plan, plan_metadata, Some(repo))?;
     Ok(LoadedSupervisorPlan {
         plan,
         consultant: SupervisorConsultantPlan::default(),
@@ -3857,7 +3886,8 @@ pub(super) fn verify_evidence_only_reaudit_source(
         .context("authenticated source run has no normalized supervisor plan")?;
     let source_plan_text = String::from_utf8(source_plan_bytes)
         .context("authenticated source supervisor plan is not UTF-8")?;
-    let source_loaded = parse_supervisor_plan_with_consultant(&source_plan_text)?;
+    let source_loaded =
+        parse_supervisor_plan_with_consultant_in_repo(&source_plan_text, Some(repo))?;
     let source_assignment = source_loaded
         .plan
         .assignments
@@ -3945,7 +3975,7 @@ fn run_supervisor_plan_file_with_runner_and_max_concurrent_children(
     let repo = discover_repo_root(&options.repo)?;
     let manager = WorktreeManager::new(&repo);
     let cleanliness = manager.acquire_repository_cleanliness()?;
-    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file, Some(&repo))?;
     validate_execution_target_pre_dispatch(&loaded, false)?;
     let runtime_model_catalog =
         admit_production_supervisor_catalog_preflight_grant(&options, &repo)
@@ -5171,6 +5201,193 @@ mod diagnostics_emission_tests {
         assert_ne!(
             emitted["coordination_topology"]["derived_coordination_depth"], emitted["max_depth"],
             "derived depth is planner output, not a copy of operator max_depth"
+        );
+    }
+}
+
+#[cfg(test)]
+mod decision_ref_live_reparse_tests {
+    use super::*;
+    #[cfg(unix)]
+    use crate::artifacts::{ArtifactFileDisposition, ArtifactRunWriter, RunArtifactFamily};
+    use crate::decision_ref::DecisionRefError;
+    use crate::decision_store::{DecisionStore, DECISION_STORE_STATE_NAMESPACE};
+    use std::fs;
+
+    fn cited_assignment_plan_json() -> String {
+        serde_json::json!({
+            "version": 1,
+            "task": "decision-ref live re-parse fixture",
+            "max_depth": 2,
+            "max_child_assignments": 1,
+            "assignments": [{
+                "id": "child-a",
+                "phase": "execution",
+                "role": "child_orchestrator",
+                "assigned_paths": ["README.md"],
+                "worker_assignments": [],
+                "decision_refs": [{
+                    "question_key": "api.transport",
+                    "expected_resolution": "Use HTTP"
+                }]
+            }],
+            "assignment_schedule": [{
+                "assignment_id": "child-a",
+                "depth": 2,
+                "flattened_index": 0
+            }]
+        })
+        .to_string()
+    }
+
+    fn init_repo() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().expect("temporary repository");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(repo.join("src")).expect("src");
+        fs::write(repo.join("README.md"), "hello\n").expect("readme");
+        git2::Repository::init(&repo).expect("initialize repository");
+        (temp, repo)
+    }
+
+    #[cfg(unix)]
+    fn write_finalized_cited_source(repo: &Path, run_id: &RunId, plan_json: &str) {
+        let mut writer = ArtifactRunWriter::reserve(
+            repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "decision-ref-live-reparse",
+        )
+        .expect("reserve source supervise run");
+        writer
+            .write_bytes(
+                "assignments/supervisor-plan.json",
+                plan_json.as_bytes(),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("write cited supervisor plan");
+        let report: SupervisorFinalReport = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "run_id": run_id.as_str(),
+            "role": "supervisor",
+            "repo": ".",
+            "plan_file": "plan.json",
+            "run_dir": ".",
+            "publishable": false,
+            "success": true,
+            "accepted": false,
+            "rejected": false,
+            "status": "succeeded",
+            "remaining_risk": "test",
+            "next_safe_action": "none"
+        }))
+        .expect("minimal final report");
+        writer
+            .write_bytes(
+                RunArtifactFamily::Supervise.final_report_relative_path(),
+                &serde_json::to_vec(&report).expect("encode final report"),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("write final report");
+        writer
+            .finalize(
+                RunArtifactFamily::Supervise.final_report_relative_path(),
+                false,
+            )
+            .expect("finalize source supervise run");
+    }
+
+    fn is_store_missing(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<DecisionRefError>()
+                .is_some_and(|error| *error == DecisionRefError::StoreMissing)
+                || cause.to_string().contains("decision store is missing")
+        })
+    }
+
+    fn is_store_query_failed(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<DecisionRefError>()
+                .is_some_and(|error| matches!(error, DecisionRefError::StoreQueryFailed { .. }))
+                || cause.to_string().contains("decision store query failed")
+        })
+    }
+
+    #[test]
+    fn cited_plan_none_wrapper_is_store_missing() {
+        let error = parse_supervisor_plan_with_consultant(&cited_assignment_plan_json())
+            .expect_err("None wrapper must not admit cited plans");
+        assert!(
+            is_store_missing(&error),
+            "None wrapper must be StoreMissing: {error:#}"
+        );
+    }
+
+    #[test]
+    fn cited_plan_in_repo_wrapper_fails_closed_when_repo_has_no_store() {
+        let (_temp, repo) = init_repo();
+        let error = parse_supervisor_plan_with_consultant_in_repo(
+            &cited_assignment_plan_json(),
+            Some(&repo),
+        )
+        .expect_err("cited plan + existing repo with no store must fail closed");
+        assert!(
+            is_store_missing(&error),
+            "empty-of-store repo must be StoreMissing: {error:#}"
+        );
+        assert!(DecisionStore::open_existing(&repo)
+            .expect("read-only query")
+            .is_none());
+    }
+
+    #[test]
+    fn cited_plan_in_repo_wrapper_queries_supplied_repo() {
+        let (_temp, repo) = init_repo();
+        fs::create_dir_all(
+            repo.join(".git")
+                .join("maco")
+                .join("state")
+                .join(DECISION_STORE_STATE_NAMESPACE),
+        )
+        .expect("create malformed decision-store namespace");
+        let error = parse_supervisor_plan_with_consultant_in_repo(
+            &cited_assignment_plan_json(),
+            Some(&repo),
+        )
+        .expect_err("malformed store must fail closed through the supplied repo");
+        assert!(
+            is_store_query_failed(&error),
+            "live in-repo wrapper must query the supplied repo: {error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_only_reaudit_live_path_passes_repo_for_cited_plan() {
+        let (_temp, repo) = init_repo();
+        let source_id = RunId::new("cited-reaudit-source").expect("source run id");
+        write_finalized_cited_source(&repo, &source_id, &cited_assignment_plan_json());
+
+        let missing_store = evidence_only_reaudit_plan_from_source(&repo, &source_id, "child-a")
+            .expect_err("cited re-audit source without a store must fail closed");
+        assert!(
+            is_store_missing(&missing_store),
+            "live re-audit path must fail closed as StoreMissing when the repo has no store: {missing_store:#}"
+        );
+
+        fs::create_dir_all(
+            repo.join(".git")
+                .join("maco")
+                .join("state")
+                .join(DECISION_STORE_STATE_NAMESPACE),
+        )
+        .expect("create malformed decision-store namespace");
+        let queried = evidence_only_reaudit_plan_from_source(&repo, &source_id, "child-a")
+            .expect_err("malformed store must be visible on the live re-audit path");
+        assert!(
+            is_store_query_failed(&queried),
+            "live evidence_only_reaudit path must pass Some(repo): {queried:#}"
         );
     }
 }

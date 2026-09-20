@@ -860,7 +860,8 @@ pub(super) fn generated_licensed_follow_up_tasks(
                     "Generated licensed-breakage follow-up in a complete ordinary supervisor plan; authenticated queue admission requires an accepted publishable source run"
                         .to_string(),
                 ),
-            };
+            decision_refs: Vec::new(),
+        };
             let schedule = vec![AssignmentScheduleEntry {
                 assignment_id: follow_up_assignment.id.clone(),
                 parent_assignment_id: None,

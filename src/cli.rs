@@ -9,6 +9,7 @@ use crate::{
     },
     autopilot,
     consult::{self, ConsultAskOptions, ConsultantRuntime, DEFAULT_CONSULT_TIMEOUT_SECONDS},
+    decision_ref::{parse_decision_ref_cli, DecisionRef, DecisionRefError},
     hierarchy_ledger::{is_coordinator_role_label, observe_hierarchy, ObservedHierarchyNode},
     inbox::{
         self, InboxMachineGlobalInput, InboxPermissionMode, InboxRunOptions, InboxScanOptions,
@@ -1130,12 +1131,10 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                 host_disk_per_child_mib: args.host_disk_per_child_mib,
                 host_fallback_children: args.host_fallback_children,
             };
-            let runtime = args.runtime.unwrap_or_else(|| {
-                supervise::load_supervisor_plan_file(&plan_file)
-                    .ok()
-                    .and_then(|plan| plan.assignments.first().and_then(|a| a.runtime))
-                    .unwrap_or(supervise::SupervisorRuntime::Codex)
-            });
+            let runtime = match args.runtime {
+                Some(runtime) => runtime,
+                None => sniff_supervise_runtime_from_plan(&plan_file, &resolved_repo)?,
+            };
             let json = args.json;
             let objective_profile_override = args.objective_profile.clone();
             let role_category_override = args.role_category_override.role_category;
@@ -4748,6 +4747,27 @@ fn execute_eval_harness_v2_operator_path(
     let results =
         crate::eval_harness::execute_v2_local_fake(manifest).map_err(anyhow::Error::from)?;
     serde_json::to_value(results).context("failed to serialize eval-harness v2 result")
+}
+
+fn sniff_supervise_runtime_from_plan(
+    plan_file: &Path,
+    repo: &Path,
+) -> Result<supervise::SupervisorRuntime> {
+    match supervise::load_supervisor_plan_file_in_repo(plan_file, repo) {
+        Ok(plan) => Ok(plan
+            .assignments
+            .first()
+            .and_then(|assignment| assignment.runtime)
+            .unwrap_or(supervise::SupervisorRuntime::Codex)),
+        Err(error) if decision_ref_error_in_chain(&error) => Err(error),
+        Err(_) => Ok(supervise::SupervisorRuntime::Codex),
+    }
+}
+
+fn decision_ref_error_in_chain(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<DecisionRefError>().is_some())
 }
 
 include!("cli/part2.rs");

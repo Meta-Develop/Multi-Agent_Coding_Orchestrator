@@ -6,7 +6,7 @@ use multi_agent_coding_orchestrator::{
     },
     decision_ref::{
         check_decision_ref, check_required_decision_ref, check_required_decision_ref_in_store,
-        DecisionRef, DecisionRefError, StaleDecisionRefReason,
+        parse_decision_ref_cli, DecisionRef, DecisionRefError, StaleDecisionRefReason,
     },
 };
 
@@ -306,4 +306,51 @@ fn required_ref_fails_closed_when_store_is_missing() {
         check_required_decision_ref_in_store(temp.path(), None).expect_err("missing ref"),
         DecisionRefError::MissingRef
     );
+}
+
+#[test]
+fn cli_citation_parses_key_and_optional_resolution() {
+    let key_only = parse_decision_ref_cli(" api.transport ").expect("key-only citation");
+    assert_eq!(key_only.question_key(), "api.transport");
+    assert_eq!(key_only.expected_resolution(), None);
+
+    let with_resolution = parse_decision_ref_cli("api.transport=Use HTTP").expect("keyed citation");
+    assert_eq!(with_resolution.question_key(), "api.transport");
+    assert_eq!(with_resolution.expected_resolution(), Some("Use HTTP"));
+
+    assert_eq!(
+        parse_decision_ref_cli("api transport").expect_err("invalid key"),
+        DecisionRefError::InvalidCitation(DecisionClaimError::InvalidInput {
+            field: DecisionInputField::QuestionKey,
+        })
+    );
+    assert_eq!(
+        parse_decision_ref_cli("api.transport=").expect_err("empty resolution"),
+        DecisionRefError::InvalidCitation(DecisionClaimError::EmptyInput {
+            field: DecisionInputField::Resolution,
+        })
+    );
+}
+
+#[test]
+fn decision_ref_serde_round_trips_through_new() {
+    let reference = DecisionRef::new("api.transport")
+        .expect("valid key")
+        .with_expected_resolution("Use HTTP")
+        .expect("valid resolution");
+    let json = serde_json::to_value(&reference).expect("serialize citation");
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "question_key": "api.transport",
+            "expected_resolution": "Use HTTP"
+        })
+    );
+    let loaded: DecisionRef = serde_json::from_value(json).expect("deserialize citation");
+    assert_eq!(loaded, reference);
+
+    let invalid = serde_json::from_value::<DecisionRef>(serde_json::json!({
+        "question_key": "api transport"
+    }));
+    assert!(invalid.is_err(), "invalid keys must fail closed at serde");
 }

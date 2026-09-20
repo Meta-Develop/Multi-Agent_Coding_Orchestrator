@@ -4989,6 +4989,7 @@ mod selection_policy_tests {
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         }
     }
 
@@ -5372,6 +5373,7 @@ mod selection_policy_tests {
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         };
         plan.assignments = vec![assignment.clone()];
         plan.role_models
@@ -5980,6 +5982,7 @@ mod selection_policy_tests {
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         }];
         let requested_plan = plan.clone();
         let catalog = test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)?;
@@ -6030,6 +6033,7 @@ mod selection_policy_tests {
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         }];
         let priors = crate::selection::built_in_prior_dataset()?;
         let ineligible = priors

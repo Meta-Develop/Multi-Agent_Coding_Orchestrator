@@ -5569,6 +5569,7 @@ mod decomposition_tests {
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         };
         let plan = SupervisorPlan {
             version: SUPERVISOR_SCHEMA_VERSION,
@@ -6024,6 +6025,7 @@ mod decomposition_tests {
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         };
         let plan = SupervisorPlan {
             version: SUPERVISOR_SCHEMA_VERSION,
@@ -6390,6 +6392,7 @@ mod decomposition_tests {
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         };
         let plan = SupervisorPlan {
             version: SUPERVISOR_SCHEMA_VERSION,
@@ -6905,6 +6908,7 @@ mod decomposition_tests {
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         };
         let mut lenses = single_parent_acceptance_review_lenses();
         let second_lens = lenses[0].clone();
@@ -7207,6 +7211,7 @@ mod decomposition_tests {
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         };
         let mut plan = SupervisorPlan {
             version: SUPERVISOR_SCHEMA_VERSION,
@@ -7502,6 +7507,7 @@ mod decomposition_tests {
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         };
         let plan = SupervisorPlan {
             version: SUPERVISOR_SCHEMA_VERSION,
@@ -8109,6 +8115,7 @@ mod decomposition_tests {
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         };
         let mut plan = SupervisorPlan {
             version: SUPERVISOR_SCHEMA_VERSION,
@@ -8889,6 +8896,7 @@ done
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         }
     }
 
@@ -9106,6 +9114,7 @@ done
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         };
         let mut plan = worker_plan("gpt-5.6-codex");
         plan.assignments = vec![assignment];
@@ -9655,6 +9664,7 @@ done
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         };
         let mut policy = AssignmentBudgetPolicy::default();
         policy.set_selector_binding_for_test(
@@ -9839,6 +9849,7 @@ done
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         };
         let mut policy = AssignmentBudgetPolicy::default();
         policy.set_selector_binding_for_test(
@@ -10037,6 +10048,7 @@ done
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         };
         let mut policy = AssignmentBudgetPolicy::default();
         policy.set_selector_binding_for_test(
@@ -10086,6 +10098,7 @@ done
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         };
         let mut policy = AssignmentBudgetPolicy::default();
         policy.set_selector_binding_for_test(
@@ -10171,6 +10184,7 @@ done
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         };
         let options = launch_fixture_options(SupervisorRuntime::Codex);
         let budget_policy = AssignmentBudgetPolicy::default();
@@ -10204,6 +10218,7 @@ done
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         };
         assignment.role_category = Some(RoleCategory::DelegatingCoordinator);
         assignment.selection_source = Some(AssignmentSelectionSource::OperatorOverride);
@@ -10527,6 +10542,7 @@ done
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         };
         let options = launch_fixture_options(SupervisorRuntime::Codex);
         let mut retry_policy = AssignmentBudgetPolicy::default();
@@ -10688,6 +10704,7 @@ done
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         }
     }
 
@@ -11899,6 +11916,7 @@ done
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         };
         let mut plan = worker_plan(ECONOMY_PROFILE_MODEL);
         plan.assignments = vec![assignment.clone()];
@@ -12806,6 +12824,7 @@ done
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         };
         let plan = SupervisorPlan {
             version: SUPERVISOR_SCHEMA_VERSION,

@@ -23,6 +23,7 @@ fn test_assignment(id: &str, path: &str) -> OrchestratorAssignment {
         environment_requirements: Vec::new(),
         licensed_breakage: None,
         notes: None,
+        decision_refs: Vec::new(),
     }
 }
 
@@ -89,6 +90,7 @@ fn direct_mechanical_assignment(id: &str) -> OrchestratorAssignment {
         environment_requirements: Vec::new(),
         licensed_breakage: None,
         notes: None,
+        decision_refs: Vec::new(),
     }
 }
 

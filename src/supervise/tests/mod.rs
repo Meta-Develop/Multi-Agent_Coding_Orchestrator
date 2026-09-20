@@ -357,6 +357,7 @@ fn injected_assignment(with_worker: bool) -> OrchestratorAssignment {
         environment_requirements: Vec::new(),
         licensed_breakage: None,
         notes: None,
+        decision_refs: Vec::new(),
     }
 }
 
@@ -376,6 +377,7 @@ fn injected_named_assignment(id: &str, path: &str) -> OrchestratorAssignment {
         environment_requirements: Vec::new(),
         licensed_breakage: None,
         notes: None,
+        decision_refs: Vec::new(),
     }
 }
 
