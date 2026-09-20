@@ -159,6 +159,7 @@ export default function Dashboard() {
                     provider={row.provider}
                     accountId={row.accountId}
                     displayName={row.displayName}
+                    isSelectedForLaunch={row.isSelectedForLaunch}
                     planLabel={result?.planLabel ?? null}
                     snapshots={snapshotsFor(result, row.accountId)}
                     result={result}
@@ -206,6 +207,7 @@ type AccountQuotaRow = {
   provider: ProviderDescriptor
   accountId: string
   displayName: string
+  isSelectedForLaunch: boolean
 }
 
 function accountQuotaRows(
@@ -222,6 +224,7 @@ function accountQuotaRows(
         provider,
         accountId: account.id,
         displayName: accountDisplayName(account),
+        isSelectedForLaunch: account.isSelectedForLaunch,
       })
     }
   }
@@ -266,6 +269,19 @@ function adapterStatusNotes(
     if (listing !== undefined && listing.accounts.length > 0) continue
     notes.push(
       `${providerName(providers, result.providerId)}: quota collection failed — ${result.outcome.error.message}`,
+    )
+  }
+  for (const provider of providers) {
+    if (!provider.capabilities.includes('launch-tool')) continue
+    const listing = listings.find((item) => item.providerId === provider.id)
+    if (listing === undefined) continue
+    const storedComplete = listing.accounts.filter(
+      (account) => account.isStored && !account.isIncomplete,
+    )
+    if (storedComplete.length === 0) continue
+    if (storedComplete.some((account) => account.isSelectedForLaunch)) continue
+    notes.push(
+      `${provider.displayName} has stored accounts but none is selected for app launch.`,
     )
   }
   return notes
