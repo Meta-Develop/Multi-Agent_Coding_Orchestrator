@@ -603,6 +603,7 @@ pub(super) struct SupervisorAutomaticSelectionState {
     account_observation: Option<AccountObserveResult>,
     observed_cost_per_accepted_task_microunits: Option<u64>,
     this_run_outcomes: Vec<OutcomeRecord>,
+    this_run_exclusions: Vec<String>,
 }
 
 impl PartialEq for SupervisorAutomaticSelectionState {
@@ -613,6 +614,7 @@ impl PartialEq for SupervisorAutomaticSelectionState {
             && self.observed_cost_per_accepted_task_microunits
                 == other.observed_cost_per_accepted_task_microunits
             && self.this_run_outcomes == other.this_run_outcomes
+            && self.this_run_exclusions == other.this_run_exclusions
     }
 }
 
@@ -1088,6 +1090,7 @@ impl SupervisorAutomaticSelectionState {
             account_observation,
             observed_cost_per_accepted_task_microunits: None,
             this_run_outcomes: Vec::new(),
+            this_run_exclusions: Vec::new(),
         })
     }
 
@@ -1095,8 +1098,13 @@ impl SupervisorAutomaticSelectionState {
         self.observed_cost_per_accepted_task_microunits = cost;
     }
 
-    pub(super) fn set_this_run_outcomes(&mut self, outcomes: Vec<OutcomeRecord>) {
+    pub(super) fn set_this_run_outcomes(
+        &mut self,
+        outcomes: Vec<OutcomeRecord>,
+        exclusions: Vec<String>,
+    ) {
         self.this_run_outcomes = outcomes;
+        self.this_run_exclusions = exclusions;
     }
 
     pub(super) fn account_observe_environment_decision(
@@ -1332,6 +1340,7 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
             )
         })?;
         decision.outcome_history = previous.outcome_history.clone();
+        attach_this_run_exclusions(&mut decision, &state.this_run_exclusions)?;
         decision.operator_prior_data = previous.operator_prior_data.clone();
         let choice = match executable_choice(&decision, runtime, role)? {
             ExecutableChoiceResolution::Executable(choice) => choice,
@@ -1362,6 +1371,35 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
         runtime_overrides,
         decisions,
     })
+}
+
+fn attach_this_run_exclusions(
+    decision: &mut SelectionProvenance,
+    exclusions: &[String],
+) -> Result<()> {
+    if exclusions.is_empty() {
+        return Ok(());
+    }
+    if let Some(history) = decision.outcome_history.as_mut() {
+        for exclusion in exclusions {
+            if !history
+                .exclusions
+                .iter()
+                .any(|existing| existing == exclusion)
+            {
+                history.exclusions.push(exclusion.clone());
+            }
+        }
+        history.exclusions.sort();
+        return Ok(());
+    }
+    decision.outcome_history = Some(crate::selection::AuthenticatedOutcomeHistoryProvenance {
+        snapshot_sha256: crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(exclusions)?),
+        source_digests: Vec::new(),
+        exclusions: exclusions.to_vec(),
+        projected_attempt_count: 0,
+    });
+    Ok(())
 }
 
 fn merge_this_run_outcomes_into_input(
@@ -5224,7 +5262,7 @@ mod tests {
         ))
         .context("rejected this-run outcome")?;
         let mut rejected_state = state.clone();
-        rejected_state.set_this_run_outcomes(vec![rejected]);
+        rejected_state.set_this_run_outcomes(vec![rejected], Vec::new());
         let rejected_reselect = reselect_roles_from_supplied_catalog_snapshot(
             &mut rejected_state,
             SupervisorRuntime::Codex,
@@ -5253,7 +5291,7 @@ mod tests {
         ))
         .context("accepted this-run outcome")?;
         let mut accepted_state = state;
-        accepted_state.set_this_run_outcomes(vec![accepted]);
+        accepted_state.set_this_run_outcomes(vec![accepted], Vec::new());
         let accepted_reselect = reselect_roles_from_supplied_catalog_snapshot(
             &mut accepted_state,
             SupervisorRuntime::Codex,
@@ -5308,7 +5346,10 @@ mod tests {
             BudgetSignal::Continue,
             &[],
         )?;
-        state.set_this_run_outcomes(this_run_outcome_records(std::slice::from_ref(&cost_only)));
+        state.set_this_run_outcomes(
+            this_run_outcome_records(std::slice::from_ref(&cost_only)),
+            Vec::new(),
+        );
         let with_cost_only = reselect_roles_from_supplied_catalog_snapshot(
             &mut state,
             SupervisorRuntime::Codex,
@@ -5327,6 +5368,49 @@ mod tests {
             .normalized_input
             .outcomes
             .is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn this_run_exclusions_append_to_existing_outcome_history() -> Result<()> {
+        let (catalog, mut state) = automatic_state()?;
+        let frozen = crate::selection::AuthenticatedOutcomeHistoryProvenance {
+            snapshot_sha256: "a".repeat(64),
+            source_digests: vec!["b".repeat(64)],
+            exclusions: vec!["frozen:unreadable_attempt".to_string()],
+            projected_attempt_count: 1,
+        };
+        for provenance in state.decisions.values_mut() {
+            provenance.outcome_history = Some(frozen.clone());
+        }
+        state.set_this_run_outcomes(
+            Vec::new(),
+            vec!["corrupt.attempt-2.json:invalid_attempt".to_string()],
+        );
+        let reselection = reselect_roles_from_supplied_catalog_snapshot(
+            &mut state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::Worker],
+            1,
+            BudgetSignal::Continue,
+            &[],
+        )?;
+        let history = reselection.decisions[0]
+            .1
+            .outcome_history
+            .as_ref()
+            .context("frozen history provenance must remain present")?;
+        assert_eq!(history.snapshot_sha256, frozen.snapshot_sha256);
+        assert_eq!(history.source_digests, frozen.source_digests);
+        assert_eq!(history.projected_attempt_count, 1);
+        assert_eq!(
+            history.exclusions,
+            vec![
+                "corrupt.attempt-2.json:invalid_attempt".to_string(),
+                "frozen:unreadable_attempt".to_string(),
+            ]
+        );
         Ok(())
     }
 

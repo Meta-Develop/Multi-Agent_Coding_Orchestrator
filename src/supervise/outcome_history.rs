@@ -1280,13 +1280,47 @@ pub(super) fn this_run_outcome_records<'a>(
 
 const THIS_RUN_ATTEMPT_EVIDENCE_MAX_BYTES: usize = 64 * 1024;
 
-pub(super) fn load_this_run_attempt_evidence(run_dir: &Path) -> Vec<AttemptOutcomeEvidence> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ThisRunAttemptLoad {
+    pub evidence: Vec<AttemptOutcomeEvidence>,
+    pub exclusions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ThisRunOutcomeLoad {
+    pub records: Vec<OutcomeRecord>,
+    pub exclusions: Vec<String>,
+}
+
+fn this_run_attempt_name_parts(name: &str) -> Option<(&str, &str)> {
+    name.strip_suffix(".json")
+        .and_then(|stem| stem.rsplit_once(".attempt-"))
+}
+
+fn this_run_exclusion(name: &str, reason: &str) -> String {
+    format!("{name}:{reason}")
+}
+
+/// Load live `selection-attempts/*.json` rows for same-run reselect.
+///
+/// A well-named `*.attempt-<n>.json` file that fails the authenticated bounded
+/// read fails the this-run merge closed. Junk names that only look similar, and
+/// parse or assignment/ordinal binding failures, become recorded exclusions
+/// with the same `{source}:{reason}` shape as frozen history. Non-json names
+/// stay soft-skipped. Corrupt bytes never become an `OutcomeRecord`.
+pub(super) fn load_this_run_attempt_evidence(run_dir: &Path) -> Result<ThisRunAttemptLoad> {
     let attempts_dir = run_dir.join(ATTEMPT_EVIDENCE_DIR);
     let entries = match std::fs::read_dir(&attempts_dir) {
         Ok(entries) => entries,
-        Err(_) => return Vec::new(),
+        Err(_) => {
+            return Ok(ThisRunAttemptLoad {
+                evidence: Vec::new(),
+                exclusions: Vec::new(),
+            });
+        }
     };
     let mut rows = Vec::new();
+    let mut exclusions = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
@@ -1295,27 +1329,26 @@ pub(super) fn load_this_run_attempt_evidence(run_dir: &Path) -> Vec<AttemptOutco
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        let Some((assignment, ordinal)) = name
-            .strip_suffix(".json")
-            .and_then(|name| name.rsplit_once(".attempt-"))
-        else {
+        let Some((assignment, ordinal)) = this_run_attempt_name_parts(name) else {
             continue;
         };
         let Ok(ordinal) = ordinal.parse::<usize>() else {
+            exclusions.push(this_run_exclusion(name, "invalid_attempt_name"));
             continue;
         };
-        let Ok(bytes) =
-            read_bounded_regular_file_nofollow(&path, THIS_RUN_ATTEMPT_EVIDENCE_MAX_BYTES)
-        else {
-            continue;
-        };
+        let bytes = read_bounded_regular_file_nofollow(&path, THIS_RUN_ATTEMPT_EVIDENCE_MAX_BYTES)
+            .with_context(|| {
+                format!("this-run attempt evidence '{name}' failed authenticated bounded read")
+            })?;
         let Ok(evidence) = serde_json::from_slice::<AttemptOutcomeEvidence>(&bytes) else {
+            exclusions.push(this_run_exclusion(name, "invalid_attempt"));
             continue;
         };
         if evidence.attempt == 0
             || evidence.attempt != ordinal
             || evidence.assignment_id != assignment
         {
+            exclusions.push(this_run_exclusion(name, "invalid_attempt_binding"));
             continue;
         }
         rows.push(evidence);
@@ -1323,11 +1356,19 @@ pub(super) fn load_this_run_attempt_evidence(run_dir: &Path) -> Vec<AttemptOutco
     rows.sort_by(|left, right| {
         (&left.assignment_id, left.attempt).cmp(&(&right.assignment_id, right.attempt))
     });
-    rows
+    exclusions.sort();
+    Ok(ThisRunAttemptLoad {
+        evidence: rows,
+        exclusions,
+    })
 }
 
-pub(super) fn load_this_run_outcome_records(run_dir: &Path) -> Vec<OutcomeRecord> {
-    this_run_outcome_records(&load_this_run_attempt_evidence(run_dir))
+pub(super) fn load_this_run_outcome_records(run_dir: &Path) -> Result<ThisRunOutcomeLoad> {
+    let load = load_this_run_attempt_evidence(run_dir)?;
+    Ok(ThisRunOutcomeLoad {
+        records: this_run_outcome_records(&load.evidence),
+        exclusions: load.exclusions,
+    })
 }
 
 #[cfg(test)]
@@ -1994,10 +2035,113 @@ mod tests {
             attempts.join("assignment-2.attempt-2.json"),
             serde_json::to_vec(&cost_only)?,
         )?;
-        let rows = load_this_run_outcome_records(temp.path());
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].attempt_id, "run-1:assignment-1:1");
-        assert_eq!(rows[0].result, OutcomeResult::Accepted);
+        let load = load_this_run_outcome_records(temp.path())?;
+        assert!(load.exclusions.is_empty());
+        assert_eq!(load.records.len(), 1);
+        assert_eq!(load.records[0].attempt_id, "run-1:assignment-1:1");
+        assert_eq!(load.records[0].result, OutcomeResult::Accepted);
+        Ok(())
+    }
+
+    #[test]
+    fn load_this_run_outcome_records_merges_accepted_and_rejected() -> Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let attempts = temp.path().join(ATTEMPT_EVIDENCE_DIR);
+        std::fs::create_dir_all(&attempts)?;
+        let accepted = fixture();
+        std::fs::write(
+            attempts.join("assignment-1.attempt-1.json"),
+            serde_json::to_vec(&accepted)?,
+        )?;
+        let mut rejected = fixture();
+        rejected.assignment_id = "assignment-3".to_string();
+        rejected.attempt = 3;
+        rejected.parent_result = Some(OutcomeResult::Rejected);
+        rejected.failure_class = Some(FailureClass::ModelQuality);
+        std::fs::write(
+            attempts.join("assignment-3.attempt-3.json"),
+            serde_json::to_vec(&rejected)?,
+        )?;
+        let load = load_this_run_outcome_records(temp.path())?;
+        assert!(load.exclusions.is_empty());
+        assert_eq!(load.records.len(), 2);
+        assert_eq!(load.records[0].attempt_id, "run-1:assignment-1:1");
+        assert_eq!(load.records[0].result, OutcomeResult::Accepted);
+        assert_eq!(load.records[1].attempt_id, "run-1:assignment-3:3");
+        assert_eq!(load.records[1].result, OutcomeResult::Rejected);
+        Ok(())
+    }
+
+    #[test]
+    fn load_this_run_attempt_evidence_fails_closed_on_well_named_oversize_file() -> Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let attempts = temp.path().join(ATTEMPT_EVIDENCE_DIR);
+        std::fs::create_dir_all(&attempts)?;
+        std::fs::write(
+            attempts.join("assignment-1.attempt-1.json"),
+            serde_json::to_vec(&fixture())?,
+        )?;
+        std::fs::write(
+            attempts.join("oversize.attempt-2.json"),
+            vec![b'x'; THIS_RUN_ATTEMPT_EVIDENCE_MAX_BYTES + 1],
+        )?;
+        let error = load_this_run_attempt_evidence(temp.path())
+            .expect_err("well-named oversize attempt file must fail the this-run merge closed");
+        let display = format!("{error:#}");
+        assert!(
+            display.contains("this-run attempt evidence 'oversize.attempt-2.json'"),
+            "{display}"
+        );
+        assert!(
+            load_this_run_outcome_records(temp.path()).is_err(),
+            "oversize sibling must not yield a silent empty or partial outcomes list"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn load_this_run_attempt_evidence_records_exclusions_for_junk_parse_and_binding() -> Result<()>
+    {
+        let temp = tempfile::TempDir::new()?;
+        let attempts = temp.path().join(ATTEMPT_EVIDENCE_DIR);
+        std::fs::create_dir_all(&attempts)?;
+        std::fs::write(
+            attempts.join("assignment-1.attempt-1.json"),
+            serde_json::to_vec(&fixture())?,
+        )?;
+        std::fs::write(attempts.join("corrupt.attempt-4.json"), b"{not-json")?;
+        std::fs::write(
+            attempts.join("mismatch.attempt-5.json"),
+            serde_json::to_vec(&fixture())?,
+        )?;
+        std::fs::write(
+            attempts.join("looks-similar.attempt-notanumber.json"),
+            b"{\"junk\":true}",
+        )?;
+        std::fs::write(attempts.join("ignored.attempt-1.txt"), b"not-json-evidence")?;
+        std::fs::write(attempts.join("notes.json"), b"{\"not\":\"an-attempt\"}")?;
+        let load = load_this_run_attempt_evidence(temp.path())?;
+        assert_eq!(load.evidence.len(), 1);
+        assert_eq!(load.evidence[0].assignment_id, "assignment-1");
+        assert_eq!(
+            load.exclusions,
+            vec![
+                "corrupt.attempt-4.json:invalid_attempt".to_string(),
+                "looks-similar.attempt-notanumber.json:invalid_attempt_name".to_string(),
+                "mismatch.attempt-5.json:invalid_attempt_binding".to_string(),
+            ]
+        );
+        let outcomes = load_this_run_outcome_records(temp.path())?;
+        assert_eq!(outcomes.records.len(), 1);
+        assert_eq!(outcomes.records[0].attempt_id, "run-1:assignment-1:1");
+        assert_eq!(outcomes.exclusions, load.exclusions);
+        assert!(
+            outcomes
+                .records
+                .iter()
+                .all(|row| !row.attempt_id.contains("corrupt")
+                    && !row.attempt_id.contains("mismatch"))
+        );
         Ok(())
     }
 
@@ -2198,10 +2342,11 @@ mod tests {
             attempts.join("assignment-1.attempt-1.json"),
             serde_json::to_vec(&stamped)?,
         )?;
-        let rows = load_this_run_outcome_records(temp.path());
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].result, OutcomeResult::Accepted);
-        assert_eq!(rows[0].candidate, candidate);
+        let load = load_this_run_outcome_records(temp.path())?;
+        assert!(load.exclusions.is_empty());
+        assert_eq!(load.records.len(), 1);
+        assert_eq!(load.records[0].result, OutcomeResult::Accepted);
+        assert_eq!(load.records[0].candidate, candidate);
 
         let mut baseline_state = state.clone();
         let baseline = reselect_roles_from_supplied_catalog_snapshot(
@@ -2217,7 +2362,7 @@ mod tests {
         assert!(baseline.decisions[0].1.normalized_input.outcomes.is_empty());
 
         let mut accepted_state = state;
-        accepted_state.set_this_run_outcomes(rows);
+        accepted_state.set_this_run_outcomes(load.records, load.exclusions);
         let accepted_reselect = reselect_roles_from_supplied_catalog_snapshot(
             &mut accepted_state,
             SupervisorRuntime::Codex,
@@ -2238,6 +2383,69 @@ mod tests {
                 .outcomes
                 .len(),
             1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn this_run_exclusions_surface_on_reselect_provenance() -> Result<()> {
+        let (catalog, mut state, candidate, task) = automatic_selector_for_this_run()?;
+        let temp = tempfile::TempDir::new()?;
+        let attempts = temp.path().join(ATTEMPT_EVIDENCE_DIR);
+        std::fs::create_dir_all(&attempts)?;
+        let mut evidence = unset_terminal_parent_result(fixture());
+        evidence.run_id = "this-run-exclusions".to_string();
+        evidence.selection = Some(AttemptSelectionBinding {
+            role: AgentRole::Worker,
+            event_assignment_id: None,
+            event_attempt: 0,
+            normalized_input_sha256: "this-run-digest".to_string(),
+            task,
+            requested_candidate: candidate.clone(),
+        });
+        evidence.requested_runtime = candidate.runtime.clone();
+        evidence.requested_model = Some(candidate.model.clone());
+        evidence.requested_effort = Some(selector_effort_as_str(candidate.effort).to_string());
+        evidence.observed_candidate = Some(candidate.clone());
+        let stamped =
+            apply_parent_terminal_assignment_result(&evidence, OutcomeResult::Accepted, None)?;
+        std::fs::write(
+            attempts.join("assignment-1.attempt-1.json"),
+            serde_json::to_vec(&stamped)?,
+        )?;
+        std::fs::write(attempts.join("corrupt.attempt-2.json"), b"{not-json")?;
+        let load = load_this_run_outcome_records(temp.path())?;
+        assert_eq!(load.records.len(), 1);
+        assert_eq!(
+            load.exclusions,
+            vec!["corrupt.attempt-2.json:invalid_attempt".to_string()]
+        );
+        state.set_this_run_outcomes(load.records, load.exclusions);
+        let reselection = reselect_roles_from_supplied_catalog_snapshot(
+            &mut state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::Worker],
+            1,
+            crate::selection::BudgetSignal::Continue,
+            &[],
+        )?;
+        let history = reselection.decisions[0]
+            .1
+            .outcome_history
+            .as_ref()
+            .context("this-run exclusions must surface on reselect provenance")?;
+        assert_eq!(
+            history.exclusions,
+            vec!["corrupt.attempt-2.json:invalid_attempt".to_string()]
+        );
+        assert_eq!(
+            reselection.decisions[0].1.normalized_input.outcomes.len(),
+            1
+        );
+        assert_eq!(
+            reselection.decisions[0].1.normalized_input.outcomes[0].result,
+            OutcomeResult::Accepted
         );
         Ok(())
     }
