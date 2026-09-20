@@ -182,6 +182,7 @@ fn omitted_profile_preserves_legacy_supervisor_plan_bytes() {
         role_models: BTreeMap::new(),
         model_pricing: BTreeMap::new(),
         review_lenses: crate::supervise::default_supervisor_review_lenses(),
+        review_lens_correlation: Default::default(),
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments: vec![OrchestratorAssignment {
             id: "agent-a".to_string(),
@@ -825,6 +826,7 @@ fn licensed_autopilot_supervisor_plan() -> (Value, LicensedBreakageDeclaration, 
         role_models: BTreeMap::new(),
         model_pricing: BTreeMap::new(),
         review_lenses: crate::supervise::default_supervisor_review_lenses(),
+        review_lens_correlation: Default::default(),
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments: vec![OrchestratorAssignment {
             id: "child-a".to_string(),

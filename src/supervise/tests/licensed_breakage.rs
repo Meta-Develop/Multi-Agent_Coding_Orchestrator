@@ -1012,6 +1012,7 @@ fn generated_follow_up_plan_inherits_gate_context_and_closes_budget() {
     let mut second_lens = source_plan.review_lenses[0].clone();
     second_lens.id = "second-acceptance".to_string();
     source_plan.review_lenses.push(second_lens);
+    source_plan.review_lens_correlation = ReviewLensCorrelation::AllowSameScope;
     source_plan.review_aggregation_policy =
         ReviewAggregationPolicy::ValidatedQuorum { minimum_accepts: 2 };
     inject_priced_process_roles(&mut source_plan, "licensed-follow-up-model", 3.25);

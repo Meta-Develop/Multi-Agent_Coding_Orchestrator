@@ -227,7 +227,7 @@ pub(super) fn validate_supervisor_plan_in_repo(
     }
     validate_assignment_phase_contract(&plan)?;
     validate_primary_worktree_execution_target(&plan, &mut metadata)?;
-    validate_review_lens_set(&plan.review_lenses)
+    validate_review_lens_set(&plan.review_lenses, plan.review_lens_correlation)
         .context("supervisor review_lenses are invalid")?;
     if plan
         .review_lenses

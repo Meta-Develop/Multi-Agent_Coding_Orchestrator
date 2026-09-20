@@ -1229,6 +1229,110 @@ fn default_stacked_uncorrelated_review_lenses_validate_with_quorum() {
     );
 }
 
+fn duplicate_full_transcript_review_lenses_json() -> Value {
+    json!([
+        {
+            "id": "parent-acceptance",
+            "backend": {
+                "kind": "model",
+                "backend_id": "openai",
+                "model": "shared-auditor",
+                "reasoning_effort": "xhigh"
+            },
+            "information_scope": "full_child_transcript"
+        },
+        {
+            "id": "second-acceptance",
+            "backend": {
+                "kind": "model",
+                "backend_id": "openai",
+                "model": "shared-auditor",
+                "reasoning_effort": "xhigh"
+            },
+            "information_scope": "full_child_transcript"
+        }
+    ])
+}
+
+#[test]
+fn supervisor_plan_rejects_duplicate_review_lens_information_scope_without_override() {
+    let mut value =
+        serde_json::from_slice::<Value>(&bounded_loader_plan_json()).expect("parse base plan");
+    let object = value.as_object_mut().expect("plan object");
+    object.insert(
+        "review_lenses".to_string(),
+        duplicate_full_transcript_review_lenses_json(),
+    );
+    let error = parse_supervisor_plan_with_consultant(
+        &serde_json::to_string(&value).expect("serialize duplicate-scope plan"),
+    )
+    .expect_err("omitted override plus duplicate scope must reject");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("duplicate information_scope"),
+        "unexpected rejection: {message}"
+    );
+}
+
+#[test]
+fn supervisor_plan_accepts_duplicate_review_lens_information_scope_with_override() {
+    let mut value =
+        serde_json::from_slice::<Value>(&bounded_loader_plan_json()).expect("parse base plan");
+    let object = value.as_object_mut().expect("plan object");
+    object.insert(
+        "review_lenses".to_string(),
+        duplicate_full_transcript_review_lenses_json(),
+    );
+    object.insert(
+        "review_lens_correlation".to_string(),
+        json!("allow_same_scope"),
+    );
+    let loaded = parse_supervisor_plan_with_consultant(
+        &serde_json::to_string(&value).expect("serialize override plan"),
+    )
+    .expect("explicit allow_same_scope must accept duplicate scopes");
+    assert_eq!(
+        loaded.plan.review_lens_correlation,
+        ReviewLensCorrelation::AllowSameScope
+    );
+    assert_eq!(loaded.plan.review_lenses.len(), 2);
+}
+
+#[test]
+fn supervisor_plan_accepts_single_review_lens_without_override() {
+    let mut loaded = parse_supervisor_plan_with_consultant(
+        std::str::from_utf8(&bounded_loader_plan_json()).expect("utf8 plan"),
+    )
+    .expect("load default plan fixture");
+    loaded.plan.review_lenses = single_parent_acceptance_review_lenses();
+    let validated =
+        validate_legacy_supervisor_plan(loaded.plan).expect("single-lens plans must stay valid");
+    assert_eq!(validated.review_lenses.len(), 1);
+    assert_eq!(
+        validated.review_lens_correlation,
+        ReviewLensCorrelation::DistinctScopes
+    );
+}
+
+#[test]
+fn supervisor_plan_accepts_shared_auditor_model_with_distinct_scopes() {
+    let mut loaded = parse_supervisor_plan_with_consultant(
+        std::str::from_utf8(&bounded_loader_plan_json()).expect("utf8 plan"),
+    )
+    .expect("load default plan fixture");
+    loaded.plan.review_lenses = crate::review::cheap_default_review_lenses();
+    let validated = validate_legacy_supervisor_plan(loaded.plan)
+        .expect("same model plus distinct scopes must stay valid");
+    assert_eq!(
+        validated.review_lenses[0].backend,
+        validated.review_lenses[1].backend
+    );
+    assert_ne!(
+        validated.review_lenses[0].information_scope,
+        validated.review_lenses[1].information_scope
+    );
+}
+
 #[test]
 fn recursive_supervisor_plan_flattens_and_preserves_schedule_on_round_trip() {
     let source = json!({

@@ -68,8 +68,8 @@ use crate::{
         aggregate_review_lenses_against_requests, validate_review_lens_set,
         ReviewAggregationDecision, ReviewAggregationPolicy, ReviewCoverageRequirement,
         ReviewInformationScope, ReviewLensAggregate, ReviewLensAggregateAuthority,
-        ReviewLensBackendConfig, ReviewLensConfig, ReviewLensCoverage, ReviewLensEvidenceKind,
-        ReviewLensRequest, ReviewLensVerdict, ReviewLensVerdictStatus,
+        ReviewLensBackendConfig, ReviewLensConfig, ReviewLensCorrelation, ReviewLensCoverage,
+        ReviewLensEvidenceKind, ReviewLensRequest, ReviewLensVerdict, ReviewLensVerdictStatus,
         REVIEW_LENS_REQUEST_LIMIT_BYTES,
     },
     runtime_adapter::RuntimeId,
@@ -727,6 +727,11 @@ pub struct SupervisorPlan {
     /// production default: parent-acceptance, output-only, and diff-only.
     #[serde(default = "default_supervisor_review_lenses")]
     pub review_lenses: Vec<ReviewLensConfig>,
+    /// Omitted `review_lens_correlation` is fail-closed: multi-lens plans must
+    /// use pairwise-distinct `information_scope` unless the operator sets
+    /// `allow_same_scope`.
+    #[serde(default)]
+    pub review_lens_correlation: ReviewLensCorrelation,
     #[serde(default)]
     pub review_aggregation_policy: ReviewAggregationPolicy,
     #[serde(default)]
@@ -2151,6 +2156,8 @@ pub struct GeneratedFollowUpSupervisorPlan {
     pub role_models: BTreeMap<AgentRole, RoleModelSelection>,
     pub model_pricing: BTreeMap<String, ModelPricing>,
     pub review_lenses: Vec<ReviewLensConfig>,
+    #[serde(default)]
+    pub review_lens_correlation: ReviewLensCorrelation,
     pub review_aggregation_policy: ReviewAggregationPolicy,
     pub assignments: Vec<OrchestratorAssignment>,
     pub spec_fragment_ids: Vec<String>,
@@ -2181,6 +2188,7 @@ impl GeneratedFollowUpSupervisorPlan {
             role_models: self.role_models.clone(),
             model_pricing: self.model_pricing.clone(),
             review_lenses: self.review_lenses.clone(),
+            review_lens_correlation: self.review_lens_correlation,
             review_aggregation_policy: self.review_aggregation_policy,
             assignments: self.assignments.clone(),
         };

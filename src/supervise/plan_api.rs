@@ -502,6 +502,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         role_models: BTreeMap::new(),
         model_pricing: BTreeMap::new(),
         review_lenses: default_supervisor_review_lenses(),
+        review_lens_correlation: Default::default(),
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments,
     };
@@ -1254,6 +1255,7 @@ fn supervisor_plan_and_consultant_from_provider_session(
         role_models: BTreeMap::new(),
         model_pricing: BTreeMap::new(),
         review_lenses: default_supervisor_review_lenses(),
+        review_lens_correlation: Default::default(),
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments,
     };

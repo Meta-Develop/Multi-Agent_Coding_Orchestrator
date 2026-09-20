@@ -1691,6 +1691,7 @@ fn experiment_plan(manifest: &ExperimentManifest, profile: &EvaluationProfile) -
         role_models,
         model_pricing: BTreeMap::new(),
         review_lenses: crate::supervise::default_supervisor_review_lenses(),
+        review_lens_correlation: Default::default(),
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments: vec![OrchestratorAssignment {
             id: "child-a".to_string(),

@@ -1178,8 +1178,11 @@ fn validate_autopilot_profile(profile: &AutopilotProfile) -> Result<()> {
     if profile.version != AUTOPILOT_PROFILE_SCHEMA_VERSION {
         bail!("unsupported autopilot profile version {}", profile.version);
     }
-    review::validate_review_lens_set(&profile.review_lenses)
-        .context("autopilot profile review_lenses are invalid")?;
+    review::validate_review_lens_set(
+        &profile.review_lenses,
+        review::ReviewLensCorrelation::DistinctScopes,
+    )
+    .context("autopilot profile review_lenses are invalid")?;
     if profile
         .review_lenses
         .iter()
@@ -2963,6 +2966,7 @@ fn supervisor_plan_for_attempt(
         role_models: profile.role_models.clone(),
         model_pricing: profile.model_pricing.clone(),
         review_lenses: profile.review_lenses.clone(),
+        review_lens_correlation: Default::default(),
         review_aggregation_policy: profile.review_aggregation_policy,
         assignments: vec![OrchestratorAssignment {
             id: agent_id.to_string(),

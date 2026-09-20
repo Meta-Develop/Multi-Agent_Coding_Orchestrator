@@ -410,6 +410,7 @@ fn injected_multi_plan(
         role_models: BTreeMap::new(),
         model_pricing: BTreeMap::new(),
         review_lenses: single_parent_acceptance_review_lenses(),
+        review_lens_correlation: Default::default(),
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments,
     }
@@ -452,6 +453,7 @@ fn injected_plan(assignment: OrchestratorAssignment, max_child_retries: u8) -> S
         role_models: BTreeMap::new(),
         model_pricing: BTreeMap::new(),
         review_lenses: single_parent_acceptance_review_lenses(),
+        review_lens_correlation: Default::default(),
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments: vec![assignment],
     }
