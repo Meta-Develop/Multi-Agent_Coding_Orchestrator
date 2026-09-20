@@ -30,6 +30,8 @@ fn artifact_owner() -> (tempfile::TempDir, std::path::PathBuf) {
 fn two_profile_held_out_manifest(repetitions: u32) -> ExperimentManifest {
     let mut manifest = experiment_manifest();
     manifest.repetitions = repetitions;
+    // Child + held-out command + stacked parent-acceptance/output-only/diff-only auditors.
+    manifest.limits.max_dispatches = 8;
     manifest
 }
 

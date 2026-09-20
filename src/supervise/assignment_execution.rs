@@ -7455,8 +7455,8 @@ mod decomposition_tests {
         );
         assert_eq!(
             auditor_invocations.load(Ordering::SeqCst),
-            1,
-            "expected one parent auditor dispatch before gate failure; gate error was: {gate_error_display}"
+            default_supervisor_review_lenses().len(),
+            "expected one parent auditor dispatch per stacked default lens before gate failure; gate error was: {gate_error_display}"
         );
         let stored: AttemptOutcomeEvidence = serde_json::from_slice(
             &std::fs::read(

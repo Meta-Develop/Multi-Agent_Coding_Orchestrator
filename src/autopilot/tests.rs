@@ -800,6 +800,13 @@ fn secure_autopilot_machine_global_retention(
     }
 }
 
+fn licensed_breakage_compatible_review_lenses() -> Vec<crate::review::ReviewLensConfig> {
+    crate::supervise::default_supervisor_review_lenses()
+        .into_iter()
+        .filter(|lens| lens.information_scope != crate::review::ReviewInformationScope::DiffOnly)
+        .collect()
+}
+
 fn licensed_autopilot_supervisor_plan() -> (Value, LicensedBreakageDeclaration, String) {
     let declaration = LicensedBreakageDeclaration {
         migration_rationale: "Rename callers to crate::api::new_name before dependent dispatch"
@@ -825,7 +832,7 @@ fn licensed_autopilot_supervisor_plan() -> (Value, LicensedBreakageDeclaration, 
         semantic_coordination: SemanticCoordinationMode::Off,
         role_models: BTreeMap::new(),
         model_pricing: BTreeMap::new(),
-        review_lenses: crate::supervise::default_supervisor_review_lenses(),
+        review_lenses: licensed_breakage_compatible_review_lenses(),
         review_lens_correlation: Default::default(),
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments: vec![OrchestratorAssignment {
