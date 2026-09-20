@@ -1488,6 +1488,22 @@ mod plan_validation_decision_ref_tests {
     }
 
     #[test]
+    fn plan_validation_cited_refs_without_repo_are_store_missing() {
+        let assignment =
+            assignment_with_refs(vec![DecisionRef::new("api.transport").expect("valid key")]);
+
+        let error = validate_assignment_decision_refs_for_repo(&[assignment], None)
+            .expect_err("repo=None must fail closed for cited assignments");
+        assert!(
+            error
+                .downcast_ref::<DecisionRefError>()
+                .is_some_and(|error| *error == DecisionRefError::StoreMissing)
+                || error.to_string().contains("decision store is missing"),
+            "missing-repo refusal must be StoreMissing: {error:#}"
+        );
+    }
+
+    #[test]
     fn plan_validation_missing_store_fails_closed() {
         let temp = tempfile::tempdir().expect("temporary repository");
         Repository::init(temp.path()).expect("initialize repository");

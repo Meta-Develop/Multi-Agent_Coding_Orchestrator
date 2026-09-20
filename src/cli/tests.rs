@@ -853,6 +853,7 @@ fn merge_arbitration_is_an_explicit_typed_opt_in() {
     );
     assert!(agent_primary.approve);
     assert!(agent_primary.decision_ref.is_empty());
+    assert_eq!(agent_primary.source_run_id, None);
 
     let with_refs = Cli::try_parse_from([
         "maco",
@@ -876,6 +877,8 @@ fn merge_arbitration_is_an_explicit_typed_opt_in() {
         "api.transport",
         "--decision-ref",
         "api.transport=Use HTTP",
+        "--source-run-id",
+        "source-supervise",
     ])
     .expect("repeatable --decision-ref should parse");
     let Command::Merge(MergeCommand {
@@ -885,6 +888,7 @@ fn merge_arbitration_is_an_explicit_typed_opt_in() {
         panic!("expected merge arbitrate command");
     };
     assert_eq!(with_refs.decision_ref.len(), 2);
+    assert_eq!(with_refs.source_run_id.as_deref(), Some("source-supervise"));
     assert_eq!(with_refs.decision_ref[0].question_key(), "api.transport");
     assert_eq!(with_refs.decision_ref[0].expected_resolution(), None);
     assert_eq!(with_refs.decision_ref[1].question_key(), "api.transport");

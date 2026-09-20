@@ -1852,7 +1852,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     let mut taxonomy_gate_id = None::<String>;
     let mut admitted_child_dispatches = 0_usize;
     let error_evidence_source_plan_sha256 =
-        supervise::normalized_supervisor_plan_file_sha256(&supervisor_options.plan_file)?;
+        supervise::normalized_supervisor_plan_file_sha256(&supervisor_options.plan_file, &repo)?;
     let command_primary_baseline = match runtime {
         SupervisorRuntime::Fake => {
             supervise::nonpublishable_simulation_whole_primary_snapshot_sha256(&repo)?

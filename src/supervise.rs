@@ -253,6 +253,9 @@ pub(crate) fn live_quota_concurrency_bound(
 }
 mod plan_api;
 pub use plan_api::*;
+pub(crate) use plan_api::{
+    load_supervisor_plan_file_in_repo, validate_generated_follow_up_plan_document_in_repo,
+};
 mod model_policy;
 pub use model_policy::*;
 mod role_authority;

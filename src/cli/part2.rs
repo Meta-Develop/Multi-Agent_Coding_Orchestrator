@@ -874,6 +874,7 @@ impl MergeCommand {
                     machine_global_config: args.machine_global_config,
                     machine_global_runtime_root_id: args.machine_global_runtime_root_id,
                     decision_refs: args.decision_ref,
+                    source_run_id: args.source_run_id.as_deref().map(RunId::new).transpose()?,
                 })?;
                 print_merge_arbitration_report(&report, args.json)
             }
@@ -1299,6 +1300,10 @@ struct MergeArbitrateArgs {
     /// Format: question_key[=resolution].
     #[arg(long = "decision-ref", value_name = "QUESTION_KEY[=RESOLUTION]", value_parser = parse_cli_decision_ref)]
     decision_ref: Vec<DecisionRef>,
+    /// Finalized Supervise run whose assignment decision_refs should be honored.
+    /// Distinct from --run-id, which remains the fresh merge arbitration artifact id.
+    #[arg(long = "source-run-id")]
+    source_run_id: Option<String>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,

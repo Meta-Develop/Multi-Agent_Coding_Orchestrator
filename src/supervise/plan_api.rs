@@ -1483,7 +1483,7 @@ pub fn task_execution_feedback_from_authenticated_supervisor_run(
         .context("authenticated provider supervisor run has no normalized supervisor plan")?;
     let plan_text = String::from_utf8(plan_bytes)
         .context("authenticated provider supervisor plan is not UTF-8")?;
-    let persisted = parse_supervisor_plan_with_consultant(&plan_text)
+    let persisted = parse_supervisor_plan_with_consultant_in_repo(&plan_text, Some(&repo))
         .context("authenticated provider supervisor plan is invalid")?;
     let persisted_document = supervisor_plan_value(
         &persisted.plan,
@@ -1828,6 +1828,13 @@ pub fn load_supervisor_plan_file(path: impl AsRef<Path>) -> Result<SupervisorPla
     Ok(load_supervisor_plan_file_with_consultant(path, None)?.plan)
 }
 
+pub(crate) fn load_supervisor_plan_file_in_repo(
+    path: impl AsRef<Path>,
+    repo: impl AsRef<Path>,
+) -> Result<SupervisorPlan> {
+    Ok(load_supervisor_plan_file_with_consultant(path, Some(repo.as_ref()))?.plan)
+}
+
 pub(super) fn load_supervisor_plan_file_with_consultant(
     path: impl AsRef<Path>,
     repo: Option<&Path>,
@@ -1884,9 +1891,16 @@ pub(super) fn parse_supervisor_plan_with_consultant_in_repo(
 pub(crate) fn validate_generated_follow_up_plan_document(
     generated: &GeneratedFollowUpSupervisorPlan,
 ) -> Result<SupervisorPlan> {
+    validate_generated_follow_up_plan_document_in_repo(generated, None)
+}
+
+pub(crate) fn validate_generated_follow_up_plan_document_in_repo(
+    generated: &GeneratedFollowUpSupervisorPlan,
+    repo: Option<&Path>,
+) -> Result<SupervisorPlan> {
     let serialized =
         serde_json::to_string(generated).context("failed to serialize generated follow-up plan")?;
-    let loaded = parse_supervisor_plan_with_consultant(&serialized)
+    let loaded = parse_supervisor_plan_with_consultant_in_repo(&serialized, repo)
         .context("generated follow-up plan failed the ordinary full-document loader")?;
     if loaded.plan != generated.ordinary_plan()
         || loaded.consultant != generated.consultant
@@ -3769,7 +3783,8 @@ pub(super) fn evidence_only_reaudit_plan_from_source(
         .context("authenticated source run has no normalized supervisor plan")?;
     let source_plan_text = String::from_utf8(source_plan_bytes)
         .context("authenticated source supervisor plan is not UTF-8")?;
-    let source_loaded = parse_supervisor_plan_with_consultant(&source_plan_text)?;
+    let source_loaded =
+        parse_supervisor_plan_with_consultant_in_repo(&source_plan_text, Some(repo))?;
     let source_assignment = source_loaded
         .plan
         .assignments
@@ -3848,7 +3863,7 @@ pub(super) fn evidence_only_reaudit_plan_from_source(
         path_proposal: source_loaded.plan_metadata.path_proposal.clone(),
         router: source_loaded.plan_metadata.router.clone(),
     };
-    let (plan, plan_metadata) = validate_supervisor_plan(plan, plan_metadata)?;
+    let (plan, plan_metadata) = validate_supervisor_plan_in_repo(plan, plan_metadata, Some(repo))?;
     Ok(LoadedSupervisorPlan {
         plan,
         consultant: SupervisorConsultantPlan::default(),
@@ -3871,7 +3886,8 @@ pub(super) fn verify_evidence_only_reaudit_source(
         .context("authenticated source run has no normalized supervisor plan")?;
     let source_plan_text = String::from_utf8(source_plan_bytes)
         .context("authenticated source supervisor plan is not UTF-8")?;
-    let source_loaded = parse_supervisor_plan_with_consultant(&source_plan_text)?;
+    let source_loaded =
+        parse_supervisor_plan_with_consultant_in_repo(&source_plan_text, Some(repo))?;
     let source_assignment = source_loaded
         .plan
         .assignments
@@ -5185,6 +5201,193 @@ mod diagnostics_emission_tests {
         assert_ne!(
             emitted["coordination_topology"]["derived_coordination_depth"], emitted["max_depth"],
             "derived depth is planner output, not a copy of operator max_depth"
+        );
+    }
+}
+
+#[cfg(test)]
+mod decision_ref_live_reparse_tests {
+    use super::*;
+    #[cfg(unix)]
+    use crate::artifacts::{ArtifactFileDisposition, ArtifactRunWriter, RunArtifactFamily};
+    use crate::decision_ref::DecisionRefError;
+    use crate::decision_store::{DecisionStore, DECISION_STORE_STATE_NAMESPACE};
+    use std::fs;
+
+    fn cited_assignment_plan_json() -> String {
+        serde_json::json!({
+            "version": 1,
+            "task": "decision-ref live re-parse fixture",
+            "max_depth": 2,
+            "max_child_assignments": 1,
+            "assignments": [{
+                "id": "child-a",
+                "phase": "execution",
+                "role": "child_orchestrator",
+                "assigned_paths": ["README.md"],
+                "worker_assignments": [],
+                "decision_refs": [{
+                    "question_key": "api.transport",
+                    "expected_resolution": "Use HTTP"
+                }]
+            }],
+            "assignment_schedule": [{
+                "assignment_id": "child-a",
+                "depth": 2,
+                "flattened_index": 0
+            }]
+        })
+        .to_string()
+    }
+
+    fn init_repo() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().expect("temporary repository");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(repo.join("src")).expect("src");
+        fs::write(repo.join("README.md"), "hello\n").expect("readme");
+        git2::Repository::init(&repo).expect("initialize repository");
+        (temp, repo)
+    }
+
+    #[cfg(unix)]
+    fn write_finalized_cited_source(repo: &Path, run_id: &RunId, plan_json: &str) {
+        let mut writer = ArtifactRunWriter::reserve(
+            repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "decision-ref-live-reparse",
+        )
+        .expect("reserve source supervise run");
+        writer
+            .write_bytes(
+                "assignments/supervisor-plan.json",
+                plan_json.as_bytes(),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("write cited supervisor plan");
+        let report: SupervisorFinalReport = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "run_id": run_id.as_str(),
+            "role": "supervisor",
+            "repo": ".",
+            "plan_file": "plan.json",
+            "run_dir": ".",
+            "publishable": false,
+            "success": true,
+            "accepted": false,
+            "rejected": false,
+            "status": "succeeded",
+            "remaining_risk": "test",
+            "next_safe_action": "none"
+        }))
+        .expect("minimal final report");
+        writer
+            .write_bytes(
+                RunArtifactFamily::Supervise.final_report_relative_path(),
+                &serde_json::to_vec(&report).expect("encode final report"),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .expect("write final report");
+        writer
+            .finalize(
+                RunArtifactFamily::Supervise.final_report_relative_path(),
+                false,
+            )
+            .expect("finalize source supervise run");
+    }
+
+    fn is_store_missing(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<DecisionRefError>()
+                .is_some_and(|error| *error == DecisionRefError::StoreMissing)
+                || cause.to_string().contains("decision store is missing")
+        })
+    }
+
+    fn is_store_query_failed(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<DecisionRefError>()
+                .is_some_and(|error| matches!(error, DecisionRefError::StoreQueryFailed { .. }))
+                || cause.to_string().contains("decision store query failed")
+        })
+    }
+
+    #[test]
+    fn cited_plan_none_wrapper_is_store_missing() {
+        let error = parse_supervisor_plan_with_consultant(&cited_assignment_plan_json())
+            .expect_err("None wrapper must not admit cited plans");
+        assert!(
+            is_store_missing(&error),
+            "None wrapper must be StoreMissing: {error:#}"
+        );
+    }
+
+    #[test]
+    fn cited_plan_in_repo_wrapper_fails_closed_when_repo_has_no_store() {
+        let (_temp, repo) = init_repo();
+        let error = parse_supervisor_plan_with_consultant_in_repo(
+            &cited_assignment_plan_json(),
+            Some(&repo),
+        )
+        .expect_err("cited plan + existing repo with no store must fail closed");
+        assert!(
+            is_store_missing(&error),
+            "empty-of-store repo must be StoreMissing: {error:#}"
+        );
+        assert!(DecisionStore::open_existing(&repo)
+            .expect("read-only query")
+            .is_none());
+    }
+
+    #[test]
+    fn cited_plan_in_repo_wrapper_queries_supplied_repo() {
+        let (_temp, repo) = init_repo();
+        fs::create_dir_all(
+            repo.join(".git")
+                .join("maco")
+                .join("state")
+                .join(DECISION_STORE_STATE_NAMESPACE),
+        )
+        .expect("create malformed decision-store namespace");
+        let error = parse_supervisor_plan_with_consultant_in_repo(
+            &cited_assignment_plan_json(),
+            Some(&repo),
+        )
+        .expect_err("malformed store must fail closed through the supplied repo");
+        assert!(
+            is_store_query_failed(&error),
+            "live in-repo wrapper must query the supplied repo: {error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_only_reaudit_live_path_passes_repo_for_cited_plan() {
+        let (_temp, repo) = init_repo();
+        let source_id = RunId::new("cited-reaudit-source").expect("source run id");
+        write_finalized_cited_source(&repo, &source_id, &cited_assignment_plan_json());
+
+        let missing_store = evidence_only_reaudit_plan_from_source(&repo, &source_id, "child-a")
+            .expect_err("cited re-audit source without a store must fail closed");
+        assert!(
+            is_store_missing(&missing_store),
+            "live re-audit path must fail closed as StoreMissing when the repo has no store: {missing_store:#}"
+        );
+
+        fs::create_dir_all(
+            repo.join(".git")
+                .join("maco")
+                .join("state")
+                .join(DECISION_STORE_STATE_NAMESPACE),
+        )
+        .expect("create malformed decision-store namespace");
+        let queried = evidence_only_reaudit_plan_from_source(&repo, &source_id, "child-a")
+            .expect_err("malformed store must be visible on the live re-audit path");
+        assert!(
+            is_store_query_failed(&queried),
+            "live evidence_only_reaudit path must pass Some(repo): {queried:#}"
         );
     }
 }
