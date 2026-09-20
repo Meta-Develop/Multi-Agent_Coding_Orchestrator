@@ -472,7 +472,9 @@ pub fn select_launch_account(
         }
     }
     let _validated_target = launch_spec_for(adapter, &target)?;
-    registry.select_complete(adapter.id(), account_id)
+    let current_revision = registry.selection_revision(adapter.id())?;
+    registry.select_complete_revision(adapter.id(), account_id, Some(current_revision))?;
+    Ok(())
 }
 
 /// Run the provider-neutral add transaction around adapter provisioning.

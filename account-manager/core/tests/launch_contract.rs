@@ -330,6 +330,46 @@ fn selection_is_persisted_only_after_adapter_validation() {
 }
 
 #[test]
+fn select_launch_account_bumps_selection_revision_under_cas() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let registry = StoredAccountRegistry::new(metadata_path(&dir));
+    for id in ["personal", "work"] {
+        registry
+            .begin_add(
+                "grok-cli",
+                id,
+                id,
+                AuthKind::OAuth,
+                StoredAccountMaterial::VendorHome,
+            )
+            .expect("begin add");
+        registry.complete_add("grok-cli", id).expect("complete add");
+    }
+    registry
+        .select_complete("grok-cli", "personal")
+        .expect("seed current selection");
+    let revision_before = registry
+        .selection_revision("grok-cli")
+        .expect("read revision before select");
+
+    let adapter = ProbeAdapter::new("grok-cli", LaunchSpec::new("grok").current_dir(dir.path()));
+    select_launch_account(&registry, &adapter, "work").expect("validated selection switch");
+
+    let error = registry
+        .select_complete_revision("grok-cli", "personal", Some(revision_before))
+        .expect_err("pre-select revision must be stale after CAS persist");
+    assert!(matches!(error, Error::StaleSelection { .. }));
+    assert_eq!(
+        registry
+            .selected("grok-cli")
+            .expect("load selection")
+            .expect("selected account")
+            .id,
+        "work"
+    );
+}
+
+#[test]
 fn refused_launch_validation_leaves_previous_selection_intact() {
     let dir = tempfile::tempdir().expect("tempdir");
     let registry = StoredAccountRegistry::new(metadata_path(&dir));
