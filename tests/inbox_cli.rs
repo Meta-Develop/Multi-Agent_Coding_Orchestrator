@@ -300,6 +300,12 @@ fn sequential_inbox_runs_draw_down_rolling_quota_then_refuse_before_dispatch() -
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let machine_global_config = write_test_machine_global_config(temp.path())?;
+    // Inbox autopilot plans omit review_lenses, so they bind the stacked
+    // 3-scope production default. Unconfigured run_budget reserves 1 token per
+    // fake-complete dispatch, and fake-backed missing usage charges that
+    // reservation: 1 child + 3 parent review lenses.
+    const STACKED_DEFAULT_FAKE_COMPLETE_TOKENS: usize = 4;
+    let rolling_ceiling = STACKED_DEFAULT_FAKE_COMPLETE_TOKENS.to_string();
 
     let first = run_success_json(&[
         "inbox",
@@ -311,7 +317,7 @@ fn sequential_inbox_runs_draw_down_rolling_quota_then_refuse_before_dispatch() -
         "--max-items",
         "1",
         "--max-rolling-tokens",
-        "2",
+        &rolling_ceiling,
         "--rolling-window-seconds",
         "86400",
         "--machine-global-config",
@@ -329,9 +335,12 @@ fn sequential_inbox_runs_draw_down_rolling_quota_then_refuse_before_dispatch() -
         &repo_path.join(".maco/inbox/runs/rolling-quota-first/item-1-autopilot-report.json"),
     )?;
     let first_budget = &first_autopilot["supervisor"]["run_budget"];
-    assert_eq!(first_budget["consumed"]["tokens"], 2);
-    // Fake child/auditor usage is now complete on the merged tree, so the first
-    // run consumes the 2-token ceiling instead of recording missing_provider_usage.
+    assert_eq!(
+        first_budget["consumed"]["tokens"],
+        json!(STACKED_DEFAULT_FAKE_COMPLETE_TOKENS)
+    );
+    // Fake child/auditor usage is complete, so the first run consumes the
+    // stacked-default ceiling instead of recording missing_provider_usage.
     assert_eq!(first_budget["usage_complete"], true);
     assert!(array_contains(
         &first_budget["reasons"],
@@ -348,7 +357,7 @@ fn sequential_inbox_runs_draw_down_rolling_quota_then_refuse_before_dispatch() -
         "--max-items",
         "1",
         "--max-rolling-tokens",
-        "2",
+        &rolling_ceiling,
         "--max-rolling-cost-usd",
         "1000000",
         "--rolling-window-seconds",
