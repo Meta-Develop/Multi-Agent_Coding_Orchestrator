@@ -16,6 +16,7 @@ export default function AccountQuotaCard({
   provider,
   accountId,
   displayName,
+  isSelectedForLaunch,
   planLabel,
   snapshots,
   result,
@@ -26,6 +27,7 @@ export default function AccountQuotaCard({
   provider: ProviderDescriptor
   accountId: string
   displayName: string
+  isSelectedForLaunch: boolean
   planLabel: string | null
   snapshots: QuotaSnapshot[]
   result: ProviderQuotaList | undefined
@@ -54,6 +56,9 @@ export default function AccountQuotaCard({
             <h3 className="font-semibold tracking-tight">{displayName}</h3>
             <span className="provider-chip">{provider.displayName}</span>
             {plan !== '' && <span className="chip chip-muted">{plan}</span>}
+            {isSelectedForLaunch && (
+              <span className="chip chip-accent">Selected for app launch</span>
+            )}
           </div>
         </div>
       </header>

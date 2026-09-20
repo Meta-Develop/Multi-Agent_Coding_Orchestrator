@@ -199,6 +199,116 @@ describe('Dashboard quota visibility', () => {
     ).not.toBeInTheDocument()
   })
 
+  it('shows the app-launch chip only on selected accounts', async () => {
+    const launchProvider = provider('grok-cli', 'Grok CLI', 'experimental', [
+      'launch-tool',
+    ])
+    const otherProvider = CLAUDE_PROVIDER
+    vi.mocked(listProviders).mockResolvedValue([launchProvider, otherProvider])
+    vi.mocked(listAccounts).mockResolvedValue([
+      listing(launchProvider, [
+        account(launchProvider, {
+          id: 'selected',
+          label: 'Grok selected',
+          isSelectedForLaunch: true,
+        }),
+        account(launchProvider, {
+          id: 'not-selected',
+          label: 'Grok other',
+          isSelectedForLaunch: false,
+        }),
+      ]),
+      listing(otherProvider, [
+        account(otherProvider, { isSelectedForLaunch: false }),
+      ]),
+    ])
+    vi.mocked(listQuota).mockResolvedValue([
+      noSignal(launchProvider.id),
+      noSignal(otherProvider.id),
+    ])
+
+    render(<Dashboard />)
+
+    const selectedCard = await screen.findByRole('article', {
+      name: 'Grok selected quota',
+    })
+    const selectedChip = within(selectedCard).getByText(
+      'Selected for app launch',
+    )
+    expect(selectedChip).toBeVisible()
+    expect(selectedChip).toHaveClass('chip', 'chip-accent')
+
+    const notSelectedCard = screen.getByRole('article', {
+      name: 'Grok other quota',
+    })
+    expect(
+      within(notSelectedCard).queryByText('Selected for app launch'),
+    ).not.toBeInTheDocument()
+
+    const claudeCard = screen.getByRole('article', {
+      name: `${accountLabel(otherProvider)} quota`,
+    })
+    expect(
+      within(claudeCard).queryByText('Selected for app launch'),
+    ).not.toBeInTheDocument()
+  })
+
+  it('warns when a launch-tool provider has stored accounts but none selected', async () => {
+    const launchProvider = provider(
+      'gemini-cli',
+      'Gemini CLI',
+      'experimental',
+      ['launch-tool'],
+    )
+    const noLaunchProvider = CODEX_PROVIDER
+    vi.mocked(listProviders).mockResolvedValue([
+      launchProvider,
+      noLaunchProvider,
+    ])
+    vi.mocked(listAccounts).mockResolvedValue([
+      listing(launchProvider, [
+        account(launchProvider, { isSelectedForLaunch: false }),
+      ]),
+      listing(noLaunchProvider, [
+        account(noLaunchProvider, { isSelectedForLaunch: false }),
+      ]),
+    ])
+    vi.mocked(listQuota).mockResolvedValue([
+      noSignal(launchProvider.id),
+      noSignal(noLaunchProvider.id),
+    ])
+
+    render(<Dashboard />)
+
+    const status = await screen.findByRole('list', { name: 'Adapter status' })
+    expect(status).toHaveTextContent(
+      'Gemini CLI has stored accounts but none is selected for app launch.',
+    )
+    expect(status).not.toHaveTextContent('Codex CLI has stored accounts')
+  })
+
+  it('does not warn for launch-tool providers when an account is selected', async () => {
+    const launchProvider = provider('grok-cli', 'Grok CLI', 'experimental', [
+      'launch-tool',
+    ])
+    vi.mocked(listProviders).mockResolvedValue([launchProvider])
+    vi.mocked(listAccounts).mockResolvedValue([
+      listing(launchProvider, [
+        account(launchProvider, { isSelectedForLaunch: true }),
+      ]),
+    ])
+    vi.mocked(listQuota).mockResolvedValue([noSignal(launchProvider.id)])
+
+    render(<Dashboard />)
+
+    await screen.findByRole('article', {
+      name: `${accountLabel(launchProvider)} quota`,
+    })
+    expect(
+      screen.queryByRole('list', { name: 'Adapter status' }),
+    ).not.toBeInTheDocument()
+  })
+
   it('keeps the account row when quota loading rejects', async () => {
     vi.mocked(listProviders).mockResolvedValue([CLAUDE_PROVIDER])
     vi.mocked(listAccounts).mockResolvedValue([listing(CLAUDE_PROVIDER)])
@@ -232,6 +342,7 @@ function provider(
   id: string,
   displayName: string,
   maturity: ProviderDescriptor['maturity'] = 'experimental',
+  capabilities: ProviderDescriptor['capabilities'] = [],
 ): ProviderDescriptor {
   return {
     id,
@@ -240,7 +351,7 @@ function provider(
     authKinds: ['oauth'],
     maturity,
     installState: 'installed',
-    capabilities: [],
+    capabilities,
   }
 }
 
