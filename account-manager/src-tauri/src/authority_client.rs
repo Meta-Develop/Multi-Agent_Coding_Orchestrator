@@ -74,8 +74,7 @@ pub(crate) fn in_process_stored_account_registry() -> Result<StoredAccountRegist
 fn connect_remote_authority(configured: &str) -> Result<AccountAuthority> {
     #[cfg(unix)]
     {
-        let client = AuthorityClient::connect(configured)?;
-        return Ok(AccountAuthority::Remote(client));
+        AuthorityClient::connect(configured).map(AccountAuthority::Remote)
     }
     #[cfg(not(unix))]
     {
@@ -117,10 +116,6 @@ impl AuthorityClient {
             path,
             authority_id: Arc::new(Mutex::new(None)),
         })
-    }
-
-    pub fn path(&self) -> &Path {
-        self.path.as_path()
     }
 
     pub fn authority_id(&self) -> Result<String> {
@@ -327,7 +322,6 @@ impl AuthorityClient {
     }
 
     fn exchange(&self, request: Value) -> Result<AuthorityResponse> {
-        use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
         use std::time::Instant;
 
