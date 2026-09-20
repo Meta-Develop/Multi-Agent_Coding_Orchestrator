@@ -3702,6 +3702,27 @@
                       "type": "array",
                       "uniqueItems": true
                     },
+                    "decision_refs": {
+                      "description": "Optional citations of resolved DecisionRecord question keys. Non-empty citations load an existing DecisionStore and fail closed on missing, stale, open, or superseded records. Omitted or empty citations do not require a store.",
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "expected_resolution": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "question_key": {
+                            "minLength": 1,
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "question_key"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
                     "environment_requirements": {
                       "items": {
                         "oneOf": [
@@ -4468,6 +4489,12 @@
                   }
                 ]
               },
+              "review_lens_correlation": {
+                "enum": [
+                  "distinct_scopes",
+                  "allow_same_scope"
+                ]
+              },
               "review_lenses": {
                 "items": {
                   "additionalProperties": false,
@@ -4554,12 +4581,6 @@
                 },
                 "minItems": 1,
                 "type": "array"
-              },
-              "review_lens_correlation": {
-                "enum": [
-                  "distinct_scopes",
-                  "allow_same_scope"
-                ]
               },
               "role_models": {
                 "additionalProperties": false,
@@ -9522,6 +9543,27 @@
                             "type": "array",
                             "uniqueItems": true
                           },
+                          "decision_refs": {
+                            "description": "Optional citations of resolved DecisionRecord question keys. Non-empty citations load an existing DecisionStore and fail closed on missing, stale, open, or superseded records. Omitted or empty citations do not require a store.",
+                            "items": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "expected_resolution": {
+                                  "minLength": 1,
+                                  "type": "string"
+                                },
+                                "question_key": {
+                                  "minLength": 1,
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "question_key"
+                              ],
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
                           "environment_requirements": {
                             "items": {
                               "oneOf": [
@@ -10288,6 +10330,12 @@
                         }
                       ]
                     },
+                    "review_lens_correlation": {
+                      "enum": [
+                        "distinct_scopes",
+                        "allow_same_scope"
+                      ]
+                    },
                     "review_lenses": {
                       "items": {
                         "additionalProperties": false,
@@ -10374,12 +10422,6 @@
                       },
                       "minItems": 1,
                       "type": "array"
-                    },
-                    "review_lens_correlation": {
-                      "enum": [
-                        "distinct_scopes",
-                        "allow_same_scope"
-                      ]
                     },
                     "role_models": {
                       "additionalProperties": false,
