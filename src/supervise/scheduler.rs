@@ -506,6 +506,7 @@ pub(super) struct AssignmentBudgetPolicy {
     selector_runtime_overrides: BTreeMap<AgentRole, SupervisorRuntime>,
     pub(super) selector_decisions: Vec<SupervisorSelectionEvent>,
     pub(super) initial_selector_decisions: Vec<SupervisorSelectionEvent>,
+    this_run_run_dir: Option<PathBuf>,
 }
 
 impl AssignmentBudgetPolicy {
@@ -602,6 +603,9 @@ impl AssignmentBudgetPolicy {
         let Some(state) = self.selector_state.as_mut() else {
             return Ok(Vec::new());
         };
+        if let Some(run_dir) = self.this_run_run_dir.as_deref() {
+            state.set_this_run_outcomes(load_this_run_outcome_records(run_dir));
+        }
         let reselection = reselect_roles_from_supplied_catalog_snapshot(
             state,
             runtime,
@@ -662,6 +666,7 @@ impl AssignmentBudgetPolicy {
         run_dir: &Path,
         reports: &[OrchestratorReviewReport],
     ) {
+        self.this_run_run_dir = Some(run_dir.to_path_buf());
         let rollup =
             this_run_accepted_task_cost(&load_this_run_attempt_cost_rows(run_dir), reports);
         if let Some(state) = self.selector_state.as_mut() {
@@ -4410,6 +4415,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                 .budget_degradation
                 .policy
                 .initial_selector_decisions = collected.selection_decisions.clone();
+            progress.budget_degradation.policy.this_run_run_dir = Some(run_dir.clone());
             progress.install_preclaim_decisions(preclaim_decisions)?;
             let scheduler_context = AssignmentSchedulerContext {
                 plan: &plan,

@@ -1207,6 +1207,81 @@ fn project_numeric_row(row: &AttemptOutcomeEvidence) -> Option<OutcomeRecord> {
     })
 }
 
+/// Convert this-run attempt evidence into a selector outcome only when the
+/// parent already recorded a terminal accepted or rejected result. Cost-only
+/// rows and attempts without `parent_result` do not invent quality.
+pub(super) fn outcome_record_from_this_run_attempt(
+    evidence: &AttemptOutcomeEvidence,
+) -> Option<OutcomeRecord> {
+    match evidence.parent_result {
+        Some(OutcomeResult::Accepted | OutcomeResult::Rejected) => project_numeric_row(evidence),
+        Some(OutcomeResult::Blocked) | None => None,
+    }
+}
+
+pub(super) fn this_run_outcome_records<'a>(
+    evidence: impl IntoIterator<Item = &'a AttemptOutcomeEvidence>,
+) -> Vec<OutcomeRecord> {
+    let mut rows = evidence
+        .into_iter()
+        .filter_map(outcome_record_from_this_run_attempt)
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.attempt_id.cmp(&right.attempt_id));
+    rows
+}
+
+const THIS_RUN_ATTEMPT_EVIDENCE_MAX_BYTES: usize = 64 * 1024;
+
+pub(super) fn load_this_run_attempt_evidence(run_dir: &Path) -> Vec<AttemptOutcomeEvidence> {
+    let attempts_dir = run_dir.join(ATTEMPT_EVIDENCE_DIR);
+    let entries = match std::fs::read_dir(&attempts_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    let mut rows = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some((assignment, ordinal)) = name
+            .strip_suffix(".json")
+            .and_then(|name| name.rsplit_once(".attempt-"))
+        else {
+            continue;
+        };
+        let Ok(ordinal) = ordinal.parse::<usize>() else {
+            continue;
+        };
+        let Ok(bytes) =
+            read_bounded_regular_file_nofollow(&path, THIS_RUN_ATTEMPT_EVIDENCE_MAX_BYTES)
+        else {
+            continue;
+        };
+        let Ok(evidence) = serde_json::from_slice::<AttemptOutcomeEvidence>(&bytes) else {
+            continue;
+        };
+        if evidence.attempt == 0
+            || evidence.attempt != ordinal
+            || evidence.assignment_id != assignment
+        {
+            continue;
+        }
+        rows.push(evidence);
+    }
+    rows.sort_by(|left, right| {
+        (&left.assignment_id, left.attempt).cmp(&(&right.assignment_id, right.attempt))
+    });
+    rows
+}
+
+pub(super) fn load_this_run_outcome_records(run_dir: &Path) -> Vec<OutcomeRecord> {
+    this_run_outcome_records(&load_this_run_attempt_evidence(run_dir))
+}
+
 #[cfg(test)]
 pub(super) fn test_trusted_grok_parent_auditor_external_run(
     command: &crate::external_agent::ExternalAgentCommand,
@@ -1819,6 +1894,55 @@ mod tests {
             .exclusions
             .iter()
             .any(|reason| reason.contains("unfinalized_or_unauthenticated")));
+        Ok(())
+    }
+
+    #[test]
+    fn this_run_outcome_record_requires_parent_terminal_result() {
+        let mut evidence = fixture();
+        let accepted = outcome_record_from_this_run_attempt(&evidence).unwrap();
+        assert_eq!(accepted.result, OutcomeResult::Accepted);
+        assert_eq!(accepted.attempt_id, "run-1:assignment-1:1");
+
+        evidence.parent_result = None;
+        assert!(outcome_record_from_this_run_attempt(&evidence).is_none());
+
+        evidence.parent_result = Some(OutcomeResult::Blocked);
+        assert!(outcome_record_from_this_run_attempt(&evidence).is_none());
+
+        evidence.parent_result = Some(OutcomeResult::Rejected);
+        let rejected = outcome_record_from_this_run_attempt(&evidence).unwrap();
+        assert_eq!(rejected.result, OutcomeResult::Rejected);
+
+        evidence.costs.execution_cost_microunits = None;
+        assert!(
+            outcome_record_from_this_run_attempt(&evidence).is_none(),
+            "cost-only or incomplete numeric rows must not invent quality"
+        );
+    }
+
+    #[test]
+    fn load_this_run_outcome_records_skips_rows_without_parent_result() -> Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let attempts = temp.path().join(ATTEMPT_EVIDENCE_DIR);
+        std::fs::create_dir_all(&attempts)?;
+        let accepted = fixture();
+        std::fs::write(
+            attempts.join("assignment-1.attempt-1.json"),
+            serde_json::to_vec(&accepted)?,
+        )?;
+        let mut cost_only = fixture();
+        cost_only.assignment_id = "assignment-2".to_string();
+        cost_only.attempt = 2;
+        cost_only.parent_result = None;
+        std::fs::write(
+            attempts.join("assignment-2.attempt-2.json"),
+            serde_json::to_vec(&cost_only)?,
+        )?;
+        let rows = load_this_run_outcome_records(temp.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].attempt_id, "run-1:assignment-1:1");
+        assert_eq!(rows[0].result, OutcomeResult::Accepted);
         Ok(())
     }
 
