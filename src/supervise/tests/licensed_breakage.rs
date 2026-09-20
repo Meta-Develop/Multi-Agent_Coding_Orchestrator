@@ -913,7 +913,7 @@ fn declared_scoped_breakage_passes_and_journals_dispatchable_follow_up_plan() {
     assert_eq!(task.supervisor_plan.max_child_assignments, 1);
     assert_eq!(
         task.supervisor_plan.review_lenses,
-        default_supervisor_review_lenses()
+        single_parent_acceptance_review_lenses()
     );
     assert_eq!(
         task.supervisor_plan.review_aggregation_policy,
