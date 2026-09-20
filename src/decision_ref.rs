@@ -13,6 +13,7 @@ use crate::{
     },
     decision_store::DecisionStore,
 };
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use thiserror::Error;
 
@@ -21,6 +22,42 @@ use thiserror::Error;
 pub struct DecisionRef {
     question_key: String,
     expected_resolution: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct DecisionRefDto {
+    question_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_resolution: Option<String>,
+}
+
+impl Serialize for DecisionRef {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        DecisionRefDto {
+            question_key: self.question_key.clone(),
+            expected_resolution: self.expected_resolution.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for DecisionRef {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let dto = DecisionRefDto::deserialize(deserializer)?;
+        let reference = DecisionRef::new(dto.question_key).map_err(serde::de::Error::custom)?;
+        match dto.expected_resolution {
+            Some(resolution) => reference
+                .with_expected_resolution(resolution)
+                .map_err(serde::de::Error::custom),
+            None => Ok(reference),
+        }
+    }
 }
 
 impl DecisionRef {
@@ -45,6 +82,17 @@ impl DecisionRef {
 
     pub fn expected_resolution(&self) -> Option<&str> {
         self.expected_resolution.as_deref()
+    }
+}
+
+/// Parses a CLI citation of the form `question_key[=resolution]`.
+pub fn parse_decision_ref_cli(value: &str) -> Result<DecisionRef> {
+    let value = value.trim();
+    match value.split_once('=') {
+        Some((question_key, resolution)) => {
+            DecisionRef::new(question_key)?.with_expected_resolution(resolution)
+        }
+        None => DecisionRef::new(value),
     }
 }
 

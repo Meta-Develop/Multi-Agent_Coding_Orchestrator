@@ -1717,6 +1717,7 @@ fn experiment_plan(manifest: &ExperimentManifest, profile: &EvaluationProfile) -
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
+            decision_refs: Vec::new(),
         }],
     }
 }

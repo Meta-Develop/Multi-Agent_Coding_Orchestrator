@@ -222,6 +222,7 @@ fn fake_arbitration_options(repo: &Path, run_id: &str) -> MergeArbitrationOption
         worktree_root: None,
         machine_global_config: repo.join("unused-machine-global.json"),
         machine_global_runtime_root_id: "runtime".to_string(),
+        decision_refs: Vec::new(),
     }
 }
 

@@ -403,6 +403,7 @@ fn messaging_plan_and_metadata() -> (SupervisorPlan, SupervisorPlanMetadata) {
         environment_requirements: Vec::new(),
         licensed_breakage: None,
         notes: None,
+        decision_refs: Vec::new(),
     };
     let worker = OrchestratorAssignment {
         id: WORKER_ID.to_string(),
@@ -422,6 +423,7 @@ fn messaging_plan_and_metadata() -> (SupervisorPlan, SupervisorPlanMetadata) {
         environment_requirements: Vec::new(),
         licensed_breakage: None,
         notes: None,
+        decision_refs: Vec::new(),
     };
     let mut plan = SupervisorPlan {
         version: SUPERVISOR_SCHEMA_VERSION,

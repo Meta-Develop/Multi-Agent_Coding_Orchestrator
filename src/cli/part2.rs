@@ -873,6 +873,7 @@ impl MergeCommand {
                     worktree_root: args.worktree_root,
                     machine_global_config: args.machine_global_config,
                     machine_global_runtime_root_id: args.machine_global_runtime_root_id,
+                    decision_refs: args.decision_ref,
                 })?;
                 print_merge_arbitration_report(&report, args.json)
             }
@@ -1294,6 +1295,10 @@ struct MergeArbitrateArgs {
     /// Reviewed root id whose canonical root must contain the actual private runtime root.
     #[arg(long)]
     machine_global_runtime_root_id: String,
+    /// Checked citation of a resolved DecisionRecord. Repeatable.
+    /// Format: question_key[=resolution].
+    #[arg(long = "decision-ref", value_name = "QUESTION_KEY[=RESOLUTION]", value_parser = parse_cli_decision_ref)]
+    decision_ref: Vec<DecisionRef>,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -2255,6 +2260,10 @@ fn parse_agent_worktree_reuse_policy(
         "fresh" => Ok(AgentWorktreeReusePolicy::Fresh),
         _ => Err("expected one of: clean, required, fresh".to_string()),
     }
+}
+
+fn parse_cli_decision_ref(value: &str) -> std::result::Result<DecisionRef, String> {
+    parse_decision_ref_cli(value).map_err(|error| error.to_string())
 }
 
 fn parse_positive_seconds(value: &str) -> std::result::Result<u64, String> {

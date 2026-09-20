@@ -852,6 +852,75 @@ fn merge_arbitration_is_an_explicit_typed_opt_in() {
         "runtime".to_string()
     );
     assert!(agent_primary.approve);
+    assert!(agent_primary.decision_ref.is_empty());
+
+    let with_refs = Cli::try_parse_from([
+        "maco",
+        "merge",
+        "arbitrate",
+        "agent-a",
+        "primary",
+        "--arbiter-id",
+        "neutral-review",
+        "--run-id",
+        "collision-refs",
+        "--first-claim",
+        "src/lib.rs",
+        "--validation-command",
+        "cargo test",
+        "--machine-global-config",
+        "/tmp/maco-machine-global.json",
+        "--machine-global-runtime-root-id",
+        "runtime",
+        "--decision-ref",
+        "api.transport",
+        "--decision-ref",
+        "api.transport=Use HTTP",
+    ])
+    .expect("repeatable --decision-ref should parse");
+    let Command::Merge(MergeCommand {
+        command: MergeSubcommand::Arbitrate(with_refs),
+    }) = with_refs.command
+    else {
+        panic!("expected merge arbitrate command");
+    };
+    assert_eq!(with_refs.decision_ref.len(), 2);
+    assert_eq!(with_refs.decision_ref[0].question_key(), "api.transport");
+    assert_eq!(with_refs.decision_ref[0].expected_resolution(), None);
+    assert_eq!(with_refs.decision_ref[1].question_key(), "api.transport");
+    assert_eq!(
+        with_refs.decision_ref[1].expected_resolution(),
+        Some("Use HTTP")
+    );
+
+    let invalid_ref = Cli::try_parse_from([
+        "maco",
+        "merge",
+        "arbitrate",
+        "agent-a",
+        "primary",
+        "--arbiter-id",
+        "neutral-review",
+        "--run-id",
+        "collision-invalid-ref",
+        "--first-claim",
+        "src",
+        "--validation-command",
+        "cargo check",
+        "--machine-global-config",
+        "/tmp/maco-machine-global.json",
+        "--machine-global-runtime-root-id",
+        "runtime",
+        "--decision-ref",
+        "api transport",
+    ])
+    .expect_err("invalid decision_ref keys must fail closed at parse");
+    assert!(
+        invalid_ref.to_string().contains("question")
+            || invalid_ref.to_string().contains("Invalid")
+            || invalid_ref.to_string().contains("invalid"),
+        "invalid --decision-ref refusal must name the citation defect: {invalid_ref}"
+    );
 
     let agent_agent = Cli::try_parse_from([
         "maco",

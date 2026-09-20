@@ -11,8 +11,10 @@ pub use crate::merge_semantic::{
 };
 use crate::{
     artifacts::{
-        state_auth::sha256_hex, ArtifactFileDisposition, ArtifactRunWriter, RunArtifactFamily,
+        state_auth::sha256_hex, ArtifactFileDisposition, ArtifactRunReader, ArtifactRunWriter,
+        RunArtifactFamily,
     },
+    decision_ref::{check_required_decision_ref_in_store, DecisionRef},
     external_agent::{
         run_external_agent, ExternalAgentCommand, ExternalAgentInvocation,
         ExternalMachineGlobalRetentionBinding,
@@ -38,7 +40,8 @@ use crate::{
     },
     semantic_coord::{SemanticIntent, SemanticIntentStore},
     supervise::{
-        verified_megafile_decomposition_evidence, AgentRole, VerifiedMegafileDecompositionEvidence,
+        verified_megafile_decomposition_evidence, AgentRole, OrchestratorAssignment,
+        VerifiedMegafileDecompositionEvidence,
     },
     sync::{normalize_repo_relative_path, PathClaim},
     sync_store::SyncStore,
@@ -274,6 +277,77 @@ pub struct MergeArbitrationOptions {
     pub worktree_root: Option<PathBuf>,
     pub machine_global_config: PathBuf,
     pub machine_global_runtime_root_id: String,
+    /// Optional citations of resolved design decisions. Empty means do not
+    /// open or create a DecisionStore.
+    pub decision_refs: Vec<DecisionRef>,
+}
+
+/// Fail-closed DecisionRef check used by merge arbitration.
+///
+/// Empty `references` does not open or create a DecisionStore.
+pub fn check_merge_arbitration_decision_refs(
+    repo: impl AsRef<Path>,
+    references: &[DecisionRef],
+) -> Result<()> {
+    if references.is_empty() {
+        return Ok(());
+    }
+    for reference in references {
+        check_required_decision_ref_in_store(repo.as_ref(), Some(reference))?;
+    }
+    Ok(())
+}
+
+fn collect_merge_arbitration_decision_refs(options: &MergeArbitrationOptions) -> Vec<DecisionRef> {
+    let mut references = options.decision_refs.clone();
+    references.extend(assignment_decision_refs_from_run_artifacts(options));
+    let mut seen = BTreeSet::new();
+    references
+        .into_iter()
+        .filter(|reference| {
+            seen.insert((
+                reference.question_key().to_string(),
+                reference.expected_resolution().map(str::to_string),
+            ))
+        })
+        .collect()
+}
+
+fn assignment_decision_refs_from_run_artifacts(
+    options: &MergeArbitrationOptions,
+) -> Vec<DecisionRef> {
+    let Ok(reader) =
+        ArtifactRunReader::open(&options.repo, RunArtifactFamily::Supervise, &options.run_id)
+    else {
+        return Vec::new();
+    };
+    let Ok(bytes) = reader.read("assignments/supervisor-plan.json") else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return Vec::new();
+    };
+    let Some(assignments) = value.get("assignments").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let side_ids = options
+        .sides
+        .iter()
+        .filter_map(|side| match side {
+            ArbitrationSideSpec::Agent { agent_id, .. } => Some(agent_id.as_str()),
+            ArbitrationSideSpec::Primary => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let mut references = Vec::new();
+    for raw in assignments {
+        let Ok(assignment) = serde_json::from_value::<OrchestratorAssignment>(raw.clone()) else {
+            continue;
+        };
+        if side_ids.contains(assignment.id.as_str()) {
+            references.extend(assignment.decision_refs);
+        }
+    }
+    references
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -731,6 +805,9 @@ fn arbitrate_merge_with_environment(
 ) -> Result<MergeArbitrationReport> {
     let options = canonicalize_arbitration_options(options)?;
     let repo_root = discover_primary_repo_root(&options.repo)?;
+    let decision_refs = collect_merge_arbitration_decision_refs(&options);
+    check_merge_arbitration_decision_refs(&repo_root, &decision_refs)
+        .context("merge arbitration decision_ref check failed")?;
     let mut writer = ArtifactRunWriter::reserve(
         &repo_root,
         RunArtifactFamily::Supervise,

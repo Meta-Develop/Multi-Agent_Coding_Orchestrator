@@ -1,4 +1,10 @@
 use super::*;
+use crate::{
+    decision_claim::DecisionRegistry,
+    decision_ref::{check_decision_ref, DecisionRef, DecisionRefError},
+    decision_store::DecisionStore,
+};
+use std::path::Path;
 
 pub(super) fn validate_assignment_phase_contract(plan: &SupervisorPlan) -> Result<()> {
     for assignment in &plan.assignments {
@@ -177,8 +183,16 @@ pub(super) fn supervisor_plan_fan_out_width_warning(
 }
 
 pub(super) fn validate_supervisor_plan(
+    plan: SupervisorPlan,
+    metadata: SupervisorPlanMetadata,
+) -> Result<(SupervisorPlan, SupervisorPlanMetadata)> {
+    validate_supervisor_plan_in_repo(plan, metadata, None)
+}
+
+pub(super) fn validate_supervisor_plan_in_repo(
     mut plan: SupervisorPlan,
     mut metadata: SupervisorPlanMetadata,
+    repo: Option<&Path>,
 ) -> Result<(SupervisorPlan, SupervisorPlanMetadata)> {
     if plan.version != SUPERVISOR_SCHEMA_VERSION {
         bail!("unsupported supervisor plan version {}", plan.version);
@@ -454,7 +468,56 @@ pub(super) fn validate_supervisor_plan(
         })
         .collect();
 
+    validate_assignment_decision_refs_for_repo(&plan.assignments, repo)?;
     Ok((plan, metadata))
+}
+
+/// Citations declared on assignments. Empty or omitted refs do not require a
+/// store and must not create one.
+pub(super) fn assignment_decision_refs(
+    assignments: &[OrchestratorAssignment],
+) -> Vec<(String, DecisionRef)> {
+    assignments
+        .iter()
+        .flat_map(|assignment| {
+            assignment
+                .decision_refs
+                .iter()
+                .cloned()
+                .map(|reference| (assignment.id.clone(), reference))
+        })
+        .collect()
+}
+
+pub(super) fn validate_assignment_decision_refs(
+    assignments: &[OrchestratorAssignment],
+    registry: &DecisionRegistry,
+) -> std::result::Result<(), DecisionRefError> {
+    for (_, reference) in assignment_decision_refs(assignments) {
+        check_decision_ref(registry, &reference)?;
+    }
+    Ok(())
+}
+
+pub(super) fn validate_assignment_decision_refs_for_repo(
+    assignments: &[OrchestratorAssignment],
+    repo: Option<&Path>,
+) -> Result<()> {
+    if assignment_decision_refs(assignments).is_empty() {
+        return Ok(());
+    }
+    let repo = repo.ok_or(DecisionRefError::StoreMissing)?;
+    let store = DecisionStore::open_existing(repo)
+        .map_err(|error| DecisionRefError::StoreQueryFailed {
+            message: format!("{error:#}"),
+        })?
+        .ok_or(DecisionRefError::StoreMissing)?;
+    let registry = store
+        .load_registry()
+        .map_err(|error| DecisionRefError::StoreQueryFailed {
+            message: format!("{error:#}"),
+        })?;
+    validate_assignment_decision_refs(assignments, &registry).map_err(Into::into)
 }
 
 fn validate_primary_worktree_execution_target(
@@ -1336,5 +1399,168 @@ pub(super) fn semantic_assignment_request(
         modules: assignment.semantic_modules.clone(),
         task_file: None,
         notes: vec!["supervise child orchestrator assignment".to_string()],
+    }
+}
+
+#[cfg(test)]
+mod plan_validation_decision_ref_tests {
+    use super::*;
+    use crate::decision_claim::{
+        DecisionClaimStatus, DecisionRecord, DecisionRegistry, DecisionRegistrySnapshot,
+        DecisionScope,
+    };
+    use crate::decision_ref::DecisionRef;
+    use crate::decision_store::DecisionStore;
+    use git2::Repository;
+    use std::path::PathBuf;
+
+    fn scope() -> DecisionScope {
+        DecisionScope::new(
+            ["api".to_string()],
+            Vec::<String>::new(),
+            Vec::<String>::new(),
+        )
+        .expect("valid test scope")
+    }
+
+    fn assignment_with_refs(refs: Vec<DecisionRef>) -> OrchestratorAssignment {
+        OrchestratorAssignment {
+            id: "child-a".to_string(),
+            phase: AssignmentPhase::Execution,
+            runtime: None,
+            role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: None,
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+            decision_refs: refs,
+        }
+    }
+
+    fn resolved_registry() -> DecisionRegistry {
+        let registry = DecisionRegistry::new();
+        registry
+            .claim_open(
+                "api.transport",
+                "Which transport should the API use?",
+                "planner-a",
+            )
+            .expect("open claim");
+        registry
+            .resolve_claim("api.transport", "planner-a", "Use HTTP", scope())
+            .expect("resolve claim");
+        registry
+    }
+
+    #[test]
+    fn plan_validation_empty_decision_refs_do_not_require_or_create_a_store() {
+        let temp = tempfile::tempdir().expect("temporary repository");
+        Repository::init(temp.path()).expect("initialize repository");
+        let assignment = assignment_with_refs(Vec::new());
+
+        validate_assignment_decision_refs_for_repo(&[assignment], Some(temp.path()))
+            .expect("omitted refs must not require a store");
+        assert!(DecisionStore::open_existing(temp.path())
+            .expect("read-only query")
+            .is_none());
+        assert!(
+            !temp.path().join(".git").join("maco").exists(),
+            "plan validation without refs must not create Git-common decision-store state"
+        );
+    }
+
+    #[test]
+    fn plan_validation_matching_resolved_record_passes_in_memory() {
+        let reference = DecisionRef::new("api.transport")
+            .expect("valid key")
+            .with_expected_resolution("Use HTTP")
+            .expect("valid resolution");
+        let assignment = assignment_with_refs(vec![reference]);
+
+        validate_assignment_decision_refs(&[assignment], &resolved_registry())
+            .expect("matching resolved citation must pass");
+    }
+
+    #[test]
+    fn plan_validation_missing_store_fails_closed() {
+        let temp = tempfile::tempdir().expect("temporary repository");
+        Repository::init(temp.path()).expect("initialize repository");
+        let assignment =
+            assignment_with_refs(vec![DecisionRef::new("api.transport").expect("valid key")]);
+
+        let error = validate_assignment_decision_refs_for_repo(&[assignment], Some(temp.path()))
+            .expect_err("missing store must fail closed");
+        assert!(
+            error
+                .downcast_ref::<DecisionRefError>()
+                .is_some_and(|error| *error == DecisionRefError::StoreMissing)
+                || error.to_string().contains("decision store is missing"),
+            "missing-store refusal must be StoreMissing: {error:#}"
+        );
+        assert!(
+            !temp.path().join(".git").join("maco").exists(),
+            "missing-store fail-closed must not create Git-common decision-store state"
+        );
+    }
+
+    #[test]
+    fn plan_validation_stale_resolution_fails_closed() {
+        let reference = DecisionRef::new("api.transport")
+            .expect("valid key")
+            .with_expected_resolution("Use a local socket")
+            .expect("valid resolution");
+        let assignment = assignment_with_refs(vec![reference]);
+
+        assert!(matches!(
+            validate_assignment_decision_refs(&[assignment], &resolved_registry())
+                .expect_err("stale resolution"),
+            DecisionRefError::StaleRef { .. }
+        ));
+    }
+
+    #[test]
+    fn plan_validation_open_claim_fails_closed() {
+        let registry = DecisionRegistry::new();
+        registry
+            .claim_open(
+                "api.transport",
+                "Which transport should the API use?",
+                "planner-a",
+            )
+            .expect("open claim");
+        let assignment =
+            assignment_with_refs(vec![DecisionRef::new("api.transport").expect("valid key")]);
+
+        assert_eq!(
+            validate_assignment_decision_refs(&[assignment], &registry).expect_err("open claim"),
+            DecisionRefError::StaleRef {
+                question_key: "api.transport".to_string(),
+                reason: crate::decision_ref::StaleDecisionRefReason::ClaimNotResolved {
+                    status: DecisionClaimStatus::Open,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn plan_validation_record_only_snapshot_still_passes() {
+        let record = DecisionRecord::new("api.transport", "Use HTTP", "planner-a", scope())
+            .expect("resolved record");
+        let registry = DecisionRegistry::from_snapshot(DecisionRegistrySnapshot {
+            claims: Vec::new(),
+            records: vec![record],
+        })
+        .expect("record-only snapshot");
+        let assignment =
+            assignment_with_refs(vec![DecisionRef::new("api.transport").expect("valid key")]);
+
+        validate_assignment_decision_refs(&[assignment], &registry)
+            .expect("record without a live claim remains a resolved target");
     }
 }

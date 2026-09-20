@@ -222,7 +222,7 @@ pub(super) fn supervisor_plan_and_consultant_from_task_file(
     let task_file = task_file.as_ref();
     let task = read_supervisor_input(task_file, "task file")?;
     if serde_json::from_str::<Value>(&task).is_ok() {
-        return parse_supervisor_plan_with_consultant(&task)
+        return parse_supervisor_plan_with_consultant_in_repo(&task, Some(&repo))
             .with_context(|| format!("failed to parse supervisor plan {}", task_file.display()));
     }
 
@@ -397,6 +397,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
                         .to_string(),
                 )
             }),
+            decision_refs: Vec::new(),
         });
         assignment_schedule.push(AssignmentScheduleEntry {
             assignment_id: planning_id.clone(),
@@ -457,6 +458,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
                     "Execution child admitted only after read-only planning root '{planning_id}' succeeds"
                 ))
             }),
+            decision_refs: Vec::new(),
         });
         assignment_schedule.push(AssignmentScheduleEntry {
             assignment_id: assignment.id,
@@ -1328,6 +1330,7 @@ fn lower_provider_assignment_tree(
         environment_requirements: Vec::new(),
         licensed_breakage: None,
         notes: None,
+        decision_refs: Vec::new(),
     });
     assignment_schedule.push(AssignmentScheduleEntry {
         assignment_id: node.id.clone(),
@@ -1822,15 +1825,16 @@ fn normalized_report_fragment_ids(
 }
 
 pub fn load_supervisor_plan_file(path: impl AsRef<Path>) -> Result<SupervisorPlan> {
-    Ok(load_supervisor_plan_file_with_consultant(path)?.plan)
+    Ok(load_supervisor_plan_file_with_consultant(path, None)?.plan)
 }
 
 pub(super) fn load_supervisor_plan_file_with_consultant(
     path: impl AsRef<Path>,
+    repo: Option<&Path>,
 ) -> Result<LoadedSupervisorPlan> {
     let path = path.as_ref();
     let contents = read_supervisor_input(path, "supervisor plan")?;
-    parse_supervisor_plan_with_consultant(&contents)
+    parse_supervisor_plan_with_consultant_in_repo(&contents, repo)
         .with_context(|| format!("failed to parse supervisor plan {}", path.display()))
 }
 
@@ -1847,6 +1851,13 @@ fn read_supervisor_input(path: &Path, label: &str) -> Result<String> {
 pub(super) fn parse_supervisor_plan_with_consultant(
     contents: &str,
 ) -> Result<LoadedSupervisorPlan> {
+    parse_supervisor_plan_with_consultant_in_repo(contents, None)
+}
+
+pub(super) fn parse_supervisor_plan_with_consultant_in_repo(
+    contents: &str,
+    repo: Option<&Path>,
+) -> Result<LoadedSupervisorPlan> {
     let value: Value = serde_json::from_str(contents).context("supervisor plan is not JSON")?;
     let consultant = consultant_from_plan_value(&value)?;
     let mut plan: SupervisorPlan =
@@ -1858,7 +1869,7 @@ pub(super) fn parse_supervisor_plan_with_consultant(
     }
     let plan_metadata = supervisor_plan_metadata_from_value(&value, plan.max_depth)?;
     plan.assignments = assignments_from_plan_value(&value)?;
-    let (mut plan, plan_metadata) = validate_supervisor_plan(plan, plan_metadata)?;
+    let (mut plan, plan_metadata) = validate_supervisor_plan_in_repo(plan, plan_metadata, repo)?;
     bind_assignment_role_categories(&mut plan);
     let assignment_metadata = assignment_metadata_from_plan_value(&value, &plan)?;
     validate_consultant_plan(&consultant)?;
@@ -2607,7 +2618,7 @@ pub(crate) fn run_held_out_fake_experiment(
         bail!("the held-out experiment entrypoint supports only nonpublishable Fake generation");
     }
     let repo = discover_repo_root(&options.repo)?;
-    let mut loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    let mut loaded = load_supervisor_plan_file_with_consultant(&options.plan_file, Some(&repo))?;
     validate_execution_target_pre_dispatch(&loaded, false)?;
     if loaded.plan_metadata.execution_target.is_some()
         || loaded.plan.assignments.len() != 1
@@ -3019,7 +3030,7 @@ fn run_held_out_production_experiment_with_runner(
         bail!("held-out production frozen runtime allowlist must start with the parent runtime");
     }
     let repo = discover_repo_root(&options.repo)?;
-    let mut loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    let mut loaded = load_supervisor_plan_file_with_consultant(&options.plan_file, Some(&repo))?;
     refuse_held_out_production_caller_plan(&loaded)?;
     if loaded.plan.assignments[0].id != authority.binding.assignment_id
         || options.run_id.as_str() != authority.binding.supervisor_run_id
@@ -3086,7 +3097,10 @@ pub(crate) fn run_fake_supervisor_plan_file_for_test(
         bail!("hermetic test plan-file execution requires the Fake runtime");
     }
     validate_max_concurrent_children(1)?;
-    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    let loaded = load_supervisor_plan_file_with_consultant(
+        &options.plan_file,
+        Some(options.repo.as_path()),
+    )?;
     validate_execution_target_pre_dispatch(&loaded, false)?;
     let runtime_model_catalog = test_runtime_model_catalog(&loaded.plan, options.runtime)?;
     let no_external_runner = |_command: &ExternalAgentCommand,
@@ -3287,7 +3301,7 @@ pub fn resume_supervisor_plan_file_cascade_with_concurrency_policy(
     concurrency_policy: SupervisorConcurrencyPolicy,
 ) -> Result<SupervisorCascadeOutcome> {
     let repo = discover_repo_root(&options.repo)?;
-    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file, Some(&repo))?;
     validate_execution_target_pre_dispatch(&loaded, false)?;
     resume_generated_follow_up_cascade(repo, loaded, options, concurrency_policy)
 }
@@ -3501,7 +3515,7 @@ fn run_supervisor_plan_file_cascade_with_gate(
     let max_concurrent_children = concurrency_policy.resolve(HostProcessCapacity::measured());
     validate_max_concurrent_children(max_concurrent_children)?;
     let repo = discover_repo_root(&options.repo)?;
-    let mut loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    let mut loaded = load_supervisor_plan_file_with_consultant(&options.plan_file, Some(&repo))?;
     apply_objective_profile_override(&mut loaded, objective_profile_override);
     validate_execution_target_pre_dispatch(&loaded, allow_primary_worktree)?;
     if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
@@ -3945,7 +3959,7 @@ fn run_supervisor_plan_file_with_runner_and_max_concurrent_children(
     let repo = discover_repo_root(&options.repo)?;
     let manager = WorktreeManager::new(&repo);
     let cleanliness = manager.acquire_repository_cleanliness()?;
-    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file)?;
+    let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file, Some(&repo))?;
     validate_execution_target_pre_dispatch(&loaded, false)?;
     let runtime_model_catalog =
         admit_production_supervisor_catalog_preflight_grant(&options, &repo)

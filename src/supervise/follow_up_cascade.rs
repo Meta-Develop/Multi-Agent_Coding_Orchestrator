@@ -923,7 +923,7 @@ pub(crate) fn generated_follow_up_dispatch_evidence_after_cascade_error(
 }
 
 pub(crate) fn normalized_supervisor_plan_file_sha256(path: &Path) -> Result<String> {
-    let loaded = load_supervisor_plan_file_with_consultant(path)?;
+    let loaded = load_supervisor_plan_file_with_consultant(path, None)?;
     normalized_supervisor_plan_sha256(
         &loaded.plan,
         &loaded.consultant,
@@ -1495,7 +1495,7 @@ fn load_exact_generated_plan_file(
     path: &Path,
     generated: &GeneratedFollowUpSupervisorPlan,
 ) -> Result<Option<LoadedSupervisorPlan>> {
-    let loaded = load_supervisor_plan_file_with_consultant(path)?;
+    let loaded = load_supervisor_plan_file_with_consultant(path, None)?;
     if !loaded_generated_plan_matches(&loaded, generated)? {
         return Ok(None);
     }
