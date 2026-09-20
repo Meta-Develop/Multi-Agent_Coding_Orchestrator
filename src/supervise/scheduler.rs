@@ -4003,6 +4003,12 @@ fn account_observation_for_launch_runtime(
                 return result;
             }
         }
+        if let Some(socket_path) = crate::account_authority::configured_cam_authority_socket() {
+            return crate::account_authority::observe_selected_via_authority_socket(
+                &socket_path,
+                provider_id,
+            );
+        }
         let Some(data_dir) = project_dirs().map(|dirs| dirs.data_dir().to_path_buf()) else {
             return Ok(None);
         };
@@ -6496,6 +6502,135 @@ mod selection_policy_tests {
                 .contains("failed to observe selected Coding Agent Manager account"));
             assert!(plan.role_models.is_empty());
             drop(temporary);
+            Ok(())
+        }
+
+        #[test]
+        fn scheduler_account_observe_routes_through_configured_authority_socket() -> Result<()> {
+            use crate::account_authority::authority_socket_config::CAM_AUTHORITY_SOCKET_ENV;
+            use coding_agent_manager_lib::account_authority::{
+                listen, resolve_socket_path, AuthorityContext, AuthorityServerConfig,
+                CategoryObservation, ModelsObservation, ObservedModel, StoredAccountRegistry,
+            };
+            use std::fs;
+            use std::os::unix::fs::PermissionsExt;
+            use std::sync::Arc;
+            use std::thread;
+
+            struct SocketEnvGuard {
+                previous: Option<std::ffi::OsString>,
+            }
+
+            impl SocketEnvGuard {
+                fn set(path: &Path) -> Self {
+                    let previous = std::env::var_os(CAM_AUTHORITY_SOCKET_ENV);
+                    std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, path);
+                    Self { previous }
+                }
+            }
+
+            impl Drop for SocketEnvGuard {
+                fn drop(&mut self) {
+                    match self.previous.take() {
+                        Some(value) => std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, value),
+                        None => std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV),
+                    }
+                }
+            }
+
+            struct SocketObserveAdapter;
+
+            impl ProviderAdapter for SocketObserveAdapter {
+                fn id(&self) -> &'static str {
+                    "codex-cli"
+                }
+
+                fn descriptor(&self) -> ProviderDescriptor {
+                    ProviderDescriptor {
+                        id: "codex-cli".to_string(),
+                        display_name: "codex-cli".to_string(),
+                        vendor: "test".to_string(),
+                        auth_kinds: vec![AuthKind::OAuth],
+                        maturity: Maturity::Experimental,
+                        install_state: InstallState::Unknown,
+                        capabilities: Vec::new(),
+                    }
+                }
+
+                fn config_paths(&self) -> Vec<PathBuf> {
+                    Vec::new()
+                }
+
+                fn detect(&self) -> InstallState {
+                    InstallState::Unknown
+                }
+
+                fn list_accounts(&self) -> coding_agent_manager_lib::error::Result<Vec<Account>> {
+                    Ok(Vec::new())
+                }
+
+                fn activate_account(
+                    &self,
+                    _account_id: &str,
+                ) -> coding_agent_manager_lib::error::Result<()> {
+                    Err(CamError::NotImplemented("activate"))
+                }
+
+                fn observe_models_for_account(
+                    &self,
+                    _account: &StoredAccountMetadata,
+                ) -> coding_agent_manager_lib::error::Result<CategoryObservation<ModelsObservation>>
+                {
+                    Ok(CategoryObservation::observed(ModelsObservation {
+                        models: vec![ObservedModel {
+                            model_id: "socket-routed-model".to_string(),
+                            supported_efforts: None,
+                            default_effort: None,
+                        }],
+                    }))
+                }
+            }
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("chmod");
+            let root = fs::canonicalize(dir.path()).expect("canonical");
+            let data = root.join("data");
+            fs::create_dir_all(&data).expect("data");
+            let registry = StoredAccountRegistry::new(stored_accounts_path(&data));
+            seed_complete_account(&registry, true);
+
+            let socket = root.join("account.sock");
+            let safe = resolve_socket_path(&socket).expect("safe socket path");
+            let mut ctx = AuthorityContext::new(registry).without_registry_fallback();
+            ctx.adapters.insert(
+                "codex-cli".to_string(),
+                Arc::new(SocketObserveAdapter) as Arc<dyn ProviderAdapter>,
+            );
+            let listener =
+                listen(safe, AuthorityServerConfig::new(ctx).expect("config")).expect("listen");
+            let socket_path = listener.path().to_path_buf();
+            thread::spawn(move || {
+                let _ = listener.accept_once();
+                let _ = listener.accept_once();
+            });
+            let _env = SocketEnvGuard::set(&socket_path);
+
+            let observation = account_observation_for_launch_runtime(SupervisorRuntime::Codex)?
+                .context("configured authority socket must observe selected account")?;
+            assert_eq!(observation.binding.account_id, "work");
+            let models = observation.models.as_ref().context("models category")?;
+            assert_eq!(models.outcome, ObservationOutcome::Observed);
+            assert_eq!(
+                models
+                    .content
+                    .as_ref()
+                    .and_then(|content| content.models.first()),
+                Some(&ObservedModel {
+                    model_id: "socket-routed-model".to_string(),
+                    supported_efforts: None,
+                    default_effort: None,
+                })
+            );
             Ok(())
         }
     }
