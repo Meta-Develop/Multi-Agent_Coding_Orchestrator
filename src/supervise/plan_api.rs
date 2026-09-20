@@ -1912,12 +1912,6 @@ pub(super) fn parse_supervisor_plan_with_consultant_in_repo(
     })
 }
 
-pub(crate) fn validate_generated_follow_up_plan_document(
-    generated: &GeneratedFollowUpSupervisorPlan,
-) -> Result<SupervisorPlan> {
-    validate_generated_follow_up_plan_document_in_repo(generated, None)
-}
-
 pub(crate) fn validate_generated_follow_up_plan_document_in_repo(
     generated: &GeneratedFollowUpSupervisorPlan,
     repo: Option<&Path>,
@@ -2701,6 +2695,7 @@ pub(crate) struct FrozenHeldOutProductionCallerPlan {
 /// Read and freeze a caller plan once through the bounded/confined supervisor
 /// loader. Generated follow-ups, execution targets, and extra assignments are
 /// refused before any experiment artifact reservation.
+#[cfg(test)]
 pub(crate) fn freeze_held_out_production_caller_plan(
     plan_file: &Path,
 ) -> Result<FrozenHeldOutProductionCallerPlan> {
@@ -2755,6 +2750,7 @@ pub(crate) fn freeze_held_out_production_caller_plan_in_repo(
 
 /// Overlay only profile `role_models` onto the frozen full document, round-trip
 /// through the ordinary loader, and refuse silent authority drift.
+#[cfg(test)]
 pub(crate) fn materialize_held_out_profile_effective_caller_plan(
     frozen: &FrozenHeldOutProductionCallerPlan,
     role_models: &BTreeMap<AgentRole, RoleModelSelection>,
