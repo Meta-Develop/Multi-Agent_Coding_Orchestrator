@@ -10,8 +10,9 @@ use crate::{
     llm::provider::Usage,
     merge::CandidateValidationBinding,
     review::{
-        ReviewAggregationDecision, ReviewInformationScope, ReviewLensAggregate,
-        ReviewLensAggregateAuthority, ReviewLensVerdictStatus,
+        AggregatedReviewLensVerdict, ReviewAggregationDecision, ReviewCoverageRequirement,
+        ReviewInformationScope, ReviewLensAggregate, ReviewLensAggregateAuthority,
+        ReviewLensVerdictStatus,
     },
     supervise::{
         held_out::HeldOutCandidateEvidence, AgentRole, Finding, OrchestratorReviewReport,
@@ -358,25 +359,43 @@ pub fn review_aggregate_establishes_full_independent_coverage(
         if !verdict.validation_errors.is_empty() {
             return Err("review aggregate retained validation errors".to_string());
         }
+    }
+    let mut omitted_independent_coverage = None;
+    for verdict in &aggregate.lens_verdicts {
         if verdict.lens.information_scope != ReviewInformationScope::FullChildTranscript {
-            return Err(
-                "review lens did not use independent full-child-transcript scope".to_string(),
-            );
+            continue;
         }
-        for worker in &aggregate.required_coverage.worker_ids {
-            if !verdict.coverage.worker_ids.contains(worker) {
-                return Err(format!(
-                    "accepted review lens omitted required worker coverage '{worker}'"
-                ));
+        match accepted_verdict_covers_required(verdict, &aggregate.required_coverage) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if omitted_independent_coverage.is_none() {
+                    omitted_independent_coverage = Some(error);
+                }
             }
         }
-        for path in &aggregate.required_coverage.paths {
-            if !verdict.coverage.paths.contains(path) {
-                return Err(format!(
-                    "accepted review lens omitted required path coverage '{}'",
-                    path.display()
-                ));
-            }
+    }
+    Err(omitted_independent_coverage.unwrap_or_else(|| {
+        "review aggregate has no independent full-child-transcript accept coverage".to_string()
+    }))
+}
+
+fn accepted_verdict_covers_required(
+    verdict: &AggregatedReviewLensVerdict,
+    required: &ReviewCoverageRequirement,
+) -> Result<(), String> {
+    for worker in &required.worker_ids {
+        if !verdict.coverage.worker_ids.contains(worker) {
+            return Err(format!(
+                "accepted review lens omitted required worker coverage '{worker}'"
+            ));
+        }
+    }
+    for path in &required.paths {
+        if !verdict.coverage.paths.contains(path) {
+            return Err(format!(
+                "accepted review lens omitted required path coverage '{}'",
+                path.display()
+            ));
         }
     }
     Ok(())
@@ -948,6 +967,80 @@ mod tests {
             .unavailable_reason
             .as_deref()
             .is_some_and(|reason| reason.contains("primary_head")));
+    }
+
+    #[test]
+    fn stacked_accept_aggregate_establishes_coverage_only_with_full_transcript() {
+        use crate::review::{
+            aggregate_review_lenses, ReviewAggregationPolicy, ReviewLensCoverage,
+            ReviewLensEvidenceKind, ReviewLensVerdict, ReviewLensVerdictStatus,
+        };
+        use crate::supervise::default_supervisor_review_lenses;
+
+        let required = ReviewCoverageRequirement {
+            worker_ids: vec!["worker-a".to_string()],
+            paths: vec![PathBuf::from("README.md")],
+        };
+        let coverage = ReviewLensCoverage {
+            worker_ids: required.worker_ids.clone(),
+            paths: required.paths.clone(),
+        };
+        let accept_aggregate = |lenses: Vec<crate::review::ReviewLensConfig>| {
+            let verdicts = lenses
+                .iter()
+                .map(|lens| {
+                    ReviewLensVerdict::for_lens(
+                        lens,
+                        sha256_hex(format!("request-{}", lens.id).as_bytes()),
+                        ReviewLensVerdictStatus::Accept,
+                        coverage.clone(),
+                        vec![(
+                            ReviewLensEvidenceKind::ModelReview,
+                            format!("stacked-accept-{}", lens.id),
+                        )],
+                    )
+                    .expect("accept verdict")
+                })
+                .collect();
+            aggregate_review_lenses(
+                &lenses,
+                ReviewAggregationPolicy::AllMustAccept,
+                required.clone(),
+                verdicts,
+            )
+            .expect("parent-computed accept aggregate")
+        };
+
+        let stacked = accept_aggregate(default_supervisor_review_lenses());
+        assert_eq!(stacked.lens_verdicts.len(), 3);
+        assert!(
+            stacked.lens_verdicts.iter().any(|verdict| {
+                verdict.lens.information_scope == ReviewInformationScope::OutputReportOnly
+            }) && stacked.lens_verdicts.iter().any(|verdict| {
+                verdict.lens.information_scope == ReviewInformationScope::DiffOnly
+            })
+        );
+        review_aggregate_establishes_full_independent_coverage(&stacked)
+            .expect("stacked FullChildTranscript + scoped Accept lenses establish coverage");
+
+        let without_full_transcript = accept_aggregate(
+            default_supervisor_review_lenses()
+                .into_iter()
+                .filter(|lens| {
+                    lens.information_scope != ReviewInformationScope::FullChildTranscript
+                })
+                .collect(),
+        );
+        assert!(without_full_transcript.lens_verdicts.iter().all(|verdict| {
+            verdict.lens.information_scope != ReviewInformationScope::FullChildTranscript
+        }));
+        let error =
+            review_aggregate_establishes_full_independent_coverage(&without_full_transcript)
+                .expect_err("coverage requires at least one FullChildTranscript Accept");
+        assert!(
+            error.contains("full-child-transcript"),
+            "unexpected coverage refusal: {error}"
+        );
     }
 
     fn commit_all<'repo>(repo: &'repo Repository, message: &str) -> Result<git2::Commit<'repo>> {
