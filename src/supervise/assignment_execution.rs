@@ -4167,6 +4167,104 @@ fn parent_auditor_repair_eligible(
         && !auditor_environment_blocked
 }
 
+fn persist_parent_terminal_assignment_outcome(
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    attempt: &mut AttemptOutcomeEvidence,
+    report: &OrchestratorReviewReport,
+    child_gate_terminal: bool,
+    auditor_environment_blocked: bool,
+    auditor_sandbox_denied: bool,
+    auditor_primary_integrity_failed: bool,
+) -> Result<()> {
+    if report.accepted && !report.rejected {
+        *attempt = record_parent_terminal_assignment_result(
+            artifacts,
+            attempt,
+            crate::selection::OutcomeResult::Accepted,
+            None,
+        )?;
+        return Ok(());
+    }
+    if report.rejected
+        && !report.accepted
+        && parent_terminal_reject_is_model_quality(
+            report,
+            child_gate_terminal,
+            auditor_environment_blocked,
+            auditor_sandbox_denied,
+            auditor_primary_integrity_failed,
+        )
+    {
+        *attempt = record_parent_terminal_assignment_result(
+            artifacts,
+            attempt,
+            crate::selection::OutcomeResult::Rejected,
+            Some(crate::selection::FailureClass::ModelQuality),
+        )?;
+    }
+    Ok(())
+}
+
+fn parent_terminal_reject_is_model_quality(
+    report: &OrchestratorReviewReport,
+    child_gate_terminal: bool,
+    auditor_environment_blocked: bool,
+    auditor_sandbox_denied: bool,
+    auditor_primary_integrity_failed: bool,
+) -> bool {
+    if auditor_environment_blocked
+        || auditor_sandbox_denied
+        || auditor_primary_integrity_failed
+        || !report.environment_failures.is_empty()
+        || report
+            .gate_denials
+            .iter()
+            .any(gate_denial_is_non_quality_failure)
+    {
+        return false;
+    }
+    if child_gate_terminal
+        && !report
+            .gate_denials
+            .iter()
+            .any(gate_denial_is_model_quality_failure)
+    {
+        return false;
+    }
+    true
+}
+
+fn gate_denial_is_non_quality_failure(denial: &GateDenial) -> bool {
+    match &denial.reason {
+        GateDenialReason::ContainmentFailure
+        | GateDenialReason::PrimaryIntegrityFailure
+        | GateDenialReason::Sandbox { .. }
+        | GateDenialReason::ExternalSideEffect { .. }
+        | GateDenialReason::BudgetAdmission { .. }
+        | GateDenialReason::ClaimConflict
+        | GateDenialReason::ApprovalReview { .. }
+        | GateDenialReason::ResumeCheckpoint { .. }
+        | GateDenialReason::DestructiveTarget { .. }
+        | GateDenialReason::AuditorRepair {
+            rejection: AuditorRejectionKind::EvidenceQuality,
+        } => true,
+        GateDenialReason::AuditorRepair {
+            rejection: AuditorRejectionKind::ImplementationDefect,
+        }
+        | GateDenialReason::ValidationRepair { .. }
+        | GateDenialReason::MergeRemediation { .. } => false,
+    }
+}
+
+fn gate_denial_is_model_quality_failure(denial: &GateDenial) -> bool {
+    matches!(
+        denial.reason,
+        GateDenialReason::AuditorRepair {
+            rejection: AuditorRejectionKind::ImplementationDefect,
+        } | GateDenialReason::ValidationRepair { .. }
+    )
+}
+
 fn parent_auditor_rejection_kind(
     assignment: &OrchestratorAssignment,
     child_report: &OrchestratorReviewReport,
@@ -5203,6 +5301,15 @@ fn execute_supervisor_assignment_inner(
                         &mut terminal_attempt_outcome,
                     )?;
                 }
+                persist_parent_terminal_assignment_outcome(
+                    artifacts,
+                    &mut terminal_attempt_outcome,
+                    &report,
+                    child_gate_terminal,
+                    auditor_environment_blocked,
+                    auditor_sandbox_denied,
+                    auditor_primary_integrity_failed,
+                )?;
                 break 'gate_controller (
                     report,
                     candidate,
@@ -8582,6 +8689,42 @@ done
             child_gate_terminal_reason(true, false, false, false, false, false),
             None
         );
+    }
+
+    fn rejected_assignment_report() -> OrchestratorReviewReport {
+        let mut report: OrchestratorReviewReport = serde_json::from_str(
+            &super::super::tests::sample_child_report_json("assignment-1"),
+        )
+        .expect("sample rejected report");
+        report.accepted = false;
+        report.rejected = true;
+        report.status = ReviewStatus::Failed;
+        report
+    }
+
+    #[test]
+    fn parent_terminal_reject_classifies_acceptance_failure_as_model_quality() {
+        let report = rejected_assignment_report();
+        assert!(parent_terminal_reject_is_model_quality(
+            &report, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn parent_terminal_reject_keeps_environment_and_authority_non_quality() {
+        let report = rejected_assignment_report();
+        assert!(!parent_terminal_reject_is_model_quality(
+            &report, true, false, false, false
+        ));
+        assert!(!parent_terminal_reject_is_model_quality(
+            &report, false, true, false, false
+        ));
+        assert!(!parent_terminal_reject_is_model_quality(
+            &report, false, false, true, false
+        ));
+        assert!(!parent_terminal_reject_is_model_quality(
+            &report, false, false, false, true
+        ));
     }
 
     #[test]
