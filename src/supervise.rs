@@ -300,6 +300,8 @@ pub use prior_input::{bind_frozen_operator_prior_data_for_run, bind_operator_pri
 
 mod messaging_bridge;
 
+pub(crate) mod cam_authority_child_env;
+
 mod assignment_execution;
 pub(crate) mod held_out;
 #[cfg(test)]

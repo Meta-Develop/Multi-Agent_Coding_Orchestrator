@@ -1991,6 +1991,7 @@ fn prepare_child_attempt<'a>(
     }
     command =
         command.with_assignment_process_launch(AssignmentProcessLaunchKind::AssignmentChild, grant);
+    command = pin_cam_authority_socket_for_nested_maco_launch(command, launch_runtime);
     Ok(AssignmentExecutionDisposition::Continue(
         PreparedChildAttempt {
             attempt_artifacts,
@@ -2135,6 +2136,25 @@ fn launch_runtime_binds_assignment_messaging(runtime: SupervisorRuntime) -> bool
             | SupervisorRuntime::ClaudeCode
             | SupervisorRuntime::GeminiCli
     )
+}
+
+fn pin_cam_authority_socket_for_nested_maco_launch(
+    command: ExternalAgentCommand,
+    launch_runtime: SupervisorRuntime,
+) -> ExternalAgentCommand {
+    if launch_runtime.is_adapter_subprocess() {
+        return command;
+    }
+    if !matches!(
+        command.assignment_process_launch_kind,
+        Some(
+            AssignmentProcessLaunchKind::AssignmentChild
+                | AssignmentProcessLaunchKind::ParentAuditor
+        )
+    ) {
+        return command;
+    }
+    super::cam_authority_child_env::apply_parent_socket_pin_to_command(command)
 }
 
 fn bind_assignment_messaging_for_external_child_launch(
@@ -3702,6 +3722,8 @@ fn prepare_parent_auditor<'a>(
     )?;
     auditor_command = auditor_command
         .with_assignment_process_launch(AssignmentProcessLaunchKind::ParentAuditor, grant);
+    auditor_command =
+        pin_cam_authority_socket_for_nested_maco_launch(auditor_command, launch_runtime);
     Ok(ParentAuditorPreparation::Ready(PreparedParentAuditor {
         lens: lens.clone(),
         expected_request: expected_request.clone(),
@@ -12764,6 +12786,128 @@ done
             .cancellation()
             .is_cancelled());
         assert!(!run_cancellation.is_cancelled());
+        Ok(())
+    }
+
+    #[test]
+    fn nested_maco_child_launch_pins_cam_authority_socket_when_parent_env_set() -> Result<()> {
+        use super::super::cam_authority_child_env::CAM_AUTHORITY_SOCKET_ENV;
+        use crate::mutation_taxonomy::AssignmentProcessLaunchKind;
+        use std::sync::{Mutex, MutexGuard};
+
+        static LOCK: Mutex<()> = Mutex::new(());
+
+        struct Guard {
+            _lock: MutexGuard<'static, ()>,
+            previous: Option<std::ffi::OsString>,
+        }
+
+        impl Guard {
+            fn set(value: Option<&str>) -> Self {
+                let lock = LOCK.lock().expect("cam authority env test lock");
+                let previous = std::env::var_os(CAM_AUTHORITY_SOCKET_ENV);
+                match value {
+                    Some(text) => std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, text),
+                    None => std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV),
+                }
+                Self {
+                    _lock: lock,
+                    previous,
+                }
+            }
+        }
+
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, value),
+                    None => std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV),
+                }
+            }
+        }
+
+        let mut command = ExternalAgentCommand::codex(
+            Path::new("/unused/codex"),
+            Path::new("/tmp"),
+            Path::new("/tmp/prompt.md"),
+            Path::new("/tmp/events.jsonl"),
+            Path::new("/tmp/report.json"),
+            Duration::from_secs(30),
+        );
+        command.assignment_process_launch_kind = Some(AssignmentProcessLaunchKind::AssignmentChild);
+
+        let _unset = Guard::set(None);
+        let unpinned = super::pin_cam_authority_socket_for_nested_maco_launch(
+            command.clone(),
+            SupervisorRuntime::Codex,
+        );
+        assert!(unpinned.cam_authority_socket_pin().is_none());
+        drop(_unset);
+
+        let _set = Guard::set(Some("/tmp/maco-nested.sock"));
+        let pinned = super::pin_cam_authority_socket_for_nested_maco_launch(
+            command,
+            SupervisorRuntime::Codex,
+        );
+        assert_eq!(
+            pinned.cam_authority_socket_pin(),
+            Some("/tmp/maco-nested.sock")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn adapter_runtime_child_launch_omits_cam_authority_socket_pin() -> Result<()> {
+        use super::super::cam_authority_child_env::CAM_AUTHORITY_SOCKET_ENV;
+        use crate::mutation_taxonomy::AssignmentProcessLaunchKind;
+        use std::sync::{Mutex, MutexGuard};
+
+        static LOCK: Mutex<()> = Mutex::new(());
+
+        struct Guard {
+            _lock: MutexGuard<'static, ()>,
+            previous: Option<std::ffi::OsString>,
+        }
+
+        impl Guard {
+            fn set(value: Option<&str>) -> Self {
+                let lock = LOCK.lock().expect("cam authority env test lock");
+                let previous = std::env::var_os(CAM_AUTHORITY_SOCKET_ENV);
+                match value {
+                    Some(text) => std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, text),
+                    None => std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV),
+                }
+                Self {
+                    _lock: lock,
+                    previous,
+                }
+            }
+        }
+
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, value),
+                    None => std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV),
+                }
+            }
+        }
+
+        let _set = Guard::set(Some("/tmp/maco-nested.sock"));
+        let mut command = ExternalAgentCommand::codex(
+            Path::new("/unused/grok"),
+            Path::new("/tmp"),
+            Path::new("/tmp/prompt.md"),
+            Path::new("/tmp/events.jsonl"),
+            Path::new("/tmp/report.json"),
+            Duration::from_secs(30),
+        );
+        command.assignment_process_launch_kind = Some(AssignmentProcessLaunchKind::AssignmentChild);
+        let unpinned = super::pin_cam_authority_socket_for_nested_maco_launch(
+            command,
+            SupervisorRuntime::Grok,
+        );
+        assert!(unpinned.cam_authority_socket_pin().is_none());
         Ok(())
     }
 }
