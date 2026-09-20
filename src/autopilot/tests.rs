@@ -801,10 +801,21 @@ fn secure_autopilot_machine_global_retention(
 }
 
 fn licensed_breakage_compatible_review_lenses() -> Vec<crate::review::ReviewLensConfig> {
-    crate::supervise::default_supervisor_review_lenses()
+    vec![crate::supervise::default_supervisor_review_lenses()
         .into_iter()
-        .filter(|lens| lens.information_scope != crate::review::ReviewInformationScope::DiffOnly)
-        .collect()
+        .find(|lens| {
+            lens.id == "parent-acceptance"
+                && lens.information_scope
+                    == crate::review::ReviewInformationScope::FullChildTranscript
+        })
+        .expect("default stacked lenses include parent-acceptance")]
+}
+
+fn licensed_autopilot_profile() -> AutopilotProfile {
+    AutopilotProfile {
+        review_lenses: licensed_breakage_compatible_review_lenses(),
+        ..AutopilotProfile::default()
+    }
 }
 
 fn licensed_autopilot_supervisor_plan() -> (Value, LicensedBreakageDeclaration, String) {
@@ -858,6 +869,75 @@ fn licensed_autopilot_supervisor_plan() -> (Value, LicensedBreakageDeclaration, 
         declaration,
         declaration_sha256,
     )
+}
+
+#[test]
+fn requested_default_stacked_profile_mismatches_licensed_diffonly_free_fixture_and_refuses_dispatch(
+) {
+    let requested = AutopilotProfile::default();
+    let (plan_value, _declaration, _declaration_sha256) = licensed_autopilot_supervisor_plan();
+    let effective: SupervisorPlan =
+        serde_json::from_value(plan_value).expect("decode licensed Autopilot fixture plan");
+
+    assert!(
+        requested.review_lenses.iter().any(|lens| {
+            lens.information_scope == crate::review::ReviewInformationScope::DiffOnly
+        }),
+        "default stacked profile must still include DiffOnly"
+    );
+    assert_eq!(effective.review_lenses.len(), 1);
+    assert_eq!(effective.review_lenses[0].id, "parent-acceptance");
+    assert_eq!(
+        effective.review_lenses[0].information_scope,
+        crate::review::ReviewInformationScope::FullChildTranscript
+    );
+    assert!(
+        effective.review_lenses.iter().all(|lens| {
+            lens.information_scope != crate::review::ReviewInformationScope::DiffOnly
+        }),
+        "licensed fixture must remain DiffOnly-free"
+    );
+
+    let binding = AutopilotProfileBindingReport::from_effective(requested, &effective);
+
+    assert_eq!(binding.status, AutopilotProfileBindingStatus::Mismatch);
+    assert_eq!(
+        binding.configuration_status,
+        AutopilotProfileBindingStatus::Mismatch
+    );
+    assert_eq!(
+        binding.failure,
+        Some(AutopilotProfileBindingFailure {
+            kind: AutopilotProfileBindingFailureKind::RequestedEffectiveMismatch,
+            mismatched_fields: vec![AutopilotProfileBindingField::ReviewLenses],
+            mismatched_roles: Vec::new(),
+            mismatched_review_lens_ids: Vec::new(),
+        })
+    );
+    assert!(!binding.permits_dispatch());
+}
+
+#[test]
+fn licensed_autopilot_profile_matches_fixture_plan_and_permits_dispatch() {
+    let requested = licensed_autopilot_profile();
+    let (plan_value, _declaration, _declaration_sha256) = licensed_autopilot_supervisor_plan();
+    let effective: SupervisorPlan =
+        serde_json::from_value(plan_value).expect("decode licensed Autopilot fixture plan");
+
+    assert_eq!(requested.review_lenses, effective.review_lenses);
+    assert_eq!(requested.review_lenses.len(), 1);
+    assert_eq!(requested.review_lenses[0].id, "parent-acceptance");
+    assert_eq!(
+        requested.review_lenses[0].information_scope,
+        crate::review::ReviewInformationScope::FullChildTranscript
+    );
+
+    let binding = AutopilotProfileBindingReport::from_effective(requested, &effective);
+    assert_eq!(
+        binding.configuration_status,
+        AutopilotProfileBindingStatus::Matched
+    );
+    assert!(binding.permits_dispatch());
 }
 
 fn injected_autopilot_child_report(
@@ -1141,7 +1221,7 @@ fn run_injected_licensed_autopilot_cascade_result_with_bounds(
             budget_max_duration_seconds: None,
             cancellation,
         },
-        None,
+        Some(licensed_autopilot_profile()),
         secure_autopilot_machine_global_retention(temp_root, run_name),
         supervisor_plan,
         &mut runner,
@@ -1539,7 +1619,7 @@ fn autopilot_source_child_cancellation_propagates_and_cleanly_unwinds() {
             budget_max_duration_seconds: None,
             cancellation: Some(caller_cancellation.clone()),
         },
-        None,
+        Some(licensed_autopilot_profile()),
         secure_autopilot_machine_global_retention(fixture.temp_path(), run_name),
         supervisor_plan,
         &mut runner,
@@ -2320,7 +2400,7 @@ fn interrupted_autopilot_queue_resumes_through_supervise_without_duplicate_ident
             budget_max_duration_seconds: None,
             cancellation: None,
         },
-        None,
+        Some(licensed_autopilot_profile()),
         retention.clone(),
         supervisor_plan,
         &mut runner,
