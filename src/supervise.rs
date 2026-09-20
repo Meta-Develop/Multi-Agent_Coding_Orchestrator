@@ -739,6 +739,31 @@ pub(crate) fn default_supervisor_review_lenses() -> Vec<ReviewLensConfig> {
     }]
 }
 
+pub(crate) fn default_stacked_uncorrelated_review_lenses() -> Vec<ReviewLensConfig> {
+    let model_backend = |reasoning_effort: &str| ReviewLensBackendConfig::Model {
+        backend_id: "openai".to_string(),
+        model: DEFAULT_PROFILE_MODEL.to_string(),
+        reasoning_effort: Some(reasoning_effort.to_string()),
+    };
+    vec![
+        ReviewLensConfig {
+            id: "parent-acceptance".to_string(),
+            backend: model_backend("xhigh"),
+            information_scope: ReviewInformationScope::FullChildTranscript,
+        },
+        ReviewLensConfig {
+            id: "output-only".to_string(),
+            backend: model_backend("high"),
+            information_scope: ReviewInformationScope::OutputReportOnly,
+        },
+        ReviewLensConfig {
+            id: "diff-only".to_string(),
+            backend: model_backend("high"),
+            information_scope: ReviewInformationScope::DiffOnly,
+        },
+    ]
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct SupervisorBudgetConfig {
     #[serde(flatten)]

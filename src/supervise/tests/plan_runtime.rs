@@ -1139,6 +1139,79 @@ fn supervisor_plan_loads_executable_stacked_review_lens_configuration() {
 }
 
 #[test]
+fn default_stacked_uncorrelated_review_lenses_return_three_distinct_scopes() {
+    let lenses = default_stacked_uncorrelated_review_lenses();
+    assert_eq!(lenses.len(), 3);
+    assert_eq!(lenses[0].id, "parent-acceptance");
+    assert_eq!(
+        lenses[0].information_scope,
+        ReviewInformationScope::FullChildTranscript
+    );
+    assert_eq!(lenses[0].backend.backend_id(), "openai");
+    assert_eq!(lenses[0].backend.model(), DEFAULT_PROFILE_MODEL);
+    assert_eq!(lenses[0].backend.reasoning_effort(), Some("xhigh"));
+    assert_eq!(lenses[1].id, "output-only");
+    assert_eq!(
+        lenses[1].information_scope,
+        ReviewInformationScope::OutputReportOnly
+    );
+    assert_eq!(lenses[1].backend.backend_id(), "openai");
+    assert_eq!(lenses[1].backend.model(), DEFAULT_PROFILE_MODEL);
+    assert_eq!(lenses[1].backend.reasoning_effort(), Some("high"));
+    assert_eq!(lenses[2].id, "diff-only");
+    assert_eq!(
+        lenses[2].information_scope,
+        ReviewInformationScope::DiffOnly
+    );
+    assert_eq!(lenses[2].backend.backend_id(), "openai");
+    assert_eq!(lenses[2].backend.model(), DEFAULT_PROFILE_MODEL);
+    assert_eq!(lenses[2].backend.reasoning_effort(), Some("high"));
+    assert_ne!(lenses[0].information_scope, lenses[1].information_scope);
+    assert_ne!(lenses[0].information_scope, lenses[2].information_scope);
+    assert_ne!(lenses[1].information_scope, lenses[2].information_scope);
+}
+
+#[test]
+fn default_supervisor_review_lenses_remain_single_parent_acceptance_lens() {
+    let lenses = default_supervisor_review_lenses();
+    assert_eq!(lenses.len(), 1);
+    assert_eq!(lenses[0].id, "parent-acceptance");
+    assert_eq!(
+        lenses[0].information_scope,
+        ReviewInformationScope::FullChildTranscript
+    );
+    assert_eq!(
+        lenses[0].backend,
+        ReviewLensBackendConfig::Model {
+            backend_id: "openai".to_string(),
+            model: DEFAULT_PROFILE_MODEL.to_string(),
+            reasoning_effort: Some("xhigh".to_string()),
+        }
+    );
+}
+
+#[test]
+fn default_stacked_uncorrelated_review_lenses_validate_with_quorum() {
+    let mut loaded = parse_supervisor_plan_with_consultant(
+        std::str::from_utf8(&bounded_loader_plan_json()).expect("utf8 plan"),
+    )
+    .expect("load default plan fixture");
+    loaded.plan.review_lenses = default_stacked_uncorrelated_review_lenses();
+    loaded.plan.review_aggregation_policy =
+        ReviewAggregationPolicy::ValidatedQuorum { minimum_accepts: 2 };
+    let validated = validate_legacy_supervisor_plan(loaded.plan)
+        .expect("stacked helper plan validates with quorum");
+    assert_eq!(
+        validated.review_lenses,
+        default_stacked_uncorrelated_review_lenses()
+    );
+    assert_eq!(
+        validated.review_aggregation_policy,
+        ReviewAggregationPolicy::ValidatedQuorum { minimum_accepts: 2 }
+    );
+}
+
+#[test]
 fn recursive_supervisor_plan_flattens_and_preserves_schedule_on_round_trip() {
     let source = json!({
         "version": 1,
