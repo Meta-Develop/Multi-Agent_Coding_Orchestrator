@@ -159,23 +159,25 @@ The current implementation covers a local-first command-line slice:
   `trusted/`, while a real external result is isolated under `incoming/`.
 - `maco consult artifacts list/latest/prune` inspects or prunes durable
   consultant run artifacts.
-- `.agents/scripts/o2-autopilot` runs bounded autonomous O2 supervisors under
-  a separate human/user-directed root O2. The root O2 is out-of-band and is not
-  counted against autonomous depth; autonomous O2-to-O2 follow-up uses
-  `NEXT_O2_TASKS.tsv` durable queue state and run ledgers such as `STATE.tsv`,
-  `HEARTBEAT.tsv`, task prompts, captured outputs, and `SUMMARY.md`.
-- `maco autopilot plan/run/status/collect` provides the local-first autopilot
-  workflow: normalize a positional task/plan or decompose `--from-goal <file>`,
-  then pass the validated plan through the live depth-2 supervisor path in
-  fake/local mode by default. `autopilot run` accepts the same
-  `--role-category` operator override as `supervise run`. Accepted, publishable
-  licensed-breakage follow-ups enter the authenticated durable bounded
-  command-level queue and execute through ordinary supervise gates. Fake or
-  otherwise non-publishable follow-ups remain deferred. Autopilot writes
-  public-safe reports under `.maco/autopilot/runs/<run-id>/` but never
-  publishes, merges, or applies a result to the primary worktree.
-- `maco autopilot artifacts list/latest/prune` inspects or prunes durable
-  autopilot run artifacts.
+- User-directed / out-of-band O2 roots may write durable run state under
+  `.maco/o2-autopilot/runs/<run-id>/` (`STATE.tsv`, `HEARTBEAT.tsv`,
+  `NEXT_O2_TASKS.tsv`, event streams, and `SUMMARY.md`). The root O2 is
+  out-of-band and is not counted against autonomous depth. That path is a
+  run store, not a shipped launcher; in-repo agents must not add
+  `.agents/scripts/o2-autopilot`.
+- `maco <instruction>` is the live local-first entrypoint: a bare instruction
+  routes into supervised goal/spec (`supervise run --literal-goal`). Use
+  `maco supervise plan/run/status/collect` for authored plans or `--from-goal`
+  files, and `maco inbox scan/run/status/collect/watch` for the fake-first
+  reaction loop. Inbox still uses the autopilot library path; it does not
+  restore the retired CLI.
+- `maco autopilot plan` and `maco autopilot run` are retired and fail closed
+  with `autopilot plan/run is retired; use literal instruction routing: maco
+  <instruction>`. Remaining query and artifact commands are
+  `maco autopilot status/collect` and
+  `maco autopilot artifacts list/latest/prune`. Historical reports remain
+  under `.maco/autopilot/runs/<run-id>/`. Autopilot never publishes, merges,
+  or applies a result to the primary worktree.
 - `maco artifacts prune --family <family>` applies one retention policy to any
   authenticated run store, the external O2 driver store, legacy workspace
   inbox runs, or direct `.maco/program-*` logs. Policies can combine count,
@@ -1780,7 +1782,7 @@ run.
 
 ### CLI run ceilings
 
-`maco supervise run` and `maco autopilot run` accept the same per-supervisor-run
+`maco supervise run` accepts the same per-supervisor-run
 hard ceilings:
 
 - `--max-tokens` (`--max-total-tokens` alias)
@@ -1814,14 +1816,14 @@ ledger; they are distinct from the per-run `--max-tokens` / `--max-cost-usd` /
 flags for inbox Autopilot dispatches and rejects the per-run supervise
 ceilings.
 
-Autopilot propagates the per-run limits to its source and generated follow-up
-supervise dispatches. Completed run-budget results also update MACO's
-authenticated rolling workspace ledger; in-flight reservations remain local to
-the run.
+Inbox item work that still uses the autopilot library path propagates the
+per-run limits to its source and generated follow-up supervise dispatches.
+Completed run-budget results also update MACO's authenticated rolling workspace
+ledger; in-flight reservations remain local to the run.
 
 ### Repository-local quota pools
 
-`maco supervise run` and `maco autopilot run` accept an optional
+`maco supervise run` accepts an optional
 `--quota-config REPO_RELATIVE_FILE`. The path is resolved inside `--repo` with
 no symlink traversal, and the bounded JSON file is parsed with unknown fields
 denied. When the flag is omitted, admission and selection retain their existing
@@ -3365,7 +3367,7 @@ specification.
 treats the bounded UTF-8 file as a high-level goal/spec, even if its contents
 happen to be valid JSON.
 
-`supervise run` and `autopilot run` accept optional `--role-category`. Omitted
+`supervise run` accepts optional `--role-category`. Omitted
 keeps automatic selection derived from the plan role. When set, the CLI stamps
 every assignment and nested `worker_assignments` entry with that category and
 `selection_source=operator_override` before launch. Accepted values are
@@ -3377,10 +3379,10 @@ categories from the original launch remain in force. The override does not
 bypass role-authority admission: a weak-model coordinator remains a typed
 refusal.
 
-`supervise run` and `autopilot run` persist launch preflight evidence under
+`supervise run` persists launch preflight evidence under
 `preflight/` (git status, repository map, sync status, and in-process runtime
-probe outcomes, each with an explicit success/failure marker). They also append
-an operator heartbeat ledger at `liveness/heartbeat.jsonl` and write
+probe outcomes, each with an explicit success/failure marker). It also appends
+an operator heartbeat ledger at `liveness/heartbeat.jsonl` and writes
 `SUMMARY.md` at finalization. A second launch targeting the same repository
 refuses while another live supervise or autopilot process is still registered;
 stale leftover records are reported without blocking. `--force-live-run` is
@@ -3768,34 +3770,39 @@ newly dirty primary paths fail that child assignment. Tests use
 fake subprocesses by default and do not require network access, provider
 credentials, or a real Codex login.
 
-Run the fake-first autopilot workflow:
+Run the fake-first autonomous workflow:
 
-`maco autopilot run` is a deliberately narrow capability spine. One command
-normalizes a positional task/plan or decomposes `--from-goal <file>` through the
-same planner used by `supervise plan`, performs typed preflight checks, builds a
-single validated supervisor plan with `max_depth: 2`, and invokes the public
-`supervise run` implementation. Omit `--codex-bin` for the deterministic
-in-process Fake runtime. Every run must name the reviewed machine-global
-configuration and runtime root used by supervise output-staging cleanup.
-The spine shape is fixed: an omitted `max_depth` or integer `max_depth: 2` is
-accepted. Any other integer depth, or any non-empty
-`assignments[*].child_assignments`, is a typed
-`approval_review`/`permission_expansion` refusal before supervise dispatch;
-malformed or non-integer depth input is invalid. When an accepted, publishable
-source run produces licensed-breakage follow-ups, a separate authenticated
-durable command-level queue admits the exact generated plans and chains one
-bounded generated batch through those same ordinary supervise gates. Fake and
-otherwise non-publishable source runs leave their generated tasks deferred.
+The shipped spine is `maco <instruction>`, `maco supervise run`, and
+`maco inbox run`. A bare instruction routes into supervised goal/spec.
+`supervise run` accepts a positional task/plan or decomposes
+`--from-goal <file>` through the same planner as `supervise plan`, then
+executes the validated plan through the live supervisor gates. Omit
+`--codex-bin` / use `--runtime fake` for the deterministic in-process Fake
+runtime. Explicit `supervise run` must name the reviewed machine-global
+configuration and runtime root used by supervise output-staging cleanup;
+`maco <instruction>` resolves the default machine-global binding when those
+flags are omitted. `inbox run` remains the fake-first reaction loop and
+still dispatches selected item work through the autopilot library path.
+
+`maco autopilot plan` and `maco autopilot run` are retired and fail closed
+before side effects with
+`autopilot plan/run is retired; use literal instruction routing: maco <instruction>`.
+Remaining `maco autopilot status/collect/artifacts` inspect leftover
+`.maco/autopilot/runs/<run-id>/` reports.
 
 This increment does not revive the legacy Autopilot repair/publication loop.
-Plan fields for outer validation, reviewer, forge, repair count, publish mode,
-and `auto_merge` remain accepted for input compatibility but cannot dispatch
-those effects. Supplying the legacy `--reviewer-command` fails closed. The
-supervisor's own worker/auditor gates are authoritative. A successful result is
-isolated and non-publishable in Fake mode, so Fake-generated follow-ups cannot
-enter the effectful queue. Autopilot never applies a result to the primary
-worktree, publishes it, or merges it. Human-reviewed arbitration and explicit
-preview/apply remain separate commands.
+Leftover plan fields for outer validation, reviewer, forge, repair count,
+publish mode, and `auto_merge` remain accepted only as library/inbox
+compatibility input and cannot dispatch those effects. Supplying the legacy
+`--reviewer-command` fails closed. The supervisor's own worker/auditor gates
+are authoritative. A successful Fake result is isolated and non-publishable,
+so Fake-generated follow-ups cannot enter an effectful queue. The live spine
+never applies a result to the primary worktree, publishes it, or merges it.
+Human-reviewed arbitration and explicit preview/apply remain separate
+commands.
+
+Leftover Autopilot plan fields remain library/inbox compatibility input, not
+a live `autopilot run` recipe:
 
 ```json
 {
@@ -3819,16 +3826,12 @@ preview/apply remain separate commands.
 ```
 
 ```bash
-cargo run -- autopilot plan autopilot-plan.json --repo . --json
-cargo run -- autopilot run autopilot-plan.json --repo . --run-id readme-demo \
-  --codex-bin codex \
-  --quota-config config/operator-quota.json \
-  --machine-global-config /etc/maco/machine-global.json \
-  --machine-global-runtime-root-id runtime --json
-cargo run -- autopilot run --from-goal goal.md --repo . \
+cargo run -- "Update the README without touching Rust code."
+cargo run -- supervise run --from-goal goal.md --repo . \
   --run-id readme-goal-demo \
   --machine-global-config /etc/maco/machine-global.json \
   --machine-global-runtime-root-id runtime --json
+cargo run -- inbox run --repo . --run-id inbox-demo --json
 cargo run -- autopilot status readme-demo --repo . --json
 cargo run -- autopilot collect readme-demo --repo . --json
 cargo run -- autopilot artifacts latest --repo . --json
@@ -3855,8 +3858,9 @@ merge-preview paths and full diffs.
 
 The disabled legacy implementation remains source-only design reference for a
 deterministic child subprocess, forge, reviewer, repair loop, and publication
-receipts. It is not called by `autopilot run`; forge, PR, review, validation,
-repair, push, and merge operations in that loop remain unreachable. The legacy
+receipts. The live spine does not call that loop; `autopilot plan/run` remain
+retired. Forge, PR, review, validation, repair, push, and merge operations in
+that loop remain unreachable. The legacy
 `--reviewer-command` shell-string option is retained only for an explicit
 fail-closed compatibility error and cannot grant real review authority. The
 following external-review rules document that disabled reference surface, not
@@ -3994,15 +3998,11 @@ requested, but `auto_merge_performed` is always `false`.
 | Machine-global destructive staging cleanup | Issues #44 (`0217cfb`), #48 (`5b3d8ba`), and #54 (`4491bf3`, merged by `a76a4b9`) bind both child-orchestrator and parent review-lens auditor staging cleanup through `SupervisorRunOptions`. CLI omission fails in argument parsing; programmatic omission fails before repository/plan effects; missing/partial or denied binding refuses cleanup and preserves staging. Fake creates no external staging and therefore records no fabricated cleanup. | `autopilot_run_cli_requires_machine_global_binding_before_effect_artifacts`, `autopilot_missing_retention_binding_fails_before_any_repository_or_runtime_side_effect`, and existing `supervise_dispatch_refuses_a_missing_staging_cleanup_binding` plus child/auditor binding tests fail if any reached destructive launch loses its binding. |
 | Human-only integration | Issue #17 (`9f92b3e`) exposes arbitration only as an opt-in proposal. Generated follow-ups can run only as isolated ordinary supervisor work; Autopilot never calls publication, arbitration, or the merge preview/review/apply workflow, and legacy `auto_merge` is recorded only. | `auto_merge_request_is_recorded_but_never_performed` asserts the false capability fields and exact primary HEAD/index/files; `legacy_reviewer_command_refuses_before_autopilot_artifacts` and the legacy validation/reviewer plan tests fail if the legacy publication loop becomes reachable. |
 
-The load-bearing CLI contract changed explicitly: previously every
-`AutopilotSubcommand::Run` returned one unconditional unavailable error and its
-integration test required zero run artifacts. It now requires a complete
-machine-global binding, performs typed preflight and pre-dispatch checks, and
-delegates exactly once to live supervise; the missing-binding test retains the
-old before-effects refusal boundary. Effectful `maco inbox run` and
-`maco inbox watch` callers are live again: they dispatch selected item work
-through that same Autopilot spine, so they inherit its machine-global binding
-requirement whenever item work launches Autopilot.
+`maco autopilot plan` and `maco autopilot run` are retired and fail closed
+before side effects. Effectful `maco inbox run` and `maco inbox watch`
+remain live: they dispatch selected item work through the autopilot
+library path, so they inherit its machine-global binding requirement
+whenever item work launches that path.
 
 Run the fake-first inbox reaction loop:
 

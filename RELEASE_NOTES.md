@@ -50,7 +50,8 @@ the Multi-Agent Coding Orchestrator.
   `--role-category` (`delegating_coordinator`,
   `non_delegating_terminal_worker`, `read_only_researcher`,
   `read_only_review_auditor`). Resume of an existing supervise run refuses a
-  new override.
+  new override. Later retired: `autopilot plan/run` fail closed; use
+  `maco <instruction>`.
 - `maco eval-harness run-v2` always parses the v2 manifest schema. `maco
   evaluation rescore` re-scores a stored results document under a named
   objective profile without overwriting the stored file. Real network
