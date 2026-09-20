@@ -182,6 +182,7 @@ pub(super) fn supervisor_plan_fan_out_width_warning(
     planning::fan_out_width_warning(plan.max_child_assignments, independent_scope_count)
 }
 
+#[cfg(test)]
 pub(super) fn validate_supervisor_plan(
     plan: SupervisorPlan,
     metadata: SupervisorPlanMetadata,
