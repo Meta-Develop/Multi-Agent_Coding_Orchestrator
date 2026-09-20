@@ -4906,6 +4906,12 @@
                 "minItems": 1,
                 "type": "array"
               },
+              "review_lens_correlation": {
+                "enum": [
+                  "distinct_scopes",
+                  "allow_same_scope"
+                ]
+              },
               "role_models": {
                 "additionalProperties": false,
                 "properties": {
@@ -10719,6 +10725,12 @@
                       },
                       "minItems": 1,
                       "type": "array"
+                    },
+                    "review_lens_correlation": {
+                      "enum": [
+                        "distinct_scopes",
+                        "allow_same_scope"
+                      ]
                     },
                     "role_models": {
                       "additionalProperties": false,

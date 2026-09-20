@@ -1732,6 +1732,7 @@ fn supervisor_required_optional_and_vector_paths_share_reversible_serialization(
         role_models: BTreeMap::new(),
         model_pricing: BTreeMap::new(),
         review_lenses: default_supervisor_review_lenses(),
+        review_lens_correlation: Default::default(),
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments: vec![OrchestratorAssignment {
             id: "child-a".to_string(),

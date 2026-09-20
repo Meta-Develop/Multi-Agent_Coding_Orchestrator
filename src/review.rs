@@ -19,9 +19,11 @@ use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
+    fmt,
     fs::File,
     io::{Read, Write},
     path::{Path, PathBuf},
+    str::FromStr,
     time::{Duration, Instant},
 };
 
@@ -461,6 +463,65 @@ pub enum ReviewInformationScope {
     FullChildTranscript,
     DiffOnly,
     OutputReportOnly,
+}
+
+/// Plan-level control for whether stacked review lenses may share an
+/// `information_scope`. Omitted values deserialize as [`Self::DistinctScopes`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReviewLensCorrelation {
+    #[default]
+    DistinctScopes,
+    AllowSameScope,
+}
+
+impl ReviewLensCorrelation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DistinctScopes => "distinct_scopes",
+            Self::AllowSameScope => "allow_same_scope",
+        }
+    }
+
+    pub const fn requires_distinct_scopes(self) -> bool {
+        matches!(self, Self::DistinctScopes)
+    }
+}
+
+impl fmt::Display for ReviewLensCorrelation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ReviewLensCorrelation {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "distinct_scopes" => Ok(Self::DistinctScopes),
+            "allow_same_scope" => Ok(Self::AllowSameScope),
+            _ => bail!("review_lens_correlation must be 'distinct_scopes' or 'allow_same_scope'"),
+        }
+    }
+}
+
+impl Serialize for ReviewLensCorrelation {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ReviewLensCorrelation {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(D::Error::custom)
+    }
 }
 
 /// Unscoped parent-side inputs. This type is deliberately not serializable;
@@ -1244,7 +1305,7 @@ pub fn aggregate_review_lenses_against_requests(
     required_coverage: ReviewCoverageRequirement,
     verdicts: Vec<ReviewLensVerdict>,
 ) -> Result<ReviewLensAggregate> {
-    validate_review_lens_set(lenses)?;
+    validate_review_lens_set_structure(lenses)?;
     if expected_requests.len() != lenses.len() {
         bail!("expected review lens requests must cover every configured lens exactly once");
     }
@@ -1290,7 +1351,7 @@ fn aggregate_review_lenses_internal(
     verdicts: Vec<ReviewLensVerdict>,
     expected_request_bindings: Option<&BTreeMap<&str, &str>>,
 ) -> Result<ReviewLensAggregate> {
-    validate_review_lens_set(lenses)?;
+    validate_review_lens_set_structure(lenses)?;
     validate_review_coverage_requirement(&required_coverage)?;
     if verdicts.len() > REVIEW_LENS_LIMIT {
         bail!(
@@ -1473,7 +1534,15 @@ fn validate_public_review_lens_aggregate_size(aggregate: &ReviewLensAggregate) -
     Ok(())
 }
 
-pub fn validate_review_lens_set(lenses: &[ReviewLensConfig]) -> Result<()> {
+pub fn validate_review_lens_set(
+    lenses: &[ReviewLensConfig],
+    correlation: ReviewLensCorrelation,
+) -> Result<()> {
+    validate_review_lens_set_structure(lenses)?;
+    validate_review_lens_information_scopes(lenses, correlation)
+}
+
+fn validate_review_lens_set_structure(lenses: &[ReviewLensConfig]) -> Result<()> {
     if lenses.is_empty() {
         bail!("review lens list cannot be empty");
     }
@@ -1488,6 +1557,26 @@ pub fn validate_review_lens_set(lenses: &[ReviewLensConfig]) -> Result<()> {
         validate_review_lens_config(lens)?;
         if !ids.insert(lens.id.as_str()) {
             bail!("review lens list contains duplicate stable ids");
+        }
+    }
+    Ok(())
+}
+
+fn validate_review_lens_information_scopes(
+    lenses: &[ReviewLensConfig],
+    correlation: ReviewLensCorrelation,
+) -> Result<()> {
+    if !correlation.requires_distinct_scopes() || lenses.len() <= 1 {
+        return Ok(());
+    }
+    for (index, left) in lenses.iter().enumerate() {
+        if lenses[index + 1..]
+            .iter()
+            .any(|right| right.information_scope == left.information_scope)
+        {
+            bail!(
+                "review lens list contains duplicate information_scope values; set review_lens_correlation to allow_same_scope to override"
+            );
         }
     }
     Ok(())

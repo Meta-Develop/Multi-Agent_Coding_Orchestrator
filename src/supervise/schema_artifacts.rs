@@ -2083,6 +2083,7 @@ fn generated_follow_up_supervisor_plan_schema_value() -> serde_json::Value {
                 "type": "array", "minItems": 1,
                 "items": review_lens_config_schema_value()
             },
+            "review_lens_correlation": review_lens_correlation_schema_value(),
             "review_aggregation_policy": review_aggregation_policy_schema_value(),
             "assignments": {
                 "type": "array", "minItems": 1, "maxItems": 1,
@@ -2197,6 +2198,10 @@ fn review_lens_config_schema_value() -> serde_json::Value {
 
 fn review_information_scope_schema_value() -> serde_json::Value {
     json!({"enum": ["full_child_transcript", "diff_only", "output_report_only"]})
+}
+
+fn review_lens_correlation_schema_value() -> serde_json::Value {
+    json!({"enum": ["distinct_scopes", "allow_same_scope"]})
 }
 
 fn review_lens_evidence_kind_schema_value() -> serde_json::Value {

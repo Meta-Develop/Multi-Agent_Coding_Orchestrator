@@ -3403,6 +3403,7 @@ mod tests {
             role_models: BTreeMap::new(),
             model_pricing: BTreeMap::new(),
             review_lenses,
+            review_lens_correlation: Default::default(),
             review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
             assignments,
             spec_fragment_ids: Vec::new(),
@@ -3451,6 +3452,7 @@ mod tests {
             role_models: template.role_models,
             model_pricing: template.model_pricing,
             review_lenses: template.review_lenses,
+            review_lens_correlation: Default::default(),
             review_aggregation_policy: template.review_aggregation_policy,
             assignments: vec![OrchestratorAssignment {
                 id: "child-a".to_string(),

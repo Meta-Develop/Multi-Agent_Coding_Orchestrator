@@ -5584,6 +5584,7 @@ mod decomposition_tests {
             role_models: BTreeMap::new(),
             model_pricing: BTreeMap::new(),
             review_lenses: default_supervisor_review_lenses(),
+            review_lens_correlation: Default::default(),
             review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
             assignments: vec![assignment.clone()],
         };
@@ -6040,6 +6041,7 @@ mod decomposition_tests {
             role_models: BTreeMap::new(),
             model_pricing: BTreeMap::new(),
             review_lenses: default_supervisor_review_lenses(),
+            review_lens_correlation: Default::default(),
             review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
             assignments: vec![assignment.clone()],
         };
@@ -6407,6 +6409,7 @@ mod decomposition_tests {
             role_models: BTreeMap::new(),
             model_pricing: BTreeMap::new(),
             review_lenses: default_supervisor_review_lenses(),
+            review_lens_correlation: Default::default(),
             review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
             assignments: vec![assignment.clone()],
         };
@@ -6929,6 +6932,7 @@ mod decomposition_tests {
             role_models: BTreeMap::new(),
             model_pricing: BTreeMap::new(),
             review_lenses: lenses,
+            review_lens_correlation: ReviewLensCorrelation::AllowSameScope,
             review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
             assignments: vec![assignment.clone()],
         };
@@ -7226,6 +7230,7 @@ mod decomposition_tests {
             role_models: BTreeMap::new(),
             model_pricing: BTreeMap::new(),
             review_lenses: default_supervisor_review_lenses(),
+            review_lens_correlation: Default::default(),
             review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
             assignments: vec![assignment.clone()],
         };
@@ -7522,6 +7527,7 @@ mod decomposition_tests {
             role_models: BTreeMap::new(),
             model_pricing: BTreeMap::new(),
             review_lenses: default_supervisor_review_lenses(),
+            review_lens_correlation: Default::default(),
             review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
             assignments: vec![assignment.clone()],
         };
@@ -8130,6 +8136,7 @@ mod decomposition_tests {
             role_models: BTreeMap::new(),
             model_pricing: BTreeMap::new(),
             review_lenses: default_supervisor_review_lenses(),
+            review_lens_correlation: Default::default(),
             review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
             assignments: vec![assignment.clone()],
         };
@@ -9073,6 +9080,7 @@ done
             role_models: BTreeMap::new(),
             model_pricing: BTreeMap::new(),
             review_lenses: default_supervisor_review_lenses(),
+            review_lens_correlation: Default::default(),
             review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
             assignments: Vec::new(),
         };
@@ -10235,6 +10243,7 @@ done
             role_models: BTreeMap::new(),
             model_pricing: BTreeMap::new(),
             review_lenses: default_supervisor_review_lenses(),
+            review_lens_correlation: Default::default(),
             review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
             assignments: vec![assignment.clone()],
         };
@@ -12839,6 +12848,7 @@ done
             role_models: BTreeMap::new(),
             model_pricing: BTreeMap::new(),
             review_lenses: default_supervisor_review_lenses(),
+            review_lens_correlation: Default::default(),
             review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
             assignments: vec![assignment.clone()],
         };

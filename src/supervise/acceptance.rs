@@ -884,6 +884,7 @@ pub(super) fn generated_licensed_follow_up_tasks(
                 role_models: plan.role_models.clone(),
                 model_pricing: plan.model_pricing.clone(),
                 review_lenses: plan.review_lenses.clone(),
+                review_lens_correlation: plan.review_lens_correlation,
                 review_aggregation_policy: plan.review_aggregation_policy,
                 assignments: vec![follow_up_assignment],
             };
@@ -914,6 +915,7 @@ pub(super) fn generated_licensed_follow_up_tasks(
                 role_models: ordinary_plan.role_models.clone(),
                 model_pricing: ordinary_plan.model_pricing.clone(),
                 review_lenses: ordinary_plan.review_lenses.clone(),
+                review_lens_correlation: ordinary_plan.review_lens_correlation,
                 review_aggregation_policy: ordinary_plan.review_aggregation_policy,
                 assignments: ordinary_plan.assignments.clone(),
                 spec_fragment_ids: Vec::new(),

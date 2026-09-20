@@ -2590,3 +2590,97 @@ fn strict_external_reviewer_cannot_read_hidden_common_state() -> Result<()> {
     assert_eq!(report.status, ReviewReportStatus::Failed);
     Ok(())
 }
+
+fn duplicate_full_transcript_lenses() -> Vec<ReviewLensConfig> {
+    vec![
+        model_review_lens(
+            "parent-acceptance",
+            "openai",
+            "shared-auditor",
+            ReviewInformationScope::FullChildTranscript,
+        ),
+        model_review_lens(
+            "second-acceptance",
+            "openai",
+            "shared-auditor",
+            ReviewInformationScope::FullChildTranscript,
+        ),
+    ]
+}
+
+#[test]
+fn validate_review_lens_set_rejects_duplicate_information_scope_without_override() {
+    let error = validate_review_lens_set(
+        &duplicate_full_transcript_lenses(),
+        ReviewLensCorrelation::DistinctScopes,
+    )
+    .expect_err("duplicate scopes must fail closed");
+    assert!(
+        error.to_string().contains("duplicate information_scope"),
+        "unexpected rejection: {error:#}"
+    );
+    assert!(
+        error.to_string().contains("allow_same_scope"),
+        "rejection must name the operator override: {error:#}"
+    );
+}
+
+#[test]
+fn validate_review_lens_set_allows_duplicate_information_scope_with_override() {
+    validate_review_lens_set(
+        &duplicate_full_transcript_lenses(),
+        ReviewLensCorrelation::AllowSameScope,
+    )
+    .expect("explicit allow_same_scope must accept duplicate scopes");
+}
+
+#[test]
+fn validate_review_lens_set_accepts_stacked_default_scopes() {
+    validate_review_lens_set(
+        &crate::supervise::default_stacked_uncorrelated_review_lenses(),
+        ReviewLensCorrelation::DistinctScopes,
+    )
+    .expect("production stacked default must stay valid without override");
+}
+
+#[test]
+fn validate_review_lens_set_accepts_single_lens() {
+    let lenses = vec![model_review_lens(
+        "parent-acceptance",
+        "openai",
+        "shared-auditor",
+        ReviewInformationScope::FullChildTranscript,
+    )];
+    validate_review_lens_set(&lenses, ReviewLensCorrelation::DistinctScopes)
+        .expect("single-lens plans must stay valid");
+}
+
+#[test]
+fn validate_review_lens_set_accepts_shared_model_with_distinct_scopes() {
+    let lenses = cheap_default_review_lenses();
+    assert_eq!(lenses[0].backend, lenses[1].backend);
+    assert_ne!(lenses[0].information_scope, lenses[1].information_scope);
+    validate_review_lens_set(&lenses, ReviewLensCorrelation::DistinctScopes)
+        .expect("same model across distinct scopes must stay valid");
+}
+
+#[test]
+fn review_lens_correlation_omitted_deserializes_as_distinct_scopes() {
+    let value = serde_json::json!({});
+    let parsed = serde_json::from_value::<ReviewLensCorrelationWire>(value)
+        .expect("omitted correlation must deserialize");
+    assert_eq!(
+        parsed.review_lens_correlation,
+        ReviewLensCorrelation::DistinctScopes
+    );
+    assert_eq!(
+        serde_json::to_value(ReviewLensCorrelation::AllowSameScope).expect("serialize override"),
+        serde_json::json!("allow_same_scope")
+    );
+}
+
+#[derive(Deserialize)]
+struct ReviewLensCorrelationWire {
+    #[serde(default)]
+    review_lens_correlation: ReviewLensCorrelation,
+}

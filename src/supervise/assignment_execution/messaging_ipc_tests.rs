@@ -438,6 +438,7 @@ fn messaging_plan_and_metadata() -> (SupervisorPlan, SupervisorPlanMetadata) {
         role_models: BTreeMap::new(),
         model_pricing: BTreeMap::new(),
         review_lenses: default_supervisor_review_lenses(),
+        review_lens_correlation: Default::default(),
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments: vec![coord, worker],
     };

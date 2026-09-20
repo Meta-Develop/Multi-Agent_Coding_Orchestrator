@@ -950,6 +950,7 @@ mod tests {
                 },
                 information_scope: ReviewInformationScope::FullChildTranscript,
             }],
+            review_lens_correlation: Default::default(),
             review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
             assignments: vec![serde_json::from_value(serde_json::json!({
                 "id": "child-a",
