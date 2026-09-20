@@ -604,7 +604,8 @@ impl AssignmentBudgetPolicy {
             return Ok(Vec::new());
         };
         if let Some(run_dir) = self.this_run_run_dir.as_deref() {
-            state.set_this_run_outcomes(load_this_run_outcome_records(run_dir));
+            let load = load_this_run_outcome_records(run_dir)?;
+            state.set_this_run_outcomes(load.records, load.exclusions);
         }
         let reselection = reselect_roles_from_supplied_catalog_snapshot(
             state,
