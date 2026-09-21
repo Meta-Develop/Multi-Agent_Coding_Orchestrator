@@ -1,0 +1,30 @@
+name: CI failure intake tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - maco-coordination.json
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-failure-intake-test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  intake-tests:
+    name: Offline CI failure intake
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run mocked CI failure intake tests
+        run: node --test .github/scripts/ci-failure-intake.test.mjs
