@@ -191,6 +191,7 @@ fn acquire_from_execution_registry(
 }
 
 /// Parameterized acquisition for isolated registry/adapter pairs (unit tests).
+#[cfg(test)]
 pub(crate) fn acquire_grok_launch_authority_from(
     registry: &StoredAccountRegistry,
     adapter: &GrokCliAdapter,
@@ -853,7 +854,9 @@ mod tests {
             data_dir: fixture_b.data_dir,
         };
         let _local = activate_cam_grok_test_harness(harness_b);
-        let error = acquire_grok_launch_authority().expect_err("unequal authorities must refuse");
+        let error = acquire_grok_launch_authority()
+            .err()
+            .expect("unequal authorities must refuse");
         let message = format!("{error:#}");
         assert!(
             message.contains("does not match the frozen selected authority")
@@ -926,8 +929,9 @@ mod tests {
             data_dir: fixture.data_dir,
         };
         let _local = activate_cam_grok_test_harness(harness);
-        let error =
-            acquire_grok_launch_authority().expect_err("changed selection must refuse launch");
+        let error = acquire_grok_launch_authority()
+            .err()
+            .expect("changed selection must refuse launch");
         let message = format!("{error:#}");
         assert!(
             message.contains("is stale")
@@ -957,7 +961,9 @@ mod tests {
             data_dir: fixture.data_dir,
         };
         let _local = activate_cam_grok_test_harness(harness);
-        let error = acquire_grok_launch_authority().expect_err("missing freeze must refuse");
+        let error = acquire_grok_launch_authority()
+            .err()
+            .expect("missing freeze must refuse");
         assert!(
             error
                 .to_string()

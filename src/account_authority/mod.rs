@@ -163,6 +163,5 @@ pub(crate) use grok::{
 };
 #[cfg(target_os = "linux")]
 pub(crate) use socket_client::{
-    observe_selected_authority_via_socket, observe_selected_via_authority_socket,
-    selected_binding_via_authority_socket,
+    observe_selected_authority_via_socket, selected_binding_via_authority_socket,
 };

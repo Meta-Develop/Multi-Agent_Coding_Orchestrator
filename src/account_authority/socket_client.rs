@@ -24,7 +24,7 @@ pub(crate) struct ObservedSocketSelection {
 }
 
 /// Observe the selected account for `provider_id` via a configured authority socket.
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn observe_selected_via_authority_socket(
     configured: &Path,
     provider_id: &str,
