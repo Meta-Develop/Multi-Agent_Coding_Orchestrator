@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
+use coding_agent_manager_lib::account_authority::authority_id_for;
 use coding_agent_manager_lib::account_authority::SelectedAccountBinding;
 use coding_agent_manager_lib::account_authority::SelectedUseLease;
 use coding_agent_manager_lib::account_authority::StoredAccountRegistry;
@@ -12,14 +13,18 @@ use coding_agent_manager_lib::paths::{project_dirs, stored_accounts_path};
 use coding_agent_manager_lib::providers::grok_cli::GrokCliAdapter;
 use coding_agent_manager_lib::providers::launch_spec_for;
 
-use super::ManagedGrokAccountSelectionEvidence;
-
-pub(crate) const GROK_CLI_PROVIDER_ID: &str = "grok-cli";
+pub(crate) use super::GROK_CLI_PROVIDER_ID;
+use super::{
+    configured_cam_authority_socket, frozen_observed_grok_selection, FrozenGrokSelectedBinding,
+    ManagedGrokAccountSelectionEvidence,
+};
 
 /// Frozen CAM selection, active use lease, and managed `GROK_HOME` for one Grok run.
 pub(crate) struct GrokLaunchAuthority {
     registry: StoredAccountRegistry,
     binding: SelectedAccountBinding,
+    authority_id: Option<String>,
+    socket_bound: bool,
     // Held until this launch authority is dropped, including failed runs.
     _selected_use_lease: SelectedUseLease,
     managed_grok_home: PathBuf,
@@ -38,6 +43,9 @@ impl GrokLaunchAuthority {
             account_id: self.binding.account_id.clone(),
             account_incarnation: self.binding.account_incarnation.clone(),
             selection_revision: self.binding.selection_revision,
+            // Report captured identity even for no-socket local observe-then-launch.
+            // `socket_bound` is the revalidation/no-fallback flag, not a hide-identity flag.
+            authority_id: self.authority_id.clone(),
         }
     }
 
@@ -51,8 +59,35 @@ impl GrokLaunchAuthority {
         }
     }
 
-    /// Re-read the registry before releasing the target process.
+    /// Re-read the chosen authority before releasing the target process.
     pub(crate) fn verify_binding_unchanged(&self) -> Result<()> {
+        if self.socket_bound {
+            let socket_path = configured_cam_authority_socket().ok_or_else(|| {
+                anyhow!(
+                    "Coding Agent Manager authority socket is no longer configured; refusing local fallback"
+                )
+            })?;
+            let live =
+                super::selected_binding_via_authority_socket(&socket_path, GROK_CLI_PROVIDER_ID)
+                    .context(
+                    "failed to revalidate Coding Agent Manager Grok selection via authority socket",
+                )?;
+            let Some((authority_id, binding)) = live else {
+                return Err(anyhow!(
+                    "no complete account is selected for Coding Agent Manager provider `{GROK_CLI_PROVIDER_ID}`"
+                ));
+            };
+            if let Some(expected_authority) = &self.authority_id {
+                if authority_id != *expected_authority {
+                    return Err(anyhow!(
+                        "Coding Agent Manager authority identity does not match the frozen selected authority"
+                    ));
+                }
+            }
+            if binding != self.binding {
+                return Err(map_binding_drift(&self.binding, &binding));
+            }
+        }
         let current = self
             .registry
             .selected_binding(GROK_CLI_PROVIDER_ID)
@@ -65,17 +100,76 @@ impl GrokLaunchAuthority {
         if current != self.binding {
             return Err(map_binding_drift(&self.binding, &current));
         }
+        if let Some(expected_authority) = &self.authority_id {
+            let actual = authority_id_for(self.registry.metadata_path());
+            if actual != *expected_authority {
+                return Err(anyhow!(
+                    "Coding Agent Manager execution authority does not match the frozen selected authority"
+                ));
+            }
+        }
         Ok(())
     }
 }
 
 /// Acquire the selected `grok-cli` binding using production CAM install paths.
 pub(crate) fn acquire_grok_launch_authority() -> Result<GrokLaunchAuthority> {
+    let frozen = frozen_observed_grok_selection();
+    if let Some(socket_path) = configured_cam_authority_socket() {
+        let frozen = frozen.ok_or_else(|| {
+            anyhow!(
+                "no frozen Grok selection binding from Coding Agent Manager authority socket observation"
+            )
+        })?;
+        revalidate_frozen_selection_via_socket(&socket_path, &frozen)?;
+        return acquire_from_execution_registry(Some(&frozen), true);
+    }
+    match frozen.as_ref() {
+        Some(frozen) => acquire_from_execution_registry(Some(frozen), false),
+        None => acquire_from_execution_registry(None, false),
+    }
+}
+
+fn revalidate_frozen_selection_via_socket(
+    socket_path: &Path,
+    frozen: &FrozenGrokSelectedBinding,
+) -> Result<()> {
+    let expected_authority = frozen.authority_id.as_deref().ok_or_else(|| {
+        anyhow!("frozen Grok selection is missing authority identity for the configured CAM socket")
+    })?;
+    let live = super::selected_binding_via_authority_socket(socket_path, GROK_CLI_PROVIDER_ID)
+        .context("failed to revalidate Coding Agent Manager Grok selection via authority socket")?;
+    let Some((authority_id, binding)) = live else {
+        return Err(anyhow!(
+            "no complete account is selected for Coding Agent Manager provider `{GROK_CLI_PROVIDER_ID}` via authority socket"
+        ));
+    };
+    if authority_id != expected_authority {
+        return Err(anyhow!(
+            "Coding Agent Manager authority identity does not match the frozen selected authority"
+        ));
+    }
+    let expected = frozen.to_selected_binding();
+    if binding != expected {
+        return Err(map_binding_drift(&expected, &binding));
+    }
+    Ok(())
+}
+
+fn acquire_from_execution_registry(
+    frozen: Option<&FrozenGrokSelectedBinding>,
+    socket_bound: bool,
+) -> Result<GrokLaunchAuthority> {
     #[cfg(test)]
     {
         let override_result = CAM_GROK_TEST_OVERRIDE.with(|cell| {
             cell.borrow().as_ref().map(|harness| {
-                acquire_grok_launch_authority_from(&harness.registry, &harness.adapter)
+                acquire_grok_launch_authority_from_bound(
+                    &harness.registry,
+                    &harness.adapter,
+                    frozen,
+                    socket_bound,
+                )
             })
         });
         if let Some(result) = override_result {
@@ -88,7 +182,12 @@ pub(crate) fn acquire_grok_launch_authority() -> Result<GrokLaunchAuthority> {
             "Coding Agent Manager data directory is unavailable; install or configure the manager",
         )?;
     let registry = StoredAccountRegistry::new(stored_accounts_path(&data_dir));
-    acquire_grok_launch_authority_from(&registry, &GrokCliAdapter::default())
+    acquire_grok_launch_authority_from_bound(
+        &registry,
+        &GrokCliAdapter::default(),
+        frozen,
+        socket_bound,
+    )
 }
 
 /// Parameterized acquisition for isolated registry/adapter pairs (unit tests).
@@ -96,7 +195,16 @@ pub(crate) fn acquire_grok_launch_authority_from(
     registry: &StoredAccountRegistry,
     adapter: &GrokCliAdapter,
 ) -> Result<GrokLaunchAuthority> {
-    let binding = registry
+    acquire_grok_launch_authority_from_bound(registry, adapter, None, false)
+}
+
+fn acquire_grok_launch_authority_from_bound(
+    registry: &StoredAccountRegistry,
+    adapter: &GrokCliAdapter,
+    frozen: Option<&FrozenGrokSelectedBinding>,
+    socket_bound: bool,
+) -> Result<GrokLaunchAuthority> {
+    let current = registry
         .selected_binding(GROK_CLI_PROVIDER_ID)
         .context("failed to read Coding Agent Manager Grok selection")?
         .ok_or_else(|| {
@@ -104,6 +212,41 @@ pub(crate) fn acquire_grok_launch_authority_from(
                 "no complete account is selected for Coding Agent Manager provider `{GROK_CLI_PROVIDER_ID}`"
             )
         })?;
+    let (binding, authority_id) = if let Some(frozen) = frozen {
+        require_execution_matches_frozen(frozen, registry, &current)?;
+        (frozen.to_selected_binding(), frozen.authority_id.clone())
+    } else {
+        (current, None)
+    };
+    finish_grok_launch_authority(registry, adapter, binding, authority_id, socket_bound)
+}
+
+fn require_execution_matches_frozen(
+    frozen: &FrozenGrokSelectedBinding,
+    registry: &StoredAccountRegistry,
+    current: &SelectedAccountBinding,
+) -> Result<()> {
+    if let Some(expected_authority) = &frozen.authority_id {
+        let actual = authority_id_for(registry.metadata_path());
+        if actual != *expected_authority {
+            return Err(anyhow!(
+                "Coding Agent Manager execution authority does not match the frozen selected authority"
+            ));
+        }
+    }
+    if !frozen.matches_selected_binding(current) {
+        return Err(map_binding_drift(&frozen.to_selected_binding(), current));
+    }
+    Ok(())
+}
+
+fn finish_grok_launch_authority(
+    registry: &StoredAccountRegistry,
+    adapter: &GrokCliAdapter,
+    binding: SelectedAccountBinding,
+    authority_id: Option<String>,
+    socket_bound: bool,
+) -> Result<GrokLaunchAuthority> {
     let selected_use_lease = registry
         .acquire_selected_use(&binding)
         .map_err(map_cam_error)?;
@@ -117,6 +260,8 @@ pub(crate) fn acquire_grok_launch_authority_from(
     Ok(GrokLaunchAuthority {
         registry: StoredAccountRegistry::new(registry.metadata_path()),
         binding,
+        authority_id,
+        socket_bound,
         _selected_use_lease: selected_use_lease,
         managed_grok_home,
         launch_env_removals,
@@ -269,6 +414,7 @@ pub(crate) fn build_cam_grok_test_harness(
         account_id: binding.account_id,
         account_incarnation: binding.account_incarnation,
         selection_revision: binding.selection_revision,
+        authority_id: None,
     };
     Ok((
         CamGrokTestHarness {
@@ -570,6 +716,309 @@ mod tests {
         let authority = acquire_grok_launch_authority()?;
         assert_eq!(authority.binding().account_id, "account-a");
         drop(guard);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn serve_registry_on_socket(
+        registry: StoredAccountRegistry,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::thread::JoinHandle<()>,
+    ) {
+        use coding_agent_manager_lib::account_authority::{
+            listen, resolve_socket_path, AuthorityContext, AuthorityServerConfig,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("socket tempdir");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("chmod");
+        let root = fs::canonicalize(dir.path()).expect("canonical");
+        let socket = root.join("account.sock");
+        let path = resolve_socket_path(&socket).expect("safe socket path");
+        let ctx = AuthorityContext::new(registry).without_registry_fallback();
+        let listener =
+            listen(path, AuthorityServerConfig::new(ctx).expect("config")).expect("listen");
+        let socket_path = listener.path().to_path_buf();
+        let handle = std::thread::spawn(move || while listener.accept_once().is_ok() {});
+        (dir, socket_path, handle)
+    }
+
+    struct SocketEnvGuard {
+        previous: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl SocketEnvGuard {
+        fn set(path: &Path) -> Self {
+            use crate::account_authority::authority_socket_config::CAM_AUTHORITY_SOCKET_ENV;
+            let _lock = crate::account_authority::CAM_AUTHORITY_SOCKET_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = std::env::var_os(CAM_AUTHORITY_SOCKET_ENV);
+            std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, path);
+            Self { previous, _lock }
+        }
+
+        fn unset() -> Self {
+            use crate::account_authority::authority_socket_config::CAM_AUTHORITY_SOCKET_ENV;
+            let _lock = crate::account_authority::CAM_AUTHORITY_SOCKET_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = std::env::var_os(CAM_AUTHORITY_SOCKET_ENV);
+            std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV);
+            Self { previous, _lock }
+        }
+    }
+
+    impl Drop for SocketEnvGuard {
+        fn drop(&mut self) {
+            use crate::account_authority::authority_socket_config::CAM_AUTHORITY_SOCKET_ENV;
+            match self.previous.take() {
+                Some(value) => std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, value),
+                None => std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV),
+            }
+        }
+    }
+
+    fn frozen_from_registry(
+        registry: &StoredAccountRegistry,
+        with_authority_id: bool,
+    ) -> super::super::FrozenGrokSelectedBinding {
+        use coding_agent_manager_lib::account_authority::authority_id_for;
+        let binding = registry
+            .selected_binding(GROK_CLI_PROVIDER_ID)
+            .expect("read selection")
+            .expect("selected");
+        super::super::FrozenGrokSelectedBinding::from_selected_binding(
+            with_authority_id.then(|| authority_id_for(registry.metadata_path())),
+            &binding,
+        )
+    }
+
+    #[test]
+    fn socket_registry_a_and_local_registry_b_refuse_acquisition() -> Result<()> {
+        let fixture_a = Fixture::new();
+        add_managed_account(
+            &fixture_a.registry,
+            &fixture_a.adapter,
+            "account-a",
+            "A",
+            None,
+        )
+        .map_err(map_cam_error)?;
+        add_managed_account(
+            &fixture_a.registry,
+            &fixture_a.adapter,
+            "account-b",
+            "B",
+            None,
+        )
+        .map_err(map_cam_error)?;
+        select_launch_account(&fixture_a.registry, &fixture_a.adapter, "account-a")
+            .map_err(map_cam_error)?;
+
+        let fixture_b = Fixture::new();
+        add_managed_account(
+            &fixture_b.registry,
+            &fixture_b.adapter,
+            "account-a",
+            "A",
+            None,
+        )
+        .map_err(map_cam_error)?;
+        add_managed_account(
+            &fixture_b.registry,
+            &fixture_b.adapter,
+            "account-b",
+            "B",
+            None,
+        )
+        .map_err(map_cam_error)?;
+        select_launch_account(&fixture_b.registry, &fixture_b.adapter, "account-b")
+            .map_err(map_cam_error)?;
+
+        let listen_registry = StoredAccountRegistry::new(fixture_a.registry.metadata_path());
+        let (_socket_dir, socket_path, _server) = serve_registry_on_socket(listen_registry);
+        let frozen = frozen_from_registry(&fixture_a.registry, true);
+        let _freeze = super::super::FrozenGrokSelectionGuard::pin(Some(frozen));
+        let _socket_env = SocketEnvGuard::set(&socket_path);
+
+        let harness_b = CamGrokTestHarness {
+            _root: fixture_b._root,
+            registry: fixture_b.registry,
+            adapter: fixture_b.adapter,
+            user_home: fixture_b.user_home,
+            data_dir: fixture_b.data_dir,
+        };
+        let _local = activate_cam_grok_test_harness(harness_b);
+        let error = acquire_grok_launch_authority().expect_err("unequal authorities must refuse");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("does not match the frozen selected authority")
+                || message.contains("is not the selected account")
+                || message.contains("is stale"),
+            "unexpected refusal: {message}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn matching_socket_and_local_authority_acquires_frozen_binding() -> Result<()> {
+        let fixture = Fixture::new();
+        add_managed_account(&fixture.registry, &fixture.adapter, "account-a", "A", None)
+            .map_err(map_cam_error)?;
+        add_managed_account(&fixture.registry, &fixture.adapter, "account-b", "B", None)
+            .map_err(map_cam_error)?;
+        select_launch_account(&fixture.registry, &fixture.adapter, "account-a")
+            .map_err(map_cam_error)?;
+
+        let listen_registry = StoredAccountRegistry::new(fixture.registry.metadata_path());
+        let (_socket_dir, socket_path, _server) = serve_registry_on_socket(listen_registry);
+        let frozen = frozen_from_registry(&fixture.registry, true);
+        let expected_account = frozen.account_id.clone();
+        let expected_authority = frozen.authority_id.clone();
+        let _freeze = super::super::FrozenGrokSelectionGuard::pin(Some(frozen));
+        let _socket_env = SocketEnvGuard::set(&socket_path);
+
+        let harness = CamGrokTestHarness {
+            _root: fixture._root,
+            registry: fixture.registry,
+            adapter: fixture.adapter,
+            user_home: fixture.user_home,
+            data_dir: fixture.data_dir,
+        };
+        let _local = activate_cam_grok_test_harness(harness);
+        let authority = acquire_grok_launch_authority()?;
+        assert_eq!(authority.binding().account_id, expected_account);
+        let evidence = authority.selection_evidence();
+        assert_eq!(evidence.account_id, expected_account);
+        assert_eq!(evidence.authority_id, expected_authority);
+        authority.verify_binding_unchanged()?;
+        Ok(())
+    }
+
+    #[test]
+    fn selection_change_after_observation_refuses_acquisition() -> Result<()> {
+        let fixture = Fixture::new();
+        add_managed_account(&fixture.registry, &fixture.adapter, "account-a", "A", None)
+            .map_err(map_cam_error)?;
+        add_managed_account(&fixture.registry, &fixture.adapter, "account-b", "B", None)
+            .map_err(map_cam_error)?;
+        select_launch_account(&fixture.registry, &fixture.adapter, "account-a")
+            .map_err(map_cam_error)?;
+
+        let frozen = frozen_from_registry(&fixture.registry, true);
+        select_launch_account(&fixture.registry, &fixture.adapter, "account-b")
+            .map_err(map_cam_error)?;
+
+        let listen_registry = StoredAccountRegistry::new(fixture.registry.metadata_path());
+        let (_socket_dir, socket_path, _server) = serve_registry_on_socket(listen_registry);
+        let _freeze = super::super::FrozenGrokSelectionGuard::pin(Some(frozen));
+        let _socket_env = SocketEnvGuard::set(&socket_path);
+
+        let harness = CamGrokTestHarness {
+            _root: fixture._root,
+            registry: fixture.registry,
+            adapter: fixture.adapter,
+            user_home: fixture.user_home,
+            data_dir: fixture.data_dir,
+        };
+        let _local = activate_cam_grok_test_harness(harness);
+        let error =
+            acquire_grok_launch_authority().expect_err("changed selection must refuse launch");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("is stale")
+                || message.contains("is not the selected account")
+                || message.contains("does not match"),
+            "unexpected refusal: {message}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_frozen_binding_with_socket_configured_refuses_acquisition() -> Result<()> {
+        let fixture = Fixture::new();
+        add_managed_account(&fixture.registry, &fixture.adapter, "account-a", "A", None)
+            .map_err(map_cam_error)?;
+        select_launch_account(&fixture.registry, &fixture.adapter, "account-a")
+            .map_err(map_cam_error)?;
+        let listen_registry = StoredAccountRegistry::new(fixture.registry.metadata_path());
+        let (_socket_dir, socket_path, _server) = serve_registry_on_socket(listen_registry);
+        let _freeze = super::super::FrozenGrokSelectionGuard::pin(None);
+        let _socket_env = SocketEnvGuard::set(&socket_path);
+        let harness = CamGrokTestHarness {
+            _root: fixture._root,
+            registry: fixture.registry,
+            adapter: fixture.adapter,
+            user_home: fixture.user_home,
+            data_dir: fixture.data_dir,
+        };
+        let _local = activate_cam_grok_test_harness(harness);
+        let error = acquire_grok_launch_authority().expect_err("missing freeze must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("no frozen Grok selection binding"),
+            "unexpected refusal: {error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn no_socket_keeps_local_registry_acquisition() -> Result<()> {
+        let _freeze = super::super::FrozenGrokSelectionGuard::pin(None);
+        let fixture = Fixture::new();
+        add_managed_account(&fixture.registry, &fixture.adapter, "account-a", "A", None)
+            .map_err(map_cam_error)?;
+        select_launch_account(&fixture.registry, &fixture.adapter, "account-a")
+            .map_err(map_cam_error)?;
+        let harness = CamGrokTestHarness {
+            _root: fixture._root,
+            registry: fixture.registry,
+            adapter: fixture.adapter,
+            user_home: fixture.user_home,
+            data_dir: fixture.data_dir,
+        };
+        let _local = activate_cam_grok_test_harness(harness);
+        let authority = acquire_grok_launch_authority()?;
+        assert_eq!(authority.binding().account_id, "account-a");
+        assert!(authority.selection_evidence().authority_id.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn no_socket_observe_then_launch_acquires_matching_local_registry() -> Result<()> {
+        let _no_socket = SocketEnvGuard::unset();
+        let fixture = Fixture::new();
+        add_managed_account(&fixture.registry, &fixture.adapter, "account-a", "A", None)
+            .map_err(map_cam_error)?;
+        select_launch_account(&fixture.registry, &fixture.adapter, "account-a")
+            .map_err(map_cam_error)?;
+        let frozen = frozen_from_registry(&fixture.registry, true);
+        let expected_account = frozen.account_id.clone();
+        let expected_authority = frozen.authority_id.clone();
+        assert!(
+            expected_authority.is_some(),
+            "local observation must freeze authority_id"
+        );
+        let _freeze = super::super::FrozenGrokSelectionGuard::pin(Some(frozen));
+        let harness = CamGrokTestHarness {
+            _root: fixture._root,
+            registry: fixture.registry,
+            adapter: fixture.adapter,
+            user_home: fixture.user_home,
+            data_dir: fixture.data_dir,
+        };
+        let _local = activate_cam_grok_test_harness(harness);
+        let authority = acquire_grok_launch_authority()?;
+        assert_eq!(authority.binding().account_id, expected_account);
+        let evidence = authority.selection_evidence();
+        assert_eq!(evidence.account_id, expected_account);
+        assert_eq!(evidence.authority_id, expected_authority);
+        authority.verify_binding_unchanged()?;
         Ok(())
     }
 }

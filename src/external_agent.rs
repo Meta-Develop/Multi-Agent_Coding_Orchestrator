@@ -2174,6 +2174,23 @@ struct GrokVerifiedAccountSession {
 #[cfg(target_os = "linux")]
 fn prepare_verified_grok_account_session() -> Result<GrokVerifiedAccountSession> {
     let authority = crate::account_authority::grok::acquire_grok_launch_authority()?;
+    if let Some(frozen) = crate::account_authority::frozen_observed_grok_selection() {
+        let evidence = authority.selection_evidence();
+        if evidence.provider_id != frozen.provider_id
+            || evidence.account_id != frozen.account_id
+            || evidence.account_incarnation != frozen.account_incarnation
+            || evidence.selection_revision != frozen.selection_revision
+        {
+            bail!(
+                "managed Grok selection does not match the frozen selected binding used for selection"
+            );
+        }
+        if frozen.authority_id.is_some() && evidence.authority_id != frozen.authority_id {
+            bail!(
+                "managed Grok selection authority does not match the frozen selected authority used for selection"
+            );
+        }
+    }
     let credentials =
         AdmittedGrokCredentials::from_managed_grok_home(authority.managed_grok_home())?;
     Ok(GrokVerifiedAccountSession {

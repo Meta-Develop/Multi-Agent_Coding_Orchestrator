@@ -10,7 +10,7 @@ use crate::selection::OutcomeResult;
 
 #[cfg(target_os = "linux")]
 use coding_agent_manager_lib::account_authority::{
-    AccountObserveRequest, ObserveCategory, StoredAccountRegistry,
+    authority_id_for, AccountObserveRequest, ObserveCategory, StoredAccountRegistry,
 };
 #[cfg(target_os = "linux")]
 use coding_agent_manager_lib::paths::{project_dirs, stored_accounts_path};
@@ -4004,16 +4004,42 @@ fn account_observation_for_launch_runtime(
                         harness.adapter.as_ref(),
                         provider_id,
                     )
+                    .map(|observation| {
+                        freeze_observed_grok_from_registry(
+                            provider_id,
+                            &harness.registry,
+                            observation.as_ref(),
+                        );
+                        observation
+                    })
                 })
             }) {
                 return result;
             }
         }
         if let Some(socket_path) = crate::account_authority::configured_cam_authority_socket() {
-            return crate::account_authority::observe_selected_via_authority_socket(
+            let observed = crate::account_authority::observe_selected_authority_via_socket(
                 &socket_path,
                 provider_id,
-            );
+            )?;
+            return Ok(match observed {
+                Some(observed) => {
+                    crate::account_authority::record_observed_grok_selection(
+                        provider_id,
+                        Some(observed.authority_id),
+                        Some(&observed.observation.binding),
+                    );
+                    Some(observed.observation)
+                }
+                None => {
+                    crate::account_authority::record_observed_grok_selection(
+                        provider_id,
+                        None,
+                        None,
+                    );
+                    None
+                }
+            });
         }
         let Some(data_dir) = project_dirs().map(|dirs| dirs.data_dir().to_path_buf()) else {
             return Ok(None);
@@ -4022,8 +4048,23 @@ fn account_observation_for_launch_runtime(
         let adapter = coding_agent_manager_lib::providers::find(provider_id).ok_or_else(|| {
             anyhow!("Coding Agent Manager provider `{provider_id}` is not registered")
         })?;
-        observe_selected_cam_binding(&registry, adapter.as_ref(), provider_id)
+        let observation = observe_selected_cam_binding(&registry, adapter.as_ref(), provider_id)?;
+        freeze_observed_grok_from_registry(provider_id, &registry, observation.as_ref());
+        Ok(observation)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn freeze_observed_grok_from_registry(
+    provider_id: &str,
+    registry: &StoredAccountRegistry,
+    observation: Option<&AccountObserveResult>,
+) {
+    crate::account_authority::record_observed_grok_selection(
+        provider_id,
+        observation.map(|_| authority_id_for(registry.metadata_path())),
+        observation.map(|observation| &observation.binding),
+    );
 }
 
 pub(super) fn initialize_supervisor_selection_from_prepared_metadata(
@@ -6644,6 +6685,164 @@ mod selection_policy_tests {
                     supported_efforts: None,
                     default_effort: None,
                 })
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn scheduler_grok_socket_observe_freezes_selected_binding() -> Result<()> {
+            use crate::account_authority::authority_socket_config::CAM_AUTHORITY_SOCKET_ENV;
+            use crate::account_authority::{
+                frozen_observed_grok_selection, FrozenGrokSelectionGuard, GROK_CLI_PROVIDER_ID,
+            };
+            use coding_agent_manager_lib::account_authority::{
+                authority_id_for, listen, resolve_socket_path, AuthorityContext,
+                AuthorityServerConfig, CategoryObservation, ModelsObservation, ObservedModel,
+            };
+            use std::fs;
+            use std::os::unix::fs::PermissionsExt;
+            use std::sync::Arc;
+            use std::thread;
+
+            struct SocketEnvGuard {
+                previous: Option<std::ffi::OsString>,
+                _lock: std::sync::MutexGuard<'static, ()>,
+            }
+
+            impl SocketEnvGuard {
+                fn set(path: &Path) -> Self {
+                    let lock = crate::account_authority::CAM_AUTHORITY_SOCKET_TEST_LOCK
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let previous = std::env::var_os(CAM_AUTHORITY_SOCKET_ENV);
+                    std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, path);
+                    Self {
+                        previous,
+                        _lock: lock,
+                    }
+                }
+            }
+
+            impl Drop for SocketEnvGuard {
+                fn drop(&mut self) {
+                    match self.previous.take() {
+                        Some(value) => std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, value),
+                        None => std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV),
+                    }
+                }
+            }
+
+            struct SocketObserveAdapter;
+
+            impl ProviderAdapter for SocketObserveAdapter {
+                fn id(&self) -> &'static str {
+                    GROK_CLI_PROVIDER_ID
+                }
+
+                fn descriptor(&self) -> ProviderDescriptor {
+                    ProviderDescriptor {
+                        id: GROK_CLI_PROVIDER_ID.to_string(),
+                        display_name: GROK_CLI_PROVIDER_ID.to_string(),
+                        vendor: "test".to_string(),
+                        auth_kinds: vec![AuthKind::OAuth],
+                        maturity: Maturity::Experimental,
+                        install_state: InstallState::Unknown,
+                        capabilities: Vec::new(),
+                    }
+                }
+
+                fn config_paths(&self) -> Vec<PathBuf> {
+                    Vec::new()
+                }
+
+                fn detect(&self) -> InstallState {
+                    InstallState::Unknown
+                }
+
+                fn list_accounts(&self) -> coding_agent_manager_lib::error::Result<Vec<Account>> {
+                    Ok(Vec::new())
+                }
+
+                fn activate_account(
+                    &self,
+                    _account_id: &str,
+                ) -> coding_agent_manager_lib::error::Result<()> {
+                    Err(CamError::NotImplemented("activate"))
+                }
+
+                fn observe_models_for_account(
+                    &self,
+                    _account: &StoredAccountMetadata,
+                ) -> coding_agent_manager_lib::error::Result<CategoryObservation<ModelsObservation>>
+                {
+                    Ok(CategoryObservation::observed(ModelsObservation {
+                        models: vec![ObservedModel {
+                            model_id: "socket-grok-model".to_string(),
+                            supported_efforts: None,
+                            default_effort: None,
+                        }],
+                    }))
+                }
+            }
+
+            let _freeze = FrozenGrokSelectionGuard::pin(None);
+            let dir = tempfile::tempdir().expect("tempdir");
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("chmod");
+            let root = fs::canonicalize(dir.path()).expect("canonical");
+            let data = root.join("data");
+            fs::create_dir_all(&data).expect("data");
+            let registry = StoredAccountRegistry::new(stored_accounts_path(&data));
+            registry
+                .begin_add(
+                    GROK_CLI_PROVIDER_ID,
+                    "work",
+                    "Work",
+                    AuthKind::OAuth,
+                    StoredAccountMaterial::VendorHome,
+                )
+                .expect("begin add");
+            registry
+                .complete_add(GROK_CLI_PROVIDER_ID, "work")
+                .expect("complete add");
+            registry
+                .select_complete_revision(GROK_CLI_PROVIDER_ID, "work", None)
+                .expect("select");
+            let expected_authority = authority_id_for(registry.metadata_path());
+            let expected_binding = registry
+                .selected_binding(GROK_CLI_PROVIDER_ID)
+                .expect("binding")
+                .expect("selected");
+
+            let socket = root.join("account.sock");
+            let safe = resolve_socket_path(&socket).expect("safe socket path");
+            let mut ctx = AuthorityContext::new(registry).without_registry_fallback();
+            ctx.adapters.insert(
+                GROK_CLI_PROVIDER_ID.to_string(),
+                Arc::new(SocketObserveAdapter) as Arc<dyn ProviderAdapter>,
+            );
+            let listener =
+                listen(safe, AuthorityServerConfig::new(ctx).expect("config")).expect("listen");
+            let socket_path = listener.path().to_path_buf();
+            thread::spawn(move || while listener.accept_once().is_ok() {});
+            let _env = SocketEnvGuard::set(&socket_path);
+
+            let observation = account_observation_for_launch_runtime(SupervisorRuntime::Grok)?
+                .context("configured authority socket must observe selected Grok account")?;
+            assert_eq!(observation.binding.account_id, "work");
+            let frozen =
+                frozen_observed_grok_selection().context("Grok observation must freeze")?;
+            assert_eq!(
+                frozen.authority_id.as_deref(),
+                Some(expected_authority.as_str())
+            );
+            assert_eq!(frozen.account_id, expected_binding.account_id);
+            assert_eq!(
+                frozen.account_incarnation,
+                expected_binding.account_incarnation
+            );
+            assert_eq!(
+                frozen.selection_revision,
+                expected_binding.selection_revision
             );
             Ok(())
         }

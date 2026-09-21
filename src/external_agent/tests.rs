@@ -10500,6 +10500,208 @@ fn verified_grok_cam_run_releases_use_lease_on_failure() -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn serve_cam_registry_on_socket(
+    registry: coding_agent_manager_lib::account_authority::StoredAccountRegistry,
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::thread::JoinHandle<()>,
+) {
+    use coding_agent_manager_lib::account_authority::{
+        listen, resolve_socket_path, AuthorityContext, AuthorityServerConfig,
+    };
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("socket tempdir");
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("chmod");
+    let root = fs::canonicalize(dir.path()).expect("canonical");
+    let socket = root.join("account.sock");
+    let path = resolve_socket_path(&socket).expect("safe socket path");
+    let ctx = AuthorityContext::new(registry).without_registry_fallback();
+    let listener = listen(path, AuthorityServerConfig::new(ctx).expect("config")).expect("listen");
+    let socket_path = listener.path().to_path_buf();
+    let handle = std::thread::spawn(move || while listener.accept_once().is_ok() {});
+    (dir, socket_path, handle)
+}
+
+#[cfg(target_os = "linux")]
+struct CamSocketEnvGuard {
+    previous: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(target_os = "linux")]
+impl CamSocketEnvGuard {
+    fn set(path: &std::path::Path) -> Self {
+        use crate::account_authority::authority_socket_config::CAM_AUTHORITY_SOCKET_ENV;
+        let lock = crate::account_authority::CAM_AUTHORITY_SOCKET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os(CAM_AUTHORITY_SOCKET_ENV);
+        std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, path);
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+
+    fn unset() -> Self {
+        use crate::account_authority::authority_socket_config::CAM_AUTHORITY_SOCKET_ENV;
+        let lock = crate::account_authority::CAM_AUTHORITY_SOCKET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os(CAM_AUTHORITY_SOCKET_ENV);
+        std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV);
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for CamSocketEnvGuard {
+    fn drop(&mut self) {
+        use crate::account_authority::authority_socket_config::CAM_AUTHORITY_SOCKET_ENV;
+        match self.previous.take() {
+            Some(value) => std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, value),
+            None => std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn freeze_harness_selection(
+    harness: &crate::account_authority::CamGrokTestHarness,
+) -> crate::account_authority::FrozenGrokSelectedBinding {
+    use crate::account_authority::{FrozenGrokSelectedBinding, GROK_CLI_PROVIDER_ID};
+    use coding_agent_manager_lib::account_authority::authority_id_for;
+
+    let binding = harness
+        .registry
+        .selected_binding(GROK_CLI_PROVIDER_ID)
+        .expect("read selection")
+        .expect("selected");
+    FrozenGrokSelectedBinding::from_selected_binding(
+        Some(authority_id_for(harness.registry.metadata_path())),
+        &binding,
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn verified_grok_socket_registry_a_vs_local_registry_b_refuses_target_launch() -> Result<()> {
+    use crate::account_authority::FrozenGrokSelectionGuard;
+    use coding_agent_manager_lib::account_authority::StoredAccountRegistry;
+
+    let temp = tempfile::tempdir()?;
+    let (harness_a, _, _) = build_cam_grok_test_harness("account-a")?;
+    let (harness_b, _, _) = build_cam_grok_test_harness("account-b")?;
+    let listen_registry = StoredAccountRegistry::new(harness_a.registry.metadata_path());
+    let (_socket_dir, socket_path, _server) = serve_cam_registry_on_socket(listen_registry);
+    let frozen = freeze_harness_selection(&harness_a);
+    let _freeze = FrozenGrokSelectionGuard::pin(Some(frozen));
+    let _socket_env = CamSocketEnvGuard::set(&socket_path);
+    let command = admitted_verified_grok_cam_command(temp.path())?;
+    let _keep_a = harness_a;
+    let report = run_external_agent_with_cam_grok_test_harness(harness_b, &command);
+    assert!(
+        !report.stdout.target_launch_attempted,
+        "unequal socket/local authorities must not launch: {report:#?}"
+    );
+    assert!(report.managed_grok_selection_evidence().is_none());
+    assert_eq!(report.process_tree, None);
+    assert!(!report.environment_failures().is_empty());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn verified_grok_no_socket_observe_then_launch_uses_matching_local_registry() -> Result<()> {
+    use crate::account_authority::FrozenGrokSelectionGuard;
+
+    let temp = tempfile::tempdir()?;
+    let _no_socket = CamSocketEnvGuard::unset();
+    let (harness, _, expected_binding) = build_cam_grok_test_harness("account-a")?;
+    let frozen = freeze_harness_selection(&harness);
+    let expected_with_authority = crate::account_authority::ManagedGrokAccountSelectionEvidence {
+        provider_id: expected_binding.provider_id.clone(),
+        account_id: expected_binding.account_id.clone(),
+        account_incarnation: expected_binding.account_incarnation.clone(),
+        selection_revision: expected_binding.selection_revision,
+        authority_id: frozen.authority_id.clone(),
+    };
+    assert!(
+        expected_with_authority.authority_id.is_some(),
+        "local observation must freeze authority_id"
+    );
+    let _freeze = FrozenGrokSelectionGuard::pin(Some(frozen));
+    let command = admitted_verified_grok_cam_command(temp.path())?;
+    let report = run_external_agent_with_cam_grok_test_harness(harness, &command);
+    assert_verified_grok_cam_admitted_provider_failure(&report, &expected_with_authority)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn verified_grok_matching_socket_and_local_authority_launches_frozen_binding() -> Result<()> {
+    use crate::account_authority::FrozenGrokSelectionGuard;
+    use coding_agent_manager_lib::account_authority::StoredAccountRegistry;
+
+    let temp = tempfile::tempdir()?;
+    let (harness, _, expected_binding) = build_cam_grok_test_harness("account-a")?;
+    let listen_registry = StoredAccountRegistry::new(harness.registry.metadata_path());
+    let (_socket_dir, socket_path, _server) = serve_cam_registry_on_socket(listen_registry);
+    let frozen = freeze_harness_selection(&harness);
+    let expected_with_authority = crate::account_authority::ManagedGrokAccountSelectionEvidence {
+        provider_id: expected_binding.provider_id.clone(),
+        account_id: expected_binding.account_id.clone(),
+        account_incarnation: expected_binding.account_incarnation.clone(),
+        selection_revision: expected_binding.selection_revision,
+        authority_id: frozen.authority_id.clone(),
+    };
+    let _freeze = FrozenGrokSelectionGuard::pin(Some(frozen));
+    let _socket_env = CamSocketEnvGuard::set(&socket_path);
+    let command = admitted_verified_grok_cam_command(temp.path())?;
+    let report = run_external_agent_with_cam_grok_test_harness(harness, &command);
+    assert_verified_grok_cam_admitted_provider_failure(&report, &expected_with_authority)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn verified_grok_selection_change_after_observation_refuses_target_launch() -> Result<()> {
+    use crate::account_authority::{FrozenGrokSelectionGuard, GROK_CLI_PROVIDER_ID};
+    use coding_agent_manager_lib::account_authority::StoredAccountRegistry;
+    use coding_agent_manager_lib::providers::select_launch_account;
+
+    let temp = tempfile::tempdir()?;
+    let (harness, _, _) = build_cam_grok_test_harness("account-a")?;
+    let frozen = freeze_harness_selection(&harness);
+    select_launch_account(&harness.registry, &harness.adapter, "account-b")?;
+    assert_eq!(
+        harness
+            .registry
+            .selected_binding(GROK_CLI_PROVIDER_ID)?
+            .expect("account-b selected")
+            .account_id,
+        "account-b"
+    );
+    let listen_registry = StoredAccountRegistry::new(harness.registry.metadata_path());
+    let (_socket_dir, socket_path, _server) = serve_cam_registry_on_socket(listen_registry);
+    let _freeze = FrozenGrokSelectionGuard::pin(Some(frozen));
+    let _socket_env = CamSocketEnvGuard::set(&socket_path);
+    let command = admitted_verified_grok_cam_command(temp.path())?;
+    let report = run_external_agent_with_cam_grok_test_harness(harness, &command);
+    assert!(
+        !report.stdout.target_launch_attempted,
+        "selection change after observation must not launch: {report:#?}"
+    );
+    assert!(report.managed_grok_selection_evidence().is_none());
+    Ok(())
+}
+
 #[test]
 fn assignment_messaging_launch_environment_refuses_mismatched_binding() -> Result<()> {
     use crate::messaging::transport::AssignmentMessagingServer;
