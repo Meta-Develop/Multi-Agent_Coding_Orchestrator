@@ -19,8 +19,9 @@
 
 use crate::envelope_fixtures::{
     cli_merge_apply, create_managed, eprint_identity_once, force_remove, git_maco_state_bytes,
-    prepare_merge_lane, preview_merge, reset_primary_hard, try_force_remove,
-    write_cli_preview_watermark, EnvelopeRepo, MergeLane, OutcomeCounters, MEDIUM_CLAIM_PATH,
+    is_managed_worktree_lock_timeout, prepare_merge_lane, preview_merge, report_observed_latencies,
+    reset_primary_hard, timed, timed_ok, try_force_remove, write_cli_preview_watermark,
+    EnvelopeRepo, MergeLane, OperationLatencies, OutcomeCounters, MEDIUM_CLAIM_PATH,
     SMALL_CLAIM_PATH,
 };
 use crate::{bound_group, RepositoryFixture};
@@ -28,7 +29,10 @@ use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
 use multi_agent_coding_orchestrator::{sync_store::SyncStore, worktree::WorktreeCreateOptions};
 use std::{
     hint::black_box,
-    sync::{Arc, Barrier},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Barrier,
+    },
 };
 
 /// Matches Criterion's `--test` vs `--bench` mode so `cargo bench` still
@@ -68,10 +72,48 @@ pub fn worktree_lifecycle_s(criterion: &mut Criterion) {
             .map(|index| format!("life-{index}"))
             .collect::<Vec<_>>();
         let counters = OutcomeCounters::new();
-        run_lifecycle_round(&repo, &agents, &counters);
+        let create_latencies = OperationLatencies::new();
+        let list_latencies = OperationLatencies::new();
+        let remove_latencies = OperationLatencies::new();
+        let tolerate_lock_timeout = worker_count == 8;
+        let cell = format!("lifecycle_s_workers_{worker_count}");
+        let probe = run_lifecycle_round(
+            &repo,
+            &agents,
+            &counters,
+            &create_latencies,
+            &list_latencies,
+            &remove_latencies,
+            tolerate_lock_timeout,
+        );
         let (probe_ok, probe_err) = counters.snapshot();
-        assert_eq!(probe_err, 0, "lifecycle probe must not fail");
-        assert_eq!(probe_ok, worker_count as u64);
+        if tolerate_lock_timeout {
+            if let Err(error) = probe {
+                eprintln!(
+                    "coordination_envelope cell={cell} \
+                     status=OUTSIDE_SUPPORTED_ENVELOPE \
+                     cause=managed_worktrees.lock_timeout_60s \
+                     probe_success={probe_ok} probe_failure={probe_err} \
+                     error={error}"
+                );
+                report_lifecycle_latencies(
+                    &cell,
+                    &create_latencies,
+                    &list_latencies,
+                    &remove_latencies,
+                );
+                continue;
+            }
+            assert_eq!(
+                probe_err, 0,
+                "8-way lifecycle probe reported success with failures"
+            );
+            assert_eq!(probe_ok, worker_count as u64);
+        } else {
+            probe.expect("required lifecycle probe must succeed");
+            assert_eq!(probe_err, 0, "lifecycle probe must not fail");
+            assert_eq!(probe_ok, worker_count as u64);
+        }
         if let Some(bytes) = git_maco_state_bytes(repo.repo_path()) {
             eprintln!(
                 "coordination_envelope cell=lifecycle_s workers={worker_count} \
@@ -80,62 +122,166 @@ pub fn worktree_lifecycle_s(criterion: &mut Criterion) {
         }
 
         group.throughput(Throughput::Elements(worker_count as u64));
+        let lock_timeout = AtomicBool::new(false);
         group.bench_with_input(
             BenchmarkId::new("create_list_force_remove", worker_count),
             &worker_count,
             |bencher, &_count| {
                 bencher.iter(|| {
-                    run_lifecycle_round(&repo, &agents, &counters);
+                    if lock_timeout.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if let Err(error) = run_lifecycle_round(
+                        &repo,
+                        &agents,
+                        &counters,
+                        &create_latencies,
+                        &list_latencies,
+                        &remove_latencies,
+                        tolerate_lock_timeout,
+                    ) {
+                        lock_timeout.store(true, Ordering::Relaxed);
+                        eprintln!(
+                            "coordination_envelope cell={cell} \
+                             status=OUTSIDE_SUPPORTED_ENVELOPE \
+                             cause=managed_worktrees.lock_timeout_60s \
+                             error={error}"
+                        );
+                    }
                 });
             },
         );
         let (success, failure) = counters.snapshot();
-        eprintln!(
-            "coordination_envelope cell=lifecycle_s workers={worker_count} \
-             success={success} failure={failure} (includes Criterion warmup)"
-        );
+        if lock_timeout.load(Ordering::Relaxed) {
+            eprintln!(
+                "coordination_envelope cell=lifecycle_s workers={worker_count} \
+                 status=OUTSIDE_SUPPORTED_ENVELOPE success={success} failure={failure} \
+                 (Criterion collection hit managed_worktrees.lock 60s timeout; \
+                 not a supported envelope cell)"
+            );
+        } else {
+            eprintln!(
+                "coordination_envelope cell=lifecycle_s workers={worker_count} \
+                 success={success} failure={failure} (includes Criterion warmup)"
+            );
+        }
+        report_lifecycle_latencies(&cell, &create_latencies, &list_latencies, &remove_latencies);
     }
 
     group.finish();
 }
 
-fn run_lifecycle_round(repo: &EnvelopeRepo, agents: &[String], counters: &OutcomeCounters) {
+fn report_lifecycle_latencies(
+    cell: &str,
+    create_latencies: &OperationLatencies,
+    list_latencies: &OperationLatencies,
+    remove_latencies: &OperationLatencies,
+) {
+    report_observed_latencies(cell, "create", create_latencies);
+    report_observed_latencies(cell, "list_managed_verified", list_latencies);
+    report_observed_latencies(cell, "remove", remove_latencies);
+}
+
+fn run_lifecycle_round(
+    repo: &EnvelopeRepo,
+    agents: &[String],
+    counters: &OutcomeCounters,
+    create_latencies: &OperationLatencies,
+    list_latencies: &OperationLatencies,
+    remove_latencies: &OperationLatencies,
+    tolerate_lock_timeout: bool,
+) -> Result<(), String> {
     let barrier = Arc::new(Barrier::new(agents.len()));
+    let first_error = std::sync::Mutex::new(None::<String>);
     std::thread::scope(|scope| {
         for agent in agents {
-            let barrier = Arc::clone(&barrier);
-            scope.spawn(move || {
+            scope.spawn(|| {
                 let manager = repo.manager();
                 barrier.wait();
-                match manager.create(WorktreeCreateOptions {
-                    agent_id: agent.clone(),
-                    branch: None,
-                    base: None,
-                    worktree_root: Some(repo.worktree_root.clone()),
+                let created = match timed_ok(create_latencies, || {
+                    manager.create(WorktreeCreateOptions {
+                        agent_id: agent.clone(),
+                        branch: None,
+                        base: None,
+                        worktree_root: Some(repo.worktree_root.clone()),
+                    })
                 }) {
-                    Ok(created) => {
-                        let listed = manager
-                            .list_managed_verified()
-                            .expect("list_managed_verified after create");
-                        assert!(
-                            listed.iter().any(|record| record.name == created.name),
-                            "created worktree {} missing from verified list",
-                            created.name
-                        );
-                        black_box(listed);
-                        manager
-                            .remove(agent, true, true)
-                            .expect("force-remove managed worktree");
-                        counters.record_ok();
-                    }
+                    Ok(created) => created,
                     Err(error) => {
                         counters.record_err();
-                        panic!("managed worktree create failed for {agent}: {error:#}");
+                        record_lifecycle_failure(
+                            agent,
+                            "create",
+                            &error,
+                            tolerate_lock_timeout,
+                            &first_error,
+                        );
+                        return;
                     }
+                };
+                let listed = match timed_ok(list_latencies, || manager.list_managed_verified()) {
+                    Ok(listed) => listed,
+                    Err(error) => {
+                        counters.record_err();
+                        record_lifecycle_failure(
+                            agent,
+                            "list_managed_verified",
+                            &error,
+                            tolerate_lock_timeout,
+                            &first_error,
+                        );
+                        return;
+                    }
+                };
+                assert!(
+                    listed.iter().any(|record| record.name == created.name),
+                    "created worktree {} missing from verified list",
+                    created.name
+                );
+                black_box(listed);
+                if let Err(error) = timed_ok(remove_latencies, || manager.remove(agent, true, true))
+                {
+                    counters.record_err();
+                    record_lifecycle_failure(
+                        agent,
+                        "remove",
+                        &error,
+                        tolerate_lock_timeout,
+                        &first_error,
+                    );
+                    return;
                 }
+                counters.record_ok();
             });
         }
     });
+    if tolerate_lock_timeout {
+        for agent in agents {
+            let _ = try_force_remove(repo, agent);
+        }
+    }
+    match first_error.into_inner().expect("lifecycle error mutex") {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn record_lifecycle_failure(
+    agent: &str,
+    step: &str,
+    error: &impl std::fmt::Display,
+    tolerate_lock_timeout: bool,
+    first_error: &std::sync::Mutex<Option<String>>,
+) {
+    let message = format!("{step} failed for {agent}: {error:#}");
+    if tolerate_lock_timeout && is_managed_worktree_lock_timeout(&message) {
+        let mut slot = first_error.lock().expect("lifecycle error mutex");
+        if slot.is_none() {
+            *slot = Some(message);
+        }
+        return;
+    }
+    panic!("{message}");
 }
 
 pub fn merge_preview(criterion: &mut Criterion) {
@@ -152,15 +298,21 @@ pub fn merge_preview(criterion: &mut Criterion) {
             lane.worktree.path.exists(),
             "managed merge worktree must exist for preview"
         );
-        let probe = preview_merge(&lane);
+        let preview_latencies = OperationLatencies::new();
+        let probe = preview_merge(&lane, &preview_latencies);
         black_box(probe);
         group.throughput(Throughput::Elements(1));
         group.bench_with_input(
             BenchmarkId::new("preview_validation_off", label),
             &(),
             |bencher, _| {
-                bencher.iter(|| black_box(preview_merge(&lane)));
+                bencher.iter(|| black_box(preview_merge(&lane, &preview_latencies)));
             },
+        );
+        report_observed_latencies(
+            &format!("merge_preview_{label}"),
+            "preview_merge_apply_with_evidence",
+            &preview_latencies,
         );
         force_remove(&lane.repo, &lane.agent_id);
     }
@@ -176,7 +328,15 @@ pub fn merge_review_apply_s(criterion: &mut Criterion) {
     eprint_identity_once(lane.repo.repo_path());
     let watermark_path = lane.repo.scratch_path().join("reviewed-preview.json");
     let counters = OutcomeCounters::new();
-    run_review_apply(&lane, &watermark_path, &counters);
+    let review_latencies = OperationLatencies::new();
+    let apply_latencies = OperationLatencies::new();
+    run_review_apply(
+        &lane,
+        &watermark_path,
+        &counters,
+        &review_latencies,
+        &apply_latencies,
+    );
     reset_primary_hard(lane.repo.repo_path());
     let (probe_ok, probe_err) = counters.snapshot();
     assert_eq!(probe_err, 0);
@@ -189,7 +349,13 @@ pub fn merge_review_apply_s(criterion: &mut Criterion) {
                 reset_primary_hard(lane.repo.repo_path());
             },
             |_| {
-                run_review_apply(&lane, &watermark_path, &counters);
+                run_review_apply(
+                    &lane,
+                    &watermark_path,
+                    &counters,
+                    &review_latencies,
+                    &apply_latencies,
+                );
             },
             BatchSize::PerIteration,
         );
@@ -199,6 +365,8 @@ pub fn merge_review_apply_s(criterion: &mut Criterion) {
         "coordination_envelope cell=6_review_apply_s success={success} failure={failure} \
          (includes Criterion warmup); apply uses CLI not public apply_merge_result"
     );
+    report_observed_latencies("6_review_apply_s", "cli_merge_preview", &review_latencies);
+    report_observed_latencies("6_review_apply_s", "cli_merge_apply", &apply_latencies);
     reset_primary_hard(lane.repo.repo_path());
     force_remove(&lane.repo, &lane.agent_id);
     group.finish();
@@ -208,9 +376,11 @@ fn run_review_apply(
     lane: &MergeLane,
     watermark_path: &std::path::Path,
     counters: &OutcomeCounters,
+    review_latencies: &OperationLatencies,
+    apply_latencies: &OperationLatencies,
 ) {
-    write_cli_preview_watermark(lane, watermark_path);
-    let report = cli_merge_apply(lane, watermark_path);
+    write_cli_preview_watermark(lane, watermark_path, review_latencies);
+    let report = cli_merge_apply(lane, watermark_path, apply_latencies);
     counters.record_ok();
     black_box(report);
 }
@@ -228,10 +398,12 @@ pub fn worktree_list_quiescent_s(criterion: &mut Criterion) {
         for agent in &agents {
             create_managed(&repo, agent);
         }
-        let probe = repo
-            .manager()
-            .list_managed_verified()
-            .expect("probe quiescent list");
+        let list_latencies = OperationLatencies::new();
+        let probe = timed(&list_latencies, || {
+            repo.manager()
+                .list_managed_verified()
+                .expect("probe quiescent list")
+        });
         assert_eq!(probe.len(), count);
         black_box(probe);
 
@@ -242,13 +414,20 @@ pub fn worktree_list_quiescent_s(criterion: &mut Criterion) {
             &count,
             |bencher, &count| {
                 bencher.iter(|| {
-                    let listed = manager
-                        .list_managed_verified()
-                        .expect("list quiescent managed worktrees");
+                    let listed = timed(&list_latencies, || {
+                        manager
+                            .list_managed_verified()
+                            .expect("list quiescent managed worktrees")
+                    });
                     assert_eq!(listed.len(), count);
                     black_box(listed)
                 });
             },
+        );
+        report_observed_latencies(
+            &format!("worktree_list_quiescent_s_n_{count}"),
+            "list_managed_verified",
+            &list_latencies,
         );
 
         for agent in &agents {

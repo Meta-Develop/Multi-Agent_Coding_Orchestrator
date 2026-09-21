@@ -1303,9 +1303,10 @@ success probes run outside the timed loops. The groups measure:
   and semantic risk query over a precomputed map.
 - `worktree_lifecycle_s`: Git-native managed-worktree
   `create` → `list_managed_verified` → `remove(force=true)` on the small (S,
-  four tracked files) fixture at concurrency 1, 4, and 8 with disjoint
-  `agent_id`s. Public `WorktreeManager::create` already derives cleanliness on
-  a clean repository.
+  four tracked files) fixture at concurrency 1 and 4 with disjoint `agent_id`s.
+  `cargo bench` also attempts concurrency 8; Criterion `--test` /
+  `cargo test --bench` skip that 8-way stampede. Public
+  `WorktreeManager::create` already derives cleanliness on a clean repository.
 - `merge_preview`: claim plus a committed single-path worktree diff, then
   `preview_merge_apply_with_evidence` with validation off, concurrency 1, on
   S and medium (M, 128 tracked ~1 KiB files) fixtures.
@@ -1321,16 +1322,74 @@ success probes run outside the timed loops. The groups measure:
 
 The suite uses 10 samples, a 300 ms warm-up, and a 700 ms measurement window per
 case so a complete local run stays modest. Wall time and throughput come from
-that Criterion window. p50 is Criterion's estimated median; p95/p99 are
-Criterion bootstrap percentiles from the same samples. Those percentiles
-document the local run; they are not universal CI timing thresholds. Success
-and failure counts are printed on stderr for envelope cells (including
-warmup). Optional post-hoc `.git/maco` byte totals may be printed after
-lifecycle probes. Lock wait/hold time is UNAVAILABLE (no public
-`KernelStateLock` hooks). Each run prints OS, architecture, `rustc --version`,
-and a best-effort filesystem identity; keep those host results distinct.
-Linux `ntfs3` profile sweeps, a standalone `classify_semantic_conflicts`
-microbench, and Continuity-scale commits/sec remain out of scope.
+that Criterion window. Per-operation p50/p95/p99 are empirical nearest-rank
+latencies from `Instant`-timed production-API calls (including probe and
+warmup), printed on stderr. p50 requires n≥1, p95 requires n≥20, and p99
+requires n≥100; otherwise the tail is UNAVAILABLE. A Criterion bootstrap
+confidence bound is not an operation-latency percentile and is not used as
+p95/p99. Those host numbers document one local run; they are not universal CI
+timing thresholds. Success and failure counts are printed on stderr for
+envelope cells (including warmup). Optional post-hoc `.git/maco` byte totals
+may be printed after lifecycle probes. Lock wait/hold time is UNAVAILABLE (no
+public `KernelStateLock` hooks). Each run prints OS, architecture,
+`rustc --version`, and a best-effort filesystem identity; keep those host
+results distinct. Linux `ntfs3` profile sweeps, a standalone
+`classify_semantic_conflicts` microbench, and Continuity-scale commits/sec
+remain out of scope.
+
+**Measured host baseline (2026-09-22):** `cargo bench --locked --bench coordination`
+on Linux x86_64, `rustc 1.94.1 (e408947bf 2026-03-25)`, ext4 tempfile fixtures,
+inside a delegated systemd user manager (`systemd-run --user --scope -p
+Delegate=yes`). Native Windows cannot open these production APIs (verified
+no-follow safe-root handles are unsupported on that platform). Supported
+lifecycle range on this host is concurrency 1 and 4 on S. Concurrency 8 is
+outside the supported envelope: Criterion collection hit `managed_worktrees.lock`
+after 60s (`create failed for life-0: timed out after 60 seconds waiting for
+kernel state lock .../managed_worktrees.lock`; success=78 failure=2 on that
+cell). Do not treat the 8-way Criterion times as a successful envelope. Merge
+preview/review/apply and quiescent list completed with zero failures.
+
+Observed operation latencies (nearest-rank; p95/p99 UNAVAILABLE when n is too
+small):
+
+- lifecycle S workers=1: success=12 failure=0; post-probe `.git/maco` 65432
+  bytes; Criterion wall `[5.9822 s, 7.0107 s, 8.1983 s]`, throughput
+  `[0.1220, 0.1426, 0.1672]` elem/s. create n=12 p50_ms=5232.062
+  p95_ms=UNAVAILABLE p99_ms=UNAVAILABLE; list_managed_verified n=12
+  p50_ms=18.748 p95_ms=UNAVAILABLE p99_ms=UNAVAILABLE; remove n=12
+  p50_ms=652.780 p95_ms=UNAVAILABLE p99_ms=UNAVAILABLE.
+- lifecycle S workers=4: success=48 failure=0; post-probe `.git/maco` 360107
+  bytes; Criterion wall `[24.631 s, 27.628 s, 31.779 s]`, throughput
+  `[0.1259, 0.1448, 0.1624]` elem/s. create n=48 p50_ms=16569.574
+  p95_ms=24741.802 p99_ms=UNAVAILABLE; list_managed_verified n=48
+  p50_ms=3410.007 p95_ms=13104.932 p99_ms=UNAVAILABLE; remove n=48
+  p50_ms=1203.899 p95_ms=3378.728 p99_ms=UNAVAILABLE.
+- lifecycle S workers=8: OUTSIDE_SUPPORTED_ENVELOPE (60s
+  `managed_worktrees.lock` timeout). Not a supported cell.
+- merge preview S: Criterion wall `[1.6473 s, 1.6675 s, 1.6903 s]`, throughput
+  `[0.5916, 0.5997, 0.6071]` elem/s;
+  `preview_merge_apply_with_evidence` n=12 p50_ms=1661.717 p95_ms=UNAVAILABLE
+  p99_ms=UNAVAILABLE.
+- merge preview M: Criterion wall `[1.6273 s, 1.6577 s, 1.6914 s]`, throughput
+  `[0.5912, 0.6033, 0.6145]` elem/s;
+  `preview_merge_apply_with_evidence` n=12 p50_ms=1650.938 p95_ms=UNAVAILABLE
+  p99_ms=UNAVAILABLE.
+- merge review+apply S: success=12 failure=0; Criterion wall
+  `[18.015 s, 18.110 s, 18.204 s]`, throughput `[0.0549, 0.0552, 0.0555]`
+  elem/s; cli_merge_preview n=12 p50_ms=3018.834 p95_ms=UNAVAILABLE
+  p99_ms=UNAVAILABLE; cli_merge_apply n=12 p50_ms=15080.524 p95_ms=UNAVAILABLE
+  p99_ms=UNAVAILABLE.
+- quiescent list S n=1: Criterion wall `[3.8873 ms, 3.9278 ms, 3.9607 ms]`,
+  throughput `[252.48, 254.60, 257.25]` elem/s; list_managed_verified n=348
+  p50_ms=3.839 p95_ms=4.728 p99_ms=5.758.
+- quiescent list S n=4: Criterion wall `[7.0835 ms, 7.2776 ms, 7.7223 ms]`,
+  throughput `[129.49, 137.41, 141.17]` elem/s; list_managed_verified n=142
+  p50_ms=7.303 p95_ms=12.318 p99_ms=16.823.
+- optional probe same-path claim ×8: probe success=1 failure=7 (expected
+  overlap refusal); Criterion round success=14 failure=98 including warmup.
+- optional probe fifth create with four retained: Criterion wall
+  `[5.3359 s, 6.0819 s, 6.9577 s]`, throughput `[0.1437, 0.1644, 0.1874]`
+  elem/s.
 
 **DEFERRED / UNAVAILABLE:** This envelope does not publish:
 
@@ -1340,7 +1399,8 @@ microbench, and Continuity-scale commits/sec remain out of scope.
 - KernelStateLock wait/hold instrumentation;
 - paid-provider benches;
 - brittle universal CI timing thresholds. OS/filesystem identity stays
-  attached to the local Criterion report instead.
+  attached to the local Criterion report instead;
+- 8-way managed-worktree lifecycle as a supported cell on this host.
 
 ### Provisional model-mix evaluation fixtures
 

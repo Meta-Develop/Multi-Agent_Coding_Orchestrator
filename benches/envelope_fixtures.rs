@@ -14,7 +14,8 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::Once,
+    sync::{Mutex, Once},
+    time::{Duration, Instant},
 };
 
 const MERGE_AGENT: &str = "envelope-merge";
@@ -36,6 +37,12 @@ pub struct MergeLane {
 pub struct OutcomeCounters {
     pub success: std::sync::atomic::AtomicU64,
     pub failure: std::sync::atomic::AtomicU64,
+}
+
+/// Observed production-API call latencies. Criterion bootstrap intervals are
+/// not stored here and are not a substitute for these percentiles.
+pub struct OperationLatencies {
+    samples_ns: Mutex<Vec<u64>>,
 }
 
 impl OutcomeCounters {
@@ -62,6 +69,103 @@ impl OutcomeCounters {
             self.failure.load(std::sync::atomic::Ordering::Relaxed),
         )
     }
+}
+
+impl OperationLatencies {
+    pub fn new() -> Self {
+        Self {
+            samples_ns: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn record(&self, elapsed: Duration) {
+        let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        self.samples_ns
+            .lock()
+            .expect("operation latency mutex")
+            .push(nanos);
+    }
+
+    pub fn snapshot_ns(&self) -> Vec<u64> {
+        self.samples_ns
+            .lock()
+            .expect("operation latency mutex")
+            .clone()
+    }
+}
+
+/// Time a successful production-API call. Failures are not recorded as latency
+/// samples; they belong in [`OutcomeCounters`].
+pub fn timed_ok<T, E>(
+    latencies: &OperationLatencies,
+    operation: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let started = Instant::now();
+    match operation() {
+        Ok(value) => {
+            latencies.record(started.elapsed());
+            Ok(value)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub fn timed<T>(latencies: &OperationLatencies, operation: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let value = operation();
+    latencies.record(started.elapsed());
+    value
+}
+
+pub fn is_managed_worktree_lock_timeout(error: &str) -> bool {
+    let text = error.to_ascii_lowercase();
+    text.contains("timed out") && text.contains("managed_worktrees.lock")
+}
+
+/// Empirical nearest-rank percentile.
+///
+/// p50 requires at least one sample. p95 requires n≥20 and p99 requires n≥100
+/// so the named tail contains at least one observation. A Criterion bootstrap
+/// confidence bound is not a latency percentile and is never returned here.
+pub fn observed_percentile_ns(sorted_ns: &[u64], percentile: u8) -> Option<u64> {
+    let min_n = match percentile {
+        50 => 1,
+        95 => 20,
+        99 => 100,
+        _ => return None,
+    };
+    let n = sorted_ns.len();
+    if n < min_n {
+        return None;
+    }
+    let rank = n.saturating_mul(usize::from(percentile)).saturating_add(99) / 100;
+    sorted_ns.get(rank.saturating_sub(1)).copied()
+}
+
+fn format_observed_ms(ns: Option<u64>) -> String {
+    match ns {
+        Some(ns) => {
+            let millis = ns / 1_000_000;
+            let micros = (ns % 1_000_000) / 1_000;
+            format!("{millis}.{micros:03}")
+        }
+        None => "UNAVAILABLE".to_string(),
+    }
+}
+
+pub fn report_observed_latencies(cell: &str, operation: &str, latencies: &OperationLatencies) {
+    let mut samples = latencies.snapshot_ns();
+    samples.sort_unstable();
+    eprintln!(
+        "coordination_envelope cell={cell} operation={operation} n={} \
+         p50_ms={} p95_ms={} p99_ms={} \
+         (observed nearest-rank Instant samples including probe/warmup; \
+         p95 needs n>=20; p99 needs n>=100; criterion bootstrap is not a latency percentile)",
+        samples.len(),
+        format_observed_ms(observed_percentile_ns(&samples, 50)),
+        format_observed_ms(observed_percentile_ns(&samples, 95)),
+        format_observed_ms(observed_percentile_ns(&samples, 99)),
+    );
 }
 
 impl EnvelopeRepo {
@@ -172,27 +276,30 @@ pub fn merge_preview_options(lane: &MergeLane) -> MergePreviewOptions {
 
 pub fn preview_merge(
     lane: &MergeLane,
+    latencies: &OperationLatencies,
 ) -> multi_agent_coding_orchestrator::merge::MergeApplyPreview {
-    let preview = preview_merge_apply_with_evidence(
-        merge_preview_options(lane),
-        ValidationEvidenceBundle::default(),
-    )
-    .expect("preview_merge_apply_with_evidence must succeed");
-    assert_ne!(
-        preview.safety.readiness.status,
-        ApplyReadinessStatus::Blocked,
-        "envelope preview must keep apply gates satisfied: {:?}",
-        preview.safety.readiness
-    );
-    assert!(
+    timed(latencies, || {
+        let preview = preview_merge_apply_with_evidence(
+            merge_preview_options(lane),
+            ValidationEvidenceBundle::default(),
+        )
+        .expect("preview_merge_apply_with_evidence must succeed");
+        assert_ne!(
+            preview.safety.readiness.status,
+            ApplyReadinessStatus::Blocked,
+            "envelope preview must keep apply gates satisfied: {:?}",
+            preview.safety.readiness
+        );
+        assert!(
+            preview
+                .candidate
+                .changed_paths
+                .iter()
+                .any(|path| path == Path::new(lane.claim_path)),
+            "preview must include the claimed single-path diff"
+        );
         preview
-            .candidate
-            .changed_paths
-            .iter()
-            .any(|path| path == Path::new(lane.claim_path)),
-        "preview must include the claimed single-path diff"
-    );
-    preview
+    })
 }
 
 pub fn reset_primary_hard(repo_path: &Path) {
@@ -244,19 +351,25 @@ pub fn maco_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_maco"))
 }
 
-pub fn write_cli_preview_watermark(lane: &MergeLane, watermark_path: &Path) {
-    let output = Command::new(maco_bin())
-        .arg("merge")
-        .arg("preview")
-        .arg(&lane.agent_id)
-        .arg("--repo")
-        .arg(lane.repo.repo_path())
-        .arg("--claim")
-        .arg(lane.claim_path)
-        .arg("--json")
-        .env("RUST_LOG", "off")
-        .output()
-        .expect("spawn maco merge preview");
+pub fn write_cli_preview_watermark(
+    lane: &MergeLane,
+    watermark_path: &Path,
+    latencies: &OperationLatencies,
+) {
+    let output = timed(latencies, || {
+        Command::new(maco_bin())
+            .arg("merge")
+            .arg("preview")
+            .arg(&lane.agent_id)
+            .arg("--repo")
+            .arg(lane.repo.repo_path())
+            .arg("--claim")
+            .arg(lane.claim_path)
+            .arg("--json")
+            .env("RUST_LOG", "off")
+            .output()
+            .expect("spawn maco merge preview")
+    });
     if !output.status.success() {
         panic!(
             "maco merge preview failed (status {:?}): stderr={} stdout={}",
@@ -268,21 +381,27 @@ pub fn write_cli_preview_watermark(lane: &MergeLane, watermark_path: &Path) {
     fs::write(watermark_path, output.stdout).expect("write reviewed preview JSON");
 }
 
-pub fn cli_merge_apply(lane: &MergeLane, watermark_path: &Path) -> serde_json::Value {
-    let output = Command::new(maco_bin())
-        .arg("merge")
-        .arg("apply")
-        .arg(&lane.agent_id)
-        .arg("--repo")
-        .arg(lane.repo.repo_path())
-        .arg("--claim")
-        .arg(lane.claim_path)
-        .arg("--reviewed-watermark")
-        .arg(watermark_path)
-        .arg("--json")
-        .env("RUST_LOG", "off")
-        .output()
-        .expect("spawn maco merge apply");
+pub fn cli_merge_apply(
+    lane: &MergeLane,
+    watermark_path: &Path,
+    latencies: &OperationLatencies,
+) -> serde_json::Value {
+    let output = timed(latencies, || {
+        Command::new(maco_bin())
+            .arg("merge")
+            .arg("apply")
+            .arg(&lane.agent_id)
+            .arg("--repo")
+            .arg(lane.repo.repo_path())
+            .arg("--claim")
+            .arg(lane.claim_path)
+            .arg("--reviewed-watermark")
+            .arg(watermark_path)
+            .arg("--json")
+            .env("RUST_LOG", "off")
+            .output()
+            .expect("spawn maco merge apply")
+    });
     if !output.status.success() {
         panic!(
             "maco merge apply failed (status {:?}): stderr={} stdout={}",
@@ -346,8 +465,10 @@ pub fn eprint_identity_once(sample_path: &Path) {
         eprintln!(
             "coordination_envelope_identity os={} arch={} rustc={} filesystem={} \
              criterion=samples:10,warmup_ms:300,measure_ms:700 \
-             p50=criterion_estimated_median \
-             p95_p99=criterion_bootstrap_percentiles_same_window_not_ci_gates \
+             p50=observed_nearest_rank_n>=1 \
+             p95=observed_nearest_rank_n>=20_else_UNAVAILABLE \
+             p99=observed_nearest_rank_n>=100_else_UNAVAILABLE \
+             criterion_bootstrap=not_an_operation_latency_percentile \
              lock_wait_hold=UNAVAILABLE \
              ntfs3_sweep=UNAVAILABLE \
              classify_semantic_conflicts=UNAVAILABLE \
