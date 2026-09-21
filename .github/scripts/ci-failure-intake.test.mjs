@@ -69,6 +69,33 @@ function markerFor(workflowId, branch = BRANCH) {
   )} -->`;
 }
 
+function evidenceMarkerFor(run) {
+  const evidenceTuple = JSON.stringify([
+    "run_id",
+    run.id,
+    "run_number",
+    run.run_number,
+    "run_attempt",
+    run.run_attempt,
+    "head_sha",
+    String(run.head_sha).toLowerCase(),
+  ]);
+  return `<!-- public-repo-ci-failure-evidence:v1:${Buffer.from(
+    evidenceTuple,
+    "utf8",
+  ).toString("base64url")} -->`;
+}
+
+function trackedIssue(number, run, { state = "open", body } = {}) {
+  return {
+    number,
+    state,
+    body:
+      body ??
+      `${markerFor(run.workflow_id)}\n${evidenceMarkerFor(run)}\n`,
+  };
+}
+
 function listedView(run) {
   return {
     id: run.id,
@@ -647,4 +674,210 @@ test("current-tip Rust CI failure still opens a marker-keyed issue", async () =>
     callsOf(harness, "issues.listForRepo")[0].params.labels,
     "ci-failure",
   );
+});
+
+function closedIssueNumbers(harness) {
+  return callsOf(harness, "issues.update")
+    .filter((call) => call.params.state === "closed")
+    .map((call) => call.params.issue_number);
+}
+
+test("stale attempt-1 success does not close a duplicate that records failed attempt 2", async () => {
+  const attemptOneSuccess = baseRun({
+    id: 50,
+    run_number: 50,
+    run_attempt: 1,
+    conclusion: "success",
+  });
+  const attemptTwoFailure = baseRun({
+    id: 50,
+    run_number: 50,
+    run_attempt: 2,
+    conclusion: "failure",
+  });
+  const harness = await runIntake(attemptOneSuccess, {
+    issues: [
+      trackedIssue(10, attemptOneSuccess),
+      trackedIssue(11, attemptTwoFailure),
+    ],
+    workflowRuns: [attemptOneSuccess],
+  });
+  assert.match(
+    harness.notices[0],
+    /tracked issue already records a newer run or attempt/,
+  );
+  assert.deepEqual(harness.failures, []);
+  assert.deepEqual(mutationMethods(harness), []);
+  assert.deepEqual(closedIssueNumbers(harness), []);
+});
+
+test("stale success does not close a duplicate that records a newer distinct run", async () => {
+  const olderSuccess = baseRun({
+    id: 101,
+    run_number: 101,
+    conclusion: "success",
+  });
+  const newerFailure = baseRun({
+    id: 102,
+    run_number: 102,
+    conclusion: "failure",
+  });
+  const harness = await runIntake(olderSuccess, {
+    issues: [trackedIssue(10, olderSuccess), trackedIssue(11, newerFailure)],
+    workflowRuns: [olderSuccess],
+  });
+  assert.match(
+    harness.notices[0],
+    /tracked issue already records a newer run or attempt/,
+  );
+  assert.deepEqual(mutationMethods(harness), []);
+  assert.deepEqual(closedIssueNumbers(harness), []);
+});
+
+test("duplicate replay of the newest failure consolidates onto the canonical tracker", async () => {
+  const attemptTwoFailure = baseRun({
+    id: 50,
+    run_number: 50,
+    run_attempt: 2,
+    conclusion: "failure",
+  });
+  const harness = await runIntake(attemptTwoFailure, {
+    issues: [
+      trackedIssue(10, attemptTwoFailure),
+      trackedIssue(11, attemptTwoFailure),
+    ],
+    workflowRuns: [attemptTwoFailure],
+  });
+  const updates = callsOf(harness, "issues.update");
+  assert.equal(callsOf(harness, "issues.create").length, 0);
+  assert.equal(callsOf(harness, "issues.createComment").length, 0);
+  assert.equal(updates[0].params.issue_number, 10);
+  assert.ok(updates[0].params.body.includes(evidenceMarkerFor(attemptTwoFailure)));
+  assert.notEqual(updates[0].params.state, "closed");
+  assert.equal(updates[1].params.issue_number, 11);
+  assert.equal(updates[1].params.state, "closed");
+  assert.equal(updates[1].params.state_reason, "completed");
+  assert.deepEqual(closedIssueNumbers(harness), [11]);
+});
+
+test("current attempt-2 success recovers duplicated trackers onto the canonical issue", async () => {
+  const attemptOneFailure = baseRun({
+    id: 50,
+    run_number: 50,
+    run_attempt: 1,
+    conclusion: "failure",
+  });
+  const attemptTwoFailure = baseRun({
+    id: 50,
+    run_number: 50,
+    run_attempt: 2,
+    conclusion: "failure",
+  });
+  const attemptTwoSuccess = baseRun({
+    id: 50,
+    run_number: 50,
+    run_attempt: 2,
+    conclusion: "success",
+  });
+  const harness = await runIntake(attemptTwoSuccess, {
+    issues: [
+      trackedIssue(10, attemptOneFailure),
+      trackedIssue(11, attemptTwoFailure),
+    ],
+    workflowRuns: [attemptOneFailure, attemptTwoSuccess],
+  });
+  const comments = callsOf(harness, "issues.createComment");
+  const updates = callsOf(harness, "issues.update");
+  assert.equal(comments.length, 1);
+  assert.equal(comments[0].params.issue_number, 10);
+  assert.match(comments[0].params.body, /CI recovered/);
+  assert.equal(updates[0].params.issue_number, 10);
+  assert.equal(updates[0].params.state, "closed");
+  assert.ok(updates[0].params.body.includes(evidenceMarkerFor(attemptTwoSuccess)));
+  assert.equal(updates[1].params.issue_number, 11);
+  assert.equal(updates[1].params.state, "closed");
+  assert.deepEqual(closedIssueNumbers(harness), [10, 11]);
+});
+
+test("newest validated evidence is written to the canonical tracker before duplicates close", async () => {
+  const attemptOneFailure = baseRun({
+    id: 50,
+    run_number: 50,
+    run_attempt: 1,
+    conclusion: "failure",
+  });
+  const attemptTwoFailure = baseRun({
+    id: 50,
+    run_number: 50,
+    run_attempt: 2,
+    conclusion: "failure",
+  });
+  const harness = await runIntake(attemptTwoFailure, {
+    issues: [
+      trackedIssue(10, attemptOneFailure),
+      trackedIssue(11, attemptTwoFailure),
+    ],
+    workflowRuns: [attemptTwoFailure],
+  });
+  const updates = callsOf(harness, "issues.update");
+  assert.equal(updates[0].params.issue_number, 10);
+  assert.ok(updates[0].params.body.includes(evidenceMarkerFor(attemptTwoFailure)));
+  assert.notEqual(updates[0].params.state, "closed");
+  assert.equal(updates[1].params.issue_number, 11);
+  assert.equal(updates[1].params.state, "closed");
+});
+
+test("missing evidence on the oldest tracker still honors newer duplicate evidence", async () => {
+  const attemptOneSuccess = baseRun({
+    id: 50,
+    run_number: 50,
+    run_attempt: 1,
+    conclusion: "success",
+  });
+  const attemptTwoFailure = baseRun({
+    id: 50,
+    run_number: 50,
+    run_attempt: 2,
+    conclusion: "failure",
+  });
+  const harness = await runIntake(attemptOneSuccess, {
+    issues: [
+      {
+        number: 10,
+        state: "open",
+        body: `${markerFor(RUST_WORKFLOW_ID)}\n`,
+      },
+      trackedIssue(11, attemptTwoFailure),
+    ],
+    workflowRuns: [attemptOneSuccess],
+  });
+  assert.match(
+    harness.notices[0],
+    /tracked issue already records a newer run or attempt/,
+  );
+  assert.deepEqual(mutationMethods(harness), []);
+});
+
+test("fails closed when a matching tracker has unreadable evidence", async () => {
+  const attemptOneSuccess = baseRun({
+    id: 50,
+    run_number: 50,
+    run_attempt: 1,
+    conclusion: "success",
+  });
+  const harness = await runIntake(attemptOneSuccess, {
+    issues: [
+      trackedIssue(10, attemptOneSuccess),
+      {
+        number: 11,
+        state: "open",
+        body: `${markerFor(RUST_WORKFLOW_ID)}\n<!-- public-repo-ci-failure-evidence:v1:not-valid -->\n`,
+      },
+    ],
+    workflowRuns: [attemptOneSuccess],
+  });
+  assert.deepEqual(harness.failures, [
+    "The tracked issue evidence could not be read.",
+  ]);
+  assert.deepEqual(mutationMethods(harness), []);
 });
