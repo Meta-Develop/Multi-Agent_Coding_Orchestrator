@@ -388,6 +388,17 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         .iter()
         .map(|fragment| fragment.id.clone())
         .collect::<Vec<_>>();
+    let declared_dependencies = proposal
+        .assignments
+        .iter()
+        .filter(|assignment| !assignment.decision_dependencies.is_empty())
+        .map(|assignment| {
+            (
+                assignment.id.clone(),
+                assignment.decision_dependencies.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut spec_fragment_ids_by_assignment = BTreeMap::new();
     let mut assignment_metadata = AssignmentMetadata::new();
     let workstream_count = proposal.assignments.len();
@@ -512,7 +523,14 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
             flattened_index: execution_index,
         });
     }
-    apply_generated_design_decisions(repo, goal, spec, &mut assignments, &assignment_schedule)?;
+    apply_generated_design_decisions(
+        repo,
+        goal,
+        spec,
+        &mut assignments,
+        &assignment_schedule,
+        &declared_dependencies,
+    )?;
     let task = combined_goal_spec(goal, spec);
     let plan = SupervisorPlan {
         version: SUPERVISOR_SCHEMA_VERSION,
@@ -1262,7 +1280,15 @@ fn supervisor_plan_and_consultant_from_provider_session(
             &mut actual_max_depth,
         )?;
     }
-    apply_generated_design_decisions(repo, goal, spec, &mut assignments, &assignment_schedule)?;
+    let declared_dependencies = collect_provider_tree_decision_dependencies(roots);
+    apply_generated_design_decisions(
+        repo,
+        goal,
+        spec,
+        &mut assignments,
+        &assignment_schedule,
+        &declared_dependencies,
+    )?;
     if assignments.is_empty() || current_fragment_ids.is_empty() {
         bail!("provider planning session has no executable remaining work");
     }
@@ -1411,14 +1437,7 @@ fn lower_provider_assignment_tree(
     Ok(())
 }
 
-const GENERATED_DESIGN_DECISION_MARKER: &str = "design-decision:";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GeneratedDesignDecision {
-    question_key: String,
-    question: String,
-    resolution: String,
-}
+type GeneratedDesignDecision = planning::DeclaredDesignDecision;
 
 fn apply_generated_design_decisions(
     repo: Option<&Path>,
@@ -1426,6 +1445,7 @@ fn apply_generated_design_decisions(
     spec: &str,
     assignments: &mut [OrchestratorAssignment],
     schedule: &[AssignmentScheduleEntry],
+    declared_dependencies: &BTreeMap<String, Vec<String>>,
 ) -> Result<()> {
     let decisions = collect_generated_design_decisions(goal, spec, assignments)?;
     if decisions.is_empty() {
@@ -1438,17 +1458,24 @@ fn apply_generated_design_decisions(
         let dependents = assignments
             .iter()
             .filter(|assignment| {
-                execution_assignment_depends_on_decision(assignment, &decision, &scope)
+                let declared_keys =
+                    declared_keys_for_assignment(&assignment.id, schedule, declared_dependencies);
+                execution_assignment_depends_on_decision(
+                    assignment,
+                    &decision,
+                    &scope,
+                    &declared_keys,
+                )
             })
             .map(|assignment| assignment.id.clone())
             .collect::<Vec<_>>();
         if dependents.is_empty() {
-            continue;
+            bail!(
+                "generated design decision '{}' was not mapped to any dependent execution assignment; dependent dispatch is blocked until reconciled",
+                decision.question_key
+            );
         }
         pending.push((decision, scope, dependents));
-    }
-    if pending.is_empty() {
-        return Ok(());
     }
     let Some(repo) = repo else {
         bail!(
@@ -1486,6 +1513,51 @@ fn apply_generated_design_decisions(
     Ok(())
 }
 
+fn collect_provider_tree_decision_dependencies(
+    roots: &[planning::ProviderTaskAssignmentTree],
+) -> BTreeMap<String, Vec<String>> {
+    let mut declared = BTreeMap::new();
+    for root in roots {
+        collect_provider_node_decision_dependencies(root, &mut declared);
+    }
+    declared
+}
+
+fn collect_provider_node_decision_dependencies(
+    node: &planning::ProviderTaskAssignmentTree,
+    declared: &mut BTreeMap<String, Vec<String>>,
+) {
+    if !node.decision_dependencies.is_empty() {
+        declared.insert(node.id.clone(), node.decision_dependencies.clone());
+    }
+    for child in &node.child_assignments {
+        collect_provider_node_decision_dependencies(child, declared);
+    }
+}
+
+fn declared_keys_for_assignment(
+    assignment_id: &str,
+    schedule: &[AssignmentScheduleEntry],
+    declared: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut current = Some(assignment_id);
+    let mut seen = BTreeSet::new();
+    while let Some(id) = current {
+        if !seen.insert(id.to_string()) {
+            break;
+        }
+        if let Some(declared_keys) = declared.get(id) {
+            keys.extend(declared_keys.iter().cloned());
+        }
+        current = schedule
+            .iter()
+            .find(|entry| entry.assignment_id == id)
+            .and_then(|entry| entry.parent_assignment_id.as_deref());
+    }
+    keys
+}
+
 fn collect_generated_design_decisions(
     goal: &str,
     spec: &str,
@@ -1502,49 +1574,7 @@ fn collect_generated_design_decisions(
 }
 
 fn parse_generated_design_decisions(text: &str) -> Result<Vec<GeneratedDesignDecision>> {
-    let mut by_key = BTreeMap::new();
-    let mut remaining = text;
-    while let Some(offset) = remaining.find(GENERATED_DESIGN_DECISION_MARKER) {
-        let after = remaining[offset + GENERATED_DESIGN_DECISION_MARKER.len()..].trim_start();
-        let parsed = parse_one_generated_design_decision(after)?;
-        if let Some(existing) = by_key.get(&parsed.question_key) {
-            if existing != &parsed {
-                bail!(
-                    "generated design decision '{}' has inconsistent question or resolution; dependent dispatch is blocked until reconciled",
-                    parsed.question_key
-                );
-            }
-        } else {
-            by_key.insert(parsed.question_key.clone(), parsed);
-        }
-        remaining = after;
-    }
-    Ok(by_key.into_values().collect())
-}
-
-fn parse_one_generated_design_decision(after_marker: &str) -> Result<GeneratedDesignDecision> {
-    let Some((question_key, rest)) = after_marker.split_once(':') else {
-        bail!("generated design-decision is missing a question-key terminator ':'");
-    };
-    let Some((question, resolution)) = rest.split_once(" = ") else {
-        bail!(
-            "generated design-decision '{}' is missing ' = ' between question and resolution",
-            question_key.trim()
-        );
-    };
-    let resolution = resolution
-        .lines()
-        .next()
-        .unwrap_or(resolution)
-        .trim()
-        .trim_end_matches('.')
-        .trim();
-    let reference = DecisionRef::new(question_key)?;
-    Ok(GeneratedDesignDecision {
-        question_key: reference.question_key().to_string(),
-        question: question.trim().to_string(),
-        resolution: resolution.to_string(),
-    })
+    planning::parse_declared_design_decisions(text)
 }
 
 fn generated_decision_scope(question_key: &str) -> Result<DecisionScope> {
@@ -1564,9 +1594,16 @@ fn execution_assignment_depends_on_decision(
     assignment: &OrchestratorAssignment,
     decision: &GeneratedDesignDecision,
     scope: &DecisionScope,
+    declared_keys: &[String],
 ) -> bool {
     if assignment.phase != AssignmentPhase::Execution {
         return false;
+    }
+    if declared_keys
+        .iter()
+        .any(|key| key == &decision.question_key)
+    {
+        return true;
     }
     let task = assignment.task.as_deref().unwrap_or("");
     task.contains(decision.question_key.as_str())
@@ -5868,7 +5905,11 @@ mod generated_design_decision_lifecycle_tests {
     #[cfg(unix)]
     use crate::decision_store::DecisionStore;
     #[cfg(unix)]
+    use crate::llm::fake::FakeProvider;
+    #[cfg(unix)]
     use crate::merge::check_merge_arbitration_decision_refs;
+    #[cfg(unix)]
+    use crate::planning::{ProviderPlanningConfig, ProviderTaskPlan, TaskAssignmentProposal};
     #[cfg(unix)]
     use std::fs;
     use std::path::PathBuf;
@@ -5924,6 +5965,18 @@ mod generated_design_decision_lifecycle_tests {
         }
     }
 
+    fn generated_assignment_with_scope(
+        id: &str,
+        phase: AssignmentPhase,
+        path: &str,
+        task: Option<&str>,
+        modules: &[&str],
+    ) -> OrchestratorAssignment {
+        let mut assignment = generated_assignment(id, phase, path, task);
+        assignment.semantic_modules = modules.iter().map(|module| (*module).to_string()).collect();
+        assignment
+    }
+
     fn generated_schedule(ids: &[(&str, Option<&str>)]) -> Vec<AssignmentScheduleEntry> {
         ids.iter()
             .enumerate()
@@ -5936,6 +5989,23 @@ mod generated_design_decision_lifecycle_tests {
                     MIN_SUPERVISOR_DEPTH
                 },
                 flattened_index: index,
+            })
+            .collect()
+    }
+
+    fn empty_declared_dependencies() -> BTreeMap<String, Vec<String>> {
+        BTreeMap::new()
+    }
+
+    #[cfg(unix)]
+    fn declared_dependencies(pairs: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
+        pairs
+            .iter()
+            .map(|(id, keys)| {
+                (
+                    (*id).to_string(),
+                    keys.iter().map(|key| (*key).to_string()).collect(),
+                )
             })
             .collect()
     }
@@ -6012,6 +6082,7 @@ mod generated_design_decision_lifecycle_tests {
             SHARED_DESIGN_SPEC,
             &mut assignments,
             &schedule,
+            &empty_declared_dependencies(),
         )
         .expect_err("dependents require an authenticated DecisionStore");
         assert!(
@@ -6046,6 +6117,7 @@ mod generated_design_decision_lifecycle_tests {
             "- Update README.md with usage notes.\n",
             &mut assignments,
             &schedule,
+            &empty_declared_dependencies(),
         )
         .expect("ordinary work without design deps");
         assert!(assignments[0].decision_refs.is_empty());
@@ -6111,6 +6183,7 @@ mod generated_design_decision_lifecycle_tests {
             "- Update README.md with usage notes.\n",
             &mut assignments,
             &schedule,
+            &empty_declared_dependencies(),
         )
         .expect("ordinary work without design deps");
         assert!(assignments[0].decision_refs.is_empty());
@@ -6186,6 +6259,7 @@ mod generated_design_decision_lifecycle_tests {
             SHARED_DESIGN_SPEC,
             &mut assignments,
             &schedule,
+            &empty_declared_dependencies(),
         )
         .expect("stamp dependents through the authenticated writer");
 
@@ -6333,6 +6407,7 @@ mod generated_design_decision_lifecycle_tests {
             SHARED_DESIGN_SPEC,
             &mut leftover,
             &leftover_schedule,
+            &empty_declared_dependencies(),
         )
         .expect("leftover re-admission must reuse the resolved decision");
         assert_eq!(
@@ -6388,8 +6463,15 @@ mod generated_design_decision_lifecycle_tests {
             ("client", Some("parent")),
             ("server", Some("parent")),
         ]);
-        apply_generated_design_decisions(Some(&repo), "", spec, &mut assignments, &schedule)
-            .expect("recursive lowering stamps dependents from the store");
+        apply_generated_design_decisions(
+            Some(&repo),
+            "",
+            spec,
+            &mut assignments,
+            &schedule,
+            &empty_declared_dependencies(),
+        )
+        .expect("recursive lowering stamps dependents from the store");
         let expected = shared_transport_ref();
         assert!(assignments
             .iter()
@@ -6430,6 +6512,7 @@ mod generated_design_decision_lifecycle_tests {
             SHARED_DESIGN_SPEC,
             &mut assignments,
             &schedule,
+            &empty_declared_dependencies(),
         )
         .expect_err("foreign open claim must block dependents");
         assert!(
@@ -6437,6 +6520,301 @@ mod generated_design_decision_lifecycle_tests {
                 || format!("{error:#}").contains("foreign-planner")
                 || format!("{error:#}").contains("blocked dependent dispatch"),
             "conflicting ownership must block generated dependent dispatch: {error:#}"
+        );
+    }
+
+    const PARAPHRASED_TRANSPORT_SPEC: &str = concat!(
+        "- Implement client transport in crate::client. design-decision: api.transport: Which shared wire protocol? = JSON over HTTP\n",
+        "- Implement server transport in crate::server. design-decision: api.transport: Which shared wire protocol? = JSON over HTTP\n",
+    );
+
+    #[cfg(unix)]
+    fn json_over_http_ref() -> DecisionRef {
+        DecisionRef::new("api.transport")
+            .expect("valid key")
+            .with_expected_resolution("JSON over HTTP")
+            .expect("valid resolution")
+    }
+
+    fn paraphrased_transport_graph() -> (Vec<OrchestratorAssignment>, Vec<AssignmentScheduleEntry>)
+    {
+        (
+            vec![
+                generated_assignment_with_scope(
+                    "client",
+                    AssignmentPhase::Execution,
+                    "src/client.rs",
+                    Some("Implement client transport"),
+                    &["crate::client"],
+                ),
+                generated_assignment_with_scope(
+                    "server",
+                    AssignmentPhase::Execution,
+                    "src/server.rs",
+                    Some("Implement server transport"),
+                    &["crate::server"],
+                ),
+            ],
+            generated_schedule(&[("client", None), ("server", None)]),
+        )
+    }
+
+    #[test]
+    fn paraphrased_namespaced_assignments_without_declared_deps_are_rejected() {
+        let (mut assignments, schedule) = paraphrased_transport_graph();
+        let error = apply_generated_design_decisions(
+            None,
+            "",
+            PARAPHRASED_TRANSPORT_SPEC,
+            &mut assignments,
+            &schedule,
+            &empty_declared_dependencies(),
+        )
+        .expect_err("unmapped paraphrased dependents must not dispatch");
+        assert!(
+            error.to_string().contains("was not mapped")
+                || error.to_string().contains("blocked until reconciled"),
+            "silent skip is forbidden: {error:#}"
+        );
+        assert!(assignments
+            .iter()
+            .all(|assignment| assignment.decision_refs.is_empty()));
+        assert!(assignments.iter().all(|assignment| {
+            !assignment
+                .task
+                .as_deref()
+                .unwrap_or("")
+                .contains("api.transport")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paraphrased_namespaced_declared_deps_stamp_authenticated_decision_refs() {
+        let (_temp, repo) = disjoint_design_repo();
+        let (mut assignments, schedule) = paraphrased_transport_graph();
+        apply_generated_design_decisions(
+            Some(&repo),
+            "",
+            PARAPHRASED_TRANSPORT_SPEC,
+            &mut assignments,
+            &schedule,
+            &declared_dependencies(&[
+                ("client", &["api.transport"]),
+                ("server", &["api.transport"]),
+            ]),
+        )
+        .expect("declared paraphrased dependents must stamp");
+        let expected = json_over_http_ref();
+        assert_eq!(
+            assignments[0].decision_refs.as_slice(),
+            std::slice::from_ref(&expected)
+        );
+        assert_eq!(
+            assignments[1].decision_refs.as_slice(),
+            std::slice::from_ref(&expected)
+        );
+        let store = DecisionStore::open_existing(&repo)
+            .expect("query store")
+            .expect("declared mapping must persist the authenticated decision");
+        let registry = store.load_registry().expect("load");
+        crate::decision_ref::check_decision_ref(&registry, &expected)
+            .expect("stamped refs must match the persisted resolved record");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ancestor_declared_decision_dependency_stamps_paraphrased_children() {
+        let (_temp, repo) = disjoint_design_repo();
+        let mut assignments = vec![
+            generated_assignment(
+                "parent",
+                AssignmentPhase::Planning,
+                "src/client.rs",
+                Some("Coordinate shared wire adapters"),
+            ),
+            generated_assignment_with_scope(
+                "client",
+                AssignmentPhase::Execution,
+                "src/client.rs",
+                Some("Implement client transport"),
+                &["crate::client"],
+            ),
+            generated_assignment_with_scope(
+                "server",
+                AssignmentPhase::Execution,
+                "src/server.rs",
+                Some("Implement server transport"),
+                &["crate::server"],
+            ),
+        ];
+        let schedule = generated_schedule(&[
+            ("parent", None),
+            ("client", Some("parent")),
+            ("server", Some("parent")),
+        ]);
+        apply_generated_design_decisions(
+            Some(&repo),
+            "",
+            PARAPHRASED_TRANSPORT_SPEC,
+            &mut assignments,
+            &schedule,
+            &declared_dependencies(&[("parent", &["api.transport"])]),
+        )
+        .expect("ancestor mapping must stamp execution children");
+        let expected = json_over_http_ref();
+        assert!(assignments
+            .iter()
+            .find(|assignment| assignment.id == "parent")
+            .expect("parent")
+            .decision_refs
+            .is_empty());
+        assert_eq!(
+            assignments
+                .iter()
+                .find(|assignment| assignment.id == "client")
+                .expect("client")
+                .decision_refs
+                .as_slice(),
+            std::slice::from_ref(&expected)
+        );
+        assert_eq!(
+            assignments
+                .iter()
+                .find(|assignment| assignment.id == "server")
+                .expect("server")
+                .decision_refs
+                .as_slice(),
+            std::slice::from_ref(&expected)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_provider_path_stamps_paraphrased_dependents_and_refuses_contradictory_sibling() {
+        skip_without_containment!();
+        let (_temp, repo) = disjoint_design_repo();
+        let spec = PARAPHRASED_TRANSPORT_SPEC;
+        let config = ProviderPlanningConfig::new("generated-path", "planner-model");
+        let mapped = ProviderTaskPlan {
+            assignments: vec![
+                TaskAssignmentProposal {
+                    id: "client".to_string(),
+                    task: "Implement client transport".to_string(),
+                    fragment_ids: vec!["fragment-001".to_string()],
+                    assigned_paths: vec![PathBuf::from("src/client.rs")],
+                    semantic_symbols: Vec::new(),
+                    semantic_modules: vec!["crate::client".to_string()],
+                    decision_dependencies: vec!["api.transport".to_string()],
+                },
+                TaskAssignmentProposal {
+                    id: "server".to_string(),
+                    task: "Implement server transport".to_string(),
+                    fragment_ids: vec!["fragment-002".to_string()],
+                    assigned_paths: vec![PathBuf::from("src/server.rs")],
+                    semantic_symbols: Vec::new(),
+                    semantic_modules: vec!["crate::server".to_string()],
+                    decision_dependencies: vec!["api.transport".to_string()],
+                },
+            ],
+        };
+        let mut provider = FakeProvider::new("fake-planner", "planner-model");
+        provider
+            .push_json_response("generated-path-proposal", &mapped)
+            .expect("script mapped proposal");
+        let session = crate::planning::propose_task_decomposition_with_provider(
+            &repo,
+            "",
+            spec,
+            &mut provider,
+            &config,
+        )
+        .expect("generated proposal");
+        let plan = supervisor_plan_from_task_planning_session_in_repo(&repo, "", spec, &session)
+            .expect("normal planning path must stamp declared dependents");
+        let expected = json_over_http_ref();
+        let client = plan
+            .assignments
+            .iter()
+            .find(|assignment| assignment.id == "client")
+            .expect("client");
+        let server = plan
+            .assignments
+            .iter()
+            .find(|assignment| assignment.id == "server")
+            .expect("server");
+        assert_eq!(
+            client.decision_refs.as_slice(),
+            std::slice::from_ref(&expected)
+        );
+        assert_eq!(
+            server.decision_refs.as_slice(),
+            std::slice::from_ref(&expected)
+        );
+        assert!(!client
+            .task
+            .as_deref()
+            .unwrap_or("")
+            .contains("api.transport"));
+        assert_eq!(client.semantic_modules, vec!["crate::client".to_string()]);
+        assert_eq!(server.semantic_modules, vec!["crate::server".to_string()]);
+        let store = DecisionStore::open_existing(&repo)
+            .expect("query store")
+            .expect("generated planning must persist the authenticated decision");
+        let registry = store.load_registry().expect("load");
+        crate::decision_ref::check_decision_ref(&registry, &expected)
+            .expect("stamped refs must match the persisted resolved record");
+
+        let contradictory = ProviderTaskPlan {
+            assignments: vec![
+                TaskAssignmentProposal {
+                    id: "client-b".to_string(),
+                    task: "Implement client transport".to_string(),
+                    fragment_ids: vec!["fragment-001".to_string()],
+                    assigned_paths: vec![PathBuf::from("src/client.rs")],
+                    semantic_symbols: Vec::new(),
+                    semantic_modules: vec!["crate::client".to_string()],
+                    decision_dependencies: vec!["api.transport".to_string()],
+                },
+                TaskAssignmentProposal {
+                    id: "server-b".to_string(),
+                    task: "Implement server transport".to_string(),
+                    fragment_ids: vec!["fragment-002".to_string()],
+                    assigned_paths: vec![PathBuf::from("src/server.rs")],
+                    semantic_symbols: Vec::new(),
+                    semantic_modules: vec!["crate::server".to_string()],
+                    decision_dependencies: vec!["api.transport".to_string()],
+                },
+            ],
+        };
+        let contradictory_spec = concat!(
+            "- Implement client transport in crate::client. design-decision: api.transport: Which shared wire protocol? = gRPC\n",
+            "- Implement server transport in crate::server. design-decision: api.transport: Which shared wire protocol? = gRPC\n",
+        );
+        let sibling_config = ProviderPlanningConfig::new("generated-path-sibling", "planner-model");
+        provider
+            .push_json_response("generated-path-sibling-proposal", &contradictory)
+            .expect("script contradictory sibling");
+        let sibling_session = crate::planning::propose_task_decomposition_with_provider(
+            &repo,
+            "",
+            contradictory_spec,
+            &mut provider,
+            &sibling_config,
+        )
+        .expect("contradictory sibling proposal is representable");
+        let sibling_error = supervisor_plan_from_task_planning_session_in_repo(
+            &repo,
+            "",
+            contradictory_spec,
+            &sibling_session,
+        )
+        .expect_err("contradictory sibling dispatch must be refused");
+        assert!(
+            format!("{sibling_error:#}").contains("inconsistent resolutions")
+                || format!("{sibling_error:#}").contains("blocked dependent dispatch")
+                || format!("{sibling_error:#}").contains("ResolutionMismatch"),
+            "sibling dispatch must refuse a contradictory resolution: {sibling_error:#}"
         );
     }
 }
