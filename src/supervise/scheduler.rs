@@ -4004,13 +4004,12 @@ fn account_observation_for_launch_runtime(
                         harness.adapter.as_ref(),
                         provider_id,
                     )
-                    .map(|observation| {
+                    .inspect(|observation| {
                         freeze_observed_grok_from_registry(
                             provider_id,
                             &harness.registry,
                             observation.as_ref(),
                         );
-                        observation
                     })
                 })
             }) {
