@@ -16,31 +16,64 @@ use serde_json::{json, Value};
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Authority identity plus observation for one selected account.
+#[cfg(target_os = "linux")]
+pub(crate) struct ObservedSocketSelection {
+    pub authority_id: String,
+    pub observation: AccountObserveResult,
+}
+
 /// Observe the selected account for `provider_id` via a configured authority socket.
 #[cfg(target_os = "linux")]
 pub(crate) fn observe_selected_via_authority_socket(
     configured: &Path,
     provider_id: &str,
 ) -> Result<Option<AccountObserveResult>> {
+    Ok(
+        observe_selected_authority_via_socket(configured, provider_id)?
+            .map(|observed| observed.observation),
+    )
+}
+
+/// Observe the selected account and return the socket authority identity used.
+#[cfg(target_os = "linux")]
+pub(crate) fn observe_selected_authority_via_socket(
+    configured: &Path,
+    provider_id: &str,
+) -> Result<Option<ObservedSocketSelection>> {
+    let client = connect_authority_socket(configured)?;
+    let Some((authority_id, binding)) = client.selection_get(provider_id)? else {
+        return Ok(None);
+    };
+    let observation = client.account_observe(&authority_id, binding).with_context(|| {
+        format!(
+            "failed to observe selected Coding Agent Manager account for `{provider_id}` via authority socket"
+        )
+    })?;
+    Ok(Some(ObservedSocketSelection {
+        authority_id,
+        observation,
+    }))
+}
+
+/// Read the selected binding from a configured authority socket without observing models.
+#[cfg(target_os = "linux")]
+pub(crate) fn selected_binding_via_authority_socket(
+    configured: &Path,
+    provider_id: &str,
+) -> Result<Option<(String, SelectedAccountBinding)>> {
+    connect_authority_socket(configured)?.selection_get(provider_id)
+}
+
+#[cfg(target_os = "linux")]
+fn connect_authority_socket(configured: &Path) -> Result<AuthoritySocketClient> {
     let path = resolve_socket_path(configured).with_context(|| {
         format!(
             "CAM authority socket path `{}` failed ancestry checks",
             configured.display()
         )
     })?;
-    let client = AuthoritySocketClient { path };
-    let selection = client.selection_get(provider_id)?;
-    let Some((authority_id, binding)) = selection else {
-        return Ok(None);
-    };
-    client
-        .account_observe(&authority_id, binding)
-        .map(Some)
-        .with_context(|| {
-            format!(
-                "failed to observe selected Coding Agent Manager account for `{provider_id}` via authority socket"
-            )
-        })
+    Ok(AuthoritySocketClient { path })
 }
 
 #[cfg(target_os = "linux")]
@@ -432,5 +465,26 @@ mod tests {
             "unexpected error: {error:#}"
         );
         drop(dir);
+    }
+
+    #[test]
+    fn observe_selected_authority_returns_stable_authority_identity() {
+        let (_registry_dir, registry) = isolated_registry();
+        seed_selected_account(&registry);
+        let expected_authority =
+            coding_agent_manager_lib::account_authority::authority_id_for(registry.metadata_path());
+        let (_guard, listener) = listen_fixture(registry);
+        let socket_path = listener.path().to_path_buf();
+        thread::spawn(move || while listener.accept_once().is_ok() {});
+        let observed = observe_selected_authority_via_socket(&socket_path, "codex-cli")
+            .expect("observe")
+            .expect("selected binding");
+        assert_eq!(observed.authority_id, expected_authority);
+        assert_eq!(observed.observation.binding.account_id, "work");
+        let selected = selected_binding_via_authority_socket(&socket_path, "codex-cli")
+            .expect("selection.get")
+            .expect("selected");
+        assert_eq!(selected.0, expected_authority);
+        assert_eq!(selected.1.account_id, "work");
     }
 }
