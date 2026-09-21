@@ -390,6 +390,13 @@ impl RuntimeCapabilities {
         ..Self::GROK
     };
 
+    /// Capabilities of a launch that has proved the immutable Grok 4.7/xhigh
+    /// adapter contract. Runtime advertisement alone does not grant this row.
+    pub(super) const GROK_4_7_XHIGH: Self = Self {
+        side_effect_confinement: SideEffectConfinement::Verified,
+        ..Self::GROK
+    };
+
     pub const CURSOR: Self = Self {
         blocking_pre_action_callback: BlockingPreActionCallback::None,
         writable_workspace: WorkspaceWritability::Partial,

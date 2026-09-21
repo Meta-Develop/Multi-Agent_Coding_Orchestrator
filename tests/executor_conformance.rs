@@ -2802,63 +2802,113 @@ fn staged_input_digest_is_deterministic_and_binds_workspace_bytes() {
 }
 
 #[test]
-fn grok_46_xhigh_writable_capability_requires_the_bounded_leaf_contract() {
+fn grok_46_and_47_xhigh_writable_capabilities_require_the_bounded_leaf_contract() {
     let workspace = TempDir::new().expect("typed Grok workspace");
+    let prompt = workspace.path().join("prompt.txt");
+    let output = workspace.path().join("output.jsonl");
+    let config = RuntimeAdapterConfig::defaults(RuntimeId::Grok);
+    for (model, expected_runtime) in [
+        ("grok-4.6", TypedRuntime::Grok46Xhigh),
+        ("grok-4.7", TypedRuntime::Grok47Xhigh),
+    ] {
+        let context = LaunchContext {
+            prompt: &prompt,
+            model: Some(model),
+            effort: Some("xhigh"),
+            cwd: workspace.path(),
+            output: &output,
+        };
+        let contract = config
+            .typed_runtime_contract(AdapterId::Grok, &context)
+            .expect("canonical typed Grok/xhigh contract");
+
+        assert_eq!(contract.runtime(), expected_runtime);
+        assert!(contract.has_bounded_cwd());
+        assert!(contract.has_bounded_output());
+        assert!(contract.subagents_disabled());
+        let mut expected_capabilities = AdapterId::Grok.capabilities();
+        expected_capabilities.side_effect_confinement = SideEffectConfinement::Verified;
+        assert_eq!(contract.capabilities(), expected_capabilities);
+        assert_eq!(
+            contract.capabilities().side_effect_confinement,
+            SideEffectConfinement::Verified
+        );
+        assert!(contract.capabilities().admits_worktree_writable());
+        assert!(!contract.capabilities().admits_writable_release());
+        assert_eq!(
+            adapter_for(AdapterId::Grok).capabilities_for_launch(&context),
+            contract.capabilities()
+        );
+
+        let launch = config.render(&context).expect("render typed Grok launch");
+        assert_eq!(launch.cwd, workspace.path());
+        assert_eq!(launch.output_capture, OutputCaptureMode::Stdout);
+        assert!(launch.argv.windows(2).any(|pair| {
+            pair[0] == "--cwd" && pair[1] == workspace.path().display().to_string()
+        }));
+        assert!(launch
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "--model" && pair[1] == model));
+        assert_eq!(
+            launch
+                .argv
+                .iter()
+                .filter(|argument| argument.as_str() == "--no-subagents")
+                .count(),
+            1
+        );
+
+        let valid = b"{\"type\":\"end\",\"stopReason\":\"stop\",\"sessionId\":\"session\",\"requestId\":\"request\"}\n";
+        assert!(contract.parse_output(valid).is_ok());
+        let oversized = vec![b'x'; 8 * 1024 * 1024 + 1];
+        let error = contract
+            .parse_output(&oversized)
+            .expect_err("oversized Grok stream must fail closed");
+        assert!(format!("{error:#}").contains("byte limit"));
+    }
+}
+
+#[test]
+fn grok_47_xhigh_acp_keeps_immutable_argv_but_refuses_capability_elevation() {
+    let workspace = TempDir::new().expect("typed Grok ACP workspace");
     let prompt = workspace.path().join("prompt.txt");
     let output = workspace.path().join("output.jsonl");
     let context = LaunchContext {
         prompt: &prompt,
-        model: Some("grok-4.6"),
+        model: Some("grok-4.7"),
         effort: Some("xhigh"),
         cwd: workspace.path(),
         output: &output,
     };
-    let config = RuntimeAdapterConfig::defaults(RuntimeId::Grok);
-    let contract = config
+    let mut config = RuntimeAdapterConfig::defaults(RuntimeId::Grok);
+    config.grok_interaction_protocol =
+        multi_agent_coding_orchestrator::runtime_adapter::GrokInteractionProtocol::AcpStdio;
+    config.argument_template =
+        multi_agent_coding_orchestrator::runtime_adapter::grok::GROK_ACP_RUNTIME_DESCRIPTOR
+            .immutable_argument_template();
+
+    assert!(config
         .typed_runtime_contract(AdapterId::Grok, &context)
-        .expect("canonical Grok 4.6/xhigh contract");
-
-    assert_eq!(contract.runtime(), TypedRuntime::Grok46Xhigh);
-    assert!(contract.has_bounded_cwd());
-    assert!(contract.has_bounded_output());
-    assert!(contract.subagents_disabled());
-    let mut expected_capabilities = AdapterId::Grok.capabilities();
-    expected_capabilities.side_effect_confinement = SideEffectConfinement::Verified;
-    assert_eq!(contract.capabilities(), expected_capabilities);
-    assert_eq!(
-        contract.capabilities().side_effect_confinement,
-        SideEffectConfinement::Verified
-    );
-    assert!(contract.capabilities().admits_worktree_writable());
-    assert!(!contract.capabilities().admits_writable_release());
-    assert_eq!(
-        adapter_for(AdapterId::Grok).capabilities_for_launch(&context),
-        contract.capabilities()
-    );
-
-    let launch = config.render(&context).expect("render typed Grok launch");
-    assert_eq!(launch.cwd, workspace.path());
-    assert_eq!(launch.output_capture, OutputCaptureMode::Stdout);
+        .is_none());
+    let launch = config
+        .render(&context)
+        .expect("render typed Grok ACP launch");
     assert!(launch
         .argv
         .windows(2)
-        .any(|pair| { pair[0] == "--cwd" && pair[1] == workspace.path().display().to_string() }));
-    assert_eq!(
-        launch
-            .argv
-            .iter()
-            .filter(|argument| argument.as_str() == "--no-subagents")
-            .count(),
-        1
-    );
-
-    let valid = b"{\"type\":\"end\",\"stopReason\":\"stop\",\"sessionId\":\"session\",\"requestId\":\"request\"}\n";
-    assert!(contract.parse_output(valid).is_ok());
-    let oversized = vec![b'x'; 8 * 1024 * 1024 + 1];
-    let error = contract
-        .parse_output(&oversized)
-        .expect_err("oversized Grok stream must fail closed");
-    assert!(format!("{error:#}").contains("byte limit"));
+        .any(|pair| { pair[0] == "-m" && pair[1] == "grok-4.7" }));
+    for required in ["--no-subagents", "agent", "--no-leader", "stdio"] {
+        assert_eq!(
+            launch
+                .argv
+                .iter()
+                .filter(|argument| argument.as_str() == required)
+                .count(),
+            1,
+            "missing or duplicated immutable ACP argument {required}"
+        );
+    }
 }
 
 #[test]
@@ -2871,6 +2921,8 @@ fn grok_capability_elevation_fails_closed_and_other_runtimes_do_not_change() {
     for (model, effort) in [
         (Some("grok-4.5"), Some("xhigh")),
         (Some("grok-4.6"), Some("high")),
+        (Some("grok-4.7"), Some("high")),
+        (Some("grok-4.7-build-fast"), Some("xhigh")),
         (None, Some("xhigh")),
         (Some("grok-4.6"), None),
     ] {
@@ -2892,7 +2944,7 @@ fn grok_capability_elevation_fails_closed_and_other_runtimes_do_not_change() {
 
     let exact = LaunchContext {
         prompt: &prompt,
-        model: Some("grok-4.6"),
+        model: Some("grok-4.7"),
         effort: Some("xhigh"),
         cwd: workspace.path(),
         output: &output,

@@ -371,24 +371,38 @@ const GROK_ALWAYS_APPROVE_ARG: &str = "--always-approve";
 pub enum TypedRuntime {
     #[serde(rename = "grok-4.6-xhigh")]
     Grok46Xhigh,
+    #[serde(rename = "grok-4.7-xhigh")]
+    Grok47Xhigh,
 }
 
 impl TypedRuntime {
     pub const fn adapter_id(self) -> AdapterId {
         match self {
-            Self::Grok46Xhigh => AdapterId::Grok,
+            Self::Grok46Xhigh | Self::Grok47Xhigh => AdapterId::Grok,
         }
     }
 
     pub const fn model(self) -> &'static str {
         match self {
             Self::Grok46Xhigh => "grok-4.6",
+            Self::Grok47Xhigh => "grok-4.7",
         }
     }
 
     pub const fn reasoning_effort(self) -> &'static str {
         match self {
-            Self::Grok46Xhigh => "xhigh",
+            Self::Grok46Xhigh | Self::Grok47Xhigh => "xhigh",
+        }
+    }
+
+    pub fn from_model(adapter: AdapterId, model: Option<&str>) -> Option<Self> {
+        if adapter != AdapterId::Grok {
+            return None;
+        }
+        match model {
+            Some("grok-4.6") => Some(Self::Grok46Xhigh),
+            Some("grok-4.7") => Some(Self::Grok47Xhigh),
+            _ => None,
         }
     }
 
@@ -397,14 +411,8 @@ impl TypedRuntime {
         model: Option<&str>,
         reasoning_effort: Option<&str>,
     ) -> Option<Self> {
-        if adapter == AdapterId::Grok
-            && model == Some(Self::Grok46Xhigh.model())
-            && reasoning_effort == Some(Self::Grok46Xhigh.reasoning_effort())
-        {
-            Some(Self::Grok46Xhigh)
-        } else {
-            None
-        }
+        let runtime = Self::from_model(adapter, model)?;
+        (reasoning_effort == Some(runtime.reasoning_effort())).then_some(runtime)
     }
 }
 
@@ -436,6 +444,7 @@ impl TypedRuntimeContract {
     pub const fn capabilities(self) -> RuntimeCapabilities {
         match self.runtime {
             TypedRuntime::Grok46Xhigh => RuntimeCapabilities::GROK_4_6_XHIGH,
+            TypedRuntime::Grok47Xhigh => RuntimeCapabilities::GROK_4_7_XHIGH,
         }
     }
 
@@ -443,7 +452,9 @@ impl TypedRuntimeContract {
     /// enforces byte, line, event-count, and terminal-event bounds.
     pub fn parse_output(self, bytes: &[u8]) -> Result<grok::GrokParsedEventStream> {
         match self.runtime {
-            TypedRuntime::Grok46Xhigh => grok::parse_grok_event_stream(bytes),
+            TypedRuntime::Grok46Xhigh | TypedRuntime::Grok47Xhigh => {
+                grok::parse_grok_event_stream(bytes)
+            }
         }
     }
 
@@ -689,7 +700,7 @@ impl RuntimeAdapterConfig {
     ) -> Option<TypedRuntimeContract> {
         let runtime = TypedRuntime::from_launch(adapter, context.model, context.effort)?;
         match runtime {
-            TypedRuntime::Grok46Xhigh => {
+            TypedRuntime::Grok46Xhigh | TypedRuntime::Grok47Xhigh => {
                 if !context.cwd.is_absolute()
                     || !self.env_passthrough.is_empty()
                     || self.feed_prompt_on_stdin
@@ -708,6 +719,9 @@ impl RuntimeAdapterConfig {
                 expected_config.restore_immutable_grok_descriptor();
                 match self.grok_interaction_protocol {
                     GrokInteractionProtocol::AcpStdio => {
+                        if runtime == TypedRuntime::Grok47Xhigh {
+                            return None;
+                        }
                         // ACP structured output is parent/protocol-owned, never an argv flag.
                         let actual = self.render(context).ok()?;
                         let expected = expected_config.render(context).ok()?;

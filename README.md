@@ -1536,10 +1536,29 @@ usable launch; it is not coerced to the default. `MACO_GROK_ARGS` cannot replace
 Grok's immutable safety argv. `acp_stdio` renders contained
 `grok agent --no-leader … stdio`. Observed model and effort are client-resolved
 parent session evidence after `session/set_model`, not backend attestation.
+Writable managed-child launch retains the legacy exact typed contract for
+`grok-4.6`/`xhigh`. The standard `grok-4.7`/`xhigh` typed writable contract is
+supported only with `headless_streaming_json`. Grok 4.7 ACP stays fail-closed
+pending the schema and resolved model/effort identity acceptance gate tracked
+in Issue #604; choosing `acp_stdio` does not elevate 4.7 capabilities, with or
+without an output schema. Select 4.7 explicitly with a `role_models` entry whose
+`model` is `grok-4.7` and whose `reasoning_effort` is `xhigh`. That selection
+also requires `--prior-data` containing a dated admissible 4.7 prior and an
+eligible operator capability row; see [Operator prior data for a supervise
+run](#operator-prior-data-for-a-supervise-run). Without both, selection fails
+closed. Runtime catalogue membership alone does not bypass dated selector
+quality/cost gates. The advertised `grok-4.7-build-fast` CLI slug has no typed
+writable contract, is not treated as a public-API model, and is not selected
+automatically. The standard 4.7 release documents low through xhigh effort and
+a 500k context window, but MACO's writable boundary remains the narrower xhigh
+streaming-JSON contract. See the [Grok 4.7 announcement](https://x.ai/news/grok-4-7)
+and [developer documentation](https://docs.x.ai/developers/grok-4-7).
 Known native cost is a repository microunit equivalent of provider
 `costUsdTicks` (100000 microunits per USD), not a billed quota. Live writable
 ExternalGrok credential confinement and remaining compatibility gates stay
-unproven. This is not production economics and does not close issue 149.
+unproven. No paid 4.7 run, benchmark, pricing inference, quality prior, or
+default-model migration is claimed; the historical 4.6 terminal seed remains
+unchanged. This is not production economics and does not close issue 149.
 
 `--additional-runtime-bin RUNTIME=ABSOLUTE_EXECUTABLE` is optional and repeatable.
 It does not replace `--runtime` / `--runtime-bin`, which remain required and still

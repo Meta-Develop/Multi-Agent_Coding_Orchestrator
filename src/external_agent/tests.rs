@@ -6137,7 +6137,18 @@ fn selected_writable_grok_command(
     prompt: impl Into<PathBuf>,
     incoming: impl Into<PathBuf>,
 ) -> Result<ExternalAgentCommand> {
+    selected_writable_grok_command_for_model(program, workspace, prompt, incoming, "grok-4.6")
+}
+
+fn selected_writable_grok_command_for_model(
+    program: impl Into<PathBuf>,
+    workspace: impl Into<PathBuf>,
+    prompt: impl Into<PathBuf>,
+    incoming: impl Into<PathBuf>,
+    model: &str,
+) -> Result<ExternalAgentCommand> {
     writable_grok_command_before_runtime_selection(program, workspace, prompt, incoming)?
+        .with_model_selection(Some(model.to_string()), Some("xhigh".to_string()))
         .with_writable_runtime_selection("grok-worker", RuntimeId::Grok, true)
 }
 
@@ -6270,6 +6281,137 @@ fn writable_grok_external_boundary_names_every_selection_and_confinement_refusal
         error.contains("writable grok failed closed before launch")
             && error.contains("blocking_pre_action_callback != All")
     }));
+    Ok(())
+}
+
+#[test]
+fn writable_grok_47_binds_selection_schema_protocol_and_worktree_proof() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("grok-worker");
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&workspace)?;
+    fs::create_dir(&incoming)?;
+    let prompt = temp.path().join("prompt.md");
+    let schema = temp.path().join("worker-report.schema.json");
+    fs::write(&prompt, "bounded Grok 4.7 task\n")?;
+    fs::write(
+        &schema,
+        r#"{"type":"object","required":["accepted"],"properties":{"accepted":{"type":"boolean"}}}"#,
+    )?;
+    let program = temp.path().join("grok");
+
+    let mut streaming =
+        writable_grok_command_before_runtime_selection(&program, &workspace, &prompt, &incoming)?
+            .with_model_selection(Some("grok-4.7".to_string()), Some("xhigh".to_string()));
+    streaming.output_schema = Some(schema.clone());
+    let streaming = streaming
+        .with_writable_runtime_selection("grok-worker", RuntimeId::Grok, true)?
+        .with_worktree_writable_confinement(writable_grok_confinement(
+            SideEffectConfinement::Verified,
+        ));
+    assert_eq!(
+        streaming.current_grok_writable_contract()?.runtime(),
+        TypedRuntime::Grok47Xhigh
+    );
+    assert!(streaming
+        .verified_writable_capabilities(RuntimeId::Grok)?
+        .admits_worktree_writable());
+    let streaming_argv = runtime_adapter_argv(&streaming)?
+        .into_iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(streaming_argv
+        .windows(2)
+        .any(|pair| pair[0] == "--model" && pair[1] == "grok-4.7"));
+    assert!(streaming_argv
+        .windows(2)
+        .any(|pair| pair[0] == "--reasoning-effort" && pair[1] == "xhigh"));
+    assert!(streaming_argv
+        .windows(2)
+        .any(|pair| pair[0] == "--json-schema" && pair[1].contains("accepted")));
+    assert_eq!(
+        streaming_argv
+            .iter()
+            .filter(|argument| argument.as_str() == "--no-subagents")
+            .count(),
+        1
+    );
+
+    let mut acp_config = RuntimeAdapterConfig::defaults(RuntimeId::Grok);
+    acp_config.grok_interaction_protocol =
+        crate::runtime_adapter::GrokInteractionProtocol::AcpStdio;
+    acp_config.argument_template =
+        crate::runtime_adapter::grok::GROK_ACP_RUNTIME_DESCRIPTOR.immutable_argument_template();
+    let mut acp = ExternalAgentCommand::codex(
+        &program,
+        &workspace,
+        &prompt,
+        incoming.join("acp-events.jsonl"),
+        incoming.join("acp-report.json"),
+        Duration::from_secs(7),
+    )
+    .with_runtime_adapter(RuntimeId::Grok, acp_config)
+    .with_model_selection(Some("grok-4.7".to_string()), Some("xhigh".to_string()))
+    .with_workspace_access(WorkspaceAccess::ReadWrite)
+    .with_writable_launch_target(WritableLaunchTarget::ManagedChildWorktree);
+    acp.output_schema = Some(schema);
+    let acp = acp
+        .with_writable_runtime_selection("grok-worker", RuntimeId::Grok, true)?
+        .with_worktree_writable_confinement(writable_grok_confinement(
+            SideEffectConfinement::Verified,
+        ));
+    let acp_refusal = acp
+        .current_grok_writable_contract()
+        .expect_err("Grok 4.7 ACP must not receive writable capability elevation")
+        .to_string();
+    assert!(
+        acp_refusal.contains(WRITABLE_GROK_ADAPTER_CONFIGURATION_UNVERIFIED),
+        "{acp_refusal}"
+    );
+    let acp_argv = runtime_adapter_argv(&acp)?
+        .into_iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(acp_argv
+        .windows(2)
+        .any(|pair| pair[0] == "-m" && pair[1] == "grok-4.7"));
+    assert!(!acp_argv.iter().any(|argument| argument == "--json-schema"));
+    for required in ["--no-subagents", "agent", "--no-leader", "stdio"] {
+        assert_eq!(
+            acp_argv
+                .iter()
+                .filter(|argument| argument.as_str() == required)
+                .count(),
+            1
+        );
+    }
+
+    let unsupported_model = selected_writable_grok_command_for_model(
+        &program,
+        &workspace,
+        &prompt,
+        &incoming,
+        "grok-4.7-build-fast",
+    )?
+    .current_grok_writable_contract()
+    .expect_err("fast Grok 4.7 must not receive the typed writable contract")
+    .to_string();
+    assert!(
+        unsupported_model.contains(WRITABLE_GROK_EXACT_MODEL_REQUIRED),
+        "{unsupported_model}"
+    );
+
+    let unsupported_effort = selected_writable_grok_command_for_model(
+        &program, &workspace, &prompt, &incoming, "grok-4.7",
+    )?
+    .with_model_selection(Some("grok-4.7".to_string()), Some("high".to_string()))
+    .current_grok_writable_contract()
+    .expect_err("Grok 4.7 high must not receive the typed writable contract")
+    .to_string();
+    assert!(
+        unsupported_effort.contains(WRITABLE_GROK_XHIGH_EFFORT_REQUIRED),
+        "{unsupported_effort}"
+    );
     Ok(())
 }
 
