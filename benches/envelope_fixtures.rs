@@ -378,11 +378,11 @@ fn rustc_version() -> String {
 fn filesystem_identity(path: &Path) -> String {
     #[cfg(windows)]
     {
-        return windows_filesystem_identity(path).unwrap_or_else(|| "UNAVAILABLE".to_string());
+        windows_filesystem_identity(path).unwrap_or_else(|| "UNAVAILABLE".to_string())
     }
     #[cfg(unix)]
     {
-        return unix_filesystem_identity(path).unwrap_or_else(|| "UNAVAILABLE".to_string());
+        unix_filesystem_identity(path).unwrap_or_else(|| "UNAVAILABLE".to_string())
     }
     #[cfg(not(any(windows, unix)))]
     {

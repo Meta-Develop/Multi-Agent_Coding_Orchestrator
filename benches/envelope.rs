@@ -1,11 +1,16 @@
 //! Finite 12-cell Git-native worktree + merge operating envelope.
 //!
 //! Cells (do not expand):
+//!
 //! 1. Lifecycle create → list_managed_verified → remove(force=true) concurrency 1 on S
+//!
 //! 2-3. Same lifecycle, disjoint agent_ids, concurrency 4 and 8 on S
+//!
 //! 4-5. Merge preview (claim + commit + preview_merge_apply_with_evidence, validation off)
-//!     concurrency 1 on S and M
+//! concurrency 1 on S and M
+//!
 //! 6. Merge review+apply: CLI preview JSON watermark → CLI apply, concurrency 1 on S
+//!
 //! 7-8. Registry list with N∈{1,4} quiescent worktrees on S (list only)
 //!
 //! Optional probes (not extra factorial cells): 8-thread same-path claim overlap;
