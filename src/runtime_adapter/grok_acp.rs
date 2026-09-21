@@ -6,11 +6,15 @@
 //! run it inside [`crate::process_runner::run_process_interactive`] via
 //! [`GrokAcpContainedTransport`].
 
-use crate::process_runner::{ContainedProcessSession, InteractiveProcessRead};
+use crate::{
+    artifacts::state_auth::sha256_hex,
+    process_runner::{ContainedProcessSession, InteractiveProcessRead},
+    runtime_adapter::grok::GROK_OUTPUT_SCHEMA_MAX_BYTES,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     time::{Duration, Instant},
 };
@@ -97,12 +101,75 @@ impl GrokAcpJsonLineTransport for GrokAcpContainedTransport<'_, '_> {
     }
 }
 
+/// Parent-owned JSON Schema identity captured at ACP launch. Publication
+/// validates against these bytes, never a later replacement of the schema file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GrokAcpBoundOutputSchema {
+    sha256: String,
+    canonical: Value,
+}
+
+impl GrokAcpBoundOutputSchema {
+    pub(crate) fn from_canonical_json(canonical: &str) -> Result<Self, GrokAcpError> {
+        if canonical.is_empty() || canonical.len() > GROK_OUTPUT_SCHEMA_MAX_BYTES as usize {
+            return Err(GrokAcpError::InvalidConfiguration {
+                message: "grok acp output schema is empty or exceeds its bound".to_string(),
+            });
+        }
+        if canonical.contains('\0') {
+            return Err(GrokAcpError::InvalidConfiguration {
+                message: "grok acp output schema contains a NUL byte".to_string(),
+            });
+        }
+        let parsed: Value = serde_json::from_str(canonical).map_err(|error| {
+            GrokAcpError::InvalidConfiguration {
+                message: format!("grok acp output schema is not valid JSON: {error}"),
+            }
+        })?;
+        if !parsed.is_object() {
+            return Err(GrokAcpError::InvalidConfiguration {
+                message: "grok acp output schema must be a JSON object".to_string(),
+            });
+        }
+        let canonical_value = canonical_json_value(&parsed);
+        let rendered = serde_json::to_string(&canonical_value).map_err(|error| {
+            GrokAcpError::InvalidConfiguration {
+                message: format!("failed to render grok acp output schema: {error}"),
+            }
+        })?;
+        if rendered.len() > GROK_OUTPUT_SCHEMA_MAX_BYTES as usize {
+            return Err(GrokAcpError::InvalidConfiguration {
+                message: "rendered grok acp output schema exceeds its bound".to_string(),
+            });
+        }
+        Ok(Self {
+            sha256: sha256_hex(rendered.as_bytes()),
+            canonical: canonical_value,
+        })
+    }
+
+    pub(crate) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub(crate) fn canonical_value(&self) -> &Value {
+        &self.canonical
+    }
+
+    pub(crate) fn validate_structured_output(&self, instance: &Value) -> Result<(), String> {
+        json_schema_accepts_instance(&self.canonical, instance, 0).map_err(|keyword| {
+            format!("Grok ACP structured output failed the admitted schema ({keyword})")
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GrokAcpTurn {
     pub(crate) cwd: String,
     pub(crate) prompt: String,
     pub(crate) requested_model: Option<String>,
     pub(crate) requested_effort: Option<String>,
+    pub(crate) output_schema: Option<GrokAcpBoundOutputSchema>,
 }
 
 impl GrokAcpTurn {
@@ -270,6 +337,236 @@ pub(crate) struct GrokAcpExecutionEvidence {
     pub(crate) permission_escalation_refused: bool,
     pub(crate) messages_received: usize,
     pub(crate) bytes_received: usize,
+}
+
+/// Parent-side ACP publication gate for exact admitted model/effort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GrokAcpIdentityPublicationStatus {
+    Admitted,
+    MissingEvidence,
+    ConflictingEvidence,
+    ModelMismatch,
+    EffortMismatch,
+}
+
+impl GrokAcpIdentityPublicationStatus {
+    pub(crate) fn allows_publication(self) -> bool {
+        matches!(self, Self::Admitted)
+    }
+
+    pub(crate) fn refusal_message(self) -> Option<&'static str> {
+        match self {
+            Self::Admitted => None,
+            Self::MissingEvidence => Some(
+                "Grok ACP publication refused: resolved identity evidence is missing or incomplete",
+            ),
+            Self::ConflictingEvidence => {
+                Some("Grok ACP publication refused: resolved identity evidence is conflicting")
+            }
+            Self::ModelMismatch => Some(
+                "Grok ACP publication refused: resolved model does not match the admitted model",
+            ),
+            Self::EffortMismatch => Some(
+                "Grok ACP publication refused: resolved effort does not match the admitted effort",
+            ),
+        }
+    }
+}
+
+pub(crate) fn grok_acp_resolution_status_from_parent_label(label: &str) -> GrokAcpResolutionStatus {
+    match label {
+        "complete" => GrokAcpResolutionStatus::Complete,
+        "incomplete" => GrokAcpResolutionStatus::Incomplete,
+        "truncated" => GrokAcpResolutionStatus::Truncated,
+        "ambiguous_model_change" => GrokAcpResolutionStatus::AmbiguousModelChange,
+        _ => GrokAcpResolutionStatus::Unresolved,
+    }
+}
+
+pub(crate) fn grok_acp_admitted_identity_publication_status(
+    admitted_model: Option<&str>,
+    admitted_effort: Option<&str>,
+    requested_model: Option<&str>,
+    requested_effort: Option<&str>,
+    resolved_model: Option<&str>,
+    resolved_effort: Option<&str>,
+    resolution_status: GrokAcpResolutionStatus,
+) -> GrokAcpIdentityPublicationStatus {
+    let Some(admitted_model) = admitted_model.filter(|value| !value.is_empty()) else {
+        return GrokAcpIdentityPublicationStatus::MissingEvidence;
+    };
+    let Some(admitted_effort) = admitted_effort.filter(|value| !value.is_empty()) else {
+        return GrokAcpIdentityPublicationStatus::MissingEvidence;
+    };
+    if requested_model != Some(admitted_model) || requested_effort != Some(admitted_effort) {
+        return GrokAcpIdentityPublicationStatus::ConflictingEvidence;
+    }
+    match resolution_status {
+        GrokAcpResolutionStatus::AmbiguousModelChange => {
+            return GrokAcpIdentityPublicationStatus::ConflictingEvidence;
+        }
+        GrokAcpResolutionStatus::Complete => {}
+        GrokAcpResolutionStatus::Incomplete
+        | GrokAcpResolutionStatus::Truncated
+        | GrokAcpResolutionStatus::Unresolved => {
+            return GrokAcpIdentityPublicationStatus::MissingEvidence;
+        }
+    }
+    match resolved_model {
+        Some(model) if model == admitted_model => {}
+        Some(_) => return GrokAcpIdentityPublicationStatus::ModelMismatch,
+        None => return GrokAcpIdentityPublicationStatus::MissingEvidence,
+    }
+    match resolved_effort {
+        Some(effort) if effort == admitted_effort => {}
+        Some(_) => return GrokAcpIdentityPublicationStatus::EffortMismatch,
+        None => return GrokAcpIdentityPublicationStatus::MissingEvidence,
+    }
+    GrokAcpIdentityPublicationStatus::Admitted
+}
+
+pub(crate) fn grok_acp_execution_identity_publication_status(
+    evidence: &GrokAcpExecutionEvidence,
+) -> GrokAcpIdentityPublicationStatus {
+    grok_acp_admitted_identity_publication_status(
+        evidence.requested.model.as_deref(),
+        evidence.requested.effort.as_deref(),
+        evidence.requested.model.as_deref(),
+        evidence.requested.effort.as_deref(),
+        resolved_field_as_str(&evidence.client_resolved.model),
+        resolved_field_as_str(&evidence.client_resolved.effort),
+        evidence.resolution_status,
+    )
+}
+
+fn resolved_field_as_str(field: &GrokAcpResolvedField) -> Option<&str> {
+    match field {
+        GrokAcpResolvedField::Known(value) => Some(value.as_str()),
+        GrokAcpResolvedField::Unknown => None,
+    }
+}
+
+const JSON_SCHEMA_MAX_DEPTH: usize = 32;
+
+fn canonical_json_value(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => {
+            Value::Array(values.iter().map(canonical_json_value).collect::<Vec<_>>())
+        }
+        Value::Object(values) => {
+            let sorted = values.iter().collect::<BTreeMap<_, _>>();
+            let mut canonical = Map::new();
+            for (key, value) in sorted {
+                canonical.insert(key.as_str().to_string(), canonical_json_value(value));
+            }
+            Value::Object(canonical)
+        }
+        scalar => scalar.clone(),
+    }
+}
+
+fn json_schema_accepts_instance(
+    schema: &Value,
+    instance: &Value,
+    depth: usize,
+) -> Result<(), &'static str> {
+    if depth > JSON_SCHEMA_MAX_DEPTH {
+        return Err("depth");
+    }
+    let Some(schema) = schema.as_object() else {
+        return Err("schema");
+    };
+    if let Some(any_of) = schema.get("anyOf").and_then(Value::as_array) {
+        if !any_of
+            .iter()
+            .any(|variant| json_schema_accepts_instance(variant, instance, depth + 1).is_ok())
+        {
+            return Err("anyOf");
+        }
+    }
+    if let Some(one_of) = schema.get("oneOf").and_then(Value::as_array) {
+        let matches = one_of
+            .iter()
+            .filter(|variant| json_schema_accepts_instance(variant, instance, depth + 1).is_ok())
+            .count();
+        if matches != 1 {
+            return Err("oneOf");
+        }
+    }
+    if let Some(all_of) = schema.get("allOf").and_then(Value::as_array) {
+        for variant in all_of {
+            json_schema_accepts_instance(variant, instance, depth + 1)?;
+        }
+    }
+    if schema
+        .get("const")
+        .is_some_and(|expected| expected != instance)
+    {
+        return Err("const");
+    }
+    if schema
+        .get("enum")
+        .and_then(Value::as_array)
+        .is_some_and(|values| !values.contains(instance))
+    {
+        return Err("enum");
+    }
+    if let Some(schema_type) = schema.get("type") {
+        let matches_type = |schema_type: &Value| match schema_type.as_str() {
+            Some("null") => instance.is_null(),
+            Some("boolean") => instance.is_boolean(),
+            Some("integer") => instance.as_i64().is_some() || instance.as_u64().is_some(),
+            Some("number") => instance.is_number(),
+            Some("string") => instance.is_string(),
+            Some("array") => instance.is_array(),
+            Some("object") => instance.is_object(),
+            _ => false,
+        };
+        let accepted_type = schema_type.as_array().map_or_else(
+            || matches_type(schema_type),
+            |types| types.iter().any(matches_type),
+        );
+        if !accepted_type {
+            return Err("type");
+        }
+    }
+    if let Some(object) = instance.as_object() {
+        let properties = schema.get("properties").and_then(Value::as_object);
+        if let Some(required) = schema.get("required").and_then(Value::as_array) {
+            if required
+                .iter()
+                .any(|name| name.as_str().is_none_or(|name| !object.contains_key(name)))
+            {
+                return Err("required");
+            }
+        }
+        for (name, value) in object {
+            match properties.and_then(|properties| properties.get(name)) {
+                Some(property_schema) => {
+                    json_schema_accepts_instance(property_schema, value, depth + 1)?;
+                }
+                None if schema.get("additionalProperties") == Some(&Value::Bool(false)) => {
+                    return Err("additionalProperties");
+                }
+                None => {
+                    if let Some(additional) = schema
+                        .get("additionalProperties")
+                        .filter(|value| value.is_object())
+                    {
+                        json_schema_accepts_instance(additional, value, depth + 1)?;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(array) = instance.as_array() {
+        if let Some(items) = schema.get("items") {
+            for value in array {
+                json_schema_accepts_instance(items, value, depth + 1)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -689,6 +986,24 @@ impl ModelResolutionTracker {
     }
 }
 
+fn session_prompt_params(
+    session_id: &str,
+    prompt: &str,
+    schema: Option<&GrokAcpBoundOutputSchema>,
+) -> Value {
+    let mut params = json!({
+        "sessionId": session_id,
+        "prompt": [{"type": "text", "text": prompt}]
+    });
+    if let Some(schema) = schema {
+        params.as_object_mut().expect("params object").insert(
+            "_meta".into(),
+            json!({ "jsonSchema": schema.canonical_value().clone() }),
+        );
+    }
+    params
+}
+
 fn validate_initialize_response(response: &Value) -> Result<(), GrokAcpError> {
     let version = response
         .pointer("/result/protocolVersion")
@@ -834,10 +1149,7 @@ where
             "jsonrpc": "2.0",
             "id": prompt_id.to_value(),
             "method": METHOD_SESSION_PROMPT,
-            "params": {
-                "sessionId": session_id,
-                "prompt": [{"type": "text", "text": turn.prompt}]
-            }
+            "params": session_prompt_params(&session_id, &turn.prompt, turn.output_schema.as_ref())
         }),
     )?;
 
@@ -845,6 +1157,7 @@ where
         session_id: &session_id,
         model_tracker: &mut model_tracker,
         permission_escalation_refused: &mut permission_escalation_refused,
+        output_schema: turn.output_schema.as_ref(),
     };
     let prompt_outcome = drive_prompt(
         &mut state,
@@ -956,6 +1269,7 @@ struct PromptSessionContext<'a> {
     session_id: &'a str,
     model_tracker: &'a mut ModelResolutionTracker,
     permission_escalation_refused: &'a mut bool,
+    output_schema: Option<&'a GrokAcpBoundOutputSchema>,
 }
 
 fn ensure_correction_actionable(
@@ -1022,10 +1336,11 @@ where
             "jsonrpc": "2.0",
             "id": new_prompt_id.to_value(),
             "method": METHOD_SESSION_PROMPT,
-            "params": {
-                "sessionId": prompt_ctx.session_id,
-                "prompt": [{"type": "text", "text": correction.prompt}]
-            }
+            "params": session_prompt_params(
+                prompt_ctx.session_id,
+                &correction.prompt,
+                prompt_ctx.output_schema,
+            )
         }),
     )?;
     Ok(SteeringApplication {
@@ -2036,6 +2351,75 @@ mod tests {
         messages
     }
 
+    fn successful_transcript_with_prompt_meta(
+        resolved_model: &str,
+        resolved_effort: &str,
+        prompt_result: Value,
+    ) -> Vec<Value> {
+        let mut messages = base_handshake("sess-1");
+        messages.push(model_changed_notification(
+            "sess-1",
+            resolved_model,
+            Some(resolved_effort),
+        ));
+        messages.push(set_model_ack(resolved_model));
+        messages.push(prompt_result);
+        messages
+    }
+
+    fn prompt_ack_with_structured(structured: Value) -> Value {
+        json!({
+            "id": 4,
+            "result": {
+                "stopReason": "end_turn",
+                "text": "hello",
+                "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+                "usage_is_incomplete": false,
+                "cost_is_partial": false,
+                "_meta": {
+                    "structuredOutput": structured
+                }
+            }
+        })
+    }
+
+    fn prompt_ack_with_structured_error() -> Value {
+        json!({
+            "id": 4,
+            "result": {
+                "stopReason": "end_turn",
+                "text": "hello",
+                "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+                "usage_is_incomplete": false,
+                "cost_is_partial": false,
+                "_meta": {
+                    "structuredOutputError": "terminal schema validation failed"
+                }
+            }
+        })
+    }
+
+    fn publication_schema() -> GrokAcpBoundOutputSchema {
+        GrokAcpBoundOutputSchema::from_canonical_json(
+            r#"{"properties":{"accepted":{"type":"boolean"}},"required":["accepted"],"type":"object"}"#,
+        )
+        .expect("publication schema")
+    }
+
+    fn requested_turn(
+        model: &str,
+        effort: &str,
+        schema: Option<GrokAcpBoundOutputSchema>,
+    ) -> GrokAcpTurn {
+        GrokAcpTurn {
+            cwd: "/tmp".into(),
+            prompt: "ping".into(),
+            requested_model: Some(model.into()),
+            requested_effort: Some(effort.into()),
+            output_schema: schema,
+        }
+    }
+
     #[test]
     fn prompt_meta_usage_cost_projects_to_parent_microunits() {
         let mut messages = base_handshake("sess-cost");
@@ -2069,6 +2453,7 @@ mod tests {
                 prompt: "ping".into(),
                 requested_model: Some("grok-4".into()),
                 requested_effort: Some("low".into()),
+                output_schema: None,
             },
             GrokAcpLimits::for_fixture_test(),
             || false,
@@ -2095,6 +2480,7 @@ mod tests {
                 prompt: "ping".into(),
                 requested_model: Some("grok-4".into()),
                 requested_effort: Some("low".into()),
+                output_schema: None,
             },
             GrokAcpLimits::for_fixture_test(),
             || false,
@@ -2125,6 +2511,7 @@ mod tests {
                 prompt: "ping".into(),
                 requested_model: Some("grok-4".into()),
                 requested_effort: Some("low".into()),
+                output_schema: None,
             },
             GrokAcpLimits::for_fixture_test(),
             || false,
@@ -2151,6 +2538,7 @@ mod tests {
                 prompt: "ping".into(),
                 requested_model: Some("grok-4".into()),
                 requested_effort: Some("low".into()),
+                output_schema: None,
             },
             GrokAcpLimits::for_fixture_test(),
             || false,
@@ -2184,6 +2572,7 @@ mod tests {
                 prompt: "ping".into(),
                 requested_model: Some("grok-4".into()),
                 requested_effort: Some("low".into()),
+                output_schema: None,
             },
             GrokAcpLimits::for_fixture_test(),
             || false,
@@ -2222,6 +2611,7 @@ mod tests {
                 prompt: "ping".into(),
                 requested_model: Some("grok-4".into()),
                 requested_effort: None,
+                output_schema: None,
             },
             GrokAcpLimits::for_fixture_test(),
             || false,
@@ -2252,6 +2642,7 @@ mod tests {
                 prompt: "ping".into(),
                 requested_model: Some("grok-4".into()),
                 requested_effort: Some("low".into()),
+                output_schema: None,
             },
             GrokAcpLimits::for_fixture_test(),
             || false,
@@ -2279,6 +2670,7 @@ mod tests {
                 prompt: "ping".into(),
                 requested_model: Some("grok-4".into()),
                 requested_effort: None,
+                output_schema: None,
             },
             GrokAcpLimits::for_fixture_test(),
             || false,
@@ -2317,6 +2709,7 @@ mod tests {
                 prompt: "ping".into(),
                 requested_model: Some("grok-4".into()),
                 requested_effort: Some("low".into()),
+                output_schema: None,
             },
             GrokAcpLimits::for_fixture_test(),
             || false,
@@ -2745,6 +3138,7 @@ mod tests {
                 prompt: "original".into(),
                 requested_model: Some("grok-4".into()),
                 requested_effort: Some("low".into()),
+                output_schema: None,
             },
             GrokAcpLimits::for_fixture_test(),
             || false,
@@ -2786,6 +3180,7 @@ mod tests {
                 prompt: "original".into(),
                 requested_model: Some("grok-4".into()),
                 requested_effort: Some("low".into()),
+                output_schema: None,
             },
             GrokAcpLimits::for_fixture_test(),
             || false,
@@ -2982,6 +3377,7 @@ mod tests {
                 prompt: "ping".into(),
                 requested_model: Some("grok-4".into()),
                 requested_effort: Some("low".into()),
+                output_schema: None,
             },
             GrokAcpLimits::for_fixture_test(),
             || false,
@@ -3030,6 +3426,7 @@ mod tests {
                 prompt: "original".into(),
                 requested_model: Some("grok-4".into()),
                 requested_effort: Some("low".into()),
+                output_schema: None,
             },
             GrokAcpLimits::for_fixture_test(),
             || false,
@@ -3119,6 +3516,7 @@ mod tests {
                 prompt: "wait".into(),
                 requested_model: Some("grok-4".into()),
                 requested_effort: Some("low".into()),
+                output_schema: None,
             },
             GrokAcpLimits::for_fixture_test(),
             || false,
@@ -3179,6 +3577,7 @@ mod tests {
                 prompt: "original".into(),
                 requested_model: Some("grok-4".into()),
                 requested_effort: Some("low".into()),
+                output_schema: None,
             },
             GrokAcpLimits::for_fixture_test(),
             || false,
@@ -3224,6 +3623,7 @@ mod tests {
                 prompt: "ping".into(),
                 requested_model: Some("grok-4".into()),
                 requested_effort: Some("low".into()),
+                output_schema: None,
             },
             GrokAcpLimits::for_fixture_test(),
             || false,
@@ -3277,6 +3677,7 @@ mod tests {
                 prompt: "original".into(),
                 requested_model: Some("grok-4".into()),
                 requested_effort: Some("low".into()),
+                output_schema: None,
             },
             GrokAcpLimits::for_fixture_test(),
             || false,
@@ -3339,6 +3740,7 @@ mod tests {
                 prompt: "ping".into(),
                 requested_model: Some("grok-4".into()),
                 requested_effort: Some("low".into()),
+                output_schema: None,
             },
             GrokAcpLimits::for_fixture_test(),
             || false,
@@ -3375,6 +3777,7 @@ mod tests {
                 prompt: "original".into(),
                 requested_model: Some("grok-4".into()),
                 requested_effort: Some("low".into()),
+                output_schema: None,
             },
             GrokAcpLimits::for_fixture_test(),
             move || *cancel_after_corrective.borrow(),
@@ -3410,6 +3813,7 @@ mod tests {
                 prompt: "original".into(),
                 requested_model: Some("grok-4".into()),
                 requested_effort: Some("low".into()),
+                output_schema: None,
             },
             GrokAcpLimits::for_fixture_test(),
             || false,
@@ -3445,6 +3849,7 @@ mod tests {
                 prompt: "ping".into(),
                 requested_model: Some("grok-4".into()),
                 requested_effort: None,
+                output_schema: None,
             },
             GrokAcpLimits::for_fixture_test(),
             || false,
@@ -3479,6 +3884,7 @@ mod tests {
                 prompt: "ping".into(),
                 requested_model: Some("grok-4".into()),
                 requested_effort: None,
+                output_schema: None,
             },
             GrokAcpLimits::for_fixture_test(),
             || false,
@@ -3492,5 +3898,269 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn matching_resolved_identity_is_admitted_for_publication() {
+        let mut transport = ScriptTransport::from_values(successful_transcript("high"));
+        let evidence = run_grok_acp_turn(
+            &mut transport,
+            &requested_turn("grok-4", "high", None),
+            GrokAcpLimits::for_fixture_test(),
+            || false,
+        )
+        .expect("matching turn");
+        assert_eq!(
+            evidence.resolution_status,
+            GrokAcpResolutionStatus::Complete
+        );
+        assert_eq!(
+            grok_acp_execution_identity_publication_status(&evidence),
+            GrokAcpIdentityPublicationStatus::Admitted
+        );
+    }
+
+    #[test]
+    fn wrong_resolved_model_refuses_publication() {
+        let mut messages = base_handshake("sess-1");
+        messages.push(model_changed_notification(
+            "sess-1",
+            "grok-other",
+            Some("high"),
+        ));
+        messages.push(set_model_ack("grok-other"));
+        messages.push(prompt_ack(true));
+        let mut transport = ScriptTransport::from_values(messages);
+        let evidence = run_grok_acp_turn(
+            &mut transport,
+            &requested_turn("grok-4", "high", None),
+            GrokAcpLimits::for_fixture_test(),
+            || false,
+        )
+        .expect("wrong-model turn still records evidence");
+        assert_eq!(
+            evidence.client_resolved.model,
+            GrokAcpResolvedField::Known("grok-other".into())
+        );
+        assert_eq!(
+            grok_acp_execution_identity_publication_status(&evidence),
+            GrokAcpIdentityPublicationStatus::ModelMismatch
+        );
+    }
+
+    #[test]
+    fn wrong_resolved_effort_refuses_publication() {
+        let mut transport = ScriptTransport::from_values(successful_transcript("high"));
+        let evidence = run_grok_acp_turn(
+            &mut transport,
+            &requested_turn("grok-4", "low", None),
+            GrokAcpLimits::for_fixture_test(),
+            || false,
+        )
+        .expect("effort-mismatch turn");
+        assert_eq!(
+            evidence.client_resolved.effort,
+            GrokAcpResolvedField::Known("high".into())
+        );
+        assert_eq!(
+            grok_acp_execution_identity_publication_status(&evidence),
+            GrokAcpIdentityPublicationStatus::EffortMismatch
+        );
+    }
+
+    #[test]
+    fn missing_resolved_effort_refuses_publication() {
+        let mut messages = base_handshake("sess-1");
+        messages.push(model_changed_notification("sess-1", "grok-4", None));
+        messages.push(set_model_ack("grok-4"));
+        messages.push(prompt_ack(true));
+        let mut transport = ScriptTransport::from_values(messages);
+        let evidence = run_grok_acp_turn(
+            &mut transport,
+            &requested_turn("grok-4", "high", None),
+            GrokAcpLimits::for_fixture_test(),
+            || false,
+        )
+        .expect("missing-effort turn");
+        assert_ne!(
+            evidence.resolution_status,
+            GrokAcpResolutionStatus::Complete
+        );
+        assert_eq!(
+            grok_acp_execution_identity_publication_status(&evidence),
+            GrokAcpIdentityPublicationStatus::MissingEvidence
+        );
+    }
+
+    #[test]
+    fn conflicting_model_change_refuses_publication() {
+        let mut messages = base_handshake("sess-1");
+        messages.push(model_changed_notification("sess-1", "grok-4", Some("high")));
+        messages.push(set_model_ack("grok-4"));
+        messages.push(model_changed_notification(
+            "sess-1",
+            "grok-other",
+            Some("high"),
+        ));
+        messages.push(prompt_ack(true));
+        let mut transport = ScriptTransport::from_values(messages);
+        let evidence = run_grok_acp_turn(
+            &mut transport,
+            &requested_turn("grok-4", "high", None),
+            GrokAcpLimits::for_fixture_test(),
+            || false,
+        )
+        .expect("conflicting turn");
+        assert_eq!(
+            evidence.resolution_status,
+            GrokAcpResolutionStatus::AmbiguousModelChange
+        );
+        assert_eq!(
+            grok_acp_execution_identity_publication_status(&evidence),
+            GrokAcpIdentityPublicationStatus::ConflictingEvidence
+        );
+    }
+
+    #[test]
+    fn requested_identity_disagreeing_with_admitted_is_conflicting() {
+        assert_eq!(
+            grok_acp_admitted_identity_publication_status(
+                Some("grok-4.6"),
+                Some("xhigh"),
+                Some("grok-4"),
+                Some("xhigh"),
+                Some("grok-4.6"),
+                Some("xhigh"),
+                GrokAcpResolutionStatus::Complete,
+            ),
+            GrokAcpIdentityPublicationStatus::ConflictingEvidence
+        );
+    }
+
+    #[test]
+    fn outbound_prompt_carries_bound_json_schema() {
+        let schema = publication_schema();
+        let digest = schema.sha256().to_string();
+        let mut transport = ScriptTransport::from_values(successful_transcript("high"));
+        run_grok_acp_turn(
+            &mut transport,
+            &requested_turn("grok-4", "high", Some(schema)),
+            GrokAcpLimits::for_fixture_test(),
+            || false,
+        )
+        .expect("schema-bound turn");
+        let prompt = parse_outbound(&transport, 3);
+        assert_eq!(
+            prompt.get("method"),
+            Some(&Value::from(METHOD_SESSION_PROMPT))
+        );
+        assert_eq!(
+            prompt.pointer("/params/_meta/jsonSchema/required/0"),
+            Some(&Value::from("accepted"))
+        );
+        assert_eq!(
+            prompt.pointer("/params/_meta/jsonSchema/properties/accepted/type"),
+            Some(&Value::from("boolean"))
+        );
+        let rebound = GrokAcpBoundOutputSchema::from_canonical_json(
+            &serde_json::to_string(prompt.pointer("/params/_meta/jsonSchema").expect("schema"))
+                .expect("render"),
+        )
+        .expect("rebind");
+        assert_eq!(rebound.sha256(), digest);
+    }
+
+    #[test]
+    fn valid_schema_structured_output_is_accepted() {
+        let schema = publication_schema();
+        let mut transport = ScriptTransport::from_values(successful_transcript_with_prompt_meta(
+            "grok-4",
+            "high",
+            prompt_ack_with_structured(json!({"accepted": true})),
+        ));
+        let evidence = run_grok_acp_turn(
+            &mut transport,
+            &requested_turn("grok-4", "high", Some(schema.clone())),
+            GrokAcpLimits::for_fixture_test(),
+            || false,
+        )
+        .expect("valid schema turn");
+        let parent =
+            crate::runtime_adapter::grok::grok_acp_parent_evidence_from_execution(evidence);
+        schema
+            .validate_structured_output(parent.structured_output.as_ref().expect("structured"))
+            .expect("accepted boolean object");
+    }
+
+    #[test]
+    fn wrong_structured_output_type_is_refused() {
+        let schema = publication_schema();
+        let mut transport = ScriptTransport::from_values(successful_transcript_with_prompt_meta(
+            "grok-4",
+            "high",
+            prompt_ack_with_structured(json!({"accepted": "wrong"})),
+        ));
+        let evidence = run_grok_acp_turn(
+            &mut transport,
+            &requested_turn("grok-4", "high", Some(schema.clone())),
+            GrokAcpLimits::for_fixture_test(),
+            || false,
+        )
+        .expect("wrong-type turn");
+        let parent =
+            crate::runtime_adapter::grok::grok_acp_parent_evidence_from_execution(evidence);
+        let error = schema
+            .validate_structured_output(parent.structured_output.as_ref().expect("structured"))
+            .expect_err("string is not boolean");
+        assert!(error.contains("type"), "{error}");
+        assert!(!error.contains("wrong"));
+    }
+
+    #[test]
+    fn absent_required_structured_output_field_is_refused() {
+        let schema = publication_schema();
+        let mut transport = ScriptTransport::from_values(successful_transcript_with_prompt_meta(
+            "grok-4",
+            "high",
+            prompt_ack_with_structured(json!({})),
+        ));
+        let evidence = run_grok_acp_turn(
+            &mut transport,
+            &requested_turn("grok-4", "high", Some(schema.clone())),
+            GrokAcpLimits::for_fixture_test(),
+            || false,
+        )
+        .expect("missing-field turn");
+        let parent =
+            crate::runtime_adapter::grok::grok_acp_parent_evidence_from_execution(evidence);
+        let error = schema
+            .validate_structured_output(parent.structured_output.as_ref().expect("structured"))
+            .expect_err("required field missing");
+        assert!(error.contains("required"), "{error}");
+    }
+
+    #[test]
+    fn terminal_structured_output_error_is_recorded() {
+        let schema = publication_schema();
+        let mut transport = ScriptTransport::from_values(successful_transcript_with_prompt_meta(
+            "grok-4",
+            "high",
+            prompt_ack_with_structured_error(),
+        ));
+        let evidence = run_grok_acp_turn(
+            &mut transport,
+            &requested_turn("grok-4", "high", Some(schema)),
+            GrokAcpLimits::for_fixture_test(),
+            || false,
+        )
+        .expect("terminal schema error turn");
+        assert_eq!(
+            grok_acp_execution_identity_publication_status(&evidence),
+            GrokAcpIdentityPublicationStatus::Admitted
+        );
+        let parent =
+            crate::runtime_adapter::grok::grok_acp_parent_evidence_from_execution(evidence);
+        assert!(parent.structured_output.is_none());
+        assert!(parent.structured_output_error.is_some());
     }
 }
