@@ -190,19 +190,10 @@ pub(crate) fn freeze_observed_grok_selection(frozen: Option<FrozenGrokSelectedBi
     }
 }
 
+#[cfg(test)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn frozen_observed_grok_selection() -> Option<FrozenGrokSelectedBinding> {
-    #[cfg(test)]
-    {
-        FROZEN_GROK_SELECTION.with(|cell| cell.borrow().clone())
-    }
-    #[cfg(not(test))]
-    {
-        FROZEN_GROK_SELECTION
-            .lock()
-            .expect("frozen Grok selection lock")
-            .clone()
-    }
+    FROZEN_GROK_SELECTION.with(|cell| cell.borrow().clone())
 }
 
 #[cfg(test)]
