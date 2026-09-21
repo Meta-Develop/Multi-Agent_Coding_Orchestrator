@@ -31,9 +31,14 @@ use crate::protected_path::{DeclaredPathCoordinate, ProtectedPathSpec};
 use crate::runtime_adapter::grok::GrokCredentialSource;
 use crate::runtime_adapter::{
     grok::{
-        grok_acp_parent_evidence_from_execution, GrokAcpParentEvidence, GrokStreamUsageEvidence,
+        grok_acp_parent_evidence_from_execution, GrokAcpParentEvidence, GrokAcpParentResolvedField,
+        GrokStreamUsageEvidence,
     },
-    grok_acp::{GrokAcpContainedTransport, GrokAcpExecutionEvidence, GrokAcpLimits, GrokAcpTurn},
+    grok_acp::{
+        grok_acp_admitted_identity_publication_status,
+        grok_acp_resolution_status_from_parent_label, GrokAcpBoundOutputSchema,
+        GrokAcpContainedTransport, GrokAcpExecutionEvidence, GrokAcpLimits, GrokAcpTurn,
+    },
     AdapterId, LaunchContext, RuntimeAdapterConfig, RuntimeId, SideEffectConfinement, TypedRuntime,
     TypedRuntimeContract, WritableLaunchTarget,
 };
@@ -3524,6 +3529,7 @@ fn run_external_agent_runtime(
         argv_digest: &argv_digest,
         program_identity: &program_identity,
         grok_acp_parent_evidence: None,
+        grok_acp_launch_schema_identity: None,
     };
     let mut retained_gate_denials = Vec::new();
     let mut retained_review_metrics = None;
@@ -3625,8 +3631,10 @@ fn run_external_agent_runtime(
         ) {
             Ok(interactive) => {
                 let mut parent_evidence = None;
+                let mut launch_schema = None;
                 let mut final_message_error = None;
                 if let Ok(outcome) = &interactive.interaction {
+                    launch_schema = outcome.launch_schema.clone();
                     parent_evidence = Some(grok_acp_parent_evidence_from_execution(
                         outcome.evidence.clone(),
                     ));
@@ -3639,7 +3647,12 @@ fn run_external_agent_runtime(
                             && interactive.process.process_error.is_none()
                             && interactive.process.stdin_error.is_none();
                         if target_ok {
-                            match grok_acp_staged_output_bytes(&target_spec, parent, true) {
+                            match grok_acp_staged_output_bytes(
+                                &target_spec,
+                                parent,
+                                true,
+                                launch_schema.as_ref(),
+                            ) {
                                 Ok(final_message) => {
                                     let staged =
                                         output_staging.reservation_mut().and_then(|reservation| {
@@ -3679,6 +3692,7 @@ fn run_external_agent_runtime(
                             argv_digest: &argv_digest,
                             program_identity: &program_identity,
                             grok_acp_parent_evidence: parent_evidence.as_ref(),
+                            grok_acp_launch_schema_identity: launch_schema.as_ref(),
                         },
                     ),
                     Err(error) => {
@@ -4332,10 +4346,12 @@ struct CompletedTargetContext<'a> {
     argv_digest: &'a str,
     program_identity: &'a ExternalProgramIdentity,
     grok_acp_parent_evidence: Option<&'a GrokAcpParentEvidence>,
+    grok_acp_launch_schema_identity: Option<&'a GrokAcpBoundOutputSchema>,
 }
 
 struct GrokAcpInteractiveOutcome {
     evidence: GrokAcpExecutionEvidence,
+    launch_schema: Option<GrokAcpBoundOutputSchema>,
 }
 
 fn run_grok_acp_external_process(
@@ -4345,11 +4361,18 @@ fn run_grok_acp_external_process(
     prompt: String,
     operation_timeout: Duration,
 ) -> Result<InteractiveProcessOutput<GrokAcpInteractiveOutcome>, ProcessRunError> {
+    let launch_schema =
+        bind_grok_acp_launch_schema(spec).map_err(|error| ProcessRunError::IoSetup {
+            label: "Grok ACP output schema".to_string(),
+            command: spec.program.display().to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string()),
+        })?;
     let turn = GrokAcpTurn {
         cwd: spec.cwd.to_string_lossy().into_owned(),
         prompt,
         requested_model: spec.model.clone(),
         requested_effort: spec.reasoning_effort.clone(),
+        output_schema: launch_schema.clone(),
     };
     let limits =
         GrokAcpLimits::from_parent_operation_timeout(operation_timeout).map_err(|error| {
@@ -4390,7 +4413,10 @@ fn run_grok_acp_external_process(
             )
         }
         .map_err(|error| error.to_string())?;
-        Ok(GrokAcpInteractiveOutcome { evidence })
+        Ok(GrokAcpInteractiveOutcome {
+            evidence,
+            launch_schema: turn.output_schema.clone(),
+        })
     });
 
     if let Some(bridge) = steering_bridge {
@@ -4406,15 +4432,63 @@ fn run_grok_acp_external_process(
     interactive
 }
 
+fn bind_grok_acp_launch_schema(
+    spec: &ExternalAgentCommand,
+) -> Result<Option<GrokAcpBoundOutputSchema>> {
+    let Some(path) = spec.output_schema.as_ref() else {
+        return Ok(None);
+    };
+    let canonical = crate::runtime_adapter::grok::load_grok_output_schema_argv(path)?;
+    Ok(Some(
+        GrokAcpBoundOutputSchema::from_canonical_json(&canonical)
+            .map_err(|error| anyhow::anyhow!("{error}"))?,
+    ))
+}
+
+fn grok_acp_parent_resolved_as_str(field: &GrokAcpParentResolvedField) -> Option<&str> {
+    match field {
+        GrokAcpParentResolvedField::Known(value) => Some(value.as_str()),
+        GrokAcpParentResolvedField::Unknown => None,
+    }
+}
+
+fn grok_acp_parent_identity_publication_refusal(
+    spec: &ExternalAgentCommand,
+    evidence: Option<&GrokAcpParentEvidence>,
+) -> Option<&'static str> {
+    let Some(evidence) = evidence else {
+        return Some(
+            "Grok ACP publication refused: resolved identity evidence is missing or incomplete",
+        );
+    };
+    grok_acp_admitted_identity_publication_status(
+        spec.model.as_deref(),
+        spec.reasoning_effort.as_deref(),
+        evidence.requested_model.as_deref(),
+        evidence.requested_effort.as_deref(),
+        grok_acp_parent_resolved_as_str(&evidence.client_resolved_model),
+        grok_acp_parent_resolved_as_str(&evidence.client_resolved_effort),
+        grok_acp_resolution_status_from_parent_label(&evidence.resolution_status),
+    )
+    .refusal_message()
+}
+
 fn grok_acp_staged_output_bytes(
     spec: &ExternalAgentCommand,
     evidence: &GrokAcpParentEvidence,
     target_completed_successfully: bool,
+    launch_schema: Option<&GrokAcpBoundOutputSchema>,
 ) -> Result<Vec<u8>> {
     if !target_completed_successfully {
         bail!("Grok ACP target did not complete successfully");
     }
-    if spec.output_schema.is_some() {
+    if spec.output_schema.is_some() || launch_schema.is_some() {
+        let Some(launch_schema) = launch_schema else {
+            bail!("Grok ACP schema identity was not bound at launch");
+        };
+        if spec.output_schema.is_none() {
+            bail!("Grok ACP launch schema identity has no admitted schema path");
+        }
         if evidence.structured_output_error.is_some() {
             bail!("Grok ACP returned a terminal structuredOutputError");
         }
@@ -4422,6 +4496,9 @@ fn grok_acp_staged_output_bytes(
             .structured_output
             .as_ref()
             .context("Grok ACP terminal response is missing structuredOutput")?;
+        launch_schema
+            .validate_structured_output(structured)
+            .map_err(anyhow::Error::msg)?;
         return crate::runtime_adapter::grok::canonical_grok_structured_output(structured);
     }
     let text = evidence
@@ -4665,6 +4742,23 @@ fn record_completed_target(
                 Some(format!(
                     "managed child private Git boundary changed during launch: {error:#}"
                 )),
+            );
+        }
+    }
+    if context.runtime == ExternalExecutionRuntime::Verified
+        && grok_acp_stdio_protocol_selected(context.spec)
+    {
+        if let Some(message) = grok_acp_parent_identity_publication_refusal(
+            context.spec,
+            context.grok_acp_parent_evidence,
+        ) {
+            report.error = append_external_error(report.error.take(), Some(message.to_string()));
+        }
+        if context.spec.output_schema.is_some() && context.grok_acp_launch_schema_identity.is_none()
+        {
+            report.error = append_external_error(
+                report.error.take(),
+                Some("Grok ACP schema identity was not bound at launch".to_string()),
             );
         }
     }

@@ -7,7 +7,7 @@ set -eu
 
 MODE="${MACO_WRITABLE_GROK_ACP_FIXTURE_MODE:-success}"
 SESSION="maco-fixture-acp-session"
-RESOLVED_MODEL="maco-fixture-synthetic-4.6"
+RESOLVED_MODEL="grok-4.6"
 RESOLVED_EFFORT="xhigh"
 COST_TICKS=20000000
 
