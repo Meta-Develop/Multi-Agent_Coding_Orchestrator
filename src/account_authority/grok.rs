@@ -1090,11 +1090,11 @@ mod tests {
         let data_dir = fixture.data_dir.clone();
         let ready = Arc::new(Barrier::new(2));
         let overwritten = Arc::new(Barrier::new(2));
+        let frozen_b_for_a = frozen_b.clone();
         let (run_a, run_b) = std::thread::scope(|scope| {
             let ready_a = ready.clone();
             let overwritten_a = overwritten.clone();
             let carried_a = carried_a.clone();
-            let frozen_b = frozen_b.clone();
             let user_home_a = user_home.clone();
             let data_dir_a = data_dir.clone();
             let run_a = scope.spawn(move || -> Result<()> {
@@ -1105,7 +1105,7 @@ mod tests {
                 assert_eq!(first, carried_a);
                 assert_eq!(second, first);
                 let _ambient_b =
-                    super::super::FrozenGrokSelectionGuard::pin(Some(frozen_b.clone()));
+                    super::super::FrozenGrokSelectionGuard::pin(Some(frozen_b_for_a.clone()));
                 let _local =
                     activate_cam_grok_test_harness(shared_path_harness(&user_home_a, &data_dir_a));
                 let error = acquire_grok_launch_authority(Some(&carried_a))
