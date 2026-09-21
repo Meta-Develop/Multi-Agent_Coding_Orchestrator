@@ -719,6 +719,9 @@ impl RuntimeAdapterConfig {
                 expected_config.restore_immutable_grok_descriptor();
                 match self.grok_interaction_protocol {
                     GrokInteractionProtocol::AcpStdio => {
+                        if runtime == TypedRuntime::Grok47Xhigh {
+                            return None;
+                        }
                         // ACP structured output is parent/protocol-owned, never an argv flag.
                         let actual = self.render(context).ok()?;
                         let expected = expected_config.render(context).ok()?;

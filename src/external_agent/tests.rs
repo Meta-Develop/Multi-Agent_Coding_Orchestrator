@@ -6360,9 +6360,13 @@ fn writable_grok_47_binds_selection_schema_protocol_and_worktree_proof() -> Resu
         .with_worktree_writable_confinement(writable_grok_confinement(
             SideEffectConfinement::Verified,
         ));
-    assert_eq!(
-        acp.current_grok_writable_contract()?.runtime(),
-        TypedRuntime::Grok47Xhigh
+    let acp_refusal = acp
+        .current_grok_writable_contract()
+        .expect_err("Grok 4.7 ACP must not receive writable capability elevation")
+        .to_string();
+    assert!(
+        acp_refusal.contains(WRITABLE_GROK_ADAPTER_CONFIGURATION_UNVERIFIED),
+        "{acp_refusal}"
     );
     let acp_argv = runtime_adapter_argv(&acp)?
         .into_iter()

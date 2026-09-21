@@ -2870,7 +2870,7 @@ fn grok_46_and_47_xhigh_writable_capabilities_require_the_bounded_leaf_contract(
 }
 
 #[test]
-fn grok_47_xhigh_acp_contract_keeps_the_immutable_agent_stdio_argv() {
+fn grok_47_xhigh_acp_keeps_immutable_argv_but_refuses_capability_elevation() {
     let workspace = TempDir::new().expect("typed Grok ACP workspace");
     let prompt = workspace.path().join("prompt.txt");
     let output = workspace.path().join("output.jsonl");
@@ -2888,11 +2888,9 @@ fn grok_47_xhigh_acp_contract_keeps_the_immutable_agent_stdio_argv() {
         multi_agent_coding_orchestrator::runtime_adapter::grok::GROK_ACP_RUNTIME_DESCRIPTOR
             .immutable_argument_template();
 
-    let contract = config
+    assert!(config
         .typed_runtime_contract(AdapterId::Grok, &context)
-        .expect("canonical Grok 4.7/xhigh ACP contract");
-    assert_eq!(contract.runtime(), TypedRuntime::Grok47Xhigh);
-    assert!(contract.capabilities().admits_worktree_writable());
+        .is_none());
     let launch = config
         .render(&context)
         .expect("render typed Grok ACP launch");
@@ -2911,13 +2909,6 @@ fn grok_47_xhigh_acp_contract_keeps_the_immutable_agent_stdio_argv() {
             "missing or duplicated immutable ACP argument {required}"
         );
     }
-
-    config
-        .argument_template
-        .retain(|argument| argument != "--no-subagents");
-    assert!(config
-        .typed_runtime_contract(AdapterId::Grok, &context)
-        .is_none());
 }
 
 #[test]
