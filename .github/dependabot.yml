@@ -1,12 +1,19 @@
 version: 2
 updates:
   - package-ecosystem: "cargo"
-    directory: "/"
+    directories:
+      - "/"
+      - "/account-manager/src-tauri"
     schedule:
       interval: "weekly"
       day: "monday"
       time: "09:00"
       timezone: "Asia/Tokyo"
+    groups:
+      cargo-across-lockfiles:
+        patterns:
+          - "*"
+        group-by: dependency-name
 
   - package-ecosystem: "github-actions"
     directory: "/"

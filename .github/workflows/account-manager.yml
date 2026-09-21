@@ -25,6 +25,28 @@ defaults:
     working-directory: account-manager
 
 jobs:
+  desktop-lock:
+    name: Desktop lockfile
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+        working-directory: .
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Detect shared-core lockfile drift
+        run: python3 scripts/check_desktop_lockfile.py --parse-only
+      - name: Install repository Rust toolchain
+        run: |
+          rustup toolchain install
+          rustc --version --verbose
+          cargo --version --verbose
+      - name: Verify consuming lockfiles with --locked
+        run: python3 scripts/check_desktop_lockfile.py --cargo-only
+
   frontend:
     name: Account manager frontend
     runs-on: ubuntu-latest
@@ -56,6 +78,7 @@ jobs:
 
   rust:
     name: Account manager ${{ matrix.mode }} (${{ matrix.os }})
+    needs: desktop-lock
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
