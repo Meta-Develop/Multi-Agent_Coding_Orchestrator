@@ -636,6 +636,7 @@ mod tests {
 
     #[test]
     fn nested_cam_grok_test_harness_restores_previous_override() -> Result<()> {
+        let _no_socket = SocketEnvGuard::unset();
         let fixture_a = Fixture::new();
         add_managed_account(
             &fixture_a.registry,
@@ -691,6 +692,7 @@ mod tests {
 
     #[test]
     fn thread_local_harness_does_not_leak_to_sibling_threads() -> Result<()> {
+        let _no_socket = SocketEnvGuard::unset();
         let root = tempfile::tempdir()?;
         let user_home = root.path().join("user-home");
         let data_dir = root.path().join("data");
@@ -763,6 +765,8 @@ mod tests {
         }
 
         fn unset() -> Self {
+            // Parallel tests share process-global MACO_CAM_AUTHORITY_SOCKET.
+            // No-socket acquire paths must hold this lock or they observe a sibling's socket.
             use crate::account_authority::authority_socket_config::CAM_AUTHORITY_SOCKET_ENV;
             let _lock = crate::account_authority::CAM_AUTHORITY_SOCKET_TEST_LOCK
                 .lock()
@@ -975,6 +979,7 @@ mod tests {
 
     #[test]
     fn no_socket_keeps_local_registry_acquisition() -> Result<()> {
+        let _no_socket = SocketEnvGuard::unset();
         let _freeze = super::super::FrozenGrokSelectionGuard::pin(None);
         let fixture = Fixture::new();
         add_managed_account(&fixture.registry, &fixture.adapter, "account-a", "A", None)

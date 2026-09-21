@@ -5623,10 +5623,16 @@ fn selected_writable_grok_acp_stdio_command(
 fn run_writable_grok_acp_helper_subprocess(test_name: &str) -> Result<()> {
     const HELPER_STDERR_MAX_BYTES: usize = 64 * 1024;
 
-    let environment = BTreeMap::from([(
-        WRITABLE_GROK_ACP_PRODUCTION_HELPER_ENV.to_string(),
-        "1".to_string(),
-    )]);
+    let environment = BTreeMap::from([
+        (
+            WRITABLE_GROK_ACP_PRODUCTION_HELPER_ENV.to_string(),
+            "1".to_string(),
+        ),
+        (
+            crate::account_authority::authority_socket_config::CAM_AUTHORITY_SOCKET_ENV.to_string(),
+            String::new(),
+        ),
+    ]);
     let output = crate::process_runner::run_process(
         ProcessSpec::direct(
             "exact writable Grok ACP helper test",
@@ -5678,6 +5684,10 @@ fn run_writable_grok_acp_production_helper_subprocess() -> Result<()> {
                 .to_str()
                 .context("writable Grok ACP helper receipt path is not UTF-8")?
                 .to_string(),
+        ),
+        (
+            crate::account_authority::authority_socket_config::CAM_AUTHORITY_SOCKET_ENV.to_string(),
+            String::new(),
         ),
     ]);
     let output = crate::process_runner::run_process(
@@ -5803,6 +5813,7 @@ fn writable_grok_acp_run_external_agent_helper(fixture_mode: &str) -> Result<()>
     use crate::runtime_adapter::grok::{GrokAcpNativeCostEquivalent, GrokAcpParentResolvedField};
     use std::os::unix::fs::PermissionsExt;
 
+    let _no_socket = CamSocketEnvGuard::unset();
     let (cam_harness, grok_home, expected_cam_binding) = build_cam_grok_test_harness("account-a")?;
     let _cam_guard = crate::account_authority::activate_cam_grok_test_harness(cam_harness);
     assert_eq!(
@@ -6389,6 +6400,10 @@ fn run_writable_grok_production_helper_subprocess() -> Result<()> {
                 .context("writable Grok helper receipt path is not UTF-8")?
                 .to_string(),
         ),
+        (
+            crate::account_authority::authority_socket_config::CAM_AUTHORITY_SOCKET_ENV.to_string(),
+            String::new(),
+        ),
     ]);
     let output = crate::process_runner::run_process(
         ProcessSpec::direct(
@@ -6482,6 +6497,7 @@ fn writable_grok_run_external_agent_helper() -> Result<()> {
     const STRUCTURED_OUTPUT_SCHEMA: &str = r#"{"properties":{"accepted":{"type":"boolean"},"path":{"type":"string"}},"required":["accepted","path"],"type":"object"}"#;
     const APPROVAL_RECORD: &str = "approval-contract:sandbox=strict;headless=always-approve;web-search=disabled;memory=disabled;subagents=disabled";
 
+    let _no_socket = CamSocketEnvGuard::unset();
     let (cam_harness, grok_home, expected_cam_binding) = build_cam_grok_test_harness("account-a")?;
     let _cam_guard = crate::account_authority::activate_cam_grok_test_harness(cam_harness);
     let sibling_b = grok_home
@@ -10436,6 +10452,7 @@ fn consult_codex_consultant_lifecycle_is_listed_as_researcher_in_supervisor_repo
 #[cfg(target_os = "linux")]
 #[test]
 fn verified_grok_cam_admission_refuses_unselected_registry() -> Result<()> {
+    let _no_socket = CamSocketEnvGuard::unset();
     let temp = tempfile::tempdir()?;
     let harness = build_cam_grok_test_harness_unselected()?;
     let command = admitted_verified_grok_cam_command(temp.path())?;
@@ -10455,6 +10472,7 @@ fn verified_grok_cam_admission_refuses_unselected_registry() -> Result<()> {
 #[cfg(target_os = "linux")]
 #[test]
 fn verified_grok_cam_consumer_on_provider_failure() -> Result<()> {
+    let _no_socket = CamSocketEnvGuard::unset();
     let temp = tempfile::tempdir()?;
     let (harness, _managed_home, expected_binding) = build_cam_grok_test_harness("account-a")?;
     let command = admitted_verified_grok_cam_command(temp.path())?;
@@ -10469,6 +10487,7 @@ fn verified_grok_cam_run_releases_use_lease_on_failure() -> Result<()> {
     use coding_agent_manager_lib::providers::grok_cli::GrokCliAdapter;
     use coding_agent_manager_lib::providers::select_launch_account;
 
+    let _no_socket = CamSocketEnvGuard::unset();
     let temp = tempfile::tempdir()?;
     let (harness, _, expected_binding) = build_cam_grok_test_harness("account-a")?;
     let metadata_path = harness.registry.metadata_path().to_path_buf();
@@ -10547,6 +10566,8 @@ impl CamSocketEnvGuard {
     }
 
     fn unset() -> Self {
+        // Parallel tests share process-global MACO_CAM_AUTHORITY_SOCKET.
+        // No-socket acquire paths must hold this lock or they observe a sibling's socket.
         use crate::account_authority::authority_socket_config::CAM_AUTHORITY_SOCKET_ENV;
         let lock = crate::account_authority::CAM_AUTHORITY_SOCKET_TEST_LOCK
             .lock()
