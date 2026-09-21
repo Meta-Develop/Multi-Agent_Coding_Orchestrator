@@ -1301,21 +1301,46 @@ success probes run outside the timed loops. The groups measure:
   bounded thread counts of 1, 4, and 8.
 - `repository_queries`: public small-repository inventory scan, semantic scan,
   and semantic risk query over a precomputed map.
+- `worktree_lifecycle_s`: Git-native managed-worktree
+  `create` → `list_managed_verified` → `remove(force=true)` on the small (S,
+  four tracked files) fixture at concurrency 1, 4, and 8 with disjoint
+  `agent_id`s. Public `WorktreeManager::create` already derives cleanliness on
+  a clean repository.
+- `merge_preview`: claim plus a committed single-path worktree diff, then
+  `preview_merge_apply_with_evidence` with validation off, concurrency 1, on
+  S and medium (M, 128 tracked ~1 KiB files) fixtures.
+- `merge_review_apply_s`: preview → reviewed-watermark → apply with gates
+  satisfied, concurrency 1 on S. Apply uses the production merge CLI (the
+  public `apply_merge_result` entrypoint remains fail-closed and is not
+  called).
+- `worktree_list_quiescent_s`: `list_managed_verified` with N∈{1,4} already
+  created worktrees on S (the timed path is list, not concurrent create).
+- `envelope_probes` (optional, not extra factorial cells): eight threads
+  overlapping the same claim path; a fifth concurrent create while four lanes
+  remain.
 
 The suite uses 10 samples, a 300 ms warm-up, and a 700 ms measurement window per
-case so a complete local run stays modest.
+case so a complete local run stays modest. Wall time and throughput come from
+that Criterion window. p50 is Criterion's estimated median; p95/p99 are
+Criterion bootstrap percentiles from the same samples. Those percentiles
+document the local run; they are not universal CI timing thresholds. Success
+and failure counts are printed on stderr for envelope cells (including
+warmup). Optional post-hoc `.git/maco` byte totals may be printed after
+lifecycle probes. Lock wait/hold time is UNAVAILABLE (no public
+`KernelStateLock` hooks). Each run prints OS, architecture, `rustc --version`,
+and a best-effort filesystem identity; keep those host results distinct.
+Linux `ntfs3` profile sweeps, a standalone `classify_semantic_conflicts`
+microbench, and Continuity-scale commits/sec remain out of scope.
 
-**DEFERRED SCOPE:** This first issue #25 increment does not benchmark:
+**DEFERRED / UNAVAILABLE:** This envelope does not publish:
 
-- managed-worktree registry create/list/remove lifecycle or merge
-  preview/review/apply
-  throughput, because successful setup requires the capability-bound managed
-  worktree API tracked by issue #11;
-- semantic merge-conflict classification, because
-  `classify_semantic_conflicts` is currently crate-private;
-- ntfs3 filesystem-profile sweeps; p50/p95/p99 and lock wait/hold
-  instrumentation; state amplification; published concurrency limits; or CI
-  regression thresholds.
+- Linux `ntfs3` filesystem-profile sweeps;
+- a standalone crate-private `classify_semantic_conflicts` microbench;
+- Continuity or any custom VCS;
+- KernelStateLock wait/hold instrumentation;
+- paid-provider benches;
+- brittle universal CI timing thresholds. OS/filesystem identity stays
+  attached to the local Criterion report instead.
 
 ### Provisional model-mix evaluation fixtures
 
