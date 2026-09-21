@@ -1,4 +1,4 @@
-use crate::account_authority::ManagedGrokAccountSelectionEvidence;
+use crate::account_authority::{FrozenGrokSelectedBinding, ManagedGrokAccountSelectionEvidence};
 use crate::agent_lifecycle::{AgentLaunchMetadata, MACO_RUN_ID_ENV, MACO_TASK_ID_ENV};
 use crate::artifacts::state_auth::sha256_hex;
 use crate::gate_denial::{ExternalSideEffectState, GateDenial};
@@ -276,6 +276,10 @@ pub struct ExternalAgentCommand {
     assignment_messaging_launch: Option<AssignmentMessagingLaunch>,
     /// Pinned headless CAM authority socket for nested MACO supervise/agent launches only.
     cam_authority_socket_pin: Option<String>,
+    /// Immutable Grok account binding admitted for this run. Launch must not recover
+    /// the selected account from process-global observation state.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    grok_run_account_binding: Option<FrozenGrokSelectedBinding>,
 }
 
 const ASSIGNMENT_MESSAGING_PROTOCOL_PROMPT_APPENDIX: &str = r#"
@@ -1110,6 +1114,7 @@ impl ExternalAgentCommand {
             assignment_mechanical_executor_duty: None,
             assignment_messaging_launch: None,
             cam_authority_socket_pin: None,
+            grok_run_account_binding: None,
         }
     }
 
@@ -1152,6 +1157,7 @@ impl ExternalAgentCommand {
             assignment_mechanical_executor_duty: None,
             assignment_messaging_launch: None,
             cam_authority_socket_pin: None,
+            grok_run_account_binding: None,
         }
     }
 
@@ -1194,6 +1200,7 @@ impl ExternalAgentCommand {
             assignment_mechanical_executor_duty: None,
             assignment_messaging_launch: None,
             cam_authority_socket_pin: None,
+            grok_run_account_binding: None,
         }
     }
 
@@ -1458,10 +1465,17 @@ impl ExternalAgentCommand {
         run_id: impl Into<String>,
         task_id: impl Into<String>,
     ) -> Self {
+        let run_id = run_id.into();
+        if self.invocation == ExternalAgentInvocation::Grok
+            && self.grok_run_account_binding.is_none()
+        {
+            self.grok_run_account_binding =
+                crate::account_authority::grok_run_account_binding(&run_id);
+        }
         self.agent_lifecycle = Some(ExternalAgentLifecycleIdentity {
             registry_repo: registry_repo.into(),
             role: role.into(),
-            run_id: run_id.into(),
+            run_id,
             task_id: task_id.into(),
             parent: None,
         });
@@ -1536,6 +1550,16 @@ impl ExternalAgentCommand {
         pin: Option<String>,
     ) -> ExternalAgentCommand {
         self.cam_authority_socket_pin = pin.filter(|value| !value.is_empty());
+        self
+    }
+
+    /// Bind the immutable Grok account evidence admitted for this specific run.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn with_grok_run_account_binding(
+        mut self,
+        binding: Option<FrozenGrokSelectedBinding>,
+    ) -> Self {
+        self.grok_run_account_binding = binding;
         self
     }
 
@@ -2174,15 +2198,14 @@ struct GrokVerifiedAccountSession {
 }
 
 #[cfg(target_os = "linux")]
-fn prepare_verified_grok_account_session() -> Result<GrokVerifiedAccountSession> {
-    let authority = crate::account_authority::grok::acquire_grok_launch_authority()?;
-    if let Some(frozen) = crate::account_authority::frozen_observed_grok_selection() {
+fn prepare_verified_grok_account_session(
+    spec: &ExternalAgentCommand,
+) -> Result<GrokVerifiedAccountSession> {
+    let frozen = spec.grok_run_account_binding.as_ref();
+    let authority = crate::account_authority::grok::acquire_grok_launch_authority(frozen)?;
+    if let Some(frozen) = frozen {
         let evidence = authority.selection_evidence();
-        if evidence.provider_id != frozen.provider_id
-            || evidence.account_id != frozen.account_id
-            || evidence.account_incarnation != frozen.account_incarnation
-            || evidence.selection_revision != frozen.selection_revision
-        {
+        if !frozen.matches_selection_evidence(&evidence) {
             bail!(
                 "managed Grok selection does not match the frozen selected binding used for selection"
             );
@@ -3028,7 +3051,7 @@ fn run_external_agent_runtime(
     let grok_session = if runtime == ExternalExecutionRuntime::Verified
         && spec.invocation == ExternalAgentInvocation::Grok
     {
-        match prepare_verified_grok_account_session() {
+        match prepare_verified_grok_account_session(spec) {
             Ok(session) => {
                 report.stdout.run_metadata.managed_grok_selection =
                     Some(session.authority.selection_evidence());
