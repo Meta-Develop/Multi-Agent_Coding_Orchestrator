@@ -5,6 +5,7 @@
 //! 1. Lifecycle create → list_managed_verified → remove(force=true) concurrency 1 on S
 //!
 //! 2-3. Same lifecycle, disjoint agent_ids, concurrency 4 and 8 on S
+//! (`cargo bench` measures 8; Criterion `--test` probes 1 and 4 only)
 //!
 //! 4-5. Merge preview (claim + commit + preview_merge_apply_with_evidence, validation off)
 //! concurrency 1 on S and M
@@ -30,11 +31,37 @@ use std::{
     sync::{Arc, Barrier},
 };
 
+/// Matches Criterion's `--test` vs `--bench` mode so `cargo bench` still
+/// measures 1/4/8 while `cargo test --bench` / `--test` skip the 8-way stampede.
+fn criterion_cli_test_mode() -> bool {
+    let mut bench = false;
+    let mut test = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--bench" => bench = true,
+            "--test" => test = true,
+            _ => {}
+        }
+    }
+    match (bench, test) {
+        (true, true) => true,
+        (true, false) => false,
+        (false, _) => true,
+    }
+}
+
+fn lifecycle_worker_counts() -> impl Iterator<Item = usize> {
+    let skip_eight_way_stampede = criterion_cli_test_mode();
+    [1_usize, 4, 8]
+        .into_iter()
+        .filter(move |&workers| !(skip_eight_way_stampede && workers == 8))
+}
+
 pub fn worktree_lifecycle_s(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("worktree_lifecycle_s");
     bound_group(&mut group);
 
-    for worker_count in [1_usize, 4, 8] {
+    for worker_count in lifecycle_worker_counts() {
         let repo = EnvelopeRepo::small();
         eprint_identity_once(repo.repo_path());
         let agents = (0..worker_count)
