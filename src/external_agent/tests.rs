@@ -5545,6 +5545,383 @@ fn nonpublishable_managed_child_grok_acp_stdio_permission_escalation_refused() -
     Ok(())
 }
 
+fn fixture_acp_parent_evidence(
+    requested_model: &str,
+    requested_effort: &str,
+    resolved_model: Option<&str>,
+    resolved_effort: Option<&str>,
+    status: &str,
+    structured: Option<serde_json::Value>,
+    structured_error: Option<&str>,
+) -> crate::runtime_adapter::grok::GrokAcpParentEvidence {
+    use crate::runtime_adapter::grok::{
+        GrokAcpNativeCostEquivalent, GrokAcpParentEvidence, GrokAcpParentResolvedField,
+    };
+    let known_or_unknown = |value: Option<&str>| match value {
+        Some(value) => GrokAcpParentResolvedField::Known(value.to_string()),
+        None => GrokAcpParentResolvedField::Unknown,
+    };
+    GrokAcpParentEvidence {
+        protocol: "grok_acp_stdio".to_string(),
+        session_id: "sess-1".to_string(),
+        requested_model: Some(requested_model.to_string()),
+        requested_effort: Some(requested_effort.to_string()),
+        client_resolved_model: known_or_unknown(resolved_model),
+        client_resolved_effort: known_or_unknown(resolved_effort),
+        resolution_status: status.to_string(),
+        terminal_usage: None,
+        native_cost_equivalent_microunits: GrokAcpNativeCostEquivalent::Unknown {
+            reason: "fixture".to_string(),
+        },
+        permission_escalation_refused: false,
+        structured_output: structured,
+        structured_output_error: structured_error.map(str::to_string),
+        final_text: Some("hello".to_string()),
+        stop_reason: Some("end_turn".to_string()),
+    }
+}
+
+fn fixture_acp_schema_command(schema_path: PathBuf) -> ExternalAgentCommand {
+    let mut config = crate::runtime_adapter::RuntimeAdapterConfig::defaults(RuntimeId::Grok);
+    config.grok_interaction_protocol = crate::runtime_adapter::GrokInteractionProtocol::AcpStdio;
+    config.argument_template =
+        crate::runtime_adapter::grok::GROK_ACP_RUNTIME_DESCRIPTOR.immutable_argument_template();
+    let mut command = ExternalAgentCommand::codex(
+        "grok",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(5),
+    )
+    .with_runtime_adapter(RuntimeId::Grok, config)
+    .with_model_selection(Some("grok-4.6".to_string()), Some("xhigh".to_string()));
+    command.output_schema = Some(schema_path);
+    command
+}
+
+fn admitted_boolean_schema() -> crate::runtime_adapter::grok_acp::GrokAcpBoundOutputSchema {
+    crate::runtime_adapter::grok_acp::GrokAcpBoundOutputSchema::from_canonical_json(
+        r#"{"properties":{"accepted":{"type":"boolean"}},"required":["accepted"],"type":"object"}"#,
+    )
+    .expect("admitted schema")
+}
+
+#[test]
+fn grok_acp_staged_output_accepts_schema_valid_object() -> Result<()> {
+    let schema = admitted_boolean_schema();
+    let command = fixture_acp_schema_command(PathBuf::from("/run/worker-report.schema.json"));
+    let evidence = fixture_acp_parent_evidence(
+        "grok-4.6",
+        "xhigh",
+        Some("grok-4.6"),
+        Some("xhigh"),
+        "complete",
+        Some(serde_json::json!({"accepted": true})),
+        None,
+    );
+    let staged = grok_acp_staged_output_bytes(&command, &evidence, true, Some(&schema))?;
+    assert_eq!(staged, br#"{"accepted":true}"#);
+    Ok(())
+}
+
+#[test]
+fn grok_acp_staged_output_refuses_wrong_type_even_after_schema_file_replacement() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let schema_path = temp.path().join("worker-report.schema.json");
+    fs::write(
+        &schema_path,
+        r#"{"type":"object","required":["accepted"],"properties":{"accepted":{"type":"boolean"}}}"#,
+    )?;
+    let bound = bind_grok_acp_launch_schema(&fixture_acp_schema_command(schema_path.clone()))?
+        .context("schema must bind at launch")?;
+    fs::write(
+        &schema_path,
+        r#"{"type":"object","required":["accepted"],"properties":{"accepted":{"type":"string"}}}"#,
+    )?;
+    let command = fixture_acp_schema_command(schema_path);
+    let wrong_type = fixture_acp_parent_evidence(
+        "grok-4.6",
+        "xhigh",
+        Some("grok-4.6"),
+        Some("xhigh"),
+        "complete",
+        Some(serde_json::json!({"accepted": "wrong"})),
+        None,
+    );
+    let error = grok_acp_staged_output_bytes(&command, &wrong_type, true, Some(&bound))
+        .expect_err("replaced schema must not accept a string")
+        .to_string();
+    assert!(error.contains("type"), "{error}");
+    assert!(!error.contains("wrong"), "{error}");
+
+    let valid = fixture_acp_parent_evidence(
+        "grok-4.6",
+        "xhigh",
+        Some("grok-4.6"),
+        Some("xhigh"),
+        "complete",
+        Some(serde_json::json!({"accepted": true})),
+        None,
+    );
+    let staged = grok_acp_staged_output_bytes(&command, &valid, true, Some(&bound))?;
+    assert_eq!(staged, br#"{"accepted":true}"#);
+    Ok(())
+}
+
+#[test]
+fn grok_acp_staged_output_refuses_absent_required_field() -> Result<()> {
+    let schema = admitted_boolean_schema();
+    let command = fixture_acp_schema_command(PathBuf::from("/run/worker-report.schema.json"));
+    let evidence = fixture_acp_parent_evidence(
+        "grok-4.6",
+        "xhigh",
+        Some("grok-4.6"),
+        Some("xhigh"),
+        "complete",
+        Some(serde_json::json!({})),
+        None,
+    );
+    let error = grok_acp_staged_output_bytes(&command, &evidence, true, Some(&schema))
+        .expect_err("missing required field")
+        .to_string();
+    assert!(error.contains("required"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn grok_acp_staged_output_refuses_terminal_schema_error() -> Result<()> {
+    let schema = admitted_boolean_schema();
+    let command = fixture_acp_schema_command(PathBuf::from("/run/worker-report.schema.json"));
+    let evidence = fixture_acp_parent_evidence(
+        "grok-4.6",
+        "xhigh",
+        Some("grok-4.6"),
+        Some("xhigh"),
+        "complete",
+        None,
+        Some("provider schema diagnostic"),
+    );
+    let error = grok_acp_staged_output_bytes(&command, &evidence, true, Some(&schema))
+        .expect_err("structuredOutputError")
+        .to_string();
+    assert!(error.contains("terminal structuredOutputError"), "{error}");
+    assert!(!error.contains("provider schema diagnostic"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn grok_acp_staged_output_refuses_unbound_schema_identity() -> Result<()> {
+    let command = fixture_acp_schema_command(PathBuf::from("/run/worker-report.schema.json"));
+    let evidence = fixture_acp_parent_evidence(
+        "grok-4.6",
+        "xhigh",
+        Some("grok-4.6"),
+        Some("xhigh"),
+        "complete",
+        Some(serde_json::json!({"accepted": true})),
+        None,
+    );
+    let error = grok_acp_staged_output_bytes(&command, &evidence, true, None)
+        .expect_err("unbound schema identity")
+        .to_string();
+    assert!(error.contains("not bound at launch"), "{error}");
+    Ok(())
+}
+
+#[cfg(unix)]
+fn record_verified_acp_publication(
+    evidence: &crate::runtime_adapter::grok::GrokAcpParentEvidence,
+) -> Result<ExternalAgentRun> {
+    use crate::process_runner::{
+        CapturedBytes, ProcessTreeEvidence, SideEffectConfinementEvidence,
+        SideEffectConfinementProfileKind,
+    };
+    use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
+    use std::process::ExitStatus;
+
+    let temp = tempfile::tempdir()?;
+    create_mandatory_control_roots(temp.path())?;
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+    let prompt = temp.path().join("prompt.md");
+    fs::write(&prompt, "acp\n")?;
+    let mut config = crate::runtime_adapter::RuntimeAdapterConfig::defaults(RuntimeId::Grok);
+    config.grok_interaction_protocol = crate::runtime_adapter::GrokInteractionProtocol::AcpStdio;
+    config.argument_template =
+        crate::runtime_adapter::grok::GROK_ACP_RUNTIME_DESCRIPTOR.immutable_argument_template();
+    let command = ExternalAgentCommand::codex(
+        "grok",
+        temp.path(),
+        &prompt,
+        incoming.join("events.jsonl"),
+        incoming.join("report.json"),
+        Duration::from_secs(5),
+    )
+    .with_runtime_adapter(RuntimeId::Grok, config)
+    .with_model_selection(Some("grok-4.6".to_string()), Some("xhigh".to_string()));
+    let staged_path = incoming.join("staged.raw");
+    let mut staged_output = reserve_external_output(&staged_path)?;
+    let mut output_reservation = reserve_external_output(&command.output_last_message)?;
+    let mut json_log_reservation = reserve_external_output(&command.json_log)?;
+    let identity_path = temp.path().join("identity.txt");
+    fs::write(&identity_path, b"id")?;
+    let program_identity = external_program_identity(&identity_path)?;
+    let mut report = ExternalAgentRun {
+        command: vec!["grok".to_string()],
+        cwd: command.cwd.clone(),
+        timeout_seconds: command.timeout.as_secs(),
+        exit_code: None,
+        duration_ms: 0,
+        timed_out: false,
+        process_tree: None,
+        side_effects: None,
+        publishable: false,
+        program_trust: ExternalProgramTrust::ExplicitCustom,
+        codex_permissions: None,
+        stdout: CapturedOutput::default(),
+        stderr: CapturedOutput::default(),
+        error: None,
+        output_last_message: None,
+        grok_stream_usage_evidence: None,
+        grok_acp_parent_evidence: None,
+        codex_parent_evidence: None,
+    };
+    let output = ProcessOutput {
+        status: Some(ExitStatus::from_raw(0)),
+        duration: Duration::from_millis(1),
+        timed_out: false,
+        process_tree: ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService),
+        side_effects: SideEffectConfinementEvidence::Verified(
+            SideEffectConfinementProfileKind::ExternalGrok,
+        ),
+        stdout: CapturedBytes::default(),
+        stderr: CapturedBytes::default(),
+        process_error: None,
+        stdin_error: None,
+    };
+    let protected_controls = protected_worktree_controls(&command)?;
+    record_completed_target(
+        &mut report,
+        output,
+        CompletedTargetStaging {
+            output: &mut staged_output,
+            codex_home: None,
+        },
+        &mut output_reservation,
+        &mut json_log_reservation,
+        &CredentialRedactor::default(),
+        CompletedTargetContext {
+            runtime: ExternalExecutionRuntime::Verified,
+            codex_version: None,
+            spec: &command,
+            protected_controls: &protected_controls,
+            argv_digest: "digest",
+            program_identity: &program_identity,
+            grok_acp_parent_evidence: Some(evidence),
+            grok_acp_launch_schema_identity: None,
+        },
+    );
+    Ok(report)
+}
+
+#[cfg(unix)]
+#[test]
+fn record_completed_target_publishes_matching_acp_identity() -> Result<()> {
+    let evidence = fixture_acp_parent_evidence(
+        "grok-4.6",
+        "xhigh",
+        Some("grok-4.6"),
+        Some("xhigh"),
+        "complete",
+        Some(serde_json::json!({"accepted": true})),
+        None,
+    );
+    let report = record_verified_acp_publication(&evidence)?;
+    assert!(report.error.is_none(), "{:?}", report.error);
+    assert!(report.publishable);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn record_completed_target_refuses_wrong_acp_model() -> Result<()> {
+    let evidence = fixture_acp_parent_evidence(
+        "grok-4.6",
+        "xhigh",
+        Some("grok-other"),
+        Some("xhigh"),
+        "complete",
+        Some(serde_json::json!({"accepted": true})),
+        None,
+    );
+    let report = record_verified_acp_publication(&evidence)?;
+    assert!(report
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("resolved model does not match the admitted model")));
+    assert!(!report.publishable);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn record_completed_target_refuses_wrong_acp_effort() -> Result<()> {
+    let evidence = fixture_acp_parent_evidence(
+        "grok-4.6",
+        "xhigh",
+        Some("grok-4.6"),
+        Some("high"),
+        "complete",
+        Some(serde_json::json!({"accepted": true})),
+        None,
+    );
+    let report = record_verified_acp_publication(&evidence)?;
+    assert!(report
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("resolved effort does not match the admitted effort")));
+    assert!(!report.publishable);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn record_completed_target_refuses_missing_and_conflicting_acp_identity() -> Result<()> {
+    let missing = fixture_acp_parent_evidence(
+        "grok-4.6",
+        "xhigh",
+        Some("grok-4.6"),
+        None,
+        "unresolved",
+        Some(serde_json::json!({"accepted": true})),
+        None,
+    );
+    let missing_report = record_verified_acp_publication(&missing)?;
+    assert!(missing_report.error.as_deref().is_some_and(|error| {
+        error.contains("resolved identity evidence is missing or incomplete")
+    }));
+    assert!(!missing_report.publishable);
+
+    let conflicting = fixture_acp_parent_evidence(
+        "grok-4.6",
+        "xhigh",
+        Some("grok-4.6"),
+        Some("xhigh"),
+        "ambiguous_model_change",
+        Some(serde_json::json!({"accepted": true})),
+        None,
+    );
+    let conflicting_report = record_verified_acp_publication(&conflicting)?;
+    assert!(conflicting_report
+        .error
+        .as_deref()
+        .is_some_and(|error| { error.contains("resolved identity evidence is conflicting") }));
+    assert!(!conflicting_report.publishable);
+    Ok(())
+}
+
 const WRITABLE_GROK_ACP_FIXTURE_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/runtime_adapter/grok"
@@ -5896,7 +6273,7 @@ fn writable_grok_acp_run_external_agent_helper(fixture_mode: &str) -> Result<()>
         assert!(report.grok_stream_usage_evidence.is_none());
         assert_eq!(
             evidence.client_resolved_model,
-            GrokAcpParentResolvedField::Known("maco-fixture-synthetic-4.6".to_string())
+            GrokAcpParentResolvedField::Known("grok-4.6".to_string())
         );
         assert_eq!(
             evidence.client_resolved_effort,
@@ -7024,6 +7401,7 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
                 argv_digest: "digest",
                 program_identity: &program_identity,
                 grok_acp_parent_evidence: None,
+                grok_acp_launch_schema_identity: None,
             },
         );
         Ok(report)
@@ -7891,6 +8269,7 @@ fn verified_nonzero_target_retains_permission_and_containment_evidence() -> Resu
             argv_digest: "verified-argv-digest",
             program_identity: &program_identity,
             grok_acp_parent_evidence: None,
+            grok_acp_launch_schema_identity: None,
         },
     );
 
@@ -10755,7 +11134,6 @@ fn freeze_harness_selection(
 #[cfg(target_os = "linux")]
 #[test]
 fn verified_grok_socket_registry_a_vs_local_registry_b_refuses_target_launch() -> Result<()> {
-    use crate::account_authority::FrozenGrokSelectionGuard;
     use coding_agent_manager_lib::account_authority::StoredAccountRegistry;
 
     let temp = tempfile::tempdir()?;
@@ -10764,9 +11142,9 @@ fn verified_grok_socket_registry_a_vs_local_registry_b_refuses_target_launch() -
     let listen_registry = StoredAccountRegistry::new(harness_a.registry.metadata_path());
     let (_socket_dir, socket_path, _server) = serve_cam_registry_on_socket(listen_registry);
     let frozen = freeze_harness_selection(&harness_a);
-    let _freeze = FrozenGrokSelectionGuard::pin(Some(frozen));
     let _socket_env = CamSocketEnvGuard::set(&socket_path);
-    let command = admitted_verified_grok_cam_command(temp.path())?;
+    let command = admitted_verified_grok_cam_command(temp.path())?
+        .with_grok_run_account_binding(Some(frozen));
     let _keep_a = harness_a;
     let report = run_external_agent_with_cam_grok_test_harness(harness_b, &command);
     assert!(
@@ -10782,8 +11160,6 @@ fn verified_grok_socket_registry_a_vs_local_registry_b_refuses_target_launch() -
 #[cfg(target_os = "linux")]
 #[test]
 fn verified_grok_no_socket_observe_then_launch_uses_matching_local_registry() -> Result<()> {
-    use crate::account_authority::FrozenGrokSelectionGuard;
-
     let temp = tempfile::tempdir()?;
     let _no_socket = CamSocketEnvGuard::unset();
     let (harness, _, expected_binding) = build_cam_grok_test_harness("account-a")?;
@@ -10799,8 +11175,8 @@ fn verified_grok_no_socket_observe_then_launch_uses_matching_local_registry() ->
         expected_with_authority.authority_id.is_some(),
         "local observation must freeze authority_id"
     );
-    let _freeze = FrozenGrokSelectionGuard::pin(Some(frozen));
-    let command = admitted_verified_grok_cam_command(temp.path())?;
+    let command = admitted_verified_grok_cam_command(temp.path())?
+        .with_grok_run_account_binding(Some(frozen));
     let report = run_external_agent_with_cam_grok_test_harness(harness, &command);
     assert_verified_grok_cam_admitted_provider_failure(&report, &expected_with_authority)?;
     Ok(())
@@ -10809,7 +11185,6 @@ fn verified_grok_no_socket_observe_then_launch_uses_matching_local_registry() ->
 #[cfg(target_os = "linux")]
 #[test]
 fn verified_grok_matching_socket_and_local_authority_launches_frozen_binding() -> Result<()> {
-    use crate::account_authority::FrozenGrokSelectionGuard;
     use coding_agent_manager_lib::account_authority::StoredAccountRegistry;
 
     let temp = tempfile::tempdir()?;
@@ -10824,9 +11199,9 @@ fn verified_grok_matching_socket_and_local_authority_launches_frozen_binding() -
         selection_revision: expected_binding.selection_revision,
         authority_id: frozen.authority_id.clone(),
     };
-    let _freeze = FrozenGrokSelectionGuard::pin(Some(frozen));
     let _socket_env = CamSocketEnvGuard::set(&socket_path);
-    let command = admitted_verified_grok_cam_command(temp.path())?;
+    let command = admitted_verified_grok_cam_command(temp.path())?
+        .with_grok_run_account_binding(Some(frozen));
     let report = run_external_agent_with_cam_grok_test_harness(harness, &command);
     assert_verified_grok_cam_admitted_provider_failure(&report, &expected_with_authority)?;
     Ok(())
@@ -10835,7 +11210,7 @@ fn verified_grok_matching_socket_and_local_authority_launches_frozen_binding() -
 #[cfg(target_os = "linux")]
 #[test]
 fn verified_grok_selection_change_after_observation_refuses_target_launch() -> Result<()> {
-    use crate::account_authority::{FrozenGrokSelectionGuard, GROK_CLI_PROVIDER_ID};
+    use crate::account_authority::GROK_CLI_PROVIDER_ID;
     use coding_agent_manager_lib::account_authority::StoredAccountRegistry;
     use coding_agent_manager_lib::providers::select_launch_account;
 
@@ -10853,9 +11228,9 @@ fn verified_grok_selection_change_after_observation_refuses_target_launch() -> R
     );
     let listen_registry = StoredAccountRegistry::new(harness.registry.metadata_path());
     let (_socket_dir, socket_path, _server) = serve_cam_registry_on_socket(listen_registry);
-    let _freeze = FrozenGrokSelectionGuard::pin(Some(frozen));
     let _socket_env = CamSocketEnvGuard::set(&socket_path);
-    let command = admitted_verified_grok_cam_command(temp.path())?;
+    let command = admitted_verified_grok_cam_command(temp.path())?
+        .with_grok_run_account_binding(Some(frozen));
     let report = run_external_agent_with_cam_grok_test_harness(harness, &command);
     assert!(
         !report.stdout.target_launch_attempted,

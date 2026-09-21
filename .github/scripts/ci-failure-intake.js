@@ -100,19 +100,46 @@ function decodeEvidenceLine(line) {
   };
 }
 
-function parseEvidence(issue) {
+function readEvidence(issue) {
   const found = [];
   for (const line of String(issue?.body ?? "").split(/\r?\n/)) {
-    const decoded = decodeEvidenceLine(line);
-    if (decoded) {
-      found.push(decoded);
+    const trimmed = String(line).trim();
+    if (!trimmed.startsWith(EVIDENCE_MARKER_PREFIX)) {
+      continue;
     }
+    const decoded = decodeEvidenceLine(line);
+    if (!decoded) {
+      return { ok: false, evidence: null };
+    }
+    found.push(decoded);
   }
   if (found.length === 0) {
-    return null;
+    return { ok: true, evidence: null };
   }
   found.sort(compareIdentity);
-  return found[found.length - 1];
+  return { ok: true, evidence: found[found.length - 1] };
+}
+
+function parseEvidence(issue) {
+  const result = readEvidence(issue);
+  return result.ok ? result.evidence : null;
+}
+
+function newestEvidence(issues) {
+  let newest = null;
+  for (const issue of issues) {
+    const result = readEvidence(issue);
+    if (!result.ok) {
+      return { ok: false, evidence: null };
+    }
+    if (
+      result.evidence &&
+      (newest === null || compareIdentity(newest, result.evidence) < 0)
+    ) {
+      newest = result.evidence;
+    }
+  }
+  return { ok: true, evidence: newest };
 }
 
 function replaceEvidenceMarker(body, marker, evidenceMarker) {
@@ -348,17 +375,35 @@ async function reconcileCiFailureIntake({
   const matches = allItems
     .filter((item) => !item.pull_request && hasExactMarker(item))
     .sort((left, right) => left.number - right.number);
+  const persistedResult = newestEvidence(matches);
+  if (!persistedResult.ok) {
+    core.setFailed("The tracked issue evidence could not be read.");
+    return;
+  }
+  const persisted = persistedResult.evidence;
   let issue = matches[0];
-  const persisted = issue ? parseEvidence(issue) : null;
   if (persisted && compareIdentity(eventIdentity, persisted) < 0) {
     core.notice(
       "Ignoring a stale workflow run; the tracked issue already records a newer run or attempt.",
     );
     return;
   }
+  const extraOpenDuplicates = matches
+    .slice(1)
+    .some((item) => item.state === "open");
+  const canonicalEvidence = issue ? parseEvidence(issue) : null;
+  const canonicalHasNewest =
+    canonicalEvidence !== null &&
+    persisted !== null &&
+    compareIdentity(canonicalEvidence, persisted) === 0;
   if (persisted && compareIdentity(eventIdentity, persisted) === 0) {
-    const needsClose = run.conclusion === "success" && issue.state === "open";
-    if (!needsClose) {
+    const needsClose =
+      run.conclusion === "success" &&
+      matches.some((item) => item.state === "open");
+    const needsConsolidate =
+      extraOpenDuplicates ||
+      (issue?.state === "open" && !canonicalHasNewest);
+    if (!needsClose && !needsConsolidate) {
       core.notice(
         "Ignoring a duplicate workflow run event that was already applied.",
       );
@@ -386,7 +431,6 @@ async function reconcileCiFailureIntake({
       return;
     }
 
-    await closeDuplicates();
     const nextBody = replaceEvidenceMarker(issue.body, marker, evidenceMarker);
     if (issue.state === "open") {
       const recoveryBody = [
@@ -423,6 +467,7 @@ async function reconcileCiFailureIntake({
         body: nextBody,
       });
     }
+    await closeDuplicates();
     return;
   }
 
@@ -559,7 +604,6 @@ async function reconcileCiFailureIntake({
     return;
   }
 
-  await closeDuplicates();
   const reopening = issue.state !== "open";
   await github.rest.issues.update({
     owner,
@@ -569,6 +613,7 @@ async function reconcileCiFailureIntake({
     body,
     ...(reopening ? { state: "open" } : {}),
   });
+  await closeDuplicates();
   if (reopening) {
     await ensureLabel("agent:inbox", "D4C5F9", "Awaiting agent triage");
     await ensureLabel("ci-failure", "B60205", "Tracked CI failure");

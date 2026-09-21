@@ -3984,10 +3984,11 @@ fn observe_selected_cam_binding(
 
 fn account_observation_for_launch_runtime(
     runtime: SupervisorRuntime,
+    run_id: Option<&str>,
 ) -> Result<Option<AccountObserveResult>> {
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = runtime;
+        let _ = (runtime, run_id);
         return Ok(None);
     }
     #[cfg(target_os = "linux")]
@@ -4006,6 +4007,7 @@ fn account_observation_for_launch_runtime(
                     )
                     .inspect(|observation| {
                         freeze_observed_grok_from_registry(
+                            run_id,
                             provider_id,
                             &harness.registry,
                             observation.as_ref(),
@@ -4024,6 +4026,7 @@ fn account_observation_for_launch_runtime(
             return Ok(match observed {
                 Some(observed) => {
                     crate::account_authority::record_observed_grok_selection(
+                        run_id,
                         provider_id,
                         Some(observed.authority_id),
                         Some(&observed.observation.binding),
@@ -4032,6 +4035,7 @@ fn account_observation_for_launch_runtime(
                 }
                 None => {
                     crate::account_authority::record_observed_grok_selection(
+                        run_id,
                         provider_id,
                         None,
                         None,
@@ -4048,18 +4052,20 @@ fn account_observation_for_launch_runtime(
             anyhow!("Coding Agent Manager provider `{provider_id}` is not registered")
         })?;
         let observation = observe_selected_cam_binding(&registry, adapter.as_ref(), provider_id)?;
-        freeze_observed_grok_from_registry(provider_id, &registry, observation.as_ref());
+        freeze_observed_grok_from_registry(run_id, provider_id, &registry, observation.as_ref());
         Ok(observation)
     }
 }
 
 #[cfg(target_os = "linux")]
 fn freeze_observed_grok_from_registry(
+    run_id: Option<&str>,
     provider_id: &str,
     registry: &StoredAccountRegistry,
     observation: Option<&AccountObserveResult>,
 ) {
     crate::account_authority::record_observed_grok_selection(
+        run_id,
         provider_id,
         observation.map(|_| authority_id_for(registry.metadata_path())),
         observation.map(|observation| &observation.binding),
@@ -4101,7 +4107,8 @@ pub(super) fn initialize_supervisor_selection_from_prepared_metadata(
             let frozen_history = current_run
                 .map(|run| load_frozen_outcome_history(repo, run))
                 .transpose()?;
-            let account_observation = account_observation_for_launch_runtime(runtime)?;
+            let account_observation =
+                account_observation_for_launch_runtime(runtime, current_run.map(RunId::as_str))?;
             let resolution = initialize_supervisor_selection_with_history(
                 plan,
                 runtime,
@@ -6432,8 +6439,9 @@ mod selection_policy_tests {
         #[test]
         fn scheduler_account_observe_admits_observed_models() -> Result<()> {
             let _guard = activate_stub(true, SchedulerObserveStubMode::ObservedModels);
-            let observation = account_observation_for_launch_runtime(SupervisorRuntime::Codex)?
-                .context("selected CAM binding must produce Some observation")?;
+            let observation =
+                account_observation_for_launch_runtime(SupervisorRuntime::Codex, None)?
+                    .context("selected CAM binding must produce Some observation")?;
             assert_eq!(observation.binding.provider_id, "codex-cli");
             let models = observation.models.as_ref().context("models category")?;
             assert_eq!(models.outcome, ObservationOutcome::Observed);
@@ -6499,8 +6507,12 @@ mod selection_policy_tests {
                 }),
                 _root: root,
             });
-            assert!(account_observation_for_launch_runtime(SupervisorRuntime::Codex)?.is_none());
-            assert!(account_observation_for_launch_runtime(SupervisorRuntime::Fake)?.is_none());
+            assert!(
+                account_observation_for_launch_runtime(SupervisorRuntime::Codex, None)?.is_none()
+            );
+            assert!(
+                account_observation_for_launch_runtime(SupervisorRuntime::Fake, None)?.is_none()
+            );
 
             let (temporary, repo, catalog, admission, mut plan, mut plan_metadata) =
                 prepared_selection_fixture()?;
@@ -6537,7 +6549,7 @@ mod selection_policy_tests {
         #[test]
         fn scheduler_account_observe_error_fails_closed() -> Result<()> {
             let _guard = activate_stub(true, SchedulerObserveStubMode::ObserveError);
-            let error = account_observation_for_launch_runtime(SupervisorRuntime::Codex)
+            let error = account_observation_for_launch_runtime(SupervisorRuntime::Codex, None)
                 .expect_err("observe error must fail closed");
             assert!(error
                 .to_string()
@@ -6669,8 +6681,9 @@ mod selection_policy_tests {
             });
             let _env = SocketEnvGuard::set(&socket_path);
 
-            let observation = account_observation_for_launch_runtime(SupervisorRuntime::Codex)?
-                .context("configured authority socket must observe selected account")?;
+            let observation =
+                account_observation_for_launch_runtime(SupervisorRuntime::Codex, None)?
+                    .context("configured authority socket must observe selected account")?;
             assert_eq!(observation.binding.account_id, "work");
             let models = observation.models.as_ref().context("models category")?;
             assert_eq!(models.outcome, ObservationOutcome::Observed);
@@ -6692,7 +6705,8 @@ mod selection_policy_tests {
         fn scheduler_grok_socket_observe_freezes_selected_binding() -> Result<()> {
             use crate::account_authority::authority_socket_config::CAM_AUTHORITY_SOCKET_ENV;
             use crate::account_authority::{
-                frozen_observed_grok_selection, FrozenGrokSelectionGuard, GROK_CLI_PROVIDER_ID,
+                admit_grok_run_account_binding, frozen_observed_grok_selection,
+                grok_run_account_binding, FrozenGrokSelectionGuard, GROK_CLI_PROVIDER_ID,
             };
             use coding_agent_manager_lib::account_authority::{
                 authority_id_for, listen, resolve_socket_path, AuthorityContext,
@@ -6825,8 +6839,11 @@ mod selection_policy_tests {
             thread::spawn(move || while listener.accept_once().is_ok() {});
             let _env = SocketEnvGuard::set(&socket_path);
 
-            let observation = account_observation_for_launch_runtime(SupervisorRuntime::Grok)?
-                .context("configured authority socket must observe selected Grok account")?;
+            let observation = account_observation_for_launch_runtime(
+                SupervisorRuntime::Grok,
+                Some("issue-601-scheduler-observe"),
+            )?
+            .context("configured authority socket must observe selected Grok account")?;
             assert_eq!(observation.binding.account_id, "work");
             let frozen =
                 frozen_observed_grok_selection().context("Grok observation must freeze")?;
@@ -6843,6 +6860,10 @@ mod selection_policy_tests {
                 frozen.selection_revision,
                 expected_binding.selection_revision
             );
+            let admitted = grok_run_account_binding("issue-601-scheduler-observe")
+                .context("Grok observation must admit a per-run binding")?;
+            assert_eq!(admitted, frozen);
+            admit_grok_run_account_binding("issue-601-scheduler-observe", None);
             Ok(())
         }
     }

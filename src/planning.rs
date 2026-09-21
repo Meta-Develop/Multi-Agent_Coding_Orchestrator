@@ -1,4 +1,5 @@
 use crate::{
+    decision_ref::DecisionRef,
     llm::{LlmProvider, LlmRequest, LlmResponse, PromptContext, Redactor, RequestBudget, Usage},
     repo_semantic,
     safe_state::{
@@ -10,11 +11,13 @@ use crate::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt, fs,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+
+pub const DESIGN_DECISION_MARKER: &str = "design-decision:";
 
 const REPOSITORY_INVENTORY_MAX_DEPTH: usize = 128;
 const REPOSITORY_INVENTORY_MAX_ENTRIES: usize = 100_000;
@@ -87,6 +90,20 @@ pub struct TaskAssignmentProposal {
     pub assigned_paths: Vec<PathBuf>,
     pub semantic_symbols: Vec<String>,
     pub semantic_modules: Vec<String>,
+    /// Spec design-decision question keys this assignment depends on.
+    ///
+    /// Empty means the assignment declared no design dependency. Provider
+    /// proposals that omit a spec-declared key fail closed during validation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decision_dependencies: Vec<String>,
+}
+
+/// One `design-decision:` claim parsed from a task spec or fragment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeclaredDesignDecision {
+    pub question_key: String,
+    pub question: String,
+    pub resolution: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -149,6 +166,8 @@ pub struct ProviderTaskAssignmentTree {
     pub semantic_symbols: Vec<String>,
     pub semantic_modules: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decision_dependencies: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub child_assignments: Vec<ProviderTaskAssignmentTree>,
 }
 
@@ -167,6 +186,7 @@ impl From<TaskAssignmentProposal> for ProviderTaskAssignmentTree {
             assigned_paths: assignment.assigned_paths,
             semantic_symbols: assignment.semantic_symbols,
             semantic_modules: assignment.semantic_modules,
+            decision_dependencies: assignment.decision_dependencies,
             child_assignments: Vec::new(),
         }
     }
@@ -182,6 +202,87 @@ impl From<ProviderTaskPlan> for ProviderRecursiveTaskPlan {
                 .collect(),
         }
     }
+}
+
+/// Parses `design-decision:` claims from spec or assignment text.
+///
+/// Duplicate keys with the same question and resolution are collapsed.
+/// Inconsistent duplicates fail closed so dependents cannot dispatch.
+pub fn parse_declared_design_decisions(text: &str) -> Result<Vec<DeclaredDesignDecision>> {
+    let mut by_key = BTreeMap::new();
+    let mut remaining = text;
+    while let Some(offset) = remaining.find(DESIGN_DECISION_MARKER) {
+        let after = remaining[offset + DESIGN_DECISION_MARKER.len()..].trim_start();
+        let parsed = parse_one_declared_design_decision(after)?;
+        if let Some(existing) = by_key.get(&parsed.question_key) {
+            if existing != &parsed {
+                anyhow::bail!(
+                    "generated design decision '{}' has inconsistent question or resolution; dependent dispatch is blocked until reconciled",
+                    parsed.question_key
+                );
+            }
+        } else {
+            by_key.insert(parsed.question_key.clone(), parsed);
+        }
+        remaining = after;
+    }
+    Ok(by_key.into_values().collect())
+}
+
+fn parse_one_declared_design_decision(after_marker: &str) -> Result<DeclaredDesignDecision> {
+    let Some((question_key, rest)) = after_marker.split_once(':') else {
+        anyhow::bail!("generated design-decision is missing a question-key terminator ':'");
+    };
+    let Some((question, resolution)) = rest.split_once(" = ") else {
+        anyhow::bail!(
+            "generated design-decision '{}' is missing ' = ' between question and resolution",
+            question_key.trim()
+        );
+    };
+    let resolution = resolution
+        .lines()
+        .next()
+        .unwrap_or(resolution)
+        .trim()
+        .trim_end_matches('.')
+        .trim();
+    let reference = DecisionRef::new(question_key)?;
+    Ok(DeclaredDesignDecision {
+        question_key: reference.question_key().to_string(),
+        question: question.trim().to_string(),
+        resolution: resolution.to_string(),
+    })
+}
+
+fn decision_dependency_keys_from_text(text: &str) -> Result<Vec<String>> {
+    Ok(parse_declared_design_decisions(text)?
+        .into_iter()
+        .map(|decision| decision.question_key)
+        .collect())
+}
+
+fn with_inferred_decision_dependencies(
+    mut assignment: TaskAssignmentProposal,
+) -> Result<TaskAssignmentProposal> {
+    assignment.decision_dependencies = decision_dependency_keys_from_text(&assignment.task)?;
+    Ok(assignment)
+}
+
+fn declared_design_decisions_from_fragments(
+    fragments: &[TaskSpecFragment],
+    allowed_fragment_ids: Option<&BTreeSet<String>>,
+) -> Result<Vec<DeclaredDesignDecision>> {
+    let mut text = String::new();
+    for fragment in fragments {
+        if allowed_fragment_ids.is_some_and(|allowed| !allowed.contains(&fragment.id)) {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&fragment.text);
+    }
+    parse_declared_design_decisions(&text)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -618,7 +719,7 @@ fn propose_task_decomposition_from_fragments(
         );
         return Ok(TaskDecompositionProposal {
             fragments,
-            assignments: vec![assignment],
+            assignments: vec![with_inferred_decision_dependencies(assignment)?],
             coverage_gaps: Vec::new(),
             diagnostics,
             disjointness: TaskDisjointnessReport {
@@ -642,7 +743,7 @@ fn propose_task_decomposition_from_fragments(
         );
         return Ok(TaskDecompositionProposal {
             fragments,
-            assignments: vec![assignment],
+            assignments: vec![with_inferred_decision_dependencies(assignment)?],
             coverage_gaps: Vec::new(),
             diagnostics,
             disjointness: TaskDisjointnessReport {
@@ -686,7 +787,7 @@ fn propose_task_decomposition_from_fragments(
     let mut unresolved_named_paths = Vec::new();
     for fragment in &fragments {
         let proposed =
-            propose_fragment_scope(fragment, repo, &files, &file_set, semantic_map.as_ref());
+            propose_fragment_scope(fragment, repo, &files, &file_set, semantic_map.as_ref())?;
         let candidate = proposed.assignment;
         if proposed.suppressed_broad_paths > 0 {
             diagnostics.notes.push(format!(
@@ -795,6 +896,7 @@ fn authoritative_single_file_assignment(
         assigned_paths: vec![only_path],
         semantic_symbols: Vec::new(),
         semantic_modules: Vec::new(),
+        decision_dependencies: Vec::new(),
     })
 }
 
@@ -839,6 +941,7 @@ fn authoritative_new_file_creation_assignment(
         assigned_paths: vec![only_path],
         semantic_symbols: Vec::new(),
         semantic_modules: Vec::new(),
+        decision_dependencies: Vec::new(),
     })
 }
 
@@ -1071,6 +1174,8 @@ pub fn propose_task_decomposition_with_provider<P: LlmProvider + ?Sized>(
         .map(|fragment| fragment.id.clone())
         .collect::<BTreeSet<_>>();
     let semantic_inventory = collect_provider_semantic_inventory(repo, &files);
+    let declared_design_decisions =
+        declared_design_decisions_from_fragments(&fragments, Some(&allowed_fragment_ids))?;
     let payload = serde_json::json!({
         "operation": "propose",
         "response_schema": {
@@ -1081,6 +1186,7 @@ pub fn propose_task_decomposition_with_provider<P: LlmProvider + ?Sized>(
                 "assigned_paths": ["repository/relative/file"],
                 "semantic_symbols": ["crate::module::symbol"],
                 "semantic_modules": ["crate::module"],
+                "decision_dependencies": ["question.key"],
                 "child_assignments": ["recursive assignment objects with this same schema"]
             }]
         },
@@ -1095,9 +1201,12 @@ pub fn propose_task_decomposition_with_provider<P: LlmProvider + ?Sized>(
             "Every assignment must own at least one file.",
             "Executable leaves must cover every supplied fragment exactly once.",
             "Internal fragment_ids must equal the union of descendant leaf fragment_ids.",
-            "Concurrent branches must be scope-disjoint; only strict ancestor/descendant nodes may share scope."
+            "Concurrent branches must be scope-disjoint; only strict ancestor/descendant nodes may share scope.",
+            "Cite every spec design-decision question key on each dependent assignment via decision_dependencies.",
+            "Unmapped design-decision keys fail closed; do not omit dependents."
         ],
         "fragments": fragments,
+        "design_decisions": declared_design_decisions,
         "repository_paths": files,
         "semantic_modules": semantic_inventory.modules,
         "semantic_symbols": semantic_inventory.symbols,
@@ -1201,6 +1310,10 @@ pub fn replan_task_decomposition_with_provider<P: LlmProvider + ?Sized>(
         "{}-replan-{next_attempt:02}",
         config.request_id_prefix.trim()
     );
+    let declared_design_decisions = declared_design_decisions_from_fragments(
+        &session.proposal.fragments,
+        Some(&allowed_fragment_ids),
+    )?;
     let payload = serde_json::json!({
         "operation": "replan",
         "attempt": next_attempt,
@@ -1216,7 +1329,9 @@ pub fn replan_task_decomposition_with_provider<P: LlmProvider + ?Sized>(
             "Every assignment must own at least one supplied repository file.",
             "Executable leaves must cover every remaining fragment exactly once.",
             "Do not reclaim path, module, or symbol scope from completed assignments.",
-            "Concurrent branches must be scope-disjoint; only strict ancestor/descendant nodes may share scope."
+            "Concurrent branches must be scope-disjoint; only strict ancestor/descendant nodes may share scope.",
+            "Cite every remaining spec design-decision question key on each dependent assignment via decision_dependencies.",
+            "Unmapped design-decision keys fail closed; do not omit dependents."
         ],
         "fragments": session.proposal.fragments,
         "remaining_fragment_ids": allowed_fragment_ids,
@@ -1225,6 +1340,7 @@ pub fn replan_task_decomposition_with_provider<P: LlmProvider + ?Sized>(
         "current_proposal": session.proposal,
         "current_provider_assignment_tree": session.provider_assignment_tree,
         "execution_feedback": normalized_feedback,
+        "design_decisions": declared_design_decisions,
         "repository_paths": files,
         "semantic_modules": semantic_inventory.modules,
         "semantic_symbols": semantic_inventory.symbols,
@@ -1614,6 +1730,12 @@ fn validated_provider_proposal(
     }
     validate_concurrent_tree_disjointness(&state.scoped_nodes, operation)?;
     validate_completed_scope_not_reclaimed(&state.scoped_nodes, completed_assignments, operation)?;
+    validate_provider_decision_mapping(
+        &fragments,
+        allowed_fragment_ids,
+        &normalized_roots,
+        operation,
+    )?;
     validate_task_assignment_disjointness(&state.leaf_assignments)
         .with_context(|| format!("{operation} executable leaves failed disjointness validation"))?;
     let disjointness = task_assignment_disjointness(&state.leaf_assignments)?;
@@ -1734,6 +1856,8 @@ fn normalize_provider_assignment_tree(
             "{operation} assignment '{id}' references unknown semantic module '{unknown}'"
         );
     }
+    let decision_dependencies =
+        normalize_decision_dependencies(&node.decision_dependencies, &id, operation)?;
     let scope_items = assigned_paths
         .len()
         .checked_add(semantic_symbols.len())
@@ -1761,6 +1885,7 @@ fn normalize_provider_assignment_tree(
         assigned_paths: collapse_covered_paths(assigned_paths),
         semantic_symbols,
         semantic_modules,
+        decision_dependencies,
     };
     state
         .scoped_nodes
@@ -1813,6 +1938,7 @@ fn normalize_provider_assignment_tree(
             assigned_paths: assignment.assigned_paths,
             semantic_symbols: assignment.semantic_symbols,
             semantic_modules: assignment.semantic_modules,
+            decision_dependencies: assignment.decision_dependencies,
             child_assignments: normalized_children,
         },
         descendant_fragment_ids,
@@ -1845,6 +1971,132 @@ fn normalize_provider_fragment_ids(
         }
     }
     Ok(normalized)
+}
+
+fn normalize_decision_dependencies(
+    values: &[String],
+    assignment_id: &str,
+    operation: &str,
+) -> Result<Vec<String>> {
+    let mut normalized = BTreeSet::new();
+    for value in values {
+        let reference = DecisionRef::new(value).with_context(|| {
+            format!(
+                "{operation} assignment '{assignment_id}' has an invalid design-decision dependency"
+            )
+        })?;
+        normalized.insert(reference.question_key().to_string());
+    }
+    Ok(normalized.into_iter().collect())
+}
+
+fn validate_provider_decision_mapping(
+    fragments: &[TaskSpecFragment],
+    allowed_fragment_ids: &BTreeSet<String>,
+    roots: &[ProviderTaskAssignmentTree],
+    operation: &str,
+) -> Result<()> {
+    let mut keys_by_fragment = BTreeMap::new();
+    let mut spec_keys = BTreeSet::new();
+    for fragment in fragments {
+        if !allowed_fragment_ids.contains(&fragment.id) {
+            continue;
+        }
+        let keys = parse_declared_design_decisions(&fragment.text)?
+            .into_iter()
+            .map(|decision| decision.question_key)
+            .collect::<BTreeSet<_>>();
+        spec_keys.extend(keys.iter().cloned());
+        if !keys.is_empty() {
+            keys_by_fragment.insert(fragment.id.clone(), keys);
+        }
+    }
+
+    let mut cited = BTreeSet::new();
+    let mut unknown = Vec::new();
+    collect_cited_decision_dependencies(roots, &spec_keys, &mut cited, &mut unknown);
+    if let Some((assignment_id, key)) = unknown.first() {
+        anyhow::bail!(
+            "{operation} assignment '{assignment_id}' cites unknown design-decision dependency '{key}'"
+        );
+    }
+    for key in &spec_keys {
+        if !cited.contains(key) {
+            anyhow::bail!(
+                "{operation} does not map design-decision '{key}' onto any assignment; dependent dispatch is blocked until reconciled"
+            );
+        }
+    }
+
+    let mut effective = BTreeMap::new();
+    for root in roots {
+        collect_effective_decision_dependencies(root, &BTreeSet::new(), &mut effective);
+    }
+    validate_leaf_fragment_decision_coverage(roots, &keys_by_fragment, &effective, operation)
+}
+
+fn collect_cited_decision_dependencies(
+    nodes: &[ProviderTaskAssignmentTree],
+    spec_keys: &BTreeSet<String>,
+    cited: &mut BTreeSet<String>,
+    unknown: &mut Vec<(String, String)>,
+) {
+    for node in nodes {
+        for key in &node.decision_dependencies {
+            if spec_keys.contains(key) {
+                cited.insert(key.clone());
+            } else {
+                unknown.push((node.id.clone(), key.clone()));
+            }
+        }
+        collect_cited_decision_dependencies(&node.child_assignments, spec_keys, cited, unknown);
+    }
+}
+
+fn collect_effective_decision_dependencies(
+    node: &ProviderTaskAssignmentTree,
+    ancestors: &BTreeSet<String>,
+    out: &mut BTreeMap<String, BTreeSet<String>>,
+) {
+    let mut keys = ancestors.clone();
+    keys.extend(node.decision_dependencies.iter().cloned());
+    out.insert(node.id.clone(), keys.clone());
+    for child in &node.child_assignments {
+        collect_effective_decision_dependencies(child, &keys, out);
+    }
+}
+
+fn validate_leaf_fragment_decision_coverage(
+    nodes: &[ProviderTaskAssignmentTree],
+    keys_by_fragment: &BTreeMap<String, BTreeSet<String>>,
+    effective: &BTreeMap<String, BTreeSet<String>>,
+    operation: &str,
+) -> Result<()> {
+    for node in nodes {
+        if node.child_assignments.is_empty() {
+            let mapped = effective.get(&node.id).cloned().unwrap_or_default();
+            for fragment_id in &node.fragment_ids {
+                if let Some(required) = keys_by_fragment.get(fragment_id) {
+                    for key in required {
+                        if !mapped.contains(key) {
+                            anyhow::bail!(
+                                "{operation} assignment '{}' does not declare required design-decision dependency '{key}'; dependent dispatch is blocked until reconciled",
+                                node.id
+                            );
+                        }
+                    }
+                }
+            }
+        } else {
+            validate_leaf_fragment_decision_coverage(
+                &node.child_assignments,
+                keys_by_fragment,
+                effective,
+                operation,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_concurrent_tree_disjointness(
@@ -2071,7 +2323,7 @@ fn propose_fragment_scope(
     files: &[PathBuf],
     file_set: &BTreeSet<PathBuf>,
     semantic_map: Option<&repo_semantic::SemanticRepoMap>,
-) -> ProposedFragmentScope {
+) -> Result<ProposedFragmentScope> {
     let lowered = fragment.text.to_ascii_lowercase();
     let normalized_text = normalize_text(&fragment.text);
     let mut explicit_paths = BTreeSet::new();
@@ -2150,19 +2402,20 @@ fn propose_fragment_scope(
         suppressed
     };
 
-    ProposedFragmentScope {
-        assignment: TaskAssignmentProposal {
+    Ok(ProposedFragmentScope {
+        assignment: with_inferred_decision_dependencies(TaskAssignmentProposal {
             id: fragment.id.clone(),
             task: fragment.text.clone(),
             fragment_ids: vec![fragment.id.clone()],
             assigned_paths: collapse_covered_paths(explicit_paths),
             semantic_symbols: semantic_symbols.into_iter().collect(),
             semantic_modules: semantic_modules.into_iter().collect(),
-        },
+            decision_dependencies: Vec::new(),
+        })?,
         suppressed_broad_paths,
         unresolved_named_paths: named.unresolved,
         notes,
-    }
+    })
 }
 
 struct ProposedFragmentScope {
@@ -2239,6 +2492,10 @@ fn merge_assignment_proposals(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
+    let mut decision_dependencies = left.decision_dependencies;
+    decision_dependencies.extend(right.decision_dependencies);
+    decision_dependencies.sort();
+    decision_dependencies.dedup();
     TaskAssignmentProposal {
         id: fragment_ids
             .first()
@@ -2249,6 +2506,7 @@ fn merge_assignment_proposals(
         assigned_paths,
         semantic_symbols,
         semantic_modules,
+        decision_dependencies,
     }
 }
 
@@ -3385,6 +3643,7 @@ mod tests {
             assigned_paths: paths.iter().map(PathBuf::from).collect(),
             semantic_symbols: symbols.iter().map(|value| value.to_string()).collect(),
             semantic_modules: modules.iter().map(|value| value.to_string()).collect(),
+            decision_dependencies: Vec::new(),
         }
     }
 
@@ -3401,6 +3660,7 @@ mod tests {
             assigned_paths: vec![PathBuf::from(path)],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
+            decision_dependencies: Vec::new(),
         }
     }
 
@@ -3417,6 +3677,7 @@ mod tests {
             assigned_paths: vec![PathBuf::from(path)],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
+            decision_dependencies: Vec::new(),
             child_assignments: Vec::new(),
         }
     }
@@ -3808,6 +4069,7 @@ mod tests {
                     ],
                     semantic_symbols: Vec::new(),
                     semantic_modules: Vec::new(),
+                    decision_dependencies: Vec::new(),
                     child_assignments: vec![
                         provider_tree_leaf(
                             "alpha",
@@ -3870,6 +4132,7 @@ mod tests {
                     ],
                     semantic_symbols: Vec::new(),
                     semantic_modules: Vec::new(),
+                    decision_dependencies: Vec::new(),
                     child_assignments: vec![
                         provider_tree_leaf(
                             "alpha",
@@ -3922,6 +4185,7 @@ mod tests {
                     ],
                     semantic_symbols: Vec::new(),
                     semantic_modules: Vec::new(),
+                    decision_dependencies: Vec::new(),
                     child_assignments: vec![
                         provider_tree_leaf(
                             "alpha",
@@ -5005,6 +5269,558 @@ Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other 
             assert!(provider_error
                 .to_string()
                 .contains("requires a heuristic planning session"));
+        });
+    }
+
+    fn shared_transport_spec() -> &'static str {
+        concat!(
+            "- Implement client transport in crate::client. design-decision: api.transport: Which shared wire protocol? = JSON over HTTP\n",
+            "- Implement server transport in crate::server. design-decision: api.transport: Which shared wire protocol? = JSON over HTTP\n",
+        )
+    }
+
+    fn namespaced_transport_leaf(
+        id: &str,
+        task: &str,
+        fragment_id: &str,
+        path: &str,
+        module: &str,
+        decision_dependencies: &[&str],
+    ) -> ProviderTaskAssignmentTree {
+        ProviderTaskAssignmentTree {
+            id: id.to_string(),
+            task: task.to_string(),
+            fragment_ids: vec![fragment_id.to_string()],
+            assigned_paths: vec![PathBuf::from(path)],
+            semantic_symbols: Vec::new(),
+            semantic_modules: vec![module.to_string()],
+            decision_dependencies: decision_dependencies
+                .iter()
+                .map(|key| (*key).to_string())
+                .collect(),
+            child_assignments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn parse_declared_design_decisions_dedupes_and_refuses_inconsistent_text() {
+        let parsed = parse_declared_design_decisions(shared_transport_spec()).expect("parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].question_key, "api.transport");
+        assert_eq!(parsed[0].resolution, "JSON over HTTP");
+
+        let error = parse_declared_design_decisions(concat!(
+            "design-decision: api.transport: Which shared wire protocol? = JSON over HTTP\n",
+            "design-decision: api.transport: Which shared wire protocol? = gRPC\n",
+        ))
+        .expect_err("inconsistent generated design text");
+        assert!(
+            error.to_string().contains("inconsistent"),
+            "spec-level inconsistent resolutions must be refused: {error:#}"
+        );
+    }
+
+    #[test]
+    fn provider_decision_mapping_rejects_unmapped_paraphrased_leaves() {
+        let fragments = task_spec_fragments("", shared_transport_spec()).expect("fragments");
+        let allowed = fragments
+            .iter()
+            .map(|fragment| fragment.id.clone())
+            .collect();
+        let roots = vec![
+            namespaced_transport_leaf(
+                "client",
+                "Implement client transport",
+                "fragment-001",
+                "src/client.rs",
+                "crate::client",
+                &[],
+            ),
+            namespaced_transport_leaf(
+                "server",
+                "Implement server transport",
+                "fragment-002",
+                "src/server.rs",
+                "crate::server",
+                &[],
+            ),
+        ];
+        let error = validate_provider_decision_mapping(
+            &fragments,
+            &allowed,
+            &roots,
+            "provider task decomposition",
+        )
+        .expect_err("unmapped spec decisions must fail closed");
+        assert!(
+            error.to_string().contains("does not map design-decision")
+                || error
+                    .to_string()
+                    .contains("does not declare required design-decision"),
+            "unmapped generated decisions must be rejected: {error:#}"
+        );
+    }
+
+    #[test]
+    fn provider_decision_mapping_accepts_leaf_and_ancestor_declarations() {
+        let fragments = task_spec_fragments("", shared_transport_spec()).expect("fragments");
+        let allowed = fragments
+            .iter()
+            .map(|fragment| fragment.id.clone())
+            .collect();
+        let leaves = vec![
+            namespaced_transport_leaf(
+                "client",
+                "Implement client transport",
+                "fragment-001",
+                "src/client.rs",
+                "crate::client",
+                &["api.transport"],
+            ),
+            namespaced_transport_leaf(
+                "server",
+                "Implement server transport",
+                "fragment-002",
+                "src/server.rs",
+                "crate::server",
+                &["api.transport"],
+            ),
+        ];
+        validate_provider_decision_mapping(
+            &fragments,
+            &allowed,
+            &leaves,
+            "provider task decomposition",
+        )
+        .expect("declared leaf dependencies must map");
+
+        let parent = vec![ProviderTaskAssignmentTree {
+            id: "parent".to_string(),
+            task: "Coordinate shared wire adapters".to_string(),
+            fragment_ids: vec!["fragment-001".to_string(), "fragment-002".to_string()],
+            assigned_paths: vec![
+                PathBuf::from("src/client.rs"),
+                PathBuf::from("src/server.rs"),
+            ],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            decision_dependencies: vec!["api.transport".to_string()],
+            child_assignments: vec![
+                namespaced_transport_leaf(
+                    "client",
+                    "Implement client transport",
+                    "fragment-001",
+                    "src/client.rs",
+                    "crate::client",
+                    &[],
+                ),
+                namespaced_transport_leaf(
+                    "server",
+                    "Implement server transport",
+                    "fragment-002",
+                    "src/server.rs",
+                    "crate::server",
+                    &[],
+                ),
+            ],
+        }];
+        validate_provider_decision_mapping(
+            &fragments,
+            &allowed,
+            &parent,
+            "provider task decomposition",
+        )
+        .expect("ancestor mapping must satisfy fragment coverage");
+
+        let unknown = vec![namespaced_transport_leaf(
+            "client",
+            "Implement client transport",
+            "fragment-001",
+            "src/client.rs",
+            "crate::client",
+            &["api.transport", "missing.protocol"],
+        )];
+        let unknown_error = validate_provider_decision_mapping(
+            &fragments,
+            &allowed,
+            &unknown,
+            "provider task decomposition",
+        )
+        .expect_err("unknown decision keys must fail closed");
+        assert!(
+            unknown_error
+                .to_string()
+                .contains("unknown design-decision dependency"),
+            "unknown keys must be rejected: {unknown_error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_proposal_schema_asks_for_decision_dependencies() {
+        skip_without_containment!();
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, "src/client.rs", "pub fn client_send() {}\n");
+            write_file(repo, "src/server.rs", "pub fn server_recv() {}\n");
+            let config = ProviderPlanningConfig::new("decision-schema", "planner-model");
+            let provider_plan = ProviderTaskPlan {
+                assignments: vec![
+                    TaskAssignmentProposal {
+                        id: "client".to_string(),
+                        task: "Implement client transport".to_string(),
+                        fragment_ids: vec!["fragment-001".to_string()],
+                        assigned_paths: vec![PathBuf::from("src/client.rs")],
+                        semantic_symbols: Vec::new(),
+                        semantic_modules: vec!["crate::client".to_string()],
+                        decision_dependencies: vec!["api.transport".to_string()],
+                    },
+                    TaskAssignmentProposal {
+                        id: "server".to_string(),
+                        task: "Implement server transport".to_string(),
+                        fragment_ids: vec!["fragment-002".to_string()],
+                        assigned_paths: vec![PathBuf::from("src/server.rs")],
+                        semantic_symbols: Vec::new(),
+                        semantic_modules: vec!["crate::server".to_string()],
+                        decision_dependencies: vec!["api.transport".to_string()],
+                    },
+                ],
+            };
+            let mut provider = FakeProvider::new("fake-planner", "planner-model");
+            provider
+                .push_json_response("decision-schema-proposal", &provider_plan)
+                .expect("script provider plan");
+
+            let session = propose_task_decomposition_with_provider(
+                repo,
+                "",
+                shared_transport_spec(),
+                &mut provider,
+                &config,
+            )
+            .expect("mapped paraphrased provider proposal");
+            let prompt = provider.calls()[0].prompt.render();
+            assert!(
+                prompt.contains("decision_dependencies"),
+                "provider contract must ask for decision dependencies"
+            );
+            assert!(prompt.contains("design_decisions"));
+            assert!(prompt.contains("api.transport"));
+            assert_eq!(
+                session.proposal().assignments[0].decision_dependencies,
+                vec!["api.transport".to_string()]
+            );
+            assert_eq!(
+                session.proposal().assignments[1].decision_dependencies,
+                vec!["api.transport".to_string()]
+            );
+            assert!(!session.proposal().assignments[0]
+                .task
+                .contains("api.transport"));
+            assert_eq!(
+                session.proposal().assignments[0].semantic_modules,
+                vec!["crate::client".to_string()]
+            );
+            assert_eq!(
+                session.proposal().assignments[1].semantic_modules,
+                vec!["crate::server".to_string()]
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_proposal_rejects_unmapped_and_unknown_decision_dependencies() {
+        skip_without_containment!();
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, "src/client.rs", "pub fn client_send() {}\n");
+            write_file(repo, "src/server.rs", "pub fn server_recv() {}\n");
+            let config = ProviderPlanningConfig::new("decision-unmap", "planner-model");
+            let unmapped = ProviderTaskPlan {
+                assignments: vec![
+                    TaskAssignmentProposal {
+                        id: "client".to_string(),
+                        task: "Implement client transport".to_string(),
+                        fragment_ids: vec!["fragment-001".to_string()],
+                        assigned_paths: vec![PathBuf::from("src/client.rs")],
+                        semantic_symbols: Vec::new(),
+                        semantic_modules: vec!["crate::client".to_string()],
+                        decision_dependencies: Vec::new(),
+                    },
+                    TaskAssignmentProposal {
+                        id: "server".to_string(),
+                        task: "Implement server transport".to_string(),
+                        fragment_ids: vec!["fragment-002".to_string()],
+                        assigned_paths: vec![PathBuf::from("src/server.rs")],
+                        semantic_symbols: Vec::new(),
+                        semantic_modules: vec!["crate::server".to_string()],
+                        decision_dependencies: Vec::new(),
+                    },
+                ],
+            };
+            let mut provider = FakeProvider::new("fake-planner", "planner-model");
+            provider
+                .push_json_response("decision-unmap-proposal", &unmapped)
+                .expect("script unmapped plan");
+            let unmapped_error = propose_task_decomposition_with_provider(
+                repo,
+                "",
+                shared_transport_spec(),
+                &mut provider,
+                &config,
+            )
+            .expect_err("unmapped spec decisions must fail closed");
+            assert!(
+                unmapped_error
+                    .to_string()
+                    .contains("does not map design-decision")
+                    || unmapped_error
+                        .to_string()
+                        .contains("does not declare required design-decision"),
+                "unmapped generated decisions must be rejected: {unmapped_error:#}"
+            );
+
+            let unknown = ProviderTaskPlan {
+                assignments: vec![
+                    TaskAssignmentProposal {
+                        id: "client".to_string(),
+                        task: "Implement client transport".to_string(),
+                        fragment_ids: vec!["fragment-001".to_string()],
+                        assigned_paths: vec![PathBuf::from("src/client.rs")],
+                        semantic_symbols: Vec::new(),
+                        semantic_modules: vec!["crate::client".to_string()],
+                        decision_dependencies: vec!["api.transport".to_string()],
+                    },
+                    TaskAssignmentProposal {
+                        id: "server".to_string(),
+                        task: "Implement server transport".to_string(),
+                        fragment_ids: vec!["fragment-002".to_string()],
+                        assigned_paths: vec![PathBuf::from("src/server.rs")],
+                        semantic_symbols: Vec::new(),
+                        semantic_modules: vec!["crate::server".to_string()],
+                        decision_dependencies: vec![
+                            "api.transport".to_string(),
+                            "missing.protocol".to_string(),
+                        ],
+                    },
+                ],
+            };
+            provider
+                .push_json_response("decision-unmap-proposal", &unknown)
+                .expect("script unknown-key plan");
+            let unknown_error = propose_task_decomposition_with_provider(
+                repo,
+                "",
+                shared_transport_spec(),
+                &mut provider,
+                &config,
+            )
+            .expect_err("unknown decision keys must fail closed");
+            assert!(
+                unknown_error
+                    .to_string()
+                    .contains("unknown design-decision dependency"),
+                "unknown keys must be rejected: {unknown_error:#}"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_replan_validates_remaining_decision_dependencies() {
+        skip_without_containment!();
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, "src/client.rs", "pub fn client_send() {}\n");
+            write_file(repo, "src/server.rs", "pub fn server_recv() {}\n");
+            let config = ProviderPlanningConfig::new("decision-replan", "planner-model");
+            let initial = ProviderTaskPlan {
+                assignments: vec![
+                    TaskAssignmentProposal {
+                        id: "client".to_string(),
+                        task: "Implement client transport".to_string(),
+                        fragment_ids: vec!["fragment-001".to_string()],
+                        assigned_paths: vec![PathBuf::from("src/client.rs")],
+                        semantic_symbols: Vec::new(),
+                        semantic_modules: vec!["crate::client".to_string()],
+                        decision_dependencies: vec!["api.transport".to_string()],
+                    },
+                    TaskAssignmentProposal {
+                        id: "server".to_string(),
+                        task: "Implement server transport".to_string(),
+                        fragment_ids: vec!["fragment-002".to_string()],
+                        assigned_paths: vec![PathBuf::from("src/server.rs")],
+                        semantic_symbols: Vec::new(),
+                        semantic_modules: vec!["crate::server".to_string()],
+                        decision_dependencies: vec!["api.transport".to_string()],
+                    },
+                ],
+            };
+            let mapped_replan = ProviderTaskPlan {
+                assignments: vec![TaskAssignmentProposal {
+                    id: "server-revised".to_string(),
+                    task: "Retry the server wire adapter".to_string(),
+                    fragment_ids: vec!["fragment-002".to_string()],
+                    assigned_paths: vec![PathBuf::from("src/server.rs")],
+                    semantic_symbols: Vec::new(),
+                    semantic_modules: vec!["crate::server".to_string()],
+                    decision_dependencies: vec!["api.transport".to_string()],
+                }],
+            };
+            let unmapped_replan = ProviderTaskPlan {
+                assignments: vec![TaskAssignmentProposal {
+                    id: "server-omitted".to_string(),
+                    task: "Retry the server wire adapter".to_string(),
+                    fragment_ids: vec!["fragment-002".to_string()],
+                    assigned_paths: vec![PathBuf::from("src/server.rs")],
+                    semantic_symbols: Vec::new(),
+                    semantic_modules: vec!["crate::server".to_string()],
+                    decision_dependencies: Vec::new(),
+                }],
+            };
+            let mut provider = FakeProvider::new("fake-planner", "planner-model");
+            provider
+                .push_json_response("decision-replan-proposal", &initial)
+                .expect("script initial")
+                .push_json_response("decision-replan-replan-01", &mapped_replan)
+                .expect("script mapped replan");
+            let mut session = propose_task_decomposition_with_provider(
+                repo,
+                "",
+                shared_transport_spec(),
+                &mut provider,
+                &config,
+            )
+            .expect("initial mapped plan");
+            replan_task_decomposition_with_provider(
+                repo,
+                &mut session,
+                &TaskExecutionFeedback {
+                    completed_assignment_ids: vec!["client".to_string()],
+                    failed_assignment_ids: vec!["server".to_string()],
+                    coverage_gap_fragment_ids: vec!["fragment-002".to_string()],
+                    notes: vec!["retry paraphrased server work".to_string()],
+                },
+                &mut provider,
+                &config,
+            )
+            .expect("mapped leftover replan");
+            assert_eq!(
+                session.proposal().assignments[0].decision_dependencies,
+                vec!["api.transport".to_string()]
+            );
+            assert!(!session.proposal().assignments[0]
+                .task
+                .contains("api.transport"));
+
+            provider
+                .push_json_response("decision-replan-proposal", &initial)
+                .expect("script second initial")
+                .push_json_response("decision-replan-replan-01", &unmapped_replan)
+                .expect("script unmapped replan");
+            let mut omitted = propose_task_decomposition_with_provider(
+                repo,
+                "",
+                shared_transport_spec(),
+                &mut provider,
+                &config,
+            )
+            .expect("second initial mapped plan");
+            let omitted_error = replan_task_decomposition_with_provider(
+                repo,
+                &mut omitted,
+                &TaskExecutionFeedback {
+                    completed_assignment_ids: vec!["client".to_string()],
+                    failed_assignment_ids: vec!["server".to_string()],
+                    coverage_gap_fragment_ids: vec!["fragment-002".to_string()],
+                    notes: vec!["retry paraphrased server work".to_string()],
+                },
+                &mut provider,
+                &config,
+            )
+            .expect_err("unmapped leftover replan must fail closed");
+            assert!(
+                omitted_error
+                    .to_string()
+                    .contains("does not map design-decision")
+                    || omitted_error
+                        .to_string()
+                        .contains("does not declare required design-decision"),
+                "replan must reject unmapped remaining decisions: {omitted_error:#}"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_tree_parent_decision_dependency_covers_child_leaves() {
+        skip_without_containment!();
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, "src/client.rs", "pub fn client_send() {}\n");
+            write_file(repo, "src/server.rs", "pub fn server_recv() {}\n");
+            let config =
+                ProviderPlanningConfig::new("decision-parent", "planner-model").with_max_depth(3);
+            let provider_plan = ProviderRecursiveTaskPlan {
+                assignments: vec![ProviderTaskAssignmentTree {
+                    id: "parent".to_string(),
+                    task: "Coordinate shared wire adapters".to_string(),
+                    fragment_ids: vec!["fragment-001".to_string(), "fragment-002".to_string()],
+                    assigned_paths: vec![
+                        PathBuf::from("src/client.rs"),
+                        PathBuf::from("src/server.rs"),
+                    ],
+                    semantic_symbols: Vec::new(),
+                    semantic_modules: Vec::new(),
+                    decision_dependencies: vec!["api.transport".to_string()],
+                    child_assignments: vec![
+                        namespaced_transport_leaf(
+                            "client",
+                            "Implement client transport",
+                            "fragment-001",
+                            "src/client.rs",
+                            "crate::client",
+                            &[],
+                        ),
+                        namespaced_transport_leaf(
+                            "server",
+                            "Implement server transport",
+                            "fragment-002",
+                            "src/server.rs",
+                            "crate::server",
+                            &[],
+                        ),
+                    ],
+                }],
+            };
+            let mut provider = FakeProvider::new("fake-planner", "planner-model");
+            provider
+                .push_json_response("decision-parent-proposal", &provider_plan)
+                .expect("script parent mapping");
+            let session = propose_task_decomposition_with_provider(
+                repo,
+                "",
+                shared_transport_spec(),
+                &mut provider,
+                &config,
+            )
+            .expect("ancestor mapping must satisfy fragment coverage");
+            assert!(session.provider_assignment_tree()[0]
+                .decision_dependencies
+                .contains(&"api.transport".to_string()));
+            assert!(session.proposal().assignments.iter().all(|assignment| {
+                assignment.decision_dependencies.is_empty()
+                    && !assignment.task.contains("api.transport")
+            }));
         });
     }
 
