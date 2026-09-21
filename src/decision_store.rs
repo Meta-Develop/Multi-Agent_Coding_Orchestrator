@@ -16,7 +16,10 @@ use crate::{
         },
     },
     authenticated_snapshot::{AuthenticatedSnapshot, AuthenticatedSnapshotStore, SnapshotSpec},
-    decision_claim::{detect_decision_contradictions, DecisionRegistry, DecisionRegistrySnapshot},
+    decision_claim::{
+        detect_decision_contradictions, DecisionClaim, DecisionRecord, DecisionRegistry,
+        DecisionRegistrySnapshot, DecisionScope,
+    },
     safe_state::SafeRoot,
     state_journal::JournalSpec,
 };
@@ -172,46 +175,95 @@ impl DecisionStore {
     /// Persists a registry snapshot. Overlapping-scope records with different
     /// resolutions are refused so contradictions cannot become durable.
     pub fn persist_registry(&self, registry: &DecisionRegistry) -> Result<()> {
-        let report = registry
-            .reconciliation_report()
-            .context("failed to inspect decision registry reconciliation state")?;
-        if report.reconciliation_needed {
-            bail!(
-                "decision registry persist refused because reconciliation_needed is true; overlapping-scope records require reconciliation"
-            );
-        }
-        let snapshot = registry
-            .snapshot()
-            .context("failed to snapshot decision registry")?;
-        if detect_decision_contradictions(&snapshot.records).reconciliation_needed {
-            bail!(
-                "decision registry persist refused because reconciliation_needed is true; overlapping-scope records require reconciliation"
-            );
-        }
+        refuse_unreconciled_registry(registry)?;
+        let authenticator = repository_authenticator_key_only(&self.repo_path)?;
+        let state_root = authenticator.state_root().clone();
+        let operation_lock = BoundStateLock::acquire(&state_root, DECISION_STORE_OPERATION_LOCK)?;
+        let result = self.write_registry_snapshot(authenticator, registry);
+        finish_operation(result, operation_lock.verify(&state_root))
+    }
 
+    /// Planner-facing authenticated claim. Duplicate open owners fail closed.
+    pub fn claim_open(
+        &self,
+        question_key: impl AsRef<str>,
+        question: impl AsRef<str>,
+        owning_assignment: impl AsRef<str>,
+    ) -> Result<DecisionClaim> {
+        let question_key = question_key.as_ref().to_string();
+        let question = question.as_ref().to_string();
+        let owning_assignment = owning_assignment.as_ref().to_string();
+        self.mutate_registry(|registry| {
+            registry
+                .claim_open(&question_key, &question, &owning_assignment)
+                .map_err(Into::into)
+        })
+    }
+
+    /// Planner-facing authenticated resolve. Overlapping different resolutions
+    /// fail closed before the snapshot becomes durable.
+    pub fn resolve_claim(
+        &self,
+        question_key: impl AsRef<str>,
+        deciding_assignment: impl AsRef<str>,
+        resolution: impl AsRef<str>,
+        scope: DecisionScope,
+    ) -> Result<DecisionRecord> {
+        let question_key = question_key.as_ref().to_string();
+        let deciding_assignment = deciding_assignment.as_ref().to_string();
+        let resolution = resolution.as_ref().to_string();
+        self.mutate_registry(|registry| {
+            registry
+                .resolve_claim(
+                    &question_key,
+                    &deciding_assignment,
+                    &resolution,
+                    scope.clone(),
+                )
+                .map_err(Into::into)
+        })
+    }
+
+    fn mutate_registry<T>(&self, op: impl FnOnce(&DecisionRegistry) -> Result<T>) -> Result<T> {
         let authenticator = repository_authenticator_key_only(&self.repo_path)?;
         let state_root = authenticator.state_root().clone();
         let operation_lock = BoundStateLock::acquire(&state_root, DECISION_STORE_OPERATION_LOCK)?;
         let result = (|| {
-            let mut store = self.open_store_with_authenticator(authenticator)?;
-            let mut value = store.current().value.clone();
-            value.registry = snapshot;
-            let revision = value
-                .snapshot_revision
-                .checked_add(1)
-                .context("decision-registry snapshot revision exhausted")?;
-            value.snapshot_revision = revision;
-            validate_state_structure(&value)?;
-
-            if revision % SNAPSHOT_ROLLOVER_INTERVAL == 0 {
-                let rollover_authenticator = repository_authenticator_key_only(&self.repo_path)?;
-                store = store.rollover(rollover_authenticator, revision, value)?;
-            } else {
-                store.commit(revision, value)?;
-            }
-            self.validate_store(&store)
+            let registry = self.load_registry()?;
+            let value = op(&registry)?;
+            refuse_unreconciled_registry(&registry)?;
+            let authenticator = repository_authenticator_key_only(&self.repo_path)?;
+            self.write_registry_snapshot(authenticator, &registry)?;
+            Ok(value)
         })();
         finish_operation(result, operation_lock.verify(&state_root))
+    }
+
+    fn write_registry_snapshot(
+        &self,
+        authenticator: RepositoryAuthenticator,
+        registry: &DecisionRegistry,
+    ) -> Result<()> {
+        let snapshot = registry
+            .snapshot()
+            .context("failed to snapshot decision registry")?;
+        let mut store = self.open_store_with_authenticator(authenticator)?;
+        let mut value = store.current().value.clone();
+        value.registry = snapshot;
+        let revision = value
+            .snapshot_revision
+            .checked_add(1)
+            .context("decision-registry snapshot revision exhausted")?;
+        value.snapshot_revision = revision;
+        validate_state_structure(&value)?;
+
+        if revision % SNAPSHOT_ROLLOVER_INTERVAL == 0 {
+            let rollover_authenticator = repository_authenticator_key_only(&self.repo_path)?;
+            store = store.rollover(rollover_authenticator, revision, value)?;
+        } else {
+            store.commit(revision, value)?;
+        }
+        self.validate_store(&store)
     }
 
     fn ensure_initialized(&self) -> Result<()> {
@@ -329,6 +381,26 @@ fn validate_state_structure(state: &AuthenticatedDecisionRegistryState) -> Resul
     Ok(())
 }
 
+fn refuse_unreconciled_registry(registry: &DecisionRegistry) -> Result<()> {
+    let report = registry
+        .reconciliation_report()
+        .context("failed to inspect decision registry reconciliation state")?;
+    if report.reconciliation_needed {
+        bail!(
+            "decision registry persist refused because reconciliation_needed is true; overlapping-scope records require reconciliation"
+        );
+    }
+    let snapshot = registry
+        .snapshot()
+        .context("failed to snapshot decision registry")?;
+    if detect_decision_contradictions(&snapshot.records).reconciliation_needed {
+        bail!(
+            "decision registry persist refused because reconciliation_needed is true; overlapping-scope records require reconciliation"
+        );
+    }
+    Ok(())
+}
+
 fn discover_repository_path(repo_path: &Path) -> Result<PathBuf> {
     let repository = crate::git_repository::discover(repo_path)
         .with_context(|| format!("failed to discover repository from {}", repo_path.display()))?;
@@ -438,6 +510,83 @@ mod tests {
         assert_eq!(
             loaded.snapshot().expect("loaded snapshot"),
             registry.snapshot().expect("source snapshot")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claim_open_and_resolve_claim_are_the_authenticated_planner_writer() {
+        let (_temp, repo) = repository();
+        let store = DecisionStore::open(&repo).expect("open decision store");
+        store
+            .claim_open(
+                "api.transport",
+                "Which transport should the API use?",
+                "planner-a",
+            )
+            .expect("planner claim_open");
+        let conflict = store
+            .claim_open(
+                "api.transport",
+                "Should the API use HTTP or a local socket?",
+                "planner-b",
+            )
+            .expect_err("open claim is exclusive");
+        assert!(
+            format!("{conflict:#}").contains("already open under assignment planner-a"),
+            "conflicting ownership must fail closed: {conflict:#}"
+        );
+        let record = store
+            .resolve_claim(
+                "api.transport",
+                "planner-a",
+                "Use HTTP",
+                scope(&["api"], &[], &[]),
+            )
+            .expect("planner resolve_claim");
+        assert_eq!(record.question_key(), "api.transport");
+        assert_eq!(record.resolution(), "Use HTTP");
+        assert_eq!(record.deciding_assignment(), "planner-a");
+
+        store
+            .claim_open(
+                "api.protocol",
+                "Which protocol should overlapping API work use?",
+                "planner-b",
+            )
+            .expect("second question can be claimed");
+        let overlapping = store
+            .resolve_claim(
+                "api.protocol",
+                "planner-b",
+                "Use a local socket",
+                scope(&["api"], &[], &[]),
+            )
+            .expect_err("overlapping different resolution must not persist");
+        assert!(
+            format!("{overlapping:#}").contains("reconciliation_needed"),
+            "inconsistent resolutions must be refused before they become durable: {overlapping:#}"
+        );
+
+        let loaded = DecisionStore::open(&repo)
+            .expect("reopen")
+            .load_registry()
+            .expect("load");
+        let snapshot = loaded.snapshot().expect("snapshot");
+        assert_eq!(snapshot.records.len(), 1);
+        assert_eq!(snapshot.records[0].question_key(), "api.transport");
+        assert_eq!(snapshot.records[0].resolution(), "Use HTTP");
+        assert!(snapshot.claims.iter().any(|claim| {
+            claim.question_key() == "api.transport"
+                && claim.status() == crate::decision_claim::DecisionClaimStatus::Resolved
+        }));
+        assert!(
+            snapshot
+                .claims
+                .iter()
+                .any(|claim| claim.question_key() == "api.protocol"
+                    && claim.status() == crate::decision_claim::DecisionClaimStatus::Open),
+            "refused overlapping resolve must leave the second question open for reconciliation"
         );
     }
 

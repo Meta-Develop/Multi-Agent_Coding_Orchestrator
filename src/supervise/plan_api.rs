@@ -1,4 +1,9 @@
 use super::*;
+use crate::decision_claim::{DecisionClaimStatus, DecisionRecord, DecisionScope};
+use crate::decision_ref::{
+    check_decision_ref, DecisionRef, DecisionRefError, StaleDecisionRefReason,
+};
+use crate::decision_store::DecisionStore;
 use crate::follow_up_queue::GeneratedFollowUpQueueEntrypoint;
 use crate::hierarchy_ledger::{observe_hierarchy, ObservedHierarchyNode};
 
@@ -274,6 +279,25 @@ pub fn supervisor_plan_from_task_planning_session(
     )
 }
 
+/// Lowers a validated planning session against a repository so generated
+/// design-decision claims can use the authenticated DecisionStore.
+pub fn supervisor_plan_from_task_planning_session_in_repo(
+    repo: impl AsRef<Path>,
+    goal: &str,
+    spec: &str,
+    session: &planning::TaskPlanningSession,
+) -> Result<SupervisorPlan> {
+    let repo = discover_repo_root(repo.as_ref())?;
+    Ok(supervisor_plan_and_consultant_from_task_planning_session(
+        goal,
+        spec,
+        None,
+        session,
+        Some(&repo),
+    )?
+    .plan)
+}
+
 /// Applies the heuristic feedback re-plan hook and lowers the revised remaining
 /// work into an ordinary supervisor plan. This does not invoke a planner model.
 pub fn supervisor_plan_from_feedback_replan(
@@ -488,6 +512,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
             flattened_index: execution_index,
         });
     }
+    apply_generated_design_decisions(repo, goal, spec, &mut assignments, &assignment_schedule)?;
     let task = combined_goal_spec(goal, spec);
     let plan = SupervisorPlan {
         version: SUPERVISOR_SCHEMA_VERSION,
@@ -1237,6 +1262,7 @@ fn supervisor_plan_and_consultant_from_provider_session(
             &mut actual_max_depth,
         )?;
     }
+    apply_generated_design_decisions(repo, goal, spec, &mut assignments, &assignment_schedule)?;
     if assignments.is_empty() || current_fragment_ids.is_empty() {
         bail!("provider planning session has no executable remaining work");
     }
@@ -1383,6 +1409,276 @@ fn lower_provider_assignment_tree(
         )?;
     }
     Ok(())
+}
+
+const GENERATED_DESIGN_DECISION_MARKER: &str = "design-decision:";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GeneratedDesignDecision {
+    question_key: String,
+    question: String,
+    resolution: String,
+}
+
+fn apply_generated_design_decisions(
+    repo: Option<&Path>,
+    goal: &str,
+    spec: &str,
+    assignments: &mut [OrchestratorAssignment],
+    schedule: &[AssignmentScheduleEntry],
+) -> Result<()> {
+    let decisions = collect_generated_design_decisions(goal, spec, assignments)?;
+    if decisions.is_empty() {
+        return Ok(());
+    }
+
+    let mut pending = Vec::new();
+    for decision in decisions {
+        let scope = generated_decision_scope(&decision.question_key)?;
+        let dependents = assignments
+            .iter()
+            .filter(|assignment| {
+                execution_assignment_depends_on_decision(assignment, &decision, &scope)
+            })
+            .map(|assignment| assignment.id.clone())
+            .collect::<Vec<_>>();
+        if dependents.is_empty() {
+            continue;
+        }
+        pending.push((decision, scope, dependents));
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let Some(repo) = repo else {
+        bail!(
+            "generated design decisions require a repository-authenticated DecisionStore; no repository path was resolved"
+        );
+    };
+    let store = DecisionStore::open(repo)
+        .context("failed to open the authenticated DecisionStore for generated planning")?;
+
+    for (decision, scope, dependents) in pending {
+        let authority = planning_authority_assignment_id(assignments, schedule, &dependents[0]);
+        let record = ensure_generated_design_decision(&store, &decision, &authority, scope)
+            .with_context(|| {
+                format!(
+                    "conflicting ownership or resolution blocked dependent dispatch for '{}'",
+                    decision.question_key
+                )
+            })?;
+        let reference = DecisionRef::new(record.question_key())?
+            .with_expected_resolution(record.resolution())?;
+        for assignment in assignments.iter_mut() {
+            if !dependents.iter().any(|id| id == &assignment.id) {
+                continue;
+            }
+            if assignment
+                .decision_refs
+                .iter()
+                .any(|existing| existing.question_key() == reference.question_key())
+            {
+                continue;
+            }
+            assignment.decision_refs.push(reference.clone());
+        }
+    }
+    Ok(())
+}
+
+fn collect_generated_design_decisions(
+    goal: &str,
+    spec: &str,
+    assignments: &[OrchestratorAssignment],
+) -> Result<Vec<GeneratedDesignDecision>> {
+    let mut text = combined_goal_spec(goal, spec);
+    for assignment in assignments {
+        if let Some(task) = assignment.task.as_deref() {
+            text.push('\n');
+            text.push_str(task);
+        }
+    }
+    parse_generated_design_decisions(&text)
+}
+
+fn parse_generated_design_decisions(text: &str) -> Result<Vec<GeneratedDesignDecision>> {
+    let mut by_key = BTreeMap::new();
+    let mut remaining = text;
+    while let Some(offset) = remaining.find(GENERATED_DESIGN_DECISION_MARKER) {
+        let after = remaining[offset + GENERATED_DESIGN_DECISION_MARKER.len()..].trim_start();
+        let parsed = parse_one_generated_design_decision(after)?;
+        if let Some(existing) = by_key.get(&parsed.question_key) {
+            if existing != &parsed {
+                bail!(
+                    "generated design decision '{}' has inconsistent question or resolution; dependent dispatch is blocked until reconciled",
+                    parsed.question_key
+                );
+            }
+        } else {
+            by_key.insert(parsed.question_key.clone(), parsed);
+        }
+        remaining = after;
+    }
+    Ok(by_key.into_values().collect())
+}
+
+fn parse_one_generated_design_decision(after_marker: &str) -> Result<GeneratedDesignDecision> {
+    let Some((question_key, rest)) = after_marker.split_once(':') else {
+        bail!("generated design-decision is missing a question-key terminator ':'");
+    };
+    let Some((question, resolution)) = rest.split_once(" = ") else {
+        bail!(
+            "generated design-decision '{}' is missing ' = ' between question and resolution",
+            question_key.trim()
+        );
+    };
+    let resolution = resolution
+        .lines()
+        .next()
+        .unwrap_or(resolution)
+        .trim()
+        .trim_end_matches('.')
+        .trim();
+    let reference = DecisionRef::new(question_key)?;
+    Ok(GeneratedDesignDecision {
+        question_key: reference.question_key().to_string(),
+        question: question.trim().to_string(),
+        resolution: resolution.to_string(),
+    })
+}
+
+fn generated_decision_scope(question_key: &str) -> Result<DecisionScope> {
+    let module = question_key
+        .split(['.', '/', ':'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(question_key);
+    DecisionScope::new(
+        [module.to_string()],
+        Vec::<String>::new(),
+        [question_key.to_string()],
+    )
+    .map_err(Into::into)
+}
+
+fn execution_assignment_depends_on_decision(
+    assignment: &OrchestratorAssignment,
+    decision: &GeneratedDesignDecision,
+    scope: &DecisionScope,
+) -> bool {
+    if assignment.phase != AssignmentPhase::Execution {
+        return false;
+    }
+    let task = assignment.task.as_deref().unwrap_or("");
+    task.contains(decision.question_key.as_str())
+        || assignment
+            .semantic_modules
+            .iter()
+            .any(|module| scope.modules.contains(module))
+        || assignment
+            .semantic_symbols
+            .iter()
+            .any(|symbol| scope.symbols.contains(symbol))
+}
+
+fn planning_authority_assignment_id(
+    assignments: &[OrchestratorAssignment],
+    schedule: &[AssignmentScheduleEntry],
+    dependent_id: &str,
+) -> String {
+    let Some(entry) = schedule
+        .iter()
+        .find(|entry| entry.assignment_id == dependent_id)
+    else {
+        return dependent_id.to_string();
+    };
+    if let Some(parent) = entry.parent_assignment_id.as_deref() {
+        if assignments.iter().any(|assignment| {
+            assignment.id == parent && assignment.phase == AssignmentPhase::Planning
+        }) {
+            return parent.to_string();
+        }
+    }
+    dependent_id.to_string()
+}
+
+fn ensure_generated_design_decision(
+    store: &DecisionStore,
+    decision: &GeneratedDesignDecision,
+    authority: &str,
+    scope: DecisionScope,
+) -> Result<DecisionRecord> {
+    let reference =
+        DecisionRef::new(&decision.question_key)?.with_expected_resolution(&decision.resolution)?;
+    let registry = store
+        .load_registry()
+        .context("failed to load DecisionStore registry for generated planning")?;
+    match check_decision_ref(&registry, &reference) {
+        Ok(record) => Ok(record),
+        Err(DecisionRefError::MissingQuestionKey { .. }) => {
+            store
+                .claim_open(&decision.question_key, &decision.question, authority)
+                .with_context(|| {
+                    format!(
+                        "planning assignment '{authority}' could not claim design question '{}'",
+                        decision.question_key
+                    )
+                })?;
+            store
+                .resolve_claim(
+                    &decision.question_key,
+                    authority,
+                    &decision.resolution,
+                    scope,
+                )
+                .with_context(|| {
+                    format!(
+                        "planning assignment '{authority}' could not resolve design question '{}'",
+                        decision.question_key
+                    )
+                })
+        }
+        Err(DecisionRefError::StaleRef {
+            reason: StaleDecisionRefReason::ClaimNotResolved { status },
+            question_key,
+        }) => {
+            if status != DecisionClaimStatus::Open {
+                bail!(
+                    "design question '{question_key}' is {status:?} and cannot admit dependent dispatch until reconciled"
+                );
+            }
+            let snapshot = registry
+                .snapshot()
+                .context("failed to snapshot DecisionStore registry for open-claim ownership")?;
+            let claim = snapshot
+                .claims
+                .iter()
+                .find(|claim| claim.question_key() == question_key.as_str())
+                .with_context(|| {
+                    format!("open design question '{question_key}' is missing from the registry snapshot")
+                })?;
+            if claim.owning_assignment() != authority {
+                bail!(
+                    "design question '{question_key}' is already open under assignment '{}'; assignment '{authority}' cannot dispatch dependents until ownership is reconciled",
+                    claim.owning_assignment()
+                );
+            }
+            store.resolve_claim(
+                &decision.question_key,
+                authority,
+                &decision.resolution,
+                scope,
+            )
+        }
+        Err(DecisionRefError::StaleRef {
+            reason: StaleDecisionRefReason::ResolutionMismatch { expected, actual },
+            question_key,
+        }) => bail!(
+            "design question '{question_key}' has inconsistent resolutions (expected {expected}, actual {actual}); dependent dispatch is blocked until reconciled"
+        ),
+        Err(error) => {
+            Err(error).context("generated design decision reference is not admissible")
+        }
+    }
 }
 
 fn combined_goal_spec(goal: &str, spec: &str) -> String {
@@ -5558,6 +5854,589 @@ mod decision_ref_live_reparse_tests {
         assert!(
             is_store_query_failed(&queried),
             "live evidence_only_reaudit path must pass Some(repo): {queried:#}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod generated_design_decision_lifecycle_tests {
+    use super::*;
+    #[cfg(unix)]
+    use crate::decision_claim::DecisionScope;
+    #[cfg(unix)]
+    use crate::decision_ref::{DecisionRef, DecisionRefError};
+    #[cfg(unix)]
+    use crate::decision_store::DecisionStore;
+    #[cfg(unix)]
+    use crate::merge::check_merge_arbitration_decision_refs;
+    #[cfg(unix)]
+    use std::fs;
+    use std::path::PathBuf;
+
+    const SHARED_DESIGN_SPEC: &str = concat!(
+        "- Update client_send in src/client.rs. design-decision: api.transport: Which transport should the API use? = Use HTTP\n",
+        "- Update server_recv in src/server.rs. design-decision: api.transport: Which transport should the API use? = Use HTTP\n",
+        "- Update README.md with usage notes.\n",
+    );
+
+    #[cfg(unix)]
+    fn disjoint_design_repo() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().expect("temporary repository");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(repo.join("src")).expect("src");
+        fs::write(repo.join("src/client.rs"), "pub fn client_send() {}\n").expect("client");
+        fs::write(repo.join("src/server.rs"), "pub fn server_recv() {}\n").expect("server");
+        fs::write(repo.join("README.md"), "hello\n").expect("readme");
+        git2::Repository::init(&repo).expect("initialize repository");
+        (temp, repo)
+    }
+
+    #[cfg(unix)]
+    fn shared_transport_ref() -> DecisionRef {
+        DecisionRef::new("api.transport")
+            .expect("valid key")
+            .with_expected_resolution("Use HTTP")
+            .expect("valid resolution")
+    }
+
+    fn generated_assignment(
+        id: &str,
+        phase: AssignmentPhase,
+        path: &str,
+        task: Option<&str>,
+    ) -> OrchestratorAssignment {
+        OrchestratorAssignment {
+            id: id.to_string(),
+            phase,
+            runtime: None,
+            role: AgentRole::ChildOrchestrator,
+            role_category: Some(AgentRole::ChildOrchestrator.authority_category()),
+            selection_source: None,
+            assigned_paths: vec![PathBuf::from(path)],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: task.map(str::to_string),
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+            decision_refs: Vec::new(),
+        }
+    }
+
+    fn generated_schedule(ids: &[(&str, Option<&str>)]) -> Vec<AssignmentScheduleEntry> {
+        ids.iter()
+            .enumerate()
+            .map(|(index, (id, parent))| AssignmentScheduleEntry {
+                assignment_id: (*id).to_string(),
+                parent_assignment_id: parent.map(str::to_string),
+                depth: if parent.is_some() {
+                    MIN_SUPERVISOR_DEPTH.saturating_add(1)
+                } else {
+                    MIN_SUPERVISOR_DEPTH
+                },
+                flattened_index: index,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parse_generated_design_decisions_dedupes_and_refuses_inconsistent_text() {
+        let parsed = parse_generated_design_decisions(SHARED_DESIGN_SPEC).expect("parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].question_key, "api.transport");
+        assert_eq!(parsed[0].resolution, "Use HTTP");
+
+        let error = parse_generated_design_decisions(concat!(
+            "design-decision: api.transport: Which transport should the API use? = Use HTTP\n",
+            "design-decision: api.transport: Which transport should the API use? = Use a local socket\n",
+        ))
+        .expect_err("inconsistent generated design text");
+        assert!(
+            error.to_string().contains("inconsistent"),
+            "spec-level inconsistent resolutions must be refused: {error:#}"
+        );
+    }
+
+    #[test]
+    fn apply_generated_design_decisions_without_repo_blocks_dependents_and_creates_no_store() {
+        let mut assignments = vec![
+            generated_assignment(
+                "client-planning",
+                AssignmentPhase::Planning,
+                "src/client.rs",
+                Some("Read-only planning gate"),
+            ),
+            generated_assignment(
+                "client",
+                AssignmentPhase::Execution,
+                "src/client.rs",
+                Some("Update client_send using api.transport"),
+            ),
+            generated_assignment(
+                "server-planning",
+                AssignmentPhase::Planning,
+                "src/server.rs",
+                Some("Read-only planning gate"),
+            ),
+            generated_assignment(
+                "server",
+                AssignmentPhase::Execution,
+                "src/server.rs",
+                Some("Update server_recv using api.transport"),
+            ),
+            generated_assignment(
+                "readme-planning",
+                AssignmentPhase::Planning,
+                "README.md",
+                Some("Read-only planning gate"),
+            ),
+            generated_assignment(
+                "readme",
+                AssignmentPhase::Execution,
+                "README.md",
+                Some("Update README.md with usage notes"),
+            ),
+        ];
+        let schedule = generated_schedule(&[
+            ("client-planning", None),
+            ("client", Some("client-planning")),
+            ("server-planning", None),
+            ("server", Some("server-planning")),
+            ("readme-planning", None),
+            ("readme", Some("readme-planning")),
+        ]);
+        let error = apply_generated_design_decisions(
+            None,
+            "",
+            SHARED_DESIGN_SPEC,
+            &mut assignments,
+            &schedule,
+        )
+        .expect_err("dependents require an authenticated DecisionStore");
+        assert!(
+            error.to_string().contains("no repository path"),
+            "missing repo must fail closed before dependent dispatch: {error:#}"
+        );
+        assert!(assignments
+            .iter()
+            .all(|assignment| assignment.decision_refs.is_empty()));
+        assert!(
+            assignments
+                .iter()
+                .filter(|assignment| assignment.phase == AssignmentPhase::Execution
+                    && assignment.id != "readme")
+                .count()
+                == 2
+        );
+    }
+
+    #[test]
+    fn apply_generated_design_decisions_without_markers_leaves_empty_refs() {
+        let mut assignments = vec![generated_assignment(
+            "readme",
+            AssignmentPhase::Execution,
+            "README.md",
+            Some("Update README.md with usage notes"),
+        )];
+        let schedule = generated_schedule(&[("readme", None)]);
+        apply_generated_design_decisions(
+            None,
+            "",
+            "- Update README.md with usage notes.\n",
+            &mut assignments,
+            &schedule,
+        )
+        .expect("ordinary work without design deps");
+        assert!(assignments[0].decision_refs.is_empty());
+    }
+
+    #[test]
+    fn generated_plan_document_round_trip_keeps_empty_refs_without_a_store() {
+        let assignments = vec![
+            generated_assignment(
+                "readme-planning",
+                AssignmentPhase::Planning,
+                "README.md",
+                Some("Read-only planning gate"),
+            ),
+            generated_assignment(
+                "readme",
+                AssignmentPhase::Execution,
+                "README.md",
+                Some("Update README.md with usage notes"),
+            ),
+        ];
+        let schedule = generated_schedule(&[
+            ("readme-planning", None),
+            ("readme", Some("readme-planning")),
+        ]);
+        let captured_max_depth = schedule
+            .iter()
+            .map(|entry| entry.depth)
+            .max()
+            .unwrap_or(MIN_SUPERVISOR_DEPTH);
+        let captured = serde_json::json!({
+            "version": 1,
+            "task": "ordinary generated plan",
+            "max_depth": captured_max_depth,
+            "max_child_assignments": assignments.len(),
+            "assignments": assignments,
+            "assignment_schedule": schedule,
+        });
+        let loaded = parse_supervisor_plan_with_consultant(&captured.to_string())
+            .expect("empty-ref generated document must parse");
+        assert!(loaded
+            .plan
+            .assignments
+            .iter()
+            .all(|assignment| assignment.decision_refs.is_empty()));
+        assert_eq!(loaded.plan_metadata.assignment_schedule, schedule);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_plan_without_design_deps_keeps_empty_refs_and_creates_no_store() {
+        let (_temp, repo) = disjoint_design_repo();
+        let mut assignments = vec![generated_assignment(
+            "readme",
+            AssignmentPhase::Execution,
+            "README.md",
+            Some("Update README.md with usage notes"),
+        )];
+        let schedule = generated_schedule(&[("readme", None)]);
+        apply_generated_design_decisions(
+            Some(&repo),
+            "",
+            "- Update README.md with usage notes.\n",
+            &mut assignments,
+            &schedule,
+        )
+        .expect("ordinary work without design deps");
+        assert!(assignments[0].decision_refs.is_empty());
+        assert!(DecisionStore::open_existing(&repo)
+            .expect("read-only query")
+            .is_none());
+        assert!(
+            !repo.join(".git").join("maco").exists(),
+            "ordinary generated planning must not create decision-store state"
+        );
+    }
+
+    #[cfg(unix)]
+    fn disjoint_dependent_graph() -> (Vec<OrchestratorAssignment>, Vec<AssignmentScheduleEntry>) {
+        (
+            vec![
+                generated_assignment(
+                    "client-planning",
+                    AssignmentPhase::Planning,
+                    "src/client.rs",
+                    Some("Read-only planning gate"),
+                ),
+                generated_assignment(
+                    "client",
+                    AssignmentPhase::Execution,
+                    "src/client.rs",
+                    Some("Update client_send using api.transport"),
+                ),
+                generated_assignment(
+                    "server-planning",
+                    AssignmentPhase::Planning,
+                    "src/server.rs",
+                    Some("Read-only planning gate"),
+                ),
+                generated_assignment(
+                    "server",
+                    AssignmentPhase::Execution,
+                    "src/server.rs",
+                    Some("Update server_recv using api.transport"),
+                ),
+                generated_assignment(
+                    "readme-planning",
+                    AssignmentPhase::Planning,
+                    "README.md",
+                    Some("Read-only planning gate"),
+                ),
+                generated_assignment(
+                    "readme",
+                    AssignmentPhase::Execution,
+                    "README.md",
+                    Some("Update README.md with usage notes"),
+                ),
+            ],
+            generated_schedule(&[
+                ("client-planning", None),
+                ("client", Some("client-planning")),
+                ("server-planning", None),
+                ("server", Some("server-planning")),
+                ("readme-planning", None),
+                ("readme", Some("readme-planning")),
+            ]),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_plan_shared_design_decision_lifecycle_refuses_inconsistent_resolutions() {
+        let (_temp, repo) = disjoint_design_repo();
+        let (mut assignments, schedule) = disjoint_dependent_graph();
+        apply_generated_design_decisions(
+            Some(&repo),
+            "",
+            SHARED_DESIGN_SPEC,
+            &mut assignments,
+            &schedule,
+        )
+        .expect("stamp dependents through the authenticated writer");
+
+        let expected = shared_transport_ref();
+        let client = assignments
+            .iter()
+            .find(|assignment| assignment.id == "client")
+            .expect("client");
+        let server = assignments
+            .iter()
+            .find(|assignment| assignment.id == "server")
+            .expect("server");
+        let readme = assignments
+            .iter()
+            .find(|assignment| assignment.id == "readme")
+            .expect("readme");
+        assert_eq!(
+            client.decision_refs.as_slice(),
+            std::slice::from_ref(&expected)
+        );
+        assert_eq!(
+            server.decision_refs.as_slice(),
+            std::slice::from_ref(&expected)
+        );
+        assert!(
+            readme.decision_refs.is_empty(),
+            "ordinary README assignment must remain empty-ref valid"
+        );
+        assert!(
+            assignments
+                .iter()
+                .filter(|assignment| {
+                    assignment.phase == AssignmentPhase::Planning
+                        && assignment.decision_refs.is_empty()
+                })
+                .count()
+                >= 2
+        );
+
+        let store = DecisionStore::open_existing(&repo)
+            .expect("query store")
+            .expect("generated planning must persist the authenticated decision");
+        let registry = store.load_registry().expect("load");
+        crate::decision_ref::check_decision_ref(&registry, &expected)
+            .expect("stamped refs must match the persisted resolved record");
+
+        let captured_max_depth = schedule
+            .iter()
+            .map(|entry| entry.depth)
+            .max()
+            .unwrap_or(MIN_SUPERVISOR_DEPTH);
+        let captured = serde_json::json!({
+            "version": 1,
+            "task": "generated design-decision fixture",
+            "max_depth": captured_max_depth,
+            "max_child_assignments": assignments.len(),
+            "assignments": assignments,
+            "assignment_schedule": schedule,
+        });
+        parse_supervisor_plan_with_consultant_in_repo(&captured.to_string(), Some(&repo))
+            .expect("run-artifact plan document must re-admit stamped refs");
+
+        check_merge_arbitration_decision_refs(&repo, &[expected.clone(), expected.clone()])
+            .expect("generated refs must reach merge arbitration checks");
+        let stale = DecisionRef::new("api.transport")
+            .expect("valid key")
+            .with_expected_resolution("Use a local socket")
+            .expect("valid stale resolution");
+        let merge_error = check_merge_arbitration_decision_refs(&repo, &[stale])
+            .expect_err("inconsistent merge citations must be refused before integration");
+        assert!(
+            merge_error.chain().any(|cause| cause
+                .downcast_ref::<DecisionRefError>()
+                .is_some_and(|error| matches!(error, DecisionRefError::StaleRef { .. })))
+                || merge_error.to_string().contains("stale"),
+            "merge must refuse stale/inconsistent resolutions: {merge_error:#}"
+        );
+
+        store
+            .claim_open(
+                "api.protocol",
+                "Which protocol should overlapping API work use?",
+                "planner-b",
+            )
+            .expect("second question can be claimed");
+        let overlapping = store
+            .resolve_claim(
+                "api.protocol",
+                "planner-b",
+                "Use a local socket",
+                DecisionScope::new(
+                    ["api".to_string()],
+                    Vec::<String>::new(),
+                    Vec::<String>::new(),
+                )
+                .expect("scope"),
+            )
+            .expect_err("overlapping different resolution must not persist");
+        assert!(
+            format!("{overlapping:#}").contains("reconciliation_needed"),
+            "inconsistent overlapping resolutions must be refused before integration: {overlapping:#}"
+        );
+
+        let mut leftover = vec![
+            generated_assignment(
+                "assignment-replan-01-001-planning",
+                AssignmentPhase::Planning,
+                "src/client.rs",
+                Some("Read-only leftover planning gate"),
+            ),
+            generated_assignment(
+                "assignment-replan-01-001",
+                AssignmentPhase::Execution,
+                "src/client.rs",
+                Some("Update client_send using api.transport"),
+            ),
+            generated_assignment(
+                "assignment-replan-01-002-planning",
+                AssignmentPhase::Planning,
+                "src/server.rs",
+                Some("Read-only leftover planning gate"),
+            ),
+            generated_assignment(
+                "assignment-replan-01-002",
+                AssignmentPhase::Execution,
+                "src/server.rs",
+                Some("Update server_recv using api.transport"),
+            ),
+        ];
+        let leftover_schedule = generated_schedule(&[
+            ("assignment-replan-01-001-planning", None),
+            (
+                "assignment-replan-01-001",
+                Some("assignment-replan-01-001-planning"),
+            ),
+            ("assignment-replan-01-002-planning", None),
+            (
+                "assignment-replan-01-002",
+                Some("assignment-replan-01-002-planning"),
+            ),
+        ]);
+        apply_generated_design_decisions(
+            Some(&repo),
+            "",
+            SHARED_DESIGN_SPEC,
+            &mut leftover,
+            &leftover_schedule,
+        )
+        .expect("leftover re-admission must reuse the resolved decision");
+        assert_eq!(
+            leftover
+                .iter()
+                .find(|assignment| assignment.id == "assignment-replan-01-001")
+                .expect("leftover client")
+                .decision_refs
+                .as_slice(),
+            std::slice::from_ref(&expected)
+        );
+        assert_eq!(
+            leftover
+                .iter()
+                .find(|assignment| assignment.id == "assignment-replan-01-002")
+                .expect("leftover server")
+                .decision_refs
+                .as_slice(),
+            std::slice::from_ref(&expected)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_recursive_planning_stamps_decision_refs_from_the_store() {
+        let (_temp, repo) = disjoint_design_repo();
+        let spec = concat!(
+            "- Update client_send in src/client.rs using api.transport. design-decision: api.transport: Which transport should the API use? = Use HTTP\n",
+            "- Update server_recv in src/server.rs using api.transport. design-decision: api.transport: Which transport should the API use? = Use HTTP\n",
+        );
+        let mut assignments = vec![
+            generated_assignment(
+                "parent",
+                AssignmentPhase::Planning,
+                "src/client.rs",
+                Some("Coordinate client and server"),
+            ),
+            generated_assignment(
+                "client",
+                AssignmentPhase::Execution,
+                "src/client.rs",
+                Some("Update client_send using api.transport"),
+            ),
+            generated_assignment(
+                "server",
+                AssignmentPhase::Execution,
+                "src/server.rs",
+                Some("Update server_recv using api.transport"),
+            ),
+        ];
+        let schedule = generated_schedule(&[
+            ("parent", None),
+            ("client", Some("parent")),
+            ("server", Some("parent")),
+        ]);
+        apply_generated_design_decisions(Some(&repo), "", spec, &mut assignments, &schedule)
+            .expect("recursive lowering stamps dependents from the store");
+        let expected = shared_transport_ref();
+        assert!(assignments
+            .iter()
+            .find(|assignment| assignment.id == "client")
+            .expect("client")
+            .decision_refs
+            .contains(&expected));
+        assert!(assignments
+            .iter()
+            .find(|assignment| assignment.id == "server")
+            .expect("server")
+            .decision_refs
+            .contains(&expected));
+        assert!(assignments
+            .iter()
+            .find(|assignment| assignment.id == "parent")
+            .expect("parent")
+            .decision_refs
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_plan_conflicting_open_ownership_blocks_dependent_dispatch() {
+        let (_temp, repo) = disjoint_design_repo();
+        let store = DecisionStore::open(&repo).expect("open");
+        store
+            .claim_open(
+                "api.transport",
+                "Which transport should the API use?",
+                "foreign-planner",
+            )
+            .expect("pre-claim");
+        let (mut assignments, schedule) = disjoint_dependent_graph();
+        let error = apply_generated_design_decisions(
+            Some(&repo),
+            "",
+            SHARED_DESIGN_SPEC,
+            &mut assignments,
+            &schedule,
+        )
+        .expect_err("foreign open claim must block dependents");
+        assert!(
+            error.to_string().contains("already open")
+                || format!("{error:#}").contains("foreign-planner")
+                || format!("{error:#}").contains("blocked dependent dispatch"),
+            "conflicting ownership must block generated dependent dispatch: {error:#}"
         );
     }
 }
