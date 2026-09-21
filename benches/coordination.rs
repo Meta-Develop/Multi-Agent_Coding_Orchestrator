@@ -1,13 +1,23 @@
 //! Reproducible Criterion baselines for MACO's public coordination substrate.
 //!
-//! Every timed case completes a successful public-API operation. Managed
-//! worktree and merge throughput are intentionally absent because their public
-//! entrypoints cannot construct the required capability-bound worktree today.
+//! Successful public-API cases remain the default. The Git-native worktree and
+//! merge envelope in `envelope.rs` measures production
+//! `WorktreeManager::{create,list_managed_verified,remove}` and
+//! `preview_merge_apply_with_evidence`, plus CLI review/apply. Public
+//! `apply_merge_result` stays fail-closed and is not called. `create()` already
+//! derives cleanliness on a clean repository; the old issue #11 / #25
+//! "capability-bound create pending" rationale is stale.
 
 #[path = "../tests/support/containment.rs"]
 mod containment;
+mod envelope;
+mod envelope_fixtures;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use envelope::{
+    envelope_probes, merge_preview, merge_review_apply_s, worktree_lifecycle_s,
+    worktree_list_quiescent_s,
+};
 use git2::{IndexAddOption, Oid, Repository, RepositoryInitOptions, Signature};
 use multi_agent_coding_orchestrator::{
     repo_map,
@@ -42,6 +52,20 @@ impl RepositoryFixture {
             ("src/lib.rs", "pub fn fixture() {}\n"),
             ("src/main.rs", "fn main() {}\n"),
         ])
+    }
+
+    /// Medium envelope repo: 128 tracked ~1 KiB files.
+    fn medium() -> Self {
+        const FILE_COUNT: usize = 128;
+        let body = format!("{}\n", "m".repeat(1023));
+        let files = (0..FILE_COUNT)
+            .map(|index| (format!("data/{index:03}.txt"), body.clone()))
+            .collect::<Vec<_>>();
+        let files = files
+            .iter()
+            .map(|(path, contents)| (path.as_str(), contents.as_str()))
+            .collect::<Vec<_>>();
+        Self::with_files(&files)
     }
 
     fn repository_map() -> Self {
@@ -454,6 +478,11 @@ criterion_group!(
     claim_acquire_release,
     claim_contention,
     claim_concurrency,
-    repository_queries
+    repository_queries,
+    worktree_lifecycle_s,
+    merge_preview,
+    merge_review_apply_s,
+    worktree_list_quiescent_s,
+    envelope_probes
 );
 criterion_main!(benches);
