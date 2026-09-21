@@ -4829,6 +4829,7 @@ fn provider_planning_session_lowers_recursive_tree_and_binds_run_identity() {
             assigned_paths: vec![PathBuf::from("src/alpha.rs"), PathBuf::from("src/beta.rs")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
+            decision_dependencies: Vec::new(),
             child_assignments: vec![
                 crate::planning::ProviderTaskAssignmentTree {
                     id: "alpha".to_string(),
@@ -4837,6 +4838,7 @@ fn provider_planning_session_lowers_recursive_tree_and_binds_run_identity() {
                     assigned_paths: vec![PathBuf::from("src/alpha.rs")],
                     semantic_symbols: Vec::new(),
                     semantic_modules: Vec::new(),
+                    decision_dependencies: Vec::new(),
                     child_assignments: Vec::new(),
                 },
                 crate::planning::ProviderTaskAssignmentTree {
@@ -4846,6 +4848,7 @@ fn provider_planning_session_lowers_recursive_tree_and_binds_run_identity() {
                     assigned_paths: vec![PathBuf::from("src/beta.rs")],
                     semantic_symbols: Vec::new(),
                     semantic_modules: Vec::new(),
+                    decision_dependencies: Vec::new(),
                     child_assignments: Vec::new(),
                 },
             ],
