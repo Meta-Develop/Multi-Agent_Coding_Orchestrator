@@ -1559,6 +1559,7 @@ impl ExternalAgentCommand {
     }
 
     /// Bind the immutable Grok account evidence admitted for this specific run.
+    #[cfg(test)]
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn with_grok_run_account_binding(
         mut self,

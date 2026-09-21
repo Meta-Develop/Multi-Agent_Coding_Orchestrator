@@ -148,6 +148,7 @@ impl GrokAcpBoundOutputSchema {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn sha256(&self) -> &str {
         &self.sha256
     }
@@ -350,10 +351,6 @@ pub(crate) enum GrokAcpIdentityPublicationStatus {
 }
 
 impl GrokAcpIdentityPublicationStatus {
-    pub(crate) fn allows_publication(self) -> bool {
-        matches!(self, Self::Admitted)
-    }
-
     pub(crate) fn refusal_message(self) -> Option<&'static str> {
         match self {
             Self::Admitted => None,
@@ -425,6 +422,7 @@ pub(crate) fn grok_acp_admitted_identity_publication_status(
     GrokAcpIdentityPublicationStatus::Admitted
 }
 
+#[cfg(test)]
 pub(crate) fn grok_acp_execution_identity_publication_status(
     evidence: &GrokAcpExecutionEvidence,
 ) -> GrokAcpIdentityPublicationStatus {
@@ -439,6 +437,7 @@ pub(crate) fn grok_acp_execution_identity_publication_status(
     )
 }
 
+#[cfg(test)]
 fn resolved_field_as_str(field: &GrokAcpResolvedField) -> Option<&str> {
     match field {
         GrokAcpResolvedField::Known(value) => Some(value.as_str()),
