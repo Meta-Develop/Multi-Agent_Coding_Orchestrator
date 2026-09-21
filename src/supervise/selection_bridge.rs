@@ -5844,6 +5844,10 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/runtime_adapter/grok/captured-minimal-20260821.txt"
     ));
+    const CAPTURED_GROK_47_CATALOG: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/runtime_adapter/grok/captured-minimal-20260922.txt"
+    ));
     const CAPTURED_CURSOR_AT_UNIX_MILLIS: u64 = 1_787_240_463_000;
 
     struct FakeCursorRunner {
@@ -6451,6 +6455,105 @@ mod tests {
             .models
             .iter()
             .any(|model| model.model == "grok-4.6"));
+        Ok(())
+    }
+
+    #[test]
+    fn advertised_grok_47_requires_task_provided_evidence_for_explicit_selection() -> Result<()> {
+        let observation = discover_grok_observation(CAPTURED_GROK_47_CATALOG)?;
+        assert!(observation.catalog().contains("grok-4.7"));
+        assert!(observation.catalog().contains("grok-4.7-build-fast"));
+
+        let production_priors = selector_priors_with_terminal_worker_economics()?;
+        let task = task_profile_for_role(AgentRole::Worker);
+        let production_catalogs = constructed_selection_catalogs(
+            SupervisorRuntime::Grok,
+            &RuntimeModelCatalog::OperatorDeclared,
+            &advertised_with_grok(observation.clone()),
+            &task,
+            &production_priors,
+            None,
+        )?;
+        assert!(production_catalogs[0]
+            .models
+            .iter()
+            .all(|model| model.model != "grok-4.7"));
+
+        let mut task_priors = production_priors.clone();
+        let mut task_prior = production_priors
+            .models
+            .iter()
+            .find(|prior| prior.runtime == "grok" && prior.model == "grok-4.6")
+            .cloned()
+            .context("test fixture requires the existing Grok terminal-worker prior shape")?;
+        task_prior.model = "grok-4.7".to_string();
+        task_prior.source_id = "test-only-grok-4.7-task-evidence".to_string();
+        task_prior.prior_scope =
+            "test-only task-provided admissible Grok 4.7 selector evidence".to_string();
+        task_prior.limitations = vec![
+            "synthetic test evidence only; not production quality, price, benchmark, or default evidence"
+                .to_string(),
+        ];
+        task_prior.one_shot_environment_fallbacks.clear();
+        task_priors.revision = format!("{}+test-grok-4.7", task_priors.revision);
+        task_priors.models.push(task_prior);
+
+        let advertised = advertised_with_grok(observation);
+        let mut input = selection_input_for_role(SelectionInputForRoleArgs {
+            role: AgentRole::Worker,
+            runtime: SupervisorRuntime::Grok,
+            catalog: &RuntimeModelCatalog::OperatorDeclared,
+            advertised: &advertised,
+            admission: &test_admission(),
+            resolved_objective_profile: &default_resolved_profile(),
+            quota_context: None,
+            quota_ledger: None,
+            account_observation: None,
+            signals: DynamicSignals {
+                retry_count: 0,
+                budget_signal: BudgetSignal::Continue,
+                previous_choice: None,
+                previous_catalog_digest: None,
+                environment_rejections: Vec::new(),
+                observed_cost_per_accepted_task_microunits: None,
+            },
+            debug_override: Some(DebugOverride {
+                candidate: CandidateKey {
+                    runtime: "grok".to_string(),
+                    model: "grok-4.7".to_string(),
+                    effort: SelectorEffort::Xhigh,
+                },
+                requested_by: "test-only-task-evidence".to_string(),
+                reason: "prove exact explicit selection without adding production priors"
+                    .to_string(),
+            }),
+            history: None,
+        })?;
+        input.catalogs = constructed_selection_catalogs(
+            SupervisorRuntime::Grok,
+            &RuntimeModelCatalog::OperatorDeclared,
+            &advertised,
+            &task,
+            &task_priors,
+            None,
+        )?;
+        input.priors = task_priors;
+        input.operational_observations = Some(live_operational_observations(&input));
+
+        assert!(input.catalogs[0]
+            .models
+            .iter()
+            .any(|model| model.model == "grok-4.7"));
+        assert!(input.catalogs[0]
+            .models
+            .iter()
+            .all(|model| model.model != "grok-4.7-build-fast"));
+        let decision = selection::select(&input)?;
+        let choice = decision.choice.context("explicit Grok 4.7 selection")?;
+        assert_eq!(choice.candidate.runtime, "grok");
+        assert_eq!(choice.candidate.model, "grok-4.7");
+        assert_eq!(choice.candidate.effort, SelectorEffort::Xhigh);
+        assert_eq!(choice.reason, selection::ChoiceReason::DebugOverride);
         Ok(())
     }
 

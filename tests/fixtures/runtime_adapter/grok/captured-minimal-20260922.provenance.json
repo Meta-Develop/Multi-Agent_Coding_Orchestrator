@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "fixture": "captured-minimal-20260922.txt",
+  "classification": "capture-derived-minimal",
+  "captured_at_utc": "2026-09-21T17:28:31Z",
+  "cli": "grok",
+  "cli_version": "1.0.40",
+  "argv": ["grok", "models"],
+  "environment": {
+    "NO_COLOR": "1",
+    "TERM": "dumb"
+  },
+  "exit_status": 0,
+  "redactions": "none",
+  "fixture_sha256": "761b89325e8ad709b7b3db273ba1b0427f82d046bdbc5bb26be46af8e4516995",
+  "scope_note": "This capture-derived minimal fixture records only the verified model listing, not a full unabridged archive."
+}

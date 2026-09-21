@@ -1818,6 +1818,10 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/runtime_adapter/grok/captured-minimal-20260821.txt"
     ));
+    const CAPTURED_47_CATALOG: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/runtime_adapter/grok/captured-minimal-20260922.txt"
+    ));
     const HAND_AUTHORED_DUPLICATE: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/runtime_adapter/grok/hand-authored-duplicate.txt"
@@ -1841,6 +1845,10 @@ mod tests {
     const CAPTURED_PROVENANCE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/runtime_adapter/grok/captured-minimal-20260821.provenance.json"
+    ));
+    const CAPTURED_47_PROVENANCE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/runtime_adapter/grok/captured-minimal-20260922.provenance.json"
     ));
     const WRITABLE_MANAGED_CHILD_STREAM: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -2466,6 +2474,31 @@ mod tests {
     }
 
     #[test]
+    fn captured_47_catalog_preserves_standard_and_fast_slugs_without_granting_fast_authority(
+    ) -> Result<()> {
+        let catalog = parse_grok_model_catalog(CAPTURED_47_CATALOG)?;
+        assert_eq!(
+            catalog.slugs().collect::<Vec<_>>(),
+            ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"]
+        );
+        assert!(matches!(
+            crate::runtime_adapter::TypedRuntime::from_launch(
+                AdapterId::Grok,
+                Some("grok-4.7"),
+                Some("xhigh")
+            ),
+            Some(crate::runtime_adapter::TypedRuntime::Grok47Xhigh)
+        ));
+        assert!(crate::runtime_adapter::TypedRuntime::from_launch(
+            AdapterId::Grok,
+            Some("grok-4.7-build-fast"),
+            Some("xhigh")
+        )
+        .is_none());
+        Ok(())
+    }
+
+    #[test]
     fn captured_fixture_provenance_is_adjacent_exact_and_content_bound() -> Result<()> {
         let provenance: serde_json::Value = serde_json::from_str(CAPTURED_PROVENANCE)?;
         assert_eq!(provenance["schema_version"], 1);
@@ -2483,6 +2516,30 @@ mod tests {
         assert_eq!(
             provenance["scope_note"],
             "This capture-derived minimal fixture is not a full unabridged archive."
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn captured_47_fixture_provenance_is_adjacent_exact_and_content_bound() -> Result<()> {
+        let provenance: serde_json::Value = serde_json::from_str(CAPTURED_47_PROVENANCE)?;
+        assert_eq!(provenance["schema_version"], 1);
+        assert_eq!(provenance["fixture"], "captured-minimal-20260922.txt");
+        assert_eq!(provenance["classification"], "capture-derived-minimal");
+        assert_eq!(provenance["cli"], "grok");
+        assert_eq!(provenance["cli_version"], "1.0.40");
+        assert_eq!(provenance["argv"], serde_json::json!(["grok", "models"]));
+        assert_eq!(provenance["environment"]["NO_COLOR"], "1");
+        assert_eq!(provenance["environment"]["TERM"], "dumb");
+        assert_eq!(provenance["exit_status"], 0);
+        assert_eq!(provenance["redactions"], "none");
+        assert_eq!(
+            provenance["fixture_sha256"],
+            sha256_hex(CAPTURED_47_CATALOG)
+        );
+        assert_eq!(
+            provenance["scope_note"],
+            "This capture-derived minimal fixture records only the verified model listing, not a full unabridged archive."
         );
         Ok(())
     }

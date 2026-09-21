@@ -1308,16 +1308,18 @@ impl ExternalAgentCommand {
                 "writable_grok_managed_worktree_required: writable Grok is restricted to a managed child worktree"
             );
         }
-        if self.model.as_deref() != Some(TypedRuntime::Grok46Xhigh.model()) {
-            bail!(
-                "{WRITABLE_GROK_EXACT_MODEL_REQUIRED}: writable Grok requires exact model '{}'",
-                TypedRuntime::Grok46Xhigh.model()
-            );
-        }
-        if self.reasoning_effort.as_deref() != Some(TypedRuntime::Grok46Xhigh.reasoning_effort()) {
+        let runtime = TypedRuntime::from_model(AdapterId::Grok, self.model.as_deref())
+            .with_context(|| {
+                format!(
+                    "{WRITABLE_GROK_EXACT_MODEL_REQUIRED}: writable Grok requires exact model '{}' or '{}'",
+                    TypedRuntime::Grok46Xhigh.model(),
+                    TypedRuntime::Grok47Xhigh.model()
+                )
+            })?;
+        if self.reasoning_effort.as_deref() != Some(runtime.reasoning_effort()) {
             bail!(
                 "{WRITABLE_GROK_XHIGH_EFFORT_REQUIRED}: writable Grok requires exact reasoning effort '{}'",
-                TypedRuntime::Grok46Xhigh.reasoning_effort()
+                runtime.reasoning_effort()
             );
         }
         let selected = self.writable_runtime_selection.as_ref().with_context(|| {
@@ -1356,7 +1358,7 @@ impl ExternalAgentCommand {
             )
             .with_context(|| {
                 format!(
-                    "{WRITABLE_GROK_ADAPTER_CONFIGURATION_UNVERIFIED}: writable Grok adapter contract is not the immutable bounded 4.6/xhigh contract"
+                    "{WRITABLE_GROK_ADAPTER_CONFIGURATION_UNVERIFIED}: writable Grok adapter contract is not an immutable bounded typed xhigh contract"
                 )
             })
     }
