@@ -24,6 +24,7 @@ exclude = [
     "AGENTS.md",
 ]
 default-run = "maco"
+autobenches = false
 
 [[bin]]
 name = "multi-agent-coding-orchestrator"
