@@ -1411,6 +1411,7 @@ pub(super) fn render_review_lens_auditor_prompt(
         OrchestrationPhase::ReviewAcceptance,
         Some(lens.backend.model()),
     );
+    let withheld_evidence_rule = review_lens_withheld_evidence_rule(lens.information_scope);
     let prompt = format!(
         r#"{cacheable_prefix}{role_prefix}{instruction_profile_section}
 
@@ -1421,6 +1422,7 @@ Review-lens execution contract:
 - Reasoning effort: {reasoning_effort}
 - Treat REVIEW_LENS_REQUEST_JSON as the complete review-information boundary.
 - Do not attempt to discover omitted child information, repository state, worktree state, artifacts, or ambient files.
+- {withheld_evidence_rule}
 - Report reviewed_worker_ids and reviewed_paths for every entry in REQUIRED_COVERAGE_JSON.
 - Return only an AuditorReport JSON matching the runtime-supplied output schema.
 
@@ -1452,6 +1454,20 @@ REVIEW_LENS_REQUEST_JSON:
         prompt,
         measurements: PromptMeasurementsArtifact::new(vec![measurement], None),
     })
+}
+
+fn review_lens_withheld_evidence_rule(scope: ReviewInformationScope) -> &'static str {
+    match scope {
+        ReviewInformationScope::DiffOnly => {
+            "The earlier instruction to reject when worker evidence, the child report, or validation results are missing does not apply to this diff-only scope: those records are withheld by the information boundary. Judge only the supplied diff against REQUIRED_COVERAGE_JSON. Reject with implementation_defect only when that diff is wrong, outside the required paths, or does not show the required change."
+        }
+        ReviewInformationScope::OutputReportOnly => {
+            "The earlier instruction to reject when the worktree diff is missing does not apply to this output-only scope: the diff is withheld by the information boundary. Judge only the supplied reports against REQUIRED_COVERAGE_JSON."
+        }
+        ReviewInformationScope::FullChildTranscript => {
+            "This full-transcript scope supplies the child transcript. Missing worker evidence inside that supplied transcript remains grounds for rejection."
+        }
+    }
 }
 
 fn assignment_task<'a>(
@@ -2730,9 +2746,13 @@ mod regression_tests {
         assert!(diff_prompt.contains("DIFF_VISIBLE_ONLY_TO_DIFF_LENS"));
         assert!(!diff_prompt.contains("REPORT_VISIBLE_ONLY_TO_REPORT_LENS"));
         assert!(!diff_prompt.contains("TRANSCRIPT_MUST_NOT_CROSS_NARROW_LENSES"));
+        assert!(diff_prompt
+            .contains("does not apply to this diff-only scope: those records are withheld"));
         assert!(report_prompt.contains("REPORT_VISIBLE_ONLY_TO_REPORT_LENS"));
         assert!(!report_prompt.contains("DIFF_VISIBLE_ONLY_TO_DIFF_LENS"));
         assert!(!report_prompt.contains("TRANSCRIPT_MUST_NOT_CROSS_NARROW_LENSES"));
+        assert!(report_prompt
+            .contains("does not apply to this output-only scope: the diff is withheld"));
 
         let catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs([
             "model-alpha",

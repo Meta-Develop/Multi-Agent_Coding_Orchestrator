@@ -3277,6 +3277,34 @@
       ],
       "type": "object"
     },
+    "executable": {
+      "additionalProperties": false,
+      "description": "producing executable",
+      "properties": {
+        "executable_sha256": {
+          "type": "string"
+        },
+        "package_version": {
+          "type": "string"
+        },
+        "source_revision": {
+          "type": "string"
+        },
+        "source_state": {
+          "enum": [
+            "clean",
+            "dirty",
+            "unknown"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "package_version",
+        "source_state"
+      ],
+      "type": "object"
+    },
     "files_changed": {
       "items": {
         "maxLength": 4096,

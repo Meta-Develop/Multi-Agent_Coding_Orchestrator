@@ -25,6 +25,21 @@
         builtins.fromTOML (builtins.readFile ./scripts/supply_chain_pins.toml);
       cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
 
+      # The package fileset has no `.git`, so identity comes from the flake.
+      macoSourceIdentity =
+        if builtins.isString self.rev then {
+          revision = self.rev;
+          state = "clean";
+        } else if builtins.isString self.dirtyRev then {
+          # Nix appends `-dirty` to the commit. The recorded revision stays
+          # the 40-digit commit; the suffix is not part of the identity.
+          revision = lib.removeSuffix "-dirty" self.dirtyRev;
+          state = "dirty";
+        } else {
+          revision = "";
+          state = "unknown";
+        };
+
       pkgsFor = system:
         import nixpkgs {
           inherit system;
@@ -44,6 +59,7 @@
           ./.cargo
           ./assets
           ./benches
+          ./build.rs
           ./Cargo.lock
           ./Cargo.toml
           ./src
@@ -66,6 +82,11 @@
           src = macoSrc;
 
           cargoLock.lockFile = ./Cargo.lock;
+
+          env = {
+            MACO_SOURCE_REVISION = macoSourceIdentity.revision;
+            MACO_SOURCE_STATE = macoSourceIdentity.state;
+          };
 
           # The crate also ships a long-name alias binary. The installable
           # package is the `maco` PATH entry required by the global-install
@@ -96,6 +117,8 @@
             version_output="$("$out/bin/maco" --version)"
             echo "$version_output"
             echo "$version_output" | grep -F "${cargoToml.package.version}"
+            printf '%s\n' "$version_output" | grep -Fx "source_revision=${macoSourceIdentity.revision}"
+            printf '%s\n' "$version_output" | grep -Fx "source_state=${macoSourceIdentity.state}"
             test ! -e "$out/bin/multi-agent-coding-orchestrator"
             runHook postInstallCheck
           '';

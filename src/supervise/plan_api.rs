@@ -4889,6 +4889,7 @@ fn supervisor_collect_lifecycle_snapshot(
         semantic_release_errors: Vec::new(),
         remaining_risk: narrative.remaining_risk.to_string(),
         next_safe_action: narrative.next_safe_action.to_string(),
+        executable: Some(crate::build_identity::ExecutableBuildIdentity::compiled()),
     }
 }
 

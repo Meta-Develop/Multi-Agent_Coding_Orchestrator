@@ -775,6 +775,7 @@ pub(super) fn supervisor_final_report_execution_fixture_bytes() -> Vec<u8> {
         semantic_release_errors: Vec::new(),
         remaining_risk: "fixture".to_string(),
         next_safe_action: String::new(),
+        executable: None,
     };
     serde_json::to_vec(&report).expect("serialize supervisor-final fixture")
 }

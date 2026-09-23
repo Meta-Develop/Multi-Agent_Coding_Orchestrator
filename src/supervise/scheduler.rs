@@ -3035,6 +3035,7 @@ fn build_supervisor_final_report(
             "inspect run reports and rerun failed child scopes after correcting the issue"
                 .to_string()
         },
+        executable: Some(crate::build_identity::ExecutableBuildIdentity::compiled()),
     }
 }
 
