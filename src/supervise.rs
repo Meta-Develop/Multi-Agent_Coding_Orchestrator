@@ -2774,6 +2774,10 @@ pub struct SupervisorFinalReport {
     pub semantic_release_errors: Vec<String>,
     pub remaining_risk: String,
     pub next_safe_action: String,
+    /// Compile-time identity of the executable that produced this report.
+    /// Historical reports omit it. This is not the orchestrated repository HEAD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<crate::build_identity::ExecutableBuildIdentity>,
 }
 
 /// A command-level view over the immutable source report and the separately
@@ -3750,6 +3754,7 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         semantic_release_errors: Vec::new(),
         remaining_risk: "test evidence".to_string(),
         next_safe_action: "merge preview".to_string(),
+        executable: None,
     };
     let mut writer = ArtifactRunWriter::reserve(
         repo,

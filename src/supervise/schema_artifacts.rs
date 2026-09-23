@@ -268,6 +268,7 @@ fn supervisor_report_properties_value(run_lifecycle: &str) -> serde_json::Value 
           "status": review_status_schema_value(),
           "run_lifecycle": {"const": run_lifecycle},
           "evidence_only_reaudit": evidence_only_reaudit_schema_value(),
+          "executable": producing_executable_schema_value(),
           "assigned_paths": path_array_schema_value(),
           "semantic_symbols": string_array_schema_value(),
           "semantic_modules": string_array_schema_value(),
@@ -492,6 +493,24 @@ fn candidate_validation_binding_schema_value() -> serde_json::Value {
             "agent_head": {"type": ["string", "null"]},
             "merge_base": {"type": ["string", "null"]},
             "diff_oid": {"type": "string", "minLength": 1}
+        }
+    })
+}
+
+fn producing_executable_schema_value() -> serde_json::Value {
+    json!({
+        "description": "producing executable",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["package_version", "source_state"],
+        "properties": {
+            "package_version": {"type": "string"},
+            "source_revision": {"type": "string"},
+            "source_state": {
+                "type": "string",
+                "enum": ["clean", "dirty", "unknown"]
+            },
+            "executable_sha256": {"type": "string"}
         }
     })
 }

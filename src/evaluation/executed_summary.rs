@@ -1139,6 +1139,7 @@ mod tests {
             semantic_release_errors: Vec::new(),
             remaining_risk: "fixture".to_string(),
             next_safe_action: "none".to_string(),
+            executable: None,
         }
     }
 

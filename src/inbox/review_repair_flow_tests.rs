@@ -591,6 +591,7 @@ fn supervisor_report(run_id: &RunId, repo: &Path) -> SupervisorFinalReport {
         semantic_release_errors: Vec::new(),
         remaining_risk: "none".to_string(),
         next_safe_action: "none".to_string(),
+        executable: None,
     }
 }
 

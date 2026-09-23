@@ -653,6 +653,65 @@ fn issue32_denials_propagate_deduplicate_round_trip_and_default() {
 }
 
 #[test]
+fn supervisor_final_report_executable_identity_round_trips_without_following_a_later_executable() {
+    use crate::build_identity::{resolve_recorded_identity, ExecutableBuildIdentity, SourceState};
+
+    let report = artifact_test_final_report(
+        &RunId::new("executable-identity-absent").expect("valid run id"),
+    );
+    let mut missing = serde_json::to_value(&report).expect("serialize report without identity");
+    missing
+        .as_object_mut()
+        .expect("report object")
+        .remove("executable");
+    let decoded: SupervisorFinalReport =
+        serde_json::from_value(missing).expect("historical report without executable");
+    assert_eq!(decoded.executable, None);
+
+    let saved = resolve_recorded_identity(
+        "9.9.9-saved",
+        "0123456789abcdef0123456789abcdef01234567",
+        "clean",
+    );
+    assert_eq!(saved.executable_sha256, None);
+    let mut explicit = decoded;
+    explicit.executable = Some(saved.clone());
+    let encoded = serde_json::to_vec(&explicit).expect("serialize explicit identity");
+    let round_trip: SupervisorFinalReport =
+        serde_json::from_slice(&encoded).expect("round-trip explicit identity");
+    assert_eq!(round_trip, explicit);
+    assert_eq!(
+        serde_json::to_vec(&round_trip).expect("reserialize explicit identity"),
+        encoded
+    );
+
+    let other_repository = "other-repository/not-the-producing-executable";
+    let later = ExecutableBuildIdentity {
+        package_version: "9.9.9-later".to_string(),
+        source_revision: Some("fedcba9876543210fedcba9876543210fedcba98".to_string()),
+        source_state: SourceState::Dirty,
+        executable_sha256: None,
+    };
+    assert_ne!(later, saved);
+    assert_ne!(later, ExecutableBuildIdentity::compiled());
+    let still: SupervisorFinalReport = serde_json::from_slice(&encoded)
+        .expect("saved record after a different identity is constructed");
+    assert_eq!(still, round_trip);
+    assert_eq!(still.executable.as_ref(), Some(&saved));
+    assert_ne!(still.executable.as_ref(), Some(&later));
+    assert_ne!(
+        still.executable.as_ref(),
+        Some(&ExecutableBuildIdentity::compiled())
+    );
+    let saved_json = String::from_utf8(encoded).expect("utf-8 report");
+    assert!(saved_json.contains("9.9.9-saved"));
+    assert!(saved_json.contains("0123456789abcdef0123456789abcdef01234567"));
+    assert!(!saved_json.contains(other_repository));
+    assert!(!saved_json.contains("9.9.9-later"));
+    assert!(!saved_json.contains("fedcba9876543210fedcba9876543210fedcba98"));
+}
+
+#[test]
 fn issue32_unsafe_denial_paths_do_not_serialize_absolute_host_paths() {
     let unsafe_path = "/home/operator/private/control";
     let denials = sandbox_denials_for_report(&[denial_fixture(
