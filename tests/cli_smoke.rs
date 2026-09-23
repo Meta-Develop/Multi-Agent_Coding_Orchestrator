@@ -19,6 +19,53 @@ const BIN: &str = env!("CARGO_BIN_EXE_maco");
 const MACHINE_GLOBAL_CONFIG_ENV: &str = "MACO_MACHINE_GLOBAL_CONFIG";
 const MACHINE_GLOBAL_RUNTIME_ROOT_ID_ENV: &str = "MACO_MACHINE_GLOBAL_RUNTIME_ROOT_ID";
 
+fn recorded_cli_version_text() -> String {
+    let package_version = env!("CARGO_PKG_VERSION");
+    let source_revision = env!("MACO_SOURCE_REVISION");
+    let source_state = env!("MACO_SOURCE_STATE");
+    format!(
+        "maco {package_version}\n\
+         package_version={package_version}\n\
+         source_revision={source_revision}\n\
+         source_state={source_state}\n"
+    )
+}
+
+struct RecordedCliVersion {
+    package_version: String,
+    source_revision: String,
+    source_state: String,
+}
+
+fn parse_cli_version(text: &str) -> Result<RecordedCliVersion> {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() != 4 {
+        anyhow::bail!("expected four version lines, got {}: {text:?}", lines.len());
+    }
+    let package_version = lines[0]
+        .strip_prefix("maco ")
+        .context("version line missing maco prefix")?
+        .to_string();
+    let repeated_package_version = lines[1]
+        .strip_prefix("package_version=")
+        .context("missing package_version")?
+        .to_string();
+    assert_eq!(package_version, repeated_package_version);
+    let source_revision = lines[2]
+        .strip_prefix("source_revision=")
+        .context("missing source_revision")?
+        .to_string();
+    let source_state = lines[3]
+        .strip_prefix("source_state=")
+        .context("missing source_state")?
+        .to_string();
+    Ok(RecordedCliVersion {
+        package_version,
+        source_revision,
+        source_state,
+    })
+}
+
 fn cli_without_machine_global_bindings() -> Command {
     let mut command = Command::new(BIN);
     command
@@ -121,17 +168,44 @@ fn cli_literal_entrypoint_preserves_explicit_subcommands_and_top_level_help_and_
         help_stdout.contains("Usage: maco <COMMAND>"),
         "{help_stdout}"
     );
+    Ok(())
+}
 
-    let version = cli_without_machine_global_bindings()
+#[test]
+fn cli_version_reports_recorded_identity_from_an_unrelated_directory() -> Result<()> {
+    let version_text = recorded_cli_version_text();
+    for flag in ["--version", "-V"] {
+        let version = cli_without_machine_global_bindings()
+            .arg(flag)
+            .output()
+            .with_context(|| format!("run top-level {flag}"))?;
+        assert!(version.status.success());
+        let version_stdout = String::from_utf8(version.stdout)
+            .with_context(|| format!("decode top-level {flag}"))?;
+        assert_eq!(version_stdout, version_text);
+    }
+
+    let unrelated = TempDir::new().context("create unrelated git repository")?;
+    let repo = Repository::init(unrelated.path()).context("init unrelated git repository")?;
+    fs::write(unrelated.path().join("README.md"), "unrelated\n")
+        .context("write unrelated readme")?;
+    let head = commit_all(&repo, "unrelated commit")?.to_string();
+    assert_eq!(head.len(), 40);
+
+    let relocated = cli_without_machine_global_bindings()
+        .current_dir(unrelated.path())
         .arg("--version")
         .output()
-        .context("run top-level version")?;
-    assert!(version.status.success());
-    let version_stdout = String::from_utf8(version.stdout).context("decode top-level version")?;
-    assert_eq!(
-        version_stdout.trim(),
-        format!("maco {}", env!("CARGO_PKG_VERSION"))
-    );
+        .context("run version inside an unrelated git repository")?;
+    assert!(relocated.status.success());
+    let relocated_stdout =
+        String::from_utf8(relocated.stdout).context("decode relocated version")?;
+    assert_eq!(relocated_stdout, version_text);
+    let recorded = parse_cli_version(&relocated_stdout)?;
+    assert_eq!(recorded.package_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(recorded.source_revision, env!("MACO_SOURCE_REVISION"));
+    assert_eq!(recorded.source_state, env!("MACO_SOURCE_STATE"));
+    assert_ne!(recorded.source_revision, head);
     Ok(())
 }
 

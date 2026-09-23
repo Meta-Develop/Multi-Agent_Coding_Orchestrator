@@ -1195,8 +1195,7 @@ cargo install --locked --path . --bin maco
 maco --version
 ```
 
-`maco --version` prints the crate version from `Cargo.toml`. After install,
-`maco` runs from any working directory.
+`maco --version` prints the package version and the compile-time source identity, the exact lines are documented in `docs/PACKAGING.md`, and after install `maco` runs from any working directory.
 
 ## Development
 

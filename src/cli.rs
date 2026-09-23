@@ -123,7 +123,8 @@ const RETIRED_AUTOPILOT_EXECUTION_MESSAGE: &str =
 #[derive(Debug, Parser)]
 #[command(name = "maco")]
 #[command(about = "Multi-Agent Coding Orchestrator")]
-#[command(version)]
+#[command(version = crate::build_identity::LONG_VERSION)]
+#[command(long_version = crate::build_identity::LONG_VERSION)]
 pub struct Cli {
     #[command(subcommand)]
     command: Command,

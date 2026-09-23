@@ -11,6 +11,7 @@ pub mod agent;
 pub mod agent_lifecycle;
 pub mod artifacts;
 pub mod autopilot;
+pub mod build_identity;
 pub mod cli;
 pub mod consult;
 #[doc(hidden)]

@@ -25,6 +25,19 @@
         builtins.fromTOML (builtins.readFile ./scripts/supply_chain_pins.toml);
       cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
 
+      # The package fileset has no `.git`, so identity comes from the flake.
+      macoSourceIdentity =
+        if builtins.isString self.rev then {
+          revision = self.rev;
+          state = "clean";
+        } else if builtins.isString self.dirtyRev then {
+          revision = self.dirtyRev;
+          state = "dirty";
+        } else {
+          revision = "";
+          state = "unknown";
+        };
+
       pkgsFor = system:
         import nixpkgs {
           inherit system;
@@ -67,6 +80,11 @@
 
           cargoLock.lockFile = ./Cargo.lock;
 
+          env = {
+            MACO_SOURCE_REVISION = macoSourceIdentity.revision;
+            MACO_SOURCE_STATE = macoSourceIdentity.state;
+          };
+
           # The crate also ships a long-name alias binary. The installable
           # package is the `maco` PATH entry required by the global-install
           # contract.
@@ -96,6 +114,7 @@
             version_output="$("$out/bin/maco" --version)"
             echo "$version_output"
             echo "$version_output" | grep -F "${cargoToml.package.version}"
+            echo "$version_output" | grep -F "source_state="
             test ! -e "$out/bin/multi-agent-coding-orchestrator"
             runHook postInstallCheck
           '';

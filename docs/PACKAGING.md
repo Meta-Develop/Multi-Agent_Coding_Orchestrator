@@ -63,11 +63,41 @@ name) is the same global-binary contract.
 
 ## Version recording
 
-`maco --version` prints the crate version from `Cargo.toml` through the
-existing Clap `version` flag. Example: `maco 0.3.0`. The Nix package
-install-check requires that same version string.
+`maco --version` and `maco -V` print this text, plus a trailing newline:
 
-That is the current version surface for a globally installed binary. Run
-artifacts, ledgers, and a repository-declared minimum or required
-orchestrator version are later work on issue 220. This slice does not change
-supervise, orchestrate, or runtime adapter behavior.
+```
+maco {package_version}
+package_version={package_version}
+source_revision={40-lowercase-hex-or-empty}
+source_state={clean|dirty|unknown}
+```
+
+`package_version` is the crate version. `source_revision` is empty, or 40
+lowercase hexadecimal digits. `source_state` is `clean`, `dirty`, or
+`unknown`.
+
+A Cargo install from a git checkout records that identity at compile time by
+probing git in `CARGO_MANIFEST_DIR`.
+
+The Nix package fileset does not include `.git`, so that probe cannot see the
+flake checkout. The derivation passes `MACO_SOURCE_REVISION` and
+`MACO_SOURCE_STATE` instead. When `self.rev` is a non-null string, the state
+is `clean` and the revision is `self.rev`. Otherwise, when `self.dirtyRev` is
+a non-null string, the state is `dirty` and the revision is `self.dirtyRev`.
+Otherwise the state is `unknown` and the revision is empty. The install check
+still requires the package version in `maco --version`, and it requires
+`source_state=` to appear.
+
+Source archives and `cargo package` have no git metadata. Set
+`MACO_SOURCE_REVISION` and `MACO_SOURCE_STATE` together for those builds. If
+that pair is absent, the identity is unknown.
+
+`unknown` and `dirty` are explicit. A revision is recorded only for `clean` or
+`dirty` when it is 40 hexadecimal digits. Any other combination is `unknown`
+with an empty revision.
+
+The running binary does not read the repository it orchestrates. The printed
+identity is the one recorded at compile time.
+
+Enforcement of a repository minimum or required orchestrator version stays
+deferred and is not part of this identity surface.
