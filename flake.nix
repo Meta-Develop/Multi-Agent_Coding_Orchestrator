@@ -31,7 +31,9 @@
           revision = self.rev;
           state = "clean";
         } else if builtins.isString self.dirtyRev then {
-          revision = self.dirtyRev;
+          # Nix appends `-dirty` to the commit. The recorded revision stays
+          # the 40-digit commit; the suffix is not part of the identity.
+          revision = lib.removeSuffix "-dirty" self.dirtyRev;
           state = "dirty";
         } else {
           revision = "";
@@ -57,6 +59,7 @@
           ./.cargo
           ./assets
           ./benches
+          ./build.rs
           ./Cargo.lock
           ./Cargo.toml
           ./src
@@ -114,7 +117,8 @@
             version_output="$("$out/bin/maco" --version)"
             echo "$version_output"
             echo "$version_output" | grep -F "${cargoToml.package.version}"
-            echo "$version_output" | grep -F "source_state="
+            printf '%s\n' "$version_output" | grep -Fx "source_revision=${macoSourceIdentity.revision}"
+            printf '%s\n' "$version_output" | grep -Fx "source_state=${macoSourceIdentity.state}"
             test ! -e "$out/bin/multi-agent-coding-orchestrator"
             runHook postInstallCheck
           '';

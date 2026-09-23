@@ -79,9 +79,11 @@ impl ExecutableBuildIdentity {
 
 /// Normalizes a recorded package version, revision, and state.
 ///
-/// A 40-digit hex revision is kept in lowercase. `clean` or `dirty` without
-/// one becomes `unknown`. Any other state drops the revision. The executable
-/// digest is always unset; this function does not read the filesystem.
+/// A 40-digit hex revision is kept in lowercase. A dirty revision may also be
+/// that commit plus the Nix `-dirty` suffix; the suffix is removed. `clean`
+/// or `dirty` without a 40-digit revision becomes `unknown`. Any other state
+/// drops the revision. The executable digest is always unset; this function
+/// does not read the filesystem.
 pub fn resolve_recorded_identity(
     package_version: &str,
     revision: &str,
@@ -107,11 +109,21 @@ fn canonical_revision(revision: &str) -> Option<String> {
 }
 
 fn normalize_recorded(revision: &str, state: &str) -> (Option<String>, SourceState) {
-    let revision = canonical_revision(revision);
+    let revision = canonical_revision(revision_for_state(revision, state));
     match (state, revision) {
         ("clean", Some(revision)) => (Some(revision), SourceState::Clean),
         ("dirty", Some(revision)) => (Some(revision), SourceState::Dirty),
         _ => (None, SourceState::Unknown),
+    }
+}
+
+/// Nix `dirtyRev` is the commit plus a `-dirty` suffix. Only the dirty state
+/// accepts that form. Keep this in step with `build.rs`.
+fn revision_for_state<'a>(revision: &'a str, state: &str) -> &'a str {
+    if state == "dirty" {
+        revision.strip_suffix("-dirty").unwrap_or(revision)
+    } else {
+        revision
     }
 }
 
@@ -179,6 +191,27 @@ mod tests {
         let words = resolve_recorded_identity(PACKAGE, "not-a-revision", "clean");
         assert_eq!(words.source_state, SourceState::Unknown);
         assert_eq!(words.source_revision, None);
+    }
+
+    #[test]
+    fn dirty_nix_suffix_keeps_the_revision() {
+        let suffixed = format!("{REVISION}-dirty");
+        let identity = resolve_recorded_identity(PACKAGE, &suffixed, "dirty");
+        assert_eq!(identity.source_state, SourceState::Dirty);
+        assert_eq!(identity.source_revision.as_deref(), Some(REVISION));
+
+        let upper = format!("{UPPER_REVISION}-dirty");
+        let upper_identity = resolve_recorded_identity(PACKAGE, &upper, "dirty");
+        assert_eq!(upper_identity.source_state, SourceState::Dirty);
+        assert_eq!(upper_identity.source_revision.as_deref(), Some(REVISION));
+    }
+
+    #[test]
+    fn clean_nix_suffix_is_unknown() {
+        let suffixed = format!("{REVISION}-dirty");
+        let identity = resolve_recorded_identity(PACKAGE, &suffixed, "clean");
+        assert_eq!(identity.source_state, SourceState::Unknown);
+        assert_eq!(identity.source_revision, None);
     }
 
     #[test]

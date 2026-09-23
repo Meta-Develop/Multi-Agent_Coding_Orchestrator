@@ -80,21 +80,31 @@ A Cargo install from a git checkout records that identity at compile time by
 probing git in `CARGO_MANIFEST_DIR`.
 
 The Nix package fileset does not include `.git`, so that probe cannot see the
-flake checkout. The derivation passes `MACO_SOURCE_REVISION` and
-`MACO_SOURCE_STATE` instead. When `self.rev` is a non-null string, the state
-is `clean` and the revision is `self.rev`. Otherwise, when `self.dirtyRev` is
-a non-null string, the state is `dirty` and the revision is `self.dirtyRev`.
+flake checkout. It does include `build.rs`, which applies the packager
+environment before the values are compiled in. The derivation passes
+`MACO_SOURCE_REVISION` and `MACO_SOURCE_STATE`. When `self.rev` is a non-null
+string, the state is `clean` and the revision is `self.rev`. Otherwise, when
+`self.dirtyRev` is a non-null string, the state is `dirty` and the revision is
+the 40-digit commit inside `self.dirtyRev`, without Nix's `-dirty` suffix.
 Otherwise the state is `unknown` and the revision is empty. The install check
-still requires the package version in `maco --version`, and it requires
-`source_state=` to appear.
+requires `maco --version` to contain the package version and the exact
+`source_revision` and `source_state` lines from those inputs.
 
 Source archives and `cargo package` have no git metadata. Set
 `MACO_SOURCE_REVISION` and `MACO_SOURCE_STATE` together for those builds. If
 that pair is absent, the identity is unknown.
 
 `unknown` and `dirty` are explicit. A revision is recorded only for `clean` or
-`dirty` when it is 40 hexadecimal digits. Any other combination is `unknown`
-with an empty revision.
+`dirty` when it is 40 hexadecimal digits. A dirty value may also arrive as
+that commit plus a `-dirty` suffix; the suffix is removed and the state stays
+`dirty`. Any other combination is `unknown` with an empty revision.
+
+The build script asks Cargo to rerun it when the package inputs (`src`, tests,
+benches, assets, schemas, docs, scripts, the manifest, the lockfile, the
+flake, and this build script) change, and when the git HEAD, index, or current
+branch ref changes. Git resolves those paths, including when `.git` is a
+linked-worktree gitfile. An incremental rebuild therefore re-probes a dirty
+worktree instead of reusing a clean stamp from the previous build script run.
 
 The running binary does not read the repository it orchestrates. The printed
 identity is the one recorded at compile time.

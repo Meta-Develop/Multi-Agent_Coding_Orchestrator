@@ -3,21 +3,42 @@
 //! An explicit packager state (`MACO_SOURCE_STATE`) is used with
 //! `MACO_SOURCE_REVISION` and skips git. Otherwise git is probed only at
 //! `CARGO_MANIFEST_DIR`. A missing git binary, a failed probe, or a revision
-//! that is not 40 lowercase hex digits records `unknown` and an empty
-//! revision. Metadata gaps do not fail the build.
+//! that is not 40 hexadecimal digits records `unknown` and an empty revision.
+//! A dirty packager revision may also use the Nix form `{40-hex}-dirty`; the
+//! suffix is removed and the state stays dirty. Metadata gaps do not fail the
+//! build.
+//!
+//! Rerun directives cover the package inputs plus the git HEAD, index, and
+//! current branch ref resolved by git. That includes a linked worktree, where
+//! `.git` is a gitfile. Emitting any `rerun-if-changed` path replaces Cargo's
+//! default package scan, so those package inputs have to be listed here.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
 
 const REVISION_HEX_LEN: usize = 40;
 
+const PACKAGE_INPUTS: &[&str] = &[
+    "build.rs",
+    "Cargo.toml",
+    "Cargo.lock",
+    "src",
+    "tests",
+    "benches",
+    "assets",
+    "schemas",
+    "docs",
+    "scripts",
+    "flake.nix",
+    "README.md",
+];
+
 fn main() {
-    println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=MACO_SOURCE_REVISION");
     println!("cargo:rerun-if-env-changed=MACO_SOURCE_STATE");
     if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
-        emit_rerun_if_file(&manifest_dir, ".git/HEAD");
-        emit_rerun_if_file(&manifest_dir, ".git/index");
+        emit_package_rerun_directives(&manifest_dir);
+        emit_git_rerun_directives(&manifest_dir);
     }
 
     let (revision, state) = match packager_override() {
@@ -121,7 +142,7 @@ fn canonical_revision(revision: &str) -> Option<String> {
 }
 
 fn normalize_recorded(revision: &str, state: &str) -> (String, &'static str) {
-    let revision = canonical_revision(revision);
+    let revision = canonical_revision(revision_for_state(revision, state));
     match (state, revision) {
         ("clean", Some(revision)) => (revision, "clean"),
         ("dirty", Some(revision)) => (revision, "dirty"),
@@ -129,15 +150,75 @@ fn normalize_recorded(revision: &str, state: &str) -> (String, &'static str) {
     }
 }
 
-/// Emit a rerun directive only when the path is an existing file. A `.git`
-/// gitfile has no child `HEAD` or `index`; that absence is ignored.
-fn emit_rerun_if_file(manifest_dir: &str, relative: &str) {
-    let path = Path::new(manifest_dir).join(relative);
-    if let Ok(metadata) = std::fs::metadata(&path) {
-        if metadata.is_file() {
+/// Nix `dirtyRev` is the commit plus a `-dirty` suffix. Only the dirty state
+/// accepts that form. Keep this in step with `build_identity::normalize_recorded`.
+fn revision_for_state<'a>(revision: &'a str, state: &str) -> &'a str {
+    if state == "dirty" {
+        revision.strip_suffix("-dirty").unwrap_or(revision)
+    } else {
+        revision
+    }
+}
+
+fn emit_package_rerun_directives(manifest_dir: &str) {
+    for relative in PACKAGE_INPUTS {
+        let path = Path::new(manifest_dir).join(relative);
+        if path.exists() {
             if let Some(text) = path.to_str() {
                 println!("cargo:rerun-if-changed={text}");
             }
         }
     }
+}
+
+/// Watch the git files that change the recorded revision or cleanliness.
+/// `git rev-parse` follows a linked-worktree gitfile, so the directive is the
+/// real HEAD, index, or branch ref rather than a missing `.git/HEAD`.
+fn emit_git_rerun_directives(manifest_dir: &str) {
+    emit_existing_git_file(manifest_dir, "HEAD");
+    emit_existing_git_file(manifest_dir, "index");
+    let Some(stdout) = run_git(manifest_dir, &["symbolic-ref", "-q", "HEAD"]) else {
+        return;
+    };
+    let Some(refname) = git_stdout_line(&stdout) else {
+        return;
+    };
+    if refname.is_empty() || refname.contains(['\n', '\r']) || refname.starts_with('-') {
+        return;
+    }
+    emit_existing_git_file(manifest_dir, &refname);
+}
+
+fn emit_existing_git_file(manifest_dir: &str, spec: &str) {
+    let Some(path) = absolute_git_path(manifest_dir, spec) else {
+        return;
+    };
+    if std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+        println!("cargo:rerun-if-changed={path}");
+    }
+}
+
+fn absolute_git_path(manifest_dir: &str, spec: &str) -> Option<String> {
+    if let Some(stdout) = run_git(
+        manifest_dir,
+        &["rev-parse", "--path-format=absolute", "--git-path", spec],
+    ) {
+        if let Some(path) = git_stdout_line(&stdout) {
+            if !path.is_empty() {
+                return Some(path);
+            }
+        }
+    }
+    let git_dir = git_stdout_line(&run_git(
+        manifest_dir,
+        &["rev-parse", "--absolute-git-dir"],
+    )?)?;
+    let relative = git_stdout_line(&run_git(manifest_dir, &["rev-parse", "--git-path", spec])?)?;
+    let relative_path = Path::new(&relative);
+    let resolved = if relative_path.is_absolute() {
+        relative_path.to_path_buf()
+    } else {
+        Path::new(&git_dir).join(relative_path)
+    };
+    resolved.to_str().map(ToString::to_string)
 }
