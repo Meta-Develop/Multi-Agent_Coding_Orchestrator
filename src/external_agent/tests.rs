@@ -5378,7 +5378,7 @@ while True:
                 },
             },
         })
-        break
+        continue
     if method == "terminal/create":
         send({
             "jsonrpc": "2.0",
