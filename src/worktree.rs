@@ -3049,8 +3049,15 @@ impl WorktreeManager {
         let registry_store = ManagedWorktreeRegistryStore::open(&repo)?;
         let registry_lock = registry_store.lock()?;
         let mut registry = registry_store.load(&registry_lock)?;
-        if let Some(operation) = registry.operations.get_mut(&name) {
-            if operation.kind == ManagedWorktreeOperationKind::Remove {
+        match registry
+            .operations
+            .get(&name)
+            .map(|operation| operation.kind)
+        {
+            Some(ManagedWorktreeOperationKind::Remove) => {
+                let operation = registry.operations.get_mut(&name).with_context(|| {
+                    format!("managed worktree operation '{name}' disappeared before removal update")
+                })?;
                 if delete_branch && !operation.delete_branch {
                     if operation.phase != ManagedWorktreeOperationPhase::RemovePrepared {
                         bail!(
@@ -3085,10 +3092,17 @@ impl WorktreeManager {
                 operation.delete_branch = delete_branch;
                 operation.gc_dirtiness_checksum = None;
                 operation.removal_safety = Some(ManagedRemovalSafety::Explicit);
-            } else {
-                operation.force = true;
+                registry_store.save(&registry_lock, &mut registry)?;
             }
-            registry_store.save(&registry_lock, &mut registry)?;
+            Some(ManagedWorktreeOperationKind::Create) => {
+                match registry_store.admit_create_recovery(&registry_lock, &name)? {
+                    CreateRecoveryAdmission::Busy => bail!(
+                        "managed worktree '{name}' has an in-progress create operation; refusing removal"
+                    ),
+                    CreateRecoveryAdmission::Admitted(lease) => drop(lease),
+                }
+            }
+            None => {}
         }
         let pending_remove_binding = registry.operations.get(&name).and_then(|operation| {
             (operation.kind == ManagedWorktreeOperationKind::Remove)

@@ -1295,7 +1295,6 @@ fn recover_pending_operations_with_held_removal_lease(
     )
 }
 
-#[cfg(not(test))]
 fn recover_pending_operations_without_creation_cleanliness(
     repo: &Repository,
     store: &ManagedWorktreeRegistryStore,
@@ -1303,14 +1302,12 @@ fn recover_pending_operations_without_creation_cleanliness(
     registry: &mut ManagedWorktreeRegistry,
     held_removal_lease: Option<&ManagedWorktreeRemovalLease>,
 ) -> Result<()> {
+    // A pending creation lock still needs a real cleanliness capability.
+    // This refusal stays ahead of any lease acquire or destructive work.
     if registry
-        .operations
+        .records
         .values()
-        .any(|operation| operation.kind == ManagedWorktreeOperationKind::Create)
-        || registry
-            .records
-            .values()
-            .any(|binding| binding.creation_lock_pending)
+        .any(|binding| binding.creation_lock_pending)
     {
         bail!(
             "managed worktree create recovery requires a capability-bound repository cleanliness input"
@@ -1318,6 +1315,30 @@ fn recover_pending_operations_without_creation_cleanliness(
     }
 
     let names = registry.operations.keys().cloned().collect::<Vec<_>>();
+    for name in &names {
+        store.verify_authenticated_registry(lock, registry)?;
+        let operation = registry
+            .operations
+            .get(name)
+            .cloned()
+            .context("managed worktree operation disappeared during recovery")?;
+        if operation.name != *name {
+            bail!("managed worktree operation key/name mismatch for '{name}'");
+        }
+        if operation.kind != ManagedWorktreeOperationKind::Create {
+            continue;
+        }
+        // A live checkout lease is not cleanliness authority. Skip that
+        // operation and let unrelated removals proceed. Any create whose
+        // lease is free still fails closed, with no registry mutation.
+        match store.admit_create_recovery(lock, name)? {
+            CreateRecoveryAdmission::Busy => {}
+            CreateRecoveryAdmission::Admitted(_) => bail!(
+                "managed worktree create recovery requires a capability-bound repository cleanliness input"
+            ),
+        }
+    }
+
     for name in names {
         store.verify_authenticated_registry(lock, registry)?;
         let operation = registry
@@ -1328,8 +1349,8 @@ fn recover_pending_operations_without_creation_cleanliness(
         if operation.name != name {
             bail!("managed worktree operation key/name mismatch for '{name}'");
         }
-        if operation.kind != ManagedWorktreeOperationKind::Remove {
-            bail!("managed worktree create recovery reached an unbound recovery path");
+        if operation.kind == ManagedWorktreeOperationKind::Create {
+            continue;
         }
         recover_remove_operation_with_lease(
             repo,

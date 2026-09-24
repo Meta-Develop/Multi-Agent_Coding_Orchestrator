@@ -4778,6 +4778,106 @@ fn same_agent_create_refuses_other_root_while_create_lease_is_live() {
     drop(lock);
 }
 
+#[cfg(unix)]
+#[test]
+fn remove_refuses_live_create_without_changing_prepared_identity() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    let worktree_root = temp.path().join("worktrees");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    commit_readme(&repo).expect("initial commit");
+
+    set_create_checkout_gap_hook({
+        let repo_path = repo_path.clone();
+        move || {
+            let repo = crate::git_repository::open(&repo_path).expect("reopen repo");
+            let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
+            let (prepared, nonce, reservation_identity) = {
+                let lock = store
+                    .lock_with_timeout(Duration::from_millis(500))
+                    .expect("registry lock must be free while the create lease is live");
+                let registry = store.load(&lock).expect("prepared registry");
+                let prepared = registry
+                    .operations
+                    .get("gap-remove")
+                    .cloned()
+                    .expect("live prepared create");
+                assert_eq!(
+                    prepared.phase,
+                    ManagedWorktreeOperationPhase::CreatePrepared
+                );
+                assert_eq!(prepared.kind, ManagedWorktreeOperationKind::Create);
+                let reservation_identity = prepared
+                    .prepared_path_identity
+                    .clone()
+                    .expect("reservation identity");
+                assert_eq!(
+                    identity_for_path(&prepared.path).expect("reservation inode"),
+                    reservation_identity
+                );
+                let nonce = store
+                    .active_incarnation(&lock, "gap-remove")
+                    .expect("live incarnation")
+                    .nonce;
+                (prepared, nonce, reservation_identity)
+            };
+
+            for delete_branch in [false, true] {
+                let error = WorktreeManager::new(&repo_path)
+                    .remove("gap-remove", true, delete_branch)
+                    .expect_err("same-agent remove must refuse a live create");
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains("in-progress create operation"),
+                    "delete_branch={delete_branch}: {message}"
+                );
+            }
+
+            let lock = store.lock().expect("registry lock after refused removal");
+            let registry = store.load(&lock).expect("registry after refused removal");
+            assert_eq!(registry.operations.get("gap-remove"), Some(&prepared));
+            assert!(registry.records.is_empty());
+            assert_eq!(
+                store
+                    .active_incarnation(&lock, "gap-remove")
+                    .expect("incarnation after refused removal")
+                    .nonce,
+                nonce
+            );
+            assert_eq!(
+                identity_for_path(&prepared.path).expect("reservation after refused removal"),
+                reservation_identity
+            );
+        }
+    });
+
+    let created = WorktreeManager::new(&repo_path)
+        .create_for_test(WorktreeCreateOptions {
+            agent_id: "gap-remove".to_string(),
+            branch: None,
+            base: None,
+            worktree_root: Some(worktree_root),
+        })
+        .expect("original create completes after refused removal");
+    assert_eq!(created.name, "gap-remove");
+    assert_eq!(created.branch, "maco/gap-remove");
+    assert!(created.path.join("README.md").exists());
+
+    let store = ManagedWorktreeRegistryStore::open(&repo).expect("final registry store");
+    let lock = store.lock().expect("final registry lock");
+    let registry = store.load(&lock).expect("final registry");
+    assert!(registry.operations.is_empty());
+    assert_eq!(
+        registry
+            .records
+            .get("gap-remove")
+            .map(|binding| binding.path.as_path()),
+        Some(created.path.as_path())
+    );
+    drop(lock);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn cross_process_create_lease_blocks_pending_recovery() {
@@ -4983,6 +5083,198 @@ fn cross_process_create_lease_blocks_pending_recovery() {
     assert_eq!(
         local_branch_oid(&repo, "maco/gap-cross").expect("owned branch cleaned after release"),
         None
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn no_cleanliness_recovery_skips_busy_create_and_refuses_after_release() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    let worktree_root = temp.path().join("worktrees");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    commit_readme(&repo).expect("initial commit");
+    let removed = WorktreeManager::new(&repo_path)
+        .create_for_test(WorktreeCreateOptions {
+            agent_id: "life-remove".to_string(),
+            branch: None,
+            base: None,
+            worktree_root: Some(worktree_root.clone()),
+        })
+        .expect("unrelated managed worktree");
+
+    let oid = repo
+        .head()
+        .expect("head")
+        .peel_to_commit()
+        .expect("head commit")
+        .id();
+    let commit = repo.find_commit(oid).expect("commit");
+    let root = SafeRoot::open_or_create_managed(&worktree_root).expect("managed root");
+    let create_name = "life-create".to_string();
+    let reserved = root
+        .reserve_direct_child_directory(&create_name)
+        .expect("empty create reservation");
+    let staging = root
+        .reserve_random_direct_child_directory("life-create-stage")
+        .expect("empty staging root");
+    repo.branch("maco/life-create", &commit, false)
+        .expect("owned create branch");
+    let reservation_identity = reserved.identity().clone();
+    let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
+    let lock = store.lock().expect("registry lock");
+    let mut registry = store.load(&lock).expect("registry");
+    registry.operations.insert(
+        create_name.clone(),
+        ManagedWorktreeOperation {
+            kind: ManagedWorktreeOperationKind::Create,
+            phase: ManagedWorktreeOperationPhase::CreatePrepared,
+            name: create_name.clone(),
+            root: root.path().to_path_buf(),
+            root_identity: root.identity().clone(),
+            path: reserved.path().to_path_buf(),
+            prepared_path_identity: Some(reservation_identity.clone()),
+            staging_root: Some(staging.path().to_path_buf()),
+            staging_root_identity: Some(staging.identity().clone()),
+            staging_path: Some(staging.path().join(&create_name)),
+            staged_path_identity: None,
+            staged_metadata: None,
+            branch: "maco/life-create".to_string(),
+            base_oid: oid.to_string(),
+            branch_preexisting_oid: None,
+            branch_ownership: ManagedBranchOwnership::CreatedByMaco,
+            owned_branch_oid: Some(oid.to_string()),
+            binding: None,
+            delete_branch: false,
+            force: false,
+            expected_branch_oid: None,
+            gc_dirtiness_checksum: None,
+            removal_safety: None,
+            worktree_quarantine_path: None,
+            worktree_quarantine_identity: None,
+            metadata_quarantine_path: None,
+            metadata_quarantine_identity: None,
+        },
+    );
+    store.save(&lock, &mut registry).expect("save busy create");
+    registry
+        .records
+        .get_mut("life-remove")
+        .expect("removable record")
+        .creation_lock_pending = true;
+    store
+        .save(&lock, &mut registry)
+        .expect("save pending creation lock");
+    let create_while_locked = registry
+        .operations
+        .get(&create_name)
+        .cloned()
+        .expect("create beside pending creation lock");
+    let pending_lock_error = recover_pending_operations_without_creation_cleanliness(
+        &repo,
+        &store,
+        &lock,
+        &mut registry,
+        None,
+    )
+    .expect_err("pending creation lock still requires cleanliness authority");
+    assert!(
+        pending_lock_error
+            .to_string()
+            .contains("capability-bound repository cleanliness"),
+        "unexpected creation-lock error: {pending_lock_error:#}"
+    );
+    let locked = store
+        .load(&lock)
+        .expect("registry after creation-lock refusal");
+    assert_eq!(
+        locked.operations.get(&create_name),
+        Some(&create_while_locked)
+    );
+    assert!(locked
+        .records
+        .get("life-remove")
+        .is_some_and(|binding| binding.creation_lock_pending));
+    assert_eq!(
+        identity_for_path(reserved.path()).expect("reservation after creation-lock refusal"),
+        reservation_identity
+    );
+    assert!(removed.path.exists());
+
+    registry = locked;
+    registry
+        .records
+        .get_mut("life-remove")
+        .expect("removable record")
+        .creation_lock_pending = false;
+    store
+        .save(&lock, &mut registry)
+        .expect("clear creation lock");
+    let lease = store
+        .try_acquire_worktree_create_lease(&lock, &create_name)
+        .expect("live create lease");
+    let (remove_binding, _, _, _) =
+        prepare_remove_operation_for_test(&repo, &store, &lock, &mut registry);
+    let create_while_busy = registry
+        .operations
+        .get(&create_name)
+        .cloned()
+        .expect("busy create");
+    recover_pending_operations_without_creation_cleanliness(
+        &repo,
+        &store,
+        &lock,
+        &mut registry,
+        None,
+    )
+    .expect("busy create must not block unrelated removal");
+    let during_lease = store.load(&lock).expect("registry during live create");
+    assert_eq!(
+        during_lease.operations.get(&create_name),
+        Some(&create_while_busy)
+    );
+    assert!(!during_lease.records.contains_key("life-remove"));
+    assert!(!during_lease.operations.contains_key("life-remove"));
+    assert!(!remove_binding.path.exists());
+    assert_eq!(
+        identity_for_path(reserved.path()).expect("reservation while create lease is held"),
+        reservation_identity
+    );
+    assert_eq!(
+        local_branch_oid(&repo, "maco/life-create").expect("create branch while lease is held"),
+        Some(oid)
+    );
+
+    drop(lease);
+    let released_error = recover_pending_operations_without_creation_cleanliness(
+        &repo,
+        &store,
+        &lock,
+        &mut registry,
+        None,
+    )
+    .expect_err("unleased create still requires cleanliness authority");
+    assert!(
+        released_error
+            .to_string()
+            .contains("capability-bound repository cleanliness"),
+        "unexpected released-lease error: {released_error:#}"
+    );
+    let released = store.load(&lock).expect("registry after released lease");
+    assert_eq!(
+        released.operations.get(&create_name),
+        Some(&create_while_busy)
+    );
+    assert!(released.records.is_empty());
+    assert_eq!(
+        identity_for_path(reserved.path()).expect("reservation after released lease"),
+        reservation_identity
+    );
+    assert!(staging.path().exists());
+    assert_eq!(
+        local_branch_oid(&repo, "maco/life-create").expect("create branch after refusal"),
+        Some(oid)
     );
 }
 
