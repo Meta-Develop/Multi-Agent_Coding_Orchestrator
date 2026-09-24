@@ -3024,6 +3024,10 @@ impl WorktreeManager {
             path: binding.path.clone(),
             branch: branch_name,
         };
+        // Publication and record cloning are done. Release the process-global
+        // registry flock before the cleanliness scan so it does not queue behind
+        // bounded-status checks. The production caller revalidates afterward.
+        drop(registry_lock);
         cleanliness.require_clean_for_repository(&registry_store.repository)?;
         Ok(record)
     }
