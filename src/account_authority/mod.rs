@@ -218,9 +218,6 @@ impl Drop for FrozenGrokSelectionGuard {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) static CAM_AUTHORITY_SOCKET_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 pub(crate) use authority_socket_config::configured_cam_authority_socket;
 #[cfg(target_os = "linux")]
 pub(crate) use grok::GrokLaunchAuthority;
