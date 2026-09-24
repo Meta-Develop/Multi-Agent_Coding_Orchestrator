@@ -465,6 +465,68 @@ impl ManagedWorktreeRegistryStore {
         })
     }
 
+    fn try_acquire_worktree_create_lease(
+        &self,
+        registry_lock: &ManagedWorktreeRegistryLock,
+        name: &str,
+    ) -> Result<ManagedWorktreeCreateLease> {
+        let incarnation = self.active_incarnation(registry_lock, name)?;
+        let lease_name = managed_worktree_lease_name(name, &incarnation)?;
+        let lock = KernelStateLock::try_acquire_exclusive_direct(&self.state_root, &lease_name)?;
+        let process_lease = ManagedProcessLease::acquire_exclusive(&lease_name, lock.path())?;
+        Ok(ManagedWorktreeCreateLease {
+            name: name.to_string(),
+            incarnation_generation: incarnation.generation,
+            incarnation_nonce: incarnation.nonce,
+            _lock: lock,
+            _process_lease: process_lease,
+        })
+    }
+
+    /// `Busy` means checkout still owns the create lease. `Admitted(None)` means
+    /// no lease file exists. `Admitted(Some)` holds a free lease file until
+    /// recovery of this operation finishes.
+    fn admit_create_recovery(
+        &self,
+        registry_lock: &ManagedWorktreeRegistryLock,
+        name: &str,
+    ) -> Result<CreateRecoveryAdmission> {
+        let incarnation = self.active_incarnation(registry_lock, name)?;
+        let lease_name = managed_worktree_lease_name(name, &incarnation)?;
+        if ManagedProcessLease::is_active(&lease_name) {
+            return Ok(CreateRecoveryAdmission::Busy);
+        }
+        match KernelStateLock::try_acquire_existing_exclusive_direct(&self.state_root, &lease_name)?
+        {
+            ExistingExclusiveLock::Busy => Ok(CreateRecoveryAdmission::Busy),
+            ExistingExclusiveLock::Missing => Ok(CreateRecoveryAdmission::Admitted(None)),
+            ExistingExclusiveLock::Acquired(kernel_lock) => {
+                let process_lease = match ManagedProcessLease::acquire_exclusive(
+                    &lease_name,
+                    kernel_lock.path(),
+                ) {
+                    Ok(process_lease) => process_lease,
+                    Err(error) => {
+                        drop(kernel_lock);
+                        if ManagedProcessLease::is_active(&lease_name) {
+                            return Ok(CreateRecoveryAdmission::Busy);
+                        }
+                        return Err(error);
+                    }
+                };
+                Ok(CreateRecoveryAdmission::Admitted(Some(
+                    ManagedWorktreeCreateLease {
+                        name: name.to_string(),
+                        incarnation_generation: incarnation.generation,
+                        incarnation_nonce: incarnation.nonce,
+                        _lock: kernel_lock,
+                        _process_lease: process_lease,
+                    },
+                )))
+            }
+        }
+    }
+
     fn worktree_has_active_execution_lease(
         &self,
         registry_lock: &ManagedWorktreeRegistryLock,
@@ -865,6 +927,40 @@ fn run_managed_registry_after_precheck_hook() {
 
 #[cfg(not(test))]
 fn run_managed_registry_after_precheck_hook() {}
+
+#[cfg(test)]
+thread_local! {
+    static CREATE_CHECKOUT_GAP_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_create_checkout_gap_hook(hook: impl FnOnce() + 'static) {
+    CREATE_CHECKOUT_GAP_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_create_checkout_gap_hook() {
+    let hook = CREATE_CHECKOUT_GAP_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_create_checkout_gap_hook() {}
+
+#[cfg(test)]
+struct CreateCheckoutGapHookGuard;
+
+#[cfg(test)]
+impl Drop for CreateCheckoutGapHookGuard {
+    fn drop(&mut self) {
+        CREATE_CHECKOUT_GAP_HOOK.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
 
 fn managed_worktree_lease_name(name: &str, incarnation: &ManagedIncarnation) -> Result<OsString> {
     let normalized = normalize_agent_id(name)?;
@@ -1331,6 +1427,44 @@ fn recover_remove_operation_with_lease_using_target_liveness(
     recover_remove_operation(repo, store, lock, registry, operation, target_liveness)
 }
 
+fn recover_failed_create(
+    repo: &Repository,
+    store: &ManagedWorktreeRegistryStore,
+    lock: &ManagedWorktreeRegistryLock,
+    registry: &mut ManagedWorktreeRegistry,
+    cleanliness: CreationCleanliness<'_>,
+    error: anyhow::Error,
+) -> Result<WorktreeRecord> {
+    recover_pending_operations_with_creation_cleanliness(
+        repo, store, lock, registry, cleanliness,
+    )
+    .with_context(|| {
+        format!(
+            "worktree creation failed and its durable create operation could not be recovered: {error:#}"
+        )
+    })?;
+    Err(error)
+}
+
+fn create_prepared_identity_current(
+    store: &ManagedWorktreeRegistryStore,
+    lock: &ManagedWorktreeRegistryLock,
+    registry: &ManagedWorktreeRegistry,
+    prepared: &ManagedWorktreeOperation,
+    incarnation: &ManagedIncarnation,
+) -> Result<bool> {
+    let Some(current) = registry.operations.get(&prepared.name) else {
+        return Ok(false);
+    };
+    if current != prepared {
+        return Ok(false);
+    }
+    let current_incarnation = store.active_incarnation(lock, &prepared.name)?;
+    Ok(current_incarnation.active
+        && current_incarnation.generation == incarnation.generation
+        && current_incarnation.nonce == incarnation.nonce)
+}
+
 fn recover_create_operation(
     repo: &Repository,
     store: &ManagedWorktreeRegistryStore,
@@ -1339,6 +1473,12 @@ fn recover_create_operation(
     mut operation: ManagedWorktreeOperation,
     cleanliness: CreationCleanliness<'_>,
 ) -> Result<()> {
+    // Checkout holds this lease outside the registry flock. A busy lease means
+    // that prepared operation is still owned; leave it untouched.
+    let _create_recovery_lease = match store.admit_create_recovery(lock, &operation.name)? {
+        CreateRecoveryAdmission::Busy => return Ok(()),
+        CreateRecoveryAdmission::Admitted(lease) => lease,
+    };
     if operation.phase == ManagedWorktreeOperationPhase::CreateIntent {
         store.verify_authenticated_registry(lock, registry)?;
         let root = SafeRoot::open_existing(&operation.root)?;

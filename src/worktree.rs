@@ -152,10 +152,9 @@ const WORKTREE_STATUS_SCAVENGE_LIMITS: PrivateDirectoryScavengeLimits =
         max_duration: Duration::from_secs(10),
     };
 const WORKTREE_STATUS_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
-// Managed worktree creation intentionally keeps the authenticated registry
-// lock across its WAL-backed Git/worktree transaction. That transaction can
-// exceed the generic state-lock budget on local NTFS, so registry contenders
-// get a larger bounded serialization window without weakening other locks.
+// Authenticated registry mutation can exceed the generic state-lock budget on
+// local NTFS. Checkout runs outside this flock under the incarnation create
+// lease; the 60-second budget stays the bound for registry commits only.
 const MANAGED_WORKTREE_REGISTRY_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(not(test))]
 const WORKTREE_STATUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -925,6 +924,28 @@ struct ManagedWorktreeRemovalLease {
     incarnation_nonce: String,
     _lock: KernelStateLock,
     _process_lease: ManagedProcessLease,
+}
+
+/// Exclusive lease held across checkout after `CreatePrepared` is durable.
+///
+/// The pathname is the incarnation execution lock. That name already carries
+/// the agent id, generation, and nonce, and retirement already unlinks it.
+/// `active_incarnation` exists once the create operation is saved, before a
+/// record is published. This is not a removal lease: a busy create lease must
+/// leave the operation untouched instead of failing the recovery caller.
+#[must_use = "the create lease must be held across off-lock checkout"]
+#[derive(Debug)]
+struct ManagedWorktreeCreateLease {
+    name: String,
+    incarnation_generation: u64,
+    incarnation_nonce: String,
+    _lock: KernelStateLock,
+    _process_lease: ManagedProcessLease,
+}
+
+enum CreateRecoveryAdmission {
+    Busy,
+    Admitted(Option<ManagedWorktreeCreateLease>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2540,6 +2561,8 @@ impl WorktreeManager {
         cleanliness: CreationCleanliness<'_>,
         creation_policy: WorktreeCreationPolicy,
     ) -> Result<WorktreeRecord> {
+        #[cfg(test)]
+        let _create_gap_hook_guard = CreateCheckoutGapHookGuard;
         let repo = self.open_repository()?;
         let registry_store = ManagedWorktreeRegistryStore::open(&repo)?;
         cleanliness.require_clean_for_repository(&registry_store.repository)?;
@@ -2580,6 +2603,11 @@ impl WorktreeManager {
         };
         if registry.records.contains_key(&name) {
             bail!("managed worktree '{name}' already has a registry binding");
+        }
+        // Recovery leaves a busy create in place. A second create for this
+        // agent must not replace that operation, its root, or its reservation.
+        if registry.operations.contains_key(&name) {
+            bail!("managed worktree '{name}' already has an in-progress registry operation");
         }
         if registry.records.len() >= MAX_MANAGED_RECORDS {
             bail!("managed worktree registry has no remaining record capacity");
@@ -2752,9 +2780,8 @@ impl WorktreeManager {
             return Err(error);
         }
 
-        let create_result =
-            (|| -> Result<()> {
-                reserved.verify(&root)?;
+        let branch_oid =
+            match (|| -> Result<Oid> {
                 let (branch, created_by_maco) =
                     ensure_branch_for_creation(&repo, &branch_name, &commit, creation_policy)?;
                 let branch_oid = branch.get().target().with_context(|| {
@@ -2793,55 +2820,201 @@ impl WorktreeManager {
                 };
                 operation.owned_branch_oid = created_by_maco.then(|| branch_oid.to_string());
                 registry_store.save(&registry_lock, &mut registry)?;
-                let _branch_guard = lock_branch_reference(&repo, &branch_name)?;
-                verify_local_branch_oid(&repo, &branch_name, branch_oid)?;
-                let reference = branch.into_reference();
-                let mut add_options = WorktreeAddOptions::new();
-                add_options.reference(Some(&reference)).lock(true);
-                repo.worktree(&name, &staging_path, Some(&add_options))
-                    .with_context(|| {
-                        format!(
-                            "failed to create worktree '{name}' at {}",
-                            staging_path.display()
-                        )
-                    })?;
-                ensure_creation_worktree_locked(&repo, &name)?;
-                reserved.verify(&root)?;
-                staging_reserved.verify(&root)?;
-                let staged = staging_root.bind_existing_managed_direct_child_directory(&name)?;
-                verify_worktree_clean_at(&staging_path, &branch_name, branch_oid, cleanliness)?;
-                let staged_metadata = capture_staged_worktree_metadata(
-                    &registry_store.repository,
-                    &name,
-                    &branch_name,
-                    &staging_path,
-                )?;
-                let operation = registry
-                    .operations
-                    .get_mut(&name)
-                    .context("create operation disappeared before staged identity was persisted")?;
-                operation.phase = ManagedWorktreeOperationPhase::CreateStaged;
-                operation.staged_path_identity = Some(staged.identity().clone());
-                operation.staged_metadata = Some(staged_metadata);
-                registry_store.save(&registry_lock, &mut registry)?;
-                Ok(())
-            })();
-        let recovery_result = recover_pending_operations_with_creation_cleanliness(
-            &repo,
+                drop(branch);
+                Ok(branch_oid)
+            })() {
+                Ok(branch_oid) => branch_oid,
+                Err(error) => {
+                    return recover_failed_create(
+                        &repo,
+                        &registry_store,
+                        &registry_lock,
+                        &mut registry,
+                        cleanliness,
+                        error,
+                    );
+                }
+            };
+        registry = registry_store.load(&registry_lock)?;
+        let prepared_operation = match registry.operations.get(&name).cloned() {
+            Some(operation) => operation,
+            None => {
+                return recover_failed_create(
+                    &repo,
+                    &registry_store,
+                    &registry_lock,
+                    &mut registry,
+                    cleanliness,
+                    anyhow::anyhow!(
+                        "prepared create '{name}' disappeared before its checkout lease was taken"
+                    ),
+                );
+            }
+        };
+        if prepared_operation.phase != ManagedWorktreeOperationPhase::CreatePrepared {
+            return recover_failed_create(
+                &repo,
+                &registry_store,
+                &registry_lock,
+                &mut registry,
+                cleanliness,
+                anyhow::anyhow!("prepared create '{name}' left the prepared phase before checkout"),
+            );
+        }
+        let prepared_incarnation = match registry_store.active_incarnation(&registry_lock, &name) {
+            Ok(incarnation) => incarnation,
+            Err(error) => {
+                return recover_failed_create(
+                    &repo,
+                    &registry_store,
+                    &registry_lock,
+                    &mut registry,
+                    cleanliness,
+                    error,
+                );
+            }
+        };
+        let create_lease =
+            match registry_store.try_acquire_worktree_create_lease(&registry_lock, &name) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    return recover_failed_create(
+                        &repo,
+                        &registry_store,
+                        &registry_lock,
+                        &mut registry,
+                        cleanliness,
+                        error,
+                    );
+                }
+            };
+        if create_lease.name != name
+            || create_lease.incarnation_generation != prepared_incarnation.generation
+            || create_lease.incarnation_nonce != prepared_incarnation.nonce
+        {
+            drop(create_lease);
+            return recover_failed_create(
+                &repo,
+                &registry_store,
+                &registry_lock,
+                &mut registry,
+                cleanliness,
+                anyhow::anyhow!(
+                    "create lease for '{name}' does not match the prepared incarnation"
+                ),
+            );
+        }
+        // Branch ownership is durable. Keep this lease across checkout so
+        // recovery will not consume the prepared operation while the registry
+        // flock is released. Reload before any later save.
+        drop(registry_lock);
+        run_create_checkout_gap_hook();
+        let create_result = (|| -> Result<(StagedWorktreeMetadata, FileIdentity)> {
+            reserved.verify(&root)?;
+            let _branch_guard = lock_branch_reference(&repo, &branch_name)?;
+            verify_local_branch_oid(&repo, &branch_name, branch_oid)?;
+            let branch = repo
+                .find_branch(&branch_name, BranchType::Local)
+                .with_context(|| {
+                    format!("failed to reopen local branch '{branch_name}' for worktree creation")
+                })?;
+            let reference = branch.into_reference();
+            let mut add_options = WorktreeAddOptions::new();
+            add_options.reference(Some(&reference)).lock(true);
+            repo.worktree(&name, &staging_path, Some(&add_options))
+                .with_context(|| {
+                    format!(
+                        "failed to create worktree '{name}' at {}",
+                        staging_path.display()
+                    )
+                })?;
+            ensure_creation_worktree_locked(&repo, &name)?;
+            reserved.verify(&root)?;
+            staging_reserved.verify(&root)?;
+            let staged = staging_root.bind_existing_managed_direct_child_directory(&name)?;
+            verify_worktree_clean_at(&staging_path, &branch_name, branch_oid, cleanliness)?;
+            let staged_metadata = capture_staged_worktree_metadata(
+                &registry_store.repository,
+                &name,
+                &branch_name,
+                &staging_path,
+            )?;
+            Ok((staged_metadata, staged.identity().clone()))
+        })();
+        let registry_lock = registry_store.lock()?;
+        registry = registry_store.load(&registry_lock)?;
+        let identity = create_prepared_identity_current(
             &registry_store,
             &registry_lock,
-            &mut registry,
-            cleanliness,
+            &registry,
+            &prepared_operation,
+            &prepared_incarnation,
         );
-        if let Err(create_error) = create_result {
-            recovery_result.with_context(|| {
-                format!(
-                    "worktree creation failed and its durable create operation could not be recovered: {create_error:#}"
-                )
-            })?;
-            return Err(create_error);
+        match (create_result, identity) {
+            (Ok((staged_metadata, staged_identity)), Ok(true)) => {
+                let staged_publication = (|| -> Result<()> {
+                    let operation = registry.operations.get_mut(&name).context(
+                        "create operation disappeared before staged identity was persisted",
+                    )?;
+                    operation.phase = ManagedWorktreeOperationPhase::CreateStaged;
+                    operation.staged_path_identity = Some(staged_identity);
+                    operation.staged_metadata = Some(staged_metadata);
+                    registry_store.save(&registry_lock, &mut registry)
+                })();
+                drop(create_lease);
+                if let Err(publication_error) = staged_publication {
+                    registry = registry_store.load(&registry_lock)?;
+                    return recover_failed_create(
+                        &repo,
+                        &registry_store,
+                        &registry_lock,
+                        &mut registry,
+                        cleanliness,
+                        publication_error,
+                    );
+                }
+                recover_pending_operations_with_creation_cleanliness(
+                    &repo,
+                    &registry_store,
+                    &registry_lock,
+                    &mut registry,
+                    cleanliness,
+                )?;
+            }
+            (Ok(_), Ok(false)) => {
+                drop(create_lease);
+                bail!(
+                    "managed worktree '{name}' create operation changed before staged publication; refusing to publish"
+                );
+            }
+            (Ok(_), Err(identity_error)) => {
+                drop(create_lease);
+                return Err(identity_error.context(
+                    "refusing to publish staged worktree metadata because the prepared create identity could not be revalidated",
+                ));
+            }
+            (Err(create_error), Ok(true)) => {
+                drop(create_lease);
+                return recover_failed_create(
+                    &repo,
+                    &registry_store,
+                    &registry_lock,
+                    &mut registry,
+                    cleanliness,
+                    create_error,
+                );
+            }
+            (Err(create_error), Ok(false)) => {
+                drop(create_lease);
+                return Err(create_error);
+            }
+            (Err(create_error), Err(identity_error)) => {
+                drop(create_lease);
+                return Err(create_error.context(format!(
+                    "prepared create identity also could not be revalidated: {identity_error:#}"
+                )));
+            }
         }
-        recovery_result?;
         let binding = registry.records.get(&name).with_context(|| {
             format!("managed worktree '{name}' was not finalized after create recovery")
         })?;

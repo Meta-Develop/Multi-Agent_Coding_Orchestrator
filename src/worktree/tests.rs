@@ -4293,5 +4293,698 @@ fn pseudo_file_descriptor_targets_do_not_make_liveness_unknown() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn create_checkout_gap_keeps_disjoint_mutation_and_skips_recovery() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    let worktree_root = temp.path().join("worktrees");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    commit_readme(&repo).expect("initial commit");
+
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(
+        None::<(ManagedWorktreeBinding, PathBuf)>,
+    ));
+    set_create_checkout_gap_hook({
+        let repo_path = repo_path.clone();
+        let worktree_root = worktree_root.clone();
+        let observed = std::sync::Arc::clone(&observed);
+        move || {
+            let repo =
+                crate::git_repository::open(&repo_path).expect("reopen repo in checkout gap");
+            let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
+            let lock = store
+                .lock_with_timeout(Duration::from_millis(500))
+                .expect("registry lock must be free while checkout is paused");
+            let mut registry = store.load(&lock).expect("registry during checkout gap");
+            let holder = registry
+                .operations
+                .get("gap-holder")
+                .cloned()
+                .expect("holder create must still be prepared");
+            assert_eq!(holder.phase, ManagedWorktreeOperationPhase::CreatePrepared);
+            let reservation_identity = holder
+                .prepared_path_identity
+                .clone()
+                .expect("prepared reservation identity");
+            assert_eq!(
+                identity_for_path(&holder.path).expect("reservation inode"),
+                reservation_identity
+            );
+            assert!(
+                holder
+                    .staging_path
+                    .as_ref()
+                    .is_some_and(|path| !path.exists()),
+                "checkout must not have started before the registry gap"
+            );
+            let branch = holder.branch.clone();
+            let reservation = holder.path.clone();
+
+            recover_pending_operations(&repo, &store, &lock, &mut registry)
+                .expect("busy create lease must not fail recovery");
+            let registry = store.load(&lock).expect("reload after skipped recovery");
+            assert_eq!(registry.operations.get("gap-holder"), Some(&holder));
+            assert!(registry.records.is_empty());
+            assert_eq!(
+                identity_for_path(&reservation).expect("reservation after skipped recovery"),
+                reservation_identity
+            );
+            assert!(
+                repo.find_branch(&branch, BranchType::Local).is_ok(),
+                "skipped recovery must not delete the in-progress branch"
+            );
+            drop(lock);
+
+            let peer = WorktreeManager::new(&repo_path)
+                .create_for_test(WorktreeCreateOptions {
+                    agent_id: "gap-peer".to_string(),
+                    branch: None,
+                    base: None,
+                    worktree_root: Some(worktree_root),
+                })
+                .expect("disjoint create while checkout is paused");
+            let lock = store
+                .lock_with_timeout(Duration::from_millis(500))
+                .expect("registry lock after disjoint create");
+            let registry = store.load(&lock).expect("registry after disjoint create");
+            assert_eq!(
+                registry
+                    .operations
+                    .get("gap-holder")
+                    .map(|operation| operation.phase),
+                Some(ManagedWorktreeOperationPhase::CreatePrepared)
+            );
+            assert_eq!(
+                registry
+                    .operations
+                    .get("gap-holder")
+                    .and_then(|operation| operation.prepared_path_identity.clone()),
+                Some(reservation_identity.clone())
+            );
+            let peer_binding = registry
+                .records
+                .get("gap-peer")
+                .cloned()
+                .expect("peer record must be durable before holder resumes");
+            assert_eq!(peer_binding.path, peer.path);
+            *observed.lock().expect("observation lock") = Some((peer_binding, reservation));
+        }
+    });
+
+    let holder = WorktreeManager::new(&repo_path)
+        .create_for_test(WorktreeCreateOptions {
+            agent_id: "gap-holder".to_string(),
+            branch: None,
+            base: None,
+            worktree_root: Some(worktree_root),
+        })
+        .expect("holder create resumes after the gap");
+    let (peer_binding, reservation) = observed
+        .lock()
+        .expect("observation lock")
+        .take()
+        .expect("checkout gap hook did not run");
+
+    let store = ManagedWorktreeRegistryStore::open(&repo).expect("final registry store");
+    let lock = store.lock().expect("final registry lock");
+    let registry = store.load(&lock).expect("final registry");
+    assert!(registry.operations.is_empty());
+    assert_eq!(registry.records.get("gap-peer"), Some(&peer_binding));
+    assert_eq!(
+        registry
+            .records
+            .get("gap-holder")
+            .map(|binding| binding.path.as_path()),
+        Some(holder.path.as_path())
+    );
+    assert_eq!(holder.path.file_name(), reservation.file_name());
+    assert!(holder.path.join("README.md").exists());
+    assert!(peer_binding.path.join("README.md").exists());
+    drop(lock);
+    let mut listed = WorktreeManager::new(&repo_path)
+        .list()
+        .expect("list both managed worktrees")
+        .into_iter()
+        .map(|record| record.name)
+        .collect::<Vec<_>>();
+    listed.sort();
+    assert_eq!(listed, ["gap-holder", "gap-peer"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn abandoned_prepared_create_recovers_after_lease_release() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    let worktree_root = temp.path().join("worktrees");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    let oid = commit_readme(&repo).expect("initial commit");
+    let commit = repo.find_commit(oid).expect("commit");
+    let root = SafeRoot::open_or_create_managed(&worktree_root).expect("managed root");
+    let name = "gap-abandoned".to_string();
+    let reserved = root
+        .reserve_direct_child_directory(&name)
+        .expect("empty reservation");
+    let staging = root
+        .reserve_random_direct_child_directory("gap-stage")
+        .expect("empty staging root");
+    repo.branch("maco/gap-abandoned", &commit, false)
+        .expect("preexisting branch");
+    let reservation_identity = reserved.identity().clone();
+    let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
+    let lock = store.lock().expect("registry lock");
+    let mut registry = store.load(&lock).expect("empty registry");
+    registry.operations.insert(
+        name.clone(),
+        ManagedWorktreeOperation {
+            kind: ManagedWorktreeOperationKind::Create,
+            phase: ManagedWorktreeOperationPhase::CreatePrepared,
+            name: name.clone(),
+            root: root.path().to_path_buf(),
+            root_identity: root.identity().clone(),
+            path: reserved.path().to_path_buf(),
+            prepared_path_identity: Some(reservation_identity.clone()),
+            staging_root: Some(staging.path().to_path_buf()),
+            staging_root_identity: Some(staging.identity().clone()),
+            staging_path: Some(staging.path().join(&name)),
+            staged_path_identity: None,
+            staged_metadata: None,
+            branch: "maco/gap-abandoned".to_string(),
+            base_oid: oid.to_string(),
+            branch_preexisting_oid: Some(oid.to_string()),
+            branch_ownership: ManagedBranchOwnership::Preexisting,
+            owned_branch_oid: None,
+            binding: None,
+            delete_branch: false,
+            force: false,
+            expected_branch_oid: None,
+            gc_dirtiness_checksum: None,
+            removal_safety: None,
+            worktree_quarantine_path: None,
+            worktree_quarantine_identity: None,
+            metadata_quarantine_path: None,
+            metadata_quarantine_identity: None,
+        },
+    );
+    store
+        .save(&lock, &mut registry)
+        .expect("save prepared create");
+    let lease = store
+        .try_acquire_worktree_create_lease(&lock, &name)
+        .expect("create lease");
+
+    recover_pending_operations(&repo, &store, &lock, &mut registry)
+        .expect("held create lease must leave recovery idle");
+    let held = store.load(&lock).expect("registry while lease is held");
+    let held_operation = held
+        .operations
+        .get(&name)
+        .expect("prepared operation remains while its lease is held");
+    assert_eq!(
+        held_operation.phase,
+        ManagedWorktreeOperationPhase::CreatePrepared
+    );
+    assert_eq!(
+        held_operation.prepared_path_identity.as_ref(),
+        Some(&reservation_identity)
+    );
+    assert!(held.records.is_empty());
+    assert_eq!(
+        identity_for_path(reserved.path()).expect("reservation while lease is held"),
+        reservation_identity
+    );
+    assert!(staging.path().exists());
+    assert_eq!(
+        local_branch_oid(&repo, "maco/gap-abandoned").expect("branch during held lease"),
+        Some(oid)
+    );
+
+    drop(lease);
+    recover_pending_operations(&repo, &store, &lock, &mut registry)
+        .expect("released lease must recover the abandoned reservation");
+    let recovered = store.load(&lock).expect("registry after recovery");
+    assert!(recovered.operations.is_empty());
+    assert!(recovered.records.is_empty());
+    assert!(!reserved.path().exists());
+    assert!(!staging.path().exists());
+    assert_eq!(
+        local_branch_oid(&repo, "maco/gap-abandoned").expect("preexisting branch after recovery"),
+        Some(oid)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn changed_operation_identity_refuses_publication_without_consuming_unrelated_state() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    let worktree_root = temp.path().join("worktrees");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    commit_readme(&repo).expect("initial commit");
+
+    let tamper = std::sync::Arc::new(std::sync::Mutex::new(
+        None::<(FileIdentity, FileIdentity, String, PathBuf)>,
+    ));
+    set_create_checkout_gap_hook({
+        let repo_path = repo_path.clone();
+        let tamper = std::sync::Arc::clone(&tamper);
+        move || {
+            let repo = crate::git_repository::open(&repo_path).expect("reopen repo");
+            let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
+            let lock = store
+                .lock_with_timeout(Duration::from_millis(500))
+                .expect("registry lock must be free before republish");
+            let mut registry = store.load(&lock).expect("prepared registry");
+            let holder = registry
+                .operations
+                .get("gap-holder")
+                .cloned()
+                .expect("holder operation");
+            let original_identity = holder
+                .prepared_path_identity
+                .clone()
+                .expect("original reservation identity");
+            let reservation = holder.path.clone();
+            assert_eq!(
+                identity_for_path(&reservation).expect("reservation before tamper"),
+                original_identity
+            );
+
+            let mut bystander = holder.clone();
+            bystander.name = "gap-bystander".to_string();
+            bystander.phase = ManagedWorktreeOperationPhase::CreateIntent;
+            bystander.path = holder.root.join("gap-bystander");
+            bystander.branch = "maco/gap-bystander".to_string();
+            bystander.base_oid = "bystander-marker".to_string();
+            bystander.prepared_path_identity = None;
+            bystander.staging_root = None;
+            bystander.staging_root_identity = None;
+            bystander.staging_path = None;
+            bystander.branch_preexisting_oid = None;
+            bystander.branch_ownership = ManagedBranchOwnership::Unknown;
+            bystander.owned_branch_oid = None;
+            registry
+                .operations
+                .insert(bystander.name.clone(), bystander);
+            registry.operations.remove("gap-holder");
+            store
+                .save(&lock, &mut registry)
+                .expect("retire the prepared incarnation");
+
+            let mut replaced = holder;
+            let mut tampered_identity = original_identity.clone();
+            tampered_identity.file = tampered_identity.file.wrapping_add(1);
+            replaced.prepared_path_identity = Some(tampered_identity.clone());
+            replaced.base_oid = "replaced-reservation".to_string();
+            registry.operations.insert(replaced.name.clone(), replaced);
+            store
+                .save(&lock, &mut registry)
+                .expect("save replacement operation and new incarnation");
+            let incarnation = store
+                .active_incarnation(&lock, "gap-holder")
+                .expect("replacement incarnation");
+            *tamper.lock().expect("tamper lock") = Some((
+                original_identity,
+                tampered_identity,
+                incarnation.nonce,
+                reservation,
+            ));
+        }
+    });
+
+    let error = WorktreeManager::new(&repo_path)
+        .create_for_test(WorktreeCreateOptions {
+            agent_id: "gap-holder".to_string(),
+            branch: None,
+            base: None,
+            worktree_root: Some(worktree_root),
+        })
+        .expect_err("tampered reservation identity must not publish");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("refusing to publish"),
+        "unexpected publication error: {message}"
+    );
+    let (original_identity, tampered_identity, nonce, reservation) = tamper
+        .lock()
+        .expect("tamper lock")
+        .take()
+        .expect("checkout gap hook did not run");
+
+    let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
+    let lock = store.lock().expect("registry lock");
+    let registry = store.load(&lock).expect("registry after refusal");
+    assert!(!registry.records.contains_key("gap-holder"));
+    assert!(!registry.records.contains_key("gap-bystander"));
+    let holder = registry
+        .operations
+        .get("gap-holder")
+        .expect("replacement operation must remain");
+    assert_eq!(holder.phase, ManagedWorktreeOperationPhase::CreatePrepared);
+    assert_eq!(holder.base_oid, "replaced-reservation");
+    assert_eq!(
+        holder.prepared_path_identity.as_ref(),
+        Some(&tampered_identity)
+    );
+    assert_eq!(
+        registry
+            .operations
+            .get("gap-bystander")
+            .map(|operation| operation.base_oid.as_str()),
+        Some("bystander-marker")
+    );
+    assert_eq!(
+        store
+            .active_incarnation(&lock, "gap-holder")
+            .expect("incarnation after refusal")
+            .nonce,
+        nonce
+    );
+    assert_eq!(reservation, holder.path);
+    assert_eq!(
+        identity_for_path(&reservation).expect("reservation was not replaced"),
+        original_identity
+    );
+    assert!(!reservation.join("README.md").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn same_agent_create_refuses_other_root_while_create_lease_is_live() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    let worktree_root = temp.path().join("worktrees");
+    let other_root = temp.path().join("other-worktrees");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    commit_readme(&repo).expect("initial commit");
+
+    set_create_checkout_gap_hook({
+        let repo_path = repo_path.clone();
+        let other_root = other_root.clone();
+        move || {
+            let repo = crate::git_repository::open(&repo_path).expect("reopen repo");
+            let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
+            let (prepared, nonce, reservation_identity) = {
+                let lock = store
+                    .lock_with_timeout(Duration::from_millis(500))
+                    .expect("registry lock must be free while the holder lease is live");
+                let registry = store.load(&lock).expect("prepared registry");
+                let prepared = registry
+                    .operations
+                    .get("gap-same")
+                    .cloned()
+                    .expect("live prepared create");
+                assert_eq!(
+                    prepared.phase,
+                    ManagedWorktreeOperationPhase::CreatePrepared
+                );
+                let reservation_identity = prepared
+                    .prepared_path_identity
+                    .clone()
+                    .expect("reservation identity");
+                assert_eq!(
+                    identity_for_path(&prepared.path).expect("reservation inode"),
+                    reservation_identity
+                );
+                let nonce = store
+                    .active_incarnation(&lock, "gap-same")
+                    .expect("live incarnation")
+                    .nonce;
+                (prepared, nonce, reservation_identity)
+            };
+
+            let error = WorktreeManager::new(&repo_path)
+                .create_for_test(WorktreeCreateOptions {
+                    agent_id: "gap-same".to_string(),
+                    branch: Some("maco/gap-same-other".to_string()),
+                    base: None,
+                    worktree_root: Some(other_root.clone()),
+                })
+                .expect_err("second create for the same agent must refuse");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("in-progress registry operation"),
+                "unexpected second-create error: {message}"
+            );
+
+            let lock = store.lock().expect("registry lock after refused create");
+            let registry = store.load(&lock).expect("registry after refused create");
+            assert_eq!(registry.operations.get("gap-same"), Some(&prepared));
+            assert!(registry.records.is_empty());
+            assert_eq!(
+                store
+                    .active_incarnation(&lock, "gap-same")
+                    .expect("incarnation after refused create")
+                    .nonce,
+                nonce
+            );
+            assert_eq!(
+                identity_for_path(&prepared.path).expect("reservation after refused create"),
+                reservation_identity
+            );
+            assert!(!other_root.join("gap-same").exists());
+        }
+    });
+
+    let created = WorktreeManager::new(&repo_path)
+        .create_for_test(WorktreeCreateOptions {
+            agent_id: "gap-same".to_string(),
+            branch: None,
+            base: None,
+            worktree_root: Some(worktree_root),
+        })
+        .expect("original create completes after the colliding create is refused");
+    assert_eq!(created.name, "gap-same");
+    assert_eq!(created.branch, "maco/gap-same");
+    assert!(created.path.join("README.md").exists());
+    assert!(!other_root.join("gap-same").exists());
+
+    let store = ManagedWorktreeRegistryStore::open(&repo).expect("final registry store");
+    let lock = store.lock().expect("final registry lock");
+    let registry = store.load(&lock).expect("final registry");
+    assert!(registry.operations.is_empty());
+    assert_eq!(
+        registry
+            .records
+            .get("gap-same")
+            .map(|binding| binding.path.as_path()),
+        Some(created.path.as_path())
+    );
+    drop(lock);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cross_process_create_lease_blocks_pending_recovery() {
+    skip_without_containment!();
+    const CHILD_ENV: &str = "MACO_TEST_CREATE_LEASE_RECOVERY_CHILD";
+    const REPO_ENV: &str = "MACO_TEST_CREATE_LEASE_REPO";
+    const RECEIPT_ENV: &str = "MACO_TEST_CREATE_LEASE_RECEIPT";
+    const COMPLETED: &[u8] = b"cross-process create lease recovery left the operation intact\n";
+
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let repo_path = PathBuf::from(std::env::var(REPO_ENV).expect("child repo path"));
+        let repo = crate::git_repository::open(&repo_path).expect("child repo");
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("child registry store");
+        let lock = store.lock().expect("child registry lock");
+        let mut registry = store.load(&lock).expect("child registry");
+        let before = registry
+            .operations
+            .get("gap-cross")
+            .cloned()
+            .expect("parent prepared create");
+        assert_eq!(before.phase, ManagedWorktreeOperationPhase::CreatePrepared);
+        let reservation_identity = before
+            .prepared_path_identity
+            .clone()
+            .expect("reservation identity");
+        assert_eq!(
+            identity_for_path(&before.path).expect("child reservation inode"),
+            reservation_identity
+        );
+        let nonce = store
+            .active_incarnation(&lock, "gap-cross")
+            .expect("child incarnation")
+            .nonce;
+        // Separate process: the parent's in-process lease table is not visible.
+        recover_pending_operations(&repo, &store, &lock, &mut registry)
+            .expect("kernel create lease must keep recovery from failing closed");
+        let after = store.load(&lock).expect("child registry after recovery");
+        assert_eq!(after.operations.get("gap-cross"), Some(&before));
+        assert!(after.records.is_empty());
+        assert_eq!(
+            identity_for_path(&before.path).expect("reservation after cross-process recovery"),
+            reservation_identity
+        );
+        assert_eq!(
+            local_branch_oid(&repo, "maco/gap-cross").expect("branch after cross-process recovery"),
+            Some(
+                Oid::from_str(&before.owned_branch_oid.expect("owned branch oid"))
+                    .expect("owned oid")
+            )
+        );
+        assert_eq!(
+            store
+                .active_incarnation(&lock, "gap-cross")
+                .expect("incarnation after cross-process recovery")
+                .nonce,
+            nonce
+        );
+        fs::write(
+            std::env::var(RECEIPT_ENV).expect("child receipt path"),
+            COMPLETED,
+        )
+        .expect("write child receipt");
+        return;
+    }
+
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    let worktree_root = temp.path().join("worktrees");
+    let receipt = temp.path().join("child-receipt");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    let oid = commit_readme(&repo).expect("initial commit");
+    let commit = repo.find_commit(oid).expect("commit");
+    let root = SafeRoot::open_or_create_managed(&worktree_root).expect("managed root");
+    let name = "gap-cross".to_string();
+    let reserved = root
+        .reserve_direct_child_directory(&name)
+        .expect("empty reservation");
+    let staging = root
+        .reserve_random_direct_child_directory("gap-cross-stage")
+        .expect("empty staging root");
+    repo.branch("maco/gap-cross", &commit, false)
+        .expect("owned branch");
+    let reservation_identity = reserved.identity().clone();
+    let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
+    let lock = store.lock().expect("registry lock");
+    let mut registry = store.load(&lock).expect("empty registry");
+    registry.operations.insert(
+        name.clone(),
+        ManagedWorktreeOperation {
+            kind: ManagedWorktreeOperationKind::Create,
+            phase: ManagedWorktreeOperationPhase::CreatePrepared,
+            name: name.clone(),
+            root: root.path().to_path_buf(),
+            root_identity: root.identity().clone(),
+            path: reserved.path().to_path_buf(),
+            prepared_path_identity: Some(reservation_identity.clone()),
+            staging_root: Some(staging.path().to_path_buf()),
+            staging_root_identity: Some(staging.identity().clone()),
+            staging_path: Some(staging.path().join(&name)),
+            staged_path_identity: None,
+            staged_metadata: None,
+            branch: "maco/gap-cross".to_string(),
+            base_oid: oid.to_string(),
+            branch_preexisting_oid: None,
+            branch_ownership: ManagedBranchOwnership::CreatedByMaco,
+            owned_branch_oid: Some(oid.to_string()),
+            binding: None,
+            delete_branch: false,
+            force: false,
+            expected_branch_oid: None,
+            gc_dirtiness_checksum: None,
+            removal_safety: None,
+            worktree_quarantine_path: None,
+            worktree_quarantine_identity: None,
+            metadata_quarantine_path: None,
+            metadata_quarantine_identity: None,
+        },
+    );
+    store
+        .save(&lock, &mut registry)
+        .expect("save prepared create");
+    let lease = store
+        .try_acquire_worktree_create_lease(&lock, &name)
+        .expect("parent create lease");
+    drop(lock);
+
+    let environment = std::collections::BTreeMap::from([
+        (CHILD_ENV.to_string(), "1".to_string()),
+        (
+            REPO_ENV.to_string(),
+            repo_path.to_str().expect("UTF-8 repo path").to_string(),
+        ),
+        (
+            RECEIPT_ENV.to_string(),
+            receipt.to_str().expect("UTF-8 receipt path").to_string(),
+        ),
+    ]);
+    let output = run_process(
+        ProcessSpec::direct(
+            "cross-process create lease recovery",
+            std::env::current_exe().expect("current test executable"),
+            [
+                "--exact",
+                "worktree::tests::cross_process_create_lease_blocks_pending_recovery",
+                "--nocapture",
+            ],
+            std::env::current_dir().expect("current test directory"),
+            64 * 1024,
+        )
+        .with_environment(EnvironmentMode::InheritAndSet(environment))
+        .with_containment(ContainmentPolicy::TrustedBestEffort)
+        .with_stdin(StdinMode::Null)
+        .with_timeout(Some(Duration::from_secs(90))),
+    )
+    .expect("run cross-process create lease recovery");
+    assert!(
+        output.status.is_some_and(|status| status.success())
+            && !output.timed_out
+            && output.process_error.is_none()
+            && output.stdin_error.is_none(),
+        "cross-process helper failed: status={:?}, timed_out={}, process_error={:?}, stdin_error={:?}, stdout={}, stderr={}",
+        output.status,
+        output.timed_out,
+        output.process_error,
+        output.stdin_error,
+        String::from_utf8_lossy(output.stdout.as_bytes()),
+        String::from_utf8_lossy(output.stderr.as_bytes()),
+    );
+    assert_eq!(fs::read(&receipt).expect("child receipt"), COMPLETED);
+
+    let lock = store.lock().expect("registry lock after child");
+    let persisted = store.load(&lock).expect("registry after child");
+    let operation = persisted
+        .operations
+        .get(&name)
+        .expect("prepared operation remains after the child");
+    assert_eq!(
+        operation.phase,
+        ManagedWorktreeOperationPhase::CreatePrepared
+    );
+    assert_eq!(
+        operation.prepared_path_identity.as_ref(),
+        Some(&reservation_identity)
+    );
+    assert!(persisted.records.is_empty());
+    assert_eq!(
+        identity_for_path(reserved.path()).expect("reservation after child"),
+        reservation_identity
+    );
+    assert_eq!(
+        local_branch_oid(&repo, "maco/gap-cross").expect("branch after child"),
+        Some(oid)
+    );
+    drop(lease);
+    let mut registry = persisted;
+    recover_pending_operations(&repo, &store, &lock, &mut registry)
+        .expect("released lease remains recoverable");
+    let recovered = store.load(&lock).expect("registry after parent recovery");
+    assert!(recovered.operations.is_empty());
+    assert!(recovered.records.is_empty());
+    assert!(!reserved.path().exists());
+    assert_eq!(
+        local_branch_oid(&repo, "maco/gap-cross").expect("owned branch cleaned after release"),
+        None
+    );
+}
+
 include!("tests_part2.rs");
 include!("tests_part3.rs");
