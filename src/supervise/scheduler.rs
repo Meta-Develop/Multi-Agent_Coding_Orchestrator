@@ -6574,7 +6574,7 @@ mod selection_policy_tests {
 
         #[test]
         fn scheduler_account_observe_routes_through_configured_authority_socket() -> Result<()> {
-            use crate::account_authority::authority_socket_config::CAM_AUTHORITY_SOCKET_ENV;
+            use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
             use coding_agent_manager_lib::account_authority::{
                 listen, resolve_socket_path, AuthorityContext, AuthorityServerConfig,
                 CategoryObservation, ModelsObservation, ObservedModel, StoredAccountRegistry,
@@ -6585,22 +6585,13 @@ mod selection_policy_tests {
             use std::thread;
 
             struct SocketEnvGuard {
-                previous: Option<std::ffi::OsString>,
+                _inner: CamAuthoritySocketTestGuard,
             }
 
             impl SocketEnvGuard {
                 fn set(path: &Path) -> Self {
-                    let previous = std::env::var_os(CAM_AUTHORITY_SOCKET_ENV);
-                    std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, path);
-                    Self { previous }
-                }
-            }
-
-            impl Drop for SocketEnvGuard {
-                fn drop(&mut self) {
-                    match self.previous.take() {
-                        Some(value) => std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, value),
-                        None => std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV),
+                    Self {
+                        _inner: CamAuthoritySocketTestGuard::install(Some(path.as_os_str())),
                     }
                 }
             }
@@ -6704,7 +6695,7 @@ mod selection_policy_tests {
 
         #[test]
         fn scheduler_grok_socket_observe_freezes_selected_binding() -> Result<()> {
-            use crate::account_authority::authority_socket_config::CAM_AUTHORITY_SOCKET_ENV;
+            use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
             use crate::account_authority::{
                 admit_grok_run_account_binding, frozen_observed_grok_selection,
                 grok_run_account_binding, FrozenGrokSelectionGuard, GROK_CLI_PROVIDER_ID,
@@ -6719,29 +6710,13 @@ mod selection_policy_tests {
             use std::thread;
 
             struct SocketEnvGuard {
-                previous: Option<std::ffi::OsString>,
-                _lock: std::sync::MutexGuard<'static, ()>,
+                _inner: CamAuthoritySocketTestGuard,
             }
 
             impl SocketEnvGuard {
                 fn set(path: &Path) -> Self {
-                    let lock = crate::account_authority::CAM_AUTHORITY_SOCKET_TEST_LOCK
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let previous = std::env::var_os(CAM_AUTHORITY_SOCKET_ENV);
-                    std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, path);
                     Self {
-                        previous,
-                        _lock: lock,
-                    }
-                }
-            }
-
-            impl Drop for SocketEnvGuard {
-                fn drop(&mut self) {
-                    match self.previous.take() {
-                        Some(value) => std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, value),
-                        None => std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV),
+                        _inner: CamAuthoritySocketTestGuard::install(Some(path.as_os_str())),
                     }
                 }
             }

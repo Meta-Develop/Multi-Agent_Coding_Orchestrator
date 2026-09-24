@@ -9,41 +9,18 @@ use git2::Signature;
 use super::*;
 
 static MERGE_LOCAL_GIT_TIMEOUT_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
-static CAM_AUTHORITY_SOCKET_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
 struct CamAuthoritySocketEnvironmentGuard {
-    _lock: MutexGuard<'static, ()>,
-    previous: Option<OsString>,
+    _inner: crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard,
 }
 
 impl CamAuthoritySocketEnvironmentGuard {
     fn install_unset() -> Self {
-        let lock = CAM_AUTHORITY_SOCKET_ENVIRONMENT_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = std::env::var_os(CAM_AUTHORITY_SOCKET_ENV);
-        // SAFETY: this guard serializes CLI parser tests that observe this process-global variable.
-        unsafe { std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV) };
         Self {
-            _lock: lock,
-            previous,
-        }
-    }
-
-    fn set(&self, value: &str) {
-        // SAFETY: the guard holds the environment lock for its entire lifetime.
-        unsafe { std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, value) };
-    }
-}
-
-impl Drop for CamAuthoritySocketEnvironmentGuard {
-    fn drop(&mut self) {
-        // SAFETY: restoration occurs while the guard still holds the environment lock.
-        unsafe {
-            match &self.previous {
-                Some(previous) => std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, previous),
-                None => std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV),
-            }
+            _inner:
+                crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard::install(
+                    None,
+                ),
         }
     }
 }
@@ -2224,41 +2201,137 @@ fn supervise_resume_cam_authority_socket_flag_sets_option() {
     );
 }
 
+const CAM_SOCKET_PARSE_CHILD_ENV: &str = "MACO_CAM_SOCKET_PARSE_CHILD";
+const CAM_AUTHORITY_SOCKET_ENV_NAME: &str = "MACO_CAM_AUTHORITY_SOCKET";
+const CAM_SOCKET_ENV_ALIAS_PARSE_RECEIPT: &str = "MACO_CAM_SOCKET_ENV_ALIAS_PARSE_OK";
+const CAM_SOCKET_ENV_MISSING_PARSE_RECEIPT: &str = "MACO_CAM_SOCKET_ENV_MISSING_PARSE_OK";
+
+fn cam_socket_parse_child_selected(test_name: &str) -> bool {
+    std::env::var(CAM_SOCKET_PARSE_CHILD_ENV).ok().as_deref() == Some(test_name)
+}
+
+fn assert_isolated_cam_socket_parser_child(
+    test_name: &str,
+    label: &str,
+    socket_env: Option<&str>,
+    receipt: &str,
+) {
+    use std::collections::BTreeMap;
+
+    let mut environment = BTreeMap::new();
+    environment.insert(
+        CAM_SOCKET_PARSE_CHILD_ENV.to_string(),
+        test_name.to_string(),
+    );
+    if let Some(socket_env) = socket_env {
+        environment.insert(
+            CAM_AUTHORITY_SOCKET_ENV_NAME.to_string(),
+            socket_env.to_string(),
+        );
+    }
+    let exact_filter = format!("cli::tests::{test_name}");
+    let launched = crate::process_runner::run_process(
+        crate::process_runner::ProcessSpec::direct(
+            label,
+            std::env::current_exe().expect("current test executable"),
+            ["--exact", exact_filter.as_str(), "--nocapture"],
+            std::env::current_dir().expect("current directory"),
+            64 * 1024,
+        )
+        .with_environment(crate::process_runner::EnvironmentMode::InheritAndSet(
+            environment,
+        ))
+        .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort)
+        .with_stdin(crate::process_runner::StdinMode::Null)
+        .with_timeout(Some(std::time::Duration::from_secs(90))),
+    );
+    let output = match launched {
+        Ok(output) => output,
+        Err(error) => panic!("cam socket parser child failed to launch: {error}"),
+    };
+    let stdout = String::from_utf8_lossy(output.stdout.as_bytes());
+    let stderr = String::from_utf8_lossy(output.stderr.as_bytes());
+    let receipt_present = output
+        .stdout
+        .as_bytes()
+        .windows(receipt.len())
+        .any(|window| window == receipt.as_bytes());
+    assert!(
+        output
+            .status
+            .as_ref()
+            .is_some_and(|status| status.success())
+            && !output.timed_out
+            && output.process_error.is_none()
+            && output.stdin_error.is_none()
+            && receipt_present,
+        "cam socket parser child did not prove Clap parsed the socket environment\nstatus: {:?}\ntimed_out: {}\nprocess_error: {:?}\nstdin_error: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status,
+        output.timed_out,
+        output.process_error,
+        output.stdin_error,
+    );
+}
+
 #[test]
 fn supervise_cam_authority_socket_reads_env_alias() {
-    let guard = CamAuthoritySocketEnvironmentGuard::install_unset();
-    guard.set("/tmp/maco-authority-from-env.sock");
-    let parsed = Cli::try_parse_from(["maco", "supervise", "resume", "interrupted-run"])
-        .expect("supervise resume should inherit cam authority socket from env");
-    let supervise = expect_supervise_command(parsed.command);
-    let SuperviseSubcommand::Resume(args) = supervise.command else {
-        panic!("expected supervise resume command");
-    };
-    assert_eq!(
-        args.cam_authority_socket.as_deref(),
-        Some("/tmp/maco-authority-from-env.sock")
+    const TEST_NAME: &str = "supervise_cam_authority_socket_reads_env_alias";
+    if cam_socket_parse_child_selected(TEST_NAME) {
+        let parsed = Cli::try_parse_from(["maco", "supervise", "resume", "interrupted-run"])
+            .expect("supervise resume should inherit cam authority socket from env");
+        let supervise = expect_supervise_command(parsed.command);
+        let SuperviseSubcommand::Resume(args) = supervise.command else {
+            panic!("expected supervise resume command");
+        };
+        assert_eq!(
+            args.cam_authority_socket.as_deref(),
+            Some("/tmp/maco-authority-from-env.sock")
+        );
+        println!("{CAM_SOCKET_ENV_ALIAS_PARSE_RECEIPT}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        return;
+    }
+    assert_isolated_cam_socket_parser_child(
+        TEST_NAME,
+        "CAM env alias parse",
+        Some("/tmp/maco-authority-from-env.sock"),
+        CAM_SOCKET_ENV_ALIAS_PARSE_RECEIPT,
     );
 }
 
 #[test]
 fn supervise_cam_authority_socket_missing_stays_none() {
-    let _guard = CamAuthoritySocketEnvironmentGuard::install_unset();
-    let parsed = Cli::try_parse_from([
-        "maco",
-        "supervise",
-        "run",
-        "plan.json",
-        "--machine-global-config",
-        "/tmp/maco-machine-global.json",
-        "--machine-global-runtime-root-id",
-        "runtime",
-    ])
-    .expect("supervise run without cam authority socket should parse");
-    let supervise = expect_supervise_command(parsed.command);
-    let SuperviseSubcommand::Run(args) = supervise.command else {
-        panic!("expected supervise run command");
-    };
-    assert_eq!(args.cam_authority_socket, None);
+    const TEST_NAME: &str = "supervise_cam_authority_socket_missing_stays_none";
+    if cam_socket_parse_child_selected(TEST_NAME) {
+        // SAFETY: this isolated child clears the socket variable before Clap reads it.
+        // The parent process environment is left unchanged.
+        unsafe { std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV_NAME) };
+        let parsed = Cli::try_parse_from([
+            "maco",
+            "supervise",
+            "run",
+            "plan.json",
+            "--machine-global-config",
+            "/tmp/maco-machine-global.json",
+            "--machine-global-runtime-root-id",
+            "runtime",
+        ])
+        .expect("supervise run without cam authority socket should parse");
+        let supervise = expect_supervise_command(parsed.command);
+        let SuperviseSubcommand::Run(args) = supervise.command else {
+            panic!("expected supervise run command");
+        };
+        assert_eq!(args.cam_authority_socket, None);
+        println!("{CAM_SOCKET_ENV_MISSING_PARSE_RECEIPT}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        return;
+    }
+    assert_isolated_cam_socket_parser_child(
+        TEST_NAME,
+        "CAM env missing parse",
+        None,
+        CAM_SOCKET_ENV_MISSING_PARSE_RECEIPT,
+    );
 }
 
 #[test]
@@ -2278,8 +2351,8 @@ fn pin_cam_authority_socket_pins_trimmed_path() {
     let _guard = CamAuthoritySocketEnvironmentGuard::install_unset();
     pin_cam_authority_socket(Some("  /tmp/maco-authority.sock  ")).expect("trimmed socket pins");
     assert_eq!(
-        std::env::var(CAM_AUTHORITY_SOCKET_ENV).expect("pinned env"),
-        "/tmp/maco-authority.sock"
+        crate::account_authority::authority_socket_config::cam_authority_socket_value(),
+        Some(OsString::from("/tmp/maco-authority.sock"))
     );
 }
 

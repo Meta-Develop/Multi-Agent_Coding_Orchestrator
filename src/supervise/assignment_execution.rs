@@ -12965,40 +12965,8 @@ done
 
     #[test]
     fn nested_maco_child_launch_pins_cam_authority_socket_when_parent_env_set() -> Result<()> {
-        use super::super::cam_authority_child_env::CAM_AUTHORITY_SOCKET_ENV;
+        use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
         use crate::mutation_taxonomy::AssignmentProcessLaunchKind;
-        use std::sync::{Mutex, MutexGuard};
-
-        static LOCK: Mutex<()> = Mutex::new(());
-
-        struct Guard {
-            _lock: MutexGuard<'static, ()>,
-            previous: Option<std::ffi::OsString>,
-        }
-
-        impl Guard {
-            fn set(value: Option<&str>) -> Self {
-                let lock = LOCK.lock().expect("cam authority env test lock");
-                let previous = std::env::var_os(CAM_AUTHORITY_SOCKET_ENV);
-                match value {
-                    Some(text) => std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, text),
-                    None => std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV),
-                }
-                Self {
-                    _lock: lock,
-                    previous,
-                }
-            }
-        }
-
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                match self.previous.take() {
-                    Some(value) => std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, value),
-                    None => std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV),
-                }
-            }
-        }
 
         let mut command = ExternalAgentCommand::codex(
             Path::new("/unused/codex"),
@@ -13010,7 +12978,7 @@ done
         );
         command.assignment_process_launch_kind = Some(AssignmentProcessLaunchKind::AssignmentChild);
 
-        let _unset = Guard::set(None);
+        let _unset = CamAuthoritySocketTestGuard::install(None);
         let unpinned = super::pin_cam_authority_socket_for_nested_maco_launch(
             command.clone(),
             SupervisorRuntime::Codex,
@@ -13018,7 +12986,9 @@ done
         assert!(unpinned.cam_authority_socket_pin().is_none());
         drop(_unset);
 
-        let _set = Guard::set(Some("/tmp/maco-nested.sock"));
+        let _set = CamAuthoritySocketTestGuard::install(Some(std::ffi::OsStr::new(
+            "/tmp/maco-nested.sock",
+        )));
         let pinned = super::pin_cam_authority_socket_for_nested_maco_launch(
             command,
             SupervisorRuntime::Codex,
@@ -13032,42 +13002,12 @@ done
 
     #[test]
     fn adapter_runtime_child_launch_omits_cam_authority_socket_pin() -> Result<()> {
-        use super::super::cam_authority_child_env::CAM_AUTHORITY_SOCKET_ENV;
+        use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
         use crate::mutation_taxonomy::AssignmentProcessLaunchKind;
-        use std::sync::{Mutex, MutexGuard};
 
-        static LOCK: Mutex<()> = Mutex::new(());
-
-        struct Guard {
-            _lock: MutexGuard<'static, ()>,
-            previous: Option<std::ffi::OsString>,
-        }
-
-        impl Guard {
-            fn set(value: Option<&str>) -> Self {
-                let lock = LOCK.lock().expect("cam authority env test lock");
-                let previous = std::env::var_os(CAM_AUTHORITY_SOCKET_ENV);
-                match value {
-                    Some(text) => std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, text),
-                    None => std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV),
-                }
-                Self {
-                    _lock: lock,
-                    previous,
-                }
-            }
-        }
-
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                match self.previous.take() {
-                    Some(value) => std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, value),
-                    None => std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV),
-                }
-            }
-        }
-
-        let _set = Guard::set(Some("/tmp/maco-nested.sock"));
+        let _set = CamAuthoritySocketTestGuard::install(Some(std::ffi::OsStr::new(
+            "/tmp/maco-nested.sock",
+        )));
         let mut command = ExternalAgentCommand::codex(
             Path::new("/unused/grok"),
             Path::new("/tmp"),
