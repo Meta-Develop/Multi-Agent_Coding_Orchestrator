@@ -29,6 +29,7 @@ use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
 use multi_agent_coding_orchestrator::{sync_store::SyncStore, worktree::WorktreeCreateOptions};
 use std::{
     hint::black_box,
+    io::Write,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Barrier,
@@ -277,6 +278,12 @@ fn record_lifecycle_failure(
     if tolerate_lock_timeout && is_managed_worktree_lock_timeout(&message) {
         let mut slot = first_error.lock().expect("lifecycle error mutex");
         if slot.is_none() {
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(
+                stderr,
+                "coordination_envelope agent={agent} step={step} message={message}"
+            );
+            let _ = stderr.flush();
             *slot = Some(message);
         }
         return;
