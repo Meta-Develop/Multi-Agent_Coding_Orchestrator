@@ -1,10 +1,16 @@
 //! Bounded Grok ACP stdio client for runtime-resolved model + effort observation.
 //!
-//! Parent-owned evidence only: observed model/effort come from post-`session/set_model`
-//! `x.ai/session_notification` `model_changed` (or equivalent `session/update`), never from
-//! prompt text or pre-resolution init metadata. This module does not spawn processes; callers
-//! run it inside [`crate::process_runner::run_process_interactive`] via
-//! [`GrokAcpContainedTransport`].
+//! Parent-owned evidence only. Legacy peers report model and effort on a
+//! post-`session/set_model` `model_changed` notification (`x.ai/session_notification` or
+//! `session/update`) plus a string `result._meta.model`. Current Grok CLI 1.0.40 acks
+//! `result._meta.model` as `{"Ok":"<slug>"}` and does not emit `model_changed`. When that
+//! ack leaves effort unknown, the client sends one correlated `session/set_config_option`
+//! with a flat string `value` and reads only `currentValue` from the response
+//! `configOptions`. Prompt text, startup `configOptions`, available option lists, and the
+//! request body are not identity. A later complete `configOptions` list that drops an
+//! identity id invalidates a committed pair.
+//! This module does not spawn processes; callers run it inside
+//! [`crate::process_runner::run_process_interactive`] via [`GrokAcpContainedTransport`].
 
 use crate::{
     artifacts::state_auth::sha256_hex,
@@ -28,6 +34,16 @@ const REASONING_EFFORT_META_KEY: &str = "reasoningEffort";
 
 /// `agent_client_protocol::AGENT_METHOD_NAMES.session_set_model` (xai-acp-lib message.rs).
 const METHOD_SESSION_SET_MODEL: &str = "session/set_model";
+
+/// Captured Grok CLI 1.0.40 `session/set_config_option` params use a flat string
+/// `value`. `result.configOptions` is the complete updated list, and
+/// `config_option_update` carries that same list. Nested `value: {value: ...}` from
+/// installed docs is not the live request.
+const METHOD_SESSION_SET_CONFIG_OPTION: &str = "session/set_config_option";
+
+const CONFIG_ID_MODEL: &str = "model";
+const CONFIG_ID_REASONING_EFFORT: &str = "reasoning_effort";
+const CONFIG_OPTION_TYPE_SELECT: &str = "select";
 
 /// Wire method for `ExtNotification::new("x.ai/session_notification", …)` — underscore-prefixed
 /// extension notification per ACP v1 extensibility (`grok-pager-bin` `_x.ai/session/close` pattern).
@@ -820,13 +836,40 @@ struct PendingModelNotification {
     effort: Option<String>,
 }
 
+enum AckModel {
+    Absent,
+    Legacy(String),
+    TaggedOk(String),
+}
+
+impl AckModel {
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Absent => None,
+            Self::Legacy(value) | Self::TaggedOk(value) => Some(value.as_str()),
+        }
+    }
+
+    fn into_string(self) -> Option<String> {
+        match self {
+            Self::Absent => None,
+            Self::Legacy(value) | Self::TaggedOk(value) => Some(value),
+        }
+    }
+}
+
 enum ModelResolutionPhase {
     Idle,
     AwaitingSetModelAck {
         pending: Option<PendingModelNotification>,
     },
+    /// Tagged-Ok set-model ack left effort unknown. Identity waits for the correlated
+    /// `session/set_config_option` response; notifications do not fill that gap.
+    AwaitingConfigOption {
+        ack_model: String,
+    },
     Committed {
-        model: String,
+        model: GrokAcpResolvedField,
         effort: GrokAcpResolvedField,
     },
     Invalidated,
@@ -835,6 +878,9 @@ enum ModelResolutionPhase {
 struct ModelResolutionTracker {
     phase: ModelResolutionPhase,
     ambiguous_during_prompt: bool,
+    /// Whether this turn asked for an effort. Decides tagged-Ok config follow-up only.
+    /// The requested string is never copied into resolved identity.
+    effort_requested: bool,
 }
 
 impl ModelResolutionTracker {
@@ -842,10 +888,12 @@ impl ModelResolutionTracker {
         Self {
             phase: ModelResolutionPhase::Idle,
             ambiguous_during_prompt: false,
+            effort_requested: false,
         }
     }
 
-    fn begin_set_model(&mut self) {
+    fn begin_set_model(&mut self, effort_requested: bool) {
+        self.effort_requested = effort_requested;
         if matches!(self.phase, ModelResolutionPhase::Idle) {
             self.phase = ModelResolutionPhase::AwaitingSetModelAck { pending: None };
         }
@@ -853,6 +901,14 @@ impl ModelResolutionTracker {
 
     /// Pre-request `model_changed` notifications are unrelated session state; ignore.
     fn note_model_changed(&mut self, model_id: &str, effort: Option<&str>) {
+        let config_ack_disagrees = matches!(
+            &self.phase,
+            ModelResolutionPhase::AwaitingConfigOption { ack_model } if ack_model != model_id
+        );
+        if config_ack_disagrees {
+            self.phase = ModelResolutionPhase::Invalidated;
+            return;
+        }
         match &mut self.phase {
             ModelResolutionPhase::Idle => {}
             ModelResolutionPhase::AwaitingSetModelAck { pending } => {
@@ -868,11 +924,15 @@ impl ModelResolutionTracker {
                     *pending = Some(next);
                 }
             }
+            ModelResolutionPhase::AwaitingConfigOption { .. } => {}
             ModelResolutionPhase::Committed {
                 model: committed_model,
                 effort: committed_effort,
             } => {
-                let same_model = committed_model == model_id;
+                let same_model = match committed_model {
+                    GrokAcpResolvedField::Known(existing) => existing == model_id,
+                    GrokAcpResolvedField::Unknown => false,
+                };
                 let same_effort = match (committed_effort, effort) {
                     (GrokAcpResolvedField::Known(existing), Some(incoming)) => existing == incoming,
                     (GrokAcpResolvedField::Unknown, None) => true,
@@ -898,12 +958,17 @@ impl ModelResolutionTracker {
                 });
             }
         };
-        let ack_model = response
-            .pointer("/result/_meta/model")
-            .and_then(Value::as_str);
+        let ack_model = match parse_set_model_ack_model(response) {
+            Ok(model) => model,
+            Err(error) => {
+                self.phase = ModelResolutionPhase::Invalidated;
+                return Err(error);
+            }
+        };
+        let tagged_ok = matches!(ack_model, AckModel::TaggedOk(_));
         let (model, effort) = match pending {
             Some(notification) => {
-                if let Some(ack) = ack_model {
+                if let Some(ack) = ack_model.as_str() {
                     if ack != notification.model_id {
                         self.phase = ModelResolutionPhase::Invalidated;
                         return Err(GrokAcpError::Unexpected {
@@ -922,23 +987,141 @@ impl ModelResolutionTracker {
                 )
             }
             None => {
-                let model = ack_model.ok_or_else(|| {
+                let Some(model) = ack_model.into_string() else {
                     self.phase = ModelResolutionPhase::Invalidated;
-                    GrokAcpError::Malformed {
+                    return Err(GrokAcpError::Malformed {
                         phase: "session/set_model",
                         message: "set-model ack missing pending notification and _meta.model"
                             .to_string(),
-                    }
-                })?;
-                (model.to_string(), GrokAcpResolvedField::Unknown)
+                    });
+                };
+                (model, GrokAcpResolvedField::Unknown)
             }
         };
-        self.phase = ModelResolutionPhase::Committed { model, effort };
+        if tagged_ok && matches!(effort, GrokAcpResolvedField::Unknown) && self.effort_requested {
+            self.phase = ModelResolutionPhase::AwaitingConfigOption { ack_model: model };
+        } else {
+            self.phase = ModelResolutionPhase::Committed {
+                model: GrokAcpResolvedField::Known(model),
+                effort,
+            };
+        }
         Ok(())
     }
 
+    fn commit_config_option_response(
+        &mut self,
+        response: &Value,
+        session_id: &str,
+    ) -> Result<(), GrokAcpError> {
+        let ack_model = match &self.phase {
+            ModelResolutionPhase::AwaitingConfigOption { ack_model } => ack_model.clone(),
+            _ => {
+                self.phase = ModelResolutionPhase::Invalidated;
+                return Err(GrokAcpError::Unexpected {
+                    phase: METHOD_SESSION_SET_CONFIG_OPTION,
+                    message: "config-option response without an in-flight request".to_string(),
+                });
+            }
+        };
+        if let Some(wire_session) = response.pointer("/result/sessionId") {
+            let Some(wire_session) = wire_session.as_str() else {
+                self.phase = ModelResolutionPhase::Invalidated;
+                return Err(GrokAcpError::Malformed {
+                    phase: METHOD_SESSION_SET_CONFIG_OPTION,
+                    message: "config option response sessionId is not a string".to_string(),
+                });
+            };
+            if wire_session != session_id {
+                self.phase = ModelResolutionPhase::Invalidated;
+                return Err(GrokAcpError::Unexpected {
+                    phase: METHOD_SESSION_SET_CONFIG_OPTION,
+                    message: "config option response targeted a different session".to_string(),
+                });
+            }
+        }
+        let Some(options) = response
+            .pointer("/result/configOptions")
+            .and_then(Value::as_array)
+        else {
+            self.phase = ModelResolutionPhase::Invalidated;
+            return Err(GrokAcpError::Malformed {
+                phase: METHOD_SESSION_SET_CONFIG_OPTION,
+                message: "set_config_option response is missing configOptions".to_string(),
+            });
+        };
+        let (model, effort) =
+            match config_currents_from_options(options, METHOD_SESSION_SET_CONFIG_OPTION) {
+                Ok(currents) => currents,
+                Err(error) => {
+                    self.phase = ModelResolutionPhase::Invalidated;
+                    return Err(error);
+                }
+            };
+        if let Some(model) = &model {
+            if model != &ack_model {
+                self.phase = ModelResolutionPhase::Invalidated;
+                return Err(GrokAcpError::Unexpected {
+                    phase: METHOD_SESSION_SET_CONFIG_OPTION,
+                    message: "config option model currentValue disagreed with the set-model ack"
+                        .to_string(),
+                });
+            }
+        }
+        self.phase = ModelResolutionPhase::Committed {
+            model: match model {
+                Some(value) => GrokAcpResolvedField::Known(value),
+                None => GrokAcpResolvedField::Unknown,
+            },
+            effort: match effort {
+                Some(value) => GrokAcpResolvedField::Known(value),
+                None => GrokAcpResolvedField::Unknown,
+            },
+        };
+        Ok(())
+    }
+
+    /// Post-commit `configOptions` is a complete list. Dropping an identity id clears
+    /// that committed field. A currentValue that was unknown is not adopted.
+    fn note_config_option_drift(
+        &mut self,
+        update: &Map<String, Value>,
+        phase: &'static str,
+    ) -> Result<(), GrokAcpError> {
+        if !matches!(self.phase, ModelResolutionPhase::Committed { .. }) {
+            return Ok(());
+        }
+        let Some(options) = update.get("configOptions").and_then(Value::as_array) else {
+            return Err(GrokAcpError::Malformed {
+                phase,
+                message: "config_option_update is missing configOptions".to_string(),
+            });
+        };
+        let (observed_model, observed_effort) = config_currents_from_options(options, phase)?;
+        let mut drifted = false;
+        if let ModelResolutionPhase::Committed { model, effort } = &mut self.phase {
+            drifted |= apply_config_identity_drift(model, observed_model);
+            drifted |= apply_config_identity_drift(effort, observed_effort);
+        }
+        if drifted {
+            self.ambiguous_during_prompt = true;
+        }
+        Ok(())
+    }
+
+    fn config_followup_pending(&self) -> bool {
+        matches!(
+            self.phase,
+            ModelResolutionPhase::AwaitingConfigOption { .. }
+        )
+    }
+
     fn invalidate_set_model_ack(&mut self) {
-        if matches!(self.phase, ModelResolutionPhase::AwaitingSetModelAck { .. }) {
+        if matches!(
+            self.phase,
+            ModelResolutionPhase::AwaitingSetModelAck { .. }
+                | ModelResolutionPhase::AwaitingConfigOption { .. }
+        ) {
             self.phase = ModelResolutionPhase::Invalidated;
         }
     }
@@ -946,7 +1129,7 @@ impl ModelResolutionTracker {
     fn client_resolved(&self) -> GrokAcpClientResolvedModelEffort {
         match &self.phase {
             ModelResolutionPhase::Committed { model, effort } => GrokAcpClientResolvedModelEffort {
-                model: GrokAcpResolvedField::Known(model.clone()),
+                model: model.clone(),
                 effort: effort.clone(),
             },
             _ => GrokAcpClientResolvedModelEffort {
@@ -982,6 +1165,138 @@ impl ModelResolutionTracker {
         } else {
             GrokAcpResolutionStatus::Unresolved
         }
+    }
+}
+
+fn parse_set_model_ack_model(response: &Value) -> Result<AckModel, GrokAcpError> {
+    let Some(model) = response.pointer("/result/_meta/model") else {
+        return Ok(AckModel::Absent);
+    };
+    if let Some(text) = model.as_str() {
+        return Ok(AckModel::Legacy(text.to_string()));
+    }
+    let Some(object) = model.as_object() else {
+        return Err(GrokAcpError::Malformed {
+            phase: "session/set_model",
+            message: "set-model ack _meta.model is neither a string nor a tagged object"
+                .to_string(),
+        });
+    };
+    if object.len() == 1 {
+        if let Some(ok) = object.get("Ok").and_then(Value::as_str) {
+            validate_identifier(ok, "set-model ack model", 256).map_err(|error| {
+                GrokAcpError::Malformed {
+                    phase: "session/set_model",
+                    message: error.to_string(),
+                }
+            })?;
+            return Ok(AckModel::TaggedOk(ok.to_string()));
+        }
+    }
+    Err(GrokAcpError::Malformed {
+        phase: "session/set_model",
+        message: "set-model ack _meta.model is malformed or Err".to_string(),
+    })
+}
+
+/// `Some` that differs from a known value invalidates without replacing it.
+/// `None` drops a known value to unknown. `Some` does not fill an unknown value.
+fn apply_config_identity_drift(
+    committed: &mut GrokAcpResolvedField,
+    observed: Option<String>,
+) -> bool {
+    match observed {
+        Some(incoming) => match committed {
+            GrokAcpResolvedField::Known(existing) => existing.as_str() != incoming.as_str(),
+            GrokAcpResolvedField::Unknown => true,
+        },
+        None => {
+            if matches!(committed, GrokAcpResolvedField::Known(_)) {
+                *committed = GrokAcpResolvedField::Unknown;
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
+fn config_currents_from_options(
+    options: &[Value],
+    phase: &'static str,
+) -> Result<(Option<String>, Option<String>), GrokAcpError> {
+    let model = select_current_value(options, CONFIG_ID_MODEL, 256, phase)?;
+    let effort = select_current_value(options, CONFIG_ID_REASONING_EFFORT, 64, phase)?;
+    Ok((model, effort))
+}
+
+/// Identity comes only from one well-shaped `type: "select"` entry per exact id.
+/// `options` (available choices) are ignored. A missing id is `Ok(None)`.
+/// Duplicate ids and non-select or non-string `currentValue`s fail closed.
+fn select_current_value(
+    options: &[Value],
+    id: &str,
+    max_len: usize,
+    phase: &'static str,
+) -> Result<Option<String>, GrokAcpError> {
+    let mut matched: Option<usize> = None;
+    for (index, option) in options.iter().enumerate() {
+        let Some(object) = option.as_object() else {
+            return Err(GrokAcpError::Malformed {
+                phase,
+                message: "config option is not an object".to_string(),
+            });
+        };
+        let Some(option_id) = object.get("id").and_then(Value::as_str) else {
+            return Err(GrokAcpError::Malformed {
+                phase,
+                message: "config option id is missing or not a string".to_string(),
+            });
+        };
+        if option_id != id {
+            continue;
+        }
+        if matched.is_some() {
+            return Err(GrokAcpError::Malformed {
+                phase,
+                message: format!("duplicate config option id `{id}`"),
+            });
+        }
+        matched = Some(index);
+    }
+    let Some(index) = matched else {
+        return Ok(None);
+    };
+    let Some(object) = options[index].as_object() else {
+        return Err(GrokAcpError::Malformed {
+            phase,
+            message: "config option is not an object".to_string(),
+        });
+    };
+    if object.get("type").and_then(Value::as_str) != Some(CONFIG_OPTION_TYPE_SELECT) {
+        return Err(GrokAcpError::Malformed {
+            phase,
+            message: format!("config option `{id}` is not a single select"),
+        });
+    }
+    match object.get("currentValue") {
+        Some(Value::String(value)) => {
+            validate_identifier(value, "config option currentValue", max_len).map_err(|error| {
+                GrokAcpError::Malformed {
+                    phase,
+                    message: error.to_string(),
+                }
+            })?;
+            Ok(Some(value.clone()))
+        }
+        Some(_) => Err(GrokAcpError::Malformed {
+            phase,
+            message: format!("config option `{id}` currentValue is not a string"),
+        }),
+        None => Err(GrokAcpError::Malformed {
+            phase,
+            message: format!("config option `{id}` is missing currentValue"),
+        }),
     }
 }
 
@@ -1129,7 +1444,7 @@ where
                 "params": params
             }),
         )?;
-        model_tracker.begin_set_model();
+        model_tracker.begin_set_model(turn.requested_effort.is_some());
         drain_until_response_or_model_changed(
             &mut state,
             transport,
@@ -1139,6 +1454,39 @@ where
             &cancelled,
             &mut permission_escalation_refused,
         )?;
+        if model_tracker.config_followup_pending() {
+            let effort =
+                turn.requested_effort
+                    .as_deref()
+                    .ok_or_else(|| GrokAcpError::Unexpected {
+                        phase: METHOD_SESSION_SET_CONFIG_OPTION,
+                        message: "reasoning effort follow-up is missing the requested effort"
+                            .to_string(),
+                    })?;
+            let config_id = state.allocate_request_id()?;
+            state.send(
+                transport,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": config_id.to_value(),
+                    "method": METHOD_SESSION_SET_CONFIG_OPTION,
+                    "params": {
+                        "sessionId": session_id,
+                        "configId": CONFIG_ID_REASONING_EFFORT,
+                        "value": effort
+                    }
+                }),
+            )?;
+            drain_until_config_option_response(
+                &mut state,
+                transport,
+                &config_id,
+                &session_id,
+                &mut model_tracker,
+                &cancelled,
+                &mut permission_escalation_refused,
+            )?;
+        }
     }
 
     let prompt_id = state.allocate_request_id()?;
@@ -1504,6 +1852,11 @@ fn dispatch_prompt_notification<T: GrokAcpJsonLineTransport>(
                         prompt_ctx
                             .model_tracker
                             .note_model_changed(model_id, effort);
+                    }
+                    "config_option_update" => {
+                        prompt_ctx
+                            .model_tracker
+                            .note_config_option_drift(update, phase)?;
                     }
                     "agent_message_chunk" => {
                         if let Some((final_text, _, _)) = supplement {
@@ -1931,6 +2284,133 @@ where
     Ok(())
 }
 
+fn drain_until_config_option_response<T, C>(
+    state: &mut ProtocolState,
+    transport: &mut T,
+    expected_id: &RequestId,
+    session_id: &str,
+    model_tracker: &mut ModelResolutionTracker,
+    cancelled: &C,
+    permission_escalation_refused: &mut bool,
+) -> Result<(), GrokAcpError>
+where
+    T: GrokAcpJsonLineTransport,
+    C: Fn() -> bool,
+{
+    let phase = METHOD_SESSION_SET_CONFIG_OPTION;
+    let mut response_seen = false;
+    while !response_seen {
+        let message = state.receive(transport, phase, cancelled)?;
+        if let Some(id) = message.get("id") {
+            if message.get("method").is_some() {
+                let method = required_text(&message, &["method"], phase, "method")?;
+                refuse_server_request(
+                    state,
+                    transport,
+                    &message,
+                    method,
+                    permission_escalation_refused,
+                )?;
+                continue;
+            }
+            let parsed = RequestId::parse(id, phase)?;
+            if !state.response_ids.insert(parsed.clone()) {
+                return Err(GrokAcpError::Duplicate {
+                    phase,
+                    message: "duplicate response id".to_string(),
+                });
+            }
+            if &parsed != expected_id {
+                return Err(GrokAcpError::Unexpected {
+                    phase,
+                    message: "response id did not match the pending config option request"
+                        .to_string(),
+                });
+            }
+            if message.get("error").is_some() {
+                model_tracker.invalidate_set_model_ack();
+                return Err(GrokAcpError::Remote {
+                    phase,
+                    message: bounded_json_summary(message.get("error").unwrap_or(&Value::Null)),
+                });
+            }
+            response_seen = true;
+            model_tracker.commit_config_option_response(&message, session_id)?;
+            continue;
+        }
+        let method = required_text(&message, &["method"], phase, "method")?;
+        match method {
+            _ if method == METHOD_XAI_SESSION_NOTIFICATION => {
+                handle_xai_session_notification(&message, session_id, model_tracker, None)?;
+                if matches!(model_tracker.phase, ModelResolutionPhase::Invalidated) {
+                    return Err(GrokAcpError::Unexpected {
+                        phase,
+                        message: "model_changed disagreed with the set-model ack".to_string(),
+                    });
+                }
+            }
+            METHOD_SESSION_UPDATE => {
+                let params = required_object(&message, &["params"], phase, "params")?;
+                let wire_session = map_required_text(params, "sessionId", phase, "session id")?;
+                if wire_session != session_id {
+                    return Err(GrokAcpError::Unexpected {
+                        phase,
+                        message: "session/update targeted a different session".to_string(),
+                    });
+                }
+                let update = params
+                    .get("update")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| GrokAcpError::Malformed {
+                        phase,
+                        message: "session/update update is not an object".to_string(),
+                    })?;
+                if update.get("sessionUpdate").and_then(Value::as_str) == Some("model_changed") {
+                    let model_id =
+                        update
+                            .get("model_id")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| GrokAcpError::Malformed {
+                                phase,
+                                message: "model_changed missing model_id".to_string(),
+                            })?;
+                    let effort = update.get("reasoning_effort").and_then(Value::as_str);
+                    model_tracker.note_model_changed(model_id, effort);
+                    if matches!(model_tracker.phase, ModelResolutionPhase::Invalidated) {
+                        return Err(GrokAcpError::Unexpected {
+                            phase,
+                            message: "model_changed disagreed with the set-model ack".to_string(),
+                        });
+                    }
+                }
+                // `config_option_update` before the correlated response is not identity.
+                // Resolved model and effort come only from that response's currentValue fields.
+            }
+            _ if method == METHOD_SESSION_REQUEST_PERMISSION || method.starts_with('_') => {
+                refuse_server_request(
+                    state,
+                    transport,
+                    &message,
+                    method,
+                    permission_escalation_refused,
+                )?;
+            }
+            _ => {
+                if is_escalation_method(method) {
+                    refuse_server_request(
+                        state,
+                        transport,
+                        &message,
+                        method,
+                        permission_escalation_refused,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn handle_xai_session_notification(
     message: &Value,
     session_id: &str,
@@ -1975,6 +2455,9 @@ fn handle_xai_session_notification(
                 })?;
             let effort = update.get("reasoning_effort").and_then(Value::as_str);
             model_tracker.note_model_changed(model_id, effort);
+        }
+        "config_option_update" => {
+            model_tracker.note_config_option_drift(update, "x.ai/session_notification")?;
         }
         "turn_completed" => {
             if let Some((final_text, stop_reason, truncated)) = supplement {
@@ -4161,5 +4644,748 @@ mod tests {
             crate::runtime_adapter::grok::grok_acp_parent_evidence_from_execution(evidence);
         assert!(parent.structured_output.is_none());
         assert!(parent.structured_output_error.is_some());
+    }
+
+    const FIXTURE_SESSION: &str = "sess-fixture";
+
+    fn captured_identity_fixture() -> Value {
+        serde_json::from_str(include_str!(
+            "../../tests/fixtures/runtime_adapter/grok/acp-cli-1.0.40-grok47-xhigh-identity.json"
+        ))
+        .expect("sanitized identity fixture")
+    }
+
+    fn fixture_config_options() -> Vec<Value> {
+        captured_identity_fixture()
+            .get("config_options")
+            .and_then(Value::as_array)
+            .expect("config_options")
+            .clone()
+    }
+
+    fn option_current<'a>(options: &'a [Value], id: &str) -> &'a str {
+        options
+            .iter()
+            .find(|option| option.get("id").and_then(Value::as_str) == Some(id))
+            .and_then(|option| option.get("currentValue"))
+            .and_then(Value::as_str)
+            .expect(id)
+    }
+
+    fn set_option_field(options: &mut [Value], id: &str, field: &str, value: Value) {
+        let option = options
+            .iter_mut()
+            .find(|option| option.get("id").and_then(Value::as_str) == Some(id))
+            .expect(id);
+        option
+            .as_object_mut()
+            .expect("config option")
+            .insert(field.to_string(), value);
+    }
+
+    fn remove_option_field(options: &mut [Value], id: &str, field: &str) {
+        let option = options
+            .iter_mut()
+            .find(|option| option.get("id").and_then(Value::as_str) == Some(id))
+            .expect(id);
+        option.as_object_mut().expect("config option").remove(field);
+    }
+
+    fn handshake_with_startup_decoy(session_id: &str) -> Vec<Value> {
+        vec![
+            json!({"id": 1, "result": {"protocolVersion": 1}}),
+            json!({
+                "id": 2,
+                "result": {
+                    "sessionId": session_id,
+                    "configOptions": [{
+                        "id": "model",
+                        "type": "select",
+                        "currentValue": "grok-4.5",
+                        "options": [{"value": "grok-4.5", "name": "Grok 4.5"}]
+                    }, {
+                        "id": "reasoning_effort",
+                        "type": "select",
+                        "currentValue": "low",
+                        "options": [{"value": "low", "name": "Low"}]
+                    }]
+                }
+            }),
+        ]
+    }
+
+    fn config_option_update(session_id: &str, options: Vec<Value>) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "method": METHOD_SESSION_UPDATE,
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "config_option_update",
+                    "configOptions": options
+                }
+            }
+        })
+    }
+
+    fn tagged_model_ack(model: Value) -> Value {
+        json!({"id": 3, "result": {"_meta": {"model": model}}})
+    }
+
+    fn config_option_response(options: Vec<Value>) -> Value {
+        json!({"id": 4, "result": {"configOptions": options}})
+    }
+
+    fn current_prompt_result(text: &str) -> Value {
+        json!({
+            "id": 5,
+            "result": {
+                "stopReason": "end_turn",
+                "text": text
+            }
+        })
+    }
+
+    fn run_requested(
+        messages: Vec<Value>,
+        model: &str,
+        effort: &str,
+        schema: Option<GrokAcpBoundOutputSchema>,
+    ) -> (
+        Result<GrokAcpExecutionEvidence, GrokAcpError>,
+        ScriptTransport,
+    ) {
+        let mut transport = ScriptTransport::from_values(messages);
+        let result = run_grok_acp_turn(
+            &mut transport,
+            &requested_turn(model, effort, schema),
+            GrokAcpLimits::for_fixture_test(),
+            || false,
+        );
+        (result, transport)
+    }
+
+    fn outbound_methods(transport: &ScriptTransport) -> Vec<String> {
+        transport
+            .outbound
+            .iter()
+            .map(|line| {
+                serde_json::from_slice::<Value>(line)
+                    .expect("outbound json")
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn assert_flat_config_request(transport: &ScriptTransport, session_id: &str, effort: &str) {
+        let frame = parse_outbound(transport, 3);
+        assert_eq!(
+            frame.get("method"),
+            Some(&Value::from(METHOD_SESSION_SET_CONFIG_OPTION))
+        );
+        assert_eq!(
+            frame.pointer("/params/sessionId").and_then(Value::as_str),
+            Some(session_id)
+        );
+        assert_eq!(
+            frame.pointer("/params/configId").and_then(Value::as_str),
+            Some(CONFIG_ID_REASONING_EFFORT)
+        );
+        let value = frame.pointer("/params/value").expect("flat value");
+        assert!(
+            value.is_string(),
+            "session/set_config_option value must be a flat string, got {value}"
+        );
+        assert_eq!(value.as_str(), Some(effort));
+    }
+
+    fn current_format_messages(
+        before_response: Vec<Value>,
+        options: Vec<Value>,
+        after_response: Vec<Value>,
+        prompt_text: &str,
+    ) -> Vec<Value> {
+        let mut messages = handshake_with_startup_decoy(FIXTURE_SESSION);
+        messages.push(tagged_model_ack(json!({"Ok": "grok-4.7"})));
+        messages.extend(before_response);
+        messages.push(config_option_response(options));
+        messages.extend(after_response);
+        messages.push(current_prompt_result(prompt_text));
+        messages
+    }
+
+    #[test]
+    fn current_cli_flat_config_value_replays_captured_identity() {
+        let fixture = captured_identity_fixture();
+        assert_eq!(
+            fixture.get("scope").and_then(Value::as_str),
+            Some(
+                "Sanitized parser-compatibility replay of native Windows Grok CLI 1.0.40 ACP identity shapes captured on 2026-09-24, including the flat session/set_config_option value string. Not backend attestation and not managed Linux MACO execution proof."
+            )
+        );
+        assert_eq!(
+            fixture.get("cli_version").and_then(Value::as_str),
+            Some("1.0.40")
+        );
+        let request_value = fixture
+            .get("set_config_option_request_value")
+            .and_then(Value::as_str)
+            .expect("flat request value");
+        assert_eq!(request_value, "xhigh");
+        assert!(fixture
+            .get("set_config_option_request_value")
+            .is_some_and(Value::is_string));
+        let options = fixture_config_options();
+        assert_eq!(option_current(&options, "model"), "grok-4.7");
+        assert_eq!(option_current(&options, "reasoning_effort"), "xhigh");
+        assert_eq!(
+            fixture.get("set_model_ack_model"),
+            Some(&json!({"Ok": "grok-4.7"}))
+        );
+
+        let (result, transport) = run_requested(
+            current_format_messages(
+                vec![config_option_update(FIXTURE_SESSION, options.clone())],
+                options.clone(),
+                vec![config_option_update(FIXTURE_SESSION, options)],
+                "ping",
+            ),
+            "grok-4.7",
+            request_value,
+            None,
+        );
+        let evidence = result.expect("captured identity replay");
+        assert_eq!(
+            evidence.client_resolved.model,
+            GrokAcpResolvedField::Known("grok-4.7".into())
+        );
+        assert_eq!(
+            evidence.client_resolved.effort,
+            GrokAcpResolvedField::Known("xhigh".into())
+        );
+        assert_eq!(
+            evidence.resolution_status,
+            GrokAcpResolutionStatus::Complete
+        );
+        assert_eq!(
+            grok_acp_execution_identity_publication_status(&evidence),
+            GrokAcpIdentityPublicationStatus::Admitted
+        );
+        assert!(!evidence.permission_escalation_refused);
+        assert_flat_config_request(&transport, FIXTURE_SESSION, request_value);
+        assert_eq!(
+            outbound_methods(&transport),
+            vec![
+                METHOD_INITIALIZE.to_string(),
+                METHOD_SESSION_NEW.to_string(),
+                METHOD_SESSION_SET_MODEL.to_string(),
+                METHOD_SESSION_SET_CONFIG_OPTION.to_string(),
+                METHOD_SESSION_PROMPT.to_string(),
+                METHOD_SESSION_CANCEL.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn current_cli_omitted_structured_output_is_not_read_from_final_text() {
+        let text = "{\"status\":\"passed\",\"checks\":3}";
+        let schema = publication_schema();
+        let (result, transport) = run_requested(
+            current_format_messages(Vec::new(), fixture_config_options(), Vec::new(), text),
+            "grok-4.7",
+            "xhigh",
+            Some(schema),
+        );
+        let evidence = result.expect("schema-bound turn with omitted structuredOutput");
+        assert_eq!(
+            grok_acp_execution_identity_publication_status(&evidence),
+            GrokAcpIdentityPublicationStatus::Admitted
+        );
+        assert_eq!(evidence.final_text.as_deref(), Some(text));
+        assert!(evidence.prompt_result_meta.is_none());
+        let parent =
+            crate::runtime_adapter::grok::grok_acp_parent_evidence_from_execution(evidence);
+        assert!(parent.structured_output.is_none());
+        assert!(parent.structured_output_error.is_none());
+        let prompt = parse_outbound(&transport, 4);
+        assert_eq!(
+            prompt.get("method"),
+            Some(&Value::from(METHOD_SESSION_PROMPT))
+        );
+        assert_eq!(
+            prompt.pointer("/params/_meta/jsonSchema/required/0"),
+            Some(&Value::from("accepted"))
+        );
+    }
+
+    #[test]
+    fn legacy_string_ack_and_model_changed_do_not_send_config_option() {
+        let mut transport = ScriptTransport::from_values(successful_transcript("high"));
+        let evidence = run_grok_acp_turn(
+            &mut transport,
+            &requested_turn("grok-4", "high", None),
+            GrokAcpLimits::for_fixture_test(),
+            || false,
+        )
+        .expect("legacy turn");
+        assert_eq!(
+            evidence.resolution_status,
+            GrokAcpResolutionStatus::Complete
+        );
+        assert_eq!(
+            evidence.client_resolved.effort,
+            GrokAcpResolvedField::Known("high".into())
+        );
+        assert_eq!(
+            outbound_methods(&transport),
+            vec![
+                METHOD_INITIALIZE.to_string(),
+                METHOD_SESSION_NEW.to_string(),
+                METHOD_SESSION_SET_MODEL.to_string(),
+                METHOD_SESSION_PROMPT.to_string(),
+                METHOD_SESSION_CANCEL.to_string(),
+            ]
+        );
+
+        let mut messages = base_handshake("sess-1");
+        messages.push(set_model_ack("grok-4"));
+        messages.push(prompt_ack(true));
+        let (result, transport) = run_requested(messages, "grok-4", "xhigh", None);
+        let evidence = result.expect("string ack without effort");
+        assert_eq!(
+            evidence.client_resolved.model,
+            GrokAcpResolvedField::Known("grok-4".into())
+        );
+        assert_eq!(
+            evidence.client_resolved.effort,
+            GrokAcpResolvedField::Unknown
+        );
+        assert_ne!(
+            evidence.resolution_status,
+            GrokAcpResolutionStatus::Complete
+        );
+        assert_eq!(
+            grok_acp_execution_identity_publication_status(&evidence),
+            GrokAcpIdentityPublicationStatus::MissingEvidence
+        );
+        assert!(!outbound_methods(&transport)
+            .iter()
+            .any(|method| method == METHOD_SESSION_SET_CONFIG_OPTION));
+    }
+
+    #[test]
+    fn tagged_ok_with_model_changed_keeps_legacy_effort() {
+        let mut messages = base_handshake("sess-1");
+        messages.push(model_changed_notification(
+            "sess-1",
+            "grok-4.7",
+            Some("xhigh"),
+        ));
+        messages.push(tagged_model_ack(json!({"Ok": "grok-4.7"})));
+        messages.push(prompt_ack(true));
+        let (result, transport) = run_requested(messages, "grok-4.7", "xhigh", None);
+        let evidence = result.expect("legacy notification with tagged ack");
+        assert_eq!(
+            evidence.client_resolved,
+            GrokAcpClientResolvedModelEffort {
+                model: GrokAcpResolvedField::Known("grok-4.7".into()),
+                effort: GrokAcpResolvedField::Known("xhigh".into()),
+            }
+        );
+        assert_eq!(
+            evidence.resolution_status,
+            GrokAcpResolutionStatus::Complete
+        );
+        assert!(!outbound_methods(&transport)
+            .iter()
+            .any(|method| method == METHOD_SESSION_SET_CONFIG_OPTION));
+    }
+
+    #[test]
+    fn tagged_ack_disagreeing_with_model_changed_fails() {
+        let mut messages = base_handshake("sess-1");
+        messages.push(model_changed_notification("sess-1", "grok-4", Some("high")));
+        messages.push(tagged_model_ack(json!({"Ok": "grok-4.7"})));
+        messages.push(prompt_ack(true));
+        let (result, _) = run_requested(messages, "grok-4.7", "xhigh", None);
+        let error = result.expect_err("disagreeing tagged ack");
+        assert!(
+            matches!(
+                &error,
+                GrokAcpError::Unexpected {
+                    phase: "session/set_model",
+                    ..
+                }
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn malformed_or_err_model_ack_fails_without_config_followup() {
+        for bad in [
+            json!({"Err": "unsupported"}),
+            json!({"Ok": ""}),
+            json!({"Ok": "grok-4.7", "Err": "also"}),
+            json!({"ok": "grok-4.7"}),
+            json!(null),
+        ] {
+            let mut messages = base_handshake("sess-1");
+            messages.push(tagged_model_ack(bad));
+            messages.push(config_option_update("sess-1", fixture_config_options()));
+            messages.push(prompt_ack(true));
+            let (result, transport) = run_requested(messages, "grok-4.7", "xhigh", None);
+            let error = result.expect_err("malformed or Err ack");
+            assert!(
+                matches!(
+                    &error,
+                    GrokAcpError::Malformed {
+                        phase: "session/set_model",
+                        ..
+                    }
+                ),
+                "{error}"
+            );
+            assert_eq!(
+                outbound_methods(&transport),
+                vec![
+                    METHOD_INITIALIZE.to_string(),
+                    METHOD_SESSION_NEW.to_string(),
+                    METHOD_SESSION_SET_MODEL.to_string(),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn missing_effort_option_stays_unresolved_despite_notification() {
+        let mut options = fixture_config_options();
+        options
+            .retain(|option| option.get("id").and_then(Value::as_str) != Some("reasoning_effort"));
+        let (result, _) = run_requested(
+            current_format_messages(
+                vec![config_option_update(
+                    FIXTURE_SESSION,
+                    fixture_config_options(),
+                )],
+                options,
+                Vec::new(),
+                "ping",
+            ),
+            "grok-4.7",
+            "xhigh",
+            None,
+        );
+        let evidence = result.expect("missing effort option");
+        assert_eq!(
+            evidence.client_resolved.model,
+            GrokAcpResolvedField::Known("grok-4.7".into())
+        );
+        assert_eq!(
+            evidence.client_resolved.effort,
+            GrokAcpResolvedField::Unknown
+        );
+        assert_ne!(
+            evidence.resolution_status,
+            GrokAcpResolutionStatus::Complete
+        );
+        assert_eq!(
+            grok_acp_execution_identity_publication_status(&evidence),
+            GrokAcpIdentityPublicationStatus::MissingEvidence
+        );
+    }
+
+    #[test]
+    fn duplicate_and_ill_shaped_config_options_fail() {
+        let mut duplicate = fixture_config_options();
+        let effort = duplicate
+            .iter()
+            .find(|option| option.get("id").and_then(Value::as_str) == Some("reasoning_effort"))
+            .expect("effort")
+            .clone();
+        duplicate.push(effort);
+        let (result, _) = run_requested(
+            current_format_messages(Vec::new(), duplicate, Vec::new(), "ping"),
+            "grok-4.7",
+            "xhigh",
+            None,
+        );
+        let error = result.expect_err("duplicate id");
+        let message = match &error {
+            GrokAcpError::Malformed { message, .. } => message.clone(),
+            other => panic!("expected malformed duplicate, got {other}"),
+        };
+        assert!(message.contains("duplicate"), "{message}");
+
+        let mut wrong_type = fixture_config_options();
+        set_option_field(
+            &mut wrong_type,
+            "reasoning_effort",
+            "type",
+            Value::from("boolean"),
+        );
+        let (result, _) = run_requested(
+            current_format_messages(Vec::new(), wrong_type, Vec::new(), "ping"),
+            "grok-4.7",
+            "xhigh",
+            None,
+        );
+        let error = result.expect_err("non-select");
+        assert!(error.to_string().contains("single select"), "{error}");
+
+        let mut not_string = fixture_config_options();
+        set_option_field(
+            &mut not_string,
+            "reasoning_effort",
+            "currentValue",
+            json!(["xhigh"]),
+        );
+        let (result, _) = run_requested(
+            current_format_messages(Vec::new(), not_string, Vec::new(), "ping"),
+            "grok-4.7",
+            "xhigh",
+            None,
+        );
+        let error = result.expect_err("non-string currentValue");
+        assert!(error.to_string().contains("not a string"), "{error}");
+
+        let mut missing_current = fixture_config_options();
+        remove_option_field(&mut missing_current, "reasoning_effort", "currentValue");
+        let (result, _) = run_requested(
+            current_format_messages(Vec::new(), missing_current, Vec::new(), "ping"),
+            "grok-4.7",
+            "xhigh",
+            None,
+        );
+        let error = result.expect_err("missing currentValue");
+        assert!(
+            error.to_string().contains("missing currentValue"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn config_option_model_current_value_must_match_ack() {
+        let mut options = fixture_config_options();
+        set_option_field(
+            &mut options,
+            "model",
+            "currentValue",
+            Value::from("grok-4.6"),
+        );
+        let (result, _) = run_requested(
+            current_format_messages(Vec::new(), options, Vec::new(), "ping"),
+            "grok-4.7",
+            "xhigh",
+            None,
+        );
+        let error = result.expect_err("model conflict");
+        assert!(error.to_string().contains("disagreed"), "{error}");
+    }
+
+    #[test]
+    fn response_current_value_beats_options_notification_and_request() {
+        let mut options = fixture_config_options();
+        set_option_field(
+            &mut options,
+            "reasoning_effort",
+            "currentValue",
+            Value::from("high"),
+        );
+        set_option_field(
+            &mut options,
+            "reasoning_effort",
+            "value",
+            Value::from("low"),
+        );
+        set_option_field(
+            &mut options,
+            "reasoning_effort",
+            "options",
+            json!([{"value": "low", "name": "Low"}, {"value": "xhigh", "name": "Extra High"}]),
+        );
+        let mut notification = fixture_config_options();
+        set_option_field(
+            &mut notification,
+            "reasoning_effort",
+            "currentValue",
+            Value::from("xhigh"),
+        );
+        let (result, transport) = run_requested(
+            current_format_messages(
+                vec![config_option_update(FIXTURE_SESSION, notification)],
+                options,
+                Vec::new(),
+                "ping",
+            ),
+            "grok-4.7",
+            "xhigh",
+            None,
+        );
+        let evidence = result.expect("currentValue wins");
+        assert_flat_config_request(&transport, FIXTURE_SESSION, "xhigh");
+        assert_eq!(
+            evidence.client_resolved.model,
+            GrokAcpResolvedField::Known("grok-4.7".into())
+        );
+        assert_eq!(
+            evidence.client_resolved.effort,
+            GrokAcpResolvedField::Known("high".into())
+        );
+        assert_eq!(
+            evidence.resolution_status,
+            GrokAcpResolutionStatus::Complete
+        );
+        assert_eq!(
+            grok_acp_execution_identity_publication_status(&evidence),
+            GrokAcpIdentityPublicationStatus::EffortMismatch
+        );
+    }
+
+    #[test]
+    fn dropped_identity_field_after_commit_clears_complete_identity() {
+        let mut dropped = fixture_config_options();
+        dropped
+            .retain(|option| option.get("id").and_then(Value::as_str) != Some("reasoning_effort"));
+        let (result, _) = run_requested(
+            current_format_messages(
+                Vec::new(),
+                fixture_config_options(),
+                vec![config_option_update(FIXTURE_SESSION, dropped)],
+                "ping",
+            ),
+            "grok-4.7",
+            "xhigh",
+            None,
+        );
+        let evidence = result.expect("dropped effort after commit");
+        assert_eq!(
+            evidence.client_resolved.model,
+            GrokAcpResolvedField::Known("grok-4.7".into())
+        );
+        assert_eq!(
+            evidence.client_resolved.effort,
+            GrokAcpResolvedField::Unknown
+        );
+        assert_eq!(
+            evidence.resolution_status,
+            GrokAcpResolutionStatus::AmbiguousModelChange
+        );
+        assert_eq!(
+            grok_acp_execution_identity_publication_status(&evidence),
+            GrokAcpIdentityPublicationStatus::ConflictingEvidence
+        );
+    }
+
+    #[test]
+    fn changed_config_during_prompt_invalidates_identity() {
+        let mut changed = fixture_config_options();
+        set_option_field(
+            &mut changed,
+            "model",
+            "currentValue",
+            Value::from("grok-4.6"),
+        );
+        set_option_field(
+            &mut changed,
+            "reasoning_effort",
+            "currentValue",
+            Value::from("high"),
+        );
+        let (result, _) = run_requested(
+            current_format_messages(
+                Vec::new(),
+                fixture_config_options(),
+                vec![config_option_update(FIXTURE_SESSION, changed)],
+                "ping",
+            ),
+            "grok-4.7",
+            "xhigh",
+            None,
+        );
+        let evidence = result.expect("drift during prompt");
+        assert_ne!(
+            evidence.client_resolved.model,
+            GrokAcpResolvedField::Known("grok-4.6".into())
+        );
+        assert_ne!(
+            evidence.client_resolved.effort,
+            GrokAcpResolvedField::Known("high".into())
+        );
+        assert_eq!(
+            evidence.resolution_status,
+            GrokAcpResolutionStatus::AmbiguousModelChange
+        );
+        assert_eq!(
+            grok_acp_execution_identity_publication_status(&evidence),
+            GrokAcpIdentityPublicationStatus::ConflictingEvidence
+        );
+    }
+
+    #[test]
+    fn later_config_notification_does_not_grant_effort_after_string_ack() {
+        let mut options = fixture_config_options();
+        set_option_field(&mut options, "model", "currentValue", Value::from("grok-4"));
+        let mut messages = base_handshake("sess-1");
+        messages.push(set_model_ack("grok-4"));
+        messages.push(config_option_update("sess-1", options));
+        messages.push(prompt_ack(true));
+        let (result, transport) = run_requested(messages, "grok-4", "xhigh", None);
+        let evidence = result.expect("string ack then notification");
+        assert_eq!(
+            evidence.client_resolved.model,
+            GrokAcpResolvedField::Known("grok-4".into())
+        );
+        assert_eq!(
+            evidence.client_resolved.effort,
+            GrokAcpResolvedField::Unknown
+        );
+        assert_eq!(
+            evidence.resolution_status,
+            GrokAcpResolutionStatus::AmbiguousModelChange
+        );
+        assert_ne!(
+            grok_acp_execution_identity_publication_status(&evidence),
+            GrokAcpIdentityPublicationStatus::Admitted
+        );
+        assert!(!outbound_methods(&transport)
+            .iter()
+            .any(|method| method == METHOD_SESSION_SET_CONFIG_OPTION));
+    }
+
+    #[test]
+    fn config_option_response_binds_request_and_session() {
+        let mut wrong_id =
+            current_format_messages(Vec::new(), fixture_config_options(), Vec::new(), "ping");
+        let response = wrong_id
+            .iter_mut()
+            .find(|message| message.get("id").and_then(Value::as_u64) == Some(4))
+            .expect("config response");
+        response
+            .as_object_mut()
+            .expect("object")
+            .insert("id".into(), json!(99));
+        let (result, _) = run_requested(wrong_id, "grok-4.7", "xhigh", None);
+        let error = result.expect_err("wrong request id");
+        assert!(error.to_string().contains("did not match"), "{error}");
+
+        let mut messages =
+            current_format_messages(Vec::new(), fixture_config_options(), Vec::new(), "ping");
+        let response = messages
+            .iter_mut()
+            .find(|message| message.get("id").and_then(Value::as_u64) == Some(4))
+            .expect("config response");
+        response
+            .pointer_mut("/result")
+            .expect("result")
+            .as_object_mut()
+            .expect("result object")
+            .insert("sessionId".into(), Value::from("sess-other"));
+        let (result, _) = run_requested(messages, "grok-4.7", "xhigh", None);
+        let error = result.expect_err("wrong session");
+        assert!(error.to_string().contains("different session"), "{error}");
     }
 }

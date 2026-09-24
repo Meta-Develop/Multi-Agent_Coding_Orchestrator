@@ -1,0 +1,64 @@
+{
+  "scope": "Sanitized parser-compatibility replay of native Windows Grok CLI 1.0.40 ACP identity shapes captured on 2026-09-24, including the flat session/set_config_option value string. Not backend attestation and not managed Linux MACO execution proof.",
+  "cli_version": "1.0.40",
+  "set_model_ack_model": {
+    "Ok": "grok-4.7"
+  },
+  "set_config_option_request_value": "xhigh",
+  "config_options": [
+    {
+      "id": "model",
+      "name": "Model",
+      "category": "model",
+      "type": "select",
+      "currentValue": "grok-4.7",
+      "options": [
+        {
+          "value": "grok-4.7",
+          "name": "Grok 4.7"
+        },
+        {
+          "value": "grok-4.7-build-fast",
+          "name": "Grok 4.7 Fast"
+        },
+        {
+          "value": "grok-4.6",
+          "name": "Grok 4.6"
+        },
+        {
+          "value": "grok-4.5",
+          "name": "Grok 4.5"
+        }
+      ]
+    },
+    {
+      "id": "reasoning_effort",
+      "name": "Reasoning Effort",
+      "category": "thought_level",
+      "type": "select",
+      "currentValue": "xhigh",
+      "options": [
+        {
+          "value": "xhigh",
+          "name": "Extra High",
+          "description": "Maximum reasoning for the hardest tasks."
+        },
+        {
+          "value": "high",
+          "name": "High",
+          "description": "Thorough reasoning and quality. Recommended."
+        },
+        {
+          "value": "medium",
+          "name": "Medium",
+          "description": "Strong quality with a faster turnaround."
+        },
+        {
+          "value": "low",
+          "name": "Low",
+          "description": "Fastest responses. Best for simple tasks."
+        }
+      ]
+    }
+  ]
+}
