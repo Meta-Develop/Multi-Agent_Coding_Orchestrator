@@ -11067,48 +11067,22 @@ fn serve_cam_registry_on_socket(
 
 #[cfg(target_os = "linux")]
 struct CamSocketEnvGuard {
-    previous: Option<std::ffi::OsString>,
-    _lock: std::sync::MutexGuard<'static, ()>,
+    _inner: crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard,
 }
 
 #[cfg(target_os = "linux")]
 impl CamSocketEnvGuard {
     fn set(path: &std::path::Path) -> Self {
-        use crate::account_authority::authority_socket_config::CAM_AUTHORITY_SOCKET_ENV;
-        let lock = crate::account_authority::CAM_AUTHORITY_SOCKET_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous = std::env::var_os(CAM_AUTHORITY_SOCKET_ENV);
-        std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, path);
+        use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
         Self {
-            previous,
-            _lock: lock,
+            _inner: CamAuthoritySocketTestGuard::install(Some(path.as_os_str())),
         }
     }
 
     fn unset() -> Self {
-        // Parallel tests share process-global MACO_CAM_AUTHORITY_SOCKET.
-        // No-socket acquire paths must hold this lock or they observe a sibling's socket.
-        use crate::account_authority::authority_socket_config::CAM_AUTHORITY_SOCKET_ENV;
-        let lock = crate::account_authority::CAM_AUTHORITY_SOCKET_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous = std::env::var_os(CAM_AUTHORITY_SOCKET_ENV);
-        std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV);
+        use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
         Self {
-            previous,
-            _lock: lock,
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for CamSocketEnvGuard {
-    fn drop(&mut self) {
-        use crate::account_authority::authority_socket_config::CAM_AUTHORITY_SOCKET_ENV;
-        match self.previous.take() {
-            Some(value) => std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, value),
-            None => std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV),
+            _inner: CamAuthoritySocketTestGuard::install(None),
         }
     }
 }

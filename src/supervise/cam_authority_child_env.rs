@@ -8,7 +8,7 @@ pub(crate) const CAM_AUTHORITY_SOCKET_ENV: &str = "MACO_CAM_AUTHORITY_SOCKET";
 
 /// Returns the supervise process pinned socket path when present and non-empty.
 pub(crate) fn parent_cam_authority_socket_value() -> Option<String> {
-    let raw = std::env::var_os(CAM_AUTHORITY_SOCKET_ENV)?;
+    let raw = crate::account_authority::authority_socket_config::cam_authority_socket_value()?;
     let value = raw.to_string_lossy();
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -39,35 +39,17 @@ pub(crate) fn apply_parent_socket_pin_to_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard};
-
-    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvGuard {
-        _lock: MutexGuard<'static, ()>,
-        previous: Option<std::ffi::OsString>,
+        _inner: crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard,
     }
 
     impl EnvGuard {
         fn set(value: Option<&str>) -> Self {
-            let lock = ENV_TEST_LOCK.lock().expect("env test lock");
-            let previous = std::env::var_os(CAM_AUTHORITY_SOCKET_ENV);
-            match value {
-                Some(text) => std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, text),
-                None => std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV),
-            }
             Self {
-                _lock: lock,
-                previous,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(value) => std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, value),
-                None => std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV),
+                _inner: crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard::install(
+                    value.map(std::ffi::OsStr::new),
+                ),
             }
         }
     }
