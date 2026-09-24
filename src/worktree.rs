@@ -2950,7 +2950,7 @@ impl WorktreeManager {
             &prepared_operation,
             &prepared_incarnation,
         );
-        match (create_result, identity) {
+        let ctx = match (create_result, identity) {
             (Ok((staged_metadata, staged_identity)), Ok(true)) => {
                 let staged_publication = (|| -> Result<()> {
                     let operation = registry.operations.get_mut(&name).context(
@@ -2961,8 +2961,8 @@ impl WorktreeManager {
                     operation.staged_metadata = Some(staged_metadata);
                     registry_store.save(&registry_lock, &mut registry)
                 })();
-                drop(create_lease);
                 if let Err(publication_error) = staged_publication {
+                    drop(create_lease);
                     registry = registry_store.load(&registry_lock)?;
                     return recover_failed_create(
                         &repo,
@@ -2973,13 +2973,17 @@ impl WorktreeManager {
                         publication_error,
                     );
                 }
-                recover_pending_operations_with_creation_cleanliness(
+                // Generic recovery skips a create while this incarnation lease is held.
+                recover_owned_create_operation(
                     &repo,
                     &registry_store,
-                    &registry_lock,
-                    &mut registry,
+                    LockedCreateRegistry {
+                        lock: registry_lock,
+                        registry,
+                    },
+                    &create_lease,
                     cleanliness,
-                )?;
+                )?
             }
             (Ok(_), Ok(false)) => {
                 drop(create_lease);
@@ -3014,7 +3018,12 @@ impl WorktreeManager {
                     "prepared create identity also could not be revalidated: {identity_error:#}"
                 )));
             }
-        }
+        };
+        drop(create_lease);
+        let LockedCreateRegistry {
+            lock: registry_lock,
+            registry,
+        } = ctx;
         let binding = registry.records.get(&name).with_context(|| {
             format!("managed worktree '{name}' was not finalized after create recovery")
         })?;
@@ -3053,6 +3062,18 @@ impl WorktreeManager {
         let registry_store = ManagedWorktreeRegistryStore::open(&repo)?;
         let registry_lock = registry_store.lock()?;
         let mut registry = registry_store.load(&registry_lock)?;
+        if registry
+            .records
+            .get(&name)
+            .is_some_and(|binding| binding.creation_lock_pending)
+        {
+            match registry_store.admit_create_recovery(&registry_lock, &name)? {
+                CreateRecoveryAdmission::Busy => bail!(
+                    "managed worktree '{name}' has an active create lease while its creation lock is pending; refusing removal"
+                ),
+                CreateRecoveryAdmission::Admitted(lease) => drop(lease),
+            }
+        }
         match registry
             .operations
             .get(&name)
@@ -3250,6 +3271,12 @@ impl WorktreeManager {
         for binding in registry.records.values() {
             if registry.operations.contains_key(&binding.name) {
                 continue;
+            }
+            if binding.creation_lock_pending {
+                match registry_store.admit_create_recovery(&registry_lock, &binding.name)? {
+                    CreateRecoveryAdmission::Busy => continue,
+                    CreateRecoveryAdmission::Admitted(lease) => drop(lease),
+                }
             }
             records.push(verified_worktree_record(
                 &repo,

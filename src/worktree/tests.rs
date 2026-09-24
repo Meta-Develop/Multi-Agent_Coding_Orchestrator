@@ -5278,5 +5278,698 @@ fn no_cleanliness_recovery_skips_busy_create_and_refuses_after_release() {
     );
 }
 
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::{Arc, Mutex};
+
+#[cfg(target_os = "linux")]
+const GAP_OWNER: &str = "gap-owner";
+#[cfg(target_os = "linux")]
+const GAP_PEER: &str = "gap-peer";
+#[cfg(target_os = "linux")]
+const GAP_BYSTANDER: &str = "gap-bystander";
+#[cfg(target_os = "linux")]
+const GAP_PEER_BRANCH: &str = "maco/gap-peer";
+#[cfg(target_os = "linux")]
+const GAP_BYSTANDER_BRANCH: &str = "maco/gap-bystander";
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+enum OwnedCleanlinessGap {
+    Staged,
+    Observed,
+    Pending,
+}
+
+#[cfg(target_os = "linux")]
+fn gap_hook_phase(kind: OwnedCleanlinessGap) -> CreateCleanlinessGapPhase {
+    match kind {
+        OwnedCleanlinessGap::Staged => {
+            CreateCleanlinessGapPhase::Operation(ManagedWorktreeOperationPhase::CreateStaged)
+        }
+        OwnedCleanlinessGap::Observed => {
+            CreateCleanlinessGapPhase::Operation(ManagedWorktreeOperationPhase::CreateObserved)
+        }
+        OwnedCleanlinessGap::Pending => CreateCleanlinessGapPhase::PendingCreationLock,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn fresh_public_create_repo(temp: &TempDir) -> (PathBuf, PathBuf) {
+    let repo_path = temp.path().join("repo");
+    let worktree_root = temp.path().join("worktrees");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    commit_readme(&crate::git_repository::open(&repo_path).expect("open repo")).expect("commit");
+    (repo_path, worktree_root)
+}
+
+#[cfg(target_os = "linux")]
+fn public_create_record(
+    repo_path: &Path,
+    agent_id: &str,
+    branch: Option<&str>,
+    worktree_root: &Path,
+) -> anyhow::Result<WorktreeRecord> {
+    WorktreeManager::new(repo_path).create(WorktreeCreateOptions {
+        agent_id: agent_id.to_string(),
+        branch: branch.map(str::to_string),
+        base: None,
+        worktree_root: Some(worktree_root.to_path_buf()),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn assert_busy_owner(
+    store: &ManagedWorktreeRegistryStore,
+    lock: &ManagedWorktreeRegistryLock,
+) -> ManagedIncarnation {
+    let incarnation = store
+        .active_incarnation(lock, GAP_OWNER)
+        .expect("active owner incarnation");
+    assert!(incarnation.active);
+    assert!(
+        matches!(
+            store
+                .admit_create_recovery(lock, GAP_OWNER)
+                .expect("admit owner create"),
+            CreateRecoveryAdmission::Busy
+        ),
+        "owner incarnation lease must stay busy during cleanliness"
+    );
+    incarnation
+}
+
+#[cfg(target_os = "linux")]
+fn assert_gap_durable(registry: &ManagedWorktreeRegistry, kind: OwnedCleanlinessGap) {
+    match kind {
+        OwnedCleanlinessGap::Staged => {
+            assert_eq!(
+                registry
+                    .operations
+                    .get(GAP_OWNER)
+                    .map(|operation| operation.phase),
+                Some(ManagedWorktreeOperationPhase::CreateStaged)
+            );
+        }
+        OwnedCleanlinessGap::Observed => {
+            let operation = registry
+                .operations
+                .get(GAP_OWNER)
+                .expect("observed create operation");
+            assert_eq!(
+                operation.phase,
+                ManagedWorktreeOperationPhase::CreateObserved
+            );
+            assert!(operation
+                .binding
+                .as_ref()
+                .is_some_and(|binding| binding.creation_lock_pending));
+        }
+        OwnedCleanlinessGap::Pending => {
+            assert!(!registry.operations.contains_key(GAP_OWNER));
+            assert!(registry
+                .records
+                .get(GAP_OWNER)
+                .is_some_and(|binding| binding.creation_lock_pending));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn intent_bystander(
+    root: &Path,
+    root_identity: FileIdentity,
+    base_oid: &str,
+) -> ManagedWorktreeOperation {
+    ManagedWorktreeOperation {
+        kind: ManagedWorktreeOperationKind::Create,
+        phase: ManagedWorktreeOperationPhase::CreateIntent,
+        name: GAP_BYSTANDER.to_string(),
+        root: root.to_path_buf(),
+        root_identity,
+        path: root.join(GAP_BYSTANDER),
+        prepared_path_identity: None,
+        staging_root: None,
+        staging_root_identity: None,
+        staging_path: None,
+        staged_path_identity: None,
+        staged_metadata: None,
+        branch: GAP_BYSTANDER_BRANCH.to_string(),
+        base_oid: base_oid.to_string(),
+        branch_preexisting_oid: None,
+        branch_ownership: ManagedBranchOwnership::Unknown,
+        owned_branch_oid: None,
+        binding: None,
+        delete_branch: false,
+        force: false,
+        expected_branch_oid: None,
+        gc_dirtiness_checksum: None,
+        removal_safety: None,
+        worktree_quarantine_path: None,
+        worktree_quarantine_identity: None,
+        metadata_quarantine_path: None,
+        metadata_quarantine_identity: None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn creation_lock_is_held(repo: &git2::Repository, name: &str) -> bool {
+    matches!(
+        repo.find_worktree(name)
+            .expect("worktree")
+            .is_locked()
+            .expect("creation lock"),
+        git2::WorktreeLockStatus::Locked(_)
+    )
+}
+
+#[cfg(target_os = "linux")]
+struct PendingOwnerSnapshot {
+    binding: ManagedWorktreeBinding,
+    incarnation: ManagedIncarnation,
+    branch_oid: Option<Oid>,
+    path_identity: FileIdentity,
+}
+
+#[cfg(target_os = "linux")]
+fn assert_pending_snapshot(
+    repo: &git2::Repository,
+    store: &ManagedWorktreeRegistryStore,
+    lock: &ManagedWorktreeRegistryLock,
+    snapshot: &PendingOwnerSnapshot,
+) {
+    let registry = store.load(lock).expect("reload pending registry");
+    assert_eq!(registry.records.get(GAP_OWNER), Some(&snapshot.binding));
+    assert!(!registry.operations.contains_key(GAP_OWNER));
+    let incarnation = store
+        .active_incarnation(lock, GAP_OWNER)
+        .expect("pending incarnation");
+    assert!(incarnation.active);
+    assert_eq!(incarnation.generation, snapshot.incarnation.generation);
+    assert_eq!(incarnation.nonce, snapshot.incarnation.nonce);
+    assert_eq!(
+        local_branch_oid(repo, &snapshot.binding.branch).expect("branch oid"),
+        snapshot.branch_oid
+    );
+    assert_eq!(
+        identity_for_path(&snapshot.binding.path).expect("path identity"),
+        snapshot.path_identity
+    );
+    assert!(creation_lock_is_held(repo, GAP_OWNER));
+}
+
+#[cfg(target_os = "linux")]
+struct StaleGapWitness {
+    nonce: String,
+    base_oid: String,
+    staged_operation: Option<ManagedWorktreeOperation>,
+    stamp: Option<i64>,
+    preserved_record: Option<ManagedWorktreeBinding>,
+    branch_oid: Option<Oid>,
+    path_identity: Option<FileIdentity>,
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn public_create_allows_peer_progress_at_each_owned_cleanliness_gap() {
+    skip_without_containment!();
+    for kind in [
+        OwnedCleanlinessGap::Staged,
+        OwnedCleanlinessGap::Observed,
+        OwnedCleanlinessGap::Pending,
+    ] {
+        let temp = TempDir::new().expect("tempdir");
+        let (repo_path, worktree_root) = fresh_public_create_repo(&temp);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(
+            None::<(
+                ManagedIncarnation,
+                ManagedWorktreeBinding,
+                ManagedIncarnation,
+            )>,
+        ));
+        set_create_cleanliness_gap_hook(gap_hook_phase(kind), {
+            let repo_path = repo_path.clone();
+            let worktree_root = worktree_root.clone();
+            let calls = Arc::clone(&calls);
+            let seen = Arc::clone(&seen);
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let repo = crate::git_repository::open(&repo_path).expect("reopen repo");
+                let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
+                let owner_incarnation = {
+                    let lock = store
+                        .lock_with_timeout(Duration::from_millis(500))
+                        .expect("registry lock must be free during cleanliness");
+                    let registry = store.load(&lock).expect("registry during cleanliness");
+                    assert_gap_durable(&registry, kind);
+                    let incarnation = assert_busy_owner(&store, &lock);
+                    drop(lock);
+                    incarnation
+                };
+                let peer = public_create_record(
+                    &repo_path,
+                    GAP_PEER,
+                    Some(GAP_PEER_BRANCH),
+                    &worktree_root,
+                )
+                .unwrap_or_else(|error| panic!("{kind:?} peer create failed: {error:#}"));
+                let lock = store
+                    .lock_with_timeout(Duration::from_millis(500))
+                    .expect("registry lock after peer create");
+                let registry = store.load(&lock).expect("registry after peer");
+                assert_gap_durable(&registry, kind);
+                let owner_after = assert_busy_owner(&store, &lock);
+                assert_eq!(owner_after.nonce, owner_incarnation.nonce);
+                assert_eq!(owner_after.generation, owner_incarnation.generation);
+                let peer_binding = registry
+                    .records
+                    .get(GAP_PEER)
+                    .cloned()
+                    .expect("exact peer binding");
+                assert_eq!(peer_binding.path, peer.path);
+                assert_eq!(peer_binding.branch, GAP_PEER_BRANCH);
+                assert!(!peer_binding.creation_lock_pending);
+                let peer_incarnation = store
+                    .active_incarnation(&lock, GAP_PEER)
+                    .expect("peer incarnation");
+                assert!(peer_incarnation.active);
+                drop(lock);
+                *seen.lock().expect("witness") =
+                    Some((owner_incarnation, peer_binding, peer_incarnation));
+            }
+        });
+
+        let owner = public_create_record(&repo_path, GAP_OWNER, None, &worktree_root)
+            .unwrap_or_else(|error| panic!("{kind:?} owner create failed: {error:#}"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{kind:?} hook count");
+        let (owner_incarnation, peer_binding, peer_incarnation) = seen
+            .lock()
+            .expect("witness")
+            .take()
+            .expect("cleanliness hook fired once");
+        let repo = crate::git_repository::open(&repo_path).expect("reopen final repo");
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("final store");
+        let lock = store.lock().expect("final lock");
+        let registry = store.load(&lock).expect("final registry");
+        assert!(registry.operations.is_empty(), "{kind:?} operations remain");
+        let owner_binding = registry.records.get(GAP_OWNER).expect("owner record");
+        assert_eq!(owner_binding.path, owner.path);
+        assert_eq!(owner_binding.branch, "maco/gap-owner");
+        assert!(!owner_binding.creation_lock_pending);
+        assert_ne!(owner_binding.branch, peer_binding.branch);
+        assert_eq!(registry.records.get(GAP_PEER), Some(&peer_binding));
+        let owner_now = store
+            .active_incarnation(&lock, GAP_OWNER)
+            .expect("final owner incarnation");
+        assert!(owner_now.active);
+        assert_eq!(owner_now.nonce, owner_incarnation.nonce);
+        assert_eq!(owner_now.generation, owner_incarnation.generation);
+        let peer_now = store
+            .active_incarnation(&lock, GAP_PEER)
+            .expect("final peer incarnation");
+        assert!(peer_now.active);
+        assert_eq!(peer_now.nonce, peer_incarnation.nonce);
+        assert_eq!(peer_now.generation, peer_incarnation.generation);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pending_owned_create_blocks_remove_and_skips_busy_recovery() {
+    skip_without_containment!();
+    let temp = TempDir::new().expect("tempdir");
+    let (repo_path, worktree_root) = fresh_public_create_repo(&temp);
+    let peer = public_create_record(&repo_path, GAP_PEER, Some(GAP_PEER_BRANCH), &worktree_root)
+        .expect("public peer before the pending cleanliness gap");
+    assert_eq!(peer.name, GAP_PEER);
+    assert_eq!(peer.branch, GAP_PEER_BRANCH);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let nonce = Arc::new(Mutex::new(None::<String>));
+    set_create_cleanliness_gap_hook(CreateCleanlinessGapPhase::PendingCreationLock, {
+        let repo_path = repo_path.clone();
+        let peer = peer.clone();
+        let calls = Arc::clone(&calls);
+        let nonce = Arc::clone(&nonce);
+        move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let repo = crate::git_repository::open(&repo_path).expect("reopen repo");
+            let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
+            let snapshot = {
+                let lock = store
+                    .lock_with_timeout(Duration::from_millis(500))
+                    .expect("registry lock must be free during pending cleanliness");
+                let registry = store.load(&lock).expect("pending registry");
+                assert_gap_durable(&registry, OwnedCleanlinessGap::Pending);
+                let incarnation = assert_busy_owner(&store, &lock);
+                let binding = registry
+                    .records
+                    .get(GAP_OWNER)
+                    .cloned()
+                    .expect("pending binding");
+                let branch_oid = local_branch_oid(&repo, &binding.branch).expect("branch oid");
+                let path_identity = identity_for_path(&binding.path).expect("path identity");
+                assert!(creation_lock_is_held(&repo, GAP_OWNER));
+                drop(lock);
+                PendingOwnerSnapshot {
+                    binding,
+                    incarnation,
+                    branch_oid,
+                    path_identity,
+                }
+            };
+
+            let listed = WorktreeManager::new(&repo_path)
+                .list()
+                .unwrap_or_else(|error| panic!("busy pending list must skip, not fail: {error:#}"));
+            assert!(
+                listed.iter().any(|record| {
+                    record.name == peer.name
+                        && record.path == peer.path
+                        && record.branch == peer.branch
+                }),
+                "busy pending list omitted the finished peer"
+            );
+            assert!(
+                listed.iter().all(|record| record.name != GAP_OWNER),
+                "busy pending owner was listed"
+            );
+            for delete_branch in [false, true] {
+                let error = WorktreeManager::new(&repo_path)
+                    .remove(GAP_OWNER, true, delete_branch)
+                    .expect_err("live create must refuse removal");
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains(GAP_OWNER),
+                    "delete_branch={delete_branch}: {message}"
+                );
+            }
+
+            let cleanliness = WorktreeManager::new(&repo_path)
+                .acquire_repository_cleanliness()
+                .expect("real cleanliness capability");
+            let lock = store
+                .lock_with_timeout(Duration::from_millis(500))
+                .expect("registry lock after refused removal");
+            assert_pending_snapshot(&repo, &store, &lock, &snapshot);
+            let mut registry = store.load(&lock).expect("registry for authorized recovery");
+            recover_pending_operations_with_creation_cleanliness(
+                &repo,
+                &store,
+                &lock,
+                &mut registry,
+                CreationCleanliness::Bound(&cleanliness),
+            )
+            .expect("authorized recovery skips busy pending create");
+            assert_pending_snapshot(&repo, &store, &lock, &snapshot);
+            registry = store
+                .load(&lock)
+                .expect("registry for no-authority recovery");
+            recover_pending_operations_without_creation_cleanliness(
+                &repo,
+                &store,
+                &lock,
+                &mut registry,
+                None,
+            )
+            .expect("no-authority recovery skips busy pending create");
+            assert_pending_snapshot(&repo, &store, &lock, &snapshot);
+            *nonce.lock().expect("nonce") = Some(snapshot.incarnation.nonce.clone());
+            drop(lock);
+        }
+    });
+
+    let owner = public_create_record(&repo_path, GAP_OWNER, None, &worktree_root)
+        .expect("owner finishes pending create");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let nonce = nonce.lock().expect("nonce").take().expect("hook fired");
+    let listed = WorktreeManager::new(&repo_path)
+        .list()
+        .expect("list after owner finishes");
+    assert!(listed.iter().any(|record| {
+        record.name == GAP_OWNER && record.path == owner.path && record.branch == owner.branch
+    }));
+    assert!(listed.iter().any(|record| {
+        record.name == peer.name && record.path == peer.path && record.branch == peer.branch
+    }));
+    let repo = crate::git_repository::open(&repo_path).expect("reopen finished repo");
+    let store = ManagedWorktreeRegistryStore::open(&repo).expect("finished store");
+    let lock = store.lock().expect("finished lock");
+    let registry = store.load(&lock).expect("finished registry");
+    assert!(registry.operations.is_empty());
+    assert!(
+        !registry
+            .records
+            .get(GAP_OWNER)
+            .expect("finished owner")
+            .creation_lock_pending
+    );
+    let incarnation = store
+        .active_incarnation(&lock, GAP_OWNER)
+        .expect("finished incarnation");
+    assert!(incarnation.active);
+    assert_eq!(incarnation.nonce, nonce);
+    assert!(!creation_lock_is_held(&repo, GAP_OWNER));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn public_create_refuses_stale_target_after_owned_cleanliness_gap() {
+    skip_without_containment!();
+    for kind in [
+        OwnedCleanlinessGap::Staged,
+        OwnedCleanlinessGap::Observed,
+        OwnedCleanlinessGap::Pending,
+    ] {
+        let temp = TempDir::new().expect("tempdir");
+        let (repo_path, worktree_root) = fresh_public_create_repo(&temp);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let witness = Arc::new(Mutex::new(None::<StaleGapWitness>));
+        set_create_cleanliness_gap_hook(gap_hook_phase(kind), {
+            let repo_path = repo_path.clone();
+            let calls = Arc::clone(&calls);
+            let witness = Arc::clone(&witness);
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let repo = crate::git_repository::open(&repo_path).expect("reopen repo");
+                let store = ManagedWorktreeRegistryStore::open(&repo).expect("registry store");
+                let lock = store
+                    .lock_with_timeout(Duration::from_millis(500))
+                    .expect("registry lock must be free during cleanliness");
+                let mut registry = store.load(&lock).expect("registry");
+                assert_gap_durable(&registry, kind);
+                let previous_nonce = assert_busy_owner(&store, &lock).nonce;
+                let proof = match kind {
+                    OwnedCleanlinessGap::Staged => {
+                        let holder = registry
+                            .operations
+                            .get(GAP_OWNER)
+                            .cloned()
+                            .expect("staged operation");
+                        let base_oid = holder.base_oid.clone();
+                        registry.operations.insert(
+                            GAP_BYSTANDER.to_string(),
+                            intent_bystander(
+                                &holder.root,
+                                holder.root_identity.clone(),
+                                &holder.base_oid,
+                            ),
+                        );
+                        registry.operations.remove(GAP_OWNER);
+                        store
+                            .save(&lock, &mut registry)
+                            .expect("retire staged incarnation");
+                        registry
+                            .operations
+                            .insert(GAP_OWNER.to_string(), holder.clone());
+                        store
+                            .save(&lock, &mut registry)
+                            .expect("reinsert staged operation");
+                        let nonce = store
+                            .active_incarnation(&lock, GAP_OWNER)
+                            .expect("replacement incarnation")
+                            .nonce;
+                        assert_ne!(nonce, previous_nonce);
+                        StaleGapWitness {
+                            nonce,
+                            base_oid,
+                            staged_operation: Some(holder),
+                            stamp: None,
+                            preserved_record: None,
+                            branch_oid: None,
+                            path_identity: None,
+                        }
+                    }
+                    OwnedCleanlinessGap::Observed => {
+                        let preserved_record = registry.records.get(GAP_OWNER).cloned();
+                        let mut operation = registry
+                            .operations
+                            .get(GAP_OWNER)
+                            .cloned()
+                            .expect("observed operation");
+                        let base_oid = operation.base_oid.clone();
+                        registry.operations.insert(
+                            GAP_BYSTANDER.to_string(),
+                            intent_bystander(
+                                &operation.root,
+                                operation.root_identity.clone(),
+                                &operation.base_oid,
+                            ),
+                        );
+                        let mut binding = operation.binding.clone().expect("observed binding");
+                        let stamp = binding
+                            .created_at_unix_nanos
+                            .expect("observed schema timestamp")
+                            .saturating_sub(1);
+                        assert_ne!(Some(stamp), binding.created_at_unix_nanos);
+                        binding.created_at_unix_nanos = Some(stamp);
+                        operation.binding = Some(binding);
+                        registry.operations.insert(GAP_OWNER.to_string(), operation);
+                        store
+                            .save(&lock, &mut registry)
+                            .expect("save observed binding timestamp");
+                        let nonce = store
+                            .active_incarnation(&lock, GAP_OWNER)
+                            .expect("observed incarnation")
+                            .nonce;
+                        assert_eq!(nonce, previous_nonce);
+                        StaleGapWitness {
+                            nonce,
+                            base_oid,
+                            staged_operation: None,
+                            stamp: Some(stamp),
+                            preserved_record,
+                            branch_oid: None,
+                            path_identity: None,
+                        }
+                    }
+                    OwnedCleanlinessGap::Pending => {
+                        let mut binding = registry
+                            .records
+                            .get(GAP_OWNER)
+                            .cloned()
+                            .expect("pending binding");
+                        let branch_oid =
+                            local_branch_oid(&repo, &binding.branch).expect("pending branch");
+                        let path_identity = identity_for_path(&binding.path).expect("pending path");
+                        let base_oid = binding.base_oid.clone();
+                        registry.operations.insert(
+                            GAP_BYSTANDER.to_string(),
+                            intent_bystander(
+                                &binding.root,
+                                binding.root_identity.clone(),
+                                &binding.base_oid,
+                            ),
+                        );
+                        let stamp = binding
+                            .created_at_unix_nanos
+                            .expect("pending schema timestamp")
+                            .saturating_sub(1);
+                        assert_ne!(Some(stamp), binding.created_at_unix_nanos);
+                        binding.created_at_unix_nanos = Some(stamp);
+                        registry.records.insert(GAP_OWNER.to_string(), binding);
+                        store
+                            .save(&lock, &mut registry)
+                            .expect("save pending binding timestamp");
+                        let nonce = store
+                            .active_incarnation(&lock, GAP_OWNER)
+                            .expect("pending incarnation")
+                            .nonce;
+                        assert_eq!(nonce, previous_nonce);
+                        assert!(creation_lock_is_held(&repo, GAP_OWNER));
+                        StaleGapWitness {
+                            nonce,
+                            base_oid,
+                            staged_operation: None,
+                            stamp: Some(stamp),
+                            preserved_record: None,
+                            branch_oid,
+                            path_identity: Some(path_identity),
+                        }
+                    }
+                };
+                drop(lock);
+                *witness.lock().expect("witness") = Some(proof);
+            }
+        });
+
+        let error = public_create_record(&repo_path, GAP_OWNER, None, &worktree_root)
+            .expect_err("stale cleanliness target must fail revalidation");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{kind:?} hook count");
+        let message = format!("{error:#}");
+        assert!(message.contains(GAP_OWNER), "{kind:?}: {message}");
+        let proof = witness
+            .lock()
+            .expect("witness")
+            .take()
+            .expect("stale hook fired");
+        let repo = crate::git_repository::open(&repo_path).expect("reopen stale repo");
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("stale store");
+        let lock = store.lock().expect("stale lock");
+        let registry = store.load(&lock).expect("stale registry");
+        assert_eq!(
+            registry
+                .operations
+                .get(GAP_BYSTANDER)
+                .map(|operation| operation.base_oid.as_str()),
+            Some(proof.base_oid.as_str())
+        );
+        let incarnation = store
+            .active_incarnation(&lock, GAP_OWNER)
+            .expect("incarnation after refusal");
+        assert!(incarnation.active);
+        assert_eq!(incarnation.nonce, proof.nonce);
+        match kind {
+            OwnedCleanlinessGap::Staged => {
+                assert_eq!(
+                    registry.operations.get(GAP_OWNER),
+                    proof.staged_operation.as_ref()
+                );
+                assert!(!registry.records.contains_key(GAP_OWNER));
+            }
+            OwnedCleanlinessGap::Observed => {
+                let operation = registry
+                    .operations
+                    .get(GAP_OWNER)
+                    .expect("stale observed operation");
+                assert_eq!(
+                    operation.phase,
+                    ManagedWorktreeOperationPhase::CreateObserved
+                );
+                assert_eq!(
+                    operation
+                        .binding
+                        .as_ref()
+                        .and_then(|binding| binding.created_at_unix_nanos),
+                    proof.stamp
+                );
+                assert_eq!(
+                    registry.records.get(GAP_OWNER),
+                    proof.preserved_record.as_ref()
+                );
+            }
+            OwnedCleanlinessGap::Pending => {
+                let binding = registry
+                    .records
+                    .get(GAP_OWNER)
+                    .expect("stale pending record");
+                assert_eq!(binding.created_at_unix_nanos, proof.stamp);
+                assert!(binding.creation_lock_pending);
+                assert!(!registry.operations.contains_key(GAP_OWNER));
+                assert_eq!(
+                    local_branch_oid(&repo, &binding.branch).expect("branch after refusal"),
+                    proof.branch_oid
+                );
+                assert_eq!(
+                    identity_for_path(&binding.path).expect("path after refusal"),
+                    proof.path_identity.expect("path identity")
+                );
+                assert!(creation_lock_is_held(&repo, GAP_OWNER));
+            }
+        }
+    }
+}
+
 include!("tests_part2.rs");
 include!("tests_part3.rs");
