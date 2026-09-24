@@ -60,5 +60,28 @@
         }
       ]
     }
-  ]
+  ],
+  "schema_probe": {
+    "scope": "Sanitized native Windows Grok CLI 1.0.40 terminal schema fields captured 2026-09-24; not Linux managed execution or backend attestation.",
+    "request_key": "outputSchema",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        }
+      },
+      "required": ["accepted"],
+      "additionalProperties": false
+    },
+    "prompt_result": {
+      "stopReason": "end_turn",
+      "_meta": {
+        "structuredOutput": {
+          "accepted": true
+        },
+        "modelId": "grok-4.7"
+      }
+    }
+  }
 }

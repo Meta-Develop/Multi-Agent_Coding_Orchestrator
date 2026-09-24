@@ -1312,7 +1312,7 @@ fn session_prompt_params(
     if let Some(schema) = schema {
         params.as_object_mut().expect("params object").insert(
             "_meta".into(),
-            json!({ "jsonSchema": schema.canonical_value().clone() }),
+            json!({ "outputSchema": schema.canonical_value().clone() }),
         );
     }
     params
@@ -2883,7 +2883,7 @@ mod tests {
 
     fn publication_schema() -> GrokAcpBoundOutputSchema {
         GrokAcpBoundOutputSchema::from_canonical_json(
-            r#"{"properties":{"accepted":{"type":"boolean"}},"required":["accepted"],"type":"object"}"#,
+            r#"{"additionalProperties":false,"properties":{"accepted":{"type":"boolean"}},"required":["accepted"],"type":"object"}"#,
         )
         .expect("publication schema")
     }
@@ -4537,16 +4537,21 @@ mod tests {
             Some(&Value::from(METHOD_SESSION_PROMPT))
         );
         assert_eq!(
-            prompt.pointer("/params/_meta/jsonSchema/required/0"),
+            prompt.pointer("/params/_meta/outputSchema/required/0"),
             Some(&Value::from("accepted"))
         );
         assert_eq!(
-            prompt.pointer("/params/_meta/jsonSchema/properties/accepted/type"),
+            prompt.pointer("/params/_meta/outputSchema/properties/accepted/type"),
             Some(&Value::from("boolean"))
         );
+        assert!(prompt.pointer("/params/_meta/jsonSchema").is_none());
         let rebound = GrokAcpBoundOutputSchema::from_canonical_json(
-            &serde_json::to_string(prompt.pointer("/params/_meta/jsonSchema").expect("schema"))
-                .expect("render"),
+            &serde_json::to_string(
+                prompt
+                    .pointer("/params/_meta/outputSchema")
+                    .expect("schema"),
+            )
+            .expect("render"),
         )
         .expect("rebind");
         assert_eq!(rebound.sha256(), digest);
@@ -4916,9 +4921,60 @@ mod tests {
             Some(&Value::from(METHOD_SESSION_PROMPT))
         );
         assert_eq!(
-            prompt.pointer("/params/_meta/jsonSchema/required/0"),
+            prompt.pointer("/params/_meta/outputSchema/required/0"),
             Some(&Value::from("accepted"))
         );
+    }
+
+    #[test]
+    fn current_cli_corrected_output_schema_returns_structured_output() {
+        let fixture = captured_identity_fixture();
+        let probe = fixture.get("schema_probe").expect("schema_probe");
+        assert_eq!(
+            probe.get("request_key").and_then(Value::as_str),
+            Some("outputSchema")
+        );
+        let prompt_result = probe.get("prompt_result").expect("prompt_result").clone();
+        // JSON-RPC ids and the session id in this transcript are test-harness
+        // bindings, not captured native wire values.
+        let mut messages = current_format_messages(
+            Vec::new(),
+            fixture_config_options(),
+            Vec::new(),
+            "untrusted prose",
+        );
+        messages
+            .last_mut()
+            .expect("terminal prompt result")
+            .as_object_mut()
+            .expect("terminal object")
+            .insert("result".into(), prompt_result);
+        let (result, transport) =
+            run_requested(messages, "grok-4.7", "xhigh", Some(publication_schema()));
+        let evidence = result.expect("captured outputSchema acceptance");
+        assert_eq!(
+            grok_acp_execution_identity_publication_status(&evidence),
+            GrokAcpIdentityPublicationStatus::Admitted
+        );
+        let parent =
+            crate::runtime_adapter::grok::grok_acp_parent_evidence_from_execution(evidence);
+        assert_eq!(parent.structured_output, Some(json!({"accepted": true})));
+        assert!(parent.structured_output_error.is_none());
+        let prompt = parse_outbound(&transport, 4);
+        assert_eq!(
+            prompt.get("method"),
+            Some(&Value::from(METHOD_SESSION_PROMPT))
+        );
+        let expected = GrokAcpBoundOutputSchema::from_canonical_json(
+            &serde_json::to_string(probe.get("schema").expect("captured schema"))
+                .expect("render captured schema"),
+        )
+        .expect("canonical captured schema");
+        assert_eq!(
+            prompt.pointer("/params/_meta/outputSchema"),
+            Some(expected.canonical_value())
+        );
+        assert!(prompt.pointer("/params/_meta/jsonSchema").is_none());
     }
 
     #[test]
