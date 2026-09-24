@@ -2787,7 +2787,49 @@
     #[cfg(unix)]
     #[test]
     fn registry_lock_rebind_after_precheck_preserves_newer_record_and_live_temp() {
-        use std::os::unix::fs::PermissionsExt;
+        const CHILD_ENV: &str = "MACO_TEST_REGISTRY_LOCK_REBIND_CHILD";
+        const REPO_ENV: &str = "MACO_TEST_REGISTRY_LOCK_REBIND_REPO";
+
+        // The child models an out-of-band writer with independent admission state.
+        if std::env::var_os(CHILD_ENV).is_some() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let repo_path = PathBuf::from(std::env::var(REPO_ENV).expect("child repo path"));
+            let repo = crate::git_repository::open(&repo_path).expect("child repo");
+            let store = ManagedWorktreeRegistryStore::open(&repo).expect("child store");
+            let lock_path = store.state_root.path().join("managed_worktrees.lock");
+            let moved_lock = store
+                .state_root
+                .path()
+                .join("managed_worktrees.lock.stale-original");
+            fs::rename(&lock_path, &moved_lock).expect("move held registry lock");
+            fs::write(&lock_path, b"").expect("create replacement registry lock");
+            fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+                .expect("private replacement lock");
+            let lock = store.lock().expect("replacement lock");
+            let mut newer_registry = store.load(&lock).expect("replacement registry");
+            let mut newer_binding = newer_registry
+                .records
+                .get("agent-a")
+                .cloned()
+                .expect("initial binding");
+            newer_binding.name = "agent-b".to_string();
+            newer_binding.branch = "maco/agent-b".to_string();
+            newer_registry
+                .records
+                .insert("agent-b".to_string(), newer_binding);
+            store
+                .save(&lock, &mut newer_registry)
+                .expect("commit newer replacement-domain record");
+            let live_temp = store
+                .state_root
+                .path()
+                .join(".managed_worktrees.json.live-writer.tmp");
+            fs::write(&live_temp, b"live writer staging").expect("create live temp");
+            fs::set_permissions(&live_temp, fs::Permissions::from_mode(0o600))
+                .expect("private live temp");
+            return;
+        }
 
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
@@ -2808,15 +2850,6 @@
         let store = ManagedWorktreeRegistryStore::open(&repo).expect("store");
         let stale_lock = store.lock().expect("stale lock");
         let mut stale_registry = store.load(&stale_lock).expect("stale registry");
-        let mut newer_binding = stale_registry
-            .records
-            .get("agent-a")
-            .cloned()
-            .expect("initial binding");
-        newer_binding.name = "agent-b".to_string();
-        newer_binding.branch = "maco/agent-b".to_string();
-        let lock_path = stale_lock.lock.path().to_path_buf();
-        let moved_lock = lock_path.with_file_name("managed_worktrees.lock.stale-original");
         let live_temp = store
             .state_root
             .path()
@@ -2825,27 +2858,48 @@
             let live_temp = live_temp.clone();
             let repo_path = repo_path.clone();
             move || {
-                fs::rename(&lock_path, &moved_lock).expect("move held registry lock");
-                fs::write(&lock_path, b"").expect("create replacement registry lock");
-                fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
-                    .expect("private replacement lock");
-                let replacement_repo =
-                    crate::git_repository::open(&repo_path).expect("replacement repo");
-                let replacement_store = ManagedWorktreeRegistryStore::open(&replacement_repo)
-                    .expect("replacement store");
-                let replacement_lock = replacement_store.lock().expect("replacement lock");
-                let mut newer_registry = replacement_store
-                    .load(&replacement_lock)
-                    .expect("replacement registry");
-                newer_registry
-                    .records
-                    .insert("agent-b".to_string(), newer_binding);
-                replacement_store
-                    .save(&replacement_lock, &mut newer_registry)
-                    .expect("commit newer replacement-domain record");
-                fs::write(&live_temp, b"live writer staging").expect("create live temp");
-                fs::set_permissions(&live_temp, fs::Permissions::from_mode(0o600))
-                    .expect("private live temp");
+                let environment = std::collections::BTreeMap::from([
+                    (CHILD_ENV.to_string(), "1".to_string()),
+                    (
+                        REPO_ENV.to_string(),
+                        repo_path.to_str().expect("UTF-8 repo path").to_string(),
+                    ),
+                ]);
+                let output = run_process(
+                    ProcessSpec::direct(
+                        "out-of-band registry lock rebind writer",
+                        std::env::current_exe().expect("current test executable"),
+                        [
+                            "--exact",
+                            "worktree::tests::registry_lock_rebind_after_precheck_preserves_newer_record_and_live_temp",
+                            "--nocapture",
+                        ],
+                        std::env::current_dir().expect("current test directory"),
+                        64 * 1024,
+                    )
+                    .with_environment(EnvironmentMode::InheritAndSet(environment))
+                    .with_containment(ContainmentPolicy::TrustedBestEffort)
+                    .with_stdin(StdinMode::Null)
+                    .with_timeout(Some(Duration::from_secs(90))),
+                )
+                .expect("run out-of-band registry lock rebind writer");
+                assert!(
+                    output.status.is_some_and(|status| status.success())
+                        && !output.timed_out
+                        && output.process_error.is_none()
+                        && output.stdin_error.is_none(),
+                    "out-of-band writer failed: status={:?}, timed_out={}, process_error={:?}, stdin_error={:?}, stdout={}, stderr={}",
+                    output.status,
+                    output.timed_out,
+                    output.process_error,
+                    output.stdin_error,
+                    String::from_utf8_lossy(output.stdout.as_bytes()),
+                    String::from_utf8_lossy(output.stderr.as_bytes()),
+                );
+                assert_eq!(
+                    fs::read(&live_temp).expect("live writer receipt"),
+                    b"live writer staging".as_slice(),
+                );
             }
         });
 

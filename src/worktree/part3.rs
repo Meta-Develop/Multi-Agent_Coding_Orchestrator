@@ -321,6 +321,238 @@ fn verified_worktree_record(
     })
 }
 
+use std::collections::VecDeque;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
+
+/// Same-process FIFO admission ahead of `managed_worktrees.lock`.
+///
+/// Callers in this process take a permit before the kernel lock. Other
+/// processes stay ordered only by that kernel lock.
+struct ManagedRegistryAdmission {
+    state: Mutex<ManagedRegistryAdmissionState>,
+    cv: Condvar,
+}
+
+struct ManagedRegistryAdmissionState {
+    next_ticket: u64,
+    active: bool,
+    queue: VecDeque<u64>,
+}
+
+enum ManagedRegistryAdmissionKind {
+    Disarmed,
+    Queued(u64),
+    Active,
+}
+
+/// RAII admission hold. Drop cancels a queued ticket or releases the active
+/// permit. The queue mutex must already be unlocked.
+struct ManagedRegistryAdmissionPermit {
+    queue: Arc<ManagedRegistryAdmission>,
+    kind: ManagedRegistryAdmissionKind,
+}
+
+type ManagedRegistryAdmissionMap = BTreeMap<(u64, u64), Weak<ManagedRegistryAdmission>>;
+
+fn managed_registry_admission_queues() -> &'static Mutex<ManagedRegistryAdmissionMap> {
+    static QUEUES: OnceLock<Mutex<ManagedRegistryAdmissionMap>> = OnceLock::new();
+    QUEUES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn managed_registry_admission_queue(
+    root: &SafeRoot,
+) -> Result<std::sync::Arc<ManagedRegistryAdmission>> {
+    let identity = root.identity();
+    let key = (identity.device, identity.file);
+    let queues = managed_registry_admission_queues();
+    let mut map = match queues.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let guard = poisoned.into_inner();
+            queues.clear_poison();
+            guard
+        }
+    };
+    // Drop dead queues only. An alive queue for this root is never replaced.
+    map.retain(|_, weak| weak.strong_count() > 0);
+    if let Some(alive) = map.get(&key).and_then(Weak::upgrade) {
+        return Ok(alive);
+    }
+    let created = Arc::new(ManagedRegistryAdmission {
+        state: Mutex::new(ManagedRegistryAdmissionState {
+            next_ticket: 0,
+            active: false,
+            queue: VecDeque::new(),
+        }),
+        cv: Condvar::new(),
+    });
+    map.insert(key, Arc::downgrade(&created));
+    Ok(created)
+}
+
+fn managed_registry_admission_timed_out(path: &Path) -> anyhow::Error {
+    anyhow::Error::msg(format!(
+        "timed out waiting for managed worktree registry lock {}",
+        path.display()
+    ))
+}
+
+fn managed_registry_admission_poisoned() -> anyhow::Error {
+    anyhow::Error::msg("managed worktree registry admission queue is poisoned")
+}
+
+fn managed_registry_lock_remaining(deadline: Instant) -> Option<Duration> {
+    let now = Instant::now();
+    if now >= deadline {
+        None
+    } else {
+        Some(deadline.saturating_duration_since(now))
+    }
+}
+
+fn allocate_admission_ticket(state: &mut ManagedRegistryAdmissionState) -> Result<u64> {
+    let ticket = state.next_ticket;
+    state.next_ticket = ticket
+        .checked_add(1)
+        .context("managed worktree registry admission ticket overflowed")?;
+    Ok(ticket)
+}
+
+impl ManagedRegistryAdmission {
+    fn lock_queue(&self) -> Result<MutexGuard<'_, ManagedRegistryAdmissionState>> {
+        match self.state.lock() {
+            Ok(guard) => Ok(guard),
+            Err(poisoned) => {
+                drop(poisoned.into_inner());
+                self.state.clear_poison();
+                Err(managed_registry_admission_poisoned())
+            }
+        }
+    }
+
+    fn acquire(
+        self: &std::sync::Arc<Self>,
+        deadline: Instant,
+        path: &Path,
+    ) -> Result<ManagedRegistryAdmissionPermit> {
+        let mut permit = ManagedRegistryAdmissionPermit::disarmed(Arc::clone(self));
+        let ticket = {
+            let mut state = self.lock_queue()?;
+            if Instant::now() >= deadline {
+                drop(state);
+                return Err(managed_registry_admission_timed_out(path));
+            }
+            if !state.active && state.queue.is_empty() {
+                state.active = true;
+                permit.kind = ManagedRegistryAdmissionKind::Active;
+                drop(state);
+                return Ok(permit);
+            }
+            let ticket = allocate_admission_ticket(&mut state)?;
+            state.queue.push_back(ticket);
+            permit.kind = ManagedRegistryAdmissionKind::Queued(ticket);
+            drop(state);
+            ticket
+        };
+
+        loop {
+            let mut state = self.lock_queue()?;
+            // Expired waiters leave before a late grant. Spurious wakeups and
+            // `wait_timeout` both recheck this predicate.
+            if Instant::now() >= deadline {
+                drop(state);
+                return Err(managed_registry_admission_timed_out(path));
+            }
+            if !state.active && state.queue.front().copied() == Some(ticket) {
+                state.queue.pop_front();
+                state.active = true;
+                permit.kind = ManagedRegistryAdmissionKind::Active;
+                drop(state);
+                return Ok(permit);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.cv.wait_timeout(state, remaining) {
+                Ok((guard, _wakeup)) => drop(guard),
+                Err(poisoned) => {
+                    drop(poisoned.into_inner());
+                    return Err(managed_registry_admission_poisoned());
+                }
+            }
+        }
+    }
+
+    fn try_acquire(
+        self: &std::sync::Arc<Self>,
+    ) -> Result<Option<ManagedRegistryAdmissionPermit>> {
+        let mut permit = ManagedRegistryAdmissionPermit::disarmed(Arc::clone(self));
+        let mut state = self.lock_queue()?;
+        // A queued waiter stays ahead of a nonblocking caller.
+        if state.active || !state.queue.is_empty() {
+            drop(state);
+            return Ok(None);
+        }
+        state.active = true;
+        permit.kind = ManagedRegistryAdmissionKind::Active;
+        drop(state);
+        Ok(Some(permit))
+    }
+
+    #[cfg(test)]
+    fn queued_waiters(&self) -> Result<usize> {
+        let state = self.lock_queue()?;
+        Ok(state.queue.len())
+    }
+}
+
+impl ManagedRegistryAdmissionPermit {
+    fn disarmed(queue: Arc<ManagedRegistryAdmission>) -> Self {
+        Self {
+            queue,
+            kind: ManagedRegistryAdmissionKind::Disarmed,
+        }
+    }
+
+    fn release(&self, kind: ManagedRegistryAdmissionKind) {
+        // A disarmed permit has nothing to undo. Locking here would deadlock if
+        // Drop ran while this thread still held the queue mutex.
+        if matches!(kind, ManagedRegistryAdmissionKind::Disarmed) {
+            return;
+        }
+        let (mut state, poisoned) = match self.queue.state.lock() {
+            Ok(guard) => (guard, false),
+            Err(poisoned) => (poisoned.into_inner(), true),
+        };
+        match kind {
+            ManagedRegistryAdmissionKind::Disarmed => {}
+            ManagedRegistryAdmissionKind::Active => {
+                state.active = false;
+            }
+            ManagedRegistryAdmissionKind::Queued(ticket) => {
+                if let Some(index) = state.queue.iter().position(|queued| *queued == ticket) {
+                    state.queue.remove(index);
+                }
+            }
+        }
+        self.queue.cv.notify_all();
+        if poisoned {
+            self.queue.state.clear_poison();
+        }
+    }
+}
+
+impl Drop for ManagedRegistryAdmissionPermit {
+    fn drop(&mut self) {
+        let kind = std::mem::replace(&mut self.kind, ManagedRegistryAdmissionKind::Disarmed);
+        self.release(kind);
+    }
+}
+
+impl std::fmt::Debug for ManagedRegistryAdmissionPermit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ManagedRegistryAdmissionPermit { .. }")
+    }
+}
+
 impl ManagedWorktreeRegistryStore {
     fn open(repo: &Repository) -> Result<Self> {
         let repository = managed_repository_binding(repo)?;
@@ -362,21 +594,50 @@ impl ManagedWorktreeRegistryStore {
     }
 
     fn lock_with_timeout(&self, timeout: Duration) -> Result<ManagedWorktreeRegistryLock> {
+        let deadline = Instant::now().checked_add(timeout).context(
+            "managed worktree registry lock timeout overflowed",
+        )?;
+        self.state_root.verify()?;
+        let lock_path = self.state_root.direct_child("managed_worktrees.lock")?;
+        let admission = managed_registry_admission_queue(&self.state_root)?;
+        let permit = admission.acquire(deadline, &lock_path)?;
+        let Some(remaining) = managed_registry_lock_remaining(deadline) else {
+            bail!(
+                "timed out waiting for managed worktree registry lock {}",
+                lock_path.display()
+            );
+        };
         let lock = KernelStateLock::acquire_direct_with_timeout(
             &self.state_root,
             "managed_worktrees.lock",
-            timeout,
+            remaining,
         )?;
+        if managed_registry_lock_remaining(deadline).is_none() {
+            drop(lock);
+            bail!(
+                "timed out waiting for managed worktree registry lock {}",
+                lock_path.display()
+            );
+        }
+        let root_identity = self.state_root.identity().clone();
+        let lock_identity = lock.identity().clone();
         let bound = ManagedWorktreeRegistryLock {
-            root_identity: self.state_root.identity().clone(),
-            lock_identity: lock.identity().clone(),
             lock,
+            root_identity,
+            lock_identity,
+            _admission: permit,
         };
         self.verify_lock(&bound)?;
         Ok(bound)
     }
 
     fn lock_existing(&self) -> Result<ManagedWorktreeRegistryLock> {
+        self.state_root.verify()?;
+        let admission = managed_registry_admission_queue(&self.state_root)?;
+        let permit = match admission.try_acquire()? {
+            Some(permit) => permit,
+            None => bail!("managed worktree registry is active elsewhere"),
+        };
         let lock = match KernelStateLock::try_acquire_existing_exclusive_direct(
             &self.state_root,
             "managed_worktrees.lock",
@@ -389,10 +650,13 @@ impl ManagedWorktreeRegistryStore {
                 bail!("authenticated managed worktree state is missing its stable registry lock")
             }
         };
+        let root_identity = self.state_root.identity().clone();
+        let lock_identity = lock.identity().clone();
         let bound = ManagedWorktreeRegistryLock {
-            root_identity: self.state_root.identity().clone(),
-            lock_identity: lock.identity().clone(),
             lock,
+            root_identity,
+            lock_identity,
+            _admission: permit,
         };
         self.verify_lock(&bound)?;
         Ok(bound)
@@ -463,6 +727,68 @@ impl ManagedWorktreeRegistryStore {
             _lock: lock,
             _process_lease: process_lease,
         })
+    }
+
+    fn try_acquire_worktree_create_lease(
+        &self,
+        registry_lock: &ManagedWorktreeRegistryLock,
+        name: &str,
+    ) -> Result<ManagedWorktreeCreateLease> {
+        let incarnation = self.active_incarnation(registry_lock, name)?;
+        let lease_name = managed_worktree_lease_name(name, &incarnation)?;
+        let lock = KernelStateLock::try_acquire_exclusive_direct(&self.state_root, &lease_name)?;
+        let process_lease = ManagedProcessLease::acquire_exclusive(&lease_name, lock.path())?;
+        Ok(ManagedWorktreeCreateLease {
+            name: name.to_string(),
+            incarnation_generation: incarnation.generation,
+            incarnation_nonce: incarnation.nonce,
+            _lock: lock,
+            _process_lease: process_lease,
+        })
+    }
+
+    /// `Busy` means checkout still owns the create lease. `Admitted(None)` means
+    /// no lease file exists. `Admitted(Some)` holds a free lease file until
+    /// recovery of this operation finishes.
+    fn admit_create_recovery(
+        &self,
+        registry_lock: &ManagedWorktreeRegistryLock,
+        name: &str,
+    ) -> Result<CreateRecoveryAdmission> {
+        let incarnation = self.active_incarnation(registry_lock, name)?;
+        let lease_name = managed_worktree_lease_name(name, &incarnation)?;
+        if ManagedProcessLease::is_active(&lease_name) {
+            return Ok(CreateRecoveryAdmission::Busy);
+        }
+        match KernelStateLock::try_acquire_existing_exclusive_direct(&self.state_root, &lease_name)?
+        {
+            ExistingExclusiveLock::Busy => Ok(CreateRecoveryAdmission::Busy),
+            ExistingExclusiveLock::Missing => Ok(CreateRecoveryAdmission::Admitted(None)),
+            ExistingExclusiveLock::Acquired(kernel_lock) => {
+                let process_lease = match ManagedProcessLease::acquire_exclusive(
+                    &lease_name,
+                    kernel_lock.path(),
+                ) {
+                    Ok(process_lease) => process_lease,
+                    Err(error) => {
+                        drop(kernel_lock);
+                        if ManagedProcessLease::is_active(&lease_name) {
+                            return Ok(CreateRecoveryAdmission::Busy);
+                        }
+                        return Err(error);
+                    }
+                };
+                Ok(CreateRecoveryAdmission::Admitted(Some(
+                    ManagedWorktreeCreateLease {
+                        name: name.to_string(),
+                        incarnation_generation: incarnation.generation,
+                        incarnation_nonce: incarnation.nonce,
+                        _lock: kernel_lock,
+                        _process_lease: process_lease,
+                    },
+                )))
+            }
+        }
     }
 
     fn worktree_has_active_execution_lease(
@@ -866,6 +1192,583 @@ fn run_managed_registry_after_precheck_hook() {
 #[cfg(not(test))]
 fn run_managed_registry_after_precheck_hook() {}
 
+#[cfg(test)]
+thread_local! {
+    static CREATE_CHECKOUT_GAP_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn set_create_checkout_gap_hook(hook: impl FnOnce() + 'static) {
+    CREATE_CHECKOUT_GAP_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_create_checkout_gap_hook() {
+    let hook = CREATE_CHECKOUT_GAP_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_create_checkout_gap_hook() {}
+
+#[cfg(test)]
+struct CreateCheckoutGapHookGuard;
+
+#[cfg(test)]
+impl Drop for CreateCheckoutGapHookGuard {
+    fn drop(&mut self) {
+        CREATE_CHECKOUT_GAP_HOOK.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+
+/// Registry lock plus the snapshot loaded under it.
+#[must_use = "the registry lock must be held for the following authenticated save"]
+struct LockedCreateRegistry {
+    lock: ManagedWorktreeRegistryLock,
+    registry: ManagedWorktreeRegistry,
+}
+
+/// Durable create subject checked around an off-lock cleanliness scan.
+///
+/// Only this subject is compared. Unrelated registry entries are left in place.
+enum CreateCheckpoint {
+    Operation {
+        expected_operation: Box<ManagedWorktreeOperation>,
+        expected_record: Option<ManagedWorktreeBinding>,
+    },
+    /// `creation_lock_pending` record and no operation for that agent.
+    PendingLock {
+        expected_binding: ManagedWorktreeBinding,
+    },
+}
+
+enum CreateRegistryContext<'a> {
+    Borrowed {
+        lock: &'a ManagedWorktreeRegistryLock,
+        registry: &'a mut ManagedWorktreeRegistry,
+    },
+    Owned {
+        state: Option<Box<LockedCreateRegistry>>,
+        owner: &'a ManagedWorktreeCreateLease,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CreateCleanlinessGapPhase {
+    Operation(ManagedWorktreeOperationPhase),
+    PendingCreationLock,
+}
+
+#[cfg(test)]
+type CreateCleanlinessGapHook = (CreateCleanlinessGapPhase, Box<dyn FnOnce()>);
+
+#[cfg(test)]
+thread_local! {
+    static CREATE_CLEANLINESS_GAP_HOOK: std::cell::RefCell<Option<CreateCleanlinessGapHook>> =
+        const { std::cell::RefCell::new(None) };
+    static CREATE_CLEANLINESS_GAP_IN_HOOK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn set_create_cleanliness_gap_hook(
+    phase: CreateCleanlinessGapPhase,
+    hook: impl FnOnce() + 'static,
+) {
+    CREATE_CLEANLINESS_GAP_HOOK.with(|slot| *slot.borrow_mut() = Some((phase, Box::new(hook))));
+}
+
+#[cfg(test)]
+struct CreateCleanlinessGapHookGuard;
+
+#[cfg(test)]
+impl Drop for CreateCleanlinessGapHookGuard {
+    fn drop(&mut self) {
+        CREATE_CLEANLINESS_GAP_IN_HOOK.with(|flag| flag.set(false));
+    }
+}
+
+fn fire_create_cleanliness_gap_hook(phase: CreateCleanlinessGapPhase) {
+    #[cfg(test)]
+    {
+        if CREATE_CLEANLINESS_GAP_IN_HOOK.with(|flag| flag.get()) {
+            return;
+        }
+        let hook = CREATE_CLEANLINESS_GAP_HOOK.with(|slot| {
+            let matched = slot
+                .borrow()
+                .as_ref()
+                .is_some_and(|(hook_phase, _)| *hook_phase == phase);
+            if matched {
+                slot.borrow_mut().take().map(|(_, hook)| hook)
+            } else {
+                None
+            }
+        });
+        if let Some(hook) = hook {
+            CREATE_CLEANLINESS_GAP_IN_HOOK.with(|flag| flag.set(true));
+            let _guard = CreateCleanlinessGapHookGuard;
+            hook();
+        }
+    }
+    #[cfg(not(test))]
+    {
+        let _ = phase;
+    }
+}
+
+fn create_checkpoint_name(checkpoint: &CreateCheckpoint) -> &str {
+    match checkpoint {
+        CreateCheckpoint::Operation {
+            expected_operation, ..
+        } => expected_operation.name.as_str(),
+        CreateCheckpoint::PendingLock { expected_binding } => expected_binding.name.as_str(),
+    }
+}
+
+struct CreateLeaseIdentity {
+    name: String,
+    generation: u64,
+    nonce: String,
+}
+
+struct CreateCleanWitness {
+    path_identity: FileIdentity,
+    metadata: StagedWorktreeMetadata,
+}
+
+struct CreateCleanScan {
+    phase: CreateCleanlinessGapPhase,
+    checkpoint: CreateCheckpoint,
+    path: PathBuf,
+    branch: String,
+    oid: Oid,
+}
+
+impl<'a> CreateRegistryContext<'a> {
+    fn is_owned(&self) -> bool {
+        matches!(self, Self::Owned { .. })
+    }
+
+    fn lease_identity(&self) -> Option<CreateLeaseIdentity> {
+        match self {
+            Self::Owned { owner, .. } => Some(CreateLeaseIdentity {
+                name: owner.name.clone(),
+                generation: owner.incarnation_generation,
+                nonce: owner.incarnation_nonce.clone(),
+            }),
+            Self::Borrowed { .. } => None,
+        }
+    }
+
+    fn registry_mut(&mut self) -> Result<&mut ManagedWorktreeRegistry> {
+        match self {
+            Self::Borrowed { registry, .. } => Ok(*registry),
+            Self::Owned { state, .. } => Ok(&mut state
+                .as_mut()
+                .context("owned create registry lock is empty")?
+                .registry),
+        }
+    }
+
+    fn verify_registry(&self, store: &ManagedWorktreeRegistryStore) -> Result<()> {
+        match self {
+            Self::Borrowed { lock, registry } => store.verify_authenticated_registry(lock, registry),
+            Self::Owned { state, .. } => {
+                let state = state
+                    .as_ref()
+                    .context("owned create registry lock is empty")?;
+                store.verify_authenticated_registry(&state.lock, &state.registry)
+            }
+        }
+    }
+
+    fn save_registry(&mut self, store: &ManagedWorktreeRegistryStore) -> Result<()> {
+        match self {
+            Self::Borrowed { lock, registry } => store.save(lock, registry),
+            Self::Owned { state, .. } => {
+                let state = state
+                    .as_mut()
+                    .context("owned create registry lock is empty")?;
+                store.save(&state.lock, &mut state.registry)
+            }
+        }
+    }
+
+    fn with_locked_registry<T>(
+        &self,
+        body: impl FnOnce(&ManagedWorktreeRegistryLock, &ManagedWorktreeRegistry) -> Result<T>,
+    ) -> Result<T> {
+        match self {
+            Self::Borrowed { lock, registry } => body(lock, registry),
+            Self::Owned { state, .. } => {
+                let state = state
+                    .as_ref()
+                    .context("owned create registry lock is empty")?;
+                body(&state.lock, &state.registry)
+            }
+        }
+    }
+
+    fn scan_create_cleanliness<'repo>(
+        &mut self,
+        repo: &'repo Repository,
+        store: &ManagedWorktreeRegistryStore,
+        scan: CreateCleanScan,
+        cleanliness: CreationCleanliness<'_>,
+        branch_guard: Option<Transaction<'repo>>,
+    ) -> Result<Option<Transaction<'repo>>> {
+        require_scan_branch_target(&scan)?;
+        self.verify_registry(store)?;
+        let Some(lease) = self.lease_identity() else {
+            verify_worktree_clean_at(&scan.path, &scan.branch, scan.oid, cleanliness)?;
+            return Ok(branch_guard);
+        };
+        self.with_locked_registry(|lock, registry| {
+            authenticate_create_checkpoint(registry, &scan.checkpoint)?;
+            authenticate_create_lease(store, lock, &lease, create_checkpoint_name(&scan.checkpoint))
+        })?;
+        let witness = capture_create_clean_witness(
+            &store.repository,
+            create_checkpoint_name(&scan.checkpoint),
+            &scan.branch,
+            &scan.path,
+        )?;
+        require_scan_path_identity(&scan.checkpoint, &scan.path, &witness.path_identity)?;
+        let LockedCreateRegistry {
+            lock,
+            registry: stale_registry,
+        } = match self {
+            Self::Owned { state, .. } => *state
+                .take()
+                .context("owned create registry lock is empty")?,
+            Self::Borrowed { .. } => bail!("borrowed create recovery cannot drop its registry lock"),
+        };
+        drop(stale_registry);
+        drop(lock);
+        fire_create_cleanliness_gap_hook(scan.phase);
+        verify_worktree_clean_at(&scan.path, &scan.branch, scan.oid, cleanliness)?;
+        drop(branch_guard);
+        let lock = store.lock()?;
+        let registry = store.load(&lock)?;
+        let branch_guard = Some(lock_branch_reference(repo, &scan.branch)?);
+        let subject = create_checkpoint_name(&scan.checkpoint).to_string();
+        authenticate_create_checkpoint(&registry, &scan.checkpoint)?;
+        authenticate_create_lease(store, &lock, &lease, &subject)?;
+        let current = capture_create_clean_witness(
+            &store.repository,
+            &subject,
+            &scan.branch,
+            &scan.path,
+        )?;
+        if current.path_identity != witness.path_identity || current.metadata != witness.metadata {
+            bail!("worktree '{subject}' changed during off-lock cleanliness");
+        }
+        require_scan_path_identity(&scan.checkpoint, &scan.path, &current.path_identity)?;
+        verify_local_branch_oid(repo, &scan.branch, scan.oid)?;
+        match &scan.checkpoint {
+            CreateCheckpoint::Operation {
+                expected_operation, ..
+            } => {
+                if verify_create_branch_exact(repo, expected_operation)? != scan.oid {
+                    bail!(
+                        "create operation '{}' branch ownership changed during off-lock cleanliness",
+                        expected_operation.name
+                    );
+                }
+                let root = SafeRoot::open_existing(&expected_operation.root)?;
+                if root.identity() != &expected_operation.root_identity
+                    || root.direct_child(&expected_operation.name)? != expected_operation.path
+                {
+                    bail!(
+                        "create operation '{}' root/path binding changed during off-lock cleanliness",
+                        expected_operation.name
+                    );
+                }
+                if matches!(
+                    expected_operation.phase,
+                    ManagedWorktreeOperationPhase::CreateStaged
+                        | ManagedWorktreeOperationPhase::CreateObserved
+                ) {
+                    ensure_creation_worktree_locked(repo, &expected_operation.name)?;
+                }
+                allow_recorded_gitdir_after_final_rename(
+                    expected_operation,
+                    &store.repository,
+                    &scan.path,
+                    &scan.branch,
+                )?;
+            }
+            CreateCheckpoint::PendingLock { expected_binding } => {
+                let verified = verify_managed_worktree_binding(
+                    repo,
+                    &store.repository,
+                    expected_binding,
+                    false,
+                )?;
+                if verified.path != scan.path || verified.branch_oid != scan.oid {
+                    bail!(
+                        "pending creation lock '{}' no longer matches its cleanliness target",
+                        expected_binding.name
+                    );
+                }
+            }
+        }
+        if let Self::Owned { state, .. } = self {
+            *state = Some(Box::new(LockedCreateRegistry { lock, registry }));
+        }
+        Ok(branch_guard)
+    }
+}
+
+fn authenticate_create_checkpoint(
+    registry: &ManagedWorktreeRegistry,
+    checkpoint: &CreateCheckpoint,
+) -> Result<()> {
+    match checkpoint {
+        CreateCheckpoint::Operation {
+            expected_operation,
+            expected_record,
+        } => {
+            if registry.operations.get(&expected_operation.name) != Some(expected_operation.as_ref())
+            {
+                bail!(
+                    "create operation '{}' changed around off-lock cleanliness",
+                    expected_operation.name
+                );
+            }
+            match expected_record {
+                Some(expected) if expected.name == expected_operation.name => {
+                    if registry.records.get(&expected_operation.name) != Some(expected) {
+                        bail!(
+                            "create record '{}' changed around off-lock cleanliness",
+                            expected_operation.name
+                        );
+                    }
+                }
+                Some(_) => bail!(
+                    "create record '{}' does not belong to its operation",
+                    expected_operation.name
+                ),
+                None => {
+                    if registry.records.contains_key(&expected_operation.name) {
+                        bail!(
+                            "create operation '{}' gained a record around off-lock cleanliness",
+                            expected_operation.name
+                        );
+                    }
+                }
+            }
+        }
+        CreateCheckpoint::PendingLock { expected_binding } => {
+            if !expected_binding.creation_lock_pending {
+                bail!(
+                    "pending creation lock for '{}' is not pending",
+                    expected_binding.name
+                );
+            }
+            if registry.operations.contains_key(&expected_binding.name) {
+                bail!(
+                    "pending creation lock '{}' has an operation",
+                    expected_binding.name
+                );
+            }
+            if registry.records.get(&expected_binding.name) != Some(expected_binding) {
+                bail!(
+                    "pending creation lock '{}' changed around off-lock cleanliness",
+                    expected_binding.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn authenticate_create_lease(
+    store: &ManagedWorktreeRegistryStore,
+    lock: &ManagedWorktreeRegistryLock,
+    lease: &CreateLeaseIdentity,
+    subject: &str,
+) -> Result<()> {
+    if lease.name != subject {
+        bail!("create lease '{}' does not own '{subject}'", lease.name);
+    }
+    let incarnation = store.active_incarnation(lock, &lease.name)?;
+    if !incarnation.active
+        || incarnation.generation != lease.generation
+        || incarnation.nonce != lease.nonce
+    {
+        bail!(
+            "create lease for '{}' does not match the authenticated incarnation",
+            lease.name
+        );
+    }
+    Ok(())
+}
+
+fn capture_create_clean_witness(
+    repository: &ManagedRepositoryBinding,
+    name: &str,
+    branch: &str,
+    path: &Path,
+) -> Result<CreateCleanWitness> {
+    Ok(CreateCleanWitness {
+        path_identity: identity_for_path(path)?,
+        metadata: capture_staged_worktree_metadata(repository, name, branch, path)?,
+    })
+}
+
+fn require_scan_branch_target(scan: &CreateCleanScan) -> Result<()> {
+    match &scan.checkpoint {
+        CreateCheckpoint::Operation {
+            expected_operation, ..
+        } => {
+            if scan.phase != CreateCleanlinessGapPhase::Operation(expected_operation.phase) {
+                bail!(
+                    "cleanliness phase is not create operation '{}' phase",
+                    expected_operation.name
+                );
+            }
+            if expected_operation.branch != scan.branch {
+                bail!(
+                    "cleanliness branch '{}' is not create operation '{}'",
+                    scan.branch,
+                    expected_operation.branch
+                );
+            }
+            if expected_create_branch_oid(expected_operation)? != scan.oid {
+                bail!(
+                    "cleanliness OID {} is not the owned branch OID for '{}'",
+                    scan.oid,
+                    expected_operation.name
+                );
+            }
+            let bound = expected_operation.path == scan.path
+                || expected_operation.staging_path.as_deref() == Some(scan.path.as_path())
+                || expected_operation
+                    .binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.path == scan.path);
+            if !bound {
+                bail!(
+                    "cleanliness path {} is not bound to create operation '{}'",
+                    scan.path.display(),
+                    expected_operation.name
+                );
+            }
+        }
+        CreateCheckpoint::PendingLock { expected_binding } => {
+            if scan.phase != CreateCleanlinessGapPhase::PendingCreationLock {
+                bail!(
+                    "cleanliness phase is not the pending creation lock for '{}'",
+                    expected_binding.name
+                );
+            }
+            if expected_binding.path != scan.path || expected_binding.branch != scan.branch {
+                bail!(
+                    "cleanliness target is not the pending worktree for '{}'",
+                    expected_binding.name
+                );
+            }
+            let created = Oid::from_str(&expected_binding.created_branch_oid)
+                .context("pending creation-lock branch OID is malformed")?;
+            if created != scan.oid {
+                bail!(
+                    "cleanliness OID {} is not the recorded branch OID for '{}'",
+                    scan.oid,
+                    expected_binding.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn require_scan_path_identity(
+    checkpoint: &CreateCheckpoint,
+    path: &Path,
+    identity: &FileIdentity,
+) -> Result<()> {
+    match checkpoint {
+        CreateCheckpoint::PendingLock { expected_binding } => {
+            if path != expected_binding.path || identity != &expected_binding.path_identity {
+                bail!(
+                    "pending worktree '{}' identity changed",
+                    expected_binding.name
+                );
+            }
+        }
+        CreateCheckpoint::Operation {
+            expected_operation, ..
+        } => {
+            if path == expected_operation.path {
+                let staged = expected_operation.staged_path_identity.as_ref().context(
+                    "final create path has no staged worktree identity",
+                )?;
+                if identity != staged {
+                    bail!(
+                        "final worktree '{}' is not the staged worktree identity",
+                        expected_operation.name
+                    );
+                }
+            } else if expected_operation.staging_path.as_deref() == Some(path) {
+                if let Some(staged) = expected_operation.staged_path_identity.as_ref() {
+                    if identity != staged {
+                        bail!(
+                            "staged worktree '{}' identity changed",
+                            expected_operation.name
+                        );
+                    }
+                }
+            } else {
+                bail!(
+                    "cleanliness path {} is not bound to create operation '{}'",
+                    path.display(),
+                    expected_operation.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn allow_recorded_gitdir_after_final_rename(
+    operation: &ManagedWorktreeOperation,
+    repository: &ManagedRepositoryBinding,
+    path: &Path,
+    branch: &str,
+) -> Result<()> {
+    let Some(recorded) = operation.staged_metadata.as_ref() else {
+        return Ok(());
+    };
+    if verify_staged_worktree_metadata(recorded, repository, branch, path)? {
+        return Ok(());
+    }
+    let on_final_path = path == operation.path.as_path();
+    let staging_gone = match operation.staging_path.as_ref() {
+        Some(staging) => !path_entry_exists(staging)?,
+        None => true,
+    };
+    if on_final_path && staging_gone {
+        verify_gitdir_backlinks(
+            &path.join(".git"),
+            &recorded.metadata_dir,
+            &recorded.metadata_dir.join("gitdir"),
+            path,
+        )?;
+        return Ok(());
+    }
+    bail!(
+        "create operation '{}' staged gitdir changed outside the final-path rewrite",
+        operation.name
+    )
+}
+
 fn managed_worktree_lease_name(name: &str, incarnation: &ManagedIncarnation) -> Result<OsString> {
     let normalized = normalize_agent_id(name)?;
     if normalized != name {
@@ -1199,7 +2102,6 @@ fn recover_pending_operations_with_held_removal_lease(
     )
 }
 
-#[cfg(not(test))]
 fn recover_pending_operations_without_creation_cleanliness(
     repo: &Repository,
     store: &ManagedWorktreeRegistryStore,
@@ -1207,21 +2109,54 @@ fn recover_pending_operations_without_creation_cleanliness(
     registry: &mut ManagedWorktreeRegistry,
     held_removal_lease: Option<&ManagedWorktreeRemovalLease>,
 ) -> Result<()> {
-    if registry
-        .operations
-        .values()
-        .any(|operation| operation.kind == ManagedWorktreeOperationKind::Create)
-        || registry
-            .records
-            .values()
-            .any(|binding| binding.creation_lock_pending)
-    {
-        bail!(
-            "managed worktree create recovery requires a capability-bound repository cleanliness input"
-        );
+    let names = registry.operations.keys().cloned().collect::<Vec<_>>();
+    for name in &names {
+        store.verify_authenticated_registry(lock, registry)?;
+        let operation = registry
+            .operations
+            .get(name)
+            .cloned()
+            .context("managed worktree operation disappeared during recovery")?;
+        if operation.name != *name {
+            bail!("managed worktree operation key/name mismatch for '{name}'");
+        }
+        if operation.kind != ManagedWorktreeOperationKind::Create {
+            continue;
+        }
+        // A live checkout lease is not cleanliness authority. Skip that
+        // operation and let unrelated removals proceed. Any create whose
+        // lease is free still fails closed, with no registry mutation.
+        match store.admit_create_recovery(lock, name)? {
+            CreateRecoveryAdmission::Busy => {}
+            CreateRecoveryAdmission::Admitted(_) => bail!(
+                "managed worktree create recovery requires a capability-bound repository cleanliness input"
+            ),
+        }
     }
 
-    let names = registry.operations.keys().cloned().collect::<Vec<_>>();
+    let pending_names = registry
+        .records
+        .iter()
+        .filter(|(_, binding)| binding.creation_lock_pending)
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    for name in &pending_names {
+        store.verify_authenticated_registry(lock, registry)?;
+        let binding = registry
+            .records
+            .get(name)
+            .context("pending creation lock disappeared during admission")?;
+        if binding.name != *name || !binding.creation_lock_pending {
+            bail!("pending creation lock '{name}' is not an authenticated pending record");
+        }
+        match store.admit_create_recovery(lock, name)? {
+            CreateRecoveryAdmission::Busy => {}
+            CreateRecoveryAdmission::Admitted(_) => bail!(
+                "managed worktree create recovery requires a capability-bound repository cleanliness input"
+            ),
+        }
+    }
+
     for name in names {
         store.verify_authenticated_registry(lock, registry)?;
         let operation = registry
@@ -1232,8 +2167,8 @@ fn recover_pending_operations_without_creation_cleanliness(
         if operation.name != name {
             bail!("managed worktree operation key/name mismatch for '{name}'");
         }
-        if operation.kind != ManagedWorktreeOperationKind::Remove {
-            bail!("managed worktree create recovery reached an unbound recovery path");
+        if operation.kind == ManagedWorktreeOperationKind::Create {
+            continue;
         }
         recover_remove_operation_with_lease(
             repo,
@@ -1331,16 +2266,129 @@ fn recover_remove_operation_with_lease_using_target_liveness(
     recover_remove_operation(repo, store, lock, registry, operation, target_liveness)
 }
 
+fn recover_failed_create(
+    repo: &Repository,
+    store: &ManagedWorktreeRegistryStore,
+    lock: &ManagedWorktreeRegistryLock,
+    registry: &mut ManagedWorktreeRegistry,
+    cleanliness: CreationCleanliness<'_>,
+    error: anyhow::Error,
+) -> Result<WorktreeRecord> {
+    recover_pending_operations_with_creation_cleanliness(
+        repo, store, lock, registry, cleanliness,
+    )
+    .with_context(|| {
+        format!(
+            "worktree creation failed and its durable create operation could not be recovered: {error:#}"
+        )
+    })?;
+    Err(error)
+}
+
+fn create_prepared_identity_current(
+    store: &ManagedWorktreeRegistryStore,
+    lock: &ManagedWorktreeRegistryLock,
+    registry: &ManagedWorktreeRegistry,
+    prepared: &ManagedWorktreeOperation,
+    incarnation: &ManagedIncarnation,
+) -> Result<bool> {
+    let Some(current) = registry.operations.get(&prepared.name) else {
+        return Ok(false);
+    };
+    if current != prepared {
+        return Ok(false);
+    }
+    let current_incarnation = store.active_incarnation(lock, &prepared.name)?;
+    Ok(current_incarnation.active
+        && current_incarnation.generation == incarnation.generation
+        && current_incarnation.nonce == incarnation.nonce)
+}
+
 fn recover_create_operation(
     repo: &Repository,
     store: &ManagedWorktreeRegistryStore,
     lock: &ManagedWorktreeRegistryLock,
     registry: &mut ManagedWorktreeRegistry,
+    operation: ManagedWorktreeOperation,
+    cleanliness: CreationCleanliness<'_>,
+) -> Result<()> {
+    // Checkout holds this lease outside the registry flock. A busy lease means
+    // that prepared operation is still owned; leave it untouched.
+    // Admitted(None) keeps the legacy locked recovery with no create lease.
+    let _create_recovery_lease = match store.admit_create_recovery(lock, &operation.name)? {
+        CreateRecoveryAdmission::Busy => return Ok(()),
+        CreateRecoveryAdmission::Admitted(lease) => lease,
+    };
+    let mut ctx = CreateRegistryContext::Borrowed { lock, registry };
+    recover_create_operation_in(repo, store, &mut ctx, operation, cleanliness)
+}
+
+fn recover_owned_create_operation(
+    repo: &Repository,
+    store: &ManagedWorktreeRegistryStore,
+    state: LockedCreateRegistry,
+    owner: &ManagedWorktreeCreateLease,
+    cleanliness: CreationCleanliness<'_>,
+) -> Result<LockedCreateRegistry> {
+    let name = owner.name.clone();
+    let operation = state
+        .registry
+        .operations
+        .get(&name)
+        .cloned()
+        .with_context(|| format!("owned create recovery has no operation for '{name}'"))?;
+    if operation.name != name || operation.kind != ManagedWorktreeOperationKind::Create {
+        bail!("owned create recovery lease '{name}' does not match its operation");
+    }
+    let incarnation = store.active_incarnation(&state.lock, &name)?;
+    if !incarnation.active
+        || incarnation.generation != owner.incarnation_generation
+        || incarnation.nonce != owner.incarnation_nonce
+    {
+        bail!("owned create lease for '{name}' does not match the authenticated incarnation");
+    }
+    if !matches!(
+        operation.phase,
+        ManagedWorktreeOperationPhase::CreateStaged | ManagedWorktreeOperationPhase::CreateObserved
+    ) {
+        bail!("owned create recovery requires a staged or observed operation for '{name}'");
+    }
+    let mut ctx = CreateRegistryContext::Owned {
+        state: Some(Box::new(state)),
+        owner,
+    };
+    recover_create_operation_in(repo, store, &mut ctx, operation, cleanliness)?;
+    match ctx {
+        CreateRegistryContext::Owned { state, .. } => state
+            .map(|state| *state)
+            .context("owned create recovery lost its registry lock"),
+        CreateRegistryContext::Borrowed { .. } => {
+            bail!("owned create recovery lost its owned registry")
+        }
+    }
+}
+
+fn recover_create_operation_in(
+    repo: &Repository,
+    store: &ManagedWorktreeRegistryStore,
+    ctx: &mut CreateRegistryContext<'_>,
     mut operation: ManagedWorktreeOperation,
     cleanliness: CreationCleanliness<'_>,
 ) -> Result<()> {
+    if ctx.is_owned()
+        && !matches!(
+            operation.phase,
+            ManagedWorktreeOperationPhase::CreateStaged
+                | ManagedWorktreeOperationPhase::CreateObserved
+        )
+    {
+        bail!(
+            "owned create recovery requires a staged or observed operation for '{}'",
+            operation.name
+        );
+    }
     if operation.phase == ManagedWorktreeOperationPhase::CreateIntent {
-        store.verify_authenticated_registry(lock, registry)?;
+        ctx.verify_registry(store)?;
         let root = SafeRoot::open_existing(&operation.root)?;
         if root.identity() != &operation.root_identity
             || root.direct_child(&operation.name)? != operation.path
@@ -1404,8 +2452,8 @@ fn recover_create_operation(
                 operation.name
             );
         }
-        registry.operations.remove(&operation.name);
-        store.save(lock, registry)?;
+        ctx.registry_mut()?.operations.remove(&operation.name);
+        ctx.save_registry(store)?;
         return Ok(());
     }
 
@@ -1423,7 +2471,7 @@ fn recover_create_operation(
     }
 
     if operation.phase == ManagedWorktreeOperationPhase::CreatePrepared {
-        store.verify_authenticated_registry(lock, registry)?;
+        ctx.verify_registry(store)?;
         let root = SafeRoot::open_existing(&operation.root)?;
         if root.identity() != &operation.root_identity {
             bail!(
@@ -1488,8 +2536,8 @@ fn recover_create_operation(
                 &operation.name,
             )?;
             cleanup_create_branch_if_owned(repo, &operation)?;
-            registry.operations.remove(&operation.name);
-            store.save(lock, registry)?;
+            ctx.registry_mut()?.operations.remove(&operation.name);
+            ctx.save_registry(store)?;
             return Ok(());
         }
         if !staging_path_exists {
@@ -1528,14 +2576,14 @@ fn recover_create_operation(
         operation.phase = ManagedWorktreeOperationPhase::CreateStaged;
         operation.staged_path_identity = Some(staged.identity().clone());
         operation.staged_metadata = Some(staged_metadata);
-        registry
+        ctx.registry_mut()?
             .operations
             .insert(operation.name.clone(), operation.clone());
-        store.save(lock, registry)?;
+        ctx.save_registry(store)?;
     }
 
     if operation.phase == ManagedWorktreeOperationPhase::CreateStaged {
-        store.verify_authenticated_registry(lock, registry)?;
+        ctx.verify_registry(store)?;
         let root = SafeRoot::open_existing(&operation.root)?;
         if root.identity() != &operation.root_identity {
             bail!(
@@ -1544,7 +2592,7 @@ fn recover_create_operation(
             );
         }
         ensure_creation_worktree_locked(repo, &operation.name)?;
-        let _branch_guard = lock_branch_reference(repo, &operation.branch)?;
+        let mut branch_guard = Some(lock_branch_reference(repo, &operation.branch)?);
         let expected_branch_oid = verify_create_branch_exact(repo, &operation)?;
         let prepared_identity = operation
             .prepared_path_identity
@@ -1639,11 +2687,23 @@ fn recover_create_operation(
             &metadata_gitdir_file,
             &operation.path,
         )?;
-        verify_worktree_clean_at(
-            &operation.path,
-            &operation.branch,
-            expected_branch_oid,
+        let staged_name = operation.name.clone();
+        let staged_record = ctx.registry_mut()?.records.get(&staged_name).cloned();
+        branch_guard = ctx.scan_create_cleanliness(
+            repo,
+            store,
+            CreateCleanScan {
+                phase: CreateCleanlinessGapPhase::Operation(operation.phase),
+                checkpoint: CreateCheckpoint::Operation {
+                    expected_operation: Box::new(operation.clone()),
+                    expected_record: staged_record,
+                },
+                path: operation.path.clone(),
+                branch: operation.branch.clone(),
+                oid: expected_branch_oid,
+            },
             cleanliness,
+            branch_guard,
         )?;
         verify_local_branch_oid(repo, &operation.branch, expected_branch_oid)?;
         let base_oid =
@@ -1661,22 +2721,35 @@ fn recover_create_operation(
         binding.created_at_unix_nanos = Some(unix_now_nanos()?);
         operation.phase = ManagedWorktreeOperationPhase::CreateObserved;
         operation.binding = Some(binding);
-        registry
+        ctx.registry_mut()?
             .operations
             .insert(operation.name.clone(), operation.clone());
-        store.save(lock, registry)?;
+        ctx.save_registry(store)?;
+        drop(branch_guard);
     }
 
     if operation.phase == ManagedWorktreeOperationPhase::CreateObserved {
-        store.verify_authenticated_registry(lock, registry)?;
+        ctx.verify_registry(store)?;
         ensure_creation_worktree_locked(repo, &operation.name)?;
-        let _branch_guard = lock_branch_reference(repo, &operation.branch)?;
+        let mut branch_guard = Some(lock_branch_reference(repo, &operation.branch)?);
         let expected_branch_oid = verify_create_branch_exact(repo, &operation)?;
-        verify_worktree_clean_at(
-            &operation.path,
-            &operation.branch,
-            expected_branch_oid,
+        let observed_name = operation.name.clone();
+        let observed_record = ctx.registry_mut()?.records.get(&observed_name).cloned();
+        branch_guard = ctx.scan_create_cleanliness(
+            repo,
+            store,
+            CreateCleanScan {
+                phase: CreateCleanlinessGapPhase::Operation(operation.phase),
+                checkpoint: CreateCheckpoint::Operation {
+                    expected_operation: Box::new(operation.clone()),
+                    expected_record: observed_record,
+                },
+                path: operation.path.clone(),
+                branch: operation.branch.clone(),
+                oid: expected_branch_oid,
+            },
             cleanliness,
+            branch_guard,
         )?;
         let root = SafeRoot::open_existing(&operation.root)?;
         if root.identity() != &operation.root_identity {
@@ -1724,7 +2797,7 @@ fn recover_create_operation(
                 )?;
             }
         }
-        if let Some(existing) = registry.records.get(&operation.name) {
+        if let Some(existing) = ctx.registry_mut()?.records.get(&operation.name) {
             if existing != &binding {
                 bail!(
                     "create operation '{}' conflicts with a different finalized binding",
@@ -1732,11 +2805,15 @@ fn recover_create_operation(
                 );
             }
         } else {
-            registry.records.insert(operation.name.clone(), binding);
+            ctx.registry_mut()?
+                .records
+                .insert(operation.name.clone(), binding);
         }
-        registry.operations.remove(&operation.name);
-        store.save(lock, registry)?;
-        complete_creation_lock(repo, store, lock, registry, &operation.name, cleanliness)?;
+        let observed_name = operation.name.clone();
+        ctx.registry_mut()?.operations.remove(&observed_name);
+        ctx.save_registry(store)?;
+        drop(branch_guard);
+        complete_creation_lock_in(repo, store, ctx, &observed_name, cleanliness)?;
         return Ok(());
     }
 
@@ -1976,7 +3053,20 @@ fn complete_creation_lock(
     name: &str,
     cleanliness: CreationCleanliness<'_>,
 ) -> Result<()> {
-    let binding = registry
+    let mut ctx = CreateRegistryContext::Borrowed { lock, registry };
+    complete_creation_lock_in(repo, store, &mut ctx, name, cleanliness)
+}
+
+fn complete_creation_lock_in(
+    repo: &Repository,
+    store: &ManagedWorktreeRegistryStore,
+    ctx: &mut CreateRegistryContext<'_>,
+    name: &str,
+    cleanliness: CreationCleanliness<'_>,
+) -> Result<()> {
+    ctx.verify_registry(store)?;
+    let binding = ctx
+        .registry_mut()?
         .records
         .get(name)
         .cloned()
@@ -1984,11 +3074,27 @@ fn complete_creation_lock(
     if !binding.creation_lock_pending {
         return Ok(());
     }
+    let branch = binding.branch.clone();
     let verified = verify_managed_worktree_binding(repo, &store.repository, &binding, false)?;
     let expected = Oid::from_str(&binding.created_branch_oid)
         .context("managed creation-lock branch OID is malformed")?;
-    verify_local_branch_oid(repo, &binding.branch, expected)?;
-    verify_worktree_clean_at(&verified.path, &binding.branch, expected, cleanliness)?;
+    let mut branch_guard = Some(lock_branch_reference(repo, &branch)?);
+    verify_local_branch_oid(repo, &branch, expected)?;
+    branch_guard = ctx.scan_create_cleanliness(
+        repo,
+        store,
+        CreateCleanScan {
+            phase: CreateCleanlinessGapPhase::PendingCreationLock,
+            checkpoint: CreateCheckpoint::PendingLock {
+                expected_binding: binding,
+            },
+            path: verified.path,
+            branch,
+            oid: expected,
+        },
+        cleanliness,
+        branch_guard,
+    )?;
     let worktree = repo
         .find_worktree(name)
         .with_context(|| format!("failed to find finalized worktree '{name}'"))?;
@@ -2001,12 +3107,14 @@ fn complete_creation_lock(
             .with_context(|| format!("failed to release creation lock for worktree '{name}'"))?,
         WorktreeLockStatus::Unlocked => {}
     }
-    registry
+    ctx.registry_mut()?
         .records
         .get_mut(name)
         .context("creation lock binding disappeared before completion")?
         .creation_lock_pending = false;
-    store.save(lock, registry)
+    ctx.save_registry(store)?;
+    drop(branch_guard);
+    Ok(())
 }
 
 fn reconcile_creation_locks(
@@ -2023,14 +3131,14 @@ fn reconcile_creation_locks(
         .map(|(name, _)| name.clone())
         .collect::<Vec<_>>();
     for name in names {
-        let branch = registry
-            .records
-            .get(&name)
-            .context("creation lock binding disappeared during recovery")?
-            .branch
-            .clone();
-        let _branch_guard = lock_branch_reference(repo, &branch)?;
-        complete_creation_lock(repo, store, lock, registry, &name, cleanliness)?;
+        store.verify_authenticated_registry(lock, registry)?;
+        match store.admit_create_recovery(lock, &name)? {
+            CreateRecoveryAdmission::Busy => {}
+            CreateRecoveryAdmission::Admitted(lease) => {
+                let _lease = lease;
+                complete_creation_lock(repo, store, lock, registry, &name, cleanliness)?;
+            }
+        }
     }
     Ok(())
 }
