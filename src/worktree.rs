@@ -1548,11 +1548,16 @@ struct ManagedWorktreeRegistryStore {
     repository: ManagedRepositoryBinding,
 }
 
+/// Kernel registry lock plus the same-process FIFO admission permit.
+///
+/// Declaration order is drop order. Kernel unlock/drop of `lock` precedes
+/// release of `_admission` on success, `verify_lock` failure, and unwind.
 #[derive(Debug)]
 struct ManagedWorktreeRegistryLock {
     lock: KernelStateLock,
     root_identity: FileIdentity,
     lock_identity: FileIdentity,
+    _admission: ManagedRegistryAdmissionPermit,
 }
 
 #[cfg(unix)]

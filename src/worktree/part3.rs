@@ -321,6 +321,238 @@ fn verified_worktree_record(
     })
 }
 
+use std::collections::VecDeque;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
+
+/// Same-process FIFO admission ahead of `managed_worktrees.lock`.
+///
+/// Callers in this process take a permit before the kernel lock. Other
+/// processes stay ordered only by that kernel lock.
+struct ManagedRegistryAdmission {
+    state: Mutex<ManagedRegistryAdmissionState>,
+    cv: Condvar,
+}
+
+struct ManagedRegistryAdmissionState {
+    next_ticket: u64,
+    active: bool,
+    queue: VecDeque<u64>,
+}
+
+enum ManagedRegistryAdmissionKind {
+    Disarmed,
+    Queued(u64),
+    Active,
+}
+
+/// RAII admission hold. Drop cancels a queued ticket or releases the active
+/// permit. The queue mutex must already be unlocked.
+struct ManagedRegistryAdmissionPermit {
+    queue: Arc<ManagedRegistryAdmission>,
+    kind: ManagedRegistryAdmissionKind,
+}
+
+type ManagedRegistryAdmissionMap = BTreeMap<(u64, u64), Weak<ManagedRegistryAdmission>>;
+
+fn managed_registry_admission_queues() -> &'static Mutex<ManagedRegistryAdmissionMap> {
+    static QUEUES: OnceLock<Mutex<ManagedRegistryAdmissionMap>> = OnceLock::new();
+    QUEUES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn managed_registry_admission_queue(
+    root: &SafeRoot,
+) -> Result<std::sync::Arc<ManagedRegistryAdmission>> {
+    let identity = root.identity();
+    let key = (identity.device, identity.file);
+    let queues = managed_registry_admission_queues();
+    let mut map = match queues.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let guard = poisoned.into_inner();
+            queues.clear_poison();
+            guard
+        }
+    };
+    // Drop dead queues only. An alive queue for this root is never replaced.
+    map.retain(|_, weak| weak.strong_count() > 0);
+    if let Some(alive) = map.get(&key).and_then(Weak::upgrade) {
+        return Ok(alive);
+    }
+    let created = Arc::new(ManagedRegistryAdmission {
+        state: Mutex::new(ManagedRegistryAdmissionState {
+            next_ticket: 0,
+            active: false,
+            queue: VecDeque::new(),
+        }),
+        cv: Condvar::new(),
+    });
+    map.insert(key, Arc::downgrade(&created));
+    Ok(created)
+}
+
+fn managed_registry_admission_timed_out(path: &Path) -> anyhow::Error {
+    anyhow::Error::msg(format!(
+        "timed out waiting for managed worktree registry lock {}",
+        path.display()
+    ))
+}
+
+fn managed_registry_admission_poisoned() -> anyhow::Error {
+    anyhow::Error::msg("managed worktree registry admission queue is poisoned")
+}
+
+fn managed_registry_lock_remaining(deadline: Instant) -> Option<Duration> {
+    let now = Instant::now();
+    if now >= deadline {
+        None
+    } else {
+        Some(deadline.saturating_duration_since(now))
+    }
+}
+
+fn allocate_admission_ticket(state: &mut ManagedRegistryAdmissionState) -> Result<u64> {
+    let ticket = state.next_ticket;
+    state.next_ticket = ticket
+        .checked_add(1)
+        .context("managed worktree registry admission ticket overflowed")?;
+    Ok(ticket)
+}
+
+impl ManagedRegistryAdmission {
+    fn lock_queue(&self) -> Result<MutexGuard<'_, ManagedRegistryAdmissionState>> {
+        match self.state.lock() {
+            Ok(guard) => Ok(guard),
+            Err(poisoned) => {
+                drop(poisoned.into_inner());
+                self.state.clear_poison();
+                Err(managed_registry_admission_poisoned())
+            }
+        }
+    }
+
+    fn acquire(
+        self: &std::sync::Arc<Self>,
+        deadline: Instant,
+        path: &Path,
+    ) -> Result<ManagedRegistryAdmissionPermit> {
+        let mut permit = ManagedRegistryAdmissionPermit::disarmed(Arc::clone(self));
+        let ticket = {
+            let mut state = self.lock_queue()?;
+            if Instant::now() >= deadline {
+                drop(state);
+                return Err(managed_registry_admission_timed_out(path));
+            }
+            if !state.active && state.queue.is_empty() {
+                state.active = true;
+                permit.kind = ManagedRegistryAdmissionKind::Active;
+                drop(state);
+                return Ok(permit);
+            }
+            let ticket = allocate_admission_ticket(&mut state)?;
+            state.queue.push_back(ticket);
+            permit.kind = ManagedRegistryAdmissionKind::Queued(ticket);
+            drop(state);
+            ticket
+        };
+
+        loop {
+            let mut state = self.lock_queue()?;
+            // Expired waiters leave before a late grant. Spurious wakeups and
+            // `wait_timeout` both recheck this predicate.
+            if Instant::now() >= deadline {
+                drop(state);
+                return Err(managed_registry_admission_timed_out(path));
+            }
+            if !state.active && state.queue.front().copied() == Some(ticket) {
+                state.queue.pop_front();
+                state.active = true;
+                permit.kind = ManagedRegistryAdmissionKind::Active;
+                drop(state);
+                return Ok(permit);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.cv.wait_timeout(state, remaining) {
+                Ok((guard, _wakeup)) => drop(guard),
+                Err(poisoned) => {
+                    drop(poisoned.into_inner());
+                    return Err(managed_registry_admission_poisoned());
+                }
+            }
+        }
+    }
+
+    fn try_acquire(
+        self: &std::sync::Arc<Self>,
+    ) -> Result<Option<ManagedRegistryAdmissionPermit>> {
+        let mut permit = ManagedRegistryAdmissionPermit::disarmed(Arc::clone(self));
+        let mut state = self.lock_queue()?;
+        // A queued waiter stays ahead of a nonblocking caller.
+        if state.active || !state.queue.is_empty() {
+            drop(state);
+            return Ok(None);
+        }
+        state.active = true;
+        permit.kind = ManagedRegistryAdmissionKind::Active;
+        drop(state);
+        Ok(Some(permit))
+    }
+
+    #[cfg(test)]
+    fn queued_waiters(&self) -> Result<usize> {
+        let state = self.lock_queue()?;
+        Ok(state.queue.len())
+    }
+}
+
+impl ManagedRegistryAdmissionPermit {
+    fn disarmed(queue: Arc<ManagedRegistryAdmission>) -> Self {
+        Self {
+            queue,
+            kind: ManagedRegistryAdmissionKind::Disarmed,
+        }
+    }
+
+    fn release(&self, kind: ManagedRegistryAdmissionKind) {
+        // A disarmed permit has nothing to undo. Locking here would deadlock if
+        // Drop ran while this thread still held the queue mutex.
+        if matches!(kind, ManagedRegistryAdmissionKind::Disarmed) {
+            return;
+        }
+        let (mut state, poisoned) = match self.queue.state.lock() {
+            Ok(guard) => (guard, false),
+            Err(poisoned) => (poisoned.into_inner(), true),
+        };
+        match kind {
+            ManagedRegistryAdmissionKind::Disarmed => {}
+            ManagedRegistryAdmissionKind::Active => {
+                state.active = false;
+            }
+            ManagedRegistryAdmissionKind::Queued(ticket) => {
+                if let Some(index) = state.queue.iter().position(|queued| *queued == ticket) {
+                    state.queue.remove(index);
+                }
+            }
+        }
+        self.queue.cv.notify_all();
+        if poisoned {
+            self.queue.state.clear_poison();
+        }
+    }
+}
+
+impl Drop for ManagedRegistryAdmissionPermit {
+    fn drop(&mut self) {
+        let kind = std::mem::replace(&mut self.kind, ManagedRegistryAdmissionKind::Disarmed);
+        self.release(kind);
+    }
+}
+
+impl std::fmt::Debug for ManagedRegistryAdmissionPermit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ManagedRegistryAdmissionPermit { .. }")
+    }
+}
+
 impl ManagedWorktreeRegistryStore {
     fn open(repo: &Repository) -> Result<Self> {
         let repository = managed_repository_binding(repo)?;
@@ -362,21 +594,50 @@ impl ManagedWorktreeRegistryStore {
     }
 
     fn lock_with_timeout(&self, timeout: Duration) -> Result<ManagedWorktreeRegistryLock> {
+        let deadline = Instant::now().checked_add(timeout).context(
+            "managed worktree registry lock timeout overflowed",
+        )?;
+        self.state_root.verify()?;
+        let lock_path = self.state_root.direct_child("managed_worktrees.lock")?;
+        let admission = managed_registry_admission_queue(&self.state_root)?;
+        let permit = admission.acquire(deadline, &lock_path)?;
+        let Some(remaining) = managed_registry_lock_remaining(deadline) else {
+            bail!(
+                "timed out waiting for managed worktree registry lock {}",
+                lock_path.display()
+            );
+        };
         let lock = KernelStateLock::acquire_direct_with_timeout(
             &self.state_root,
             "managed_worktrees.lock",
-            timeout,
+            remaining,
         )?;
+        if managed_registry_lock_remaining(deadline).is_none() {
+            drop(lock);
+            bail!(
+                "timed out waiting for managed worktree registry lock {}",
+                lock_path.display()
+            );
+        }
+        let root_identity = self.state_root.identity().clone();
+        let lock_identity = lock.identity().clone();
         let bound = ManagedWorktreeRegistryLock {
-            root_identity: self.state_root.identity().clone(),
-            lock_identity: lock.identity().clone(),
             lock,
+            root_identity,
+            lock_identity,
+            _admission: permit,
         };
         self.verify_lock(&bound)?;
         Ok(bound)
     }
 
     fn lock_existing(&self) -> Result<ManagedWorktreeRegistryLock> {
+        self.state_root.verify()?;
+        let admission = managed_registry_admission_queue(&self.state_root)?;
+        let permit = match admission.try_acquire()? {
+            Some(permit) => permit,
+            None => bail!("managed worktree registry is active elsewhere"),
+        };
         let lock = match KernelStateLock::try_acquire_existing_exclusive_direct(
             &self.state_root,
             "managed_worktrees.lock",
@@ -389,10 +650,13 @@ impl ManagedWorktreeRegistryStore {
                 bail!("authenticated managed worktree state is missing its stable registry lock")
             }
         };
+        let root_identity = self.state_root.identity().clone();
+        let lock_identity = lock.identity().clone();
         let bound = ManagedWorktreeRegistryLock {
-            root_identity: self.state_root.identity().clone(),
-            lock_identity: lock.identity().clone(),
             lock,
+            root_identity,
+            lock_identity,
+            _admission: permit,
         };
         self.verify_lock(&bound)?;
         Ok(bound)

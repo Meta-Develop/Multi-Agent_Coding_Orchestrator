@@ -5971,5 +5971,456 @@ fn public_create_refuses_stale_target_after_owned_cleanliness_gap() {
     }
 }
 
+const REGISTRY_ADMISSION_LOCK_NAME: &str = "managed_worktrees.lock";
+
+fn registry_admission_repo(temp: &TempDir, name: &str) -> PathBuf {
+    let repo_path = temp.path().join(name);
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    commit_readme(&repo).expect("initial commit");
+    repo_path
+}
+
+fn open_admission_store(repo_path: &Path) -> (Repository, ManagedWorktreeRegistryStore) {
+    let repo = crate::git_repository::open(repo_path).expect("open repo");
+    let store = ManagedWorktreeRegistryStore::open(&repo).expect("open registry store");
+    (repo, store)
+}
+
+fn registry_admission_lock_path() -> &'static Path {
+    Path::new(REGISTRY_ADMISSION_LOCK_NAME)
+}
+
+fn wait_for_admission_waiters(queue: &ManagedRegistryAdmission, expected: usize, bound: Duration) {
+    let deadline = Instant::now() + bound;
+    loop {
+        let observed = queue
+            .queued_waiters()
+            .expect("count queued admission waiters");
+        if observed == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "queued admission waiters stayed at {observed}, expected {expected}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn assert_classifiable_lock_timeout(message: &str) {
+    let lower = message.to_ascii_lowercase();
+    assert!(
+        ["timed out", "timeout", "time limit", "deadline", "expired"]
+            .iter()
+            .any(|needle| lower.contains(needle)),
+        "expected a classifiable registry lock timeout: {message}"
+    );
+}
+
+fn assert_registry_lock_busy(store: &ManagedWorktreeRegistryStore) {
+    let error = store
+        .lock_existing()
+        .expect_err("lock_existing must not bypass registry admission");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("active elsewhere"),
+        "expected busy registry admission, got: {message}"
+    );
+}
+
+struct GatedRegistryLock {
+    handle: std::thread::JoinHandle<()>,
+    start: std::sync::mpsc::Sender<()>,
+    ready: std::sync::mpsc::Receiver<()>,
+    done: std::sync::mpsc::Receiver<std::result::Result<(), String>>,
+}
+
+fn spawn_gated_registry_lock(
+    repo_path: PathBuf,
+    budget: Duration,
+    on_acquire: impl FnOnce() + Send + 'static,
+) -> GatedRegistryLock {
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (start_tx, start_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        // git2::Repository is not Sync; each worker opens its own store.
+        let repo = crate::git_repository::open(&repo_path).expect("worker repo");
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("worker store");
+        ready_tx.send(()).expect("worker ready");
+        start_rx.recv().expect("worker start");
+        let result = match store.lock_with_timeout(budget) {
+            Ok(guard) => {
+                on_acquire();
+                drop(guard);
+                Ok(())
+            }
+            Err(error) => Err(format!("{error:#}")),
+        };
+        let _ = done_tx.send(result);
+    });
+    GatedRegistryLock {
+        handle,
+        start: start_tx,
+        ready: ready_rx,
+        done: done_rx,
+    }
+}
+
+impl GatedRegistryLock {
+    fn wait_ready(&self) {
+        self.ready
+            .recv_timeout(Duration::from_secs(10))
+            .expect("worker opened its repository");
+    }
+
+    fn release(&self) {
+        self.start.send(()).expect("worker start gate");
+    }
+
+    fn finish(self, bound: Duration, label: &str) -> std::result::Result<(), String> {
+        match self.done.recv_timeout(bound) {
+            Ok(result) => {
+                self.handle
+                    .join()
+                    .unwrap_or_else(|_| panic!("{label} worker panicked"));
+                result
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("{label} did not finish within {bound:?}");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match self.handle.join() {
+                Ok(()) => panic!("{label} worker ended without a lock result"),
+                Err(_) => panic!("{label} worker panicked before reporting a lock result"),
+            },
+        }
+    }
+}
+
+#[test]
+fn same_root_registry_guards_admit_in_fifo_order() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = registry_admission_repo(&temp, "repo");
+    let other_path = registry_admission_repo(&temp, "other-repo");
+    let (_repo, store) = open_admission_store(&repo_path);
+    let (_peer_repo, peer) = open_admission_store(&repo_path);
+    let (_other_repo, other) = open_admission_store(&other_path);
+    let queue = managed_registry_admission_queue(&store.state_root).expect("admission queue");
+    let peer_queue =
+        managed_registry_admission_queue(&peer.state_root).expect("peer admission queue");
+    let other_queue =
+        managed_registry_admission_queue(&other.state_root).expect("other admission queue");
+    assert!(
+        std::sync::Arc::ptr_eq(&queue, &peer_queue),
+        "separate stores for one state root must share the admission queue"
+    );
+    assert!(
+        !std::sync::Arc::ptr_eq(&queue, &other_queue),
+        "unrelated state roots must not share an admission queue"
+    );
+
+    let held = store.lock().expect("hold registry guard");
+    assert_eq!(queue.queued_waiters().expect("waiters"), 0);
+    assert_registry_lock_busy(&peer);
+    assert!(queue.try_acquire().expect("try acquire").is_none());
+
+    let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let budget = Duration::from_secs(20);
+    let order_b = std::sync::Arc::clone(&order);
+    let order_c = std::sync::Arc::clone(&order);
+    let order_a = std::sync::Arc::clone(&order);
+    let waiter_b = spawn_gated_registry_lock(repo_path.clone(), budget, move || {
+        order_b.lock().expect("order").push("B");
+    });
+    let waiter_c = spawn_gated_registry_lock(repo_path.clone(), budget, move || {
+        order_c.lock().expect("order").push("C");
+    });
+    let waiter_a = spawn_gated_registry_lock(repo_path, budget, move || {
+        order_a.lock().expect("order").push("A");
+    });
+    waiter_b.wait_ready();
+    waiter_c.wait_ready();
+    waiter_a.wait_ready();
+
+    waiter_b.release();
+    wait_for_admission_waiters(&queue, 1, Duration::from_secs(5));
+    assert_registry_lock_busy(&peer);
+    waiter_c.release();
+    wait_for_admission_waiters(&queue, 2, Duration::from_secs(5));
+    assert_registry_lock_busy(&peer);
+    assert!(queue
+        .try_acquire()
+        .expect("try acquire behind queued waiters")
+        .is_none());
+
+    let queued_before_other = queue.queued_waiters().expect("waiters");
+    let other_held = other
+        .lock_with_timeout(Duration::from_secs(8))
+        .expect("unrelated state root acquires while this queue is occupied");
+    assert_eq!(
+        queue.queued_waiters().expect("waiters"),
+        queued_before_other,
+        "unrelated root must not enter this admission queue"
+    );
+    assert_eq!(other_queue.queued_waiters().expect("other waiters"), 0);
+    drop(other_held);
+    drop(other.lock_existing().expect("unrelated root is not busy"));
+
+    waiter_a.release();
+    wait_for_admission_waiters(&queue, 3, Duration::from_secs(5));
+    assert_registry_lock_busy(&peer);
+    assert!(queue
+        .try_acquire()
+        .expect("try acquire cannot cut ahead of A")
+        .is_none());
+    drop(held);
+
+    for (label, waiter) in [("B", waiter_b), ("C", waiter_c), ("A", waiter_a)] {
+        waiter
+            .finish(Duration::from_secs(10), label)
+            .unwrap_or_else(|error| panic!("{label} registry guard failed: {error}"));
+    }
+    assert_eq!(
+        order.lock().expect("order").as_slice(),
+        ["B", "C", "A"],
+        "immediate reacquisition must follow waiters already queued"
+    );
+    assert_eq!(queue.queued_waiters().expect("waiters"), 0);
+    drop(
+        peer.lock_existing()
+            .expect("same root is free after the queue drains"),
+    );
+}
+
+#[test]
+fn queued_registry_timeouts_cancel_and_permit_drop_releases_successor() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = registry_admission_repo(&temp, "repo");
+    let (_repo, store) = open_admission_store(&repo_path);
+    let (_peer_repo, peer) = open_admission_store(&repo_path);
+    drop(store.lock().expect("prime registry lock"));
+    let queue = managed_registry_admission_queue(&store.state_root).expect("admission queue");
+    let lock_path = registry_admission_lock_path();
+
+    let permit = queue
+        .acquire(Instant::now() + Duration::from_secs(20), lock_path)
+        .expect("hold queue permit without the kernel lock");
+    assert_eq!(queue.queued_waiters().expect("waiters"), 0);
+    assert_registry_lock_busy(&peer);
+    let successor = spawn_gated_registry_lock(repo_path.clone(), Duration::from_secs(15), || {});
+    successor.wait_ready();
+    successor.release();
+    wait_for_admission_waiters(&queue, 1, Duration::from_secs(5));
+    assert_registry_lock_busy(&peer);
+    assert!(queue
+        .try_acquire()
+        .expect("try acquire while a waiter is queued")
+        .is_none());
+    let holder_error: anyhow::Result<()> = {
+        let _permit = permit;
+        Err(anyhow::anyhow!("admission holder failed"))
+    };
+    let holder_error = holder_error.expect_err("holder returns an error");
+    assert!(
+        format!("{holder_error:#}").contains("admission holder failed"),
+        "{holder_error:#}"
+    );
+    successor
+        .finish(Duration::from_secs(8), "error-drop successor")
+        .expect("dropping the active permit on error releases the successor");
+    assert_eq!(queue.queued_waiters().expect("waiters"), 0);
+    drop(
+        peer.lock_existing()
+            .expect("admission released after error drop"),
+    );
+
+    let held = store.lock().expect("hold registry guard");
+    let head = spawn_gated_registry_lock(repo_path.clone(), Duration::from_secs(5), || {});
+    let middle = spawn_gated_registry_lock(repo_path.clone(), Duration::from_secs(5), || {});
+    let tail = spawn_gated_registry_lock(repo_path.clone(), Duration::from_secs(20), || {});
+    head.wait_ready();
+    middle.wait_ready();
+    tail.wait_ready();
+    head.release();
+    wait_for_admission_waiters(&queue, 1, Duration::from_secs(5));
+    middle.release();
+    wait_for_admission_waiters(&queue, 2, Duration::from_secs(5));
+    tail.release();
+    wait_for_admission_waiters(&queue, 3, Duration::from_secs(5));
+    let head_error = head
+        .finish(Duration::from_secs(12), "head timeout")
+        .expect_err("head waiter must time out while the guard is held");
+    let middle_error = middle
+        .finish(Duration::from_secs(12), "middle timeout")
+        .expect_err("middle waiter must time out while the guard is held");
+    assert_classifiable_lock_timeout(&head_error);
+    assert_classifiable_lock_timeout(&middle_error);
+    assert_eq!(
+        queue.queued_waiters().expect("waiters"),
+        1,
+        "cancelled head and middle waiters must not strand the successor"
+    );
+    assert!(
+        matches!(
+            tail.done.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ),
+        "successor acquired before the holder released"
+    );
+    assert_registry_lock_busy(&peer);
+    drop(held);
+    tail.finish(Duration::from_secs(8), "tail after cancelled waiters")
+        .expect("successor acquires after cancelled waiters are removed");
+    assert_eq!(queue.queued_waiters().expect("waiters"), 0);
+
+    let guard = store.lock().expect("hold guard for unwind");
+    let unwind_successor = spawn_gated_registry_lock(repo_path, Duration::from_secs(15), || {});
+    unwind_successor.wait_ready();
+    unwind_successor.release();
+    wait_for_admission_waiters(&queue, 1, Duration::from_secs(5));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = guard;
+        panic!("drop registry guard during unwind");
+    }));
+    assert!(panicked.is_err(), "unwind hook did not panic");
+    unwind_successor
+        .finish(Duration::from_secs(8), "unwind successor")
+        .expect("unwinding the active guard releases the next waiter");
+    assert_eq!(queue.queued_waiters().expect("waiters"), 0);
+    drop(
+        peer.lock_existing()
+            .expect("admission released after unwind"),
+    );
+}
+
+#[test]
+fn registry_lock_uses_one_deadline_for_queue_and_kernel() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = registry_admission_repo(&temp, "repo");
+    let (_repo, store) = open_admission_store(&repo_path);
+    drop(store.lock().expect("prime registry lock"));
+    let queue = managed_registry_admission_queue(&store.state_root).expect("admission queue");
+    let lock_path = registry_admission_lock_path();
+
+    let expired = queue
+        .acquire(Instant::now() - Duration::from_secs(1), lock_path)
+        .expect_err("expired deadline must refuse even when the queue is idle");
+    assert_classifiable_lock_timeout(&format!("{expired:#}"));
+    assert_eq!(queue.queued_waiters().expect("waiters"), 0);
+    drop(
+        queue
+            .try_acquire()
+            .expect("try after expired refusal")
+            .expect("expired refusal must not keep the admission permit"),
+    );
+
+    let zero_started = Instant::now();
+    let zero = store
+        .lock_with_timeout(Duration::ZERO)
+        .expect_err("zero budget must refuse");
+    assert!(
+        zero_started.elapsed() < Duration::from_secs(2),
+        "zero budget blocked instead of refusing"
+    );
+    assert_classifiable_lock_timeout(&format!("{zero:#}"));
+    assert_eq!(queue.queued_waiters().expect("waiters"), 0);
+    drop(
+        store
+            .lock_with_timeout(Duration::from_secs(5))
+            .expect("registry lock recovers after a zero-budget refusal"),
+    );
+
+    let budget = Duration::from_secs(8);
+    let permit = queue
+        .acquire(Instant::now() + Duration::from_secs(30), lock_path)
+        .expect("queue permit delays the public lock");
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (start_tx, start_rx) = std::sync::mpsc::channel::<()>();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker_path = repo_path.clone();
+    let worker = std::thread::spawn(move || {
+        let repo = crate::git_repository::open(&worker_path).expect("worker repo");
+        let store = ManagedWorktreeRegistryStore::open(&repo).expect("worker store");
+        ready_tx.send(()).expect("worker ready");
+        start_rx.recv().expect("worker start");
+        let started_at = Instant::now();
+        started_tx.send(started_at).expect("started");
+        let result = store.lock_with_timeout(budget);
+        let finished_at = Instant::now();
+        done_tx
+            .send((
+                finished_at,
+                result.map(|_| ()).map_err(|error| format!("{error:#}")),
+            ))
+            .expect("done");
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("waiter opened its repository");
+    start_tx.send(()).expect("start waiter");
+    let started = started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("waiter entered lock_with_timeout");
+    wait_for_admission_waiters(&queue, 1, Duration::from_secs(3));
+    let release_at = started + Duration::from_secs(4);
+    if let Some(pause) = release_at.checked_duration_since(Instant::now()) {
+        std::thread::sleep(pause);
+    }
+    let elapsed_in_queue = Instant::now().saturating_duration_since(started);
+    assert!(
+        budget.saturating_sub(elapsed_in_queue) >= Duration::from_secs(1),
+        "queue wait consumed the original budget before the kernel lock was contested: {elapsed_in_queue:?}"
+    );
+    assert_eq!(
+        queue.queued_waiters().expect("waiters"),
+        1,
+        "waiter left the queue before the kernel lock contested the remaining budget"
+    );
+    // The raw kernel lock is independent of the queue permit and must spend only
+    // the time still left on the waiter's original lock_with_timeout deadline.
+    let kernel = KernelStateLock::acquire_direct_with_timeout(
+        &store.state_root,
+        REGISTRY_ADMISSION_LOCK_NAME,
+        Duration::from_secs(5),
+    )
+    .expect("kernel lock while the admission permit is held separately");
+    let released_at = Instant::now();
+    drop(permit);
+    let (finished_at, result) = done_rx.recv_timeout(Duration::from_secs(6)).unwrap_or_else(|_| {
+        panic!(
+            "waiter was still blocked after the original remaining budget; a fresh kernel budget may still be running"
+        );
+    });
+    let message = result.expect_err("lock_with_timeout granted after its original deadline");
+    assert_classifiable_lock_timeout(&message);
+    let after_release = finished_at.saturating_duration_since(released_at);
+    assert!(
+        after_release < budget,
+        "registry lock waited a fresh full budget after queue admission: {after_release:?}"
+    );
+    assert!(
+        finished_at < started + budget + Duration::from_secs(3),
+        "registry lock outlived the original deadline by another full budget"
+    );
+    assert!(
+        matches!(
+            done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+                | Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ),
+        "waiter produced a second, late grant"
+    );
+    drop(kernel);
+    worker.join().expect("waiter thread");
+    assert_eq!(queue.queued_waiters().expect("waiters"), 0);
+    drop(
+        store
+            .lock_with_timeout(Duration::from_secs(5))
+            .expect("registry lock recovers after the shared-deadline timeout"),
+    );
+}
+
 include!("tests_part2.rs");
 include!("tests_part3.rs");
