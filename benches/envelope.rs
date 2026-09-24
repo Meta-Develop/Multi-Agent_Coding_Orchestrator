@@ -278,10 +278,22 @@ fn record_lifecycle_failure(
     if tolerate_lock_timeout && is_managed_worktree_lock_timeout(&message) {
         let mut slot = first_error.lock().expect("lifecycle error mutex");
         if slot.is_none() {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0.0, |d| d.as_secs_f64());
+            #[cfg(target_os = "linux")]
+            let native_tid = Some(unsafe {
+                // SAFETY: gettid is side-effect-free and takes no pointers.
+                libc::gettid()
+            });
+            #[cfg(not(target_os = "linux"))]
+            let native_tid: Option<i32> = None;
             let mut stderr = std::io::stderr().lock();
             let _ = writeln!(
                 stderr,
-                "coordination_envelope agent={agent} step={step} message={message}"
+                "coordination_envelope agent={agent} step={step} message={message} \
+                 timestamp={timestamp:.6} native_tid={native_tid:?}"
             );
             let _ = stderr.flush();
             *slot = Some(message);
