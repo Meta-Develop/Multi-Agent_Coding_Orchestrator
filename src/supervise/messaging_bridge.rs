@@ -547,6 +547,19 @@ pub(super) fn recover_supervisor_messaging_session(run_directory: &Path) -> Resu
 }
 
 #[cfg(test)]
+pub(super) fn read_persistent_supervisor_messaging_journal_for_test(
+    run_directory: &Path,
+) -> Result<String> {
+    let binding = PersistentMessagingBinding::open(run_directory)?;
+    let factory =
+        SupervisorMessagingSessionFactory::from_persistent_binding(run_directory, binding)?;
+    let _broker = factory.open_existing_broker()?;
+    let journal = fs::read_to_string(factory.durable_store_path())
+        .context("read durable messaging journal from state namespace")?;
+    Ok(journal)
+}
+
+#[cfg(test)]
 pub(super) fn forget_supervisor_messaging_session_for_test(run_directory: &Path) -> Result<()> {
     let mut sessions = run_sessions()
         .lock()

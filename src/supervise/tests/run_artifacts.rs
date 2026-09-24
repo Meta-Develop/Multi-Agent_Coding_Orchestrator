@@ -1320,13 +1320,33 @@ fn fake_supervise_run_manifests_creation_only_messaging_artifacts() {
     let run_directory = repo_path
         .join(RunArtifactFamily::Supervise.run_root())
         .join(run_id.as_str());
+    let second_run_id =
+        RunId::new("artifact-messaging-created-only-peer").expect("valid peer run id");
+    let mut second_writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        second_run_id,
+        "supervise-test",
+    )
+    .expect("reserve peer messaging session");
+    let second_plan = injected_plan(injected_assignment(true), 0);
+    let second_metadata = messaging_plan_metadata(&second_plan);
+    messaging_bridge::initialize_supervisor_messaging_session(
+        &mut second_writer,
+        &second_plan,
+        &second_metadata,
+    )
+    .expect("initialize peer messaging session");
+    let missing_session =
+        messaging_bridge::with_supervisor_messaging_session(&run_directory, |_| Ok(()))
+            .expect_err("later initialization prunes the finalized messaging session");
+    assert!(
+        format!("{missing_session:#}").contains("supervisor messaging session is not initialized"),
+        "unexpected missing-session error: {missing_session:#}"
+    );
     let journal_text =
-        messaging_bridge::with_supervisor_messaging_session(&run_directory, |factory| {
-            let journal = fs::read_to_string(factory.durable_store_path())
-                .context("read durable messaging journal from state namespace")?;
-            Ok(journal)
-        })
-        .expect("inspect durable messaging journal after fake supervise run");
+        messaging_bridge::read_persistent_supervisor_messaging_journal_for_test(&run_directory)
+            .expect("inspect durable messaging journal after fake supervise run");
     assert_eq!(journal_text.lines().count(), 1);
     let created: serde_json::Value =
         serde_json::from_str(&journal_text).expect("decode messaging creation record");
