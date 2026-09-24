@@ -1597,10 +1597,16 @@ Grok's immutable safety argv. `acp_stdio` renders contained
 parent session evidence after `session/set_model`, not backend attestation.
 Writable managed-child launch retains the legacy exact typed contract for
 `grok-4.6`/`xhigh`. The standard `grok-4.7`/`xhigh` typed writable contract is
-supported only with `headless_streaming_json`. Grok 4.7 ACP stays fail-closed
-pending the schema and resolved model/effort identity acceptance gate tracked
-in Issue #604; choosing `acp_stdio` does not elevate 4.7 capabilities, with or
-without an output schema. Select 4.7 explicitly with a `role_models` entry whose
+supported only with `headless_streaming_json`. The Issue #604 publication gate
+is implemented. Grok 4.7 ACP writable admission stays off pending Linux
+credential-confined, account-bound managed acceptance in Issue #616. Native
+Grok CLI 1.0.40's current ACP identity format can be parsed from the tagged
+set-model ack and from `currentValue` on the `session/set_config_option`
+response. The source wire contract is `_meta.outputSchema`. A corrected native
+Windows CLI 1.0.40 check returned `structuredOutput` `{"accepted":true}`; the
+earlier `_meta.jsonSchema` key was a client defect, not a provider limitation.
+That receipt is not MACO Linux containment proof, and choosing `acp_stdio`
+does not elevate 4.7 capabilities, with or without an output schema. Select 4.7 explicitly with a `role_models` entry whose
 `model` is `grok-4.7` and whose `reasoning_effort` is `xhigh`. That selection
 also requires `--prior-data` containing a dated admissible 4.7 prior and an
 eligible operator capability row; see [Operator prior data for a supervise
@@ -1615,9 +1621,9 @@ and [developer documentation](https://docs.x.ai/developers/grok-4-7).
 Known native cost is a repository microunit equivalent of provider
 `costUsdTicks` (100000 microunits per USD), not a billed quota. Live writable
 ExternalGrok credential confinement and remaining compatibility gates stay
-unproven. No paid 4.7 run, benchmark, pricing inference, quality prior, or
-default-model migration is claimed; the historical 4.6 terminal seed remains
-unchanged. This is not production economics and does not close issue 149.
+unproven. No live managed MACO 4.7 acceptance is claimed. No benchmark,
+pricing inference, quality prior, or default-model migration is claimed; the
+historical 4.6 terminal seed remains unchanged. This is not production economics and does not close issue 149.
 
 `--additional-runtime-bin RUNTIME=ABSOLUTE_EXECUTABLE` is optional and repeatable.
 It does not replace `--runtime` / `--runtime-bin`, which remain required and still
