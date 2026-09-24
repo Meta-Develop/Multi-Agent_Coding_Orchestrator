@@ -718,9 +718,12 @@ mod tests {
             data_dir,
         };
         let guard = activate_cam_grok_test_harness(harness);
-        let sibling = std::thread::spawn(|| acquire_grok_launch_authority(None).is_err())
-            .join()
-            .expect("join sibling");
+        let sibling = std::thread::spawn(|| {
+            let _no_socket = SocketEnvGuard::unset();
+            acquire_grok_launch_authority(None).is_err()
+        })
+        .join()
+        .expect("join sibling");
         assert!(sibling);
         let authority = acquire_grok_launch_authority(None)?;
         assert_eq!(authority.binding().account_id, "account-a");
@@ -755,40 +758,21 @@ mod tests {
     }
 
     struct SocketEnvGuard {
-        previous: Option<std::ffi::OsString>,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _inner: crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard,
     }
 
     impl SocketEnvGuard {
         fn set(path: &Path) -> Self {
-            use crate::account_authority::authority_socket_config::CAM_AUTHORITY_SOCKET_ENV;
-            let _lock = crate::account_authority::CAM_AUTHORITY_SOCKET_TEST_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let previous = std::env::var_os(CAM_AUTHORITY_SOCKET_ENV);
-            std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, path);
-            Self { previous, _lock }
+            use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
+            Self {
+                _inner: CamAuthoritySocketTestGuard::install(Some(path.as_os_str())),
+            }
         }
 
         fn unset() -> Self {
-            // Parallel tests share process-global MACO_CAM_AUTHORITY_SOCKET.
-            // No-socket acquire paths must hold this lock or they observe a sibling's socket.
-            use crate::account_authority::authority_socket_config::CAM_AUTHORITY_SOCKET_ENV;
-            let _lock = crate::account_authority::CAM_AUTHORITY_SOCKET_TEST_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let previous = std::env::var_os(CAM_AUTHORITY_SOCKET_ENV);
-            std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV);
-            Self { previous, _lock }
-        }
-    }
-
-    impl Drop for SocketEnvGuard {
-        fn drop(&mut self) {
-            use crate::account_authority::authority_socket_config::CAM_AUTHORITY_SOCKET_ENV;
-            match self.previous.take() {
-                Some(value) => std::env::set_var(CAM_AUTHORITY_SOCKET_ENV, value),
-                None => std::env::remove_var(CAM_AUTHORITY_SOCKET_ENV),
+            use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
+            Self {
+                _inner: CamAuthoritySocketTestGuard::install(None),
             }
         }
     }
@@ -1058,6 +1042,9 @@ mod tests {
             admit_grok_run_account_binding, freeze_observed_grok_selection,
             grok_run_account_binding,
         };
+        use crate::account_authority::authority_socket_config::{
+            cam_authority_socket_value, CamAuthoritySocketTestGuard,
+        };
 
         const RUN_A: &str = "issue-601-acquire-run-a";
         const RUN_B: &str = "issue-601-acquire-run-b";
@@ -1085,6 +1072,7 @@ mod tests {
         let listen_registry = StoredAccountRegistry::new(fixture.registry.metadata_path());
         let (_socket_dir, socket_path, _server) = serve_registry_on_socket(listen_registry);
         let _socket_env = SocketEnvGuard::set(&socket_path);
+        let captured_socket = cam_authority_socket_value();
 
         let user_home = fixture.user_home.clone();
         let data_dir = fixture.data_dir.clone();
@@ -1097,7 +1085,10 @@ mod tests {
             let carried_a = carried_a.clone();
             let user_home_a = user_home.clone();
             let data_dir_a = data_dir.clone();
+            let captured_socket_a = captured_socket.clone();
             let run_a = scope.spawn(move || -> Result<()> {
+                let _thread_socket =
+                    CamAuthoritySocketTestGuard::install(captured_socket_a.as_deref());
                 ready_a.wait();
                 overwritten_a.wait();
                 let first = grok_run_account_binding(RUN_A).expect("run A map");
@@ -1131,6 +1122,8 @@ mod tests {
             });
 
             let run_b = scope.spawn(move || -> Result<()> {
+                let _thread_socket =
+                    CamAuthoritySocketTestGuard::install(captured_socket.as_deref());
                 ready.wait();
                 admit_grok_run_account_binding(RUN_B, Some(frozen_b.clone()));
                 freeze_observed_grok_selection(Some(frozen_b.clone()));
