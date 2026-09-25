@@ -4284,6 +4284,7 @@ fn run_read_only_researcher_app_server_process(
         permission_profile: "maco_external_codex".to_string(),
         prompt,
         model: spec.model.clone(),
+        output_schema: load_codex_app_server_output_schema(spec)?,
     };
     run_process_interactive(process_spec, cancellation, |session| {
         let mut transport = codex_app_server::ContainedJsonLineTransport::new(session);
@@ -4309,6 +4310,39 @@ fn run_read_only_researcher_app_server_process(
         // the existing verified outer profile remains enforced, and every approval cancels.
         Ok(outcome)
     })
+}
+
+fn load_codex_app_server_output_schema(
+    spec: &ExternalAgentCommand,
+) -> Result<Option<serde_json::Value>, ProcessRunError> {
+    let Some(path) = spec.output_schema.as_ref() else {
+        return Ok(None);
+    };
+    let bytes = read_bounded_regular_file_nofollow(path, 1024 * 1024).map_err(|source| {
+        ProcessRunError::IoSetup {
+            label: "Codex app-server output schema".to_string(),
+            command: spec.program.display().to_string(),
+            source,
+        }
+    })?;
+    let schema = serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|error| {
+        ProcessRunError::IoSetup {
+            label: "Codex app-server output schema".to_string(),
+            command: spec.program.display().to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+        }
+    })?;
+    if !schema.is_object() {
+        return Err(ProcessRunError::IoSetup {
+            label: "Codex app-server output schema".to_string(),
+            command: spec.program.display().to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "output schema root must be an object",
+            ),
+        });
+    }
+    Ok(Some(schema))
 }
 
 fn validate_read_only_researcher_app_server_outcome(
@@ -4355,6 +4389,16 @@ fn run_duplex_app_server_process(
         permission_profile: "maco_external_codex".to_string(),
         prompt,
         model: spec.model.clone(),
+        output_schema: match load_codex_app_server_output_schema(spec) {
+            Ok(schema) => schema,
+            Err(error) => {
+                return DuplexProcessAttempt {
+                    process: Err(error),
+                    metrics: reviewer.reviewer.metrics(),
+                    gate_denials: Vec::new(),
+                };
+            }
+        },
     };
     let mut process = run_process_interactive(process_spec, cancellation, |session| {
         let mut transport = codex_app_server::ContainedJsonLineTransport::new(session);

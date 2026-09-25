@@ -481,6 +481,7 @@ pub(crate) struct AppServerTurn {
     pub(crate) permission_profile: String,
     pub(crate) prompt: String,
     pub(crate) model: Option<String>,
+    pub(crate) output_schema: Option<Value>,
 }
 
 impl AppServerTurn {
@@ -1318,6 +1319,14 @@ where
     )?;
     state.send(transport, &json!({"method": "initialized"}))?;
 
+    // An empty environment selection disables execution access. Select only the
+    // local environment; the fixed permission profile and outer systemd scope
+    // still constrain filesystem writes and network access.
+    let local_environment = json!({
+        "environmentId": "local",
+        "cwd": turn.cwd,
+        "runtimeWorkspaceRoots": [turn.cwd],
+    });
     let thread_start_id = state.allocate_request_id()?;
     let mut thread_params = Map::from_iter([
         ("cwd".to_string(), Value::from(turn.cwd.clone())),
@@ -1333,7 +1342,10 @@ where
         ("ephemeral".to_string(), Value::from(true)),
         ("experimentalRawEvents".to_string(), Value::from(false)),
         ("dynamicTools".to_string(), Value::Array(Vec::new())),
-        ("environments".to_string(), Value::Array(Vec::new())),
+        (
+            "environments".to_string(),
+            Value::Array(vec![local_environment.clone()]),
+        ),
     ]);
     if let Some(model) = &turn.model {
         thread_params.insert("model".to_string(), Value::from(model.clone()));
@@ -1399,19 +1411,29 @@ where
 
     let turn_start_id = state.allocate_request_id()?;
     let mut lifecycle = ThreadLifecycleNotices::default();
+    let mut turn_params = Map::from_iter([
+        ("threadId".to_string(), Value::from(thread_id.clone())),
+        (
+            "input".to_string(),
+            json!([{"type": "text", "text": turn.prompt, "text_elements": []}]),
+        ),
+        ("approvalPolicy".to_string(), Value::from("on-request")),
+        ("approvalsReviewer".to_string(), Value::from("user")),
+        (
+            "permissions".to_string(),
+            Value::from(turn.permission_profile.clone()),
+        ),
+        ("environments".to_string(), json!([local_environment])),
+    ]);
+    if let Some(schema) = &turn.output_schema {
+        turn_params.insert("outputSchema".to_string(), schema.clone());
+    }
     state.send(
         transport,
         &json!({
             "id": turn_start_id.to_value(),
             "method": "turn/start",
-            "params": {
-                "threadId": thread_id,
-                "input": [{"type": "text", "text": turn.prompt, "text_elements": []}],
-                "approvalPolicy": "on-request",
-                "approvalsReviewer": "user",
-                "permissions": turn.permission_profile,
-                "environments": []
-            }
+            "params": turn_params,
         }),
     )?;
     let turn_response = wait_for_response(
@@ -2796,6 +2818,7 @@ mod tests {
             permission_profile: "maco_external_codex".to_string(),
             prompt: "perform the bounded task".to_string(),
             model: None,
+            output_schema: None,
         }
     }
 
@@ -2821,9 +2844,12 @@ mod tests {
         let mut transport = FakeTransport::from_values(messages_with_startup_information(
             captured_startup_information(),
         ));
+        let mut turn = test_turn();
+        turn.output_schema =
+            Some(json!({"type": "object", "properties": {"status": {"type": "string"}}}));
         let outcome = run_app_server_turn(
             &mut transport,
-            &test_turn(),
+            &turn,
             AppServerLimits::default(),
             &mut |_: ApprovalRequest| panic!("informational prelude is not an approval"),
             || false,
@@ -2838,8 +2864,26 @@ mod tests {
         assert_eq!(transport.sent.len(), 4);
         assert_eq!(transport.sent[2]["method"], "thread/start");
         assert_eq!(transport.sent[2]["id"], 2);
+        let expected_environment = json!({
+            "environmentId": "local",
+            "cwd": "/workspace",
+            "runtimeWorkspaceRoots": ["/workspace"],
+        });
+        assert_eq!(
+            transport.sent[2]["params"]["environments"],
+            json!([expected_environment])
+        );
         assert_eq!(transport.sent[3]["method"], "turn/start");
         assert_eq!(transport.sent[3]["id"], 3);
+        assert_eq!(
+            transport.sent[3]["params"]["outputSchema"],
+            turn.output_schema
+                .expect("bounded structured output schema")
+        );
+        assert_eq!(
+            transport.sent[3]["params"]["environments"],
+            transport.sent[2]["params"]["environments"]
+        );
     }
 
     #[test]
@@ -3291,8 +3335,8 @@ mod tests {
                 ..AppServerLimits::default()
             },
             AppServerLimits {
-                max_line_bytes: 512,
-                max_total_bytes: 512,
+                max_line_bytes: 1024,
+                max_total_bytes: 1024,
                 ..AppServerLimits::default()
             },
         ] {
