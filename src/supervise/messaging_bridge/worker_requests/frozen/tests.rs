@@ -532,3 +532,49 @@ fn frozen_inbox_shutdown_race_includes_exactly_durable_submissions() -> Result<(
     }
     Ok(())
 }
+
+#[test]
+fn prepared_worker_inbox_turn_owns_fresh_match_and_extracts_once() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let turn = fixture.turn()?;
+    let inbox = fixture.inbox(false)?;
+    let mut prepared = PreparedWorkerInboxTurn::new(turn, inbox)?;
+    assert_eq!(prepared.turn().binding, fixture.binding);
+    assert_eq!(prepared.turn().turn, 1);
+    let extracted = prepared.take_inbox()?;
+    assert!(!extracted.requires_reconciliation());
+    assert!(extracted.requests()?.is_empty());
+    extracted.verify_ipc_binding(&prepared.turn().binding, &prepared.turn().repository)?;
+    assert_eq!(prepared.turn().binding, fixture.binding);
+    assert!(prepared.take_inbox().is_err());
+    Ok(())
+}
+
+#[test]
+fn prepared_worker_inbox_turn_rejects_mismatched_binding() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let turn = fixture.turn()?;
+    let mut binding = fixture.binding.clone();
+    binding.generation = "foreign".into();
+    let inbox =
+        WorkerRequestInbox::create(repository_authenticator_key_only(&fixture.repo)?, binding)?;
+    assert!(PreparedWorkerInboxTurn::new(turn, inbox).is_err());
+    Ok(())
+}
+
+#[test]
+fn prepared_worker_inbox_turn_rejects_recovered_and_nonempty() -> Result<()> {
+    let nonempty = Fixture::new()?;
+    let mut inbox = nonempty.inbox(false)?;
+    inbox.submit("request", "worker")?;
+    assert!(!inbox.requires_reconciliation());
+    assert!(PreparedWorkerInboxTurn::new(nonempty.turn()?, inbox).is_err());
+
+    let recovered = Fixture::new()?;
+    drop(recovered.inbox(false)?);
+    let inbox = recovered.inbox(true)?;
+    assert!(inbox.requires_reconciliation());
+    assert!(inbox.requests()?.is_empty());
+    assert!(PreparedWorkerInboxTurn::new(recovered.turn()?, inbox).is_err());
+    Ok(())
+}
