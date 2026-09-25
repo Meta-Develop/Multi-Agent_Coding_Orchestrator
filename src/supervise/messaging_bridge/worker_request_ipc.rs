@@ -1,6 +1,7 @@
 //! Opt-in submit/status transport for a supervisor-held inbox. No launch authority.
 //!
-//! The caller supplies the frozen authored parent, current attempt/generation and an
+//! A fresh session may mint one supervisor-owned first-turn binding below. The staged
+//! transport caller supplies the frozen authored parent, current binding and an
 //! already-opened inbox. It must persist/reuse that generation, reconcile recovery,
 //! and cancel/drop the endpoint at attempt end. There is no automatic fresh/recover
 //! fallback here. Ordinary assignment endpoints do not gain Worker request access.
@@ -10,7 +11,11 @@ use super::{
     worker_requests::{WorkerRequestBinding, WorkerRequestInbox},
     *,
 };
-use crate::{artifacts::state_auth::RepositoryAuthenticator, process_runner::ProcessCancellation};
+use crate::{
+    artifacts::state_auth::{random_identifier, RepositoryAuthenticator},
+    process_runner::ProcessCancellation,
+    supervise::SupervisorRuntime,
+};
 
 /// Owned by the endpoint, retaining the inbox's exclusive journal handle for its
 /// whole lifetime. Child input can neither attach a journal nor choose its binding.
@@ -31,6 +36,49 @@ pub(super) enum SubmitBoundary {
 }
 
 impl SupervisorMessagingSessionFactory {
+    pub(super) fn revoke_fresh_worker_request_admission(&self) -> Result<()> {
+        self.fresh_worker_request_parents
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fresh Worker request admission is poisoned"))?
+            .take();
+        Ok(())
+    }
+
+    /// Claims the session's sole fresh inbox identity, before any broker reopen.
+    /// `parent`, `attempt`, and the resolved runtime must come from supervisor launch
+    /// context. Exact authored equality prevents substituting another parent's Workers.
+    /// Even a refused claim consumes authority; callers must retain the returned binding
+    /// for this live turn, never retry construction after downstream failure. This is
+    /// inbox admission only, not permission to dispatch or recover any Worker.
+    #[allow(dead_code)] // No production caller until the complete turn controller lands.
+    pub(in crate::supervise) fn claim_fresh_worker_request_binding(
+        &self,
+        run_id: &RunId,
+        parent: &OrchestratorAssignment,
+        attempt: usize,
+        resolved_runtime: SupervisorRuntime,
+    ) -> Result<WorkerRequestBinding> {
+        // Consume before verification, randomness, or any other fallible downstream work.
+        let parents = self
+            .fresh_worker_request_parents
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fresh Worker request admission is poisoned"))?
+            .take()
+            .context("fresh Worker request admission is unavailable or already consumed")?;
+        if attempt != 1
+            || resolved_runtime != SupervisorRuntime::Codex
+            || parent
+                .runtime
+                .is_some_and(|runtime| runtime != SupervisorRuntime::Codex)
+            || !parents.iter().any(|authored| authored == parent)
+        {
+            bail!("fresh Worker request admission requires the exact authored first Codex parent turn");
+        }
+        let generation =
+            random_identifier().context("failed to mint fresh Worker inbox generation")?;
+        self.worker_request_binding(run_id, parent, attempt, &generation)
+    }
+
     /// `parent` and attempt identity must come from the current supervisor context,
     /// never from an IPC request or a child report. This grants enqueueing only.
     #[allow(dead_code)] // Staged supervisor caller; no scheduler wiring in this leaf.
