@@ -322,6 +322,28 @@ fn advertised_catalogs_from_live_runtimes(repo: &Path) -> Result<AdvertisedCatal
             }
         };
     let grok_program = std::env::var_os("MACO_GROK_BIN");
+    #[cfg(target_os = "linux")]
+    let grok = match crate::account_authority::grok::acquire_optional_grok_catalog_authority()? {
+        Some(authority) => {
+            authority.verify_binding_unchanged()?;
+            let runner = crate::runtime_adapter::grok::BoundGrokCatalogCommandRunner::new(
+                authority.managed_grok_home(),
+            )?;
+            let observed = observe_optional_live_grok_catalog(
+                &runner,
+                repo,
+                observed_at_unix_millis,
+                grok_program.as_deref(),
+            )?;
+            authority.verify_binding_unchanged()?;
+            observed
+        }
+        None if grok_program.is_none() => None,
+        None => bail!(
+            "live Grok catalog requires a complete Coding Agent Manager selected grok-cli account"
+        ),
+    };
+    #[cfg(not(target_os = "linux"))]
     let grok = observe_optional_live_grok_catalog(
         &crate::runtime_adapter::grok::ScreenedGrokCatalogCommandRunner,
         repo,
