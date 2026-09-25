@@ -140,6 +140,44 @@ impl<'a> WorkerInboxTurn<'a> {
     }
 }
 
+/// Owns one verified turn and its fresh inbox. Taking the inbox is one-shot.
+/// This container grants no execution authority.
+struct PreparedWorkerInboxTurn<'a> {
+    turn: WorkerInboxTurn<'a>,
+    inbox: Option<WorkerRequestInbox<RepositoryAuthenticator>>,
+}
+
+impl<'a> PreparedWorkerInboxTurn<'a> {
+    fn new(
+        turn: WorkerInboxTurn<'a>,
+        inbox: WorkerRequestInbox<RepositoryAuthenticator>,
+    ) -> Result<Self> {
+        turn.verify()?;
+        inbox.verify_ipc_binding(&turn.binding, &turn.repository)?;
+        if inbox.requires_reconciliation() {
+            bail!("recovered inbox cannot be prepared for a worker turn");
+        }
+        if !inbox.requests()?.is_empty() {
+            bail!("nonempty inbox cannot be prepared for a worker turn");
+        }
+        Ok(Self {
+            turn,
+            inbox: Some(inbox),
+        })
+    }
+
+    fn turn(&self) -> &WorkerInboxTurn<'a> {
+        &self.turn
+    }
+
+    fn take_inbox(&mut self) -> Result<WorkerRequestInbox<RepositoryAuthenticator>> {
+        match self.inbox.take() {
+            Some(inbox) => Ok(inbox),
+            None => bail!("prepared worker inbox turn was already taken"),
+        }
+    }
+}
+
 /// Owns both endpoint and inbox. No API hands out the service Arc or live inbox.
 /// Dropping without freezing still joins; reopening afterward remains quarantined.
 pub(in crate::supervise) struct WorkerInboxEndpoint<'a> {
