@@ -990,17 +990,31 @@ fn write_injected_worker_journals_from_report(command: &ExternalAgentCommand) {
         Ok(contents) => contents,
         Err(_) => return,
     };
-    let report = match serde_json::from_slice::<OrchestratorReviewReport>(&contents) {
-        Ok(report) => report,
-        Err(_) => return,
-    };
-    let Some(incoming_root) = command.output_last_message.parent() else {
+    // Both report structs share enough fields that Serde can deserialize a
+    // direct Worker report as an orchestrator report with zero workers. Use the
+    // envelope key to distinguish the two fixture formats before parsing.
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&contents) else {
         return;
     };
-    let journal_root = incoming_root.join("worker-journals");
-    fs::create_dir_all(&journal_root).expect("create injected worker journal directory");
-    for worker in &report.worker_reports {
-        let journal_path = journal_root.join(worker_execution_journal_file_name(&worker.id));
+    let workers = if value.get("worker_reports").is_some() {
+        let Ok(report) = serde_json::from_value::<OrchestratorReviewReport>(value) else {
+            return;
+        };
+        report.worker_reports
+    } else {
+        let Ok(worker) = serde_json::from_value::<WorkerReport>(value) else {
+            return;
+        };
+        vec![worker]
+    };
+    for worker in &workers {
+        let Some(artifact) = command
+            .worker_journal_artifacts
+            .iter()
+            .find(|artifact| artifact.worker_id == worker.id)
+        else {
+            continue;
+        };
         let journal = if worker.files_changed.is_empty() && worker.commands_run.is_empty() {
             String::new()
         } else {
@@ -1014,7 +1028,12 @@ fn write_injected_worker_journals_from_report(command: &ExternalAgentCommand) {
                 .join("\n")
                 + "\n"
         };
-        fs::write(&journal_path, journal).expect("write injected worker journal");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&artifact.path)
+            .expect("open precreated injected worker journal");
+        std::io::Write::write_all(&mut file, journal.as_bytes())
+            .expect("append injected worker journal");
     }
 }
 

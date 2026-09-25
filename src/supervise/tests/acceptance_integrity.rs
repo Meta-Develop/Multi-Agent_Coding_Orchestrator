@@ -2748,3 +2748,162 @@ fn collect_parent_auditor_report_rejects_self_asserted_codex_but_retains_parent_
         Some(parent_evidence)
     );
 }
+
+fn generated_direct_worker_report(assignment: &OrchestratorAssignment) -> OrchestratorReviewReport {
+    let mut worker = injected_child_report(&injected_assignment(true))
+        .worker_reports
+        .remove(0);
+    worker.id = assignment.id.clone();
+    worker.assigned_paths = assignment.assigned_paths.clone();
+    worker.semantic_symbols = assignment.semantic_symbols.clone();
+    worker.semantic_modules = assignment.semantic_modules.clone();
+    direct_worker_report_envelope(worker)
+}
+
+#[test]
+fn generated_direct_workers_reject_missing_invalid_and_inconsistent_journals() {
+    for plan in
+        crate::supervise::plan_api::generated_terminal_worker_tests::generated_plans_for_gate_tests(
+        )
+    {
+        let assignment = plan.assignments.last().unwrap();
+        let report_path = Path::new("direct-worker-report.json");
+        let command = injected_command_record();
+        let entry = WorkerExecutionJournalEntry {
+            command: command.command.clone(),
+            cwd: command.cwd.clone(),
+            ..injected_journal_entry(assignment.assigned_paths.clone())
+        };
+        let mut valid = generated_direct_worker_report(assignment);
+        valid.files_changed = assignment.assigned_paths.clone();
+        valid.worker_reports[0].files_changed = assignment.assigned_paths.clone();
+        valid.worker_reports[0].commands_run = vec![command];
+        let evidence = |status| {
+            BTreeMap::from([(
+                assignment.id.clone(),
+                WorkerExecutionJournalEvidence {
+                    incoming_relative_path: worker_execution_journal_incoming_relative_for_id(
+                        &assignment.id,
+                    ),
+                    evidence_relative_path: worker_execution_journal_evidence_relative(
+                        &assignment.id,
+                        &assignment.id,
+                    ),
+                    status,
+                },
+            )])
+        };
+        let mut accepted = valid.clone();
+        validate_worker_execution_journal_evidence(
+            assignment,
+            report_path,
+            &evidence(WorkerExecutionJournalStatus::Loaded(vec![entry.clone()])),
+            &mut accepted,
+        );
+        assert_eq!(accepted, valid, "matching direct-worker evidence must pass");
+
+        let mut command_mismatch = entry.clone();
+        command_mismatch.command = vec!["different-command".to_string()];
+        let mut cwd_mismatch = entry.clone();
+        cwd_mismatch.cwd = PathBuf::from("different-cwd");
+        let mut paths_missing = entry.clone();
+        paths_missing.changed_paths.clear();
+        let mut outside_scope = entry.clone();
+        outside_scope
+            .changed_paths
+            .push(PathBuf::from("unassigned.txt"));
+        let mut wrong_id = evidence(WorkerExecutionJournalStatus::Loaded(vec![entry]));
+        let journal = wrong_id.remove(&assignment.id).unwrap();
+        wrong_id.insert(format!("{}-worker", assignment.id), journal);
+        for (journals, expected) in [
+            (BTreeMap::new(), "was not imported"),
+            (wrong_id, "was not imported"),
+            (
+                evidence(WorkerExecutionJournalStatus::Missing),
+                "execution journal is missing",
+            ),
+            (
+                evidence(WorkerExecutionJournalStatus::Invalid(
+                    "invalid JSON".to_string(),
+                )),
+                "is invalid",
+            ),
+            (
+                evidence(WorkerExecutionJournalStatus::Loaded(vec![command_mismatch])),
+                "commands_run entries are not supported",
+            ),
+            (
+                evidence(WorkerExecutionJournalStatus::Loaded(vec![cwd_mismatch])),
+                "commands_run entries are not supported",
+            ),
+            (
+                evidence(WorkerExecutionJournalStatus::Loaded(vec![paths_missing])),
+                "files_changed paths are not supported",
+            ),
+            (
+                evidence(WorkerExecutionJournalStatus::Loaded(vec![outside_scope])),
+                "outside assigned_paths",
+            ),
+        ] {
+            let mut rejected = valid.clone();
+            validate_worker_execution_journal_evidence(
+                assignment,
+                report_path,
+                &journals,
+                &mut rejected,
+            );
+            assert_eq!(rejected.status, ReviewStatus::Failed, "{expected}");
+            assert!(!rejected.accepted);
+            assert!(rejected.rejected);
+            assert_eq!(rejected.worker_reports[0].status, ReviewStatus::Failed);
+            assert!(finding_messages(&rejected).contains(expected), "{expected}");
+        }
+    }
+}
+
+#[test]
+fn generated_direct_workers_require_parent_audit_for_zero_diff_success() {
+    for plan in
+        crate::supervise::plan_api::generated_terminal_worker_tests::generated_plans_for_gate_tests(
+        )
+    {
+        let assignment = plan.assignments.last().unwrap();
+        let report_path = Path::new("direct-worker-report.json");
+        let report = generated_direct_worker_report(assignment);
+        assert!(report.files_changed.is_empty());
+        assert!(parent_auditor_required(assignment, &report));
+        assert_eq!(
+            required_auditor_prompt_subject_ids(assignment, &report),
+            vec![assignment.id.clone()]
+        );
+        let mut audit = injected_auditor_report(assignment, &report);
+        audit.commands_run.push(injected_command_record());
+
+        let mut accepted = report.clone();
+        accepted.audit_reports.push(audit.clone());
+        validate_auditor_reports(assignment, report_path, &mut accepted);
+        assert_eq!(accepted.status, ReviewStatus::Succeeded);
+        assert!(accepted.accepted);
+        assert!(!accepted.rejected);
+
+        let mut wrong_subject = audit.clone();
+        wrong_subject.reviewed_worker_ids = vec![format!("{}-worker", assignment.id)];
+        let mut wrong_parent = audit.clone();
+        wrong_parent.id = "unrelated-auditor".to_string();
+        let mut wrong_paths = audit;
+        wrong_paths.reviewed_paths = vec![PathBuf::from("unassigned.txt")];
+        for audits in [
+            vec![],
+            vec![wrong_subject],
+            vec![wrong_parent],
+            vec![wrong_paths],
+        ] {
+            let mut rejected = report.clone();
+            rejected.audit_reports = audits;
+            validate_auditor_reports(assignment, report_path, &mut rejected);
+            assert_eq!(rejected.status, ReviewStatus::Failed);
+            assert!(!rejected.accepted);
+            assert!(rejected.rejected);
+        }
+    }
+}

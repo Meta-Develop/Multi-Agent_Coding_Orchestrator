@@ -695,9 +695,9 @@ fn supervise_plan_literal_new_file_emits_parent_gated_direct_worker_contract() -
 }
 
 #[test]
-fn supervise_plan_from_goal_emits_nested_traceable_disjoint_workstreams() -> Result<()> {
+fn supervise_plan_from_goal_emits_parent_gated_traceable_disjoint_workers() -> Result<()> {
     support::require_containment!(
-        "supervise_plan_from_goal_emits_nested_traceable_disjoint_workstreams"
+        "supervise_plan_from_goal_emits_parent_gated_traceable_disjoint_workers"
     );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
@@ -816,12 +816,30 @@ fn supervise_plan_from_goal_emits_nested_traceable_disjoint_workstreams() -> Res
                 "nested assignment depth must be exactly one below its parent"
             );
             assert!(depth > 2, "nested assignments must be deeper than O1 roots");
+            let worker = assignments_by_id[assignment_id];
+            let parent = assignments_by_id[parent_id];
+            assert_eq!(worker["phase"], "execution");
+            assert_eq!(worker["role"], "worker");
+            assert_eq!(worker["role_category"], "non_delegating_terminal_worker");
+            assert_eq!(parent["phase"], "planning");
+            assert_eq!(parent["role"], "child_orchestrator");
+            assert_eq!(parent["role_category"], "delegating_coordinator");
+            for field in ["assigned_paths", "semantic_symbols", "semantic_modules"] {
+                assert_eq!(
+                    worker[field], parent[field],
+                    "parent/worker {field} must agree"
+                );
+            }
             nested_entry_count += 1;
         } else {
             assert_eq!(
                 depth, 2,
                 "independent workstream roots must stay at depth 2"
             );
+            let parent = assignments_by_id[assignment_id];
+            assert_eq!(parent["phase"], "planning");
+            assert_eq!(parent["role"], "child_orchestrator");
+            assert_eq!(parent["role_category"], "delegating_coordinator");
             root_ids.push(assignment_id.to_string());
         }
 
@@ -835,6 +853,11 @@ fn supervise_plan_from_goal_emits_nested_traceable_disjoint_workstreams() -> Res
     assert!(
         nested_entry_count > 0,
         "goal planning must emit at least one genuine parented assignment"
+    );
+    assert_eq!(
+        nested_entry_count,
+        root_ids.len(),
+        "each planning workstream must have a parent-gated terminal Worker"
     );
 
     let mut root_paths = root_ids
@@ -862,7 +885,7 @@ fn supervise_plan_from_goal_emits_nested_traceable_disjoint_workstreams() -> Res
     let mut readme_worker_preserves_path = false;
     let mut rust_worker_preserves_path_and_semantics = false;
     for assignment in assignments {
-        assert_eq!(assignment["role"], "child_orchestrator");
+        let is_execution = assignment["phase"] == "execution";
         let assigned_paths = string_array(assignment, "assigned_paths")?;
         let fragments = assignment
             .get("spec_fragment_ids")
@@ -872,23 +895,21 @@ fn supervise_plan_from_goal_emits_nested_traceable_disjoint_workstreams() -> Res
         let workers = assignment["worker_assignments"]
             .as_array()
             .context("worker assignments must be an array")?;
+        assert!(
+            workers.is_empty(),
+            "generated planning coordinators and terminal Workers must not delegate native nested workers"
+        );
 
         match assigned_paths.as_slice() {
             [path] if path == "README.md" => {
                 readme_fragments.extend(fragments);
-                readme_worker_preserves_path |= workers.iter().any(|worker| {
-                    string_array(worker, "assigned_paths").is_ok_and(|paths| paths == ["README.md"])
-                });
+                readme_worker_preserves_path |= is_execution;
             }
             [path] if path == "src/lib.rs" => {
                 rust_fragments.extend(fragments);
                 rust_semantics.extend(string_array(assignment, "semantic_symbols")?);
-                rust_worker_preserves_path_and_semantics |= workers.iter().any(|worker| {
-                    string_array(worker, "assigned_paths")
-                        .is_ok_and(|paths| paths == ["src/lib.rs"])
-                        && string_array(worker, "semantic_symbols")
-                            .is_ok_and(|symbols| symbols == ["crate::ok"])
-                });
+                rust_worker_preserves_path_and_semantics |=
+                    is_execution && string_array(assignment, "semantic_symbols")? == ["crate::ok"];
             }
             other => panic!("unexpected generated assignment scope: {other:?}"),
         }
