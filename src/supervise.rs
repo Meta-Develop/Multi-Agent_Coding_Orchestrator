@@ -299,8 +299,13 @@ pub use accepted_task_cost::AcceptedTaskCostRollup;
 mod environment_observation;
 mod outcome_history;
 mod prior_input;
+mod runtime_executables;
 use outcome_history::*;
 pub use prior_input::{bind_frozen_operator_prior_data_for_run, bind_operator_prior_data};
+pub(crate) use runtime_executables::{
+    bind_new as bind_explicit_runtime_executables,
+    bind_resume as bind_frozen_runtime_executables_for_run,
+};
 
 mod messaging_bridge;
 
