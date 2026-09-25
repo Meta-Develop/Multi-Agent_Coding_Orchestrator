@@ -9,6 +9,10 @@ mod nested_worker_executor;
 #[allow(dead_code)]
 #[path = "parent_turn_yield.rs"]
 mod parent_turn_yield;
+// Staged binding of a held yield to a frozen inbox; no execution/collection caller.
+#[allow(dead_code)]
+#[path = "bound_parent_turn.rs"]
+mod bound_parent_turn;
 use crate::mutation_taxonomy::{
     admit_assignment_child_process_intent, admit_parent_auditor_process_intent,
     AssignmentProcessLaunchKind, SealedMechanicalExecutorDuty, SealedMechanicalExecutorPhase,
@@ -913,6 +917,7 @@ fn refuse_source_head_execution_base(
 }
 
 pub(super) struct AssignmentExecutionPreflight<'a> {
+    nested_turn_issued: AtomicBool,
     journal_parent_id: &'a str,
     environment_requirements: Vec<EnvironmentRequirement>,
     semantic_token: Option<u64>,
@@ -928,10 +933,56 @@ pub(super) struct AssignmentExecutionPreflight<'a> {
 }
 
 impl<'a> AssignmentExecutionPreflight<'a> {
+    /// Burn the slot before checking the request. Failed construction and permit
+    /// drop never authorize a replacement driver, including for another attempt.
+    fn issue_nested_turn(
+        &self,
+        parent_attempt: usize,
+    ) -> Result<NestedTurnExecutionPermit<'_, 'a>> {
+        if self.nested_turn_issued.swap(true, Ordering::AcqRel) {
+            bail!("nested turn execution permit has already been issued");
+        }
+        if parent_attempt == 0
+            || self.assignment.role != AgentRole::ChildOrchestrator
+            || self.assignment.phase != AssignmentPhase::Execution
+        {
+            bail!("nested turn execution permit requires an authored parent execution attempt");
+        }
+        Ok(NestedTurnExecutionPermit {
+            preflight: self,
+            parent_attempt,
+        })
+    }
+
     pub(super) fn managed_process_cancellation(
         &self,
     ) -> &crate::sync_store::ManagedClaimProcessCancellation {
         &self.managed_process_cancellation
+    }
+}
+
+/// Supervisor-local and deliberately neither Clone nor Deserialize. The reference
+/// pins the exact preflight identity for the permit's lifetime, not just its labels.
+/// Shared lease observations (including a frozen inbox) are allowed; execution
+/// requires an exclusive borrow of this unique permit as well as the outcome.
+struct NestedTurnExecutionPermit<'owner, 'resources> {
+    preflight: &'owner AssignmentExecutionPreflight<'resources>,
+    parent_attempt: usize,
+}
+
+impl NestedTurnExecutionPermit<'_, '_> {
+    fn revalidate(
+        &self,
+        preflight: &AssignmentExecutionPreflight<'_>,
+        parent_attempt: usize,
+    ) -> Result<()> {
+        if !std::ptr::eq(self.preflight, preflight)
+            || self.parent_attempt != parent_attempt
+            || !preflight.nested_turn_issued.load(Ordering::Acquire)
+        {
+            bail!("nested turn execution permit differs from the current preflight or attempt");
+        }
+        Ok(())
     }
 }
 
@@ -1459,6 +1510,7 @@ fn prepare_assignment_execution<'a>(
         })?;
     Ok(AssignmentExecutionDisposition::Continue(
         AssignmentExecutionPreflight {
+            nested_turn_issued: AtomicBool::new(false),
             journal_parent_id,
             environment_requirements,
             semantic_token,
@@ -1530,8 +1582,8 @@ pub(super) fn bind_worker_journal_artifacts(
 }
 
 /// A staged launch input, not a final-report or resumed-execution authority.
-/// Production construction is unavailable: the yield and completed evidence do
-/// not yet carry the authenticated state-instance and inbox-generation binding.
+/// Production construction is unavailable: even a BoundParentTurnYield cannot
+/// bind completed Worker evidence to its authenticated inbox request/turn yet.
 /// Only an explicitly unbound test fixture exercises this staged preparation.
 pub(super) struct ParentContinuationLaunch<'evidence> {
     run_id: String,
@@ -1585,7 +1637,7 @@ impl<'evidence> ParentContinuationLaunch<'evidence> {
         let mut by_id = BTreeMap::new();
         for evidence in completed {
             if by_id
-                .insert(evidence.report.id.as_str(), evidence)
+                .insert(evidence.report().id.as_str(), evidence)
                 .is_some()
             {
                 bail!("continuation contains duplicate completed Worker identities");
@@ -1613,7 +1665,7 @@ impl<'evidence> ParentContinuationLaunch<'evidence> {
                 bail!("continuation requires one exact authored terminal Worker");
             }
             let report_bytes = evidence
-                .run
+                .run()
                 .output_last_message()
                 .context("continuation requires a descriptor-held Worker result")?;
             let expected_artifact = PathBuf::from("nested")
@@ -1622,8 +1674,8 @@ impl<'evidence> ParentContinuationLaunch<'evidence> {
                 .join(worker_id)
                 .join("report.json");
             if report_bytes.len() > MAX_PARENT_CONTINUATION_BYTES
-                || evidence.artifacts.raw_report_relative != expected_artifact
-                || evidence.artifacts.prompt_path
+                || evidence.artifacts().raw_report_relative != expected_artifact
+                || evidence.artifacts().prompt_path
                     != context
                         .run_dir
                         .join("nested")
@@ -1631,40 +1683,41 @@ impl<'evidence> ParentContinuationLaunch<'evidence> {
                         .join(format!("attempt-{source_attempt}"))
                         .join(worker_id)
                         .join("prompt.md")
-                || evidence.model_provenance.launch_runtime != SupervisorRuntime::Codex
-                || !evidence.run.stdout.target_launch_attempted
-                || evidence.run.cwd != preflight.worktree.path
-                || !evidence.run.scratch_quiescence_verified()
-                || !external_process_completed(&evidence.run, SupervisorRuntime::Codex)
-                || !external_containment_verified(&evidence.run, SupervisorRuntime::Codex)
-                || !evidence.run.sandbox_denials().is_empty()
-                || !evidence.run.gate_denials().is_empty()
-                || evidence.run.external_side_effect_state().is_some()
-                || evidence.run.environment_blocked()
-                || evidence.report.role != AgentRole::Worker
-                || evidence.report.assigned_paths != worker.assigned_paths
-                || evidence.report.semantic_symbols != worker.semantic_symbols
-                || evidence.report.semantic_modules != worker.semantic_modules
-                || evidence.report.claim_token != Some(preflight.claim.token.get())
-                || evidence.report.semantic_intent_token != preflight.semantic_token
-                || evidence.report.no_further_delegation != Some(true)
-                || evidence.report.files_changed != evidence.observed_changed_paths
-                || evidence.journals.len() != 1
-                || !evidence.journals.get(worker_id).is_some_and(|journal| {
+                || evidence.model_provenance().launch_runtime != SupervisorRuntime::Codex
+                || !evidence.run().stdout.target_launch_attempted
+                || evidence.run().cwd != preflight.worktree.path
+                || !evidence.run().scratch_quiescence_verified()
+                || !external_process_completed(evidence.run(), SupervisorRuntime::Codex)
+                || !external_containment_verified(evidence.run(), SupervisorRuntime::Codex)
+                || !evidence.run().sandbox_denials().is_empty()
+                || !evidence.run().gate_denials().is_empty()
+                || evidence.run().external_side_effect_state().is_some()
+                || evidence.run().environment_blocked()
+                || evidence.report().role != AgentRole::Worker
+                || evidence.report().assigned_paths != worker.assigned_paths
+                || evidence.report().semantic_symbols != worker.semantic_symbols
+                || evidence.report().semantic_modules != worker.semantic_modules
+                || evidence.report().claim_token != Some(preflight.claim.token.get())
+                || evidence.report().semantic_intent_token != preflight.semantic_token
+                || evidence.report().no_further_delegation != Some(true)
+                || evidence.report().files_changed != *evidence.observed_changed_paths()
+                || evidence.journals().len() != 1
+                || !evidence.journals().get(worker_id).is_some_and(|journal| {
                     matches!(journal.status, WorkerExecutionJournalStatus::Loaded(_))
                 })
             {
                 bail!("continuation Worker evidence is incomplete, oversized or has a different binding");
             }
-            if read_worker_report(Some(report_bytes), &expected_artifact)?.report != evidence.report
+            if read_worker_report(Some(report_bytes), &expected_artifact)?.report
+                != *evidence.report()
             {
                 bail!("continuation Worker report differs from its held capture");
             }
             summaries.push(json!({
                 "request_id": request_id, "worker_id": worker_id,
-                "worker_report": evidence.report,
-                "observed_changed_paths": evidence.observed_changed_paths,
-                "launched_model": evidence.model_provenance.launched_model,
+                "worker_report": evidence.report(),
+                "observed_changed_paths": evidence.observed_changed_paths(),
+                "launched_model": evidence.model_provenance().launched_model,
                 "report_artifact": expected_artifact,
             }));
             if serde_json::to_vec(&summaries)?.len() > MAX_PARENT_CONTINUATION_BYTES {
@@ -2384,6 +2437,25 @@ fn prepare_child_attempt<'a>(
     ))
 }
 
+// Owned dispatch evidence, not a final report or authority to accept a yield.
+// Preserve scratch and reservation ownership until ordinary collection consumes it.
+// Containment observations may be negative; callers must not infer quiescence.
+struct CapturedChildAttempt<'a> {
+    attempt_artifacts: ChildAttemptArtifacts,
+    corrective_retry_used: bool,
+    model_provenance: CompletedLaunchModelProvenance,
+    external_run: ExternalAgentRun,
+    command: ExternalAgentCommand,
+    primary_before: PrimaryWorktreeSnapshot,
+    primary_scope_before: Option<PrimaryScopeSnapshot>,
+    incoming_scratch: ArtifactScratchDirectory,
+    capture_scratch: ArtifactScratchDirectory,
+    budget_reservation: DispatchBudgetReservation<'a>,
+    launch_runtime: SupervisorRuntime,
+    environment_blocked: bool,
+    attempt_containment_verified: bool,
+}
+
 struct CollectedChildAttempt<'a> {
     attempt_report: OrchestratorReviewReport,
     report_shape_problems: Vec<String>,
@@ -2410,11 +2482,15 @@ struct CollectedChildAttempt<'a> {
 
 /// Internal readiness only: the scheduler/IPC does not construct this driver yet.
 /// A collected supervisor result, never a child report, proves the parent turn
-/// ended. Holding the mutable preflight serializes subsequent users of its lease.
+/// ended. The one-shot permit serializes nested execution even with separate
+/// outcomes. Shared preflight lets the non-cloneable frozen turn keep its lease
+/// borrow and journal lock; neither that evidence nor shared preflight authorizes
+/// dispatch. The driver owns the permit and exclusively borrows the outcome.
 #[allow(dead_code)]
 struct NestedWorkerSerialDriver<'turn, 'context, 'writer, 'resources> {
     context: &'turn AssignmentExecutionContext<'context, 'writer>,
-    preflight: &'turn mut AssignmentExecutionPreflight<'resources>,
+    preflight: &'turn AssignmentExecutionPreflight<'resources>,
+    permit: NestedTurnExecutionPermit<'turn, 'resources>,
     outcome: &'turn mut AssignmentExecutionOutcome,
     parent: &'turn CollectedChildAttempt<'context>,
     parent_attempt: usize,
@@ -2427,11 +2503,12 @@ impl<'turn, 'context, 'writer, 'resources>
 {
     fn from_collected_parent(
         context: &'turn AssignmentExecutionContext<'context, 'writer>,
-        preflight: &'turn mut AssignmentExecutionPreflight<'resources>,
+        preflight: &'turn AssignmentExecutionPreflight<'resources>,
         outcome: &'turn mut AssignmentExecutionOutcome,
         parent_attempt: usize,
         parent: &'turn CollectedChildAttempt<'context>,
     ) -> Result<Self> {
+        let permit = preflight.issue_nested_turn(parent_attempt)?;
         if context.execution_runtime != SupervisorExecutionRuntime::Verified
             || context.execution_target.is_some()
             || context.evidence_only_reaudit.is_some()
@@ -2450,6 +2527,7 @@ impl<'turn, 'context, 'writer, 'resources>
         Ok(Self {
             context,
             preflight,
+            permit,
             outcome,
             parent,
             parent_attempt,
@@ -2544,6 +2622,7 @@ impl<'turn, 'context, 'writer, 'resources>
         nested_worker_executor::execute_nested_worker_attempt(
             &context,
             self.preflight,
+            &mut self.permit,
             self.outcome,
             self.parent_attempt,
             worker_id,
@@ -2717,11 +2796,28 @@ fn dispatch_and_collect_child_attempt<'a>(
     attempt: usize,
     prepared: PreparedChildAttempt<'a>,
 ) -> Result<CollectedChildAttempt<'a>> {
+    let captured = dispatch_and_capture_child_attempt(
+        context,
+        outcome,
+        preflight,
+        journal_parent_id,
+        attempt,
+        prepared,
+    )?;
+    collect_ordinary_child_attempt(context, outcome, preflight, captured)
+}
+
+fn dispatch_and_capture_child_attempt<'a>(
+    context: &AssignmentExecutionContext<'a, '_>,
+    outcome: &mut AssignmentExecutionOutcome,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    journal_parent_id: &str,
+    attempt: usize,
+    prepared: PreparedChildAttempt<'a>,
+) -> Result<CapturedChildAttempt<'a>> {
     let AssignmentExecutionContext {
         assignment_metadata,
         options,
-        repo,
-        execution_runtime,
         artifacts,
         external_runner,
         ..
@@ -3031,6 +3127,56 @@ fn dispatch_and_collect_child_attempt<'a>(
             &command,
             launch_runtime,
         ));
+    Ok(CapturedChildAttempt {
+        attempt_artifacts,
+        corrective_retry_used,
+        model_provenance,
+        external_run,
+        command,
+        primary_before,
+        primary_scope_before,
+        incoming_scratch,
+        capture_scratch,
+        budget_reservation,
+        launch_runtime,
+        environment_blocked,
+        attempt_containment_verified,
+    })
+}
+
+// This is the sole ordinary-report path. Keep schema validation, evidence import,
+// scratch cleanup, integrity inspection and Git materialization in their original order.
+fn collect_ordinary_child_attempt<'a>(
+    context: &AssignmentExecutionContext<'a, '_>,
+    outcome: &mut AssignmentExecutionOutcome,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    captured: CapturedChildAttempt<'a>,
+) -> Result<CollectedChildAttempt<'a>> {
+    let AssignmentExecutionContext {
+        assignment_metadata,
+        options,
+        repo,
+        execution_runtime,
+        artifacts,
+        ..
+    } = context;
+    let assignment = &preflight.assignment;
+    let worktree = &preflight.worktree;
+    let CapturedChildAttempt {
+        attempt_artifacts,
+        corrective_retry_used,
+        model_provenance,
+        external_run,
+        command,
+        primary_before,
+        primary_scope_before,
+        incoming_scratch,
+        capture_scratch,
+        budget_reservation,
+        launch_runtime,
+        environment_blocked,
+        attempt_containment_verified,
+    } = captured;
     let raw_report_validated = direct_assignment_report_is_valid(
         assignment_attempt_report_role(assignment.role, context.evidence_only_reaudit.is_some()),
         external_run.output_last_message(),
@@ -6547,6 +6693,20 @@ mod decomposition_tests {
 
     #[test]
     fn extracted_assignment_units_are_directly_exercised_in_phase_order() {
+        exercise_captured_child_boundary("ordinary");
+    }
+
+    #[test]
+    fn captured_child_boundary_ordinary_collection_rejects_malformed_output() {
+        exercise_captured_child_boundary("malformed");
+    }
+
+    #[test]
+    fn captured_child_boundary_drop_retains_unimported_scratch_and_settled_budget() {
+        exercise_captured_child_boundary("drop");
+    }
+
+    fn exercise_captured_child_boundary(case: &str) {
         let temp = tempfile::tempdir().expect("temporary phase fixture");
         let repo = temp.path().join("repo");
         Repository::init(&repo).expect("initialize phase fixture repository");
@@ -6733,7 +6893,7 @@ mod decomposition_tests {
             options.machine_global_retention
         );
         assert!(prepared.command.read_only_input_files.is_empty());
-        let collected = dispatch_and_collect_child_attempt(
+        let mut captured = dispatch_and_capture_child_attempt(
             &context,
             &mut outcome,
             &preflight,
@@ -6742,6 +6902,58 @@ mod decomposition_tests {
             prepared,
         )
         .expect("direct child dispatch invocation");
+        assert_eq!(outcome.command_records.len(), 1);
+        assert_eq!(budget_ledger.report().unwrap().active_reservations, 0);
+        let budget_after_capture = budget_ledger.report().unwrap().consumed;
+        let incoming = captured.incoming_scratch.path().to_path_buf();
+        let capture = captured.capture_scratch.path().to_path_buf();
+        let report_path = run_dir.join(&captured.attempt_artifacts.raw_report_relative);
+        assert!(incoming.is_dir());
+        assert!(capture.is_dir());
+        assert!(
+            !report_path.exists(),
+            "capture must not import the final report"
+        );
+        assert_eq!(
+            current_head_oid(&preflight.worktree.path).unwrap(),
+            preflight.child_base_head
+        );
+        if case == "drop" {
+            drop(captured);
+            assert!(incoming.is_dir());
+            assert!(capture.is_dir());
+            assert!(!report_path.exists());
+            assert_eq!(budget_ledger.report().unwrap().active_reservations, 0);
+            assert_eq!(
+                budget_ledger.report().unwrap().consumed,
+                budget_after_capture
+            );
+            return;
+        }
+        if case == "malformed" {
+            captured.external_run.output_last_message = Some(b"not a report".to_vec());
+        }
+        let collected =
+            collect_ordinary_child_attempt(&context, &mut outcome, &preflight, captured)
+                .expect("ordinary collection after capture");
+        assert_eq!(
+            budget_ledger.report().unwrap().consumed,
+            budget_after_capture
+        );
+        assert_eq!(
+            outcome.command_records.len(),
+            1,
+            "collection must not redispatch or account twice"
+        );
+        if case == "malformed" {
+            assert!(!collected.report_shape_problems.is_empty());
+            assert!(report_failed(&collected.attempt_report));
+            assert_eq!(
+                current_head_oid(&preflight.worktree.path).unwrap(),
+                preflight.child_base_head
+            );
+            return;
+        }
         assert!(collected.attempt_containment_verified);
         assert_eq!(outcome.command_records.len(), 1);
 
@@ -13602,3 +13814,7 @@ mod messaging_ipc_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "assignment_execution/nested_driver_tests.rs"]
 mod nested_driver_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "assignment_execution/bound_parent_turn_tests.rs"]
+mod bound_parent_turn_tests;

@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 // Real managed resources and the existing prepare/collect boundary, with an
 // injected deterministic runner. No provider process or native subagent runs.
-fn driver_fixture(case: &str) -> Result<()> {
+pub(super) fn driver_fixture(case: &str) -> Result<()> {
     let temp = tempfile::tempdir()?;
     let repo = temp.path().join("repo");
     WorktreeManager::init_repository(&repo, "main")?;
@@ -22,7 +22,7 @@ fn driver_fixture(case: &str) -> Result<()> {
         "worker_assignments":[{"id":"worker", "role":"worker",
             "assigned_paths":["src/lib.rs"], "task":"worker task", "report_path":"worker.json"}]
     }))?;
-    if case.starts_with("continuation-") {
+    if case.starts_with("continuation-") || case.starts_with("bound-") {
         let mut second = parent.worker_assignments[0].clone();
         second.id = "worker-two".into();
         second.report_path = Some("worker-two.json".into());
@@ -58,7 +58,8 @@ fn driver_fixture(case: &str) -> Result<()> {
     let semantic_store = SemanticIntentStore::open(&repo)?;
     let claim = sync_store.claim_paths_for_run(&run_id, &parent.id, &parent.assigned_paths)?;
     let cancellation = ProcessCancellation::new();
-    let mut preflight = AssignmentExecutionPreflight {
+    let preflight = AssignmentExecutionPreflight {
+        nested_turn_issued: AtomicBool::new(false),
         journal_parent_id: run_id.as_str(),
         environment_requirements: Vec::new(),
         semantic_token: None,
@@ -225,6 +226,46 @@ fn driver_fixture(case: &str) -> Result<()> {
             parent_running.store(false, Ordering::SeqCst);
         } else if case == "worker-uncertain" {
             run.process_tree = None;
+        } else if case.starts_with("bound-evidence-") {
+            match case {
+                "bound-evidence-edits" | "bound-evidence-second-failure"
+                    if case == "bound-evidence-edits" || subject.id == "worker-two" =>
+                {
+                    fs::write(
+                        command.cwd.join("src/lib.rs"),
+                        format!("// written by {}\n", subject.id),
+                    )
+                    .unwrap();
+                    let mut report: WorkerReport =
+                        serde_json::from_slice(run.output_last_message().unwrap()).unwrap();
+                    report.files_changed = vec!["src/lib.rs".into()];
+                    report.commands_run = vec![serde_json::from_value(json!({
+                        "command":["fixture-edit"], "cwd":command.cwd, "exit_code":0,
+                        "status":"succeeded", "timeout_seconds":1, "duration_ms":1, "timed_out":false
+                    })).unwrap()];
+                    run.output_last_message = Some(serde_json::to_vec(&report).unwrap());
+                    let mut captures = run.worker_journal_artifacts().to_vec();
+                    captures[0].status = crate::external_agent::WorkerJournalArtifactCaptureStatus::Loaded(
+                        serde_json::to_vec(&json!({"command":["fixture-edit"], "cwd":command.cwd,
+                            "start_timestamp":"fixture-start", "end_timestamp":"fixture-end", "changed_paths":["src/lib.rs"]})).unwrap());
+                    run.replace_worker_journal_artifacts(captures);
+                }
+                "bound-evidence-forged" | "bound-evidence-widened" => {
+                    let mut report: WorkerReport =
+                        serde_json::from_slice(run.output_last_message().unwrap()).unwrap();
+                    if case == "bound-evidence-forged" {
+                        report.id = "forged".into();
+                    } else {
+                        report.assigned_paths.push("outside".into());
+                    }
+                    run.output_last_message = Some(serde_json::to_vec(&report).unwrap());
+                }
+                "bound-evidence-failure" | "bound-evidence-second-failure" => {
+                    run.exit_code = Some(1)
+                }
+                "bound-evidence-cancel-during" => cancellation.cancel(),
+                _ => {}
+            }
         }
         run
     };
@@ -295,6 +336,109 @@ fn driver_fixture(case: &str) -> Result<()> {
         prepared,
     )?;
     assert_eq!(*calls.lock().unwrap(), ["parent"]);
+    if case.starts_with("permit-") {
+        match case {
+            "permit-failed-issue" => {
+                assert!(preflight.issue_nested_turn(0).is_err());
+            }
+            "permit-failed-construction" => {
+                let evidence = collected.external_run.process_tree.take();
+                assert!(NestedWorkerSerialDriver::from_collected_parent(
+                    &context,
+                    &preflight,
+                    &mut outcome,
+                    1,
+                    &collected,
+                )
+                .is_err());
+                collected.external_run.process_tree = evidence;
+            }
+            "permit-drop" => {
+                drop(NestedWorkerSerialDriver::from_collected_parent(
+                    &context,
+                    &preflight,
+                    &mut outcome,
+                    1,
+                    &collected,
+                )?);
+            }
+            "permit-race" => {
+                let barrier = std::sync::Barrier::new(2);
+                std::thread::scope(|scope| {
+                    let construct = || {
+                        let mut independent_outcome = AssignmentExecutionOutcome::default();
+                        barrier.wait();
+                        let result = NestedWorkerSerialDriver::from_collected_parent(
+                            &context,
+                            &preflight,
+                            &mut independent_outcome,
+                            1,
+                            &collected,
+                        );
+                        // Hold the successful driver until both constructors return.
+                        barrier.wait();
+                        result.is_ok()
+                    };
+                    let first = scope.spawn(construct);
+                    let second = scope.spawn(construct);
+                    assert_eq!(
+                        usize::from(first.join().unwrap()) + usize::from(second.join().unwrap()),
+                        1
+                    );
+                });
+            }
+            _ => bail!("unknown permit case {case}"),
+        }
+        for attempt in [1, 2] {
+            let mut different_outcome = AssignmentExecutionOutcome::default();
+            let error = NestedWorkerSerialDriver::from_collected_parent(
+                &context,
+                &preflight,
+                &mut different_outcome,
+                attempt,
+                &collected,
+            )
+            .err()
+            .context("nested permit was reissued")?;
+            assert!(error.to_string().contains("already been issued"));
+        }
+        assert_eq!(*calls.lock().unwrap(), ["parent"]);
+        assert_eq!(sync_store.snapshot()?, vec![claim.clone()]);
+        assert_eq!(ledger.report()?.active_reservations, 0);
+        return Ok(());
+    }
+    if case.starts_with("bound-") {
+        super::bound_parent_turn_tests::exercise(
+            case,
+            &context,
+            &preflight,
+            &mut outcome,
+            &mut collected,
+        )?;
+        let expected = match case {
+            "bound-shared-driver"
+            | "bound-evidence-happy"
+            | "bound-evidence-edits"
+            | "bound-evidence-candidate-after"
+            | "bound-evidence-cancel-after"
+            | "bound-evidence-second-failure"
+            | "bound-evidence-claim-revoked" => vec!["parent", "worker-two", "worker"],
+            "bound-evidence-forged"
+            | "bound-evidence-widened"
+            | "bound-evidence-failure"
+            | "bound-evidence-cancel-during" => vec!["parent", "worker-two"],
+            case if case.starts_with("bound-evidence-handoff-") => vec!["parent", "worker-two"],
+            _ => vec!["parent"],
+        };
+        assert_eq!(*calls.lock().unwrap(), expected);
+        context.manager.verify_write_execution_lease(
+            &parent.id,
+            preflight.worktree_write_lease.as_ref().unwrap(),
+        )?;
+        assert_eq!(context.manager.list_managed_verified()?.len(), 1);
+        assert_eq!(ledger.report()?.active_reservations, 0);
+        return Ok(());
+    }
     if case.starts_with("continuation-") {
         let mut policy = context.budget_policy.clone();
         policy.set_selector_binding_for_test(
@@ -308,7 +452,7 @@ fn driver_fixture(case: &str) -> Result<()> {
         );
         let mut driver = NestedWorkerSerialDriver::from_collected_parent(
             &context,
-            &mut preflight,
+            &preflight,
             &mut outcome,
             1,
             &collected,
@@ -324,29 +468,14 @@ fn driver_fixture(case: &str) -> Result<()> {
             driver.execute_worker("worker-two", &policy)?,
         ];
         drop(driver);
-        match case {
-            "continuation-missing" => {
-                completed.pop();
-            }
-            "continuation-duplicate" => completed[1].report.id = "worker".into(),
-            "continuation-forged-id" => completed[1].report.id = "outside".into(),
-            "continuation-forged-summary" => {
-                completed[0].report.remaining_risk = "substituted".into()
-            }
-            "continuation-wrong-attempt-artifact" => {
-                completed[0].artifacts.raw_report_relative =
-                    "nested/parent/attempt-99/worker/report.json".into()
-            }
-            "continuation-missing-journal" => completed[0].journals.clear(),
-            "continuation-restored" => {
-                completed[0].run = serde_json::from_value(serde_json::to_value(&completed[0].run)?)?
-            }
-            "continuation-oversize" => {
-                completed[0].report.remaining_risk = "x".repeat(MAX_PARENT_CONTINUATION_BYTES);
-                completed[0].run.output_last_message =
-                    Some(serde_json::to_vec(&completed[0].report)?);
-            }
-            _ => {}
+        if case == "continuation-missing" {
+            completed.pop();
+        } else {
+            nested_worker_executor::corrupt_continuation_evidence_for_test(
+                &mut completed,
+                case,
+                MAX_PARENT_CONTINUATION_BYTES,
+            )?;
         }
         let contract = ParentContinuationLaunch::from_unbound_completed_workers_for_test(
             &context, &preflight, &yielded, &completed,
@@ -427,7 +556,7 @@ fn driver_fixture(case: &str) -> Result<()> {
             assert_eq!(summaries[0]["request_id"], "request-2");
             assert_eq!(
                 summaries[0]["worker_report"],
-                serde_json::to_value(&completed[1].report)?
+                serde_json::to_value(completed[1].report())?
             );
             assert!(contract.revalidate(&context, &preflight, 1).is_err());
             let prepared = match prepare_child_attempt(
@@ -564,7 +693,7 @@ fn driver_fixture(case: &str) -> Result<()> {
     let attempt = if case == "parent-wrong-attempt" { 2 } else { 1 };
     let binding = NestedWorkerSerialDriver::from_collected_parent(
         &context,
-        &mut preflight,
+        &preflight,
         &mut outcome,
         attempt,
         &collected,
@@ -643,8 +772,8 @@ fn driver_fixture(case: &str) -> Result<()> {
         );
         if case == "happy" {
             let evidence = result?;
-            assert_eq!(evidence.report.id, "worker");
-            assert_eq!(evidence.journals.len(), 1);
+            assert_eq!(evidence.report().id, "worker");
+            assert_eq!(evidence.journals().len(), 1);
             assert!(
                 driver.execute_worker("worker", &active_policy).is_err(),
                 "replayed worker"
@@ -684,6 +813,19 @@ fn driver_fixture(case: &str) -> Result<()> {
             .selected_runtime_for(AgentRole::Worker),
         None
     );
+    Ok(())
+}
+
+#[test]
+fn nested_driver_permit_is_one_shot_across_failure_drop_and_concurrent_issuance() -> Result<()> {
+    for case in [
+        "permit-failed-issue",
+        "permit-failed-construction",
+        "permit-drop",
+        "permit-race",
+    ] {
+        driver_fixture(case)?;
+    }
     Ok(())
 }
 

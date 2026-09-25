@@ -113,6 +113,31 @@ impl<'a> WorkerInboxTurn<'a> {
         }
         Ok(())
     }
+
+    /// Match the consumer's current preflight to the original held resources.
+    /// Equal labels or a replacement lease cannot substitute for this turn owner.
+    pub(in crate::supervise) fn verify_parent_resources(
+        &self,
+        run: &RunId,
+        attempt: usize,
+        resources: WorkerInboxResources<'_>,
+    ) -> Result<()> {
+        if self.binding.run != run.as_str()
+            || self.binding.attempt != attempt
+            || self.resources.repo != resources.repo
+            || self.resources.parent != resources.parent
+            || !std::ptr::eq(self.resources.lease, resources.lease)
+            || self.resources.claim != resources.claim
+            || self.resources.claims.state_path() != resources.claims.state_path()
+        {
+            bail!("frozen inbox differs from the current parent attempt or held resources");
+        }
+        self.verify()?;
+        if resources.verify(&self.binding)? != self.repository {
+            bail!("frozen inbox consumer repository authority changed");
+        }
+        Ok(())
+    }
 }
 
 /// Owns both endpoint and inbox. No API hands out the service Arc or live inbox.
@@ -176,6 +201,7 @@ impl<'a> WorkerInboxEndpoint<'a> {
             turn,
             run_directory,
         } = self;
+        let launch = server.launch();
         drop(server);
         let service = Arc::try_unwrap(service)
             .map_err(|_| anyhow::anyhow!("joined endpoint still has a shared inbox owner"))?;
@@ -203,6 +229,7 @@ impl<'a> WorkerInboxEndpoint<'a> {
         Ok(FrozenWorkerInbox {
             inbox,
             turn,
+            launch,
             run_directory,
             records,
             watermark,
@@ -223,6 +250,7 @@ pub(in crate::supervise) struct WorkerInboxWatermark {
 pub(in crate::supervise) struct FrozenWorkerInbox<'a> {
     inbox: WorkerRequestInbox<RepositoryAuthenticator>,
     turn: &'a WorkerInboxTurn<'a>,
+    launch: AssignmentMessagingLaunch,
     run_directory: PathBuf,
     records: Vec<WorkerRequestRecord>,
     watermark: WorkerInboxWatermark,
@@ -236,6 +264,19 @@ pub(in crate::supervise) struct FrozenWorkerInboxView<'a> {
 }
 
 impl FrozenWorkerInbox<'_> {
+    /// Bind the collected parent command to the exact endpoint that was joined.
+    /// The ephemeral launch capability is held only in memory, never in yield JSON.
+    pub(in crate::supervise) fn verify_parent_launch(
+        &self,
+        run_directory: &Path,
+        launch: &AssignmentMessagingLaunch,
+    ) -> Result<()> {
+        if self.run_directory != run_directory || self.launch != *launch {
+            bail!("parent command did not use this frozen inbox endpoint");
+        }
+        Ok(())
+    }
+
     /// Read-only authenticated evidence. A later consumer still needs parent
     /// quiescence, current cancellation/budget/admission checks and durable reservation.
     pub(in crate::supervise) fn view(
