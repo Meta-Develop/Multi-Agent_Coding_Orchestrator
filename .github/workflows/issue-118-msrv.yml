@@ -32,6 +32,10 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Negative ruleset acceptance probe
+        if: github.event_name == 'pull_request' && github.head_ref == 'codex/ci-gate-negative-20260926'
+        run: exit 1
+
       - name: Install Linux native build dependencies for headless CAM
         run: |
           sudo apt-get update
