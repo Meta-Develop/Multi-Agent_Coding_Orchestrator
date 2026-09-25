@@ -1180,7 +1180,7 @@ fn render_researcher_prompt(
         PromptMeasurementRole::Researcher,
         &context.assignment.id,
         &prompt,
-        prefix,
+        &prefix,
         WORKER_PROMPT_FIXTURE_CEILING_BYTES,
     )?;
     Ok(RenderedPromptWithMeasurements {
