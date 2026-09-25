@@ -2140,6 +2140,7 @@ impl<'turn, 'context, 'writer, 'resources>
             || parent._primary_after.inspection_problem().is_some()
             || !parent.sandbox_denials.is_empty()
             || !parent.pre_action_refusals.is_empty()
+            || parent.external_side_effect_state.is_some()
         {
             bail!(
                 "nested serial handoff requires verified parent-process quiescence and integrity"
