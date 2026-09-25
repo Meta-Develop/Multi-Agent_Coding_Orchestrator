@@ -267,7 +267,8 @@ fn supervisor_plan_and_consultant_from_goal_spec(
 ///
 /// Heuristic sessions retain the established read-only planning-root plus
 /// execution-child shape. Provider sessions retain the provider's validated
-/// recursive assignment forest.
+/// recursive assignment forest. Execution leaves use direct terminal Workers;
+/// planning nodes retain their parent-scheduled coordination role.
 pub fn supervisor_plan_from_task_planning_session(
     goal: &str,
     spec: &str,
@@ -400,7 +401,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         })
         .collect::<BTreeMap<_, _>>();
     let mut spec_fragment_ids_by_assignment = BTreeMap::new();
-    let mut assignment_metadata = AssignmentMetadata::new();
+    let assignment_metadata = AssignmentMetadata::new();
     let workstream_count = proposal.assignments.len();
     let assignment_capacity = workstream_count
         .checked_mul(2)
@@ -464,49 +465,19 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
 
         spec_fragment_ids_by_assignment
             .insert(assignment.id.clone(), assignment.fragment_ids.clone());
-        let (execution_role, execution_role_category, worker_assignments) =
-            if is_explicit_new_file_workstream || is_explicit_existing_file_edit_workstream {
-                (
-                    AgentRole::Worker,
-                    AgentRole::Worker.authority_category(),
-                    Vec::new(),
-                )
-            } else {
-                let worker = WorkerAssignment {
-                    id: format!("{}-worker", assignment.id),
-                    role: AgentRole::Worker,
-                    role_category: Some(AgentRole::Worker.authority_category()),
-                    selection_source: None,
-                    assigned_paths: assignment.assigned_paths.clone(),
-                    semantic_symbols: assignment.semantic_symbols.clone(),
-                    semantic_modules: assignment.semantic_modules.clone(),
-                    task: Some(assignment.task.clone()),
-                    environment_requirements: Vec::new(),
-                    report_path: None,
-                };
-                assignment_metadata.insert(
-                    (assignment.id.clone(), worker.id.clone()),
-                    WorkerAssignmentMetadata::default(),
-                );
-                (
-                    AgentRole::ChildOrchestrator,
-                    AgentRole::ChildOrchestrator.authority_category(),
-                    vec![worker],
-                )
-            };
         let execution_index = assignments.len();
         assignments.push(OrchestratorAssignment {
             id: assignment.id.clone(),
             phase: AssignmentPhase::Execution,
             runtime: None,
-            role: execution_role,
-            role_category: Some(execution_role_category),
+            role: AgentRole::Worker,
+            role_category: Some(AgentRole::Worker.authority_category()),
             selection_source: None,
             assigned_paths: assignment.assigned_paths,
             semantic_symbols: assignment.semantic_symbols,
             semantic_modules: assignment.semantic_modules,
             task: Some(assignment.task),
-            worker_assignments,
+            worker_assignments: Vec::new(),
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: generated_preclaim_notes.or_else(|| {
@@ -1263,7 +1234,7 @@ fn supervisor_plan_and_consultant_from_provider_session(
 
     let mut assignments = Vec::new();
     let mut assignment_schedule = Vec::new();
-    let mut assignment_metadata = AssignmentMetadata::new();
+    let assignment_metadata = AssignmentMetadata::new();
     let mut spec_fragment_ids_by_assignment = BTreeMap::new();
     let mut current_fragment_ids = BTreeSet::new();
     let mut actual_max_depth = MIN_SUPERVISOR_DEPTH;
@@ -1274,7 +1245,6 @@ fn supervisor_plan_and_consultant_from_provider_session(
             MIN_SUPERVISOR_DEPTH,
             &mut assignments,
             &mut assignment_schedule,
-            &mut assignment_metadata,
             &mut spec_fragment_ids_by_assignment,
             &mut current_fragment_ids,
             &mut actual_max_depth,
@@ -1344,7 +1314,6 @@ fn lower_provider_assignment_tree(
     depth: u8,
     assignments: &mut Vec<OrchestratorAssignment>,
     assignment_schedule: &mut Vec<AssignmentScheduleEntry>,
-    assignment_metadata: &mut AssignmentMetadata,
     spec_fragment_ids_by_assignment: &mut BTreeMap<String, Vec<String>>,
     current_fragment_ids: &mut BTreeSet<String>,
     actual_max_depth: &mut u8,
@@ -1359,31 +1328,18 @@ fn lower_provider_assignment_tree(
     }
     *actual_max_depth = (*actual_max_depth).max(depth);
     let is_leaf = node.child_assignments.is_empty();
-    let worker_assignments = if is_leaf {
-        let worker = WorkerAssignment {
-            id: format!("{}-worker", node.id),
-            role: AgentRole::Worker,
-            role_category: Some(AgentRole::Worker.authority_category()),
-            selection_source: None,
-            assigned_paths: node.assigned_paths.clone(),
-            semantic_symbols: node.semantic_symbols.clone(),
-            semantic_modules: node.semantic_modules.clone(),
-            task: Some(node.task.clone()),
-            environment_requirements: Vec::new(),
-            report_path: None,
-        };
-        assignment_metadata.insert(
-            (node.id.clone(), worker.id.clone()),
-            WorkerAssignmentMetadata::default(),
-        );
+    if is_leaf {
         for fragment_id in &node.fragment_ids {
             current_fragment_ids.insert(fragment_id.clone());
         }
         spec_fragment_ids_by_assignment.insert(node.id.clone(), node.fragment_ids.clone());
-        vec![worker]
     } else {
         spec_fragment_ids_by_assignment.insert(node.id.clone(), Vec::new());
-        Vec::new()
+    }
+    let role = if is_leaf {
+        AgentRole::Worker
+    } else {
+        AgentRole::ChildOrchestrator
     };
 
     let flattened_index = assignments.len();
@@ -1395,14 +1351,14 @@ fn lower_provider_assignment_tree(
             AssignmentPhase::Planning
         },
         runtime: None,
-        role: AgentRole::ChildOrchestrator,
-        role_category: Some(AgentRole::ChildOrchestrator.authority_category()),
+        role,
+        role_category: Some(role.authority_category()),
         selection_source: None,
         assigned_paths: node.assigned_paths.clone(),
         semantic_symbols: node.semantic_symbols.clone(),
         semantic_modules: node.semantic_modules.clone(),
         task: Some(node.task.clone()),
-        worker_assignments,
+        worker_assignments: Vec::new(),
         environment_requirements: Vec::new(),
         licensed_breakage: None,
         notes: None,
@@ -1428,7 +1384,6 @@ fn lower_provider_assignment_tree(
             child_depth,
             assignments,
             assignment_schedule,
-            assignment_metadata,
             spec_fragment_ids_by_assignment,
             current_fragment_ids,
             actual_max_depth,
@@ -5119,6 +5074,205 @@ pub fn verified_megafile_decomposition_evidence(
 }
 
 #[cfg(test)]
+pub(super) mod generated_terminal_worker_tests {
+    use super::*;
+
+    fn ordinary_proposal() -> planning::TaskDecompositionProposal {
+        let task = "Update alpha behavior.";
+        serde_json::from_value(json!({
+            "fragments": [{"id": "fragment-001", "text": task}],
+            "assignments": [{
+                "id": "alpha", "task": task, "fragment_ids": ["fragment-001"],
+                "assigned_paths": ["src/alpha.rs"],
+                "semantic_symbols": ["crate::alpha::run"], "semantic_modules": ["crate::alpha"]
+            }],
+            "diagnostics": {}, "disjointness": {"disjoint": true}
+        }))
+        .expect("proposal fixture")
+    }
+
+    pub(in crate::supervise) fn generated_plans_for_gate_tests() -> Vec<SupervisorPlan> {
+        let proposal = ordinary_proposal();
+        let loaded = supervisor_plan_and_consultant_from_goal_spec_proposal(
+            "",
+            "Update alpha behavior.",
+            None,
+            proposal.clone(),
+            None,
+        )
+        .expect("goal lowering");
+        let mut plans = vec![loaded.plan.clone()];
+        let leaf = planning::ProviderTaskAssignmentTree::from(proposal.assignments[0].clone());
+        let mut root = leaf.clone();
+        root.id = "parent".to_string();
+        root.child_assignments = vec![leaf.clone()];
+        for node in [root, leaf] {
+            let mut plan = loaded.plan.clone();
+            plan.assignments.clear();
+            let mut metadata = loaded.plan_metadata.clone();
+            metadata.assignment_schedule.clear();
+            metadata.spec_fragment_ids_by_assignment.clear();
+            lower_provider_assignment_tree(
+                &node,
+                None,
+                MIN_SUPERVISOR_DEPTH,
+                &mut plan.assignments,
+                &mut metadata.assignment_schedule,
+                &mut metadata.spec_fragment_ids_by_assignment,
+                &mut BTreeSet::new(),
+                &mut plan.max_depth,
+            )
+            .expect("provider lowering");
+            plans.push(
+                validate_supervisor_plan_in_repo(plan, metadata, None)
+                    .expect("validate provider plan")
+                    .0,
+            );
+        }
+        plans
+    }
+
+    #[test]
+    fn generated_leaf_lowering_preserves_scope_schedule_models_and_review() {
+        let task = "Update alpha behavior.";
+        let proposal = ordinary_proposal();
+        let mut loaded = supervisor_plan_and_consultant_from_goal_spec_proposal(
+            "",
+            task,
+            None,
+            proposal.clone(),
+            None,
+        )
+        .expect("lower ordinary goal proposal without repository inventory");
+        assert_eq!(
+            loaded.plan.assignments[0].role,
+            AgentRole::ChildOrchestrator
+        );
+        assert_eq!(loaded.plan.assignments[0].phase, AssignmentPhase::Planning);
+        assert!(loaded.assignment_metadata.workers.is_empty());
+        let worker = &loaded.plan.assignments[1];
+        assert_eq!(worker.role, AgentRole::Worker);
+        assert_eq!(
+            worker.role_category,
+            Some(RoleCategory::NonDelegatingTerminalWorker)
+        );
+        assert_eq!(worker.phase, AssignmentPhase::Execution);
+        assert!(worker.worker_assignments.is_empty());
+        assert_eq!(
+            worker.assigned_paths,
+            proposal.assignments[0].assigned_paths
+        );
+        assert_eq!(
+            worker.semantic_symbols,
+            proposal.assignments[0].semantic_symbols
+        );
+        assert_eq!(
+            worker.semantic_modules,
+            proposal.assignments[0].semantic_modules
+        );
+        assert_eq!(worker.task.as_deref(), Some(task));
+        assert_eq!(
+            loaded.plan_metadata.assignment_schedule[1],
+            AssignmentScheduleEntry {
+                assignment_id: "alpha".to_string(),
+                parent_assignment_id: Some("alpha-planning".to_string()),
+                depth: 3,
+                flattened_index: 1,
+            }
+        );
+        assert_eq!(
+            loaded.plan.review_lenses,
+            default_supervisor_review_lenses()
+        );
+        assert_eq!(
+            loaded.plan.review_aggregation_policy,
+            ReviewAggregationPolicy::AllMustAccept
+        );
+        assert_eq!(
+            loaded.plan.max_gate_corrections,
+            DEFAULT_MAX_GATE_CORRECTIONS
+        );
+        loaded.plan.role_models.insert(
+            AgentRole::Worker,
+            RoleModelSelection {
+                model: Some("grok-4.6".to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+        let resolved = runtime_resolved_prompt_plan(
+            &loaded.plan,
+            &loaded.plan.assignments[1],
+            SupervisorRuntime::Grok,
+            SupervisorRuntime::Grok,
+            &RuntimeModelCatalog::OperatorDeclared,
+        )
+        .expect("resolve generated worker model");
+        assert_eq!(
+            effective_role_model_selection(&resolved, AgentRole::Worker),
+            loaded.plan.role_models[&AgentRole::Worker]
+        );
+
+        let leaf = planning::ProviderTaskAssignmentTree::from(proposal.assignments[0].clone());
+        let mut root = leaf.clone();
+        root.id = "parent".to_string();
+        root.child_assignments = vec![leaf.clone()];
+        // Cover both recursive providers and the accepted flat forest-of-leaves shape.
+        for node in [root, leaf] {
+            let mut assignments = Vec::new();
+            let mut schedule = Vec::new();
+            let mut fragments = BTreeMap::new();
+            let mut current_fragments = BTreeSet::new();
+            let mut depth = MIN_SUPERVISOR_DEPTH;
+            lower_provider_assignment_tree(
+                &node,
+                None,
+                MIN_SUPERVISOR_DEPTH,
+                &mut assignments,
+                &mut schedule,
+                &mut fragments,
+                &mut current_fragments,
+                &mut depth,
+            )
+            .expect("lower provider tree");
+            let worker = assignments.last().expect("provider leaf");
+            assert_eq!(
+                worker,
+                &OrchestratorAssignment {
+                    notes: None,
+                    ..loaded.plan.assignments[1].clone()
+                }
+            );
+            assert_eq!(fragments["alpha"], vec!["fragment-001"]);
+            assert_eq!(
+                current_fragments,
+                BTreeSet::from(["fragment-001".to_string()])
+            );
+            if assignments.len() == 2 {
+                assert_eq!(assignments[0].role, AgentRole::ChildOrchestrator);
+                assert_eq!(assignments[0].phase, AssignmentPhase::Planning);
+                assert!(assignments[0].worker_assignments.is_empty());
+                assert_eq!(schedule[1].parent_assignment_id.as_deref(), Some("parent"));
+                assert_eq!(schedule[1].depth, 3);
+                assert_eq!(schedule[1].flattened_index, 1);
+            } else {
+                assert!(schedule[0].parent_assignment_id.is_none());
+                assert_eq!(depth, 2);
+            }
+            let mut plan = loaded.plan.clone();
+            plan.assignments = assignments;
+            let metadata = SupervisorPlanMetadata {
+                assignment_schedule: schedule,
+                spec_fragment_ids_by_assignment: fragments,
+                ..loaded.plan_metadata.clone()
+            };
+            validate_supervisor_plan_in_repo(plan, metadata, None)
+                .expect("provider terminal tree retains plan validation");
+        }
+    }
+}
+
+#[cfg(test)]
 mod diagnostics_emission_tests {
     use super::*;
     use git2::Signature;
@@ -6757,6 +6911,14 @@ mod generated_design_decision_lifecycle_tests {
             .as_deref()
             .unwrap_or("")
             .contains("api.transport"));
+        for leaf in [client, server] {
+            assert_eq!(leaf.role, AgentRole::Worker);
+            assert_eq!(
+                leaf.role_category,
+                Some(RoleCategory::NonDelegatingTerminalWorker)
+            );
+            assert!(leaf.worker_assignments.is_empty());
+        }
         assert_eq!(client.semantic_modules, vec!["crate::client".to_string()]);
         assert_eq!(server.semantic_modules, vec!["crate::server".to_string()]);
         let store = DecisionStore::open_existing(&repo)
