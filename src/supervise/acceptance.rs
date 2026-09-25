@@ -503,6 +503,33 @@ pub(super) fn collect_child_report_for_runtime(
     }
     prepare_licensed_breakage_review(assignment, &mut report);
     enforce_researcher_zero_diff(&mut report);
+    if assignment.role == AgentRole::Researcher {
+        let observed = if runtime == SupervisorRuntime::Codex
+            && external_run.program_trust == ExternalProgramTrust::TrustedSystemCodex
+            && external_command.workspace_access == WorkspaceAccess::ReadOnly
+        {
+            verify_researcher_command_evidence(
+                &report,
+                external_run.codex_command_execution_evidence(),
+            )
+        } else {
+            Err(anyhow!(
+                "researcher command evidence requires a trusted read-only Codex launch"
+            ))
+        };
+        if let Err(error) = observed {
+            let message = format!("researcher host command evidence rejected: {error:#}");
+            report_shape_problems.push(message.clone());
+            report.status = ReviewStatus::Failed;
+            report.accepted = false;
+            report.rejected = true;
+            report.findings.push(Finding {
+                severity: FindingSeverity::Error,
+                message,
+                paths: vec![report_path.to_path_buf()],
+            });
+        }
+    }
     validate_worker_report_evidence(assignment, assignment_metadata, report_path, &mut report);
     validate_assignment_report_plumbing(assignment, assignment_metadata, report_path, &mut report);
     if let Some(source) = evidence_only_source {

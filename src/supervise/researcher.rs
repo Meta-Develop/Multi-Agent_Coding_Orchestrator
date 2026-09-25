@@ -95,6 +95,108 @@ pub(super) fn enforce_researcher_zero_diff(report: &mut OrchestratorReviewReport
     }
 }
 
+/// A Researcher report is authored by the model. Only the app-server transcript held by the
+/// supervisor can establish that its inspection commands actually ran. Require a complete,
+/// one-to-one account of every observed command, then bind validation claims to distinct
+/// successful commands. The protocol cannot authenticate stdout, timing, or timeout claims.
+pub(super) fn verify_researcher_command_evidence(
+    report: &OrchestratorReviewReport,
+    evidence: Option<&crate::external_agent::codex_app_server::CommandExecutionEvidence>,
+) -> Result<()> {
+    use crate::external_agent::codex_app_server::{
+        CommandExecutionObservation as Observation, CommandExecutionStatus as Status,
+        TurnTerminalStatus,
+    };
+
+    if report.role != AgentRole::Researcher {
+        bail!("researcher command evidence requires a researcher report");
+    }
+    let Some(evidence) = evidence else {
+        bail!("researcher command execution transcript is unavailable");
+    };
+    if evidence.thread_id.is_empty()
+        || evidence.turn_id.is_empty()
+        || evidence.turn_status != TurnTerminalStatus::Completed
+    {
+        bail!("researcher command execution turn is incomplete");
+    }
+    if evidence.observations.is_empty() {
+        bail!("researcher command execution transcript contains no inspection command");
+    }
+    if evidence.observations.len() != report.commands_run.len() {
+        bail!("researcher command claims do not account for every observed execution");
+    }
+    let mut matched = vec![false; evidence.observations.len()];
+    for claim in &report.commands_run {
+        if claim.command.len() != 1
+            || claim.command[0].trim().is_empty()
+            || claim.timed_out
+            || claim.timeout_seconds != 0
+            || claim.duration_ms != 0
+            || !claim.stdout.is_empty()
+            || !claim.stderr.is_empty()
+            || !claim.sandbox_denials.is_empty()
+            || !claim.environment_preflight_results.is_empty()
+            || !claim.environment_failures.is_empty()
+            || claim.error.is_some()
+            || claim.grok_stream_usage_evidence.is_some()
+            || claim.grok_acp_parent_evidence.is_some()
+            || claim.codex_parent_evidence.is_some()
+            || claim.fixed_version_probe_evidence.is_some()
+        {
+            bail!("researcher command claim contains unsupported or unauthenticated fields");
+        }
+        let found = evidence
+            .observations
+            .iter()
+            .enumerate()
+            .find(|(index, observation)| {
+                !matched[*index]
+                    && matches!(observation, Observation::Complete { started, completed, .. }
+                    if started.command == claim.command[0]
+                        && claim.cwd == Path::new(&started.cwd)
+                        && completed.command == started.command
+                        && completed.cwd == started.cwd
+                        && match completed.status {
+                            Status::Completed => claim.status == ReviewStatus::Succeeded
+                                && claim.exit_code == Some(0),
+                            Status::Failed => claim.status == ReviewStatus::Failed
+                                && claim.exit_code == completed.exit_code,
+                            Status::InProgress | Status::Declined => false,
+                        })
+            })
+            .map(|(index, _)| index);
+        let Some(index) = found else {
+            bail!("researcher command claim has no matching completed host observation");
+        };
+        matched[index] = true;
+    }
+    if matched.iter().any(|found| !found) {
+        bail!("researcher transcript contains an unclaimed or incomplete command");
+    }
+    let mut validated = vec![false; report.commands_run.len()];
+    for validation in &report.validation_results {
+        if validation.status != ReviewStatus::Succeeded || validation.command.len() != 1 {
+            bail!("researcher validation must name a successful observed command");
+        }
+        let found = report
+            .commands_run
+            .iter()
+            .enumerate()
+            .find(|(index, command)| {
+                !validated[*index]
+                    && command.status == ReviewStatus::Succeeded
+                    && command.exit_code == Some(0)
+                    && validation.command == command.command
+            });
+        let Some((index, _)) = found else {
+            bail!("researcher validation reuses or invents a command execution");
+        };
+        validated[index] = true;
+    }
+    Ok(())
+}
+
 pub(super) fn researcher_report_schema_value() -> Value {
     let mut schema = orchestrator_report_schema_value();
     schema["title"] = json!("ResearcherReport");
@@ -399,6 +501,75 @@ mod tests {
             "inspection input"
         );
         assert!(!workspace.path().join("created.txt").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn researcher_claims_require_distinct_complete_host_command_observations() -> Result<()> {
+        use crate::external_agent::codex_app_server::{
+            CommandExecutionEvidence, CommandExecutionObservation as Observation,
+            CommandExecutionSnapshot, CommandExecutionStatus as Status, TurnTerminalStatus,
+        };
+
+        let mut report =
+            read_researcher_report(Some(evidence().to_string().as_bytes()), Path::new("report"))?
+                .report;
+        report.commands_run[0].command = vec!["rg API src".to_string()];
+        report.commands_run[0].cwd = PathBuf::from("/tmp/research-worktree");
+        report.commands_run[0].timeout_seconds = 0;
+        report.commands_run[0].duration_ms = 0;
+        report.validation_results[0].command = report.commands_run[0].command.clone();
+        let started = CommandExecutionSnapshot {
+            command: "rg API src".to_string(),
+            cwd: "/tmp/research-worktree".to_string(),
+            status: Status::InProgress,
+            exit_code: None,
+        };
+        let completed = CommandExecutionSnapshot {
+            status: Status::Completed,
+            exit_code: Some(0),
+            ..started.clone()
+        };
+        let transcript = CommandExecutionEvidence {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            turn_status: TurnTerminalStatus::Completed,
+            observations: vec![Observation::Complete {
+                item_id: "item-1".to_string(),
+                started,
+                completed,
+            }],
+        };
+        verify_researcher_command_evidence(&report, Some(&transcript))?;
+        assert!(verify_researcher_command_evidence(&report, None).is_err());
+
+        let mut forged = report.clone();
+        forged.commands_run[0].command = vec!["true".to_string()];
+        assert!(verify_researcher_command_evidence(&forged, Some(&transcript)).is_err());
+        forged = report.clone();
+        forged.commands_run[0].cwd = PathBuf::from("/tmp/other-worktree");
+        assert!(verify_researcher_command_evidence(&forged, Some(&transcript)).is_err());
+        forged = report.clone();
+        forged.commands_run[0].stdout = "invented output".to_string();
+        assert!(verify_researcher_command_evidence(&forged, Some(&transcript)).is_err());
+        forged = report.clone();
+        forged.commands_run.push(forged.commands_run[0].clone());
+        assert!(verify_researcher_command_evidence(&forged, Some(&transcript)).is_err());
+        forged = report.clone();
+        forged
+            .validation_results
+            .push(forged.validation_results[0].clone());
+        assert!(verify_researcher_command_evidence(&forged, Some(&transcript)).is_err());
+
+        let mut incomplete = transcript.clone();
+        incomplete.observations.push(Observation::Incomplete {
+            item_id: "item-2".to_string(),
+            reason: crate::external_agent::codex_app_server::CommandExecutionObservationIssue::MissingOrInvalidCompletedFields,
+        });
+        assert!(verify_researcher_command_evidence(&report, Some(&incomplete)).is_err());
+        let mut failed_turn = transcript.clone();
+        failed_turn.turn_status = TurnTerminalStatus::Failed;
+        assert!(verify_researcher_command_evidence(&report, Some(&failed_turn)).is_err());
         Ok(())
     }
 }

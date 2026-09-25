@@ -2751,6 +2751,10 @@ fn collect_parent_auditor_report_rejects_self_asserted_codex_but_retains_parent_
 
 #[test]
 fn authored_researcher_collects_zero_diff_evidence_and_requires_subject_audit() {
+    use crate::external_agent::codex_app_server::{
+        CommandExecutionEvidence, CommandExecutionObservation, CommandExecutionSnapshot,
+        CommandExecutionStatus, TurnTerminalStatus,
+    };
     let (temp, repo_path) = injected_repository();
     let mut assignment = injected_assignment(false);
     assignment.role = AgentRole::Researcher;
@@ -2763,24 +2767,51 @@ fn authored_researcher_collects_zero_diff_evidence_and_requires_subject_audit() 
         temp.path().join("events"),
         temp.path().join("report"),
         Duration::from_secs(1),
-    );
+    )
+    .with_workspace_access(WorkspaceAccess::ReadOnly);
     let mut child = injected_child_report(&assignment);
     child.role = AgentRole::Researcher;
     child.worker_reports.clear();
     child.audit_reports.clear();
     child.files_changed.clear();
-    child.commands_run.push(injected_command_record());
+    child.validation_results.clear();
+    let mut inspection = injected_command_record();
+    inspection.command = vec!["git status".to_string()];
+    inspection.cwd = repo_path.clone();
+    inspection.timeout_seconds = 0;
+    inspection.duration_ms = 0;
+    child.commands_run.push(inspection);
     child.validation_results.push(ValidationResult {
         name: "read-only inspection".to_string(),
         status: ReviewStatus::Succeeded,
-        command: vec!["git".to_string(), "status".to_string()],
+        command: vec!["git status".to_string()],
         message: None,
     });
     let mut wire = serde_json::to_value(&child).unwrap();
     wire["read_only"] = json!(true);
     wire["no_further_delegation"] = json!(true);
     write_injected_json(&command.output_last_message, &wire);
-    let external_run = injected_verified_run(&command);
+    let mut external_run = injected_verified_run(&command);
+    let started = CommandExecutionSnapshot {
+        command: "git status".to_string(),
+        cwd: repo_path.to_string_lossy().into_owned(),
+        status: CommandExecutionStatus::InProgress,
+        exit_code: None,
+    };
+    external_run.set_codex_command_execution_evidence_for_test(CommandExecutionEvidence {
+        thread_id: "researcher-thread".to_string(),
+        turn_id: "researcher-turn".to_string(),
+        turn_status: TurnTerminalStatus::Completed,
+        observations: vec![CommandExecutionObservation::Complete {
+            item_id: "inspection".to_string(),
+            completed: CommandExecutionSnapshot {
+                status: CommandExecutionStatus::Completed,
+                exit_code: Some(0),
+                ..started.clone()
+            },
+            started,
+        }],
+    });
     for changed in [vec![], assignment.assigned_paths.clone()] {
         let (report, problems) = collect_child_report(ChildReportCollectionContext {
             assignment: &assignment,
@@ -2818,6 +2849,29 @@ fn authored_researcher_collects_zero_diff_evidence_and_requires_subject_audit() 
             validate_auditor_reports(&assignment, &command.output_last_message, &mut rejected);
             assert!(report_failed(&rejected));
         }
+    }
+    let unchanged = Vec::<PathBuf>::new();
+    for untrusted in [injected_verified_run(&command), {
+        let mut run = external_run.clone();
+        run.program_trust = ExternalProgramTrust::ExplicitCustom;
+        run
+    }] {
+        let (rejected, problems) = collect_child_report(ChildReportCollectionContext {
+            assignment: &assignment,
+            assignment_metadata: &AssignmentMetadata::new(),
+            report_path: &command.output_last_message,
+            external_run: &untrusted,
+            external_command: &command,
+            worktree_path: &repo_path,
+            child_base_head: &injected_oid("researcher-base"),
+            observed_changed_paths: Some(&unchanged),
+            worker_journals: &WorkerExecutionJournalEvidenceSet::default(),
+            evidence_only_source: None,
+        });
+        assert!(report_failed(&rejected));
+        assert!(problems
+            .iter()
+            .any(|message| message.contains("researcher host command evidence rejected")));
     }
 }
 

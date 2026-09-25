@@ -5917,10 +5917,10 @@ pub(crate) fn grok_acp_stdio_protocol_selected(spec: &ExternalAgentCommand) -> b
 
 fn external_agent_stdin_mode(
     spec: &ExternalAgentCommand,
-    duplex_review_required: bool,
+    app_server_required: bool,
     prompt: Vec<u8>,
 ) -> StdinMode {
-    if duplex_review_required || grok_acp_stdio_protocol_selected(spec) {
+    if app_server_required || grok_acp_stdio_protocol_selected(spec) {
         StdinMode::Interactive
     } else if spec
         .runtime_adapter
@@ -6099,7 +6099,7 @@ fn codex_hardened_argv_with_service_tier(
     argv
 }
 
-/// Production writable-Codex app-server launch arguments.
+/// Audited app-server arguments shared by hosted writable review and read-only Researcher.
 fn codex_app_server_argv(
     spec: &ExternalAgentCommand,
     controls: &ProtectedWorktreeControls,
