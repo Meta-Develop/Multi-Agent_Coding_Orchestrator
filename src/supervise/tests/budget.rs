@@ -1324,6 +1324,52 @@ fn budget_integration_parseable_usage_from_truncated_capture_is_estimated() {
     ));
 }
 
+#[test]
+fn completed_app_server_parent_usage_is_available_without_cli_jsonl() {
+    use crate::external_agent::{
+        CodexParentEvidence, CodexParentResolvedField, CodexParentTurnUsage,
+    };
+
+    let temp = tempfile::tempdir().expect("app-server usage fixture");
+    let command = ExternalAgentCommand::codex(
+        "codex",
+        temp.path(),
+        temp.path().join("prompt.md"),
+        temp.path().join("missing-cli-capture.jsonl"),
+        temp.path().join("report.json"),
+        Duration::from_secs(1),
+    );
+    let mut run = injected_verified_run_without_journals(&command);
+    run.codex_parent_evidence = Some(CodexParentEvidence {
+        codex_version: Some("0.144.4".to_string()),
+        thread_id: Some("correlated-thread".to_string()),
+        requested_model: Some("gpt-5.6-sol".to_string()),
+        requested_effort: Some("xhigh".to_string()),
+        rollout_model: CodexParentResolvedField::Unknown,
+        rollout_effort: CodexParentResolvedField::Unknown,
+        observed_model: CodexParentResolvedField::Known("gpt-5.6-sol".to_string()),
+        observed_effort: CodexParentResolvedField::Known("xhigh".to_string()),
+        server_rerouted_model: None,
+        model_mismatch: false,
+        turn_usage: CodexParentTurnUsage::Known {
+            input_tokens: 25,
+            output_tokens: 7,
+            cached_input_tokens: 3,
+            reasoning_output_tokens: 2,
+        },
+        resolution_status: "complete".to_string(),
+    });
+    assert_eq!(
+        complete_external_codex_usage(&run, &command).map(|usage| usage.total_tokens),
+        Some(32)
+    );
+    run.codex_parent_evidence
+        .as_mut()
+        .expect("parent evidence")
+        .resolution_status = "jsonl_invalid".to_string();
+    assert!(complete_external_codex_usage(&run, &command).is_none());
+}
+
 #[cfg(unix)]
 #[test]
 fn budget_integration_large_capture_distinguishes_display_shortening_from_raw_loss() {

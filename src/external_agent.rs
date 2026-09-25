@@ -69,7 +69,10 @@ mod codex_parent_evidence;
 pub(crate) mod executor;
 mod grok_steering;
 
-use codex_parent_evidence::{codex_parent_evidence_from_run, CodexParentEvidenceInputs};
+use codex_parent_evidence::{
+    codex_parent_evidence_from_app_server_run, codex_parent_evidence_from_run,
+    CodexParentEvidenceInputs,
+};
 pub use codex_parent_evidence::{
     CodexParentEvidence, CodexParentResolutionStatus, CodexParentResolvedField,
     CodexParentTurnUsage, CodexServerRerouteEvidence,
@@ -4763,6 +4766,21 @@ fn record_completed_app_server_target(
     context: CompletedTargetContext<'_>,
 ) {
     let protocol = interactive.interaction;
+    let parent_evidence = output_staging.codex_home.as_ref().map(|codex_home| {
+        let inputs = CodexParentEvidenceInputs {
+            codex_version: context.codex_version,
+            cwd: &context.spec.cwd,
+            requested_model: context.spec.model.as_deref(),
+            requested_effort: context.spec.reasoning_effort.as_deref(),
+        };
+        codex_parent_evidence_from_app_server_run(
+            &inputs,
+            (!interactive.process.stdout.is_truncated())
+                .then(|| protocol.as_ref().ok())
+                .flatten(),
+            codex_home,
+        )
+    });
     let mut final_message_error = None;
     if let Ok(outcome) = &protocol {
         report.retain_codex_command_execution_evidence(outcome);
@@ -4797,6 +4815,11 @@ fn record_completed_app_server_target(
             );
             report.publishable = false;
         }
+    }
+    // record_completed_target handles ordinary `codex exec --json` launches.
+    // Replace its CLI-stream interpretation only for this verified app-server turn.
+    if let Some(evidence) = parent_evidence {
+        report.codex_parent_evidence = Some(evidence);
     }
     if let Some(error) = final_message_error {
         report.error = append_external_error(report.error.take(), Some(error));
