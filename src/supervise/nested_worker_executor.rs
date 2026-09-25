@@ -339,8 +339,9 @@ pub(super) fn execute_nested_worker_attempt(
         create_named_invocation_scratches(writer, &layout.incoming, &layout.capture)
     })?;
     let mut invoked = false;
+    let mut spawned = false;
     let mut safety_verified = false;
-    let result = (|| -> Result<NestedWorkerAttemptEvidence> {
+    let mut result = (|| -> Result<NestedWorkerAttemptEvidence> {
         let incoming_root = SecureOutputRoot::open_private(incoming.path())?;
         let capture_root = SecureOutputRoot::open_private(capture.path())?;
         command = bind_worker_journal_artifacts(
@@ -385,6 +386,7 @@ pub(super) fn execute_nested_worker_attempt(
                 json!({"attempt": parent_attempt, "runtime": runtime, "model": command.model, "resource_owner": preflight.assignment.id}),
             )?,
         )?;
+        spawned = true;
         preflight.mandatory_worktree_controls.revalidate()?;
         if let Some(expected) = context.worktree_creation.expected_source_head() {
             if current_head_oid(&preflight.worktree.path)? != expected {
@@ -442,7 +444,7 @@ pub(super) fn execute_nested_worker_attempt(
                 &subject,
                 &incoming,
                 &run,
-                &layout.root.join("journals"),
+                Some(&layout.root.join("journals")),
             )
         });
         let cleanup = with_supervisor_artifacts(context.artifacts, |writer, _| {
@@ -508,14 +510,6 @@ pub(super) fn execute_nested_worker_attempt(
         {
             bail!("nested worker journal evidence is incomplete");
         }
-        record_shared_orchestration_event(
-            context.artifacts,
-            worker_id,
-            Some(&preflight.assignment.id),
-            OrchestrationRole::Worker,
-            OrchestrationEventKind::Status,
-            lifecycle_event_payload("completed", Some(parent_attempt), None),
-        )?;
         Ok(NestedWorkerAttemptEvidence {
             report,
             journals,
@@ -532,10 +526,45 @@ pub(super) fn execute_nested_worker_attempt(
             context.cancellation.cancel();
             outcome.assignment_failed = true;
             outcome.external_containment_failed |= !safety_verified;
-        } else {
+        } else if let Err(cleanup_error) =
             with_supervisor_artifacts(context.artifacts, |writer, _| {
                 discard_invocation_scratches(writer, &incoming, &capture)
-            })?;
+            })
+        {
+            result = match result {
+                Ok(_) => Err(cleanup_error).context("nested invocation scratch cleanup failed"),
+                Err(attempt_error) => Err(attempt_error.context(format!(
+                    "nested invocation scratch cleanup also failed: {cleanup_error:#}"
+                ))),
+            };
+        }
+    }
+    // Finalize every recorded Spawn, including failures before the runner call
+    // and errors during cleanup. Uncertain process quiescence still retains scratch.
+    if spawned {
+        let terminal = record_shared_orchestration_event(
+            context.artifacts,
+            worker_id,
+            Some(&preflight.assignment.id),
+            OrchestrationRole::Worker,
+            OrchestrationEventKind::Status,
+            lifecycle_event_payload(
+                if result.is_ok() {
+                    "completed"
+                } else {
+                    "failed"
+                },
+                Some(parent_attempt),
+                None,
+            ),
+        );
+        if let Err(error) = terminal {
+            result = match result {
+                Ok(_) => Err(error).context("failed to record nested terminal status"),
+                Err(attempt_error) => Err(attempt_error.context(format!(
+                    "recording nested terminal status also failed: {error:#}"
+                ))),
+            };
         }
     }
     result
@@ -782,7 +811,10 @@ mod tests {
             autonomy_kpis: &mut kpis,
             checkpoint: None,
         });
-        let budget_config = SupervisorBudgetConfig::default();
+        let budget_config = SupervisorBudgetConfig {
+            role_token_reservations: BTreeMap::from([(AgentRole::Worker, 2)]),
+            ..Default::default()
+        };
         let limits = if case == "budget" {
             RunBudgetLimits {
                 hard_tokens: Some(1),
@@ -907,6 +939,10 @@ mod tests {
         if case == "cancelled" {
             cancellation.cancel();
         }
+        if case == "snapshot" {
+            let child_git = crate::git_repository::open(&worktree.path)?;
+            fs::write(child_git.path().join("index"), b"invalid index fixture")?;
+        }
         let mut outcome = AssignmentExecutionOutcome::default();
         let result = execute_nested_worker_attempt(
             &context,
@@ -944,12 +980,64 @@ mod tests {
             assert_eq!(calls.load(Ordering::SeqCst), 1);
         } else {
             assert!(result.is_err(), "unexpected success for {case}");
+            if case == "budget" {
+                assert!(result
+                    .as_ref()
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("nested worker budget refused: HardTokenCeiling"));
+            }
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 usize::from(matches!(
                     case,
                     "quiescence" | "panic" | "report" | "scope" | "revoked-after"
                 ))
+            );
+        }
+        let event_path = run_dir.join(crate::orchestration_event::ORCHESTRATION_EVENT_PATH);
+        let event_text = if event_path.exists() {
+            fs::read_to_string(event_path)?
+        } else {
+            String::new()
+        };
+        let events = event_text
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let worker_events = events
+            .iter()
+            .filter(|event| event["node"] == "worker")
+            .collect::<Vec<_>>();
+        let spawned = !matches!(case, "unknown" | "revoked" | "cancelled" | "budget");
+        assert_eq!(
+            worker_events
+                .iter()
+                .filter(|event| event["kind"] == "spawn")
+                .count(),
+            usize::from(spawned),
+            "spawn events for {case}"
+        );
+        let terminal = worker_events
+            .iter()
+            .filter(|event| event["kind"] == "status")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            terminal.len(),
+            usize::from(spawned),
+            "one terminal status per spawn for {case}"
+        );
+        if spawned {
+            assert_eq!(terminal[0]["parent"], "parent");
+            assert_eq!(terminal[0]["payload"]["attempt"], 1);
+            assert_eq!(
+                terminal[0]["payload"]["status"],
+                if case == "happy" {
+                    "completed"
+                } else {
+                    "failed"
+                }
             );
         }
         let layout = NestedArtifactLayout::new("parent", "worker", 1, 1)?;
@@ -988,7 +1076,7 @@ mod tests {
         ignore = "requires Linux authenticated managed resources"
     )]
     fn nested_executor_refuses_before_dispatch_and_cleans_reserved_scratch() -> Result<()> {
-        for case in ["unknown", "revoked", "cancelled", "budget"] {
+        for case in ["unknown", "revoked", "cancelled", "budget", "snapshot"] {
             execution_fixture(case)?;
         }
         Ok(())

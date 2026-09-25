@@ -645,11 +645,25 @@ fn sanitized_git_output_once(
     .with_stdin(StdinMode::Null)
     .with_timeout(Some(SNAPSHOT_GIT_TIMEOUT));
     let output = run_process(match runtime {
-        SupervisorExecutionRuntime::Verified => process_spec
-            .with_private_runtime_home(true)
-            .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
-                StrictOfflineWorkspaceProfile::read_only(workdir),
-            )),
+        SupervisorExecutionRuntime::Verified => {
+            // A linked worktree's .git marker points outside the workspace. The
+            // trusted snapshot subprocess needs that administration metadata to
+            // read HEAD, status and split-index dependencies, still read-only.
+            // Keep repository authentication state hidden, as for other fixed Git
+            // inspections; this does not change the worker's launch confinement.
+            let repository = crate::git_repository::open(workdir)
+                .context("failed to resolve snapshot Git administration roots")?;
+            let profile = StrictOfflineWorkspaceProfile::read_only(workdir)
+                .with_visible_read_only_root(repository.commondir())
+                .with_hidden_root(crate::artifacts::state_auth::sensitive_state_root(
+                    repository.commondir(),
+                )?);
+            process_spec
+                .with_private_runtime_home(true)
+                .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
+                    profile,
+                ))
+        }
         SupervisorExecutionRuntime::NonpublishableSimulation => process_spec
             .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
     })?;
