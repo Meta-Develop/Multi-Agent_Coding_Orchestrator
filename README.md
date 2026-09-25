@@ -3563,13 +3563,16 @@ not execute a primary-worktree target.
 
 Goal/spec planning fragments the source and emits one nested subtree per
 disjoint workstream: a depth-2 read-only planning root followed by a depth-3
-execution child with a real `parent_assignment_id`. Every normalized assignment
+execution child with a real `parent_assignment_id`. Generated execution children
+are direct, non-delegating MACO `Worker` assignments with no nested
+`worker_assignments`; the MACO parent schedules them through the existing terminal
+worker execution and review path. Every normalized assignment
 carries a required typed `phase`; schedule identity and flattened index are
 validated before that authority is consumed at launch. Every recursive
 assignment must declare `planning` or `execution`. Omitted, mixed
 present/absent, null, and unknown phases are rejected rather than inheriting
 writable execution authority. The execution child keeps
-the proposed `assigned_paths`, worker assignment, and any parser-backed Rust
+the proposed `assigned_paths` and any parser-backed Rust
 `semantic_symbols` and `semantic_modules`. These are proposed path claims and
 semantic intents; `supervise run` still acquires and enforces the authoritative
 runtime claims. Fragments whose scopes overlap are coalesced, and the complete
@@ -3601,8 +3604,11 @@ assignments, coverage gaps, and bounded notes into at most two provider re-plan
 attempts. Invalid responses and failed provider calls count against that cap.
 Validated sessions lower through
 `supervisor_plan_from_task_planning_session` and can be bound to one future
-authenticated supervise run for feedback re-planning. The local `FakeProvider`
-exercises this boundary; no network provider is configured or selected by
+authenticated supervise run for feedback re-planning. Internal provider tree nodes
+remain read-only planning assignments; provider leaves become direct terminal
+`Worker` assignments with their original scope and schedule identity. Explicit
+user-authored plans retain their declared roles and nested workers. The local
+`FakeProvider` exercises this boundary; no network provider is configured or selected by
 supervise, so the CLI remains heuristic/offline by default.
 
 The emitted document is directly usable as a supervisor plan and preserves

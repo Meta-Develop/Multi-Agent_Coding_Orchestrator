@@ -2650,3 +2650,64 @@ fn unknown_and_weak_models_cannot_take_excluded_phases() {
         ));
     }
 }
+
+#[test]
+fn generated_direct_worker_prompt_binds_exact_attempt_journal_path_and_contract() {
+    for plan in
+        crate::supervise::plan_api::generated_terminal_worker_tests::generated_plans_for_gate_tests(
+        )
+    {
+        let assignment = plan.assignments.last().unwrap();
+        let worktree = WorktreeRecord {
+            name: assignment.id.clone(),
+            path: PathBuf::from("/worktree"),
+            branch: "maco/alpha".to_string(),
+        };
+        let claim = PathClaim {
+            token: ClaimToken::from_u64(41),
+            agent_id: assignment.id.clone(),
+            paths: assignment.assigned_paths.clone(),
+        };
+        // Incoming storage can be attempt-specific and must not be inferred from run_dir.
+        let incoming_root = Path::new("/attempt-2/incoming");
+        let prompt = child_orchestrator_prompt_with_incoming_root_and_field_guide(
+            ChildOrchestratorPromptContext {
+                plan: &plan,
+                execution_target: None,
+                assignment,
+                run_dir: Path::new("/run"),
+                worktree: &worktree,
+                report_path: Path::new("/attempt-2/incoming/alpha.json"),
+                schema_path: Path::new("/schemas/orchestrator.json"),
+                worker_schema_path: Path::new("/schemas/worker.json"),
+                auditor_schema_path: Path::new("/schemas/auditor.json"),
+                consultant: &SupervisorConsultantPlan::default(),
+                claim_context: ChildPromptClaimContext {
+                    claim: &claim,
+                    semantic_intent_token: None,
+                },
+            },
+            incoming_root,
+            &AssignmentMetadata::new(),
+            &SupervisorFieldGuidePrompt::empty().unwrap(),
+        )
+        .expect("render generated direct worker prompt");
+        let expected = incoming_root.join(worker_execution_journal_incoming_relative_for_id(
+            &assignment.id,
+        ));
+        assert!(prompt.contains(&format!("Execution journal path: {}", expected.display())));
+        for contract in [
+            "Append one JSON line directly",
+            "exact precreated journal",
+            "parent is nonwritable",
+            "Never create, replace, rename, link, truncate, or swap",
+            "Never reconstruct at the end",
+            "WorkerExecutionJournalRecordError",
+            "each command array element and cwd must be copied byte-for-byte",
+            "Preserve the full apply_patch record:",
+        ] {
+            assert!(prompt.contains(contract), "{contract}");
+        }
+        assert!(!prompt.contains("runtime-native SubAgent"));
+    }
+}
