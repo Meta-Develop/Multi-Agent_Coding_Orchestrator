@@ -51,6 +51,8 @@ const MAX_ID_BYTES: usize = 128;
 const MAX_WORKERS: usize = 256;
 const DOMAIN: AuthenticationDomain = AuthenticationDomain::new(b"MACO\0worker-request-inbox\0v1\0");
 
+pub(in crate::supervise) mod frozen;
+
 /// Server-owned identity, deliberately not deserializable. Generation must be persisted by
 /// the supervisor and reused on recovery, never regenerated to evade an existing inbox.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
