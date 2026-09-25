@@ -28,6 +28,7 @@ const EXTERNAL_CODEX_PERMISSION_PROFILE: &str = "maco_external_codex";
 const STARTUP_INFORMATION_MAX_MESSAGES: usize = 8;
 const STARTUP_INFORMATION_MAX_BYTES: usize = 16 * 1024;
 const THREAD_STATUS_MAX_MESSAGES: usize = 32;
+const ACCOUNT_RATE_LIMIT_MAX_MESSAGES: usize = 64;
 
 // Only the informational prelude observed before thread/start on audited Codex 0.144.4.
 // Upstream declares both methods as ServerNotification in app-server-protocol's common.rs.
@@ -180,6 +181,73 @@ fn valid_thread_status_changed(line: &[u8]) -> bool {
 struct ThreadLifecycleNotices {
     started: bool,
     status_count: usize,
+}
+
+// Codex emits account-wide rate-limit telemetry during a turn. It has no
+// thread/turn identity and conveys no execution authority, so validate the
+// original bounded JSON against the published shape before ignoring it.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountRateLimitsUpdated {
+    method: String,
+    params: AccountRateLimitsParams,
+    #[serde(default, rename = "emittedAtMs")]
+    emitted_at_ms: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountRateLimitsParams {
+    #[serde(rename = "rateLimits")]
+    rate_limits: AccountRateLimitSnapshot,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AccountRateLimitSnapshot {
+    limit_id: Option<String>,
+    limit_name: Option<String>,
+    normal_model_slug: Option<String>,
+    primary: Option<AccountRateLimitWindow>,
+    secondary: Option<AccountRateLimitWindow>,
+    credits: Option<AccountCreditsSnapshot>,
+    individual_limit: Option<AccountSpendControlLimit>,
+    spend_control_reached: Option<bool>,
+    plan_type: Option<String>,
+    rate_limit_reached_type: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AccountRateLimitWindow {
+    used_percent: i32,
+    window_duration_mins: Option<i64>,
+    resets_at: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AccountCreditsSnapshot {
+    has_credits: bool,
+    unlimited: bool,
+    balance: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AccountSpendControlLimit {
+    limit: String,
+    used: String,
+    remaining_percent: i32,
+    resets_at: i64,
+}
+
+fn valid_account_rate_limits_updated(line: &[u8]) -> bool {
+    line.len() <= STARTUP_INFORMATION_MAX_BYTES
+        && matches!(
+            serde_json::from_slice::<AccountRateLimitsUpdated>(line),
+            Ok(AccountRateLimitsUpdated { method, .. }) if method == "account/rateLimits/updated"
+        )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -958,6 +1026,17 @@ impl ProtocolState {
                     message: "thread status notification is malformed or oversized".to_string(),
                 });
             }
+            if phase == "turn"
+                && message.get("method").and_then(Value::as_str)
+                    == Some("account/rateLimits/updated")
+                && !valid_account_rate_limits_updated(&line)
+            {
+                return Err(AppServerError::Malformed {
+                    phase,
+                    message: "account rate-limit notification is malformed or oversized"
+                        .to_string(),
+                });
+            }
             self.command_snapshot =
                 if matches!(
                     message.get("method").and_then(Value::as_str),
@@ -1331,6 +1410,7 @@ where
     let mut pending_correction_responses = BTreeMap::<RequestId, String>::new();
     let mut refused_ceiling_expansions = 0usize;
     let mut turn_started_seen = false;
+    let mut account_rate_limit_notices = 0usize;
 
     loop {
         let message = state.receive(transport, "turn", cancelled)?;
@@ -1406,6 +1486,22 @@ where
                     return Err(AppServerError::Malformed {
                         phase: "thread/status/changed",
                         message: "thread status notifications exceeded their bound".to_string(),
+                    });
+                }
+            }
+            "account/rateLimits/updated" => {
+                if !turn_started_seen {
+                    return Err(AppServerError::Unexpected {
+                        phase: "account/rateLimits/updated",
+                        message: "rate-limit telemetry arrived before turn/started".to_string(),
+                    });
+                }
+                account_rate_limit_notices += 1;
+                if account_rate_limit_notices > ACCOUNT_RATE_LIMIT_MAX_MESSAGES {
+                    return Err(AppServerError::Malformed {
+                        phase: "account/rateLimits/updated",
+                        message: "account rate-limit notifications exceeded their bound"
+                            .to_string(),
                     });
                 }
             }
@@ -2558,6 +2654,61 @@ mod tests {
         ));
         assert!(!valid_thread_status_changed(
             br#"{"method":"thread/status/changed","params":{"threadId":"thread-1","threadId":"other-thread","status":{"type":"active","activeFlags":[]}}}"#
+        ));
+    }
+
+    fn captured_rate_limit_notice() -> Value {
+        // The 0.144.4 real-provider notification shape, with account values replaced.
+        json!({"method":"account/rateLimits/updated","params":{"rateLimits":{
+            "limitId":"codex", "limitName":null,
+            "primary":{"usedPercent":1,"windowDurationMins":300,"resetsAt":1},
+            "secondary":null,
+            "credits":{"hasCredits":true,"unlimited":false,"balance":null},
+            "individualLimit":null,"planType":"pro","rateLimitReachedType":null
+        }}})
+    }
+
+    #[test]
+    fn captured_rate_limit_telemetry_does_not_change_command_evidence() {
+        let baseline = run_command_observation_messages(command_observation_messages())
+            .expect("baseline turn");
+        let mut messages = command_observation_messages();
+        messages.insert(4, captured_rate_limit_notice());
+        let outcome = run_command_observation_messages(messages).expect("account telemetry");
+        assert_eq!(outcome.status, TurnTerminalStatus::Completed);
+        assert_eq!(outcome.messages_received, baseline.messages_received + 1);
+        assert_eq!(
+            outcome.command_execution_evidence,
+            baseline.command_execution_evidence
+        );
+    }
+
+    #[test]
+    fn rate_limit_telemetry_rejects_malformed_and_excessive_notices() {
+        let notice = captured_rate_limit_notice();
+        for invalid in [
+            json!({"method":"account/rateLimits/updated","id":77,"params":{"rateLimits":{}}}),
+            json!({"method":"account/rateLimits/updated","params":{"rateLimits":null}}),
+            json!({"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":"1"}}}}),
+            json!({"method":"account/rateLimits/updated","params":{"rateLimits":{},"grantRoot":"/"}}),
+        ] {
+            let mut messages = command_observation_messages();
+            messages.insert(4, invalid);
+            assert!(run_command_observation_messages(messages).is_err());
+        }
+        let mut messages = command_observation_messages();
+        for _ in 0..=ACCOUNT_RATE_LIMIT_MAX_MESSAGES {
+            messages.insert(4, notice.clone());
+        }
+        assert!(matches!(
+            run_command_observation_messages(messages),
+            Err(AppServerError::Malformed {
+                phase: "account/rateLimits/updated",
+                ..
+            })
+        ));
+        assert!(!valid_account_rate_limits_updated(
+            br#"{"method":"account/rateLimits/updated","params":{"rateLimits":{"limitId":"codex","limitId":"other"}}}"#
         ));
     }
 
