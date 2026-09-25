@@ -1301,6 +1301,7 @@ fn assignment_messaging_ipc_acceptance(
         &schema_path,
         &worker_schema_path,
         &auditor_schema_path,
+        None,
     )? {
         AssignmentExecutionDisposition::Continue(prepared) => prepared,
         AssignmentExecutionDisposition::Complete => {

@@ -16,16 +16,24 @@ fn driver_fixture(case: &str) -> Result<()> {
     let tree = git.find_tree(index.write_tree()?)?;
     let signature = git2::Signature::now("test", "test@example.invalid")?;
     git.commit(Some("HEAD"), &signature, &signature, "base", &tree, &[])?;
-    let parent: OrchestratorAssignment = serde_json::from_value(json!({
+    let mut parent: OrchestratorAssignment = serde_json::from_value(json!({
         "id":"parent", "phase":"execution", "role":"child_orchestrator",
         "assigned_paths":["src"], "task":"parent task",
         "worker_assignments":[{"id":"worker", "role":"worker",
             "assigned_paths":["src/lib.rs"], "task":"worker task", "report_path":"worker.json"}]
     }))?;
+    if case.starts_with("continuation-") {
+        let mut second = parent.worker_assignments[0].clone();
+        second.id = "worker-two".into();
+        second.report_path = Some("worker-two.json".into());
+        parent.worker_assignments.push(second);
+    }
     let worker: OrchestratorAssignment = serde_json::from_value(json!({
         "id":"worker", "phase":"execution", "role":"worker",
         "assigned_paths":["src/lib.rs"], "task":"worker task", "worker_assignments":[]
     }))?;
+    let mut worker_two = worker.clone();
+    worker_two.id = "worker-two".into();
     let plan: SupervisorPlan = serde_json::from_value(json!({
         "version":SUPERVISOR_SCHEMA_VERSION, "task":"nested driver fixture",
         "max_depth":2, "max_child_assignments":1, "max_child_retries":0,
@@ -156,7 +164,11 @@ fn driver_fixture(case: &str) -> Result<()> {
             );
             assert_eq!(command.reasoning_effort.as_deref(), Some("xhigh"));
             assert!(command.assignment_messaging_launch().is_none());
-            &worker
+            if command.agent_lifecycle.as_ref().unwrap().task_id == "worker-two" {
+                &worker_two
+            } else {
+                &worker
+            }
         };
         calls.lock().unwrap().push(subject.id.clone());
         assert_eq!(command.cwd, worktree.path);
@@ -185,12 +197,18 @@ fn driver_fixture(case: &str) -> Result<()> {
             executable_identity: "fixture".into(),
         });
         if subject.id == "parent" {
-            if case.starts_with("yield-") {
-                let report = json!({
+            if case.starts_with("yield-") || case.starts_with("continuation-") {
+                let mut report = json!({
                     "version":1, "outcome":"yield_workers", "run_id":run_id.as_str(),
                     "parent_id":"parent", "parent_attempt":1,
                     "requests":[{"request_id":"request-1", "worker_id":"worker"}]
                 });
+                if case.starts_with("continuation-") {
+                    report["requests"] = json!([
+                        {"request_id":"request-2", "worker_id":"worker-two"},
+                        {"request_id":"request-1", "worker_id":"worker"}
+                    ]);
+                }
                 let mut captured = report.clone();
                 if case == "yield-forged-capture" {
                     captured["requests"][0]["request_id"] = json!("forged");
@@ -261,6 +279,7 @@ fn driver_fixture(case: &str) -> Result<()> {
         &dirs.schemas.join("orchestrator-review-report.schema.json"),
         &dirs.schemas.join("worker-report.schema.json"),
         &dirs.schemas.join("auditor-report.schema.json"),
+        None,
     )? {
         AssignmentExecutionDisposition::Continue(prepared) => prepared,
         AssignmentExecutionDisposition::Complete => {
@@ -276,6 +295,243 @@ fn driver_fixture(case: &str) -> Result<()> {
         prepared,
     )?;
     assert_eq!(*calls.lock().unwrap(), ["parent"]);
+    if case.starts_with("continuation-") {
+        let mut policy = context.budget_policy.clone();
+        policy.set_selector_binding_for_test(
+            AgentRole::Worker,
+            SupervisorRuntime::Codex,
+            RoleModelSelection {
+                model: Some("gpt-5.6-sol".into()),
+                reasoning_effort: Some("xhigh".into()),
+                ..Default::default()
+            },
+        );
+        let mut driver = NestedWorkerSerialDriver::from_collected_parent(
+            &context,
+            &mut preflight,
+            &mut outcome,
+            1,
+            &collected,
+        )?;
+        let expected = [
+            parent_turn_yield::ExpectedWorkerRequest::new("request-2", "worker-two")?,
+            parent_turn_yield::ExpectedWorkerRequest::new("request-1", "worker")?,
+        ];
+        let yielded = driver.validate_parent_turn_yield(&expected)?;
+        // Input completion order is deliberately different from the frozen yield order.
+        let mut completed = vec![
+            driver.execute_worker("worker", &policy)?,
+            driver.execute_worker("worker-two", &policy)?,
+        ];
+        drop(driver);
+        match case {
+            "continuation-missing" => {
+                completed.pop();
+            }
+            "continuation-duplicate" => completed[1].report.id = "worker".into(),
+            "continuation-forged-id" => completed[1].report.id = "outside".into(),
+            "continuation-forged-summary" => {
+                completed[0].report.remaining_risk = "substituted".into()
+            }
+            "continuation-wrong-attempt-artifact" => {
+                completed[0].artifacts.raw_report_relative =
+                    "nested/parent/attempt-99/worker/report.json".into()
+            }
+            "continuation-missing-journal" => completed[0].journals.clear(),
+            "continuation-restored" => {
+                completed[0].run = serde_json::from_value(serde_json::to_value(&completed[0].run)?)?
+            }
+            "continuation-oversize" => {
+                completed[0].report.remaining_risk = "x".repeat(MAX_PARENT_CONTINUATION_BYTES);
+                completed[0].run.output_last_message =
+                    Some(serde_json::to_vec(&completed[0].report)?);
+            }
+            _ => {}
+        }
+        let contract = ParentContinuationLaunch::from_unbound_completed_workers_for_test(
+            &context, &preflight, &yielded, &completed,
+        );
+        if case == "continuation-missing-live-inbox-binding" {
+            // The same held results pass all staged preparation checks, but
+            // matching run/attempt paths do not prove state-instance/generation.
+            let fixture = contract?;
+            fixture.revalidate(&context, &preflight, 2)?;
+            let error = ParentContinuationLaunch::from_completed_workers(
+                &context, &preflight, &yielded, &completed,
+            )
+            .err()
+            .context("constructed continuation without a live inbox binding")?;
+            assert!(error.to_string().contains("construction unavailable"));
+            assert!(error
+                .to_string()
+                .contains("state-instance and inbox-generation"));
+        } else if let Some(drift) = case.strip_prefix("continuation-candidate-") {
+            let mut contract = contract?;
+            let candidate_git = crate::git_repository::open(&worktree.path)?;
+            match drift {
+                "content" => {
+                    fs::write(worktree.path.join("src/lib.rs"), "changed after binding\n")?
+                }
+                "untracked" => fs::write(worktree.path.join("src/new.rs"), "new after binding\n")?,
+                "index" => {
+                    let mut index = candidate_git.index()?;
+                    index.remove_path(Path::new("src/lib.rs"))?;
+                    index.write()?;
+                }
+                "head" => {
+                    // Keep the held metadata inode intact: test the snapshot
+                    // check, not the separate replaced-metadata identity gate.
+                    fs::write(
+                        candidate_git.path().join("HEAD"),
+                        format!("{}\n", candidate_git.head()?.target().unwrap()),
+                    )?
+                }
+                "uninspectable" => fs::write(candidate_git.path().join("index"), b"invalid index")?,
+                "incomplete-held" => {
+                    contract.candidate_snapshot.inspection_error =
+                        Some("incomplete fixture".into());
+                }
+                _ => bail!("unknown candidate drift case {drift}"),
+            }
+            let error = prepare_child_attempt(
+                &context,
+                &mut outcome,
+                &policy,
+                &preflight,
+                run_id.as_str(),
+                2,
+                1,
+                &None,
+                &dirs.schemas.join("orchestrator-review-report.schema.json"),
+                &dirs.schemas.join("worker-report.schema.json"),
+                &dirs.schemas.join("auditor-report.schema.json"),
+                Some(&contract),
+            )
+            .err()
+            .with_context(|| format!("accepted candidate drift: {drift}"))?;
+            assert!(
+                error.to_string().contains("candidate snapshot"),
+                "{error:#}"
+            );
+            assert!(!dirs
+                .schemas
+                .join("parent-continuation-2.schema.json")
+                .exists());
+        } else if case != "continuation-happy" {
+            assert!(contract.is_err(), "accepted {case}");
+        } else {
+            let contract = contract?;
+            assert_eq!(contract.worker_ids(), ["worker-two", "worker"]);
+            let summaries: serde_json::Value = serde_json::from_str(contract.summaries())?;
+            assert_eq!(summaries[0]["worker_id"], "worker-two");
+            assert_eq!(summaries[0]["request_id"], "request-2");
+            assert_eq!(
+                summaries[0]["worker_report"],
+                serde_json::to_value(&completed[1].report)?
+            );
+            assert!(contract.revalidate(&context, &preflight, 1).is_err());
+            let prepared = match prepare_child_attempt(
+                &context,
+                &mut outcome,
+                &policy,
+                &preflight,
+                run_id.as_str(),
+                2,
+                1,
+                &None,
+                &dirs.schemas.join("orchestrator-review-report.schema.json"),
+                &dirs.schemas.join("worker-report.schema.json"),
+                &dirs.schemas.join("auditor-report.schema.json"),
+                Some(&contract),
+            )? {
+                AssignmentExecutionDisposition::Continue(prepared) => prepared,
+                AssignmentExecutionDisposition::Complete => {
+                    bail!("continuation preparation refused")
+                }
+            };
+            assert!(!prepared.corrective_retry_used);
+            assert_eq!(prepared.command.workspace_access, WorkspaceAccess::ReadOnly);
+            assert!(prepared.command.worktree_control_exceptions.is_empty());
+            assert!(prepared.command.cam_authority_socket_pin().is_none());
+            assert!(prepared.command_admission.is_none());
+            assert!(prepared.command.worker_journal_artifacts.is_empty());
+            assert!(!prepared
+                .incoming_scratch
+                .path()
+                .join("worker-journals")
+                .exists());
+            let prompt = fs::read_to_string(&prepared.attempt_artifacts.prompt_path)?;
+            let initial = fs::read_to_string(&collected.attempt_artifacts.prompt_path)?;
+            assert!(initial.contains("Launch every supplied terminal worker"));
+            assert!(!prompt.contains("Launch every supplied terminal worker"));
+            assert!(prompt.contains("Native SubAgent, spawn_agent, raw CLI/provider processes and nested MACO launches are forbidden"));
+            assert!(prompt.contains(contract.summaries()));
+            assert!(prompt.contains("Fresh parent turn: 2"));
+            assert!(prompt.contains("No Worker-journal write capability"));
+            assert!(prompt.contains("Source is read-only"));
+            assert!(prompt.contains("do not edit, stage, commit, reset"));
+            contract.revalidate(&context, &preflight, 2)?;
+            let schema_path = prepared.command.output_schema.as_ref().unwrap();
+            assert!(schema_path.ends_with("parent-continuation-2.codex-output.schema.json"));
+            let codex_schema: serde_json::Value = serde_json::from_slice(&fs::read(schema_path)?)?;
+            let schema =
+                super::super::schema_artifacts::parent_continuation_schema_value(&contract);
+            assert_eq!(codex_schema["title"], "ParentContinuationTurn");
+            let instance = json!({"version":1, "run_id":run_id.as_str(), "parent_id":"parent",
+                "source_parent_attempt":1, "parent_attempt":2,
+                "completed_worker_ids":["worker-two", "worker"],
+                "turn":{"outcome":"yield_workers", "requests":[{"request_id":"next", "worker_id":"unresolved"}]}});
+            for schema in [schema, codex_schema] {
+                let authoritative = schema["properties"]["turn"].get("oneOf").is_some();
+                let mut compiler = boon::Compiler::new();
+                compiler.set_default_draft(boon::Draft::V2020_12);
+                compiler
+                    .add_resource("urn:maco:continuation-test", schema)
+                    .expect("register continuation schema");
+                let mut schemas = boon::Schemas::new();
+                let index = compiler
+                    .compile("urn:maco:continuation-test", &mut schemas)
+                    .expect("compile continuation schema");
+                schemas
+                    .validate(&instance, index)
+                    .expect("valid yield envelope");
+                if authoritative {
+                    let mut final_turn = instance.clone();
+                    final_turn["turn"] =
+                        json!({"outcome":"final_report", "report":collected.attempt_report});
+                    schemas
+                        .validate(&final_turn, index)
+                        .expect("valid final report envelope");
+                    final_turn["turn"]["requests"] = instance["turn"]["requests"].clone();
+                    assert!(schemas.validate(&final_turn, index).is_err());
+                }
+                let mut mixed = instance.clone();
+                mixed["turn"]["report"] = json!({});
+                assert!(schemas.validate(&mixed, index).is_err());
+                mixed["turn"]["outcome"] = json!("final_report");
+                assert!(schemas.validate(&mixed, index).is_err());
+                for ids in [
+                    json!(["worker", "worker-two"]),
+                    json!(["worker", "worker"]),
+                    json!(["forged", "worker"]),
+                    json!(["worker"]),
+                ] {
+                    let mut wrong = instance.clone();
+                    wrong["completed_worker_ids"] = ids;
+                    assert!(schemas.validate(&wrong, index).is_err());
+                }
+                assert!(schemas.validate(&instance["turn"], index).is_err());
+            }
+            // Preparation only: no fresh parent, IPC, collector or acceptance is invoked.
+            drop(prepared);
+            cancellation.cancel();
+            assert!(contract.revalidate(&context, &preflight, 2).is_err());
+        }
+        assert_eq!(*calls.lock().unwrap(), ["parent", "worker", "worker-two"]);
+        assert_eq!(sync_store.snapshot()?, vec![claim.clone()]);
+        assert_eq!(ledger.report()?.active_reservations, 0);
+        return Ok(());
+    }
     match case {
         "yield-blocked" => collected.environment_blocked = true,
         "yield-side-effects" => {
@@ -470,6 +726,49 @@ fn parent_turn_yield_refuses_nonquiescent_restored_or_revoked_parent() -> Result
         "yield-side-effects",
     ] {
         driver_fixture(case)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn parent_continuation_preparation_binds_held_results_without_worker_journal_capability(
+) -> Result<()> {
+    driver_fixture("continuation-happy")
+}
+
+#[test]
+fn parent_continuation_rejects_missing_forged_duplicate_or_oversized_held_results() -> Result<()> {
+    for case in [
+        "continuation-missing",
+        "continuation-duplicate",
+        "continuation-forged-id",
+        "continuation-forged-summary",
+        "continuation-wrong-attempt-artifact",
+        "continuation-missing-journal",
+        "continuation-restored",
+        "continuation-oversize",
+    ] {
+        driver_fixture(case)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn parent_continuation_construction_requires_unavailable_live_inbox_binding() -> Result<()> {
+    driver_fixture("continuation-missing-live-inbox-binding")
+}
+
+#[test]
+fn parent_continuation_refuses_candidate_drift_or_incomplete_snapshot() -> Result<()> {
+    for drift in [
+        "content",
+        "untracked",
+        "index",
+        "head",
+        "uninspectable",
+        "incomplete-held",
+    ] {
+        driver_fixture(&format!("continuation-candidate-{drift}"))?;
     }
     Ok(())
 }

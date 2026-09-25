@@ -1518,6 +1518,244 @@ pub(super) fn bind_worker_journal_artifacts(
     Ok(command)
 }
 
+/// A staged launch input, not a final-report or resumed-execution authority.
+/// Production construction is unavailable: the yield and completed evidence do
+/// not yet carry the authenticated state-instance and inbox-generation binding.
+/// Only an explicitly unbound test fixture exercises this staged preparation.
+pub(super) struct ParentContinuationLaunch<'evidence> {
+    run_id: String,
+    assignment: OrchestratorAssignment,
+    source_attempt: usize,
+    attempt: usize,
+    worktree: PathBuf,
+    candidate_snapshot: PrimaryWorktreeSnapshot,
+    claim_token: u64,
+    semantic_token: Option<u64>,
+    ordered_worker_ids: Vec<String>,
+    summaries: String,
+    _held_workers: Vec<&'evidence nested_worker_executor::NestedWorkerAttemptEvidence>,
+}
+
+#[cfg(test)]
+const MAX_PARENT_CONTINUATION_BYTES: usize = 64 * 1024;
+
+impl<'evidence> ParentContinuationLaunch<'evidence> {
+    #[allow(dead_code)] // Fail closed until the live inbox-to-completion binding exists.
+    fn from_completed_workers(
+        _context: &AssignmentExecutionContext<'_, '_>,
+        _preflight: &AssignmentExecutionPreflight<'_>,
+        _yielded: &parent_turn_yield::ValidatedParentTurnYield,
+        _completed: &'evidence [nested_worker_executor::NestedWorkerAttemptEvidence],
+    ) -> Result<Self> {
+        bail!("continuation construction unavailable: supervisor-owned state-instance and inbox-generation are not bound through yield/request and completed Worker evidence");
+    }
+
+    // This does not prove an inbox generation. It is intentionally absent from
+    // non-test builds; matching run/attempt/artifact paths cannot open the gate.
+    #[cfg(test)]
+    fn from_unbound_completed_workers_for_test(
+        context: &AssignmentExecutionContext<'_, '_>,
+        preflight: &AssignmentExecutionPreflight<'_>,
+        yielded: &parent_turn_yield::ValidatedParentTurnYield,
+        completed: &'evidence [nested_worker_executor::NestedWorkerAttemptEvidence],
+    ) -> Result<Self> {
+        let (run_id, parent_id, source_attempt) = yielded.parent_binding();
+        let attempt = source_attempt
+            .checked_add(1)
+            .context("parent turn overflow")?;
+        if run_id != context.options.run_id.as_str()
+            || parent_id != preflight.assignment.id
+            || source_attempt == 0
+            || completed.is_empty()
+            || completed.len() != yielded.requests().count()
+        {
+            bail!("continuation differs from the held parent yield and completed Worker set");
+        }
+        let mut by_id = BTreeMap::new();
+        for evidence in completed {
+            if by_id
+                .insert(evidence.report.id.as_str(), evidence)
+                .is_some()
+            {
+                bail!("continuation contains duplicate completed Worker identities");
+            }
+        }
+        let mut summaries = Vec::new();
+        let mut held_workers = Vec::new();
+        let mut ordered_worker_ids = Vec::new();
+        for (request_id, worker_id) in yielded.requests() {
+            let evidence = by_id
+                .remove(worker_id)
+                .context("continuation Worker result is missing")?;
+            let mut authored = preflight
+                .assignment
+                .worker_assignments
+                .iter()
+                .filter(|worker| worker.id == worker_id);
+            let worker = authored
+                .next()
+                .context("continuation Worker is not authored")?;
+            if authored.next().is_some()
+                || worker.role != AgentRole::Worker
+                || worker.effective_role_category() != RoleCategory::NonDelegatingTerminalWorker
+            {
+                bail!("continuation requires one exact authored terminal Worker");
+            }
+            let report_bytes = evidence
+                .run
+                .output_last_message()
+                .context("continuation requires a descriptor-held Worker result")?;
+            let expected_artifact = PathBuf::from("nested")
+                .join(parent_id)
+                .join(format!("attempt-{source_attempt}"))
+                .join(worker_id)
+                .join("report.json");
+            if report_bytes.len() > MAX_PARENT_CONTINUATION_BYTES
+                || evidence.artifacts.raw_report_relative != expected_artifact
+                || evidence.artifacts.prompt_path
+                    != context
+                        .run_dir
+                        .join("nested")
+                        .join(parent_id)
+                        .join(format!("attempt-{source_attempt}"))
+                        .join(worker_id)
+                        .join("prompt.md")
+                || evidence.model_provenance.launch_runtime != SupervisorRuntime::Codex
+                || !evidence.run.stdout.target_launch_attempted
+                || evidence.run.cwd != preflight.worktree.path
+                || !evidence.run.scratch_quiescence_verified()
+                || !external_process_completed(&evidence.run, SupervisorRuntime::Codex)
+                || !external_containment_verified(&evidence.run, SupervisorRuntime::Codex)
+                || !evidence.run.sandbox_denials().is_empty()
+                || !evidence.run.gate_denials().is_empty()
+                || evidence.run.external_side_effect_state().is_some()
+                || evidence.run.environment_blocked()
+                || evidence.report.role != AgentRole::Worker
+                || evidence.report.assigned_paths != worker.assigned_paths
+                || evidence.report.semantic_symbols != worker.semantic_symbols
+                || evidence.report.semantic_modules != worker.semantic_modules
+                || evidence.report.claim_token != Some(preflight.claim.token.get())
+                || evidence.report.semantic_intent_token != preflight.semantic_token
+                || evidence.report.no_further_delegation != Some(true)
+                || evidence.report.files_changed != evidence.observed_changed_paths
+                || evidence.journals.len() != 1
+                || !evidence.journals.get(worker_id).is_some_and(|journal| {
+                    matches!(journal.status, WorkerExecutionJournalStatus::Loaded(_))
+                })
+            {
+                bail!("continuation Worker evidence is incomplete, oversized or has a different binding");
+            }
+            if read_worker_report(Some(report_bytes), &expected_artifact)?.report != evidence.report
+            {
+                bail!("continuation Worker report differs from its held capture");
+            }
+            summaries.push(json!({
+                "request_id": request_id, "worker_id": worker_id,
+                "worker_report": evidence.report,
+                "observed_changed_paths": evidence.observed_changed_paths,
+                "launched_model": evidence.model_provenance.launched_model,
+                "report_artifact": expected_artifact,
+            }));
+            if serde_json::to_vec(&summaries)?.len() > MAX_PARENT_CONTINUATION_BYTES {
+                bail!("continuation Worker summaries exceed the payload limit");
+            }
+            held_workers.push(evidence);
+            ordered_worker_ids.push(worker_id.to_string());
+        }
+        if !by_id.is_empty() {
+            bail!("continuation includes an unrequested Worker result");
+        }
+        let contract = Self {
+            run_id: run_id.to_string(),
+            assignment: preflight.assignment.clone(),
+            source_attempt,
+            attempt,
+            worktree: preflight.worktree.path.clone(),
+            candidate_snapshot: primary_worktree_snapshot(
+                &preflight.worktree.path,
+                context.execution_runtime,
+            )?,
+            claim_token: preflight.claim.token.get(),
+            semantic_token: preflight.semantic_token,
+            ordered_worker_ids,
+            summaries: serde_json::to_string(&summaries)?,
+            _held_workers: held_workers,
+        };
+        contract.revalidate(context, preflight, attempt)?;
+        Ok(contract)
+    }
+
+    fn revalidate(
+        &self,
+        context: &AssignmentExecutionContext<'_, '_>,
+        preflight: &AssignmentExecutionPreflight<'_>,
+        attempt: usize,
+    ) -> Result<()> {
+        if context.execution_runtime != SupervisorExecutionRuntime::Verified
+            || context.execution_target.is_some()
+            || context.evidence_only_reaudit.is_some()
+            || context.assignment != &self.assignment
+            || preflight.assignment != self.assignment
+            || self.assignment.role != AgentRole::ChildOrchestrator
+            || self.assignment.phase != AssignmentPhase::Execution
+            || self.run_id != context.options.run_id.as_str()
+            || attempt != self.attempt
+            || preflight.worktree.path != self.worktree
+            || preflight.claim.token.get() != self.claim_token
+            || preflight.semantic_token != self.semantic_token
+        {
+            bail!("continuation launch differs from its held run, turn or assignment resources");
+        }
+        // The same live resources must still be held even though this input conveys
+        // no new admission or permission to execute a Worker.
+        if context.cancellation.is_cancelled()
+            || preflight
+                .managed_process_cancellation
+                .cancellation()
+                .is_cancelled()
+            || !context.sync_store.snapshot()?.contains(&preflight.claim)
+        {
+            bail!("continuation resources are cancelled or revoked");
+        }
+        preflight.mandatory_worktree_controls.revalidate()?;
+        let observed = primary_worktree_snapshot(&self.worktree, context.execution_runtime)
+            .context("failed to capture continuation candidate snapshot")?;
+        if self.candidate_snapshot.inspection_problem().is_some()
+            || observed.inspection_problem().is_some()
+        {
+            bail!("continuation candidate snapshot is incomplete");
+        }
+        if self.candidate_snapshot != observed {
+            bail!(
+                "continuation candidate snapshot changed since completed Worker results were bound"
+            );
+        }
+        context.manager.verify_write_execution_lease(
+            &self.assignment.id,
+            preflight
+                .worktree_write_lease
+                .as_ref()
+                .context("continuation lost its write lease")?,
+        )?;
+        Ok(())
+    }
+
+    pub(super) fn binding(&self) -> (&str, &str, usize, usize) {
+        (
+            &self.run_id,
+            &self.assignment.id,
+            self.source_attempt,
+            self.attempt,
+        )
+    }
+    pub(super) fn worker_ids(&self) -> &[String] {
+        &self.ordered_worker_ids
+    }
+    pub(super) fn summaries(&self) -> &str {
+        &self.summaries
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_child_attempt<'a>(
     context: &AssignmentExecutionContext<'a, '_>,
@@ -1531,6 +1769,7 @@ fn prepare_child_attempt<'a>(
     schema_path: &Path,
     worker_schema_path: &Path,
     auditor_schema_path: &Path,
+    continuation: Option<&ParentContinuationLaunch<'_>>,
 ) -> Result<AssignmentExecutionDisposition<PreparedChildAttempt<'a>>> {
     let AssignmentExecutionContext {
         index,
@@ -1554,6 +1793,16 @@ fn prepare_child_attempt<'a>(
         ..
     } = context;
     let assignment = &preflight.assignment;
+    if let Some(continuation) = continuation {
+        if retry_feedback.is_some() {
+            bail!("yield continuation cannot be combined with corrective retry feedback");
+        }
+        continuation.revalidate(context, preflight, attempt)?;
+        if assignment_launch_runtime(assignment, options, budget_policy) != SupervisorRuntime::Codex
+        {
+            bail!("continuation preparation requires the verified Codex runtime");
+        }
+    }
     if let Some(expected) = context.worktree_creation.expected_source_head() {
         let observed = current_head_oid(&preflight.worktree.path)?;
         if observed != expected {
@@ -1596,14 +1845,13 @@ fn prepare_child_attempt<'a>(
         &capture_path,
         &assignment.id,
         attempt,
-        max_attempts > 1,
+        max_attempts > 1 || continuation.is_some(),
     );
     let corrective_retry_used = retry_feedback.is_some();
     let budget_plan = budget_policy.apply(plan);
     let launch_runtime = assignment_launch_runtime(assignment, options, budget_policy);
     let nested_worker_runtime = nested_worker_launch_runtime(launch_runtime, budget_policy);
-    let resolved_prompt_plan = evidence_only_reaudit
-        .is_none()
+    let resolved_prompt_plan = (evidence_only_reaudit.is_none() && continuation.is_none())
         .then(|| {
             runtime_resolved_prompt_plan(
                 &budget_plan,
@@ -1614,10 +1862,47 @@ fn prepare_child_attempt<'a>(
             )
         })
         .transpose()?;
+    let continuation_schema = continuation
+        .map(|contract| {
+            let relative = PathBuf::from("schemas").join(format!(
+                "{}-continuation-{attempt}.schema.json",
+                assignment.id
+            ));
+            with_supervisor_artifacts(artifacts, |writer, _| {
+                super::schema_artifacts::write_parent_continuation_schemas(
+                    writer, &relative, contract,
+                )
+            })?;
+            Ok::<_, anyhow::Error>(run_dir.join(relative))
+        })
+        .transpose()?;
     let RenderedPromptWithMeasurements {
         prompt,
         mut measurements,
-    } = if let Some(source) = evidence_only_reaudit {
+    } = if let Some(contract) = continuation {
+        super::prompts::render_parent_continuation_prompt(
+            ChildOrchestratorPromptContext {
+                plan: &budget_plan,
+                execution_target: None,
+                assignment,
+                run_dir,
+                worktree,
+                report_path: &attempt_artifacts.report_path,
+                schema_path: continuation_schema
+                    .as_deref()
+                    .context("missing continuation schema")?,
+                worker_schema_path,
+                auditor_schema_path,
+                consultant,
+                claim_context: ChildPromptClaimContext {
+                    claim: &preflight.claim,
+                    semantic_intent_token: preflight.semantic_token,
+                },
+            },
+            contract,
+            field_guide,
+        )?
+    } else if let Some(source) = evidence_only_reaudit {
         let preserved_base = source
             .operation
             .preserved_candidate_binding
@@ -1688,7 +1973,11 @@ fn prepare_child_attempt<'a>(
             field_guide,
             attempt,
         )?;
-        for worker in &assignment.worker_assignments {
+        for worker in assignment
+            .worker_assignments
+            .iter()
+            .filter(|_| continuation.is_none())
+        {
             record_field_guide_prompt_injection_strict(
                 artifacts,
                 &worker.id,
@@ -1699,15 +1988,17 @@ fn prepare_child_attempt<'a>(
                 attempt,
             )?;
         }
-        record_field_guide_prompt_injection_strict(
-            artifacts,
-            &format!("{}-review-auditor", assignment.id),
-            Some(&assignment.id),
-            OrchestrationRole::Auditor,
-            SupervisePromptRole::ReviewAuditor,
-            field_guide,
-            attempt,
-        )?;
+        if continuation.is_none() {
+            record_field_guide_prompt_injection_strict(
+                artifacts,
+                &format!("{}-review-auditor", assignment.id),
+                Some(&assignment.id),
+                OrchestrationRole::Auditor,
+                SupervisePromptRole::ReviewAuditor,
+                field_guide,
+                attempt,
+            )?;
+        }
     }
     let attempt_prompt = match retry_feedback {
         Some(ChildAttemptCorrection::StructuralReport) => prompt_with_structural_retry(&prompt),
@@ -1760,13 +2051,21 @@ fn prepare_child_attempt<'a>(
         mechanical_duty,
     )?;
     command = bound_launch.command;
-    let direct_report_schema_path =
-        direct_assignment_report_schema_path(assignment.role, schema_path, worker_schema_path)?;
+    let direct_report_schema_path = match continuation_schema.as_deref() {
+        Some(path) => path,
+        None => {
+            direct_assignment_report_schema_path(assignment.role, schema_path, worker_schema_path)?
+        }
+    };
     command = bind_runtime_output_schema(command, launch_runtime, direct_report_schema_path)?;
     command = bind_runtime_read_only_schema_files(
         command,
         launch_runtime,
-        &[schema_path, worker_schema_path, auditor_schema_path],
+        &if continuation.is_some() {
+            vec![direct_report_schema_path]
+        } else {
+            vec![schema_path, worker_schema_path, auditor_schema_path]
+        },
     );
     // Agent lifecycle records and binds repository metadata. Child-visible Git paths are
     // derived separately from `command.cwd` as an exact linked-worktree allowlist; the
@@ -1781,7 +2080,7 @@ fn prepare_child_attempt<'a>(
     command = bind_supervisor_machine_global_staging_cleanup(command, options)?;
     command =
         apply_canonical_environment_requirements(command, &preflight.environment_requirements);
-    command = if evidence_only_reaudit.is_some() {
+    command = if evidence_only_reaudit.is_some() || continuation.is_some() {
         configure_read_only_auditor_command(command)?
     } else {
         configure_assignment_phase_command(command, assignment_phase, &assignment.assigned_paths)?
@@ -1854,7 +2153,7 @@ fn prepare_child_attempt<'a>(
         })?;
         bail!("descriptor-held invocation scratch roots changed during setup");
     }
-    if evidence_only_reaudit.is_none() {
+    if evidence_only_reaudit.is_none() && continuation.is_none() {
         let journal_paths = match precreate_worker_execution_journals(assignment, &incoming_scratch)
         {
             Ok(paths) => paths,
@@ -2003,7 +2302,9 @@ fn prepare_child_attempt<'a>(
     }
     command =
         command.with_assignment_process_launch(AssignmentProcessLaunchKind::AssignmentChild, grant);
-    command = pin_cam_authority_socket_for_nested_maco_launch(command, launch_runtime);
+    if continuation.is_none() {
+        command = pin_cam_authority_socket_for_nested_maco_launch(command, launch_runtime);
+    }
     let command_admission_result = if *execution_runtime == SupervisorExecutionRuntime::Verified
         && !context
             .worktree_creation
@@ -2029,6 +2330,18 @@ fn prepare_child_attempt<'a>(
             return Err(error);
         }
     };
+    if let Some(contract) = continuation {
+        // Recheck after preparation as well. The eventual dispatcher/collector
+        // must retain and recheck this binding too; neither is activated here.
+        if let Err(error) = contract.revalidate(context, preflight, attempt) {
+            drop(incoming_output_root);
+            drop(capture_output_root);
+            with_supervisor_artifacts(artifacts, |writer, _| {
+                discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
+            })?;
+            return Err(error);
+        }
+    }
     Ok(AssignmentExecutionDisposition::Continue(
         PreparedChildAttempt {
             attempt_artifacts,
@@ -4915,6 +5228,7 @@ fn execute_supervisor_assignment_inner(
                 &schema_path,
                 &worker_schema_path,
                 &auditor_schema_path,
+                None,
             )? {
                 AssignmentExecutionDisposition::Continue(prepared) => prepared,
                 AssignmentExecutionDisposition::Complete => return Ok(()),
@@ -5916,6 +6230,7 @@ mod decomposition_tests {
             &schema_path,
             &worker_schema_path,
             &auditor_schema_path,
+            None,
         )
         .expect("prepare child and reserve budget")
         {
@@ -6368,6 +6683,7 @@ mod decomposition_tests {
             &schema_path,
             &worker_schema_path,
             &auditor_schema_path,
+            None,
         )
         .expect("direct child preparation invocation")
         {
@@ -6804,6 +7120,7 @@ mod decomposition_tests {
             &schema_path,
             &worker_schema_path,
             &auditor_schema_path,
+            None,
         )
         .expect("child preparation")
         {
@@ -7849,6 +8166,7 @@ mod decomposition_tests {
             &schema_path,
             &worker_schema_path,
             &auditor_schema_path,
+            None,
         )
         .expect("issuer child preparation")
         {
@@ -7998,6 +8316,7 @@ mod decomposition_tests {
             &schema_path,
             &worker_schema_path,
             &auditor_schema_path,
+            None,
         )
         .expect("issuer child staging preparation")
         {
@@ -8523,6 +8842,7 @@ mod decomposition_tests {
             &schema_path,
             &worker_schema_path,
             &auditor_schema_path,
+            None,
         )
         .expect("direct child preparation invocation")
         {
@@ -11118,6 +11438,7 @@ done
             &schema_path,
             &worker_schema_path,
             &auditor_schema_path,
+            None,
         )? {
             AssignmentExecutionDisposition::Continue(prepared) => prepared,
             AssignmentExecutionDisposition::Complete => {
@@ -11837,6 +12158,7 @@ done
             &schema_path,
             &worker_schema_path,
             &auditor_schema_path,
+            None,
         )? {
             AssignmentExecutionDisposition::Continue(prepared) => prepared,
             AssignmentExecutionDisposition::Complete => {
@@ -12247,6 +12569,7 @@ done
             &schema_path,
             &worker_schema_path,
             &auditor_schema_path,
+            None,
         )? {
             AssignmentExecutionDisposition::Continue(prepared) => prepared,
             AssignmentExecutionDisposition::Complete => {
@@ -12530,6 +12853,7 @@ done
                 &schema_path,
                 &worker_schema_path,
                 &auditor_schema_path,
+                None,
             )? {
                 AssignmentExecutionDisposition::Continue(prepared) => prepared,
                 AssignmentExecutionDisposition::Complete => {
@@ -12881,6 +13205,7 @@ done
                 &schema_path,
                 &worker_schema_path,
                 &auditor_schema_path,
+                None,
             )? {
                 AssignmentExecutionDisposition::Continue(prepared) => prepared,
                 AssignmentExecutionDisposition::Complete => {
