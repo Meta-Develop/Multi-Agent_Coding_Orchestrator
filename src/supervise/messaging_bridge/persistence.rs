@@ -202,6 +202,14 @@ impl PersistentMessagingBinding {
         )
     }
 
+    pub(super) fn state_instance_id(&self) -> &str {
+        &self.body.state_instance_id
+    }
+
+    pub(super) fn repository_binding(&self) -> &RepositoryAuthBinding {
+        &self.body.repository
+    }
+
     pub(super) fn hierarchy(&self) -> &HierarchyLedgerSnapshot {
         &self.hierarchy
     }
