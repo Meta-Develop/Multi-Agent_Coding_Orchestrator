@@ -317,6 +317,16 @@ pub(super) fn collect_child_report(
     collect_child_report_for_runtime(context, runtime)
 }
 
+// The evidence-only stage refreshes the outer report, never the preserved WorkerReport.
+// This is a wire-format choice; it does not change assignment authority or accounting.
+pub(super) fn assignment_attempt_report_role(role: AgentRole, evidence_only: bool) -> AgentRole {
+    if evidence_only && role == AgentRole::Worker {
+        AgentRole::ChildOrchestrator
+    } else {
+        role
+    }
+}
+
 pub(super) fn collect_child_report_for_runtime(
     context: ChildReportCollectionContext<'_>,
     runtime: SupervisorRuntime,
@@ -346,7 +356,9 @@ pub(super) fn collect_child_report_for_runtime(
             Vec::new(),
         );
     }
-    let direct_worker = assignment.role == AgentRole::Worker
+    let report_role =
+        assignment_attempt_report_role(assignment.role, evidence_only_source.is_some());
+    let direct_worker = report_role == AgentRole::Worker
         && assignment.role_category == Some(RoleCategory::NonDelegatingTerminalWorker);
     let mut report_shape_problems = Vec::new();
     let parsed_report = if direct_worker {
@@ -393,11 +405,8 @@ pub(super) fn collect_child_report_for_runtime(
                     paths: vec![report_path.to_path_buf()],
                 });
             }
-            if report.role != assignment.role {
-                let message = format!(
-                    "assignment report role must be '{}'",
-                    assignment.role.as_str()
-                );
+            if report.role != report_role {
+                let message = format!("assignment report role must be '{}'", report_role.as_str());
                 report_shape_problems.push(message.clone());
                 report.status = ReviewStatus::Failed;
                 report.accepted = false;
@@ -408,6 +417,8 @@ pub(super) fn collect_child_report_for_runtime(
                     paths: vec![report_path.to_path_buf()],
                 });
             }
+            // Restore the original role for all downstream gates and final accounting.
+            report.role = assignment.role;
             if !external_process_completed(external_run, runtime)
                 && report.status == ReviewStatus::Succeeded
             {
@@ -1368,7 +1379,8 @@ pub(super) fn parent_auditor_required(
     assignment: &OrchestratorAssignment,
     report: &OrchestratorReviewReport,
 ) -> bool {
-    (!assignment.worker_assignments.is_empty() && !report.worker_reports.is_empty())
+    assignment.role == AgentRole::Worker
+        || (!assignment.worker_assignments.is_empty() && !report.worker_reports.is_empty())
         || (assignment.worker_assignments.is_empty() && !report.files_changed.is_empty())
         || report.licensed_breakage_review.is_some()
         || report_has_field_guide_suggestions(report)
@@ -1579,7 +1591,9 @@ fn required_auditor_review_subject_ids(
     assignment: &OrchestratorAssignment,
     report: &OrchestratorReviewReport,
 ) -> BTreeSet<String> {
-    if assignment.worker_assignments.is_empty() {
+    if assignment.role == AgentRole::Worker {
+        BTreeSet::from([assignment.id.clone()])
+    } else if assignment.worker_assignments.is_empty() {
         if report.files_changed.is_empty()
             && !report_has_field_guide_suggestions(report)
             && report.licensed_breakage_review.is_none()
@@ -2493,15 +2507,20 @@ pub(super) fn validate_worker_execution_journal_evidence(
     journals: &WorkerExecutionJournalEvidenceSet,
     report: &mut OrchestratorReviewReport,
 ) {
-    if assignment.worker_assignments.is_empty() || report.worker_reports.is_empty() {
+    if (assignment.role != AgentRole::Worker && assignment.worker_assignments.is_empty())
+        || report.worker_reports.is_empty()
+    {
         return;
     }
 
-    let workers_by_id = assignment
+    let mut worker_paths_by_id = assignment
         .worker_assignments
         .iter()
-        .map(|worker| (worker.id.as_str(), worker))
+        .map(|worker| (worker.id.as_str(), worker.assigned_paths.as_slice()))
         .collect::<BTreeMap<_, _>>();
+    if assignment.role == AgentRole::Worker {
+        worker_paths_by_id.insert(assignment.id.as_str(), assignment.assigned_paths.as_slice());
+    }
     let actual_set = report
         .files_changed
         .iter()
@@ -2510,7 +2529,7 @@ pub(super) fn validate_worker_execution_journal_evidence(
     let mut blocking_messages = Vec::new();
 
     for worker_report in &mut report.worker_reports {
-        let Some(worker_assignment) = workers_by_id.get(worker_report.id.as_str()) else {
+        let Some(assigned_paths) = worker_paths_by_id.get(worker_report.id.as_str()) else {
             continue;
         };
         let Some(journal) = journals.get(&worker_report.id) else {
@@ -2566,8 +2585,7 @@ pub(super) fn validate_worker_execution_journal_evidence(
         for entry in entries {
             for path in &entry.changed_paths {
                 journal_paths.insert(path.clone());
-                if !worker_assignment
-                    .assigned_paths
+                if !assigned_paths
                     .iter()
                     .any(|assigned| path_is_covered_by_claim(path, assigned))
                 {
