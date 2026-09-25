@@ -38,9 +38,13 @@ jobs:
         run: python3 scripts/check_repository_portability.py
 
   linux-library:
-    name: Linux library tests
+    name: Linux library tests (${{ matrix.shard }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [autopilot, supervise, rest]
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -66,18 +70,22 @@ jobs:
           cargo clippy --version
 
       - name: Check formatting
+        if: matrix.shard == 'rest'
         run: cargo fmt --all -- --check
 
       - name: Check all targets against Cargo.lock
+        if: matrix.shard == 'rest'
         run: cargo check --locked --all-targets
 
       - name: Lint all targets
+        if: matrix.shard == 'rest'
         run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Install pinned Codex CLI on GitHub-hosted Ubuntu
         run: bash .github/scripts/install-github-hosted-ci-codex.sh
 
       - name: Verify nested Codex sandbox integration
+        if: matrix.shard == 'rest'
         run: |
           bash .github/scripts/run-linux-all-tests-in-delegated-user-scope.sh \
             cargo test --locked --lib \
@@ -85,7 +93,7 @@ jobs:
             -- --exact --nocapture
 
       - name: Run library tests
-        run: bash .github/scripts/run-linux-ci-cargo-test-partition.sh lib
+        run: bash .github/scripts/run-linux-ci-cargo-test-partition.sh lib "${{ matrix.shard }}"
 
   linux-integration:
     name: Linux integration tests
@@ -131,6 +139,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Require partitioned Linux test jobs
+        # A matrix job succeeds only when every shard succeeds. Cancelled,
+        # failed, or skipped shards must not satisfy this required gate.
         env:
           LIBRARY_RESULT: ${{ needs.linux-library.result }}
           INTEGRATION_RESULT: ${{ needs.linux-integration.result }}
