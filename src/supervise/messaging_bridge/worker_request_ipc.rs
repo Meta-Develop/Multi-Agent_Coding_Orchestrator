@@ -19,12 +19,12 @@ pub(in crate::supervise) struct WorkerRequestIpc {
     expected: WorkerRequestBinding,
     cancellation: ProcessCancellation,
     #[cfg(test)]
-    submit_observer: Option<Box<dyn Fn(SubmitBoundary) -> Result<()> + Send + Sync>>,
+    pub(super) submit_observer: Option<Box<dyn Fn(SubmitBoundary) -> Result<()> + Send + Sync>>,
 }
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SubmitBoundary {
+pub(super) enum SubmitBoundary {
     BeforeAdmission,
     BeforeAppend,
     AfterAppend,
@@ -59,6 +59,25 @@ impl SupervisorMessagingSessionFactory {
 }
 
 impl WorkerRequestIpc {
+    #[allow(dead_code)] // Staged frozen owner transfer, not a scheduler entry point.
+    pub(super) fn verify_fresh_binding(
+        &self,
+        expected: &WorkerRequestBinding,
+        repository: &crate::artifacts::state_auth::RepositoryAuthBinding,
+    ) -> Result<()> {
+        let inbox = self
+            .inbox
+            .lock()
+            .map_err(|_| anyhow::anyhow!("worker inbox lock is poisoned"))?;
+        if &self.expected != expected
+            || inbox.requires_reconciliation()
+            || !inbox.requests()?.is_empty()
+        {
+            bail!("frozen turn requires a fresh empty inbox with the exact supervisor binding");
+        }
+        inbox.verify_ipc_binding(expected, repository)
+    }
+
     /// Supply the current supervisor binding and combined attempt/run cancellation.
     /// The endpoint revalidates this binding on attachment and every inbox operation.
     #[allow(dead_code)] // Staged supervisor caller; no scheduler wiring in this leaf.
