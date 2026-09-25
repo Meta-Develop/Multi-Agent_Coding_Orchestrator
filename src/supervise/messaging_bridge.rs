@@ -103,6 +103,9 @@ pub(super) struct SupervisorMessagingSessionFactory {
     registry: CredentialRegistry,
     capabilities: BTreeMap<String, PresentedCredential>,
     persistent: Option<PersistentMessagingBinding>,
+    // Process-local, one-shot authority; never reconstructed from a descriptor or journal.
+    // Only successful fresh initialization installs the exact supervisor-authored plan.
+    fresh_worker_request_parents: Mutex<Option<Vec<OrchestratorAssignment>>>,
 }
 
 impl SupervisorMessagingSessionFactory {
@@ -173,6 +176,7 @@ impl SupervisorMessagingSessionFactory {
             registry,
             capabilities,
             persistent: None,
+            fresh_worker_request_parents: Mutex::new(None),
         })
     }
 
@@ -227,6 +231,7 @@ impl SupervisorMessagingSessionFactory {
             registry,
             capabilities,
             persistent: Some(binding),
+            fresh_worker_request_parents: Mutex::new(None),
         })
     }
 
@@ -264,6 +269,7 @@ impl SupervisorMessagingSessionFactory {
     }
 
     fn open_existing_broker(&self) -> Result<MessagingBroker> {
+        self.revoke_fresh_worker_request_admission()?;
         self.verify_run_and_binding()?;
         let broker = if self.persistent.is_some() {
             MessagingBroker::open(
@@ -396,17 +402,6 @@ impl SupervisorMessagingSessionFactory {
     }
 }
 
-fn reopen_registered_session(run_directory: &Path) -> Result<()> {
-    let sessions = run_sessions()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("supervisor messaging session registry is poisoned"))?;
-    let factory = sessions
-        .get(run_directory)
-        .context("supervisor messaging session is not initialized")?;
-    drop(factory.open_or_create()?);
-    Ok(())
-}
-
 fn run_sessions() -> &'static Mutex<BTreeMap<PathBuf, SupervisorMessagingSessionFactory>> {
     static RUN_SESSIONS: OnceLock<Mutex<BTreeMap<PathBuf, SupervisorMessagingSessionFactory>>> =
         OnceLock::new();
@@ -448,31 +443,30 @@ pub(super) fn initialize_supervisor_messaging_session(
     plan: &SupervisorPlan,
     metadata: &SupervisorPlanMetadata,
 ) -> Result<()> {
+    let run_directory = writer.run_dir().to_path_buf();
+    // Serialize creation with recovery/reinitialization: a racing reopen must not be
+    // overwritten by a late fresh factory and thereby regain one-shot authority.
+    let mut sessions = run_sessions()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervisor messaging session registry is poisoned"))?;
+    if let Some(existing) = sessions.get(&run_directory) {
+        existing.revoke_fresh_worker_request_admission()?;
+    }
     if plan.assignments.is_empty() {
         return Ok(());
     }
-    let run_directory = writer.run_dir().to_path_buf();
     let (hierarchy, identities) = admitted_messaging_authority(plan, metadata)?;
 
-    let resume_existing = {
-        let mut sessions = run_sessions()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("supervisor messaging session registry is poisoned"))?;
-        sessions.retain(|directory, _| {
-            directory.is_dir()
-                && !directory
-                    .join(super::ARTIFACT_FINALIZATION_MARKER)
-                    .is_file()
-        });
-        if let Some(existing) = sessions.get(&run_directory) {
-            existing.revalidate_authority(&hierarchy, &identities)?;
-            true
-        } else {
-            false
-        }
-    };
-    if resume_existing {
-        return reopen_registered_session(&run_directory);
+    sessions.retain(|directory, _| {
+        directory.is_dir()
+            && !directory
+                .join(super::ARTIFACT_FINALIZATION_MARKER)
+                .is_file()
+    });
+    if let Some(existing) = sessions.get(&run_directory) {
+        existing.revalidate_authority(&hierarchy, &identities)?;
+        drop(existing.open_or_create()?);
+        return Ok(());
     }
 
     if legacy_artifact_messaging_exists(&run_directory)? {
@@ -484,7 +478,7 @@ pub(super) fn initialize_supervisor_messaging_session(
     let (binding, newly_created) =
         PersistentMessagingBinding::prepare(writer, &hierarchy, &identities)
             .context("supervisor messaging durable session preparation failed")?;
-    let factory =
+    let mut factory =
         SupervisorMessagingSessionFactory::from_persistent_binding(&run_directory, binding)
             .context("supervisor messaging pre-launch admission failed")?;
     if newly_created {
@@ -493,6 +487,7 @@ pub(super) fn initialize_supervisor_messaging_session(
                 .create_initial_persistent_broker()
                 .context("supervisor messaging pre-launch journal creation failed")?,
         );
+        factory.fresh_worker_request_parents = Mutex::new(Some(plan.assignments.clone()));
     } else {
         drop(
             factory
@@ -501,23 +496,18 @@ pub(super) fn initialize_supervisor_messaging_session(
         );
     }
 
-    let mut sessions = run_sessions()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("supervisor messaging session registry is poisoned"))?;
     sessions.insert(run_directory, factory);
     Ok(())
 }
 
 /// Authenticates and replays an existing durable session, retaining legacy credential refusals.
 pub(super) fn recover_supervisor_messaging_session(run_directory: &Path) -> Result<()> {
-    let already_registered = {
-        let sessions = run_sessions()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("supervisor messaging session registry is poisoned"))?;
-        sessions.contains_key(run_directory)
-    };
-    if already_registered {
-        return reopen_registered_session(run_directory);
+    let mut sessions = run_sessions()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("supervisor messaging session registry is poisoned"))?;
+    if let Some(existing) = sessions.get(run_directory) {
+        drop(existing.open_or_create()?);
+        return Ok(());
     }
 
     let has_legacy = legacy_artifact_messaging_exists(run_directory)?;
@@ -536,9 +526,6 @@ pub(super) fn recover_supervisor_messaging_session(run_directory: &Path) -> Resu
                 .open_existing_broker()
                 .context("failed to recover durable supervisor messaging journal")?,
         );
-        let mut sessions = run_sessions()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("supervisor messaging session registry is poisoned"))?;
         sessions.insert(run_directory.to_path_buf(), factory);
         return Ok(());
     }
