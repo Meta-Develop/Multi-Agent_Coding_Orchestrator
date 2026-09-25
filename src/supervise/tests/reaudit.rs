@@ -8,7 +8,36 @@ fn run_evidence_rejected_source(
     run_id: &str,
     rejection_kind: AuditorRejectionKind,
 ) -> (SupervisorFinalReport, OrchestratorAssignment, PathBuf) {
-    let assignment = injected_assignment(true);
+    run_evidence_rejected_source_with_assignment(
+        temp,
+        repo,
+        run_id,
+        rejection_kind,
+        injected_assignment(true),
+    )
+}
+
+fn reaudit_source_child_report(assignment: &OrchestratorAssignment) -> OrchestratorReviewReport {
+    if assignment.role != AgentRole::Worker {
+        return injected_child_report(assignment);
+    }
+    let mut worker = injected_child_report(&injected_assignment(true))
+        .worker_reports
+        .remove(0);
+    worker.id = assignment.id.clone();
+    worker.assigned_paths = assignment.assigned_paths.clone();
+    worker.semantic_symbols = assignment.semantic_symbols.clone();
+    worker.semantic_modules = assignment.semantic_modules.clone();
+    direct_worker_report_envelope(worker)
+}
+
+fn run_evidence_rejected_source_with_assignment(
+    temp: &tempfile::TempDir,
+    repo: &Path,
+    run_id: &str,
+    rejection_kind: AuditorRejectionKind,
+    assignment: OrchestratorAssignment,
+) -> (SupervisorFinalReport, OrchestratorAssignment, PathBuf) {
     let mut plan = injected_plan(assignment.clone(), 0);
     plan.max_gate_corrections = 1;
     let budget = injected_run_budget(None, None, None, None, 100, 100);
@@ -21,7 +50,7 @@ fn run_evidence_rejected_source(
             .and_then(OsStr::to_str)
             .unwrap_or_default();
         if name.contains("review-auditor") {
-            let mut child = injected_child_report(&assignment);
+            let mut child = reaudit_source_child_report(&assignment);
             child.files_changed = vec![PathBuf::from("README.md")];
             child.worker_reports[0].files_changed = vec![PathBuf::from("README.md")];
             let mut auditor = injected_auditor_report(&assignment, &child);
@@ -48,10 +77,28 @@ fn run_evidence_rejected_source(
             preserved_worktree = Some(command.cwd.clone());
             fs::write(command.cwd.join("README.md"), "preserved implementation\n")
                 .expect("write preserved implementation diff");
-            let mut child = injected_child_report(&assignment);
+            let mut child = reaudit_source_child_report(&assignment);
             child.files_changed = vec![PathBuf::from("README.md")];
             child.worker_reports[0].files_changed = vec![PathBuf::from("README.md")];
-            write_injected_json(&command.output_last_message, &child);
+            if assignment.role == AgentRole::Worker {
+                let worker = &child.worker_reports[0];
+                let journal = command
+                    .worker_journal_artifacts
+                    .iter()
+                    .find(|artifact| artifact.worker_id == assignment.id)
+                    .expect("direct journal capture");
+                let mut file = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&journal.path)
+                    .expect("precreated journal");
+                for entry in injected_worker_journal_entries(worker) {
+                    append_worker_execution_journal_record(&mut file, &entry)
+                        .expect("append worker journal");
+                }
+                write_injected_json(&command.output_last_message, worker);
+            } else {
+                write_injected_json(&command.output_last_message, &child);
+            }
             write_injected_usage(command, 13, 7);
         }
         injected_verified_run(command)
@@ -83,13 +130,34 @@ fn run_evidence_rejected_source(
 #[test]
 fn evidence_rejection_reaudits_preserved_diff_without_worker_rerun_and_can_accept() {
     skip_without_containment!();
+    assert_evidence_reaudit_preserves_candidate(false);
+}
+
+#[test]
+fn generated_direct_worker_evidence_rejection_reaudits_unchanged_candidate_and_accepts() {
+    skip_without_containment!();
+    assert_evidence_reaudit_preserves_candidate(true);
+}
+
+fn assert_evidence_reaudit_preserves_candidate(generated_direct: bool) {
     let (temp, repo) = injected_repository();
+    let assignment = if generated_direct {
+        let plan =
+            supervisor_plan_from_goal_spec(&repo, "", "Update README.md.").expect("generated plan");
+        let worker = plan.assignments.last().unwrap().clone();
+        assert_eq!(worker.role, AgentRole::Worker);
+        assert!(worker.worker_assignments.is_empty());
+        worker
+    } else {
+        injected_assignment(true)
+    };
     let source_id = RunId::new("reaudit-source-evidence").expect("valid source run id");
-    let (source, assignment, preserved_worktree) = run_evidence_rejected_source(
+    let (source, assignment, preserved_worktree) = run_evidence_rejected_source_with_assignment(
         &temp,
         &repo,
         source_id.as_str(),
         AuditorRejectionKind::EvidenceQuality,
+        assignment,
     );
     assert!(!source.success);
     assert_eq!(
@@ -139,6 +207,7 @@ fn evidence_rejection_reaudits_preserved_diff_without_worker_rerun_and_can_accep
         .clone()
         .expect("evidence-only operation");
     assert_eq!(operation.preserved_candidate_binding, source_binding);
+    assert_eq!(loaded.plan.assignments[0].role, assignment.role);
     let options = injected_options(&repo, temp.path(), "reaudit-accepts-preserved");
     let mut evidence_dispatches = 0usize;
     let mut auditor_dispatches = 0usize;
@@ -182,6 +251,18 @@ fn evidence_rejection_reaudits_preserved_diff_without_worker_rerun_and_can_accep
             evidence.gate_denials.clear();
             evidence.gate_correction_outcomes.clear();
             evidence.findings.clear();
+            evidence.role = AgentRole::ChildOrchestrator;
+            evidence.validation_results.push(ValidationResult {
+                name: "refreshed unchanged-candidate validation".to_string(),
+                status: ReviewStatus::Succeeded,
+                command: vec!["validation".to_string()],
+                message: None,
+            });
+            assert!(command.output_schema.as_ref().is_some_and(|path| path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("orchestrator-review-report")));
             evidence.accepted = true;
             evidence.rejected = false;
             evidence.status = ReviewStatus::Succeeded;
@@ -196,6 +277,11 @@ fn evidence_rejection_reaudits_preserved_diff_without_worker_rerun_and_can_accep
         .expect("run evidence-only re-audit");
 
     assert!(report.success, "unexpected re-audit failure: {report:#?}");
+    assert_eq!(report.orchestrator_reports[0].role, assignment.role);
+    assert!(report.orchestrator_reports[0]
+        .validation_results
+        .iter()
+        .any(|result| result.name == "refreshed unchanged-candidate validation"));
     assert_eq!(evidence_dispatches, 1);
     assert_eq!(auditor_dispatches, 1);
     assert!(
@@ -226,7 +312,7 @@ fn evidence_rejection_reaudits_preserved_diff_without_worker_rerun_and_can_accep
     assert_eq!(
         role_budgets
             .iter()
-            .find(|budget| budget.role == AgentRole::ChildOrchestrator)
+            .find(|budget| budget.role == assignment.role)
             .map(|budget| budget.consumed.tokens),
         Some(7),
         "only the refreshed evidence report belongs to the child-orchestrator role"
@@ -563,4 +649,87 @@ fn ordinary_report_refuses_candidate_mismatch_across_parent_audit() {
         .assignment_traceability
         .iter()
         .all(|trace| trace.produced_diff_binding.is_none()));
+}
+
+#[test]
+fn generated_direct_worker_reaudit_collects_refreshed_envelope_and_preserves_worker_evidence() {
+    for plan in
+        crate::supervise::plan_api::generated_terminal_worker_tests::generated_plans_for_gate_tests(
+        )
+    {
+        let assignment = plan.assignments.last().unwrap();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            temp.path(),
+            temp.path().join("prompt"),
+            temp.path().join("log"),
+            temp.path().join("report.json"),
+            Duration::from_secs(1),
+        );
+        let mut source = reaudit_source_child_report(assignment);
+        source.files_changed = assignment.assigned_paths.clone();
+        source.worker_reports[0].files_changed = source.files_changed.clone();
+        let mut rejection = injected_auditor_report(assignment, &source);
+        rejection.commands_run.push(injected_command_record());
+        rejection.accepted = false;
+        rejection.rejected = true;
+        rejection.status = ReviewStatus::Rejected;
+        rejection.rejection_kind = Some(AuditorRejectionKind::EvidenceQuality);
+        source.audit_reports.push(rejection);
+        validate_auditor_reports(assignment, Path::new("source.json"), &mut source);
+        assert!(report_failed(&source));
+        let mut refreshed = source.clone();
+        refreshed.role = AgentRole::ChildOrchestrator;
+        refreshed.audit_reports.clear();
+        refreshed.findings.clear();
+        refreshed.accepted = true;
+        refreshed.rejected = false;
+        refreshed.status = ReviewStatus::Succeeded;
+        refreshed.validation_results.push(ValidationResult {
+            name: "refreshed validation".to_string(),
+            status: ReviewStatus::Succeeded,
+            command: vec!["validate".to_string()],
+            message: None,
+        });
+        for tampered in [false, true] {
+            let mut response = refreshed.clone();
+            if tampered {
+                response.worker_reports[0].validation_results =
+                    refreshed.validation_results.clone();
+            }
+            write_injected_json(&command.output_last_message, &response);
+            let run = injected_verified_run_without_journals(&command);
+            let (mut collected, shape_problems) =
+                collect_child_report(ChildReportCollectionContext {
+                    assignment,
+                    assignment_metadata: &AssignmentMetadata::new(),
+                    report_path: &command.output_last_message,
+                    external_run: &run,
+                    external_command: &command,
+                    worktree_path: temp.path(),
+                    child_base_head: &injected_oid("preserved-base"),
+                    observed_changed_paths: None,
+                    worker_journals: &WorkerExecutionJournalEvidenceSet::new(),
+                    evidence_only_source: Some(&source),
+                });
+            assert!(shape_problems.is_empty(), "{shape_problems:?}");
+            assert_eq!(collected.role, AgentRole::Worker);
+            if tampered {
+                assert!(report_failed(&collected));
+                assert!(finding_messages(&collected)
+                    .contains("changed preserved implementation evidence"));
+            } else {
+                assert!(!report_failed(&collected), "{collected:#?}");
+                assert_eq!(collected.worker_reports, source.worker_reports);
+                assert_eq!(collected.files_changed, source.files_changed);
+                assert_eq!(collected.validation_results, refreshed.validation_results);
+                let mut audit = injected_auditor_report(assignment, &collected);
+                audit.commands_run.push(injected_command_record());
+                collected.audit_reports.push(audit);
+                validate_auditor_reports(assignment, &command.output_last_message, &mut collected);
+                assert!(!report_failed(&collected), "{collected:#?}");
+            }
+        }
+    }
 }
