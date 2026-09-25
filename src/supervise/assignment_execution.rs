@@ -1,9 +1,12 @@
 use super::*;
+#[path = "nested_worker.rs"]
+mod nested_worker;
 use crate::mutation_taxonomy::{
     admit_assignment_child_process_intent, admit_parent_auditor_process_intent,
     AssignmentProcessLaunchKind, SealedMechanicalExecutorDuty, SealedMechanicalExecutorPhase,
     SealedMechanicalExecutorRole, ASSIGNMENT_CHILD_PROCESS_DUTY, PARENT_AUDITOR_PROCESS_DUTY,
 };
+use nested_worker::{AssignmentAttemptAuthority, AssignmentCommandAdmission};
 
 fn live_invocation_started_millis(duration_ms: u64) -> u64 {
     let now = SystemTime::now()
@@ -1457,6 +1460,7 @@ struct PreparedChildAttempt<'a> {
     attempt_artifacts: ChildAttemptArtifacts,
     corrective_retry_used: bool,
     command: ExternalAgentCommand,
+    command_admission: Option<AssignmentCommandAdmission>,
     model_provenance: CompletedLaunchModelProvenance,
     primary_before: PrimaryWorktreeSnapshot,
     primary_scope_before: Option<PrimaryScopeSnapshot>,
@@ -1992,11 +1996,37 @@ fn prepare_child_attempt<'a>(
     command =
         command.with_assignment_process_launch(AssignmentProcessLaunchKind::AssignmentChild, grant);
     command = pin_cam_authority_socket_for_nested_maco_launch(command, launch_runtime);
+    let command_admission_result = if *execution_runtime == SupervisorExecutionRuntime::Verified
+        && !context
+            .worktree_creation
+            .bypass_verified_admission_for_test()
+        && assignment_phase == AssignmentPhase::Execution
+        && command.workspace_access == WorkspaceAccess::ReadWrite
+        && execution_target.is_none()
+    {
+        AssignmentAttemptAuthority::from_preflight(context, preflight, attempt)
+            .and_then(|authority| authority.admit(&assignment.id, &command, launch_runtime))
+            .map(Some)
+    } else {
+        Ok(None)
+    };
+    let command_admission = match command_admission_result {
+        Ok(admission) => admission,
+        Err(error) => {
+            drop(incoming_output_root);
+            drop(capture_output_root);
+            with_supervisor_artifacts(artifacts, |writer, _| {
+                discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
+            })?;
+            return Err(error);
+        }
+    };
     Ok(AssignmentExecutionDisposition::Continue(
         PreparedChildAttempt {
             attempt_artifacts,
             corrective_retry_used,
             command,
+            command_admission,
             model_provenance: bound_launch.model_provenance,
             primary_before,
             primary_scope_before,
@@ -2226,6 +2256,19 @@ fn dispatch_and_collect_child_attempt<'a>(
     let launch_runtime = prepared.launch_runtime;
     let mut budget_reservation = prepared.budget_reservation;
     let pre_action_review_context = prepared.pre_action_review_context;
+    if let Some(admission) = prepared.command_admission {
+        let result = AssignmentAttemptAuthority::from_preflight(context, preflight, attempt)
+            .and_then(|authority| admission.revalidate(&authority, &assignment.id, &command));
+        if let Err(error) = result {
+            budget_reservation.settle_not_started()?;
+            drop(incoming_output_root);
+            drop(capture_output_root);
+            with_supervisor_artifacts(artifacts, |writer, _| {
+                discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
+            })?;
+            return Err(error);
+        }
+    }
     let assignment_journal_role = direct_assignment_orchestration_role(assignment.role)?;
     if let Some(expected) = context.worktree_creation.expected_source_head() {
         let observed = current_head_oid(&worktree.path)?;

@@ -1314,6 +1314,17 @@ impl ExternalAgentCommand {
         self
     }
 
+    /// Reuse the process boundary's typed identity check during supervisor admission.
+    /// A wire report or messaging capability is never a substitute for this grant.
+    pub(crate) fn verify_assignment_child_admission_identity(&self) -> Result<()> {
+        if self.assignment_process_launch_kind != Some(AssignmentProcessLaunchKind::AssignmentChild)
+        {
+            bail!("assignment admission requires an assignment-child process intent");
+        }
+        refuse_assignment_process_launch_before_preflight(self)?;
+        Ok(())
+    }
+
     fn current_grok_writable_contract(&self) -> Result<TypedRuntimeContract> {
         if self.writable_launch_target != WritableLaunchTarget::ManagedChildWorktree {
             bail!(
