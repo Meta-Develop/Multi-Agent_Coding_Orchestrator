@@ -26,6 +26,19 @@ pub(super) fn write_orchestrator_schema(
     write_schema(writer, relative, orchestrator_report_schema_value())
 }
 
+pub(super) fn write_researcher_schemas(writer: &mut ArtifactRunWriter) -> Result<()> {
+    write_schema(
+        writer,
+        Path::new("schemas/researcher-report.schema.json"),
+        researcher_report_schema_value(),
+    )?;
+    write_schema(
+        writer,
+        Path::new("schemas/researcher-report.codex-output.schema.json"),
+        codex_response_format_schema(researcher_report_schema_value())?,
+    )
+}
+
 pub(super) fn write_codex_orchestrator_schema(
     writer: &mut ArtifactRunWriter,
     relative: &Path,
@@ -42,6 +55,71 @@ pub(super) fn write_supervisor_final_schema(
     relative: &Path,
 ) -> Result<()> {
     write_schema(writer, relative, supervisor_final_report_schema_value())
+}
+
+/// Staged turn envelope. The discriminator lives inside `turn` so the Codex
+/// root remains an object, while exclusive closed variants survive projection.
+pub(super) fn parent_continuation_schema_value(
+    continuation: &super::assignment_execution::ParentContinuationLaunch<'_>,
+) -> serde_json::Value {
+    let (run_id, parent_id, source_attempt, attempt) = continuation.binding();
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "ParentContinuationTurn", "type": "object", "additionalProperties": false,
+        "required": ["version", "run_id", "parent_id", "source_parent_attempt", "parent_attempt", "completed_worker_ids", "turn"],
+        "properties": {
+            "version": {"type": "integer", "const": 1},
+            "run_id": {"type": "string", "const": run_id},
+            "parent_id": {"type": "string", "const": parent_id},
+            "source_parent_attempt": {"type": "integer", "const": source_attempt},
+            "parent_attempt": {"type": "integer", "const": attempt},
+            "completed_worker_ids": {"type": "array", "items": {"type": "string"}, "const": continuation.worker_ids()},
+            "turn": {"oneOf": [
+                {"type": "object", "additionalProperties": false,
+                 "required": ["outcome", "requests"], "properties": {
+                    "outcome": {"type": "string", "const": "yield_workers"},
+                    "requests": {"type": "array", "minItems": 1, "items": {
+                        "type": "object", "additionalProperties": false,
+                        "required": ["request_id", "worker_id"], "properties": {
+                            "request_id": {"type": "string"}, "worker_id": {"type": "string"}
+                        }
+                    }}
+                 }},
+                {"type": "object", "additionalProperties": false,
+                 "required": ["outcome", "report"], "properties": {
+                    "outcome": {"type": "string", "const": "final_report"},
+                    "report": orchestrator_report_schema_value()
+                 }}
+            ]}
+        }
+    })
+}
+
+pub(super) fn write_parent_continuation_schemas(
+    writer: &mut ArtifactRunWriter,
+    relative: &Path,
+    continuation: &super::assignment_execution::ParentContinuationLaunch<'_>,
+) -> Result<()> {
+    let schema = parent_continuation_schema_value(continuation);
+    // Project the nested final report separately so supervisor-owned fields are
+    // removed just as they are for the existing top-level report schema.
+    let mut codex = schema.clone();
+    codex["properties"]["turn"]["oneOf"][1]["properties"]["report"] =
+        codex_response_format_schema(orchestrator_report_schema_value())?;
+    // The envelope has no serde Option fields. Its report has already passed
+    // the existing title-specific projection; keep that default guard unchanged.
+    make_codex_response_format_compatible(&mut codex)?;
+    validate_codex_response_format_schema(&codex)?;
+    let codex_relative = relative.with_file_name(format!(
+        "{}.codex-output.schema.json",
+        relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".schema.json"))
+            .context("invalid continuation schema filename")?
+    ));
+    write_schema(writer, relative, schema)?;
+    write_schema(writer, &codex_relative, codex)
 }
 
 pub(super) fn write_worktree_writable_admission_schema(
@@ -1312,7 +1390,7 @@ fn budget_degradation_records_schema_value() -> serde_json::Value {
 fn agent_role_schema_value() -> serde_json::Value {
     json!({
         "type": "string",
-        "enum": ["supervisor", "child_orchestrator", "worker", "gate_classifier", "auditor"]
+        "enum": ["supervisor", "child_orchestrator", "worker", "researcher", "gate_classifier", "auditor"]
     })
 }
 
@@ -1325,6 +1403,7 @@ fn role_map_schema_value(value_schema: serde_json::Value) -> serde_json::Value {
             "supervisor": value_schema.clone(),
             "child_orchestrator": value_schema.clone(),
             "worker": value_schema.clone(),
+            "researcher": value_schema.clone(),
             "gate_classifier": value_schema.clone(),
             "auditor": value_schema
         }
@@ -1765,6 +1844,7 @@ fn run_budget_report_schema_value() -> serde_json::Value {
                                 "supervisor",
                                 "child_orchestrator",
                                 "worker",
+                                "researcher",
                                 "gate_classifier",
                                 "auditor"
                             ]
@@ -1813,10 +1893,13 @@ pub(super) fn orchestrator_report_schema_value() -> serde_json::Value {
 }
 
 fn supervisor_final_orchestrator_report_schema_value() -> serde_json::Value {
-    orchestrator_report_schema_value_with_decomposition(
+    let mut schema = orchestrator_report_schema_value_with_decomposition(
         supervisor_final_worker_report_schema_value(),
         supervisor_final_decomposition_completion_object_schema_value(),
-    )
+    );
+    schema["properties"]["role"] =
+        json!({"type": "string", "enum": ["child_orchestrator", "worker", "researcher"]});
+    schema
 }
 
 fn orchestrator_report_schema_value_with_decomposition(
@@ -2128,6 +2211,7 @@ fn partial_role_map_schema_value(value_schema: serde_json::Value) -> serde_json:
             "supervisor": value_schema.clone(),
             "child_orchestrator": value_schema.clone(),
             "worker": value_schema.clone(),
+            "researcher": value_schema.clone(),
             "gate_classifier": value_schema.clone(),
             "auditor": value_schema
         }
@@ -2321,7 +2405,7 @@ fn orchestrator_assignment_schema_value() -> serde_json::Value {
             "id": identifier_schema_value(),
             "phase": {"enum": ["planning", "execution"]},
             "runtime": {"enum": ["codex", "fake", "grok", "cursor", "claude-code", "gemini-cli"]},
-            "role": {"const": "child_orchestrator"},
+            "role": {"enum": ["child_orchestrator", "worker", "researcher"]},
             "role_category": role_category_schema_value(),
             "selection_source": assignment_selection_source_schema_value(),
             "assigned_paths": path_array_schema_value(),
@@ -2627,11 +2711,12 @@ pub(super) fn write_codex_auditor_schema(
 pub(super) fn codex_response_format_schema(
     mut authoritative: serde_json::Value,
 ) -> Result<serde_json::Value> {
-    if authoritative
-        .get("title")
-        .and_then(serde_json::Value::as_str)
-        == Some("OrchestratorReviewReport")
-    {
+    if matches!(
+        authoritative
+            .get("title")
+            .and_then(serde_json::Value::as_str),
+        Some("OrchestratorReviewReport" | "ResearcherReport")
+    ) {
         let properties = authoritative
             .get_mut("properties")
             .and_then(serde_json::Value::as_object_mut)
@@ -2696,7 +2781,7 @@ fn apply_codex_serde_option_projection(schema: &mut serde_json::Value) -> Result
         .context("Codex report schema omitted its title")?
     {
         "WorkerReport" | "AuditorReport" => 13,
-        "OrchestratorReviewReport" => 39,
+        "OrchestratorReviewReport" | "ResearcherReport" => 39,
         title => bail!("unsupported Codex report schema title '{title}'"),
     };
     let projected = project_serde_option_properties(schema)?;

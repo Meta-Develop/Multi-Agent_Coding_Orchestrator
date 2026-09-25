@@ -515,12 +515,20 @@ impl AssignmentBudgetPolicy {
         for (role, selection) in &self.model_overrides {
             effective.role_models.insert(*role, selection.clone());
         }
-        for role in [
+        let mut roles = vec![
             AgentRole::ChildOrchestrator,
             AgentRole::Worker,
             AgentRole::GateClassifier,
             AgentRole::Auditor,
-        ] {
+        ];
+        if plan
+            .assignments
+            .iter()
+            .any(|assignment| assignment.role == AgentRole::Researcher)
+        {
+            roles.push(AgentRole::Researcher);
+        }
+        for role in roles {
             let mut selection = effective_role_model_selection(&effective, role);
             let resolved = resolve_reasoning_effort(
                 role,
@@ -848,7 +856,7 @@ impl BudgetDegradationController {
                 },
             )?;
         }
-        let (selection_roles, selection_cause, budget_signal) = if budget_trigger {
+        let (mut selection_roles, selection_cause, budget_signal) = if budget_trigger {
             (
                 vec![
                     AgentRole::ChildOrchestrator,
@@ -865,6 +873,11 @@ impl BudgetDegradationController {
                 crate::selection::BudgetSignal::Continue,
             )
         };
+        if assignment.role == AgentRole::Researcher
+            && !selection_roles.contains(&AgentRole::Researcher)
+        {
+            selection_roles.push(AgentRole::Researcher);
+        }
         let selector_decisions = self.policy.reselect(
             request.runtime,
             request.catalog,
@@ -3343,6 +3356,14 @@ fn initialize_scheduler_evidence(
         initialization.artifact_writer,
         Path::new("schemas/worker-report.schema.json"),
     )?;
+    if initialization
+        .plan
+        .assignments
+        .iter()
+        .any(|assignment| assignment.role == AgentRole::Researcher)
+    {
+        write_researcher_schemas(initialization.artifact_writer)?;
+    }
     write_codex_worker_schema(
         initialization.artifact_writer,
         Path::new("schemas/worker-report.codex-output.schema.json"),
