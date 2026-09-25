@@ -3751,25 +3751,12 @@ fn completion_first_observed_after_deadline_is_a_timeout() {
 }
 
 #[cfg(unix)]
-#[test]
-fn normal_exit_terminates_descendants_holding_pipes() {
+fn run_normal_exit_pipe_fixture(command: String, workdir: &Path) -> ProcessOutput {
     const WHOLE_CALL_BOUND: Duration = Duration::from_secs(3);
 
-    let temp = tempfile::tempdir().expect("tempdir");
-    let descendant_pid = temp.path().join("descendant.pid");
-    let command = format!(
-            "(trap '' TERM; echo descendant-started; echo descendant-error >&2; while :; do sleep 1; done) & descendant=$!; echo \"$descendant\" > '{}'; echo parent-exiting",
-            descendant_pid.display()
-        );
-    let spec = ProcessSpec::shell(
-        "hung command",
-        Shell::UnixSh,
-        command,
-        temp.path(),
-        8 * 1024,
-    )
-    .with_containment(ContainmentPolicy::TrustedBestEffort)
-    .with_timeout(Some(Duration::from_secs(2)));
+    let spec = ProcessSpec::shell("hung command", Shell::UnixSh, command, workdir, 8 * 1024)
+        .with_containment(ContainmentPolicy::TrustedBestEffort)
+        .with_timeout(Some(Duration::from_secs(2)));
 
     let (completion_tx, completion_rx) = mpsc::channel();
     // Start before `thread::spawn`: worker creation and scheduling are part of the whole call.
@@ -3794,6 +3781,29 @@ fn normal_exit_terminates_descendants_holding_pipes() {
     assert!(!output.timed_out);
     assert!(output.status.is_some_and(|status| status.success()));
     assert_eq!(output.process_error, None);
+    output
+}
+
+#[cfg(unix)]
+#[test]
+fn normal_exit_terminates_descendants_holding_pipes() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let descendant_pid = temp.path().join("descendant.pid");
+    // Parent exit permits immediate cleanup. Publish readiness only after the TERM
+    // trap and both pipe writes, so successful cleanup cannot preempt those writes.
+    // Polling observes a condition, not an assumed scheduling delay; the runner's
+    // unchanged two-second timeout also bounds a missing readiness notification.
+    let command = format!(
+        "(trap '' TERM; echo descendant-started; echo descendant-error >&2; : > descendant.ready; while :; do sleep 1; done) & descendant=$!; echo \"$descendant\" > '{}'; while [ ! -f descendant.ready ]; do sleep 0.01; done; echo parent-exiting",
+        descendant_pid.display()
+    );
+    let output = run_normal_exit_pipe_fixture(command, temp.path());
+    assert!(temp.path().join("descendant.ready").is_file());
+    assert!(output
+        .stdout
+        .summarize_chars(8 * 1024)
+        .text
+        .contains("parent-exiting"));
     assert!(output
         .stdout
         .summarize_chars(8 * 1024)
@@ -3806,6 +3816,32 @@ fn normal_exit_terminates_descendants_holding_pipes() {
         .contains("descendant-error"));
     let pid = std::fs::read_to_string(descendant_pid).expect("descendant pid");
     assert_process_gone(&pid, "output-pipe descendant");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn normal_exit_terminates_descendant_stopped_before_output() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let descendant_pid = temp.path().join("descendant.pid");
+    // A separate shell gives $$ the descendant's PID. SIGSTOP deterministically
+    // prevents its trap and output from running. The parent observes /proc state T
+    // before exiting; no guessed sleep duration stands in for that observation.
+    let command = format!(
+        r#"sh -c 'kill -STOP "$$"; trap "" TERM; echo descendant-started; echo descendant-error >&2; while :; do sleep 1; done' & descendant=$!; echo "$descendant" > '{}'; while :; do IFS= read -r stat < "/proc/$descendant/stat" || exit 1; case "$stat" in *") T "*) break;; esac; sleep 0.01; done; echo descendant-stopped; echo parent-exiting"#,
+        descendant_pid.display()
+    );
+    let output = run_normal_exit_pipe_fixture(command, temp.path());
+    let stdout = output.stdout.summarize_chars(8 * 1024).text;
+    assert!(stdout.contains("descendant-stopped"));
+    assert!(stdout.contains("parent-exiting"));
+    assert!(!stdout.contains("descendant-started"));
+    assert!(!output
+        .stderr
+        .summarize_chars(8 * 1024)
+        .text
+        .contains("descendant-error"));
+    let pid = fs::read_to_string(descendant_pid).expect("stopped descendant pid");
+    assert_process_gone(&pid, "stopped-before-output descendant");
 }
 
 #[cfg(unix)]

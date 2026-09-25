@@ -6,12 +6,70 @@ use super::*;
 
 /// Evidence for the enclosing parent's gate, never an accepted/materialized change.
 pub(super) struct NestedWorkerAttemptEvidence {
-    pub(super) report: WorkerReport,
-    pub(super) journals: WorkerExecutionJournalEvidenceSet,
-    pub(super) artifacts: ChildAttemptArtifacts,
-    pub(super) run: ExternalAgentRun,
-    pub(super) observed_changed_paths: Vec<PathBuf>,
-    pub(super) model_provenance: CompletedLaunchModelProvenance,
+    report: WorkerReport,
+    journals: WorkerExecutionJournalEvidenceSet,
+    artifacts: ChildAttemptArtifacts,
+    run: ExternalAgentRun,
+    observed_changed_paths: Vec<PathBuf>,
+    model_provenance: CompletedLaunchModelProvenance,
+    // Exact snapshots used below for scope and report validation; never recaptured.
+    candidate_before: PrimaryWorktreeSnapshot,
+    candidate_after: PrimaryWorktreeSnapshot,
+}
+
+impl NestedWorkerAttemptEvidence {
+    pub(super) fn report(&self) -> &WorkerReport {
+        &self.report
+    }
+    pub(super) fn journals(&self) -> &WorkerExecutionJournalEvidenceSet {
+        &self.journals
+    }
+    pub(super) fn artifacts(&self) -> &ChildAttemptArtifacts {
+        &self.artifacts
+    }
+    pub(super) fn run(&self) -> &ExternalAgentRun {
+        &self.run
+    }
+    pub(super) fn observed_changed_paths(&self) -> &Vec<PathBuf> {
+        &self.observed_changed_paths
+    }
+    pub(super) fn model_provenance(&self) -> &CompletedLaunchModelProvenance {
+        &self.model_provenance
+    }
+    pub(super) fn candidate_snapshots(
+        &self,
+    ) -> (&PrimaryWorktreeSnapshot, &PrimaryWorktreeSnapshot) {
+        (&self.candidate_before, &self.candidate_after)
+    }
+}
+
+// Deliberate corruptions for the existing negative continuation tests only.
+// Production consumers receive shared references and cannot rewrite evidence.
+#[cfg(test)]
+pub(super) fn corrupt_continuation_evidence_for_test(
+    completed: &mut [NestedWorkerAttemptEvidence],
+    case: &str,
+    max_bytes: usize,
+) -> Result<()> {
+    match case {
+        "continuation-duplicate" => completed[1].report.id = "worker".into(),
+        "continuation-forged-id" => completed[1].report.id = "outside".into(),
+        "continuation-forged-summary" => completed[0].report.remaining_risk = "substituted".into(),
+        "continuation-wrong-attempt-artifact" => {
+            completed[0].artifacts.raw_report_relative =
+                "nested/parent/attempt-99/worker/report.json".into()
+        }
+        "continuation-missing-journal" => completed[0].journals.clear(),
+        "continuation-restored" => {
+            completed[0].run = serde_json::from_value(serde_json::to_value(&completed[0].run)?)?
+        }
+        "continuation-oversize" => {
+            completed[0].report.remaining_risk = "x".repeat(max_bytes);
+            completed[0].run.output_last_message = Some(serde_json::to_vec(&completed[0].report)?);
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn terminal_subject(
@@ -156,17 +214,20 @@ fn validate_report_binding(
     Ok(())
 }
 
-/// One execution per worker per enclosing attempt. The mutable preflight borrow
-/// serializes this API with other users of the parent's resources. Its caller must
+/// One execution per worker per enclosing attempt. The exclusive permit borrow
+/// serializes nested execution while frozen evidence shares the preflight lease.
+/// A distinct outcome cannot bypass that one-shot permit. Its caller must
 /// already own the enclosing assignment's started checkpoint; nested attempts do
 /// not create a second top-level dispatch or an independently resumable assignment.
 pub(super) fn execute_nested_worker_attempt(
     context: &AssignmentExecutionContext<'_, '_>,
-    preflight: &mut AssignmentExecutionPreflight<'_>,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    permit: &mut NestedTurnExecutionPermit<'_, '_>,
     outcome: &mut AssignmentExecutionOutcome,
     parent_attempt: usize,
     worker_id: &str,
 ) -> Result<NestedWorkerAttemptEvidence> {
+    permit.revalidate(preflight, parent_attempt)?;
     if context.execution_runtime != SupervisorExecutionRuntime::Verified
         || context.execution_target.is_some()
         || context.evidence_only_reaudit.is_some()
@@ -399,6 +460,7 @@ pub(super) fn execute_nested_worker_attempt(
             bail!("nested launch requires a complete worker worktree snapshot: {error}");
         }
         admission.revalidate(&authority, worker_id, &command)?;
+        permit.revalidate(preflight, parent_attempt)?;
         reservation.mark_invoked_for_runtime(runtime)?;
         invoked = true;
         let mut review_journal = SupervisorPreActionJournalSink {
@@ -515,6 +577,8 @@ pub(super) fn execute_nested_worker_attempt(
             journals,
             artifacts,
             run,
+            candidate_before: worker_before,
+            candidate_after: worker_after,
             observed_changed_paths: worker_changes.paths,
             model_provenance: bound.model_provenance,
         })
@@ -756,7 +820,8 @@ mod tests {
         let semantic_store = SemanticIntentStore::open(&repo)?;
         let claim = sync_store.claim_paths_for_run(&run_id, &parent.id, &parent.assigned_paths)?;
         let cancellation = ProcessCancellation::new();
-        let mut preflight = AssignmentExecutionPreflight {
+        let preflight = AssignmentExecutionPreflight {
+            nested_turn_issued: AtomicBool::new(false),
             journal_parent_id: run_id.as_str(),
             environment_requirements: Vec::new(),
             semantic_token: None,
@@ -770,6 +835,41 @@ mod tests {
                 .managed_process_cancellation_for_claim(claim.token, &cancellation)?,
             assignment: parent.clone(),
             _semantic_block_turn: None,
+        };
+        let foreign_preflight = if case == "foreign-permit" {
+            let mut assignment = parent.clone();
+            assignment.id = "foreign-parent".into();
+            assignment.assigned_paths = vec!["foreign".into()];
+            assignment.worker_assignments.clear();
+            let worktree = manager.create(crate::worktree::WorktreeCreateOptions {
+                agent_id: assignment.id.clone(),
+                branch: None,
+                base: None,
+                worktree_root: Some(temp.path().join("worktrees")),
+            })?;
+            let claim = sync_store.claim_paths_for_run(
+                &run_id,
+                &assignment.id,
+                &assignment.assigned_paths,
+            )?;
+            Some(AssignmentExecutionPreflight {
+                nested_turn_issued: AtomicBool::new(false),
+                journal_parent_id: run_id.as_str(),
+                environment_requirements: Vec::new(),
+                semantic_token: None,
+                child_base_head: current_head_oid(&worktree.path)?,
+                mandatory_worktree_controls: provision_mandatory_worktree_controls(&worktree.path)?,
+                worktree_write_lease: Some(manager.acquire_write_execution_lease(&assignment.id)?),
+                worktree,
+                primary_scope_baseline: None,
+                managed_process_cancellation: sync_store
+                    .managed_process_cancellation_for_claim(claim.token, &cancellation)?,
+                claim,
+                assignment,
+                _semantic_block_turn: None,
+            })
+        } else {
+            None
         };
         let options = SupervisorRunOptions {
             repo: repo.clone(),
@@ -944,9 +1044,21 @@ mod tests {
             fs::write(child_git.path().join("index"), b"invalid index fixture")?;
         }
         let mut outcome = AssignmentExecutionOutcome::default();
+        // Both owners have issued permits: rejecting the foreign one must depend
+        // on exact preflight identity, not merely the destination's issued bit.
+        let _target_permit = if foreign_preflight.is_some() {
+            Some(preflight.issue_nested_turn(1)?)
+        } else {
+            None
+        };
+        let mut permit = foreign_preflight
+            .as_ref()
+            .unwrap_or(&preflight)
+            .issue_nested_turn(if case == "wrong-permit-attempt" { 2 } else { 1 })?;
         let result = execute_nested_worker_attempt(
             &context,
-            &mut preflight,
+            &preflight,
+            &mut permit,
             &mut outcome,
             1,
             if case == "unknown" {
@@ -968,7 +1080,8 @@ mod tests {
             assert_eq!(outcome.command_records.len(), 1);
             assert!(execute_nested_worker_attempt(
                 &context,
-                &mut preflight,
+                &preflight,
+                &mut permit,
                 &mut outcome,
                 1,
                 "worker"
@@ -980,6 +1093,19 @@ mod tests {
             assert_eq!(calls.load(Ordering::SeqCst), 1);
         } else {
             assert!(result.is_err(), "unexpected success for {case}");
+            if matches!(case, "foreign-permit" | "wrong-permit-attempt") {
+                assert!(result
+                    .as_ref()
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("permit differs"));
+                assert!(
+                    !run_dir.join("nested").exists(),
+                    "foreign permit created reservation artifacts"
+                );
+                assert!(outcome.command_records.is_empty());
+            }
             if case == "budget" {
                 assert!(result
                     .as_ref()
@@ -1010,7 +1136,15 @@ mod tests {
             .iter()
             .filter(|event| event["node"] == "worker")
             .collect::<Vec<_>>();
-        let spawned = !matches!(case, "unknown" | "revoked" | "cancelled" | "budget");
+        let spawned = !matches!(
+            case,
+            "unknown"
+                | "revoked"
+                | "cancelled"
+                | "budget"
+                | "foreign-permit"
+                | "wrong-permit-attempt"
+        );
         assert_eq!(
             worker_events
                 .iter()
@@ -1057,8 +1191,22 @@ mod tests {
             0,
             "budget reservation leaked for {case}"
         );
-        assert_eq!(manager.list_managed_verified()?.len(), 1);
+        assert_eq!(
+            manager.list_managed_verified()?.len(),
+            if case == "foreign-permit" { 2 } else { 1 }
+        );
         Ok(())
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "requires Linux authenticated managed resources"
+    )]
+    fn nested_executor_rejects_foreign_preflight_and_attempt_permits_before_dispatch() -> Result<()>
+    {
+        execution_fixture("foreign-permit")?;
+        execution_fixture("wrong-permit-attempt")
     }
 
     #[test]
