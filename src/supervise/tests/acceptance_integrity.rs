@@ -2870,6 +2870,155 @@ fn collect_parent_auditor_report_rejects_self_asserted_codex_but_retains_parent_
 
 #[test]
 fn authored_researcher_collects_zero_diff_evidence_and_requires_subject_audit() {
+    exercise_authored_researcher_collection(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn researcher_finalization_persists_typed_success_failures_and_terminal_decisions() {
+    exercise_authored_researcher_collection(true);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn researcher_foreign_id_collision_after_retry_keeps_final_evidence_on_authored_subject() {
+    let (temp, repo) = injected_repository();
+    fs::write(repo.join("other.md"), "other research subject\n").unwrap();
+    commit_injected_repository(&repo, "add second research subject");
+    let mut first = injected_assignment(false);
+    first.role = AgentRole::Researcher;
+    first.role_category = Some(RoleCategory::ReadOnlyResearcher);
+    let mut second = first.clone();
+    second.id = "researcher-b".to_string();
+    second.assigned_paths = vec![PathBuf::from("other.md")];
+    let mut plan = injected_plan(first.clone(), 1);
+    plan.max_child_assignments = 2;
+    plan.assignments.push(second.clone());
+    let options = injected_options(&repo, temp.path(), "researcher-id-collision");
+    let run_id = options.run_id.clone();
+    let mut calls = BTreeMap::<String, usize>::new();
+    let mut runner = |command: &ExternalAgentCommand| {
+        let identity = command.agent_lifecycle.as_ref().unwrap();
+        if identity.role == "auditor" {
+            let subject = if identity.task_id.starts_with(&second.id) {
+                &second
+            } else {
+                &first
+            };
+            let child = injected_child_report(subject);
+            write_injected_json(
+                &command.output_last_message,
+                &injected_auditor_report(subject, &child),
+            );
+            return injected_verified_run(command);
+        }
+        assert_eq!(identity.role, "researcher");
+        *calls.entry(identity.task_id.clone()).or_default() += 1;
+        let subject = if identity.task_id == first.id {
+            &first
+        } else {
+            &second
+        };
+        assert_eq!(identity.task_id, subject.id);
+        let mut child = injected_child_report(subject);
+        child.role = AgentRole::Researcher;
+        // Both turns report failure; the first also impersonates an authored sibling.
+        child.id.clone_from(&second.id);
+        child.status = ReviewStatus::Failed;
+        child.accepted = false;
+        child.rejected = true;
+        let mut wire = serde_json::to_value(child).unwrap();
+        wire["read_only"] = json!(true);
+        wire["no_further_delegation"] = json!(true);
+        write_injected_json(&command.output_last_message, &wire);
+        injected_verified_run(command)
+    };
+    let final_report = run_supervisor_plan_with_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        &mut runner,
+    )
+    .expect("finalize exhausted researcher attempts");
+    assert_eq!(
+        calls.get(&first.id),
+        Some(&2),
+        "exercise exhausted structural retry"
+    );
+    assert!(calls.contains_key(&second.id), "sibling must also execute");
+    assert!(!final_report.success);
+    assert!(final_report.rejected);
+    assert_eq!(final_report.orchestrator_reports.len(), 2);
+    let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id).unwrap();
+    let stored_final: SupervisorFinalReport = serde_json::from_slice(
+        &reader
+            .read(RunArtifactFamily::Supervise.final_report_relative_path())
+            .unwrap(),
+    )
+    .unwrap();
+    let events = read_finalized_orchestration_events(&reader);
+    for subject in [&first, &second] {
+        let matching = final_report
+            .orchestrator_reports
+            .iter()
+            .filter(|report| report.id == subject.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching.len(),
+            1,
+            "foreign ID must not collide in parent aggregate"
+        );
+        let aggregate = matching[0];
+        assert_eq!(aggregate.role, AgentRole::Researcher);
+        assert_eq!(aggregate.status, ReviewStatus::Failed);
+        assert!(!aggregate.accepted && aggregate.rejected);
+        let private: OrchestratorReviewReport = serde_json::from_slice(
+            &reader
+                .read(Path::new(&format!("reports/{}.json", subject.id)))
+                .unwrap(),
+        )
+        .unwrap();
+        let aggregate_wire = serde_json::to_value(aggregate).unwrap();
+        assert_eq!(
+            serde_json::to_value(&private).unwrap(),
+            aggregate_wire,
+            "private receipt and aggregate must have identical wire evidence"
+        );
+        let stored = stored_final
+            .orchestrator_reports
+            .iter()
+            .find(|r| r.id == subject.id)
+            .expect("stored final report must retain this researcher");
+        assert_eq!(serde_json::to_value(stored).unwrap(), aggregate_wire);
+        let decisions = events
+            .iter()
+            .filter(|event| {
+                event.node == subject.id
+                    && matches!(
+                        event.kind,
+                        OrchestrationEventKind::Accept | OrchestrationEventKind::Reject
+                    )
+            })
+            .collect::<Vec<_>>();
+        let terminal = decisions
+            .last()
+            .expect("final researcher decision must be recorded after retry events");
+        assert_eq!(terminal.role, OrchestrationRole::Researcher);
+        assert_eq!(terminal.kind, OrchestrationEventKind::Reject);
+        assert_eq!(terminal.payload["status"], json!(aggregate.status));
+        assert_eq!(terminal.payload["accepted"], json!(aggregate.accepted));
+        assert_eq!(terminal.payload["rejected"], json!(aggregate.rejected));
+        if subject.id == first.id {
+            assert!(aggregate
+                .findings
+                .iter()
+                .any(|finding| finding.message.contains("differs from authored researcher")));
+        }
+    }
+}
+
+fn exercise_authored_researcher_collection(persist_final: bool) {
     use crate::external_agent::codex_app_server::{
         CommandExecutionEvidence, CommandExecutionObservation, CommandExecutionSnapshot,
         CommandExecutionStatus, TurnTerminalStatus,
@@ -2879,6 +3028,11 @@ fn authored_researcher_collects_zero_diff_evidence_and_requires_subject_audit() 
     assignment.role = AgentRole::Researcher;
     assignment.role_category = Some(RoleCategory::ReadOnlyResearcher);
     assignment.worker_assignments.clear();
+    let persist = |report: &OrchestratorReviewReport, case: &str| {
+        if persist_final {
+            assert_researcher_final_persistence(&repo_path, &assignment, report, case);
+        }
+    };
     let command = ExternalAgentCommand::codex(
         "codex",
         &repo_path,
@@ -2947,6 +3101,7 @@ fn authored_researcher_collects_zero_diff_evidence_and_requires_subject_audit() 
         assert!(problems.is_empty(), "{problems:?}");
         if !changed.is_empty() {
             assert!(report_failed(&report));
+            persist(&report, "observed-diff");
             continue;
         }
         assert!(!report_failed(&report), "{:?}", report.findings);
@@ -2961,20 +3116,25 @@ fn authored_researcher_collects_zero_diff_evidence_and_requires_subject_audit() 
         accepted.audit_reports.push(audit.clone());
         validate_auditor_reports(&assignment, &command.output_last_message, &mut accepted);
         assert!(!report_failed(&accepted), "{:?}", accepted.findings);
+        persist(&accepted, "accepted");
         audit.reviewed_worker_ids = vec!["wrong-subject".to_string()];
-        for audits in [vec![], vec![audit]] {
+        for (index, audits) in [vec![], vec![audit]].into_iter().enumerate() {
             let mut rejected = report.clone();
             rejected.audit_reports = audits;
             validate_auditor_reports(&assignment, &command.output_last_message, &mut rejected);
             assert!(report_failed(&rejected));
+            persist(&rejected, &format!("audit-rejected-{index}"));
         }
     }
     let unchanged = Vec::<PathBuf>::new();
-    for untrusted in [injected_verified_run(&command), {
+    for (index, untrusted) in [injected_verified_run(&command), {
         let mut run = external_run.clone();
         run.program_trust = ExternalProgramTrust::ExplicitCustom;
         run
-    }] {
+    }]
+    .into_iter()
+    .enumerate()
+    {
         let (rejected, problems) = collect_child_report(ChildReportCollectionContext {
             assignment: &assignment,
             assignment_metadata: &AssignmentMetadata::new(),
@@ -2991,7 +3151,230 @@ fn authored_researcher_collects_zero_diff_evidence_and_requires_subject_audit() 
         assert!(problems
             .iter()
             .any(|message| message.contains("researcher host command evidence rejected")));
+        persist(&rejected, &format!("untrusted-{index}"));
     }
+    // Missing/invalid child output still needs an authenticated typed failure receipt.
+    for (case, bytes) in [
+        ("missing", None),
+        ("malformed", Some(b"not a report".to_vec())),
+        ("foreign-id", {
+            wire["id"] = json!("other-researcher");
+            Some(serde_json::to_vec(&wire).unwrap())
+        }),
+    ] {
+        let mut run = external_run.clone();
+        run.output_last_message = bytes;
+        let (report, problems) = collect_child_report(ChildReportCollectionContext {
+            assignment: &assignment,
+            assignment_metadata: &AssignmentMetadata::new(),
+            report_path: &command.output_last_message,
+            external_run: &run,
+            external_command: &command,
+            worktree_path: &repo_path,
+            child_base_head: &injected_oid("researcher-base"),
+            observed_changed_paths: Some(&unchanged),
+            worker_journals: &WorkerExecutionJournalEvidenceSet::default(),
+            evidence_only_source: None,
+        });
+        assert!(!problems.is_empty());
+        assert!(report_failed(&report));
+        persist(&report, case);
+    }
+}
+
+fn assert_researcher_final_persistence(
+    repo: &Path,
+    assignment: &OrchestratorAssignment,
+    report: &OrchestratorReviewReport,
+    case: &str,
+) {
+    drop(crate::artifacts::repository_auth_writer(repo).unwrap());
+    let run = RunId::new(format!("researcher-final-{case}")).unwrap();
+    let mut writer = ArtifactRunWriter::reserve(
+        repo,
+        RunArtifactFamily::Supervise,
+        run.clone(),
+        "supervise-test",
+    )
+    .unwrap();
+    let mut journal = Some(initialize_orchestration_event_journal(repo, &run, None).unwrap());
+    write_researcher_schemas(&mut writer).unwrap();
+    record_orchestration_event(
+        &mut journal,
+        &mut writer,
+        &assignment.id,
+        Some(run.as_str()),
+        OrchestrationRole::Researcher,
+        OrchestrationEventKind::Spawn,
+        record_supervision_spawn_payload_with_category(
+            &assignment.id,
+            run.as_str(),
+            OrchestrationRole::Researcher,
+            AgentRole::Researcher,
+            assignment.category_override(),
+            write_boundary_refs(&assignment.assigned_paths),
+            &assignment_scope_ref(&assignment.id),
+            json!({"attempt": 1}),
+        )
+        .unwrap(),
+    );
+    let relative = Path::new("reports/researcher.json");
+    let path = writer.run_dir().join(relative);
+    if case == "accepted" {
+        assert!(
+            persist_final_assignment_report(
+                &mut writer,
+                &mut journal,
+                assignment,
+                run.as_str(),
+                Path::new("../outside-run.json"),
+                &path,
+                report,
+            )
+            .is_err(),
+            "a refused artifact write must not emit an acceptance decision"
+        );
+    }
+    persist_final_assignment_report(
+        &mut writer,
+        &mut journal,
+        assignment,
+        run.as_str(),
+        relative,
+        &path,
+        report,
+    )
+    .expect("supervisor persists typed researcher final report");
+    write_final_report(&mut writer, &artifact_test_final_report(&run)).unwrap();
+    writer
+        .finalize(
+            RunArtifactFamily::Supervise.final_report_relative_path(),
+            false,
+        )
+        .unwrap();
+    let reader = ArtifactRunReader::open(repo, RunArtifactFamily::Supervise, &run).unwrap();
+    for expected in [
+        relative,
+        Path::new("schemas/researcher-final-report.schema.json"),
+    ] {
+        assert!(reader.finalization().files.iter().any(|record| {
+            record.path == expected
+                && record.disposition == ArtifactFileDisposition::PrivateEvidence
+        }));
+    }
+    let bytes = reader.read(relative).unwrap();
+    let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let persisted: OrchestratorReviewReport = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(persisted.role, AgentRole::Researcher);
+    assert_eq!(persisted.id, assignment.id);
+    assert_eq!(persisted.status, report.status);
+    assert_eq!(persisted.accepted, report.accepted);
+    assert_eq!(persisted.rejected, report.rejected);
+    assert_eq!(persisted.commands_run, report.commands_run);
+    assert_eq!(persisted.files_changed, report.files_changed);
+    assert_eq!(persisted.audit_reports, report.audit_reports);
+    assert_eq!(
+        persisted.review_lens_aggregate,
+        report.review_lens_aggregate
+    );
+    assert!(report
+        .findings
+        .iter()
+        .all(|finding| persisted.findings.contains(finding)));
+    assert!(
+        wire.get("read_only").is_none(),
+        "do not synthesize child attestations"
+    );
+    assert!(wire.get("no_further_delegation").is_none());
+    assert!(
+        read_researcher_report(Some(&bytes), relative).is_err(),
+        "final evidence is not child input authority"
+    );
+    assert!(read_child_report(Some(&bytes), relative).is_err());
+    if case == "accepted" {
+        let command = ExternalAgentCommand::codex(
+            "injected-codex",
+            repo,
+            path.with_extension("prompt"),
+            path.with_extension("events"),
+            &path,
+            Duration::from_secs(1),
+        )
+        .with_workspace_access(WorkspaceAccess::ReadOnly);
+        let external_run = injected_verified_run_without_journals(&command);
+        for (role, expected_problem) in [
+            (AgentRole::Researcher, "read_only"),
+            (AgentRole::ChildOrchestrator, "non-child role"),
+        ] {
+            let mut subject = assignment.clone();
+            subject.role = role;
+            let (replayed, problems) = collect_child_report(ChildReportCollectionContext {
+                assignment: &subject,
+                assignment_metadata: &AssignmentMetadata::new(),
+                report_path: relative,
+                external_run: &external_run,
+                external_command: &command,
+                worktree_path: repo,
+                child_base_head: &current_head_oid(repo).unwrap(),
+                observed_changed_paths: Some(&[]),
+                worker_journals: &WorkerExecutionJournalEvidenceSet::default(),
+                evidence_only_source: None,
+            });
+            assert!(report_failed(&replayed));
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem.contains(expected_problem)),
+                "{problems:?}"
+            );
+        }
+    }
+
+    let schema: serde_json::Value = serde_json::from_slice(
+        &reader
+            .read(Path::new("schemas/researcher-final-report.schema.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    let mut compiler = boon::Compiler::new();
+    assert_eq!(schema["title"], "FinalResearcherReport");
+    assert_eq!(schema["properties"]["role"]["const"], "researcher");
+    let id = "https://example.invalid/final-researcher-report";
+    compiler.add_resource(id, schema).unwrap();
+    let mut schemas = boon::Schemas::new();
+    let index = compiler.compile(id, &mut schemas).unwrap();
+    schemas.validate(&wire, index).unwrap();
+    let mut mislabeled = wire.clone();
+    mislabeled["role"] = json!("child_orchestrator");
+    assert!(schemas.validate(&mislabeled, index).is_err());
+
+    let events = read_finalized_orchestration_events(&reader);
+    let decisions = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                OrchestrationEventKind::Accept | OrchestrationEventKind::Reject,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(decisions.len(), 1);
+    let decision = decisions[0];
+    assert_eq!(decision.node, assignment.id);
+    assert_eq!(decision.parent.as_deref(), Some(run.as_str()));
+    assert_eq!(decision.role, OrchestrationRole::Researcher);
+    assert_eq!(
+        decision.kind,
+        if report_failed(&persisted) {
+            OrchestrationEventKind::Reject
+        } else {
+            OrchestrationEventKind::Accept
+        }
+    );
+    assert_eq!(decision.payload["status"], wire["status"]);
+    assert_eq!(decision.payload["accepted"], wire["accepted"]);
+    assert_eq!(decision.payload["rejected"], wire["rejected"]);
+    reconstruct_hierarchy_ledger(&events).expect("researcher terminal decision replays");
 }
 
 fn generated_direct_worker_report(assignment: &OrchestratorAssignment) -> OrchestratorReviewReport {
