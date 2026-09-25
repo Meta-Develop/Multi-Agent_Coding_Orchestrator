@@ -177,12 +177,54 @@ fn metadata_identity_matches(left: &fs::Metadata, right: &fs::Metadata) -> bool 
     }
 }
 
+/// Match fs2's native contention code, not std's platform-dependent ErrorKind.
+/// In particular, Windows ERROR_LOCK_VIOLATION (33) can be Uncategorized.
+pub(crate) fn is_lock_contention(error: &io::Error) -> bool {
+    error
+        .raw_os_error()
+        .is_some_and(|code| Some(code) == fs2::lock_contended_error().raw_os_error())
+}
+
 fn lock_error(path: &Path, source: io::Error) -> Error {
-    if source.kind() == io::ErrorKind::WouldBlock {
+    if is_lock_contention(&source) {
         Error::AccountAuthorityBusy {
             reason: format!("{} is held by another process", path.display()),
         }
     } else {
         fsx::io_at(path, source)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_native_lock_contention_maps_to_authority_busy() {
+        let path = Path::new("FAKE-lock");
+        assert!(is_lock_contention(&fs2::lock_contended_error()));
+        assert!(matches!(
+            lock_error(path, fs2::lock_contended_error()),
+            Error::AccountAuthorityBusy { .. }
+        ));
+        for error in [
+            io::Error::other("FAKE-unrelated"),
+            io::Error::new(io::ErrorKind::PermissionDenied, "FAKE-denied"),
+        ] {
+            assert!(!is_lock_contention(&error));
+            assert!(matches!(lock_error(path, error), Error::Io(_)));
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(fs2::lock_contended_error().raw_os_error(), Some(33));
+            // Access denied and sharing violation are not lock contention.
+            for code in [5, 32] {
+                assert!(!is_lock_contention(&io::Error::from_raw_os_error(code)));
+            }
+        }
+        #[cfg(unix)]
+        assert!(!is_lock_contention(&io::Error::from_raw_os_error(
+            libc::EACCES
+        )));
     }
 }

@@ -1,4 +1,111 @@
 use super::*;
+
+thread_local! {
+    static GROK_PREFLIGHT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn run_grok_preflight_hook() {
+    GROK_PREFLIGHT_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn verified_grok_preflight_launch_evidence_and_source_replacement() -> Result<()> {
+    let _no_socket = CamSocketEnvGuard::unset();
+    for mutation in ["none", "missing", "replaced"] {
+        let temp = tempfile::tempdir()?;
+        let (harness, home, binding) = build_cam_grok_test_harness("account-a")?;
+        let command = admitted_verified_grok_cam_command(temp.path())?
+            .with_environment_requirement(EnvironmentRequirement::executable(
+                EnvironmentExecutable::Git,
+                None,
+            ))
+            .with_environment_requirement(EnvironmentRequirement::network(
+                EnvironmentNetworkAccess::Enabled,
+            ));
+        GROK_PREFLIGHT_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                if mutation != "none" {
+                    let auth = home.join("auth.json");
+                    fs::rename(&auth, home.join("held-auth.json")).unwrap();
+                    if mutation == "replaced" {
+                        fs::copy(CAM_GROK_AUTH_FIXTURE, auth).unwrap();
+                    }
+                }
+            }));
+        });
+        let report = run_external_agent_with_cam_grok_test_harness(harness, &command);
+        assert!(
+            GROK_PREFLIGHT_HOOK.with(|hook| hook.borrow().is_none()),
+            "launch must reach preflight: {report:#?}"
+        );
+        let auth = report
+            .environment_preflight_results()
+            .iter()
+            .find(|result| result.requirement == grok_auth_environment_requirement())
+            .expect("launch must record auth preflight");
+        if mutation == "none" {
+            assert_verified_grok_cam_admitted_provider_failure(&report, &binding)?;
+            assert_eq!(auth.status, EnvironmentPreflightStatus::Satisfied);
+            assert!(report
+                .environment_preflight_results()
+                .iter()
+                .any(|result| result.requirement
+                    == external_sandbox_requirement(ExternalAgentInvocation::Grok)
+                    && result.status == EnvironmentPreflightStatus::Satisfied));
+            assert!(!report
+                .environment_preflight_results()
+                .iter()
+                .any(|result| result.requirement == codex_environment_requirement()));
+            for requirement in &command.environment_requirements {
+                assert!(report.environment_preflight_results().iter().any(|result| {
+                    &result.requirement == requirement
+                        && result.status == EnvironmentPreflightStatus::Satisfied
+                }));
+            }
+        } else {
+            assert_eq!(auth.status, EnvironmentPreflightStatus::Blocked);
+            assert!(!report.stdout.target_launch_attempted);
+            assert!(
+                !report
+                    .stdout
+                    .run_metadata
+                    .environment_preflight_process_started
+            );
+            assert_eq!(
+                report.environment_failures()[0].category,
+                EnvironmentFailureCategory::MissingCredential
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn verified_grok_preflight_rejects_unavailable_offline_requirement_before_launch() -> Result<()> {
+    let _no_socket = CamSocketEnvGuard::unset();
+    let temp = tempfile::tempdir()?;
+    let (harness, _, _) = build_cam_grok_test_harness("account-a")?;
+    let command = admitted_verified_grok_cam_command(temp.path())?.with_environment_requirement(
+        EnvironmentRequirement::network(EnvironmentNetworkAccess::Disabled),
+    );
+    let report = run_external_agent_with_cam_grok_test_harness(harness, &command);
+    assert!(!report.stdout.target_launch_attempted, "{report:#?}");
+    assert!(report.environment_preflight_results().iter().any(|result| {
+        result.requirement == EnvironmentRequirement::network(EnvironmentNetworkAccess::Disabled)
+            && result.status == EnvironmentPreflightStatus::Blocked
+    }));
+    assert!(report
+        .environment_failures()
+        .iter()
+        .any(|failure| { failure.category == EnvironmentFailureCategory::SandboxUnavailable }));
+    Ok(())
+}
 #[cfg(target_os = "linux")]
 use crate::agent_lifecycle::{AgentListFilter, AgentRegistry};
 use crate::process_runner::{
@@ -5371,11 +5478,13 @@ fn environment_preflight_classifies_static_blockers_without_launching_probes() {
         let mut process_evidence = EnvironmentPreflightProcessEvidence::default();
         let (result, failure, timed_out) = evaluate_environment_requirement(
             &requirement,
+            ExternalAgentInvocation::CodexSupervisor,
             Path::new("/workspace"),
             Duration::from_secs(1),
             &cancellation,
             &environment,
             &wrong_profile,
+            None,
             None,
             codex_version,
             verified_confinement,
@@ -5395,11 +5504,13 @@ fn environment_preflight_classifies_static_blockers_without_launching_probes() {
     let mut process_evidence = EnvironmentPreflightProcessEvidence::default();
     let (result, failure, _) = evaluate_environment_requirement(
         &disabled_network,
+        ExternalAgentInvocation::CodexSupervisor,
         Path::new("/workspace"),
         Duration::from_secs(1),
         &cancellation,
         &environment,
         &wrong_profile,
+        None,
         None,
         Some(EnvironmentVersion::new(0, 142, 0)),
         None,
@@ -8109,6 +8220,241 @@ fn grok_prompt_file_is_an_exact_read_only_sandbox_input() -> Result<()> {
     assert!(!profile.visible_read_only_roots().contains(&schema_root));
     assert!(!profile.visible_read_write_files().contains(&schema));
     assert!(!profile.visible_read_write_roots().contains(&schema_root));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn grok_managed_worker_profile_binds_only_exact_program() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    create_mandatory_control_roots(&workspace)?;
+    let incoming = temp.path().join("incoming");
+    let bin = temp.path().join("custom-bin");
+    fs::create_dir(&incoming)?;
+    fs::create_dir(&bin)?;
+    let prompt = workspace.join("prompt.md");
+    let program = bin.join("grok");
+    fs::write(&prompt, "bounded worker prompt\n")?;
+    fs::write(&program, "#!/bin/sh\nexit 0\n")?;
+    let command = selected_writable_grok_command(&program, &workspace, &prompt, &incoming)?;
+    let controls = protected_worktree_controls(&command)?;
+    let SideEffectConfinementProfile::ExternalGrok(profile) = external_side_effect_profile(
+        &command,
+        &program,
+        ExternalProgramTrust::ExplicitCustom,
+        &controls,
+    )?
+    else {
+        bail!("expected managed Grok profile")
+    };
+    assert_eq!(profile.workspace_access(), WorkspaceAccess::ReadWrite);
+    assert!(profile.visible_read_only_files().contains(&program));
+    assert!(!profile
+        .visible_read_only_roots()
+        .iter()
+        .any(|root| program.starts_with(root)));
+    assert!(!profile
+        .visible_read_write_roots()
+        .iter()
+        .any(|root| program.starts_with(root)));
+    assert!(!profile.visible_read_write_files().contains(&program));
+    let properties = crate::process_runner::external_grok_systemd_properties_for_test(
+        profile, &program, &workspace,
+    )?;
+    assert!(properties.contains(&"--property=ProtectHome=tmpfs".to_string()));
+    assert!(properties.contains(&format!(
+        "--property=BindReadOnlyPaths={}",
+        program.display()
+    )));
+    assert!(properties.contains(&format!("--property=ReadOnlyPaths={}", program.display())));
+    assert!(!properties.contains(&format!("--property=BindReadOnlyPaths={}", bin.display())));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn grok_configuration_preflight_accepts_only_the_exact_bound_profile() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    let grok_home = temp.path().join("grok-home");
+    fs::create_dir(&workspace)?;
+    fs::create_dir(&grok_home)?;
+    let auth = grok_home.join("auth.json");
+    fs::write(&auth, "held-auth-fixture")?;
+    let credentials = AdmittedGrokCredentials::from_managed_grok_home(&grok_home)?;
+
+    for base in [
+        ExternalGrokProfile::read_only(&workspace),
+        ExternalGrokProfile::read_write(&workspace),
+    ] {
+        let unbound = SideEffectConfinementProfile::ExternalGrok(base.clone());
+        let bound = BoundGrokCredentials::new(&credentials, base)?;
+        let profile = SideEffectConfinementProfile::ExternalGrok(bound.profile.clone());
+        assert_grok_configuration_preflight(Some(&bound), &profile, true);
+        assert_grok_configuration_preflight(None, &profile, false);
+        assert_grok_configuration_preflight(Some(&bound), &unbound, false);
+        let mutated = SideEffectConfinementProfile::ExternalGrok(
+            bound
+                .profile
+                .clone()
+                .with_visible_read_only_root(&grok_home),
+        );
+        assert_grok_configuration_preflight(Some(&bound), &mutated, false);
+        assert_eq!(
+            bound.profile.visible_read_only_files(),
+            std::slice::from_ref(&auth)
+        );
+        assert!(bound.profile.visible_read_only_roots().is_empty());
+        assert!(bound.profile.visible_read_write_roots().is_empty());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn assert_grok_configuration_preflight(
+    credentials: Option<&BoundGrokCredentials<'_>>,
+    profile: &SideEffectConfinementProfile,
+    expected_present: bool,
+) {
+    // A plausible environment pathname cannot substitute for the held capability.
+    let environment = BTreeMap::from([("GROK_HOME".to_string(), "/ambient/grok".to_string())]);
+    let mut process_evidence = EnvironmentPreflightProcessEvidence::default();
+    let (result, failure, timed_out) = evaluate_environment_requirement(
+        &grok_auth_environment_requirement(),
+        ExternalAgentInvocation::Grok,
+        Path::new("/workspace"),
+        Duration::from_secs(1),
+        &ProcessCancellation::new(),
+        &environment,
+        profile,
+        None,
+        credentials,
+        None,
+        None,
+        None,
+        None,
+        &mut process_evidence,
+    );
+    assert_eq!(
+        result.status,
+        if expected_present {
+            EnvironmentPreflightStatus::Satisfied
+        } else {
+            EnvironmentPreflightStatus::Blocked
+        }
+    );
+    assert_eq!(
+        result.observation,
+        expected_present.then_some(EnvironmentPreflightObservation::ConfigurationPresent {
+            configuration: EnvironmentConfiguration::GrokAuthFile,
+        })
+    );
+    assert_eq!(
+        failure.as_ref().map(|failure| failure.category),
+        (!expected_present).then_some(EnvironmentFailureCategory::MissingCredential)
+    );
+    assert!(!timed_out);
+    assert!(!process_evidence.started);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn grok_configuration_preflight_rejects_missing_replaced_and_symlinked_sources() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir()?;
+    let grok_home = temp.path().join("grok-home");
+    fs::create_dir(&grok_home)?;
+    assert!(AdmittedGrokCredentials::from_managed_grok_home(&grok_home).is_err());
+    let unbound =
+        SideEffectConfinementProfile::ExternalGrok(ExternalGrokProfile::read_only(temp.path()));
+    assert_grok_configuration_preflight(None, &unbound, false);
+
+    for leaf in ["auth.json", "config.toml"] {
+        for change in ["remove", "replace", "symlink"] {
+            let fixture = tempfile::tempdir()?;
+            let auth = fixture.path().join("auth.json");
+            let config = fixture.path().join("config.toml");
+            let secret = "credential-fixture-must-not-escape";
+            fs::write(&auth, secret)?;
+            fs::write(&config, secret)?;
+            let credentials = AdmittedGrokCredentials::from_managed_grok_home(fixture.path())?;
+            let bound = BoundGrokCredentials::new(
+                &credentials,
+                ExternalGrokProfile::read_only(temp.path()),
+            )?;
+            let profile = SideEffectConfinementProfile::ExternalGrok(bound.profile.clone());
+            assert_grok_configuration_preflight(Some(&bound), &profile, true);
+
+            let source = fixture.path().join(leaf);
+            let moved = fixture.path().join("held-original");
+            fs::rename(&source, &moved)?;
+            match change {
+                "replace" => fs::write(&source, secret)?,
+                "symlink" => symlink(&moved, &source)?,
+                "remove" => (),
+                _ => unreachable!(),
+            }
+            assert_grok_configuration_preflight(Some(&bound), &profile, false);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn grok_configuration_preflight_rejects_foreign_source_and_non_grok_profiles() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let source_home = temp.path().join("source");
+    let other_home = temp.path().join("other");
+    fs::create_dir(&source_home)?;
+    fs::create_dir(&other_home)?;
+    fs::write(source_home.join("auth.json"), "source-auth")?;
+    fs::write(other_home.join("auth.json"), "other-auth")?;
+    let source = AdmittedGrokCredentials::from_managed_grok_home(&source_home)?;
+    let other = AdmittedGrokCredentials::from_managed_grok_home(&other_home)?;
+    let bound = BoundGrokCredentials::new(&source, ExternalGrokProfile::read_only(temp.path()))?;
+    let foreign = BoundGrokCredentials::new(&other, ExternalGrokProfile::read_only(temp.path()))?;
+    for profile in [
+        SideEffectConfinementProfile::ExternalGrok(foreign.profile),
+        SideEffectConfinementProfile::ExternalCodex(ExternalCodexProfile::read_only(temp.path())),
+        SideEffectConfinementProfile::StrictOfflineWorkspace(
+            StrictOfflineWorkspaceProfile::read_only(temp.path()),
+        ),
+        SideEffectConfinementProfile::TrustedCompatibility,
+    ] {
+        assert_grok_configuration_preflight(Some(&bound), &profile, false);
+    }
+    let grok_profile = SideEffectConfinementProfile::ExternalGrok(bound.profile.clone());
+    assert!(!configuration_present(
+        EnvironmentConfiguration::CodexAuthFile,
+        None,
+        Some(&bound),
+        &grok_profile,
+    ));
+    let codex_auth = ValidatedCodexAuth {
+        path: temp.path().join("codex-auth.json"),
+        length: 2,
+        modified: None,
+        device: 1,
+        inode: 2,
+        bytes: b"{}".to_vec(),
+    };
+    let codex_profile =
+        SideEffectConfinementProfile::ExternalCodex(ExternalCodexProfile::read_only(temp.path()));
+    assert!(configuration_present(
+        EnvironmentConfiguration::CodexAuthFile,
+        Some(&codex_auth),
+        None,
+        &codex_profile,
+    ));
+    assert!(!configuration_present(
+        EnvironmentConfiguration::GrokAuthFile,
+        Some(&codex_auth),
+        None,
+        &codex_profile,
+    ));
     Ok(())
 }
 

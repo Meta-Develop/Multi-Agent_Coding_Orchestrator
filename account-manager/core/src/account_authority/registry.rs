@@ -72,6 +72,54 @@ impl StoredAccountRegistry {
         })
     }
 
+    /// Reserve a fresh pending OAuth identity and prepare its vendor home before
+    /// publishing it. The callback must create the home exclusively, never
+    /// adopt existing material, launch login, or reenter this registry.
+    /// On callback failure no pending row is published. A home left by a failed
+    /// metadata write is retained and must not be adopted by a later attempt.
+    pub(crate) fn prepare_pending_oauth_vendor_home<R>(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+        prepare: impl FnOnce(&StoredAccountMetadata) -> Result<R>,
+    ) -> Result<R> {
+        validate_metadata_fields(provider_id, account_id, account_id)?;
+        let _process = in_process_guard()?;
+        let _registry = RegistryFileLock::acquire(&self.path)?;
+        let mut document = self.read_document_under_lock()?;
+        if document
+            .accounts
+            .iter()
+            .any(|account| account.provider_id == provider_id && account.id == account_id)
+        {
+            return Err(metadata_write_error(provider_id, "account already exists"));
+        }
+        let account = StoredAccountMetadata {
+            id: account_id.to_string(),
+            provider_id: provider_id.to_string(),
+            label: account_id.to_string(),
+            auth_kind: AuthKind::OAuth,
+            state: StoredAccountState::Pending,
+            material: StoredAccountMaterial::VendorHome,
+            is_selected: false,
+            account_incarnation: new_account_incarnation(),
+        };
+        let binding = super::use_lease::PendingLoginBinding {
+            provider_id: account.provider_id.clone(),
+            account_id: account.id.clone(),
+            account_incarnation: account.account_incarnation.clone(),
+        };
+        // Reserve this exact new incarnation while the registry lock excludes
+        // prepare/delete/recreate interleavings. Keep its lease through commit.
+        let _login = super::use_lease::PendingLoginLease::acquire_while_registry_files_held(
+            &self.path, &binding,
+        )?;
+        let prepared = prepare(&account)?;
+        document.accounts.push(account);
+        self.write_document(&document)?;
+        Ok(prepared)
+    }
+
     pub fn complete_add(&self, provider_id: &str, account_id: &str) -> Result<()> {
         self.update_account(provider_id, account_id, |account| {
             if account.state != StoredAccountState::Pending {
@@ -157,6 +205,60 @@ impl StoredAccountRegistry {
             account.state = StoredAccountState::Complete;
             Ok(())
         })
+    }
+
+    /// Complete and explicitly select a pending OAuth vendor home in one write.
+    /// The validator must only inspect vendor state, never reenter the registry
+    /// or launch login. Keep both the registry lock and exact-incarnation login
+    /// lease through validation and the durable metadata replacement.
+    pub(crate) fn complete_pending_oauth_vendor_home_and_select(
+        &self,
+        binding: &super::use_lease::PendingLoginBinding,
+        validate: impl FnOnce(&StoredAccountMetadata, Option<&StoredAccountMetadata>) -> Result<()>,
+    ) -> Result<SelectedAccountBinding> {
+        let _process = in_process_guard()?;
+        let _registry = RegistryFileLock::acquire(&self.path)?;
+        let mut document = self.read_document_under_lock()?;
+        verify_pending_login_target(
+            &document,
+            &binding.provider_id,
+            &binding.account_id,
+            &binding.account_incarnation,
+            AuthKind::OAuth,
+            StoredAccountMaterial::VendorHome,
+        )?;
+        // Check other use/login leases before acquiring our own shared lease.
+        // The registry lock prevents another CAM lease acquisition in between.
+        refuse_provider_authority_mutations(&self.path, &binding.provider_id)?;
+        let _login = super::use_lease::PendingLoginLease::acquire_while_registry_files_held(
+            &self.path, binding,
+        )?;
+        let target = document
+            .accounts
+            .iter()
+            .find(|account| {
+                account.provider_id == binding.provider_id && account.id == binding.account_id
+            })
+            .ok_or_else(|| Error::UnknownAccount(binding.account_id.clone()))?;
+        let previous = document
+            .accounts
+            .iter()
+            .find(|account| account.provider_id == binding.provider_id && account.is_selected);
+        validate(target, previous)?;
+        for account in document
+            .accounts
+            .iter_mut()
+            .filter(|account| account.provider_id == binding.provider_id)
+        {
+            account.is_selected = account.id == binding.account_id;
+            if account.is_selected {
+                account.state = StoredAccountState::Complete;
+            }
+        }
+        let revision = bump_selection_revision(&mut document, &binding.provider_id)?;
+        let selected = binding_for_selection(&document, &binding.provider_id, revision)?;
+        self.write_document(&document)?;
+        Ok(selected)
     }
 
     pub fn add_with_secret(
@@ -602,6 +704,88 @@ mod pending_login_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("stored-accounts.json");
         (dir, StoredAccountRegistry::new(path))
+    }
+
+    #[test]
+    fn atomic_completion_holds_pending_lease_and_failed_validation_preserves_document() {
+        let (_dir, registry) = registry();
+        let account = registry
+            .begin_add(
+                "grok-cli",
+                "work",
+                "Work",
+                AuthKind::OAuth,
+                StoredAccountMaterial::VendorHome,
+            )
+            .unwrap();
+        let before = fs::read(registry.metadata_path()).unwrap();
+        let binding = super::super::use_lease::PendingLoginBinding {
+            provider_id: account.provider_id.clone(),
+            account_id: account.id.clone(),
+            account_incarnation: account.account_incarnation.clone(),
+        };
+        let result = registry.complete_pending_oauth_vendor_home_and_select(
+            &binding,
+            |pending, previous| {
+                assert_eq!(pending.account_incarnation, binding.account_incarnation);
+                assert!(previous.is_none());
+                // This inspects the real lease files without reentering the registry.
+                assert!(matches!(
+                    refuse_provider_authority_mutations(registry.metadata_path(), "grok-cli"),
+                    Err(Error::AccountAuthorityBusy { .. })
+                ));
+                Err(metadata_write_error("grok-cli", "FAKE-validator-refusal"))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(registry.metadata_path()).unwrap(), before);
+        refuse_provider_authority_mutations(registry.metadata_path(), "grok-cli").unwrap();
+    }
+
+    #[test]
+    fn fresh_home_preparation_holds_exact_identity_and_registry_lock_before_publication() {
+        use fs2::FileExt;
+        let contention_code = fs2::lock_contended_error()
+            .raw_os_error()
+            .expect("fs2 provides a native lock-contention code");
+        #[cfg(windows)]
+        assert_eq!(contention_code, 33, "Windows ERROR_LOCK_VIOLATION");
+        let (_dir, registry) = registry();
+        let result: Result<()> =
+            registry.prepare_pending_oauth_vendor_home("grok-cli", "work", |pending| {
+                assert_eq!(pending.state, StoredAccountState::Pending);
+                assert!(!pending.is_selected);
+                let binding = SelectedAccountBinding {
+                    provider_id: pending.provider_id.clone(),
+                    account_id: pending.id.clone(),
+                    account_incarnation: pending.account_incarnation.clone(),
+                    selection_revision: 0,
+                };
+                let lease_path =
+                    super::super::use_lease::use_lock_path(registry.metadata_path(), &binding)?;
+                let lease_file = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(lease_path)?;
+                let lease_error = FileExt::try_lock_exclusive(&lease_file).unwrap_err();
+                assert_eq!(lease_error.raw_os_error(), Some(contention_code));
+                let registry_path =
+                    super::super::lock::registry_lock_path(registry.metadata_path());
+                let registry_file = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(registry_path)?;
+                let registry_error = FileExt::try_lock_exclusive(&registry_file).unwrap_err();
+                assert_eq!(registry_error.raw_os_error(), Some(contention_code));
+                assert!(
+                    !registry.metadata_path().exists(),
+                    "pending row published before fresh-home reservation"
+                );
+                Err(metadata_write_error("grok-cli", "FAKE-reservation-refusal"))
+            });
+        assert!(result.is_err());
+        assert!(!registry.metadata_path().exists());
+        refuse_provider_authority_mutations(registry.metadata_path(), "grok-cli").unwrap();
     }
 
     #[test]
