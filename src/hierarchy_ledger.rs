@@ -52,6 +52,7 @@ impl RoleCategory {
             | OrchestrationRole::Supervisor
             | OrchestrationRole::Orchestrator => Self::DelegatingCoordinator,
             OrchestrationRole::Worker => Self::NonDelegatingTerminalWorker,
+            OrchestrationRole::Researcher => Self::ReadOnlyResearcher,
             OrchestrationRole::Auditor => Self::ReadOnlyReviewAuditor,
         }
     }

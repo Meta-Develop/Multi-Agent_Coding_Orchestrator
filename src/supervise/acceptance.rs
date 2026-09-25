@@ -373,6 +373,8 @@ pub(super) fn collect_child_report_for_runtime(
                 recovered: parsed.recovered,
             }
         })
+    } else if assignment.role == AgentRole::Researcher {
+        read_researcher_report(external_run.output_last_message(), report_path)
     } else {
         read_child_report(external_run.output_last_message(), report_path)
     };
@@ -500,6 +502,7 @@ pub(super) fn collect_child_report_for_runtime(
         );
     }
     prepare_licensed_breakage_review(assignment, &mut report);
+    enforce_researcher_zero_diff(&mut report);
     validate_worker_report_evidence(assignment, assignment_metadata, report_path, &mut report);
     validate_assignment_report_plumbing(assignment, assignment_metadata, report_path, &mut report);
     if let Some(source) = evidence_only_source {
@@ -1379,7 +1382,7 @@ pub(super) fn parent_auditor_required(
     assignment: &OrchestratorAssignment,
     report: &OrchestratorReviewReport,
 ) -> bool {
-    assignment.role == AgentRole::Worker
+    matches!(assignment.role, AgentRole::Worker | AgentRole::Researcher)
         || (!assignment.worker_assignments.is_empty() && !report.worker_reports.is_empty())
         || (assignment.worker_assignments.is_empty() && !report.files_changed.is_empty())
         || report.licensed_breakage_review.is_some()
@@ -1591,7 +1594,7 @@ fn required_auditor_review_subject_ids(
     assignment: &OrchestratorAssignment,
     report: &OrchestratorReviewReport,
 ) -> BTreeSet<String> {
-    if assignment.role == AgentRole::Worker {
+    if matches!(assignment.role, AgentRole::Worker | AgentRole::Researcher) {
         BTreeSet::from([assignment.id.clone()])
     } else if assignment.worker_assignments.is_empty() {
         if report.files_changed.is_empty()

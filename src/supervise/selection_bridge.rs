@@ -890,7 +890,14 @@ pub(super) fn initialize_supervisor_selection_with_history(
     // executable role and apply authored entries only as exact debug
     // overrides so launch and persisted evidence share one complete decision
     // set.
-    let roles = all_selector_roles().to_vec();
+    let mut roles = all_selector_roles().to_vec();
+    if plan
+        .assignments
+        .iter()
+        .any(|assignment| assignment.role == AgentRole::Researcher)
+    {
+        roles.push(AgentRole::Researcher);
+    }
     if runtime == SupervisorRuntime::Cursor
         && advertised.cursor.is_none()
         && account_observation.is_none()
@@ -1425,6 +1432,9 @@ fn role_for_task_profile(task: &TaskProfile) -> Result<AgentRole> {
     match task.authority_role {
         AuthorityRole::AcceptanceGate => Ok(AgentRole::Supervisor),
         AuthorityRole::Delegating => Ok(AgentRole::ChildOrchestrator),
+        AuthorityRole::TerminalLeaf if task.task_class == JUDGMENT_SELECTION_TASK_CLASS => {
+            Ok(AgentRole::Researcher)
+        }
         AuthorityRole::TerminalLeaf => Ok(AgentRole::Worker),
         AuthorityRole::FailureClassification => Ok(AgentRole::GateClassifier),
         AuthorityRole::ReviewAuditor => Ok(AgentRole::Auditor),
@@ -2501,6 +2511,14 @@ pub(super) fn runtime_catalog_from_priors(
 
 fn task_profile_for_role(role: AgentRole) -> TaskProfile {
     match role {
+        AgentRole::Researcher => TaskProfile {
+            task_class: JUDGMENT_SELECTION_TASK_CLASS.to_string(),
+            risk: RiskLevel::Medium,
+            boundedness: Boundedness::Bounded,
+            context: ContextSize::Medium,
+            horizon: TaskHorizon::Medium,
+            authority_role: AuthorityRole::TerminalLeaf,
+        },
         AgentRole::Worker => TaskProfile {
             task_class: AUTOMATIC_SELECTION_TASK_CLASS.to_string(),
             risk: RiskLevel::Medium,
@@ -2944,7 +2962,11 @@ pub(super) fn record_supervisor_invocation_observation(
         DecisionId::new(format!("{}:root", observation.run_id))
             .map_err(|error| anyhow!("live invocation decision id: {error}"))?,
     );
-    record.task_class = Some(AUTOMATIC_SELECTION_TASK_CLASS.to_string());
+    record.task_class = Some(if observation.role == AgentRole::Researcher {
+        JUDGMENT_SELECTION_TASK_CLASS.to_string()
+    } else {
+        AUTOMATIC_SELECTION_TASK_CLASS.to_string()
+    });
     let backend = backend_id_for_runtime(observation.runtime)?;
     record.backend = Some(backend.clone());
     record.provider = Some(provider_id_for_runtime(observation.runtime)?);
@@ -2970,6 +2992,7 @@ pub(super) fn record_supervisor_invocation_observation(
         AgentRole::Auditor => CostClass::DirectAuditor,
         AgentRole::Worker => CostClass::DirectWorker,
         AgentRole::GateClassifier => CostClass::DirectPlanner,
+        AgentRole::Researcher => CostClass::DirectPlanner,
         AgentRole::ChildOrchestrator | AgentRole::Supervisor => CostClass::DirectPlanner,
     });
     record_live_invocation(record.clone())?;
@@ -3237,6 +3260,7 @@ fn optimizer_role(role: AgentRole) -> OptimizerRole {
         AgentRole::Supervisor => OptimizerRole::Supervisor,
         AgentRole::ChildOrchestrator => OptimizerRole::ChildOrchestrator,
         AgentRole::Worker => OptimizerRole::Worker,
+        AgentRole::Researcher => OptimizerRole::Researcher,
         AgentRole::GateClassifier => OptimizerRole::GateClassifier,
         AgentRole::Auditor => OptimizerRole::Auditor,
     }
@@ -3995,6 +4019,46 @@ mod tests {
                         && choice.switch_cost_microunits == 0
                 })
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn authored_researcher_selection_preserves_distinct_role_and_binding() -> Result<()> {
+        let catalog = codex_catalog()?;
+        let mut plan = test_plan();
+        plan.assignments.push(serde_json::from_value(json!({
+            "id": "research", "phase": "execution", "role": "researcher", "role_category": "read_only_researcher",
+            "assigned_paths": ["src"], "worker_assignments": []
+        }))?);
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+        )?;
+        assert!(
+            resolution.selection_preflight_failure.is_none(),
+            "{:?}",
+            resolution.selection_preflight_failure
+        );
+        let decision = resolution
+            .decisions
+            .iter()
+            .find(|decision| decision.role == AgentRole::Researcher)
+            .context("missing Researcher selection")?;
+        assert_eq!(
+            role_for_task_profile(&decision.provenance.normalized_task)?,
+            AgentRole::Researcher
+        );
+        assert_eq!(
+            optimizer_role(AgentRole::Researcher),
+            OptimizerRole::Researcher
+        );
+        validate_known_judgment_role_model(
+            AgentRole::Researcher,
+            plan.role_models[&AgentRole::Researcher].model.as_deref(),
+        )?;
         Ok(())
     }
 
