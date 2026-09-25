@@ -180,3 +180,26 @@ jobs:
 
       - name: Compile all tests without running them
         run: cargo test --locked --all-targets --no-run
+
+  required-rust-gate:
+    name: Required Rust CI gate
+    runs-on: ubuntu-latest
+    needs:
+      - repository-portability
+      - linux-gate
+      - portable-build
+    if: always()
+    timeout-minutes: 5
+    steps:
+      - name: Require portability, Linux tests, and portable builds
+        env:
+          PORTABILITY_RESULT: ${{ needs.repository-portability.result }}
+          LINUX_RESULT: ${{ needs.linux-gate.result }}
+          PORTABLE_RESULT: ${{ needs.portable-build.result }}
+        run: |
+          if [[ "${PORTABILITY_RESULT}" != "success" || "${LINUX_RESULT}" != "success" || "${PORTABLE_RESULT}" != "success" ]]; then
+            echo "repository-portability result: ${PORTABILITY_RESULT}"
+            echo "linux-gate result: ${LINUX_RESULT}"
+            echo "portable-build result: ${PORTABLE_RESULT}"
+            exit 1
+          fi
