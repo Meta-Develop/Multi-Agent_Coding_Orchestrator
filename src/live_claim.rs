@@ -1781,13 +1781,13 @@ fn capture_claim_board_snapshot(
         } else {
             MAX_CLAIM_BYTES
         };
-        let generation = read_entry_generation(root, &file_name, max_bytes).map_err(|_| {
+        let generation = read_entry_generation(root, &file_name, max_bytes).with_context(|| {
             if file_name == OsStr::new(TEMPLATE_FILE) {
-                anyhow::anyhow!("claim template is not a bounded regular file")
+                "claim template is not a bounded regular file"
             } else if file_name == OsStr::new(BOARD_LOCK_FILE) {
-                anyhow::anyhow!("claim board lock file is unsafe")
+                "claim board lock file is unsafe"
             } else {
-                anyhow::anyhow!("claim board entry is not a bounded regular file")
+                "claim board entry is not a bounded regular file"
             }
         })?;
         entries.insert(file_name, generation);

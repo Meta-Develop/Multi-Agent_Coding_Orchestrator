@@ -1318,9 +1318,15 @@ impl ResolvedSystemdSandbox {
                 false,
             ));
         }
-        let Some(private_tmp_root) = [Path::new("/tmp"), Path::new("/var/tmp")]
-            .into_iter()
-            .find(|root| program.starts_with(root))
+        let Some((private_root, protection)) = [
+            (Path::new("/tmp"), "PrivateTmp=yes"),
+            (Path::new("/var/tmp"), "PrivateTmp=yes"),
+            (Path::new("/home"), "ProtectHome=tmpfs"),
+            (Path::new("/root"), "ProtectHome=tmpfs"),
+            (Path::new("/run/user"), "ProtectHome=tmpfs"),
+        ]
+        .into_iter()
+        .find(|(root, _)| program.starts_with(root))
         else {
             return Ok(());
         };
@@ -1329,9 +1335,9 @@ impl ResolvedSystemdSandbox {
         }
         Err(environment_failure_io(
             EnvironmentFailure::sandbox_unavailable(format!(
-                "the sandbox cannot start program {} because PrivateTmp=yes replaces that root inside the transient unit: {}; place the executable outside the hidden root before retrying",
+                "the sandbox cannot start program {} because {protection} replaces that root inside the transient unit: {}; place the executable outside the hidden root or bind it explicitly before retrying",
                 program.display(),
-                private_tmp_root.display(),
+                private_root.display(),
             )),
             false,
         ))

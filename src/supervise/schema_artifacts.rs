@@ -57,6 +57,71 @@ pub(super) fn write_supervisor_final_schema(
     write_schema(writer, relative, supervisor_final_report_schema_value())
 }
 
+/// Staged turn envelope. The discriminator lives inside `turn` so the Codex
+/// root remains an object, while exclusive closed variants survive projection.
+pub(super) fn parent_continuation_schema_value(
+    continuation: &super::assignment_execution::ParentContinuationLaunch<'_>,
+) -> serde_json::Value {
+    let (run_id, parent_id, source_attempt, attempt) = continuation.binding();
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "ParentContinuationTurn", "type": "object", "additionalProperties": false,
+        "required": ["version", "run_id", "parent_id", "source_parent_attempt", "parent_attempt", "completed_worker_ids", "turn"],
+        "properties": {
+            "version": {"type": "integer", "const": 1},
+            "run_id": {"type": "string", "const": run_id},
+            "parent_id": {"type": "string", "const": parent_id},
+            "source_parent_attempt": {"type": "integer", "const": source_attempt},
+            "parent_attempt": {"type": "integer", "const": attempt},
+            "completed_worker_ids": {"type": "array", "items": {"type": "string"}, "const": continuation.worker_ids()},
+            "turn": {"oneOf": [
+                {"type": "object", "additionalProperties": false,
+                 "required": ["outcome", "requests"], "properties": {
+                    "outcome": {"type": "string", "const": "yield_workers"},
+                    "requests": {"type": "array", "minItems": 1, "items": {
+                        "type": "object", "additionalProperties": false,
+                        "required": ["request_id", "worker_id"], "properties": {
+                            "request_id": {"type": "string"}, "worker_id": {"type": "string"}
+                        }
+                    }}
+                 }},
+                {"type": "object", "additionalProperties": false,
+                 "required": ["outcome", "report"], "properties": {
+                    "outcome": {"type": "string", "const": "final_report"},
+                    "report": orchestrator_report_schema_value()
+                 }}
+            ]}
+        }
+    })
+}
+
+pub(super) fn write_parent_continuation_schemas(
+    writer: &mut ArtifactRunWriter,
+    relative: &Path,
+    continuation: &super::assignment_execution::ParentContinuationLaunch<'_>,
+) -> Result<()> {
+    let schema = parent_continuation_schema_value(continuation);
+    // Project the nested final report separately so supervisor-owned fields are
+    // removed just as they are for the existing top-level report schema.
+    let mut codex = schema.clone();
+    codex["properties"]["turn"]["oneOf"][1]["properties"]["report"] =
+        codex_response_format_schema(orchestrator_report_schema_value())?;
+    // The envelope has no serde Option fields. Its report has already passed
+    // the existing title-specific projection; keep that default guard unchanged.
+    make_codex_response_format_compatible(&mut codex)?;
+    validate_codex_response_format_schema(&codex)?;
+    let codex_relative = relative.with_file_name(format!(
+        "{}.codex-output.schema.json",
+        relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".schema.json"))
+            .context("invalid continuation schema filename")?
+    ));
+    write_schema(writer, relative, schema)?;
+    write_schema(writer, &codex_relative, codex)
+}
+
 pub(super) fn write_worktree_writable_admission_schema(
     writer: &mut ArtifactRunWriter,
     relative: &Path,

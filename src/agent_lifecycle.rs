@@ -1088,22 +1088,41 @@ enum ProcessIdentityState {
 }
 
 fn process_state(pid: u32, expected_start_time: &str) -> Result<ProcessIdentityState> {
-    if !process_exists(pid)? {
+    process_state_with_probes(pid, expected_start_time, process_exists, process_identity)
+}
+
+fn process_state_with_probes(
+    pid: u32,
+    expected_start_time: &str,
+    exists: impl FnOnce(u32) -> Result<bool>,
+    identity: impl FnOnce(u32) -> Result<(char, String)>,
+) -> Result<ProcessIdentityState> {
+    if !exists(pid)? {
         return Ok(ProcessIdentityState::Gone);
     }
-    match process_identity(pid) {
+    match identity(pid) {
         Ok(('Z' | 'X', _)) => Ok(ProcessIdentityState::Gone),
         Ok((_, observed)) if observed == expected_start_time => Ok(ProcessIdentityState::Live),
         Ok(_) => Ok(ProcessIdentityState::Reused),
-        Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            Ok(ProcessIdentityState::Gone)
-        }
+        Err(error) if vanished_identity_error(&error) => Ok(ProcessIdentityState::Gone),
         Err(error) => Err(error),
     }
+}
+
+fn vanished_identity_error(error: &anyhow::Error) -> bool {
+    let Some(io) = error.downcast_ref::<std::io::Error>() else {
+        return false;
+    };
+    if io.kind() == std::io::ErrorKind::NotFound {
+        return true;
+    }
+    // Linux can report ESRCH, rather than ENOENT, when /proc/<pid>/stat vanishes
+    // after the preceding kill(pid, 0) liveness probe.
+    #[cfg(target_os = "linux")]
+    if io.raw_os_error() == Some(libc::ESRCH) {
+        return true;
+    }
+    false
 }
 
 #[cfg(unix)]
@@ -1380,6 +1399,45 @@ mod tests {
     use git2::Repository;
     use std::process::{Child, Command};
     use tempfile::TempDir;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn vanished_process_between_liveness_probe_and_identity_read_is_gone() -> Result<()> {
+        let missing_stat = std::io::Error::from_raw_os_error(libc::ESRCH);
+        assert_ne!(missing_stat.kind(), std::io::ErrorKind::NotFound);
+        let state = process_state_with_probes(
+            77,
+            "boot:1",
+            |_| Ok(true),
+            |_| Err(anyhow::Error::new(missing_stat).context("failed to read /proc/77/stat")),
+        )?;
+        assert_eq!(state, ProcessIdentityState::Gone);
+        Ok(())
+    }
+
+    #[test]
+    fn identity_probe_preserves_permission_and_reused_pid_failures() -> Result<()> {
+        let denied = process_state_with_probes(
+            77,
+            "boot:1",
+            |_| Ok(true),
+            |_| {
+                Err(
+                    anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                        .context("failed to read /proc/77/stat"),
+                )
+            },
+        );
+        assert!(denied.is_err());
+        let reused = process_state_with_probes(
+            77,
+            "boot:1",
+            |_| Ok(true),
+            |_| Ok(('S', "boot:2".to_string())),
+        )?;
+        assert_eq!(reused, ProcessIdentityState::Reused);
+        Ok(())
+    }
 
     struct SleepChild(Child);
 
