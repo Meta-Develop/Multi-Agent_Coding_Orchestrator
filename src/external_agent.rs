@@ -1585,7 +1585,7 @@ impl ExternalAgentCommand {
         self.cam_authority_socket_pin.as_deref()
     }
 
-    #[cfg(test)]
+    /// Supervisor-held endpoint identity for binding a collected parent turn.
     pub(crate) fn assignment_messaging_launch(&self) -> Option<&AssignmentMessagingLaunch> {
         self.assignment_messaging_launch.as_ref()
     }

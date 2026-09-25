@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 // Real managed resources and the existing prepare/collect boundary, with an
 // injected deterministic runner. No provider process or native subagent runs.
-fn driver_fixture(case: &str) -> Result<()> {
+pub(super) fn driver_fixture(case: &str) -> Result<()> {
     let temp = tempfile::tempdir()?;
     let repo = temp.path().join("repo");
     WorktreeManager::init_repository(&repo, "main")?;
@@ -22,7 +22,7 @@ fn driver_fixture(case: &str) -> Result<()> {
         "worker_assignments":[{"id":"worker", "role":"worker",
             "assigned_paths":["src/lib.rs"], "task":"worker task", "report_path":"worker.json"}]
     }))?;
-    if case.starts_with("continuation-") {
+    if case.starts_with("continuation-") || case.starts_with("bound-") {
         let mut second = parent.worker_assignments[0].clone();
         second.id = "worker-two".into();
         second.report_path = Some("worker-two.json".into());
@@ -295,6 +295,17 @@ fn driver_fixture(case: &str) -> Result<()> {
         prepared,
     )?;
     assert_eq!(*calls.lock().unwrap(), ["parent"]);
+    if case.starts_with("bound-") {
+        super::bound_parent_turn_tests::exercise(case, &context, &preflight, &mut collected)?;
+        assert_eq!(*calls.lock().unwrap(), ["parent"]);
+        context.manager.verify_write_execution_lease(
+            &parent.id,
+            preflight.worktree_write_lease.as_ref().unwrap(),
+        )?;
+        assert_eq!(context.manager.list_managed_verified()?.len(), 1);
+        assert_eq!(ledger.report()?.active_reservations, 0);
+        return Ok(());
+    }
     if case.starts_with("continuation-") {
         let mut policy = context.budget_policy.clone();
         policy.set_selector_binding_for_test(
