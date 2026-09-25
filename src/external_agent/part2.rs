@@ -5053,7 +5053,11 @@ fn external_side_effect_profile(
                 }
             }
             let canonical_workspace = fs::canonicalize(&spec.cwd)?;
-            if !program.starts_with(&canonical_workspace) {
+            if spec.invocation == ExternalAgentInvocation::Grok {
+                // ProtectHome hides custom installations. Expose the executable itself,
+                // not adjacent home files, and keep it read-only even inside the workspace.
+                profile = profile.with_visible_read_only_file(program);
+            } else if !program.starts_with(&canonical_workspace) {
                 profile = profile.with_visible_read_only_root(program_parent);
             }
             if let Some(schema) = &spec.output_schema {

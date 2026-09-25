@@ -7677,6 +7677,55 @@ fn grok_prompt_file_is_an_exact_read_only_sandbox_input() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn grok_managed_worker_profile_binds_only_exact_program() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    create_mandatory_control_roots(&workspace)?;
+    let incoming = temp.path().join("incoming");
+    let bin = temp.path().join("custom-bin");
+    fs::create_dir(&incoming)?;
+    fs::create_dir(&bin)?;
+    let prompt = workspace.join("prompt.md");
+    let program = bin.join("grok");
+    fs::write(&prompt, "bounded worker prompt\n")?;
+    fs::write(&program, "#!/bin/sh\nexit 0\n")?;
+    let command = selected_writable_grok_command(&program, &workspace, &prompt, &incoming)?;
+    let controls = protected_worktree_controls(&command)?;
+    let SideEffectConfinementProfile::ExternalGrok(profile) = external_side_effect_profile(
+        &command,
+        &program,
+        ExternalProgramTrust::ExplicitCustom,
+        &controls,
+    )?
+    else {
+        bail!("expected managed Grok profile")
+    };
+    assert_eq!(profile.workspace_access(), WorkspaceAccess::ReadWrite);
+    assert!(profile.visible_read_only_files().contains(&program));
+    assert!(!profile
+        .visible_read_only_roots()
+        .iter()
+        .any(|root| program.starts_with(root)));
+    assert!(!profile
+        .visible_read_write_roots()
+        .iter()
+        .any(|root| program.starts_with(root)));
+    assert!(!profile.visible_read_write_files().contains(&program));
+    let properties = crate::process_runner::external_grok_systemd_properties_for_test(
+        profile, &program, &workspace,
+    )?;
+    assert!(properties.contains(&"--property=ProtectHome=tmpfs".to_string()));
+    assert!(properties.contains(&format!(
+        "--property=BindReadOnlyPaths={}",
+        program.display()
+    )));
+    assert!(properties.contains(&format!("--property=ReadOnlyPaths={}", program.display())));
+    assert!(!properties.contains(&format!("--property=BindReadOnlyPaths={}", bin.display())));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn grok_live_launch_profile_binds_exact_credentials_and_normalized_home() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let workspace = temp.path().join("workspace");
