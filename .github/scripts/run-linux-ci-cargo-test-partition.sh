@@ -2,14 +2,14 @@
 # Run one Linux CI cargo test partition inside the delegated systemd user scope.
 set -euo pipefail
 
-if [[ "$#" -ne 1 ]]; then
-  printf '%s\n' "usage: $0 <lib|non-lib>" >&2
+if [[ "$#" -lt 1 || "$#" -gt 2 ]]; then
+  printf '%s\n' "usage: $0 lib <autopilot|supervise|rest> | non-lib" >&2
   exit 1
 fi
 
 partition="$1"
-case "${partition}" in
-  lib | non-lib) ;;
+case "${partition}:${2:-}" in
+  lib:autopilot | lib:supervise | lib:rest | non-lib:) ;;
   *)
     printf '%s\n' "invalid partition: ${partition}" >&2
     exit 1
@@ -49,6 +49,11 @@ done <<< "${partition_argv_output}"
 if [[ "${#partition_args[@]}" -eq 0 ]]; then
   printf '%s\n' "partition produced no cargo test flags: ${partition}" >&2
   exit 1
+fi
+
+if [[ "${partition}" == lib ]]; then
+  exec bash "${delegated}" python3 "${script_dir}/linux_ci_library_shards.py" \
+    "$2" --manifest-dir "${repo_root}"
 fi
 
 exec bash "${delegated}" cargo test --locked "${partition_args[@]}"
