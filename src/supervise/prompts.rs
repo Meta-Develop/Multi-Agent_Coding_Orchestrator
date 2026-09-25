@@ -231,8 +231,19 @@ Safety requirements:
     )
 }
 
-pub(super) fn worker_cacheable_prefix() -> Result<String> {
+fn worker_execution_journal_prompt_contract() -> Result<String> {
     let apply_patch_journal_example = worker_execution_journal_apply_patch_example()?;
+    Ok(format!(
+        r#"- Append one JSON line directly to the exact precreated journal before each action: {{command,cwd,start_timestamp,end_timestamp,changed_paths}}; use absolute cwd, nonempty RFC3339 timestamps, and canonical repo-relative paths. Never reconstruct at the end.
+- It is the only non-source write; its parent is nonwritable. Never create, replace, rename, link, truncate, or swap it. On empty command, blank apply_patch command[1]/cwd/timestamps, or invalid paths, report WorkerExecutionJournalRecordError and stop. No prose/Markdown.
+- WorkerReport.commands_run may be a subset of real journal records; each command array element and cwd must be copied byte-for-byte, failed commands included. Never paraphrase, summarize, normalize environment assignments, drop shell wrappers, or invent command identities.
+- Preserve the full apply_patch record:
+{apply_patch_journal_example}"#
+    ))
+}
+
+pub(super) fn worker_cacheable_prefix() -> Result<String> {
+    let journal_contract = worker_execution_journal_prompt_contract()?;
     Ok(format!(
         r#"You are a terminal worker/researcher in an opt-in local Codex CLI supervised run.
 Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher/review-auditor.
@@ -247,11 +258,7 @@ Rules:
 - Do not broaden the assignment, add claimed paths, or change files outside the assigned path set.
 - Do not request, access, read, write, disclose, or transmit credentials, secrets, tokens, or keys.
 - Do not stage, commit, push, merge, or otherwise publish changes.
-- Append one JSON line directly to the exact precreated journal before each action: {{command,cwd,start_timestamp,end_timestamp,changed_paths}}; use absolute cwd, nonempty RFC3339 timestamps, and canonical repo-relative paths. Never reconstruct at the end.
-- It is the only non-source write; its parent is nonwritable. Never create, replace, rename, link, truncate, or swap it. On empty command, blank apply_patch command[1]/cwd/timestamps, or invalid paths, report WorkerExecutionJournalRecordError and stop. No prose/Markdown.
-- WorkerReport.commands_run may be a subset of real journal records; each command array element and cwd must be copied byte-for-byte, failed commands included. Never paraphrase, summarize, normalize environment assignments, drop shell wrappers, or invent command identities.
-- Preserve the full apply_patch record:
-{apply_patch_journal_example}
+{journal_contract}
 - Validate, or record why not.
 - Return exactly one WorkerReport JSON object with assignment_kind, target_path, files_changed, commands_run, validation_results, findings, bloated_file_flags, decomposition_completion, remaining_risk, and next_safe_action. Do not wrap it in Markdown, a code fence, or prose.
 - Include environment_failures as [] when no typed environment failure occurred. When it is nonempty, do not report an accepted or succeeded outcome, and never include credential or secret values.
@@ -265,7 +272,7 @@ Rules:
 "#,
         tool_call_batching_guidance = TOOL_CALL_BATCHING_GUIDANCE,
         max_bloated_file_flags = MAX_BLOATED_FILE_FLAGS_PER_WORKER,
-        apply_patch_journal_example = apply_patch_journal_example,
+        journal_contract = journal_contract,
     ))
 }
 
@@ -309,13 +316,14 @@ fn worker_cacheable_prefix_for_target(
 
 fn direct_terminal_worker_cacheable_prefix(
     execution_target: Option<&SupervisorExecutionTarget>,
-) -> String {
+) -> Result<String> {
+    let journal_contract = worker_execution_journal_prompt_contract()?;
     let scope_rule = if execution_target.is_some() {
         "- The assigned worktree is the existing primary checkout. Edit only the exact declared primary-worktree claim paths; do not stage, commit, or change Git metadata."
     } else {
         "- Edit only inside the assigned worktree and only inside the exact declared assigned paths.\n- Do not mutate the primary worktree."
     };
-    format!(
+    Ok(format!(
         r#"You are an admitted direct terminal worker in an opt-in local Codex CLI supervised run.
 Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> admitted direct terminal worker.
 You are not a supervisor, child orchestrator, reviewer, acceptance gate, merger, or publisher. Your authority is execution-only.
@@ -328,6 +336,7 @@ Rules:
 - Do not broaden the assignment, add claim paths, or change files outside the exact assigned path set.
 - Do not request, access, read, write, disclose, or transmit credentials, secrets, tokens, or keys.
 - Do not stage, commit, push, merge, or otherwise publish changes.
+{journal_contract}
 - Validate the bounded change, or report exactly why validation could not run.
 - Return exactly one WorkerReport JSON object matching the declared worker schema. Do not return an OrchestratorReviewReport, prose, Markdown, or a code fence.
 - Set assignment_kind to ordinary, target_path to null, and decomposition_completion to null.
@@ -341,7 +350,7 @@ Rules:
         tool_call_batching_guidance = TOOL_CALL_BATCHING_GUIDANCE,
         scope_rule = scope_rule,
         max_bloated_file_flags = MAX_BLOATED_FILE_FLAGS_PER_WORKER,
-    )
+    ))
 }
 
 pub(super) fn review_auditor_cacheable_prefix() -> String {
@@ -386,7 +395,7 @@ Runtime boundary:
 
 Review requirements:
 - Review the child report, worker_reports, child worktree diff/changed paths, validation_results, findings, remaining_risk, assigned worker IDs, and assigned paths.
-- Verify every assigned worker id has adequate WorkerReport coverage and terminal no-delegation evidence. When there are no assigned workers, verify reviewed_worker_ids covers the child orchestrator id for the changed child diff.
+- Verify every required review subject id has adequate WorkerReport coverage and terminal no-delegation evidence. For a direct terminal worker, reviewed_worker_ids must cover its assignment id even when no files changed. For a workerless child orchestrator, cover its id when review is required.
 - Verify reviewed_paths covers the assigned paths and any changed paths relevant to this child scope.
 - For megafile_decomposition, verify the worker and child completion evidence names the exact target_path and is supported by the normal claim, journal, validation, and diff evidence.
 - reviewed_paths coverage is computed over repository-relative entries only. Absolute out-of-repo evidence paths are allowed and retained verbatim as evidence, but excluded from coverage computation.
@@ -604,7 +613,12 @@ pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guid
     worker_launch_runtime: SupervisorRuntime,
 ) -> Result<RenderedPromptWithMeasurements> {
     if context.assignment.role == AgentRole::Worker {
-        return render_direct_terminal_worker_prompt(context, field_guide, child_launch_runtime);
+        return render_direct_terminal_worker_prompt(
+            context,
+            incoming_root,
+            field_guide,
+            child_launch_runtime,
+        );
     }
     if context.assignment.role != AgentRole::ChildOrchestrator {
         bail!(
@@ -906,6 +920,7 @@ Orchestrator assignment JSON:
 
 fn render_direct_terminal_worker_prompt(
     context: ChildOrchestratorPromptContext<'_>,
+    incoming_root: &Path,
     field_guide: &SupervisorFieldGuidePrompt,
     launch_runtime: SupervisorRuntime,
 ) -> Result<RenderedPromptWithMeasurements> {
@@ -935,7 +950,10 @@ fn render_direct_terminal_worker_prompt(
         );
     }
 
-    let cacheable_prefix = direct_terminal_worker_cacheable_prefix(execution_target);
+    let cacheable_prefix = direct_terminal_worker_cacheable_prefix(execution_target)?;
+    let journal_path = incoming_root.join(worker_execution_journal_incoming_relative_for_id(
+        &assignment.id,
+    ));
     let role_prefix =
         supervise_role_prefix(SupervisePromptRole::TerminalWorker, &assignment.id, None);
     let assignment_json = serde_json::to_string_pretty(assignment)
@@ -968,6 +986,7 @@ Direct-worker assignment context:
 - Path claim token: {claim_token}
 - Semantic intent token: {semantic_intent_token}
 - Run artifact root: {run_dir}
+- Execution journal path: {journal_path}
 - Exact WorkerReport output-last-message path: {report_path}
 - WorkerReport schema path: {worker_schema_path}
 
@@ -998,6 +1017,7 @@ Direct worker assignment JSON:
             .map(|token| token.to_string())
             .unwrap_or_else(|| "<none>".to_string()),
         run_dir = run_dir.display(),
+        journal_path = journal_path.display(),
         report_path = report_path.display(),
         worker_schema_path = worker_schema_path.display(),
         launch_runtime = launch_runtime.as_str(),

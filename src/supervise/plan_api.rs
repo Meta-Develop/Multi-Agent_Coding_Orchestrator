@@ -5074,13 +5074,12 @@ pub fn verified_megafile_decomposition_evidence(
 }
 
 #[cfg(test)]
-mod generated_terminal_worker_tests {
+pub(super) mod generated_terminal_worker_tests {
     use super::*;
 
-    #[test]
-    fn generated_leaf_lowering_preserves_scope_schedule_models_and_review() {
+    fn ordinary_proposal() -> planning::TaskDecompositionProposal {
         let task = "Update alpha behavior.";
-        let proposal: planning::TaskDecompositionProposal = serde_json::from_value(json!({
+        serde_json::from_value(json!({
             "fragments": [{"id": "fragment-001", "text": task}],
             "assignments": [{
                 "id": "alpha", "task": task, "fragment_ids": ["fragment-001"],
@@ -5089,7 +5088,54 @@ mod generated_terminal_worker_tests {
             }],
             "diagnostics": {}, "disjointness": {"disjoint": true}
         }))
-        .expect("proposal fixture");
+        .expect("proposal fixture")
+    }
+
+    pub(in crate::supervise) fn generated_plans_for_gate_tests() -> Vec<SupervisorPlan> {
+        let proposal = ordinary_proposal();
+        let loaded = supervisor_plan_and_consultant_from_goal_spec_proposal(
+            "",
+            "Update alpha behavior.",
+            None,
+            proposal.clone(),
+            None,
+        )
+        .expect("goal lowering");
+        let mut plans = vec![loaded.plan.clone()];
+        let leaf = planning::ProviderTaskAssignmentTree::from(proposal.assignments[0].clone());
+        let mut root = leaf.clone();
+        root.id = "parent".to_string();
+        root.child_assignments = vec![leaf.clone()];
+        for node in [root, leaf] {
+            let mut plan = loaded.plan.clone();
+            plan.assignments.clear();
+            let mut metadata = loaded.plan_metadata.clone();
+            metadata.assignment_schedule.clear();
+            metadata.spec_fragment_ids_by_assignment.clear();
+            lower_provider_assignment_tree(
+                &node,
+                None,
+                MIN_SUPERVISOR_DEPTH,
+                &mut plan.assignments,
+                &mut metadata.assignment_schedule,
+                &mut metadata.spec_fragment_ids_by_assignment,
+                &mut BTreeSet::new(),
+                &mut plan.max_depth,
+            )
+            .expect("provider lowering");
+            plans.push(
+                validate_supervisor_plan_in_repo(plan, metadata, None)
+                    .expect("validate provider plan")
+                    .0,
+            );
+        }
+        plans
+    }
+
+    #[test]
+    fn generated_leaf_lowering_preserves_scope_schedule_models_and_review() {
+        let task = "Update alpha behavior.";
+        let proposal = ordinary_proposal();
         let mut loaded = supervisor_plan_and_consultant_from_goal_spec_proposal(
             "",
             task,

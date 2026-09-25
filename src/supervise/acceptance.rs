@@ -1368,7 +1368,8 @@ pub(super) fn parent_auditor_required(
     assignment: &OrchestratorAssignment,
     report: &OrchestratorReviewReport,
 ) -> bool {
-    (!assignment.worker_assignments.is_empty() && !report.worker_reports.is_empty())
+    assignment.role == AgentRole::Worker
+        || (!assignment.worker_assignments.is_empty() && !report.worker_reports.is_empty())
         || (assignment.worker_assignments.is_empty() && !report.files_changed.is_empty())
         || report.licensed_breakage_review.is_some()
         || report_has_field_guide_suggestions(report)
@@ -1579,7 +1580,9 @@ fn required_auditor_review_subject_ids(
     assignment: &OrchestratorAssignment,
     report: &OrchestratorReviewReport,
 ) -> BTreeSet<String> {
-    if assignment.worker_assignments.is_empty() {
+    if assignment.role == AgentRole::Worker {
+        BTreeSet::from([assignment.id.clone()])
+    } else if assignment.worker_assignments.is_empty() {
         if report.files_changed.is_empty()
             && !report_has_field_guide_suggestions(report)
             && report.licensed_breakage_review.is_none()
@@ -2493,15 +2496,20 @@ pub(super) fn validate_worker_execution_journal_evidence(
     journals: &WorkerExecutionJournalEvidenceSet,
     report: &mut OrchestratorReviewReport,
 ) {
-    if assignment.worker_assignments.is_empty() || report.worker_reports.is_empty() {
+    if (assignment.role != AgentRole::Worker && assignment.worker_assignments.is_empty())
+        || report.worker_reports.is_empty()
+    {
         return;
     }
 
-    let workers_by_id = assignment
+    let mut worker_paths_by_id = assignment
         .worker_assignments
         .iter()
-        .map(|worker| (worker.id.as_str(), worker))
+        .map(|worker| (worker.id.as_str(), worker.assigned_paths.as_slice()))
         .collect::<BTreeMap<_, _>>();
+    if assignment.role == AgentRole::Worker {
+        worker_paths_by_id.insert(assignment.id.as_str(), assignment.assigned_paths.as_slice());
+    }
     let actual_set = report
         .files_changed
         .iter()
@@ -2510,7 +2518,7 @@ pub(super) fn validate_worker_execution_journal_evidence(
     let mut blocking_messages = Vec::new();
 
     for worker_report in &mut report.worker_reports {
-        let Some(worker_assignment) = workers_by_id.get(worker_report.id.as_str()) else {
+        let Some(assigned_paths) = worker_paths_by_id.get(worker_report.id.as_str()) else {
             continue;
         };
         let Some(journal) = journals.get(&worker_report.id) else {
@@ -2566,8 +2574,7 @@ pub(super) fn validate_worker_execution_journal_evidence(
         for entry in entries {
             for path in &entry.changed_paths {
                 journal_paths.insert(path.clone());
-                if !worker_assignment
-                    .assigned_paths
+                if !assigned_paths
                     .iter()
                     .any(|assigned| path_is_covered_by_claim(path, assigned))
                 {
