@@ -721,6 +721,7 @@ assert start["params"]["cwd"] == str(workspace)
 assert start["params"]["approvalsReviewer"] == "user"
 send({"id":start["id"], "result":{
     "thread":{"id":"research-thread"}, "cwd":str(workspace),
+    "model":"gpt-5.6-sol", "reasoningEffort":"xhigh",
     "approvalPolicy":"on-request", "approvalsReviewer":"user",
     "activePermissionProfile":{"id":"maco_external_codex"}
 }})
@@ -1426,6 +1427,8 @@ assert thread_start["method"] == "thread/start"
 assert thread_start["params"]["approvalsReviewer"] == "user"
 send({"id": thread_start["id"], "result": {
     "thread": {"id": "thread-contained"},
+    "model": "gpt-5.6-sol",
+    "reasoningEffort": "xhigh",
     "approvalPolicy": "on-request",
     "approvalsReviewer": "user",
     "activePermissionProfile": {"id": "maco_external_codex"},
