@@ -6,6 +6,7 @@
 //! identity.
 
 mod persistence;
+pub(super) mod worker_requests;
 
 #[cfg(test)]
 use super::ArtifactFileDisposition;
